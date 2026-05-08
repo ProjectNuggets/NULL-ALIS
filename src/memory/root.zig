@@ -620,6 +620,34 @@ pub fn freeWorkingMemorySlots(allocator: std.mem.Allocator, slots: []WorkingMemo
     allocator.free(slots);
 }
 
+/// V1.13 Day 2 — extraction queue job. Brokers async work between the
+/// agent turn loop (enqueue) and the heartbeat worker (process).
+/// job_type values:
+///   "wiki_link"   — entity_pipeline pass over a turn-text snapshot
+///   "session_end" — full session-end transcript pass
+///   "backfill"    — admin one-shot re-extraction over historical data
+///
+/// payload is JSONB-stringified per job_type:
+///   wiki_link:   {"turn_text": "...", "session_id": "..."}
+///   session_end: {"transcript_text": "...", "session_id": "..."}
+///   backfill:    {"target_keys": [...], "since_unix": N}
+///
+/// Caller owns string fields via the supplied allocator.
+pub const ExtractionJob = struct {
+    id: i64,
+    user_id: i64,
+    session_id: []const u8,
+    job_type: []const u8,
+    payload_json: []const u8,
+    attempts: i32,
+
+    pub fn deinit(self: *const ExtractionJob, allocator: std.mem.Allocator) void {
+        allocator.free(self.session_id);
+        allocator.free(self.job_type);
+        allocator.free(self.payload_json);
+    }
+};
+
 /// V1.9-1 — result of a cascade-rename operation on the entity graph.
 /// Returned by `state_mgr.cascadeRenameEntity(allocator, user_id,
 /// old_name, new_name)`. Caller owns `old_id` + `new_id` via the

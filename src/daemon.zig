@@ -1034,6 +1034,12 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
             }
         }
 
+        // V1.13 Day 2.2 — Extraction queue worker tick will plug in
+        // here. Day 2.1 (this commit) lands the queue DDL + CRUD; the
+        // worker that drains the queue + runs entity_pipeline.runOnTurn
+        // out of the agent's critical path needs provider+embedder init
+        // wiring that's deferred to the follow-up commit.
+
         std.Thread.sleep(std.time.ns_per_s);
     }
 }

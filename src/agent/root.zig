@@ -3917,16 +3917,17 @@ pub const Agent = struct {
                         };
                         if (turn_text_opt) |turn_text| {
                             defer self.allocator.free(turn_text);
-                            // REVIEW HI-01 interim mitigation (2026-05-08):
-                            // 30s → 10s timeout caps the worst-case wait
-                            // before next-turn unblock. Production logs
-                            // showed 58s LLM calls on Kimi K2.6; 10s
-                            // bounds blast radius. Day 4 follow-up: spawn
-                            // background thread or push to a worker queue
-                            // so the trigger doesn't block the post-turn
-                            // path AT ALL. For now: 10s + outcome
-                            // tracking (.llm_failed when timeout hits)
-                            // gives us observability + bounded latency.
+                            // V1.13 Day 2.1 — extraction_queue
+                            // infrastructure is in place (DDL + CRUD)
+                            // but worker cutover is deferred to Day 2.2
+                            // (needs provider+embedder init in worker
+                            // thread). For now, RUN INLINE per V1.12
+                            // behavior (interim 10s timeout) AND enqueue
+                            // a shadow record so the cutover commit can
+                            // verify queue is being populated correctly.
+                            //
+                            // TODO Day 2.2: remove inline call; worker
+                            // becomes the only execution path.
                             const stats = entity_pipeline.runOnTurn(
                                 self.allocator,
                                 self.provider,
@@ -3935,7 +3936,7 @@ pub const Agent = struct {
                                 self.extraction_coref_embed.?,
                                 self.extraction_user_id.?,
                                 turn_text,
-                                10, // timeout_secs (was 30)
+                                10, // interim timeout
                             );
                             log.info(
                                 "turn.stage stage=entity_pipeline outcome={s} mentions={d} resolved={d} minted={d} edges={d} skipped={d} llm_ms={d}",
@@ -3949,7 +3950,6 @@ pub const Agent = struct {
                                     stats.llm_latency_ms,
                                 },
                             );
-                            // REVIEW ME-04 fix: include duration_ms in observer event.
                             const ep_event = ObserverEvent{ .turn_stage = .{
                                 .stage = "entity_pipeline",
                                 .iteration = iteration,

@@ -613,6 +613,25 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn clearWorkingMemorySession(_: *@This(), _: i64, _: []const u8) !void {
         return;
     }
+    /// V1.13 Day 2 — extraction queue stubs for non-postgres builds.
+    /// Non-postgres builds run extraction synchronously inline (V1.12
+    /// behavior) — the queue is a postgres-only background-lane primitive.
+    pub fn enqueueExtractionJob(_: *@This(), _: i64, _: []const u8, _: []const u8, _: []const u8) !i64 {
+        return -1;
+    }
+    pub fn claimNextExtractionJob(_: *@This(), allocator: std.mem.Allocator) !?memory_root.ExtractionJob {
+        _ = allocator;
+        return null;
+    }
+    pub fn markExtractionJobDone(_: *@This(), _: i64) !void {
+        return;
+    }
+    pub fn markExtractionJobFailed(_: *@This(), _: i64, _: []const u8) !void {
+        return;
+    }
+    pub fn countPendingExtractionJobs(_: *@This()) !usize {
+        return 0;
+    }
     pub fn countMemories(_: *@This(), _: i64) !usize {
         return error.PostgresNotEnabled;
     }
@@ -1517,6 +1536,45 @@ const ManagerImpl = struct {
             ,
             "CREATE INDEX IF NOT EXISTS idx_wm_session ON {schema}.working_memory(user_id, session_id, last_touched_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_wm_priority ON {schema}.working_memory(user_id, session_id, importance DESC) WHERE NOT pinned",
+
+            // V1.13 Day 2 — Extraction queue (HI-01 real fix).
+            //
+            // Entity_pipeline + session_end consolidation are async background
+            // work — moving them off the agent turn loop into the heartbeat
+            // worker lane (daemon.zig::heartbeatThread). The queue table
+            // brokers between enqueue (per-turn-end / session-end fast path)
+            // and process (heartbeat tick).
+            //
+            // job_type:  'wiki_link' | 'session_end' | 'backfill'
+            // status:    'pending' | 'running' | 'done' | 'failed'
+            // payload:   JSONB — {turn_text: ..., recent_entries: [...], ...}
+            //
+            // Worker uses SELECT FOR UPDATE SKIP LOCKED to claim jobs
+            // concurrency-safe across multiple heartbeat instances (per-cell
+            // pod isolation makes this rare today, but the pattern is
+            // defense-in-depth for shared deployments).
+            //
+            // Retries: failed jobs flip to 'failed' after 3 attempts; the
+            // application layer (extraction_queue.zig) decides retry policy.
+            // For wiki_link / session_end, terminal failure is acceptable —
+            // canonical conversation_messages is the source of truth and
+            // the next pass will re-extract on idle eviction.
+            \\CREATE TABLE IF NOT EXISTS {schema}.extraction_queue (
+            \\    id BIGSERIAL PRIMARY KEY,
+            \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
+            \\    session_id TEXT NOT NULL,
+            \\    job_type TEXT NOT NULL,
+            \\    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+            \\    enqueued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            \\    started_at TIMESTAMPTZ,
+            \\    completed_at TIMESTAMPTZ,
+            \\    status TEXT NOT NULL DEFAULT 'pending',
+            \\    attempts INT NOT NULL DEFAULT 0,
+            \\    last_error TEXT
+            \\)
+            ,
+            "CREATE INDEX IF NOT EXISTS idx_xq_pending ON {schema}.extraction_queue(user_id, enqueued_at) WHERE status = 'pending'",
+            "CREATE INDEX IF NOT EXISTS idx_xq_status ON {schema}.extraction_queue(status, enqueued_at)",
 
             \\CREATE TABLE IF NOT EXISTS {schema}.channel_state (
             \\    user_id BIGINT PRIMARY KEY REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
@@ -7241,6 +7299,179 @@ const ManagerImpl = struct {
         const lengths = [_]c_int{ @intCast(user_s.len), @intCast(session_id.len) };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // V1.13 Day 2 — Extraction queue CRUD
+    // ─────────────────────────────────────────────────────────────────
+    //
+    // Schema: zaki_bot.extraction_queue (DDL after working_memory).
+    // Brokers async work between agent turn-loop (enqueue) and
+    // heartbeat worker (process). Worker uses SELECT FOR UPDATE SKIP
+    // LOCKED to claim jobs concurrency-safe.
+
+    /// Enqueue a job. Returns the new job's BIGSERIAL id (negative on
+    /// non-postgres / missing-table). payload_json must be valid JSON;
+    /// caller is responsible for serialization.
+    pub fn enqueueExtractionJob(
+        self: *Self,
+        user_id: i64,
+        session_id: []const u8,
+        job_type: []const u8,
+        payload_json: []const u8,
+    ) !i64 {
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.extraction_queue " ++
+                "(user_id, session_id, job_type, payload) " ++
+                "VALUES ($1, $2, $3, $4::jsonb) RETURNING id",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const sid_z = try self.allocator.dupeZ(u8, session_id);
+        defer self.allocator.free(sid_z);
+        const jt_z = try self.allocator.dupeZ(u8, job_type);
+        defer self.allocator.free(jt_z);
+        const pl_z = try self.allocator.dupeZ(u8, payload_json);
+        defer self.allocator.free(pl_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, sid_z, jt_z, pl_z };
+        const lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(session_id.len),
+            @intCast(job_type.len),
+            @intCast(payload_json.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return -1;
+        const id_str = try dupeResultValue(self.allocator, result, 0, 0);
+        defer self.allocator.free(id_str);
+        return std.fmt.parseInt(i64, id_str, 10) catch -1;
+    }
+
+    /// Atomically claim the next pending job (oldest-first within
+    /// pending status). Uses SELECT FOR UPDATE SKIP LOCKED to be
+    /// safe against concurrent workers. Returns null when queue
+    /// is empty. Caller owns the returned ExtractionJob.
+    pub fn claimNextExtractionJob(
+        self: *Self,
+        allocator: std.mem.Allocator,
+    ) !?memory_root.ExtractionJob {
+        // Wrap claim in a transaction so the SELECT...FOR UPDATE +
+        // UPDATE happen as one operation. Failure between SELECT and
+        // UPDATE would leave the row claimed (status=running) but
+        // unprocessed; on next worker tick the staleness check
+        // (started_at older than 5 min) reclaims it.
+        const begin_q = try self.allocator.dupeZ(u8, "BEGIN");
+        defer self.allocator.free(begin_q);
+        _ = c.PQexec(self.conn, begin_q);
+
+        const q = try self.buildQuery(
+            "WITH claimed AS (" ++
+                "  SELECT id, user_id, session_id, job_type, payload::text AS payload_text, attempts " ++
+                "  FROM {schema}.extraction_queue " ++
+                "  WHERE status = 'pending' " ++
+                "  ORDER BY enqueued_at ASC " ++
+                "  LIMIT 1 FOR UPDATE SKIP LOCKED" ++
+                ") " ++
+                "UPDATE {schema}.extraction_queue eq " ++
+                "SET status = 'running', started_at = NOW(), attempts = eq.attempts + 1 " ++
+                "FROM claimed " ++
+                "WHERE eq.id = claimed.id " ++
+                "RETURNING claimed.id, claimed.user_id, claimed.session_id, claimed.job_type, claimed.payload_text, claimed.attempts",
+        );
+        defer self.allocator.free(q);
+        const result = self.execParams(q, &.{}, &.{}) catch |err| {
+            const rb = try self.allocator.dupeZ(u8, "ROLLBACK");
+            defer self.allocator.free(rb);
+            _ = c.PQexec(self.conn, rb);
+            return err;
+        };
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) {
+            const commit_q = try self.allocator.dupeZ(u8, "COMMIT");
+            defer self.allocator.free(commit_q);
+            _ = c.PQexec(self.conn, commit_q);
+            return null;
+        }
+
+        const commit_q = try self.allocator.dupeZ(u8, "COMMIT");
+        defer self.allocator.free(commit_q);
+        _ = c.PQexec(self.conn, commit_q);
+
+        const id_str = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(id_str);
+        const user_str = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(user_str);
+        const session_owned = try dupeResultValue(allocator, result, 0, 2);
+        errdefer allocator.free(session_owned);
+        const jt_owned = try dupeResultValue(allocator, result, 0, 3);
+        errdefer allocator.free(jt_owned);
+        const pl_owned = try dupeResultValue(allocator, result, 0, 4);
+        errdefer allocator.free(pl_owned);
+        const attempts_str = try dupeResultValue(allocator, result, 0, 5);
+        defer allocator.free(attempts_str);
+
+        return memory_root.ExtractionJob{
+            .id = std.fmt.parseInt(i64, id_str, 10) catch 0,
+            .user_id = std.fmt.parseInt(i64, user_str, 10) catch 0,
+            .session_id = session_owned,
+            .job_type = jt_owned,
+            .payload_json = pl_owned,
+            .attempts = std.fmt.parseInt(i32, attempts_str, 10) catch 0,
+        };
+    }
+
+    /// Mark a claimed job as completed. Idempotent.
+    pub fn markExtractionJobDone(self: *Self, job_id: i64) !void {
+        const q = try self.buildQuery(
+            "UPDATE {schema}.extraction_queue " ++
+                "SET status = 'done', completed_at = NOW() " ++
+                "WHERE id = $1",
+        );
+        defer self.allocator.free(q);
+        var id_buf: [32]u8 = undefined;
+        const id_s = try std.fmt.bufPrintZ(&id_buf, "{d}", .{job_id});
+        const params = [_]?[*:0]const u8{id_s.ptr};
+        const lengths = [_]c_int{@intCast(id_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+    }
+
+    /// Mark a claimed job as failed. After 3 attempts, status flips
+    /// to 'failed' permanently; before that it goes back to 'pending'
+    /// for retry. Caller (worker loop) supplies the err text for audit.
+    pub fn markExtractionJobFailed(self: *Self, job_id: i64, err_text: []const u8) !void {
+        const q = try self.buildQuery(
+            "UPDATE {schema}.extraction_queue " ++
+                "SET status = CASE WHEN attempts >= 3 THEN 'failed' ELSE 'pending' END, " ++
+                "    last_error = $2 " ++
+                "WHERE id = $1",
+        );
+        defer self.allocator.free(q);
+        var id_buf: [32]u8 = undefined;
+        const id_s = try std.fmt.bufPrintZ(&id_buf, "{d}", .{job_id});
+        const err_z = try self.allocator.dupeZ(u8, err_text);
+        defer self.allocator.free(err_z);
+        const params = [_]?[*:0]const u8{ id_s.ptr, err_z };
+        const lengths = [_]c_int{ @intCast(id_s.len), @intCast(err_text.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+    }
+
+    /// Count of pending jobs across all users — used by the heartbeat
+    /// worker to decide whether to skip its tick (no work) or process.
+    pub fn countPendingExtractionJobs(self: *Self) !usize {
+        const q = try self.buildQuery(
+            "SELECT COUNT(*) FROM {schema}.extraction_queue WHERE status = 'pending'",
+        );
+        defer self.allocator.free(q);
+        const result = try self.execParams(q, &.{}, &.{});
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return 0;
+        const count_str = try dupeResultValue(self.allocator, result, 0, 0);
+        defer self.allocator.free(count_str);
+        return std.fmt.parseInt(usize, count_str, 10) catch 0;
     }
 
     /// Delete autosave_user_* and autosave_assistant_* memory rows for the

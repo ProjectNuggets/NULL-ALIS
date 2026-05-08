@@ -1480,6 +1480,10 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                     };
                     if (transcript_text) |tt| {
                         defer self.allocator.free(tt);
+                        // V1.13 Day 2.1 — extraction_queue infra is in
+                        // place (DDL + CRUD); worker cutover deferred
+                        // to Day 2.2. Run inline (V1.12 behavior with
+                        // interim 10s timeout) until worker ships.
                         const ep_stats = @import("entity_pipeline.zig").runOnTurn(
                             self.allocator,
                             self.provider,
@@ -1488,7 +1492,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                             emb_ep,
                             uid_ep,
                             tt,
-                            10, // REVIEW HI-01: 30→10s timeout
+                            10,
                         );
                         log.info(
                             "session_end.entity_pipeline outcome={s} mentions={d} resolved={d} minted={d} edges={d} skipped={d} failed={d} llm_ms={d}",
@@ -1503,7 +1507,6 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                                 ep_stats.llm_latency_ms,
                             },
                         );
-                        // REVIEW ME-04: emit observer event for session-end pass too.
                         const ep_event = observability.ObserverEvent{ .turn_stage = .{
                             .stage = "session_end_entity_pipeline",
                             .duration_ms = @intCast(@max(0, ep_stats.llm_latency_ms)),
