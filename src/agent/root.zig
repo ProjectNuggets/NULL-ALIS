@@ -76,6 +76,10 @@ pub const entity_pipeline = @import("entity_pipeline.zig");
 /// session that persist across turns and render into the volatile
 /// prompt block. See agent/working_memory.zig.
 pub const working_memory = @import("working_memory.zig");
+/// V1.13 Day 4 — Procedural memory (Layer 6). Captures skill execution
+/// traces for recall on next invocation. Schema lives in
+/// zaki_state.skill_executions; Day 4.2 adds render + capture.
+pub const procedural_memory = @import("procedural_memory.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
 const ToolExecutionResult = dispatcher.ToolExecutionResult;
 

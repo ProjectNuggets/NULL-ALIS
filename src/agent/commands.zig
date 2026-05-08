@@ -1516,6 +1516,41 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                         .stage = "session_end_entity_pipeline_enqueued",
                     } };
                     self.observer.recordEvent(&ep_event);
+
+                    // V1.13 Day 4.2 — capture procedural memory trace.
+                    // Coarse-grained: one trace per session if it
+                    // crossed the tool-count threshold. Future Day 4.3
+                    // will refine via per-skill detection.
+                    //
+                    // task_summary: derive from the most-recent user
+                    // entry. tool_call_names: empty for now (would
+                    // require session-wide tracking; left as future
+                    // refinement). total_tool_calls: use entry count
+                    // as a heuristic proxy until session-wide counter
+                    // ships.
+                    const procedural_memory = @import("procedural_memory.zig");
+                    var task_text: ?[]const u8 = null;
+                    var i: usize = entries.len;
+                    while (i > 0) {
+                        i -= 1;
+                        if (std.mem.eql(u8, entries[i].role, "user")) {
+                            task_text = entries[i].content;
+                            break;
+                        }
+                    }
+                    const tool_count_proxy: u32 = @intCast(@min(entries.len, std.math.maxInt(u32)));
+                    if (tool_count_proxy >= procedural_memory.CAPTURE_TOOL_THRESHOLD) {
+                        const empty_names: []const []const u8 = &.{};
+                        _ = procedural_memory.captureSession(
+                            self.allocator,
+                            smgr_ep,
+                            uid_ep,
+                            session_id,
+                            task_text,
+                            empty_names,
+                            tool_count_proxy,
+                        );
+                    }
                 }
             }
         }
