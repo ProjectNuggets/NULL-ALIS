@@ -648,6 +648,37 @@ pub const ExtractionJob = struct {
     }
 };
 
+/// V1.13 Day 4 — Procedural memory record. One row in skill_executions.
+/// Captured at end of a turn that ran a skill; recalled at start of the
+/// next invocation of the same skill so the agent builds on prior runs
+/// rather than starting cold every time.
+pub const SkillExecution = struct {
+    id: i64,
+    user_id: i64,
+    session_id: ?[]const u8,
+    skill_name: []const u8,
+    task_summary: ?[]const u8,
+    steps_executed_json: []const u8, // JSONB-stringified array
+    assumptions_made_json: []const u8, // JSONB-stringified array
+    user_feedback: ?[]const u8,
+    outcome_quality: ?f64,
+    created_at_unix: i64,
+
+    pub fn deinit(self: *const SkillExecution, allocator: std.mem.Allocator) void {
+        if (self.session_id) |s| allocator.free(s);
+        allocator.free(self.skill_name);
+        if (self.task_summary) |s| allocator.free(s);
+        allocator.free(self.steps_executed_json);
+        allocator.free(self.assumptions_made_json);
+        if (self.user_feedback) |s| allocator.free(s);
+    }
+};
+
+pub fn freeSkillExecutions(allocator: std.mem.Allocator, items: []SkillExecution) void {
+    for (items) |*s| s.deinit(allocator);
+    allocator.free(items);
+}
+
 /// V1.9-1 — result of a cascade-rename operation on the entity graph.
 /// Returned by `state_mgr.cascadeRenameEntity(allocator, user_id,
 /// old_name, new_name)`. Caller owns `old_id` + `new_id` via the

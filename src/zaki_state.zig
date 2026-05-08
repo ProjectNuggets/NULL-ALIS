@@ -632,6 +632,19 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn countPendingExtractionJobs(_: *@This()) !usize {
         return 0;
     }
+    /// V1.13 Day 4 — skill executions stubs for non-postgres builds.
+    /// Returns empty / no-op so non-postgres deploys compile and the
+    /// procedural-memory path silently degrades to V1.12 behavior
+    /// (skills read .md files cold every time).
+    pub fn insertSkillExecution(_: *@This(), _: i64, _: ?[]const u8, _: []const u8, _: ?[]const u8, _: []const u8, _: []const u8, _: ?f64) !i64 {
+        return -1;
+    }
+    pub fn listRecentSkillExecutions(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const u8, _: usize) ![]memory_root.SkillExecution {
+        return allocator.alloc(memory_root.SkillExecution, 0);
+    }
+    pub fn updateSkillExecutionFeedback(_: *@This(), _: i64, _: []const u8, _: ?f64) !void {
+        return;
+    }
     pub fn countMemories(_: *@This(), _: i64) !usize {
         return error.PostgresNotEnabled;
     }
@@ -1582,6 +1595,47 @@ const ManagerImpl = struct {
             ,
             "CREATE INDEX IF NOT EXISTS idx_xq_pending ON {schema}.extraction_queue(user_id, enqueued_at) WHERE status = 'pending'",
             "CREATE INDEX IF NOT EXISTS idx_xq_status ON {schema}.extraction_queue(status, enqueued_at)",
+
+            // V1.13 Day 4 — Procedural memory (Layer 6).
+            //
+            // Skills today are static .md files in the workspace. Every
+            // invocation reads from scratch — no learning from practice.
+            // skill_executions captures the trace of each skill run so
+            // future invocations can recall: what was assumed, what
+            // worked, what the user pushed back on, what to do
+            // differently next time.
+            //
+            // Capture is auto: turns with ≥3 tool calls that look like
+            // a skill execution get traced. Recall happens at
+            // skill-tool invocation time — last 3 traces of the same
+            // skill_name for this user are injected into the prompt.
+            //
+            // Schema notes:
+            //   skill_name: free-form string (e.g. "content-strategy");
+            //              eventually constrained to skill_registry.
+            //   task_summary: 1-line description from the user's turn.
+            //   steps_executed: JSONB array of {step, tools_used,
+            //                  output_excerpt, success}.
+            //   assumptions_made: JSONB array of strings.
+            //   user_feedback: derived heuristically from next turn
+            //                 (positive if user continues, neutral
+            //                 if not, negative on explicit pushback).
+            //   outcome_quality: 0..1, agent self-assessed at capture
+            //                   time, refined by feedback signal.
+            \\CREATE TABLE IF NOT EXISTS {schema}.skill_executions (
+            \\    id BIGSERIAL PRIMARY KEY,
+            \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
+            \\    session_id TEXT,
+            \\    skill_name TEXT NOT NULL,
+            \\    task_summary TEXT,
+            \\    steps_executed JSONB NOT NULL DEFAULT '[]'::jsonb,
+            \\    assumptions_made JSONB NOT NULL DEFAULT '[]'::jsonb,
+            \\    user_feedback TEXT,
+            \\    outcome_quality FLOAT,
+            \\    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            \\)
+            ,
+            "CREATE INDEX IF NOT EXISTS idx_skill_exec_user_time ON {schema}.skill_executions(user_id, skill_name, created_at DESC)",
 
             \\CREATE TABLE IF NOT EXISTS {schema}.channel_state (
             \\    user_id BIGINT PRIMARY KEY REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
@@ -7479,6 +7533,195 @@ const ManagerImpl = struct {
         const count_str = try dupeResultValue(self.allocator, result, 0, 0);
         defer self.allocator.free(count_str);
         return std.fmt.parseInt(usize, count_str, 10) catch 0;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // V1.13 Day 4 — Skill executions (procedural memory)
+    // ─────────────────────────────────────────────────────────────────
+    //
+    // Schema: zaki_bot.skill_executions (DDL after extraction_queue).
+    // Captures the trace of each skill invocation so future runs can
+    // recall: assumptions made, steps executed, outcome quality.
+
+    /// Insert one skill execution trace. JSONB payloads are passed as
+    /// pre-stringified strings; caller is responsible for valid JSON.
+    pub fn insertSkillExecution(
+        self: *Self,
+        user_id: i64,
+        session_id: ?[]const u8,
+        skill_name: []const u8,
+        task_summary: ?[]const u8,
+        steps_executed_json: []const u8,
+        assumptions_made_json: []const u8,
+        outcome_quality: ?f64,
+    ) !i64 {
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.skill_executions " ++
+                "(user_id, session_id, skill_name, task_summary, " ++
+                " steps_executed, assumptions_made, outcome_quality) " ++
+                "VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7) RETURNING id",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const sid_text = session_id orelse "";
+        const sid_z = try self.allocator.dupeZ(u8, sid_text);
+        defer self.allocator.free(sid_z);
+        const skill_z = try self.allocator.dupeZ(u8, skill_name);
+        defer self.allocator.free(skill_z);
+        const summary_text = task_summary orelse "";
+        const summary_z = try self.allocator.dupeZ(u8, summary_text);
+        defer self.allocator.free(summary_z);
+        const steps_z = try self.allocator.dupeZ(u8, steps_executed_json);
+        defer self.allocator.free(steps_z);
+        const assump_z = try self.allocator.dupeZ(u8, assumptions_made_json);
+        defer self.allocator.free(assump_z);
+        var oq_buf: [32]u8 = undefined;
+        const oq_text = if (outcome_quality) |oqv| std.fmt.bufPrintZ(&oq_buf, "{d:.4}", .{oqv}) catch "" else "";
+        const oq_z = try self.allocator.dupeZ(u8, oq_text);
+        defer self.allocator.free(oq_z);
+
+        const params = [_]?[*:0]const u8{
+            user_s.ptr,
+            if (session_id == null) null else sid_z,
+            skill_z,
+            if (task_summary == null) null else summary_z,
+            steps_z,
+            assump_z,
+            if (outcome_quality == null) null else oq_z,
+        };
+        const lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(sid_text.len),
+            @intCast(skill_name.len),
+            @intCast(summary_text.len),
+            @intCast(steps_executed_json.len),
+            @intCast(assumptions_made_json.len),
+            @intCast(oq_text.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return -1;
+        const id_str = try dupeResultValue(self.allocator, result, 0, 0);
+        defer self.allocator.free(id_str);
+        return std.fmt.parseInt(i64, id_str, 10) catch -1;
+    }
+
+    /// List the most-recent N skill execution traces for (user, skill_name).
+    /// Used at the start of a skill invocation to inject "what worked
+    /// last time" into the prompt. Returns owned slice; caller calls
+    /// freeSkillExecutions.
+    pub fn listRecentSkillExecutions(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        skill_name: []const u8,
+        limit: usize,
+    ) ![]memory_root.SkillExecution {
+        const q = try self.buildQuery(
+            "SELECT id, session_id, skill_name, task_summary, " ++
+                "steps_executed::text, assumptions_made::text, user_feedback, " ++
+                "outcome_quality, EXTRACT(EPOCH FROM created_at)::bigint " ++
+                "FROM {schema}.skill_executions " ++
+                "WHERE user_id = $1 AND skill_name = $2 " ++
+                "ORDER BY created_at DESC LIMIT $3",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const skill_z = try self.allocator.dupeZ(u8, skill_name);
+        defer self.allocator.free(skill_z);
+        var lim_buf: [32]u8 = undefined;
+        const lim_s = try std.fmt.bufPrintZ(&lim_buf, "{d}", .{limit});
+        const params = [_]?[*:0]const u8{ user_s.ptr, skill_z, lim_s.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(skill_name.len), @intCast(lim_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const n: usize = @intCast(c.PQntuples(result));
+        var out: std.ArrayListUnmanaged(memory_root.SkillExecution) = .{};
+        errdefer {
+            for (out.items) |s| s.deinit(allocator);
+            out.deinit(allocator);
+        }
+        try out.ensureTotalCapacity(allocator, n);
+
+        for (0..n) |i| {
+            const row_idx: c_int = @intCast(i);
+            const id_str = try dupeResultValue(allocator, result, row_idx, 0);
+            defer allocator.free(id_str);
+            const sid_owned: ?[]u8 = blk: {
+                if (c.PQgetisnull(result, row_idx, 1) == 1) break :blk null;
+                break :blk try dupeResultValue(allocator, result, row_idx, 1);
+            };
+            errdefer if (sid_owned) |s| allocator.free(s);
+            const skill_owned = try dupeResultValue(allocator, result, row_idx, 2);
+            errdefer allocator.free(skill_owned);
+            const summary_owned: ?[]u8 = blk: {
+                if (c.PQgetisnull(result, row_idx, 3) == 1) break :blk null;
+                break :blk try dupeResultValue(allocator, result, row_idx, 3);
+            };
+            errdefer if (summary_owned) |s| allocator.free(s);
+            const steps_owned = try dupeResultValue(allocator, result, row_idx, 4);
+            errdefer allocator.free(steps_owned);
+            const assump_owned = try dupeResultValue(allocator, result, row_idx, 5);
+            errdefer allocator.free(assump_owned);
+            const feedback_owned: ?[]u8 = blk: {
+                if (c.PQgetisnull(result, row_idx, 6) == 1) break :blk null;
+                break :blk try dupeResultValue(allocator, result, row_idx, 6);
+            };
+            errdefer if (feedback_owned) |s| allocator.free(s);
+            const oq_str: ?[]u8 = blk: {
+                if (c.PQgetisnull(result, row_idx, 7) == 1) break :blk null;
+                break :blk try dupeResultValue(allocator, result, row_idx, 7);
+            };
+            defer if (oq_str) |s| allocator.free(s);
+            const created_str = try dupeResultValue(allocator, result, row_idx, 8);
+            defer allocator.free(created_str);
+
+            try out.append(allocator, .{
+                .id = std.fmt.parseInt(i64, id_str, 10) catch 0,
+                .user_id = user_id,
+                .session_id = sid_owned,
+                .skill_name = skill_owned,
+                .task_summary = summary_owned,
+                .steps_executed_json = steps_owned,
+                .assumptions_made_json = assump_owned,
+                .user_feedback = feedback_owned,
+                .outcome_quality = if (oq_str) |s| (std.fmt.parseFloat(f64, s) catch null) else null,
+                .created_at_unix = std.fmt.parseInt(i64, created_str, 10) catch 0,
+            });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Update feedback signal on an existing skill execution. Used when
+    /// the next-turn user response signals positive/neutral/negative
+    /// feedback on the prior skill output.
+    pub fn updateSkillExecutionFeedback(
+        self: *Self,
+        execution_id: i64,
+        feedback: []const u8,
+        outcome_quality: ?f64,
+    ) !void {
+        const q = try self.buildQuery(
+            "UPDATE {schema}.skill_executions " ++
+                "SET user_feedback = $2, outcome_quality = COALESCE($3, outcome_quality) " ++
+                "WHERE id = $1",
+        );
+        defer self.allocator.free(q);
+        var id_buf: [32]u8 = undefined;
+        const id_s = try std.fmt.bufPrintZ(&id_buf, "{d}", .{execution_id});
+        const fb_z = try self.allocator.dupeZ(u8, feedback);
+        defer self.allocator.free(fb_z);
+        var oq_buf: [32]u8 = undefined;
+        const oq_text = if (outcome_quality) |oqv| std.fmt.bufPrintZ(&oq_buf, "{d:.4}", .{oqv}) catch "" else "";
+        const oq_z = try self.allocator.dupeZ(u8, oq_text);
+        defer self.allocator.free(oq_z);
+        const params = [_]?[*:0]const u8{ id_s.ptr, fb_z, if (outcome_quality == null) null else oq_z };
+        const lengths = [_]c_int{ @intCast(id_s.len), @intCast(feedback.len), @intCast(oq_text.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
     }
 
     /// Delete autosave_user_* and autosave_assistant_* memory rows for the
