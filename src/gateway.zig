@@ -12710,7 +12710,13 @@ fn handleBrainMemoryDetail(
     };
     defer allocator.free(key);
 
-    if (key.len == 0 or key.len > 256) {
+    // M1 fix (2026-05-08, REVIEW-v1.11-day1) — reject NUL bytes in the
+    // decoded key. libpq text format silently truncates parameters at
+    // the first \0 → query for `realkey\0attackertail` resolves to
+    // `realkey`, returning data for a different memory than the URL
+    // names. Not a privilege bypass (isBrainVisibleKey runs on the full
+    // decoded slice below) but a confusion vector worth closing.
+    if (key.len == 0 or key.len > 256 or std.mem.indexOfScalar(u8, key, 0) != null) {
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_key\"}" };
     }
 
@@ -24412,6 +24418,52 @@ test "tenant config normalization strips operator-owned runtime keys" {
     try std.testing.expect(std.mem.indexOf(u8, normalized.json, "\"agent\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, normalized.json, "\"memory\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, normalized.json, "\"product_settings\"") != null);
+}
+
+test "percentDecodePathSegment: happy path colon" {
+    const out = try percentDecodePathSegment(std.testing.allocator, "2026-04-05%3A1139");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("2026-04-05:1139", out);
+}
+
+test "percentDecodePathSegment: rejects trailing percent (no hex digits)" {
+    try std.testing.expectError(error.InvalidEncoding, percentDecodePathSegment(std.testing.allocator, "abc%"));
+    try std.testing.expectError(error.InvalidEncoding, percentDecodePathSegment(std.testing.allocator, "abc%4"));
+}
+
+test "percentDecodePathSegment: rejects non-hex sequences" {
+    try std.testing.expectError(error.InvalidEncoding, percentDecodePathSegment(std.testing.allocator, "abc%ZZ"));
+    try std.testing.expectError(error.InvalidEncoding, percentDecodePathSegment(std.testing.allocator, "abc%4Z"));
+}
+
+test "percentDecodePathSegment: %00 produces NUL byte (caller responsible for rejecting)" {
+    // Pins current behavior — the route boundary in handleBrainMemoryDetail
+    // checks for \0 after decoding (M1 fix). The decoder itself stays
+    // RFC-3986-spec-compliant; the policy decision lives at the call site.
+    const out = try percentDecodePathSegment(std.testing.allocator, "real%00garbage");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqual(@as(usize, 12), out.len);
+    try std.testing.expectEqual(@as(u8, 0), out[4]);
+}
+
+test "percentDecodePathSegment: unencoded plus stays literal plus" {
+    // RFC 3986: '+' has no special meaning in path segments (only in
+    // application/x-www-form-urlencoded query strings). Keep as-is.
+    const out = try percentDecodePathSegment(std.testing.allocator, "a+b+c");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("a+b+c", out);
+}
+
+test "percentDecodePathSegment: lowercase hex" {
+    const out = try percentDecodePathSegment(std.testing.allocator, "%3a%2f%2520");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(":/%20", out);
+}
+
+test "percentDecodePathSegment: empty input returns empty" {
+    const out = try percentDecodePathSegment(std.testing.allocator, "");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("", out);
 }
 
 test "telegramReplyContainsMediaMarkers detects audio marker" {
