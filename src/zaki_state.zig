@@ -7418,15 +7418,13 @@ const ManagerImpl = struct {
         self: *Self,
         allocator: std.mem.Allocator,
     ) !?memory_root.ExtractionJob {
-        // Wrap claim in a transaction so the SELECT...FOR UPDATE +
-        // UPDATE happen as one operation. Failure between SELECT and
-        // UPDATE would leave the row claimed (status=running) but
-        // unprocessed; on next worker tick the staleness check
-        // (started_at older than 5 min) reclaims it.
-        const begin_q = try self.allocator.dupeZ(u8, "BEGIN");
-        defer self.allocator.free(begin_q);
-        _ = c.PQexec(self.conn, begin_q);
-
+        // The CTE-then-UPDATE-RETURNING pattern is ATOMIC in PG — a
+        // single statement runs the SELECT...FOR UPDATE SKIP LOCKED
+        // and the UPDATE in the same implicit transaction with no
+        // possibility of another worker claiming the same row. No
+        // explicit BEGIN/COMMIT needed (and execParams acquires a
+        // pooled connection per-call, so a multi-statement transaction
+        // would need acquireConn directly anyway).
         const q = try self.buildQuery(
             "WITH claimed AS (" ++
                 "  SELECT id, user_id, session_id, job_type, payload::text AS payload_text, attempts " ++
@@ -7442,23 +7440,9 @@ const ManagerImpl = struct {
                 "RETURNING claimed.id, claimed.user_id, claimed.session_id, claimed.job_type, claimed.payload_text, claimed.attempts",
         );
         defer self.allocator.free(q);
-        const result = self.execParams(q, &.{}, &.{}) catch |err| {
-            const rb = try self.allocator.dupeZ(u8, "ROLLBACK");
-            defer self.allocator.free(rb);
-            _ = c.PQexec(self.conn, rb);
-            return err;
-        };
+        const result = try self.execParams(q, &.{}, &.{});
         defer c.PQclear(result);
-        if (c.PQntuples(result) == 0) {
-            const commit_q = try self.allocator.dupeZ(u8, "COMMIT");
-            defer self.allocator.free(commit_q);
-            _ = c.PQexec(self.conn, commit_q);
-            return null;
-        }
-
-        const commit_q = try self.allocator.dupeZ(u8, "COMMIT");
-        defer self.allocator.free(commit_q);
-        _ = c.PQexec(self.conn, commit_q);
+        if (c.PQntuples(result) == 0) return null;
 
         const id_str = try dupeResultValue(allocator, result, 0, 0);
         defer allocator.free(id_str);

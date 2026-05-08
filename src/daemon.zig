@@ -1012,11 +1012,10 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
         b.deinit();
         allocator.destroy(b);
     };
+    // HI-02 fix: collapsed redundant inner check. EmbeddingProvider.deinit
+    // consumes self by value via the vtable; one captured deinit suffices.
     var worker_embedder: ?embeddings.EmbeddingProvider = null;
-    defer if (worker_embedder) |_| {
-        // EmbeddingProvider.deinit consumes self by value via vtable
-        if (worker_embedder) |e| e.deinit();
-    };
+    defer if (worker_embedder) |e| e.deinit();
     if (pg_mgr != null) init_worker: {
         const bundle_ptr = allocator.create(providers.runtime_bundle.RuntimeProviderBundle) catch |err| {
             log.warn("extraction_queue.worker.bundle_alloc_failed err={s}", .{@errorName(err)});
@@ -1036,12 +1035,18 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
         const embed_provider_name = config.memory.search.provider;
         if (!std.mem.eql(u8, embed_provider_name, "none")) {
             const api_key_lookup = providerNameForEmbeddingApiKey(embed_provider_name);
+            // HI-03 fix: when config.providers has a matching entry but
+            // the dupe OOMs, fall through to the env-var resolver
+            // instead of giving up. Prior code did `break :blk null`
+            // which left embedder dead even when TOGETHER_API_KEY was
+            // set in the environment.
             const api_key_owned: ?[]u8 = blk: {
                 if (config.providers.len > 0) {
                     for (config.providers) |entry| {
                         if (entry.api_key) |k| {
                             if (std.mem.eql(u8, providerNameForEmbeddingApiKey(entry.name), api_key_lookup)) {
-                                break :blk allocator.dupe(u8, k) catch null;
+                                if (allocator.dupe(u8, k)) |duped| break :blk duped else |_| {}
+                                // Dupe failed; fall through to env-var fallback.
                             }
                         }
                     }
@@ -1122,7 +1127,15 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
             if (worker_provider_bundle) |bundle| {
                 if (worker_embedder) |embedder| {
                     var jobs_processed: usize = 0;
-                    const MAX_JOBS_PER_TICK: usize = 5;
+                    // HI-04 fix: dropped 5 → 2. Worst-case worker tick
+                    // = MAX_JOBS_PER_TICK × per-job-timeout. With 5 × 10s
+                    // = 50s the heartbeat thread could stall state-flush
+                    // / channel-watch / idle-sweep for ~50s (still long).
+                    // 2 × 10s = 20s is acceptable. Drains 2 jobs/sec
+                    // sustained = 7200/hr = headroom for any realistic
+                    // load on a single user; multi-tenant scale uses
+                    // per-cell pods anyway (each gets its own daemon).
+                    const MAX_JOBS_PER_TICK: usize = 2;
                     while (jobs_processed < MAX_JOBS_PER_TICK) : (jobs_processed += 1) {
                         const had_job = processOneExtractionJob(
                             allocator,
@@ -1138,6 +1151,16 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
                     }
                     if (jobs_processed > 0) {
                         log.info("extraction_queue.tick processed={d}", .{jobs_processed});
+                    }
+                    // HI-01 fix: periodic backlog warn so silent
+                    // worker-init failure (HI-01 from review) doesn't
+                    // let queue grow forever without an alert. Check
+                    // every 60 ticks (~60s) and warn if backlog > 50.
+                    if (last_flush_s != 0 and @mod(now_s, 60) == 0) {
+                        const backlog = worker_mgr.countPendingExtractionJobs() catch 0;
+                        if (backlog > 50) {
+                            log.warn("extraction_queue.backlog_high pending={d} — worker may not be processing", .{backlog});
+                        }
                     }
                 }
             }
@@ -1201,7 +1224,11 @@ fn processOneExtractionJob(
         embedder,
         job.user_id,
         text_field,
-        30, // worker has no turn-loop pressure → full 30s timeout
+        // HI-04 fix: 30s → 10s. The per-job timeout × MAX_JOBS_PER_TICK
+        // bounds heartbeat-thread stall. Together LLM responses >10s
+        // are rare in practice; .llm_failed retry path handles the tail
+        // (job goes back to pending, retried up to 3 attempts).
+        10, // per-job timeout
     );
     const elapsed = std.time.milliTimestamp() - t_start;
     log.info(
