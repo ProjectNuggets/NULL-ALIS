@@ -3881,6 +3881,16 @@ pub const Agent = struct {
                         };
                         if (turn_text_opt) |turn_text| {
                             defer self.allocator.free(turn_text);
+                            // REVIEW HI-01 interim mitigation (2026-05-08):
+                            // 30s → 10s timeout caps the worst-case wait
+                            // before next-turn unblock. Production logs
+                            // showed 58s LLM calls on Kimi K2.6; 10s
+                            // bounds blast radius. Day 4 follow-up: spawn
+                            // background thread or push to a worker queue
+                            // so the trigger doesn't block the post-turn
+                            // path AT ALL. For now: 10s + outcome
+                            // tracking (.llm_failed when timeout hits)
+                            // gives us observability + bounded latency.
                             const stats = entity_pipeline.runOnTurn(
                                 self.allocator,
                                 self.provider,
@@ -3889,22 +3899,26 @@ pub const Agent = struct {
                                 self.extraction_coref_embed.?,
                                 self.extraction_user_id.?,
                                 turn_text,
-                                30, // timeout_secs
+                                10, // timeout_secs (was 30)
                             );
                             log.info(
-                                "turn.stage stage=entity_pipeline mentions={d} resolved={d} minted={d} edges={d} llm_ms={d}",
+                                "turn.stage stage=entity_pipeline outcome={s} mentions={d} resolved={d} minted={d} edges={d} skipped={d} llm_ms={d}",
                                 .{
+                                    @tagName(stats.outcome),
                                     stats.mentions_extracted,
                                     stats.entities_resolved,
                                     stats.entities_minted,
                                     stats.edges_emitted,
+                                    stats.edges_skipped,
                                     stats.llm_latency_ms,
                                 },
                             );
+                            // REVIEW ME-04 fix: include duration_ms in observer event.
                             const ep_event = ObserverEvent{ .turn_stage = .{
                                 .stage = "entity_pipeline",
                                 .iteration = iteration,
                                 .count = @intCast(stats.edges_emitted),
+                                .duration_ms = @intCast(@max(0, stats.llm_latency_ms)),
                                 .run_id = self.current_run_id,
                             } };
                             self.observer.recordEvent(&ep_event);

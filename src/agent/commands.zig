@@ -1482,18 +1482,27 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                             emb_ep,
                             uid_ep,
                             tt,
-                            30,
+                            10, // REVIEW HI-01: 30→10s timeout
                         );
                         log.info(
-                            "session_end.entity_pipeline mentions={d} resolved={d} minted={d} edges={d} llm_ms={d}",
+                            "session_end.entity_pipeline outcome={s} mentions={d} resolved={d} minted={d} edges={d} skipped={d} failed={d} llm_ms={d}",
                             .{
+                                @tagName(ep_stats.outcome),
                                 ep_stats.mentions_extracted,
                                 ep_stats.entities_resolved,
                                 ep_stats.entities_minted,
                                 ep_stats.edges_emitted,
+                                ep_stats.edges_skipped,
+                                ep_stats.failed_mentions,
                                 ep_stats.llm_latency_ms,
                             },
                         );
+                        // REVIEW ME-04: emit observer event for session-end pass too.
+                        const ep_event = observability.ObserverEvent{ .turn_stage = .{
+                            .stage = "session_end_entity_pipeline",
+                            .duration_ms = @intCast(@max(0, ep_stats.llm_latency_ms)),
+                        } };
+                        self.observer.recordEvent(&ep_event);
                     }
                 }
             }

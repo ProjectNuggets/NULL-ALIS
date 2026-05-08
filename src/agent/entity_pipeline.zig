@@ -127,11 +127,28 @@ pub fn freeResolved(allocator: std.mem.Allocator, resolved: []ResolvedEntity) vo
 /// Pipeline run statistics — emitted as a structured log line at end of
 /// run, and returnable to callers (the wiki_link tool surfaces these to
 /// the agent so it can report to the user).
+///
+/// REVIEW ME-03 fix (2026-05-08): outcome distinguishes the three
+/// possible "no edges" terminal states so callers can tell:
+///   - `.ok`: pipeline ran cleanly (may have 0 mentions if turn was
+///     genuinely entity-free, e.g. "hi", "thanks")
+///   - `.llm_failed`: LLM call errored (network / timeout / provider) —
+///     no mentions because we never got a response
+///   - `.parse_failed`: LLM responded but JSON was unparseable — the
+///     model returned non-JSON or malformed output
+/// Without this, `mentions=0` conflates "user said hi" with "the LLM
+/// crashed", violating the no-silent-fallback policy from .planning/.
+pub const RunOutcome = enum { ok, llm_failed, parse_failed };
+
 pub const RunStats = struct {
+    outcome: RunOutcome = .ok,
     mentions_extracted: usize = 0,
     entities_resolved: usize = 0,
     entities_minted: usize = 0,
     edges_emitted: usize = 0,
+    /// REVIEW ME-01 fix: now assigned. Counts edge upserts that returned
+    /// an error from upsertMemoryEdge (logged + skipped per failure-soft
+    /// contract). Distinct from `failed_mentions` (resolve-time failures).
     edges_skipped: usize = 0,
     llm_latency_ms: i64 = 0,
     failed_mentions: usize = 0,
@@ -261,10 +278,24 @@ pub fn parseMentionsJson(allocator: std.mem.Allocator, raw: []const u8) ![]Entit
             }
         };
 
+        // REVIEW ME-02 fix (2026-05-08): the previous struct-literal
+        // form leaked already-duped strings if a later dupe in the
+        // same literal failed mid-construction (e.g. surface+canonical
+        // duped, then OOM on entity_type → both prior dupes leaked
+        // because the struct never reached the errdefer scope).
+        // Fix: dupe each field into a local first, then build the
+        // struct as the final non-failing step.
+        const surface_owned = try allocator.dupe(u8, surface);
+        errdefer allocator.free(surface_owned);
+        const canonical_owned = try allocator.dupe(u8, canonical);
+        errdefer allocator.free(canonical_owned);
+        const type_owned = try allocator.dupe(u8, entity_type);
+        errdefer allocator.free(type_owned);
+
         try out.append(allocator, .{
-            .surface = try allocator.dupe(u8, surface),
-            .canonical = try allocator.dupe(u8, canonical),
-            .entity_type = try allocator.dupe(u8, entity_type),
+            .surface = surface_owned,
+            .canonical = canonical_owned,
+            .entity_type = type_owned,
             .confidence = conf,
         });
     }
@@ -306,23 +337,57 @@ fn isValidEntityType(t: []const u8) bool {
 
 /// Defensive backstop — reject pronoun-shaped canonicals. NOT a primary
 /// defense (the LLM prompt is the semantic gate). Just guards against
-/// LLM slippage. Bounded to ~10 common pronouns in 6 languages — keeping
-/// this short is intentional; we are NOT trying to be exhaustive.
+/// LLM slippage. Bounded to common pronouns in tier-1 languages.
+///
+/// REVIEW HI-02 fix (2026-05-08): the pronoun list was kept ASCII-only
+/// because `std.ascii.toLower` no-ops above 0x7F (silently passes
+/// "Él"/"ÉL" through unchanged, defeating the case-fold). For non-ASCII
+/// pronouns we compare both the surface form and a manually-folded
+/// uppercase variant. Removed bogus entries `"yo,"` and `"tu,"` that
+/// had literal trailing commas (typo in initial implementation —
+/// could never match anything).
 fn looksLikePronoun(s: []const u8) bool {
-    // Length-bounded: any pronoun is short. Skip the check on long strings.
-    if (s.len > 6) return false;
-    // Lowercase ASCII compare for tier-1 latin pronouns.
-    var buf: [8]u8 = undefined;
-    if (s.len > buf.len) return false;
-    for (s, 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
-    const lower = buf[0..s.len];
-    const tokens = [_][]const u8{
-        "i",   "me",   "you",  "he",  "she", "it",
-        "we",  "they", "them", "us",  "him", "her",
-        "yo",  "tu",   "él",   "yo,", "je",  "tu,",
-        "wo",  "ni",   "ta",
+    if (s.len == 0 or s.len > 6) return false;
+
+    // ASCII-only fast path: lowercase via std.ascii then compare.
+    var ascii_only = true;
+    for (s) |ch| {
+        if (ch > 0x7F) {
+            ascii_only = false;
+            break;
+        }
+    }
+    if (ascii_only) {
+        var buf: [8]u8 = undefined;
+        if (s.len > buf.len) return false;
+        for (s, 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
+        const lower = buf[0..s.len];
+        const ascii_tokens = [_][]const u8{
+            "i",  "me",  "you",  "he",  "she", "it",  "we", "they",
+            "us", "him", "her",  "yo",  "tu",  "je",  "wo", "ni",
+            "ta", "ja",  "anche","mim", "ona", "esa",
+        };
+        for (ascii_tokens) |t| if (std.mem.eql(u8, lower, t)) return true;
+        return false;
+    }
+
+    // Non-ASCII path: exact-form compare against both lower and upper
+    // variants of common pronouns. We keep this list short — the
+    // semantic gate is the LLM, not this backstop.
+    const utf8_tokens = [_][]const u8{
+        // Spanish/French/Portuguese with diacritics
+        "él",  "Él",
+        "tú",  "Tú",
+        "à",   "À",
+        "ô",   "Ô",
+        // Arabic pronouns (commonly slipped by LLMs)
+        "أنا", "نحن", "هو",  "هي",  "هم",
+        // Mandarin (already short)
+        "我",  "你",  "他",  "她",  "它",  "我们",
+        // Hindi
+        "मैं",
     };
-    for (tokens) |t| if (std.mem.eql(u8, lower, t)) return true;
+    for (utf8_tokens) |t| if (std.mem.eql(u8, s, t)) return true;
     return false;
 }
 
@@ -330,8 +395,21 @@ fn looksLikePronoun(s: []const u8) bool {
 // LLM call
 // ─────────────────────────────────────────────────────────────────────────
 
+/// REVIEW ME-03 fix: extractMentions now returns an outcome alongside
+/// the slice so callers can distinguish LLM failure / parse failure
+/// from "genuinely no entities."
+pub const ExtractResult = struct {
+    mentions: []EntityMention,
+    outcome: RunOutcome,
+    llm_latency_ms: i64,
+
+    pub fn deinit(self: *const ExtractResult, allocator: std.mem.Allocator) void {
+        freeMentions(allocator, self.mentions);
+    }
+};
+
 /// Run the wiki-link extractor LLM over a turn's text. Returns owned
-/// EntityMention slice. Caller must freeMentions on the result.
+/// EntityMention slice + outcome. Caller must deinit on the result.
 ///
 /// `turn_text` should be the user message + assistant reply concatenated,
 /// or a multi-turn batch — the prompt handles either. Length-cap the
@@ -342,7 +420,7 @@ pub fn extractMentions(
     model_name: []const u8,
     turn_text: []const u8,
     timeout_secs: u32,
-) ![]EntityMention {
+) !ExtractResult {
     const MAX_INPUT_BYTES: usize = 4096;
     const truncated = if (turn_text.len > MAX_INPUT_BYTES)
         turn_text[0..MAX_INPUT_BYTES]
@@ -374,8 +452,14 @@ pub fn extractMentions(
         model_name,
         0.1,
     ) catch |err| {
-        log.warn("entity_pipeline: LLM call failed err={s}", .{@errorName(err)});
-        return allocator.alloc(EntityMention, 0);
+        const elapsed = std.time.milliTimestamp() - t_start;
+        log.warn("entity_pipeline: LLM call failed err={s} latency_ms={d}", .{ @errorName(err), elapsed });
+        // ME-03: explicit outcome instead of empty-mentions silence.
+        return ExtractResult{
+            .mentions = try allocator.alloc(EntityMention, 0),
+            .outcome = .llm_failed,
+            .llm_latency_ms = elapsed,
+        };
     };
     const t_end = std.time.milliTimestamp();
 
@@ -394,8 +478,12 @@ pub fn extractMentions(
 
     const raw = resp.contentOrEmpty();
     const mentions = parseMentionsJson(allocator, raw) catch |err| {
-        log.warn("entity_pipeline: parse failed err={s}", .{@errorName(err)});
-        return allocator.alloc(EntityMention, 0);
+        log.warn("entity_pipeline: parse failed err={s} raw_len={d}", .{ @errorName(err), raw.len });
+        return ExtractResult{
+            .mentions = try allocator.alloc(EntityMention, 0),
+            .outcome = .parse_failed,
+            .llm_latency_ms = t_end - t_start,
+        };
     };
 
     log.info("entity_pipeline.extract count={d} latency_ms={d} raw_len={d}", .{
@@ -403,7 +491,11 @@ pub fn extractMentions(
         t_end - t_start,
         raw.len,
     });
-    return mentions;
+    return ExtractResult{
+        .mentions = mentions,
+        .outcome = .ok,
+        .llm_latency_ms = t_end - t_start,
+    };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -450,6 +542,13 @@ pub fn resolveEntity(
     };
 }
 
+/// Emit-result tuple — distinguishes successful upserts from skips
+/// (REVIEW ME-01 fix: now we surface both counts to the caller).
+pub const EmitResult = struct {
+    emitted: usize = 0,
+    skipped: usize = 0,
+};
+
 /// Emit COOCCURS edges for every pair of entities in the same turn.
 /// Reuses zaki_state.upsertMemoryEdge — its ON CONFLICT logic increments
 /// `weight` on duplicate triples, so re-mentions accumulate.
@@ -461,10 +560,10 @@ pub fn emitCooccurrenceEdges(
     user_id: i64,
     resolved: []const ResolvedEntity,
     confidence: f64,
-) !usize {
-    if (resolved.len < 2) return 0;
+) !EmitResult {
+    if (resolved.len < 2) return EmitResult{};
 
-    var emitted: usize = 0;
+    var result = EmitResult{};
     for (resolved, 0..) |a, i| {
         if (a.entity_id.len == 0) continue;
         for (resolved[i + 1 ..]) |b| {
@@ -487,12 +586,13 @@ pub fn emitCooccurrenceEdges(
                 log.warn("entity_pipeline: edge emit failed err={s} src={s} tgt={s}", .{
                     @errorName(err), src_id, tgt_id,
                 });
+                result.skipped += 1;
                 continue;
             };
-            emitted += 1;
+            result.emitted += 1;
         }
     }
-    return emitted;
+    return result;
 }
 
 /// Emit speaker → entity edges. The user node is the synthetic key
@@ -504,13 +604,13 @@ pub fn emitSpeakerEdges(
     user_id: i64,
     resolved: []const ResolvedEntity,
     confidence: f64,
-) !usize {
-    if (resolved.len == 0) return 0;
+) !EmitResult {
+    if (resolved.len == 0) return EmitResult{};
 
     const speaker_key = try std.fmt.allocPrint(allocator, "user:{d}", .{user_id});
     defer allocator.free(speaker_key);
 
-    var emitted: usize = 0;
+    var result = EmitResult{};
     for (resolved) |r| {
         if (r.entity_id.len == 0) continue;
         state_mgr.upsertMemoryEdge(
@@ -524,11 +624,12 @@ pub fn emitSpeakerEdges(
             log.warn("entity_pipeline: speaker edge failed err={s} entity={s}", .{
                 @errorName(err), r.entity_id,
             });
+            result.skipped += 1;
             continue;
         };
-        emitted += 1;
+        result.emitted += 1;
     }
-    return emitted;
+    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -554,20 +655,23 @@ pub fn runOnTurn(
     var stats = RunStats{};
     if (turn_text.len < 8) return stats; // skip trivial turns
 
-    const t_start = std.time.milliTimestamp();
-    const mentions = extractMentions(
+    const extract_result = extractMentions(
         allocator,
         provider,
         model_name,
         turn_text,
         timeout_secs,
     ) catch |err| {
-        log.warn("entity_pipeline.runOnTurn: extract failed err={s}", .{@errorName(err)});
+        log.warn("entity_pipeline.runOnTurn: extract OOM err={s}", .{@errorName(err)});
+        stats.outcome = .llm_failed;
         return stats;
     };
-    defer freeMentions(allocator, mentions);
-    stats.llm_latency_ms = std.time.milliTimestamp() - t_start;
-    stats.mentions_extracted = mentions.len;
+    defer extract_result.deinit(allocator);
+
+    stats.outcome = extract_result.outcome;
+    stats.llm_latency_ms = extract_result.llm_latency_ms;
+    stats.mentions_extracted = extract_result.mentions.len;
+    const mentions = extract_result.mentions;
 
     if (mentions.len == 0) return stats;
 
@@ -589,7 +693,7 @@ pub fn runOnTurn(
         resolved_list.append(allocator, r) catch |err| {
             log.warn("entity_pipeline.runOnTurn: append failed err={s}", .{@errorName(err)});
             stats.failed_mentions += 1;
-            // r leaks here; acceptable on OOM
+            r.deinit(allocator); // free entity_id immediately on OOM (LO-01 fix)
             continue;
         };
     }
@@ -602,16 +706,16 @@ pub fn runOnTurn(
         avg_conf = sum / @as(f64, @floatFromInt(mentions.len));
     }
 
-    const cooccur_emitted = emitCooccurrenceEdges(
+    const cooccur = emitCooccurrenceEdges(
         state_mgr,
         user_id,
         resolved_list.items,
         avg_conf,
     ) catch |err| blk: {
         log.warn("entity_pipeline.runOnTurn: cooccur edges failed err={s}", .{@errorName(err)});
-        break :blk 0;
+        break :blk EmitResult{};
     };
-    const speaker_emitted = emitSpeakerEdges(
+    const speaker = emitSpeakerEdges(
         allocator,
         state_mgr,
         user_id,
@@ -619,18 +723,22 @@ pub fn runOnTurn(
         avg_conf,
     ) catch |err| blk: {
         log.warn("entity_pipeline.runOnTurn: speaker edges failed err={s}", .{@errorName(err)});
-        break :blk 0;
+        break :blk EmitResult{};
     };
-    stats.edges_emitted = cooccur_emitted + speaker_emitted;
+    stats.edges_emitted = cooccur.emitted + speaker.emitted;
+    stats.edges_skipped = cooccur.skipped + speaker.skipped;
 
     log.info(
-        "entity_pipeline.runOnTurn user={d} mentions={d} resolved={d} minted={d} edges={d} llm_ms={d}",
+        "entity_pipeline.runOnTurn user={d} outcome={s} mentions={d} resolved={d} minted={d} edges={d} skipped={d} failed={d} llm_ms={d}",
         .{
             user_id,
+            @tagName(stats.outcome),
             stats.mentions_extracted,
             stats.entities_resolved,
             stats.entities_minted,
             stats.edges_emitted,
+            stats.edges_skipped,
+            stats.failed_mentions,
             stats.llm_latency_ms,
         },
     );
