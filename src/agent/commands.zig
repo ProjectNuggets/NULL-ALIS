@@ -1473,46 +1473,49 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         // duplicate rows. Failure-soft.
         if (self.extraction_state_mgr) |smgr_ep| {
             if (self.extraction_user_id) |uid_ep| {
-                if (self.extraction_coref_embed) |emb_ep| {
-                    const transcript_text = buildSessionEndTranscriptText(self.allocator, entries) catch |err| blk: {
-                        log.warn("session_end.entity_pipeline.build_text_failed err={s}", .{@errorName(err)});
-                        break :blk null;
+                _ = self.extraction_coref_embed; // worker uses its own
+                const transcript_text = buildSessionEndTranscriptText(self.allocator, entries) catch |err| blk: {
+                    log.warn("session_end.entity_pipeline.build_text_failed err={s}", .{@errorName(err)});
+                    break :blk null;
+                };
+                if (transcript_text) |tt| {
+                    defer self.allocator.free(tt);
+                    // V1.13 Day 2.2 — enqueue session-end pass instead
+                    // of running inline. session_end already holds the
+                    // session mutex via evictIdle; the prior inline
+                    // approach could block reconnecting users for
+                    // 10-30s waiting on LLM calls. Enqueue returns in
+                    // <5ms; heartbeat worker handles the actual
+                    // extraction out-of-band. Idempotent w.r.t.
+                    // earlier per-turn runs.
+                    const payload_str = std.fmt.allocPrint(
+                        self.allocator,
+                        "{{\"transcript_text\":{f}}}",
+                        .{std.json.fmt(tt, .{})},
+                    ) catch |err| blk: {
+                        log.warn("session_end.entity_pipeline.payload_alloc_failed err={s}", .{@errorName(err)});
+                        break :blk @as([]u8, &.{});
                     };
-                    if (transcript_text) |tt| {
-                        defer self.allocator.free(tt);
-                        // V1.13 Day 2.1 — extraction_queue infra is in
-                        // place (DDL + CRUD); worker cutover deferred
-                        // to Day 2.2. Run inline (V1.12 behavior with
-                        // interim 10s timeout) until worker ships.
-                        const ep_stats = @import("entity_pipeline.zig").runOnTurn(
-                            self.allocator,
-                            self.provider,
-                            self.model_name,
-                            smgr_ep,
-                            emb_ep,
-                            uid_ep,
-                            tt,
-                            10,
-                        );
-                        log.info(
-                            "session_end.entity_pipeline outcome={s} mentions={d} resolved={d} minted={d} edges={d} skipped={d} failed={d} llm_ms={d}",
-                            .{
-                                @tagName(ep_stats.outcome),
-                                ep_stats.mentions_extracted,
-                                ep_stats.entities_resolved,
-                                ep_stats.entities_minted,
-                                ep_stats.edges_emitted,
-                                ep_stats.edges_skipped,
-                                ep_stats.failed_mentions,
-                                ep_stats.llm_latency_ms,
-                            },
-                        );
-                        const ep_event = observability.ObserverEvent{ .turn_stage = .{
-                            .stage = "session_end_entity_pipeline",
-                            .duration_ms = @intCast(@max(0, ep_stats.llm_latency_ms)),
-                        } };
-                        self.observer.recordEvent(&ep_event);
-                    }
+                    defer if (payload_str.len > 0) self.allocator.free(payload_str);
+
+                    const job_id = if (payload_str.len > 0) smgr_ep.enqueueExtractionJob(
+                        uid_ep,
+                        session_id,
+                        "session_end",
+                        payload_str,
+                    ) catch |err| blk: {
+                        log.warn("session_end.entity_pipeline.enqueue_failed err={s}", .{@errorName(err)});
+                        break :blk @as(i64, -1);
+                    } else @as(i64, -1);
+
+                    log.info(
+                        "session_end.entity_pipeline_enqueued job_id={d} payload_bytes={d} session={s}",
+                        .{ job_id, payload_str.len, session_id },
+                    );
+                    const ep_event = observability.ObserverEvent{ .turn_stage = .{
+                        .stage = "session_end_entity_pipeline_enqueued",
+                    } };
+                    self.observer.recordEvent(&ep_event);
                 }
             }
         }

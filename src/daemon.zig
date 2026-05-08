@@ -30,6 +30,9 @@ const zaki_state = @import("zaki_state.zig");
 const ops_guard = @import("ops_guard.zig");
 const heartbeat_wake = @import("heartbeat_wake.zig");
 const json_util = @import("json_util.zig");
+const providers = @import("providers/root.zig");
+const embeddings = @import("memory/vector/embeddings.zig");
+const entity_pipeline = @import("agent/entity_pipeline.zig");
 const tools_mod = @import("tools/root.zig");
 const entitlement_mod = @import("entitlement.zig");
 const runtime_resolver = @import("delivery/runtime_resolver.zig");
@@ -992,6 +995,81 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
         pg_mgr = mgr;
     }
 
+    // V1.13 Day 2.2 — extraction queue worker primitives. Initialized
+    // once at heartbeat thread startup, reused for the lifetime of the
+    // daemon. Both are optional — if init fails (no API key, missing
+    // model), the worker tick is a no-op and trigger sites continue
+    // running inline (V1.12 fallback).
+    //
+    // Provider: same RuntimeProviderBundle the agent path uses (Kimi
+    // K2.6 via Together by default). The bundle is heap-allocated so
+    // we can pass a stable Provider interface to processOneExtractionJob.
+    //
+    // Embedder: created via the same factory memory_runtimes use
+    // (createEmbeddingProvider). Together-hosted bge-large by default.
+    var worker_provider_bundle: ?*providers.runtime_bundle.RuntimeProviderBundle = null;
+    defer if (worker_provider_bundle) |b| {
+        b.deinit();
+        allocator.destroy(b);
+    };
+    var worker_embedder: ?embeddings.EmbeddingProvider = null;
+    defer if (worker_embedder) |_| {
+        // EmbeddingProvider.deinit consumes self by value via vtable
+        if (worker_embedder) |e| e.deinit();
+    };
+    if (pg_mgr != null) init_worker: {
+        const bundle_ptr = allocator.create(providers.runtime_bundle.RuntimeProviderBundle) catch |err| {
+            log.warn("extraction_queue.worker.bundle_alloc_failed err={s}", .{@errorName(err)});
+            break :init_worker;
+        };
+        errdefer allocator.destroy(bundle_ptr);
+        bundle_ptr.* = providers.runtime_bundle.RuntimeProviderBundle.init(allocator, config) catch |err| {
+            log.warn("extraction_queue.worker.bundle_init_failed err={s}", .{@errorName(err)});
+            allocator.destroy(bundle_ptr);
+            break :init_worker;
+        };
+        worker_provider_bundle = bundle_ptr;
+
+        // Resolve embedding provider api_key from config.providers list
+        // OR env var fallback (same logic memory/root.zig::resolveEmbeddingApiKey
+        // uses, copy-locally since that helper isn't exported).
+        const embed_provider_name = config.memory.search.provider;
+        if (!std.mem.eql(u8, embed_provider_name, "none")) {
+            const api_key_lookup = providerNameForEmbeddingApiKey(embed_provider_name);
+            const api_key_owned: ?[]u8 = blk: {
+                if (config.providers.len > 0) {
+                    for (config.providers) |entry| {
+                        if (entry.api_key) |k| {
+                            if (std.mem.eql(u8, providerNameForEmbeddingApiKey(entry.name), api_key_lookup)) {
+                                break :blk allocator.dupe(u8, k) catch null;
+                            }
+                        }
+                    }
+                }
+                break :blk providers.resolveApiKey(allocator, api_key_lookup, null) catch null;
+            };
+            defer if (api_key_owned) |k| allocator.free(k);
+
+            const ep = embeddings.createEmbeddingProvider(
+                allocator,
+                embed_provider_name,
+                api_key_owned,
+                config.memory.search.model,
+                config.memory.search.dimensions,
+            ) catch |err| blk: {
+                log.warn("extraction_queue.worker.embedder_init_failed err={s}", .{@errorName(err)});
+                break :blk null;
+            };
+            if (ep) |e| {
+                worker_embedder = e;
+                log.info(
+                    "extraction_queue.worker.ready embed_provider={s} embed_model={s}",
+                    .{ embed_provider_name, config.memory.search.model },
+                );
+            }
+        }
+    }
+
     var last_flush_s: i64 = 0;
     var last_sweep_s: i64 = 0;
     while (!isShutdownRequested()) {
@@ -1034,14 +1112,116 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
             }
         }
 
-        // V1.13 Day 2.2 — Extraction queue worker tick will plug in
-        // here. Day 2.1 (this commit) lands the queue DDL + CRUD; the
-        // worker that drains the queue + runs entity_pipeline.runOnTurn
-        // out of the agent's critical path needs provider+embedder init
-        // wiring that's deferred to the follow-up commit.
+        // V1.13 Day 2.2 — Extraction queue worker tick.
+        //
+        // Drains pending jobs (max 5 per tick = max 5 LLM calls/sec
+        // worst-case) into entity_pipeline.runOnTurn out-of-band. Agent
+        // turn loop already returned in <5ms (enqueue-only on producer
+        // side once the trigger sites are cut over).
+        if (pg_mgr) |worker_mgr| {
+            if (worker_provider_bundle) |bundle| {
+                if (worker_embedder) |embedder| {
+                    var jobs_processed: usize = 0;
+                    const MAX_JOBS_PER_TICK: usize = 5;
+                    while (jobs_processed < MAX_JOBS_PER_TICK) : (jobs_processed += 1) {
+                        const had_job = processOneExtractionJob(
+                            allocator,
+                            config,
+                            worker_mgr,
+                            bundle.provider(),
+                            embedder,
+                        ) catch |err| blk: {
+                            log.warn("extraction_queue.worker_tick_err err={s}", .{@errorName(err)});
+                            break :blk false;
+                        };
+                        if (!had_job) break;
+                    }
+                    if (jobs_processed > 0) {
+                        log.info("extraction_queue.tick processed={d}", .{jobs_processed});
+                    }
+                }
+            }
+        }
 
         std.Thread.sleep(std.time.ns_per_s);
     }
+}
+
+/// V1.13 Day 2.2 — process one extraction job from the queue. Returns
+/// true when a job was processed (drain loop continues), false when
+/// queue empty (drain loop stops). All errors are failure-soft.
+fn processOneExtractionJob(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    state_mgr: *zaki_state.Manager,
+    provider: providers.Provider,
+    embedder: embeddings.EmbeddingProvider,
+) !bool {
+    const job = (try state_mgr.claimNextExtractionJob(allocator)) orelse return false;
+    defer job.deinit(allocator);
+
+    const t_start = std.time.milliTimestamp();
+    log.info("extraction_queue.processing job_id={d} type={s} user={d} attempts={d}", .{
+        job.id, job.job_type, job.user_id, job.attempts,
+    });
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, job.payload_json, .{}) catch |err| {
+        log.warn("extraction_queue.payload_parse_failed job_id={d} err={s}", .{ job.id, @errorName(err) });
+        state_mgr.markExtractionJobFailed(job.id, "parse_failed") catch {};
+        return true;
+    };
+    defer parsed.deinit();
+
+    const text_field: []const u8 = blk: {
+        if (parsed.value != .object) break :blk "";
+        if (std.mem.eql(u8, job.job_type, "wiki_link")) {
+            if (parsed.value.object.get("turn_text")) |v| {
+                if (v == .string) break :blk v.string;
+            }
+        } else if (std.mem.eql(u8, job.job_type, "session_end")) {
+            if (parsed.value.object.get("transcript_text")) |v| {
+                if (v == .string) break :blk v.string;
+            }
+        }
+        break :blk "";
+    };
+
+    if (text_field.len < 8) {
+        log.warn("extraction_queue.payload_text_missing job_id={d} type={s}", .{ job.id, job.job_type });
+        state_mgr.markExtractionJobDone(job.id) catch {};
+        return true;
+    }
+
+    const model_name = config.default_model orelse "moonshotai/Kimi-K2.6";
+    const stats = entity_pipeline.runOnTurn(
+        allocator,
+        provider,
+        model_name,
+        state_mgr,
+        embedder,
+        job.user_id,
+        text_field,
+        30, // worker has no turn-loop pressure → full 30s timeout
+    );
+    const elapsed = std.time.milliTimestamp() - t_start;
+    log.info(
+        "extraction_queue.processed job_id={d} type={s} outcome={s} mentions={d} edges={d} elapsed_ms={d}",
+        .{ job.id, job.job_type, @tagName(stats.outcome), stats.mentions_extracted, stats.edges_emitted, elapsed },
+    );
+    if (stats.outcome == .ok) {
+        state_mgr.markExtractionJobDone(job.id) catch {};
+    } else {
+        state_mgr.markExtractionJobFailed(job.id, @tagName(stats.outcome)) catch {};
+    }
+    return true;
+}
+
+/// V1.13 Day 2.2 — embedding provider name normalizer (mirrors
+/// memory/root.zig::providerNameForEmbeddingApiKey, copied locally
+/// because that helper is private).
+fn providerNameForEmbeddingApiKey(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "together-ai")) return "together";
+    return name;
 }
 
 /// How often the channel watcher checks health (seconds).

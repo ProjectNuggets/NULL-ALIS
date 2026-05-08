@@ -3917,44 +3917,41 @@ pub const Agent = struct {
                         };
                         if (turn_text_opt) |turn_text| {
                             defer self.allocator.free(turn_text);
-                            // V1.13 Day 2.1 — extraction_queue
-                            // infrastructure is in place (DDL + CRUD)
-                            // but worker cutover is deferred to Day 2.2
-                            // (needs provider+embedder init in worker
-                            // thread). For now, RUN INLINE per V1.12
-                            // behavior (interim 10s timeout) AND enqueue
-                            // a shadow record so the cutover commit can
-                            // verify queue is being populated correctly.
-                            //
-                            // TODO Day 2.2: remove inline call; worker
-                            // becomes the only execution path.
-                            const stats = entity_pipeline.runOnTurn(
+                            // V1.13 Day 2.2 — HI-01 REAL FIX: enqueue
+                            // to extraction_queue. Heartbeat worker
+                            // (daemon.zig::processOneExtractionJob)
+                            // drains the queue and runs entity_pipeline
+                            // out-of-band. Agent turn loop returns in
+                            // <5ms (one INSERT) instead of up to 20s.
+                            const sid_for_q = self.memory_session_id orelse "default";
+                            const payload_str = std.fmt.allocPrint(
                                 self.allocator,
-                                self.provider,
-                                self.model_name,
-                                self.extraction_state_mgr.?,
-                                self.extraction_coref_embed.?,
+                                "{{\"turn_text\":{f}}}",
+                                .{std.json.fmt(turn_text, .{})},
+                            ) catch |err| blk: {
+                                log.warn("entity_pipeline.payload_alloc_failed err={s}", .{@errorName(err)});
+                                break :blk @as([]u8, &.{});
+                            };
+                            defer if (payload_str.len > 0) self.allocator.free(payload_str);
+
+                            const job_id = if (payload_str.len > 0) self.extraction_state_mgr.?.enqueueExtractionJob(
                                 self.extraction_user_id.?,
-                                turn_text,
-                                10, // interim timeout
-                            );
+                                sid_for_q,
+                                "wiki_link",
+                                payload_str,
+                            ) catch |err| blk: {
+                                log.warn("entity_pipeline.enqueue_failed err={s}", .{@errorName(err)});
+                                break :blk @as(i64, -1);
+                            } else @as(i64, -1);
+
                             log.info(
-                                "turn.stage stage=entity_pipeline outcome={s} mentions={d} resolved={d} minted={d} edges={d} skipped={d} llm_ms={d}",
-                                .{
-                                    @tagName(stats.outcome),
-                                    stats.mentions_extracted,
-                                    stats.entities_resolved,
-                                    stats.entities_minted,
-                                    stats.edges_emitted,
-                                    stats.edges_skipped,
-                                    stats.llm_latency_ms,
-                                },
+                                "turn.stage stage=entity_pipeline_enqueued job_id={d} payload_bytes={d}",
+                                .{ job_id, payload_str.len },
                             );
                             const ep_event = ObserverEvent{ .turn_stage = .{
-                                .stage = "entity_pipeline",
+                                .stage = "entity_pipeline_enqueued",
                                 .iteration = iteration,
-                                .count = @intCast(stats.edges_emitted),
-                                .duration_ms = @intCast(@max(0, stats.llm_latency_ms)),
+                                .count = if (job_id > 0) 1 else 0,
                                 .run_id = self.current_run_id,
                             } };
                             self.observer.recordEvent(&ep_event);
