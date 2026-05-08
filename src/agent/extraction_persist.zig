@@ -278,6 +278,27 @@ pub fn parseExtractedJson(
             if (year < 1970 or year > 2100) break :blk null;
             if (month < 1 or month > 12) break :blk null;
             if (day < 1 or day > 31) break :blk null;
+            // MD-04 fix (REVIEW V1.14): reject impossible dates per
+            // month. Pre-fix: 2020-02-30 silently became March 1 via
+            // overflow. Now: validate day against month-specific max,
+            // accounting for leap year on Feb. Reject → null
+            // (write-time falls back).
+            const leap_now = (@mod(year, 4) == 0 and @mod(year, 100) != 0) or (@mod(year, 400) == 0);
+            const max_day_per_month = [_]u8{
+                31, // Jan
+                if (leap_now) 29 else 28, // Feb
+                31, // Mar
+                30, // Apr
+                31, // May
+                30, // Jun
+                31, // Jul
+                31, // Aug
+                30, // Sep
+                31, // Oct
+                30, // Nov
+                31, // Dec
+            };
+            if (day > max_day_per_month[@as(usize, @intCast(month)) - 1]) break :blk null;
             // Days-since-epoch via simple table; sufficient for
             // brain-graph time anchoring (not financial-grade).
             const days_per_month = [_]u32{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };

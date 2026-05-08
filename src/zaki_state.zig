@@ -6826,6 +6826,11 @@ const ManagerImpl = struct {
         const ep_z = try self.allocator.dupeZ(u8, ep_text);
         defer self.allocator.free(ep_z);
 
+        // MD-02 fix (REVIEW V1.14): treat empty strings as NULL for
+        // consistency with how `attribution` is handled (line above).
+        // Otherwise an empty-string fact gets written as '' rather
+        // than NULL, breaking the COALESCE semantic on subsequent
+        // re-mentions (the empty '' would shadow a real fact later).
         const params = [_]?[*:0]const u8{
             user_s.ptr,
             src_z,
@@ -6833,9 +6838,9 @@ const ManagerImpl = struct {
             pred_z,
             if (attr_text.len == 0) null else attr_z,
             if (confidence == null) null else conf_z,
-            if (fact == null) null else fact_z,
+            if (fact == null or fact_text.len == 0) null else fact_z,
             if (temporal_anchor_unix == null) null else anchor_z,
-            if (episode_key == null) null else ep_z,
+            if (episode_key == null or ep_text.len == 0) null else ep_z,
         };
         const lengths = [_]c_int{
             @intCast(user_s.len),
