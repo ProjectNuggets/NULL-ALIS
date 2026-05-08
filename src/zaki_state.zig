@@ -387,6 +387,11 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn listIdentityFacts(_: *@This(), allocator: std.mem.Allocator, _: i64, _: u32) ![]memory_root.MemoryEntry {
         return allocator.alloc(memory_root.MemoryEntry, 0);
     }
+    /// V1.11 hardening (2026-05-08) — stub for non-postgres builds; the
+    /// /brain/me endpoint degrades to 404 on file-state deployments.
+    pub fn pickSelfAnchor(_: *@This(), _: std.mem.Allocator, _: i64) !?memory_root.MemoryEntry {
+        return null;
+    }
     /// V1.7a-9a — stubs for non-postgres builds. Communities feature
     /// degrades to "no communities yet" — every node has community_id=null
     /// on /brain/graph, /brain/communities returns empty, recompute is a
@@ -3920,6 +3925,100 @@ const ManagerImpl = struct {
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
         return try decodeMemoryRows(allocator, result, false);
+    }
+
+    /// V1.11 hardening (2026-05-08, FE spec #2 follow-up) — pick the
+    /// canonical self-anchor memory for /brain/me.
+    ///
+    /// Three-tier picker (each tier checked in order, first hit wins):
+    ///
+    /// **Tier 1 — Canonical identity-card key.** If the corpus has a
+    /// memory keyed `boss_identity` (or prefixed `boss_identity_`,
+    /// `user_identity`, `user_persona`, `identity_self`), return it.
+    /// These are convention keys our extractor + manual writes use for
+    /// "this is the user." Verified live: user 1's corpus has
+    /// `boss_identity` with content "Boss is Alfred Succer..." but
+    /// zero outbound identity-class edges (the extractor doesn't fire
+    /// on identity-card content directly), so source-degree ranking
+    /// alone misses the actual user node.
+    ///
+    /// **Tier 2 — Source-degree ranking.** Memories that are the SOURCE
+    /// of the most identity-class edges (NAME/IS/WORKS_AT/PREFERS etc).
+    /// The "user node" is whoever's the SOURCE of the most identity
+    /// claims by definition.
+    ///
+    /// **Tier 3 — Empty.** Return null. Cold-corpus → /brain/me 404 →
+    /// FE renders empty-state ("ZAKI hasn't learned about you yet").
+    ///
+    /// Returns null only on Tier 3. Caller frees the entry.
+    pub fn pickSelfAnchor(self: *Self, allocator: std.mem.Allocator, user_id: i64) !?memory_root.MemoryEntry {
+        // ── Tier 1 — Canonical identity-card key ──────────────────────
+        // PostgreSQL ILIKE is case-insensitive; wildcard prefixes match
+        // boss_identity, boss_identity_v2, user_identity_card, etc.
+        const tier1_q = try self.buildQuery(
+            "SELECT id, key, content, memory_type, " ++
+                "COALESCE((EXTRACT(EPOCH FROM created_at))::bigint::text, '0'), " ++
+                "session_id, valid_to FROM {schema}.memories " ++
+                "WHERE user_id = $1 AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
+                "AND (key = 'boss_identity' OR key ILIKE 'boss_identity_%' " ++
+                "     OR key ILIKE 'user_identity%' OR key ILIKE 'user_persona%' " ++
+                "     OR key ILIKE 'identity_self%') " ++
+                "ORDER BY " ++
+                "  (CASE WHEN key = 'boss_identity' THEN 0 " ++
+                "        WHEN key ILIKE 'boss_identity_%' THEN 1 " ++
+                "        WHEN key ILIKE 'user_identity%' THEN 2 " ++
+                "        WHEN key ILIKE 'user_persona%' THEN 3 " ++
+                "        ELSE 4 END) ASC, " ++
+                "  created_at DESC " ++
+                "LIMIT 1",
+        );
+        defer self.allocator.free(tier1_q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        {
+            const result = try self.execParams(tier1_q, &params, &lengths);
+            defer c.PQclear(result);
+            if (c.PQntuples(result) > 0) {
+                return try decodeMemoryEntry(allocator, result, 0);
+            }
+        }
+
+        // ── Tier 2 — Source-degree ranking on identity-class edges ────
+        const tier2_q = try self.buildQuery(
+            "SELECT m.id, m.key, m.content, m.memory_type, " ++
+                "COALESCE((EXTRACT(EPOCH FROM m.created_at))::bigint::text, '0'), " ++
+                "m.session_id, m.valid_to FROM {schema}.memories m " ++
+                "WHERE m.user_id = $1 AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
+                "AND m.key IN (" ++
+                "  SELECT e.source_key FROM {schema}.memory_edges e " ++
+                "  WHERE e.user_id = $1 AND e.is_latest " ++
+                "  AND e.predicate IN (" ++
+                "    'NAME','NAMED','IS','IS_A','LIVES_IN'," ++
+                "    'WORKS_AT','WORKS_AS','WORKS_ON','ROLE','ROLE_IS'," ++
+                "    'BORN_IN','SPEAKS','FOLLOWS_GOAL','PREFERS'," ++
+                "    'STAKEHOLDER_OF','HAS_ACTIVE_CONTRACT'" ++
+                "  )" ++
+                ") " ++
+                "ORDER BY (" ++
+                "  SELECT COUNT(*) FROM {schema}.memory_edges e2 " ++
+                "  WHERE e2.user_id = $1 AND e2.is_latest " ++
+                "  AND e2.source_key = m.key " ++
+                "  AND e2.predicate IN (" ++
+                "    'NAME','NAMED','IS','IS_A','LIVES_IN'," ++
+                "    'WORKS_AT','WORKS_AS','WORKS_ON','ROLE','ROLE_IS'," ++
+                "    'BORN_IN','SPEAKS','FOLLOWS_GOAL','PREFERS'," ++
+                "    'STAKEHOLDER_OF','HAS_ACTIVE_CONTRACT'" ++
+                "  )" ++
+                ") DESC, m.created_at DESC " ++
+                "LIMIT 1",
+        );
+        defer self.allocator.free(tier2_q);
+        const result = try self.execParams(tier2_q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
+        return try decodeMemoryEntry(allocator, result, 0);
     }
 
     /// V1.7a-9a — pull edges enriched with the metadata the LPA needs:

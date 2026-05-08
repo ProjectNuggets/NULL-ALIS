@@ -13331,18 +13331,22 @@ fn handleBrainMe(
         return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
     };
 
-    // limit=20 — enough headroom for a future picker that ranks by
-    // edge degree without re-querying. Today we just take the first.
-    const facts = state_mgr.listIdentityFacts(allocator, numeric_user_id, 20) catch {
-        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"identity_query_failed\"}" };
+    // V1.11 follow-up (2026-05-08) — switched from listIdentityFacts[0]
+    // to pickSelfAnchor (zaki_state.zig:3925), which ranks identity-class
+    // edge SOURCE memories by outbound degree with `boss_identity`-prefix
+    // tiebreaker. Pre-fix the picker took the most-recent identity fact
+    // which on real corpora picked noisy facts ("Assistant is Agent
+    // Zero" instead of the user's identity card). Source-degree ranking
+    // anchors on whoever's the SOURCE of the most identity claims —
+    // which is the user by definition.
+    const me_opt = state_mgr.pickSelfAnchor(allocator, numeric_user_id) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"self_anchor_query_failed\"}" };
     };
-    defer memory_mod.freeEntries(allocator, facts);
-
-    if (facts.len == 0) {
+    var me = me_opt orelse {
         return .{ .status = "404 Not Found", .body = "{\"error\":\"no_self_anchor\"}" };
-    }
+    };
+    defer me.deinit(allocator);
 
-    const me = &facts[0];
     const summary_len = brainTruncateUtf8Boundary(me.content, BRAIN_SUMMARY_CHARS);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
