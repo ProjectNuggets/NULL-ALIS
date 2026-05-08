@@ -89,6 +89,11 @@ pub const schedule = @import("schedule.zig");
 pub const todo = @import("todo.zig");
 pub const compose_memory = @import("compose_memory.zig");
 pub const brain_graph = @import("brain_graph.zig");
+/// V1.12 — wiki_link tool. Wraps agent/entity_pipeline.runOnTurn so the
+/// agent (or admin/UI button) can run on-demand entity-mention extraction
+/// with co-occurrence edge emission. Imported here so its tests run with
+/// the rest of the suite.
+pub const wiki_link = @import("wiki_link.zig");
 pub const delegate = @import("delegate.zig");
 pub const browser = @import("browser.zig");
 pub const image = @import("image.zig");
@@ -473,6 +478,19 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .flags = .{},
         .risk_level = .low,
         .cost_class = .a,
+    },
+    .{
+        // V1.12 — wiki_link: on-demand entity-mention extraction +
+        // co-occurrence edge emission. Mutating (writes memory_entities
+        // + memory_edges). Low risk: re-running is idempotent (existing
+        // upsertMemoryEdge ON CONFLICT bumps weight, no duplicate rows;
+        // findEntityByCosine + upsertEntity for entities). Cost class b:
+        // one LLM call (~$0.0003 on Kimi K2.6 cheap path) plus N cosine
+        // resolutions, capped at MAX_MENTIONS_PER_TURN=24.
+        .name = wiki_link.WikiLinkTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .low,
+        .cost_class = .b,
     },
     .{
         // Schedule has read-only actions (list/get/runs) but the tool as a
@@ -1123,6 +1141,15 @@ pub fn allTools(
     const tnt = try allocator.create(time_now.TimeNowTool);
     tnt.* = .{};
     try list.append(allocator, tnt.tool());
+
+    // V1.12 — wiki_link: on-demand entity-mention extraction. State
+    // manager + user_id wired via bindStateMgrTenant; provider + model
+    // + embedder wired via bindWikiLinkContext (separate function so
+    // the wiki_link tool gets its own provider+model+embedder triple
+    // independent of memory_store's judge wiring).
+    const wlt = try allocator.create(wiki_link.WikiLinkTool);
+    wlt.* = .{};
+    try list.append(allocator, wlt.tool());
 
     // Delegate + spawn: dormant by default for V1. Both are coded but have
     // incomplete end-to-end behavior (subagent result visibility on follow-up
@@ -1783,6 +1810,13 @@ pub fn bindStateMgrTenant(tools: []const Tool, state_mgr: ?*zaki_state.Manager, 
             const mt: *memory_store.MemoryStoreTool = @ptrCast(@alignCast(t.ptr));
             mt.state_mgr = state_mgr;
             mt.user_id = user_id;
+        } else if (t.vtable == &wiki_link.WikiLinkTool.vtable) {
+            // V1.12 — wiki_link needs tenant context to write
+            // memory_entities + memory_edges. Provider + model + embedder
+            // wired separately via bindWikiLinkContext.
+            const mt: *wiki_link.WikiLinkTool = @ptrCast(@alignCast(t.ptr));
+            mt.state_mgr = state_mgr;
+            mt.user_id = user_id;
         } else if (t.vtable == &brain_graph.BrainGraphTool.vtable) {
             // V1.7-ship S2a — read-only graph navigation. Same tenant
             // binding as the writers above. With state_mgr=null (sqlite
@@ -1869,6 +1903,29 @@ pub fn bindMemoryMaintainSidecar(
             const mt: *memory_maintain.MemoryMaintainTool = @ptrCast(@alignCast(t.ptr));
             mt.judge_provider = sidecar_provider;
             mt.judge_model = sidecar_model;
+        }
+    }
+}
+
+/// V1.12 — wire the LLM provider, model name, and embedding provider
+/// into the wiki_link tool. Separated from `bindMemoryStoreUnifiedContext`
+/// because wiki_link uses the SAME provider+model as the chat path
+/// (Kimi K2.6 cheap call) — not a sidecar — and shares the embedder
+/// with the memory_store unified path. Pass null on any field to leave
+/// it unwired (the tool surfaces a clear "not wired" error to the agent
+/// rather than crashing).
+pub fn bindWikiLinkContext(
+    tools: []const Tool,
+    provider: ?@import("../providers/root.zig").Provider,
+    model_name: ?[]const u8,
+    embedder: ?@import("../memory/vector/embeddings.zig").EmbeddingProvider,
+) void {
+    for (tools) |t| {
+        if (t.vtable == &wiki_link.WikiLinkTool.vtable) {
+            const mt: *wiki_link.WikiLinkTool = @ptrCast(@alignCast(t.ptr));
+            mt.provider = provider;
+            mt.model_name = model_name;
+            mt.embedder = embedder;
         }
     }
 }
@@ -2333,8 +2390,9 @@ test "all tools includes extras when enabled" {
     // + 1 memory_demote from V1.6 cmt11) + http_request + web_fetch +
     // web_search + browser + brain_graph (V1.7-ship S2a)
     // + memory_maintain (V1.9-5 truth-maintenance toolkit)
-    // + time_now (V1.9-DX1 wall-clock tool) = 43.
-    try std.testing.expectEqual(@as(usize, 43), tools.len);
+    // + time_now (V1.9-DX1 wall-clock tool)
+    // + wiki_link (V1.12 entity-mention extractor) = 44.
+    try std.testing.expectEqual(@as(usize, 44), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -2354,8 +2412,9 @@ test "all tools excludes extras when disabled" {
     // + calculator + file_read_hashed + file_edit_hashed (nullclaw cherry-pick)
     // + memory_archive + memory_demote (V1.6 cmt11) + brain_graph (V1.7-ship S2a)
     // + memory_maintain (V1.9-5 truth-maintenance toolkit)
-    // + time_now (V1.9-DX1 wall-clock tool) = 39
-    try std.testing.expectEqual(@as(usize, 39), tools.len);
+    // + time_now (V1.9-DX1 wall-clock tool)
+    // + wiki_link (V1.12 entity-mention extractor) = 40
+    try std.testing.expectEqual(@as(usize, 40), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -2488,7 +2547,8 @@ test "all tools includes message when event bus is available" {
     // V1.7-ship S2a added brain_graph → 37.
     // V1.9-5 added memory_maintain (truth-maintenance toolkit) → 38.
     // V1.9-DX1 added time_now (wall-clock awareness) → 39.
-    try std.testing.expectEqual(@as(usize, 39), tools.len);
+    // V1.12 added wiki_link (entity-mention extractor) → 40.
+    try std.testing.expectEqual(@as(usize, 40), tools.len);
 
     var found_message = false;
     for (tools) |t| {

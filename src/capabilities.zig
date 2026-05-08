@@ -35,6 +35,10 @@ const core_tool_names = [_][]const u8{
     "skill_registry",
     "spawn",
     "screenshot",
+    // V1.12 — wiki_link: on-demand entity-mention extraction. Per-3-turn
+    // auto-trigger handles forward-flow ingestion; this tool surfaces it
+    // for explicit invocation (user "relink this" / button / admin CLI).
+    "wiki_link",
 };
 
 const optional_tool_names = [_][]const u8{

@@ -67,6 +67,11 @@ const usage_runtime_mod = @import("../usage_runtime.zig");
 const memory_loader = @import("memory_loader.zig");
 pub const transcript = @import("transcript.zig");
 pub const commands = @import("commands.zig");
+/// V1.12 — wiki-link entity pipeline. Per-3-turn LLM extraction of entity
+/// mentions, cosine-resolution against memory_entities, COOCCURS edge
+/// emission. Multilingual by construction. See entity_pipeline.zig for
+/// the design contract.
+pub const entity_pipeline = @import("entity_pipeline.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
 const ToolExecutionResult = dispatcher.ToolExecutionResult;
 
@@ -574,6 +579,11 @@ pub const Agent = struct {
 
     /// Turns since last memory nudge (periodic prompt asking agent what to persist).
     turns_since_memory_nudge: u32 = 0,
+    /// V1.12 — turns since last entity-pipeline (wiki_link) run. Auto-fires
+    /// every 3 turns to extract entity mentions from the recent turn pair(s)
+    /// and emit COOCCURS edges. Multilingual by construction. See
+    /// agent/entity_pipeline.zig for the design contract.
+    turns_since_extraction: u32 = 0,
     /// Tool calls in the last completed turn (for skills auto-extraction).
     last_turn_tool_count: u32 = 0,
 
@@ -3838,6 +3848,70 @@ pub const Agent = struct {
                     }
                 }
 
+                // V1.12 — entity-pipeline (wiki_link) per-3-turn trigger.
+                // Forward-flow connectivity layer: every 3 turns we run a
+                // single LLM call that scans the most recent turn pair(s)
+                // for entity mentions, resolves them against
+                // memory_entities (cosine 0.85), and emits COOCCURS +
+                // MENTIONED edges in memory_edges. Multilingual by
+                // construction — the extractor prompt handles any
+                // language. Idempotent — re-mentions bump existing edge
+                // weights via upsertMemoryEdge ON CONFLICT logic.
+                //
+                // Failure-soft: every error inside runOnTurn is logged
+                // and reflected in stats; the trigger never propagates
+                // an error to the turn loop. Skipping a run on tenant-
+                // missing is intentional (single-user dev mode without
+                // postgres state manager runs without entity edges; UI
+                // degrades gracefully — no /brain orphans surface).
+                self.turns_since_extraction += 1;
+                if (self.turns_since_extraction >= 3) {
+                    self.turns_since_extraction = 0;
+                    if (self.extraction_state_mgr != null and
+                        self.extraction_user_id != null and
+                        self.extraction_coref_embed != null)
+                    {
+                        // Build text from the last few history entries —
+                        // grab the most recent user + assistant exchange
+                        // (and the prior pair if present, up to ~4KB
+                        // capped by entity_pipeline truncation).
+                        const turn_text_opt = buildRecentTurnText(self.allocator, self.history.items) catch |err| blk: {
+                            log.warn("entity_pipeline.build_text_failed err={s}", .{@errorName(err)});
+                            break :blk null;
+                        };
+                        if (turn_text_opt) |turn_text| {
+                            defer self.allocator.free(turn_text);
+                            const stats = entity_pipeline.runOnTurn(
+                                self.allocator,
+                                self.provider,
+                                self.model_name,
+                                self.extraction_state_mgr.?,
+                                self.extraction_coref_embed.?,
+                                self.extraction_user_id.?,
+                                turn_text,
+                                30, // timeout_secs
+                            );
+                            log.info(
+                                "turn.stage stage=entity_pipeline mentions={d} resolved={d} minted={d} edges={d} llm_ms={d}",
+                                .{
+                                    stats.mentions_extracted,
+                                    stats.entities_resolved,
+                                    stats.entities_minted,
+                                    stats.edges_emitted,
+                                    stats.llm_latency_ms,
+                                },
+                            );
+                            const ep_event = ObserverEvent{ .turn_stage = .{
+                                .stage = "entity_pipeline",
+                                .iteration = iteration,
+                                .count = @intCast(stats.edges_emitted),
+                                .run_id = self.current_run_id,
+                            } };
+                            self.observer.recordEvent(&ep_event);
+                        }
+                    }
+                }
+
                 // Skills auto-extraction: after complex tasks (5+ tool calls), prompt
                 // the agent to extract a reusable procedure. Hermes pattern: the self-
                 // improvement flywheel. Cooldown: only prompt if the previous turn
@@ -4833,6 +4907,63 @@ fn dupeHistoryBytes(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     const src: [*]align(1) const u8 = @ptrCast(source.ptr);
     std.mem.copyForwards(u8, out, src[0..source.len]);
     return out;
+}
+
+/// V1.12 — build a recent-turn-text string for the entity_pipeline
+/// per-3-turn trigger. Walks back from the end of history collecting
+/// the most recent user + assistant pair(s), up to ~3KB total to leave
+/// room for prompt overhead in the extractor's 4KB cap.
+///
+/// Skips system messages and tool messages — only user-facing content
+/// goes into the entity pipeline (tool outputs are noise for entity
+/// extraction; system messages are agent instructions, not user data).
+///
+/// Returns owned string. Caller must free. Returns null-equivalent
+/// (empty allocation) if no usable history exists.
+fn buildRecentTurnText(
+    allocator: std.mem.Allocator,
+    history: []const Agent.OwnedMessage,
+) ![]u8 {
+    if (history.len == 0) return allocator.alloc(u8, 0);
+
+    const MAX_BYTES: usize = 3072;
+    var collected: std.ArrayListUnmanaged(u8) = .{};
+    errdefer collected.deinit(allocator);
+
+    // Walk backwards collecting user/assistant content until we hit
+    // the byte cap. We accumulate in reverse, then we'll reverse-stitch
+    // by writing newest-first; that's fine for entity extraction (the
+    // extractor doesn't care about turn order, just about what entities
+    // appear). Bound at 8 messages to avoid pathological cases.
+    var msgs_collected: usize = 0;
+    var i: usize = history.len;
+    while (i > 0 and msgs_collected < 8 and collected.items.len < MAX_BYTES) : (msgs_collected += 1) {
+        i -= 1;
+        const msg = history[i];
+        // Skip non-content roles: system/tool messages aren't user prose.
+        const role_str: []const u8 = switch (msg.role) {
+            .user => "user",
+            .assistant => "assistant",
+            .system, .tool => continue,
+        };
+        if (msg.content.len == 0) continue;
+
+        // Append "role: content\n" with bounded size.
+        const remaining = MAX_BYTES - collected.items.len;
+        const prefix_overhead: usize = role_str.len + 3; // "role: \n"
+        if (remaining <= prefix_overhead) break;
+        const content_budget = remaining - prefix_overhead;
+        const content_slice = if (msg.content.len > content_budget) msg.content[0..content_budget] else msg.content;
+
+        var line_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer line_buf.deinit(allocator);
+        try line_buf.writer(allocator).print("{s}: {s}\n", .{ role_str, content_slice });
+        // Prepend (since we're walking newest-first, but we want oldest-first
+        // in the final string for natural reading).
+        try collected.insertSlice(allocator, 0, line_buf.items);
+    }
+
+    return collected.toOwnedSlice(allocator);
 }
 
 pub const cli = @import("cli.zig");
