@@ -312,6 +312,36 @@ pub fn workspacePromptFingerprint(
 /// MUST NOT include: timestamps, session state, conversation context, retrieved
 /// memory, or any content that varies per turn. Those belong in the volatile
 /// block (see buildVolatileSystemPrompt).
+/// V1.13 — Stable system prompt, ENGINEERED for cache stability.
+///
+/// Sections are ordered by cache-invalidation tier. Provider byte-prefix
+/// caches (Together vLLM, Anthropic with cache_control) match from
+/// byte 0 — when ANY byte in the stable prefix changes, the cache
+/// invalidates from that point onward. The goal is to put the
+/// truly-immutable bytes FIRST so day-to-day workspace edits invalidate
+/// only the tail of the stable section, not the whole thing.
+///
+/// Tier 1 (truly comptime, NEVER changes between deploys):
+///   link_type vocab, brain architecture, response protocol,
+///   channel attachments, turn classification, task decomposition,
+///   safety
+///
+/// Tier 2 (deploy-config stable — changes when tools list / config
+/// changes, infrequent):
+///   tools catalog, capabilities
+///
+/// Tier 3 (workspace stable — changes when user edits workspace
+/// files, frequent in active sessions):
+///   persona (SOUL.md frontmatter), identity (workspace MD files),
+///   skills, workspace path
+///
+/// Tier 4 (runtime — model name; stable per session):
+///   runtime info
+///
+/// Result: when MEMORY.md / USER.md change (most common edits), only
+/// Tier 3+ invalidates — Tier 1+2 (typical 15-25 KB) stays cached.
+/// Pre-V1.13 ordering put Tier 3 FIRST, invalidating everything on
+/// any workspace edit — wasted ~50 KB of cached prefix per edit.
 pub fn buildStableSystemPrompt(
     allocator: std.mem.Allocator,
     ctx: PromptContext,
@@ -320,72 +350,67 @@ pub fn buildStableSystemPrompt(
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
 
-    // Identity section — inject workspace MD files
-    try buildIdentitySection(allocator, w, ctx.workspace_dir);
+    // ─── Tier 1: comptime constants (never change between deploys) ──
 
-    // Tools section
-    try buildToolsSection(w, ctx.tools);
-
-    // V1.7a-5 (spec seam 3) — link_type vocabulary. Placed immediately after
-    // the tools catalog because compose_memory takes an optional `link_type`
-    // arg and the agent reasons about extracted-memory categories when
-    // synthesizing or correcting facts. Bytes are comptime-derived from the
-    // memory_root.ALL_LINK_TYPES single source of truth so this block
-    // CANNOT drift from the enum it documents.
+    // V1.7a-5 — link_type vocabulary. Comptime-derived from
+    // memory_root.ALL_LINK_TYPES. ~1 KB.
     try buildLinkTypeSection(w);
 
-    // V1.13 — Brain architecture briefing. Tells the agent what's
-    // actually available + how to leverage it. Stays in the STABLE
-    // block because the architecture is workspace-stable across
-    // turns; the volatile block surfaces the per-turn working-memory
-    // slots that this section describes.
+    // V1.13 — brain architecture briefing. Tells the agent what's
+    // available + how to leverage Layers 0/1/2/3/4/6/7. ~3 KB.
     try buildBrainArchitectureSection(w);
 
-    // Response protocol — tool-first dispatch rules. Placed immediately after
-    // Tools so the model sees the tool catalog and the rules that govern its
-    // use as one unit, not as separate concerns.
+    // Response protocol — tool-first dispatch rules. ~3 KB.
     try buildResponseProtocolSection(w);
 
-    // Attachment marker conventions for channel delivery.
+    // Attachment marker conventions. ~500 B.
     try appendChannelAttachmentsSection(w);
 
+    // Turn classification (intent → response shape). ~1 KB.
+    try buildTurnClassificationSection(w);
+
+    // Task decomposition heuristics. ~1 KB.
+    try buildTaskDecompositionSection(w);
+
+    // Safety rules. ~1 KB.
+    try buildSafetySection(w);
+
+    // ─── Tier 2: deploy-config (changes when tool list changes) ──
+
+    // Tools catalog. Sorted by name for byte-stable bytes within the
+    // section across runs. ~8-15 KB.
+    try buildToolsSection(w, ctx.tools);
+
+    // Capabilities derived from config + tool flags. Optional. ~2-5 KB.
     if (ctx.capabilities_section) |section| {
         try w.writeAll(section);
     }
 
-    // Persona section — injected before turn classification and safety (T-1.5-10)
+    // ─── Tier 3: workspace files (changes when user edits MD) ──
+
+    // Persona from SOUL.md front-matter. ~500 B.
     if (ctx.sections.persona) |persona| {
         try buildPersonaSection(w, persona);
     }
 
-    // Turn classification section
-    try buildTurnClassificationSection(w);
+    // Identity — workspace MD files (AGENTS, SOUL, USER, MEMORY, etc).
+    // ~5-30 KB; the dominant Tier 3 cost.
+    try buildIdentitySection(allocator, w, ctx.workspace_dir);
 
-    // Task decomposition section
-    try buildTaskDecompositionSection(w);
-
-    // Safety section
-    try buildSafetySection(w);
-
-    // Narration section — placeholder insertion point for REQ-019
-    // (emits nothing when null — downstream sprint will populate)
-    _ = ctx.sections.narration;
-
-    // Learned facts section — placeholder insertion point for REQ-021
-    // (emits nothing when null — downstream sprint will populate)
-    _ = ctx.sections.learned_facts;
-
-    // Tool use policy — placeholder insertion point for REQ-020
-    // (emits nothing when null — downstream sprint will populate)
-    _ = ctx.sections.tool_use;
-
-    // Skills section
+    // Skills directory listing. ~0-10 KB.
     try appendSkillsSection(allocator, w, ctx.workspace_dir);
 
-    // Workspace section
+    // Workspace path string. ~200 B.
     try buildWorkspaceSection(w, ctx.workspace_dir);
 
-    // Runtime section (model name is stable within a session)
+    // Reserved insertion points (REQ-019/020/021 — currently no-op).
+    _ = ctx.sections.narration;
+    _ = ctx.sections.learned_facts;
+    _ = ctx.sections.tool_use;
+
+    // ─── Tier 4: runtime (per-session stable) ──
+
+    // Runtime info — model name. ~200 B.
     try buildRuntimeSection(w, ctx.model_name);
 
     return try buf.toOwnedSlice(allocator);
@@ -1994,7 +2019,7 @@ test "buildPersonaSection with default PersonaSection emits balanced defaults" {
     try std.testing.expect(std.mem.indexOf(u8, output, "digital twin") == null);
 }
 
-test "buildSystemPrompt with persona section places persona before safety" {
+test "buildSystemPrompt persona renders + sits in Tier 3 after Tier 1 safety (V1.13 cache ordering)" {
     const allocator = std.testing.allocator;
     const p = try buildSystemPrompt(allocator, .{
         .workspace_dir = "/tmp/nonexistent",
@@ -2006,7 +2031,12 @@ test "buildSystemPrompt with persona section places persona before safety" {
 
     const persona_pos = std.mem.indexOf(u8, p, "## Persona Calibration") orelse return error.PersonaSectionMissing;
     const safety_pos = std.mem.indexOf(u8, p, "## Safety") orelse return error.SafetySectionMissing;
-    try std.testing.expect(persona_pos < safety_pos);
+    // V1.13 engineered ordering: Tier 1 comptime (safety) FIRST, Tier 3
+    // workspace-stable (persona) AFTER. Reasoning: safety rules are
+    // foundational (rarely change between deploys); persona is workspace-
+    // local (SOUL.md edits invalidate cache). Placing comptime first
+    // keeps the cached prefix maximal across workspace edits.
+    try std.testing.expect(safety_pos < persona_pos);
     try std.testing.expect(std.mem.indexOf(u8, p, "warm, personable tone") != null);
     try std.testing.expect(std.mem.indexOf(u8, p, "digital twin") != null);
 }
