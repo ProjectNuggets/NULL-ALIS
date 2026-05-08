@@ -241,6 +241,13 @@ pub const PromptContext = struct {
     /// memory_loader.loadTurnMemorySlot. Omitted from the stable block to
     /// preserve byte-identical caching of the stable prefix across turns.
     memory_slot: ?[]const u8 = null,
+    /// V1.13 Day 1 — Working Memory block for the volatile system prompt.
+    /// Pre-formatted by agent/working_memory.zig::renderBlock as
+    /// `<working_memory>...</working_memory>`. Sits BEFORE memory_slot in
+    /// the volatile block — open loops + active goals + identity render
+    /// at the top so the agent sees them before loaded prose. Empty
+    /// string when no slots exist (new session, postgres unavailable).
+    working_memory_block: ?[]const u8 = null,
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -401,6 +408,19 @@ pub fn buildVolatileSystemPrompt(
 
     // DateTime section — current UTC time. Always changes turn-to-turn.
     try appendDateTimeSection(allocator, w, ctx.workspace_dir);
+
+    // V1.13 Day 1 — Working Memory block. Renders BEFORE retrieved
+    // memory so the agent sees pinned identity / active goals / open
+    // loops first. Pre-fenced as <working_memory>...</working_memory>
+    // by agent/working_memory.zig::renderBlock. Empty string means no
+    // slots exist (new session or postgres unavailable — failure-soft).
+    if (ctx.working_memory_block) |wm| {
+        if (wm.len > 0) {
+            try w.writeAll(wm);
+            if (wm[wm.len - 1] != '\n') try w.writeAll("\n");
+            try w.writeAll("\n");
+        }
+    }
 
     // Retrieved-memory payload for this turn, if any. Pre-fenced by
     // memory_loader.loadTurnMemorySlot. Empty string means no memory this turn.

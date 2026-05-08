@@ -51,6 +51,7 @@ const providers = @import("../providers/root.zig");
 const edge_resolution = @import("edge_resolution.zig");
 const memory_embeddings = @import("../memory/vector/embeddings.zig");
 const text_norm = @import("../memory/text_norm.zig");
+const working_memory = @import("working_memory.zig");
 
 /// One atomic fact extracted from a conversation. Mirrors the JSON
 /// schema specified in compaction.zig::summarizer_system. Produced by
@@ -772,6 +773,33 @@ pub fn persistExtracted(
         // syncVectorAfterStore, doesn't affect the memory row.
         if (mem_rt) |rt| _ = rt.syncVectorAfterStore(allocator, key, m.text);
 
+        // V1.13 Day 1 — Working Memory auto-promotion. When the
+        // extracted fact's predicate signals an open loop / active
+        // goal / decision / etc, promote it to a working-memory slot
+        // so it surfaces in subsequent prompts without requiring
+        // recall to find it. Failure-soft: any error logs and
+        // continues — the canonical memory row is the source of truth.
+        if (session_id) |sid| {
+            if (predicateToSlotType(m.predicate)) |slot_type| {
+                _ = working_memory.promoteSlot(
+                    allocator,
+                    state_mgr,
+                    user_id,
+                    sid,
+                    slot_type,
+                    m.text,
+                    key,
+                    @max(m.confidence, 0.5),
+                    false, // pinned=false; only identity slots are pinned
+                ) catch |err| {
+                    log.warn("extraction.wm_promote_failed err={s} predicate={s}", .{
+                        @errorName(err), m.predicate,
+                    });
+                    null;
+                };
+            }
+        }
+
         log.info("extraction.persisted key={s} subject={s} predicate={s} attributed_to={s}", .{
             key, m.subject, m.predicate, m.attributed_to,
         });
@@ -779,6 +807,50 @@ pub fn persistExtracted(
     }
 
     return result;
+}
+
+/// V1.13 Day 1 — map an extraction predicate to a Working Memory slot
+/// type, or null if the predicate doesn't warrant promotion. Conservative
+/// list — predicates that materially affect future turns get promoted;
+/// ordinary attributive facts (BIRTHDAY, WORKS_AT) don't take WM slots
+/// because they live in canonical memory and are recalled by hybrid
+/// search when relevant.
+fn predicateToSlotType(predicate: []const u8) ?[]const u8 {
+    // Open loops — pending actions the user mentioned.
+    if (std.ascii.eqlIgnoreCase(predicate, "TODO")) return working_memory.SlotType.open_loop;
+    if (std.ascii.eqlIgnoreCase(predicate, "WILL_DO")) return working_memory.SlotType.open_loop;
+    if (std.ascii.eqlIgnoreCase(predicate, "REMINDS_ME_TO")) return working_memory.SlotType.open_loop;
+    if (std.ascii.eqlIgnoreCase(predicate, "NEEDS_TO")) return working_memory.SlotType.open_loop;
+    if (std.ascii.eqlIgnoreCase(predicate, "PROMISED")) return working_memory.SlotType.open_loop;
+    if (std.ascii.eqlIgnoreCase(predicate, "OPEN_LOOP")) return working_memory.SlotType.open_loop;
+
+    // Active goals — current projects / objectives.
+    if (std.ascii.eqlIgnoreCase(predicate, "WORKING_ON")) return working_memory.SlotType.active_goal;
+    if (std.ascii.eqlIgnoreCase(predicate, "BUILDING")) return working_memory.SlotType.active_goal;
+    if (std.ascii.eqlIgnoreCase(predicate, "GOAL")) return working_memory.SlotType.active_goal;
+    if (std.ascii.eqlIgnoreCase(predicate, "FOCUSING_ON")) return working_memory.SlotType.active_goal;
+    if (std.ascii.eqlIgnoreCase(predicate, "WANTS_TO_FINISH")) return working_memory.SlotType.active_goal;
+
+    // Decisions — committed choices.
+    if (std.ascii.eqlIgnoreCase(predicate, "DECIDED")) return working_memory.SlotType.decision;
+    if (std.ascii.eqlIgnoreCase(predicate, "CHOSE")) return working_memory.SlotType.decision;
+    if (std.ascii.eqlIgnoreCase(predicate, "PICKED")) return working_memory.SlotType.decision;
+
+    // Emotional state.
+    if (std.ascii.eqlIgnoreCase(predicate, "FEELS")) return working_memory.SlotType.emotional;
+    if (std.ascii.eqlIgnoreCase(predicate, "MENTAL_STATE")) return working_memory.SlotType.emotional;
+    if (std.ascii.eqlIgnoreCase(predicate, "STRESSED_ABOUT")) return working_memory.SlotType.emotional;
+
+    // Open questions.
+    if (std.ascii.eqlIgnoreCase(predicate, "ASKING")) return working_memory.SlotType.open_question;
+    if (std.ascii.eqlIgnoreCase(predicate, "WONDERING")) return working_memory.SlotType.open_question;
+
+    // Temporal events.
+    if (std.ascii.eqlIgnoreCase(predicate, "HAPPENS_ON")) return working_memory.SlotType.temporal;
+    if (std.ascii.eqlIgnoreCase(predicate, "SCHEDULED_FOR")) return working_memory.SlotType.temporal;
+    if (std.ascii.eqlIgnoreCase(predicate, "BIRTHDAY")) return working_memory.SlotType.temporal;
+
+    return null;
 }
 
 /// V1.6 commit 7 — derive a stable entity-side target key from an object

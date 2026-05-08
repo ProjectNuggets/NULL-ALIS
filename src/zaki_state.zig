@@ -595,6 +595,24 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn upsertEntity(_: *@This(), allocator: std.mem.Allocator, _: i64, name: []const u8, _: []const f32) ![]u8 {
         return allocator.dupe(u8, name);
     }
+    /// V1.13 Day 1 — working memory stubs for non-postgres builds.
+    /// Non-postgres returns empty / no-op; the working-memory layer is a
+    /// postgres-only feature (pinned to per-cell tenant isolation).
+    pub fn listWorkingMemorySlots(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const u8) ![]memory_root.WorkingMemorySlot {
+        return allocator.alloc(memory_root.WorkingMemorySlot, 0);
+    }
+    pub fn upsertWorkingMemorySlot(_: *@This(), _: i64, _: []const u8, _: i32, _: []const u8, _: []const u8, _: ?[]const u8, _: f64, _: bool) !i32 {
+        return -1;
+    }
+    pub fn touchWorkingMemorySlot(_: *@This(), _: i64, _: []const u8, _: i32) !void {
+        return;
+    }
+    pub fn removeWorkingMemorySlot(_: *@This(), _: i64, _: []const u8, _: i32) !void {
+        return;
+    }
+    pub fn clearWorkingMemorySession(_: *@This(), _: i64, _: []const u8) !void {
+        return;
+    }
     pub fn countMemories(_: *@This(), _: i64) !usize {
         return error.PostgresNotEnabled;
     }
@@ -1455,6 +1473,51 @@ const ManagerImpl = struct {
             \\    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             \\)
             ,
+
+            // V1.13 Day 1 — Working Memory (Layer 0).
+            //
+            // 15 hot slots per (user_id, session_id). Persists across turns
+            // within a session; flushes to canonical memory at session end.
+            // Renders into the volatile system prompt block at top of every
+            // prompt — agent always has open loops, active goals, recent
+            // emotional context, identity facts in mind without rebuilding
+            // from prose recall every turn.
+            //
+            // slot_id is stable position 0..14 — eviction reuses slot_ids
+            // (lowest composite-priority evicted on overflow); slot 0 and 1
+            // reserved for pinned identity facts.
+            //
+            // slot_type: open_loop | active_goal | emotional | identity |
+            //            relationship | decision | recent_entity |
+            //            skill_state | temporal | open_question
+            //
+            // importance: 0..1 composite (recency × explicit_signal × retrieval_count).
+            // pinned: never evicted regardless of priority (identity facts).
+            // source_key: optional ref to memories table key that birthed
+            //   this slot — lets the slot promote-back a related memory
+            //   into recall context if the slot fires.
+            //
+            // V1.13 architectural rule: this is the ONLY working-memory
+            // surface. No parallel session-scoped slot tables. Future
+            // procedural / dream extensions write through the same row
+            // shape with their own slot_type values.
+            \\CREATE TABLE IF NOT EXISTS {schema}.working_memory (
+            \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
+            \\    session_id TEXT NOT NULL,
+            \\    slot_id INT NOT NULL,
+            \\    slot_type TEXT NOT NULL,
+            \\    content TEXT NOT NULL,
+            \\    source_key TEXT,
+            \\    importance FLOAT NOT NULL DEFAULT 0.5,
+            \\    pinned BOOLEAN NOT NULL DEFAULT FALSE,
+            \\    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            \\    last_touched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            \\    PRIMARY KEY (user_id, session_id, slot_id)
+            \\)
+            ,
+            "CREATE INDEX IF NOT EXISTS idx_wm_session ON {schema}.working_memory(user_id, session_id, last_touched_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_wm_priority ON {schema}.working_memory(user_id, session_id, importance DESC) WHERE NOT pinned",
+
             \\CREATE TABLE IF NOT EXISTS {schema}.channel_state (
             \\    user_id BIGINT PRIMARY KEY REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
             \\    telegram JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -6946,6 +7009,238 @@ const ManagerImpl = struct {
         const returned_id = try dupeResultValue(allocator, result, 0, 0);
         self.allocator.free(id);
         return returned_id;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // V1.13 Day 1 — Working Memory CRUD
+    // ─────────────────────────────────────────────────────────────────
+    //
+    // Schema lives in zaki_bot.working_memory (DDL above ~line 1390).
+    // 15 slots max per (user_id, session_id); slot_id is stable position
+    // 0..14. Eviction reuses slot_ids — application layer
+    // (agent/working_memory.zig) computes which slot to evict based on
+    // composite priority (importance × recency_decay) and calls
+    // upsertWorkingMemorySlot with that slot_id.
+
+    /// List all slots for (user_id, session_id), ordered by composite
+    /// priority (pinned first, then importance × recency_decay desc).
+    /// Returns owned slice — caller must call freeWorkingMemorySlots.
+    pub fn listWorkingMemorySlots(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        session_id: []const u8,
+    ) ![]memory_root.WorkingMemorySlot {
+        const q = try self.buildQuery(
+            "SELECT slot_id, slot_type, content, source_key, importance, pinned, " ++
+                "EXTRACT(EPOCH FROM created_at)::bigint, EXTRACT(EPOCH FROM last_touched_at)::bigint " ++
+                "FROM {schema}.working_memory " ++
+                "WHERE user_id = $1 AND session_id = $2 " ++
+                "ORDER BY pinned DESC, " ++
+                "  (importance * EXP(-(EXTRACT(EPOCH FROM (NOW() - last_touched_at))/3600.0))) DESC " ++
+                "LIMIT 15",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const sid_z = try self.allocator.dupeZ(u8, session_id);
+        defer self.allocator.free(sid_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, sid_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(session_id.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const n: usize = @intCast(c.PQntuples(result));
+        var out: std.ArrayListUnmanaged(memory_root.WorkingMemorySlot) = .{};
+        errdefer {
+            for (out.items) |s| s.deinit(allocator);
+            out.deinit(allocator);
+        }
+        try out.ensureTotalCapacity(allocator, n);
+
+        for (0..n) |i| {
+            const row_idx: c_int = @intCast(i);
+            const slot_id_str = try dupeResultValue(allocator, result, row_idx, 0);
+            defer allocator.free(slot_id_str);
+            const slot_type_owned = try dupeResultValue(allocator, result, row_idx, 1);
+            errdefer allocator.free(slot_type_owned);
+            const content_owned = try dupeResultValue(allocator, result, row_idx, 2);
+            errdefer allocator.free(content_owned);
+            const source_key_owned: ?[]u8 = blk: {
+                if (c.PQgetisnull(result, row_idx, 3) == 1) break :blk null;
+                break :blk try dupeResultValue(allocator, result, row_idx, 3);
+            };
+            errdefer if (source_key_owned) |sk| allocator.free(sk);
+            const importance_str = try dupeResultValue(allocator, result, row_idx, 4);
+            defer allocator.free(importance_str);
+            const pinned_str = try dupeResultValue(allocator, result, row_idx, 5);
+            defer allocator.free(pinned_str);
+            const created_str = try dupeResultValue(allocator, result, row_idx, 6);
+            defer allocator.free(created_str);
+            const touched_str = try dupeResultValue(allocator, result, row_idx, 7);
+            defer allocator.free(touched_str);
+            const session_owned = try allocator.dupe(u8, session_id);
+            errdefer allocator.free(session_owned);
+
+            try out.append(allocator, .{
+                .user_id = user_id,
+                .session_id = session_owned,
+                .slot_id = std.fmt.parseInt(i32, slot_id_str, 10) catch 0,
+                .slot_type = slot_type_owned,
+                .content = content_owned,
+                .source_key = source_key_owned,
+                .importance = std.fmt.parseFloat(f64, importance_str) catch 0.5,
+                .pinned = std.mem.eql(u8, pinned_str, "t") or std.mem.eql(u8, pinned_str, "true"),
+                .created_at_unix = std.fmt.parseInt(i64, created_str, 10) catch 0,
+                .last_touched_at_unix = std.fmt.parseInt(i64, touched_str, 10) catch 0,
+            });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Upsert a working-memory slot at the given slot_id. ON CONFLICT
+    /// updates content / slot_type / importance / pinned / source_key
+    /// and bumps last_touched_at. Caller (working_memory.zig) is
+    /// responsible for picking the slot_id (eviction logic — lowest
+    /// composite priority gets reused).
+    ///
+    /// Returns the slot_id used (echoed back for caller observability).
+    pub fn upsertWorkingMemorySlot(
+        self: *Self,
+        user_id: i64,
+        session_id: []const u8,
+        slot_id: i32,
+        slot_type: []const u8,
+        content: []const u8,
+        source_key: ?[]const u8,
+        importance: f64,
+        pinned: bool,
+    ) !i32 {
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.working_memory " ++
+                "(user_id, session_id, slot_id, slot_type, content, source_key, importance, pinned, last_touched_at) " ++
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) " ++
+                "ON CONFLICT (user_id, session_id, slot_id) DO UPDATE SET " ++
+                "slot_type = EXCLUDED.slot_type, " ++
+                "content = EXCLUDED.content, " ++
+                "source_key = EXCLUDED.source_key, " ++
+                "importance = EXCLUDED.importance, " ++
+                "pinned = EXCLUDED.pinned, " ++
+                "last_touched_at = NOW()",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const sid_z = try self.allocator.dupeZ(u8, session_id);
+        defer self.allocator.free(sid_z);
+        var slot_buf: [16]u8 = undefined;
+        const slot_s = try std.fmt.bufPrintZ(&slot_buf, "{d}", .{slot_id});
+        const stype_z = try self.allocator.dupeZ(u8, slot_type);
+        defer self.allocator.free(stype_z);
+        const content_z = try self.allocator.dupeZ(u8, content);
+        defer self.allocator.free(content_z);
+        const sk_text = source_key orelse "";
+        const sk_z = try self.allocator.dupeZ(u8, sk_text);
+        defer self.allocator.free(sk_z);
+        var imp_buf: [32]u8 = undefined;
+        const imp_s = try std.fmt.bufPrintZ(&imp_buf, "{d:.6}", .{importance});
+        const pinned_str: []const u8 = if (pinned) "t" else "f";
+        const pinned_z = try self.allocator.dupeZ(u8, pinned_str);
+        defer self.allocator.free(pinned_z);
+
+        const params = [_]?[*:0]const u8{
+            user_s.ptr, sid_z,    slot_s.ptr,                          stype_z,
+            content_z,  if (source_key == null) null else sk_z, imp_s.ptr, pinned_z,
+        };
+        const lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(session_id.len),
+            @intCast(slot_s.len),
+            @intCast(slot_type.len),
+            @intCast(content.len),
+            @intCast(sk_text.len),
+            @intCast(imp_s.len),
+            @intCast(pinned_str.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        return slot_id;
+    }
+
+    /// Bump last_touched_at on a slot (called when the slot's referent
+    /// is recalled or re-mentioned in a turn). Application layer uses
+    /// this to drive recency-decay component of composite priority.
+    pub fn touchWorkingMemorySlot(
+        self: *Self,
+        user_id: i64,
+        session_id: []const u8,
+        slot_id: i32,
+    ) !void {
+        const q = try self.buildQuery(
+            "UPDATE {schema}.working_memory SET last_touched_at = NOW() " ++
+                "WHERE user_id = $1 AND session_id = $2 AND slot_id = $3",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const sid_z = try self.allocator.dupeZ(u8, session_id);
+        defer self.allocator.free(sid_z);
+        var slot_buf: [16]u8 = undefined;
+        const slot_s = try std.fmt.bufPrintZ(&slot_buf, "{d}", .{slot_id});
+        const params = [_]?[*:0]const u8{ user_s.ptr, sid_z, slot_s.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(session_id.len), @intCast(slot_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+    }
+
+    /// Remove a single slot (e.g. on user "forget X" or when an
+    /// open_loop is marked resolved).
+    pub fn removeWorkingMemorySlot(
+        self: *Self,
+        user_id: i64,
+        session_id: []const u8,
+        slot_id: i32,
+    ) !void {
+        const q = try self.buildQuery(
+            "DELETE FROM {schema}.working_memory " ++
+                "WHERE user_id = $1 AND session_id = $2 AND slot_id = $3",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const sid_z = try self.allocator.dupeZ(u8, session_id);
+        defer self.allocator.free(sid_z);
+        var slot_buf: [16]u8 = undefined;
+        const slot_s = try std.fmt.bufPrintZ(&slot_buf, "{d}", .{slot_id});
+        const params = [_]?[*:0]const u8{ user_s.ptr, sid_z, slot_s.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(session_id.len), @intCast(slot_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+    }
+
+    /// Clear all working-memory slots for (user_id, session_id).
+    /// Called on /new (session reset) and at the end of session_end
+    /// after slots have been promoted/flushed to canonical memory.
+    pub fn clearWorkingMemorySession(
+        self: *Self,
+        user_id: i64,
+        session_id: []const u8,
+    ) !void {
+        const q = try self.buildQuery(
+            "DELETE FROM {schema}.working_memory " ++
+                "WHERE user_id = $1 AND session_id = $2",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const sid_z = try self.allocator.dupeZ(u8, session_id);
+        defer self.allocator.free(sid_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, sid_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(session_id.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
     }
 
     /// Delete autosave_user_* and autosave_assistant_* memory rows for the

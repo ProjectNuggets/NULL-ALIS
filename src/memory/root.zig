@@ -577,6 +577,49 @@ pub const CommunityAssignment = struct {
     community_id: i32,
 };
 
+/// V1.13 Day 1 — Working Memory slot. One row in the working_memory
+/// table; 15 slots max per (user_id, session_id). Renders into the
+/// volatile system prompt block so the agent always has open loops,
+/// active goals, recent emotional context, and identity in mind.
+///
+/// Slot types (free-form text but conventionally one of):
+///   open_loop       — pending action user mentioned ("call Alfred about MNDA")
+///   active_goal     — current project / objective
+///   emotional       — recent emotional state ("user is stressed about launch")
+///   identity        — pinned identity facts (boss_identity, user_persona)
+///   relationship    — key relationship summary
+///   decision        — recent commitment / choice
+///   recent_entity   — frequently-mentioned entity in this session
+///   skill_state     — last skill execution context
+///   temporal        — upcoming event / scheduled item
+///   open_question   — question awaiting answer
+///
+/// Caller owns all slice fields via the supplied allocator.
+pub const WorkingMemorySlot = struct {
+    user_id: i64,
+    session_id: []const u8,
+    slot_id: i32,
+    slot_type: []const u8,
+    content: []const u8,
+    source_key: ?[]const u8, // optional ref to memories.key
+    importance: f64,
+    pinned: bool,
+    created_at_unix: i64,
+    last_touched_at_unix: i64,
+
+    pub fn deinit(self: *const WorkingMemorySlot, allocator: std.mem.Allocator) void {
+        allocator.free(self.session_id);
+        allocator.free(self.slot_type);
+        allocator.free(self.content);
+        if (self.source_key) |sk| allocator.free(sk);
+    }
+};
+
+pub fn freeWorkingMemorySlots(allocator: std.mem.Allocator, slots: []WorkingMemorySlot) void {
+    for (slots) |*s| s.deinit(allocator);
+    allocator.free(slots);
+}
+
 /// V1.9-1 — result of a cascade-rename operation on the entity graph.
 /// Returned by `state_mgr.cascadeRenameEntity(allocator, user_id,
 /// old_name, new_name)`. Caller owns `old_id` + `new_id` via the

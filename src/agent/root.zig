@@ -72,6 +72,10 @@ pub const commands = @import("commands.zig");
 /// emission. Multilingual by construction. See entity_pipeline.zig for
 /// the design contract.
 pub const entity_pipeline = @import("entity_pipeline.zig");
+/// V1.13 Day 1 — Working Memory layer (Layer 0). 15 hot slots per
+/// session that persist across turns and render into the volatile
+/// prompt block. See agent/working_memory.zig.
+pub const working_memory = @import("working_memory.zig");
 const ParsedToolCall = dispatcher.ParsedToolCall;
 const ToolExecutionResult = dispatcher.ToolExecutionResult;
 
@@ -2717,6 +2721,37 @@ pub const Agent = struct {
                 .twin_mode = p.twin_mode,
             } else null;
 
+            // V1.13 Day 1 — Working Memory block. Renders pinned identity +
+            // active goals + open loops at the top of the volatile system
+            // prompt. Failure-soft: when state_mgr / user_id missing
+            // (sqlite build, pre-tenant), we get an empty block and the
+            // agent proceeds with recall-only memory (V1.12 behavior).
+            //
+            // The block is rebuilt every turn (not cached) because slot
+            // priorities decay with time and the eviction order may
+            // change. ~50ms cost per turn for the SQL fetch + render —
+            // acceptable for the experiential payoff of always-present
+            // open-loops + identity anchoring.
+            const wm_render_set = blk: {
+                if (self.extraction_state_mgr) |smgr| {
+                    if (self.extraction_user_id) |uid| {
+                        const sid = self.memory_session_id orelse break :blk null;
+                        break :blk working_memory.loadForRender(self.allocator, smgr, uid, sid);
+                    }
+                }
+                break :blk null;
+            };
+            defer if (wm_render_set) |s| s.deinit(self.allocator);
+            const wm_block: ?[]u8 = blk: {
+                const set = wm_render_set orelse break :blk null;
+                if (set.slots.len == 0) break :blk null;
+                break :blk working_memory.renderBlock(self.allocator, set.slots) catch |err| {
+                    log.warn("working_memory.render_failed err={s}", .{@errorName(err)});
+                    break :blk null;
+                };
+            };
+            defer if (wm_block) |b| self.allocator.free(b);
+
             // Context v2: build stable + volatile separately so tool instructions
             // can sit in the STABLE half (byte-identical across turns) rather than
             // after the volatile block. This preserves byte-prefix cache stability
@@ -2729,6 +2764,7 @@ pub const Agent = struct {
                 .conversation_context = self.conversation_context,
                 .sections = .{ .persona = persona_section },
                 .memory_slot = if (memory_slot_result.fenced_content.len > 0) memory_slot_result.fenced_content else null,
+                .working_memory_block = wm_block,
             };
 
             const stable_prompt = try prompt.buildStableSystemPrompt(self.allocator, prompt_ctx);
