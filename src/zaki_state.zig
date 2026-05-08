@@ -1535,7 +1535,14 @@ const ManagerImpl = struct {
             \\)
             ,
             "CREATE INDEX IF NOT EXISTS idx_wm_session ON {schema}.working_memory(user_id, session_id, last_touched_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_wm_priority ON {schema}.working_memory(user_id, session_id, importance DESC) WHERE NOT pinned",
+            // HI-01 fix (REVIEW V1.13 Day 1): dropped idx_wm_priority.
+            // The prior partial index on (user_id, session_id, importance
+            // DESC) WHERE NOT pinned was dead — listWorkingMemorySlots
+            // ORDERs BY the composite expression `importance × exp(-age/3600)`
+            // (not raw importance), so PG's planner couldn't use the
+            // index. idx_wm_session covers the (user_id, session_id)
+            // WHERE clause; the ORDER BY is a small in-memory sort over
+            // ≤15 rows per session — no index needed.
 
             // V1.13 Day 2 — Extraction queue (HI-01 real fix).
             //

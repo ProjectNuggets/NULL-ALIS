@@ -39,6 +39,7 @@ const log = std.log.scoped(.working_memory);
 const memory_root = @import("../memory/root.zig");
 const WorkingMemorySlot = memory_root.WorkingMemorySlot;
 const zaki_state = @import("../zaki_state.zig");
+const text_norm = @import("../memory/text_norm.zig");
 
 /// Max slots rendered into the prompt block. Less than the storage
 /// cap (15) so we leave room for slots that exist but aren't worth
@@ -122,13 +123,27 @@ pub fn loadForRender(
 
     if (all.len <= RENDER_TOP_N) return .{ .slots = all };
 
-    // Truncate to top-N. listWorkingMemorySlots already returns
-    // them sorted by (pinned DESC, composite DESC), so the first N
-    // are the right ones. Free the tail.
-    const tail = all[RENDER_TOP_N..];
-    for (tail) |s| s.deinit(allocator);
-    const truncated = allocator.realloc(all, RENDER_TOP_N) catch all;
-    return .{ .slots = truncated[0..RENDER_TOP_N] };
+    // CR-02 fix (REVIEW V1.13 Day 1): the prior implementation deinit'd
+    // the tail's inner strings then returned a length-N slice over an
+    // alloc-of-original-length-M memory region (when realloc failed).
+    // freeWorkingMemorySlots on that slice panics under GPA / leaks
+    // under c_allocator because the slice length doesn't match the
+    // allocation length, AND the deinit'd-but-exposed tail had
+    // dangling pointers. Fix: copy the top-N entries into a fresh
+    // allocation, deinit + free the original full slice, return the
+    // top-N. No realloc-with-shrink — never partial cleanup.
+    const top = allocator.alloc(WorkingMemorySlot, RENDER_TOP_N) catch {
+        // OOM on the truncated alloc — return the full slice as-is.
+        // The caller's deinit will free correctly because slice length
+        // matches the underlying allocation.
+        return .{ .slots = all };
+    };
+    @memcpy(top, all[0..RENDER_TOP_N]);
+    // Deinit the tail (inner strings); free the original slab — its
+    // strings have been transferred to `top` via memcpy of the structs.
+    for (all[RENDER_TOP_N..]) |s| s.deinit(allocator);
+    allocator.free(all);
+    return .{ .slots = top };
 }
 
 /// Render slots into the volatile system prompt block.
@@ -157,11 +172,13 @@ pub fn renderBlock(
         // Full content is still in the DB; this is just the prompt
         // surface. 10 slots × ~250 bytes max ≈ 2.5KB block — fits
         // comfortably in the 64KB volatile budget.
+        //
+        // HI-02 fix (REVIEW V1.13 Day 1): use text_norm.truncateUtf8 to
+        // avoid splitting multi-byte UTF-8 codepoints (Arabic, Hebrew,
+        // CJK) — the prior raw [0..200] slice would emit malformed
+        // UTF-8 mid-codepoint and break prompt rendering.
         const max_content: usize = 200;
-        const truncated_content = if (s.content.len > max_content)
-            s.content[0..max_content]
-        else
-            s.content;
+        const truncated_content = text_norm.truncateUtf8(s.content, max_content);
         try w.print("  {s}: {s}\n", .{ s.slot_type, truncated_content });
     }
     try w.writeAll("</working_memory>\n");

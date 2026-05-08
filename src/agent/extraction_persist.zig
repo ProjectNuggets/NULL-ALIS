@@ -791,11 +791,11 @@ pub fn persistExtracted(
                     key,
                     @max(m.confidence, 0.5),
                     false, // pinned=false; only identity slots are pinned
-                ) catch |err| {
+                ) catch |err| blk: {
                     log.warn("extraction.wm_promote_failed err={s} predicate={s}", .{
                         @errorName(err), m.predicate,
                     });
-                    null;
+                    break :blk null;
                 };
             }
         }
