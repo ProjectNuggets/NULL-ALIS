@@ -581,13 +581,30 @@ pub fn emitCooccurrenceEdges(
             const src_id = if (std.mem.order(u8, a.entity_id, b.entity_id) == .lt) a.entity_id else b.entity_id;
             const tgt_id = if (std.mem.order(u8, a.entity_id, b.entity_id) == .lt) b.entity_id else a.entity_id;
 
-            state_mgr.upsertMemoryEdge(
+            // V1.14 — emit a synthesized "fact" sentence for the
+            // co-occurrence edge so brain page rendering becomes
+            // scannable. Format: "<a.canonical_name> co-occurred with
+            // <b.canonical_name> in this conversation". No temporal
+            // anchor (co-occurrence is contextual, not time-anchored);
+            // no episode key (entity_pipeline runs on prose snapshots
+            // not memory rows — the memory key isn't in scope here).
+            const fact_buf = std.fmt.allocPrint(
+                std.heap.page_allocator,
+                "{s} co-occurred with {s} in conversation",
+                .{ a.canonical_name, b.canonical_name },
+            ) catch null;
+            defer if (fact_buf) |b_| std.heap.page_allocator.free(b_);
+
+            state_mgr.upsertMemoryEdgeRich(
                 user_id,
                 src_id,
                 tgt_id,
                 COOCCURS_PREDICATE,
                 WIKI_LINK_ATTRIBUTION,
                 confidence,
+                fact_buf,
+                null, // co-occurrence has no temporal anchor
+                null, // no episode key in this scope (V1.15 follow-up)
             ) catch |err| {
                 log.warn("entity_pipeline: edge emit failed err={s} src={s} tgt={s}", .{
                     @errorName(err), src_id, tgt_id,
@@ -619,13 +636,25 @@ pub fn emitSpeakerEdges(
     var result = EmitResult{};
     for (resolved) |r| {
         if (r.entity_id.len == 0) continue;
-        state_mgr.upsertMemoryEdge(
+        // V1.14 — synthesize a "user mentioned X" fact for the speaker
+        // edge so the brain page can render it scannably.
+        const fact_buf = std.fmt.allocPrint(
+            allocator,
+            "user mentioned {s}",
+            .{r.canonical_name},
+        ) catch null;
+        defer if (fact_buf) |b_| allocator.free(b_);
+
+        state_mgr.upsertMemoryEdgeRich(
             user_id,
             speaker_key,
             r.entity_id,
             SPEAKER_PREDICATE,
             WIKI_LINK_ATTRIBUTION,
             confidence,
+            fact_buf,
+            null,
+            null,
         ) catch |err| {
             log.warn("entity_pipeline: speaker edge failed err={s} entity={s}", .{
                 @errorName(err), r.entity_id,
