@@ -2658,30 +2658,24 @@ pub const Agent = struct {
         // of being prepended to the user message. Load it first so we can
         // include it in the system prompt rebuild below.
         const enrich_start_ms = std.time.milliTimestamp();
-        // V1.13 DUP-1 fix: when working_memory infrastructure is wired
-        // (postgres + tenant + session), it owns the identity render
-        // via the volatile prompt's <working_memory> block. Tell
-        // memory_loader to skip its legacy <active_identity> injection
-        // to avoid duplicating identity facts in every turn's prompt
-        // (saves ~500B-2KB volatile bytes per turn). Falls back to
-        // legacy when WM infra is missing.
-        const wm_owns_identity: bool = self.extraction_state_mgr != null and
-            self.extraction_user_id != null and
-            self.memory_session_id != null;
+        // V1.13 DUP-1: REVERTED before merge. The cleaner fix needs
+        // pinIdentitySlot to actually fire at session-start (Day 5.2
+        // follow-up — currently no caller). Until then, working_memory
+        // doesn't auto-populate identity slots, so skipping the legacy
+        // <active_identity> block would cause identity LOSS on early
+        // turns (race: WM empty + legacy skipped = agent has no
+        // identity render). Reverting to the duplicated-but-safe path.
+        // Cost: ~500B-2KB extra per turn until pinIdentitySlot is
+        // wired.  Acceptable. Better than dropping identity.
         const memory_slot_result = if (self.mem) |mem|
-            memory_loader.loadTurnMemorySlotOpts(
+            memory_loader.loadTurnMemorySlot(
                 self.allocator,
                 mem,
                 self.mem_rt,
                 user_message,
                 self.memory_session_id,
-                // V1.7a-2 graph-recall: thread the same state_mgr +
-                // user_id we already use for extraction so the memory
-                // loader can append a `<graph_neighbors>` block when
-                // NULLALIS_GRAPH_RECALL_MAX_HOPS > 0 (default 1).
                 self.extraction_state_mgr,
                 self.extraction_user_id,
-                .{ .skip_legacy_identity = wm_owns_identity },
             ) catch |err| blk: {
                 log.warn("memory.enrichment_failed error={s} — proceeding without memory slot", .{@errorName(err)});
                 break :blk memory_loader.MemorySlot{
