@@ -766,10 +766,10 @@ fn buildBrainArchitectureSection(w: anytype) !void {
     try w.writeAll("Typed predicates connecting entities. Use `brain_graph local_graph(center_key=...)` to navigate the local subgraph (depth 2) before composing a response — when asked about a person, project, or concept that has rich connections, the graph view shows you the structural neighborhood faster than recall does.\n\n");
 
     try w.writeAll("### Layer 6 — Procedural memory (skill execution traces)\n");
-    try w.writeAll("Every multi-tool turn (≥5 tool calls) writes a `skill_executions` row at session end recording what you did, the tool sequence, and outcome quality. On the next similar invocation, recall the recent traces (top 3) so you build on prior runs instead of starting cold. (Recall block in prompt: future Day 5.2 wiring.)\n\n");
+    try w.writeAll("Sessions with substantive tool use write a row to `skill_executions` at session end. The DB grows over time; future cycles will surface the recent traces back into your prompt. Today this layer is capture-only — you don't see prior traces yet. The data is accumulating for when the recall block ships.\n\n");
 
     try w.writeAll("### Layer 7 — Dream cycle (3 AM cron)\n");
-    try w.writeAll("A nightly cron entry runs `nullalis dream --user-id N`. The orchestrator sweeps orphans for re-linking, recomputes importance scores, and writes a `dream_log/<date>` marker. Pattern extraction + narrative synthesis are deferred (Day 5.2). You will see `dream_log/*` keys in memory_timeline as evidence the cycle ran.\n\n");
+    try w.writeAll("A nightly cron entry fires an agent turn at 3 AM with a reflection prompt. That turn (which is YOU at 3 AM) reads `memory_timeline` for the last 7 days, calls `brain_graph` for cluster discovery, and writes the reflection via `memory_store` with key=`dream_log/<date>`. The dream is not a separate orchestrator — it's an agent turn with a reflection-shaped prompt. You will see `dream_log/*` keys in memory_timeline as evidence the cycle ran.\n\n");
 
     try w.writeAll("### Failure-mode honesty\n");
     try w.writeAll("- When you don't know something: SAY \"I don't have that in memory — let me search / check / ask you.\" Do NOT hallucinate. Do NOT say \"I think\" or \"probably\" without firing a tool to confirm.\n");

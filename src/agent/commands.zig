@@ -1538,8 +1538,28 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                             break;
                         }
                     }
-                    const tool_count_proxy: u32 = @intCast(@min(entries.len, std.math.maxInt(u32)));
-                    if (tool_count_proxy >= procedural_memory.CAPTURE_TOOL_THRESHOLD) {
+                    // MD-01 fix (REVIEW V1.13 final): use the agent's
+                    // last_turn_tool_count signal, not entries.len. The
+                    // proxy was over-capturing — any 5+ message
+                    // conversation triggered a procedural trace,
+                    // polluting skill_executions with junk rows from
+                    // pure conversational turns.
+                    //
+                    // last_turn_tool_count tracks the actual count of
+                    // tool calls in the most-recent turn (set by the
+                    // agent loop). For a multi-tool skill execution
+                    // we expect ≥5 tool calls in a single turn. This
+                    // is conservative — sessions with sustained tool
+                    // activity across multiple turns won't capture
+                    // unless one of them crossed the threshold. That's
+                    // acceptable for the V1.13 capture-only state;
+                    // future Day 5.2+ refinement can track session-wide
+                    // tool counts properly.
+                    const tool_count_real: u32 = if (@hasField(@TypeOf(self.*), "last_turn_tool_count"))
+                        self.last_turn_tool_count
+                    else
+                        0;
+                    if (tool_count_real >= procedural_memory.CAPTURE_TOOL_THRESHOLD) {
                         const empty_names: []const []const u8 = &.{};
                         _ = procedural_memory.captureSession(
                             self.allocator,
@@ -1548,7 +1568,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                             session_id,
                             task_text,
                             empty_names,
-                            tool_count_proxy,
+                            tool_count_real,
                         );
                     }
                 }
