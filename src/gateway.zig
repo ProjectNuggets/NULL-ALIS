@@ -1598,6 +1598,19 @@ const TenantRuntime = struct {
             cmt96_coref_embed,
         );
 
+        // V1.12 — wire wiki_link tool with the same provider+model+embedder
+        // as the unified-context path. The per-3-turn auto-trigger uses
+        // agent.extraction_* fields directly (already wired); this binding
+        // is for explicit tool invocation: agent calling wiki_link("...")
+        // on user demand, the /brain "Re-link this session" button (Day 3),
+        // and `nullalis admin wiki-relink` CLI (Day 3).
+        tools_mod.bindWikiLinkContext(
+            runtime.tools,
+            provider_i,
+            runtime.config.default_model,
+            cmt96_coref_embed,
+        );
+
         // V1.10-B — wire the sidecar provider/model to memory_maintain
         // so the `prose_survey` action can run the cheap LLM-judge prose
         // surveyor. Reuses the same sidecar bundle the agent uses for
