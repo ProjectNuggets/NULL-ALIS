@@ -103,6 +103,12 @@ pub const WikiLinkTool = struct {
         const emb = self.embedder orelse
             return ToolResult.fail("wiki_link unavailable: embedder not wired");
 
+        // V1.14.3 (G-03 closure) — Manual tool invocation has no
+        // session anchor (the agent calls this from arbitrary text the
+        // user supplies). Pass null; the resulting edges have empty
+        // `episodes[]` which is correct semantics for unanchored text.
+        // Daemon's wiki_link worker (the per-3-turn enqueue path) does
+        // pass session_id; that path produces traceable edges.
         const stats = entity_pipeline.runOnTurn(
             allocator,
             prov,
@@ -112,6 +118,7 @@ pub const WikiLinkTool = struct {
             uid,
             text,
             self.timeout_secs,
+            null, // V1.14.3: no episode anchor for manual invocation
         );
 
         // Render stats as a compact summary so the agent can echo it

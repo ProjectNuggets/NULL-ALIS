@@ -1216,6 +1216,14 @@ fn processOneExtractionJob(
     }
 
     const model_name = config.default_model orelse "moonshotai/Kimi-K2.6";
+    // V1.14.3 (G-03 closure) — Pass the job's session_id as the episode
+    // anchor for all edges emitted from this job. The daemon already
+    // holds `job.session_id` per the ExtractionJob struct (V1.13 schema).
+    // Empty string → null so upsertMemoryEdgeRich's empty-string guard
+    // (MD-02 fix) treats it correctly. Same `episode_key` is appended
+    // (deduped) to every edge emitted from this job, so re-running the
+    // same job (retry path) doesn't double-write into `episodes[]`.
+    const episode_key_for_run: ?[]const u8 = if (job.session_id.len == 0) null else job.session_id;
     const stats = entity_pipeline.runOnTurn(
         allocator,
         provider,
@@ -1238,6 +1246,7 @@ fn processOneExtractionJob(
         // retry behavior amplifies the stall but only on actual
         // transient failures; on success it returns at first success.
         30, // per-job timeout — matches Together's typical latency floor
+        episode_key_for_run, // V1.14.3 (G-03): edge provenance anchor
     );
     const elapsed = std.time.milliTimestamp() - t_start;
     log.info(

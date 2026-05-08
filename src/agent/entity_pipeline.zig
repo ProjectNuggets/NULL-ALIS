@@ -566,6 +566,7 @@ pub fn emitCooccurrenceEdges(
     user_id: i64,
     resolved: []const ResolvedEntity,
     confidence: f64,
+    episode_key: ?[]const u8,
 ) !EmitResult {
     if (resolved.len < 2) return EmitResult{};
 
@@ -585,9 +586,17 @@ pub fn emitCooccurrenceEdges(
             // co-occurrence edge so brain page rendering becomes
             // scannable. Format: "<a.canonical_name> co-occurred with
             // <b.canonical_name> in this conversation". No temporal
-            // anchor (co-occurrence is contextual, not time-anchored);
-            // no episode key (entity_pipeline runs on prose snapshots
-            // not memory rows — the memory key isn't in scope here).
+            // anchor (co-occurrence is contextual, not time-anchored).
+            //
+            // V1.14.3 (G-03 closure) — episode_key now plumbed: when
+            // the caller provides it (daemon's wiki_link path passes
+            // job.session_id), this edge is provenance-tagged. Earlier
+            // V1.14.2 passed null; the missing link meant co-occurrence
+            // edges had no traceable origin, while LLM-extraction edges
+            // (extraction_persist.zig) did. Now both paths populate
+            // `episodes[]` consistently — `array_append IF NOT ANY` in
+            // upsertMemoryEdgeRich dedupes if the same (edge, episode)
+            // recurs across re-extractions of the same session.
             const fact_buf = std.fmt.allocPrint(
                 std.heap.page_allocator,
                 "{s} co-occurred with {s} in conversation",
@@ -604,7 +613,7 @@ pub fn emitCooccurrenceEdges(
                 confidence,
                 fact_buf,
                 null, // co-occurrence has no temporal anchor
-                null, // no episode key in this scope (V1.15 follow-up)
+                episode_key, // V1.14.3 (G-03): provenance from caller
             ) catch |err| {
                 log.warn("entity_pipeline: edge emit failed err={s} src={s} tgt={s}", .{
                     @errorName(err), src_id, tgt_id,
@@ -627,6 +636,7 @@ pub fn emitSpeakerEdges(
     user_id: i64,
     resolved: []const ResolvedEntity,
     confidence: f64,
+    episode_key: ?[]const u8,
 ) !EmitResult {
     if (resolved.len == 0) return EmitResult{};
 
@@ -638,6 +648,8 @@ pub fn emitSpeakerEdges(
         if (r.entity_id.len == 0) continue;
         // V1.14 — synthesize a "user mentioned X" fact for the speaker
         // edge so the brain page can render it scannably.
+        // V1.14.3 (G-03 closure) — episode_key plumbed; same provenance
+        // story as emitCooccurrenceEdges above.
         const fact_buf = std.fmt.allocPrint(
             allocator,
             "user mentioned {s}",
@@ -654,7 +666,7 @@ pub fn emitSpeakerEdges(
             confidence,
             fact_buf,
             null,
-            null,
+            episode_key, // V1.14.3 (G-03): provenance from caller
         ) catch |err| {
             log.warn("entity_pipeline: speaker edge failed err={s} entity={s}", .{
                 @errorName(err), r.entity_id,
@@ -686,6 +698,15 @@ pub fn runOnTurn(
     user_id: i64,
     turn_text: []const u8,
     timeout_secs: u32,
+    /// V1.14.3 (G-03 closure) — Episode anchor for emitted edges. Used
+    /// as the value appended to `memory_edges.episodes[]` so co-
+    /// occurrence + speaker edges carry traceable provenance back to
+    /// the originating session. Pass null when the caller has no
+    /// session anchor (manual `wiki_link` tool invocation, tests).
+    /// Daemon's wiki_link worker passes `job.session_id`; same value
+    /// used for all edges from the same job dedupes naturally via
+    /// upsertMemoryEdgeRich's `array_append IF NOT ANY` clause.
+    episode_key: ?[]const u8,
 ) RunStats {
     var stats = RunStats{};
     if (turn_text.len < 8) return stats; // skip trivial turns
@@ -746,6 +767,7 @@ pub fn runOnTurn(
         user_id,
         resolved_list.items,
         avg_conf,
+        episode_key, // V1.14.3 (G-03): provenance plumbed from caller
     ) catch |err| blk: {
         log.warn("entity_pipeline.runOnTurn: cooccur edges failed err={s}", .{@errorName(err)});
         break :blk EmitResult{};
@@ -756,6 +778,7 @@ pub fn runOnTurn(
         user_id,
         resolved_list.items,
         avg_conf,
+        episode_key, // V1.14.3 (G-03): provenance plumbed from caller
     ) catch |err| blk: {
         log.warn("entity_pipeline.runOnTurn: speaker edges failed err={s}", .{@errorName(err)});
         break :blk EmitResult{};

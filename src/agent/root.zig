@@ -2674,16 +2674,74 @@ pub const Agent = struct {
         // can't fetch the slots). Otherwise fall back to legacy
         // <active_identity> for safety.
         //
-        // Verify safety: even if pinIdentityFromUserState found 0
-        // facts (truly fresh user), the agent prompt's stable
-        // BrainArchitecture block + the conversation itself convey
-        // identity context. The legacy block was a 500B-2KB pin of
-        // listIdentityFacts content; if listIdentityFacts returns
-        // empty there's nothing to skip anyway.
-        const wm_owns_identity: bool = self.extraction_state_mgr != null and
-            self.extraction_user_id != null and
-            self.memory_session_id != null and
-            self.mem_rt != null;
+        // V1.14.3 (G-08 closure) — Load Working Memory FIRST so
+        // skip_legacy_identity is gated on ACTUAL wm content, not
+        // predicted infrastructure presence.
+        //
+        // Pre-V1.14.3: the gate was 4 conditions (state_mgr + user_id
+        // + session_id + mem_rt all non-null). It said "if WM
+        // infrastructure is wired, skip legacy <active_identity>" —
+        // assuming pinIdentitySlot ran successfully and slot 0 holds
+        // identity content. But the gate didn't VERIFY the assumption.
+        // If pinIdentityFromUserState returned 0 facts (truly empty
+        // user, or postgres flake during session creation, or future
+        // refactor breaking the chain silently), the agent ended up
+        // with neither legacy <active_identity> NOR a usable
+        // <working_memory> identity block.
+        //
+        // V1.14.3: load wm here, render the block, THEN compute
+        // skip_legacy_identity from `wm_block != null and len > 0`.
+        // Identity is rendered exactly once: via WM if available, via
+        // legacy <active_identity> otherwise. No silent identity loss.
+        //
+        // Cost: WM load was already happening per turn (just later in
+        // the function). Moving it earlier is free (~50ms either way).
+        const turn_wm_render_set_opt = blk: {
+            if (self.extraction_state_mgr) |smgr| {
+                if (self.extraction_user_id) |uid| {
+                    const sid = self.memory_session_id orelse break :blk null;
+                    break :blk working_memory.loadForRender(self.allocator, smgr, uid, sid);
+                }
+            }
+            break :blk null;
+        };
+        defer if (turn_wm_render_set_opt) |s| s.deinit(self.allocator);
+        const turn_wm_block: ?[]u8 = blk: {
+            const set = turn_wm_render_set_opt orelse break :blk null;
+            if (set.slots.len == 0) break :blk null;
+            break :blk working_memory.renderBlock(self.allocator, set.slots) catch |err| {
+                log.warn("working_memory.render_failed err={s}", .{@errorName(err)});
+                break :blk null;
+            };
+        };
+        defer if (turn_wm_block) |b| self.allocator.free(b);
+
+        // The actual gate: WM owns identity iff a slot with
+        // slot_type == "identity" actually exists in the rendered set.
+        //
+        // V1.14.3 review HIGH-1 fix — the prior version checked only
+        // `wm_block.len > 0`, but extraction can promote `open_loop` /
+        // `active_goal` / `recent_entity` slots without ever pinning
+        // an identity slot (extraction_persist.zig:863, 899-911 fire
+        // promoteSlot for those types unconditionally). A user with
+        // empty pinIdentityFromUserState output AND extracted goals
+        // would have wm_block non-empty (containing the goals) but
+        // zero identity content, then skip_legacy_identity=true
+        // would suppress the legacy <active_identity> block —
+        // resulting in an agent prompt with NO identity at all.
+        //
+        // Iterating slot_type checks the actual presence of identity
+        // content. Ordering: working_memory.SlotType.identity matches
+        // the constant the writer side uses (working_memory.zig:59).
+        const wm_owns_identity: bool = blk: {
+            const set = turn_wm_render_set_opt orelse break :blk false;
+            for (set.slots) |s| {
+                if (std.mem.eql(u8, s.slot_type, working_memory.SlotType.identity)) {
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        };
         const memory_slot_result = if (self.mem) |mem|
             memory_loader.loadTurnMemorySlotOpts(
                 self.allocator,
@@ -2753,36 +2811,50 @@ pub const Agent = struct {
                 .twin_mode = p.twin_mode,
             } else null;
 
-            // V1.13 Day 1 — Working Memory block. Renders pinned identity +
-            // active goals + open loops at the top of the volatile system
-            // prompt. Failure-soft: when state_mgr / user_id missing
-            // (sqlite build, pre-tenant), we get an empty block and the
-            // agent proceeds with recall-only memory (V1.12 behavior).
+            // V1.14.3 (G-08 closure) — wm_block was hoisted above the
+            // memory_slot load so skip_legacy_identity gates on actual
+            // content. We reuse that hoisted value here instead of
+            // re-loading. Renamed to local alias for the prompt_ctx
+            // builder below.
+            const wm_block: ?[]u8 = turn_wm_block;
+
+            // V1.14.3 (G-07 closure) — Procedural memory recall block.
             //
-            // The block is rebuilt every turn (not cached) because slot
-            // priorities decay with time and the eviction order may
-            // change. ~50ms cost per turn for the SQL fetch + render —
-            // acceptable for the experiential payoff of always-present
-            // open-loops + identity anchoring.
-            const wm_render_set = blk: {
-                if (self.extraction_state_mgr) |smgr| {
-                    if (self.extraction_user_id) |uid| {
-                        const sid = self.memory_session_id orelse break :blk null;
-                        break :blk working_memory.loadForRender(self.allocator, smgr, uid, sid);
-                    }
-                }
-                break :blk null;
-            };
-            defer if (wm_render_set) |s| s.deinit(self.allocator);
-            const wm_block: ?[]u8 = blk: {
-                const set = wm_render_set orelse break :blk null;
-                if (set.slots.len == 0) break :blk null;
-                break :blk working_memory.renderBlock(self.allocator, set.slots) catch |err| {
-                    log.warn("working_memory.render_failed err={s}", .{@errorName(err)});
+            // V1.13 shipped capture (skill_executions table + insertSkillExecution
+            // in commands.zig at session_end). The reader (listRecentSkillExecutions)
+            // and renderer (procedural_memory.renderBlock) also shipped in V1.13
+            // but were never wired into the volatile prompt — agent saw no prior
+            // traces. G-07 was the half-loop bug. This block closes it.
+            //
+            // Skill name: GENERIC_SKILL_NAME (V1.13 capture is coarse-grained,
+            // one row per multi-tool turn). Future refinement: detect specific
+            // skill invocations and recall per-skill. For now, the agent sees
+            // the last 3 substantive turns regardless of skill name.
+            //
+            // Failure-soft on every layer: missing state_mgr or user_id → null;
+            // postgres error → empty traces; OOM on render → null. Same shape
+            // as wm_block above so the prompt builder treats both uniformly.
+            const skill_traces_block: ?[]u8 = blk: {
+                const smgr = self.extraction_state_mgr orelse break :blk null;
+                const uid = self.extraction_user_id orelse break :blk null;
+                const set = procedural_memory.loadForRender(
+                    self.allocator,
+                    smgr,
+                    uid,
+                    procedural_memory.GENERIC_SKILL_NAME,
+                );
+                defer set.deinit(self.allocator);
+                if (set.traces.len == 0) break :blk null;
+                break :blk procedural_memory.renderBlock(
+                    self.allocator,
+                    procedural_memory.GENERIC_SKILL_NAME,
+                    set.traces,
+                ) catch |err| {
+                    log.warn("procedural_memory.render_failed err={s}", .{@errorName(err)});
                     break :blk null;
                 };
             };
-            defer if (wm_block) |b| self.allocator.free(b);
+            defer if (skill_traces_block) |b| self.allocator.free(b);
 
             // Context v2: build stable + volatile separately so tool instructions
             // can sit in the STABLE half (byte-identical across turns) rather than
@@ -2797,6 +2869,7 @@ pub const Agent = struct {
                 .sections = .{ .persona = persona_section },
                 .memory_slot = if (memory_slot_result.fenced_content.len > 0) memory_slot_result.fenced_content else null,
                 .working_memory_block = wm_block,
+                .skill_traces_block = if (skill_traces_block) |b| (if (b.len > 0) b else null) else null,
             };
 
             const stable_prompt = try prompt.buildStableSystemPrompt(self.allocator, prompt_ctx);

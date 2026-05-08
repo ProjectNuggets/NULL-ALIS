@@ -248,6 +248,15 @@ pub const PromptContext = struct {
     /// at the top so the agent sees them before loaded prose. Empty
     /// string when no slots exist (new session, postgres unavailable).
     working_memory_block: ?[]const u8 = null,
+    /// V1.14.3 (G-07 closure) — Procedural memory recall block. Pre-
+    /// formatted by agent/procedural_memory.zig::renderBlock as
+    /// `<recent_skill_traces>...</recent_skill_traces>`. Sits AFTER
+    /// memory_slot in the volatile block — the agent reads its episodic
+    /// memory first, then "what worked recently for this kind of task"
+    /// last so procedural recall doesn't drown semantic recall. Empty
+    /// when no traces exist or postgres unavailable. V1.13 schema +
+    /// renderer existed; this field finally wires it into the prompt.
+    skill_traces_block: ?[]const u8 = null,
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -460,6 +469,20 @@ pub fn buildVolatileSystemPrompt(
         if (slot.len > 0) {
             try w.writeAll(slot);
             if (slot[slot.len - 1] != '\n') try w.writeAll("\n");
+            try w.writeAll("\n");
+        }
+    }
+
+    // V1.14.3 (G-07 closure) — Procedural memory recall block. Pre-
+    // fenced as <recent_skill_traces>...</recent_skill_traces> by
+    // agent/procedural_memory.zig::renderBlock. Sits LAST in the
+    // volatile section so the agent reads identity → working memory →
+    // semantic memory → procedural memory ("what worked last time for
+    // this kind of task"). Empty when no traces or postgres unavailable.
+    if (ctx.skill_traces_block) |traces| {
+        if (traces.len > 0) {
+            try w.writeAll(traces);
+            if (traces[traces.len - 1] != '\n') try w.writeAll("\n");
             try w.writeAll("\n");
         }
     }
@@ -766,7 +789,7 @@ fn buildBrainArchitectureSection(w: anytype) !void {
     try w.writeAll("Typed predicates connecting entities. Use `brain_graph local_graph(center_key=...)` to navigate the local subgraph (depth 2) before composing a response — when asked about a person, project, or concept that has rich connections, the graph view shows you the structural neighborhood faster than recall does.\n\n");
 
     try w.writeAll("### Layer 6 — Procedural memory (skill execution traces)\n");
-    try w.writeAll("Sessions with substantive tool use write a row to `skill_executions` at session end. The DB grows over time; future cycles will surface the recent traces back into your prompt. Today this layer is capture-only — you don't see prior traces yet. The data is accumulating for when the recall block ships.\n\n");
+    try w.writeAll("Sessions with substantive tool use (≥5 tool calls) write a row to `skill_executions` at session end — task summary, tools used, outcome quality, user feedback signal. The most-recent 3 traces for the active skill render in your volatile prompt as `<recent_skill_traces>` (V1.14.3, G-07 closed). Read them when starting a similar task: \"task=X, used these tools, outcome 0.85, feedback=positive\" tells you what worked last time so you don't restart from cold every session. Empty block means no prior runs yet — first attempt at this skill.\n\n");
 
     try w.writeAll("### Layer 7 — Dream cycle (3 AM cron)\n");
     try w.writeAll("A nightly cron entry fires an agent turn at 3 AM with a reflection prompt. That turn (which is YOU at 3 AM) reads `memory_timeline` for the last 7 days, calls `brain_graph` for cluster discovery, and writes the reflection via `memory_store` with key=`dream_log/<date>`. The dream is not a separate orchestrator — it's an agent turn with a reflection-shaped prompt. You will see `dream_log/*` keys in memory_timeline as evidence the cycle ran.\n\n");
@@ -1766,6 +1789,100 @@ test "buildVolatileSystemPrompt includes datetime and optional memory slot" {
     try std.testing.expect(std.mem.indexOf(u8, volatile_out, "## Current Date & Time") != null);
     try std.testing.expect(std.mem.indexOf(u8, volatile_out, "<memory_for_turn>") != null);
     try std.testing.expect(std.mem.indexOf(u8, volatile_out, "test fact") != null);
+}
+
+test "buildVolatileSystemPrompt G-07: skill_traces_block renders after memory_slot" {
+    const allocator = std.testing.allocator;
+    const memory_block = "<memory_for_turn>\nsem fact\n</memory_for_turn>\n";
+    const traces_block = "<recent_skill_traces skill=\"generic_multi_tool\" count=\"1\">\n  [trace_id 7]: task=test\n</recent_skill_traces>\n";
+
+    const volatile_out = try buildVolatileSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .memory_slot = memory_block,
+        .skill_traces_block = traces_block,
+    });
+    defer allocator.free(volatile_out);
+
+    // Both blocks must appear
+    try std.testing.expect(std.mem.indexOf(u8, volatile_out, "<memory_for_turn>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, volatile_out, "<recent_skill_traces") != null);
+    try std.testing.expect(std.mem.indexOf(u8, volatile_out, "trace_id 7") != null);
+
+    // Ordering: memory_for_turn must precede recent_skill_traces. The agent
+    // reads identity → working memory → semantic memory → procedural memory.
+    const mem_pos = std.mem.indexOf(u8, volatile_out, "<memory_for_turn>") orelse unreachable;
+    const traces_pos = std.mem.indexOf(u8, volatile_out, "<recent_skill_traces") orelse unreachable;
+    try std.testing.expect(mem_pos < traces_pos);
+}
+
+test "buildVolatileSystemPrompt G-07: skill_traces_block omitted when null" {
+    const allocator = std.testing.allocator;
+    const volatile_out = try buildVolatileSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .skill_traces_block = null,
+    });
+    defer allocator.free(volatile_out);
+
+    // Empty/null skill_traces_block leaves no trace tag in the prompt.
+    try std.testing.expect(std.mem.indexOf(u8, volatile_out, "<recent_skill_traces") == null);
+}
+
+test "buildVolatileSystemPrompt G-08: empty working_memory_block omits the <working_memory> tag" {
+    // V1.14.3 (G-08 partial closure) — Rendering invariant test only.
+    //
+    // SCOPE: this test verifies the prompt-builder's behavior — that
+    // empty/null `working_memory_block` produces a prompt without a
+    // `<working_memory>` tag, and a populated block produces one with
+    // the tag. It does NOT exercise the upstream gate logic
+    // (`wm_owns_identity` in root.zig::generateTurn) which decides
+    // whether to suppress the legacy <active_identity> block.
+    //
+    // The full G-08 contract — "identity content always rendered
+    // exactly once across WM + legacy paths" — requires an
+    // integration test against root.zig::generateTurn with a state
+    // manager that returns slots-without-identity. That test does
+    // not exist yet; review HIGH-1 fix in root.zig is the load-bearing
+    // closure here, this test backstops only the rendering side.
+    const allocator = std.testing.allocator;
+
+    // Case A: working_memory_block = null
+    const out_null = try buildVolatileSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .working_memory_block = null,
+    });
+    defer allocator.free(out_null);
+    try std.testing.expect(std.mem.indexOf(u8, out_null, "<working_memory>") == null);
+
+    // Case B: working_memory_block = empty string (the actual return
+    // shape from working_memory.renderBlock([]) per its existing test).
+    const out_empty = try buildVolatileSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .working_memory_block = "",
+    });
+    defer allocator.free(out_empty);
+    try std.testing.expect(std.mem.indexOf(u8, out_empty, "<working_memory>") == null);
+
+    // Case C: working_memory_block populated → tag SHOULD render.
+    // Asserts the inverse so we know the test isn't trivially passing
+    // because the tag is never emitted under any condition.
+    const wm_payload = "<working_memory>\nslot 0: identity=alice\n</working_memory>\n";
+    const out_full = try buildVolatileSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .working_memory_block = wm_payload,
+    });
+    defer allocator.free(out_full);
+    try std.testing.expect(std.mem.indexOf(u8, out_full, "<working_memory>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_full, "identity=alice") != null);
 }
 
 // ─── New section-builder tests (REQ-018) ────────────────────────────────────
