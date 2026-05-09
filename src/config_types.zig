@@ -161,33 +161,44 @@ pub const SchedulerConfig = struct {
 
 /// V1.14.7 — extraction trigger gates.
 ///
-/// Per-turn extraction (legacy V1.12-V1.14.6) is being deprecated in favor of
-/// extraction-at-distillation (compaction + session-end + agent-explicit
-/// memory_store). Reference agents (Claude Code, Hermes, Mem0, Letta) do NOT
-/// extract per turn — they extract at natural distillation moments. Per-turn
-/// extraction is unique to nullalis and produced 100-150s session-load turns
-/// in the V1.14.6 bench because each session-load became a tool-loop.
+/// Per-turn extraction (legacy V1.12-V1.14.6) was unique to nullalis among
+/// reference agents (Claude Code, Hermes, Mem0, Letta — none extract per turn).
+/// It produced 100-150s session-load turns in the V1.14.6 bench because each
+/// session-load became a tool-loop driven by the every-10-turn memory_nudge,
+/// the every-3-turn entity_pipeline enqueue, and the after-≥5-tool-calls
+/// skills_nudge. The replacement architecture extracts at natural distillation
+/// moments only:
+///   1. Compaction (Pass A drop window OR Pass C summary window) — already an
+///      LLM call, extraction rides the same call via JSON-tail dual-output.
+///   2. Session end (persistSessionCheckpoint) — already runs an LLM call;
+///      extraction is inlined via persistExtracted on the parsed facts.
+///   3. Agent-explicit memory_store calls — agent calls the tool when a fact
+///      crosses the durability bar; the system prompt's R14 verbal-commitment
+///      rule covers the "remember this" path without any nudge.
 ///
-/// V1.14.7 ships in three commits:
-///   C1: Add these gates with defaults true (zero behavior change).
-///   C2: Wire structured extraction into compaction Pass A/C + persistSessionCheckpoint.
-///   C3: Flip defaults to false and delete the per-turn enqueue + nudge sites.
+/// V1.14.7 shipped in three commits:
+///   C1 (eb902ea): added these gates with defaults true (zero behavior change).
+///   C2 (5456ae6): wired Pass A drop-window extraction + session-end enqueue
+///                 gate (Pass C and inline session-end were already wired).
+///   C3 (this):    flipped defaults to false + deleted the per-turn enqueue,
+///                 memory_nudge, skills_nudge sites + updated the Brain
+///                 Architecture prompt section.
 ///
-/// Operators can flip a gate to disable a legacy trigger without rebuilding.
+/// Operators wanting the legacy V1.14.6 behavior can flip any gate back to
+/// true via TOML; the gate sites are gone in C3 so this is a config-only
+/// re-enable from the system_prompt's perspective. The actual code paths
+/// were removed; reverting the V1.14.7 behavior requires reverting C3.
 pub const ExtractionConfig = struct {
-    /// V1.12 every-3-turn entity_pipeline enqueue. When false, no
-    /// per-turn wiki_link extraction job is enqueued. Extraction still
-    /// happens at compaction (C2) and session-end.
-    per_turn_enqueue_enabled: bool = true,
-    /// Every-10-turn memory_nudge that injects a SYSTEM message asking
-    /// the agent to evaluate what to memory_store. When false, no nudge
-    /// is injected; the agent's organic memory_store calls + the system
-    /// prompt's R14 verbal-commitment rule cover the durable-write path.
-    memory_nudge_enabled: bool = true,
-    /// After-≥5-tool-calls skills_extraction nudge that asks the agent
-    /// to consider saving a SKILL.md. When false, no nudge is injected;
-    /// the user can ask explicitly when they want the procedure saved.
-    skills_nudge_enabled: bool = true,
+    /// Legacy V1.12 every-3-turn entity_pipeline enqueue. C3 removed
+    /// the trigger site; this field is retained for forward compat
+    /// (operators can read its value via /runtime_info or config dumps).
+    per_turn_enqueue_enabled: bool = false,
+    /// Legacy every-10-turn memory_nudge SYSTEM-message injection. C3
+    /// removed the trigger site; same retention rationale.
+    memory_nudge_enabled: bool = false,
+    /// Legacy after-≥5-tool-calls skills_extraction nudge. C3 removed
+    /// the trigger site; same retention rationale.
+    skills_nudge_enabled: bool = false,
 };
 
 pub const AssistantModePresetAgentConfig = struct {

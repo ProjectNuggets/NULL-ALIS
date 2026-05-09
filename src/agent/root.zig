@@ -4006,207 +4006,47 @@ pub const Agent = struct {
                 // Track tool usage for skills extraction
                 self.last_turn_tool_count = turn_tool_calls_total;
 
-                // Periodic memory nudge: every 10 turns, inject a prompt asking the
-                // agent to self-evaluate what to persist to long-term memory.
+                // V1.14.7 C3 — memory_nudge SITE DELETED.
                 //
-                // V1.14.7 C1: gated behind extraction_cfg.memory_nudge_enabled.
-                // Default true (V1.14.6 behavior preserved); C3 will flip to false
-                // and delete this site entirely. Reference agents (Claude Code,
-                // Hermes, Mem0, Letta) do not nudge per-N-turns — the agent's
-                // organic memory_store calls + system prompt R14 verbal-commitment
-                // rule cover the durable-write path without scheduled prompts.
-                self.turns_since_memory_nudge += 1;
-                if (self.turns_since_memory_nudge >= 10 and !self.extraction_cfg.memory_nudge_enabled) {
-                    // Gated off: reset counter so we don't burst-fire on flag flip,
-                    // emit telemetry so operators see the gate firing.
-                    self.turns_since_memory_nudge = 0;
-                    log.info("extraction.gated reason=memory_nudge_disabled site=post_turn_memory_nudge", .{});
-                }
-                if (self.turns_since_memory_nudge >= 10 and self.extraction_cfg.memory_nudge_enabled) {
-                    self.turns_since_memory_nudge = 0;
-                    if (self.mem != null) {
-                        // Use .user role (not .system) because Anthropic/Gemini drop
-                        // mid-history system messages. The "SYSTEM:" prefix ensures
-                        // the model treats it as an instruction, not user input.
-                        // **D1.11 self-review fix** — DO NOT propagate
-                        // append failure here. Pre-D1.11 these writes
-                        // happened AFTER turn_complete and any failure
-                        // was silent (per ugly truth #11). Post-D1.11
-                        // they happen BEFORE turn_complete; if we let
-                        // the error propagate we'd skip turn_complete
-                        // entirely — a worse regression than the
-                        // silent-mutation bug we were fixing. Log on
-                        // failure (Sprint 4 policy) and continue.
-                        // V1.14.6 audit: tightened from a permissive "review and save" prompt
-                        // into a hard filter — the previous wording ("important decisions") was
-                        // interpreted broadly and produced low-value writes in heavy sessions.
-                        // Memory hygiene: name the keep-list AND the skip-list explicitly.
-                        const nudge_content = self.allocator.dupe(u8, "SYSTEM: Save NOW only durable user facts via `memory_store` — " ++
-                            "stable preferences, named decisions, cross-session truths, " ++
-                            "concrete commitments. SKIP: transient turn details, " ++
-                            "restatements of visible workspace docs, anything you can re-derive, " ++
-                            "or one-off observations. If nothing meets the bar this turn, " ++
-                            "store nothing — silence is a valid response.") catch |err| blk: {
-                            log.warn("post_turn_memory_nudge.dupe_failed err={s}", .{@errorName(err)});
-                            break :blk null;
-                        };
-                        if (nudge_content) |content| {
-                            self.history.append(self.allocator, .{
-                                .role = .user,
-                                .content = content,
-                            }) catch |err| {
-                                log.warn("post_turn_memory_nudge.append_failed err={s}", .{@errorName(err)});
-                                self.allocator.free(content);
-                            };
-                            log.info("turn.stage stage=memory_nudge turns_elapsed=10", .{});
-                            const nudge_event = ObserverEvent{ .turn_stage = .{
-                                .stage = "post_turn_memory_nudge",
-                                .iteration = iteration,
-                                .run_id = self.current_run_id,
-                            } };
-                            self.observer.recordEvent(&nudge_event);
-                        }
-                    }
-                }
-
-                // V1.12 — entity-pipeline (wiki_link) per-3-turn trigger.
-                // Forward-flow connectivity layer: every 3 turns we run a
-                // single LLM call that scans the most recent turn pair(s)
-                // for entity mentions, resolves them against
-                // memory_entities (cosine 0.85), and emits COOCCURS +
-                // MENTIONED edges in memory_edges. Multilingual by
-                // construction — the extractor prompt handles any
-                // language. Idempotent — re-mentions bump existing edge
-                // weights via upsertMemoryEdge ON CONFLICT logic.
+                // The legacy every-10-turn memory_nudge that injected a SYSTEM
+                // message asking the agent to evaluate what to memory_store
+                // has been removed. Replaced by:
+                //   - Agent-explicit memory_store calls (the agent is the best
+                //     judge of what to persist; system prompt R14 covers the
+                //     "remember this" verbal-commitment rule)
+                //   - Inline structured extraction at compaction (Pass A, Pass C)
+                //     and at session end via persistSessionCheckpoint
                 //
-                // Failure-soft: every error inside runOnTurn is logged
-                // and reflected in stats; the trigger never propagates
-                // an error to the turn loop. Skipping a run on tenant-
-                // missing is intentional (single-user dev mode without
-                // postgres state manager runs without entity edges; UI
-                // degrades gracefully — no /brain orphans surface).
-                // V1.14.7 C1: per-turn entity_pipeline enqueue gated behind
-                // extraction_cfg.per_turn_enqueue_enabled. Default true; C3 will
-                // flip to false and delete this site. Replaced by extraction at
-                // compaction (Pass A drop window + Pass C summary window) +
-                // session-end (persistSessionCheckpoint extraction tail).
-                self.turns_since_extraction += 1;
-                if (self.turns_since_extraction >= 3 and !self.extraction_cfg.per_turn_enqueue_enabled) {
-                    self.turns_since_extraction = 0;
-                    log.info("extraction.gated reason=per_turn_disabled site=entity_pipeline_enqueue", .{});
-                }
-                if (self.turns_since_extraction >= 3 and self.extraction_cfg.per_turn_enqueue_enabled) {
-                    self.turns_since_extraction = 0;
-                    if (self.extraction_state_mgr != null and
-                        self.extraction_user_id != null and
-                        self.extraction_coref_embed != null)
-                    {
-                        // Build text from the last few history entries —
-                        // grab the most recent user + assistant exchange
-                        // (and the prior pair if present, up to ~4KB
-                        // capped by entity_pipeline truncation).
-                        const turn_text_opt = buildRecentTurnText(self.allocator, self.history.items) catch |err| blk: {
-                            log.warn("entity_pipeline.build_text_failed err={s}", .{@errorName(err)});
-                            break :blk null;
-                        };
-                        if (turn_text_opt) |turn_text| {
-                            defer self.allocator.free(turn_text);
-                            // V1.13 Day 2.2 — HI-01 REAL FIX: enqueue
-                            // to extraction_queue. Heartbeat worker
-                            // (daemon.zig::processOneExtractionJob)
-                            // drains the queue and runs entity_pipeline
-                            // out-of-band. Agent turn loop returns in
-                            // <5ms (one INSERT) instead of up to 20s.
-                            const sid_for_q = self.memory_session_id orelse "default";
-                            const payload_str = std.fmt.allocPrint(
-                                self.allocator,
-                                "{{\"turn_text\":{f}}}",
-                                .{std.json.fmt(turn_text, .{})},
-                            ) catch |err| blk: {
-                                log.warn("entity_pipeline.payload_alloc_failed err={s}", .{@errorName(err)});
-                                break :blk @as([]u8, &.{});
-                            };
-                            defer if (payload_str.len > 0) self.allocator.free(payload_str);
+                // The `turns_since_memory_nudge` counter is retained on Agent
+                // for forward compat (any external observer that sampled it
+                // continues to see a static 0). Reference: ExtractionConfig
+                // docs in config_types.zig.
 
-                            const job_id = if (payload_str.len > 0) self.extraction_state_mgr.?.enqueueExtractionJob(
-                                self.extraction_user_id.?,
-                                sid_for_q,
-                                "wiki_link",
-                                payload_str,
-                            ) catch |err| blk: {
-                                log.warn("entity_pipeline.enqueue_failed err={s}", .{@errorName(err)});
-                                break :blk @as(i64, -1);
-                            } else @as(i64, -1);
-
-                            log.info(
-                                "turn.stage stage=entity_pipeline_enqueued job_id={d} payload_bytes={d}",
-                                .{ job_id, payload_str.len },
-                            );
-                            const ep_event = ObserverEvent{ .turn_stage = .{
-                                .stage = "entity_pipeline_enqueued",
-                                .iteration = iteration,
-                                .count = if (job_id > 0) 1 else 0,
-                                .run_id = self.current_run_id,
-                            } };
-                            self.observer.recordEvent(&ep_event);
-                        }
-                    }
-                }
-
-                // Skills auto-extraction: after complex tasks (5+ tool calls), prompt
-                // the agent to extract a reusable procedure. Hermes pattern: the self-
-                // improvement flywheel. Cooldown: only prompt if the previous turn
-                // did NOT already have 5+ tool calls (avoid per-turn injection in
-                // sustained agentic workflows).
+                // V1.14.7 C3 — per-turn entity_pipeline_enqueue SITE DELETED.
                 //
-                // V1.14.7 C1: gated behind extraction_cfg.skills_nudge_enabled.
-                // Default true; C3 will flip to false and delete this site. The
-                // user can ask explicitly when they want a procedure saved.
-                if (turn_tool_calls_total >= 5 and self.workspace_dir.len > 0 and
-                    self.last_turn_tool_count < 5 and !self.extraction_cfg.skills_nudge_enabled)
-                {
-                    log.info("extraction.gated reason=skills_nudge_disabled site=post_turn_skills_extraction tool_calls={d}", .{turn_tool_calls_total});
-                }
-                if (turn_tool_calls_total >= 5 and self.workspace_dir.len > 0 and
-                    self.last_turn_tool_count < 5 and self.extraction_cfg.skills_nudge_enabled)
-                {
-                    // **D1.11 self-review fix** — same rationale as the
-                    // memory_nudge block above: never let an append
-                    // failure here skip turn_complete.
-                    // V1.14.6 audit: tightened to bias against creating low-value SKILL.md
-                    // files. Same shape as the memory_nudge above — name the keep-list
-                    // (genuinely repeatable procedures with a stable trigger), name the
-                    // skip-list (one-off explorations, debug sessions, ad-hoc research),
-                    // and explicitly authorize "store nothing this turn".
-                    const skills_content = self.allocator.dupe(u8, "SYSTEM: You just used 5+ tools in one turn. " ++
-                        "If this procedure has a stable trigger AND will repeat across tasks " ++
-                        "(deploy flow, release ritual, debug pattern, refactor loop), " ++
-                        "save as `SKILL.md` in the workspace with the trigger documented. " ++
-                        "SKIP: one-off exploration, debug session, ad-hoc research, " ++
-                        "or anything you'd never invoke again the same way. " ++
-                        "If nothing meets the bar this turn, store nothing.") catch |err| blk: {
-                        log.warn("post_turn_skills_extraction.dupe_failed err={s}", .{@errorName(err)});
-                        break :blk null;
-                    };
-                    if (skills_content) |content| {
-                        self.history.append(self.allocator, .{
-                            .role = .user,
-                            .content = content,
-                        }) catch |err| {
-                            log.warn("post_turn_skills_extraction.append_failed err={s}", .{@errorName(err)});
-                            self.allocator.free(content);
-                        };
-                        log.info("turn.stage stage=skills_extraction_prompt tool_calls={d}", .{turn_tool_calls_total});
-                        const skills_event = ObserverEvent{ .turn_stage = .{
-                            .stage = "post_turn_skills_extraction_prompt",
-                            .iteration = iteration,
-                            .count = turn_tool_calls_total,
-                            .run_id = self.current_run_id,
-                        } };
-                        self.observer.recordEvent(&skills_event);
-                    }
-                }
+                // The legacy V1.12 every-3-turn enqueue that wrote
+                // wiki_link extraction jobs to extraction_queue has been
+                // removed. The same edges now land via:
+                //   - Pass A drop-window extraction (compaction.zig
+                //     extractFromDropWindow, V1.14.7 C2)
+                //   - Pass C summary JSON tail (existing V1.6 5b.2 path)
+                //   - Inline session-end persistExtracted (commands.zig:1437,
+                //     existing V1.9-6 path)
+                //
+                // The `turns_since_extraction` counter is retained on Agent for
+                // forward compat (external observers that sampled it continue
+                // to see a static 0). Reference: ExtractionConfig docs in
+                // config_types.zig.
 
+                // V1.14.7 C3 — skills_extraction nudge SITE DELETED.
+                //
+                // The legacy after-≥5-tool-calls nudge that prompted the agent
+                // to consider saving a SKILL.md has been removed. Reference
+                // agents (Claude Code, Hermes) don't auto-prompt for skills
+                // extraction either — when the user wants a procedure saved
+                // they ask explicitly, or the agent recognises a clear pattern
+                // and proposes it organically. The nudge generated low-value
+                // SKILL.md files for one-off task sequences.
                 // **D1.11** — turn_complete now fires LAST, after all
                 // post-turn maintenance writes have been recorded as
                 // visible turn_stage events. Pre-D1.11 turn_complete
@@ -11719,32 +11559,34 @@ test "TurnOutcome tool_only_turn flag distinguishes empty-text-with-spawns from 
 // V1.14.7 C1 — extraction trigger gates
 // ═══════════════════════════════════════════════════════════════════════════
 
-test "ExtractionConfig defaults preserve V1.14.6 per-turn behavior" {
-    // C1 contract: defaults are all true so existing deployments see
-    // identical behavior after C1 lands. C3 will flip these.
+test "ExtractionConfig defaults disable all per-turn legacy triggers (V1.14.7 C3)" {
+    // C3 contract: defaults are all FALSE — per-turn extraction is the legacy
+    // path; new architecture extracts at compaction + session-end + agent-
+    // explicit moments. Operators can flip true to re-enable legacy triggers,
+    // but the trigger SITES were deleted in C3 — flipping true is a no-op
+    // unless C3 is reverted.
     const cfg = config_types.ExtractionConfig{};
-    try std.testing.expect(cfg.per_turn_enqueue_enabled);
-    try std.testing.expect(cfg.memory_nudge_enabled);
-    try std.testing.expect(cfg.skills_nudge_enabled);
+    try std.testing.expect(!cfg.per_turn_enqueue_enabled);
+    try std.testing.expect(!cfg.memory_nudge_enabled);
+    try std.testing.expect(!cfg.skills_nudge_enabled);
 }
 
 test "AgentConfig.extraction defaults to ExtractionConfig{}" {
-    // C1 plumbing: AgentConfig carries an ExtractionConfig field with
-    // its default-initialized value. Operators set this via TOML
-    // [agent.extraction] section.
+    // Plumbing: AgentConfig carries an ExtractionConfig field with its
+    // default-initialized value. Defaults updated to false in C3.
     const cfg = config_types.AgentConfig{};
-    try std.testing.expect(cfg.extraction.per_turn_enqueue_enabled);
-    try std.testing.expect(cfg.extraction.memory_nudge_enabled);
-    try std.testing.expect(cfg.extraction.skills_nudge_enabled);
+    try std.testing.expect(!cfg.extraction.per_turn_enqueue_enabled);
+    try std.testing.expect(!cfg.extraction.memory_nudge_enabled);
+    try std.testing.expect(!cfg.extraction.skills_nudge_enabled);
 
-    // Mutated copy: operator can override individually without losing
-    // the other defaults.
+    // Operator can flip individual flags via TOML [agent.extraction] —
+    // the FIELD remains writable for forward compat.
     const operator_set = config_types.AgentConfig{
-        .extraction = .{ .memory_nudge_enabled = false },
+        .extraction = .{ .memory_nudge_enabled = true },
     };
-    try std.testing.expect(operator_set.extraction.per_turn_enqueue_enabled);
-    try std.testing.expect(!operator_set.extraction.memory_nudge_enabled);
-    try std.testing.expect(operator_set.extraction.skills_nudge_enabled);
+    try std.testing.expect(!operator_set.extraction.per_turn_enqueue_enabled);
+    try std.testing.expect(operator_set.extraction.memory_nudge_enabled);
+    try std.testing.expect(!operator_set.extraction.skills_nudge_enabled);
 }
 
 test "memory_nudge gate disables append when memory_nudge_enabled=false" {
@@ -11837,22 +11679,25 @@ test "per_turn_enqueue gate skips enqueue when per_turn_enqueue_enabled=false" {
     // skip the enqueue body — the assertion that matters is the gated branch).
 }
 
-test "skills_nudge gate suppresses nudge append when skills_nudge_enabled=false" {
-    // Same shape for the after-≥5-tool-calls skills_extraction nudge at
-    // root.zig:4156 area. The legacy site checks turn_tool_calls_total
-    // and self.last_turn_tool_count; we model the gate predicate here.
+test "skills_nudge gate predicate evaluates correctly across enabled states" {
+    // C3 contract: skills_nudge_enabled defaults to false (legacy site
+    // deleted). The SHAPE of the predicate is preserved for any future
+    // re-enable, even though the trigger code path is gone. This test
+    // exercises only the predicate calculation, not the deleted site.
     const turn_tool_calls_total: u32 = 7;
     const last_turn_tool_count: u32 = 0;
     const workspace_set = true;
 
-    const cfg_disabled = config_types.ExtractionConfig{ .skills_nudge_enabled = false };
-    const cfg_enabled = config_types.ExtractionConfig{};
+    // Default config (skills_nudge_enabled=false post-C3) → predicate false.
+    const cfg_default = config_types.ExtractionConfig{};
+    try std.testing.expect(!cfg_default.skills_nudge_enabled);
+    const default_would_fire = turn_tool_calls_total >= 5 and workspace_set and
+        last_turn_tool_count < 5 and cfg_default.skills_nudge_enabled;
+    try std.testing.expect(!default_would_fire);
 
-    const would_fire_disabled = turn_tool_calls_total >= 5 and workspace_set and
-        last_turn_tool_count < 5 and cfg_disabled.skills_nudge_enabled;
-    const would_fire_enabled = turn_tool_calls_total >= 5 and workspace_set and
-        last_turn_tool_count < 5 and cfg_enabled.skills_nudge_enabled;
-
-    try std.testing.expect(!would_fire_disabled);
-    try std.testing.expect(would_fire_enabled);
+    // Operator-overridden true → predicate true (counterfactual).
+    const cfg_legacy = config_types.ExtractionConfig{ .skills_nudge_enabled = true };
+    const legacy_would_fire = turn_tool_calls_total >= 5 and workspace_set and
+        last_turn_tool_count < 5 and cfg_legacy.skills_nudge_enabled;
+    try std.testing.expect(legacy_would_fire);
 }
