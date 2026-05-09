@@ -352,23 +352,75 @@ pub fn curlStream(
         return curl_stream_fallback(allocator, url, body, auth_header, extra_headers, timeout_secs, callback, ctx);
 }
 
-/// True when the operator has set `NULLALIS_FORCE_CURL_STREAM=1` (or
-/// any non-empty non-`0` value). Cached after first read since the
-/// env var doesn't change per-process.
-fn forceCurlStreamPath() bool {
+/// True when the streaming path should be forced through the curl
+/// subprocess instead of Zig's native TLS stack.
+///
+/// V1.14.4 F-G1.5 (booth-week hardening) — auto-default by platform:
+///
+/// - **macOS arm64 (Apple Silicon)**: defaults to TRUE because Zig
+///   0.15.2's std.crypto.pcurves.p256 SIGILLs during ECDSA cert
+///   verification on M1/M2/M3 (verified on M3 / Mac15,14; reproduced
+///   3× consistently with macOS DiagnosticReports captured). Operators
+///   who explicitly want native (e.g. for benchmarking the bug, or
+///   after a Zig fix lands) can set `NULLALIS_FORCE_CURL_STREAM=0`.
+///
+/// - **Other platforms** (Linux x86_64, Linux arm64, macOS x86_64):
+///   defaults to FALSE — use native. The SIGILL is Apple Silicon-
+///   specific. Operators can opt INTO curl with
+///   `NULLALIS_FORCE_CURL_STREAM=1` if they hit issues.
+///
+/// Cached after first read since neither the env var nor the platform
+/// changes per-process. Logged at boot via `logStreamingTransportBanner`
+/// so operators see which path is active.
+pub fn forceCurlStreamPath() bool {
     const State = struct {
         var checked: bool = false;
         var force: bool = false;
     };
     if (State.checked) return State.force;
     State.checked = true;
+    const platform_default: bool = isApplePlatformDefault();
     const value = std.process.getEnvVarOwned(std.heap.page_allocator, "NULLALIS_FORCE_CURL_STREAM") catch {
-        State.force = false;
-        return false;
+        // No env var set → use platform default
+        State.force = platform_default;
+        return State.force;
     };
     defer std.heap.page_allocator.free(value);
-    State.force = value.len > 0 and value[0] != '0';
+    if (value.len == 0) {
+        State.force = platform_default;
+    } else if (value[0] == '0') {
+        // Explicit opt-out (works on any platform)
+        State.force = false;
+    } else {
+        // Explicit opt-in
+        State.force = true;
+    }
     return State.force;
+}
+
+/// True if this is macOS arm64, where Zig 0.15.2's TLS stack hits
+/// SIGILL during ECDSA verification (F-G1). Comptime check — no
+/// runtime cost.
+fn isApplePlatformDefault() bool {
+    const builtin = @import("builtin");
+    return builtin.target.os.tag == .macos and builtin.target.cpu.arch == .aarch64;
+}
+
+/// One-shot startup banner — logs which streaming TLS transport is
+/// active and why. Called by gateway boot so operators can verify the
+/// F-G1 workaround is in effect (or that they explicitly opted out).
+pub fn logStreamingTransportBanner() void {
+    const force = forceCurlStreamPath();
+    const apple_default = isApplePlatformDefault();
+    if (force) {
+        if (apple_default) {
+            std.log.scoped(.sse).info("streaming.tls transport=curl_subprocess reason=apple_silicon_zig_tls_sigill_workaround override_with=NULLALIS_FORCE_CURL_STREAM=0", .{});
+        } else {
+            std.log.scoped(.sse).info("streaming.tls transport=curl_subprocess reason=operator_opt_in env=NULLALIS_FORCE_CURL_STREAM=1", .{});
+        }
+    } else {
+        std.log.scoped(.sse).info("streaming.tls transport=zig_native reason=platform_default", .{});
+    }
 }
 
 fn curl_stream_fallback(

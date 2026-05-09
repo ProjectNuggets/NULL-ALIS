@@ -4875,6 +4875,11 @@ fn applyStartupSelfCheck(state: *GatewayState, cfg: *const Config, postgres_init
 }
 
 fn logStartupSelfCheck(state: *const GatewayState) void {
+    // V1.14.4 F-G1.5 — banner the streaming TLS transport so operators
+    // can verify the Apple Silicon SIGILL workaround is in effect (or
+    // that they explicitly opted out). One-shot at boot.
+    providers.sse.logStreamingTransportBanner();
+
     log.info(
         "startup.self_check config_path={s} tenant_enabled={s} heartbeat_enabled={s} heartbeat_interval_minutes={d} state_configured={s} state_effective={s} degraded={s} pg_host={s} pg_port={d} pg_schema={s} scheduler_backend={s} webhook_mode={s} chat_provider={s} chat_fallbacks={s} embedding_provider={s} internal_auth_required={s} internal_token_configured={s} internal_token_policy_ok={s} internal_token_policy_reason={s}",
         .{
