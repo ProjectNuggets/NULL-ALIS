@@ -311,6 +311,30 @@ pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 3600;
 /// Spawns `curl -s --no-buffer --fail-with-body` and reads stdout incrementally.
 /// For each SSE delta, calls `callback(ctx, chunk)`.
 /// Returns accumulated result after stream completes.
+///
+/// V1.14.4 F-G1 fix — escape hatch for native TLS crash on Apple Silicon.
+///
+/// On macOS arm64 (M3 verified, possibly M1/M2 too), Zig 0.15.2's
+/// std.crypto.pcurves.p256 hits SIGILL during ECDSA signature
+/// verification for some server cert chains (Together's reproduces
+/// reliably). Crash report:
+///   crypto.pcurves.p256.P256.add → mulPublic → Verifier.verifyPrehashed
+///   → crypto.tls.Client.init → http_native.TlsIoState.init
+///   → providers.sse.native_stream → exception SIGILL "Address size fault"
+///
+/// Since SIGILL kills the process before native_stream can RETURN an
+/// error, the existing `catch → curl_stream_fallback` never fires.
+/// Set `NULLALIS_FORCE_CURL_STREAM=1` to bypass native_stream entirely
+/// and route every streaming request through the curl subprocess path,
+/// which uses the system's TLS implementation (Apple LibreSSL or
+/// equivalent) and avoids the Zig stdlib bug.
+///
+/// Cost: ~5-10ms extra per request for the curl subprocess fork+exec.
+/// Acceptable for booth-week demo and any LLM-bound workload (the LLM
+/// roundtrip is 100-30000ms; subprocess overhead is rounding error).
+///
+/// Long-term: file Zig upstream issue, switch to a maintained TLS
+/// library, or wait for Zig 0.16+ stdlib crypto fixes.
 pub fn curlStream(
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -321,8 +345,30 @@ pub fn curlStream(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
+    if (forceCurlStreamPath()) {
+        return curl_stream_fallback(allocator, url, body, auth_header, extra_headers, timeout_secs, callback, ctx);
+    }
     return native_stream(allocator, url, body, auth_header, extra_headers, timeout_secs, callback, ctx) catch
         return curl_stream_fallback(allocator, url, body, auth_header, extra_headers, timeout_secs, callback, ctx);
+}
+
+/// True when the operator has set `NULLALIS_FORCE_CURL_STREAM=1` (or
+/// any non-empty non-`0` value). Cached after first read since the
+/// env var doesn't change per-process.
+fn forceCurlStreamPath() bool {
+    const State = struct {
+        var checked: bool = false;
+        var force: bool = false;
+    };
+    if (State.checked) return State.force;
+    State.checked = true;
+    const value = std.process.getEnvVarOwned(std.heap.page_allocator, "NULLALIS_FORCE_CURL_STREAM") catch {
+        State.force = false;
+        return false;
+    };
+    defer std.heap.page_allocator.free(value);
+    State.force = value.len > 0 and value[0] != '0';
+    return State.force;
 }
 
 fn curl_stream_fallback(
@@ -1104,6 +1150,10 @@ pub fn extractAnthropicUsage(json_str: []const u8) !?u32 {
 ///
 /// Similar to `curlStream()` but uses stateful Anthropic SSE parsing.
 /// `headers` is a slice of pre-formatted header strings (e.g. "x-api-key: sk-...").
+///
+/// V1.14.4 F-G1 — same `NULLALIS_FORCE_CURL_STREAM` escape hatch as
+/// `curlStream` above. The Anthropic native_stream path uses the
+/// same Zig stdlib TLS that crashes with SIGILL on Apple Silicon.
 pub fn curlStreamAnthropic(
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -1112,6 +1162,9 @@ pub fn curlStreamAnthropic(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
+    if (forceCurlStreamPath()) {
+        return curl_stream_anthropic_fallback(allocator, url, body, headers, callback, ctx);
+    }
     return native_stream_anthropic(allocator, url, body, headers, callback, ctx) catch
         return curl_stream_anthropic_fallback(allocator, url, body, headers, callback, ctx);
 }

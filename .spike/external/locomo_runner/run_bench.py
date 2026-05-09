@@ -86,8 +86,9 @@ def parse_sse_events(stream: requests.Response) -> list[dict[str, Any]]:
 def extract_reply_text(events: list[dict[str, Any]]) -> str:
     """Extract the final reply text from SSE events.
 
-    Reply chunks come on event=reply_chunk with data={delta:"..."}.
-    The final reply also appears in event=reply_complete with the full text.
+    nullalis gateway emits the final user-facing reply as `event: token`
+    with `data={delta:"...", content:"...", seq:N, stream_kind:"final_reply"}`.
+    Verified live via curl probe 2026-05-09.
     """
     final_reply: list[str] = []
     for ev in events:
@@ -95,12 +96,12 @@ def extract_reply_text(events: list[dict[str, Any]]) -> str:
         d = ev.get("data") or {}
         if not isinstance(d, dict):
             continue
-        if et == "reply_complete":
-            text = d.get("text") or d.get("content") or d.get("reply")
-            if text:
-                return text
-        if et == "reply_chunk":
-            delta = d.get("delta") or d.get("text") or ""
+        if et == "token":
+            # Only count tokens marked stream_kind=final_reply (skip
+            # progress/thinking tokens that may use the same event).
+            if d.get("stream_kind") and d.get("stream_kind") != "final_reply":
+                continue
+            delta = d.get("delta") or d.get("content") or ""
             if delta:
                 final_reply.append(delta)
     return "".join(final_reply).strip()
