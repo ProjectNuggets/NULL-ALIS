@@ -36,26 +36,47 @@ import requests
 
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://127.0.0.1:3000")
 GATEWAY_TOKEN = os.environ.get("GATEWAY_TOKEN", "")
-USER_ID = int(os.environ.get("USER_ID", "1"))
+# Per-conversation user isolation (F-G4.1). Each LoCoMo conversation
+# is mapped to a distinct nullalis tenant user_id so memory layers
+# (memory_recall, brain_graph, wiki extraction) cannot bleed between
+# conversations. Without isolation, a query in conv 5 (Maria) could
+# pull from conv 0's (Caroline) wiki edges since the V1.14 brain
+# extraction writes to per-USER memory, not per-session.
+#
+# This matches the standard LoCoMo eval methodology used by mem0/
+# Letta/Zep — each conversation evaluated as a fresh user. The
+# alternative (single user_id, session-isolated) is non-standard and
+# would be challenged by reviewers.
+#
+# USER_ID env var is used as the BASE; conv N maps to USER_ID + N.
+# Auto-provisioning at the gateway handles fresh users on demand.
+USER_ID_BASE = int(os.environ.get("USER_ID", "2000"))
 DEFAULT_DATA = Path(__file__).resolve().parent.parent / "locomo" / "data" / "locomo10.json"
 LOCOMO_DATA = Path(os.environ.get("LOCOMO_DATA", str(DEFAULT_DATA)))
 
 CHAT_PATH = "/api/v1/chat/stream"
 
+
+def user_id_for_sample(sample_idx: int) -> int:
+    """Per-conversation tenant isolation. F-G4.1."""
+    return USER_ID_BASE + sample_idx
+
+
 # Session key shape mandated by gateway: agent:<bot>:user:<id>:<lane>
-def session_key_for(run_id: str) -> str:
+def session_key_for(sample_idx: int, run_id: str) -> str:
     # Use main lane (only one accepted besides thread:/task:/cron: prefixes per
     # gateway error). Different run IDs go on different sessions via the
     # bench-suffix trick: we use task:<run_id> which is allowed.
-    return f"agent:zaki-bot:user:{USER_ID}:task:locomo_{run_id}"
+    uid = user_id_for_sample(sample_idx)
+    return f"agent:zaki-bot:user:{uid}:task:locomo_{run_id}"
 
 
-def headers() -> dict[str, str]:
+def headers(sample_idx: int) -> dict[str, str]:
     if not GATEWAY_TOKEN:
         sys.exit("ERROR: set GATEWAY_TOKEN env var to the gateway internal token")
     return {
         "X-Internal-Token": GATEWAY_TOKEN,
-        "X-Zaki-User-Id": str(USER_ID),
+        "X-Zaki-User-Id": str(user_id_for_sample(sample_idx)),
         "Content-Type": "application/json",
     }
 
@@ -109,8 +130,10 @@ def extract_reply_text(events: list[dict[str, Any]]) -> str:
     return "".join(final_reply).strip()
 
 
-def chat_send(message: str, sk: str, max_retries: int = 30) -> str:
+def chat_send(message: str, sk: str, sample_idx: int, max_retries: int = 30) -> str:
     """POST one user turn to the gateway, return the assistant reply.
+
+    sample_idx selects the per-conversation tenant user_id (F-G4.1).
 
     Handles:
       - HTTP 200 + SSE stream (normal path)
@@ -123,7 +146,7 @@ def chat_send(message: str, sk: str, max_retries: int = 30) -> str:
     for attempt in range(max_retries):
         with requests.post(
             f"{GATEWAY_URL}{CHAT_PATH}",
-            headers=headers(),
+            headers=headers(sample_idx),
             data=json.dumps(body),
             stream=True,
             timeout=180,
@@ -167,7 +190,7 @@ def chat_send(message: str, sk: str, max_retries: int = 30) -> str:
     raise RuntimeError(f"chat_send: gave up after {max_retries} retries on lock")
 
 
-def load_conversation_into_session(conv: dict[str, Any], sk: str, max_sessions: int):
+def load_conversation_into_session(conv: dict[str, Any], sk: str, sample_idx: int, max_sessions: int):
     """Feed each LoCoMo session as a single combined message into nullalis.
 
     LoCoMo each session = 18 dialog turns between Caroline and Melanie. We
@@ -201,13 +224,13 @@ def load_conversation_into_session(conv: dict[str, Any], sk: str, max_sessions: 
             f"{body}"
         )
         try:
-            reply = chat_send(msg, sk)
+            reply = chat_send(msg, sk, sample_idx)
             print(f"    session_{i+1}: ack={reply[:60]!r}", flush=True)
         except Exception as e:
             print(f"    session_{i+1}: FAILED — {e}", flush=True)
 
 
-def probe_qa(qa_pairs: list[dict[str, Any]], sk: str, max_qa: int) -> list[dict[str, Any]]:
+def probe_qa(qa_pairs: list[dict[str, Any]], sk: str, sample_idx: int, max_qa: int) -> list[dict[str, Any]]:
     """Run the QA probes against the loaded session. Capture replies."""
     results = []
     for i, qa in enumerate(qa_pairs[:max_qa]):
@@ -216,7 +239,7 @@ def probe_qa(qa_pairs: list[dict[str, Any]], sk: str, max_qa: int) -> list[dict[
         category = qa.get("category", "?")
         evidence = qa.get("evidence", [])
         try:
-            reply = chat_send(question, sk)
+            reply = chat_send(question, sk, sample_idx)
         except Exception as e:
             reply = f"[ERROR: {e}]"
         results.append(
@@ -468,7 +491,7 @@ def main():
     print(f"== LoCoMo runner ==", flush=True)
     print(f"  data: {LOCOMO_DATA}", flush=True)
     print(f"  gateway: {GATEWAY_URL}", flush=True)
-    print(f"  user_id: {USER_ID}", flush=True)
+    print(f"  user_id_base: {USER_ID_BASE} (per-conv isolation: conv N → user {USER_ID_BASE}+N)", flush=True)
     print(f"  out: {out_dir}", flush=True)
 
     with open(LOCOMO_DATA) as f:
@@ -480,13 +503,14 @@ def main():
     for s_idx in samples:
         sample = dataset[s_idx]
         run_id = f"s{s_idx}_{uuid.uuid4().hex[:6]}"
-        sk = session_key_for(run_id)
-        print(f"\n--- sample {s_idx} (sk={sk}) ---", flush=True)
-        load_conversation_into_session(sample["conversation"], sk, args.max_sessions)
+        sk = session_key_for(s_idx, run_id)
+        uid = user_id_for_sample(s_idx)
+        print(f"\n--- sample {s_idx} (user_id={uid} sk={sk}) ---", flush=True)
+        load_conversation_into_session(sample["conversation"], sk, s_idx, args.max_sessions)
         # Brief pause for extraction queue to drain
         print(f"  draining extraction queue (10s)...", flush=True)
         time.sleep(10)
-        results = probe_qa(sample["qa"], sk, args.max_qa)
+        results = probe_qa(sample["qa"], sk, s_idx, args.max_qa)
         scorer = locomo_score if args.scorer == "locomo_f1" else simple_score
         scored = [scorer(r) for r in results]
         agg = aggregate(scored)
