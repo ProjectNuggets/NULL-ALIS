@@ -7606,9 +7606,18 @@ test "turn auto-compacts on token pressure before provider call" {
         .workspace_dir = "/tmp",
         .max_tool_iterations = 2,
         .max_history_messages = 50,
-        .token_limit = 4_000,
+        // F-PA2: Pass A switched from in-place rewrite to drop-from-middle.
+        // Drop is more aggressive — under the prior 4_000 token_limit +
+        // keep_recent=2 fixture the post-drop pressure fell below 90% AND
+        // Pass C's internal cap_keep=4 left nothing to compact, so Pass C
+        // never fired and the user-facing turn call returned "compaction
+        // summary" (call #1) instead of "ok" (call #2). Tuned both:
+        //   - token_limit=1_000 → post-drop pressure stays >90% (Pass C trigger)
+        //   - keep_recent=4    → Pass A leaves 5 msgs (Pass C has 1 to summarize)
+        // Preserves the test's intent (Pass C fires + turn call completes).
+        .token_limit = 1_000,
         .max_tokens = 512,
-        .compaction_keep_recent = 2,
+        .compaction_keep_recent = 4,
         .compact_context_enabled = true,
         .auto_save = false,
         .history = .empty,
@@ -7765,8 +7774,14 @@ test "auto compaction refreshes durable continuity artifacts" {
     agent.mem = mem;
     agent.memory_session_id = "agent:test:user:1:main";
     agent.compact_context_enabled = true;
-    agent.compaction_keep_recent = 2;
-    agent.token_limit = 4_000;
+    // F-PA2: keep_recent bumped from 2 → 4 and token_limit dropped from
+    // 4_000 → 1_000 — both same rationale as the sibling "turn
+    // auto-compacts on token pressure" test above. The more aggressive
+    // drop-from-middle leaves only first_user + tail; with keep_recent=2
+    // that's 3 messages, less than Pass C's internal cap_keep floor of 4,
+    // so Pass C exits early with no work and never refreshes continuity.
+    agent.compaction_keep_recent = 4;
+    agent.token_limit = 1_000;
     agent.max_tokens = 512;
 
     for (0..5) |_| {

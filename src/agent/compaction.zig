@@ -233,11 +233,30 @@ pub fn autoCompactHistory(
     //
     // For Kimi K2.5 (262K window): Pass A ~183K, Pass C ~236K.
 
-    // ── Pass A: Cheap dedup + placeholder substitution at 70% ──
+    // ── Pass A: Drop-from-middle at 70% ──
+    // F-PA2 (V1.14.6 SOTA context): the prior in-place placeholder
+    // substitution rewrote bytes on cached prefix, invalidating every
+    // provider's KV cache from the rewrite point onward (Anthropic
+    // ephemeral, Together vLLM byte-prefix, Moonshot automatic — all
+    // impacted). "Don't Break the Cache" (arxiv 2601.06007) measured
+    // this anti-pattern as 41-80% cost overhead. Replaced with the SOTA
+    // pattern (Claude Code / Cline / Hermes / OpenAI Agents SDK):
+    // drop oldest user/assistant/tool messages from the middle while
+    // preserving system + first user turn + last keep_recent messages.
+    // Append-only mutation downstream of the protected prefix preserves
+    // cache hits on the unchanged prefix. Tool-call/tool-result pair
+    // hygiene mirrors compactHistoryKeepingRecent's existing logic.
     const cheap_threshold = (config.token_limit * 70) / 100;
     if (estimate_before > cheap_threshold) {
-        log.info("compaction.auto: pass=A firing (cheap dedup + placeholder)", .{});
-        const reduced = cheapCompactionPass(allocator, history, config.keep_recent);
+        log.info("compaction.auto: pass=A firing (drop-from-middle)", .{});
+        const reduced = dropOldestPairsFromMiddle(
+            allocator,
+            history,
+            config.keep_recent,
+            config.archive_memory,
+            config.archive_mem_rt,
+            config.archive_session_id,
+        );
         if (reduced) compacted = true;
     }
 
@@ -293,60 +312,148 @@ pub fn autoCompactHistory(
     return compacted;
 }
 
-/// Pass A: Cheap compaction — no LLM calls. Pure string operations.
+/// Pass A (F-PA2): Drop oldest messages from the middle of history.
 ///
-/// 1. Replace old tool results (outside keep_recent window) with short placeholders.
-///    Format: "[tool_result truncated — see earlier context]"
-/// 2. Deduplicate consecutive tool results with identical content.
+/// **SOTA context-engineering pattern** (Claude Code, Cline, Hermes,
+/// OpenAI Agents SDK). Append-only mutation downstream of the protected
+/// prefix preserves provider KV cache hits on the unchanged head. The
+/// prior implementation rewrote tool_result bytes in place, which
+/// invalidated cache from the rewrite point onward (textbook anti-pattern
+/// per "Don't Break the Cache", arxiv 2601.06007 — 41-80% cost overhead).
 ///
-/// Returns true if any content was reduced.
-fn cheapCompactionPass(
+/// Protection regions ("system_and_first_and_last_N" — Hermes terminology):
+///   1. The system prompt (index 0 if present).
+///   2. The first user message (the original task framing — agents
+///      consistently regress when this disappears).
+///   3. The last `keep_recent` messages (immediate working context).
+///
+/// Drop region: everything between (2) and (3), with tool-call/tool-result
+/// pair hygiene at both boundaries so we never split a pair.
+///
+/// Best-effort archive: when archive_memory + archive_session_id are set,
+/// dropped messages are persisted as `compaction_dropped/{session}/{ts}`
+/// before deletion (mirrors forceCompressHistoryWithArchive). Recallable
+/// via memory_timeline / memory_recall after the fact.
+///
+/// Returns true if any messages were dropped.
+fn dropOldestPairsFromMiddle(
     allocator: std.mem.Allocator,
     history: *std.ArrayListUnmanaged(OwnedMessage),
     keep_recent: u32,
+    archive_memory: ?Memory,
+    archive_mem_rt: ?*MemoryRuntime,
+    archive_session_id: ?[]const u8,
 ) bool {
-    const has_system = history.items.len > 0 and history.items[0].role == .system;
-    const start: usize = if (has_system) 1 else 0;
-    const non_system_count = history.items.len - start;
-    if (non_system_count <= keep_recent) return false;
+    const total = history.items.len;
+    const has_system = total > 0 and history.items[0].role == .system;
+    const sys_count: usize = if (has_system) 1 else 0;
 
-    const protect_boundary = history.items.len - @min(non_system_count, keep_recent);
-    var reduced = false;
-
-    // Phase 1: Replace old tool results with placeholders
-    const placeholder = "[tool_result truncated — see earlier context]";
-    for (history.items[start..protect_boundary]) |*msg| {
-        if (msg.role != .tool) continue;
-        // Only replace if the content is significantly longer than the placeholder
-        if (msg.content.len <= placeholder.len + 20) continue;
-
-        const new_content = allocator.dupe(u8, placeholder) catch continue;
-        allocator.free(msg.content);
-        msg.content = new_content;
-        reduced = true;
-    }
-
-    // Phase 2: Deduplicate consecutive identical tool results in older messages.
-    // If two adjacent .tool messages have the same content, replace the earlier
-    // one with a short dedup marker.
-    if (protect_boundary > start + 1) {
-        const dedup_marker = "[duplicate tool_result removed]";
-        var i: usize = start;
-        while (i + 1 < protect_boundary) : (i += 1) {
-            if (history.items[i].role != .tool or history.items[i + 1].role != .tool) continue;
-            if (!std.mem.eql(u8, history.items[i].content, history.items[i + 1].content)) continue;
-            // Replace the earlier duplicate with a short marker
-            const marker = allocator.dupe(u8, dedup_marker) catch continue;
-            allocator.free(history.items[i].content);
-            history.items[i].content = marker;
-            reduced = true;
+    // Find first user message after the optional system prompt — that's
+    // the task framing we always preserve. If there's no user message yet
+    // (system-only history), nothing to drop.
+    var first_user_idx_opt: ?usize = null;
+    {
+        var i: usize = sys_count;
+        while (i < total) : (i += 1) {
+            if (history.items[i].role == .user) {
+                first_user_idx_opt = i;
+                break;
+            }
         }
     }
+    const first_user_idx = first_user_idx_opt orelse return false;
 
-    if (reduced) {
-        log.info("compaction: cheap pass reduced old tool outputs (placeholder substitution + dedup)", .{});
+    // Tail protection — last keep_recent messages.
+    if (total <= sys_count + 1 + keep_recent) return false;
+    var tail_start: usize = total - keep_recent;
+
+    // Tool-pair hygiene at tail boundary: if the first kept message is a
+    // .tool result, walk backward so its preceding assistant tool_call is
+    // also kept. Mirrors compactHistoryKeepingRecent's logic.
+    while (tail_start > first_user_idx + 1 and
+        tail_start < total and
+        history.items[tail_start].role == .tool)
+    {
+        tail_start -= 1;
     }
-    return reduced;
+
+    // Drop region: (first_user_idx, tail_start). Strictly after the first
+    // user turn, strictly before the kept tail.
+    var drop_start: usize = first_user_idx + 1;
+    var drop_end: usize = tail_start;
+    if (drop_end <= drop_start) return false;
+
+    // Tool-pair hygiene at drop_end boundary: if the last dropped message
+    // is an assistant message that issued a tool_call AND the first kept
+    // message is the corresponding .tool result, the result would be
+    // orphaned. Walk drop_end backward past trailing assistant messages
+    // when the next-kept is a .tool. (Inverse of the tail walk above.)
+    while (drop_end > drop_start and
+        drop_end < total and
+        history.items[drop_end].role == .tool and
+        history.items[drop_end - 1].role == .assistant)
+    {
+        drop_end -= 1;
+    }
+
+    // Tool-pair hygiene at drop_start boundary: if the first dropped
+    // message is a .tool result, the assistant call sits at drop_start-1
+    // (which we're keeping, since it's the first user message or earlier).
+    // That's malformed — a tool result can never directly follow a user
+    // message. Defensively, if drop_start lands on .tool, advance past it
+    // (we'd rather keep one extra .tool than emit an orphaned result).
+    while (drop_start < drop_end and history.items[drop_start].role == .tool) {
+        drop_start += 1;
+    }
+
+    if (drop_end <= drop_start) return false;
+    const dropped_count = drop_end - drop_start;
+
+    // Compute byte savings before mutation for the notify event.
+    var dropped_bytes: u64 = 0;
+    for (history.items[drop_start..drop_end]) |*msg| dropped_bytes += msg.content.len;
+
+    log.info(
+        "compaction.passA.drop start={d} end={d} dropped={d} bytes={d} sys={d} first_user={d} tail_start={d}",
+        .{ drop_start, drop_end, dropped_count, dropped_bytes, sys_count, first_user_idx, tail_start },
+    );
+
+    // Best-effort archive before deletion (continuity artifact). Mirrors
+    // forceCompressHistoryWithArchive — same key shape so memory_timeline
+    // surfaces both via a single prefix scan.
+    if (archive_memory) |m| {
+        archiveDroppedMessages(
+            allocator,
+            m,
+            archive_mem_rt,
+            archive_session_id,
+            history.items[drop_start..drop_end],
+            dropped_count,
+        );
+    }
+
+    // Free dropped messages
+    for (history.items[drop_start..drop_end]) |*msg| {
+        msg.deinit(allocator);
+    }
+
+    // Shift the kept tail forward to fill the gap (append-only downstream
+    // of `drop_start` from the cache's perspective — no mutation of the
+    // protected prefix [0..drop_start)).
+    const tail = history.items[drop_end..];
+    std.mem.copyForwards(OwnedMessage, history.items[drop_start..], tail);
+    history.items.len -= dropped_count;
+
+    // F-CB2 mirror: emit a structured notify event so cache-hit-rate
+    // telemetry can attribute the drop. Distinguished from the broader
+    // auto_passA_or_passC notify (which fires once per
+    // autoCompactHistory call covering Pass A + Pass C combined).
+    log.info(
+        "compaction.notify reason=passA_drop dropped_messages={d} dropped_bytes={d}",
+        .{ dropped_count, dropped_bytes },
+    );
+
+    return true;
 }
 
 /// Manual compaction for explicit operator boundaries.
@@ -1695,7 +1802,7 @@ test "tool-call pair hygiene: boundary never orphans tool result" {
     try std.testing.expectEqualStrings("tool_call:read_file", history.items[final_boundary].content);
 }
 
-test "cheapCompactionPass replaces old tool results with placeholders" {
+test "dropOldestPairsFromMiddle drops middle messages, preserves prefix + tail" {
     const allocator = std.testing.allocator;
     var history: std.ArrayListUnmanaged(OwnedMessage) = .empty;
     defer {
@@ -1703,33 +1810,37 @@ test "cheapCompactionPass replaces old tool results with placeholders" {
         history.deinit(allocator);
     }
 
-    // Build history with a large tool result in the old section
+    // Build history: system + first_user + several middle pairs + recent tail
     try history.append(allocator, .{ .role = .system, .content = try allocator.dupe(u8, "sys") });
-    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u1") });
-    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "let me read that") });
-    // Large tool result (200 chars) — should be replaced
-    const big_tool = try allocator.dupe(u8, "x" ** 200);
-    try history.append(allocator, .{ .role = .tool, .content = big_tool });
-    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u2") });
-    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "a2") });
-    // Recent messages (keep_recent=2 protects these)
-    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "u3") });
-    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "a3") });
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "first user task") });
+    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "ack") });
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "middle u1") });
+    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "middle a1") });
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "middle u2") });
+    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "middle a2") });
+    // Recent tail (keep_recent=2 protects these)
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "recent_u") });
+    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "recent_a") });
 
-    const reduced = cheapCompactionPass(allocator, &history, 2);
+    const reduced = dropOldestPairsFromMiddle(allocator, &history, 2, null, null, null);
     try std.testing.expect(reduced);
 
-    // The old tool result (index 3) should now be a short placeholder
-    try std.testing.expect(history.items[3].role == .tool);
-    try std.testing.expect(history.items[3].content.len < 100);
-    try std.testing.expect(std.mem.indexOf(u8, history.items[3].content, "truncated") != null);
+    // Protected prefix preserved
+    try std.testing.expectEqualStrings("sys", history.items[0].content);
+    try std.testing.expectEqualStrings("first user task", history.items[1].content);
 
-    // Recent messages should be untouched
-    try std.testing.expectEqualStrings("u3", history.items[6].content);
-    try std.testing.expectEqualStrings("a3", history.items[7].content);
+    // Recent tail preserved (now at indices 2 + 3 after drop)
+    const last = history.items.len;
+    try std.testing.expectEqualStrings("recent_a", history.items[last - 1].content);
+    try std.testing.expectEqualStrings("recent_u", history.items[last - 2].content);
+
+    // Middle messages gone
+    for (history.items) |msg| {
+        try std.testing.expect(std.mem.indexOf(u8, msg.content, "middle") == null);
+    }
 }
 
-test "cheapCompactionPass deduplicates consecutive identical tool results" {
+test "dropOldestPairsFromMiddle preserves tool_call/tool_result pair at tail boundary" {
     const allocator = std.testing.allocator;
     var history: std.ArrayListUnmanaged(OwnedMessage) = .empty;
     defer {
@@ -1738,21 +1849,41 @@ test "cheapCompactionPass deduplicates consecutive identical tool results" {
     }
 
     try history.append(allocator, .{ .role = .system, .content = try allocator.dupe(u8, "sys") });
-    // Two consecutive tool results with identical (short) content
-    try history.append(allocator, .{ .role = .tool, .content = try allocator.dupe(u8, "same output") });
-    try history.append(allocator, .{ .role = .tool, .content = try allocator.dupe(u8, "same output") });
-    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "recent") });
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "first") });
+    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "old1") });
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "old_u") });
+    // The pair that must stay together: assistant tool_call followed by .tool result.
+    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "tool_call:read_file") });
+    try history.append(allocator, .{ .role = .tool, .content = try allocator.dupe(u8, "file contents") });
+    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "summary") });
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "recent_u") });
+    try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "recent_a") });
 
-    const reduced = cheapCompactionPass(allocator, &history, 1);
-    try std.testing.expect(reduced);
+    // keep_recent=4 lands tail_start at index 5 (the .tool message); the
+    // tail-boundary walk should pull tail_start backward to include the
+    // assistant tool_call at index 4, keeping the pair intact.
+    _ = dropOldestPairsFromMiddle(allocator, &history, 4, null, null, null);
 
-    // First tool result should be replaced with dedup marker
-    try std.testing.expect(std.mem.indexOf(u8, history.items[1].content, "duplicate") != null);
-    // Second tool result keeps original content
-    try std.testing.expectEqualStrings("same output", history.items[2].content);
+    // Find the .tool message — its preceding message must still be the matching .assistant tool_call.
+    var found_pair = false;
+    var i: usize = 1;
+    while (i < history.items.len) : (i += 1) {
+        if (history.items[i].role == .tool) {
+            try std.testing.expect(i > 0);
+            try std.testing.expect(history.items[i - 1].role == .assistant);
+            try std.testing.expectEqualStrings("tool_call:read_file", history.items[i - 1].content);
+            found_pair = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_pair);
+
+    // System + first user always preserved.
+    try std.testing.expectEqualStrings("sys", history.items[0].content);
+    try std.testing.expectEqualStrings("first", history.items[1].content);
 }
 
-test "cheapCompactionPass no-op when all messages are recent" {
+test "dropOldestPairsFromMiddle no-op when total under keep_recent + protect prefix" {
     const allocator = std.testing.allocator;
     var history: std.ArrayListUnmanaged(OwnedMessage) = .empty;
     defer {
@@ -1765,6 +1896,6 @@ test "cheapCompactionPass no-op when all messages are recent" {
     try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "a1") });
 
     // keep_recent=10 covers everything
-    const reduced = cheapCompactionPass(allocator, &history, 10);
+    const reduced = dropOldestPairsFromMiddle(allocator, &history, 10, null, null, null);
     try std.testing.expect(!reduced);
 }
