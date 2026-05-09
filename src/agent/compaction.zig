@@ -276,6 +276,18 @@ pub fn autoCompactHistory(
             estimate_after,
             saved_pct,
         });
+        // F-CB2 (V1.14.6 SOTA context): notifyCompaction emits a
+        // structured log so cache-hit-rate telemetry can reset its
+        // baseline. Otherwise the legitimate post-compaction prefix
+        // change registers as a cache regression in our metrics.
+        // Mirrors Claude Code's `notifyCompaction()` pattern (see
+        // claude-code/src/services/compact/apiMicrocompact.ts).
+        // Format chosen so a single grep for "compaction.notify" gives
+        // operators every compaction event with bytes saved + reason.
+        log.info(
+            "compaction.notify reason=auto_passA_or_passC bytes_before={d} bytes_after={d} saved_bytes={d} pressure_before={d}%",
+            .{ estimate_before, estimate_after, saved, pressure_pct },
+        );
     }
 
     return compacted;
@@ -620,6 +632,16 @@ pub fn forceCompressHistoryWithArchive(
     const to_remove = keep_start - start;
 
     log.warn("compaction: force-compressing history — dropping {} messages (context exhausted, LLM unavailable)", .{to_remove});
+
+    // F-CB2 (V1.14.6 SOTA context): notifyCompaction fires on the
+    // emergency force-compress path too. Operators see EVERY
+    // compaction event from a single grep "compaction.notify" — this
+    // path's reason marks the emergency case so it's distinguishable
+    // from the normal auto-compaction notify.
+    log.info(
+        "compaction.notify reason=force_compress messages_dropped={d}",
+        .{to_remove},
+    );
 
     // Archive dropped messages to memory before deletion (best-effort)
     if (mem) |m| {
