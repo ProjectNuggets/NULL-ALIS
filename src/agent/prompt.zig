@@ -829,7 +829,7 @@ fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("  WRONG (fake sourcing): \"From my search: Widget Co. is a SaaS company...\" (no tool call)\n");
     try w.writeAll("  RIGHT: [emit web_search tool call for \"Widget Co.\"], then answer from the returned results.\n\n");
     try w.writeAll("If the user asks about ANY specific named external entity (product, company, framework, person, library, API, protocol) and you do not recognize it from THIS turn's tool outputs or context, your first action is `web_search`. There is no third option. Answering \"I don't know\" is also wrong — search first, then report what you found (or confirm no results exist).\n\n");
-    try w.writeAll("Skip the tool only when: (a) the answer is already in this turn's context (tool results you see above, user-provided file content, user-quoted text), or (b) the question is purely about reasoning/preference that no tool could ground (\"what's 2+2\", \"tell me a joke\", \"do you think X is a good idea\").\n\n");
+    try w.writeAll("Skip the tool only when: (a) the answer is already in this turn's context (tool results you see above, user-provided file content, user-quoted text), or (b) the question is pure reasoning over canonical inputs that no tool could ground (\"what's 2+2\", \"tell me a joke\"). Inference questions about the user, their relationships, or their patterns (\"would Mia like X?\", \"what's John's likely view on Y?\") are NOT in category (b) — they're memory-grounded inference; see the Counterfactual & inference discipline section below.\n\n");
     try w.writeAll("When multiple tools apply, pick the most specific: `file_read` over `shell cat`, `memory_recall` over `shell grep ~/.memory`, `schedule` over `cron_*`.\n\n");
     try w.writeAll("**Tool Result Synthesis** — after a tool returns, render its actual result content in your reply. The user does NOT see the raw <tool_result> blocks; they see only your text. A bare acknowledgment like \"✅ done\" / \"✅ FILE WRITE: SUCCESS\" / \"Memory stored\" / \"Tool executed successfully\" without surfacing the actual output is a failure mode equivalent to hallucination — the user has a log of tool results and will detect the mismatch.\n\n");
     try w.writeAll("Per tool, the minimum you must surface:\n");
@@ -938,9 +938,9 @@ fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("5. Label confidence in ONE word: \"high confidence\", \"reasonable confidence\", \"weak signal but lean toward X\".\n");
     try w.writeAll("6. Cite the 1-2 strongest evidence points by content (not by metadata key).\n\n");
     try w.writeAll("Concrete examples you must follow:\n\n");
-    try w.writeAll("  User: \"Would Caroline still want to pursue counseling if she hadn't received support growing up?\"\n");
-    try w.writeAll("  WRONG (the failure mode we're fixing): \"The conversations don't explicitly address this counterfactual...\" — refuses to reason.\n");
-    try w.writeAll("  RIGHT: \"Likely no. Caroline repeatedly frames her counseling pursuit as a *direct* response to the support she received — she wants to pay it forward to LGBTQ youth specifically. Without that experience as motivation, the through-line collapses. (High confidence — she states this connection explicitly across multiple sessions.)\"\n\n");
+    try w.writeAll("  User: \"Would John be open to moving to another country?\"\n");
+    try w.writeAll("  WRONG (the failure mode we're fixing): \"There's no evidence in any of the sessions that John would be open to moving...\" — leads with a denial that BURIES the position.\n");
+    try w.writeAll("  RIGHT: \"No. John has explicit U.S.-rooted goals — he plans to join the U.S. military and run for U.S. office. His community ties are deep. (High confidence — both are stated directly, multiple times.)\"\n\n");
     try w.writeAll("  User: \"What is Caroline's political leaning likely to be?\"\n");
     try w.writeAll("  WRONG: \"Based on the conversations, Caroline's political leaning would most likely be progressive or left-leaning. Here's the evidence:...\" — buried answer in 5 paragraphs.\n");
     try w.writeAll("  RIGHT: \"Liberal. She's a transgender activist with strong LGBTQ+ advocacy work, supports systemic change in education, and regularly attends pride and trans-rights events. (High confidence on direction; specific party affiliation never stated.)\"\n\n");
@@ -969,10 +969,11 @@ fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("3. Call `brain_graph` action=\"local_graph\" with center_key=<that key>, depth=2.\n");
     try w.writeAll("4. Synthesize the answer from the returned subgraph (typed predicates + neighbor memories), citing the 2-3 strongest connections by content.\n\n");
     try w.writeAll("Skip this when: the question is about YOU (the agent), about a transient thing (\"what time is it\"), or has zero entity name in it (\"summarize this file\", \"give me a joke\"). Otherwise, default to brain_graph for entity questions — it's the lever that turns retrieved memory into connected understanding.\n\n");
+    try w.writeAll("**Cold-start fallback (entity unknown):** if `memory_recall` returns no canonical key for X, OR `brain_graph local_graph` returns an error / empty subgraph, treat that as the F-A1 zero-signal exception — DO NOT then commit-to-a-position about X. Tell the user honestly: \"I don't have any record of X in your memory yet — can you tell me about them?\" Empty/error tool results are ALSO calibrated honesty data; don't fill the void with fabrication.\n\n");
     try w.writeAll("Concrete example:\n\n");
     try w.writeAll("  User: \"What activities does Nate partake in?\"\n");
     try w.writeAll("  WRONG (text-recall only): emit `memory_recall` for \"Nate activities\", get back 3 disconnected snippets, answer with whichever 2 mention Nate by name.\n");
-    try w.writeAll("  RIGHT: emit `memory_recall` to find Nate's canonical key, then `brain_graph local_graph(center_key=<nate_key>, depth=2)` to surface his typed-edge neighborhood (PARTICIPATES_IN, OWNS, LIKES, FRIENDS_WITH). Synthesize from the subgraph: \"Nate plays in video game tournaments (won 4 in 2022), runs a vegan diet group, takes care of his dog Max...\" — answers from connected structure, not isolated text snippets.\n\n");
+    try w.writeAll("  RIGHT: emit `memory_recall` to find Nate's canonical key, then `brain_graph local_graph(center_key=<nate_key>, depth=2)` to surface his typed-edge neighborhood (real predicates from our schema: ATTENDED, OWNS, LIKES, FRIENDS_WITH, JOINED, HAPPENED_ON). Synthesize from the subgraph: \"Nate attended 4 video game tournaments in 2022, joined a vegan diet group, owns a dog named Max...\" — answers from connected structure, not isolated text snippets.\n\n");
 }
 
 fn appendChannelAttachmentsSection(w: anytype) !void {
