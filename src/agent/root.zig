@@ -2901,6 +2901,15 @@ pub const Agent = struct {
             // operators can confirm byte-identical prefix across turns of the
             // same session. Gated by NULLALIS_LOG_PREFIX_HASH=1 to keep noise
             // out of prod logs.
+            //
+            // V1.14.6 follow-up: also hash the kept history TAIL (last 4
+            // messages of self.history). F-PA2's drop-from-middle pattern
+            // promises that when no Pass C summarization fires, the kept
+            // tail bytes match the prior turn — that's what makes vLLM /
+            // Together / Moonshot prefix caching usable on long sessions.
+            // Two consecutive same-session turns with identical
+            // `prefix.tail` hashes confirm the contract holds. Diverging
+            // hashes when nothing semantic changed is a regression signal.
             if (std.process.getEnvVarOwned(self.allocator, "NULLALIS_LOG_PREFIX_HASH")) |env_value| {
                 defer self.allocator.free(env_value);
                 if (env_value.len > 0 and env_value[0] != '0') {
@@ -2908,6 +2917,31 @@ pub const Agent = struct {
                     log.info("prefix.stable hash={x} bytes={d} session={s}", .{
                         stable_hash,
                         stable_prefix_len,
+                        self.memory_session_id orelse "none",
+                    });
+
+                    // Tail hash: walk the last up-to-4 history items and
+                    // FNV-1a their content bytes. Skipping the system row
+                    // (already covered by prefix.stable above). Empty
+                    // history → tail_bytes=0, hash=fnv1a("").
+                    const TAIL_HASH_MSGS: usize = 4;
+                    var tail_hasher = std.hash.Fnv1a_64.init();
+                    var tail_bytes: usize = 0;
+                    var tail_msgs: usize = 0;
+                    if (self.history.items.len > 0) {
+                        const start_idx = self.history.items.len -|
+                            @min(TAIL_HASH_MSGS, self.history.items.len);
+                        for (self.history.items[start_idx..]) |*m| {
+                            if (m.role == .system) continue;
+                            tail_hasher.update(m.content);
+                            tail_bytes += m.content.len;
+                            tail_msgs += 1;
+                        }
+                    }
+                    log.info("prefix.tail hash={x} bytes={d} msgs={d} session={s}", .{
+                        tail_hasher.final(),
+                        tail_bytes,
+                        tail_msgs,
                         self.memory_session_id orelse "none",
                     });
                 }
@@ -3558,6 +3592,27 @@ pub const Agent = struct {
             // Track tokens
             self.total_tokens += response.usage.total_tokens;
             self.last_turn_usage = response.usage;
+
+            // V1.14.6 follow-up: structured cache-hit telemetry. Together
+            // (vLLM), OpenRouter, and OpenAI-compat all return prompt
+            // cache hit count via `usage.cached_prompt_tokens` (parsed by
+            // compatible.zig — 3 wire shapes handled). Surface it here so
+            // operators can grep `cache.hit` and measure F-PA2's actual
+            // impact on the production path without re-running benches.
+            // Format mirrors `compaction.notify` for grep-symmetry.
+            const cached_tok: u64 = response.usage.cached_prompt_tokens;
+            const prompt_tok: u64 = response.usage.prompt_tokens;
+            const hit_pct: u8 = if (prompt_tok > 0)
+                @intCast(@min(100, (cached_tok * 100) / prompt_tok))
+            else
+                0;
+            log.info("cache.hit provider={s} model={s} prompt_tokens={d} cached_tokens={d} hit_pct={d}%", .{
+                self.provider.getName(),
+                if (response.model.len > 0) response.model else self.model_name,
+                prompt_tok,
+                cached_tok,
+                hit_pct,
+            });
             if (self.usage_rt) |urt| {
                 const input: u64 = @intCast(response.usage.prompt_tokens);
                 const output: u64 = @intCast(response.usage.completion_tokens);
@@ -7649,6 +7704,176 @@ test "turn auto-compacts on token pressure before provider call" {
     try std.testing.expect(agent.last_turn_compacted);
     try std.testing.expectEqual(@as(usize, 1), agent.last_turn_context.auto_compaction_events);
     try std.testing.expect(agent.last_turn_context.auto_compacted_messages > 0);
+}
+
+test "thrash guard skips compaction when prior 2 firings each saved <10%" {
+    // V1.14.6 follow-up: cover the existing anti-thrash guard at
+    // root.zig:899-973. The guard prevents repeated expensive Pass C
+    // calls on tightly-packed sessions that can't release more bytes.
+    // Test contract: with the savings ring pre-loaded with two below-
+    // threshold entries, autoCompactHistory must short-circuit BEFORE
+    // touching any provider, even when token pressure would otherwise
+    // trigger Pass A or Pass C.
+    const NoCallProvider = struct {
+        called: bool = false,
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.called = true;
+            return .{
+                .content = try allocator.dupe(u8, "should-not-be-called"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "no-call-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var provider_state = NoCallProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = NoCallProvider.chatWithSystem,
+        .chat = NoCallProvider.chat,
+        .supportsNativeTools = NoCallProvider.supportsNativeTools,
+        .getName = NoCallProvider.getName,
+        .deinit = NoCallProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 50,
+        .token_limit = 1_000,
+        .max_tokens = 512,
+        .compaction_keep_recent = 4,
+        .compact_context_enabled = true,
+        .auto_save = false,
+        .history = .empty,
+        // The under-test condition: prior two firings each saved 5%
+        // (well under the 10% COMPACTION_MIN_SAVINGS_PERCENT floor).
+        .compaction_savings_ring = .{ 5, 5 },
+    };
+    defer agent.deinit();
+
+    // Build heavy history that would otherwise trigger Pass A + Pass C.
+    for (0..5) |_| {
+        const u = try allocator.alloc(u8, 2_500);
+        @memset(u, 'u');
+        try agent.history.append(allocator, .{ .role = .user, .content = u });
+        const a = try allocator.alloc(u8, 2_500);
+        @memset(a, 'a');
+        try agent.history.append(allocator, .{ .role = .assistant, .content = a });
+    }
+
+    const compacted = try agent.autoCompactHistory();
+    try std.testing.expect(!compacted);
+    // Provider must NOT have been called — the guard short-circuits
+    // before Pass C's summarization call would fire.
+    try std.testing.expect(!provider_state.called);
+    // Ring is unchanged (recordCompactionSavings only fires after a
+    // successful compaction).
+    try std.testing.expectEqual(@as(u8, 5), agent.compaction_savings_ring[0]);
+    try std.testing.expectEqual(@as(u8, 5), agent.compaction_savings_ring[1]);
+}
+
+test "thrash guard releases when a recent firing exceeded the floor" {
+    // Inverse of the above: ring [5, 30] (one entry over 10%) should
+    // NOT skip — the guard requires BOTH entries to be under-threshold.
+    const TrackProvider = struct {
+        called: bool = false,
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.called = true;
+            return .{
+                .content = try allocator.dupe(u8, "summary"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "track-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var provider_state = TrackProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = TrackProvider.chatWithSystem,
+        .chat = TrackProvider.chat,
+        .supportsNativeTools = TrackProvider.supportsNativeTools,
+        .getName = TrackProvider.getName,
+        .deinit = TrackProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 50,
+        .token_limit = 1_000,
+        .max_tokens = 512,
+        .compaction_keep_recent = 4,
+        .compact_context_enabled = true,
+        .auto_save = false,
+        .history = .empty,
+        .compaction_savings_ring = .{ 5, 30 },
+    };
+    defer agent.deinit();
+
+    for (0..5) |_| {
+        const u = try allocator.alloc(u8, 2_500);
+        @memset(u, 'u');
+        try agent.history.append(allocator, .{ .role = .user, .content = u });
+        const a = try allocator.alloc(u8, 2_500);
+        @memset(a, 'a');
+        try agent.history.append(allocator, .{ .role = .assistant, .content = a });
+    }
+
+    _ = try agent.autoCompactHistory();
+    // Provider was called for Pass C summarization — guard did NOT fire.
+    try std.testing.expect(provider_state.called);
 }
 
 test "assistant autosave stores the full final visible reply" {
