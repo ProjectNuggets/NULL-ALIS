@@ -820,14 +820,26 @@ fn extractFromDropWindow(
 
     if (transcript.len == 0) return;
 
-    // Build the structured-extraction prompt. Plain JSON-only output for
-    // strict parseability via extraction_persist.parseExtractedJson.
+    // Build the structured-extraction prompt. Strict JSON ARRAY at top level
+    // — matches `extraction_persist.parseExtractedJson` which expects an
+    // array (not an object with a `facts` wrapper). Schema fields are the
+    // canonical Pass C set so the same parser handles both call sites.
     const sys_prompt =
-        "You extract durable facts and entity relations from a conversation slice. " ++
-        "Output STRICT JSON only — no prose, no markdown, no commentary. " ++
-        "Schema: {\"facts\":[{\"text\":\"<verbatim or close paraphrase>\",\"subject\":\"<entity>\",\"predicate\":\"<UPPERCASE_REL>\",\"object\":\"<entity or value>\",\"confidence\":0.0-1.0}]}. " ++
-        "Only emit facts that will be useful in FUTURE conversations (preferences, named decisions, durable attributes). " ++
-        "Skip transient turn details. Empty array `{\"facts\":[]}` is valid output when nothing crystallizable was said.";
+        "You extract durable facts from a conversation slice. " ++
+        "Output STRICT JSON ARRAY at top level — no prose, no markdown, no commentary, no `{\"facts\":...}` wrapper. " ++
+        "Empty array `[]` is valid output when nothing crystallizable was said.\n\n" ++
+        "Each array element:\n" ++
+        "{\n" ++
+        "  \"text\": \"<15-80 word atomic self-contained fact>\",\n" ++
+        "  \"subject\": \"<entity name, e.g. 'user', 'Alex', 'project'>\",\n" ++
+        "  \"predicate\": \"<RELATION_TYPE_SCREAMING_SNAKE_CASE, e.g. 'PREFERS', 'WORKS_AT', 'BIRTHDAY'>\",\n" ++
+        "  \"object\": \"<value or target entity name>\",\n" ++
+        "  \"attributed_to\": \"user\" | \"assistant\" | \"assistant_offer\" | \"undecided\",\n" ++
+        "  \"confidence\": <number 0.0-1.0>\n" ++
+        "}\n\n" ++
+        "Only emit facts useful in FUTURE conversations (preferences, named decisions, durable attributes, " ++
+        "stable relationships). Skip transient turn details, pleasantries, ack-only exchanges. " ++
+        "Reject meta-predicates: GREETED, SAID, ASKED, MENTIONED, REPLIED, ACKNOWLEDGED.";
 
     var messages = [_]ChatMessage{
         .{ .role = .system, .content = sys_prompt },
