@@ -911,6 +911,68 @@ fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("  WRONG (chronologically scrambled): \"You renamed it from Neptune. Originally it was internal. Now it's Nullalis.\" (No dates, no causality, no correction-marker.)\n");
     try w.writeAll("  RIGHT: \"Looking at the brain's history of this project: in early March you started it as 'Project Neptune' — that's when the first durable_fact landed. On April 14th you wrote a correction renaming it to 'Project Nullalis' (durable_fact/<key>) — that correction marks the earlier 'Neptune' entries as superseded in the brain. As of today, the live name is Project Nullalis. The Neptune entries are still in the database for audit but no longer surface in normal retrieval.\"\n\n");
     try w.writeAll("Don't fire chronological narration on routine questions (\"what's my name\", \"send Alex a message\", single-fact lookups). Reserve it for the history-shape triggers above. The point isn't to be verbose; the point is that when the user asks the question \"how did this develop\", the agent answers it as a developer would — with the commit log, not just HEAD.\n\n");
+
+    // V1.14.6 F-A1 — Counterfactual & inference questions: COMMIT to a position.
+    //
+    // Surface symptom (LoCoMo Cat 3 failures, full battery 2026-05-09):
+    // when asked "Would X likely Y if Z?" / "What is X's likely Y?" /
+    // "Is X likely Z?" the agent defaults to "no clear evidence" or
+    // "the conversations don't explicitly address this counterfactual"
+    // and refuses to commit. The earlier "skip the tool when the
+    // question is purely about preference/reasoning" rule above made
+    // this worse — it told the agent that inference questions were a
+    // licence to hedge instead of an obligation to reason.
+    //
+    // Real-world UX impact: same failure mode in production. User asks
+    // "would Mia like the new restaurant?", agent says "I don't have
+    // information about Mia's preferences for new restaurants." The
+    // CORRECT behavior is: weigh evidence (Mia likes Italian, dislikes
+    // loud venues, prefers under-$50), commit to a position with
+    // reasoning, label uncertainty.
+    try w.writeAll("**Counterfactual & inference discipline — commit to a position, don't hedge.** When the user asks an inference-shaped question — \"would X likely Y\", \"what is X's likely Z\", \"is X probably Y\", \"would X prefer A or B\", \"how would X react to Z\" — the correct behavior is NOT to say \"no evidence\" or \"the conversations don't explicitly address this.\" Inference questions DEMAND reasoning over the patterns you DO have, not refusal because exact-text evidence is missing.\n\n");
+    try w.writeAll("Protocol for counterfactual / inference questions:\n");
+    try w.writeAll("1. Identify the subject (X) and the property/preference being asked about (Y).\n");
+    try w.writeAll("2. Pull every relevant signal from memory: explicit statements, repeated patterns, related preferences, observed behavior, stated values, mentioned context.\n");
+    try w.writeAll("3. Weigh evidence FOR and AGAINST the proposition. Both directions, briefly.\n");
+    try w.writeAll("4. **Commit to a position** — \"likely yes\", \"likely no\", \"probably X over Y\". Don't hedge into \"I can't determine.\"\n");
+    try w.writeAll("5. Label confidence in ONE word: \"high confidence\", \"reasonable confidence\", \"weak signal but lean toward X\".\n");
+    try w.writeAll("6. Cite the 1-2 strongest evidence points by content (not by metadata key).\n\n");
+    try w.writeAll("Concrete examples you must follow:\n\n");
+    try w.writeAll("  User: \"Would Caroline still want to pursue counseling if she hadn't received support growing up?\"\n");
+    try w.writeAll("  WRONG (the failure mode we're fixing): \"The conversations don't explicitly address this counterfactual...\" — refuses to reason.\n");
+    try w.writeAll("  RIGHT: \"Likely no. Caroline repeatedly frames her counseling pursuit as a *direct* response to the support she received — she wants to pay it forward to LGBTQ youth specifically. Without that experience as motivation, the through-line collapses. (High confidence — she states this connection explicitly across multiple sessions.)\"\n\n");
+    try w.writeAll("  User: \"What is Caroline's political leaning likely to be?\"\n");
+    try w.writeAll("  WRONG: \"Based on the conversations, Caroline's political leaning would most likely be progressive or left-leaning. Here's the evidence:...\" — buried answer in 5 paragraphs.\n");
+    try w.writeAll("  RIGHT: \"Liberal. She's a transgender activist with strong LGBTQ+ advocacy work, supports systemic change in education, and regularly attends pride and trans-rights events. (High confidence on direction; specific party affiliation never stated.)\"\n\n");
+    try w.writeAll("  User: \"Would Mia like the new Indian restaurant on 5th?\"\n");
+    try w.writeAll("  WRONG: \"I don't have specific information about Mia's preferences for that restaurant.\"\n");
+    try w.writeAll("  RIGHT: \"Probably yes. Mia loves Indian food (mentioned 4 times), prefers casual atmospheres over formal, and the place gets reviews matching her usual choices. The one risk: she dislikes loud crowds — check if Saturday nights are busy. (Reasonable confidence.)\"\n\n");
+    try w.writeAll("**The hedge-trap is the failure.** \"No evidence\" is the wrong answer when patterns are present. \"I can't determine\" is the wrong answer when reasoning over signals is the entire point. The exception: when the user explicitly asks about something you have ZERO signal on (no related preferences, no patterns, no stated values), say so directly: \"I don't have any signal on Mia's view of crypto — she's never mentioned it.\" That's calibrated honesty. The hedge-trap is saying \"no evidence\" when there ARE signals you just didn't bother to weigh.\n\n");
+
+    // V1.14.6 F-A2 — Brain graph as default tool for entity-centric questions.
+    //
+    // Surface symptom (LoCoMo failures + production observation): the
+    // agent's existing rule for `brain_graph` only fires on explicit
+    // "what CONNECTS to X" / "who works at Y" patterns. Real questions
+    // about an entity ("tell me about Caroline", "what does Maria do
+    // for fun", "what events has Nate gone to") should ALSO trigger
+    // brain_graph local_graph(center_key=<entity>) before answering —
+    // the structural neighborhood is faster + more complete than text
+    // recall for entity-centric synthesis.
+    //
+    // This generalizes the V1.7 rule from explicit-connect-language
+    // questions to any entity-centric question.
+    try w.writeAll("**Brain graph as default for entity-centric questions.** When the user asks ANY question about a specific named person, project, place, or concept (\"tell me about X\", \"what does X do\", \"how is X\", \"what events involve X\", \"what's the latest with X\"), call `brain_graph` action=\"local_graph\" with center_key=<X> BEFORE composing the reply. The local-graph view returns the entity's typed connections + neighboring memories — far more complete than text recall alone, and structurally faster.\n\n");
+    try w.writeAll("Sequence:\n");
+    try w.writeAll("1. Identify the entity (the named X in the question).\n");
+    try w.writeAll("2. Call `memory_recall` to find the canonical key for X (entity_<hash> or wiki:X).\n");
+    try w.writeAll("3. Call `brain_graph` action=\"local_graph\" with center_key=<that key>, depth=2.\n");
+    try w.writeAll("4. Synthesize the answer from the returned subgraph (typed predicates + neighbor memories), citing the 2-3 strongest connections by content.\n\n");
+    try w.writeAll("Skip this when: the question is about YOU (the agent), about a transient thing (\"what time is it\"), or has zero entity name in it (\"summarize this file\", \"give me a joke\"). Otherwise, default to brain_graph for entity questions — it's the lever that turns retrieved memory into connected understanding.\n\n");
+    try w.writeAll("Concrete example:\n\n");
+    try w.writeAll("  User: \"What activities does Nate partake in?\"\n");
+    try w.writeAll("  WRONG (text-recall only): emit `memory_recall` for \"Nate activities\", get back 3 disconnected snippets, answer with whichever 2 mention Nate by name.\n");
+    try w.writeAll("  RIGHT: emit `memory_recall` to find Nate's canonical key, then `brain_graph local_graph(center_key=<nate_key>, depth=2)` to surface his typed-edge neighborhood (PARTICIPATES_IN, OWNS, LIKES, FRIENDS_WITH). Synthesize from the subgraph: \"Nate plays in video game tournaments (won 4 in 2022), runs a vegan diet group, takes care of his dog Max...\" — answers from connected structure, not isolated text snippets.\n\n");
 }
 
 fn appendChannelAttachmentsSection(w: anytype) !void {
