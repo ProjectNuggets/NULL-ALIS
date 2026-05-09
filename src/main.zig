@@ -277,6 +277,42 @@ fn gatewayLoopbackHost(host: []const u8) []const u8 {
     return host;
 }
 
+/// V1.14.4 review F-1 closure — Standalone CLI subagent delivery.
+///
+/// Signature matches `yc.subagent.SubagentManager.CompletionDeliveryFn`.
+/// The standalone CLI (`nullalis run`, `nullalis service`) creates a
+/// SubagentManager with bus=null. Without a completion_delivery wired,
+/// every subagent result hit the `path=none` branch in subagent.zig:709
+/// and got silently discarded — the original symptom of
+/// `project_subagent_received_bug` for CLI users.
+///
+/// This callback prints the subagent content directly to stderr so the
+/// user sees the result in real-time as the subagent finishes. We don't
+/// route into the parent agent's history because:
+///   - The parent's turn loop has typically already returned by the
+///     time the async subagent completes; pushing into history mid-
+///     reply is racy and CLI doesn't have the gateway's session-pin
+///     infrastructure.
+///   - stderr is the user's terminal in CLI mode, exactly the right
+///     surface for "here's what your delegate produced."
+///
+/// session_key is logged for traceability (CLI typically has one
+/// session at a time so it's not strictly load-bearing, but matches
+/// gateway tenant logging shape for future debugging).
+///
+/// Errors are non-fatal — we log to stderr regardless. Returning !void
+/// keeps the signature contract; we never actually fail.
+fn cliSubagentCompletionDelivery(
+    _: ?*anyopaque,
+    session_key: []const u8,
+    content: []const u8,
+) anyerror!void {
+    std.debug.print(
+        "\n[subagent → {s}]\n{s}\n\n",
+        .{ session_key, content },
+    );
+}
+
 fn isLoopbackBindHost(host_raw: []const u8) bool {
     const host = std.mem.trim(u8, host_raw, " \t\r\n");
     if (host.len == 0) return false;
@@ -2759,6 +2795,11 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
 
     var subagent_manager = yc.subagent.SubagentManager.init(allocator, config, null, .{});
     defer subagent_manager.deinit();
+    // V1.14.4 review F-1 — wire CLI completion delivery so subagent
+    // results surface to stderr instead of vanishing into the path=none
+    // discard branch (subagent.zig:709). Closes the original symptom of
+    // project_subagent_received_bug for CLI users.
+    subagent_manager.attachCompletionDelivery(null, cliSubagentCompletionDelivery);
 
     // Create tools (for system prompt and tool calling)
     const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
@@ -3082,6 +3123,10 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
 
     var subagent_manager = yc.subagent.SubagentManager.init(allocator, &config, null, .{});
     defer subagent_manager.deinit();
+    // V1.14.4 review F-1 — same CLI completion delivery wire-up as the
+    // standalone-run path above. Closes project_subagent_received_bug
+    // for the service-mode CLI entry point as well.
+    subagent_manager.attachCompletionDelivery(null, cliSubagentCompletionDelivery);
 
     // Create tools (for system prompt and tool calling)
     const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
