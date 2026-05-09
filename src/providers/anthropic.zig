@@ -415,34 +415,93 @@ pub const AnthropicProvider = struct {
 
 /// Serialize a single message's content field in Anthropic format.
 /// Plain text → JSON string, multimodal → content array with type:text / type:image blocks.
-fn serializeAnthropicContent(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, msg: ChatMessage) !void {
+///
+/// **F-CB1 (V1.14.6 SOTA context):** when `cache_breakpoint` is true, the
+/// content is always emitted as an array (even for plain strings) with
+/// `cache_control: {"type": "ephemeral"}` attached to the LAST content
+/// block. This creates an Anthropic prompt-cache breakpoint at this
+/// message, so the request prefix up to and including this point becomes
+/// cacheable independently from any breakpoint set by other blocks. The
+/// "system_and_3" pattern (Hermes / claude-code) places breakpoints at
+/// the system prompt + the last 3 user messages → rolling cache windows
+/// that survive most turns. Anthropic supports up to 4 breakpoints per
+/// request, which is exactly what system_and_3 consumes.
+fn serializeAnthropicContent(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    msg: ChatMessage,
+    cache_breakpoint: bool,
+) !void {
     if (msg.content_parts) |parts| {
         try buf.append(allocator, '[');
         for (parts, 0..) |part, j| {
             if (j > 0) try buf.append(allocator, ',');
+            const is_last = (j + 1 == parts.len);
             switch (part) {
                 .text => |text| {
                     try buf.appendSlice(allocator, "{\"type\":\"text\",\"text\":");
                     try root.appendJsonString(buf, allocator, text);
+                    if (cache_breakpoint and is_last) {
+                        try buf.appendSlice(allocator, ",\"cache_control\":{\"type\":\"ephemeral\"}");
+                    }
                     try buf.append(allocator, '}');
                 },
                 .image_url => |img| {
                     try buf.appendSlice(allocator, "{\"type\":\"image\",\"source\":{\"type\":\"url\",\"url\":");
                     try root.appendJsonString(buf, allocator, img.url);
-                    try buf.appendSlice(allocator, "}}");
+                    try buf.appendSlice(allocator, "}");
+                    if (cache_breakpoint and is_last) {
+                        try buf.appendSlice(allocator, ",\"cache_control\":{\"type\":\"ephemeral\"}");
+                    }
+                    try buf.append(allocator, '}');
                 },
                 .image_base64 => |img| {
                     try buf.appendSlice(allocator, "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");
                     try root.appendJsonString(buf, allocator, img.media_type);
                     try buf.appendSlice(allocator, ",\"data\":");
                     try root.appendJsonString(buf, allocator, img.data);
-                    try buf.appendSlice(allocator, "}}");
+                    try buf.appendSlice(allocator, "}");
+                    if (cache_breakpoint and is_last) {
+                        try buf.appendSlice(allocator, ",\"cache_control\":{\"type\":\"ephemeral\"}");
+                    }
+                    try buf.append(allocator, '}');
                 },
             }
         }
         try buf.append(allocator, ']');
+    } else if (cache_breakpoint) {
+        // Plain-string content — wrap as a single text block so the
+        // cache_control field has somewhere to live (Anthropic only
+        // accepts cache_control on content blocks, not on the message itself).
+        try buf.appendSlice(allocator, "[{\"type\":\"text\",\"text\":");
+        try root.appendJsonString(buf, allocator, msg.content);
+        try buf.appendSlice(allocator, ",\"cache_control\":{\"type\":\"ephemeral\"}}]");
     } else {
         try root.appendJsonString(buf, allocator, msg.content);
+    }
+}
+
+/// F-CB1: identify byte-positions in the messages array where cache
+/// breakpoints should be placed (the last 3 user messages — combined
+/// with the system-prompt breakpoint that's always set, this consumes
+/// all 4 of Anthropic's per-request cache_control slots).
+///
+/// Returns a stack-allocated [_]bool table of length `messages.len` where
+/// `table[i] == true` means message `i` should be emitted with a cache
+/// breakpoint. Caller passes a writable buffer of sufficient capacity.
+fn computeCacheBreakpoints(
+    messages: []const ChatMessage,
+    out: []bool,
+) void {
+    @memset(out, false);
+    var marked: usize = 0;
+    var i: usize = messages.len;
+    while (i > 0 and marked < 3) {
+        i -= 1;
+        if (messages[i].role == .user) {
+            out[i] = true;
+            marked += 1;
+        }
     }
 }
 
@@ -480,9 +539,16 @@ fn buildChatRequestBody(
         try NNGTs_cache.serializeSystemCacheable(&buf, allocator, sys);
     }
 
+    // F-CB1: pre-compute which messages get cache_control breakpoints
+    // (system_and_3 — system prompt + last 3 user messages, total 4 = the
+    // Anthropic per-request limit).
+    const bp_table = try allocator.alloc(bool, request.messages.len);
+    defer allocator.free(bp_table);
+    computeCacheBreakpoints(request.messages, bp_table);
+
     try buf.appendSlice(allocator, ",\"messages\":[");
     var count: usize = 0;
-    for (request.messages) |msg| {
+    for (request.messages, 0..) |msg, idx| {
         if (msg.role == .system) continue;
         if (count > 0) try buf.append(allocator, ',');
         count += 1;
@@ -495,7 +561,7 @@ fn buildChatRequestBody(
         try buf.appendSlice(allocator, "{\"role\":\"");
         try buf.appendSlice(allocator, role_str);
         try buf.appendSlice(allocator, "\",\"content\":");
-        try serializeAnthropicContent(&buf, allocator, msg);
+        try serializeAnthropicContent(&buf, allocator, msg, bp_table[idx]);
         try buf.append(allocator, '}');
     }
 
@@ -547,9 +613,14 @@ fn buildStreamingChatRequestBody(
         try NNGTs_cache.serializeSystemCacheable(&buf, allocator, sys);
     }
 
+    // F-CB1: same cache-breakpoint logic as the non-streaming builder.
+    const bp_table = try allocator.alloc(bool, request.messages.len);
+    defer allocator.free(bp_table);
+    computeCacheBreakpoints(request.messages, bp_table);
+
     try buf.appendSlice(allocator, ",\"messages\":[");
     var count: usize = 0;
-    for (request.messages) |msg| {
+    for (request.messages, 0..) |msg, idx| {
         if (msg.role == .system) continue;
         if (count > 0) try buf.append(allocator, ',');
         count += 1;
@@ -561,7 +632,7 @@ fn buildStreamingChatRequestBody(
         try buf.appendSlice(allocator, "{\"role\":\"");
         try buf.appendSlice(allocator, role_str);
         try buf.appendSlice(allocator, "\",\"content\":");
-        try serializeAnthropicContent(&buf, allocator, msg);
+        try serializeAnthropicContent(&buf, allocator, msg, bp_table[idx]);
         try buf.append(allocator, '}');
     }
 
@@ -959,9 +1030,17 @@ test "vtable supports_streaming is not null" {
 
 // ── Multimodal Serialization Tests ──────────────────────────────
 
-test "buildChatRequestBody without content_parts serializes plain string" {
+test "buildChatRequestBody without content_parts serializes plain string when outside cache window" {
     const allocator = std.testing.allocator;
-    const msgs = [_]root.ChatMessage{root.ChatMessage.user("plain text")};
+    // F-CB1: any user message in the last-3 window is now wrapped as a
+    // content array to carry cache_control. To exercise the plain-string
+    // path, the target message must be older than the last 3 user msgs.
+    const msgs = [_]root.ChatMessage{
+        root.ChatMessage.user("plain text"), // oldest — outside the cache window
+        root.ChatMessage.user("u2"),
+        root.ChatMessage.user("u3"),
+        root.ChatMessage.user("u4"),
+    };
     const req = root.ChatRequest{ .messages = &msgs };
     const body = try buildChatRequestBody(allocator, req, "claude-3-opus", 0.7);
     defer allocator.free(body);
@@ -1057,4 +1136,140 @@ test "buildStreamingChatRequestBody with content_parts serializes correctly" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "AAAA") != null);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// F-CB1 — cache breakpoints (system_and_3)
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "computeCacheBreakpoints marks the last 3 user messages" {
+    const msgs = [_]root.ChatMessage{
+        .{ .role = .system, .content = "sys" },
+        .{ .role = .user, .content = "u1" }, // oldest user
+        .{ .role = .assistant, .content = "a1" },
+        .{ .role = .user, .content = "u2" },
+        .{ .role = .assistant, .content = "a2" },
+        .{ .role = .user, .content = "u3" },
+        .{ .role = .assistant, .content = "a3" },
+        .{ .role = .user, .content = "u4" }, // newest user
+    };
+    var bp: [8]bool = undefined;
+    computeCacheBreakpoints(&msgs, &bp);
+
+    // System (idx 0) is NOT marked here — its cache_control is set by
+    // serializeSystemCacheable (the 4th breakpoint, separate path).
+    try std.testing.expect(!bp[0]);
+    try std.testing.expect(!bp[1]); // u1 — too old, falls outside last-3 window
+    try std.testing.expect(!bp[2]);
+    try std.testing.expect(bp[3]); // u2 — third-newest user
+    try std.testing.expect(!bp[4]);
+    try std.testing.expect(bp[5]); // u3
+    try std.testing.expect(!bp[6]);
+    try std.testing.expect(bp[7]); // u4 — newest
+}
+
+test "computeCacheBreakpoints handles fewer than 3 user messages" {
+    const msgs = [_]root.ChatMessage{
+        .{ .role = .system, .content = "sys" },
+        .{ .role = .user, .content = "only-user" },
+        .{ .role = .assistant, .content = "a1" },
+    };
+    var bp: [3]bool = undefined;
+    computeCacheBreakpoints(&msgs, &bp);
+
+    try std.testing.expect(!bp[0]);
+    try std.testing.expect(bp[1]); // marked even though it's the only user msg
+    try std.testing.expect(!bp[2]);
+}
+
+test "buildChatRequestBody emits cache_control on the last user message" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{
+        .{ .role = .system, .content = "sys" },
+        .{ .role = .user, .content = "first user msg" },
+        .{ .role = .assistant, .content = "ack" },
+        .{ .role = .user, .content = "newest user msg" },
+    };
+    const req = root.ChatRequest{ .messages = &msgs };
+    const body = try buildChatRequestBody(allocator, req, "claude-3-opus", 0.7);
+    defer allocator.free(body);
+
+    // Both user messages are within the last-3 window, so both get cache breakpoints.
+    // The system prompt also gets one via serializeSystemCacheable (4 total = limit).
+    var bp_count: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, body, idx, "\"cache_control\":{\"type\":\"ephemeral\"}")) |found| {
+        bp_count += 1;
+        idx = found + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), bp_count); // system + 2 user messages
+
+    // The LAST user message must be wrapped as content array with cache_control.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":\"newest user msg\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "[{\"type\":\"text\",\"text\":\"newest user msg\",\"cache_control\":") != null);
+}
+
+test "buildChatRequestBody with content_parts attaches cache_control to last block only" {
+    const allocator = std.testing.allocator;
+    const parts = [_]root.ContentPart{
+        root.makeTextPart("first part"),
+        root.makeTextPart("second part"),
+    };
+    const msgs = [_]root.ChatMessage{
+        .{ .role = .system, .content = "sys" },
+        .{ .role = .user, .content = "", .content_parts = &parts },
+    };
+    const req = root.ChatRequest{ .messages = &msgs };
+    const body = try buildChatRequestBody(allocator, req, "claude-3-opus", 0.7);
+    defer allocator.free(body);
+
+    // First part: NO cache_control. Second part: has cache_control.
+    // Use indexOf to assert ordering.
+    const first_part_pos = std.mem.indexOf(u8, body, "\"text\":\"first part\"") orelse return error.TestUnexpectedResult;
+    const second_part_pos = std.mem.indexOf(u8, body, "\"text\":\"second part\"") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(first_part_pos < second_part_pos);
+
+    // The cache_control marker should appear AFTER second_part_pos but
+    // before the next message-level closing.
+    const cc_pos = std.mem.indexOfPos(u8, body, second_part_pos, "\"cache_control\"") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cc_pos > second_part_pos);
+    // And must NOT appear between first_part_pos and second_part_pos.
+    const slice_between = body[first_part_pos..second_part_pos];
+    try std.testing.expect(std.mem.indexOf(u8, slice_between, "\"cache_control\"") == null);
+}
+
+test "buildChatRequestBody respects the 3-breakpoint limit on long histories" {
+    const allocator = std.testing.allocator;
+    // 5 user + 4 assistant + 1 system = 10 messages. Only the last 3 user
+    // messages should get breakpoints (system gets a 4th separately).
+    const msgs = [_]root.ChatMessage{
+        .{ .role = .system, .content = "sys" },
+        .{ .role = .user, .content = "u-oldest" },
+        .{ .role = .assistant, .content = "a1" },
+        .{ .role = .user, .content = "u-2" },
+        .{ .role = .assistant, .content = "a2" },
+        .{ .role = .user, .content = "u-3" },
+        .{ .role = .assistant, .content = "a3" },
+        .{ .role = .user, .content = "u-4" },
+        .{ .role = .assistant, .content = "a4" },
+        .{ .role = .user, .content = "u-newest" },
+    };
+    const req = root.ChatRequest{ .messages = &msgs };
+    const body = try buildChatRequestBody(allocator, req, "claude-3-opus", 0.7);
+    defer allocator.free(body);
+
+    // u-oldest should NOT be wrapped as content array (no cache_control).
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"u-oldest\"") != null);
+
+    // The newest user message MUST be wrapped + carry cache_control.
+    try std.testing.expect(std.mem.indexOf(u8, body, "[{\"type\":\"text\",\"text\":\"u-newest\",\"cache_control\":") != null);
+
+    // Total cache_control occurrences = 4 (system + last 3 user messages).
+    var bp_count: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, body, idx, "\"cache_control\":{\"type\":\"ephemeral\"}")) |found| {
+        bp_count += 1;
+        idx = found + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), bp_count);
 }
