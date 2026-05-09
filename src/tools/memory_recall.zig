@@ -9,6 +9,23 @@ const Memory = mem_root.Memory;
 const MemoryEntry = mem_root.MemoryEntry;
 const zaki_state = @import("../zaki_state.zig");
 const supersede_filter = @import("supersede_filter.zig");
+const text_norm = @import("../memory/text_norm.zig");
+
+// F-T1 (V1.14.6 SOTA context): per-result content cap. Each individual
+// memory_recall hit's content is capped at this many bytes (UTF-8-safe
+// truncation at codepoint boundary). Stops the firehose at the source.
+//
+// Pre-fix observation: each result was 500-2000 chars. With ~5 results
+// per call and ~2.4 calls per QA in our LoCoMo bench, raw output per
+// QA averaged 5-25KB. Across 30 QAs, ~150-750KB accumulated in
+// conversation history → token-pressure climbed 1.5pp/QA.
+//
+// Post-fix: each result ≤ 500 chars. Total per-call output ≤ ~3KB,
+// per-QA ≤ ~7KB. Pressure growth roughly halved.
+//
+// The agent's brain still HAS the full content via re-call; this cap
+// is on the in-context PROJECTION, not the underlying data.
+const PER_RESULT_CONTENT_CAP: usize = 500;
 
 /// Memory recall tool — lets the agent search its own memory.
 /// When a MemoryRuntime is available, uses the full retrieval pipeline
@@ -261,7 +278,14 @@ pub const MemoryRecallTool = struct {
                 try buf.appendSlice(allocator, entry.timestamp);
             }
             try buf.appendSlice(allocator, ": ");
-            try buf.appendSlice(allocator, entry.content);
+            // F-T1: cap per-result content. Source content stays full
+            // in the underlying memory layer; this only caps the in-
+            // context projection of the recall result.
+            const capped = text_norm.truncateUtf8(entry.content, PER_RESULT_CONTENT_CAP);
+            try buf.appendSlice(allocator, capped);
+            if (capped.len < entry.content.len) {
+                try buf.appendSlice(allocator, " […recall again for full]");
+            }
             try buf.append(allocator, '\n');
         }
 
@@ -328,7 +352,16 @@ pub const MemoryRecallTool = struct {
             const score_str = std.fmt.bufPrint(&score_buf, " score={d:.2}", .{cand.final_score}) catch "";
             try buf.appendSlice(allocator, score_str);
             try buf.appendSlice(allocator, ": ");
-            try buf.appendSlice(allocator, cand.snippet);
+            // F-T1: cap per-candidate snippet. Same rationale as
+            // formatEntries above — context-projection cap, not data
+            // truncation. Snippet is already a slice of full content;
+            // re-call returns the full snippet from the retrieval
+            // pipeline if needed.
+            const capped = text_norm.truncateUtf8(cand.snippet, PER_RESULT_CONTENT_CAP);
+            try buf.appendSlice(allocator, capped);
+            if (capped.len < cand.snippet.len) {
+                try buf.appendSlice(allocator, " […recall again for full]");
+            }
             try buf.append(allocator, '\n');
         }
 
