@@ -178,8 +178,10 @@ fn deriveSessionEndEntityKey(allocator: std.mem.Allocator, object: []const u8) !
 /// V1.12 — build a compact transcript text from MessageEntries for the
 /// session-end entity_pipeline pass. Walks the entries in order
 /// (oldest-first), filters to user/assistant content, caps at ~3KB.
-/// Mirrors agent/root.zig::buildRecentTurnText but works on
-/// MessageEntry slices instead of OwnedMessage.
+/// V1.14.7 cleanup: previously mirrored agent/root.zig::buildRecentTurnText,
+/// which was deleted in V1.14.7 C3 along with the per-turn enqueue site
+/// it served. This function remains for the session-end legacy enqueue
+/// path (gated false by default; operator-flippable for forward compat).
 fn buildSessionEndTranscriptText(
     allocator: std.mem.Allocator,
     entries: []const memory_mod.MessageEntry,

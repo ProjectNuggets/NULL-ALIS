@@ -6,9 +6,12 @@
 //!
 //! ## When the agent invokes this
 //!
-//! Rarely. The pipeline is auto-triggered every 3 turns (see
-//! `agent/root.zig::turns_since_extraction`); the agent does not need to
-//! call this manually. The tool exists primarily so that:
+//! Rarely. As of V1.14.7, the entity_pipeline is no longer per-turn
+//! auto-triggered (the every-3-turn enqueue site was removed). Entity
+//! edges now land via Pass A drop-window extraction (compaction.zig
+//! extractFromDropWindow), Pass C summary JSON tail, and inline session-
+//! end persistExtracted. The agent does not need to call this manually
+//! during normal turns. The tool exists primarily so that:
 //!
 //! 1. The agent CAN re-link a specific historical block of prose if a
 //!    user asks ("ZAKI, reconnect the brain with what I just said").

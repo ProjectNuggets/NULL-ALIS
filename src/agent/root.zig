@@ -5017,61 +5017,12 @@ fn dupeHistoryBytes(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
 /// last 8-12 user+assistant turns instead of the last 2-3, so
 /// entities discussed across a longer arc don't get clipped.
 ///
-/// Skips system messages and tool messages — only user-facing content
-/// goes into the entity pipeline (tool outputs are noise for entity
-/// extraction; system messages are agent instructions, not user data).
-///
-/// Returns owned string. Caller must free. Returns null-equivalent
-/// (empty allocation) if no usable history exists.
-fn buildRecentTurnText(
-    allocator: std.mem.Allocator,
-    history: []const Agent.OwnedMessage,
-) ![]u8 {
-    if (history.len == 0) return allocator.alloc(u8, 0);
-
-    const MAX_BYTES: usize = 12 * 1024;
-    var collected: std.ArrayListUnmanaged(u8) = .{};
-    errdefer collected.deinit(allocator);
-
-    // Walk backwards collecting user/assistant content until we hit
-    // the byte cap. We accumulate in reverse, then we'll reverse-stitch
-    // by writing newest-first; that's fine for entity extraction (the
-    // extractor doesn't care about turn order, just about what entities
-    // appear). Bound at 8 messages to avoid pathological cases.
-    var msgs_collected: usize = 0;
-    var i: usize = history.len;
-    // V1.13: 8 → 24 messages. Pairs with the 12KB byte cap so we
-    // collect a wider window of conversation. Byte cap still bounds
-    // total cost; message count just allows us to walk further back
-    // before the byte cap stops us.
-    while (i > 0 and msgs_collected < 24 and collected.items.len < MAX_BYTES) : (msgs_collected += 1) {
-        i -= 1;
-        const msg = history[i];
-        // Skip non-content roles: system/tool messages aren't user prose.
-        const role_str: []const u8 = switch (msg.role) {
-            .user => "user",
-            .assistant => "assistant",
-            .system, .tool => continue,
-        };
-        if (msg.content.len == 0) continue;
-
-        // Append "role: content\n" with bounded size.
-        const remaining = MAX_BYTES - collected.items.len;
-        const prefix_overhead: usize = role_str.len + 3; // "role: \n"
-        if (remaining <= prefix_overhead) break;
-        const content_budget = remaining - prefix_overhead;
-        const content_slice = if (msg.content.len > content_budget) msg.content[0..content_budget] else msg.content;
-
-        var line_buf: std.ArrayListUnmanaged(u8) = .{};
-        defer line_buf.deinit(allocator);
-        try line_buf.writer(allocator).print("{s}: {s}\n", .{ role_str, content_slice });
-        // Prepend (since we're walking newest-first, but we want oldest-first
-        // in the final string for natural reading).
-        try collected.insertSlice(allocator, 0, line_buf.items);
-    }
-
-    return collected.toOwnedSlice(allocator);
-}
+// V1.14.7 cleanup: buildRecentTurnText DELETED. Sole caller was the
+// per-turn entity_pipeline_enqueue site removed in V1.14.7 C3. The
+// session-end path uses buildSessionEndTranscriptText (commands.zig:183),
+// and Pass A drop-window extraction uses buildCompactionTranscript
+// (compaction.zig). Keeping the function as zero-caller dead code would
+// invite future drift; deleted.
 
 pub const cli = @import("cli.zig");
 
