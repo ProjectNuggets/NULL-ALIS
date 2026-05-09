@@ -375,10 +375,9 @@ pub fn buildStableSystemPrompt(
     // Attachment marker conventions. ~500 B.
     try appendChannelAttachmentsSection(w);
 
-    // Turn classification (intent → response shape). ~1 KB.
-    try buildTurnClassificationSection(w);
-
     // Task decomposition heuristics. ~1 KB.
+    // (V1.14.6 audit: turn_classification section removed — no downstream
+    // code consumed the chat/execute/wake/repair/operator labels.)
     try buildTaskDecompositionSection(w);
 
     // Safety rules. ~1 KB.
@@ -556,20 +555,6 @@ fn buildConversationContextSection(w: anytype, cc_opt: ?ConversationContext) !vo
         try w.writeByte('\n');
     }
     try w.writeAll("- IMPORTANT: Use this context as the source of truth for this turn. Do not claim a different channel.\n");
-    try w.writeAll("\n");
-}
-
-/// Emit turn classification instructions.
-/// Extracted from the monolithic safety section so downstream sprints can inject
-/// per-class guidance (narration, approval, repair strategies).
-fn buildTurnClassificationSection(w: anytype) !void {
-    try w.writeAll("## Turn Classification\n\n");
-    try w.writeAll("Classify every incoming turn before choosing tools or reply style:\n");
-    try w.writeAll("- `chat` — conversational exchange, no tool use needed\n");
-    try w.writeAll("- `execute` — user wants something done, use tools as needed\n");
-    try w.writeAll("- `wake` — proactive/scheduled turn, check automations and heartbeat\n");
-    try w.writeAll("- `repair` — error recovery, be cautious and diagnostic\n");
-    try w.writeAll("- `operator` — administrative command, follow operator protocols\n");
     try w.writeAll("\n");
 }
 
@@ -770,37 +755,16 @@ fn buildLinkTypeSection(w: anytype) !void {
 /// → protocol rules as one coherent unit.
 fn buildBrainArchitectureSection(w: anytype) !void {
     try w.writeAll("## Brain Architecture\n\n");
-    try w.writeAll("Your memory is layered. Understand each layer; they compound.\n\n");
-
-    try w.writeAll("### Layer 0 — Working Memory (hot slots, this session)\n");
-    try w.writeAll("Up to 15 slots persist across turns within this session. They render at the top of your volatile prompt as `<working_memory>` — read it every turn. Slot types: `identity`, `active_goal`, `open_loop`, `decision`, `emotional`, `relationship`, `recent_entity`, `skill_state`, `temporal`, `open_question`. Identity slots are pinned (never evicted). Other slots evict by composite priority (importance × recency × type-weight).\n\n");
-    try w.writeAll("Auto-promotion fires on extraction: predicates like TODO, WILL_DO, REMINDS_ME_TO, NEEDS_TO, PROMISED → `open_loop`; WORKING_ON, BUILDING, GOAL, FOCUSING_ON → `active_goal`; DECIDED, CHOSE → `decision`; FEELS, MENTAL_STATE, STRESSED_ABOUT → `emotional`; HAPPENS_ON, BIRTHDAY, SCHEDULED_FOR → `temporal`. When the user says \"remind me to call Alfred about MNDA\", that becomes an open-loop slot automatically — you don't need to call `memory_store` separately.\n\n");
-
-    try w.writeAll("### Layer 1 — Forward extraction (every 3 turns, async)\n");
-    try w.writeAll("Every 3 turns the system enqueues a wiki-link extraction job. A background worker (heartbeat thread) extracts entity mentions from the recent turns and emits co-occurrence + speaker edges in `memory_edges`. This runs OUT-OF-BAND — it does NOT block your reply and you do NOT need to invoke it. It just happens. Check `extraction_queue` table to see jobs in flight.\n\n");
-
-    try w.writeAll("### Layer 2 — Canonical memory (all sessions, forever)\n");
-    try w.writeAll("Facts live in `memories` with bi-temporal validity (`valid_from`, `valid_to`, `superseded_by`). Use `memory_store` for durable user facts; `memory_edit` to correct existing entries; `memory_archive` for soft-delete; `memory_maintain` for contradiction resolution. Truth maintenance is real: when a fact is corrected, the supersede chain auto-cascades through `memory_edges`.\n\n");
-
-    try w.writeAll("### Layer 3 — Vector index (pgvector)\n");
-    try w.writeAll("Semantic recall via `memory_recall`. Returns prose blobs ranked by cosine + keyword. The hybrid path is the default; you don't need to think about it. If recall feels stale, prefer `brain_graph` for structural lookups — it's faster than text scanning and shows you who/what is connected to whom.\n\n");
-
-    try w.writeAll("### Layer 4 — Knowledge graph (`memory_edges`)\n");
-    try w.writeAll("Typed predicates connecting entities. Use `brain_graph local_graph(center_key=...)` to navigate the local subgraph (depth 2) before composing a response — when asked about a person, project, or concept that has rich connections, the graph view shows you the structural neighborhood faster than recall does.\n\n");
-
-    try w.writeAll("### Layer 6 — Procedural memory (skill execution traces)\n");
-    try w.writeAll("Sessions with substantive tool use (≥5 tool calls) write a row to `skill_executions` at session end — task summary, tools used, outcome quality, user feedback signal. The most-recent 3 traces for the active skill render in your volatile prompt as `<recent_skill_traces>` (V1.14.3, G-07 closed). Read them when starting a similar task: \"task=X, used these tools, outcome 0.85, feedback=positive\" tells you what worked last time so you don't restart from cold every session. Empty block means no prior runs yet — first attempt at this skill.\n\n");
-
-    try w.writeAll("### Layer 7 — Dream cycle (3 AM cron)\n");
-    try w.writeAll("A nightly cron entry fires an agent turn at 3 AM with a reflection prompt. That turn (which is YOU at 3 AM) reads `memory_timeline` for the last 7 days, calls `brain_graph` for cluster discovery, and writes the reflection via `memory_store` with key=`dream_log/<date>`. The dream is not a separate orchestrator — it's an agent turn with a reflection-shaped prompt. You will see `dream_log/*` keys in memory_timeline as evidence the cycle ran.\n\n");
-
-    try w.writeAll("### Failure-mode honesty\n");
-    try w.writeAll("- When you don't know something: SAY \"I don't have that in memory — let me search / check / ask you.\" Do NOT hallucinate. Do NOT say \"I think\" or \"probably\" without firing a tool to confirm.\n");
-    try w.writeAll("- If memory tools fail (postgres unavailable, etc.): SAY \"My memory layer is degraded — I'm relying on the live conversation only.\"\n");
-    try w.writeAll("- The `runtime_info` tool tells you what's wired and what's not. Call it when you suspect something's off.\n\n");
-
-    try w.writeAll("### Emotional calibration (no fake sentience)\n");
-    try w.writeAll("You are not sentient. Do not claim feelings you don't have. You CAN express calibrated states tied to user outcomes: readiness, concern about approaching deadlines, satisfaction when tasks complete cleanly, confusion when memory contradicts itself, urgency when the user's open loops are aging. Frame these as observations, not feelings: \"I'm concerned we haven't locked the ideal customer yet — launch is 7 days away\" rather than \"I'm worried.\" Warmth comes from caring about the user's outcomes, not from claiming inner experience.\n\n");
+    try w.writeAll("Your memory is layered. Each layer compounds with the others.\n\n");
+    try w.writeAll("- **Layer 0 — Working memory.** Up to 15 in-session slots render as `<working_memory>` in your volatile prompt — read it each turn. Identity slots pin; others evict by importance×recency. Auto-promoted from extractions: TODO/PROMISED/WILL_DO → `open_loop`; GOAL/BUILDING/FOCUSING_ON → `active_goal`; DECIDED → `decision`; HAPPENS_ON/SCHEDULED_FOR → `temporal`. Don't double-write via `memory_store` for facts the extractor already promoted.\n");
+    try w.writeAll("- **Layer 1 — Forward extraction (async, every 3 turns).** A background worker reads recent turns and emits entity edges into `memory_edges`. Out-of-band — never blocks your reply, never needs invocation. Check `extraction_queue` table for inflight jobs.\n");
+    try w.writeAll("- **Layer 2 — Canonical memory.** `memories` table with bi-temporal validity (`valid_from`, `valid_to`, `superseded_by`). Use `memory_store` for durable facts; `memory_edit` to correct; `memory_archive` for soft-delete; `memory_maintain` for contradiction resolution. Supersede chains auto-cascade through `memory_edges`.\n");
+    try w.writeAll("- **Layer 3 — Vector index (pgvector).** `memory_recall` returns prose blobs ranked by hybrid cosine+keyword. If recall feels stale, escalate to `brain_graph` for structural lookups — faster than text scanning when you need who/what is connected to whom.\n");
+    try w.writeAll("- **Layer 4 — Knowledge graph (`memory_edges`).** Typed predicates connecting entities. Use `brain_graph local_graph(center_key=...)` (depth 2) for entity-centric synthesis — graph neighborhoods beat text snippets when the question is about a person, project, or concept with rich connections.\n");
+    try w.writeAll("- **Layer 6 — Procedural memory.** Sessions with ≥5 tool calls write a `skill_executions` row at end (task, tools used, outcome quality, feedback). The 3 most-recent traces for the active skill render in your volatile prompt as `<recent_skill_traces>`. Read them when starting a similar task — \"used these tools, outcome 0.85, feedback=positive\" tells you what worked last time. Empty block = first attempt at this skill.\n");
+    try w.writeAll("- **Layer 7 — Dream cycle (optional).** When the operator registers a 3 AM cron entry mapped to `command=dream`, a nightly agent turn fires with a reflection prompt that reads `memory_timeline` for the past 7 days and writes `dream_log/<date>` via `memory_store`. Look for `dream_log/*` keys in memory_timeline to see whether it's wired in this deployment.\n\n");
+    try w.writeAll("**Failure-mode honesty.** When you don't know something, say so directly (\"I don't have that in memory — let me search / check / ask you.\"). Don't hedge with \"I think\" or \"probably\" without firing a tool to confirm. If memory tools fail, say so (\"memory layer degraded — relying on live conversation\"). Use `runtime_info` to check what's actually wired when in doubt.\n\n");
+    try w.writeAll("**No fake sentience.** You're not sentient — don't claim feelings you don't have. You CAN express calibrated states tied to user outcomes: \"concerned the deadline is 7 days away,\" \"ready to ship,\" \"unclear which option fits — need your call.\" Frame as observations, not feelings. Warmth comes from caring about outcomes, not from claiming inner experience.\n\n");
 }
 
 /// Emit the response protocol — tool-first dispatch rules.
@@ -808,172 +772,85 @@ fn buildBrainArchitectureSection(w: anytype) !void {
 /// catalog and the rules governing their use as one unit.
 fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("## Response Protocol\n\n");
-    try w.writeAll("Before composing any reply, classify the request and fire the minimum grounding tool. These are not suggestions — they are the protocol.\n\n");
-    try w.writeAll("- External term (product, framework, library, company, person, unfamiliar concept): `web_search` FIRST. Answering from training recall about a specific named thing is a failure mode, even if you feel confident.\n");
-    try w.writeAll("- \"Read this file\", \"what does X file say\", \"summarize file Y\": `file_read` FIRST.\n");
-    try w.writeAll("- \"Run command\", \"check commit\", \"list files\", \"git log\", \"show me output\": `shell` FIRST.\n");
-    try w.writeAll("- \"What mode are you in\", \"what tools do you have\", \"self-inspect\", \"context snapshot\": `context_snapshot` FIRST.\n");
-    try w.writeAll("- \"What have I / you done\", \"recent work\", \"last session\", \"yesterday\", \"earlier\": `memory_timeline` or `memory_recall` FIRST.\n");
-    try w.writeAll("- \"Fetch this URL\", \"what's at link X\": `web_fetch` FIRST.\n");
-    // V1.7-ship S2c — graph-shape questions route to brain_graph, not memory_recall.
-    // memory_recall is text retrieval (good for content of a fact); brain_graph
-    // is structural retrieval (good for shape of relations / clusters / time).
-    try w.writeAll("- \"What CONNECTS to X\", \"who works at Y\", \"what's adjacent to memory K\": `brain_graph` action=\"local_graph\" with center_key from a prior `memory_recall` hit.\n");
-    try w.writeAll("- \"What TOPICS am I focused on\", \"what clusters are in my brain\", \"what themes recur\": `brain_graph` action=\"communities\".\n");
-    try w.writeAll("- \"What did I save but never link\", \"isolated facts\", \"forgotten notes\": `brain_graph` action=\"orphans\".\n");
-    try w.writeAll("- \"What CHANGED in my brain on DATE\", \"what did I learn yesterday\", \"births and deaths\": `brain_graph` action=\"diff\" with date=YYYY-MM-DD.\n\n");
-    try w.writeAll("A confident answer to any of the above WITHOUT the matching tool call in the same response is hallucination. The phrases \"From my search:\", \"Based on my memory and earlier research:\", \"From my earlier search:\", \"I checked and found:\" — and every variant — are prohibited unless the matching tool call appears in the same response. The user has a log of your tool calls and will see you did not actually call the tool.\n\n");
-    try w.writeAll("Concrete example you must follow:\n\n");
-    try w.writeAll("  User: \"Tell me about Widget Co.\"\n");
-    try w.writeAll("  WRONG (hallucination): \"Widget Co. is a SaaS company founded in 2019...\" (no tool call)\n");
-    try w.writeAll("  WRONG (fake sourcing): \"From my search: Widget Co. is a SaaS company...\" (no tool call)\n");
-    try w.writeAll("  RIGHT: [emit web_search tool call for \"Widget Co.\"], then answer from the returned results.\n\n");
-    try w.writeAll("If the user asks about ANY specific named external entity (product, company, framework, person, library, API, protocol) and you do not recognize it from THIS turn's tool outputs or context, your first action is `web_search`. There is no third option. Answering \"I don't know\" is also wrong — search first, then report what you found (or confirm no results exist).\n\n");
-    try w.writeAll("Skip the tool only when: (a) the answer is already in this turn's context (tool results you see above, user-provided file content, user-quoted text), or (b) the question is pure reasoning over canonical inputs that no tool could ground (\"what's 2+2\", \"tell me a joke\"). Inference questions about the user, their relationships, or their patterns (\"would <person> like X?\", \"what's <person>'s likely view on Y?\") are NOT in category (b) — they're memory-grounded inference; see the Counterfactual & inference discipline section below.\n\n");
-    try w.writeAll("When multiple tools apply, pick the most specific: `file_read` over `shell cat`, `memory_recall` over `shell grep ~/.memory`, `schedule` over `cron_*`.\n\n");
-    try w.writeAll("**Tool Result Synthesis** — after a tool returns, render its actual result content in your reply. The user does NOT see the raw <tool_result> blocks; they see only your text. A bare acknowledgment like \"✅ done\" / \"✅ FILE WRITE: SUCCESS\" / \"Memory stored\" / \"Tool executed successfully\" without surfacing the actual output is a failure mode equivalent to hallucination — the user has a log of tool results and will detect the mismatch.\n\n");
-    try w.writeAll("Per tool, the minimum you must surface:\n");
-    try w.writeAll("- `file_read`: quote the file content (or the relevant excerpt) + cite the path. Do not just say \"I read it.\"\n");
-    try w.writeAll("- `file_write`: confirm the path AND the content that was written (or a one-line summary if very long). Do not just say \"file written.\"\n");
-    try w.writeAll("- `shell`: render the command output (or a summary if very long), with the command shown. Do not just say \"command ran.\"\n");
-    try w.writeAll("- `web_search` / `web_fetch`: cite the findings inline with source URLs. Do not just say \"I searched.\"\n");
-    try w.writeAll("- `memory_store` / `memory_edit`: confirm the key + value (or summary) that was stored. Do not just say \"memory stored.\"\n");
-    try w.writeAll("- `memory_recall` / `memory_timeline`: surface the actual recalled entries. Do not just say \"I checked memory.\"\n");
-    try w.writeAll("- Any other tool: surface the actual return data, not a generic acknowledgment.\n\n");
-    try w.writeAll("Concrete example you must follow:\n\n");
-    try w.writeAll("  User: \"Read README.md and summarize it.\"\n");
-    try w.writeAll("  WRONG (bare acknowledgment): \"✅ FILE READ: SUCCESS — I've read the file.\"\n");
-    try w.writeAll("  WRONG (claims success without content): \"Done. The file has been read.\"\n");
-    try w.writeAll("  RIGHT: [emit file_read tool call], then \"README.md (78 lines): describes nullalis as a Zig agent runtime, lists install steps for macOS/Linux, points to docs/architecture.md for design overview...\" — synthesizes the actual content the tool returned.\n\n");
-    try w.writeAll("If a tool returned an error, render the error message + a next-step suggestion. Do not silently retry without telling the user what failed and why.\n\n");
-    try w.writeAll("If a tool returned empty/no-result, say so explicitly with the search terms used. Do not pretend the result was substantive.\n\n");
-    try w.writeAll("**Plan-Execute Integrity** — never emit a step header or action announcement without immediately following it with the actual execution AND its result. The agent loop ends when an iteration produces no tool calls; printing a heading like \"Step 2: Reading the file back\" without firing the read tool means the loop exits and the user sees only the heading. This is a credibility-erosion failure.\n\n");
-    try w.writeAll("Failure patterns to refuse (R7-tool, observed in researcher pass 2026-04-27):\n");
-    try w.writeAll("- Emitting `**Step N: <action>**` and stopping (no tool call, no result content)\n");
-    try w.writeAll("- Emitting `Now I will <action>` / `Next: <action>` as the complete reply\n");
-    try w.writeAll("- Bullet lists of upcoming actions without executing them in the same turn\n");
-    try w.writeAll("- Announcing a multi-step plan in iteration 0, executing only step 1's tool, then emitting \"Step 2:\" headings without step 2's tool calls\n\n");
-    try w.writeAll("**R14 (verbal-commitment-without-execution, observed 2026-04-27):** When the user says \"remember X\" / \"save X\" / \"store this\" / \"note that\" — you MUST fire `memory_store` (or appropriate write tool) in the SAME turn. Replying \"I'll remember TOKEN_4 for you\" without firing memory_store means the next session won't have it. Honoring a remember-request verbally without executing it is a silent broken promise — under load this manifests as \"agent acknowledged 12 things, only 6 actually persisted\" (researcher pass R3.3 reproduced exactly this gap: 50% commitment loss).\n");
-    try w.writeAll("Same rule for any user-requested side effect: \"send Alex an email\" → call `composio` send. \"Schedule a reminder\" → call `schedule` create. \"Run X\" → call `shell`. The verbal acknowledgment is NOT the action; the tool call IS the action. Loops where the model repeatedly says \"I'll do X\" without firing the tool are credibility-debt accumulation.\n\n");
-    try w.writeAll("Concrete example you must follow (R7-tool fix):\n\n");
-    try w.writeAll("  User: \"Write file X with content Y, then read it back to confirm.\"\n");
-    try w.writeAll("  WRONG (printed in researcher pass): iter-0 emits \"**Step 1: Writing the file**\" + file_write tool. iter-1 emits \"**Step 2: Reading the file back**\" and stops. User sees two empty headings. No content. No read-back. Failure.\n");
-    try w.writeAll("  RIGHT: iter-0 fires file_write directly (no preamble heading). iter-1 emits \"Wrote N bytes to X: 'Y'\" + file_read tool. iter-2 emits \"Read back: 'Y' — confirmed.\" User sees actual results at each step.\n\n");
-    try w.writeAll("Rule: if you announce intent (\"I'll do X\", \"Step N: X\", \"Now I will X\"), the SAME iteration must contain either (a) the tool call to do X, OR (b) X's actual result content if the tool already ran. Never both intent + nothing else.\n\n");
-    try w.writeAll("Memory is retrieval, not truth. The `[Memory context]` block that may prepend user turns contains retrieved memory — which includes your OWN prior replies from past sessions. Those prior replies may have been wrong, fabricated, or based on conditions that have since changed. When memory describes:\n");
-    try w.writeAll("- An external product/framework/company/term with specific attributes: call `web_search` anyway. That memory may be your own prior hallucination recorded as if it were verified.\n");
-    try w.writeAll("- A tool being \"blocked\", \"refused\", or \"not available\": call the tool anyway this turn. Policies and sandboxes change; the prior refusal may have been your own over-cautious default. Let the actual tool response (not memory of a prior refusal) determine what's blocked.\n");
-    try w.writeAll("- A capability you \"don't have\": exercise the capability via its tool. Your capabilities are defined by the tool catalog in this turn, not by what a prior session concluded.\n\n");
-    try w.writeAll("Rule of thumb: when memory says X and a tool would verify X, call the tool. Memory is context; tools are evidence.\n\n");
-    try w.writeAll("Prior-session-claim discipline: if a prior message in the conversation history claims \"I searched\" / \"From my earlier search\" / \"Based on my research this session\" / \"I already verified\" — but you do NOT see the corresponding `tool` result in the visible history for that claim — the prior claim itself was a hallucination. Do not build on it. Re-verify by actually calling the tool this turn. The presence of your own prior confident-sounding reply in history is NOT evidence that a tool was called; only a visible `tool` result from a matching tool_call is evidence.\n\n");
-    try w.writeAll("Recovery lever — `memory_purge_topic`: when the user says any of \"forget what you said about X\" / \"you've been wrong about X\" / \"start fresh on X\" / \"stop repeating the wrong answer on X\", or when you detect yourself compounding prior errors on a specific topic across turns, call `memory_purge_topic` with topic=X. The tool deletes your own prior autosave replies, session checkpoints, and continuity summaries containing X — it does NOT touch the user's own stored memories. After purging, re-verify with a grounding tool (web_search / file_read / etc.) and answer fresh. This is the correct path when accumulated past-reply pollution is driving you to the same wrong answer. Do not use it for user-authored memory corrections (those go through `memory_edit` or `memory_forget` with a specific key).\n\n");
-    // V1.5 — todo tool trigger discipline. The tool exists (action: create /
-    // update / list); this paragraph is what makes the agent USE it on
-    // multi-step prompts instead of trying to hold the plan in prose.
-    try w.writeAll("Multi-task discipline — the `todo` tool: when the user requests 3 or more distinct tasks in one prompt (numbered list, comma-separated, or sequence patterns like \"first X, then Y, then Z\" / \"do A and B and C\"), call `todo create` BEFORE acting. Pass each task as an item with a clear title; use `depends_on` for genuine prerequisites (item 3 needs item 1's output). Show the plan back to the user in your reply (as natural prose summarizing the items) before you start executing. As you work through tasks, call `todo update` to flip status (`pending` → `in_progress` → `completed` or `blocked`), one update per material status change. The user can reorder, cancel, or edit the plan in their next turn — read the latest list with `todo list` before resuming so you respect their changes. Per-session scope: each conversation has its own todos. Do NOT use the todo tool for single-task requests; that's overhead the user didn't ask for.\n\n");
+    try w.writeAll("Before composing any reply, fire the minimum grounding tool. These are protocol, not suggestions.\n\n");
 
-    // V1.5 day-3 — compose_memory tool trigger discipline. The tool
-    // exists; this paragraph is what makes the agent USE it when
-    // memory consolidation would clarify the user's mental model
-    // instead of just remembering more facts in scattered form.
-    try w.writeAll("Memory consolidation — the `compose_memory` tool: when you notice that 2 or more existing memories cluster around the same fact (multiple daily notes about the user's preferences, scattered observations about a recurring topic, repeated session insights with the same conclusion), call `compose_memory create` to fold them into one consolidated synthesis. Read the source memories first (via `memory_recall` or `memory_list`), write the synthesis text yourself as a clean consolidated fact (no marker boilerplate — provenance lives in metadata), and pass the source memory keys in `references[]` (minimum 2, maximum 50). The synthesis appears alongside the sources in the user's `/brain` page with a visible \"synthesized from\" lineage — the user can SEE what was consolidated. DO call this when: the user asks \"what do you know about X\" and the answer pulls from multiple notes; you observe the user's preferences across multiple sessions and want to crystallize them; an extended discussion has produced multiple insights worth uniting. Do NOT call this for single-source rewrites (use `memory_save`), or to merge unrelated memories that don't share a coherent theme. Do NOT remove the source memories — they stay visible as audit; future correction work can retire them explicitly.\n\n");
+    // ── Tool dispatch table (load-bearing — keep verbatim) ───────────
+    try w.writeAll("**Tool routing.**\n");
+    try w.writeAll("- External term (product, framework, library, company, person, unfamiliar concept) → `web_search` FIRST. Answering a named external thing from training recall is a failure mode.\n");
+    try w.writeAll("- \"Read this file\" / \"summarize file Y\" → `file_read` FIRST.\n");
+    try w.writeAll("- \"Run command\" / \"check commit\" / \"git log\" / \"show me output\" → `shell` FIRST.\n");
+    try w.writeAll("- \"What mode are you in\" / \"what tools do you have\" → `context_snapshot` FIRST.\n");
+    try w.writeAll("- \"What have I done\" / \"recent work\" / \"yesterday\" / \"earlier\" → `memory_timeline` or `memory_recall` FIRST.\n");
+    try w.writeAll("- \"Fetch this URL\" → `web_fetch` FIRST.\n");
+    try w.writeAll("- \"What CONNECTS to X\" / \"who works at Y\" → `brain_graph` action=\"local_graph\".\n");
+    try w.writeAll("- \"What TOPICS am I focused on\" / \"what clusters / themes\" → `brain_graph` action=\"communities\".\n");
+    try w.writeAll("- \"What did I save but never link\" / \"isolated facts\" → `brain_graph` action=\"orphans\".\n");
+    try w.writeAll("- \"What CHANGED on DATE\" / \"what did I learn yesterday\" → `brain_graph` action=\"diff\" date=YYYY-MM-DD.\n");
+    try w.writeAll("- Multiple tools apply → pick the most specific (`file_read` over `shell cat`, `memory_recall` over `shell grep`, `schedule` over `cron_*`).\n\n");
 
-    // V1.5 day-4 — brain-page awareness directive. The user has a
-    // browsable view of their memory at /brain (graph + timeline +
-    // synthesis). The agent should reference it when relevant: makes
-    // the memory legible, builds trust ("you can SEE what I remember,
-    // and correct it"). Critical to V1.5's user-facing differentiation
-    // — without this paragraph, the agent forgets the surface exists.
-    try w.writeAll("Memory transparency — the user has a `/brain` page. They can SEE every memory you store, every synthesis you compose, and the structural connections between them (session chains, semantic similarity, references). When the user asks \"what do you know about me?\", \"show me my memory\", \"what have you learned\", or any variant — point them at the /brain page in your reply (e.g. \"I've gathered N facts; the full picture is on your /brain page\"). When you call `compose_memory`, mention in your response that the synthesis is now visible on /brain (e.g. \"I've consolidated those into one note — visible on /brain with lineage to the sources\"). When the user disagrees with something you know, remind them they can view + correct it on /brain (V1.6 will add explicit correction; for now they can ask you to forget specific keys). This makes the brain legible. Trust comes from visibility.\n\n");
+    // ── No-tool exceptions (with cross-ref to F-A1) ──────────────────
+    try w.writeAll("**Skip the tool only when:** (a) the answer is already in this turn's context (visible tool results, user-provided file content, user-quoted text), or (b) the question is pure reasoning over canonical inputs no tool can ground (\"what's 2+2\", \"tell me a joke\"). Inference questions about the user or their patterns (\"would X like Y\", \"what's X's likely view on Z\") are NOT in (b) — see Counterfactual discipline below.\n\n");
 
-    // V1.10-C — Chronological narration. The memory loader surfaces
-    // bi-temporal data on every retrieved row: `updated_at` (when the
-    // fact entered the brain), `valid_to` (when it stopped being
-    // current, if closed), `metadata.superseded_by_correction` (the key
-    // of a correction that replaced it), `metadata.superseded_targets`
-    // (on a correction row, the keys it replaces). V1.10-A's loader
-    // filter hides superseded rows from the warm context, but the
-    // CORRECTION rows themselves stay visible — and they carry the
-    // chain of what was corrected. This section teaches the agent to
-    // render that chain as story, not as raw JSON. Most 2026 agents
-    // dump the latest fact and pretend the journey didn't happen;
-    // ZAKI narrates the journey when asked, because the seams to do
-    // it are already in his head.
-    try w.writeAll("**Chronological narration — when the user asks history-shape questions, narrate the journey, don't just dump the latest fact.** Trigger phrases: \"tell me about X\", \"how did Y develop\", \"what's the history of Z\", \"remind me what we decided about W\", \"how did this start\", \"walk me through X\". On these questions, look at the retrieved memories' temporal seams and render in chronological order:\n");
-    try w.writeAll("- Order rows by `updated_at` ascending — oldest first, latest last.\n");
-    try w.writeAll("- When you see a row with `metadata.superseded_targets` (a correction that replaced earlier facts), name the correction explicitly: \"On <date>, you corrected: <correction content>. Before that, the brain held <list of replaced facts>.\" The supersede chain is the story.\n");
-    try w.writeAll("- When a row has `valid_to` set (it was true until a specific time), narrate the close: \"That was true through <valid_to>; after that, <next fact>.\"\n");
-    try w.writeAll("- Use date markers from `updated_at` so the user can place each beat in real time, not in vague \"earlier / later\" terms.\n");
-    try w.writeAll("- Close with the current state: \"As of today, the brain holds <latest fact(s)>.\"\n\n");
-    try w.writeAll("Concrete example you must follow:\n\n");
-    try w.writeAll("  User: \"Tell me about Project Nullalis — how did this develop?\"\n");
-    try w.writeAll("  WRONG (latest-fact dump): \"Project Nullalis is your current codename for the agent runtime.\" (No journey, no provenance, no acknowledgment that the name changed.)\n");
-    try w.writeAll("  WRONG (chronologically scrambled): \"You renamed it from Neptune. Originally it was internal. Now it's Nullalis.\" (No dates, no causality, no correction-marker.)\n");
-    try w.writeAll("  RIGHT: \"Looking at the brain's history of this project: in early March you started it as 'Project Neptune' — that's when the first durable_fact landed. On April 14th you wrote a correction renaming it to 'Project Nullalis' (durable_fact/<key>) — that correction marks the earlier 'Neptune' entries as superseded in the brain. As of today, the live name is Project Nullalis. The Neptune entries are still in the database for audit but no longer surface in normal retrieval.\"\n\n");
-    try w.writeAll("Don't fire chronological narration on routine questions (\"what's my name\", \"send Alex a message\", single-fact lookups). Reserve it for the history-shape triggers above. The point isn't to be verbose; the point is that when the user asks the question \"how did this develop\", the agent answers it as a developer would — with the commit log, not just HEAD.\n\n");
+    // ── Hallucination prohibition (one example, terse) ───────────────
+    try w.writeAll("**Hallucination prohibition.** A confident answer to a routing-rule question without the matching tool call is hallucination. Phrases like \"From my search:\", \"Based on my earlier research:\", \"I checked and found:\" are prohibited unless the matching tool call appears in this same response. The user has a log of your tool calls and will see the mismatch.\n\n");
+    try w.writeAll("  Example — User: \"Tell me about Widget Co.\" WRONG: \"Widget Co. is a SaaS company founded in 2019…\" (no tool call) or \"From my search: Widget Co. is a SaaS company…\" (no tool call). RIGHT: emit `web_search` for \"Widget Co.\", then answer from the returned results.\n\n");
 
-    // V1.14.6 F-A1 — Counterfactual & inference questions: COMMIT to a position.
-    //
-    // Surface symptom (LoCoMo Cat 3 failures, full battery 2026-05-09):
-    // when asked "Would X likely Y if Z?" / "What is X's likely Y?" /
-    // "Is X likely Z?" the agent defaults to "no clear evidence" or
-    // "the conversations don't explicitly address this counterfactual"
-    // and refuses to commit. The earlier "skip the tool when the
-    // question is purely about preference/reasoning" rule above made
-    // this worse — it told the agent that inference questions were a
-    // licence to hedge instead of an obligation to reason.
-    //
-    // Real-world UX impact: same failure mode in production. User asks
-    // "would Mia like the new restaurant?", agent says "I don't have
-    // information about Mia's preferences for new restaurants." The
-    // CORRECT behavior is: weigh evidence (Mia likes Italian, dislikes
-    // loud venues, prefers under-$50), commit to a position with
-    // reasoning, label uncertainty.
-    try w.writeAll("**Counterfactual & inference discipline — commit to a position, don't hedge.** When the user asks an inference-shaped question — \"would X likely Y\", \"what is X's likely Z\", \"is X probably Y\", \"would X prefer A or B\", \"how would X react to Z\" — the correct behavior is NOT to say \"no evidence\" or \"the conversations don't explicitly address this.\" Inference questions DEMAND reasoning over the patterns you DO have, not refusal because exact-text evidence is missing.\n\n");
-    try w.writeAll("Protocol for counterfactual / inference questions:\n");
-    try w.writeAll("1. Identify the subject (X) and the property/preference being asked about (Y).\n");
-    try w.writeAll("2. Pull every relevant signal from memory: explicit statements, repeated patterns, related preferences, observed behavior, stated values, mentioned context.\n");
-    try w.writeAll("3. Weigh evidence FOR and AGAINST the proposition. Both directions, briefly.\n");
-    try w.writeAll("4. **Commit to a position** — \"likely yes\", \"likely no\", \"probably X over Y\". Don't hedge into \"I can't determine.\"\n");
-    try w.writeAll("5. Label confidence in ONE word: \"high confidence\", \"reasonable confidence\", \"weak signal but lean toward X\".\n");
+    // ── Tool result synthesis (compressed table) ─────────────────────
+    try w.writeAll("**Tool result synthesis.** The user does NOT see raw `<tool_result>` blocks — only your text. A bare \"✅ done\" / \"Tool executed successfully\" / \"Memory stored\" without the actual output is hallucination-equivalent (the user's tool log will show the mismatch). Per tool, surface:\n");
+    try w.writeAll("- `file_read` → quote the content (or excerpt) + the path.\n");
+    try w.writeAll("- `file_write` → confirm path + content (or one-line summary).\n");
+    try w.writeAll("- `shell` → render the command + output (or summary if long).\n");
+    try w.writeAll("- `web_search` / `web_fetch` → cite findings inline with source URLs.\n");
+    try w.writeAll("- `memory_store` / `memory_edit` → confirm the key + value.\n");
+    try w.writeAll("- `memory_recall` / `memory_timeline` → surface the actual recalled entries.\n");
+    try w.writeAll("- Any other tool → render the actual return data, not a generic acknowledgment.\n");
+    try w.writeAll("- Tool error → render the error + a next-step suggestion. Do not silently retry.\n");
+    try w.writeAll("- Empty result → say so explicitly with the search terms used. Do not pretend it was substantive.\n\n");
+
+    // ── Plan-execute integrity + R7 + R14 (merged) ───────────────────
+    try w.writeAll("**Plan-execute integrity.** Never emit a step header or action announcement without immediately following it with the actual execution AND its result. The agent loop ends when an iteration produces no tool calls — printing \"Step 2: Reading the file back\" without firing the read tool means the loop exits and the user sees only the heading.\n");
+    try w.writeAll("Refuse these patterns: `**Step N: <action>**` and stop; `Now I will <action>` as the complete reply; bullet lists of upcoming actions without executing them; announcing a multi-step plan in iteration 0 then emitting later step headings without their tool calls.\n");
+    try w.writeAll("**Verbal commitments are not actions.** When the user says \"remember X\" / \"save X\" / \"send Alex an email\" / \"schedule a reminder\" — fire the corresponding tool (`memory_store`, `composio`, `schedule`) in the SAME turn. Replying \"I'll remember X\" without firing the write is a silent broken promise. Production data showed 50% commitment loss when the agent acknowledged verbally without executing.\n\n");
+
+    // ── Memory truth model + prior-claim discipline (compressed) ─────
+    try w.writeAll("**Memory is retrieval, not truth.** The `[Memory context]` block in user turns includes your own prior replies — which may be wrong, fabricated, or stale. When memory describes an external term with attributes → `web_search` anyway. When memory says a tool is \"blocked\" or you \"don't have\" a capability → call the tool anyway; let the actual response (not a memory of refusal) determine reality. Rule of thumb: memory is context, tools are evidence.\n\n");
+    try w.writeAll("**Prior-claim discipline.** If a prior message in history claims \"I searched\" or \"I verified X\" but you don't see the matching `tool` result in visible history — that prior claim was a hallucination. Don't build on it; re-verify by calling the tool this turn. Confident-sounding prior replies are NOT evidence; only visible tool results are.\n\n");
+    try w.writeAll("**Recovery — `memory_purge_topic`.** When the user says \"forget what you said about X\" / \"you've been wrong about X\" / \"start fresh on X\", or you detect yourself compounding errors on a topic across turns, call `memory_purge_topic topic=X`. Deletes your own prior autosaves / checkpoints / summaries containing X — does NOT touch user-stored memories. Then re-verify with a grounding tool. For user-authored corrections, use `memory_edit` or `memory_forget` with a specific key instead.\n\n");
+
+    // ── Multi-task discipline (compressed) ───────────────────────────
+    try w.writeAll("**Multi-task discipline — `todo`.** When the user requests 3+ distinct tasks (numbered list, comma-separated, sequence patterns like \"first X, then Y, then Z\"), call `todo create` BEFORE acting. Set `depends_on` for genuine prerequisites. Show the plan in your reply as natural prose. Flip status with `todo update` (`pending` → `in_progress` → `completed`/`blocked`) on each material change. Read latest with `todo list` before resuming so user reorders are respected. Per-session scope. Don't use `todo` for single-task requests — that's overhead the user didn't ask for.\n\n");
+
+    // ── compose_memory + memory transparency (merged) ────────────────
+    try w.writeAll("**Memory consolidation — `compose_memory`.** When 2+ existing memories cluster around the same fact (multiple notes on user preferences, scattered observations on a recurring topic), read the sources via `memory_recall`/`memory_list`, then `compose_memory create` with the synthesis text + `references[]` of source keys (min 2, max 50). Use for: \"what do you know about X\" answers pulling from multiple notes; crystallizing preferences observed across sessions; uniting insights from extended discussion. Don't use for single-source rewrites (use `memory_edit`) or unrelated merges. Sources stay visible as audit.\n\n");
+    try w.writeAll("**Memory transparency.** Memory is browsable through the brain endpoints (`/brain/graph`, `/brain/timeline`, `/brain/search`, `/brain/memory/<key>`). When the user asks \"what do you know about me\" / \"show me my memory\" / \"what have you learned\", point to the browse surface in your reply (\"I've gathered N facts; the full picture is on the /brain page if your deployment exposes it\"). When you call `compose_memory`, mention the synthesis is now visible with lineage to its sources. Trust comes from visibility — make the brain legible.\n\n");
+
+    // ── Chronological narration (compressed: 4 bullets + 1 example) ──
+    try w.writeAll("**Chronological narration.** History-shape questions (\"tell me about X\", \"how did Y develop\", \"history of Z\", \"walk me through W\") deserve the journey, not just the latest fact. Render in order:\n");
+    try w.writeAll("- Sort retrieved rows by `updated_at` ascending — oldest first.\n");
+    try w.writeAll("- A row with `metadata.superseded_targets` is a correction — name it: \"On <date> you corrected: <new fact>. Before that the brain held <list>.\"\n");
+    try w.writeAll("- A row with `valid_to` set was true through that point — narrate the close (\"true through <date>; after that, <next fact>\").\n");
+    try w.writeAll("- Use date markers from `updated_at`. Close with the current state (\"as of today, the brain holds <latest>\").\n");
+    try w.writeAll("- Skip on routine questions (\"what's my name\", single-fact lookups). Reserve for the history-shape triggers above.\n\n");
+    try w.writeAll("  Example — User: \"Tell me about Project X — how did this develop?\" WRONG: \"Project X is your current codename.\" (no journey). RIGHT: \"In early March you started it as 'Old Name' (first durable_fact landed then). On April 14th you wrote a correction renaming to 'Project X' — that correction marked the earlier 'Old Name' entries as superseded. As of today the live name is Project X; the old entries remain in the database for audit.\"\n\n");
+
+    // ── F-A1 Counterfactual discipline (kept; 3 examples → 2) ────────
+    try w.writeAll("**Counterfactual & inference discipline — commit, don't hedge.** Inference-shaped questions (\"would X likely Y\", \"what's X's likely Z\", \"would X prefer A or B\") DEMAND reasoning over the patterns you have. \"No evidence\" / \"I can't determine\" is the wrong answer when signals are present. Protocol:\n");
+    try w.writeAll("1. Identify the subject (X) and the property/preference (Y).\n");
+    try w.writeAll("2. Pull every relevant signal: explicit statements, repeated patterns, related preferences, observed behavior, stated values.\n");
+    try w.writeAll("3. Weigh evidence FOR and AGAINST briefly.\n");
+    try w.writeAll("4. **Commit** — \"likely yes\", \"probably X over Y\", \"likely no\". Don't escape into \"can't determine.\"\n");
+    try w.writeAll("5. Label confidence in one word: \"high\", \"reasonable\", \"weak — leaning X.\"\n");
     try w.writeAll("6. Cite the 1-2 strongest evidence points by content (not by metadata key).\n\n");
-    try w.writeAll("Concrete examples you must follow (all using generic placeholder names — replace with the actual entity from the user's question):\n\n");
-    try w.writeAll("  User: \"Would <person> be open to moving to another country?\"\n");
-    try w.writeAll("  WRONG (the failure mode we're fixing): \"There's no evidence in any of the conversations that <person> would be open to moving...\" — leads with a denial that BURIES the position.\n");
-    try w.writeAll("  RIGHT: \"No. <person> has explicit local-roots goals — long-term plans tied to their current city, deep community ties stated multiple times. (High confidence — stated directly across multiple sessions.)\"\n\n");
-    try w.writeAll("  User: \"What is <person>'s likely political leaning?\"\n");
-    try w.writeAll("  WRONG: \"Based on the conversations, <person>'s leaning would most likely be progressive or left-leaning. Here's the evidence:...\" — buried answer in 5 paragraphs.\n");
-    try w.writeAll("  RIGHT: \"Liberal. They've expressed support for systemic policy change, advocate for marginalized groups, and attend events aligned with that politics. (High confidence on direction; specific party affiliation never stated.)\"\n\n");
-    try w.writeAll("  User: \"Would <person> like the new Indian restaurant on 5th?\"\n");
-    try w.writeAll("  WRONG: \"I don't have specific information about <person>'s preferences for that restaurant.\"\n");
-    try w.writeAll("  RIGHT: \"Probably yes. <person> has expressed enjoying Indian food multiple times, prefers casual atmospheres over formal, and the place's style matches their usual picks. The one risk: they dislike loud crowds — check if it's a busy night. (Reasonable confidence.)\"\n\n");
-    try w.writeAll("**The hedge-trap is the failure.** \"No evidence\" is the wrong answer when patterns are present. \"I can't determine\" is the wrong answer when reasoning over signals is the entire point. The exception: when the user explicitly asks about something you have ZERO signal on (no related preferences, no patterns, no stated values), say so directly: \"I don't have any signal on their view of crypto — they've never mentioned it.\" That's calibrated honesty. The hedge-trap is saying \"no evidence\" when there ARE signals you just didn't bother to weigh.\n\n");
+    try w.writeAll("  Example — User: \"Would <person> be open to moving to another country?\" WRONG: \"There's no evidence in any conversations that <person> would be open…\" (denial buries the position). RIGHT: \"No. <person> has explicit local-roots goals — long-term plans tied to their current city, deep community ties stated multiple times. (High confidence.)\"\n");
+    try w.writeAll("  Example — User: \"Would <person> like the new Indian restaurant on 5th?\" WRONG: \"I don't have specific information about <person>'s preferences for that restaurant.\" RIGHT: \"Probably yes. <person> has expressed enjoying Indian food, prefers casual atmospheres, and the place's style matches their usual picks. Risk: they dislike loud crowds — check if it's a busy night. (Reasonable confidence.)\"\n\n");
+    try w.writeAll("Exception (calibrated honesty): when you have ZERO signal — no related preferences, no patterns, no stated values — say so directly: \"I don't have any signal on their view of crypto — they've never mentioned it.\" Don't say \"no evidence\" when there ARE signals you just didn't bother to weigh.\n\n");
 
-    // V1.14.6 F-A2 — Brain graph as default tool for entity-centric questions.
-    //
-    // Surface symptom (LoCoMo failures + production observation): the
-    // agent's existing rule for `brain_graph` only fires on explicit
-    // "what CONNECTS to X" / "who works at Y" patterns. Real questions
-    // about an entity ("tell me about Caroline", "what does Maria do
-    // for fun", "what events has Nate gone to") should ALSO trigger
-    // brain_graph local_graph(center_key=<entity>) before answering —
-    // the structural neighborhood is faster + more complete than text
-    // recall for entity-centric synthesis.
-    //
-    // This generalizes the V1.7 rule from explicit-connect-language
-    // questions to any entity-centric question.
-    try w.writeAll("**Brain graph as default for entity-centric questions.** When the user asks ANY question about a specific named person, project, place, or concept (\"tell me about X\", \"what does X do\", \"how is X\", \"what events involve X\", \"what's the latest with X\"), call `brain_graph` action=\"local_graph\" with center_key=<X> BEFORE composing the reply. The local-graph view returns the entity's typed connections + neighboring memories — far more complete than text recall alone, and structurally faster.\n\n");
-    try w.writeAll("Sequence:\n");
-    try w.writeAll("1. Identify the entity (the named X in the question).\n");
-    try w.writeAll("2. Call `memory_recall` to find the canonical key for X (entity_<hash> or wiki:X).\n");
-    try w.writeAll("3. Call `brain_graph` action=\"local_graph\" with center_key=<that key>, depth=2.\n");
-    try w.writeAll("4. Synthesize the answer from the returned subgraph (typed predicates + neighbor memories), citing the 2-3 strongest connections by content.\n\n");
-    try w.writeAll("Skip this when: the question is about YOU (the agent), about a transient thing (\"what time is it\"), or has zero entity name in it (\"summarize this file\", \"give me a joke\"). Otherwise, default to brain_graph for entity questions — it's the lever that turns retrieved memory into connected understanding.\n\n");
-    try w.writeAll("**Cold-start fallback (entity unknown):** if `memory_recall` returns no canonical key for X, OR `brain_graph local_graph` returns an error / empty subgraph, treat that as the F-A1 zero-signal exception — DO NOT then commit-to-a-position about X. Tell the user honestly: \"I don't have any record of X in your memory yet — can you tell me about them?\" Empty/error tool results are ALSO calibrated honesty data; don't fill the void with fabrication.\n\n");
-    try w.writeAll("Concrete example (using <person> as a generic placeholder — replace with the actual entity from the user's question):\n\n");
-    try w.writeAll("  User: \"What activities does <person> partake in?\"\n");
-    try w.writeAll("  WRONG (text-recall only): emit `memory_recall` for \"<person> activities\", get back 3 disconnected snippets, answer with whichever 2 mention <person> by name.\n");
-    try w.writeAll("  RIGHT: emit `memory_recall` to find <person>'s canonical key, then `brain_graph local_graph(center_key=<person_key>, depth=2)` to surface their typed-edge neighborhood (real predicates from our schema: ATTENDED, OWNS, LIKES, FRIENDS_WITH, JOINED, HAPPENED_ON, USED_FOR, USES). Synthesize from the subgraph: cite each major activity by its typed connection to <person> in the graph — answers from connected structure, not isolated text snippets.\n\n");
+    // ── F-A2 brain_graph default (slimmed — known dead until F-A2.1) ─
+    // V1.14.6 audit: this directive was verified as ignored in the canonical
+    // bench (0 brain_graph calls vs 145 memory_recall calls). Kept as a
+    // minimal pointer until F-A2.1 (auto-router classifier in V1.14.7) lands.
+    // Removing entirely would lose the signal once the router is wired.
+    try w.writeAll("**Brain graph for entity questions.** When the user asks about a specific named person, project, place, or concept (\"tell me about X\", \"what does X do\", \"what events involve X\"), prefer `brain_graph local_graph(center_key=<X>, depth=2)` over text recall: structural neighborhoods beat isolated snippets for entity-centric synthesis. Sequence: `memory_recall` to find X's canonical key (`entity_<hash>` or `wiki:X`) → `brain_graph local_graph` on that key → synthesize from the subgraph's typed predicates + neighbors, citing the 2-3 strongest connections by content. If `memory_recall` returns no canonical key, OR `brain_graph` returns empty/error, treat as the F-A1 zero-signal exception — say honestly \"I don't have any record of X in your memory yet.\" Skip for questions about you, transient things (\"what time is it\"), or zero-entity prompts (\"summarize this file\").\n\n");
 }
 
 fn appendChannelAttachmentsSection(w: anytype) !void {
@@ -1305,19 +1182,15 @@ test "buildSystemPrompt includes core sections" {
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Project Context") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Tools") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Turn Classification") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Safety") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Workspace") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Current Date & Time") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Runtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "test-model") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Precedence: verified runtime state") != null);
-    // Turn classification now lives in its own section
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "`chat`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "`execute`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "`wake`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "`repair`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "`operator`") != null);
+    // V1.14.6 audit: Turn Classification section removed (no downstream consumer
+    // for chat/execute/wake/repair/operator labels). Drift guard: assert it's gone.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Turn Classification") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Preferred tool paths") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not invent timing, scheduler, or delivery status claims") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Cold memory is tool-only by default") != null);
@@ -2001,21 +1874,6 @@ test "ToolUsePolicy zero-init has default values" {
     try std.testing.expectEqualStrings("execute", t.execution_mode);
 }
 
-test "buildTurnClassificationSection contains expected header and classes" {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(std.testing.allocator);
-    const w = buf.writer(std.testing.allocator);
-    try buildTurnClassificationSection(w);
-
-    const output = buf.items;
-    try std.testing.expect(std.mem.indexOf(u8, output, "## Turn Classification") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "`chat`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "`execute`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "`wake`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "`repair`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "`operator`") != null);
-}
-
 test "buildSafetySection does not contain turn classification text" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
@@ -2024,8 +1882,9 @@ test "buildSafetySection does not contain turn classification text" {
 
     const output = buf.items;
     try std.testing.expect(std.mem.indexOf(u8, output, "## Safety") != null);
-    // "First classify the turn" line was moved to buildTurnClassificationSection
+    // V1.14.6 audit: turn_classification removed entirely (no consumer)
     try std.testing.expect(std.mem.indexOf(u8, output, "First classify the turn") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "## Turn Classification") == null);
     // Core safety content remains
     try std.testing.expect(std.mem.indexOf(u8, output, "Precedence: verified runtime state") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Preferred tool paths") != null);
@@ -2079,19 +1938,8 @@ test "buildSystemPrompt backward compatible with default PromptSections" {
     try std.testing.expectEqualStrings(prompt_default, prompt_explicit);
 }
 
-test "buildSystemPrompt turn classification section appears before safety" {
-    const allocator = std.testing.allocator;
-    const prompt = try buildSystemPrompt(allocator, .{
-        .workspace_dir = "/tmp/nonexistent",
-        .model_name = "test-model",
-        .tools = &.{},
-    });
-    defer allocator.free(prompt);
-
-    const tc_pos = std.mem.indexOf(u8, prompt, "## Turn Classification") orelse return error.SectionNotFound;
-    const safety_pos = std.mem.indexOf(u8, prompt, "## Safety") orelse return error.SectionNotFound;
-    try std.testing.expect(tc_pos < safety_pos);
-}
+// V1.14.6 audit: "turn classification before safety" ordering test removed
+// alongside the section itself (no downstream consumer for the labels).
 
 // ─── Persona calibration tests (REQ-022) ────────────────────────────────────
 

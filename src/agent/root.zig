@@ -4018,10 +4018,16 @@ pub const Agent = struct {
                         // entirely — a worse regression than the
                         // silent-mutation bug we were fixing. Log on
                         // failure (Sprint 4 policy) and continue.
-                        const nudge_content = self.allocator.dupe(u8, "SYSTEM: Review the recent conversation. If any user preferences, " ++
-                            "important decisions, or reusable procedures should be remembered " ++
-                            "long-term, save them now using the memory tool. Only save what " ++
-                            "has lasting relevance beyond this session.") catch |err| blk: {
+                        // V1.14.6 audit: tightened from a permissive "review and save" prompt
+                        // into a hard filter — the previous wording ("important decisions") was
+                        // interpreted broadly and produced low-value writes in heavy sessions.
+                        // Memory hygiene: name the keep-list AND the skip-list explicitly.
+                        const nudge_content = self.allocator.dupe(u8, "SYSTEM: Save NOW only durable user facts via `memory_store` — " ++
+                            "stable preferences, named decisions, cross-session truths, " ++
+                            "concrete commitments. SKIP: transient turn details, " ++
+                            "restatements of visible workspace docs, anything you can re-derive, " ++
+                            "or one-off observations. If nothing meets the bar this turn, " ++
+                            "store nothing — silence is a valid response.") catch |err| blk: {
                             log.warn("post_turn_memory_nudge.dupe_failed err={s}", .{@errorName(err)});
                             break :blk null;
                         };
@@ -4130,11 +4136,18 @@ pub const Agent = struct {
                     // **D1.11 self-review fix** — same rationale as the
                     // memory_nudge block above: never let an append
                     // failure here skip turn_complete.
-                    const skills_content = self.allocator.dupe(u8, "SYSTEM: You just completed a multi-step task with multiple tool " ++
-                        "calls. If this procedure could be useful in the future, consider " ++
-                        "saving it as a reusable skill file (SKILL.md) in the workspace. " ++
-                        "Only do this if the procedure is genuinely reusable — not for " ++
-                        "one-off tasks.") catch |err| blk: {
+                    // V1.14.6 audit: tightened to bias against creating low-value SKILL.md
+                    // files. Same shape as the memory_nudge above — name the keep-list
+                    // (genuinely repeatable procedures with a stable trigger), name the
+                    // skip-list (one-off explorations, debug sessions, ad-hoc research),
+                    // and explicitly authorize "store nothing this turn".
+                    const skills_content = self.allocator.dupe(u8, "SYSTEM: You just used 5+ tools in one turn. " ++
+                        "If this procedure has a stable trigger AND will repeat across tasks " ++
+                        "(deploy flow, release ritual, debug pattern, refactor loop), " ++
+                        "save as `SKILL.md` in the workspace with the trigger documented. " ++
+                        "SKIP: one-off exploration, debug session, ad-hoc research, " ++
+                        "or anything you'd never invoke again the same way. " ++
+                        "If nothing meets the bar this turn, store nothing.") catch |err| blk: {
                         log.warn("post_turn_skills_extraction.dupe_failed err={s}", .{@errorName(err)});
                         break :blk null;
                     };
