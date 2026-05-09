@@ -156,3 +156,100 @@ zaki-prod/.../i18n/locales/ar.json   | 10 ~~ — Arabic translations
 ```
 
 Verdict: **SHIP.**
+
+---
+
+## F-1 closure review (2026-05-09)
+
+Commit `beb87ad` — `fix(subagent): F-1 — close standalone CLI subagent "received" bug`. Single-file change: +45 lines in `src/main.zig`. Adds `cliSubagentCompletionDelivery` free function + two `attachCompletionDelivery` calls at the standalone-CLI dispatch sites.
+
+### Checklist verification
+
+| # | Claim | Result |
+|---|---|---|
+| 1 | Signature matches `CompletionDeliveryFn` | **OK.** `(_: ?*anyopaque, []const u8, []const u8) anyerror!void` matches `subagent.zig:88-92` exactly. `attachCompletionDelivery` accepts `?*anyopaque = null` (`subagent.zig:198-207`). |
+| 2 | stderr is the right surface | **OK.** `std.debug.print` writes to stderr; CLI stdout is reserved for the agent's reply text. Mixing subagent fallbacks into stdout would corrupt user-visible reply. |
+| 3 | Allocation / lifetime | **OK.** `subagent.zig:684-689` does `defer self.allocator.free(content)` and calls delivery synchronously inside that scope. The callback only reads + prints. No retention, no UAF risk. |
+| 4 | Format-string safety | **OK.** Zig `std.fmt` is comptime/value-based, not C-style. Runtime content cannot inject format specifiers via `{s}`. |
+| 5 | Concurrency | **OK.** `std.debug.print` (Zig 0.15.2 `lib/std/debug.zig:227`) wraps the format with `lockStderrWriter`/`unlockStderrWriter` — atomic per call. No other contended stderr writers in the CLI hot path that would interleave inside a single delivery call. |
+| 6 | "Errors are non-fatal" | **OK.** Body has no `try`; `std.debug.print` swallows write errors (the inner `nosuspend bw.print(...) catch return;`). Returning `!void` is just contract conformance. |
+| 7 | Both call sites attach properly | **OK.** `main.zig:2796/2802` (runSignalChannel) and `main.zig:3124/3129` (runTelegramChannel) both attach immediately after `defer subagent_manager.deinit()` and well before the agent loop starts. No subagent could have dispatched yet — race-free. |
+| 8 | Gateway standalone path untouched | **OK.** `gateway.zig:18562` already wires `appendSubagentCompletionToGatewaySession` with router context. Independent shape; commit correctly does not touch it. |
+| 9 | "No unit-test surface" | **PARTIALLY HONEST** — see HI-04 below. |
+
+### New findings
+
+#### HIGH HI-03 — Third standalone-CLI SubagentManager site missed (`agent/cli.zig:130`)
+
+**Severity:** High. Same class of bug as F-1 was supposed to close.
+
+`grep "SubagentManager.init" src/` reveals a third user-facing CLI dispatch site this commit did not address:
+
+```
+src/agent/cli.zig:130:    var subagent_manager = subagent_mod.SubagentManager.init(allocator, &cfg, null, .{});
+```
+
+This is the `nullalis agent` subcommand path (dispatched from `main.zig:422` → `yc.agent.run`). It:
+1. Creates `SubagentManager` with `bus = null` — same shape as the two sites this commit fixes.
+2. Passes `&subagent_manager` into the tool set at `agent/cli.zig:146`, so delegate/subagent tool calls *will* dispatch real async subagents.
+3. Has **no** `attachCompletionDelivery` call.
+
+When a subagent completes from this entry point, it lands in `subagent.zig:709` `path=none` and gets discarded — the exact bug F-1 claims to close for "CLI users." `nullalis agent` is part of the CLI surface; the closure is incomplete.
+
+**Fix (trivial — same pattern):**
+
+```zig
+// src/agent/cli.zig, line 131:
+var subagent_manager = subagent_mod.SubagentManager.init(allocator, &cfg, null, .{});
+defer subagent_manager.deinit();
+// V1.14.4 review F-1 — wire CLI completion delivery (same as main.zig
+// runSignalChannel/runTelegramChannel sites). Otherwise async subagent
+// results vanish into subagent.zig:709 path=none.
+subagent_manager.attachCompletionDelivery(null, cliSubagentCompletionDelivery);
+```
+
+This requires either:
+- Hoisting `cliSubagentCompletionDelivery` into a shared module (e.g., `src/subagent.zig` exports a `defaultStderrDelivery`, or a new `src/agent/cli_delivery.zig`), or
+- Defining a local twin in `agent/cli.zig` (mild duplication, but cheap and self-contained).
+
+The commit message phrase "Code review SHIP-with-fixes is now fully closed end-to-end" is overstated until this third site is wired.
+
+#### MEDIUM MD-05 — F-1 follow-up entry not removed from "Open follow-ups" table
+
+The "Open follow-ups" table at line 125 still lists F-1 as open (`Medium`, ReleaseFast standalone CLI loses results). With this commit, the table should be updated to mark F-1 as closed (or moved to a "Closed in V1.14.5" subsection) — and HI-03 above added if my finding holds.
+
+#### LOW LO-05 — Format string spacing
+
+The format string is `"\n[subagent → {s}]\n{s}\n\n"`. Two trailing newlines + leading newline = three blank-line separations bracketing the content. In a TTY this is fine; for piped/captured stderr (e.g., `nullalis run 2> log`) it produces extra whitespace in logs. Cosmetic; not blocking.
+
+### Honest pushback on commit-message claims
+
+1. **"Closes V1.14.4 review F-1 ... fully closed end-to-end."** — *Overstated.* HI-03 above shows the third CLI dispatch site (`agent/cli.zig:130`) is structurally identical and unwired. F-1's framing in the original review specifically said "main.zig:2760 + 3083 standalone CLI subagent dispatch sites" — narrowly read, those two are closed. But the *bug class* (CLI bus=null + no delivery → discard) still has one live site.
+
+2. **"No unit-test surface."** — *Partially honest.* True that exercising the *production* CLI flow needs a live subagent run. But the existing test infrastructure (`subagent.zig:1320` `RecordingCompletionDelivery`) shows the delivery callback contract is unit-testable. A test that:
+   - constructs a `SubagentManager` with `bus=null`
+   - attaches `cliSubagentCompletionDelivery`
+   - dispatches a synthetic completion
+   - asserts no `path=none` log fires
+   ...would lock the wiring contract. Not blocking, but the "no surface" claim sells the test surface short. Recommend adding a follow-up test alongside the HI-03 fix.
+
+3. **stderr-only delivery is a real UX choice, not a workaround.** The doc-comment rationale (parent turn loop has typically returned; CLI lacks gateway session-pin) is correct. Accept the design.
+
+### Verdict
+
+**SHIP-WITH-FIXES.**
+
+The two sites this commit targets are correctly wired and the callback is sound. But HI-03 means the bug class F-1 was meant to close still has a live third site (`nullalis agent` subcommand). One additional 3-line wire-up (with a shared or duplicated callback) closes the class properly. Until then, F-1 should remain on the V1.14.5 follow-up list with scope amended.
+
+If this commit ships as-is for booth without the third site, that is acceptable *only* because:
+- The `nullalis agent` path is rarely hit on the booth demo (gateway tenant is the demo surface, per the original review).
+- The debug-build stderr fallback at `subagent.zig:748-753` still fires for `agent/cli.zig` users in dev/test builds.
+
+But the commit message should not claim "fully closed end-to-end" while the third site is open.
+
+**Recommended actions before next commit:**
+1. Wire `agent/cli.zig:130` with the same callback (HI-03). Hoist `cliSubagentCompletionDelivery` to a shared location to avoid duplication.
+2. Update this doc's "Open follow-ups" table: mark F-1 closed; add F-1b/HI-03 if the third site isn't wired in the same push.
+3. (Optional, recommended) Add a `RecordingCompletionDelivery`-style test that exercises the attach + dispatch contract for `bus=null + delivery_attached` to lock the wiring against future regression.
+
+Reviewed: 2026-05-08 (commit `beb87ad`, branch `main`).
