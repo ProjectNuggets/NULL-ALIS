@@ -159,6 +159,37 @@ pub const SchedulerConfig = struct {
     max_concurrent: u32 = 4,
 };
 
+/// V1.14.7 — extraction trigger gates.
+///
+/// Per-turn extraction (legacy V1.12-V1.14.6) is being deprecated in favor of
+/// extraction-at-distillation (compaction + session-end + agent-explicit
+/// memory_store). Reference agents (Claude Code, Hermes, Mem0, Letta) do NOT
+/// extract per turn — they extract at natural distillation moments. Per-turn
+/// extraction is unique to nullalis and produced 100-150s session-load turns
+/// in the V1.14.6 bench because each session-load became a tool-loop.
+///
+/// V1.14.7 ships in three commits:
+///   C1: Add these gates with defaults true (zero behavior change).
+///   C2: Wire structured extraction into compaction Pass A/C + persistSessionCheckpoint.
+///   C3: Flip defaults to false and delete the per-turn enqueue + nudge sites.
+///
+/// Operators can flip a gate to disable a legacy trigger without rebuilding.
+pub const ExtractionConfig = struct {
+    /// V1.12 every-3-turn entity_pipeline enqueue. When false, no
+    /// per-turn wiki_link extraction job is enqueued. Extraction still
+    /// happens at compaction (C2) and session-end.
+    per_turn_enqueue_enabled: bool = true,
+    /// Every-10-turn memory_nudge that injects a SYSTEM message asking
+    /// the agent to evaluate what to memory_store. When false, no nudge
+    /// is injected; the agent's organic memory_store calls + the system
+    /// prompt's R14 verbal-commitment rule cover the durable-write path.
+    memory_nudge_enabled: bool = true,
+    /// After-≥5-tool-calls skills_extraction nudge that asks the agent
+    /// to consider saving a SKILL.md. When false, no nudge is injected;
+    /// the user can ask explicitly when they want the procedure saved.
+    skills_nudge_enabled: bool = true,
+};
+
 pub const AssistantModePresetAgentConfig = struct {
     compact_context: bool = true,
     max_history_messages: u32,
@@ -386,6 +417,10 @@ pub const AgentConfig = struct {
     tts_limit_chars: u32 = 0,
     tts_summary: bool = false,
     tts_audio: bool = false,
+    /// V1.14.7 — extraction trigger gates. See ExtractionConfig docs for
+    /// the migration plan. Defaults preserve V1.14.6 per-turn behavior;
+    /// C3 will flip defaults to disabled.
+    extraction: ExtractionConfig = .{},
 };
 
 pub const ToolsConfig = struct {

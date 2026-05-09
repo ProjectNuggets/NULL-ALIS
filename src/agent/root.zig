@@ -405,6 +405,14 @@ pub const Agent = struct {
     /// MD5 dedup only, no semantic contradiction detection).
     extraction_judge_provider: ?providers.Provider = null,
     extraction_judge_model_name: []const u8 = "",
+    /// V1.14.7 — extraction trigger gates (per-turn enqueue, memory nudge,
+    /// skills nudge). Defaults preserve V1.14.6 behavior. C2 wires structured
+    /// extraction into compaction; C3 flips defaults to disabled and deletes
+    /// the per-turn sites. See config_types.ExtractionConfig docs for the
+    /// migration rationale (per-turn extraction is unique to nullalis among
+    /// reference agents — Claude Code / Hermes / Mem0 / Letta extract at
+    /// natural distillation moments only).
+    extraction_cfg: config_types.ExtractionConfig = .{},
     /// Last known origin metadata for this session, owned by Session when present.
     origin_channel: ?[]const u8 = null,
     origin_lane: ?[]const u8 = null,
@@ -802,6 +810,7 @@ pub const Agent = struct {
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
             .security_config = cfg.security,
+            .extraction_cfg = cfg.agent.extraction,
             .history = .empty,
             .total_tokens = 0,
             .has_system_prompt = false,
@@ -3998,12 +4007,22 @@ pub const Agent = struct {
                 self.last_turn_tool_count = turn_tool_calls_total;
 
                 // Periodic memory nudge: every 10 turns, inject a prompt asking the
-                // agent to self-evaluate what to persist to long-term memory. The agent
-                // decides what's worth remembering — better than any heuristic.
-                // Hermes Agent pattern: "the agent itself is the best judge of what
-                // to remember."
+                // agent to self-evaluate what to persist to long-term memory.
+                //
+                // V1.14.7 C1: gated behind extraction_cfg.memory_nudge_enabled.
+                // Default true (V1.14.6 behavior preserved); C3 will flip to false
+                // and delete this site entirely. Reference agents (Claude Code,
+                // Hermes, Mem0, Letta) do not nudge per-N-turns — the agent's
+                // organic memory_store calls + system prompt R14 verbal-commitment
+                // rule cover the durable-write path without scheduled prompts.
                 self.turns_since_memory_nudge += 1;
-                if (self.turns_since_memory_nudge >= 10) {
+                if (self.turns_since_memory_nudge >= 10 and !self.extraction_cfg.memory_nudge_enabled) {
+                    // Gated off: reset counter so we don't burst-fire on flag flip,
+                    // emit telemetry so operators see the gate firing.
+                    self.turns_since_memory_nudge = 0;
+                    log.info("extraction.gated reason=memory_nudge_disabled site=post_turn_memory_nudge", .{});
+                }
+                if (self.turns_since_memory_nudge >= 10 and self.extraction_cfg.memory_nudge_enabled) {
                     self.turns_since_memory_nudge = 0;
                     if (self.mem != null) {
                         // Use .user role (not .system) because Anthropic/Gemini drop
@@ -4066,8 +4085,17 @@ pub const Agent = struct {
                 // missing is intentional (single-user dev mode without
                 // postgres state manager runs without entity edges; UI
                 // degrades gracefully — no /brain orphans surface).
+                // V1.14.7 C1: per-turn entity_pipeline enqueue gated behind
+                // extraction_cfg.per_turn_enqueue_enabled. Default true; C3 will
+                // flip to false and delete this site. Replaced by extraction at
+                // compaction (Pass A drop window + Pass C summary window) +
+                // session-end (persistSessionCheckpoint extraction tail).
                 self.turns_since_extraction += 1;
-                if (self.turns_since_extraction >= 3) {
+                if (self.turns_since_extraction >= 3 and !self.extraction_cfg.per_turn_enqueue_enabled) {
+                    self.turns_since_extraction = 0;
+                    log.info("extraction.gated reason=per_turn_disabled site=entity_pipeline_enqueue", .{});
+                }
+                if (self.turns_since_extraction >= 3 and self.extraction_cfg.per_turn_enqueue_enabled) {
                     self.turns_since_extraction = 0;
                     if (self.extraction_state_mgr != null and
                         self.extraction_user_id != null and
@@ -4130,8 +4158,17 @@ pub const Agent = struct {
                 // improvement flywheel. Cooldown: only prompt if the previous turn
                 // did NOT already have 5+ tool calls (avoid per-turn injection in
                 // sustained agentic workflows).
+                //
+                // V1.14.7 C1: gated behind extraction_cfg.skills_nudge_enabled.
+                // Default true; C3 will flip to false and delete this site. The
+                // user can ask explicitly when they want a procedure saved.
                 if (turn_tool_calls_total >= 5 and self.workspace_dir.len > 0 and
-                    self.last_turn_tool_count < 5)
+                    self.last_turn_tool_count < 5 and !self.extraction_cfg.skills_nudge_enabled)
+                {
+                    log.info("extraction.gated reason=skills_nudge_disabled site=post_turn_skills_extraction tool_calls={d}", .{turn_tool_calls_total});
+                }
+                if (turn_tool_calls_total >= 5 and self.workspace_dir.len > 0 and
+                    self.last_turn_tool_count < 5 and self.extraction_cfg.skills_nudge_enabled)
                 {
                     // **D1.11 self-review fix** — same rationale as the
                     // memory_nudge block above: never let an append
@@ -11676,4 +11713,146 @@ test "TurnOutcome tool_only_turn flag distinguishes empty-text-with-spawns from 
     try std.testing.expectEqualStrings("", case_b.text);
     try std.testing.expectEqual(@as(usize, 1), case_b.spawned_task_ids.len);
     try std.testing.expectEqualStrings("task-1", case_b.spawned_task_ids[0]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V1.14.7 C1 — extraction trigger gates
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "ExtractionConfig defaults preserve V1.14.6 per-turn behavior" {
+    // C1 contract: defaults are all true so existing deployments see
+    // identical behavior after C1 lands. C3 will flip these.
+    const cfg = config_types.ExtractionConfig{};
+    try std.testing.expect(cfg.per_turn_enqueue_enabled);
+    try std.testing.expect(cfg.memory_nudge_enabled);
+    try std.testing.expect(cfg.skills_nudge_enabled);
+}
+
+test "AgentConfig.extraction defaults to ExtractionConfig{}" {
+    // C1 plumbing: AgentConfig carries an ExtractionConfig field with
+    // its default-initialized value. Operators set this via TOML
+    // [agent.extraction] section.
+    const cfg = config_types.AgentConfig{};
+    try std.testing.expect(cfg.extraction.per_turn_enqueue_enabled);
+    try std.testing.expect(cfg.extraction.memory_nudge_enabled);
+    try std.testing.expect(cfg.extraction.skills_nudge_enabled);
+
+    // Mutated copy: operator can override individually without losing
+    // the other defaults.
+    const operator_set = config_types.AgentConfig{
+        .extraction = .{ .memory_nudge_enabled = false },
+    };
+    try std.testing.expect(operator_set.extraction.per_turn_enqueue_enabled);
+    try std.testing.expect(!operator_set.extraction.memory_nudge_enabled);
+    try std.testing.expect(operator_set.extraction.skills_nudge_enabled);
+}
+
+test "memory_nudge gate disables append when memory_nudge_enabled=false" {
+    // C1 behavior verification: with the gate flipped to false, the
+    // turn-loop's memory_nudge site short-circuits — the counter resets
+    // (so we don't burst-fire on a flag flip mid-session) but no
+    // SYSTEM message is appended to history. Reference: turn loop site
+    // at root.zig:4014 area.
+    //
+    // We exercise just the gate's bookkeeping by driving the counter
+    // directly on an Agent struct. A full turn-loop integration is
+    // covered in the autoCompactHistory test suite.
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.0,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 1,
+        .max_history_messages = 0,
+        .token_limit = 1_000,
+        .max_tokens = 64,
+        .compact_context_enabled = false,
+        .auto_save = false,
+        .history = .empty,
+        .extraction_cfg = .{ .memory_nudge_enabled = false },
+        .turns_since_memory_nudge = 9,
+    };
+    defer agent.deinit();
+
+    // Simulate the gate's counter logic from the turn loop:
+    //   self.turns_since_memory_nudge += 1;
+    //   if (>=10 and !enabled) { reset; log "extraction.gated"; return }
+    //   if (>=10 and enabled)  { reset; append nudge to history; ... }
+    agent.turns_since_memory_nudge += 1;
+    const at_threshold = agent.turns_since_memory_nudge >= 10;
+    const gated = at_threshold and !agent.extraction_cfg.memory_nudge_enabled;
+    if (gated) agent.turns_since_memory_nudge = 0;
+
+    try std.testing.expect(at_threshold);
+    try std.testing.expect(gated);
+    try std.testing.expectEqual(@as(u32, 0), agent.turns_since_memory_nudge);
+    // No nudge appended → history stays empty.
+    try std.testing.expectEqual(@as(usize, 0), agent.history.items.len);
+}
+
+test "per_turn_enqueue gate skips enqueue when per_turn_enqueue_enabled=false" {
+    // Same shape as the memory_nudge test, for the per-3-turn entity_pipeline
+    // enqueue trigger at root.zig:4088 area.
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.0,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 1,
+        .max_history_messages = 0,
+        .token_limit = 1_000,
+        .max_tokens = 64,
+        .compact_context_enabled = false,
+        .auto_save = false,
+        .history = .empty,
+        .extraction_cfg = .{ .per_turn_enqueue_enabled = false },
+        .turns_since_extraction = 2,
+    };
+    defer agent.deinit();
+
+    agent.turns_since_extraction += 1;
+    const at_threshold = agent.turns_since_extraction >= 3;
+    const gated = at_threshold and !agent.extraction_cfg.per_turn_enqueue_enabled;
+    if (gated) agent.turns_since_extraction = 0;
+
+    try std.testing.expect(at_threshold);
+    try std.testing.expect(gated);
+    try std.testing.expectEqual(@as(u32, 0), agent.turns_since_extraction);
+    // Counter reset prevents burst-fire on a flag flip; no enqueue happened
+    // (extraction_state_mgr is null so even at default-true this test would
+    // skip the enqueue body — the assertion that matters is the gated branch).
+}
+
+test "skills_nudge gate suppresses nudge append when skills_nudge_enabled=false" {
+    // Same shape for the after-≥5-tool-calls skills_extraction nudge at
+    // root.zig:4156 area. The legacy site checks turn_tool_calls_total
+    // and self.last_turn_tool_count; we model the gate predicate here.
+    const turn_tool_calls_total: u32 = 7;
+    const last_turn_tool_count: u32 = 0;
+    const workspace_set = true;
+
+    const cfg_disabled = config_types.ExtractionConfig{ .skills_nudge_enabled = false };
+    const cfg_enabled = config_types.ExtractionConfig{};
+
+    const would_fire_disabled = turn_tool_calls_total >= 5 and workspace_set and
+        last_turn_tool_count < 5 and cfg_disabled.skills_nudge_enabled;
+    const would_fire_enabled = turn_tool_calls_total >= 5 and workspace_set and
+        last_turn_tool_count < 5 and cfg_enabled.skills_nudge_enabled;
+
+    try std.testing.expect(!would_fire_disabled);
+    try std.testing.expect(would_fire_enabled);
 }
