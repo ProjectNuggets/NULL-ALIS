@@ -707,8 +707,51 @@ pub const SubagentManager = struct {
                 log.err("subagent: failed to publish result to bus: {}", .{err});
             };
         } else {
+            // V1.14.4 (booth-readiness, subagent "received" bug fix).
+            //
+            // Pre-V1.14.4 this branch silently discarded the subagent's
+            // result. Symptom: parent agent's reply contained "received"
+            // or a generic completion fragment with NO subagent output —
+            // the user-visible bug from `project_subagent_received_bug`.
+            //
+            // V1.14.4 closes ONE of the production paths that hit here
+            // and partially mitigates the others:
+            //
+            //   - gateway.zig tenant init OOM on SubagentCompletionRouter
+            //     allocation: PREVIOUSLY `catch null` silently degraded
+            //     to bus-only delivery (and tenant bus has no consumer).
+            //     V1.14.4 propagates the OOM as hard error so tenant
+            //     init fails loudly rather than running with broken
+            //     subagent delivery. This closes the OOM-at-init class.
+            //
+            //   - main.zig standalone CLI (line 2760, 3083): SubagentManager
+            //     created with bus=null and no completion_delivery
+            //     attached. NOT FIXED in V1.14.4 — the dispatch site
+            //     never wires a delivery callback. Mitigation in this
+            //     branch: Debug + ReleaseSafe builds (where
+            //     std.debug.runtime_safety = true) dump the content to
+            //     stderr so test runs and dev sessions surface it. CLI
+            //     is rare for booth (gateway tenant is the demo path);
+            //     full dispatch-site wiring tracked as F-2 for V1.14.5.
+            //
+            //   - gateway.zig:18485 (standalone-mode router create) STILL
+            //     uses `catch null`. Same fix as the tenant path applies
+            //     and is queued; V1.14.4 review HI-02 honest disclosure.
+            //
+            // ReleaseFast (production booth build) has runtime_safety=false:
+            // stderr fallback does NOT fire, only the log.warn lands.
+            // That's UX-degraded but not new behavior — same as pre-V1.14.4
+            // on this branch. Release-build users still don't see the
+            // result. Booth-week acceptable because the path that ships
+            // (gateway tenant) is now closed.
+            log.warn("subagent.delivery path=none task_id={d} — no bus or completion_delivery attached", .{task_id});
+            if (std.debug.runtime_safety) {
+                std.debug.print(
+                    "[subagent fallback — task_id={d}]\n{s}\n",
+                    .{ task_id, content },
+                );
+            }
             self.allocator.free(content);
-            log.warn("subagent.delivery path=none task_id={d} — no bus or completion_delivery attached, result discarded", .{task_id});
         }
     }
 

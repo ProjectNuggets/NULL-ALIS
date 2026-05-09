@@ -1408,7 +1408,23 @@ const TenantRuntime = struct {
             mgr.deinit();
             allocator.destroy(mgr);
         };
-        runtime.completion_router = if (runtime.subagent_manager != null) allocator.create(SubagentCompletionRouter) catch null else null;
+        // V1.14.4 (booth-readiness, subagent "received" bug fix) — if
+        // SubagentManager exists, completion_router MUST exist too.
+        // Pre-V1.14.4: `catch null` silently degraded on OOM, leaving
+        // mgr.completion_delivery unwired. The subagent bus path (line
+        // 1400 sets event_bus) then becomes the only delivery surface —
+        // but the tenant bus has NO consumer (subagent.zig:651 comment),
+        // so subagent results vanish silently. Symptom: parent agent's
+        // history misses the subagent's output, user sees a generic
+        // "completed" or "received"-style fragment with no real content.
+        //
+        // Fix: propagate the OOM as a hard error. Tenant runtime init
+        // failing loudly is strictly better than running with broken
+        // subagent delivery.
+        runtime.completion_router = if (runtime.subagent_manager != null)
+            try allocator.create(SubagentCompletionRouter)
+        else
+            null;
         errdefer if (runtime.completion_router) |router| allocator.destroy(router);
 
         // Build observer chain first — needed by task delivery
@@ -18462,11 +18478,17 @@ pub fn runWithRole(
                     .search_api_key_override = resolved_api_key,
                 });
 
+                // V1.14.4 review HI-02 — same fail-loud rule applied
+                // here as the tenant init path (line 1425). If the
+                // SubagentManager exists, the completion router MUST
+                // exist; otherwise subagent results vanish silently
+                // (subagent.zig:709 path=none branch). `try` propagates
+                // OOM up rather than silently degrading.
                 const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
                 if (subagent_manager) |mgr| {
                     mgr.* = subagent_mod.SubagentManager.init(allocator, cfg, event_bus, .{});
                     subagent_manager_opt = mgr;
-                    completion_router_opt = allocator.create(SubagentCompletionRouter) catch null;
+                    completion_router_opt = try allocator.create(SubagentCompletionRouter);
                 }
 
                 // Task ledger + delivery + usage runtime (Phase 2)

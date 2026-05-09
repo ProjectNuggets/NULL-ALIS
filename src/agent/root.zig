@@ -10473,6 +10473,49 @@ const CountingRuntimeInfoTool = struct {
     }
 };
 
+test "V1.14.4 booth-readiness: approval_continues_turn defaults to true (regression lock)" {
+    // Lock the production default at root.zig:507. The "approval drops
+    // after click" bug (2026-04-18) was fixed by adding the
+    // continue-turn synthetic message in commands.zig::handleGenericToolApprove
+    // (lines 2711-2802). That fix is gated on this flag being `true`.
+    //
+    // If a future refactor accidentally flips the default to `false`,
+    // every production approval would return raw tool output as the
+    // /approve reply text — the agent's turn loop never sees the result,
+    // never produces its next reasoning step, and the user sees the
+    // same "approve drops instead of executing" symptom from 2026-04-18.
+    //
+    // Test-only sites at lines 10494, 10540, 10590, 10647 explicitly
+    // set false to preserve legacy "tool output as reply" behavior in
+    // tests that don't have a live provider.
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    const tools_arr = [_]Tool{};
+    const policy = SecurityPolicy{ .autonomy = .full, .workspace_dir = "/tmp" };
+
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = tools_arr[0..],
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        // Note: NO explicit approval_continues_turn — relying on default.
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .policy = &policy,
+    };
+    defer allocator.free(agent.tool_specs);
+    defer agent.history.deinit(allocator);
+
+    try std.testing.expect(agent.approval_continues_turn);
+}
+
 test "/approve allow-once executes pending tool exactly once" {
     const allocator = std.testing.allocator;
     var noop = observability.NoopObserver{};

@@ -18,7 +18,18 @@ pub const AutonomyLevel = enum {
 
     pub fn toString(self: AutonomyLevel) []const u8 {
         return switch (self) {
-            .read_only => "readonly",
+            // V1.14.4 review CR-01 fix — emit "read_only" (underscore
+            // form) to match the FE TypeScript contract at
+            // ZakiSettingsSheet.tsx:80
+            //   `autonomy: "read_only" | "supervised" | "full"`.
+            // Pre-fix this returned "readonly" (no underscore), causing
+            // round-trip break: backend writes "readonly" → FE
+            // settingsDraft holds it but radio buttons use "read_only" →
+            // none of the radios appear selected, summary i18n key
+            // `levels.readonly.label` doesn't exist (i18next renders
+            // raw key). fromString below remains permissive and accepts
+            // both forms for backward-compat with stored configs.
+            .read_only => "read_only",
             .supervised => "supervised",
             .full => "full",
         };
@@ -953,7 +964,11 @@ test "autonomy fromString read_only alias" {
 }
 
 test "autonomy toString all levels" {
-    try std.testing.expectEqualStrings("readonly", AutonomyLevel.read_only.toString());
+    // V1.14.4 review CR-01 — toString emits "read_only" (underscore)
+    // to match the FE TypeScript union type. fromString remains
+    // permissive and accepts both "readonly" and "read_only" for
+    // backward-compat with stored configs.
+    try std.testing.expectEqualStrings("read_only", AutonomyLevel.read_only.toString());
     try std.testing.expectEqualStrings("supervised", AutonomyLevel.supervised.toString());
     try std.testing.expectEqualStrings("full", AutonomyLevel.full.toString());
 }

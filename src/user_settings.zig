@@ -1,6 +1,10 @@
 const std = @import("std");
 const config_types = @import("config_types.zig");
 const Config = @import("config.zig").Config;
+// V1.14.4 review MD-04 — pulled from config_types' re-export rather
+// than direct security/policy import, honoring the documented
+// "single source of truth" indirection at config_types.zig:12.
+const AutonomyLevel = config_types.AutonomyLevel;
 
 pub const AssistantMode = enum {
     fast,
@@ -47,6 +51,22 @@ pub const ProductSettings = struct {
     proactive_updates: bool = true,
     voice_replies: bool = false,
     session_timeout_minutes: u32 = 30,
+    /// V1.14.4 (booth-readiness, autonomy toggle wire-up).
+    ///
+    /// User-controllable autonomy: `.read_only` (no writes), `.supervised`
+    /// (approval-gated medium-risk), `.full` (auto-approve within
+    /// SecurityPolicy bounds). Default matches `AutonomyConfig.level`'s
+    /// default at config_types.zig:67 (`.full`) — single source of truth
+    /// for "what does a fresh user get."
+    ///
+    /// Gap pre-V1.14.4: FE shipped this toggle as
+    /// `autonomy: "read_only" | "supervised" | "full"` (zaki-prod
+    /// ZakiSettingsSheet.tsx:79, default "supervised"); backend
+    /// ProductSettings struct didn't have the field, so saving from FE
+    /// silently no-op'd at the backend. parseProductSettings rejected
+    /// the field as InvalidPayload, but the FE error was swallowed by
+    /// retry logic. Now wired.
+    autonomy: AutonomyLevel = .full,
 };
 
 pub const Error = error{
@@ -56,6 +76,7 @@ pub const Error = error{
     InvalidProactiveUpdates,
     InvalidVoiceReplies,
     InvalidSessionTimeoutMinutes,
+    InvalidAutonomy,
 };
 
 pub const OwnershipPlane = enum {
@@ -162,6 +183,7 @@ const tenant_preference_product_settings_keys = [_][]const u8{
     "proactive_updates",
     "voice_replies",
     "session_timeout_minutes",
+    "autonomy",
 };
 
 pub const NormalizedTenantConfig = struct {
@@ -196,6 +218,7 @@ pub fn errorCode(err: anyerror) []const u8 {
         error.InvalidProactiveUpdates => "invalid_proactive_updates",
         error.InvalidVoiceReplies => "invalid_voice_replies",
         error.InvalidSessionTimeoutMinutes => "invalid_session_timeout_minutes",
+        error.InvalidAutonomy => "invalid_autonomy",
         else => "invalid_payload",
     };
 }
@@ -218,9 +241,35 @@ pub fn deriveNearestFromConfigJson(allocator: std.mem.Allocator, config_json: []
 
     const parsed = std.json.parseFromSlice(std.json.Value, a, config_json, .{}) catch return defaults();
     if (parsed.value != .object) return defaults();
-    const agent_val = parsed.value.object.get("agent") orelse return defaults();
-    if (agent_val != .object) return defaults();
-    return deriveNearestFromAgentObject(agent_val.object);
+    // V1.14.4 review MD-01 — operator-set autonomy.level is honored when
+    // the tenant has no `product_settings` block. Pre-fix path returned
+    // defaults() ⇒ autonomy=.full regardless of operator config, silently
+    // elevating autonomy on first FE save. Now we extract autonomy.level
+    // (if present at the top level) BEFORE delegating to the agent-shape
+    // snapper, then merge it into the snapped result.
+    var operator_autonomy: ?AutonomyLevel = null;
+    if (parsed.value.object.get("autonomy")) |aut_val| {
+        if (aut_val == .object) {
+            if (aut_val.object.get("level")) |lvl| {
+                if (lvl == .string) {
+                    operator_autonomy = AutonomyLevel.fromString(lvl.string);
+                }
+            }
+        }
+    }
+    const agent_val = parsed.value.object.get("agent") orelse {
+        var fallback = defaults();
+        if (operator_autonomy) |ao| fallback.autonomy = ao;
+        return fallback;
+    };
+    if (agent_val != .object) {
+        var fallback = defaults();
+        if (operator_autonomy) |ao| fallback.autonomy = ao;
+        return fallback;
+    }
+    var snapped = deriveNearestFromAgentObject(agent_val.object);
+    if (operator_autonomy) |ao| snapped.autonomy = ao;
+    return snapped;
 }
 
 pub fn resolveSettingsFromConfigJson(allocator: std.mem.Allocator, config_json: []const u8) !ProductSettings {
@@ -270,6 +319,11 @@ pub fn applyPatchToSettingsJson(
             next.session_timeout_minutes = clampSessionTimeoutMinutesI64(value.integer);
             continue;
         }
+        if (std.mem.eql(u8, key, "autonomy")) {
+            if (value != .string) return error.InvalidAutonomy;
+            next.autonomy = AutonomyLevel.fromString(value.string) orelse return error.InvalidAutonomy;
+            continue;
+        }
         return error.InvalidPayload;
     }
     return next;
@@ -293,6 +347,7 @@ pub fn mergeSettingsIntoConfigJson(
     try putBool(product_obj, a, "proactive_updates", settings.proactive_updates);
     try putBool(product_obj, a, "voice_replies", settings.voice_replies);
     try putInt(product_obj, a, "session_timeout_minutes", settings.session_timeout_minutes);
+    try putString(product_obj, a, "autonomy", settings.autonomy.toString());
 
     var rendered = try std.json.Stringify.valueAlloc(allocator, root, .{});
     if (rendered.len == 0 or rendered[rendered.len - 1] != '\n') {
@@ -328,6 +383,7 @@ pub fn normalizeTenantConfigJson(
     try putBool(product_obj, a, "proactive_updates", settings.proactive_updates);
     try putBool(product_obj, a, "voice_replies", settings.voice_replies);
     try putInt(product_obj, a, "session_timeout_minutes", settings.session_timeout_minutes);
+    try putString(product_obj, a, "autonomy", settings.autonomy.toString());
 
     var rendered = try std.json.Stringify.valueAlloc(allocator, root, .{});
     if (rendered.len == 0 or rendered[rendered.len - 1] != '\n') {
@@ -416,19 +472,36 @@ pub fn applySettingsToConfig(cfg: *Config, settings: ProductSettings) void {
     cfg.agent.tts_audio = settings.voice_replies;
     cfg.agent.session_ttl_secs = settings.session_timeout_minutes * 60;
     cfg.session.cross_channel_shared_main = false;
+
+    // V1.14.4 (booth-readiness, autonomy toggle) — propagate user-chosen
+    // autonomy into the operative SecurityPolicy via cfg.autonomy.level.
+    // Downstream readers:
+    //   - capabilities.zig:108 (allowed_paths plumbing — operator surface)
+    //   - security/policy.zig (gate decisions — autonomy.level drives
+    //     read_only block, supervised approval-gate, full auto-approve)
+    //   - security/approval_modes.zig::ApprovalPolicy.forTool
+    //     (per-tool decision: returns auto_approve / confirm_once / deny
+    //     based on tool risk level × autonomy level)
+    //
+    // The other AutonomyConfig fields (workspace_only, max_actions_per_hour,
+    // allowed_commands, allowed_paths, etc.) stay operator-controlled
+    // via config.json — those are deployment policy, not user
+    // preference. The user choice is solely the level.
+    cfg.autonomy.level = settings.autonomy;
     cfg.syncFlatFields();
 }
 
 pub fn renderSettingsJson(allocator: std.mem.Allocator, settings: ProductSettings) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "{{\"assistant_mode\":\"{s}\",\"group_activation\":\"{s}\",\"proactive_updates\":{s},\"voice_replies\":{s},\"session_timeout_minutes\":{d}}}",
+        "{{\"assistant_mode\":\"{s}\",\"group_activation\":\"{s}\",\"proactive_updates\":{s},\"voice_replies\":{s},\"session_timeout_minutes\":{d},\"autonomy\":\"{s}\"}}",
         .{
             settings.assistant_mode.toSlice(),
             settings.group_activation.toSlice(),
             if (settings.proactive_updates) "true" else "false",
             if (settings.voice_replies) "true" else "false",
             settings.session_timeout_minutes,
+            settings.autonomy.toString(),
         },
     );
 }
@@ -462,12 +535,23 @@ fn parseProductSettings(value: std.json.Value) Error!ProductSettings {
     const timeout_raw = obj.get("session_timeout_minutes") orelse return error.InvalidSessionTimeoutMinutes;
     if (timeout_raw != .integer or timeout_raw.integer < 0) return error.InvalidSessionTimeoutMinutes;
 
+    // V1.14.4 — autonomy is OPTIONAL on read so that pre-V1.14.4 stored
+    // configs (no `autonomy` key in product_settings) deserialize cleanly
+    // to the default. New writes always include the key (mergeSettingsIntoConfigJson
+    // + normalizeTenantConfigJson + renderSettingsJson all emit it).
+    const autonomy_resolved: AutonomyLevel = blk: {
+        const raw = obj.get("autonomy") orelse break :blk .full;
+        if (raw != .string) return error.InvalidAutonomy;
+        break :blk AutonomyLevel.fromString(raw.string) orelse return error.InvalidAutonomy;
+    };
+
     return .{
         .assistant_mode = assistant_mode,
         .group_activation = group_activation,
         .proactive_updates = proactive_raw.bool,
         .voice_replies = voice_raw.bool,
         .session_timeout_minutes = clampSessionTimeoutMinutesI64(timeout_raw.integer),
+        .autonomy = autonomy_resolved,
     };
 }
 
@@ -795,5 +879,146 @@ test "ownership registry classifies operator and tenant preference keys" {
     try std.testing.expect(topLevelKeyOwnership("foo") == .unknown);
     try std.testing.expect(productSettingsFieldOwnership("assistant_mode") == .tenant_preference);
     try std.testing.expect(productSettingsFieldOwnership("voice_replies") == .tenant_preference);
+    try std.testing.expect(productSettingsFieldOwnership("autonomy") == .tenant_preference);
     try std.testing.expect(productSettingsFieldOwnership("queue_mode") == .unknown);
+}
+
+test "V1.14.4: autonomy default is .full and survives patch round-trip" {
+    const settings = defaults();
+    try std.testing.expect(settings.autonomy == .full);
+
+    const patched = try applyPatchToSettingsJson(std.testing.allocator, settings, "{\"autonomy\":\"supervised\"}");
+    try std.testing.expect(patched.autonomy == .supervised);
+
+    const patched2 = try applyPatchToSettingsJson(std.testing.allocator, patched, "{\"autonomy\":\"read_only\"}");
+    try std.testing.expect(patched2.autonomy == .read_only);
+}
+
+test "V1.14.4: applyPatchToSettingsJson rejects invalid autonomy" {
+    const base = defaults();
+    try std.testing.expectError(
+        error.InvalidAutonomy,
+        applyPatchToSettingsJson(std.testing.allocator, base, "{\"autonomy\":\"yolo\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidAutonomy,
+        applyPatchToSettingsJson(std.testing.allocator, base, "{\"autonomy\":42}"),
+    );
+}
+
+test "V1.14.4: applySettingsToConfig propagates autonomy into cfg.autonomy.level" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "test/mock-model",
+        .allocator = std.testing.allocator,
+    };
+
+    applySettingsToConfig(&cfg, .{
+        .assistant_mode = .balanced,
+        .group_activation = .mention,
+        .proactive_updates = true,
+        .voice_replies = false,
+        .session_timeout_minutes = 30,
+        .autonomy = .supervised,
+    });
+    try std.testing.expect(cfg.autonomy.level == .supervised);
+
+    applySettingsToConfig(&cfg, .{
+        .assistant_mode = .balanced,
+        .group_activation = .mention,
+        .proactive_updates = true,
+        .voice_replies = false,
+        .session_timeout_minutes = 30,
+        .autonomy = .read_only,
+    });
+    try std.testing.expect(cfg.autonomy.level == .read_only);
+
+    applySettingsToConfig(&cfg, .{
+        .assistant_mode = .balanced,
+        .group_activation = .mention,
+        .proactive_updates = true,
+        .voice_replies = false,
+        .session_timeout_minutes = 30,
+        .autonomy = .full,
+    });
+    try std.testing.expect(cfg.autonomy.level == .full);
+}
+
+test "V1.14.4: pre-V1.14.4 stored configs without autonomy key default to .full" {
+    // Backward-compat: a tenant config saved before V1.14.4 won't have
+    // the `autonomy` key in product_settings. Loading should yield
+    // .full (matching ProductSettings default + AutonomyConfig default).
+    const cfg =
+        \\{"product_settings":{"assistant_mode":"balanced","group_activation":"mention","proactive_updates":true,"voice_replies":false,"session_timeout_minutes":30}}
+    ;
+    const settings = try resolveSettingsFromConfigJson(std.testing.allocator, cfg);
+    try std.testing.expect(settings.autonomy == .full);
+}
+
+test "V1.14.4 review MD-01: operator-set cfg.autonomy.level honored when product_settings absent" {
+    // The legacy fallback path (deriveNearestFromAgentObject) MUST read
+    // the operator's autonomy.level from cfg.autonomy.level when no
+    // product_settings block exists. Pre-fix this returned .full
+    // unconditionally, silently elevating autonomy beyond what the
+    // operator configured.
+    const cfg_supervised =
+        \\{"agent":{"queue_mode":"serial","queue_cap":12},"autonomy":{"level":"supervised"}}
+    ;
+    const settings_s = try resolveSettingsFromConfigJson(std.testing.allocator, cfg_supervised);
+    try std.testing.expect(settings_s.autonomy == .supervised);
+
+    const cfg_readonly =
+        \\{"agent":{"queue_mode":"serial","queue_cap":12},"autonomy":{"level":"read_only"}}
+    ;
+    const settings_r = try resolveSettingsFromConfigJson(std.testing.allocator, cfg_readonly);
+    try std.testing.expect(settings_r.autonomy == .read_only);
+
+    // Legacy underscoreless form should still resolve via fromString
+    // (defense-in-depth — older configs may have used the old toString
+    // output before V1.14.4 review CR-01).
+    const cfg_legacy =
+        \\{"agent":{"queue_mode":"serial","queue_cap":12},"autonomy":{"level":"readonly"}}
+    ;
+    const settings_l = try resolveSettingsFromConfigJson(std.testing.allocator, cfg_legacy);
+    try std.testing.expect(settings_l.autonomy == .read_only);
+
+    // No agent block at all: still extract autonomy from top-level.
+    const cfg_no_agent =
+        \\{"autonomy":{"level":"supervised"}}
+    ;
+    const settings_na = try resolveSettingsFromConfigJson(std.testing.allocator, cfg_no_agent);
+    try std.testing.expect(settings_na.autonomy == .supervised);
+}
+
+test "V1.14.4: renderSettingsJson includes autonomy" {
+    const out = try renderSettingsJson(std.testing.allocator, .{
+        .assistant_mode = .deep,
+        .group_activation = .always,
+        .proactive_updates = false,
+        .voice_replies = true,
+        .session_timeout_minutes = 45,
+        .autonomy = .supervised,
+    });
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"autonomy\":\"supervised\"") != null);
+}
+
+test "V1.14.4: mergeSettingsIntoConfigJson writes canonical autonomy" {
+    const merged = try mergeSettingsIntoConfigJson(std.testing.allocator, "{}", .{
+        .assistant_mode = .balanced,
+        .group_activation = .mention,
+        .proactive_updates = true,
+        .voice_replies = false,
+        .session_timeout_minutes = 30,
+        .autonomy = .read_only,
+    });
+    defer std.testing.allocator.free(merged);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, merged, .{});
+    defer parsed.deinit();
+    const product = parsed.value.object.get("product_settings").?.object;
+    // V1.14.4 review CR-01 fix — toString emits "read_only" (underscore
+    // form) to match the FE TypeScript contract.
+    try std.testing.expectEqualStrings("read_only", product.get("autonomy").?.string);
 }
