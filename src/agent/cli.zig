@@ -33,6 +33,34 @@ fn cliStreamCallback(_: *anyopaque, chunk: providers.StreamChunk) void {
     wr.flush() catch {};
 }
 
+/// V1.14.4 review F-1 / HI-03 closure — Standalone CLI subagent delivery.
+///
+/// Mirrors `cliSubagentCompletionDelivery` in main.zig (the function
+/// can't be shared because main.zig is the binary entrypoint and not
+/// importable; same shape, kept literal for review traceability). The
+/// `nullalis agent` subcommand's SubagentManager runs with bus=null;
+/// without this attach, subagent results land in subagent.zig:709's
+/// path=none branch and get silently discarded — the original symptom
+/// of `project_subagent_received_bug`.
+///
+/// stderr is the right surface in CLI mode because stdout carries
+/// the agent's streamed reply (cliStreamCallback above). Mixing
+/// subagent fallback content into stdout would corrupt the
+/// user-visible reply stream.
+///
+/// Errors are non-fatal — std.debug.print swallows write errors per
+/// std library convention; we never actually return an error.
+fn cliSubagentCompletionDelivery(
+    _: ?*anyopaque,
+    session_key: []const u8,
+    content: []const u8,
+) anyerror!void {
+    std.debug.print(
+        "\n[subagent → {s}]\n{s}\n\n",
+        .{ session_key, content },
+    );
+}
+
 /// Run the agent in single-message or interactive REPL mode.
 /// This is the main entry point called by `nullalis agent`.
 pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -129,6 +157,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     var subagent_manager = subagent_mod.SubagentManager.init(allocator, &cfg, null, .{});
     defer subagent_manager.deinit();
+    // V1.14.4 review F-1 / HI-03 — third standalone CLI dispatch site
+    // (the `nullalis agent` subcommand). Same shape as main.zig:2796 +
+    // 3124: SubagentManager init with bus=null was leaving subagent
+    // results to vanish at subagent.zig:709's path=none branch. Wire
+    // the local cliSubagentCompletionDelivery so subagent content
+    // surfaces to stderr instead of being silently discarded.
+    subagent_manager.attachCompletionDelivery(null, cliSubagentCompletionDelivery);
 
     // Create tools (with agents config for delegate depth enforcement)
     const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
