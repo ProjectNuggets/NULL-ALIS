@@ -1471,8 +1471,18 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         // Idempotent w.r.t. earlier per-3-turn runs: re-emitting the same
         // edge bumps weight via upsertMemoryEdge ON CONFLICT — no
         // duplicate rows. Failure-soft.
-        if (self.extraction_state_mgr) |smgr_ep| {
-            if (self.extraction_user_id) |uid_ep| {
+        //
+        // V1.14.7 C2: gated behind extraction_cfg.per_turn_enqueue_enabled
+        // (same flag covers per-turn AND session-end enqueue paths since
+        // both write to the same extraction_queue table; both will be
+        // deleted in C3). Inline structured extraction at lines 1437-1454
+        // above (via persistExtracted on the summary's parsed.extracted_facts)
+        // is the new path and is NOT gated — it fires regardless and writes
+        // facts/edges synchronously without queueing.
+        if (self.extraction_cfg.per_turn_enqueue_enabled and self.extraction_state_mgr != null and self.extraction_user_id != null) {
+            const smgr_ep = self.extraction_state_mgr.?;
+            const uid_ep = self.extraction_user_id.?;
+            {
                 _ = self.extraction_coref_embed; // worker uses its own
                 const transcript_text = buildSessionEndTranscriptText(self.allocator, entries) catch |err| blk: {
                     log.warn("session_end.entity_pipeline.build_text_failed err={s}", .{@errorName(err)});

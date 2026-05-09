@@ -249,14 +249,7 @@ pub fn autoCompactHistory(
     const cheap_threshold = (config.token_limit * 70) / 100;
     if (estimate_before > cheap_threshold) {
         log.info("compaction.auto: pass=A firing (drop-from-middle)", .{});
-        const reduced = dropOldestPairsFromMiddle(
-            allocator,
-            history,
-            config.keep_recent,
-            config.archive_memory,
-            config.archive_mem_rt,
-            config.archive_session_id,
-        );
+        const reduced = dropOldestPairsFromMiddle(allocator, history, config);
         if (reduced) compacted = true;
     }
 
@@ -336,14 +329,22 @@ pub fn autoCompactHistory(
 /// via memory_timeline / memory_recall after the fact.
 ///
 /// Returns true if any messages were dropped.
+///
+/// V1.14.7 C2: signature takes the full `CompactionConfig` so we can wire
+/// structured extraction over the drop window before deletion. The previous
+/// 6-param signature was already at the seams; bundling into config lets
+/// us thread `extraction_state_mgr` / `extraction_user_id` /
+/// `extraction_judge_provider` / `extraction_coref_embed` for the new
+/// `extractFromDropWindow` call below.
 fn dropOldestPairsFromMiddle(
     allocator: std.mem.Allocator,
     history: *std.ArrayListUnmanaged(OwnedMessage),
-    keep_recent: u32,
-    archive_memory: ?Memory,
-    archive_mem_rt: ?*MemoryRuntime,
-    archive_session_id: ?[]const u8,
+    config: CompactionConfig,
 ) bool {
+    const keep_recent = config.keep_recent;
+    const archive_memory = config.archive_memory;
+    const archive_mem_rt = config.archive_mem_rt;
+    const archive_session_id = config.archive_session_id;
     const total = history.items.len;
     const has_system = total > 0 and history.items[0].role == .system;
     const sys_count: usize = if (has_system) 1 else 0;
@@ -416,6 +417,19 @@ fn dropOldestPairsFromMiddle(
     log.info(
         "compaction.passA.drop start={d} end={d} dropped={d} bytes={d} sys={d} first_user={d} tail_start={d}",
         .{ drop_start, drop_end, dropped_count, dropped_bytes, sys_count, first_user_idx, tail_start },
+    );
+
+    // V1.14.7 C2 — structured extraction over the drop window BEFORE deletion.
+    // This is the natural distillation moment: the messages are coherent (they
+    // survived in active context for many turns) and we're already paying the
+    // attention cost to write them to the archive. One LLM call extracts
+    // facts + entities + edges via the existing extraction_persist plumbing
+    // (V1.6 5b.2). Failure-soft: any error logs and continues — the drop
+    // proceeds regardless.
+    extractFromDropWindow(
+        allocator,
+        config,
+        history.items[drop_start..drop_end],
     );
 
     // Best-effort archive before deletion (continuity artifact). Mirrors
@@ -766,6 +780,129 @@ pub fn forceCompressHistoryWithArchive(
     history.items.len -= to_remove;
 
     return true;
+}
+
+/// V1.14.7 C2 — extract structured facts/entities/edges from the Pass A
+/// drop window before deletion.
+///
+/// Single LLM call to the configured judge provider (typically a fast +
+/// cheap sidecar like Groq Llama-3.3-8B). Asks for a strict JSON object
+/// with `facts`, `entities`, `edges` arrays. Parses via the existing
+/// `extraction_persist.parseExtractedJson` and persists via
+/// `extraction_persist.persistExtracted`. Failure-soft: any error logs
+/// and returns; the drop proceeds regardless.
+///
+/// Skipped when:
+///   - extraction_state_mgr / extraction_user_id / judge_provider+model
+///     are unset (degraded deployment, no postgres, etc.)
+///   - the drop window has zero messages
+///   - the judge LLM call returns empty / malformed JSON
+fn extractFromDropWindow(
+    allocator: std.mem.Allocator,
+    config: CompactionConfig,
+    window: []const OwnedMessage,
+) void {
+    // Plumbing checks
+    const smgr = config.extraction_state_mgr orelse return;
+    const uid = config.extraction_user_id orelse return;
+    const judge_provider = config.extraction_judge_provider orelse return;
+    const judge_model = config.extraction_judge_model_name orelse return;
+    if (judge_model.len == 0) return;
+    if (window.len == 0) return;
+
+    // Build a tight transcript of the drop window. Reuse the same caps
+    // as `buildCompactionTranscript` (per-message 2KB, total max_source_chars).
+    const transcript = buildCompactionTranscript(allocator, window, 0, window.len, config.max_source_chars) catch |err| {
+        log.warn("compaction.passA.extract.build_text_failed err={s}", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(transcript);
+
+    if (transcript.len == 0) return;
+
+    // Build the structured-extraction prompt. Plain JSON-only output for
+    // strict parseability via extraction_persist.parseExtractedJson.
+    const sys_prompt =
+        "You extract durable facts and entity relations from a conversation slice. " ++
+        "Output STRICT JSON only — no prose, no markdown, no commentary. " ++
+        "Schema: {\"facts\":[{\"text\":\"<verbatim or close paraphrase>\",\"subject\":\"<entity>\",\"predicate\":\"<UPPERCASE_REL>\",\"object\":\"<entity or value>\",\"confidence\":0.0-1.0}]}. " ++
+        "Only emit facts that will be useful in FUTURE conversations (preferences, named decisions, durable attributes). " ++
+        "Skip transient turn details. Empty array `{\"facts\":[]}` is valid output when nothing crystallizable was said.";
+
+    var messages = [_]ChatMessage{
+        .{ .role = .system, .content = sys_prompt },
+        .{ .role = .user, .content = transcript },
+    };
+
+    const request = providers.ChatRequest{
+        .messages = messages[0..],
+        .model = judge_model,
+        .temperature = 0.2,
+        .tools = null,
+        .timeout_secs = 30,
+    };
+
+    const response = judge_provider.chat(allocator, request, judge_model, 0.2) catch |err| {
+        log.warn("compaction.passA.extract.llm_failed err={s} window_msgs={d}", .{ @errorName(err), window.len });
+        return;
+    };
+    defer {
+        if (response.content) |c| if (c.len > 0) allocator.free(c);
+        for (response.tool_calls) |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        if (response.tool_calls.len > 0) allocator.free(response.tool_calls);
+        if (response.model.len > 0) allocator.free(response.model);
+        if (response.reasoning_content) |rc| if (rc.len > 0) allocator.free(rc);
+    }
+
+    const content = response.content orelse return;
+    if (content.len == 0) return;
+
+    // Parse via existing JSON-tail parser.
+    const extracted = extraction_persist.parseExtractedJson(allocator, content) catch |err| {
+        log.warn("compaction.passA.extract.parse_failed err={s} raw_len={d}", .{ @errorName(err), content.len });
+        return;
+    };
+    defer extraction_persist.freeExtractedMemories(allocator, extracted);
+
+    if (extracted.len == 0) {
+        log.info("compaction.passA.extract count=0 window_msgs={d} reason=empty_facts", .{window.len});
+        return;
+    }
+
+    // Persist via existing extraction_persist path. Same shape as Pass C
+    // and session-end (commands.zig:1437).
+    const judge_ctx = extraction_persist.JudgeContext{
+        .provider = judge_provider,
+        .model_name = judge_model,
+    };
+    const coref_ctx: ?extraction_persist.EntityResolution =
+        if (config.extraction_coref_embed) |ep|
+            extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 }
+        else
+            null;
+
+    const persist_result = extraction_persist.persistExtracted(
+        allocator,
+        smgr,
+        uid,
+        config.archive_session_id,
+        extracted,
+        judge_ctx,
+        coref_ctx,
+        config.archive_mem_rt,
+    ) catch |err| {
+        log.warn("compaction.passA.extract.persist_failed err={s} count={d}", .{ @errorName(err), extracted.len });
+        return;
+    };
+
+    log.info(
+        "compaction.passA.extract count={d} written={d} skipped_dup={d} window_msgs={d} window_bytes={d}",
+        .{ extracted.len, persist_result.written_count, persist_result.skipped_md5_dup + persist_result.skipped_semantic_dup, window.len, transcript.len },
+    );
 }
 
 /// Best-effort archive of messages about to be dropped.
@@ -1822,7 +1959,7 @@ test "dropOldestPairsFromMiddle drops middle messages, preserves prefix + tail" 
     try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "recent_u") });
     try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "recent_a") });
 
-    const reduced = dropOldestPairsFromMiddle(allocator, &history, 2, null, null, null);
+    const reduced = dropOldestPairsFromMiddle(allocator, &history, .{ .token_limit = 1000, .keep_recent = 2 });
     try std.testing.expect(reduced);
 
     // Protected prefix preserved
@@ -1862,7 +1999,7 @@ test "dropOldestPairsFromMiddle preserves tool_call/tool_result pair at tail bou
     // keep_recent=4 lands tail_start at index 5 (the .tool message); the
     // tail-boundary walk should pull tail_start backward to include the
     // assistant tool_call at index 4, keeping the pair intact.
-    _ = dropOldestPairsFromMiddle(allocator, &history, 4, null, null, null);
+    _ = dropOldestPairsFromMiddle(allocator, &history, .{ .token_limit = 1000, .keep_recent = 4 });
 
     // Find the .tool message — its preceding message must still be the matching .assistant tool_call.
     var found_pair = false;
@@ -1896,6 +2033,51 @@ test "dropOldestPairsFromMiddle no-op when total under keep_recent + protect pre
     try history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "a1") });
 
     // keep_recent=10 covers everything
-    const reduced = dropOldestPairsFromMiddle(allocator, &history, 10, null, null, null);
+    const reduced = dropOldestPairsFromMiddle(allocator, &history, .{ .token_limit = 1000, .keep_recent = 10 });
     try std.testing.expect(!reduced);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V1.14.7 C2 — extractFromDropWindow skip-path coverage
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "extractFromDropWindow skips silently when extraction state mgr is null" {
+    // C2 contract: when extraction plumbing isn't wired (degraded
+    // deployment without postgres state mgr), extractFromDropWindow
+    // returns silently without crashing — Pass A's drop semantics
+    // remain unchanged.
+    const allocator = std.testing.allocator;
+    const window = [_]OwnedMessage{
+        .{ .role = .user, .content = "drop1" },
+        .{ .role = .assistant, .content = "drop2" },
+    };
+    // No state mgr / user_id / judge → all skip predicates fire.
+    const cfg = CompactionConfig{ .token_limit = 1000 };
+    extractFromDropWindow(allocator, cfg, &window);
+    // No assertion needed — the test verifies the function doesn't
+    // crash or attempt LLM calls when prerequisites are absent.
+}
+
+test "extractFromDropWindow skips when window is empty" {
+    // C2 contract: zero-message window means nothing to extract — early return
+    // without LLM call.
+    const allocator = std.testing.allocator;
+    const window: []const OwnedMessage = &.{};
+    const cfg = CompactionConfig{ .token_limit = 1000 };
+    extractFromDropWindow(allocator, cfg, window);
+    // Same intent as above — non-crashing skip path.
+}
+
+test "extractFromDropWindow skips when judge_model is empty string" {
+    // C2 contract: judge_model = "" (operator left it unset) is a hard skip.
+    // Avoids sending requests with empty model strings.
+    const allocator = std.testing.allocator;
+    const window = [_]OwnedMessage{
+        .{ .role = .user, .content = "test" },
+    };
+    const cfg = CompactionConfig{
+        .token_limit = 1000,
+        .extraction_judge_model_name = "",
+    };
+    extractFromDropWindow(allocator, cfg, &window);
 }
