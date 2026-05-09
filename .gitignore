@@ -24,3 +24,9 @@ result
 .codex-tmp/
 tests/compaction_corpus/results/
 .claude/scheduled_tasks.lock
+
+# V1.14.4 booth-readiness: external bench harness
+.spike/external/gorilla/
+.spike/external/locomo/
+.spike/external/locomo_runner/.venv/
+.spike/external/locomo_runner/runs/
