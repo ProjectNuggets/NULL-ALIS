@@ -302,11 +302,21 @@ pub fn parseSummaryResponse(
                             const pred_v = item.object.get("predicate") orelse continue;
                             const obj_v = item.object.get("object") orelse continue;
                             if (text_v != .string or subj_v != .string or pred_v != .string or obj_v != .string) continue;
-                            // Match prose fact by content equality.
+                            // V1.14.7 — match prose fact by content equality OR by
+                            // substring (LLMs paraphrase; pre-V1.14.7 the strict
+                            // byte-eql match failed silently and edges=0 was the
+                            // norm). Try strict match first (idempotent), then
+                            // substring fallback. If nothing matches, ADD a new
+                            // fact built from the JSON entry — its content is the
+                            // JSON `text` field. This guarantees JSON triples
+                            // contribute to the graph even when prose drifted.
+                            var matched = false;
                             for (facts.items) |*f| {
                                 if (!std.mem.eql(u8, f.content, text_v.string)) continue;
-                                // Idempotent: skip if already enriched.
-                                if (f.subject != null) break;
+                                if (f.subject != null) {
+                                    matched = true;
+                                    break;
+                                }
                                 f.subject = allocator.dupe(u8, subj_v.string) catch null;
                                 f.predicate = allocator.dupe(u8, pred_v.string) catch null;
                                 f.object = allocator.dupe(u8, obj_v.string) catch null;
@@ -320,8 +330,70 @@ pub fn parseSummaryResponse(
                                         else => null,
                                     };
                                 }
+                                matched = true;
                                 break;
                             }
+                            if (matched) continue;
+                            // Substring fallback: maybe the LLM paraphrased the
+                            // JSON text but the prose still contains the key
+                            // entity name. Match if either string contains the
+                            // other (>=12 chars overlap to avoid false positives).
+                            if (text_v.string.len >= 12) {
+                                for (facts.items) |*f| {
+                                    if (f.subject != null) continue;
+                                    if (std.mem.indexOf(u8, f.content, text_v.string) != null or
+                                        std.mem.indexOf(u8, text_v.string, f.content) != null)
+                                    {
+                                        f.subject = allocator.dupe(u8, subj_v.string) catch null;
+                                        f.predicate = allocator.dupe(u8, pred_v.string) catch null;
+                                        f.object = allocator.dupe(u8, obj_v.string) catch null;
+                                        if (item.object.get("attributed_to")) |a| {
+                                            if (a == .string) f.attributed_to = allocator.dupe(u8, a.string) catch null;
+                                        }
+                                        if (item.object.get("confidence")) |cv| {
+                                            f.confidence = switch (cv) {
+                                                .float => |fv| fv,
+                                                .integer => |iv| @floatFromInt(iv),
+                                                else => null,
+                                            };
+                                        }
+                                        matched = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (matched) continue;
+                            // No prose match — promote JSON entry to its own fact.
+                            // Skips the dual-path optimization but ensures the
+                            // graph half (entities + edges) gets populated.
+                            const jkey = std.fmt.allocPrint(allocator, "extracted_fact_{d}", .{facts.items.len}) catch continue;
+                            errdefer allocator.free(jkey);
+                            const jcontent = allocator.dupe(u8, text_v.string) catch {
+                                allocator.free(jkey);
+                                continue;
+                            };
+                            errdefer allocator.free(jcontent);
+                            var nf = ExtractedFact{
+                                .key = jkey,
+                                .content = jcontent,
+                                .category = .core,
+                            };
+                            nf.subject = allocator.dupe(u8, subj_v.string) catch null;
+                            nf.predicate = allocator.dupe(u8, pred_v.string) catch null;
+                            nf.object = allocator.dupe(u8, obj_v.string) catch null;
+                            if (item.object.get("attributed_to")) |a| {
+                                if (a == .string) nf.attributed_to = allocator.dupe(u8, a.string) catch null;
+                            }
+                            if (item.object.get("confidence")) |cv| {
+                                nf.confidence = switch (cv) {
+                                    .float => |fv| fv,
+                                    .integer => |iv| @floatFromInt(iv),
+                                    else => null,
+                                };
+                            }
+                            facts.append(allocator, nf) catch {
+                                nf.deinit(allocator);
+                            };
                         }
                     }
                 }
