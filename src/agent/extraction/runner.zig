@@ -30,6 +30,24 @@ const schema = @import("schema.zig");
 const prompts = @import("prompts.zig");
 const parser = @import("parser.zig");
 const extraction_persist = @import("../extraction_persist.zig");
+const working_memory = @import("../working_memory.zig");
+
+/// V1.14.8 C4 — map a schema.Edge.SlotIntent to the static
+/// working_memory.SlotType string the persist layer expects.
+/// Returns null when the LLM didn't tag intent or when the intent
+/// has no corresponding working-memory slot type (`.preference` —
+/// preferences live in canonical memory, not working slots).
+fn slotIntentToWorkingMemoryType(intent: ?schema.Edge.SlotIntent) ?[]const u8 {
+    const i = intent orelse return null;
+    return switch (i) {
+        .open_loop => working_memory.SlotType.open_loop,
+        .active_goal => working_memory.SlotType.active_goal,
+        .decision => working_memory.SlotType.decision,
+        .identity => working_memory.SlotType.identity,
+        .temporal => working_memory.SlotType.temporal,
+        .preference => null, // preferences stay in canonical memory only
+    };
+}
 
 const Memory = memory_root.Memory;
 const MemoryRuntime = memory_root.MemoryRuntime;
@@ -286,6 +304,10 @@ fn persistExtraction(
             .attributed_to = try allocator.dupe(u8, "user"),
             .confidence = edge.confidence orelse 0.85,
             .temporal_anchor_unix = edge.valid_at,
+            // V1.14.8 C4: forward LLM-tagged slot intent to persistExtracted
+            // so it promotes the right working-memory slot. Static-string
+            // mapping — never freed by ExtractedMemory.deinit.
+            .slot_intent = slotIntentToWorkingMemoryType(edge.slot_intent),
         };
     }
 

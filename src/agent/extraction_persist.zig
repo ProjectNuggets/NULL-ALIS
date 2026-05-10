@@ -68,6 +68,15 @@ pub const ExtractedMemory = struct {
     /// includes `valid_at` (an ISO-8601 datetime). null means "no
     /// temporal anchor known"; downstream uses write-time as fallback.
     temporal_anchor_unix: ?i64 = null,
+    /// V1.14.8 C4 — optional working-memory slot type to promote to.
+    /// MUST be one of the static strings on `working_memory.SlotType`
+    /// (e.g., "open_loop", "active_goal", "decision", "identity",
+    /// "temporal"). Always a static string slice — never freed by deinit.
+    /// When set, persistExtracted prefers this over the predicate-derived
+    /// mapping so the LLM-tagged intent wins (catches cases where the
+    /// predicate isn't on `predicateToSlotType`'s allowlist but the LLM
+    /// correctly identified the working-memory intent).
+    slot_intent: ?[]const u8 = null,
 
     pub fn deinit(self: *const ExtractedMemory, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
@@ -75,6 +84,7 @@ pub const ExtractedMemory = struct {
         allocator.free(self.predicate);
         allocator.free(self.object);
         allocator.free(self.attributed_to);
+        // slot_intent is a static string (working_memory.SlotType.*) — never freed.
     }
 };
 
@@ -858,8 +868,16 @@ pub fn persistExtracted(
         // so it surfaces in subsequent prompts without requiring
         // recall to find it. Failure-soft: any error logs and
         // continues — the canonical memory row is the source of truth.
+        //
+        // V1.14.8 C4: prefer LLM-tagged `m.slot_intent` (set by the
+        // boundary extractor when the LLM identifies the working-memory
+        // intent directly) over the predicate-derived mapping. The
+        // predicate fallback still catches cases where the LLM didn't
+        // tag intent but the predicate is on the legacy allowlist.
         if (session_id) |sid| {
-            if (predicateToSlotType(m.predicate)) |slot_type| {
+            const slot_type_opt: ?[]const u8 =
+                m.slot_intent orelse predicateToSlotType(m.predicate);
+            if (slot_type_opt) |slot_type| {
                 _ = working_memory.promoteSlot(
                     allocator,
                     state_mgr,
