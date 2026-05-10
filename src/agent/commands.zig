@@ -4,6 +4,7 @@ const learning = @import("learning.zig");
 const prompt_mod = @import("prompt.zig");
 const providers = @import("../providers/root.zig");
 const extraction_persist = @import("extraction_persist.zig");
+const extraction_runner = @import("extraction/runner.zig");
 const text_norm = @import("../memory/text_norm.zig");
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
@@ -1466,6 +1467,44 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             triple_edges_written,
             next,
         });
+
+        // V1.14.8 C3 — unified boundary extraction at session end (additive
+        // to the legacy `parsed.extracted_facts` persist loop above). Routes
+        // through the same extraction_runner used by Pass C, ensuring a
+        // single extractor shape across all distillation moments. Failure-
+        // soft per layer; existing per-fact persist remains the legacy
+        // primary writer until C5 cleanup. Dedup at persistExtracted handles
+        // overlap between the two paths.
+        if (self.extraction_judge_provider) |jp| {
+            if (self.extraction_judge_model_name.len > 0 and self.history.items.len > 0) {
+                var msgs_buf = std.ArrayListUnmanaged(providers.ChatMessage).initCapacity(self.allocator, self.history.items.len) catch null;
+                if (msgs_buf) |*buf| {
+                    defer buf.deinit(self.allocator);
+                    for (self.history.items) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
+                    const ctx = extraction_runner.ExtractionContext{
+                        .judge_provider = jp,
+                        .judge_model = self.extraction_judge_model_name,
+                        .state_mgr = self.extraction_state_mgr,
+                        .user_id = self.extraction_user_id,
+                        .session_id = session_id,
+                        .coref_embed = self.extraction_coref_embed,
+                        .archive_mem = self.mem,
+                        .archive_mem_rt = self.mem_rt,
+                    };
+                    const br = extraction_runner.extractAtBoundary(self.allocator, buf.items, ctx);
+                    defer br.deinit(self.allocator);
+                    log.info(
+                        "session_end.unified_extract entities={d} edges={d} hydration_present={} session={s}",
+                        .{
+                            if (br.extraction) |e| e.entities.len else 0,
+                            if (br.extraction) |e| e.edges.len else 0,
+                            br.hydration != null,
+                            session_id,
+                        },
+                    );
+                }
+            }
+        }
 
         // V1.12 — session-end entity-pipeline pass. Catches sessions that
         // ended without hitting the per-3-turn auto-trigger boundary

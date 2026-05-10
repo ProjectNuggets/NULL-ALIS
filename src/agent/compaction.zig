@@ -18,11 +18,7 @@ const Agent = @import("root.zig").Agent;
 const OwnedMessage = Agent.OwnedMessage;
 const zaki_state = @import("../zaki_state.zig");
 const extraction_persist = @import("extraction_persist.zig");
-// V1.14.8 C1 typecheck — keep imported so the module graph compiles the new
-// extraction/ files. Wired into actual call sites in C3.
-comptime {
-    _ = @import("extraction/runner.zig");
-}
+const extraction_runner = @import("extraction/runner.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
@@ -708,6 +704,44 @@ fn compactHistoryKeepingRecent(
                 }
             };
         }
+    }
+
+    // V1.14.8 C3 — unified boundary extraction (additive to legacy JSON-tail
+    // path above). Fires the structured extraction (graphiti-shape JSON →
+    // entities + edges) and hydration (Claude-Code-shape XML → summary_latest/
+    // <session>) using the configured judge provider. Failure-soft per layer;
+    // existing JSON-tail path at lines 637-710 remains the primary edge writer
+    // until C5 cleanup. Dedup at persistExtracted handles overlap.
+    if (config.extraction_judge_provider) |jp| {
+        if (config.extraction_judge_model_name) |jm| if (jm.len > 0) {
+            const window = history.items[start..compact_end];
+            var msgs_buf = std.ArrayListUnmanaged(ChatMessage).initCapacity(allocator, window.len) catch null;
+            if (msgs_buf) |*buf| {
+                defer buf.deinit(allocator);
+                for (window) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
+                const ctx = extraction_runner.ExtractionContext{
+                    .judge_provider = jp,
+                    .judge_model = jm,
+                    .state_mgr = config.extraction_state_mgr,
+                    .user_id = config.extraction_user_id,
+                    .session_id = config.archive_session_id,
+                    .coref_embed = config.extraction_coref_embed,
+                    .archive_mem = config.archive_memory,
+                    .archive_mem_rt = config.archive_mem_rt,
+                    .max_source_chars = config.max_source_chars,
+                };
+                const br = extraction_runner.extractAtBoundary(allocator, buf.items, ctx);
+                defer br.deinit(allocator);
+                log.info(
+                    "compaction.passC.unified_extract entities={d} edges={d} hydration_present={}",
+                    .{
+                        if (br.extraction) |e| e.entities.len else 0,
+                        if (br.extraction) |e| e.edges.len else 0,
+                        br.hydration != null,
+                    },
+                );
+            }
+        };
     }
 
     // Free old messages being compacted
