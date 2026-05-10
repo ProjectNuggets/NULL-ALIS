@@ -331,12 +331,10 @@ pub fn autoCompactHistory(
 ///
 /// Returns true if any messages were dropped.
 ///
-/// V1.14.7 C2: signature takes the full `CompactionConfig` so we can wire
-/// structured extraction over the drop window before deletion. The previous
-/// 6-param signature was already at the seams; bundling into config lets
-/// us thread `extraction_state_mgr` / `extraction_user_id` /
-/// `extraction_judge_provider` / `extraction_coref_embed` for the new
-/// `extractFromDropWindow` call below.
+/// V1.14.7 C2 / V1.14.8 C6: signature takes the full `CompactionConfig` so
+/// we can wire structured extraction over the drop window before deletion.
+/// The extraction call uses extraction_runner.extractAtBoundary with
+/// `enable_hydration=false` (Pass A is mid-session — extraction only).
 fn dropOldestPairsFromMiddle(
     allocator: std.mem.Allocator,
     history: *std.ArrayListUnmanaged(OwnedMessage),
@@ -420,30 +418,56 @@ fn dropOldestPairsFromMiddle(
         .{ drop_start, drop_end, dropped_count, dropped_bytes, sys_count, first_user_idx, tail_start },
     );
 
-    // V1.14.8 C2 — Pass A extraction wire DEACTIVATED.
+    // V1.14.8 C6 — Pass A wired to the unified boundary extractor.
     //
-    // Original V1.14.7 C2 fired `extractFromDropWindow` here so a per-drop
-    // LLM call extracted facts before the messages were freed. We're keeping
-    // the drop-from-middle behavior (cache-stable + cheap) but routing
-    // extraction through the unified boundary runner (`extraction/runner.zig`)
-    // at Pass C + session-end only. Pass A is too frequent in real traffic
-    // (fires on every token-budget breach, often mid-thread) — running an
-    // extraction LLM call per drop turned into a hidden cost multiplier
-    // without paying back in graph density (the same facts get re-extracted
-    // at Pass C anyway, then dedup-skipped on persist).
+    // Why we wire it (reverses the C2 deactivation): Pass A fires whenever
+    // history exceeds 70% of token_limit. At Kimi K2.5 (256K window) this
+    // is ~183K tokens — frequent on long benches (LoCoMo eval observed 8
+    // fires in one session, hit 99% pressure). Each fire drops a window
+    // of oldest mid-history messages PERMANENTLY before Pass C ever sees
+    // them. Without extraction here, every entity/edge mentioned in the
+    // dropped turns is lost from the graph layer (only the raw bytes
+    // survive in `compaction_dropped/{session}/{ts}`, recallable by text
+    // search but invisible to the typed-edge brain).
     //
-    // The function `extractFromDropWindow` is preserved as inert code +
-    // tests so we can re-enable Pass A extraction by re-wiring it to the
-    // unified runner once we have evidence Pass A is firing in production.
-    //
-    // (Wire planned in C3: extractAtBoundary called from Pass C summary +
-    // session-end TTL only. The cache holds in-flight context between
-    // those boundaries.)
-    // extractFromDropWindow(
-    //     allocator,
-    //     config,
-    //     history.items[drop_start..drop_end],
-    // );
+    // Cost mitigation vs C2's concern: hydration is SKIPPED for Pass A
+    // (`enable_hydration = false`). Hydration is for full session
+    // summaries — a mid-session drop slice isn't worth a second LLM call
+    // for that. So Pass A pays one LLM call per fire, not two. Pass C +
+    // session-end keep both calls. Dedup at persistExtracted handles
+    // overlap with downstream Pass C extraction of the surviving tail.
+    if (config.extraction_judge_provider) |jp| {
+        if (config.extraction_judge_model_name) |jm| if (jm.len > 0) {
+            const window = history.items[drop_start..drop_end];
+            var msgs_buf = std.ArrayListUnmanaged(ChatMessage).initCapacity(allocator, window.len) catch null;
+            if (msgs_buf) |*buf| {
+                defer buf.deinit(allocator);
+                for (window) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
+                const ctx = extraction_runner.ExtractionContext{
+                    .judge_provider = jp,
+                    .judge_model = jm,
+                    .state_mgr = config.extraction_state_mgr,
+                    .user_id = config.extraction_user_id,
+                    .session_id = config.archive_session_id,
+                    .coref_embed = config.extraction_coref_embed,
+                    .archive_mem = config.archive_memory,
+                    .archive_mem_rt = config.archive_mem_rt,
+                    .max_source_chars = config.max_source_chars,
+                    .enable_hydration = false, // Pass A is mid-session — extraction only.
+                };
+                const br = extraction_runner.extractAtBoundary(allocator, buf.items, ctx);
+                defer br.deinit(allocator);
+                log.info(
+                    "compaction.passA.unified_extract entities={d} edges={d} window_msgs={d}",
+                    .{
+                        if (br.extraction) |e| e.entities.len else 0,
+                        if (br.extraction) |e| e.edges.len else 0,
+                        window.len,
+                    },
+                );
+            }
+        };
+    }
 
     // Best-effort archive before deletion (continuity artifact). Mirrors
     // forceCompressHistoryWithArchive — same key shape so memory_timeline
@@ -831,141 +855,6 @@ pub fn forceCompressHistoryWithArchive(
     history.items.len -= to_remove;
 
     return true;
-}
-
-/// V1.14.7 C2 — extract structured facts/entities/edges from the Pass A
-/// drop window before deletion.
-///
-/// Single LLM call to the configured judge provider (typically a fast +
-/// cheap sidecar like Groq Llama-3.3-8B). Asks for a strict JSON object
-/// with `facts`, `entities`, `edges` arrays. Parses via the existing
-/// `extraction_persist.parseExtractedJson` and persists via
-/// `extraction_persist.persistExtracted`. Failure-soft: any error logs
-/// and returns; the drop proceeds regardless.
-///
-/// Skipped when:
-///   - extraction_state_mgr / extraction_user_id / judge_provider+model
-///     are unset (degraded deployment, no postgres, etc.)
-///   - the drop window has zero messages
-///   - the judge LLM call returns empty / malformed JSON
-fn extractFromDropWindow(
-    allocator: std.mem.Allocator,
-    config: CompactionConfig,
-    window: []const OwnedMessage,
-) void {
-    // Plumbing checks
-    const smgr = config.extraction_state_mgr orelse return;
-    const uid = config.extraction_user_id orelse return;
-    const judge_provider = config.extraction_judge_provider orelse return;
-    const judge_model = config.extraction_judge_model_name orelse return;
-    if (judge_model.len == 0) return;
-    if (window.len == 0) return;
-
-    // Build a tight transcript of the drop window. Reuse the same caps
-    // as `buildCompactionTranscript` (per-message 2KB, total max_source_chars).
-    const transcript = buildCompactionTranscript(allocator, window, 0, window.len, config.max_source_chars) catch |err| {
-        log.warn("compaction.passA.extract.build_text_failed err={s}", .{@errorName(err)});
-        return;
-    };
-    defer allocator.free(transcript);
-
-    if (transcript.len == 0) return;
-
-    // Build the structured-extraction prompt. Strict JSON ARRAY at top level
-    // — matches `extraction_persist.parseExtractedJson` which expects an
-    // array (not an object with a `facts` wrapper). Schema fields are the
-    // canonical Pass C set so the same parser handles both call sites.
-    const sys_prompt =
-        "You extract durable facts from a conversation slice. " ++
-        "Output STRICT JSON ARRAY at top level — no prose, no markdown, no commentary, no `{\"facts\":...}` wrapper. " ++
-        "Empty array `[]` is valid output when nothing crystallizable was said.\n\n" ++
-        "Each array element:\n" ++
-        "{\n" ++
-        "  \"text\": \"<15-80 word atomic self-contained fact>\",\n" ++
-        "  \"subject\": \"<entity name, e.g. 'user', 'Alex', 'project'>\",\n" ++
-        "  \"predicate\": \"<RELATION_TYPE_SCREAMING_SNAKE_CASE, e.g. 'PREFERS', 'WORKS_AT', 'BIRTHDAY'>\",\n" ++
-        "  \"object\": \"<value or target entity name>\",\n" ++
-        "  \"attributed_to\": \"user\" | \"assistant\" | \"assistant_offer\" | \"undecided\",\n" ++
-        "  \"confidence\": <number 0.0-1.0>\n" ++
-        "}\n\n" ++
-        "Only emit facts useful in FUTURE conversations (preferences, named decisions, durable attributes, " ++
-        "stable relationships). Skip transient turn details, pleasantries, ack-only exchanges. " ++
-        "Reject meta-predicates: GREETED, SAID, ASKED, MENTIONED, REPLIED, ACKNOWLEDGED.";
-
-    var messages = [_]ChatMessage{
-        .{ .role = .system, .content = sys_prompt },
-        .{ .role = .user, .content = transcript },
-    };
-
-    const request = providers.ChatRequest{
-        .messages = messages[0..],
-        .model = judge_model,
-        .temperature = 0.2,
-        .tools = null,
-        .timeout_secs = 30,
-    };
-
-    const response = judge_provider.chat(allocator, request, judge_model, 0.2) catch |err| {
-        log.warn("compaction.passA.extract.llm_failed err={s} window_msgs={d}", .{ @errorName(err), window.len });
-        return;
-    };
-    defer {
-        if (response.content) |c| if (c.len > 0) allocator.free(c);
-        for (response.tool_calls) |tc| {
-            allocator.free(tc.id);
-            allocator.free(tc.name);
-            allocator.free(tc.arguments);
-        }
-        if (response.tool_calls.len > 0) allocator.free(response.tool_calls);
-        if (response.model.len > 0) allocator.free(response.model);
-        if (response.reasoning_content) |rc| if (rc.len > 0) allocator.free(rc);
-    }
-
-    const content = response.content orelse return;
-    if (content.len == 0) return;
-
-    // Parse via existing JSON-tail parser.
-    const extracted = extraction_persist.parseExtractedJson(allocator, content) catch |err| {
-        log.warn("compaction.passA.extract.parse_failed err={s} raw_len={d}", .{ @errorName(err), content.len });
-        return;
-    };
-    defer extraction_persist.freeExtractedMemories(allocator, extracted);
-
-    if (extracted.len == 0) {
-        log.info("compaction.passA.extract count=0 window_msgs={d} reason=empty_facts", .{window.len});
-        return;
-    }
-
-    // Persist via existing extraction_persist path. Same shape as Pass C
-    // and session-end (commands.zig:1437).
-    const judge_ctx = extraction_persist.JudgeContext{
-        .provider = judge_provider,
-        .model_name = judge_model,
-    };
-    const coref_ctx: ?extraction_persist.EntityResolution =
-        if (config.extraction_coref_embed) |ep|
-            extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 }
-        else
-            null;
-
-    const persist_result = extraction_persist.persistExtracted(
-        allocator,
-        smgr,
-        uid,
-        config.archive_session_id,
-        extracted,
-        judge_ctx,
-        coref_ctx,
-        config.archive_mem_rt,
-    ) catch |err| {
-        log.warn("compaction.passA.extract.persist_failed err={s} count={d}", .{ @errorName(err), extracted.len });
-        return;
-    };
-
-    log.info(
-        "compaction.passA.extract count={d} written={d} skipped_dup={d} window_msgs={d} window_bytes={d}",
-        .{ extracted.len, persist_result.written_count, persist_result.skipped_md5_dup + persist_result.skipped_semantic_dup, window.len, transcript.len },
-    );
 }
 
 /// Best-effort archive of messages about to be dropped.
@@ -2100,47 +1989,8 @@ test "dropOldestPairsFromMiddle no-op when total under keep_recent + protect pre
     try std.testing.expect(!reduced);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// V1.14.7 C2 — extractFromDropWindow skip-path coverage
-// ═══════════════════════════════════════════════════════════════════════════
-
-test "extractFromDropWindow skips silently when extraction state mgr is null" {
-    // C2 contract: when extraction plumbing isn't wired (degraded
-    // deployment without postgres state mgr), extractFromDropWindow
-    // returns silently without crashing — Pass A's drop semantics
-    // remain unchanged.
-    const allocator = std.testing.allocator;
-    const window = [_]OwnedMessage{
-        .{ .role = .user, .content = "drop1" },
-        .{ .role = .assistant, .content = "drop2" },
-    };
-    // No state mgr / user_id / judge → all skip predicates fire.
-    const cfg = CompactionConfig{ .token_limit = 1000 };
-    extractFromDropWindow(allocator, cfg, &window);
-    // No assertion needed — the test verifies the function doesn't
-    // crash or attempt LLM calls when prerequisites are absent.
-}
-
-test "extractFromDropWindow skips when window is empty" {
-    // C2 contract: zero-message window means nothing to extract — early return
-    // without LLM call.
-    const allocator = std.testing.allocator;
-    const window: []const OwnedMessage = &.{};
-    const cfg = CompactionConfig{ .token_limit = 1000 };
-    extractFromDropWindow(allocator, cfg, window);
-    // Same intent as above — non-crashing skip path.
-}
-
-test "extractFromDropWindow skips when judge_model is empty string" {
-    // C2 contract: judge_model = "" (operator left it unset) is a hard skip.
-    // Avoids sending requests with empty model strings.
-    const allocator = std.testing.allocator;
-    const window = [_]OwnedMessage{
-        .{ .role = .user, .content = "test" },
-    };
-    const cfg = CompactionConfig{
-        .token_limit = 1000,
-        .extraction_judge_model_name = "",
-    };
-    extractFromDropWindow(allocator, cfg, &window);
-}
+// V1.14.8 C6: extractFromDropWindow skip-path tests removed alongside the
+// function. Pass A is now wired through extraction_runner.extractAtBoundary
+// — its skip-path coverage lives in extraction/runner.zig's tests
+// ("extractAtBoundary skip path: empty window", "empty judge_model",
+// "no state mgr", "zero edges").

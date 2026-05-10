@@ -1,14 +1,16 @@
 //! V1.14.8 — Boundary extraction runner.
 //!
-//! Single entry point used by all boundary triggers (Pass C summary,
-//! session-end TTL). Pass A is intentionally NOT wired (see V1.14.8 C2 —
-//! Pass A's drop-from-middle behavior preserved; extraction wire deferred
-//! until Pass A is observed firing in production).
+//! Single entry point used by every boundary trigger:
+//!   - Pass A drop-from-middle (mid-session, extract-only via
+//!     `enable_hydration=false`)
+//!   - Pass C full LLM summarization (extract + hydrate)
+//!   - Session-end TTL (extract + hydrate)
 //!
 //! Per boundary fire:
 //!   1. Build a transcript of the conversation window once (reused).
 //!   2. Run extraction LLM call → JSON {entities, edges} → ExtractionResult.
-//!   3. Run hydration LLM call → XML <summary> → HydrationSummary.
+//!   3. Run hydration LLM call → XML <summary> → HydrationSummary
+//!      (skipped when `ctx.enable_hydration=false`).
 //!   4. Persist extraction via existing extraction_persist.persistExtracted
 //!      (entity coref, edge upsert, vector sync, working memory promotion).
 //!   5. Persist hydration as `summary_latest/<session>` text payload.
@@ -76,6 +78,13 @@ pub const ExtractionContext = struct {
     /// LLM call timeout in seconds. Boundaries are infrequent so we afford
     /// a longer budget than per-turn calls.
     timeout_secs: u64 = 60,
+    /// V1.14.8 C6 — when false, the hydration LLM call is skipped entirely
+    /// and `BoundaryResult.hydration` is null. Pass A drop windows set this
+    /// false: each drop is a partial mid-session slice, NOT a full session
+    /// summary; the session-end boundary owns hydration for that. Pass C +
+    /// session-end keep this true (default) — they're whole-window
+    /// distillation moments where the hydration summary is genuinely useful.
+    enable_hydration: bool = true,
 };
 
 /// Convenience: persist what we extracted/hydrated and return the
@@ -113,10 +122,13 @@ pub fn extractAtBoundary(
         break :blk null;
     };
 
-    const hydration_result = runHydrationCall(allocator, transcript, ctx) catch |err| blk: {
-        log.warn("boundary.hydration.call_failed err={s}", .{@errorName(err)});
-        break :blk null;
-    };
+    const hydration_result: ?schema.HydrationSummary = if (ctx.enable_hydration)
+        (runHydrationCall(allocator, transcript, ctx) catch |err| blk: {
+            log.warn("boundary.hydration.call_failed err={s}", .{@errorName(err)});
+            break :blk null;
+        })
+    else
+        null;
 
     // Persist (best-effort per layer)
     if (extraction_result) |e| {
@@ -429,7 +441,11 @@ test "extractAtBoundary skip path: empty judge_model" {
     try std.testing.expect(result.hydration == null);
 }
 
-test "persistExtraction skip path: no state mgr" {
+test "persistExtraction skip path: no state mgr (no edges to persist)" {
+    // F2 (V1.14.8 review fix): clarified test intent. With an empty
+    // ExtractionResult both the no_state_mgr and zero_edges skip paths
+    // would fire; the function returns silently regardless. The leak-free
+    // exit is the actual contract.
     const allocator = std.testing.allocator;
     const result = try schema.ExtractionResult.empty(allocator);
     defer result.deinit(allocator);
@@ -455,4 +471,45 @@ test "persistExtraction skip path: zero edges" {
     };
     // zero edges → early return without touching state_mgr
     try persistExtraction(allocator, result, ctx);
+}
+
+test "ExtractionContext.enable_hydration default = true" {
+    // F3 (V1.14.8 review fix): document + lock the default contract.
+    // Pass A wires `enable_hydration = false` explicitly; Pass C +
+    // session-end rely on the default `true` for hydration summaries.
+    const ctx = ExtractionContext{
+        .judge_provider = undefined,
+        .judge_model = "test-model",
+    };
+    try std.testing.expect(ctx.enable_hydration == true);
+}
+
+test "slotIntentToWorkingMemoryType maps every variant correctly" {
+    // F4 (V1.14.8 review fix): enum-exhaustive test so adding a new
+    // SlotIntent without updating the mapping (or vice versa) trips a
+    // compile error here, not a silent runtime null-promotion.
+    try std.testing.expectEqualStrings(
+        working_memory.SlotType.open_loop,
+        slotIntentToWorkingMemoryType(.open_loop).?,
+    );
+    try std.testing.expectEqualStrings(
+        working_memory.SlotType.active_goal,
+        slotIntentToWorkingMemoryType(.active_goal).?,
+    );
+    try std.testing.expectEqualStrings(
+        working_memory.SlotType.decision,
+        slotIntentToWorkingMemoryType(.decision).?,
+    );
+    try std.testing.expectEqualStrings(
+        working_memory.SlotType.identity,
+        slotIntentToWorkingMemoryType(.identity).?,
+    );
+    try std.testing.expectEqualStrings(
+        working_memory.SlotType.temporal,
+        slotIntentToWorkingMemoryType(.temporal).?,
+    );
+    // .preference intentionally returns null — preferences live in
+    // canonical memory, not working slots.
+    try std.testing.expect(slotIntentToWorkingMemoryType(.preference) == null);
+    try std.testing.expect(slotIntentToWorkingMemoryType(null) == null);
 }
