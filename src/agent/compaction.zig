@@ -18,6 +18,11 @@ const Agent = @import("root.zig").Agent;
 const OwnedMessage = Agent.OwnedMessage;
 const zaki_state = @import("../zaki_state.zig");
 const extraction_persist = @import("extraction_persist.zig");
+// V1.14.8 C1 typecheck — keep imported so the module graph compiles the new
+// extraction/ files. Wired into actual call sites in C3.
+comptime {
+    _ = @import("extraction/runner.zig");
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
