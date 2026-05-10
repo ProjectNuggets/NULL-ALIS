@@ -424,18 +424,30 @@ fn dropOldestPairsFromMiddle(
         .{ drop_start, drop_end, dropped_count, dropped_bytes, sys_count, first_user_idx, tail_start },
     );
 
-    // V1.14.7 C2 — structured extraction over the drop window BEFORE deletion.
-    // This is the natural distillation moment: the messages are coherent (they
-    // survived in active context for many turns) and we're already paying the
-    // attention cost to write them to the archive. One LLM call extracts
-    // facts + entities + edges via the existing extraction_persist plumbing
-    // (V1.6 5b.2). Failure-soft: any error logs and continues — the drop
-    // proceeds regardless.
-    extractFromDropWindow(
-        allocator,
-        config,
-        history.items[drop_start..drop_end],
-    );
+    // V1.14.8 C2 — Pass A extraction wire DEACTIVATED.
+    //
+    // Original V1.14.7 C2 fired `extractFromDropWindow` here so a per-drop
+    // LLM call extracted facts before the messages were freed. We're keeping
+    // the drop-from-middle behavior (cache-stable + cheap) but routing
+    // extraction through the unified boundary runner (`extraction/runner.zig`)
+    // at Pass C + session-end only. Pass A is too frequent in real traffic
+    // (fires on every token-budget breach, often mid-thread) — running an
+    // extraction LLM call per drop turned into a hidden cost multiplier
+    // without paying back in graph density (the same facts get re-extracted
+    // at Pass C anyway, then dedup-skipped on persist).
+    //
+    // The function `extractFromDropWindow` is preserved as inert code +
+    // tests so we can re-enable Pass A extraction by re-wiring it to the
+    // unified runner once we have evidence Pass A is firing in production.
+    //
+    // (Wire planned in C3: extractAtBoundary called from Pass C summary +
+    // session-end TTL only. The cache holds in-flight context between
+    // those boundaries.)
+    // extractFromDropWindow(
+    //     allocator,
+    //     config,
+    //     history.items[drop_start..drop_end],
+    // );
 
     // Best-effort archive before deletion (continuity artifact). Mirrors
     // forceCompressHistoryWithArchive — same key shape so memory_timeline
