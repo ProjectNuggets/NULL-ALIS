@@ -943,6 +943,11 @@ pub const Agent = struct {
             .extraction_state_mgr = self.extraction_state_mgr,
             .extraction_user_id = self.extraction_user_id,
             .extraction_coref_embed = self.extraction_coref_embed,
+            .extraction_judge_provider = self.extraction_judge_provider,
+            .extraction_judge_model_name = if (self.extraction_judge_model_name.len > 0)
+                self.extraction_judge_model_name
+            else
+                compact_model,
         };
 
         // iter22 (Nova's Medium finding): measure thrash savings in TOKENS,
