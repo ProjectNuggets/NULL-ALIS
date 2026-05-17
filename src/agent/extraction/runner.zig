@@ -31,6 +31,9 @@ const zaki_state = @import("../../zaki_state.zig");
 const schema = @import("schema.zig");
 const prompts = @import("prompts.zig");
 const parser = @import("parser.zig");
+const chunker = @import("chunker.zig");
+const merger = @import("merger.zig");
+const telemetry = @import("telemetry.zig");
 const extraction_persist = @import("../extraction_persist.zig");
 const working_memory = @import("../working_memory.zig");
 
@@ -85,10 +88,48 @@ pub const ExtractionContext = struct {
     /// session-end keep this true (default) — they're whole-window
     /// distillation moments where the hydration summary is genuinely useful.
     enable_hydration: bool = true,
+    /// V1.14.9 — Target episode size in estimated tokens (chunker soft
+    /// target). Lower = more, smaller calls (better coherence, higher
+    /// total cost). Higher = fewer, larger calls. 4000 is the
+    /// Llama-3.3-70B-Instruct-Turbo coherence sweet spot per the
+    /// 2026-05-10 research report.
+    target_episode_tokens: u32 = 4000,
+    /// V1.14.9 — Hard cap on episode size in tokens. Mid-turn splits
+    /// only fire when adding the next message would exceed this.
+    /// Conventionally 2x target.
+    max_episode_tokens: u32 = 8000,
+    /// V1.14.9 — Cost guard. Max extraction LLM calls per boundary.
+    /// When chunker emits more, sample first 5 + last (cap-5) to
+    /// preserve narrative anchor + recent context. 20 = ~$0.04 per
+    /// boundary at Llama prices.
+    max_episodes_per_boundary: u32 = 20,
+    /// V1.14.9 — Parallelism for episode fan-out. 1 = sequential.
+    /// Higher = parallel via std.Thread.Pool. 8 = saturates Together
+    /// API rate limit comfortably without contention per research
+    /// report; tested green in P6. Default 8 for boundary calls
+    /// (called once per Pass A / Pass C / session-end, not per turn).
+    extraction_concurrency: u32 = 8,
 };
 
-/// Convenience: persist what we extracted/hydrated and return the
-/// combined result. Caller frees via BoundaryResult.deinit.
+/// V1.14.9 — Episode-based boundary extraction. Replaces the V1.14.8
+/// "one giant LLM call on the full window" pattern that degraded to
+/// entities=0 edges=0 on long sessions (293-msg windows truncated to
+/// 80KB of fragments).
+///
+/// Pipeline:
+///   1. chunker.chunkIntoEpisodes(window) → semantic episodes
+///   2. for each episode: build per-episode transcript (no aggressive
+///      per-msg cap), fire one extraction LLM call. Sequential in P3;
+///      parallel in P4 (gated by ctx.extraction_concurrency).
+///   3. merger.mergeEpisodeResults(results) → ONE merged ExtractionResult
+///      (entity coref + structural edge dedup)
+///   4. Hydration runs ONCE on a condensed full-window transcript
+///      (it's a summary, not an extraction — one coherent call is
+///      correct shape).
+///   5. persistExtraction (existing path) handles MD5 + semantic dedup
+///      on the merged result.
+///
+/// Caller frees via BoundaryResult.deinit.
 pub fn extractAtBoundary(
     allocator: std.mem.Allocator,
     window: []const ChatMessage,
@@ -103,35 +144,80 @@ pub fn extractAtBoundary(
         return .{ .extraction = null, .hydration = null };
     }
 
-    const transcript = buildTranscript(allocator, window, ctx.max_source_chars) catch |err| {
-        log.warn("boundary.transcript_failed err={s}", .{@errorName(err)});
+    // Phase 1 — chunk into semantic episodes.
+    const episodes = chunker.chunkIntoEpisodes(
+        allocator,
+        window,
+        ctx.target_episode_tokens,
+        ctx.max_episode_tokens,
+        ctx.max_episodes_per_boundary,
+    ) catch |err| {
+        log.warn("boundary.chunk_failed err={s}", .{@errorName(err)});
         return .{ .extraction = null, .hydration = null };
     };
-    defer allocator.free(transcript);
+    defer allocator.free(episodes);
 
-    if (transcript.len == 0) {
-        log.info("boundary.skip reason=empty_transcript", .{});
+    if (episodes.len == 0) {
+        log.info("boundary.skip reason=zero_episodes", .{});
         return .{ .extraction = null, .hydration = null };
     }
 
-    // Two LLM calls. Sequential for simplicity (parallel adds threading
-    // complexity and boundaries are infrequent — once per Pass A drop or
-    // session end, not per turn).
-    const extraction_result = runExtractionCall(allocator, transcript, ctx) catch |err| blk: {
-        log.warn("boundary.extraction.call_failed err={s}", .{@errorName(err)});
+    log.info(
+        "boundary.chunked window_msgs={d} episodes={d} target_tokens={d} max_episodes={d}",
+        .{ window.len, episodes.len, ctx.target_episode_tokens, ctx.max_episodes_per_boundary },
+    );
+
+    // Phase 2 — extract per episode. Sequential when concurrency<=1
+    // OR when there's only one episode (no point spinning up a pool).
+    // Parallel via std.Thread.Pool when concurrency>1 and we have
+    // multiple episodes. Timed for R1 telemetry (review fix M-04).
+    const use_parallel = ctx.extraction_concurrency > 1 and episodes.len > 1;
+    var extraction_timer = std.time.Timer.start() catch null;
+    const episode_results = (if (use_parallel)
+        extractEpisodesParallel(allocator, episodes, ctx)
+    else
+        extractEpisodesSequential(allocator, episodes, ctx)) catch |err| blk: {
+        log.warn("boundary.extract_episodes_failed err={s}", .{@errorName(err)});
         break :blk null;
     };
+    const extraction_ms_total: u64 = if (extraction_timer) |*t| t.read() / std.time.ns_per_ms else 0;
+    defer if (episode_results) |er| freeEpisodeResults(allocator, er);
 
-    const hydration_result: ?schema.HydrationSummary = if (ctx.enable_hydration)
-        (runHydrationCall(allocator, transcript, ctx) catch |err| blk: {
+    // Phase 3 — merge with coref + structural dedup.
+    const merged_extraction: ?schema.ExtractionResult = if (episode_results) |er| blk: {
+        const coref_ctx: ?merger.CorefCtx = if (ctx.coref_embed) |ep|
+            merger.CorefCtx{ .embed_provider = ep, .threshold = 0.95 }
+        else
+            null;
+        break :blk merger.mergeEpisodeResults(allocator, er, coref_ctx) catch |err| inner: {
+            log.warn("boundary.merge_failed err={s}", .{@errorName(err)});
+            break :inner null;
+        };
+    } else null;
+
+    // Phase 4 — hydration on a single condensed transcript (no chunking;
+    // hydration is intentionally a whole-window summary). Timed for R1
+    // telemetry (review fix M-04).
+    var hydration_timer = std.time.Timer.start() catch null;
+    const hydration_result: ?schema.HydrationSummary = if (ctx.enable_hydration) hydration: {
+        const transcript = buildTranscript(allocator, window, ctx.max_source_chars) catch |err| {
+            log.warn("boundary.hydration.transcript_failed err={s}", .{@errorName(err)});
+            break :hydration null;
+        };
+        defer allocator.free(transcript);
+        if (transcript.len == 0) break :hydration null;
+        break :hydration runHydrationCall(allocator, transcript, ctx) catch |err| inner: {
             log.warn("boundary.hydration.call_failed err={s}", .{@errorName(err)});
-            break :blk null;
-        })
+            break :inner null;
+        };
+    } else null;
+    const hydration_ms: u64 = if (ctx.enable_hydration)
+        (if (hydration_timer) |*t| t.read() / std.time.ns_per_ms else 0)
     else
-        null;
+        0;
 
-    // Persist (best-effort per layer)
-    if (extraction_result) |e| {
+    // Phase 5 — persist (best-effort per layer).
+    if (merged_extraction) |e| {
         persistExtraction(allocator, e, ctx) catch |err| {
             log.warn("boundary.extraction.persist_failed err={s}", .{@errorName(err)});
         };
@@ -142,18 +228,215 @@ pub fn extractAtBoundary(
         };
     }
 
+    // Aggregate telemetry. R1's `boundary.metrics` log + zero_density
+    // + episode_failure_high alerts live in telemetry.zig.
+    const episodes_extracted_success = if (episode_results) |er| countNonNull(er) else 0;
+    const episodes_extracted_failed = if (episode_results) |er| er.len - episodes_extracted_success else 0;
+
+    // Sum window bytes for density calculation. Cheap O(N) pass over
+    // ChatMessage slice (no string copy).
+    var window_bytes: u64 = 0;
+    for (window) |m| window_bytes += m.content.len;
+
+    telemetry.recordBoundary(.{
+        .kind = inferBoundaryKind(ctx),
+        .window_msg_count = @intCast(window.len),
+        .window_byte_total = window_bytes,
+        .episodes_chunked = @intCast(episodes.len),
+        .episodes_extracted_success = @intCast(episodes_extracted_success),
+        .episodes_extracted_failed = @intCast(episodes_extracted_failed),
+        .entities_extracted = @intCast(if (merged_extraction) |e| e.entities.len else 0),
+        .edges_extracted = @intCast(if (merged_extraction) |e| e.edges.len else 0),
+        .hydration_present = hydration_result != null,
+        // V1.14.9 review fix M-04: wall-clock timings via
+        // std.time.Timer (captured around the fan-out + hydration
+        // calls above). Hydration timer skipped when disabled.
+        .extraction_ms_total = extraction_ms_total,
+        .hydration_ms = hydration_ms,
+    });
+
+    // Keep the legacy boundary.complete line for grep-compat with
+    // any existing alerting that expects it. telemetry.zig's
+    // boundary.metrics is the canonical structured log going forward.
     log.info(
-        "boundary.complete entities={d} edges={d} hydration_present={} window_msgs={d} transcript_bytes={d}",
+        "boundary.complete episodes={d} episodes_ok={d} episodes_failed={d} entities={d} edges={d} hydration_present={} window_msgs={d}",
         .{
-            if (extraction_result) |e| e.entities.len else 0,
-            if (extraction_result) |e| e.edges.len else 0,
+            episodes.len,
+            episodes_extracted_success,
+            episodes_extracted_failed,
+            if (merged_extraction) |e| e.entities.len else 0,
+            if (merged_extraction) |e| e.edges.len else 0,
             hydration_result != null,
             window.len,
-            transcript.len,
         },
     );
 
-    return .{ .extraction = extraction_result, .hydration = hydration_result };
+    return .{ .extraction = merged_extraction, .hydration = hydration_result };
+}
+
+/// Best-effort boundary-kind inference from context fields. The
+/// runner doesn't get told explicitly whether it's serving Pass A,
+/// Pass C, or session-end — but we can infer from `enable_hydration`
+/// (Pass A disables it) and `archive_mem` (session-end usually has it).
+/// Not load-bearing — alerts fire correctly either way; this just
+/// improves grep-ability.
+fn inferBoundaryKind(ctx: ExtractionContext) telemetry.BoundaryKind {
+    if (!ctx.enable_hydration) return .pass_a;
+    if (ctx.archive_mem == null) return .pass_c;
+    return .session_end;
+}
+
+/// V1.14.9 — Run extraction sequentially across episodes. Each
+/// episode failure returns null in its slot; we don't abort the
+/// whole boundary on one bad episode (partial signal beats none).
+/// P4 introduces a parallel variant gated on
+/// `ctx.extraction_concurrency`.
+fn extractEpisodesSequential(
+    allocator: std.mem.Allocator,
+    episodes: []const chunker.Episode,
+    ctx: ExtractionContext,
+) ![]?schema.ExtractionResult {
+    var results = try allocator.alloc(?schema.ExtractionResult, episodes.len);
+    errdefer allocator.free(results);
+    for (episodes, 0..) |ep, i| {
+        results[i] = runExtractionOnEpisode(allocator, ep, ctx) catch |err| blk: {
+            log.warn("boundary.episode[{d}].failed err={s} msgs={d}", .{ i, @errorName(err), ep.messages.len });
+            break :blk null;
+        };
+    }
+    return results;
+}
+
+/// V1.14.9 P4 — Parallel episode extraction via std.Thread.Pool.
+/// Called when `ctx.extraction_concurrency > 1`. Each episode runs
+/// in its own worker; failures are isolated (slot stays null,
+/// others proceed). Caller frees via freeEpisodeResults.
+///
+/// Allocator thread-safety: the agent's primary allocator is
+/// expected to be thread-safe (std.heap.GeneralPurposeAllocator with
+/// `.thread_safe = true` OR the C allocator). The runner doesn't
+/// override; it inherits whatever the caller passes. Each thread's
+/// LLM call uses curl-subprocess transport (provider-level), which
+/// is process-isolated and inherently thread-safe.
+fn extractEpisodesParallel(
+    allocator: std.mem.Allocator,
+    episodes: []const chunker.Episode,
+    ctx: ExtractionContext,
+) ![]?schema.ExtractionResult {
+    var results = try allocator.alloc(?schema.ExtractionResult, episodes.len);
+    @memset(results, null);
+    errdefer allocator.free(results);
+
+    // Cap thread count at the smaller of (episodes count, configured
+    // concurrency). No point spinning up 8 threads for 3 episodes.
+    const n_jobs: usize = @min(episodes.len, @as(usize, ctx.extraction_concurrency));
+
+    var pool: std.Thread.Pool = undefined;
+    pool.init(.{ .allocator = allocator, .n_jobs = n_jobs }) catch |err| {
+        log.warn("boundary.pool_init_failed err={s} falling_back=sequential", .{@errorName(err)});
+        // Free the pre-allocated results array so the sequential path
+        // can allocate fresh.
+        allocator.free(results);
+        return extractEpisodesSequential(allocator, episodes, ctx);
+    };
+    defer pool.deinit();
+
+    var wg: std.Thread.WaitGroup = .{};
+    for (episodes, 0..) |ep, i| {
+        pool.spawnWg(&wg, episodeWorker, .{ &results[i], ep, ctx, allocator, i });
+    }
+    wg.wait();
+
+    return results;
+}
+
+/// Worker function for parallel episode extraction. One per episode.
+/// Writes its result (or null on failure) into the pre-allocated slot.
+fn episodeWorker(
+    slot: *?schema.ExtractionResult,
+    episode: chunker.Episode,
+    ctx: ExtractionContext,
+    allocator: std.mem.Allocator,
+    idx: usize,
+) void {
+    slot.* = runExtractionOnEpisode(allocator, episode, ctx) catch |err| blk: {
+        log.warn("boundary.episode[{d}].parallel_failed err={s} msgs={d}", .{ idx, @errorName(err), episode.messages.len });
+        break :blk null;
+    };
+}
+
+/// Free an array of per-episode results allocated by
+/// extractEpisodesSequential / extractEpisodesParallel.
+fn freeEpisodeResults(allocator: std.mem.Allocator, results: []?schema.ExtractionResult) void {
+    for (results) |opt| {
+        if (opt) |r| r.deinit(allocator);
+    }
+    allocator.free(results);
+}
+
+fn countNonNull(results: []const ?schema.ExtractionResult) usize {
+    var n: usize = 0;
+    for (results) |r| {
+        if (r != null) n += 1;
+    }
+    return n;
+}
+
+/// Per-message content cap inside `buildEpisodeTranscript`. Episodes
+/// are bounded by `target_episode_tokens` overall but a SINGLE
+/// pathologically-large message (tool output dump, file paste, very
+/// long assistant reply) can still dominate the LLM's view and
+/// recreate the V1.14.8 fragmentation failure mode. 8KB is generous
+/// enough for substantive turn content while bounding the worst case.
+/// Review fix M-03.
+const PER_MESSAGE_EPISODE_CAP: usize = 8_000;
+
+/// V1.14.9 — Build a transcript for ONE episode. Episodes are
+/// bounded by `target_episode_tokens` at the chunker level, but
+/// `buildEpisodeTranscript` still caps each individual message at
+/// `PER_MESSAGE_EPISODE_CAP` so a single oversized tool output or
+/// file dump can't dominate one episode's view and recreate the
+/// V1.14.8 fragmentation problem at the per-episode level. When a
+/// message is truncated, we append a sentinel so the LLM knows the
+/// content was cut.
+fn buildEpisodeTranscript(
+    allocator: std.mem.Allocator,
+    episode: chunker.Episode,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    for (episode.messages) |*msg| {
+        const role_str: []const u8 = switch (msg.role) {
+            .system => "SYSTEM",
+            .user => "USER",
+            .assistant => "ASSISTANT",
+            .tool => "TOOL",
+        };
+        try buf.appendSlice(allocator, role_str);
+        try buf.appendSlice(allocator, ": ");
+        if (msg.content.len > PER_MESSAGE_EPISODE_CAP) {
+            try buf.appendSlice(allocator, msg.content[0..PER_MESSAGE_EPISODE_CAP]);
+            try buf.appendSlice(allocator, "\n[...truncated for extraction...]");
+        } else {
+            try buf.appendSlice(allocator, msg.content);
+        }
+        try buf.append(allocator, '\n');
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+/// V1.14.9 — Fire one extraction LLM call against a single episode.
+/// Returns parsed ExtractionResult or null on any failure.
+fn runExtractionOnEpisode(
+    allocator: std.mem.Allocator,
+    episode: chunker.Episode,
+    ctx: ExtractionContext,
+) !?schema.ExtractionResult {
+    if (episode.messages.len == 0) return null;
+    const transcript = try buildEpisodeTranscript(allocator, episode);
+    defer allocator.free(transcript);
+    if (transcript.len == 0) return null;
+    return runExtractionCall(allocator, transcript, ctx);
 }
 
 /// Build a compact transcript of the conversation window. Per-message cap

@@ -824,6 +824,16 @@ const ManagerImpl = struct {
     pool_acquire_timeouts: u64,
     statement_timeout_ms: u32,
     lock_timeout_ms: u32,
+    // F6 (2026-05-10): cached existence flag for the cross-schema
+    // `public.zaki_users` FK target. When the zaki-prod backend isn't
+    // co-located (nullalis-only dev / standalone deploys), the table
+    // doesn't exist. Without this cache, every `hasExternalIdentity`
+    // call hits the noisy `relation does not exist` postgres error path
+    // — a real bench run logged ~200 of these in one session. First
+    // failure sets this flag true; subsequent calls short-circuit
+    // silently. Reset to .unknown on a new connection (future: cell
+    // pod hot-swap).
+    external_identity_status: enum { unknown, available, unavailable } = .unknown,
 
     pub const ClaimedJob = struct {
         id: []u8,
@@ -1911,6 +1921,16 @@ const ManagerImpl = struct {
     }
 
     pub fn hasExternalIdentity(self: *Self, user_id: i64) !?bool {
+        // F6 (2026-05-10): short-circuit when we've already learned the
+        // `public.zaki_users` table doesn't exist in this deployment.
+        // The first call probes; if it fails with a missing-table error,
+        // every subsequent call returns null silently. Without this guard
+        // a long bench logged ~200 identical `relation does not exist`
+        // errors.
+        if (self.external_identity_status == .unavailable) {
+            return null;
+        }
+
         var user_buf: [32]u8 = undefined;
         const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
         const query =
@@ -1918,12 +1938,18 @@ const ManagerImpl = struct {
 
         const result = self.execParams(query, &.{user_s.ptr}, &.{@as(c_int, @intCast(user_s.len))}) catch |err| switch (err) {
             // Compatibility mode: keep provisioning behavior when the identity
-            // table is inaccessible in this runtime.
-            error.ExecFailed, error.ConnectionFailed => return null,
+            // table is inaccessible in this runtime. F6: cache the
+            // unavailability so the next 200 calls don't repeat the noisy
+            // error log.
+            error.ExecFailed, error.ConnectionFailed => {
+                self.external_identity_status = .unavailable;
+                return null;
+            },
             else => return err,
         };
         defer c.PQclear(result);
 
+        self.external_identity_status = .available;
         return c.PQntuples(result) > 0;
     }
 

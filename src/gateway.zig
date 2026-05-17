@@ -1675,7 +1675,20 @@ const TenantRuntime = struct {
                     // Closes the third callsite where contradictions
                     // could land but didn't (commands.zig session-end).
                     runtime.session_mgr.extraction_judge_provider = provider_i;
-                    runtime.session_mgr.extraction_judge_model_name = runtime.config.default_model orelse "";
+                    // V1.14.8.1 (2026-05-10): prefer the dedicated
+                    // extraction sidecar override when set. Falls back to
+                    // default_model only when no override is configured.
+                    // Kimi K2.5 (a typical default_model on the zaki_bot
+                    // profile) is a reasoning model and produces empty
+                    // `content` on JSON-extraction prompts because it burns
+                    // its output budget on hidden reasoning — the override
+                    // lets ops pin a non-reasoning model like
+                    // Llama-3.3-70B-Instruct-Turbo without changing the
+                    // primary chat model.
+                    runtime.session_mgr.extraction_judge_model_name = if (runtime.config.agent.extraction_judge_model.len > 0)
+                        runtime.config.agent.extraction_judge_model
+                    else
+                        runtime.config.default_model orelse "";
                     log.info("extraction.enabled user_id={d} coref={s} judge={s}", .{
                         numeric_user_id,
                         if (coref_on) "on" else "off-no-embed",
