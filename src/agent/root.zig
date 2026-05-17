@@ -943,6 +943,20 @@ pub const Agent = struct {
             .extraction_state_mgr = self.extraction_state_mgr,
             .extraction_user_id = self.extraction_user_id,
             .extraction_coref_embed = self.extraction_coref_embed,
+            // V1.14.9 (2026-05-10): propagate the judge fields the agent
+            // already holds. The Pass A + Pass C wires inside compaction.zig
+            // gate on these — without them the unified extractor (V1.14.8 C6
+            // / V1.14.9) silently skips every compaction boundary, leaving
+            // memory_edges empty even though the extractor wire is
+            // architecturally correct. F5 V1.14.9 diagnosis confirmed this
+            // is the missing link: Pass A fired (dropped 424 msgs) but no
+            // boundary.chunked / boundary.metrics logs appeared because the
+            // wire guards on extraction_judge_provider were null.
+            .extraction_judge_provider = self.extraction_judge_provider,
+            .extraction_judge_model_name = if (self.extraction_judge_model_name.len > 0)
+                self.extraction_judge_model_name
+            else
+                null,
         };
 
         // iter22 (Nova's Medium finding): measure thrash savings in TOKENS,
