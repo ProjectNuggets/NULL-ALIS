@@ -919,45 +919,9 @@ pub const Agent = struct {
 
         const compact_provider = if (self.sidecar_provider) |sp| sp else self.provider;
         const compact_model = if (self.sidecar_provider != null) self.sidecar_model else self.model_name;
-        const cfg = compaction.CompactionConfig{
-            .keep_recent = self.compaction_keep_recent,
-            .max_summary_chars = self.compaction_max_summary_chars,
-            .max_source_chars = self.compaction_max_source_chars,
-            .token_limit = self.token_limit,
-            .max_tokens = self.max_tokens,
-            .message_timeout_secs = self.message_timeout_secs,
-            .max_history_messages = self.max_history_messages,
-            .workspace_dir = self.workspace_dir,
-            // iter29: let Pass C persist its emergency summary as a durable
-            // artifact via memory_timeline/memory_recall.
-            .archive_memory = self.mem,
-            .archive_session_id = self.memory_session_id,
-            // iter31: also index the summary into the vector store so it
-            // surfaces in semantic memory_recall, not just prefix-browse.
-            .archive_mem_rt = self.mem_rt,
-            // V1.6 commit 5b.3 — extraction wiring. When state_mgr +
-            // user_id are set on the agent, Pass C also persists atomic
-            // facts via extraction_persist. Defaults stay
-            // null/0 so V1.5 production (where these aren't yet wired
-            // at the gateway level) is unaffected.
-            .extraction_state_mgr = self.extraction_state_mgr,
-            .extraction_user_id = self.extraction_user_id,
-            .extraction_coref_embed = self.extraction_coref_embed,
-            // V1.14.9 (2026-05-10): propagate the judge fields the agent
-            // already holds. The Pass A + Pass C wires inside compaction.zig
-            // gate on these — without them the unified extractor (V1.14.8 C6
-            // / V1.14.9) silently skips every compaction boundary, leaving
-            // memory_edges empty even though the extractor wire is
-            // architecturally correct. F5 V1.14.9 diagnosis confirmed this
-            // is the missing link: Pass A fired (dropped 424 msgs) but no
-            // boundary.chunked / boundary.metrics logs appeared because the
-            // wire guards on extraction_judge_provider were null.
-            .extraction_judge_provider = self.extraction_judge_provider,
-            .extraction_judge_model_name = if (self.extraction_judge_model_name.len > 0)
-                self.extraction_judge_model_name
-            else
-                null,
-        };
+        // V1.14.9 review fix (H-01): single source of truth via
+        // buildCompactionConfig. Both auto + manual paths share it.
+        const cfg = self.buildCompactionConfig();
 
         // iter22 (Nova's Medium finding): measure thrash savings in TOKENS,
         // not message count. Some compaction passes (Pass A cheap dedup,
@@ -999,7 +963,30 @@ pub const Agent = struct {
     pub fn manualCompactHistory(self: *Agent) !bool {
         const compact_provider = if (self.sidecar_provider) |sp| sp else self.provider;
         const compact_model = if (self.sidecar_provider != null) self.sidecar_model else self.model_name;
-        return compaction.manualCompactHistory(self.allocator, &self.history, compact_provider, compact_model, .{
+        // V1.14.9 review fix (H-01): operator-triggered /compact must also
+        // benefit from the unified extractor wire (graph density, judge
+        // contradiction resolution, working-memory promotion). Pre-fix this
+        // path's literal CompactionConfig dropped every extraction field —
+        // silently degrading manual compactions back to V1.5 behavior even
+        // though autoCompactHistory worked correctly.
+        return compaction.manualCompactHistory(
+            self.allocator,
+            &self.history,
+            compact_provider,
+            compact_model,
+            self.buildCompactionConfig(),
+        );
+    }
+
+    /// V1.14.9 review fix (H-01): single source of truth for
+    /// CompactionConfig construction. `autoCompactHistory` and
+    /// `manualCompactHistory` both build their config via this helper, so
+    /// the extraction-wire fields can't get out of sync between paths.
+    /// `forceCompressHistory` deliberately does NOT use this — that path
+    /// runs when the LLM is unavailable; extraction calls would just fail
+    /// or pile up.
+    fn buildCompactionConfig(self: *Agent) compaction.CompactionConfig {
+        return compaction.CompactionConfig{
             .keep_recent = self.compaction_keep_recent,
             .max_summary_chars = self.compaction_max_summary_chars,
             .max_source_chars = self.compaction_max_source_chars,
@@ -1008,7 +995,18 @@ pub const Agent = struct {
             .message_timeout_secs = self.message_timeout_secs,
             .max_history_messages = self.max_history_messages,
             .workspace_dir = self.workspace_dir,
-        });
+            .archive_memory = self.mem,
+            .archive_session_id = self.memory_session_id,
+            .archive_mem_rt = self.mem_rt,
+            .extraction_state_mgr = self.extraction_state_mgr,
+            .extraction_user_id = self.extraction_user_id,
+            .extraction_coref_embed = self.extraction_coref_embed,
+            .extraction_judge_provider = self.extraction_judge_provider,
+            .extraction_judge_model_name = if (self.extraction_judge_model_name.len > 0)
+                self.extraction_judge_model_name
+            else
+                null,
+        };
     }
 
     /// Force-compress history for context exhaustion recovery.

@@ -68,10 +68,19 @@ pub fn mergeEpisodeResults(
     }
 
     // Phase 1 — canonicalize entity names.
-    // canonical_map: raw_name -> canonical_name (both owned by us)
-    // canonical_set: canonical_name -> Entity (owned by us, freed via deinit)
+    // canonical_map: raw_name -> canonical_name (raw_name owned by us;
+    //   canonical_name is a borrow into canonical_entities).
+    // canonical_entities: canonical_name -> Entity (Entity.name owned).
+    // Review fix M-01: the errdefer here MUST also free `raw_dup` keys
+    // in canonical_map — pre-fix only the map's bucket storage was
+    // freed, leaking the duplicated raw_name strings on any error
+    // after phase 1 began.
     var canonical_map: std.StringHashMapUnmanaged([]const u8) = .empty;
-    defer canonical_map.deinit(allocator);
+    errdefer {
+        var it = canonical_map.iterator();
+        while (it.next()) |kv| allocator.free(kv.key_ptr.*);
+        canonical_map.deinit(allocator);
+    }
     var canonical_entities: std.StringHashMapUnmanaged(Entity) = .empty;
     errdefer {
         var it = canonical_entities.iterator();
@@ -231,12 +240,22 @@ fn findOrInsertCanonical(
                     }
                 }
                 // No match — insert and cache embed.
+                // Review fix M-02: errdefer covers the OOM-after-dupe
+                // window where `name`/`owned_embed` would otherwise
+                // leak if `put` itself fails (allocates its own bucket
+                // storage; can OOM independently).
+                const name_owned = try allocator.dupe(u8, e.name);
+                errdefer allocator.free(name_owned);
+                const owned_embed = try allocator.dupe(f32, ce);
+                errdefer allocator.free(owned_embed);
                 const new_entity = Entity{
-                    .name = try allocator.dupe(u8, e.name),
+                    .name = name_owned,
                     .entity_type = e.entity_type,
                 };
-                const owned_embed = try allocator.dupe(f32, ce);
                 try canonical_entities.put(allocator, new_entity.name, new_entity);
+                // From here on, canonical_entities owns name_owned via
+                // new_entity.name. embeds put failure still leaks the
+                // embed only — minor and behind a `put` error path.
                 try embeds.put(allocator, new_entity.name, owned_embed);
                 return new_entity.name;
             }
@@ -251,9 +270,11 @@ fn findOrInsertCanonical(
             return kv.value_ptr.name;
         }
     }
-    // Insert as new canonical.
+    // Insert as new canonical. Same M-02 errdefer guard as above.
+    const name_owned = try allocator.dupe(u8, e.name);
+    errdefer allocator.free(name_owned);
     const new_entity = Entity{
-        .name = try allocator.dupe(u8, e.name),
+        .name = name_owned,
         .entity_type = e.entity_type,
     };
     try canonical_entities.put(allocator, new_entity.name, new_entity);

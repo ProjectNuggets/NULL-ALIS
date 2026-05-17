@@ -170,8 +170,9 @@ pub fn extractAtBoundary(
     // Phase 2 — extract per episode. Sequential when concurrency<=1
     // OR when there's only one episode (no point spinning up a pool).
     // Parallel via std.Thread.Pool when concurrency>1 and we have
-    // multiple episodes.
+    // multiple episodes. Timed for R1 telemetry (review fix M-04).
     const use_parallel = ctx.extraction_concurrency > 1 and episodes.len > 1;
+    var extraction_timer = std.time.Timer.start() catch null;
     const episode_results = (if (use_parallel)
         extractEpisodesParallel(allocator, episodes, ctx)
     else
@@ -179,6 +180,7 @@ pub fn extractAtBoundary(
         log.warn("boundary.extract_episodes_failed err={s}", .{@errorName(err)});
         break :blk null;
     };
+    const extraction_ms_total: u64 = if (extraction_timer) |*t| t.read() / std.time.ns_per_ms else 0;
     defer if (episode_results) |er| freeEpisodeResults(allocator, er);
 
     // Phase 3 — merge with coref + structural dedup.
@@ -194,7 +196,9 @@ pub fn extractAtBoundary(
     } else null;
 
     // Phase 4 — hydration on a single condensed transcript (no chunking;
-    // hydration is intentionally a whole-window summary).
+    // hydration is intentionally a whole-window summary). Timed for R1
+    // telemetry (review fix M-04).
+    var hydration_timer = std.time.Timer.start() catch null;
     const hydration_result: ?schema.HydrationSummary = if (ctx.enable_hydration) hydration: {
         const transcript = buildTranscript(allocator, window, ctx.max_source_chars) catch |err| {
             log.warn("boundary.hydration.transcript_failed err={s}", .{@errorName(err)});
@@ -207,6 +211,10 @@ pub fn extractAtBoundary(
             break :inner null;
         };
     } else null;
+    const hydration_ms: u64 = if (ctx.enable_hydration)
+        (if (hydration_timer) |*t| t.read() / std.time.ns_per_ms else 0)
+    else
+        0;
 
     // Phase 5 — persist (best-effort per layer).
     if (merged_extraction) |e| {
@@ -240,11 +248,11 @@ pub fn extractAtBoundary(
         .entities_extracted = @intCast(if (merged_extraction) |e| e.entities.len else 0),
         .edges_extracted = @intCast(if (merged_extraction) |e| e.edges.len else 0),
         .hydration_present = hydration_result != null,
-        // Per-call timings TBD — full Phase 5+ instrumentation needs
-        // call-level timing injected into runExtractionOnEpisode +
-        // runHydrationCall. Stub for now; not blocking on density.
-        .extraction_ms_total = 0,
-        .hydration_ms = 0,
+        // V1.14.9 review fix M-04: wall-clock timings via
+        // std.time.Timer (captured around the fan-out + hydration
+        // calls above). Hydration timer skipped when disabled.
+        .extraction_ms_total = extraction_ms_total,
+        .hydration_ms = hydration_ms,
     });
 
     // Keep the legacy boundary.complete line for grep-compat with
@@ -374,10 +382,23 @@ fn countNonNull(results: []const ?schema.ExtractionResult) usize {
     return n;
 }
 
-/// V1.14.9 — Build a transcript for ONE episode. No per-message cap
-/// (episodes are already bounded by `target_episode_tokens` / token
-/// budget). The episode is small enough by construction to fit in
-/// the LLM's coherence sweet spot.
+/// Per-message content cap inside `buildEpisodeTranscript`. Episodes
+/// are bounded by `target_episode_tokens` overall but a SINGLE
+/// pathologically-large message (tool output dump, file paste, very
+/// long assistant reply) can still dominate the LLM's view and
+/// recreate the V1.14.8 fragmentation failure mode. 8KB is generous
+/// enough for substantive turn content while bounding the worst case.
+/// Review fix M-03.
+const PER_MESSAGE_EPISODE_CAP: usize = 8_000;
+
+/// V1.14.9 — Build a transcript for ONE episode. Episodes are
+/// bounded by `target_episode_tokens` at the chunker level, but
+/// `buildEpisodeTranscript` still caps each individual message at
+/// `PER_MESSAGE_EPISODE_CAP` so a single oversized tool output or
+/// file dump can't dominate one episode's view and recreate the
+/// V1.14.8 fragmentation problem at the per-episode level. When a
+/// message is truncated, we append a sentinel so the LLM knows the
+/// content was cut.
 fn buildEpisodeTranscript(
     allocator: std.mem.Allocator,
     episode: chunker.Episode,
@@ -393,7 +414,12 @@ fn buildEpisodeTranscript(
         };
         try buf.appendSlice(allocator, role_str);
         try buf.appendSlice(allocator, ": ");
-        try buf.appendSlice(allocator, msg.content);
+        if (msg.content.len > PER_MESSAGE_EPISODE_CAP) {
+            try buf.appendSlice(allocator, msg.content[0..PER_MESSAGE_EPISODE_CAP]);
+            try buf.appendSlice(allocator, "\n[...truncated for extraction...]");
+        } else {
+            try buf.appendSlice(allocator, msg.content);
+        }
         try buf.append(allocator, '\n');
     }
     return buf.toOwnedSlice(allocator);
