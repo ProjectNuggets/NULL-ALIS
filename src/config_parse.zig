@@ -835,6 +835,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("session_idle_timeout_secs")) |v| {
                 if (v == .integer) self.agent.session_idle_timeout_secs = @intCast(v.integer);
             }
+            // V1.14.8.1 (2026-05-10): extraction sidecar model override.
+            // Empty = inherit default_model (legacy behavior). See
+            // AgentConfig.extraction_judge_model docstring for rationale.
+            if (ag.object.get("extraction_judge_model")) |v| {
+                if (v == .string) self.agent.extraction_judge_model = try self.allocator.dupe(u8, v.string);
+            }
             if (ag.object.get("compaction_keep_recent")) |v| {
                 if (v == .integer) self.agent.compaction_keep_recent = @intCast(v.integer);
             }

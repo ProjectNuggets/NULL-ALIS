@@ -411,6 +411,16 @@ pub const AgentConfig = struct {
     /// Not serialized; used to distinguish override vs default fallback chain.
     token_limit_explicit: bool = false,
     session_idle_timeout_secs: u64 = 1800, // evict idle sessions after 30 min
+    /// V1.14.8.1 (2026-05-10): override for the extraction sidecar model.
+    /// When empty (default), the gateway uses `default_model` for extraction
+    /// — which is wrong when the default model is a reasoning model like
+    /// Kimi K2.5 (we confirmed it burns its output budget on hidden
+    /// reasoning and returns empty `content`, so the unified extractor
+    /// produces 0 entities/0 edges). Set this to a non-reasoning instruct
+    /// model with strong JSON discipline + a context window large enough
+    /// for the boundary transcript (Llama-3.3-70B-Instruct-Turbo on
+    /// Together = $0.88/1M, 128K ctx, recommended default).
+    extraction_judge_model: []const u8 = "",
     compaction_keep_recent: u32 = 20,
     compaction_max_summary_chars: u32 = 16_000,
     compaction_max_source_chars: u32 = 80_000,
