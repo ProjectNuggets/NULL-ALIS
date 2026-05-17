@@ -454,6 +454,7 @@ fn dropOldestPairsFromMiddle(
                     .archive_mem_rt = config.archive_mem_rt,
                     .max_source_chars = config.max_source_chars,
                     .enable_hydration = false, // Pass A is mid-session — extraction only.
+                    .boundary_kind = .pass_a, // V1.14.9 L-01: explicit telemetry tag
                 };
                 const br = extraction_runner.extractAtBoundary(allocator, buf.items, ctx);
                 defer br.deinit(allocator);
@@ -753,6 +754,7 @@ fn compactHistoryKeepingRecent(
                     .archive_mem = config.archive_memory,
                     .archive_mem_rt = config.archive_mem_rt,
                     .max_source_chars = config.max_source_chars,
+                    .boundary_kind = .pass_c, // V1.14.9 L-01: explicit telemetry tag
                 };
                 const br = extraction_runner.extractAtBoundary(allocator, buf.items, ctx);
                 defer br.deinit(allocator);

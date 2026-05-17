@@ -2789,6 +2789,49 @@ pub const Agent = struct {
         const enrich_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - enrich_start_ms));
         turn_memory_enrich_ms = enrich_duration_ms;
         log.info("turn.stage stage=memory_enrich duration_ms={d}", .{enrich_duration_ms});
+
+        // V1.14.9 #6 — Retrieval-side telemetry symmetric to R1
+        // boundary.metrics. R1 measures EXTRACTION (write side); this
+        // measures RECALL (read side). One structured log line per turn
+        // captures: did we serve any memory at all (available), how many
+        // candidates considered (candidate_count), how that decomposed
+        // by retrieval kind (durable_fact / timeline / search-match /
+        // global), and how many bytes/entries each bucket contributed.
+        // Operators can grep `recall.metrics` to spot per-user retrieval
+        // collapse (available=false on a populated user = R3 graph
+        // traversal opportunity OR R4 BM25 fusion gap).
+        const rstats = memory_slot_result.stats;
+        log.info(
+            "recall.metrics available={} candidates={d} global_candidates={d} durable_facts={d} timeline_summaries={d} search_matches={d} global_fallbacks={d} summary_latest_used={} context_anchor_used={} continuity_entries={d} continuity_bytes={d} semantic_entries={d} semantic_bytes={d} fallback_entries={d} fallback_bytes={d} enrich_ms={d}",
+            .{
+                rstats.available,
+                rstats.candidate_count,
+                rstats.global_candidate_count,
+                rstats.durable_fact_count,
+                rstats.timeline_summary_count,
+                rstats.search_match_count,
+                rstats.global_fallback_count,
+                rstats.summary_latest_used,
+                rstats.context_anchor_used,
+                rstats.continuity_bucket_entries,
+                rstats.continuity_bucket_bytes,
+                rstats.semantic_bucket_entries,
+                rstats.semantic_bucket_bytes,
+                rstats.fallback_bucket_entries,
+                rstats.fallback_bucket_bytes,
+                enrich_duration_ms,
+            },
+        );
+        // Retrieval-side alert (mirror of R1 boundary.zero_density):
+        // user has memory available but retrieval returned 0 candidates
+        // on a non-trivial user message. Surfaces stale embeddings,
+        // missing entity coref, or graph layer not yet populated.
+        if (self.mem != null and user_message.len > 32 and rstats.available and rstats.candidate_count == 0) {
+            log.warn(
+                "recall.zero_candidates user_msg_len={d} — retrieval pipeline returned no matches on a substantive query; check embeddings / coref / graph",
+                .{user_message.len},
+            );
+        }
         const memory_stage_event = ObserverEvent{ .turn_stage = .{
             .stage = "memory_enrich",
             .duration_ms = enrich_duration_ms,

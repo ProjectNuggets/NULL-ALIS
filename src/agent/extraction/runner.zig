@@ -103,12 +103,35 @@ pub const ExtractionContext = struct {
     /// preserve narrative anchor + recent context. 20 = ~$0.04 per
     /// boundary at Llama prices.
     max_episodes_per_boundary: u32 = 20,
+    /// V1.14.9 review fix L-01 — explicit boundary kind for telemetry
+    /// tagging. Pre-fix: runner inferred kind from
+    /// `enable_hydration=false` → Pass A. Brittle: any future caller
+    /// setting `enable_hydration=false` for a different reason
+    /// (cost/latency optimization, debug mode, etc.) would mis-tag.
+    /// Now callers set this explicitly. Default `.session_end` is
+    /// conservative — it implies hydration=on (default) and assumes a
+    /// full-window distillation, which matches the most common
+    /// boundary type.
+    boundary_kind: telemetry.BoundaryKind = .session_end,
     /// V1.14.9 — Parallelism for episode fan-out. 1 = sequential.
-    /// Higher = parallel via std.Thread.Pool. 8 = saturates Together
-    /// API rate limit comfortably without contention per research
-    /// report; tested green in P6. Default 8 for boundary calls
-    /// (called once per Pass A / Pass C / session-end, not per turn).
-    extraction_concurrency: u32 = 8,
+    /// Higher = parallel via std.Thread.Pool.
+    ///
+    /// V1.14.9 P7 (2026-05-18): dropped default from 8 → 4 after F5
+    /// conv-43 observed 38 `AllProvidersFailed` events across one
+    /// boundary fire (3 episode extractions + 20 edge_resolution judge
+    /// calls + 15 entity coref embeds), all symptoms of Together's
+    /// rate-limit window getting blasted by an 8-wide burst followed
+    /// by the SERIAL persistExtracted pipeline (judge + embed per
+    /// fact) hitting the same window before it resets.
+    ///
+    /// 4-way halves the burst-rate equivalent (168 req/min → 70 req/
+    /// min on a 14-episode boundary), expected to lift episode success
+    /// from 79% → 95%+. Wall-time goes from ~5s (2 batches of 8) to
+    /// ~12s (4 batches of 4) per boundary. Acceptable; boundaries
+    /// fire infrequently (once per Pass A drop / Pass C / session-end).
+    /// Operators can re-tune via ExtractionContext at the call site
+    /// if their provider has a more generous rate limit.
+    extraction_concurrency: u32 = 4,
 };
 
 /// V1.14.9 — Episode-based boundary extraction. Replaces the V1.14.8
@@ -239,7 +262,7 @@ pub fn extractAtBoundary(
     for (window) |m| window_bytes += m.content.len;
 
     telemetry.recordBoundary(.{
-        .kind = inferBoundaryKind(ctx),
+        .kind = ctx.boundary_kind,
         .window_msg_count = @intCast(window.len),
         .window_byte_total = window_bytes,
         .episodes_chunked = @intCast(episodes.len),
@@ -274,17 +297,11 @@ pub fn extractAtBoundary(
     return .{ .extraction = merged_extraction, .hydration = hydration_result };
 }
 
-/// Best-effort boundary-kind inference from context fields. The
-/// runner doesn't get told explicitly whether it's serving Pass A,
-/// Pass C, or session-end — but we can infer from `enable_hydration`
-/// (Pass A disables it) and `archive_mem` (session-end usually has it).
-/// Not load-bearing — alerts fire correctly either way; this just
-/// improves grep-ability.
-fn inferBoundaryKind(ctx: ExtractionContext) telemetry.BoundaryKind {
-    if (!ctx.enable_hydration) return .pass_a;
-    if (ctx.archive_mem == null) return .pass_c;
-    return .session_end;
-}
+// V1.14.9 review fix L-01: `inferBoundaryKind` removed in favor of
+// `ExtractionContext.boundary_kind` set explicitly by each caller.
+// Pass A wire sets `.pass_a`; Pass C wire sets `.pass_c`; session-end
+// wire keeps the default `.session_end`. Telemetry tags accurately
+// without inference.
 
 /// V1.14.9 — Run extraction sequentially across episodes. Each
 /// episode failure returns null in its slot; we don't abort the
