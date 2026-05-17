@@ -56,13 +56,18 @@ Pre-fix scorer reported 67.3% on this same data — the gap was 45/47 Cat 5 ques
 
 ---
 
-## V1.14.8 graph-density validation status
+## V1.14.8 graph-density validation status — VALIDATED 2026-05-10
 
-**WIRE: CONFIRMED LIVE.** Two `boundary.complete` events fired during the conv-26 run:
-- `session=agent:zaki-bot:user:9999:main` (smoke session, 3 msgs) — entities=0 edges=0 hydration_present=true ✓
-- `session=agent:zaki-bot:user:2000:task:locomo_s0_bf6704` (2-session sub-batch, 11 msgs) — entities=0 edges=0 hydration_present=**false** ⚠
+**WIRE: CONFIRMED LIVE + DELIVERING GRAPH DATA.** Validated on `feat/v1148-validate-and-graph-density` after the **V1.14.8.1 sidecar-model fix** (7f8de1ed). Pre-fix the unified extractor returned entities=0 edges=0 on every real session because the wire inherited Kimi K2.5 (a reasoning model — burns its output budget on internal reasoning, returns empty `content`). Post-fix with Llama-3.3-70B-Instruct-Turbo wired as the sidecar:
 
-**DENSITY: UNVALIDATED.** Both observed fires returned 0 entities/0 edges. Could be legitimate (tiny windows had no extractable facts) or a real wire issue. The main conv-26 long-session (19 sessions, 6 hrs of conversation) hadn't gone idle by the 30-min default TTL during the run window. **F3 (in progress on `feat/v1148-validate-and-graph-density`)** sets TTL to 60s and validates the wire on a real populated session.
+| Session | window_msgs | transcript_bytes | entities | edges | hydration |
+|---|---|---|---|---|---|
+| user 5555 ("SMOKE OK 3") | 3 | 2060 | 1 | 1 | 327 B XML |
+| user 4444 (4 substantive turns) | 17 | 14504 | **8** | **5** | 1286 B XML |
+
+V1.14.8 extracts **MORE than the legacy `parseSummaryResponse` path** on the same window (5 vs 2 edges for user 4444). All 5 unified edges correctly caught as `semantic_dup` against legacy fact writes — no double-writes. The persistence dedup layer is doing its job.
+
+**Diagnostic discovery worth keeping**: probing Together directly with Kimi K2.5 + our graphiti extraction prompt returns `message.content = ""` and `message.reasoning = "[truncated reasoning that lists the entities + edges but never gets to JSON]"`. Reasoning models burn their output budget on hidden thinking and never emit structured output — use non-reasoning sidecars for extraction.
 
 ---
 
@@ -71,8 +76,10 @@ Pre-fix scorer reported 67.3% on this same data — the gap was 45/47 Cat 5 ques
 | Commit | Change | Branch |
 |---|---|---|
 | `67def0b9` | Doc sweep: 27 historical docs archived; STATUS.md hydrated | main |
-| `d4be7e2b` | F1 scorer fix: skip GT-empty rows | feat/v1148 |
-| `82c3e2f6` | F6 silence `public.zaki_users` log noise (~200 lines/run before; one line after) | feat/v1148 |
+| `d4be7e2b` | F1 scorer fix: skip GT-empty rows (conv-26: 67% → 87%) | feat/v1148 |
+| `82c3e2f6` | F6 silence `public.zaki_users` log noise (~200 lines/run → 1) | feat/v1148 |
+| `67636b48` | F2 STATUS.md refresh with V1.14.8 numbers | feat/v1148 |
+| `7f8de1ed` | **V1.14.8.1** extractor model override: gateway no longer wires Kimi K2.5 (reasoning) by default; recommends Llama-3.3-70B-Instruct-Turbo for the sidecar. F3 validated post-fix. | feat/v1148 |
 
 ---
 
