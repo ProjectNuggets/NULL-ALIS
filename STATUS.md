@@ -27,13 +27,43 @@ Single-binary Zig agent runtime (`src/main.zig`). Per-user cell-pod architecture
 
 | Version | Theme | Status |
 |---|---|---|
-| **V1.14.8** | Unified boundary extraction at `src/agent/extraction/` (schema + prompts + parser + runner). All 4 boundaries (Pass A, Pass C, session-end, force-compress) flow through one `extractAtBoundary`. `slot_intent` → working_memory.promote synchronously. Pass A extract-only (hydration skipped). | **Shipped + scored** |
+| **V1.14.9** (2026-05-18) | **Episode-based boundary extraction.** New `src/agent/extraction/{chunker,merger,telemetry}.zig` (~780 LOC) replaces "one giant LLM call per boundary" with semantic-chunk → parallel fan-out (Thread.Pool 8-way) → coref+dedup merge. Industry-aligned with Graphiti episodes / mem0 chunks / Zep auto-boundary / HippoRAG. R1 graph-density telemetry shipped. Pass A wire fix (CompactionConfig propagation H-01). | **Shipped + acceptance gate met** |
+| V1.14.8.1 | Sidecar model override — gateway no longer wires Kimi K2.5 (reasoning model burns output budget) by default. Recommends Llama-3.3-70B-Instruct-Turbo. | Shipped |
+| V1.14.8 | Unified boundary extraction at `src/agent/extraction/` (schema + prompts + parser + runner). All 4 boundaries (Pass A, Pass C, session-end, force-compress) flow through one `extractAtBoundary`. `slot_intent` → working_memory.promote. | Shipped, fragmentation bug fixed in V1.14.9 |
 | V1.14.7 | Per-turn extraction deletion. F-A1 calibrated-honesty regression fix. Layer 4 graph-empty bug fixed. | Shipped + verified |
 | V1.14.6 | F-CB1 cache breakpoints, F-PA2 drop-from-middle Pass A, S-tier prompt rewrite. | Shipped, headline result |
 
 ---
 
 ## Bench standings
+
+### V1.14.9 conv-43 acceptance — 2026-05-18
+
+Episode-based extraction + Pass A wire fix + Llama-3.3-70B sidecar. Full 199-question conv-43:
+
+| Cat | V1.14.9 + Pass A fix | Earlier V1.14.9 | V1.14.8 | Publishable 2026-05-09 | Δ vs publishable |
+|---|---|---|---|---|---|
+| Cat 1 (single-hop) | 87.1% (27/31) | 87.1% | 87.1% | 91.2% avg | −4.1pp |
+| **Cat 2 (multi-hop)** | **92.3% (24/26)** | 88.5% | 88.5% | 93.6% avg | −1.3pp |
+| Cat 3 (temporal/inference) | 64.3% (9/14) | 50.0% | 64.3% | 75.3% avg | −11pp (R2 target) |
+| **Cat 4 (open-domain)** | **91.6% (98/107)** | 89.7% | 61.7% | 90.3% avg | **+1.3pp 🎯 ABOVE publishable** |
+| Cat 5 (adversarial) | 0/0 scorable (21 GT-empty, skipped) | same | same | n/a | — |
+| **Overall scorable** | **88.8% (158/178)** | 86.0% | 70.2% | conv-43 publishable: 95% (60-Q subset) | parity within run-to-run + GT-empty Cat 5 |
+
+**Graph layer for user 2004 (post session-end TTL):**
+- 73 edges written to `memory_edges` (input 78, dedup 5)
+- 12 entities (coref-collapsed from 79)
+- 15 working_memory slots (slot_intent → working_memory promotion working)
+- 20 contradictions resolved (bi-temporal judge active)
+- 14 episodes chunked, 11 succeeded (79% success rate)
+- 0.96 edges per 1K tokens density
+- Window: 461 msgs / 324KB (vs V1.14.8's 80KB cap)
+
+**Acceptance gates: BOTH MET** ✓
+- ✓ Cat 4 ≥ 90%: 91.6%
+- ✓ memory_edges ≥ 50: 73
+
+Sample predicates show typed SCREAMING_SNAKE_CASE quality: `VISITED`, `FAN_OF`, `SIGNED_ENDORSEMENT_DEAL_WITH`, `FAVORITE_BOOK`, `ENDORSED_BY`, `WATCHES_DURING_HOLIDAYS`, `WANTS_TO_VISIT`, `RECOMMENDS_BOOK_TO`.
 
 ### Last validated: V1.14.8 conv-26, 2026-05-10
 
