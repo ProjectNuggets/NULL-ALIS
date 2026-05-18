@@ -473,6 +473,61 @@ pub const RetrievalEngine = struct {
             valid_count += 1;
         }
 
+        // R4 telemetry — per-source candidate breakdown. Placed BEFORE
+        // the single-source early-return so we get coverage on Cat 1
+        // (typically 1 source wins) AND multi-source Cat 2/3 queries.
+        // Lets us see which source wins on which query category
+        // without a separate harness. Cheap info-level log; one line
+        // per retrieval call.
+        // When R3 PPR lands as an additional source, the breakdown
+        // shows whether PPR is actually contributing or being filtered
+        // out by min_score / MMR downstream.
+        {
+            const has_vec_tele = vector_candidates != null and vector_candidates.?.len > 0;
+            var src_counts: [16]usize = undefined;
+            var src_names: [16][]const u8 = undefined;
+            var src_n: usize = 0;
+            for (source_results, 0..) |sr, i| {
+                if (src_n >= src_counts.len) break;
+                src_counts[src_n] = sr.len;
+                src_names[src_n] = if (i < self.sources.items.len)
+                    self.sources.items[i].getName()
+                else
+                    "unknown";
+                src_n += 1;
+            }
+            if (has_vec_tele and src_n < src_counts.len) {
+                src_counts[src_n] = vector_candidates.?.len;
+                src_names[src_n] = "vector";
+                src_n += 1;
+            }
+            // Compact one-line summary; query truncated to keep logs
+            // grep-friendly without leaking long user content.
+            const q_show_len = @min(query.len, 60);
+            switch (src_n) {
+                0 => log.info(
+                    "retrieval.source_breakdown query=\"{s}\" sources=0 merge_k={d} top_k={d}",
+                    .{ query[0..q_show_len], self.merge_k, self.top_k },
+                ),
+                1 => log.info(
+                    "retrieval.source_breakdown query=\"{s}\" {s}={d} merge_k={d} top_k={d}",
+                    .{ query[0..q_show_len], src_names[0], src_counts[0], self.merge_k, self.top_k },
+                ),
+                2 => log.info(
+                    "retrieval.source_breakdown query=\"{s}\" {s}={d} {s}={d} merge_k={d} top_k={d}",
+                    .{ query[0..q_show_len], src_names[0], src_counts[0], src_names[1], src_counts[1], self.merge_k, self.top_k },
+                ),
+                3 => log.info(
+                    "retrieval.source_breakdown query=\"{s}\" {s}={d} {s}={d} {s}={d} merge_k={d} top_k={d}",
+                    .{ query[0..q_show_len], src_names[0], src_counts[0], src_names[1], src_counts[1], src_names[2], src_counts[2], self.merge_k, self.top_k },
+                ),
+                else => log.info(
+                    "retrieval.source_breakdown query=\"{s}\" sources={d} first={s}={d} merge_k={d} top_k={d}",
+                    .{ query[0..q_show_len], src_n, src_names[0], src_counts[0], self.merge_k, self.top_k },
+                ),
+            }
+        }
+
         // Single source with results → set final_score from keyword_rank, skip RRF
         if (valid_count <= 1 and (vector_candidates == null or vector_candidates.?.len == 0)) {
             // Find the one with results
@@ -536,56 +591,6 @@ pub const RetrievalEngine = struct {
         }
         if (has_vec) {
             rrf_sources[source_results.len] = vector_candidates.?;
-        }
-
-        // R4 telemetry — per-source candidate breakdown. Lets us see
-        // which source wins on which query category (Cat 1 single-hop
-        // vs Cat 3 multi-hop) without a separate harness. Cheap
-        // info-level log; emits once per multi-source retrieval call.
-        // When R3 PPR lands as a 5th source, the breakdown shows
-        // whether PPR is actually contributing or being filtered out
-        // by min_score / MMR. Read in conjunction with the per-stage
-        // counts later in the pipeline.
-        {
-            var src_counts: [16]usize = undefined;
-            var src_names: [16][]const u8 = undefined;
-            var src_n: usize = 0;
-            for (source_results, 0..) |sr, i| {
-                if (src_n >= src_counts.len) break;
-                src_counts[src_n] = sr.len;
-                src_names[src_n] = if (i < self.sources.items.len)
-                    self.sources.items[i].getName()
-                else
-                    "unknown";
-                src_n += 1;
-            }
-            if (has_vec and src_n < src_counts.len) {
-                src_counts[src_n] = vector_candidates.?.len;
-                src_names[src_n] = "vector";
-                src_n += 1;
-            }
-            // Compact one-line summary; query truncated to keep logs
-            // grep-friendly without leaking long user content.
-            const q_show_len = @min(query.len, 60);
-            switch (src_n) {
-                0 => {},
-                1 => log.info(
-                    "retrieval.source_breakdown query=\"{s}\" {s}={d} merge_k={d} top_k={d}",
-                    .{ query[0..q_show_len], src_names[0], src_counts[0], self.merge_k, self.top_k },
-                ),
-                2 => log.info(
-                    "retrieval.source_breakdown query=\"{s}\" {s}={d} {s}={d} merge_k={d} top_k={d}",
-                    .{ query[0..q_show_len], src_names[0], src_counts[0], src_names[1], src_counts[1], self.merge_k, self.top_k },
-                ),
-                3 => log.info(
-                    "retrieval.source_breakdown query=\"{s}\" {s}={d} {s}={d} {s}={d} merge_k={d} top_k={d}",
-                    .{ query[0..q_show_len], src_names[0], src_counts[0], src_names[1], src_counts[1], src_names[2], src_counts[2], self.merge_k, self.top_k },
-                ),
-                else => log.info(
-                    "retrieval.source_breakdown query=\"{s}\" sources={d} first={s}={d} merge_k={d} top_k={d}",
-                    .{ query[0..q_show_len], src_n, src_names[0], src_counts[0], self.merge_k, self.top_k },
-                ),
-            }
         }
 
         var merged = try rrf.rrfMerge(allocator, rrf_sources, self.merge_k, self.top_k * 4);
