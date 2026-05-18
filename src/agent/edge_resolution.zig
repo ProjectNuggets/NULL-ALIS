@@ -375,7 +375,32 @@ fn buildResolvePrompt(
         \\EXISTING FACT: idx=2, "Bob ran 5 miles on Tuesday"
         \\NEW FACT: "Bob ran 3 miles on Wednesday"
         \\Result: duplicate_facts=[], contradicted_facts=[] (different events on different days — neither duplicate nor contradiction)
+        \\
+        \\EXISTING FACT: idx=3, "Layer 0 IS_TYPE_OF Working Memory"
+        \\NEW FACT: "Layer 0 IS_TYPE_OF Distillation Extraction"
+        \\Result: duplicate_facts=[], contradicted_facts=[]
+        \\(set-valued predicate — Layer 0 can have many type-members; both coexist. Only contradict if the NEW FACT explicitly negates, e.g. "Layer 0 IS_TYPE_OF Distillation Extraction, NOT Working Memory anymore" or "Layer 0 no longer IS_TYPE_OF Working Memory".)
+        \\
+        \\EXISTING FACT: idx=4, "Alice LIKES sushi"
+        \\NEW FACT: "Alice LIKES Indian food"
+        \\Result: duplicate_facts=[], contradicted_facts=[]
+        \\(set-valued predicate — Alice can like many cuisines; both coexist. Contradiction would require explicit negation: "Alice no longer likes sushi" or "Alice stopped liking sushi".)
         \\</EXAMPLE>
+        \\
+        \\SET-VALUED PREDICATES — multiple values CAN coexist without contradiction:
+        \\  Membership: IS_TYPE_OF, INCLUDES, MEMBER_OF, PART_OF, FOLLOWS
+        \\  Preference: LIKES, HATES, AVOIDS, FAVORS, DISLIKES, ENJOYS, VALUES
+        \\  Usage:      USES, USED_FOR, OWNS, DEPENDS_ON, BUILDS_WITH, DEPLOYS_TO
+        \\  Episode:    ATTENDED, JOINED, VISITED, HAPPENED_ON, OCCURRED_AT, MENTIONS
+        \\  Relationship: KNOWS, FRIENDS_WITH, WORKS_WITH, COLLABORATES_WITH, MANAGES, RELATED_TO
+        \\For these, the SAME subject + predicate + DIFFERENT object is normally a NEW fact, not a contradiction.
+        \\Flag a contradiction ONLY when the NEW FACT explicitly states the existing value is wrong, replaced, no longer true, or supersedes ("no longer X", "stopped X-ing", "instead of X", "used to X but now Y").
+        \\
+        \\SINGLE-VALUED PREDICATES — a new value DOES contradict the existing one:
+        \\  Identity: BIRTHDAY, LIVES_IN, WORKS_AT (current title/role)
+        \\  Status:   MARRIED_TO, REPORTS_TO, CURRENT_PROJECT
+        \\  Supersession (explicit): REPLACES, USED_TO_BE, FORMERLY, PREVIOUSLY, USED_TO_PREFER, USED_TO_USE
+        \\For these, the Alice/Acme/senior-engineer pattern above applies — same subject + predicate + different object = contradiction.
         \\
         \\Respond with EXACTLY this JSON shape (no prose, no code fence):
         \\{"duplicate_facts": [<idx>...], "contradicted_facts": [<idx>...]}

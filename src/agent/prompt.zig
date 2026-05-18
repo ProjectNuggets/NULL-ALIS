@@ -857,6 +857,18 @@ fn buildResponseProtocolSection(w: anytype) !void {
     // minimal pointer until F-A2.1 (auto-router classifier in V1.14.7) lands.
     // Removing entirely would lose the signal once the router is wired.
     try w.writeAll("**Brain graph for entity questions.** When the user asks about a specific named person, project, place, or concept (\"tell me about X\", \"what does X do\", \"what events involve X\"), prefer `brain_graph local_graph(center_key=<X>, depth=2)` over text recall: structural neighborhoods beat isolated snippets for entity-centric synthesis. Sequence: `memory_recall` to find X's canonical key (`entity_<hash>` or `wiki:X`) → `brain_graph local_graph` on that key → synthesize from the subgraph's typed predicates + neighbors, citing the 2-3 strongest connections by content. If `memory_recall` returns no canonical key, OR `brain_graph` returns empty/error, treat as the F-A1 zero-signal exception — say honestly \"I don't have any record of X in your memory yet.\" Skip for questions about you, transient things (\"what time is it\"), or zero-entity prompts (\"summarize this file\").\n\n");
+
+    // ── R6 Knowledge escalation — web_search bridges user-side memory to external facts ──
+    // V1.14.11 (LoCoMo Cat 3 weakest-cohort uplift). Cat 3 multi-hop
+    // questions bridge user-side preferences (in memory) to external
+    // world knowledge (restaurant names, recent events, third-party
+    // attributes, prices, schedules). Memory alone can't answer; the
+    // agent currently hedges instead of escalating. This rule is the
+    // symmetric complement to the line 816 "memory says tool is blocked
+    // → try anyway" rule: that one says don't trust memory's REFUSAL,
+    // this one says don't trust memory's INSUFFICIENCY without firing
+    // the tool that could ground it.
+    try w.writeAll("**Knowledge escalation — bridge memory to the world via `web_search`.** When memory contains the user-side signal (preferences, history, context) but the QUESTION requires external facts the agent cannot derive from memory or training (restaurant names, recent events, third-party attributes, prices, schedules, current state), reach for `web_search` BEFORE answering. Pattern: \"<user> likes <category>\" (from memory) + \"What's the best <category> near <place>?\" (external) → `web_search` for \"best <category> near <place>\", then ground the answer in BOTH signals (\"You enjoy Thai food; based on current results, <restaurant> is well-reviewed and matches your usual style — casual, low-key.\"). The hedge \"I don't have current information on that\" is the WRONG answer when `web_search` is available; it's a hedge, not honesty. Skip only when (a) the question is purely about the user themselves with no external bridge, OR (b) `web_search` was already tried this turn and failed.\n\n");
 }
 
 fn appendChannelAttachmentsSection(w: anytype) !void {
