@@ -1398,64 +1398,59 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                             triple_edges_written += 1;
                         }
 
-                        // V1.7 cmt9.6: also route through persistExtracted for
-                        // coref + source attribution + (future) judge. Coref
-                        // creates/reuses entity row in memory_entities; source
-                        // attribution writes session_id + snippet to the new
-                        // extracted_<hash> row. Judge skipped today (Agent
-                        // doesn't carry judge_provider plumb yet — TODO).
-                        // Failure non-fatal: edge already wrote above.
-                        const mems = [_]extraction_persist.ExtractedMemory{.{
-                            .text = fact.content,
-                            .subject = fact.subject.?,
-                            .predicate = fact.predicate.?,
-                            .object = fact.object.?,
-                            .attributed_to = fact.attributed_to orelse "user",
-                            .confidence = fact.confidence orelse 0.9,
-                        }};
-                        const coref_ctx: ?extraction_persist.EntityResolution =
-                            if (self.extraction_coref_embed) |ep|
-                                extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 }
-                            else
-                                null;
-                        // V1.9-6: judge_ctx now wired. V1.7-IN-03 closed.
-                        // Mirrors the gateway's V1.8-1 wiring of
-                        // memory_store + compaction Pass C — same provider,
-                        // same model, same JudgeContext shape. Closes
-                        // ZAKI's "MNDA blocked vs signed coexist" pain
-                        // class (his stress-test letter named this) where
-                        // session-end durable_fact writes accumulated
-                        // contradictory states because the judge never ran.
-                        const judge_ctx: ?extraction_persist.JudgeContext = blk: {
-                            if (self.extraction_judge_provider) |jp| {
-                                if (self.extraction_judge_model_name.len > 0) {
-                                    break :blk extraction_persist.JudgeContext{
-                                        .provider = jp,
-                                        .model_name = self.extraction_judge_model_name,
-                                    };
+                        // V1.14.12 (M5 review HIGH#1) — early-return gate.
+                        // Placed BEFORE mems/coref_ctx allocation so no
+                        // wasted work happens when flag is off. Mirrors
+                        // compaction.zig:697 placement.
+                        if (!self.extraction_legacy_direct_writes) {
+                            log.info("session_end.legacy_direct_skipped reason=M5_flag_off key={s} — work flows through extractAtBoundary path", .{fact_key});
+                        } else {
+                            // V1.7 cmt9.6: route through persistExtracted for
+                            // coref + source attribution + judge.
+                            const mems = [_]extraction_persist.ExtractedMemory{.{
+                                .text = fact.content,
+                                .subject = fact.subject.?,
+                                .predicate = fact.predicate.?,
+                                .object = fact.object.?,
+                                .attributed_to = fact.attributed_to orelse "user",
+                                .confidence = fact.confidence orelse 0.9,
+                            }};
+                            const coref_ctx: ?extraction_persist.EntityResolution =
+                                if (self.extraction_coref_embed) |ep|
+                                    extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 }
+                                else
+                                    null;
+                            const judge_ctx: ?extraction_persist.JudgeContext = blk: {
+                                if (self.extraction_judge_provider) |jp| {
+                                    if (self.extraction_judge_model_name.len > 0) {
+                                        break :blk extraction_persist.JudgeContext{
+                                            .provider = jp,
+                                            .model_name = self.extraction_judge_model_name,
+                                        };
+                                    }
                                 }
-                            }
-                            break :blk null;
-                        };
-                        _ = extraction_persist.persistExtracted(
-                            self.allocator,
-                            smgr,
-                            uid,
-                            session_id,
-                            &mems,
-                            judge_ctx,
-                            coref_ctx,
-                            self.mem_rt, // V1.8-2: vector coverage on session-end
-                            .session_end_durable_fact, // V1.14.12 (M1) — telemetry tag; M5 candidate for removal if redundant with session_end_extract
-                        ) catch |err| {
-                            log.warn("session_end persistExtracted failed key={s} err={s}", .{
-                                fact_key, @errorName(err),
+                                break :blk null;
+                            };
+                            _ = extraction_persist.persistExtracted(
+                                self.allocator,
+                                smgr,
+                                uid,
+                                session_id,
+                                &mems,
+                                judge_ctx,
+                                coref_ctx,
+                                self.mem_rt, // V1.8-2: vector coverage on session-end
+                                .session_end_durable_fact, // V1.14.12 (M1) — telemetry tag
+                            ) catch |err| {
+                                log.warn("session_end persistExtracted failed key={s} err={s}", .{
+                                    fact_key, @errorName(err),
+                                });
+                            };
+                            log.info("session_end.persistExtracted judge_ctx={s} key={s}", .{
+                                if (judge_ctx != null) "wired" else "null",
+                                fact_key,
                             });
-                        };
-                        log.info("session_end.persistExtracted judge_ctx={s} key={s}", .{
-                            if (judge_ctx != null) "wired" else "null",
-                            fact_key,
-                        });
+                        }
                     }
                 }
             }

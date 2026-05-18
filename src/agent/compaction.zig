@@ -105,6 +105,12 @@ pub const CompactionConfig = struct {
     // sidecar model for latency.
     extraction_judge_provider: ?Provider = null,
     extraction_judge_model_name: ?[]const u8 = null,
+    /// V1.14.12 (M5) — legacy direct-write callsite gate (default ON
+    /// for 1-week soak). When false, the Pass C parsed_facts direct
+    /// `persistExtracted` at compaction.zig:699 is SKIPPED — the work
+    /// flows through `extractAtBoundary` at compaction.zig:759 only.
+    /// See `config_types.AgentConfig.extraction_legacy_direct_writes`.
+    extraction_legacy_direct_writes: bool = true,
     // V1.6 commit 8: optional embedding provider for entity coreference.
     // When set, extracted-fact object strings get cosine-resolved against
     // existing memory_entities rows (≥0.95 = same entity, reuse id; new
@@ -681,53 +687,67 @@ fn compactHistoryKeepingRecent(
                     // model_name — already in scope, already authenticated,
                     // already configured; saves wiring two fields up through
                     // SessionManager / Agent / TenantRuntime.
-                    const judge_provider: providers.Provider = config.extraction_judge_provider orelse provider;
-                    const judge_model: []const u8 = config.extraction_judge_model_name orelse model_name;
-                    const judge_ctx: ?extraction_persist.JudgeContext =
-                        extraction_persist.JudgeContext{
-                            .provider = judge_provider,
-                            .model_name = judge_model,
-                        };
+                    // V1.14.12 (M5) — legacy direct-write gate. When the
+                    // flag is OFF, skip this Pass C direct write entirely;
+                    // the same content flows through extractAtBoundary at
+                    // line ~775 below (write_origin=pass_c_compaction_extract).
+                    // During soak the flag stays ON (default) so behavior
+                    // is unchanged; M1 telemetry proves redundancy before
+                    // the flip.
+                    if (!config.extraction_legacy_direct_writes) {
+                        log.info(
+                            "compaction.passC.legacy_direct_skipped reason=M5_flag_off parsed={d} — work flows through extractAtBoundary path",
+                            .{extracted.len},
+                        );
+                    } else {
+                        const judge_provider: providers.Provider = config.extraction_judge_provider orelse provider;
+                        const judge_model: []const u8 = config.extraction_judge_model_name orelse model_name;
+                        const judge_ctx: ?extraction_persist.JudgeContext =
+                            extraction_persist.JudgeContext{
+                                .provider = judge_provider,
+                                .model_name = judge_model,
+                            };
 
-                    // V1.6 cmt8: coref context wraps the runtime embedding
-                    // provider when configured. Mem0's 0.95 cosine threshold.
-                    const coref_ctx: ?extraction_persist.EntityResolution =
-                        if (config.extraction_coref_embed) |ep|
-                            extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 }
-                        else
-                            null;
+                        // V1.6 cmt8: coref context wraps the runtime embedding
+                        // provider when configured. Mem0's 0.95 cosine threshold.
+                        const coref_ctx: ?extraction_persist.EntityResolution =
+                            if (config.extraction_coref_embed) |ep|
+                                extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 }
+                            else
+                                null;
 
-                    const persist_result = extraction_persist.persistExtracted(
-                        allocator,
-                        state_mgr,
-                        uid,
-                        session_id_for_extract,
-                        extracted,
-                        judge_ctx,
-                        coref_ctx,
-                        config.archive_mem_rt, // V1.8-2: vector coverage
-                        .pass_c_compaction_direct, // V1.14.12 (M1) — telemetry tag; M5 candidate for removal if redundant with pass_c_compaction_extract
-                    ) catch |err| blk: {
-                        log.warn("compaction: extraction persist failed err={s}", .{@errorName(err)});
-                        break :blk extraction_persist.PersistResult{
-                            .written_count = 0,
-                            .skipped_blacklist = 0,
-                            .skipped_md5_dup = 0,
-                            .skipped_cosine_dup = 0,
-                            .skipped_semantic_dup = 0,
-                            .contradictions_resolved = 0,
-                            .failed_count = 0,
+                        const persist_result = extraction_persist.persistExtracted(
+                            allocator,
+                            state_mgr,
+                            uid,
+                            session_id_for_extract,
+                            extracted,
+                            judge_ctx,
+                            coref_ctx,
+                            config.archive_mem_rt, // V1.8-2: vector coverage
+                            .pass_c_compaction_direct, // V1.14.12 (M1) — telemetry tag
+                        ) catch |err| blk: {
+                            log.warn("compaction: extraction persist failed err={s}", .{@errorName(err)});
+                            break :blk extraction_persist.PersistResult{
+                                .written_count = 0,
+                                .skipped_blacklist = 0,
+                                .skipped_md5_dup = 0,
+                                .skipped_cosine_dup = 0,
+                                .skipped_semantic_dup = 0,
+                                .contradictions_resolved = 0,
+                                .failed_count = 0,
+                            };
                         };
-                    };
-                    log.info("compaction.extraction parsed={d} written={d} skipped_blacklist={d} skipped_md5_dup={d} skipped_semantic_dup={d} contradictions_resolved={d} failed={d}", .{
-                        extracted.len,
-                        persist_result.written_count,
-                        persist_result.skipped_blacklist,
-                        persist_result.skipped_md5_dup,
-                        persist_result.skipped_semantic_dup,
-                        persist_result.contradictions_resolved,
-                        persist_result.failed_count,
-                    });
+                        log.info("compaction.extraction parsed={d} written={d} skipped_blacklist={d} skipped_md5_dup={d} skipped_semantic_dup={d} contradictions_resolved={d} failed={d}", .{
+                            extracted.len,
+                            persist_result.written_count,
+                            persist_result.skipped_blacklist,
+                            persist_result.skipped_md5_dup,
+                            persist_result.skipped_semantic_dup,
+                            persist_result.contradictions_resolved,
+                            persist_result.failed_count,
+                        });
+                    }
                 }
             };
         }
@@ -1999,3 +2019,13 @@ test "dropOldestPairsFromMiddle no-op when total under keep_recent + protect pre
 // — its skip-path coverage lives in extraction/runner.zig's tests
 // ("extractAtBoundary skip path: empty window", "empty judge_model",
 // "no state mgr", "zero edges").
+
+test "V1.14.12 (M5): CompactionConfig.extraction_legacy_direct_writes defaults to true" {
+    // Soak-safe default: the flag MUST default to true so M5 ships
+    // with zero behavior change. Operators flip to false only after
+    // M1 telemetry confirms redundancy. If this default ever changes
+    // to false silently, a deployment could lose Pass C direct-write
+    // coverage on tenants without judge wiring.
+    const cfg = CompactionConfig{};
+    try std.testing.expect(cfg.extraction_legacy_direct_writes);
+}

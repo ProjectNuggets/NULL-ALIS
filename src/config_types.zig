@@ -463,6 +463,32 @@ pub const AgentConfig = struct {
     /// Set to FALSE to restore pre-M3 behavior (every fact re-extracted
     /// at boundary). Debug/migration use only.
     extraction_coverage_filter_enabled: bool = true,
+    /// V1.14.12 (M5) — legacy direct-write callsite gate.
+    ///
+    /// Two write paths in compaction.zig:699 (Pass C parsed_facts
+    /// direct) and commands.zig:1440 (session-end durable_fact direct)
+    /// historically wrote facts that the corresponding extractAtBoundary
+    /// path (compaction.zig:759, commands.zig:1494) ALSO writes from
+    /// the same content. Pre-M3 the duplication was visible as 2x
+    /// write volume on Pass C and session-end paths; with M3's coverage
+    /// filter the duplicates collide on canonical key but the LLM
+    /// extraction calls still fire twice.
+    ///
+    /// When TRUE (default for 1-week soak per architecture-review
+    /// reviewer #9), both direct paths remain active (pre-M5 behavior).
+    /// When FALSE, both direct paths no-op with a log line; their work
+    /// flows entirely through the extractAtBoundary path.
+    ///
+    /// Soak gate: M1 telemetry's per-origin histogram must confirm
+    /// `.pass_c_compaction_direct` and `.session_end_durable_fact`
+    /// counts <= their `_extract` equivalents (proves they're redundant)
+    /// before flipping default to false. Manual flip target: 2026-05-26
+    /// (1 week post-M5 deploy).
+    ///
+    /// One-way door warning: deletion of the gated code is a separate
+    /// follow-up commit AFTER soak confirms zero regressions. The flag
+    /// allows reverting via config without git revert during soak.
+    extraction_legacy_direct_writes: bool = true,
     compaction_keep_recent: u32 = 20,
     compaction_max_summary_chars: u32 = 16_000,
     compaction_max_source_chars: u32 = 80_000,

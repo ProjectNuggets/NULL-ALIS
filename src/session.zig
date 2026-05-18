@@ -209,6 +209,10 @@ pub const SessionManager = struct {
     /// contradiction detection on session-end).
     extraction_judge_provider: ?Provider = null,
     extraction_judge_model_name: []const u8 = "",
+    /// V1.14.12 (M5) — legacy direct-write callsite gate. Threaded
+    /// from gateway config to per-session Agent. Default true preserves
+    /// pre-M5 behavior during the 1-week soak window.
+    extraction_legacy_direct_writes: bool = true,
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
@@ -447,6 +451,9 @@ pub const SessionManager = struct {
         // V1.9-6 — judge provider for session-end summarizer path.
         agent.extraction_judge_provider = self.extraction_judge_provider;
         agent.extraction_judge_model_name = self.extraction_judge_model_name;
+        // V1.14.12 (M5) — legacy direct-write gate, threaded from
+        // SessionManager (which gateway.zig sets from config).
+        agent.extraction_legacy_direct_writes = self.extraction_legacy_direct_writes;
         return agent;
     }
 

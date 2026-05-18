@@ -405,6 +405,13 @@ pub const Agent = struct {
     /// MD5 dedup only, no semantic contradiction detection).
     extraction_judge_provider: ?providers.Provider = null,
     extraction_judge_model_name: []const u8 = "",
+    /// V1.14.12 (M5) — legacy direct-write callsite gate. Read by
+    /// commands.zig session-end durable_fact promotion path. When
+    /// false, the direct persistExtracted call at commands.zig:1440 is
+    /// SKIPPED; the same content flows through extractAtBoundary at
+    /// commands.zig:1494 (write_origin=session_end_extract). Default
+    /// true preserves pre-M5 behavior during 1-week soak.
+    extraction_legacy_direct_writes: bool = true,
     /// V1.14.7 — extraction trigger gates (per-turn enqueue, memory nudge,
     /// skills nudge). Defaults preserve V1.14.6 behavior. C2 wires structured
     /// extraction into compaction; C3 flips defaults to disabled and deletes
@@ -1065,6 +1072,10 @@ pub const Agent = struct {
                 self.extraction_judge_model_name
             else
                 null,
+            // V1.14.12 (M5) — propagate the legacy direct-write flag
+            // from Agent → CompactionConfig so the Pass C parsed_facts
+            // direct path can honor the gate.
+            .extraction_legacy_direct_writes = self.extraction_legacy_direct_writes,
         };
     }
 
