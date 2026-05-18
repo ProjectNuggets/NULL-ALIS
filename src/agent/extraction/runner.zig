@@ -138,6 +138,18 @@ pub const ExtractionContext = struct {
     /// the right tag (pass_a_drop / pass_c_compaction_extract /
     /// session_end_extract). Default mirrors the boundary_kind default.
     write_origin: @import("../extraction_persist.zig").WriteOrigin = .session_end_extract,
+    /// V1.14.12 (M3) — coverage filter gate. When true (default),
+    /// boundary extraction skips facts whose canonical key matches
+    /// one already written by the agent's memory_store tool (per
+    /// state_mgr.listAgentMemoryStoreKeys, horizon-bounded). When
+    /// false, boundary extraction processes all extracted edges
+    /// (pre-M3 behavior).
+    ///
+    /// Operators disable via `agent.extraction_coverage_filter_enabled
+    /// = false` in config.json. Coverage filter is the architectural
+    /// fix for the Captain Mochi double-write problem — disable only
+    /// for debugging or migration scenarios.
+    coverage_filter_enabled: bool = true,
 };
 
 /// V1.14.9 — Episode-based boundary extraction. Replaces the V1.14.8
@@ -603,17 +615,104 @@ fn persistExtraction(
         return;
     }
 
-    // Convert each edge to an ExtractedMemory. The text/subject/predicate/
+    // V1.14.12 (M3) — coverage filter. Skip extracted edges whose
+    // canonical key matches one already written by the agent's
+    // memory_store tool. This is the architectural fix that prevents
+    // boundary re-extraction from creating duplicates of facts the
+    // agent already explicitly stored.
+    //
+    // Race-safety: extractAtBoundary fires AFTER the agent's turn loop
+    // completes. All memory_store tool calls in this session have
+    // already committed (synchronous within the turn) by the time
+    // we reach here. Cross-session writes are visible via the SQL
+    // query's user_id scope + horizon bounds.
+    //
+    // Failure mode: if the keys query fails (DB connection, etc.),
+    // we LOG + PROCEED — filtering is an optimization, not a correctness
+    // guarantee. Worst case: today's behavior (some duplicates, judge
+    // cleans up via M2 fast-path or contradiction detection).
+    //
+    // Bounds: 30 days horizon + 5000 key cap. Tunable later.
+    //
+    // Filter runs BEFORE the ExtractedMemory allocation so we avoid the
+    // partial-deinit / double-free hazard of in-place filtering a fixed
+    // slice. The kept-edges slice is what feeds the persist call.
+    const COVERAGE_HORIZON_DAYS: u32 = 30;
+    const COVERAGE_KEY_CAP: u32 = 5000;
+    var kept_edges_buf = std.ArrayListUnmanaged(schema.Edge){};
+    defer kept_edges_buf.deinit(allocator);
+
+    if (ctx.coverage_filter_enabled) {
+        const agent_keys = smgr.listAgentMemoryStoreKeys(
+            allocator,
+            uid,
+            COVERAGE_HORIZON_DAYS,
+            COVERAGE_KEY_CAP,
+        ) catch |err| blk: {
+            log.warn("boundary.extraction.coverage_keys_failed err={s} — proceeding without filter", .{@errorName(err)});
+            break :blk &.{};
+        };
+        defer {
+            for (agent_keys) |k| allocator.free(k);
+            allocator.free(agent_keys);
+        }
+
+        if (agent_keys.len == 0) {
+            log.info("boundary.extraction.coverage_filter agent_keys=0 — passive-only session", .{});
+            try kept_edges_buf.appendSlice(allocator, result.edges);
+        } else {
+            var key_set = std.StringHashMapUnmanaged(void){};
+            defer key_set.deinit(allocator);
+            for (agent_keys) |k| try key_set.put(allocator, k, {});
+
+            var skipped: usize = 0;
+            for (result.edges) |edge| {
+                const candidate_key = extraction_persist.deriveExtractionKey(
+                    allocator,
+                    edge.source_name,
+                    edge.relation_type,
+                    edge.target_name,
+                ) catch |err| {
+                    log.warn("boundary.extraction.coverage_key_compute_failed err={s} subject={s}", .{ @errorName(err), edge.source_name });
+                    // Conservative: keep on failure.
+                    try kept_edges_buf.append(allocator, edge);
+                    continue;
+                };
+                defer allocator.free(candidate_key);
+                if (key_set.contains(candidate_key)) {
+                    skipped += 1;
+                } else {
+                    try kept_edges_buf.append(allocator, edge);
+                }
+            }
+            log.info(
+                "boundary.extraction.coverage_filter agent_keys={d} input_edges={d} skipped={d} remaining={d}",
+                .{ agent_keys.len, result.edges.len, skipped, kept_edges_buf.items.len },
+            );
+        }
+    } else {
+        // Filter disabled — pass all edges through.
+        try kept_edges_buf.appendSlice(allocator, result.edges);
+    }
+
+    if (kept_edges_buf.items.len == 0) {
+        log.info("boundary.extraction.skip_persist reason=coverage_filter_kept_zero", .{});
+        return;
+    }
+
+    const kept_edges = kept_edges_buf.items;
+
+    // Convert each kept edge to an ExtractedMemory. text/subject/predicate/
     // object map directly. attributed_to defaults to "user" (boundary
     // extraction is implicitly user-attributed; the agent's own writes go
     // through memory_store, not this path).
-    const mems = try allocator.alloc(extraction_persist.ExtractedMemory, result.edges.len);
+    const mems = try allocator.alloc(extraction_persist.ExtractedMemory, kept_edges.len);
     defer {
         for (mems) |m| m.deinit(allocator);
         allocator.free(mems);
     }
 
-    for (result.edges, 0..) |edge, i| {
+    for (kept_edges, 0..) |edge, i| {
         mems[i] = .{
             .text = try allocator.dupe(u8, edge.fact),
             .subject = try allocator.dupe(u8, edge.source_name),

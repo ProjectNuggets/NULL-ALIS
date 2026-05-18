@@ -409,7 +409,14 @@ fn categoryForAttribution(attributed_to: []const u8) memory_root.MemoryCategory 
 /// They just don't dedupe against post-fix re-extractions of the SAME fact
 /// with DIFFERENT case (one orphan duplicate per fact is the worst case,
 /// matching pre-fix behavior). Going forward, new writes converge.
-fn deriveExtractionKey(
+///
+/// V1.14.12 (M3) — visibility changed from `fn` to `pub fn`. Callers
+/// outside this module (specifically the coverage filter in
+/// extraction/runner.zig) need to compute the same canonical key
+/// to compare against agent_keys returned by
+/// state_mgr.listAgentMemoryStoreKeys. Single source of truth for
+/// the hash function — DO NOT inline-recompute in other modules.
+pub fn deriveExtractionKey(
     allocator: std.mem.Allocator,
     subject: []const u8,
     predicate: []const u8,
@@ -445,9 +452,16 @@ fn deriveExtractionKey(
 ///   }
 ///
 /// Caller frees returned slice.
+///
+/// V1.14.12 (M3) — `origin` field is now persisted to
+/// `metadata->>'write_origin'` so the M3 coverage filter SQL query
+/// (`listAgentMemoryStoreKeys`) can filter for facts the agent's
+/// memory_store tool wrote, distinguishing them from boundary
+/// extraction writes.
 fn buildExtractionMetadata(
     allocator: std.mem.Allocator,
     mem: ExtractedMemory,
+    origin: WriteOrigin,
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .{};
     errdefer buf.deinit(allocator);
@@ -462,6 +476,11 @@ fn buildExtractionMetadata(
     try w.writeAll("\",\"attributed_to\":\"");
     try writeJsonEscaped(w, mem.attributed_to);
     try w.writeAll("\",\"attribution\":\"extraction_classifier\"");
+    // V1.14.12 (M3) — write_origin enables the coverage filter to
+    // identify agent-tool writes via SQL `metadata->>'write_origin'`.
+    try w.writeAll(",\"write_origin\":\"");
+    try writeJsonEscaped(w, origin.toSlice());
+    try w.writeAll("\"");
     // V1.7a-5 (spec seam 3) — emit link_type derived from predicate so
     // SQL-side population (`metadata->>'link_type'`) populates the column
     // atomically with the metadata write. SQL backfill for legacy rows
@@ -867,7 +886,7 @@ pub fn persistExtracted(
         };
         defer allocator.free(key);
 
-        const metadata_json = buildExtractionMetadata(allocator, m) catch |err| {
+        const metadata_json = buildExtractionMetadata(allocator, m, origin) catch |err| {
             log.warn("extraction.metadata_build_failed err={s}", .{@errorName(err)});
             result.failed_count += 1;
             continue;

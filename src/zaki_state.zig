@@ -537,6 +537,12 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn findRelatedExtractedMemories(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const u8, _: usize) ![]memory_root.MemoryEntry {
         return allocator.alloc(memory_root.MemoryEntry, 0);
     }
+    /// V1.14.12 (M3) — stub for non-postgres builds. Coverage filter
+    /// returns empty set; boundary extraction proceeds without filtering
+    /// (same behavior as pre-M3 on these builds).
+    pub fn listAgentMemoryStoreKeys(_: *@This(), allocator: std.mem.Allocator, _: i64, _: u32, _: u32) ![]const []const u8 {
+        return allocator.alloc([]const u8, 0);
+    }
     /// V1.6 commit 6 — stub for non-postgres builds. Bi-temporal close-out
     /// silently no-ops; the contradiction judge path is already disabled
     /// upstream when the live state manager is absent.
@@ -6312,6 +6318,74 @@ const ManagerImpl = struct {
     /// `idx_memories_subject` once the writer populates them.
     ///
     /// Caller frees each MemoryEntry + the slice.
+    /// V1.14.12 (M3) — list canonical extracted_<hash> keys written by
+    /// the agent's memory_store tool for this user, bounded by horizon.
+    /// The session-end extraction coverage filter uses this to skip
+    /// re-extracting facts the agent already explicitly stored.
+    ///
+    /// Filters:
+    ///   - `user_id = $1` (tenant scope)
+    ///   - `metadata->>'write_origin' = 'memory_store_tool'` (agent-tool only)
+    ///   - `key LIKE 'extracted_%'` (canonical-key shape; rules out legacy)
+    ///   - `MEMORIES_VALIDITY_FILTER` (skip superseded rows so we don't
+    ///     un-filter facts the user explicitly invalidated)
+    ///   - `created_at > NOW() - INTERVAL '$2 days'` (horizon by time)
+    ///   - LIMIT by recent-session-cap ($3)
+    ///
+    /// Cross-session by design: a fact the agent stored 5 days ago in
+    /// session A should still suppress re-extraction in session B's
+    /// boundary batch. The reviewer flagged unbounded growth — horizon
+    /// bounds (default 30 days OR 100 most recent sessions) prevent the
+    /// cache from ballooning on long-active users.
+    ///
+    /// Caller frees the returned slice + each []const u8 key.
+    pub fn listAgentMemoryStoreKeys(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        horizon_days: u32,
+        horizon_session_cap: u32,
+    ) ![]const []const u8 {
+        const q = try self.buildQuery(
+            "SELECT DISTINCT key FROM {schema}.memories " ++
+                "WHERE user_id = $1 " ++
+                "AND key LIKE 'extracted_%' " ++
+                "AND metadata ? 'write_origin' " ++
+                "AND metadata->>'write_origin' = 'memory_store_tool' " ++
+                "AND created_at > NOW() - ($2 || ' days')::interval " ++
+                "AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
+                "ORDER BY key LIMIT $3",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const days_text = try std.fmt.allocPrint(allocator, "{d}", .{horizon_days});
+        defer allocator.free(days_text);
+        const days_z = try allocator.dupeZ(u8, days_text);
+        defer allocator.free(days_z);
+        const cap_text = try std.fmt.allocPrint(allocator, "{d}", .{horizon_session_cap});
+        defer allocator.free(cap_text);
+        const cap_z = try allocator.dupeZ(u8, cap_text);
+        defer allocator.free(cap_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, days_z, cap_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(days_text.len), @intCast(cap_text.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const tuples = c.PQntuples(result);
+        var out = std.ArrayListUnmanaged([]const u8){};
+        errdefer {
+            for (out.items) |k| allocator.free(k);
+            out.deinit(allocator);
+        }
+        var i: c_int = 0;
+        while (i < tuples) : (i += 1) {
+            const k = try dupeResultValue(allocator, result, i, 0);
+            errdefer allocator.free(k);
+            try out.append(allocator, k);
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
     pub fn findRelatedExtractedMemories(
         self: *Self,
         allocator: std.mem.Allocator,

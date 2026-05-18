@@ -442,6 +442,27 @@ pub const AgentConfig = struct {
     /// Reversibility: set to FALSE to restore V1.14.11 behavior (judge
     /// fires on every write, including set-valued additives).
     extraction_cardinality_fastpath: bool = true,
+    /// V1.14.12 (M3) — coverage filter gate.
+    ///
+    /// When TRUE (default), boundary extraction (Pass A drop, Pass C
+    /// compaction summary, session-end TTL) skips facts whose canonical
+    /// extraction_<hash> key matches one already written by the agent's
+    /// memory_store tool within the horizon (30 days, 5000-key cap).
+    ///
+    /// Rationale: pre-M3 the boundary batches re-extracted everything in
+    /// the conversation window, including facts the agent had ALREADY
+    /// explicitly stored via memory_store. Combined with case-variance
+    /// canonicalization issues (closed by V1.14.11 commit 06b07895),
+    /// this produced duplicate rows that the judge then cleaned up —
+    /// wasteful work + alarming "contradiction" log lines.
+    ///
+    /// With the coverage filter, agent-store'd facts are skipped at
+    /// extraction time. The judge still runs on legitimately new facts
+    /// the agent didn't memory_store (passive conversation extraction).
+    ///
+    /// Set to FALSE to restore pre-M3 behavior (every fact re-extracted
+    /// at boundary). Debug/migration use only.
+    extraction_coverage_filter_enabled: bool = true,
     compaction_keep_recent: u32 = 20,
     compaction_max_summary_chars: u32 = 16_000,
     compaction_max_source_chars: u32 = 80_000,
