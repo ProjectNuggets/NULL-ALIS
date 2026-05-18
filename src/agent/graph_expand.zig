@@ -201,20 +201,22 @@ pub fn expandFromSeeds(
             allocator.free(hop_edges);
         }
 
-        // V1.14.11 (R3) — predicate-aware edge weighting. Multiply each
-        // edge's stored weight by a predicate-type prior before sorting.
-        // Single-valued predicates (LIVES_IN, MARRIED_TO, BIRTHDAY)
-        // propagate at full weight — they ARE the canonical truth.
-        // Set-valued predicates (LIKES, USES, IS_TYPE_OF, ATTENDED)
-        // propagate at 0.5x — many edges of this type per node, so
-        // each individual one carries less semantic weight.
-        // Mirrors the cardinality split documented in
+        // V1.14.11 (R3) — predicate-aware edge weighting via sort-time
+        // comparator (NOT in-place mutation). Single-valued predicates
+        // (LIVES_IN, MARRIED_TO, BIRTHDAY) propagate at full weight —
+        // they ARE the canonical truth. Set-valued predicates (LIKES,
+        // USES, IS_TYPE_OF, ATTENDED) propagate at 0.5x — many edges
+        // per node, each carries less semantic weight. Mirrors the
+        // cardinality split documented in
         // src/agent/edge_resolution.zig::buildResolvePrompt.
-        for (hop_edges) |*e| {
-            e.weight *= predicateTypePrior(e.predicate);
-        }
-        // Sort by weight DESC so the cap drops the weakest edges first.
-        std.sort.pdq(memory_root.TypedEdge, hop_edges, {}, edgeWeightDesc);
+        //
+        // BUG FIX (post-review): the original implementation mutated
+        // `e.weight *= prior` in place. That leaked into
+        // gateway.zig:13767 which emits `e.weight` to the /brain/graph
+        // FE, surfacing priored weights (0.5 / 1.0) instead of true
+        // DB-stored weights. Sort with an adjusted-weight comparator
+        // instead so edge.weight stays intact for downstream readers.
+        std.sort.pdq(memory_root.TypedEdge, hop_edges, {}, edgeAdjustedWeightDesc);
 
         // R3 per-hop telemetry: emits the frontier size + edge count
         // per hop. Lets us see in production whether depth-2 expansion
@@ -301,6 +303,15 @@ pub fn expandFromSeeds(
 
 fn edgeWeightDesc(_: void, a: memory_root.TypedEdge, b: memory_root.TypedEdge) bool {
     return a.weight > b.weight;
+}
+
+/// V1.14.11 (R3) — predicate-aware comparator. Computes the priored
+/// weight at compare-time without touching the underlying edge struct,
+/// so callers downstream (e.g. /brain/graph JSON emission at
+/// gateway.zig:13767) still see the true DB-stored weight, not the
+/// prior-multiplied value used internally for cap-eviction ordering.
+fn edgeAdjustedWeightDesc(_: void, a: memory_root.TypedEdge, b: memory_root.TypedEdge) bool {
+    return a.weight * predicateTypePrior(a.predicate) > b.weight * predicateTypePrior(b.predicate);
 }
 
 /// V1.14.11 (R3) — predicate-type prior for PPR-style edge weighting.
@@ -576,4 +587,30 @@ test "predicateTypePrior: amplification ratio between single and set-valued is 2
     // breaks. Catches accidental weight changes during tuning.
     const ratio = predicateTypePrior("LIVES_IN") / predicateTypePrior("LIKES");
     try std.testing.expectEqual(@as(f64, 2.0), ratio);
+}
+
+test "edgeAdjustedWeightDesc: ranks single-valued above set-valued at equal raw weight" {
+    // The whole point of the predicate-aware sort. Two edges with
+    // identical DB-stored weight but different predicate cardinality
+    // should rank with the single-valued one first.
+    const single: memory_root.TypedEdge = .{ .source_key = "x", .target_key = "y", .predicate = "LIVES_IN", .weight = 1.0 };
+    const set_val: memory_root.TypedEdge = .{ .source_key = "x", .target_key = "z", .predicate = "LIKES", .weight = 1.0 };
+    try std.testing.expect(edgeAdjustedWeightDesc({}, single, set_val));
+    try std.testing.expect(!edgeAdjustedWeightDesc({}, set_val, single));
+}
+
+test "edgeAdjustedWeightDesc: does NOT mutate edge.weight (regression for /brain/graph leak)" {
+    // V1.14.11 post-review bug fix. Original implementation multiplied
+    // e.weight *= predicateTypePrior(...) in place, which leaked
+    // priored weights into gateway.zig:13767's /brain/graph JSON
+    // emission, surfacing 0.5 / 1.0 instead of true DB values.
+    // Now the prior applies only at compare-time. This test asserts
+    // the compare itself does not mutate.
+    const a: memory_root.TypedEdge = .{ .source_key = "x", .target_key = "y", .predicate = "LIKES", .weight = 0.8 };
+    const b: memory_root.TypedEdge = .{ .source_key = "x", .target_key = "z", .predicate = "LIVES_IN", .weight = 0.6 };
+    _ = edgeAdjustedWeightDesc({}, a, b);
+    _ = edgeAdjustedWeightDesc({}, b, a);
+    // Weights must be untouched after compare calls.
+    try std.testing.expectEqual(@as(f64, 0.8), a.weight);
+    try std.testing.expectEqual(@as(f64, 0.6), b.weight);
 }
