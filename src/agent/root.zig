@@ -591,6 +591,14 @@ pub const Agent = struct {
     /// Whether compaction was performed during the last turn.
     last_turn_compacted: bool = false,
 
+    /// V1.14.10 A — in-flight guard for async lifecycle summarizer.
+    /// True while a background lifecycle thread is running. Hot-path
+    /// callers (compaction:auto, summary_seed:auto) skip enqueuing
+    /// when already in-flight — the next legitimate trigger picks
+    /// up whatever the in-flight one missed. Atomic so the spawned
+    /// thread can clear it safely from a non-agent thread.
+    lifecycle_in_flight: std.atomic.Value(bool) = .{ .raw = false },
+
     /// Whether context was force-compacted due to exhaustion during the current turn.
     context_was_compacted: bool = false,
 
@@ -868,7 +876,37 @@ pub const Agent = struct {
         return if (self.cached_config) |*cfg| cfg else null;
     }
 
+    /// V1.14.10 A — Wait for any in-flight async lifecycle worker to
+    /// complete. Bounded by `timeout_ms`. Returns true if drained,
+    /// false if timed out.
+    ///
+    /// Used by Agent.deinit (with a generous 30s timeout) so the
+    /// detached worker doesn't outlive the Agent it references.
+    /// Also exposed publicly so tests that assert on side-effects
+    /// (memory writes) of the lifecycle path can wait deterministically
+    /// before asserting.
+    pub fn waitForLifecycleIdle(self: *Agent, timeout_ms: i64) bool {
+        const wait_start_ms = std.time.milliTimestamp();
+        while (self.lifecycle_in_flight.load(.acquire)) {
+            const elapsed = std.time.milliTimestamp() - wait_start_ms;
+            if (elapsed > timeout_ms) return false;
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+        return true;
+    }
+
     pub fn deinit(self: *Agent) void {
+        // V1.14.10 A — wait for any in-flight async lifecycle worker to
+        // finish before tearing down. The detached worker holds a
+        // pointer to `self` (and uses self.allocator + self.provider).
+        // Without this wait, Agent.deinit could free state the worker
+        // is mid-use. Bounded — after 30s we give up and proceed
+        // (worker will segfault but at least the shutdown path is
+        // bounded — better than hanging on an unhealthy provider).
+        if (!self.waitForLifecycleIdle(30_000)) {
+            log.warn("Agent.deinit: async lifecycle still in flight after 30000ms — proceeding (worker may segfault)", .{});
+        }
+
         self.clearCurrentTurnProviderOverride();
         if (self.cached_config) |*cfg| cfg.deinit();
         if (self.model_name_owned) self.allocator.free(self.model_name);
@@ -4947,7 +4985,20 @@ pub const Agent = struct {
 
     fn refreshDurableContinuityAfterCompaction(self: *Agent) void {
         if (!self.last_turn_compacted) return;
-        self.last_turn_context.durable_continuity_refreshed = commands.persistSessionCheckpointDetailed(self, "compaction:auto");
+        // V1.14.10 A — async: this used to block the turn return for
+        // 30-180s on dense sessions (legacy lifecycle path fires
+        // 50-100+ contradiction-judge + entity-coref calls per
+        // compaction). The full battery on 2026-05-18 saw 9 of 199
+        // session-load turns hit the 180s HTTP read timeout because
+        // of this — sample 4 dropped from 88% to 67% as a result.
+        // Async fires the lifecycle on a detached worker thread;
+        // the turn returns immediately. `durable_continuity_refreshed`
+        // is set optimistically to `true` because the write will
+        // happen unless the spawn itself fails (in which case the
+        // async wrapper falls back to sync — same behavior as
+        // before).
+        commands.persistSessionCheckpointAsync(self, "compaction:auto");
+        self.last_turn_context.durable_continuity_refreshed = true;
     }
 
     fn ensureDurableContinuitySeed(self: *Agent) void {
@@ -4966,7 +5017,11 @@ pub const Agent = struct {
             return;
         }
 
-        _ = commands.persistSessionCheckpointDetailed(self, "summary_seed:auto");
+        // V1.14.10 A — async (see refreshDurableContinuityAfterCompaction
+        // above for rationale). summary_seed fires every turn that
+        // would have no summary yet — making it sync was extra
+        // contention on a path that didn't need to block.
+        commands.persistSessionCheckpointAsync(self, "summary_seed:auto");
     }
 
     /// Run a single message through the agent and return the response.
@@ -7929,6 +7984,9 @@ test "auto compaction refreshes durable continuity artifacts" {
     try std.testing.expect(agent.last_turn_compacted);
     try std.testing.expect(agent.last_turn_context.durable_continuity_refreshed);
 
+    // V1.14.10 A — lifecycle persist is async; wait for it before
+    // asserting on the resulting memory write.
+    try std.testing.expect(agent.waitForLifecycleIdle(5_000));
     const anchor = (try mem.get(allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
     defer anchor.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=compaction:auto") != null);
@@ -8017,6 +8075,10 @@ test "message-count boundary no longer auto-compacts without token pressure" {
     try std.testing.expect(!agent.last_turn_compacted);
     try std.testing.expect(!agent.last_turn_context.durable_continuity_refreshed);
     try std.testing.expectEqual(@as(u32, 0), agent.last_turn_context.trim_events);
+
+    // V1.14.10 A — lifecycle persist is async; wait before asserting on
+    // the memory side-effects (anchor + latest summary).
+    try std.testing.expect(agent.waitForLifecycleIdle(5_000));
 
     const anchor = (try mem.get(allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
     defer anchor.deinit(allocator);
@@ -8168,6 +8230,10 @@ test "normal main-lane turn seeds summary_latest when compaction never runs" {
     defer allocator.free(response);
     try std.testing.expectEqualStrings("ok", response);
     try std.testing.expect(!agent.last_turn_compacted);
+
+    // V1.14.10 A — lifecycle persist is async; wait before asserting on
+    // the memory writes.
+    try std.testing.expect(agent.waitForLifecycleIdle(5_000));
 
     const latest = (try mem.get(allocator, "summary_latest/agent:test:user:1:main")) orelse return error.TestUnexpectedResult;
     defer latest.deinit(allocator);
