@@ -46,15 +46,26 @@ const FALLBACK_ENTRY_MAX_BYTES: usize = 320;
 // V1.7a-2 — graph-expand recall consumer.
 //
 // When a state_mgr is threaded through `loadTurnMemorySlot` AND
-// `NULLALIS_GRAPH_RECALL_MAX_HOPS` (default 1) is non-zero, an additional
-// `<graph_neighbors>` block is appended to the memory_for_turn slot. This
-// block lists 1-hop neighbors of the recall seeds that the legacy keyword/
-// vector recall would NOT have surfaced (because they don't textually
-// match the query, but they are graph-connected to a seed that does).
+// `NULLALIS_GRAPH_RECALL_MAX_HOPS` (default 2 — see V1.14.11 below) is
+// non-zero, an additional `<graph_neighbors>` block is appended to the
+// memory_for_turn slot. This block lists hop-1+ neighbors of the recall
+// seeds that the legacy keyword/vector recall would NOT have surfaced
+// (because they don't textually match the query, but they are graph-
+// connected to a seed that does).
 //
 // `max_hops=0` disables graph-mode entirely (legacy behavior — strict
 // backward compat). Operators set the env to 0 to roll back if needed.
-const DEFAULT_GRAPH_RECALL_MAX_HOPS: u8 = 1;
+//
+// V1.14.11 (Phase 3 R3 — Cat 3 multi-hop uplift). Default raised from
+// 1 → 2. LoCoMo Cat 3 (temporal/inference) often needs friend-of-
+// friend reach: "Mia mentioned a place; what cuisine does she like?"
+// requires Mia → mentioned_place (hop 1) → cuisine_type (hop 2).
+// At hop=1 we got only one of those bridges. The cost is bounded:
+// max_nodes_per_hop=20 caps the depth-2 frontier at ~40 nodes,
+// ~80 edges = 2 SQL round trips per turn. Block size unchanged
+// (1500 byte cap → still ~6-10 neighbors in the prompt; the cap
+// just gives the scorer a richer pool to pick from).
+const DEFAULT_GRAPH_RECALL_MAX_HOPS: u8 = 2;
 const DEFAULT_GRAPH_RECALL_SEEDS: usize = 5;
 const DEFAULT_GRAPH_RECALL_MAX_NODES_PER_HOP: usize = 20;
 /// Hard cap on the appended `<graph_neighbors>` block bytes. Keeps the

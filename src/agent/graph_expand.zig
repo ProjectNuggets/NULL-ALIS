@@ -201,8 +201,27 @@ pub fn expandFromSeeds(
             allocator.free(hop_edges);
         }
 
+        // V1.14.11 (R3) — predicate-aware edge weighting. Multiply each
+        // edge's stored weight by a predicate-type prior before sorting.
+        // Single-valued predicates (LIVES_IN, MARRIED_TO, BIRTHDAY)
+        // propagate at full weight — they ARE the canonical truth.
+        // Set-valued predicates (LIKES, USES, IS_TYPE_OF, ATTENDED)
+        // propagate at 0.5x — many edges of this type per node, so
+        // each individual one carries less semantic weight.
+        // Mirrors the cardinality split documented in
+        // src/agent/edge_resolution.zig::buildResolvePrompt.
+        for (hop_edges) |*e| {
+            e.weight *= predicateTypePrior(e.predicate);
+        }
         // Sort by weight DESC so the cap drops the weakest edges first.
         std.sort.pdq(memory_root.TypedEdge, hop_edges, {}, edgeWeightDesc);
+
+        // R3 per-hop telemetry: emits the frontier size + edge count
+        // per hop. Lets us see in production whether depth-2 expansion
+        // is actually producing additional reach on Cat 3 queries.
+        log.info("graph_expand.hop hop={d} frontier_size={d} edges={d} admitted_cap={d}", .{
+            hop, frontier.items.len, hop_edges.len, config.max_nodes_per_hop,
+        });
 
         // Build next frontier from edge targets that are NEW.
         var next_frontier: std.ArrayListUnmanaged([]const u8) = .{};
@@ -282,6 +301,96 @@ pub fn expandFromSeeds(
 
 fn edgeWeightDesc(_: void, a: memory_root.TypedEdge, b: memory_root.TypedEdge) bool {
     return a.weight > b.weight;
+}
+
+/// V1.14.11 (R3) — predicate-type prior for PPR-style edge weighting.
+///
+/// Set-valued predicates (a node can have many of them — IS_TYPE_OF,
+/// LIKES, USES, ATTENDED, etc.) propagate at 0.5x because each
+/// individual edge carries less semantic weight when many coexist.
+/// Single-valued predicates (LIVES_IN, MARRIED_TO, BIRTHDAY) propagate
+/// at full 1.0 because each IS the canonical fact for that subject.
+///
+/// Default for unknown predicates is 0.7 — a middle value that doesn't
+/// over-penalize unmapped vocab. The unmapped tail will surface in
+/// `linkTypeForPredicate.linktype_map_default` logs and can be
+/// classified explicitly here over time.
+///
+/// **Cardinality vocabulary** mirrors the split documented in
+/// `src/agent/edge_resolution.zig::buildResolvePrompt` (R3-prereq):
+/// any drift between the two lists weakens the contradiction judge's
+/// correlation with PPR propagation. Keep them in sync.
+///
+/// Reference: HippoRAG (Gutiérrez et al. 2024) uses 0.5 / 0.85 as the
+/// propagation prior; we widened the gap (0.5 / 1.0) to amplify the
+/// signal on this corpus's predicate distribution.
+pub fn predicateTypePrior(predicate: []const u8) f64 {
+    // Normalize uppercase for compare — predicates are typically
+    // uppercase in storage but tolerate lowercase too.
+    var buf: [64]u8 = undefined;
+    if (predicate.len == 0 or predicate.len > buf.len) return 0.7;
+    for (predicate, 0..) |ch, i| buf[i] = std.ascii.toUpper(ch);
+    const norm = buf[0..predicate.len];
+
+    // Single-valued — propagate at full weight.
+    // Identity/location/status. Same value drives the contradiction
+    // judge to flag a new value as superseding the old one.
+    if (std.mem.eql(u8, norm, "LIVES_IN")) return 1.0;
+    if (std.mem.eql(u8, norm, "WORKS_AT")) return 1.0;
+    if (std.mem.eql(u8, norm, "MARRIED_TO")) return 1.0;
+    if (std.mem.eql(u8, norm, "REPORTS_TO")) return 1.0;
+    if (std.mem.eql(u8, norm, "BIRTHDAY")) return 1.0;
+    if (std.mem.eql(u8, norm, "BORN_ON")) return 1.0;
+    if (std.mem.eql(u8, norm, "CURRENT_PROJECT")) return 1.0;
+    // Explicit supersession edges — the predicate ITSELF is single-
+    // valued because it names a temporal transition.
+    if (std.mem.eql(u8, norm, "REPLACES")) return 1.0;
+    if (std.mem.eql(u8, norm, "USED_TO_BE")) return 1.0;
+    if (std.mem.eql(u8, norm, "FORMERLY")) return 1.0;
+    if (std.mem.eql(u8, norm, "PREVIOUSLY")) return 1.0;
+
+    // Set-valued — propagate at 0.5x.
+    // Membership.
+    if (std.mem.eql(u8, norm, "IS_TYPE_OF")) return 0.5;
+    if (std.mem.eql(u8, norm, "INCLUDES")) return 0.5;
+    if (std.mem.eql(u8, norm, "MEMBER_OF")) return 0.5;
+    if (std.mem.eql(u8, norm, "PART_OF")) return 0.5;
+    if (std.mem.eql(u8, norm, "FOLLOWS")) return 0.5;
+    // Preference.
+    if (std.mem.eql(u8, norm, "LIKES")) return 0.5;
+    if (std.mem.eql(u8, norm, "HATES")) return 0.5;
+    if (std.mem.eql(u8, norm, "AVOIDS")) return 0.5;
+    if (std.mem.eql(u8, norm, "FAVORS")) return 0.5;
+    if (std.mem.eql(u8, norm, "DISLIKES")) return 0.5;
+    if (std.mem.eql(u8, norm, "ENJOYS")) return 0.5;
+    if (std.mem.eql(u8, norm, "VALUES")) return 0.5;
+    // Usage.
+    if (std.mem.eql(u8, norm, "USES")) return 0.5;
+    if (std.mem.eql(u8, norm, "USED_FOR")) return 0.5;
+    if (std.mem.eql(u8, norm, "OWNS")) return 0.5;
+    if (std.mem.eql(u8, norm, "DEPENDS_ON")) return 0.5;
+    if (std.mem.eql(u8, norm, "BUILDS_WITH")) return 0.5;
+    if (std.mem.eql(u8, norm, "DEPLOYS_TO")) return 0.5;
+    // Episode.
+    if (std.mem.eql(u8, norm, "ATTENDED")) return 0.5;
+    if (std.mem.eql(u8, norm, "JOINED")) return 0.5;
+    if (std.mem.eql(u8, norm, "VISITED")) return 0.5;
+    if (std.mem.eql(u8, norm, "HAPPENED_ON")) return 0.5;
+    if (std.mem.eql(u8, norm, "OCCURRED_AT")) return 0.5;
+    if (std.mem.eql(u8, norm, "MENTIONS")) return 0.5;
+    // Relationship (set-valued: a person KNOWS many people).
+    if (std.mem.eql(u8, norm, "KNOWS")) return 0.5;
+    if (std.mem.eql(u8, norm, "FRIENDS_WITH")) return 0.5;
+    if (std.mem.eql(u8, norm, "WORKS_WITH")) return 0.5;
+    if (std.mem.eql(u8, norm, "COLLABORATES_WITH")) return 0.5;
+    if (std.mem.eql(u8, norm, "MANAGES")) return 0.5;
+    if (std.mem.eql(u8, norm, "RELATED_TO")) return 0.5;
+
+    // Unmapped predicate — middle prior. log.info upstream
+    // (linkTypeForPredicate.linktype_map_default) surfaces the
+    // vocab gap; this returns a sensible default so PPR doesn't
+    // crash on a missing classification.
+    return 0.7;
 }
 
 fn scoredNodeDesc(_: void, a: ScoredNode, b: ScoredNode) bool {
@@ -430,4 +539,41 @@ test "edgeWeightDesc orders by weight descending" {
     const b: memory_root.TypedEdge = .{ .source_key = "x", .target_key = "z", .predicate = "P", .weight = 0.5 };
     try std.testing.expect(edgeWeightDesc({}, a, b));
     try std.testing.expect(!edgeWeightDesc({}, b, a));
+}
+
+test "predicateTypePrior: single-valued identity predicates propagate at full weight" {
+    try std.testing.expectEqual(@as(f64, 1.0), predicateTypePrior("LIVES_IN"));
+    try std.testing.expectEqual(@as(f64, 1.0), predicateTypePrior("MARRIED_TO"));
+    try std.testing.expectEqual(@as(f64, 1.0), predicateTypePrior("BIRTHDAY"));
+    try std.testing.expectEqual(@as(f64, 1.0), predicateTypePrior("REPLACES"));
+}
+
+test "predicateTypePrior: set-valued predicates dampen to 0.5x" {
+    try std.testing.expectEqual(@as(f64, 0.5), predicateTypePrior("LIKES"));
+    try std.testing.expectEqual(@as(f64, 0.5), predicateTypePrior("USES"));
+    try std.testing.expectEqual(@as(f64, 0.5), predicateTypePrior("IS_TYPE_OF"));
+    try std.testing.expectEqual(@as(f64, 0.5), predicateTypePrior("ATTENDED"));
+    try std.testing.expectEqual(@as(f64, 0.5), predicateTypePrior("KNOWS"));
+}
+
+test "predicateTypePrior: case-insensitive lookup" {
+    try std.testing.expectEqual(@as(f64, 1.0), predicateTypePrior("lives_in"));
+    try std.testing.expectEqual(@as(f64, 0.5), predicateTypePrior("Likes"));
+}
+
+test "predicateTypePrior: unmapped predicates get sensible middle prior" {
+    try std.testing.expectEqual(@as(f64, 0.7), predicateTypePrior("CUSTOM_UNMAPPED"));
+    try std.testing.expectEqual(@as(f64, 0.7), predicateTypePrior(""));
+    // Oversize predicate — falls through without panic.
+    const big = "X" ** 100;
+    try std.testing.expectEqual(@as(f64, 0.7), predicateTypePrior(big));
+}
+
+test "predicateTypePrior: amplification ratio between single and set-valued is 2x" {
+    // R3 design invariant: single-valued predicates should propagate
+    // at 2x the weight of set-valued ones. If this ratio shifts, the
+    // PPR scoring intuition (canonical facts dominate over set members)
+    // breaks. Catches accidental weight changes during tuning.
+    const ratio = predicateTypePrior("LIVES_IN") / predicateTypePrior("LIKES");
+    try std.testing.expectEqual(@as(f64, 2.0), ratio);
 }
