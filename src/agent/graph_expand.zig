@@ -56,6 +56,7 @@ const log = std.log.scoped(.graph_expand);
 const zaki_state = @import("../zaki_state.zig");
 const memory_root = @import("../memory/root.zig");
 const importance = @import("../memory/importance.zig");
+const edge_resolution = @import("edge_resolution.zig");
 
 /// One node in the expanded neighborhood with its hop distance from the
 /// nearest seed and its composite score.
@@ -323,85 +324,24 @@ fn edgeAdjustedWeightDesc(_: void, a: memory_root.TypedEdge, b: memory_root.Type
 /// at full 1.0 because each IS the canonical fact for that subject.
 ///
 /// Default for unknown predicates is 0.7 — a middle value that doesn't
-/// over-penalize unmapped vocab. The unmapped tail will surface in
-/// `linkTypeForPredicate.linktype_map_default` logs and can be
-/// classified explicitly here over time.
+/// over-penalize unmapped vocab.
 ///
-/// **Cardinality vocabulary** mirrors the split documented in
-/// `src/agent/edge_resolution.zig::buildResolvePrompt` (R3-prereq):
-/// any drift between the two lists weakens the contradiction judge's
-/// correlation with PPR propagation. Keep them in sync.
+/// V1.14.12 (M2) — refactored to delegate to
+/// `edge_resolution.classifyPredicate` (single source of truth for
+/// cardinality vocab). Pre-M2 this function maintained an inline copy
+/// of the same predicate list as `buildResolvePrompt`'s SET-VALUED
+/// section; drift between them weakened correctness. Now both consult
+/// the same enum-returning helper.
 ///
 /// Reference: HippoRAG (Gutiérrez et al. 2024) uses 0.5 / 0.85 as the
 /// propagation prior; we widened the gap (0.5 / 1.0) to amplify the
 /// signal on this corpus's predicate distribution.
 pub fn predicateTypePrior(predicate: []const u8) f64 {
-    // Normalize uppercase for compare — predicates are typically
-    // uppercase in storage but tolerate lowercase too.
-    var buf: [64]u8 = undefined;
-    if (predicate.len == 0 or predicate.len > buf.len) return 0.7;
-    for (predicate, 0..) |ch, i| buf[i] = std.ascii.toUpper(ch);
-    const norm = buf[0..predicate.len];
-
-    // Single-valued — propagate at full weight.
-    // Identity/location/status. Same value drives the contradiction
-    // judge to flag a new value as superseding the old one.
-    if (std.mem.eql(u8, norm, "LIVES_IN")) return 1.0;
-    if (std.mem.eql(u8, norm, "WORKS_AT")) return 1.0;
-    if (std.mem.eql(u8, norm, "MARRIED_TO")) return 1.0;
-    if (std.mem.eql(u8, norm, "REPORTS_TO")) return 1.0;
-    if (std.mem.eql(u8, norm, "BIRTHDAY")) return 1.0;
-    if (std.mem.eql(u8, norm, "BORN_ON")) return 1.0;
-    if (std.mem.eql(u8, norm, "CURRENT_PROJECT")) return 1.0;
-    // Explicit supersession edges — the predicate ITSELF is single-
-    // valued because it names a temporal transition.
-    if (std.mem.eql(u8, norm, "REPLACES")) return 1.0;
-    if (std.mem.eql(u8, norm, "USED_TO_BE")) return 1.0;
-    if (std.mem.eql(u8, norm, "FORMERLY")) return 1.0;
-    if (std.mem.eql(u8, norm, "PREVIOUSLY")) return 1.0;
-
-    // Set-valued — propagate at 0.5x.
-    // Membership.
-    if (std.mem.eql(u8, norm, "IS_TYPE_OF")) return 0.5;
-    if (std.mem.eql(u8, norm, "INCLUDES")) return 0.5;
-    if (std.mem.eql(u8, norm, "MEMBER_OF")) return 0.5;
-    if (std.mem.eql(u8, norm, "PART_OF")) return 0.5;
-    if (std.mem.eql(u8, norm, "FOLLOWS")) return 0.5;
-    // Preference.
-    if (std.mem.eql(u8, norm, "LIKES")) return 0.5;
-    if (std.mem.eql(u8, norm, "HATES")) return 0.5;
-    if (std.mem.eql(u8, norm, "AVOIDS")) return 0.5;
-    if (std.mem.eql(u8, norm, "FAVORS")) return 0.5;
-    if (std.mem.eql(u8, norm, "DISLIKES")) return 0.5;
-    if (std.mem.eql(u8, norm, "ENJOYS")) return 0.5;
-    if (std.mem.eql(u8, norm, "VALUES")) return 0.5;
-    // Usage.
-    if (std.mem.eql(u8, norm, "USES")) return 0.5;
-    if (std.mem.eql(u8, norm, "USED_FOR")) return 0.5;
-    if (std.mem.eql(u8, norm, "OWNS")) return 0.5;
-    if (std.mem.eql(u8, norm, "DEPENDS_ON")) return 0.5;
-    if (std.mem.eql(u8, norm, "BUILDS_WITH")) return 0.5;
-    if (std.mem.eql(u8, norm, "DEPLOYS_TO")) return 0.5;
-    // Episode.
-    if (std.mem.eql(u8, norm, "ATTENDED")) return 0.5;
-    if (std.mem.eql(u8, norm, "JOINED")) return 0.5;
-    if (std.mem.eql(u8, norm, "VISITED")) return 0.5;
-    if (std.mem.eql(u8, norm, "HAPPENED_ON")) return 0.5;
-    if (std.mem.eql(u8, norm, "OCCURRED_AT")) return 0.5;
-    if (std.mem.eql(u8, norm, "MENTIONS")) return 0.5;
-    // Relationship (set-valued: a person KNOWS many people).
-    if (std.mem.eql(u8, norm, "KNOWS")) return 0.5;
-    if (std.mem.eql(u8, norm, "FRIENDS_WITH")) return 0.5;
-    if (std.mem.eql(u8, norm, "WORKS_WITH")) return 0.5;
-    if (std.mem.eql(u8, norm, "COLLABORATES_WITH")) return 0.5;
-    if (std.mem.eql(u8, norm, "MANAGES")) return 0.5;
-    if (std.mem.eql(u8, norm, "RELATED_TO")) return 0.5;
-
-    // Unmapped predicate — middle prior. log.info upstream
-    // (linkTypeForPredicate.linktype_map_default) surfaces the
-    // vocab gap; this returns a sensible default so PPR doesn't
-    // crash on a missing classification.
-    return 0.7;
+    return switch (edge_resolution.classifyPredicate(predicate)) {
+        .single_valued => 1.0,
+        .set_valued => 0.5,
+        .unknown => 0.7,
+    };
 }
 
 fn scoredNodeDesc(_: void, a: ScoredNode, b: ScoredNode) bool {

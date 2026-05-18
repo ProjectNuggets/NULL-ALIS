@@ -421,6 +421,27 @@ pub const AgentConfig = struct {
     /// for the boundary transcript (Llama-3.3-70B-Instruct-Turbo on
     /// Together = $0.88/1M, 128K ctx, recommended default).
     extraction_judge_model: []const u8 = "",
+    /// V1.14.12 (M2) — cardinality fast-path gate.
+    ///
+    /// When TRUE (default), persistExtracted's judge step is SKIPPED for
+    /// facts where (a) the predicate is set-valued (LIKES, USES,
+    /// IS_TYPE_OF, etc. — see edge_resolution.classifyPredicate) AND
+    /// (b) the fact's text contains no explicit negation language
+    /// ("no longer", "stopped", etc. — see
+    /// edge_resolution.textHasExplicitNegation). The MD5 content_hash
+    /// dedup + canonical-key dedup + entity coref still run; only the
+    /// LLM contradiction judge call is bypassed.
+    ///
+    /// Rationale: Captain Mochi investigation (2026-05-18) showed
+    /// Llama-3.3-70B-Instruct-Turbo over-fires contradictions on
+    /// set-valued additions (e.g., flags LIKES Indian as contradicting
+    /// LIKES Thai). The fast-path moves the cardinality rule from a
+    /// prompt instruction (Llama under-respects) to a code gate (always
+    /// honored).
+    ///
+    /// Reversibility: set to FALSE to restore V1.14.11 behavior (judge
+    /// fires on every write, including set-valued additives).
+    extraction_cardinality_fastpath: bool = true,
     compaction_keep_recent: u32 = 20,
     compaction_max_summary_chars: u32 = 16_000,
     compaction_max_source_chars: u32 = 80_000,

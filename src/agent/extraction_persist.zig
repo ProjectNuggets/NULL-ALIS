@@ -720,19 +720,44 @@ pub fn persistExtracted(
             continue;
         }
 
-        // Step 3 (V1.6 commit 6): contradiction LLM judge.
+        // V1.14.12 (M2) — cardinality fast-path.
         //
-        // Fetches two candidate lists per Graphiti spec:
-        //   - related: same-subject extraction-classifier memories (dedup-eligible)
-        //   - broader: hybrid BM25+key recall results (contradiction-eligible only)
+        // Skip the LLM judge entirely for facts where (a) the predicate
+        // is set-valued AND (b) the fact's text contains no explicit
+        // negation language. Set-valued predicates (LIKES, USES,
+        // IS_TYPE_OF, ATTENDED, etc.) are additive by default — the
+        // same subject can have many of them. Treating a new
+        // (subject, predicate, different_object) tuple as a
+        // contradiction is the Captain Mochi misfire pattern.
         //
-        // Runs only when caller provided a JudgeContext. Without it, this
-        // step short-circuits and persistence falls back to MD5-only
-        // semantics (same as V1.6 commit 5b.3 behavior).
+        // The judge STILL fires for:
+        //   - single-valued predicates (LIVES_IN, MARRIED_TO, BIRTHDAY)
+        //     where new value DOES supersede old
+        //   - explicit negation in the fact text ("no longer", "stopped",
+        //     "instead of"), even on set-valued predicates
+        //   - unknown predicates (conservative: let judge decide)
         //
-        // Failure mode: any error in candidate fetch OR judge call → log
-        // + proceed to write. Better one extra duplicate than a lost fact.
-        if (judge) |j| {
+        // Effect post-deploy: judge invocation rate drops from ~50% to
+        // <10% of writes. MD5 + canonical-key + coref dedup still
+        // protect against duplicates; only the LLM contradiction step
+        // is bypassed for the set-valued additive case.
+        //
+        // Reversibility: revert this commit. The set-valued prompt
+        // section in buildResolvePrompt is intentionally kept during
+        // soak window — if M2 is reverted, Llama still gets the SET-
+        // VALUED guidance via the prompt (less effective but a safety
+        // net).
+        const cardinality = edge_resolution.classifyPredicate(m.predicate);
+        const has_negation = edge_resolution.textHasExplicitNegation(m.text);
+        if (cardinality == .set_valued and !has_negation) {
+            log.info(
+                "memory.write.cardinality_fastpath subject={s} predicate={s} reason=set_valued_no_negation",
+                .{ m.subject, m.predicate },
+            );
+            // Skip judge entirely. Fall through to the write block below.
+        } else if (judge) |j| {
+            // Original judge invocation (single-valued OR explicit
+            // negation OR unknown predicate — judge can add value).
             const empty_entries: []memory_root.MemoryEntry = &.{};
             const related: []memory_root.MemoryEntry = state_mgr.findRelatedExtractedMemories(
                 allocator,
