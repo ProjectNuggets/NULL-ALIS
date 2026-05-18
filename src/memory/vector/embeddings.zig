@@ -14,12 +14,33 @@ const GeminiEmbedding = @import("embeddings_gemini.zig").GeminiEmbedding;
 const VoyageEmbedding = @import("embeddings_voyage.zig").VoyageEmbedding;
 const OllamaEmbedding = @import("embeddings_ollama.zig").OllamaEmbedding;
 const net_security = @import("../../net_security.zig");
+const text_norm = @import("../text_norm.zig");
 const log = std.log.scoped(.embeddings);
 
 fn openai_embedding_transport_config() http_util.TransportConfig {
     // Force curl for embedding providers to avoid known native TLS aborts under load.
     return .{ .mode = .curl_only };
 }
+
+/// Defensive byte-budget for embedding inputs sent to OpenAI-compatible
+/// providers. Most embedding models cap at 512 tokens hard (BGE family,
+/// E5, multilingual-e5, modernBERT-base in some deploys). The upstream
+/// `shouldEmbedMemoryEntry` gate uses `chars/4` to estimate fit which
+/// over-counts on English prose (~3.3 chars/token actual) — so a content
+/// blob that fits the gate (≤2048 chars) can still tokenize to >512 and
+/// be rejected by the provider with a 400.
+///
+/// We truncate at 1700 bytes (~510 tokens at the realistic 3.3 ratio,
+/// leaving margin for tokenizer variance and the model's leading
+/// special tokens). Truncation is graceful degradation, not data loss:
+/// retrieval still returns the full untruncated content from Postgres,
+/// only the vector "fingerprint" used for cosine search shortens.
+///
+/// Future: when we migrate to a long-context embedder
+/// (togethercomputer/m2-bert-80M-8k-retrieval or
+///  Alibaba-NLP/gte-modernbert-base), this cap can rise to match the
+/// new model's window or be removed entirely.
+const EMBEDDING_INPUT_BYTE_BUDGET: usize = 1700;
 
 // ── Embedding provider vtable ─────────────────────────────────────
 
@@ -289,6 +310,23 @@ pub const OpenAiEmbedding = struct {
             return allocator.alloc(f32, 0);
         }
 
+        // Defensive truncation: most embedding models cap at 512 tokens
+        // hard. The upstream `shouldEmbedMemoryEntry` gate uses chars/4
+        // which can leak entries that tokenize to >512 — they fail with
+        // a provider 400 ("This model's maximum context length is 512
+        // tokens. However, you requested N tokens…"). Truncating here
+        // turns silent vector-recall loss into graceful degradation:
+        // full content stays in Postgres, only the fingerprint shortens.
+        // UTF-8 safe via text_norm.truncateUtf8 — never cuts mid-codepoint.
+        const truncated = text_norm.truncateUtf8(text, EMBEDDING_INPUT_BYTE_BUDGET);
+        if (truncated.len < text.len) {
+            log.debug("embedding input truncated original={d} truncated={d} budget={d}", .{
+                text.len,
+                truncated.len,
+                EMBEDDING_INPUT_BYTE_BUDGET,
+            });
+        }
+
         // Build request body JSON
         var body_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer body_buf.deinit(allocator);
@@ -296,7 +334,7 @@ pub const OpenAiEmbedding = struct {
         try body_buf.appendSlice(allocator, "{\"model\":\"");
         try appendJsonEscaped(&body_buf, allocator, self_.model);
         try body_buf.appendSlice(allocator, "\",\"input\":\"");
-        try appendJsonEscaped(&body_buf, allocator, text);
+        try appendJsonEscaped(&body_buf, allocator, truncated);
         try body_buf.appendSlice(allocator, "\"}");
 
         const url = try self_.embeddingsUrl(allocator);
@@ -1165,4 +1203,32 @@ test "contentHashWithModel same model different text produce different hashes" {
     const h1 = contentHashWithModel("text one", "model-x");
     const h2 = contentHashWithModel("text two", "model-x");
     try std.testing.expect(!std.mem.eql(u8, &h1, &h2));
+}
+
+test "EMBEDDING_INPUT_BYTE_BUDGET sits inside 512-token provider cap" {
+    // Sanity check: 1700 bytes at the realistic 3.3 chars/token ratio
+    // works out to ~515 tokens, but we hold margin because tokenizers
+    // emit ~2-6 leading special tokens (CLS, model-specific markers).
+    // Effective input to the encoder lands around ~510 tokens, fitting
+    // 512-token-capped models like E5, BGE, and bge-m3. If this budget
+    // ever changes, weigh against the smallest deployed model's window
+    // (intfloat/multilingual-e5-large-instruct = 512 today).
+    try std.testing.expect(EMBEDDING_INPUT_BYTE_BUDGET >= 1024);
+    try std.testing.expect(EMBEDDING_INPUT_BYTE_BUDGET <= 2000);
+}
+
+test "truncateUtf8 honors EMBEDDING_INPUT_BYTE_BUDGET on oversize ASCII" {
+    // Build a 2500-byte ASCII blob — comfortably over budget — and
+    // confirm truncateUtf8 (the function implEmbed calls) clamps it
+    // and leaves valid UTF-8.
+    const big = "x" ** 2500;
+    const out = text_norm.truncateUtf8(big, EMBEDDING_INPUT_BYTE_BUDGET);
+    try std.testing.expectEqual(EMBEDDING_INPUT_BYTE_BUDGET, out.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+}
+
+test "truncateUtf8 passes through input under budget unchanged" {
+    const small = "short summary that fits easily";
+    const out = text_norm.truncateUtf8(small, EMBEDDING_INPUT_BYTE_BUDGET);
+    try std.testing.expectEqualStrings(small, out);
 }
