@@ -538,6 +538,56 @@ pub const RetrievalEngine = struct {
             rrf_sources[source_results.len] = vector_candidates.?;
         }
 
+        // R4 telemetry — per-source candidate breakdown. Lets us see
+        // which source wins on which query category (Cat 1 single-hop
+        // vs Cat 3 multi-hop) without a separate harness. Cheap
+        // info-level log; emits once per multi-source retrieval call.
+        // When R3 PPR lands as a 5th source, the breakdown shows
+        // whether PPR is actually contributing or being filtered out
+        // by min_score / MMR. Read in conjunction with the per-stage
+        // counts later in the pipeline.
+        {
+            var src_counts: [16]usize = undefined;
+            var src_names: [16][]const u8 = undefined;
+            var src_n: usize = 0;
+            for (source_results, 0..) |sr, i| {
+                if (src_n >= src_counts.len) break;
+                src_counts[src_n] = sr.len;
+                src_names[src_n] = if (i < self.sources.items.len)
+                    self.sources.items[i].getName()
+                else
+                    "unknown";
+                src_n += 1;
+            }
+            if (has_vec and src_n < src_counts.len) {
+                src_counts[src_n] = vector_candidates.?.len;
+                src_names[src_n] = "vector";
+                src_n += 1;
+            }
+            // Compact one-line summary; query truncated to keep logs
+            // grep-friendly without leaking long user content.
+            const q_show_len = @min(query.len, 60);
+            switch (src_n) {
+                0 => {},
+                1 => log.info(
+                    "retrieval.source_breakdown query=\"{s}\" {s}={d} merge_k={d} top_k={d}",
+                    .{ query[0..q_show_len], src_names[0], src_counts[0], self.merge_k, self.top_k },
+                ),
+                2 => log.info(
+                    "retrieval.source_breakdown query=\"{s}\" {s}={d} {s}={d} merge_k={d} top_k={d}",
+                    .{ query[0..q_show_len], src_names[0], src_counts[0], src_names[1], src_counts[1], self.merge_k, self.top_k },
+                ),
+                3 => log.info(
+                    "retrieval.source_breakdown query=\"{s}\" {s}={d} {s}={d} {s}={d} merge_k={d} top_k={d}",
+                    .{ query[0..q_show_len], src_names[0], src_counts[0], src_names[1], src_counts[1], src_names[2], src_counts[2], self.merge_k, self.top_k },
+                ),
+                else => log.info(
+                    "retrieval.source_breakdown query=\"{s}\" sources={d} first={s}={d} merge_k={d} top_k={d}",
+                    .{ query[0..q_show_len], src_n, src_names[0], src_counts[0], self.merge_k, self.top_k },
+                ),
+            }
+        }
+
         var merged = try rrf.rrfMerge(allocator, rrf_sources, self.merge_k, self.top_k * 4);
 
         // ── Stage 4: min_relevance ──
@@ -1078,6 +1128,30 @@ test "Engine with hybrid disabled stays keyword-only" {
     const results = try engine.search(allocator, "test", null);
     defer freeCandidates(allocator, results);
     try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "R4 audit: RetrievalEngine uses literature-standard rrf_k=60 by default" {
+    // V1.14.11 — Phase 2 R4 audit. The RRF k constant has a meaningful
+    // impact on multi-source fusion (small k → top-ranked items dominate;
+    // large k → flatter score distribution). The literature default of 60
+    // is widely cited (Cormack et al. 2009) and matches what production
+    // tooling like Elasticsearch / Vespa use. If this drifts to a non-60
+    // value via a config rewrite, we want the test to catch it loudly
+    // before a bench run mis-attributes the score change.
+    const allocator = std.testing.allocator;
+    var engine = RetrievalEngine.init(allocator, .{});
+    defer engine.deinit();
+    try std.testing.expectEqual(@as(u32, 60), engine.merge_k);
+}
+
+test "R4 audit: rrf_k config knob propagates through engine init" {
+    // Companion to the default-value test: confirms operators can override
+    // k via memory.search.query.rrf_k without code changes, AND that the
+    // engine actually reads it (not silently ignored).
+    const allocator = std.testing.allocator;
+    var engine = RetrievalEngine.init(allocator, .{ .rrf_k = 90 });
+    defer engine.deinit();
+    try std.testing.expectEqual(@as(u32, 90), engine.merge_k);
 }
 
 test "Engine.setVectorSearch stores fields" {
