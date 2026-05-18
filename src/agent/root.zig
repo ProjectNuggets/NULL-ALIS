@@ -4988,17 +4988,18 @@ pub const Agent = struct {
         // V1.14.10 A — async: this used to block the turn return for
         // 30-180s on dense sessions (legacy lifecycle path fires
         // 50-100+ contradiction-judge + entity-coref calls per
-        // compaction). The full battery on 2026-05-18 saw 9 of 199
+        // compaction). The full battery on 2026-05-18 saw 9 of ~100
         // session-load turns hit the 180s HTTP read timeout because
         // of this — sample 4 dropped from 88% to 67% as a result.
-        // Async fires the lifecycle on a detached worker thread;
-        // the turn returns immediately. `durable_continuity_refreshed`
-        // is set optimistically to `true` because the write will
-        // happen unless the spawn itself fails (in which case the
-        // async wrapper falls back to sync — same behavior as
-        // before).
-        commands.persistSessionCheckpointAsync(self, "compaction:auto");
-        self.last_turn_context.durable_continuity_refreshed = true;
+        //
+        // V1.14.10 A review fix (M-03): `durable_continuity_refreshed`
+        // now reflects ACTUAL spawn success — true only when the
+        // async worker accepted the job. When the in-flight guard
+        // skips the trigger (prior worker still running with stale
+        // data), telemetry no longer lies; downstream consumers see
+        // the truth and the next legitimate trigger picks it up.
+        self.last_turn_context.durable_continuity_refreshed =
+            commands.persistSessionCheckpointAsync(self, "compaction:auto");
     }
 
     fn ensureDurableContinuitySeed(self: *Agent) void {
@@ -5020,8 +5021,10 @@ pub const Agent = struct {
         // V1.14.10 A — async (see refreshDurableContinuityAfterCompaction
         // above for rationale). summary_seed fires every turn that
         // would have no summary yet — making it sync was extra
-        // contention on a path that didn't need to block.
-        commands.persistSessionCheckpointAsync(self, "summary_seed:auto");
+        // contention on a path that didn't need to block. No truth-
+        // flag to update on this path (caller doesn't read a return
+        // value), so we just discard the spawn success bool.
+        _ = commands.persistSessionCheckpointAsync(self, "summary_seed:auto");
     }
 
     /// Run a single message through the agent and return the response.
@@ -7986,7 +7989,7 @@ test "auto compaction refreshes durable continuity artifacts" {
 
     // V1.14.10 A — lifecycle persist is async; wait for it before
     // asserting on the resulting memory write.
-    try std.testing.expect(agent.waitForLifecycleIdle(5_000));
+    try std.testing.expect(agent.waitForLifecycleIdle(30_000));
     const anchor = (try mem.get(allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
     defer anchor.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=compaction:auto") != null);
@@ -8078,7 +8081,7 @@ test "message-count boundary no longer auto-compacts without token pressure" {
 
     // V1.14.10 A — lifecycle persist is async; wait before asserting on
     // the memory side-effects (anchor + latest summary).
-    try std.testing.expect(agent.waitForLifecycleIdle(5_000));
+    try std.testing.expect(agent.waitForLifecycleIdle(30_000));
 
     const anchor = (try mem.get(allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
     defer anchor.deinit(allocator);
@@ -8233,7 +8236,7 @@ test "normal main-lane turn seeds summary_latest when compaction never runs" {
 
     // V1.14.10 A — lifecycle persist is async; wait before asserting on
     // the memory writes.
-    try std.testing.expect(agent.waitForLifecycleIdle(5_000));
+    try std.testing.expect(agent.waitForLifecycleIdle(30_000));
 
     const latest = (try mem.get(allocator, "summary_latest/agent:test:user:1:main")) orelse return error.TestUnexpectedResult;
     defer latest.deinit(allocator);

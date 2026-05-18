@@ -1654,20 +1654,40 @@ pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
 /// legitimate trigger picks up whatever this one missed (lifecycle
 /// is naturally re-firing on every Pass C / summary_seed cycle).
 ///
-/// Falls back to SYNC if spawn fails (OOM / thread limit) — the
-/// agent.turn() will block but at least the data lands. Logs the
-/// fallback so operators can spot it.
+/// Returns:
+///   `true`  — spawned successfully OR fell through to sync because
+///             the guard was clear; the write WILL happen (or has).
+///   `false` — guard was already set; trigger silently dropped.
+///             Caller should NOT advertise "continuity refreshed" on
+///             this turn — the previous worker is still running with
+///             prior data; THIS turn's trigger never enqueued.
+///
+/// V1.14.10 A review fix (M-03): the return value lets callers stop
+/// lying about `durable_continuity_refreshed = true` when the trigger
+/// was a no-op.
+///
+/// V1.14.10 A review fix (H-03): the spawn-failure fallback no longer
+/// runs sync. Under the very thread pressure that causes spawn to
+/// fail, sync execution re-introduces the exact 30-180s block this
+/// patch fixes. Instead we log and return false — the next legitimate
+/// trigger retries when (presumably) the thread pressure has cleared.
+///
+/// V1.14.10 A review fix (L-01): log lines include session_id for
+/// per-session debugging during bench analysis.
 ///
 /// TTL-evict and operator-triggered (`reset:manual`) paths keep using
 /// the sync version — they already run off the HTTP turn so blocking
 /// is harmless.
-pub fn persistSessionCheckpointAsync(self: anytype, reason: []const u8) void {
+pub fn persistSessionCheckpointAsync(self: anytype, reason: []const u8) bool {
+    const session_id_for_log: []const u8 = self.memory_session_id orelse "unknown";
     if (self.lifecycle_in_flight.swap(true, .acquire)) {
-        log.info("lifecycle.async.skip_in_flight reason={s}", .{reason});
-        return;
+        log.info("lifecycle.async.skip_in_flight reason={s} session={s}", .{ reason, session_id_for_log });
+        return false;
     }
     // Heap-allocate the worker context. Owned by the spawned thread;
-    // freed in `lifecycleAsyncWorker` after the checkpoint completes.
+    // freed in `Worker.run`'s deferred cleanup (in the correct order:
+    // allocator work first, in-flight flag LAST — see review fix H-04
+    // for why ordering is load-bearing).
     const Ctx = struct {
         agent: @TypeOf(self),
         reason_owned: []u8,
@@ -1675,40 +1695,58 @@ pub fn persistSessionCheckpointAsync(self: anytype, reason: []const u8) void {
     };
     const ctx = self.allocator.create(Ctx) catch {
         self.lifecycle_in_flight.store(false, .release);
-        log.warn("lifecycle.async.alloc_failed reason={s} — falling back to sync", .{reason});
-        _ = persistSessionCheckpointDetailed(self, reason);
-        return;
+        log.warn("lifecycle.async.alloc_failed reason={s} session={s} — dropping", .{ reason, session_id_for_log });
+        return false;
     };
     const reason_owned = self.allocator.dupe(u8, reason) catch {
         self.lifecycle_in_flight.store(false, .release);
         self.allocator.destroy(ctx);
-        log.warn("lifecycle.async.dupe_failed reason={s} — falling back to sync", .{reason});
-        _ = persistSessionCheckpointDetailed(self, reason);
-        return;
+        log.warn("lifecycle.async.dupe_failed reason={s} session={s} — dropping", .{ reason, session_id_for_log });
+        return false;
     };
     ctx.* = .{ .agent = self, .reason_owned = reason_owned, .allocator = self.allocator };
 
     const Worker = struct {
         fn run(c: *Ctx) void {
-            defer {
-                c.agent.lifecycle_in_flight.store(false, .release);
-                c.allocator.free(c.reason_owned);
-                c.allocator.destroy(c);
-            }
-            _ = persistSessionCheckpointDetailed(c.agent, c.reason_owned);
+            // V1.14.10 A review fix (H-04): ordering matters here.
+            // Clearing `lifecycle_in_flight` BEFORE freeing the heap
+            // context releases any waiter (Agent.deinit) — which can
+            // then free the allocator out from under our subsequent
+            // `free(reason_owned)` and `destroy(c)` calls. UAF on the
+            // allocator itself.
+            //
+            // Fix: capture allocator-side pointers + agent ref BEFORE
+            // freeing the ctx; do the allocator work; THEN release
+            // the in-flight flag last so the waiter only observes
+            // `false` after all worker memory effects are done.
+            const allocator = c.allocator;
+            const reason_local = c.reason_owned;
+            const agent = c.agent;
+            _ = persistSessionCheckpointDetailed(agent, reason_local);
+            allocator.free(reason_local);
+            allocator.destroy(c);
+            // Release happens-before any subsequent acquire-load — the
+            // waiter that observes `false` will see ALL of the above
+            // memory effects, including the allocator's free state.
+            agent.lifecycle_in_flight.store(false, .release);
         }
     };
 
     const thread = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, Worker.run, .{ctx}) catch {
+        // V1.14.10 A review fix (H-03): no more sync fallback. Under
+        // thread pressure (the exact condition causing spawn to fail),
+        // sync re-introduces the 180s block we're trying to fix.
+        // Clear the in-flight flag + free the context + log; the next
+        // legitimate trigger retries when pressure clears.
         self.lifecycle_in_flight.store(false, .release);
         self.allocator.free(reason_owned);
         self.allocator.destroy(ctx);
-        log.warn("lifecycle.async.spawn_failed reason={s} — falling back to sync", .{reason});
-        _ = persistSessionCheckpointDetailed(self, reason);
-        return;
+        log.warn("lifecycle.async.spawn_failed reason={s} session={s} — dropping (next trigger will retry)", .{ reason, session_id_for_log });
+        return false;
     };
     thread.detach();
-    log.info("lifecycle.async.spawned reason={s}", .{reason});
+    log.info("lifecycle.async.spawned reason={s} session={s}", .{ reason, session_id_for_log });
+    return true;
 }
 
 pub fn persistSessionCheckpointDetailed(self: anytype, reason: []const u8) bool {
