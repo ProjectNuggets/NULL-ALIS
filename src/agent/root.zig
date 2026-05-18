@@ -895,16 +895,36 @@ pub const Agent = struct {
         return true;
     }
 
+    /// V1.14.10 A review fix (M-02): default Agent.deinit keeps the
+    /// 30s budget for shutdown contexts (process teardown — generous
+    /// because we want lifecycle data to land when the provider is
+    /// reachable). Hot-path callers (e.g. `recycleSessionInPlace` in
+    /// session.zig — H-02) should call `deinitWithTimeout` directly
+    /// with a tighter budget AND check the return value to skip the
+    /// destructive operation rather than UAF if the worker won't drain.
     pub fn deinit(self: *Agent) void {
-        // V1.14.10 A — wait for any in-flight async lifecycle worker to
-        // finish before tearing down. The detached worker holds a
-        // pointer to `self` (and uses self.allocator + self.provider).
-        // Without this wait, Agent.deinit could free state the worker
-        // is mid-use. Bounded — after 30s we give up and proceed
-        // (worker will segfault but at least the shutdown path is
-        // bounded — better than hanging on an unhealthy provider).
-        if (!self.waitForLifecycleIdle(30_000)) {
-            log.warn("Agent.deinit: async lifecycle still in flight after 30000ms — proceeding (worker may segfault)", .{});
+        _ = self.deinitWithTimeout(30_000);
+    }
+
+    /// V1.14.10 A review fix (M-02 + H-02): deinit with a custom
+    /// drain timeout. Returns `true` if the lifecycle worker drained
+    /// cleanly within the budget; `false` if it timed out.
+    ///
+    /// On `false`, the function STILL proceeds with the tear-down
+    /// because the alternative (hanging forever) is worse for
+    /// SessionManager / runtime shutdown. The detached worker may
+    /// segfault on subsequent allocator use — that's a known
+    /// trade-off, logged for operators.
+    ///
+    /// Hot-path callers (recycleSessionInPlace / TTL evict) should:
+    ///   1. Call `deinitWithTimeout(5_000)` with a tight budget.
+    ///   2. If returning `false`, SKIP whatever destructive next-step
+    ///      they had planned (recycle, replace) — the worker may
+    ///      still need the agent. Retry next loop iteration.
+    pub fn deinitWithTimeout(self: *Agent, timeout_ms: i64) bool {
+        const drained = self.waitForLifecycleIdle(timeout_ms);
+        if (!drained) {
+            log.warn("Agent.deinit: async lifecycle still in flight after {d}ms — proceeding (worker may segfault)", .{timeout_ms});
         }
 
         self.clearCurrentTurnProviderOverride();
@@ -922,6 +942,7 @@ pub const Agent = struct {
         }
         self.history.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
+        return drained;
     }
 
     /// Estimate total tokens in conversation history.

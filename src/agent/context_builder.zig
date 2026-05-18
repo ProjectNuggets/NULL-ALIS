@@ -62,6 +62,15 @@ pub const LastTurnContext = struct {
     auto_compacted_messages: usize = 0,
     force_compression_events: usize = 0,
     force_compressed_messages: usize = 0,
+    /// V1.14.10 A semantic shift (review fix N-02): pre-V1.14.10 this
+    /// flag meant "the persistSessionCheckpoint sync call completed,
+    /// data is on disk." Post-V1.14.10 (review fix M-03): it means
+    /// "we successfully spawned an async lifecycle worker for this
+    /// turn." When the in-flight guard drops a duplicate trigger, the
+    /// flag is `false` — telemetry honestly reflects that THIS turn's
+    /// data is queued behind the prior worker (the prior worker will
+    /// pick up what was missed). Don't read this as a write-completion
+    /// guarantee — read it as "spawn attempted-and-accepted."
     durable_continuity_refreshed: bool = false,
     memory_selection: MemorySelection = .{},
 };
