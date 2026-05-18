@@ -177,6 +177,7 @@ pub const MemoryStoreTool = struct {
             judge_ctx,
             coref_ctx,
             self.mem_rt, // V1.8-2: vector coverage on agent memory_store tool
+            .memory_store_tool, // V1.14.12 (M1) — per-path telemetry tag
         ) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to store memory via unified pipeline: {s}", .{@errorName(err)});
             return ToolResult{ .success = false, .output = msg };

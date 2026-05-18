@@ -1446,6 +1446,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                             judge_ctx,
                             coref_ctx,
                             self.mem_rt, // V1.8-2: vector coverage on session-end
+                            .session_end_durable_fact, // V1.14.12 (M1) — telemetry tag; M5 candidate for removal if redundant with session_end_extract
                         ) catch |err| {
                             log.warn("session_end persistExtracted failed key={s} err={s}", .{
                                 fact_key, @errorName(err),
@@ -1490,6 +1491,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                         .coref_embed = self.extraction_coref_embed,
                         .archive_mem = self.mem,
                         .archive_mem_rt = self.mem_rt,
+                        .write_origin = .session_end_extract, // V1.14.12 (M1) — per-path telemetry tag
                     };
                     const br = extraction_runner.extractAtBoundary(self.allocator, buf.items, ctx);
                     defer br.deinit(self.allocator);

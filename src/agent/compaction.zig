@@ -455,6 +455,7 @@ fn dropOldestPairsFromMiddle(
                     .max_source_chars = config.max_source_chars,
                     .enable_hydration = false, // Pass A is mid-session — extraction only.
                     .boundary_kind = .pass_a, // V1.14.9 L-01: explicit telemetry tag
+                    .write_origin = .pass_a_drop, // V1.14.12 (M1) — per-path telemetry tag
                 };
                 const br = extraction_runner.extractAtBoundary(allocator, buf.items, ctx);
                 defer br.deinit(allocator);
@@ -705,6 +706,7 @@ fn compactHistoryKeepingRecent(
                         judge_ctx,
                         coref_ctx,
                         config.archive_mem_rt, // V1.8-2: vector coverage
+                        .pass_c_compaction_direct, // V1.14.12 (M1) — telemetry tag; M5 candidate for removal if redundant with pass_c_compaction_extract
                     ) catch |err| blk: {
                         log.warn("compaction: extraction persist failed err={s}", .{@errorName(err)});
                         break :blk extraction_persist.PersistResult{
@@ -755,6 +757,7 @@ fn compactHistoryKeepingRecent(
                     .archive_mem_rt = config.archive_mem_rt,
                     .max_source_chars = config.max_source_chars,
                     .boundary_kind = .pass_c, // V1.14.9 L-01: explicit telemetry tag
+                    .write_origin = .pass_c_compaction_extract, // V1.14.12 (M1) — per-path telemetry tag
                 };
                 const br = extraction_runner.extractAtBoundary(allocator, buf.items, ctx);
                 defer br.deinit(allocator);

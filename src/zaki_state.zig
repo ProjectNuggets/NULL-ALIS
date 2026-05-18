@@ -11911,6 +11911,7 @@ test "V1.7a-5 link_type rich wiring — column populated from metadata + backfil
         null,
         null,
         null, // V1.8-2: mem_rt — test fixture, no runtime
+        .test_wire, // V1.14.12 (M1) — per-path telemetry tag
     );
     try std.testing.expect(persist_result.written_count == 1);
     {

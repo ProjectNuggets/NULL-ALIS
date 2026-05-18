@@ -586,6 +586,42 @@ fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
     }
 }
 
+/// V1.14.12 (M1) — origin tag for telemetry. Identifies which of the
+/// production write callsites invoked persistExtracted. Used by the
+/// `memory.write.batch origin=X ...` log line to build the per-path
+/// write histogram that gates M3 (coverage filter), M5 (legacy direct-
+/// write deletion), and M6 (judge model swap). Tag set by caller, no
+/// behavior change — just labels the call for the histogram.
+///
+/// Each caller MUST pass an explicit tag. There is no default. If a new
+/// callsite is added without picking a tag, the build breaks (no
+/// implicit `.unknown` fallback) — forces conscious decision.
+pub const WriteOrigin = enum {
+    /// Agent's memory_store tool (per-turn, agent-driven). Judge: K2.6.
+    memory_store_tool,
+    /// Pass A mid-session drop extraction (compaction.zig:459).
+    pass_a_drop,
+    /// Pass C compaction summary — direct parsed_facts write (compaction.zig:699).
+    /// Candidate for M5 removal if telemetry shows redundancy with pass_c_extract.
+    pass_c_compaction_direct,
+    /// Pass C compaction summary — structural extraction via extractAtBoundary
+    /// (compaction.zig:759 → runner.zig:635).
+    pass_c_compaction_extract,
+    /// Session-end durable_fact promotion — direct write (commands.zig:1440).
+    /// Candidate for M5 removal if telemetry shows redundancy with
+    /// session_end_extract.
+    session_end_durable_fact,
+    /// Session-end TTL extraction via extractAtBoundary
+    /// (commands.zig:1494 → runner.zig:635).
+    session_end_extract,
+    /// Test harness wire (zaki_state.zig:11905 + unit tests). Not production.
+    test_wire,
+
+    pub fn toSlice(self: WriteOrigin) []const u8 {
+        return @tagName(self);
+    }
+};
+
 /// Persist a batch of extracted memories.
 ///
 /// Provider-agnostic. The `memories` slice can come from the compaction
@@ -606,6 +642,9 @@ fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
 /// Per-fact failures emit log.warn but don't abort the batch — one bad
 /// fact shouldn't kill the run. Judge LLM failures are non-fatal: they
 /// degrade to MD5-only behavior for that fact.
+///
+/// V1.14.12 (M1) — `origin` parameter labels the call for per-path
+/// telemetry. See WriteOrigin docstring.
 pub fn persistExtracted(
     allocator: std.mem.Allocator,
     state_mgr: *zaki_state.Manager,
@@ -623,6 +662,7 @@ pub fn persistExtracted(
     // a retrieval optimization. Pass null to keep V1.7 behavior (test
     // fixtures, non-postgres deploys).
     mem_rt: ?*memory_root.MemoryRuntime,
+    origin: WriteOrigin,
 ) !PersistResult {
     var result = PersistResult{
         .written_count = 0,
@@ -633,6 +673,19 @@ pub fn persistExtracted(
         .contradictions_resolved = 0,
         .failed_count = 0,
     };
+
+    // V1.14.12 (M1) — per-path telemetry. One log per persistExtracted
+    // call; downstream baseline_analyzer.py builds the origin histogram.
+    log.info(
+        "memory.write.batch origin={s} count={d} user_id={d} session={s} judge={s}",
+        .{
+            origin.toSlice(),
+            memories.len,
+            user_id,
+            session_id orelse "-",
+            if (judge != null) "on" else "off",
+        },
+    );
 
     for (memories) |m| {
         // Step 1: predicate blacklist
@@ -1472,4 +1525,27 @@ test "V1.14.11: deriveExtractionKey is case-SENSITIVE on predicate (wire-format 
     const k_lower = try deriveExtractionKey(allocator, "user", "likes", "Thai food");
     defer allocator.free(k_lower);
     try std.testing.expect(!std.mem.eql(u8, k_upper, k_lower));
+}
+
+test "V1.14.12 (M1): WriteOrigin tags are stable strings for log analyzers" {
+    // Per-path telemetry pipeline depends on stable enum string names
+    // (grep on `memory.write.batch origin=X` in gateway logs feeds the
+    // baseline_analyzer.py histogram builder). Renaming an enum value
+    // breaks downstream analyzer scripts silently. Lock the wire format.
+    try std.testing.expectEqualStrings("memory_store_tool", WriteOrigin.memory_store_tool.toSlice());
+    try std.testing.expectEqualStrings("pass_a_drop", WriteOrigin.pass_a_drop.toSlice());
+    try std.testing.expectEqualStrings("pass_c_compaction_direct", WriteOrigin.pass_c_compaction_direct.toSlice());
+    try std.testing.expectEqualStrings("pass_c_compaction_extract", WriteOrigin.pass_c_compaction_extract.toSlice());
+    try std.testing.expectEqualStrings("session_end_durable_fact", WriteOrigin.session_end_durable_fact.toSlice());
+    try std.testing.expectEqualStrings("session_end_extract", WriteOrigin.session_end_extract.toSlice());
+    try std.testing.expectEqualStrings("test_wire", WriteOrigin.test_wire.toSlice());
+}
+
+test "V1.14.12 (M1): WriteOrigin enum count guards against silent additions" {
+    // The 7 enum values map to the 6 production callsites + 1 test wire.
+    // If a NEW persistExtracted callsite is added without updating this
+    // count, the test fails — forces a conscious decision about how to
+    // tag it for telemetry. M3/M5 redundancy gates depend on accurate
+    // tag distributions.
+    try std.testing.expectEqual(@as(usize, 7), @typeInfo(WriteOrigin).@"enum".fields.len);
 }

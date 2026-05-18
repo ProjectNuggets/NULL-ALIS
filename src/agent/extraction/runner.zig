@@ -132,6 +132,12 @@ pub const ExtractionContext = struct {
     /// Operators can re-tune via ExtractionContext at the call site
     /// if their provider has a more generous rate limit.
     extraction_concurrency: u32 = 4,
+    /// V1.14.12 (M1) — write origin tag for per-path telemetry.
+    /// Passed through to `persistExtracted` inside this runner. Each
+    /// of the three production callers of extractAtBoundary must set
+    /// the right tag (pass_a_drop / pass_c_compaction_extract /
+    /// session_end_extract). Default mirrors the boundary_kind default.
+    write_origin: @import("../extraction_persist.zig").WriteOrigin = .session_end_extract,
 };
 
 /// V1.14.9 — Episode-based boundary extraction. Replaces the V1.14.8
@@ -641,6 +647,7 @@ fn persistExtraction(
         judge_ctx,
         coref_ctx,
         ctx.archive_mem_rt,
+        ctx.write_origin, // V1.14.12 (M1) — per-path telemetry tag from caller
     ) catch |err| {
         log.warn("boundary.extraction.persistExtracted_failed err={s} edges={d}", .{ @errorName(err), result.edges.len });
         return;
