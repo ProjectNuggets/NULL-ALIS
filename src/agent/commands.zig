@@ -1638,6 +1638,79 @@ pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
     _ = persistSessionCheckpointDetailed(self, reason);
 }
 
+/// V1.14.10 A — Async lifecycle checkpoint.
+///
+/// Spawns a detached worker thread that runs
+/// `persistSessionCheckpointDetailed` off the agent's hot path. Used
+/// by hot-path callers (compaction:auto, summary_seed:auto in
+/// root.zig) to prevent the 30-180s post-reply lifecycle from
+/// blocking the HTTP response. Slow LLM contention can pile up legacy
+/// extraction calls (sometimes 100+ judge + coref calls per session)
+/// — sync execution makes the bench client see 180s read timeouts.
+///
+/// In-flight guard via the Agent's `lifecycle_in_flight` atomic:
+/// only one lifecycle worker per agent at a time. If a new trigger
+/// fires while one is in flight, it's silently dropped — the next
+/// legitimate trigger picks up whatever this one missed (lifecycle
+/// is naturally re-firing on every Pass C / summary_seed cycle).
+///
+/// Falls back to SYNC if spawn fails (OOM / thread limit) — the
+/// agent.turn() will block but at least the data lands. Logs the
+/// fallback so operators can spot it.
+///
+/// TTL-evict and operator-triggered (`reset:manual`) paths keep using
+/// the sync version — they already run off the HTTP turn so blocking
+/// is harmless.
+pub fn persistSessionCheckpointAsync(self: anytype, reason: []const u8) void {
+    if (self.lifecycle_in_flight.swap(true, .acquire)) {
+        log.info("lifecycle.async.skip_in_flight reason={s}", .{reason});
+        return;
+    }
+    // Heap-allocate the worker context. Owned by the spawned thread;
+    // freed in `lifecycleAsyncWorker` after the checkpoint completes.
+    const Ctx = struct {
+        agent: @TypeOf(self),
+        reason_owned: []u8,
+        allocator: std.mem.Allocator,
+    };
+    const ctx = self.allocator.create(Ctx) catch {
+        self.lifecycle_in_flight.store(false, .release);
+        log.warn("lifecycle.async.alloc_failed reason={s} — falling back to sync", .{reason});
+        _ = persistSessionCheckpointDetailed(self, reason);
+        return;
+    };
+    const reason_owned = self.allocator.dupe(u8, reason) catch {
+        self.lifecycle_in_flight.store(false, .release);
+        self.allocator.destroy(ctx);
+        log.warn("lifecycle.async.dupe_failed reason={s} — falling back to sync", .{reason});
+        _ = persistSessionCheckpointDetailed(self, reason);
+        return;
+    };
+    ctx.* = .{ .agent = self, .reason_owned = reason_owned, .allocator = self.allocator };
+
+    const Worker = struct {
+        fn run(c: *Ctx) void {
+            defer {
+                c.agent.lifecycle_in_flight.store(false, .release);
+                c.allocator.free(c.reason_owned);
+                c.allocator.destroy(c);
+            }
+            _ = persistSessionCheckpointDetailed(c.agent, c.reason_owned);
+        }
+    };
+
+    const thread = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, Worker.run, .{ctx}) catch {
+        self.lifecycle_in_flight.store(false, .release);
+        self.allocator.free(reason_owned);
+        self.allocator.destroy(ctx);
+        log.warn("lifecycle.async.spawn_failed reason={s} — falling back to sync", .{reason});
+        _ = persistSessionCheckpointDetailed(self, reason);
+        return;
+    };
+    thread.detach();
+    log.info("lifecycle.async.spawned reason={s}", .{reason});
+}
+
 pub fn persistSessionCheckpointDetailed(self: anytype, reason: []const u8) bool {
     const start_ms = std.time.milliTimestamp();
     defer {
