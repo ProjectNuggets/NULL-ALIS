@@ -24451,7 +24451,10 @@ test "tenant preference application uses operator-owned assistant mode presets" 
     try std.testing.expectEqualStrings("off", cfg.agent.send_mode);
     try std.testing.expectEqualStrings("inbound", cfg.agent.tts_mode);
     try std.testing.expect(cfg.agent.tts_audio);
-    try std.testing.expectEqual(@as(?u64, 2700), cfg.agent.session_ttl_secs);
+    // V1.14.11: session_timeout_minutes now wires to idle eviction,
+    // not hard TTL. Hard TTL stays operator-only via raw config.json.
+    try std.testing.expectEqual(@as(u64, 2700), cfg.agent.session_idle_timeout_secs);
+    try std.testing.expectEqual(@as(?u64, null), cfg.agent.session_ttl_secs);
     try std.testing.expect(cfg.memory.summarizer.enabled);
     try std.testing.expectEqual(@as(u32, 8000), cfg.memory.summarizer.window_size_tokens);
     try std.testing.expectEqual(@as(u32, 700), cfg.memory.summarizer.summary_max_tokens);

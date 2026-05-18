@@ -470,7 +470,14 @@ pub fn applySettingsToConfig(cfg: *Config, settings: ProductSettings) void {
     cfg.agent.send_mode = if (settings.proactive_updates) "inherit" else "off";
     cfg.agent.tts_mode = if (settings.voice_replies) "inbound" else "off";
     cfg.agent.tts_audio = settings.voice_replies;
-    cfg.agent.session_ttl_secs = settings.session_timeout_minutes * 60;
+    // V1.14.11 — session_timeout_minutes wires to the IDLE eviction
+    // timer, not the hard TTL. User mental model of "session timeout"
+    // (Slack/Discord/Notion convention) means "evict after N minutes
+    // of no activity," not "hard-kill at N minutes from creation."
+    // Hard TTL (`session_ttl_secs`) stays operator-controlled via raw
+    // config.json for the rare deployments that actually want it.
+    // Downstream reader: daemon.zig:2325 evictIdle(idle_timeout_secs).
+    cfg.agent.session_idle_timeout_secs = @as(u64, settings.session_timeout_minutes) * 60;
     cfg.session.cross_channel_shared_main = false;
 
     // V1.14.4 (booth-readiness, autonomy toggle) — propagate user-chosen
@@ -599,7 +606,13 @@ fn deriveNearestFromAgentObject(agent: std.json.ObjectMap) ProductSettings {
     } else if (getObjectString(agent, "tts_mode")) |raw| {
         result.voice_replies = !std.ascii.eqlIgnoreCase(raw, "off");
     }
-    if (getObjectU32(agent, "session_ttl_secs")) |secs| {
+    // V1.14.11 — read-back symmetric to applySettingsToConfig:
+    // session_idle_timeout_secs is the operative field. Fall back to
+    // legacy session_ttl_secs for configs written before the rewire
+    // (preserves UI display continuity across upgrade).
+    if (getObjectU32(agent, "session_idle_timeout_secs")) |secs| {
+        result.session_timeout_minutes = clampSessionTimeoutMinutes(@max(1, secs / 60));
+    } else if (getObjectU32(agent, "session_ttl_secs")) |secs| {
         result.session_timeout_minutes = clampSessionTimeoutMinutes(@max(1, secs / 60));
     }
     return result;
@@ -806,6 +819,49 @@ test "resolveSettingsFromConfigJson clamps huge canonical timeout" {
     ;
     const settings = try resolveSettingsFromConfigJson(std.testing.allocator, cfg);
     try std.testing.expectEqual(@as(u32, 180), settings.session_timeout_minutes);
+}
+
+test "applySettingsToConfig wires session_timeout_minutes to session_idle_timeout_secs" {
+    // V1.14.11 — confirms the UI slider drives the IDLE eviction
+    // (Slack/Discord semantic) rather than the hard TTL kill. The
+    // daemon's evictIdle loop (daemon.zig:2325) reads
+    // session_idle_timeout_secs; the hard TTL stays operator-only.
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "test/mock-model",
+        .allocator = std.testing.allocator,
+    };
+
+    applySettingsToConfig(&cfg, .{
+        .assistant_mode = .balanced,
+        .group_activation = .mention,
+        .proactive_updates = true,
+        .voice_replies = false,
+        .session_timeout_minutes = 5,
+    });
+
+    try std.testing.expectEqual(@as(u64, 300), cfg.agent.session_idle_timeout_secs);
+    // Hard TTL must NOT be touched by the UI slider (operator-only).
+    try std.testing.expectEqual(@as(?u64, null), cfg.agent.session_ttl_secs);
+}
+
+test "deriveNearestFromAgentObject reads session_idle_timeout_secs first, falls back to legacy session_ttl_secs" {
+    // V1.14.11 — read-back must mirror write. Configs written post-
+    // rewire surface session_idle_timeout_secs; configs from before
+    // the rewire still have session_ttl_secs and must render in the
+    // UI without a visual reset to default.
+    const cfg_new =
+        \\{"agent":{"queue_mode":"serial","queue_cap":8,"queue_drop":"summarize","max_history_messages":0,"session_idle_timeout_secs":420}}
+    ;
+    const new_settings = try resolveSettingsFromConfigJson(std.testing.allocator, cfg_new);
+    try std.testing.expectEqual(@as(u32, 7), new_settings.session_timeout_minutes);
+
+    const cfg_legacy =
+        \\{"agent":{"queue_mode":"serial","queue_cap":8,"queue_drop":"summarize","max_history_messages":0,"session_ttl_secs":600}}
+    ;
+    const legacy_settings = try resolveSettingsFromConfigJson(std.testing.allocator, cfg_legacy);
+    try std.testing.expectEqual(@as(u32, 10), legacy_settings.session_timeout_minutes);
 }
 
 test "resolveSettingsFromConfigJson keeps canonical profile when agent fields drift" {
