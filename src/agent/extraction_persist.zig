@@ -383,18 +383,49 @@ fn categoryForAttribution(attributed_to: []const u8) memory_root.MemoryCategory 
 /// just don't dedupe across re-extractions. New writes use the stable
 /// shape going forward; one-shot backfill (V1.6 cmt15) will rekey legacy
 /// rows if needed.
+///
+/// **V1.14.11 — canonicalization fix (Captain Mochi investigation, 2026-05-18):**
+/// Pre-fix, `subject` and `object` were hashed as-is, so the same logical
+/// fact written via two paths with different casing produced two distinct
+/// extracted_<hash> keys:
+///   - Agent's memory_store: subject="user" → key A
+///   - Extraction batch re-extract: subject="User" → key B
+/// Two rows for one fact = duplicate writes that bypass primary-key dedup.
+/// The contradiction judge then cleaned up the duplicates, but wastefully
+/// (extra LLM call per orphan + alarming-looking "contradiction" log lines).
+///
+/// Fix: lowercase subject + object via `lowerForEntityKey` (the SAME
+/// canonicalizer used by `deriveEntityKey` for entity-side hashing). Now
+/// the same logical fact produces the SAME extracted_<hash> key regardless
+/// of casing path, so re-extraction collides on primary key via
+/// `INSERT ... ON CONFLICT DO NOTHING` → no duplicate row → no judge call.
+///
+/// **Predicate is NOT lowercased** because predicates are stored as
+/// uppercase tokens by convention (LIKES, USES, IS_TYPE_OF) and the
+/// extractor + agent both already emit them uppercase. Lowercasing
+/// would break the existing wire format.
+///
+/// **Backwards compat:** pre-fix `extracted_<hash>` rows survive untouched.
+/// They just don't dedupe against post-fix re-extractions of the SAME fact
+/// with DIFFERENT case (one orphan duplicate per fact is the worst case,
+/// matching pre-fix behavior). Going forward, new writes converge.
 fn deriveExtractionKey(
     allocator: std.mem.Allocator,
     subject: []const u8,
     predicate: []const u8,
     object: []const u8,
 ) ![]u8 {
+    const subject_lower = try lowerForEntityKey(allocator, subject);
+    defer allocator.free(subject_lower);
+    const object_lower = try lowerForEntityKey(allocator, object);
+    defer allocator.free(object_lower);
+
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(subject);
+    hasher.update(subject_lower);
     hasher.update("|");
     hasher.update(predicate);
     hasher.update("|");
-    hasher.update(object);
+    hasher.update(object_lower);
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     var hex_buf: [16]u8 = undefined;
@@ -1370,4 +1401,75 @@ test "lowerForEntityKey: deriveEntityKey unifies Latin-1 case variants (Café/CA
     // post-fix they collapse to one.
     try std.testing.expectEqualStrings(k1, k2);
     try std.testing.expectEqualStrings(k2, k3);
+}
+
+test "V1.14.11: deriveExtractionKey is case-insensitive on subject (Captain Mochi fix)" {
+    // The Captain Mochi investigation (2026-05-18) found that the agent's
+    // memory_store path wrote subject="user" (lowercase) while the
+    // session-end extraction batch wrote subject="User" (capitalized) for
+    // the same logical fact. Pre-fix these produced TWO different
+    // extracted_<hash> keys, allowing duplicate rows that the contradiction
+    // judge then cleaned up — wasteful and alarming-looking in logs.
+    //
+    // Post-fix: same fact → same key regardless of subject casing.
+    // Primary-key collision on re-extraction prevents the duplicate write.
+    const allocator = std.testing.allocator;
+    const k1 = try deriveExtractionKey(allocator, "user", "LIKES", "Thai food");
+    defer allocator.free(k1);
+    const k2 = try deriveExtractionKey(allocator, "User", "LIKES", "Thai food");
+    defer allocator.free(k2);
+    const k3 = try deriveExtractionKey(allocator, "USER", "LIKES", "Thai food");
+    defer allocator.free(k3);
+    try std.testing.expectEqualStrings(k1, k2);
+    try std.testing.expectEqualStrings(k2, k3);
+}
+
+test "V1.14.11: deriveExtractionKey is case-insensitive on object" {
+    // Same canonicalization applied to object — "Thai food" vs "thai food"
+    // vs "THAI FOOD" must produce the same extraction key for the same
+    // logical fact. Mirrors deriveEntityKey behavior at line 1019 for the
+    // target-side entity hashing.
+    const allocator = std.testing.allocator;
+    const k1 = try deriveExtractionKey(allocator, "user", "LIKES", "Thai food");
+    defer allocator.free(k1);
+    const k2 = try deriveExtractionKey(allocator, "user", "LIKES", "thai food");
+    defer allocator.free(k2);
+    const k3 = try deriveExtractionKey(allocator, "user", "LIKES", "THAI FOOD");
+    defer allocator.free(k3);
+    try std.testing.expectEqualStrings(k1, k2);
+    try std.testing.expectEqualStrings(k2, k3);
+}
+
+test "V1.14.11: deriveExtractionKey distinguishes different subjects (no collision)" {
+    // Sanity: canonicalization MUST NOT collapse genuinely-different facts.
+    // user LIKES Thai food MUST differ from cat LIKES Thai food and from
+    // user LIKES Indian food (set-valued objects ARE different facts, the
+    // R3-prereq prompt change made the JUDGE understand this — the KEY
+    // derivation must agree).
+    const allocator = std.testing.allocator;
+    const ka = try deriveExtractionKey(allocator, "user", "LIKES", "Thai food");
+    defer allocator.free(ka);
+    const kb = try deriveExtractionKey(allocator, "cat", "LIKES", "Thai food");
+    defer allocator.free(kb);
+    const kc = try deriveExtractionKey(allocator, "user", "LIKES", "Indian food");
+    defer allocator.free(kc);
+    const kd = try deriveExtractionKey(allocator, "user", "USES", "Thai food");
+    defer allocator.free(kd);
+    try std.testing.expect(!std.mem.eql(u8, ka, kb)); // different subject
+    try std.testing.expect(!std.mem.eql(u8, ka, kc)); // different object
+    try std.testing.expect(!std.mem.eql(u8, ka, kd)); // different predicate
+}
+
+test "V1.14.11: deriveExtractionKey is case-SENSITIVE on predicate (wire-format invariant)" {
+    // Predicates are stored uppercase by convention (LIKES, USES, IS_TYPE_OF).
+    // The extractor + agent both emit them uppercase. Lowercasing here
+    // would silently collapse with a hypothetical lowercase predicate from
+    // a future code path — better to preserve the wire-format invariant.
+    // If a code path emits a lowercase predicate, the bug is upstream.
+    const allocator = std.testing.allocator;
+    const k_upper = try deriveExtractionKey(allocator, "user", "LIKES", "Thai food");
+    defer allocator.free(k_upper);
+    const k_lower = try deriveExtractionKey(allocator, "user", "likes", "Thai food");
+    defer allocator.free(k_lower);
+    try std.testing.expect(!std.mem.eql(u8, k_upper, k_lower));
 }
