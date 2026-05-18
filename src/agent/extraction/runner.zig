@@ -593,6 +593,71 @@ fn freeResponse(allocator: std.mem.Allocator, response: providers.ChatResponse) 
     if (response.reasoning_content) |rc| if (rc.len > 0) allocator.free(rc);
 }
 
+/// V1.14.12 (M3 review HIGH#3) — coverage filter implementation,
+/// extracted into a helper so persistExtraction can wrap it in a
+/// single catch that no-ops on ANY failure (DB error, OOM,
+/// key-compute failure). Filtering is an optimization; it must not
+/// error-propagate to break boundary extraction.
+///
+/// Reads agent_keys via state_mgr.listAgentMemoryStoreKeys, builds
+/// the canonical key for each candidate edge, and appends only
+/// non-matching edges to `out`.
+fn runCoverageFilter(
+    allocator: std.mem.Allocator,
+    smgr: *zaki_state.Manager,
+    user_id: i64,
+    edges: []const schema.Edge,
+    out: *std.ArrayListUnmanaged(schema.Edge),
+    horizon_days: u32,
+    horizon_session_cap: u32,
+) !void {
+    const agent_keys = try smgr.listAgentMemoryStoreKeys(
+        allocator,
+        user_id,
+        horizon_days,
+        horizon_session_cap,
+    );
+    defer {
+        for (agent_keys) |k| allocator.free(k);
+        allocator.free(agent_keys);
+    }
+
+    if (agent_keys.len == 0) {
+        log.info("boundary.extraction.coverage_filter agent_keys=0 — passive-only session", .{});
+        try out.appendSlice(allocator, edges);
+        return;
+    }
+
+    var key_set = std.StringHashMapUnmanaged(void){};
+    defer key_set.deinit(allocator);
+    for (agent_keys) |k| try key_set.put(allocator, k, {});
+
+    var skipped: usize = 0;
+    for (edges) |edge| {
+        const candidate_key = extraction_persist.deriveExtractionKey(
+            allocator,
+            edge.source_name,
+            edge.relation_type,
+            edge.target_name,
+        ) catch |err| {
+            log.warn("boundary.extraction.coverage_key_compute_failed err={s} subject={s}", .{ @errorName(err), edge.source_name });
+            // Conservative: keep on failure.
+            try out.append(allocator, edge);
+            continue;
+        };
+        defer allocator.free(candidate_key);
+        if (key_set.contains(candidate_key)) {
+            skipped += 1;
+        } else {
+            try out.append(allocator, edge);
+        }
+    }
+    log.info(
+        "boundary.extraction.coverage_filter agent_keys={d} input_edges={d} skipped={d} remaining={d}",
+        .{ agent_keys.len, edges.len, skipped, out.items.len },
+    );
+}
+
 /// Convert the structured ExtractionResult into ExtractedMemory[] and
 /// persist via the existing extraction_persist.persistExtracted path
 /// (entity coref + edge upsert + vector sync). This is where Layer 4
@@ -642,56 +707,32 @@ fn persistExtraction(
     var kept_edges_buf = std.ArrayListUnmanaged(schema.Edge){};
     defer kept_edges_buf.deinit(allocator);
 
+    // V1.14.12 (M3 review HIGH#3): wrap the coverage filter in a
+    // self-contained block that NEVER fails the persist path. Any
+    // error inside the filter (OOM, DB error, key compute failure)
+    // logs + falls back to "no filtering" so the persist path
+    // proceeds with all edges. Filtering is an optimization, not a
+    // correctness gate — it must not error-propagate to break boundary
+    // extraction.
+    var filter_succeeded = true;
     if (ctx.coverage_filter_enabled) {
-        const agent_keys = smgr.listAgentMemoryStoreKeys(
+        runCoverageFilter(
             allocator,
+            smgr,
             uid,
+            result.edges,
+            &kept_edges_buf,
             COVERAGE_HORIZON_DAYS,
             COVERAGE_KEY_CAP,
-        ) catch |err| blk: {
-            log.warn("boundary.extraction.coverage_keys_failed err={s} — proceeding without filter", .{@errorName(err)});
-            break :blk &.{};
+        ) catch |err| {
+            log.warn("boundary.extraction.coverage_filter_failed err={s} — proceeding without filter", .{@errorName(err)});
+            filter_succeeded = false;
         };
-        defer {
-            for (agent_keys) |k| allocator.free(k);
-            allocator.free(agent_keys);
-        }
-
-        if (agent_keys.len == 0) {
-            log.info("boundary.extraction.coverage_filter agent_keys=0 — passive-only session", .{});
-            try kept_edges_buf.appendSlice(allocator, result.edges);
-        } else {
-            var key_set = std.StringHashMapUnmanaged(void){};
-            defer key_set.deinit(allocator);
-            for (agent_keys) |k| try key_set.put(allocator, k, {});
-
-            var skipped: usize = 0;
-            for (result.edges) |edge| {
-                const candidate_key = extraction_persist.deriveExtractionKey(
-                    allocator,
-                    edge.source_name,
-                    edge.relation_type,
-                    edge.target_name,
-                ) catch |err| {
-                    log.warn("boundary.extraction.coverage_key_compute_failed err={s} subject={s}", .{ @errorName(err), edge.source_name });
-                    // Conservative: keep on failure.
-                    try kept_edges_buf.append(allocator, edge);
-                    continue;
-                };
-                defer allocator.free(candidate_key);
-                if (key_set.contains(candidate_key)) {
-                    skipped += 1;
-                } else {
-                    try kept_edges_buf.append(allocator, edge);
-                }
-            }
-            log.info(
-                "boundary.extraction.coverage_filter agent_keys={d} input_edges={d} skipped={d} remaining={d}",
-                .{ agent_keys.len, result.edges.len, skipped, kept_edges_buf.items.len },
-            );
-        }
-    } else {
-        // Filter disabled — pass all edges through.
+    }
+    if (!ctx.coverage_filter_enabled or !filter_succeeded) {
+        // Filter disabled OR filter errored — pass all edges through
+        // (preserves pre-M3 behavior on failure).
+        kept_edges_buf.clearRetainingCapacity();
         try kept_edges_buf.appendSlice(allocator, result.edges);
     }
 

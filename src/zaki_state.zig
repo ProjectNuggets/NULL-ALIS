@@ -6346,15 +6346,22 @@ const ManagerImpl = struct {
         horizon_days: u32,
         horizon_session_cap: u32,
     ) ![]const []const u8 {
+        // V1.14.12 (M3 review MEDIUM#5) — ORDER BY created_at DESC so
+        // when the LIMIT clips, the OLDEST keys (most likely to drift
+        // out of horizon anyway) get evicted first. Pre-fix ORDER BY
+        // key gave alphabetic eviction which is arbitrary w.r.t.
+        // recency. DISTINCT outer wrapper preserves uniqueness.
         const q = try self.buildQuery(
-            "SELECT DISTINCT key FROM {schema}.memories " ++
+            "SELECT key FROM (" ++
+                "SELECT DISTINCT ON (key) key, created_at FROM {schema}.memories " ++
                 "WHERE user_id = $1 " ++
                 "AND key LIKE 'extracted_%' " ++
                 "AND metadata ? 'write_origin' " ++
                 "AND metadata->>'write_origin' = 'memory_store_tool' " ++
                 "AND created_at > NOW() - ($2 || ' days')::interval " ++
                 "AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
-                "ORDER BY key LIMIT $3",
+                "ORDER BY key, created_at DESC" ++
+                ") t ORDER BY created_at DESC LIMIT $3",
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;

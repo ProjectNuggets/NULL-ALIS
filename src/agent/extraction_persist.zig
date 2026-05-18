@@ -427,10 +427,27 @@ pub fn deriveExtractionKey(
     const object_lower = try lowerForEntityKey(allocator, object);
     defer allocator.free(object_lower);
 
+    // V1.14.12 (M3 review HIGH#2) — uppercase-normalize predicate.
+    // Pre-fix: if the agent's memory_store wrote `predicate="likes"`
+    // and the boundary extractor emitted `predicate="LIKES"`, the
+    // hashes diverged and the M3 coverage filter silently MISSED the
+    // duplicate — defeating the whole sprint. Predicates are stored
+    // uppercase by convention (LIKES, USES, IS_TYPE_OF) but LLMs
+    // occasionally emit them in mixed/lower case; this normalize
+    // ensures key collision happens regardless of writer's casing.
+    //
+    // Migration note: like the V1.14.11 subject/object lowercase fix,
+    // pre-V1.14.12 `extracted_<hash>` rows hashed without this
+    // normalization survive untouched. New writes converge.
+    var pred_buf: [128]u8 = undefined;
+    const pred_len = @min(predicate.len, pred_buf.len);
+    for (predicate[0..pred_len], 0..) |ch, i| pred_buf[i] = std.ascii.toUpper(ch);
+    const predicate_upper = pred_buf[0..pred_len];
+
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(subject_lower);
     hasher.update("|");
-    hasher.update(predicate);
+    hasher.update(predicate_upper);
     hasher.update("|");
     hasher.update(object_lower);
     var digest: [32]u8 = undefined;
@@ -1557,18 +1574,22 @@ test "V1.14.11: deriveExtractionKey distinguishes different subjects (no collisi
     try std.testing.expect(!std.mem.eql(u8, ka, kd)); // different predicate
 }
 
-test "V1.14.11: deriveExtractionKey is case-SENSITIVE on predicate (wire-format invariant)" {
-    // Predicates are stored uppercase by convention (LIKES, USES, IS_TYPE_OF).
-    // The extractor + agent both emit them uppercase. Lowercasing here
-    // would silently collapse with a hypothetical lowercase predicate from
-    // a future code path — better to preserve the wire-format invariant.
-    // If a code path emits a lowercase predicate, the bug is upstream.
+test "V1.14.12 (M3 review HIGH#2): deriveExtractionKey is case-INSENSITIVE on predicate" {
+    // Per M3 reviewer HIGH#2: agent's memory_store may write predicate
+    // in any case (LLMs occasionally lowercase) while boundary extractor
+    // may emit a different case. Pre-fix the keys diverged and M3's
+    // coverage filter MISSED the duplicate. Post-fix all casings produce
+    // the same key, so coverage filter catches the dup regardless of
+    // which writer used which casing.
     const allocator = std.testing.allocator;
     const k_upper = try deriveExtractionKey(allocator, "user", "LIKES", "Thai food");
     defer allocator.free(k_upper);
     const k_lower = try deriveExtractionKey(allocator, "user", "likes", "Thai food");
     defer allocator.free(k_lower);
-    try std.testing.expect(!std.mem.eql(u8, k_upper, k_lower));
+    const k_mixed = try deriveExtractionKey(allocator, "user", "Likes", "Thai food");
+    defer allocator.free(k_mixed);
+    try std.testing.expectEqualStrings(k_upper, k_lower);
+    try std.testing.expectEqualStrings(k_upper, k_mixed);
 }
 
 test "V1.14.12 (M1): WriteOrigin tags are stable strings for log analyzers" {

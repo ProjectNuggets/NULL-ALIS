@@ -197,21 +197,48 @@ pub fn classifyPredicate(predicate: []const u8) PredicateCardinality {
 ///
 /// Case-insensitive. Truncates to 4KB to bound cost (typical facts
 /// are <500 chars).
+///
+/// V1.14.12 (M3 review HIGH#1) — broadened pattern coverage with
+/// word-boundary semantics via stem matching. Pre-fix patterns
+/// required trailing space (e.g. `"stopped "`) and failed to match
+/// `"stopped."` or end-of-string `"…I stopped"`. New approach:
+/// detect each stem and require the surrounding context is a word
+/// boundary (start-of-text, end-of-text, or non-alphabetic char).
+/// Pattern set also expanded with contractions (`don't`, `didn't`,
+/// `doesn't`) and verbs of transition (`switched`, `moved`, `quit`).
 pub fn textHasExplicitNegation(text: []const u8) bool {
     if (text.len == 0) return false;
     var lower_buf: [4096]u8 = undefined;
     const slice_len = @min(text.len, lower_buf.len);
     for (text[0..slice_len], 0..) |c, i| lower_buf[i] = std.ascii.toLower(c);
     const lower = lower_buf[0..slice_len];
-    const patterns = [_][]const u8{
-        "no longer", "stopped ", "instead of", "not anymore",
-        "used to ", "previously ", " formerly", " ex-",
-        "but now ", " no more",
+
+    // Stems that, when present at a word boundary, indicate explicit
+    // negation/supersession. Each stem is matched then validated to
+    // have non-alpha char (or text edge) immediately before AND after.
+    const stems = [_][]const u8{
+        "no longer",   "stopped",     "instead of",
+        "not anymore", "used to",     "previously",
+        "formerly",    "but now",     "no more",
+        "don't",       "doesn't",     "didn't",
+        "never",       "switched",    "moved from",
+        "quit",        "ex-",
     };
-    for (patterns) |p| {
-        if (std.mem.indexOf(u8, lower, p) != null) return true;
+    for (stems) |stem| {
+        var search_from: usize = 0;
+        while (std.mem.indexOfPos(u8, lower, search_from, stem)) |pos| {
+            const left_ok = pos == 0 or !isAlphaByte(lower[pos - 1]);
+            const end = pos + stem.len;
+            const right_ok = end == lower.len or !isAlphaByte(lower[end]);
+            if (left_ok and right_ok) return true;
+            search_from = pos + 1;
+        }
     }
     return false;
+}
+
+fn isAlphaByte(b: u8) bool {
+    return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z');
 }
 
 /// Resolve duplicate + contradiction status for one new fact against
