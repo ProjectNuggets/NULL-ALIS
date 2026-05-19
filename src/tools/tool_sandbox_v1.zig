@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const config_types = @import("../config_types.zig");
 const security = @import("../security/root.zig");
 const process_util = @import("process_util.zig");
@@ -10,17 +11,76 @@ pub const SandboxExecConfig = struct {
     workspace_dir: []const u8 = ".",
     allowed_roots: []const []const u8 = &.{},
     /// When `enabled = true` but the resolved sandbox is `noop` (no real
-    /// backend available on the host), control behavior:
-    /// - `false` (default, production-safe): return error.SandboxUnavailable.
-    ///   Shell tool refuses. Forces operators to fix the missing-backend
-    ///   condition rather than silently shipping unsandboxed shell to users.
-    /// - `true` (dev-friendly): log.warn + return argv unchanged. Shell tool
-    ///   runs the command without isolation. The warn is the audit trail
-    ///   that operators can grep for.
+    /// backend available on the host), control behavior. The fail-open
+    /// path is **double-gated** as of V8 (v1.14.13 Step 0): a misconfigured
+    /// prod deploy with this field stuck at `true` used to silently ship
+    /// unsandboxed shell to users — that was the security hole.
+    ///
+    /// To fall through to unsandboxed argv ALL of the following must hold:
+    ///   1. `fail_open_on_dev = true` (this field, set in config)
+    ///   2. env var `NULLALIS_ALLOW_UNSANDBOXED_DEV=1` at process start
+    ///   3. resolved sandbox name is `"none"` (no real backend installed)
+    ///
+    /// Missing #1 or #2 → `error.SandboxUnavailable`. The double-gate
+    /// means a single misconfigured config OR a single missing env var
+    /// closes the hole — no single point of failure.
+    ///
+    /// The matching `log.err` (not warn) when bypass fires is the audit
+    /// trail; surface it in alerting.
     fail_open_on_dev: bool = false,
 };
 
 pub const MAX_WRAPPED_ARGV: usize = 160;
+
+/// Env var that authorizes the unsandboxed fall-through path. Operators
+/// who deliberately want to run tools without isolation on a dev host
+/// MUST set this AND `fail_open_on_dev=true` in config. Either alone is
+/// insufficient — see `SandboxExecConfig.fail_open_on_dev` doc.
+pub const UNSANDBOXED_DEV_ENV_VAR = "NULLALIS_ALLOW_UNSANDBOXED_DEV";
+
+/// Test seam. Production code keeps this `null` and the helper falls
+/// through to `std.posix.getenv`. Tests assign `true`/`false` directly
+/// to gate the dev-bypass path without mutating the process env (which
+/// is racy under parallel test runners and lacks a portable Zig stdlib
+/// API in 0.15.2). The runtime checks this BEFORE consulting the env.
+///
+/// MUST remain `null` outside test scope. There is no production code
+/// path that writes to this.
+pub var unsandboxed_dev_env_test_override: ?bool = null;
+
+fn unsandboxedDevEnvAuthorized() bool {
+    if (unsandboxed_dev_env_test_override) |v| return v;
+    const val = std.posix.getenv(UNSANDBOXED_DEV_ENV_VAR) orelse return false;
+    return std.mem.eql(u8, val, "1");
+}
+
+/// Emit a large warning banner at process startup if the operator has
+/// set `NULLALIS_ALLOW_UNSANDBOXED_DEV=1`. This pairs with the
+/// double-gate in `resolve_sandboxed_argv` so the dev-bypass condition
+/// is visible in both the boot log and in alerting (log.err level).
+///
+/// Idempotency is the caller's responsibility — call this once at
+/// daemon/main startup, not per-request.
+pub fn logUnsandboxedDevBannerIfEnabled() void {
+    if (!unsandboxedDevEnvAuthorized()) return;
+    // AGENTS.md §3.6: log.err during tests causes the default test runner
+    // to fail the test; the banner is a runtime audit signal so we gate
+    // it on `!is_test`. Tests exercising the gate verify behavior, not
+    // the log line itself.
+    if (builtin.is_test) return;
+    log.err(
+        "\n" ++
+            "  ======================================================================\n" ++
+            "  ==  SECURITY: NULLALIS_ALLOW_UNSANDBOXED_DEV=1 IS SET               ==\n" ++
+            "  ==                                                                  ==\n" ++
+            "  ==  Tool execution MAY fall through to the host unsandboxed when   ==\n" ++
+            "  ==  the resolved backend is 'none' AND fail_open_on_dev=true in    ==\n" ++
+            "  ==  config. This is a DEVELOPMENT-ONLY escape hatch — NEVER ship   ==\n" ++
+            "  ==  this env var to production. Install bwrap/firejail/docker.     ==\n" ++
+            "  ======================================================================",
+        .{},
+    );
+}
 
 const WorkspaceValidationReason = enum(u8) {
     none = 0,
@@ -160,8 +220,23 @@ pub fn resolve_sandboxed_argv(
         &sandbox_storage,
     );
     if (std.mem.eql(u8, sandbox.name(), "none")) {
-        if (exec_cfg.fail_open_on_dev) {
-            log.warn("sandbox: no real backend available, falling through unsandboxed (fail_open_on_dev=true). This is acceptable on dev hosts; on production hosts install bwrap/firejail/docker and set fail_open_on_dev=false.", .{});
+        // V8 (v1.14.13 Step 0): double-gate the dev-bypass. Both
+        // `fail_open_on_dev=true` AND env `NULLALIS_ALLOW_UNSANDBOXED_DEV=1`
+        // must hold. Logged at err level (not warn) so alerting picks it up.
+        if (exec_cfg.fail_open_on_dev and unsandboxedDevEnvAuthorized()) {
+            // AGENTS.md §3.6: gate the audit log on `!is_test`. The bypass
+            // path is intentionally exercised by tests; the log line is a
+            // runtime audit signal, not a test assertion.
+            if (!builtin.is_test) {
+                log.err(
+                    "SANDBOX BYPASS: no real backend available; falling through " ++
+                        "unsandboxed because fail_open_on_dev=true AND " ++
+                        "NULLALIS_ALLOW_UNSANDBOXED_DEV=1. Dev-host behavior only — " ++
+                        "if you see this on a production host, fix the config or " ++
+                        "install bwrap/firejail/docker immediately.",
+                    .{},
+                );
+            }
             return argv;
         }
         return error.SandboxUnavailable;

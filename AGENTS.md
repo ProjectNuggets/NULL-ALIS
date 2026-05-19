@@ -29,7 +29,7 @@ Entitlement + secret-vault + cost-class surfaces (Sprint 2 / D8):
 - `src/gateway/secret_vault.zig` — two-phase mutation handshake with audit trail
 - `src/tools/metadata.zig` — cost classes A/B/C on `ToolMetadata`; weight-budget gate in preflight
 
-Current scale (2026-04-24, post-Sprint-6): **260 source files, ~214K Zig LoC (excluding vendored sqlite), 5,597 tests**.
+Current scale (2026-05-19, HEAD `365065b1`): **296 Zig files under `src/`, ~260K Zig LoC, 6,149 default build tests** (`zig build test --summary all`: 6,083 passed / 66 skipped). Treat these numbers as a snapshot, not a promise; refresh them when publishing a new roadmap/status lock.
 
 Build and test:
 
@@ -58,7 +58,7 @@ These codebase realities should drive every design decision:
 2. **Binary size and memory are hard product constraints**
    - `zig build -Doptimize=ReleaseSmall` is the release target. Every dependency and abstraction has a size cost.
    - Avoid adding libc calls, runtime allocations, or large data tables without justification.
-   - `MaxRSS` during `zig build test` must stay well under 50 MB.
+   - `MaxRSS` during `zig build test` should stay under 50 MB. Current HEAD (2026-05-19) reports 61M, so the RSS budget is an open performance debt, not a normalized baseline.
 
 3. **Security-critical surfaces are first-class**
    - `src/gateway.zig`, `src/security/`, `src/tools/`, `src/runtime.zig` carry high blast radius.
@@ -137,7 +137,7 @@ src/
   health.zig            component health registry
   runtime.zig           runtime adapters (native, docker, wasm, cloudflare)
   tunnel.zig            tunnel providers (cloudflared, ngrok, tailscale, custom)
-  skillforge.zig        skill discovery and integration
+  skills.zig            skill discovery and integration
   migration.zig         memory migration from other backends
   hardware.zig          hardware discovery and management
   peripherals.zig       hardware peripherals (Arduino, STM32/Nucleo, RPi)
@@ -322,3 +322,135 @@ When working in fast iterative mode:
 - Do not "ship and hope" on security-sensitive paths.
 - If uncertain about Zig 0.15 API, check `src/` for existing usage patterns before guessing.
 - If uncertain about architecture, read the vtable interface definition before implementing.
+
+## 14) Standards — Nullalis-Grade (Swiss-Watch Build)
+
+Effective 2026-05-19. These rules apply to every agent (Claude, Codex, human) working in this
+repo. They are the lift from "running code" to "production-grade product." Violations are
+treated as defects, not preferences.
+
+**Bound documents (read these before working):**
+- `docs/ROADMAP.md` — the versioned plan (which V block lands at which tag).
+- `docs/MULTI_AGENT_PLAN.md` — the agent dispatch matrix (which agent does what, file ownership,
+  branch conventions, bench gate convergence). When you are spawned as Agent A/B/C/..., your
+  scope, owned files, and closing standard come from this document.
+- `docs/STATUS.md` — current snapshot.
+
+### 14.1 Per-finding discipline (mandatory)
+
+Every defect, audit finding, or sprint task follows the **plan → recon → fix → review** loop:
+
+1. **Plan** — write the diff shape in prose before editing. Name affected files, expected new
+   tests, the regression you're guarding against. Get explicit owner approval if the change
+   touches a high-risk path (§5).
+2. **Recon** — read the target code AT HEAD. Do not work from memory. Use `git log -- <file>` to
+   reconstruct intent for any module you don't recognize. Confirm the plan matches the actual
+   shape of the code.
+3. **Fix** — apply the minimal surgical edit. One commit per finding. No batching across
+   findings — one commit MAY span multiple files iff they're a single logical change (e.g.,
+   a struct + its registration + its callsite).
+4. **Review** — re-read the diff before commit. Run `zig build test` (must exit 0). For
+   memory-/state-/tx-changing edits, run the relevant integration test or document why
+   skipped. Confirm no regression.
+
+No exceptions. If a change is too big for one commit, it's too big for one finding — split
+the finding before splitting the commit.
+
+### 14.2 Archaeology before deletion
+
+**Never delete code on the grounds that "no production callers exist."** Zero callers means one
+of three things:
+- We finished half a feature and forgot to wire it (FINISH it).
+- We changed direction and never cleaned up (DOCUMENT the abandonment in a successor doc).
+- We genuinely don't need it anymore (delete WITH a one-paragraph rationale in the commit
+  body referencing the original intent).
+
+The reflex "delete unwired code" is the WRONG default. Every orphan was built for a reason.
+The question is whether the reason still holds, not whether the symbol has a caller today.
+
+Operationally:
+```bash
+git log --follow --all -- <file>          # find original commit
+git show <original-commit>                 # read the intent
+grep -rn "<symbol>" src/                   # confirm orphan status across all of src/
+```
+Only then propose: **wire-it / document-it-and-delete / wire-it-with-tests-as-canonical**.
+
+### 14.3 No regressions — bench-gated transitions
+
+Each roadmap block (`v1.X.X` in `docs/ROADMAP.md`) ends with an explicit bench gate before the
+next block opens:
+
+- `zig build test --summary all` → 0 failures, 0 leaks
+- LoCoMo cold + polluted → no decline from prior block's tag
+- τ-bench Airline (once baselined) → no decline from prior block's tag
+- Any block-specific custom gates declared in the roadmap
+
+A block does not "ship" until its bench gate passes. Failing benches are a STOP. Diagnose
+before continuing. The Karpathy keep/discard loop from the LoCoMo iteration sprints is the
+template: hypothesize → iterate → bench → keep or discard with reason in `.spike/results.tsv`.
+
+### 14.4 Wire-or-document, never wire-or-delete
+
+When a module/field/handler is found unwired:
+
+| Outcome | When | Required artifacts |
+|---|---|---|
+| **Wire** | The original intent still holds AND value is real | Commit wires it + test that exercises the new path + roadmap update |
+| **Document + park** | Intent holds but priority is post-current-block | Note in `docs/deferred-register.md` + comment block in the orphan file linking to the deferred entry |
+| **Document + delete** | Intent obsolete, successor exists OR feature genuinely killed | Commit body explains the original intent, names the successor (or "no successor — feature killed because X"), then deletes |
+
+"Just delete it" is not in the table. Choose one of the three.
+
+### 14.5 No loose ends — completion contract
+
+A feature is "complete" only when ALL of:
+1. Code lands.
+2. Tests cover the happy path + the documented failure modes.
+3. The vtable / config / prompt directive that activates it is wired through to the runtime.
+4. User-facing surface (tool description, error message, channel renderer) reflects the
+   actual behavior. **No tool description shall advertise an action the code can't perform.**
+5. Bench gate passes (§14.3).
+6. AGENTS.md / ROADMAP.md / STATUS.md updated if the feature changes the operating surface.
+
+Shipping a feature that meets (1) but not (2-6) is not shipping. It's adding cruft.
+
+### 14.6 Honest config surface
+
+Every field parsed from `config.json` MUST be consumed somewhere downstream of the parse, OR
+documented as deprecated in the same file. Parsed-but-unused config is user-facing dishonesty
+(operators read `config.json`, fill in the field, and silently get nothing). The audit
+caught Email/Teams/Nostr + several others; treat these as defects, not omissions.
+
+Operational rule: when adding a config field, the same PR must wire it. When removing a
+feature, the same PR must remove its config field (or replace with a clear deprecation
+log on parse).
+
+### 14.7 Honest prompts
+
+No prompt directive ships unless evidence demonstrates the model acts on it. If a directive
+is added and a bench round shows it's ignored (the F-A2 brain_graph pattern), the directive
+is STRIPPED, not retained "in hope." Aspirational instructions in the system prompt erode
+compliance on the surrounding instructions. Bench-validate prompt additions OR don't ship them.
+
+### 14.8 Zig competence baseline
+
+Working in this repo presumes:
+- Comfortable with Zig 0.15.2 stdlib (the API constraints in §2.4 are correct as of 2026-05).
+- Allocator-explicit thinking (every alloc has a free path, every defer chain has an order).
+- `std.testing.allocator` for leak detection in tests — every test must pass at zero leaks.
+- Vtable interface pattern (read §6.2).
+- comptime-derived constants (e.g., `BRAIN_USER_KEY_FILTER` in `zaki_state.zig:65`).
+
+If a Zig-language question blocks progress, look it up against the language reference rather
+than guess. Bluffing on language semantics is a §14.1 violation (the "Recon" step).
+
+### 14.9 Reputation contract
+
+This codebase carries the work of "nullalis as Nova's son." Every commit either makes the
+agent better or makes the foundation harder to build on. There is no neutral commit. The
+standard is not "the code compiles" — it is **"a future maintainer can read this and
+understand exactly what we were thinking and why."**
+
+If a change can't pass that test, rewrite the commit message and inline comments until it
+can.

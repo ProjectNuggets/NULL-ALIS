@@ -13,6 +13,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const json_util = @import("../json_util.zig");
+const schema = @import("../tools/schema.zig");
 
 /// ToolSpec from the provider interface.
 const ToolSpec = root.ToolSpec;
@@ -64,7 +65,9 @@ pub fn convertToolsSorted(
         try buf.appendSlice(allocator, ",\"description\":");
         try json_util.appendJsonString(buf, allocator, tool.description);
         try buf.appendSlice(allocator, ",\"parameters\":");
-        try buf.appendSlice(allocator, tool.parameters_json);
+        const cleaned_parameters = try schema.cleanForProvider(allocator, .openai, tool.parameters_json);
+        defer allocator.free(cleaned_parameters);
+        try buf.appendSlice(allocator, cleaned_parameters);
         try buf.appendSlice(allocator, "}}");
     }
     try buf.append(allocator, ']');
@@ -122,4 +125,22 @@ test "convertToolsSorted single tool" {
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"shell\"") != null);
     try std.testing.expect(buf.items[0] == '[');
     try std.testing.expect(buf.items[buf.items.len - 1] == ']');
+}
+
+test "convertToolsSorted cleans parameter schema before serialization" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    const tool = ToolSpec{
+        .name = "lookup",
+        .description = "Resolve an item",
+        .parameters_json =
+        \\{"type":"object","properties":{"id":{"$ref":"#/$defs/Id"}},"$defs":{"Id":{"type":"string","const":"fixed"}}}
+        ,
+    };
+    try convertToolsSorted(&buf, allocator, &.{tool});
+
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"$ref\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"enum\"") != null);
 }

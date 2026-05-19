@@ -2,6 +2,7 @@ const std = @import("std");
 const json_util = @import("../json_util.zig");
 const http_util = @import("../http_util.zig");
 const config_types = @import("../config_types.zig");
+const schema = @import("../tools/schema.zig");
 const root = @import("root.zig");
 const ToolSpec = root.ToolSpec;
 
@@ -331,7 +332,9 @@ pub fn convertToolsOpenAI(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.A
         try buf.appendSlice(allocator, ",\"description\":");
         try json_util.appendJsonString(buf, allocator, tool.description);
         try buf.appendSlice(allocator, ",\"parameters\":");
-        try buf.appendSlice(allocator, tool.parameters_json);
+        const cleaned_parameters = try schema.cleanForProvider(allocator, .openai, tool.parameters_json);
+        defer allocator.free(cleaned_parameters);
+        try buf.appendSlice(allocator, cleaned_parameters);
         try buf.appendSlice(allocator, "}}");
     }
     try buf.append(allocator, ']');
@@ -352,7 +355,9 @@ pub fn convertToolsAnthropic(buf: *std.ArrayListUnmanaged(u8), allocator: std.me
         try buf.appendSlice(allocator, ",\"description\":");
         try json_util.appendJsonString(buf, allocator, tool.description);
         try buf.appendSlice(allocator, ",\"input_schema\":");
-        try buf.appendSlice(allocator, tool.parameters_json);
+        const cleaned_parameters = try schema.cleanForProvider(allocator, .anthropic, tool.parameters_json);
+        defer allocator.free(cleaned_parameters);
+        try buf.appendSlice(allocator, cleaned_parameters);
         try buf.append(allocator, '}');
     }
     try buf.append(allocator, ']');
@@ -531,6 +536,24 @@ test "convertToolsOpenAI empty tools" {
     try std.testing.expectEqualStrings("[]", buf.items);
 }
 
+test "convertToolsOpenAI cleans parameter schema through provider strategy" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+    const tools = &[_]ToolSpec{.{
+        .name = "lookup",
+        .description = "Resolve an item",
+        .parameters_json =
+        \\{"type":"object","properties":{"id":{"$ref":"#/$defs/Id"}},"$defs":{"Id":{"type":"string","const":"fixed"}}}
+        ,
+    }};
+
+    try convertToolsOpenAI(&buf, alloc, tools);
+
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"$ref\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"enum\"") != null);
+}
+
 test "convertToolsAnthropic produces valid JSON" {
     const alloc = std.testing.allocator;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -562,6 +585,25 @@ test "convertToolsAnthropic empty tools" {
     defer buf.deinit(alloc);
     try convertToolsAnthropic(&buf, alloc, &.{});
     try std.testing.expectEqualStrings("[]", buf.items);
+}
+
+test "convertToolsAnthropic strips Anthropic-unsupported schema refs" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+    const tools = &[_]ToolSpec{.{
+        .name = "lookup",
+        .description = "Resolve an item",
+        .parameters_json =
+        \\{"type":"object","properties":{"id":{"$ref":"#/$defs/Id"}},"$defs":{"Id":{"type":"string","minLength":1}}}
+        ,
+    }};
+
+    try convertToolsAnthropic(&buf, alloc, tools);
+
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"$ref\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"$defs\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"minLength\"") != null);
 }
 
 test "providerUrl returns correct URLs" {

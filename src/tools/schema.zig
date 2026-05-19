@@ -97,6 +97,11 @@ pub const SchemaCleanr = struct {
         return clean(allocator, schema_json, .openai);
     }
 
+    /// Clean schema using the conservative fallback strategy.
+    pub fn cleanForConservative(allocator: std.mem.Allocator, schema_json: []const u8) ![]const u8 {
+        return clean(allocator, schema_json, .conservative);
+    }
+
     /// Validate that a schema has a "type" field.
     pub fn validate(allocator: std.mem.Allocator, schema_json: []const u8) bool {
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, schema_json, .{}) catch return false;
@@ -132,6 +137,14 @@ pub const SchemaCleanr = struct {
         return try serializeJson(allocator, cleaned);
     }
 };
+
+/// Correctly-spelled alias for new callers; keep SchemaCleanr for compatibility.
+pub const SchemaCleaner = SchemaCleanr;
+
+/// Clean a JSON schema for the selected provider strategy.
+pub fn cleanForProvider(allocator: std.mem.Allocator, strategy: CleaningStrategy, schema_json: []const u8) ![]const u8 {
+    return SchemaCleaner.clean(allocator, schema_json, strategy);
+}
 
 // ── Internal helpers ────────────────────────────────────────────────
 

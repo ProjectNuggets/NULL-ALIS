@@ -3,6 +3,7 @@ const root = @import("root.zig");
 const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
 const NNGTs_prefix_order = @import("NNGTs_prefix_order.zig");
+const schema = @import("../tools/schema.zig");
 
 const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
@@ -258,7 +259,9 @@ pub const OpenRouterProvider = struct {
             try buf.appendSlice(allocator, "\",\"description\":\"");
             try buf.appendSlice(allocator, tool.description);
             try buf.appendSlice(allocator, "\",\"parameters\":");
-            try buf.appendSlice(allocator, tool.parameters_json);
+            const cleaned_parameters = try schema.cleanForProvider(allocator, .openai, tool.parameters_json);
+            defer allocator.free(cleaned_parameters);
+            try buf.appendSlice(allocator, cleaned_parameters);
             try buf.appendSlice(allocator, "}}");
         }
 

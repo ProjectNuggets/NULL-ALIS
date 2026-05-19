@@ -253,3 +253,156 @@ But the commit message should not claim "fully closed end-to-end" while the thir
 3. (Optional, recommended) Add a `RecordingCompletionDelivery`-style test that exercises the attach + dispatch contract for `bus=null + delivery_attached` to lock the wiring against future regression.
 
 Reviewed: 2026-05-08 (commit `beb87ad`, branch `main`).
+
+---
+
+## F-A1 + F-A2 review (2026-05-09)
+
+**Commit:** `fe0d094` — `feat(prompt): F-A1 + F-A2 — counterfactual reasoning + brain graph as default for entities`
+**Scope:** Single file, +62 lines, `src/agent/prompt.zig` (response protocol section).
+**Verdict:** **SHIP-WITH-FIXES.** Two CRITICAL issues that should land in the same wave or as a fast follow-up before the bench re-run is interpreted; one HIGH worth flagging publicly even if not patched today; the rest are MEDIUM/LOW. Detail below — and an explicit pushback on the framing in the closing section.
+
+### Findings
+
+#### CRITICAL CR-A1 — Direct contradiction with line 832 produces an ordering-bias coin-flip.
+
+**File:** `src/agent/prompt.zig:832` vs. `src/agent/prompt.zig:932`.
+
+The pre-existing rule at line 832 still reads:
+
+> Skip the tool only when: (a) the answer is already in this turn's context, or (b) the question is purely about reasoning/preference that no tool could ground (\"what's 2+2\", \"tell me a joke\", **\"do you think X is a good idea\"**).
+
+The new F-A1 paragraph at line 932 directly forbids the behavior the older rule licenses ("would Mia like the new restaurant" is structurally identical to "do you think X is a good idea"). The two rules now point in opposite directions for the exact class of question this commit is trying to fix. LLMs given conflicting instructions tend to favor the more recent / more strongly worded one, but that is a tendency, not a contract — Cat 3 will get a coin-flip's worth of regression on whichever turns the model latches onto the older rule.
+
+The commit message even acknowledges this ("the earlier 'skip the tool' rule made this worse — it told the agent that inference questions were a licence to hedge") but did not edit line 832. The fix is a 1-line edit: drop the third "do you think X is a good idea" example from the line 832 exception list, or replace the parenthetical with `(\"what's 2+2\", \"tell me a joke\")` and add an explicit cross-reference: `Inference / counterfactual questions ("would X likely Y") are NOT in this exception — see the counterfactual discipline rule below.`
+
+**Severity rationale:** this is the central conflict the new section was supposed to resolve. Leaving it unresolved means the prompt ships in a self-contradictory state on its primary use case.
+
+**Fix:** Edit line 832, do not add another paragraph. Adding more text to win an ordering battle is the wrong lever; remove the source of the contradiction.
+
+#### CRITICAL CR-A2 — F-A2 advertises a predicate that does not exist (`PARTICIPATES_IN`).
+
+**File:** `src/agent/prompt.zig:975`.
+
+The Nate worked example reads:
+
+> ...`brain_graph local_graph(center_key=<nate_key>, depth=2)` to surface his typed-edge neighborhood (PARTICIPATES_IN, OWNS, LIKES, FRIENDS_WITH).
+
+`OWNS`, `LIKES`, `FRIENDS_WITH` are real (verified in `src/memory/root.zig:290-301` and `src/agent/extraction_persist.zig:464-493`). **`PARTICIPATES_IN` is not in the codebase.** The closest existing predicates for the "Nate plays in tournaments / runs a vegan diet group" content the example walks through are `JOINED`, `ATTENDED`, `HAPPENED_ON` — all under the `episode` LinkType.
+
+Why it matters: the example primes the agent to look for a predicate label it will never find in the subgraph, and to potentially reason about edges that aren't there. In the worst case, the agent reads the prompt as a contract about predicate names available in `local_graph` output, then fabricates `PARTICIPATES_IN`-shaped edges in its narration of the subgraph. That is exactly the "boundary erosion" risk flagged in the review brief — except it is now self-induced by the prompt rather than driven by the user.
+
+**Fix:** Replace `PARTICIPATES_IN` with `JOINED` (or `ATTENDED`) in the Nate example. Two characters, one PR, removes the misleading advertisement.
+
+#### HIGH HI-A1 — F-A1's "Caroline counseling" example mis-frames the bench behavior we're fixing.
+
+**File:** `src/agent/prompt.zig:941-943` vs. `.spike/external/baselines/locomo_full_battery_2026-05-09.json`.
+
+The example claims the agent's WRONG behavior on this question is:
+
+> "The conversations don't explicitly address this counterfactual..." — refuses to reason.
+
+The actual recall=0.0 reply we logged is:
+
+> "The conversations don't explicitly address this counterfactual, but Caroline consistently describes her career choice as a direct result of the support she received... **the text strongly suggests she would not have pursued counseling specifically** without having experienced its impact firsthand."
+
+The agent **did commit to a position** ("would not have pursued counseling specifically"). It scored 0.0 because the LoCoMo recall scorer is a bag-of-words substring match against the ground truth string `"Likely no"` — and the agent's commit was framed as `"would not have pursued"` instead of containing the literal token `"likely no"`. The bench failure is **not** a hedging failure; it is a scorer-string-match failure.
+
+This matters for two reasons:
+
+1. **The product diagnosis is wrong.** F-A1 is targeted at a hedging behavior that this specific Cat 3 example does not actually exhibit. The real failure mode, as captured in the trail, is a stylistic mismatch with the LoCoMo bag-of-words scorer. F-A1 will likely lift recall on this question because the prompt explicitly trains the agent to lead with a 2-word phrase ("Likely no.") that the substring scorer will match — but that lift is the scorer, not reasoning quality.
+
+2. **The framing in the commit message ("ship product value first, let the benchmark show the real result") is at risk of being optimistic about its own causation.** If the next bench run shows Cat 3 jumping from 75.3% → ~85%+, the most parsimonious explanation is "we taught the agent to start replies with the literal tokens the scorer tokenizes against." That is closer to gaming the scorer (via prompt) than the framing admits. See the **Pushback** section below.
+
+**Fix:** Replace the Caroline counseling WRONG example with one where the agent actually refused to reason (e.g., the "Mia restaurant" pattern — that one is a real production failure mode per the commit message). Keep Caroline as a RIGHT-only worked example to anchor the protocol, since the actual failure here was scorer-shape, not reasoning-shape.
+
+#### HIGH HI-A2 — F-A2 has no cold-start handling; combined with F-A1 it primes hallucination.
+
+**File:** `src/agent/prompt.zig:965-975` interacting with `src/tools/brain_graph.zig:117, 124, 133`.
+
+`brain_graph local_graph` returns a hard tool error in three real conditions:
+- `center_key` missing entirely → `"action=local_graph requires 'center_key'..."`
+- `center_key` is a system bookkeeping key → `"center_key is hidden..."`
+- `center_key` not found in the brain → `"center_key not found (or archived). Try memory_recall first to find a live key."`
+
+For any entity the brain has never indexed (a person mentioned for the first time, a project name the agent has never persisted), the new F-A2 sequence is:
+1. memory_recall — returns nothing useful
+2. brain_graph local_graph — returns the third error above
+3. ...silence in the prompt.
+
+There is no "fall back to text recall," "say you don't know," or "report what failed" guidance after step 4 fails. The earlier R7-tool / R14 rules tell the agent to surface tool errors, which is good — but the new section's confidence-weighted "commit to a position" instruction (F-A1, three paragraphs above) is now the most recent specific guidance the model sees about how to answer entity questions. Under load, the most likely failure mode is: agent calls memory_recall, gets nothing, calls brain_graph, gets an error, then synthesizes an answer "from training" without admitting either tool failed — exactly the hallucination pattern the F-A1 exception clause was supposed to prevent.
+
+**Fix:** Add one line at the end of F-A2: `If brain_graph local_graph returns an error or empty subgraph, fall back to memory_recall results alone — and if those are also empty, say "I have no signal on <entity>" (per the F-A1 zero-signal exception). Do not synthesize from training.`
+
+#### MEDIUM MD-A1 — Cat 1 regression risk from F-A1's "commit to a position" rule.
+
+**File:** `src/agent/prompt.zig:932-950`.
+
+Cat 1 (single-hop factual) was the strongest category in the F-G4 baseline at 91.2%. Single-hop questions sometimes legitimately have no answer — when the truth is "the user never mentioned this," `memory_recall returns empty` is the right answer. F-A1's prose places strong gravity on "commit to a position" / "Don't hedge into 'I can't determine'" / "the hedge-trap is the failure" — *three* separate restatements of the commit-or-die directive — against *one* exception clause at the end (the ZERO-signal carve-out). Under recency-bias the carve-out is the most recent, which helps; but the cumulative weight of the page leans "commit." Expect Cat 1 to take a 1-3 point hit as the agent invents low-confidence guesses on questions where the right answer was "no mention."
+
+**Fix:** Either (a) restate the zero-signal exception at the top of the section as well, not just at the end, so it has the same recency advantage as the commit rule; or (b) explicitly scope F-A1 to inference-shaped surface forms ("would X likely Y", etc.) and forbid it from firing on factual-shaped questions ("what is X's birthday"). Option (b) is the cleaner fix.
+
+#### MEDIUM MD-A2 — `memory_recall` does not return a "canonical key" the way step 2 implies.
+
+**File:** `src/agent/prompt.zig:968`.
+
+> 2. Call `memory_recall` to find the canonical key for X (entity_<hash> or wiki:X).
+
+`memory_recall` is text retrieval — it returns matched fact rows with their keys, but those keys are content keys (`durable_fact/<hash>`, etc.), not entity keys. The semantics implied by "find the canonical key" suggest there is a deterministic name-to-key resolver, which there isn't. In practice the agent will likely pass the key of whatever fact-row mentions Nate most prominently, then `local_graph` will expand from that fact-row, which gives a reasonable but less-than-ideal subgraph.
+
+This is not a blocker — the path still produces useful output — but the prompt is more confident than the underlying tool semantics warrant. The agent reading "find the canonical key for X" may attempt key formats (`entity_<hash>`, `wiki:X`) that the `memory_recall` results don't include, then get confused about why none of the keys it tried fit.
+
+**Fix:** Soften step 2 to reflect actual semantics: `Call memory_recall for "<entity name>" and pick the key of the most directly entity-naming fact row from the results. If memory_recall returns no rows, skip step 3 and report "no signal" per F-A1.`
+
+#### LOW LO-A1 — Ordering-bias also affects the broadened brain_graph rule vs. line 821.
+
+**File:** `src/agent/prompt.zig:821-824` vs. `src/agent/prompt.zig:965`.
+
+The line 821 rule routes graph-shape questions ("what CONNECTS to X", "who works at Y") to brain_graph. The new rule at 965 broadens this to ANY entity-centric question. The two are not strictly contradictory (broad rule subsumes narrow), but the older rule's narrowness implicitly signals that other entity questions go to memory_recall alone — which the new rule overturns.
+
+The agent will probably do the right thing because the new rule names the entity-centric pattern explicitly. But for hygiene: append `(see also "Brain graph as default for entity-centric questions" below — that rule generalizes this dispatch to all entity questions, not only explicit-connect language)` to line 821. One sentence; aligns the table-of-contents view of the protocol with the actual protocol.
+
+#### LOW LO-A2 — Latency cost is real but acceptable for the entity-centric path.
+
+The 3-call sequence (memory_recall → memory_recall again for canonical key → brain_graph local_graph) doubles tool round-trips on entity questions vs. the prior memory_recall-only path. For the LoCoMo bench (sequential, single user, single conv) this is fine. For production at the booth or post-booth, it adds ~600-1200ms per entity question depending on Together latency.
+
+This is a UX trade-off, not a correctness issue, and the rule has a reasonable skip clause (questions about the agent itself, transient questions, no-entity questions). Flagging for awareness only — the trade is correct given the recall lift the structural neighborhood provides.
+
+#### INFO IN-A1 — Comments are not emitted (verified).
+
+The reviewer brief asks to confirm that `// V1.14.6 F-A1...` comments aren't accidentally written into the system prompt text. Verified: comments at lines 915-931, 952-964 are Zig source comments, separate from `try w.writeAll(...)` calls, and stay in the binary as compile-time-stripped. No prompt-text leak.
+
+#### INFO IN-A2 — Token cost is ~1.0-1.2 KB, not 5 KB.
+
+The brief estimated +5 KB (62 lines × 80 chars). Actual: the new section is ~5400 characters of prose embedded in `writeAll` calls — roughly 1.0-1.2 KB of system-prompt tokens after subtracting Zig-source overhead (string-literal escapes, indentation, comment lines). Marginal against the existing ~50 KB prompt. Not a concern.
+
+### Pushback on the commit-message framing
+
+The commit message reads:
+
+> Both scaffolds are PURE PRODUCT IMPROVEMENTS — no scoring tweaks. They ship value to real users (counterfactual questions, "tell me about X" questions) regardless of bench impact. The benchmark is the honest test for whether they move the needle.
+
+I want to push back on this honestly because the brief invited dissent.
+
+**The framing is true for F-A2 and partially true for F-A1, but it understates what F-A1 is actually doing on the LoCoMo Cat 3 numbers.**
+
+The Caroline counterfactual baseline reply (HI-A1 above) committed to a position, reasoned over the evidence, and scored 0.0 — because the recall scorer is a substring match against `"Likely no"` and the agent said `"would not have pursued"`. The product behavior on that question was already correct in the F-G4 baseline. The F-A1 prompt explicitly trains the agent to **lead with the 2-word phrase** ("Likely no.", "Liberal.", "Probably yes.") that the substring scorer rewards. If the bench re-run shows a meaningful Cat 3 lift, the dominant cause will be "answers now begin with scorer-friendly tokens," not "the agent reasons better."
+
+That is not the same thing as scoring tweaks (which would edit the scorer or the answer extraction logic), but it sits closer to "shape the prompt to win the scorer" than the commit message admits. The product lift on UX-shaped questions ("would Mia like the restaurant?") is real and worth shipping; the bench lift will be partly real reasoning and partly scorer-targeting. Both should be acknowledged when the bench result lands.
+
+Concretely: when reporting the post-commit Cat 3 number, also report **what fraction of the lift comes from questions where the F-G4 baseline already committed to the correct position but failed the substring match.** That number is the "scorer-targeting" portion of the gain. If it's >50%, the honest readout is "F-A1 lifted bench Cat 3 by N points, of which X points were prompt-shape alignment with the recall scorer and Y points were genuine reasoning improvements; production UX impact is captured separately by the qualitative pre/post on Mia-shaped questions."
+
+This is the inverse of the test-fixing problem the brief asked me to look for: not "we changed the scorer to match the agent" but "we shaped the agent to match the scorer's tokenizer." The product justification covers it; the scorer-targeting portion should still be named.
+
+### Verdict
+
+**SHIP-WITH-FIXES.**
+
+Recommended order:
+1. **Land CR-A1 (line 832 edit) and CR-A2 (`PARTICIPATES_IN` → `JOINED`) before the bench re-run is interpreted** — both are 1-line edits. Without CR-A1 the agent gets contradictory guidance on the exact class of question this commit fixes; without CR-A2 the prompt asks the agent to reason over a predicate that doesn't exist.
+2. **Add HI-A2 cold-start fallback in the same wave** — one sentence appended to F-A2.
+3. **Address HI-A1 in the bench writeup** — even if the prompt example isn't edited, the bench post-mortem should report the scorer-shape vs. reasoning-shape decomposition described above.
+4. MD-A1, MD-A2, LO-A1 are V1.14.7 hygiene; not blockers.
+
+Without the CRs landed in the same wave, the bench re-run measures an internally-conflicted prompt and the result will be harder to interpret cleanly.
+
