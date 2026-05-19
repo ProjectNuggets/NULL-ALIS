@@ -34,6 +34,7 @@ const providers = @import("providers/root.zig");
 const embeddings = @import("memory/vector/embeddings.zig");
 const entity_pipeline = @import("agent/entity_pipeline.zig");
 const tools_mod = @import("tools/root.zig");
+const tool_sandbox_v1 = @import("tools/tool_sandbox_v1.zig");
 const entitlement_mod = @import("entitlement.zig");
 const runtime_resolver = @import("delivery/runtime_resolver.zig");
 const inbound_canonicalizer = @import("inbound_canonicalizer.zig");
@@ -2333,6 +2334,12 @@ fn inboundDispatcherThread(
 /// `host` and `port` are CLI-parsed values that override `config.gateway`.
 pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16) !void {
     ignoreSigpipe();
+
+    // V8 (v1.14.13 Step 0): if the operator launched with
+    // NULLALIS_ALLOW_UNSANDBOXED_DEV=1 they consented to a development-only
+    // bypass of the tool sandbox when no real backend is installed.
+    // Surface that loudly at boot so it never hides in stdout noise.
+    tool_sandbox_v1.logUnsandboxedDevBannerIfEnabled();
 
     // Ensure lifecycle parity: workspace bootstrap files must exist
     // even when users skip onboard and start runtime directly.

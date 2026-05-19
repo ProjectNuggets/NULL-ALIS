@@ -484,7 +484,30 @@ pub fn build(b: *std.Build) void {
 
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
 
+    // V8 (v1.14.13 Step 0): security tests live outside src/ because
+    // they pin cross-module boundaries (sandbox bypass gate). Wire each
+    // such test as its own addTest step with `nullalis` as an import.
+    const security_sandbox_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/security/sandbox_fail_closed_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nullalis", .module = lib_mod },
+            },
+        }),
+    });
+    if (sqlite3) |lib| {
+        security_sandbox_tests.linkLibrary(lib);
+    }
+    if (enable_postgres) {
+        addHomebrewLibpqPaths(security_sandbox_tests);
+        addHomebrewLibpqPaths(security_sandbox_tests.root_module);
+        security_sandbox_tests.root_module.linkSystemLibrary("pq", .{});
+    }
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+    test_step.dependOn(&b.addRunArtifact(security_sandbox_tests).step);
 }
