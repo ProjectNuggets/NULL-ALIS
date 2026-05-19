@@ -1612,6 +1612,7 @@ const TenantRuntime = struct {
             provider_i, // V1.8-1: judge_provider (was null)
             runtime.config.default_model, // V1.8-1: judge_model_name (was null)
             cmt96_coref_embed,
+            runtime.config.agent.extraction_cardinality_fastpath, // V1.14.12 (M2 review CRITICAL)
         );
 
         // V1.12 — wire wiki_link tool with the same provider+model+embedder
@@ -1675,11 +1676,40 @@ const TenantRuntime = struct {
                     // Closes the third callsite where contradictions
                     // could land but didn't (commands.zig session-end).
                     runtime.session_mgr.extraction_judge_provider = provider_i;
-                    runtime.session_mgr.extraction_judge_model_name = runtime.config.default_model orelse "";
-                    log.info("extraction.enabled user_id={d} coref={s} judge={s}", .{
+                    // V1.14.8.1 (2026-05-10): prefer the dedicated
+                    // extraction sidecar override when set. Falls back to
+                    // default_model only when no override is configured.
+                    // Kimi K2.5 (a typical default_model on the zaki_bot
+                    // profile) is a reasoning model and produces empty
+                    // `content` on JSON-extraction prompts because it burns
+                    // its output budget on hidden reasoning — the override
+                    // lets ops pin a non-reasoning model like
+                    // Llama-3.3-70B-Instruct-Turbo without changing the
+                    // primary chat model.
+                    runtime.session_mgr.extraction_judge_model_name = if (runtime.config.agent.extraction_judge_model.len > 0)
+                        runtime.config.agent.extraction_judge_model
+                    else
+                        runtime.config.default_model orelse "";
+                    // V1.14.12 (M5) — thread the legacy direct-write
+                    // flag from config to session manager. Default true
+                    // (1-week soak); operator flips to false in config
+                    // after M1 telemetry confirms redundancy.
+                    //
+                    // V1.14.12 (Path A) — M5 safety guard + flag-flip override removed.
+                    // The legacy direct paths and their flag are deleted;
+                    // extractAtBoundary now handles null judge gracefully
+                    // (runner.zig:798), eliminating the silent-data-loss
+                    // vector the override protected against.
+                    //
+                    // V1.14.12 (M2 review CRITICAL) — wire fast-path flag
+                    // from config to session_mgr so each per-session Agent
+                    // inherits it and propagates to JudgeContext.
+                    runtime.session_mgr.extraction_cardinality_fastpath = runtime.config.agent.extraction_cardinality_fastpath;
+                    log.info("extraction.enabled user_id={d} coref={s} judge={s} cardinality_fastpath={s}", .{
                         numeric_user_id,
                         if (coref_on) "on" else "off-no-embed",
                         "wired-session-end-v1.9-6",
+                        if (runtime.config.agent.extraction_cardinality_fastpath) "on" else "off",
                     });
                 }
             } else |_| {
@@ -11678,6 +11708,33 @@ fn buildBrainReferenceEdges(
     return edges.toOwnedSlice(allocator);
 }
 
+/// V1.14.12 (Memory audit Finding 2 fix, 2026-05-19) — `entity_<hex>`
+/// targets are not stored in the `memories` table; they live in
+/// `memory_entities` (coref-resolved IDs) or are synthesized hashes
+/// (`deriveEntityKey` shape: `entity_<sha256(lower(name))[..16hex]>`).
+/// Recognize either shape so the typed-edge filter allows edges from a
+/// visible memory row to such a target; entity-side BrainNodes are
+/// synthesized by the caller after `buildBrainTypedEdges` returns.
+fn isEntityNodeKey(key: []const u8) bool {
+    // Shape 1: hash fallback `entity_<16 hex>` (deriveEntityKey).
+    if (std.mem.startsWith(u8, key, "entity_")) {
+        const tail = key[7..];
+        if (tail.len != 16) return false;
+        for (tail) |ch| {
+            const is_hex = (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f');
+            if (!is_hex) return false;
+        }
+        return true;
+    }
+    // Shape 2: coref-resolved random ID — 32 hex chars, no prefix.
+    if (key.len != 32) return false;
+    for (key) |ch| {
+        const is_hex = (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f');
+        if (!is_hex) return false;
+    }
+    return true;
+}
+
 /// V1.7a-3 — typed-edge builder, materialized-table variant.
 ///
 /// Reads typed edges from the canonical `memory_edges` table via
@@ -11687,6 +11744,15 @@ fn buildBrainReferenceEdges(
 /// rejected-predicate filter (defense-in-depth), and caps each source's
 /// outbound edges at `BRAIN_TYPED_EDGE_CAP_PER_SOURCE` for hub-node
 /// budget control.
+///
+/// V1.14.12 (Memory audit Finding 2 fix, 2026-05-19) — edges to
+/// entity-shape targets (entity_<16hex> or 32-hex coref IDs) are
+/// preserved instead of dropped. The caller synthesizes BrainNode-
+/// kind="entity" entries for these targets so the FE has both endpoints.
+/// Pre-fix, the strict "both endpoints in visible set" rule silently
+/// dropped all typed edges from visible memory rows to entity refs,
+/// making /brain/graph look empty even when extraction had populated
+/// the edge table.
 ///
 /// **Why findEdgesByKeys not listEdgesForUser:** post-cmt9.8 v1 used
 /// listEdgesForUser, which scales with the user's TOTAL edge count.
@@ -11780,10 +11846,17 @@ fn buildBrainTypedEdges(
     }
 
     for (incident_edges) |e| {
-        // Both endpoints must be in the rendered node set; an incident
-        // edge to an off-graph endpoint would dangle.
+        // Source endpoint MUST be a visible memory row — edges from
+        // hidden/off-graph sources would surface continuity-internal
+        // connections the user shouldn't see.
         if (!visible.contains(e.source_key)) continue;
-        if (!visible.contains(e.target_key)) continue;
+        // V1.14.12 (Memory audit Finding 2 fix, 2026-05-19) — target
+        // is allowed to be either a visible memory row OR an entity-
+        // shape key. Caller materializes the entity side as a
+        // BrainNode-kind="entity" so the FE has both endpoints. The
+        // old strict "both endpoints visible" rule dropped every typed
+        // edge from memory→entity_<hex>, making /brain/graph look empty.
+        if (!visible.contains(e.target_key) and !isEntityNodeKey(e.target_key)) continue;
 
         // Defense-in-depth predicate filter (matches old JSONB path).
         if (isRejectedExtractionPredicate(e.predicate)) continue;
@@ -11928,10 +12001,6 @@ fn handleBrainGraph(
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
     };
 
-    const state_mgr = state.zaki_state orelse {
-        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
-    };
-
     // ── Parse query params ────────────────────────────────────────
     const since_param = parseQueryParam(target, "since");
     const max_nodes_param = parseQueryParam(target, "max_nodes");
@@ -11940,6 +12009,7 @@ fn handleBrainGraph(
     const search_param = parseQueryParam(target, "search");
     const link_types_csv = parseQueryParam(target, "link_types");
     const exclude_orphans_param = parseQueryParam(target, "exclude_orphans");
+    const semantic_min_weight_param = parseQueryParam(target, "semantic_min_weight");
     const exclude_orphans: bool = if (exclude_orphans_param) |s|
         (std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "1"))
     else
@@ -11947,11 +12017,28 @@ fn handleBrainGraph(
 
     const since: ?i64 = if (since_param) |s| std.fmt.parseInt(i64, s, 10) catch null else null;
     var max_nodes: u32 = if (max_nodes_param) |s|
-        std.fmt.parseInt(u32, s, 10) catch BRAIN_DEFAULT_MAX_NODES
+        std.fmt.parseInt(u32, s, 10) catch {
+            // Fail closed on malformed explicit caps. A literal shell token
+            // like `max_nodes=$n` previously expanded to the 500-node default,
+            // making manual smoke tests much heavier than intended.
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_max_nodes\"}" };
+        }
     else
         BRAIN_DEFAULT_MAX_NODES;
     if (max_nodes == 0) max_nodes = BRAIN_DEFAULT_MAX_NODES;
     if (max_nodes > BRAIN_MAX_MAX_NODES) max_nodes = BRAIN_MAX_MAX_NODES;
+    const semantic_threshold = blk: {
+        const requested = if (semantic_min_weight_param) |s|
+            std.fmt.parseFloat(f32, s) catch BRAIN_SEMANTIC_THRESHOLD
+        else
+            BRAIN_SEMANTIC_THRESHOLD;
+        if (!std.math.isFinite(requested)) break :blk BRAIN_SEMANTIC_THRESHOLD;
+        break :blk std.math.clamp(requested, BRAIN_SEMANTIC_THRESHOLD, 1.0);
+    };
+
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
 
     // ── Fetch nodes ───────────────────────────────────────────────
     // listMemoriesBrainVisible applies BOTH the bi-temporal validity
@@ -12149,7 +12236,7 @@ fn handleBrainGraph(
             allocator,
             numeric_user_id,
             keys,
-            BRAIN_SEMANTIC_THRESHOLD,
+            semantic_threshold,
             BRAIN_SEMANTIC_MAX_PAIRS,
         ) catch blk: {
             semantic_degraded = true;
@@ -12240,6 +12327,37 @@ fn handleBrainGraph(
     const typed_edges = buildBrainTypedEdges(allocator, nodes, state_mgr, numeric_user_id) catch empty_typed;
     defer freeBrainTypedEdges(allocator, typed_edges);
 
+    // ── V1.14.12 (Memory audit Finding 2 fix, 2026-05-19) ─────────────
+    // Synthesize entity-side BrainNodes for entity-shape targets in the
+    // typed-edge set. Pre-fix, edges from a visible memory row to an
+    // entity_<hex> target were dropped because the target wasn't in
+    // `nodes[]`. Now buildBrainTypedEdges keeps those edges; we look up
+    // each unique entity target's name via findEntitiesByKeys and emit
+    // a kind="entity" node so the FE has both endpoints to render.
+    //
+    // Hash-fallback shape (entity_<16hex> from extraction_persist.
+    // deriveEntityKey) has no memory_entities row — use the key itself
+    // as a synthetic label.
+    var entity_keys_dedupe: std.StringHashMapUnmanaged(void) = .{};
+    defer entity_keys_dedupe.deinit(allocator);
+    var entity_keys_list: std.ArrayListUnmanaged([]const u8) = .{};
+    defer entity_keys_list.deinit(allocator);
+    for (typed_edges) |e| {
+        if (!isEntityNodeKey(e.target)) continue;
+        const gop = entity_keys_dedupe.getOrPut(allocator, e.target) catch continue;
+        if (!gop.found_existing) entity_keys_list.append(allocator, e.target) catch continue;
+    }
+    const entity_rows_alloc = state_mgr.findEntitiesByKeys(allocator, numeric_user_id, entity_keys_list.items) catch &[_]memory_mod.EntityRow{};
+    defer {
+        for (entity_rows_alloc) |*r| r.deinit(allocator);
+        allocator.free(entity_rows_alloc);
+    }
+    // Map id → name for fast label lookup. Entity refs not present in the
+    // result fall back to the key itself as a label.
+    var entity_name_map: std.StringHashMapUnmanaged([]const u8) = .{};
+    defer entity_name_map.deinit(allocator);
+    for (entity_rows_alloc) |r| entity_name_map.put(allocator, r.id, r.name) catch {};
+
     // ── V1.6 commit 4 — compute per-node importance score ────────────
     //
     // Sized for FE node-radius rendering (M1 from spec §4.3). Count
@@ -12314,6 +12432,10 @@ fn handleBrainGraph(
             }
             displayed_keys.put(allocator, n.key, {}) catch {};
         }
+        // V1.14.12 (Memory audit Finding 2 fix) — entity refs are always
+        // displayed (they only exist as edge endpoints; degree=0 is
+        // impossible by construction). Skip the orphan filter for them.
+        for (entity_keys_list.items) |k| displayed_keys.put(allocator, k, {}) catch {};
     }
 
     // ── Build JSON response ──────────────────────────────────────
@@ -12403,6 +12525,26 @@ fn handleBrainGraph(
             w.writeAll("null,\"community_name\":null") catch return response_build_err;
         }
         w.writeAll("}") catch return response_build_err;
+    }
+
+    // V1.14.12 (Memory audit Finding 2 fix, 2026-05-19) — emit entity-
+    // side nodes for the targets of typed edges that don't have a
+    // memories-table row. Each gets kind="entity" so the FE can style
+    // them distinctly. Label is the entity's display name from
+    // memory_entities (when coref-resolved) or the key itself as a
+    // synthetic fallback (hash-shape entity_<16hex>). importance=0 and
+    // community fields null — entity refs are connection points, not
+    // first-class memory rows.
+    for (entity_keys_list.items) |ek| {
+        if (!displayed_keys.contains(ek)) continue;
+        if (!first_node_emitted) w.writeAll(",") catch return response_build_err;
+        first_node_emitted = false;
+        const label = entity_name_map.get(ek) orelse ek;
+        w.writeAll("{\"id\":\"") catch return response_build_err;
+        jsonEscapeInto(w, ek) catch return response_build_err;
+        w.writeAll("\",\"kind\":\"entity\",\"created_at\":0,\"session_id\":null,\"summary\":\"") catch return response_build_err;
+        jsonEscapeInto(w, label) catch return response_build_err;
+        w.writeAll("\",\"valid_to\":null,\"importance\":0.000,\"community_id\":null,\"community_name\":null}") catch return response_build_err;
     }
 
     w.writeAll("],\"edges\":[") catch return response_build_err;
@@ -17574,6 +17716,44 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
     ctx.response_body = "{\"status\":\"ok\"}";
 }
 
+const HTTP_RESPONSE_WRITE_TIMEOUT_MS: i32 = 30_000;
+
+fn waitForHttpResponseWritable(stream: anytype) !void {
+    const StreamType = @TypeOf(stream);
+    const DeclType = switch (@typeInfo(StreamType)) {
+        .pointer => |ptr| ptr.child,
+        else => StreamType,
+    };
+    if (@hasDecl(DeclType, "waitWritable")) {
+        return stream.waitWritable();
+    }
+
+    var fds = [_]std.posix.pollfd{.{
+        .fd = stream.handle,
+        .events = @intCast(std.posix.POLL.OUT),
+        .revents = 0,
+    }};
+    const ready = try std.posix.poll(&fds, HTTP_RESPONSE_WRITE_TIMEOUT_MS);
+    if (ready == 0) return error.ResponseWriteTimeout;
+    const failure_mask: i16 = @intCast(std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL);
+    if ((fds[0].revents & failure_mask) != 0) return error.BrokenPipe;
+}
+
+fn writeHttpResponseBytes(stream: anytype, bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const written = stream.write(bytes[offset..]) catch |err| {
+            if (@as(anyerror, err) == error.WouldBlock) {
+                try waitForHttpResponseWritable(stream);
+                continue;
+            }
+            return err;
+        };
+        if (written == 0) return error.BrokenPipe;
+        offset += written;
+    }
+}
+
 fn sendHttpResponse(stream: anytype, status: []const u8, content_type: []const u8, body: []const u8) !void {
     var header_buf: [512]u8 = undefined;
     const header = try std.fmt.bufPrint(
@@ -17581,8 +17761,8 @@ fn sendHttpResponse(stream: anytype, status: []const u8, content_type: []const u
         "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
         .{ status, content_type, body.len },
     );
-    try stream.writeAll(header);
-    if (body.len > 0) try stream.writeAll(body);
+    try writeHttpResponseBytes(stream, header);
+    if (body.len > 0) try writeHttpResponseBytes(stream, body);
 }
 
 fn sendHttpResponseRetryAfter(
@@ -17598,8 +17778,8 @@ fn sendHttpResponseRetryAfter(
         "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nRetry-After: {d}\r\nConnection: close\r\n\r\n",
         .{ status, content_type, body.len, @max(@as(u16, 1), retry_after_secs) },
     );
-    try stream.writeAll(header);
-    if (body.len > 0) try stream.writeAll(body);
+    try writeHttpResponseBytes(stream, header);
+    if (body.len > 0) try writeHttpResponseBytes(stream, body);
 }
 
 fn setListenerNonBlocking(server: *std.net.Server) void {
@@ -18140,9 +18320,22 @@ fn handleAcceptedConnection(
     }
 
     if (response_retry_after_secs) |retry_secs| {
-        sendHttpResponseRetryAfter(conn.stream, response_status, response_content_type, response_body, retry_secs) catch {};
+        sendHttpResponseRetryAfter(conn.stream, response_status, response_content_type, response_body, retry_secs) catch |err| {
+            log.warn("http response write failed status={s} body_len={d} retry_after={d} err={s}", .{
+                response_status,
+                response_body.len,
+                retry_secs,
+                @errorName(err),
+            });
+        };
     } else {
-        sendHttpResponse(conn.stream, response_status, response_content_type, response_body) catch {};
+        sendHttpResponse(conn.stream, response_status, response_content_type, response_body) catch |err| {
+            log.warn("http response write failed status={s} body_len={d} err={s}", .{
+                response_status,
+                response_body.len,
+                @errorName(err),
+            });
+        };
     }
 }
 
@@ -22716,6 +22909,79 @@ test "readHttpRequestFromReader maps WouldBlock to RequestTimeout" {
     try std.testing.expectError(error.RequestTimeout, readHttpRequestFromReader(std.testing.allocator, &reader));
 }
 
+test "sendHttpResponse writes full large body across partial writes" {
+    const ChunkyStream = struct {
+        allocator: std.mem.Allocator,
+        max_chunk: usize,
+        out: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn write(self: *@This(), bytes: []const u8) error{OutOfMemory}!usize {
+            const n = @min(self.max_chunk, bytes.len);
+            try self.out.appendSlice(self.allocator, bytes[0..n]);
+            return n;
+        }
+
+        fn waitWritable(_: *@This()) !void {}
+
+        fn deinit(self: *@This()) void {
+            self.out.deinit(self.allocator);
+        }
+    };
+
+    const body = try std.testing.allocator.alloc(u8, 700 * 1024);
+    defer std.testing.allocator.free(body);
+    @memset(body, 'x');
+
+    var stream = ChunkyStream{
+        .allocator = std.testing.allocator,
+        .max_chunk = 8191,
+    };
+    defer stream.deinit();
+
+    try sendHttpResponse(&stream, "200 OK", "application/json", body);
+
+    const expected_header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 716800\r\nConnection: close\r\n\r\n";
+    try std.testing.expect(std.mem.startsWith(u8, stream.out.items, expected_header));
+    try std.testing.expectEqual(expected_header.len + body.len, stream.out.items.len);
+    try std.testing.expectEqualSlices(u8, body, stream.out.items[expected_header.len..]);
+}
+
+test "sendHttpResponse waits and resumes when response write would block" {
+    const WouldBlockStream = struct {
+        allocator: std.mem.Allocator,
+        blocked: bool = false,
+        wait_count: usize = 0,
+        out: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn write(self: *@This(), bytes: []const u8) error{ WouldBlock, OutOfMemory }!usize {
+            if (!self.blocked and self.out.items.len > 0) {
+                self.blocked = true;
+                return error.WouldBlock;
+            }
+            const n = @min(@as(usize, 7), bytes.len);
+            try self.out.appendSlice(self.allocator, bytes[0..n]);
+            return n;
+        }
+
+        fn waitWritable(self: *@This()) !void {
+            self.wait_count += 1;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.out.deinit(self.allocator);
+        }
+    };
+
+    var stream = WouldBlockStream{ .allocator = std.testing.allocator };
+    defer stream.deinit();
+
+    try sendHttpResponse(&stream, "200 OK", "application/json", "{\"ok\":true}");
+
+    try std.testing.expectEqual(@as(usize, 1), stream.wait_count);
+    try std.testing.expect(std.mem.endsWith(u8, stream.out.items, "{\"ok\":true}"));
+    try std.testing.expect(std.mem.indexOf(u8, stream.out.items, "Content-Length: 11") != null);
+}
+
 test "userFacingAgentError maps ProviderDoesNotSupportVision" {
     try std.testing.expectEqualStrings(
         "The current provider does not support image input.",
@@ -24438,7 +24704,10 @@ test "tenant preference application uses operator-owned assistant mode presets" 
     try std.testing.expectEqualStrings("off", cfg.agent.send_mode);
     try std.testing.expectEqualStrings("inbound", cfg.agent.tts_mode);
     try std.testing.expect(cfg.agent.tts_audio);
-    try std.testing.expectEqual(@as(?u64, 2700), cfg.agent.session_ttl_secs);
+    // V1.14.11: session_timeout_minutes now wires to idle eviction,
+    // not hard TTL. Hard TTL stays operator-only via raw config.json.
+    try std.testing.expectEqual(@as(u64, 2700), cfg.agent.session_idle_timeout_secs);
+    try std.testing.expectEqual(@as(?u64, null), cfg.agent.session_ttl_secs);
     try std.testing.expect(cfg.memory.summarizer.enabled);
     try std.testing.expectEqual(@as(u32, 8000), cfg.memory.summarizer.window_size_tokens);
     try std.testing.expectEqual(@as(u32, 700), cfg.memory.summarizer.summary_max_tokens);
@@ -26242,6 +26511,72 @@ test "brain: buildBrainTypedEdges (V1.7a-3) materialized path filters + caps + s
     try std.testing.expectEqual(BRAIN_TYPED_EDGE_CAP_PER_SOURCE, node_d_edge_count);
 }
 
+test "V1.14.12 (Memory audit Finding 2): isEntityNodeKey shape detection" {
+    // Hash-fallback shape: entity_<16 hex>
+    try std.testing.expect(isEntityNodeKey("entity_0123456789abcdef"));
+    try std.testing.expect(isEntityNodeKey("entity_aaaaaaaaaaaaaaaa"));
+    try std.testing.expect(!isEntityNodeKey("entity_short")); // not 16 hex
+    try std.testing.expect(!isEntityNodeKey("entity_0123456789abcdefXX")); // 18 chars
+    try std.testing.expect(!isEntityNodeKey("entity_ZZZZZZZZZZZZZZZZ")); // not hex
+
+    // Coref-resolved shape: 32 hex chars, no prefix
+    try std.testing.expect(isEntityNodeKey("0123456789abcdef0123456789abcdef"));
+    try std.testing.expect(!isEntityNodeKey("0123456789abcdef0123456789abcde")); // 31 chars
+    try std.testing.expect(!isEntityNodeKey("0123456789abcdef0123456789abcdeg")); // 'g' not hex
+
+    // Regular memory keys are NOT entity-shaped
+    try std.testing.expect(!isEntityNodeKey("user_lang"));
+    try std.testing.expect(!isEntityNodeKey("extracted_1700000000_abcdef12"));
+    try std.testing.expect(!isEntityNodeKey("durable_fact/1700000000/0"));
+    try std.testing.expect(!isEntityNodeKey("node_GHOST"));
+    try std.testing.expect(!isEntityNodeKey("")); // empty
+}
+
+test "V1.14.12 (Memory audit Finding 2): buildBrainTypedEdges keeps edges to entity targets" {
+    // Pre-fix this edge was silently dropped because the entity target
+    // wasn't in the visible memory node set, making /brain/graph appear
+    // empty even when extraction had populated the edge table.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_brain_entity_edge_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    defer mgr.dropSchemaForTests() catch {};
+    try mgr.provisionUser(2, "/tmp/nullalis-brain-entity-edge-user-2/workspace");
+
+    try mgr.upsertMemory(2, "extracted_user_pref", "user PREFERS Helix", .core, null);
+    // Entity-shape targets (both shapes the extraction pipeline emits).
+    try mgr.upsertMemoryEdge(2, "extracted_user_pref", "entity_abcdef1234567890", "PREFERS", "extraction_classifier", 0.95);
+    try mgr.upsertMemoryEdge(2, "extracted_user_pref", "fedcba9876543210fedcba9876543210", "PREFERS", "extraction_classifier", 0.95);
+    // Non-entity off-graph target — still must be filtered.
+    try mgr.upsertMemoryEdge(2, "extracted_user_pref", "node_OFFSCREEN", "RELATES_TO", "extraction", 0.5);
+
+    const nodes = [_]BrainNode{
+        .{ .key = "extracted_user_pref", .kind = "core", .session_id = null, .created_at = 0, .summary = "", .valid_to = null },
+    };
+    const edges = try buildBrainTypedEdges(allocator, &nodes, &mgr, 2);
+    defer freeBrainTypedEdges(allocator, edges);
+
+    // Expected: 2 entity-target edges kept, 1 non-entity off-graph edge dropped.
+    try std.testing.expectEqual(@as(usize, 2), edges.len);
+    var saw_hash_shape = false;
+    var saw_coref_shape = false;
+    for (edges) |e| {
+        if (std.mem.eql(u8, e.target, "entity_abcdef1234567890")) saw_hash_shape = true;
+        if (std.mem.eql(u8, e.target, "fedcba9876543210fedcba9876543210")) saw_coref_shape = true;
+    }
+    try std.testing.expect(saw_hash_shape);
+    try std.testing.expect(saw_coref_shape);
+}
+
 test "brain: buildBrainTypedEdges (V1.7a-3) returns empty for user with no edges" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -26330,6 +26665,13 @@ test "handleBrainGraph rejects invalid user_id" {
     var dummy_state: GatewayState = undefined;
     const resp = handleBrainGraph(std.testing.allocator, "GET", "not_a_number", "/api/v1/users/not_a_number/brain/graph", &dummy_state);
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+test "handleBrainGraph rejects malformed max_nodes" {
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainGraph(std.testing.allocator, "GET", "1", "/api/v1/users/1/brain/graph?max_nodes=$n", &dummy_state);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid_max_nodes") != null);
 }
 
 // ── /brain/timeline cursor pagination unit tests ───────────────────

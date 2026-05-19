@@ -835,6 +835,26 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("session_idle_timeout_secs")) |v| {
                 if (v == .integer) self.agent.session_idle_timeout_secs = @intCast(v.integer);
             }
+            // V1.14.8.1 (2026-05-10): extraction sidecar model override.
+            // Empty = inherit default_model (legacy behavior). See
+            // AgentConfig.extraction_judge_model docstring for rationale.
+            if (ag.object.get("extraction_judge_model")) |v| {
+                if (v == .string) self.agent.extraction_judge_model = try self.allocator.dupe(u8, v.string);
+            }
+            // V1.14.12 (M2/M3/M5 hardening pass) — wire the three new
+            // gate flags so operators can actually override them via
+            // config.json. Without these, the AgentConfig defaults are
+            // the only values reachable and a "set this to false in
+            // config" recommendation silently no-ops.
+            if (ag.object.get("extraction_cardinality_fastpath")) |v| {
+                if (v == .bool) self.agent.extraction_cardinality_fastpath = v.bool;
+            }
+            if (ag.object.get("extraction_coverage_filter_enabled")) |v| {
+                if (v == .bool) self.agent.extraction_coverage_filter_enabled = v.bool;
+            }
+            // V1.14.12 (Path A) — extraction_legacy_direct_writes reader removed.
+            // Field deleted from AgentConfig; the M5 gated legacy paths
+            // no longer exist (deleted in commands.zig + compaction.zig).
             if (ag.object.get("compaction_keep_recent")) |v| {
                 if (v == .integer) self.agent.compaction_keep_recent = @intCast(v.integer);
             }

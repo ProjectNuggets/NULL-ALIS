@@ -1369,13 +1369,20 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             // commands; future commit may collapse to single-write once
             // those tools migrate to extracted_* keys.
             //
+            // V1.14.12 (Memory audit Finding 1 fix, 2026-05-19) — the
+            // durable_fact/* prefix is now brain-VISIBLE (was previously
+            // hidden via BRAIN_HIDDEN_PREFIXES, which combined with the
+            // MD5 dedup below to make session-end facts invisible
+            // everywhere). The dedup below is now intentional, not a
+            // bug: durable_fact is THE visible user-facing row; the
+            // extracted_<hash> path is the (no-op'd) coref+judge enrich
+            // path. The edge write further below ALWAYS fires regardless
+            // of MD5 dedup — covers the graph half of unification.
+            //
             // MD5 dedup in persistExtracted will see the durable_fact row's
             // identical content_hash and silently skip the extracted_<hash>
-            // write. To make BOTH writes succeed, we'd need to bypass MD5
-            // for triple-bearing session-end writes — deferred. Today the
-            // edge write below ALWAYS fires (covers the graph half of
-            // unification); the persistExtracted call covers the coref +
-            // judge half when content is novel enough.
+            // write. This is the intended behavior post-Finding-1: one
+            // visible row per session-end fact, not two.
             if (fact.hasTriple()) {
                 if (self.extraction_state_mgr) |smgr| {
                     if (self.extraction_user_id) |uid| {
@@ -1398,63 +1405,13 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                             triple_edges_written += 1;
                         }
 
-                        // V1.7 cmt9.6: also route through persistExtracted for
-                        // coref + source attribution + (future) judge. Coref
-                        // creates/reuses entity row in memory_entities; source
-                        // attribution writes session_id + snippet to the new
-                        // extracted_<hash> row. Judge skipped today (Agent
-                        // doesn't carry judge_provider plumb yet — TODO).
-                        // Failure non-fatal: edge already wrote above.
-                        const mems = [_]extraction_persist.ExtractedMemory{.{
-                            .text = fact.content,
-                            .subject = fact.subject.?,
-                            .predicate = fact.predicate.?,
-                            .object = fact.object.?,
-                            .attributed_to = fact.attributed_to orelse "user",
-                            .confidence = fact.confidence orelse 0.9,
-                        }};
-                        const coref_ctx: ?extraction_persist.EntityResolution =
-                            if (self.extraction_coref_embed) |ep|
-                                extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 }
-                            else
-                                null;
-                        // V1.9-6: judge_ctx now wired. V1.7-IN-03 closed.
-                        // Mirrors the gateway's V1.8-1 wiring of
-                        // memory_store + compaction Pass C — same provider,
-                        // same model, same JudgeContext shape. Closes
-                        // ZAKI's "MNDA blocked vs signed coexist" pain
-                        // class (his stress-test letter named this) where
-                        // session-end durable_fact writes accumulated
-                        // contradictory states because the judge never ran.
-                        const judge_ctx: ?extraction_persist.JudgeContext = blk: {
-                            if (self.extraction_judge_provider) |jp| {
-                                if (self.extraction_judge_model_name.len > 0) {
-                                    break :blk extraction_persist.JudgeContext{
-                                        .provider = jp,
-                                        .model_name = self.extraction_judge_model_name,
-                                    };
-                                }
-                            }
-                            break :blk null;
-                        };
-                        _ = extraction_persist.persistExtracted(
-                            self.allocator,
-                            smgr,
-                            uid,
-                            session_id,
-                            &mems,
-                            judge_ctx,
-                            coref_ctx,
-                            self.mem_rt, // V1.8-2: vector coverage on session-end
-                        ) catch |err| {
-                            log.warn("session_end persistExtracted failed key={s} err={s}", .{
-                                fact_key, @errorName(err),
-                            });
-                        };
-                        log.info("session_end.persistExtracted judge_ctx={s} key={s}", .{
-                            if (judge_ctx != null) "wired" else "null",
-                            fact_key,
-                        });
+                        // V1.14.12 (Path A) — legacy direct write deleted.
+                        // Session-end durable_fact promotion flows entirely
+                        // through extractAtBoundary at the block below
+                        // (write_origin = .session_end_extract). The
+                        // extractAtBoundary path now handles null-judge
+                        // gracefully so this deletion doesn't regress
+                        // no-judge tenants.
                     }
                 }
             }
@@ -1475,34 +1432,44 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         // soft per layer; existing per-fact persist remains the legacy
         // primary writer until C5 cleanup. Dedup at persistExtracted handles
         // overlap between the two paths.
-        if (self.extraction_judge_provider) |jp| {
-            if (self.extraction_judge_model_name.len > 0 and self.history.items.len > 0) {
-                var msgs_buf = std.ArrayListUnmanaged(providers.ChatMessage).initCapacity(self.allocator, self.history.items.len) catch null;
-                if (msgs_buf) |*buf| {
-                    defer buf.deinit(self.allocator);
-                    for (self.history.items) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
-                    const ctx = extraction_runner.ExtractionContext{
-                        .judge_provider = jp,
-                        .judge_model = self.extraction_judge_model_name,
-                        .state_mgr = self.extraction_state_mgr,
-                        .user_id = self.extraction_user_id,
-                        .session_id = session_id,
-                        .coref_embed = self.extraction_coref_embed,
-                        .archive_mem = self.mem,
-                        .archive_mem_rt = self.mem_rt,
-                    };
-                    const br = extraction_runner.extractAtBoundary(self.allocator, buf.items, ctx);
-                    defer br.deinit(self.allocator);
-                    log.info(
-                        "session_end.unified_extract entities={d} edges={d} hydration_present={} session={s}",
-                        .{
-                            if (br.extraction) |e| e.entities.len else 0,
-                            if (br.extraction) |e| e.edges.len else 0,
-                            br.hydration != null,
-                            session_id,
-                        },
-                    );
-                }
+        // V1.14.12 (Path A) — judge guard removed. extractAtBoundary now
+        // handles null-judge gracefully (judge_ctx becomes null inside
+        // runner.zig when judge_model is empty). No-judge tenants get
+        // MD5+canonical-key dedup only — same as the legacy direct
+        // path's pre-M5 behavior. This unblocks deletion of the gated
+        // legacy direct path at this file's session-end block.
+        if (self.history.items.len > 0) {
+            var msgs_buf = std.ArrayListUnmanaged(providers.ChatMessage).initCapacity(self.allocator, self.history.items.len) catch null;
+            if (msgs_buf) |*buf| {
+                defer buf.deinit(self.allocator);
+                for (self.history.items) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
+                const ctx = extraction_runner.ExtractionContext{
+                    // Provider may be null when no judge configured;
+                    // runner.zig:798 checks judge_model.len before
+                    // constructing JudgeContext, so this `orelse undefined`
+                    // is never read in the no-judge path.
+                    .judge_provider = self.extraction_judge_provider orelse undefined,
+                    .judge_model = self.extraction_judge_model_name,
+                    .state_mgr = self.extraction_state_mgr,
+                    .user_id = self.extraction_user_id,
+                    .session_id = session_id,
+                    .coref_embed = self.extraction_coref_embed,
+                    .archive_mem = self.mem,
+                    .archive_mem_rt = self.mem_rt,
+                    .write_origin = .session_end_extract, // V1.14.12 (M1) — per-path telemetry tag
+                    .cardinality_fastpath_enabled = self.extraction_cardinality_fastpath, // V1.14.12 (M2 review CRITICAL)
+                };
+                const br = extraction_runner.extractAtBoundary(self.allocator, buf.items, ctx);
+                defer br.deinit(self.allocator);
+                log.info(
+                    "session_end.unified_extract entities={d} edges={d} hydration_present={} session={s}",
+                    .{
+                        if (br.extraction) |e| e.entities.len else 0,
+                        if (br.extraction) |e| e.edges.len else 0,
+                        br.hydration != null,
+                        session_id,
+                    },
+                );
             }
         }
 
@@ -1636,6 +1603,117 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
 
 pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
     _ = persistSessionCheckpointDetailed(self, reason);
+}
+
+/// V1.14.10 A — Async lifecycle checkpoint.
+///
+/// Spawns a detached worker thread that runs
+/// `persistSessionCheckpointDetailed` off the agent's hot path. Used
+/// by hot-path callers (compaction:auto, summary_seed:auto in
+/// root.zig) to prevent the 30-180s post-reply lifecycle from
+/// blocking the HTTP response. Slow LLM contention can pile up legacy
+/// extraction calls (sometimes 100+ judge + coref calls per session)
+/// — sync execution makes the bench client see 180s read timeouts.
+///
+/// In-flight guard via the Agent's `lifecycle_in_flight` atomic:
+/// only one lifecycle worker per agent at a time. If a new trigger
+/// fires while one is in flight, it's silently dropped — the next
+/// legitimate trigger picks up whatever this one missed (lifecycle
+/// is naturally re-firing on every Pass C / summary_seed cycle).
+///
+/// Returns:
+///   `true`  — spawned successfully OR fell through to sync because
+///             the guard was clear; the write WILL happen (or has).
+///   `false` — guard was already set; trigger silently dropped.
+///             Caller should NOT advertise "continuity refreshed" on
+///             this turn — the previous worker is still running with
+///             prior data; THIS turn's trigger never enqueued.
+///
+/// V1.14.10 A review fix (M-03): the return value lets callers stop
+/// lying about `durable_continuity_refreshed = true` when the trigger
+/// was a no-op.
+///
+/// V1.14.10 A review fix (H-03): the spawn-failure fallback no longer
+/// runs sync. Under the very thread pressure that causes spawn to
+/// fail, sync execution re-introduces the exact 30-180s block this
+/// patch fixes. Instead we log and return false — the next legitimate
+/// trigger retries when (presumably) the thread pressure has cleared.
+///
+/// V1.14.10 A review fix (L-01): log lines include session_id for
+/// per-session debugging during bench analysis.
+///
+/// TTL-evict and operator-triggered (`reset:manual`) paths keep using
+/// the sync version — they already run off the HTTP turn so blocking
+/// is harmless.
+pub fn persistSessionCheckpointAsync(self: anytype, reason: []const u8) bool {
+    const session_id_for_log: []const u8 = self.memory_session_id orelse "unknown";
+    if (self.lifecycle_in_flight.swap(true, .acquire)) {
+        log.info("lifecycle.async.skip_in_flight reason={s} session={s}", .{ reason, session_id_for_log });
+        return false;
+    }
+    // Heap-allocate the worker context. Owned by the spawned thread;
+    // freed in `Worker.run`'s deferred cleanup (in the correct order:
+    // allocator work first, in-flight flag LAST — see review fix H-04
+    // for why ordering is load-bearing).
+    const Ctx = struct {
+        agent: @TypeOf(self),
+        reason_owned: []u8,
+        allocator: std.mem.Allocator,
+    };
+    const ctx = self.allocator.create(Ctx) catch {
+        self.lifecycle_in_flight.store(false, .release);
+        log.warn("lifecycle.async.alloc_failed reason={s} session={s} — dropping", .{ reason, session_id_for_log });
+        return false;
+    };
+    const reason_owned = self.allocator.dupe(u8, reason) catch {
+        self.lifecycle_in_flight.store(false, .release);
+        self.allocator.destroy(ctx);
+        log.warn("lifecycle.async.dupe_failed reason={s} session={s} — dropping", .{ reason, session_id_for_log });
+        return false;
+    };
+    ctx.* = .{ .agent = self, .reason_owned = reason_owned, .allocator = self.allocator };
+
+    const Worker = struct {
+        fn run(c: *Ctx) void {
+            // V1.14.10 A review fix (H-04): ordering matters here.
+            // Clearing `lifecycle_in_flight` BEFORE freeing the heap
+            // context releases any waiter (Agent.deinit) — which can
+            // then free the allocator out from under our subsequent
+            // `free(reason_owned)` and `destroy(c)` calls. UAF on the
+            // allocator itself.
+            //
+            // Fix: capture allocator-side pointers + agent ref BEFORE
+            // freeing the ctx; do the allocator work; THEN release
+            // the in-flight flag last so the waiter only observes
+            // `false` after all worker memory effects are done.
+            const allocator = c.allocator;
+            const reason_local = c.reason_owned;
+            const agent = c.agent;
+            _ = persistSessionCheckpointDetailed(agent, reason_local);
+            allocator.free(reason_local);
+            allocator.destroy(c);
+            // Release happens-before any subsequent acquire-load — the
+            // waiter that observes `false` will see ALL of the above
+            // memory effects, including the allocator's free state.
+            agent.lifecycle_in_flight.store(false, .release);
+        }
+    };
+
+    const thread = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, Worker.run, .{ctx}) catch {
+        // V1.14.10 A review fix (H-03): no more sync fallback. Under
+        // thread pressure (the exact condition causing spawn to fail),
+        // sync re-introduces the 180s block we're trying to fix.
+        // Clear the in-flight flag + free the context + log; the next
+        // legitimate trigger retries when pressure clears.
+        self.lifecycle_in_flight.store(false, .release);
+        self.allocator.free(reason_owned);
+        self.allocator.destroy(ctx);
+        log.warn("lifecycle.async.spawn_failed reason={s} session={s} — dropping (next trigger will retry)", .{ reason, session_id_for_log });
+        return false;
+    };
+    thread.detach();
+    log.info("lifecycle.async.spawned reason={s} session={s}", .{ reason, session_id_for_log });
+    return true;
 }
 
 pub fn persistSessionCheckpointDetailed(self: anytype, reason: []const u8) bool {

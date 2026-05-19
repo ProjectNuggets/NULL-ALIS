@@ -126,6 +126,20 @@ pub const PersistResult = struct {
 pub const JudgeContext = struct {
     provider: providers.Provider,
     model_name: []const u8,
+    /// V1.14.12 (M2 review CRITICAL fix) — cardinality fast-path runtime
+    /// gate. When TRUE (default), persistExtracted skips the judge for
+    /// set-valued predicates without explicit negation (M2 behavior).
+    /// When FALSE, the judge fires on every write regardless of
+    /// cardinality (pre-M2 behavior).
+    ///
+    /// Wired from `agent.extraction_cardinality_fastpath` config field
+    /// through the 6 caller sites (memory_store, compaction Pass A/C,
+    /// commands session-end). Default true preserves M2 effects.
+    ///
+    /// Pre-fix: the config flag was parsed but never read at the gate
+    /// (persistExtracted ignored it). Operators couldn't disable M2 via
+    /// config — only via code revert. This restores the contract.
+    cardinality_fastpath_enabled: bool = true,
 };
 
 /// V1.6 commit 8 — optional embedding provider for entity coreference.
@@ -383,18 +397,73 @@ fn categoryForAttribution(attributed_to: []const u8) memory_root.MemoryCategory 
 /// just don't dedupe across re-extractions. New writes use the stable
 /// shape going forward; one-shot backfill (V1.6 cmt15) will rekey legacy
 /// rows if needed.
-fn deriveExtractionKey(
+///
+/// **V1.14.11 — canonicalization fix (Captain Mochi investigation, 2026-05-18):**
+/// Pre-fix, `subject` and `object` were hashed as-is, so the same logical
+/// fact written via two paths with different casing produced two distinct
+/// extracted_<hash> keys:
+///   - Agent's memory_store: subject="user" → key A
+///   - Extraction batch re-extract: subject="User" → key B
+/// Two rows for one fact = duplicate writes that bypass primary-key dedup.
+/// The contradiction judge then cleaned up the duplicates, but wastefully
+/// (extra LLM call per orphan + alarming-looking "contradiction" log lines).
+///
+/// Fix: lowercase subject + object via `lowerForEntityKey` (the SAME
+/// canonicalizer used by `deriveEntityKey` for entity-side hashing). Now
+/// the same logical fact produces the SAME extracted_<hash> key regardless
+/// of casing path, so re-extraction collides on primary key via
+/// `INSERT ... ON CONFLICT DO NOTHING` → no duplicate row → no judge call.
+///
+/// **Predicate is NOT lowercased** because predicates are stored as
+/// uppercase tokens by convention (LIKES, USES, IS_TYPE_OF) and the
+/// extractor + agent both already emit them uppercase. Lowercasing
+/// would break the existing wire format.
+///
+/// **Backwards compat:** pre-fix `extracted_<hash>` rows survive untouched.
+/// They just don't dedupe against post-fix re-extractions of the SAME fact
+/// with DIFFERENT case (one orphan duplicate per fact is the worst case,
+/// matching pre-fix behavior). Going forward, new writes converge.
+///
+/// V1.14.12 (M3) — visibility changed from `fn` to `pub fn`. Callers
+/// outside this module (specifically the coverage filter in
+/// extraction/runner.zig) need to compute the same canonical key
+/// to compare against agent_keys returned by
+/// state_mgr.listAgentMemoryStoreKeys. Single source of truth for
+/// the hash function — DO NOT inline-recompute in other modules.
+pub fn deriveExtractionKey(
     allocator: std.mem.Allocator,
     subject: []const u8,
     predicate: []const u8,
     object: []const u8,
 ) ![]u8 {
+    const subject_lower = try lowerForEntityKey(allocator, subject);
+    defer allocator.free(subject_lower);
+    const object_lower = try lowerForEntityKey(allocator, object);
+    defer allocator.free(object_lower);
+
+    // V1.14.12 (M3 review HIGH#2) — uppercase-normalize predicate.
+    // Pre-fix: if the agent's memory_store wrote `predicate="likes"`
+    // and the boundary extractor emitted `predicate="LIKES"`, the
+    // hashes diverged and the M3 coverage filter silently MISSED the
+    // duplicate — defeating the whole sprint. Predicates are stored
+    // uppercase by convention (LIKES, USES, IS_TYPE_OF) but LLMs
+    // occasionally emit them in mixed/lower case; this normalize
+    // ensures key collision happens regardless of writer's casing.
+    //
+    // Migration note: like the V1.14.11 subject/object lowercase fix,
+    // pre-V1.14.12 `extracted_<hash>` rows hashed without this
+    // normalization survive untouched. New writes converge.
+    var pred_buf: [128]u8 = undefined;
+    const pred_len = @min(predicate.len, pred_buf.len);
+    for (predicate[0..pred_len], 0..) |ch, i| pred_buf[i] = std.ascii.toUpper(ch);
+    const predicate_upper = pred_buf[0..pred_len];
+
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(subject);
+    hasher.update(subject_lower);
     hasher.update("|");
-    hasher.update(predicate);
+    hasher.update(predicate_upper);
     hasher.update("|");
-    hasher.update(object);
+    hasher.update(object_lower);
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     var hex_buf: [16]u8 = undefined;
@@ -414,9 +483,16 @@ fn deriveExtractionKey(
 ///   }
 ///
 /// Caller frees returned slice.
+///
+/// V1.14.12 (M3) — `origin` field is now persisted to
+/// `metadata->>'write_origin'` so the M3 coverage filter SQL query
+/// (`listAgentMemoryStoreKeys`) can filter for facts the agent's
+/// memory_store tool wrote, distinguishing them from boundary
+/// extraction writes.
 fn buildExtractionMetadata(
     allocator: std.mem.Allocator,
     mem: ExtractedMemory,
+    origin: WriteOrigin,
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .{};
     errdefer buf.deinit(allocator);
@@ -431,6 +507,11 @@ fn buildExtractionMetadata(
     try w.writeAll("\",\"attributed_to\":\"");
     try writeJsonEscaped(w, mem.attributed_to);
     try w.writeAll("\",\"attribution\":\"extraction_classifier\"");
+    // V1.14.12 (M3) — write_origin enables the coverage filter to
+    // identify agent-tool writes via SQL `metadata->>'write_origin'`.
+    try w.writeAll(",\"write_origin\":\"");
+    try writeJsonEscaped(w, origin.toSlice());
+    try w.writeAll("\"");
     // V1.7a-5 (spec seam 3) — emit link_type derived from predicate so
     // SQL-side population (`metadata->>'link_type'`) populates the column
     // atomically with the metadata write. SQL backfill for legacy rows
@@ -555,6 +636,40 @@ fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
     }
 }
 
+/// V1.14.12 (M1) — origin tag for telemetry. Identifies which of the
+/// production write callsites invoked persistExtracted. Used by the
+/// `memory.write.batch origin=X ...` log line to build the per-path
+/// write histogram that gates M3 (coverage filter), M5 (legacy direct-
+/// write deletion), and M6 (judge model swap). Tag set by caller, no
+/// behavior change — just labels the call for the histogram.
+///
+/// Each caller MUST pass an explicit tag. There is no default. If a new
+/// callsite is added without picking a tag, the build breaks (no
+/// implicit `.unknown` fallback) — forces conscious decision.
+pub const WriteOrigin = enum {
+    /// Agent's memory_store tool (per-turn, agent-driven).
+    memory_store_tool,
+    /// Mid-session compaction drop extraction (compaction.zig::compactHistory).
+    pass_a_drop,
+    /// End-of-compaction summary extraction via extractAtBoundary
+    /// (compaction.zig Pass C site → runner.zig::extractAtBoundary).
+    pass_c_compaction_extract,
+    /// Session-end TTL extraction via extractAtBoundary
+    /// (commands.zig session_end site → runner.zig::extractAtBoundary).
+    session_end_extract,
+    /// Test harness wire (zaki_state.zig test fixture + unit tests). Not production.
+    test_wire,
+    /// V1.14.12 (M3 review MED) — defensive fallback for a future caller
+    /// added without picking a precise tag. A `.unknown` emission in the
+    /// histogram is a LOUD signal to add a real tag. Never use in new
+    /// callers; safety net only.
+    unknown,
+
+    pub fn toSlice(self: WriteOrigin) []const u8 {
+        return @tagName(self);
+    }
+};
+
 /// Persist a batch of extracted memories.
 ///
 /// Provider-agnostic. The `memories` slice can come from the compaction
@@ -575,6 +690,9 @@ fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
 /// Per-fact failures emit log.warn but don't abort the batch — one bad
 /// fact shouldn't kill the run. Judge LLM failures are non-fatal: they
 /// degrade to MD5-only behavior for that fact.
+///
+/// V1.14.12 (M1) — `origin` parameter labels the call for per-path
+/// telemetry. See WriteOrigin docstring.
 pub fn persistExtracted(
     allocator: std.mem.Allocator,
     state_mgr: *zaki_state.Manager,
@@ -592,6 +710,7 @@ pub fn persistExtracted(
     // a retrieval optimization. Pass null to keep V1.7 behavior (test
     // fixtures, non-postgres deploys).
     mem_rt: ?*memory_root.MemoryRuntime,
+    origin: WriteOrigin,
 ) !PersistResult {
     var result = PersistResult{
         .written_count = 0,
@@ -602,6 +721,26 @@ pub fn persistExtracted(
         .contradictions_resolved = 0,
         .failed_count = 0,
     };
+
+    // V1.14.12 (M1) — per-path telemetry. One log per persistExtracted
+    // call; downstream baseline_analyzer.py builds the origin histogram.
+    //
+    // V1.14.12 (M1 review MEDIUM#2) — renamed `count` → `attempted` to
+    // reflect that this is INPUT cardinality, not write cardinality.
+    // Blacklist + MD5 + cardinality fast-path + judge skips can all
+    // reduce attempted → written. The trailing log line at end of
+    // batch reports `written` + `skipped_total` so M3/M5 redundancy
+    // decisions get accurate numerators/denominators.
+    log.info(
+        "memory.write.batch origin={s} attempted={d} user_id={d} session={s} judge={s}",
+        .{
+            origin.toSlice(),
+            memories.len,
+            user_id,
+            session_id orelse "-",
+            if (judge != null) "on" else "off",
+        },
+    );
 
     for (memories) |m| {
         // Step 1: predicate blacklist
@@ -636,19 +775,48 @@ pub fn persistExtracted(
             continue;
         }
 
-        // Step 3 (V1.6 commit 6): contradiction LLM judge.
+        // V1.14.12 (M2) — cardinality fast-path.
         //
-        // Fetches two candidate lists per Graphiti spec:
-        //   - related: same-subject extraction-classifier memories (dedup-eligible)
-        //   - broader: hybrid BM25+key recall results (contradiction-eligible only)
+        // Skip the LLM judge entirely for facts where (a) the predicate
+        // is set-valued AND (b) the fact's text contains no explicit
+        // negation language. Set-valued predicates (LIKES, USES,
+        // IS_TYPE_OF, ATTENDED, etc.) are additive by default — the
+        // same subject can have many of them. Treating a new
+        // (subject, predicate, different_object) tuple as a
+        // contradiction is the Captain Mochi misfire pattern.
         //
-        // Runs only when caller provided a JudgeContext. Without it, this
-        // step short-circuits and persistence falls back to MD5-only
-        // semantics (same as V1.6 commit 5b.3 behavior).
+        // The judge STILL fires for:
+        //   - single-valued predicates (LIVES_IN, MARRIED_TO, BIRTHDAY)
+        //     where new value DOES supersede old
+        //   - explicit negation in the fact text ("no longer", "stopped",
+        //     "instead of"), even on set-valued predicates
+        //   - unknown predicates (conservative: let judge decide)
         //
-        // Failure mode: any error in candidate fetch OR judge call → log
-        // + proceed to write. Better one extra duplicate than a lost fact.
-        if (judge) |j| {
+        // Effect post-deploy: judge invocation rate drops from ~50% to
+        // <10% of writes. MD5 + canonical-key + coref dedup still
+        // protect against duplicates; only the LLM contradiction step
+        // is bypassed for the set-valued additive case.
+        //
+        // Reversibility: revert this commit. The set-valued prompt
+        // section in buildResolvePrompt is intentionally kept during
+        // soak window — if M2 is reverted, Llama still gets the SET-
+        // VALUED guidance via the prompt (less effective but a safety
+        // net).
+        const cardinality = edge_resolution.classifyPredicate(m.predicate);
+        const has_negation = edge_resolution.textHasExplicitNegation(m.text);
+        // V1.14.12 (M2 review CRITICAL): read the fast-path flag from
+        // the JudgeContext. Null judge → flag doesn't matter (no judge
+        // to skip), but we conservatively treat null as flag=true.
+        const fastpath_enabled = if (judge) |j| j.cardinality_fastpath_enabled else true;
+        if (fastpath_enabled and cardinality == .set_valued and !has_negation) {
+            log.info(
+                "memory.write.cardinality_fastpath subject={s} predicate={s} reason=set_valued_no_negation",
+                .{ m.subject, m.predicate },
+            );
+            // Skip judge entirely. Fall through to the write block below.
+        } else if (judge) |j| {
+            // Original judge invocation (single-valued OR explicit
+            // negation OR unknown predicate — judge can add value).
             const empty_entries: []memory_root.MemoryEntry = &.{};
             const related: []memory_root.MemoryEntry = state_mgr.findRelatedExtractedMemories(
                 allocator,
@@ -758,7 +926,7 @@ pub fn persistExtracted(
         };
         defer allocator.free(key);
 
-        const metadata_json = buildExtractionMetadata(allocator, m) catch |err| {
+        const metadata_json = buildExtractionMetadata(allocator, m, origin) catch |err| {
             log.warn("extraction.metadata_build_failed err={s}", .{@errorName(err)});
             result.failed_count += 1;
             continue;
@@ -767,13 +935,20 @@ pub fn persistExtracted(
 
         const category = categoryForAttribution(m.attributed_to);
 
-        state_mgr.upsertMemoryWithMetadata(
+        // V1.14.12 (Memory audit Finding 6 fix, 2026-05-19) — route
+        // through the event-typed variant so memory_events.event_type
+        // = 'extraction' (not 'compose'). Matches the contract docstring
+        // at extraction_persist.zig:34 and makes timeline / audit
+        // analytics able to distinguish extraction-classifier writes
+        // from compose-tool writes.
+        state_mgr.upsertMemoryWithMetadataAndEventType(
             user_id,
             key,
             m.text,
             category,
             session_id,
             metadata_json,
+            "extraction",
         ) catch |err| {
             log.warn("extraction.write_failed key={s} err={s}", .{ key, @errorName(err) });
             result.failed_count += 1;
@@ -902,6 +1077,26 @@ pub fn persistExtracted(
         });
         result.written_count += 1;
     }
+
+    // V1.14.12 (M1 review MEDIUM#2) — trailing summary log. Pairs with
+    // the leading `memory.write.batch attempted=N` line to give the
+    // baseline_analyzer.py histogram both attempted AND actually-
+    // written counts per origin. M3/M5 redundancy gates compare the
+    // WRITTEN counts (not attempted) to decide whether direct paths
+    // are subsumed by extract paths.
+    log.info(
+        "memory.write.batch_done origin={s} attempted={d} written={d} skipped_md5={d} skipped_semantic={d} skipped_blacklist={d} contradictions={d} failed={d}",
+        .{
+            origin.toSlice(),
+            memories.len,
+            result.written_count,
+            result.skipped_md5_dup,
+            result.skipped_semantic_dup,
+            result.skipped_blacklist,
+            result.contradictions_resolved,
+            result.failed_count,
+        },
+    );
 
     return result;
 }
@@ -1370,4 +1565,115 @@ test "lowerForEntityKey: deriveEntityKey unifies Latin-1 case variants (Café/CA
     // post-fix they collapse to one.
     try std.testing.expectEqualStrings(k1, k2);
     try std.testing.expectEqualStrings(k2, k3);
+}
+
+test "V1.14.11: deriveExtractionKey is case-insensitive on subject (Captain Mochi fix)" {
+    // The Captain Mochi investigation (2026-05-18) found that the agent's
+    // memory_store path wrote subject="user" (lowercase) while the
+    // session-end extraction batch wrote subject="User" (capitalized) for
+    // the same logical fact. Pre-fix these produced TWO different
+    // extracted_<hash> keys, allowing duplicate rows that the contradiction
+    // judge then cleaned up — wasteful and alarming-looking in logs.
+    //
+    // Post-fix: same fact → same key regardless of subject casing.
+    // Primary-key collision on re-extraction prevents the duplicate write.
+    const allocator = std.testing.allocator;
+    const k1 = try deriveExtractionKey(allocator, "user", "LIKES", "Thai food");
+    defer allocator.free(k1);
+    const k2 = try deriveExtractionKey(allocator, "User", "LIKES", "Thai food");
+    defer allocator.free(k2);
+    const k3 = try deriveExtractionKey(allocator, "USER", "LIKES", "Thai food");
+    defer allocator.free(k3);
+    try std.testing.expectEqualStrings(k1, k2);
+    try std.testing.expectEqualStrings(k2, k3);
+}
+
+test "V1.14.11: deriveExtractionKey is case-insensitive on object" {
+    // Same canonicalization applied to object — "Thai food" vs "thai food"
+    // vs "THAI FOOD" must produce the same extraction key for the same
+    // logical fact. Mirrors deriveEntityKey behavior at line 1019 for the
+    // target-side entity hashing.
+    const allocator = std.testing.allocator;
+    const k1 = try deriveExtractionKey(allocator, "user", "LIKES", "Thai food");
+    defer allocator.free(k1);
+    const k2 = try deriveExtractionKey(allocator, "user", "LIKES", "thai food");
+    defer allocator.free(k2);
+    const k3 = try deriveExtractionKey(allocator, "user", "LIKES", "THAI FOOD");
+    defer allocator.free(k3);
+    try std.testing.expectEqualStrings(k1, k2);
+    try std.testing.expectEqualStrings(k2, k3);
+}
+
+test "V1.14.11: deriveExtractionKey distinguishes different subjects (no collision)" {
+    // Sanity: canonicalization MUST NOT collapse genuinely-different facts.
+    // user LIKES Thai food MUST differ from cat LIKES Thai food and from
+    // user LIKES Indian food (set-valued objects ARE different facts, the
+    // R3-prereq prompt change made the JUDGE understand this — the KEY
+    // derivation must agree).
+    const allocator = std.testing.allocator;
+    const ka = try deriveExtractionKey(allocator, "user", "LIKES", "Thai food");
+    defer allocator.free(ka);
+    const kb = try deriveExtractionKey(allocator, "cat", "LIKES", "Thai food");
+    defer allocator.free(kb);
+    const kc = try deriveExtractionKey(allocator, "user", "LIKES", "Indian food");
+    defer allocator.free(kc);
+    const kd = try deriveExtractionKey(allocator, "user", "USES", "Thai food");
+    defer allocator.free(kd);
+    try std.testing.expect(!std.mem.eql(u8, ka, kb)); // different subject
+    try std.testing.expect(!std.mem.eql(u8, ka, kc)); // different object
+    try std.testing.expect(!std.mem.eql(u8, ka, kd)); // different predicate
+}
+
+test "V1.14.12 (M3 review HIGH#2): deriveExtractionKey is case-INSENSITIVE on predicate" {
+    // Per M3 reviewer HIGH#2: agent's memory_store may write predicate
+    // in any case (LLMs occasionally lowercase) while boundary extractor
+    // may emit a different case. Pre-fix the keys diverged and M3's
+    // coverage filter MISSED the duplicate. Post-fix all casings produce
+    // the same key, so coverage filter catches the dup regardless of
+    // which writer used which casing.
+    const allocator = std.testing.allocator;
+    const k_upper = try deriveExtractionKey(allocator, "user", "LIKES", "Thai food");
+    defer allocator.free(k_upper);
+    const k_lower = try deriveExtractionKey(allocator, "user", "likes", "Thai food");
+    defer allocator.free(k_lower);
+    const k_mixed = try deriveExtractionKey(allocator, "user", "Likes", "Thai food");
+    defer allocator.free(k_mixed);
+    try std.testing.expectEqualStrings(k_upper, k_lower);
+    try std.testing.expectEqualStrings(k_upper, k_mixed);
+}
+
+test "V1.14.12 (M1): WriteOrigin tags are stable strings for log analyzers" {
+    // Per-path telemetry pipeline depends on stable enum string names
+    // (grep on `memory.write.batch origin=X` in gateway logs feeds the
+    // baseline_analyzer.py histogram builder). Renaming an enum value
+    // breaks downstream analyzer scripts silently. Lock the wire format.
+    try std.testing.expectEqualStrings("memory_store_tool", WriteOrigin.memory_store_tool.toSlice());
+    try std.testing.expectEqualStrings("pass_a_drop", WriteOrigin.pass_a_drop.toSlice());
+    try std.testing.expectEqualStrings("pass_c_compaction_extract", WriteOrigin.pass_c_compaction_extract.toSlice());
+    try std.testing.expectEqualStrings("session_end_extract", WriteOrigin.session_end_extract.toSlice());
+    try std.testing.expectEqualStrings("test_wire", WriteOrigin.test_wire.toSlice());
+}
+
+test "V1.14.12 (M1 + Path A): WriteOrigin enum count guards against silent additions" {
+    // 6 variants: 4 production callsites + 1 test wire + 1 .unknown
+    // defensive fallback. Path A deleted the 2 legacy-direct variants
+    // (pass_c_compaction_direct, session_end_durable_fact) along with
+    // their callers. If a NEW persistExtracted callsite is added without
+    // updating this count, the test fails — forces a conscious decision
+    // about tagging for telemetry.
+    //
+    // Hygiene audit 2026-05-19: all 4 production callsites verified to set
+    // an explicit, distinct WriteOrigin (memory_store.zig:175,
+    // compaction.zig:470 + 707, commands.zig:1452). The `.unknown` default
+    // on ExtractionContext.write_origin is the M1 review HIGH#1 loud-signal
+    // pattern — do NOT change to a production tag. A forgotten field must
+    // surface as `.unknown` so it appears in the histogram as an outlier,
+    // not silently inflate the session_end bucket.
+    //
+    // Parallel write path: entity_pipeline (daemon.zig:1227,
+    // tools/wiki_link.zig:115) writes edges with attribution="wiki_link"
+    // and predicates MENTIONS/MENTIONED. Distinct from extraction
+    // (attribution="extraction_classifier") by metadata alone. Not a
+    // hygiene gap — different schema layer (memory_edges, not memories).
+    try std.testing.expectEqual(@as(usize, 6), @typeInfo(WriteOrigin).@"enum".fields.len);
 }

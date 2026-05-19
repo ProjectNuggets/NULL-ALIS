@@ -402,7 +402,25 @@ def locomo_score(qa_result: dict[str, Any], threshold: float = 0.5) -> dict[str,
         truth = str(truth_raw)
     reply = qa_result.get("reply") or ""
 
-    if not truth or not reply or reply.startswith("[ERROR"):
+    # F1 (2026-05-10): distinguish "no GT provided in dataset" from "agent
+    # gave no/error reply". The first is a data quality issue (LoCoMo Cat 5
+    # commonly has empty `answer` fields for adversarial probes) and MUST
+    # NOT count against the agent. The second is a real agent failure.
+    # Both formerly returned score_method='missing_or_error' which made the
+    # aggregator treat them identically — 45/47 Cat 5 questions on conv-26
+    # have empty truth and were counted as zeros, dragging headline from
+    # ~87% to ~67%. The aggregator now skips `skipped_empty_gt` rows from
+    # the accuracy denominator entirely; `missing_or_error` continues to
+    # count as a real failure.
+    if not truth:
+        return {
+            **qa_result,
+            "f1": None,
+            "em": None,
+            "score": None,
+            "score_method": "skipped_empty_gt",
+        }
+    if not reply or reply.startswith("[ERROR"):
         return {**qa_result, "f1": 0.0, "em": False, "score": 0, "score_method": "missing_or_error"}
 
     # For Cat 3 (temporal/inference), LoCoMo's evaluate splits ground truth
@@ -436,25 +454,39 @@ def locomo_score(qa_result: dict[str, Any], threshold: float = 0.5) -> dict[str,
 
 
 def aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
+    # F1 (2026-05-10): rows scored as `skipped_empty_gt` (LoCoMo dataset
+    # entries with no ground-truth answer — frequent in Cat 5 adversarial)
+    # are excluded from the accuracy denominator entirely. The skipped
+    # count is surfaced separately so reviewers can see how many questions
+    # were unscorable. Pre-fix behavior counted these as 0 and dragged the
+    # headline down ~20 percentage points.
     by_cat: dict[Any, dict[str, int]] = {}
     for r in results:
         c = r.get("category", "?")
-        by_cat.setdefault(c, {"correct": 0, "total": 0})
+        by_cat.setdefault(c, {"correct": 0, "scorable": 0, "skipped": 0, "total": 0})
         by_cat[c]["total"] += 1
+        if r.get("score_method") == "skipped_empty_gt":
+            by_cat[c]["skipped"] += 1
+            continue
+        by_cat[c]["scorable"] += 1
         if r.get("score") == 1:
             by_cat[c]["correct"] += 1
     cat_scores = {
         c: {
             **v,
-            "accuracy": (v["correct"] / v["total"]) if v["total"] else 0.0,
+            "accuracy": (v["correct"] / v["scorable"]) if v["scorable"] else 0.0,
         }
         for c, v in by_cat.items()
     }
     total_correct = sum(v["correct"] for v in by_cat.values())
+    total_scorable = sum(v["scorable"] for v in by_cat.values())
+    total_skipped = sum(v["skipped"] for v in by_cat.values())
     total = sum(v["total"] for v in by_cat.values())
     return {
-        "overall_accuracy": (total_correct / total) if total else 0.0,
+        "overall_accuracy": (total_correct / total_scorable) if total_scorable else 0.0,
         "total_correct": total_correct,
+        "total_scorable": total_scorable,
+        "total_skipped": total_skipped,
         "total_qa": total,
         "by_category": cat_scores,
     }
@@ -522,7 +554,11 @@ def main():
                 "summary": agg,
             }
         )
-        print(f"  sample {s_idx} accuracy: {agg['overall_accuracy']:.3f} ({agg['total_correct']}/{agg['total_qa']})", flush=True)
+        # F1 (2026-05-10): display reports correct/scorable (not /total)
+        # so the denominator matches the percentage. `skipped` is the count
+        # of GT-empty questions excluded from scoring.
+        skipped_str = f", {agg['total_skipped']} skipped GT-empty" if agg.get('total_skipped') else ""
+        print(f"  sample {s_idx} accuracy: {agg['overall_accuracy']:.3f} ({agg['total_correct']}/{agg['total_scorable']}{skipped_str})", flush=True)
 
     out_path = out_dir / "results.json"
     with open(out_path, "w") as f:
@@ -570,20 +606,25 @@ def rescore_only(args: argparse.Namespace) -> None:
                 "summary": agg,
             }
         )
+        # F1 (2026-05-10): display correct/scorable (skipped GT-empty
+        # excluded from denominator + percentage; surfaced separately).
+        skipped_str = f", {agg['total_skipped']} skipped" if agg.get('total_skipped') else ""
         print(
-            f"  sample {sample.get('sample_id')}: {agg['overall_accuracy']*100:.1f}% ({agg['total_correct']}/{agg['total_qa']})",
+            f"  sample {sample.get('sample_id')}: {agg['overall_accuracy']*100:.1f}% ({agg['total_correct']}/{agg['total_scorable']}{skipped_str})",
             flush=True,
         )
 
     overall = aggregate([r for s in new_samples for r in s["results"]])
+    overall_skipped = f", {overall['total_skipped']} skipped GT-empty" if overall.get('total_skipped') else ""
     print(
-        f"\n  OVERALL: {overall['overall_accuracy']*100:.1f}% ({overall['total_correct']}/{overall['total_qa']})",
+        f"\n  OVERALL: {overall['overall_accuracy']*100:.1f}% ({overall['total_correct']}/{overall['total_scorable']}{overall_skipped})",
         flush=True,
     )
     print("  by category:", flush=True)
     for cat in sorted(overall["by_category"].keys()):
         v = overall["by_category"][cat]
-        print(f"    cat {cat}: {v['accuracy']*100:.1f}% ({v['correct']}/{v['total']})", flush=True)
+        skipped_cat = f", {v['skipped']} skipped" if v.get('skipped') else ""
+        print(f"    cat {cat}: {v['accuracy']*100:.1f}% ({v['correct']}/{v['scorable']}{skipped_cat})", flush=True)
 
     out_path = src.parent / f"{src.stem}.{args.scorer}.json"
     with open(out_path, "w") as f:

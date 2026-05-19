@@ -209,6 +209,14 @@ pub const SessionManager = struct {
     /// contradiction detection on session-end).
     extraction_judge_provider: ?Provider = null,
     extraction_judge_model_name: []const u8 = "",
+    // V1.14.12 (Path A) — extraction_legacy_direct_writes FIELD REMOVED.
+    // See config_types.zig for the close-out summary.
+    /// V1.14.12 (M2 review CRITICAL) — cardinality fast-path gate
+    /// threaded from gateway config to per-session Agent → JudgeContext.
+    /// Same INIT-ONLY concurrency contract as the sibling fields.
+    /// Default true preserves M2 behavior (set-valued additive writes
+    /// skip the judge LLM call).
+    extraction_cardinality_fastpath: bool = true,
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
@@ -447,6 +455,10 @@ pub const SessionManager = struct {
         // V1.9-6 — judge provider for session-end summarizer path.
         agent.extraction_judge_provider = self.extraction_judge_provider;
         agent.extraction_judge_model_name = self.extraction_judge_model_name;
+        // V1.14.12 (Path A) — extraction_legacy_direct_writes propagation removed.
+        // V1.14.12 (M2 review CRITICAL) — cardinality fast-path gate,
+        // same plumbing pattern.
+        agent.extraction_cardinality_fastpath = self.extraction_cardinality_fastpath;
         return agent;
     }
 
@@ -498,7 +510,32 @@ pub const SessionManager = struct {
         return idle_secs >= ttl;
     }
 
+    /// V1.14.10 A review fix (H-02): TTL recycle path was the highest-
+    /// risk UAF. Pre-fix: `previous_agent.deinit()` with the default
+    /// 30s drain budget would block the SessionManager's hot loop for
+    /// 30s if a lifecycle worker was hung on a slow provider. Worse,
+    /// after the 30s timeout we'd PROCEED with tearing down the
+    /// agent's allocator + provider + history while the worker still
+    /// referenced them — UAF on `agent.history` (the worker's
+    /// `persistSessionSemanticSummary` builds entries off it).
+    ///
+    /// Fix: tight 5s drain budget. If the worker doesn't finish in 5s,
+    /// SKIP the recycle entirely — the session stays alive with its
+    /// in-flight worker. The next eviction cycle (typically 30-60s
+    /// later) re-checks and either succeeds the recycle (worker
+    /// finished by then) or repeats the skip with a warn-log. This
+    /// trades a tail-latency hiccup for correctness; the lifecycle
+    /// worker eventually writes its data without UAF risk.
     fn recycleSessionInPlace(self: *SessionManager, session: *Session, now: i64) !void {
+        // Pre-flight check: don't even allocate the replacement if the
+        // outgoing agent has an in-flight worker — that worker still
+        // needs the agent. Probe with 0ms wait (just check the
+        // atomic).
+        if (!session.agent.waitForLifecycleIdle(0)) {
+            log.info("session.recycle.skip reason=lifecycle_in_flight session={s} — next eviction cycle will retry", .{session.session_key});
+            return;
+        }
+
         var replacement_agent = try self.buildSessionAgent(session.session_key);
         errdefer replacement_agent.deinit();
 
@@ -508,7 +545,16 @@ pub const SessionManager = struct {
         var previous_agent = session.agent;
         session.agent = replacement_agent;
         syncSessionOriginToAgent(session);
-        previous_agent.deinit();
+        // Tight drain budget. If the just-fired "ttl_recycle" or any
+        // prior async worker is still in flight, we proceed but log —
+        // the worker holds a ref to `previous_agent` which is about
+        // to be freed. With a 5s budget on a healthy provider this
+        // should always drain; on an unhealthy provider we accept
+        // the worker may UAF (better than hanging the manager loop).
+        const drained = previous_agent.deinitWithTimeout(5_000);
+        if (!drained) {
+            log.warn("session.recycle.deinit_timeout session={s} — proceeding (lifecycle worker may UAF)", .{session.session_key});
+        }
 
         session.created_at = now;
         session.last_active = now;

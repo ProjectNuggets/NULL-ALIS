@@ -31,6 +31,9 @@ const zaki_state = @import("../../zaki_state.zig");
 const schema = @import("schema.zig");
 const prompts = @import("prompts.zig");
 const parser = @import("parser.zig");
+const chunker = @import("chunker.zig");
+const merger = @import("merger.zig");
+const telemetry = @import("telemetry.zig");
 const extraction_persist = @import("../extraction_persist.zig");
 const working_memory = @import("../working_memory.zig");
 
@@ -85,10 +88,113 @@ pub const ExtractionContext = struct {
     /// session-end keep this true (default) — they're whole-window
     /// distillation moments where the hydration summary is genuinely useful.
     enable_hydration: bool = true,
+    /// V1.14.9 — Target episode size in estimated tokens (chunker soft
+    /// target). Lower = more, smaller calls (better coherence, higher
+    /// total cost). Higher = fewer, larger calls. 4000 is the
+    /// Llama-3.3-70B-Instruct-Turbo coherence sweet spot per the
+    /// 2026-05-10 research report.
+    target_episode_tokens: u32 = 4000,
+    /// V1.14.9 — Hard cap on episode size in tokens. Mid-turn splits
+    /// only fire when adding the next message would exceed this.
+    /// Conventionally 2x target.
+    max_episode_tokens: u32 = 8000,
+    /// V1.14.9 — Cost guard. Max extraction LLM calls per boundary.
+    /// When chunker emits more, sample first 5 + last (cap-5) to
+    /// preserve narrative anchor + recent context. 20 = ~$0.04 per
+    /// boundary at Llama prices.
+    max_episodes_per_boundary: u32 = 20,
+    /// V1.14.9 review fix L-01 — explicit boundary kind for telemetry
+    /// tagging. Pre-fix: runner inferred kind from
+    /// `enable_hydration=false` → Pass A. Brittle: any future caller
+    /// setting `enable_hydration=false` for a different reason
+    /// (cost/latency optimization, debug mode, etc.) would mis-tag.
+    /// Now callers set this explicitly. Default `.session_end` is
+    /// conservative — it implies hydration=on (default) and assumes a
+    /// full-window distillation, which matches the most common
+    /// boundary type.
+    boundary_kind: telemetry.BoundaryKind = .session_end,
+    /// V1.14.9 — Parallelism for episode fan-out. 1 = sequential.
+    /// Higher = parallel via std.Thread.Pool.
+    ///
+    /// V1.14.9 P7 (2026-05-18): dropped default from 8 → 4 after F5
+    /// conv-43 observed 38 `AllProvidersFailed` events across one
+    /// boundary fire (3 episode extractions + 20 edge_resolution judge
+    /// calls + 15 entity coref embeds), all symptoms of Together's
+    /// rate-limit window getting blasted by an 8-wide burst followed
+    /// by the SERIAL persistExtracted pipeline (judge + embed per
+    /// fact) hitting the same window before it resets.
+    ///
+    /// 4-way halves the burst-rate equivalent (168 req/min → 70 req/
+    /// min on a 14-episode boundary), expected to lift episode success
+    /// from 79% → 95%+. Wall-time goes from ~5s (2 batches of 8) to
+    /// ~12s (4 batches of 4) per boundary. Acceptable; boundaries
+    /// fire infrequently (once per Pass A drop / Pass C / session-end).
+    /// Operators can re-tune via ExtractionContext at the call site
+    /// if their provider has a more generous rate limit.
+    extraction_concurrency: u32 = 4,
+    /// V1.14.12 (M1) — write origin tag for per-path telemetry.
+    /// Passed through to `persistExtracted` inside this runner. Each
+    /// of the three production callers of extractAtBoundary must set
+    /// the right tag (pass_a_drop / pass_c_compaction_extract /
+    /// session_end_extract).
+    ///
+    /// V1.14.12 (M1 review HIGH#1 fix) — default changed from
+    /// .session_end_extract → .unknown. Pre-fix a forgotten field on
+    /// a new ExtractionContext construction silently inflated the
+    /// session_end histogram. Post-fix a forgotten field surfaces as
+    /// `.unknown` in the histogram — a LOUD signal that a new
+    /// callsite needs a precise tag. M3/M5 redundancy gates depend on
+    /// accurate per-path distributions; this default change protects
+    /// those gates from silent corruption.
+    write_origin: @import("../extraction_persist.zig").WriteOrigin = .unknown,
+    /// V1.14.12 (M3) — coverage filter gate. When true (default),
+    /// boundary extraction skips facts whose canonical key matches
+    /// one already written by the agent's memory_store tool (per
+    /// state_mgr.listAgentMemoryStoreKeys, horizon-bounded). When
+    /// false, boundary extraction processes all extracted edges
+    /// (pre-M3 behavior).
+    ///
+    /// Operators disable via `agent.extraction_coverage_filter_enabled
+    /// = false` in config.json. Coverage filter is the architectural
+    /// fix for the Captain Mochi double-write problem — disable only
+    /// for debugging or migration scenarios.
+    coverage_filter_enabled: bool = true,
+    /// V1.14.12 (M3 review MED) — coverage filter horizon bounds.
+    /// Promoted from hardcoded local consts so high-volume tenants
+    /// can tune. Defaults match the reviewer-approved horizons.
+    /// horizon_days = 30 means agent-store'd facts older than 30 days
+    /// don't suppress re-extraction (allows cardinality drift to
+    /// surface). horizon_session_cap = 5000 bounds memory usage on
+    /// long-active users; the SQL ORDER BY created_at DESC ensures
+    /// eviction is recency-based (M3 review MEDIUM#5).
+    coverage_horizon_days: u32 = 30,
+    coverage_horizon_session_cap: u32 = 5000,
+    /// V1.14.12 (M2 review CRITICAL) — cardinality fast-path flag,
+    /// passed through to JudgeContext inside persistExtraction so
+    /// operator config actually controls M2 behavior. Default true
+    /// preserves M2 fast-path effects.
+    cardinality_fastpath_enabled: bool = true,
 };
 
-/// Convenience: persist what we extracted/hydrated and return the
-/// combined result. Caller frees via BoundaryResult.deinit.
+/// V1.14.9 — Episode-based boundary extraction. Replaces the V1.14.8
+/// "one giant LLM call on the full window" pattern that degraded to
+/// entities=0 edges=0 on long sessions (293-msg windows truncated to
+/// 80KB of fragments).
+///
+/// Pipeline:
+///   1. chunker.chunkIntoEpisodes(window) → semantic episodes
+///   2. for each episode: build per-episode transcript (no aggressive
+///      per-msg cap), fire one extraction LLM call. Sequential in P3;
+///      parallel in P4 (gated by ctx.extraction_concurrency).
+///   3. merger.mergeEpisodeResults(results) → ONE merged ExtractionResult
+///      (entity coref + structural edge dedup)
+///   4. Hydration runs ONCE on a condensed full-window transcript
+///      (it's a summary, not an extraction — one coherent call is
+///      correct shape).
+///   5. persistExtraction (existing path) handles MD5 + semantic dedup
+///      on the merged result.
+///
+/// Caller frees via BoundaryResult.deinit.
 pub fn extractAtBoundary(
     allocator: std.mem.Allocator,
     window: []const ChatMessage,
@@ -103,35 +209,80 @@ pub fn extractAtBoundary(
         return .{ .extraction = null, .hydration = null };
     }
 
-    const transcript = buildTranscript(allocator, window, ctx.max_source_chars) catch |err| {
-        log.warn("boundary.transcript_failed err={s}", .{@errorName(err)});
+    // Phase 1 — chunk into semantic episodes.
+    const episodes = chunker.chunkIntoEpisodes(
+        allocator,
+        window,
+        ctx.target_episode_tokens,
+        ctx.max_episode_tokens,
+        ctx.max_episodes_per_boundary,
+    ) catch |err| {
+        log.warn("boundary.chunk_failed err={s}", .{@errorName(err)});
         return .{ .extraction = null, .hydration = null };
     };
-    defer allocator.free(transcript);
+    defer allocator.free(episodes);
 
-    if (transcript.len == 0) {
-        log.info("boundary.skip reason=empty_transcript", .{});
+    if (episodes.len == 0) {
+        log.info("boundary.skip reason=zero_episodes", .{});
         return .{ .extraction = null, .hydration = null };
     }
 
-    // Two LLM calls. Sequential for simplicity (parallel adds threading
-    // complexity and boundaries are infrequent — once per Pass A drop or
-    // session end, not per turn).
-    const extraction_result = runExtractionCall(allocator, transcript, ctx) catch |err| blk: {
-        log.warn("boundary.extraction.call_failed err={s}", .{@errorName(err)});
+    log.info(
+        "boundary.chunked window_msgs={d} episodes={d} target_tokens={d} max_episodes={d}",
+        .{ window.len, episodes.len, ctx.target_episode_tokens, ctx.max_episodes_per_boundary },
+    );
+
+    // Phase 2 — extract per episode. Sequential when concurrency<=1
+    // OR when there's only one episode (no point spinning up a pool).
+    // Parallel via std.Thread.Pool when concurrency>1 and we have
+    // multiple episodes. Timed for R1 telemetry (review fix M-04).
+    const use_parallel = ctx.extraction_concurrency > 1 and episodes.len > 1;
+    var extraction_timer = std.time.Timer.start() catch null;
+    const episode_results = (if (use_parallel)
+        extractEpisodesParallel(allocator, episodes, ctx)
+    else
+        extractEpisodesSequential(allocator, episodes, ctx)) catch |err| blk: {
+        log.warn("boundary.extract_episodes_failed err={s}", .{@errorName(err)});
         break :blk null;
     };
+    const extraction_ms_total: u64 = if (extraction_timer) |*t| t.read() / std.time.ns_per_ms else 0;
+    defer if (episode_results) |er| freeEpisodeResults(allocator, er);
 
-    const hydration_result: ?schema.HydrationSummary = if (ctx.enable_hydration)
-        (runHydrationCall(allocator, transcript, ctx) catch |err| blk: {
+    // Phase 3 — merge with coref + structural dedup.
+    const merged_extraction: ?schema.ExtractionResult = if (episode_results) |er| blk: {
+        const coref_ctx: ?merger.CorefCtx = if (ctx.coref_embed) |ep|
+            merger.CorefCtx{ .embed_provider = ep, .threshold = 0.95 }
+        else
+            null;
+        break :blk merger.mergeEpisodeResults(allocator, er, coref_ctx) catch |err| inner: {
+            log.warn("boundary.merge_failed err={s}", .{@errorName(err)});
+            break :inner null;
+        };
+    } else null;
+
+    // Phase 4 — hydration on a single condensed transcript (no chunking;
+    // hydration is intentionally a whole-window summary). Timed for R1
+    // telemetry (review fix M-04).
+    var hydration_timer = std.time.Timer.start() catch null;
+    const hydration_result: ?schema.HydrationSummary = if (ctx.enable_hydration) hydration: {
+        const transcript = buildTranscript(allocator, window, ctx.max_source_chars) catch |err| {
+            log.warn("boundary.hydration.transcript_failed err={s}", .{@errorName(err)});
+            break :hydration null;
+        };
+        defer allocator.free(transcript);
+        if (transcript.len == 0) break :hydration null;
+        break :hydration runHydrationCall(allocator, transcript, ctx) catch |err| inner: {
             log.warn("boundary.hydration.call_failed err={s}", .{@errorName(err)});
-            break :blk null;
-        })
+            break :inner null;
+        };
+    } else null;
+    const hydration_ms: u64 = if (ctx.enable_hydration)
+        (if (hydration_timer) |*t| t.read() / std.time.ns_per_ms else 0)
     else
-        null;
+        0;
 
-    // Persist (best-effort per layer)
-    if (extraction_result) |e| {
+    // Phase 5 — persist (best-effort per layer).
+    if (merged_extraction) |e| {
         persistExtraction(allocator, e, ctx) catch |err| {
             log.warn("boundary.extraction.persist_failed err={s}", .{@errorName(err)});
         };
@@ -142,18 +293,209 @@ pub fn extractAtBoundary(
         };
     }
 
+    // Aggregate telemetry. R1's `boundary.metrics` log + zero_density
+    // + episode_failure_high alerts live in telemetry.zig.
+    const episodes_extracted_success = if (episode_results) |er| countNonNull(er) else 0;
+    const episodes_extracted_failed = if (episode_results) |er| er.len - episodes_extracted_success else 0;
+
+    // Sum window bytes for density calculation. Cheap O(N) pass over
+    // ChatMessage slice (no string copy).
+    var window_bytes: u64 = 0;
+    for (window) |m| window_bytes += m.content.len;
+
+    telemetry.recordBoundary(.{
+        .kind = ctx.boundary_kind,
+        .window_msg_count = @intCast(window.len),
+        .window_byte_total = window_bytes,
+        .episodes_chunked = @intCast(episodes.len),
+        .episodes_extracted_success = @intCast(episodes_extracted_success),
+        .episodes_extracted_failed = @intCast(episodes_extracted_failed),
+        .entities_extracted = @intCast(if (merged_extraction) |e| e.entities.len else 0),
+        .edges_extracted = @intCast(if (merged_extraction) |e| e.edges.len else 0),
+        .hydration_present = hydration_result != null,
+        // V1.14.9 review fix M-04: wall-clock timings via
+        // std.time.Timer (captured around the fan-out + hydration
+        // calls above). Hydration timer skipped when disabled.
+        .extraction_ms_total = extraction_ms_total,
+        .hydration_ms = hydration_ms,
+    });
+
+    // Keep the legacy boundary.complete line for grep-compat with
+    // any existing alerting that expects it. telemetry.zig's
+    // boundary.metrics is the canonical structured log going forward.
     log.info(
-        "boundary.complete entities={d} edges={d} hydration_present={} window_msgs={d} transcript_bytes={d}",
+        "boundary.complete episodes={d} episodes_ok={d} episodes_failed={d} entities={d} edges={d} hydration_present={} window_msgs={d}",
         .{
-            if (extraction_result) |e| e.entities.len else 0,
-            if (extraction_result) |e| e.edges.len else 0,
+            episodes.len,
+            episodes_extracted_success,
+            episodes_extracted_failed,
+            if (merged_extraction) |e| e.entities.len else 0,
+            if (merged_extraction) |e| e.edges.len else 0,
             hydration_result != null,
             window.len,
-            transcript.len,
         },
     );
 
-    return .{ .extraction = extraction_result, .hydration = hydration_result };
+    return .{ .extraction = merged_extraction, .hydration = hydration_result };
+}
+
+// V1.14.9 review fix L-01: `inferBoundaryKind` removed in favor of
+// `ExtractionContext.boundary_kind` set explicitly by each caller.
+// Pass A wire sets `.pass_a`; Pass C wire sets `.pass_c`; session-end
+// wire keeps the default `.session_end`. Telemetry tags accurately
+// without inference.
+
+/// V1.14.9 — Run extraction sequentially across episodes. Each
+/// episode failure returns null in its slot; we don't abort the
+/// whole boundary on one bad episode (partial signal beats none).
+/// P4 introduces a parallel variant gated on
+/// `ctx.extraction_concurrency`.
+fn extractEpisodesSequential(
+    allocator: std.mem.Allocator,
+    episodes: []const chunker.Episode,
+    ctx: ExtractionContext,
+) ![]?schema.ExtractionResult {
+    var results = try allocator.alloc(?schema.ExtractionResult, episodes.len);
+    errdefer allocator.free(results);
+    for (episodes, 0..) |ep, i| {
+        results[i] = runExtractionOnEpisode(allocator, ep, ctx) catch |err| blk: {
+            log.warn("boundary.episode[{d}].failed err={s} msgs={d}", .{ i, @errorName(err), ep.messages.len });
+            break :blk null;
+        };
+    }
+    return results;
+}
+
+/// V1.14.9 P4 — Parallel episode extraction via std.Thread.Pool.
+/// Called when `ctx.extraction_concurrency > 1`. Each episode runs
+/// in its own worker; failures are isolated (slot stays null,
+/// others proceed). Caller frees via freeEpisodeResults.
+///
+/// Allocator thread-safety: the agent's primary allocator is
+/// expected to be thread-safe (std.heap.GeneralPurposeAllocator with
+/// `.thread_safe = true` OR the C allocator). The runner doesn't
+/// override; it inherits whatever the caller passes. Each thread's
+/// LLM call uses curl-subprocess transport (provider-level), which
+/// is process-isolated and inherently thread-safe.
+fn extractEpisodesParallel(
+    allocator: std.mem.Allocator,
+    episodes: []const chunker.Episode,
+    ctx: ExtractionContext,
+) ![]?schema.ExtractionResult {
+    var results = try allocator.alloc(?schema.ExtractionResult, episodes.len);
+    @memset(results, null);
+    errdefer allocator.free(results);
+
+    // Cap thread count at the smaller of (episodes count, configured
+    // concurrency). No point spinning up 8 threads for 3 episodes.
+    const n_jobs: usize = @min(episodes.len, @as(usize, ctx.extraction_concurrency));
+
+    var pool: std.Thread.Pool = undefined;
+    pool.init(.{ .allocator = allocator, .n_jobs = n_jobs }) catch |err| {
+        log.warn("boundary.pool_init_failed err={s} falling_back=sequential", .{@errorName(err)});
+        // Free the pre-allocated results array so the sequential path
+        // can allocate fresh.
+        allocator.free(results);
+        return extractEpisodesSequential(allocator, episodes, ctx);
+    };
+    defer pool.deinit();
+
+    var wg: std.Thread.WaitGroup = .{};
+    for (episodes, 0..) |ep, i| {
+        pool.spawnWg(&wg, episodeWorker, .{ &results[i], ep, ctx, allocator, i });
+    }
+    wg.wait();
+
+    return results;
+}
+
+/// Worker function for parallel episode extraction. One per episode.
+/// Writes its result (or null on failure) into the pre-allocated slot.
+fn episodeWorker(
+    slot: *?schema.ExtractionResult,
+    episode: chunker.Episode,
+    ctx: ExtractionContext,
+    allocator: std.mem.Allocator,
+    idx: usize,
+) void {
+    slot.* = runExtractionOnEpisode(allocator, episode, ctx) catch |err| blk: {
+        log.warn("boundary.episode[{d}].parallel_failed err={s} msgs={d}", .{ idx, @errorName(err), episode.messages.len });
+        break :blk null;
+    };
+}
+
+/// Free an array of per-episode results allocated by
+/// extractEpisodesSequential / extractEpisodesParallel.
+fn freeEpisodeResults(allocator: std.mem.Allocator, results: []?schema.ExtractionResult) void {
+    for (results) |opt| {
+        if (opt) |r| r.deinit(allocator);
+    }
+    allocator.free(results);
+}
+
+fn countNonNull(results: []const ?schema.ExtractionResult) usize {
+    var n: usize = 0;
+    for (results) |r| {
+        if (r != null) n += 1;
+    }
+    return n;
+}
+
+/// Per-message content cap inside `buildEpisodeTranscript`. Episodes
+/// are bounded by `target_episode_tokens` overall but a SINGLE
+/// pathologically-large message (tool output dump, file paste, very
+/// long assistant reply) can still dominate the LLM's view and
+/// recreate the V1.14.8 fragmentation failure mode. 8KB is generous
+/// enough for substantive turn content while bounding the worst case.
+/// Review fix M-03.
+const PER_MESSAGE_EPISODE_CAP: usize = 8_000;
+
+/// V1.14.9 — Build a transcript for ONE episode. Episodes are
+/// bounded by `target_episode_tokens` at the chunker level, but
+/// `buildEpisodeTranscript` still caps each individual message at
+/// `PER_MESSAGE_EPISODE_CAP` so a single oversized tool output or
+/// file dump can't dominate one episode's view and recreate the
+/// V1.14.8 fragmentation problem at the per-episode level. When a
+/// message is truncated, we append a sentinel so the LLM knows the
+/// content was cut.
+fn buildEpisodeTranscript(
+    allocator: std.mem.Allocator,
+    episode: chunker.Episode,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    for (episode.messages) |*msg| {
+        const role_str: []const u8 = switch (msg.role) {
+            .system => "SYSTEM",
+            .user => "USER",
+            .assistant => "ASSISTANT",
+            .tool => "TOOL",
+        };
+        try buf.appendSlice(allocator, role_str);
+        try buf.appendSlice(allocator, ": ");
+        if (msg.content.len > PER_MESSAGE_EPISODE_CAP) {
+            try buf.appendSlice(allocator, msg.content[0..PER_MESSAGE_EPISODE_CAP]);
+            try buf.appendSlice(allocator, "\n[...truncated for extraction...]");
+        } else {
+            try buf.appendSlice(allocator, msg.content);
+        }
+        try buf.append(allocator, '\n');
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+/// V1.14.9 — Fire one extraction LLM call against a single episode.
+/// Returns parsed ExtractionResult or null on any failure.
+fn runExtractionOnEpisode(
+    allocator: std.mem.Allocator,
+    episode: chunker.Episode,
+    ctx: ExtractionContext,
+) !?schema.ExtractionResult {
+    if (episode.messages.len == 0) return null;
+    const transcript = try buildEpisodeTranscript(allocator, episode);
+    defer allocator.free(transcript);
+    if (transcript.len == 0) return null;
+    return runExtractionCall(allocator, transcript, ctx);
 }
 
 /// Build a compact transcript of the conversation window. Per-message cap
@@ -275,6 +617,71 @@ fn freeResponse(allocator: std.mem.Allocator, response: providers.ChatResponse) 
     if (response.reasoning_content) |rc| if (rc.len > 0) allocator.free(rc);
 }
 
+/// V1.14.12 (M3 review HIGH#3) — coverage filter implementation,
+/// extracted into a helper so persistExtraction can wrap it in a
+/// single catch that no-ops on ANY failure (DB error, OOM,
+/// key-compute failure). Filtering is an optimization; it must not
+/// error-propagate to break boundary extraction.
+///
+/// Reads agent_keys via state_mgr.listAgentMemoryStoreKeys, builds
+/// the canonical key for each candidate edge, and appends only
+/// non-matching edges to `out`.
+fn runCoverageFilter(
+    allocator: std.mem.Allocator,
+    smgr: *zaki_state.Manager,
+    user_id: i64,
+    edges: []const schema.Edge,
+    out: *std.ArrayListUnmanaged(schema.Edge),
+    horizon_days: u32,
+    horizon_session_cap: u32,
+) !void {
+    const agent_keys = try smgr.listAgentMemoryStoreKeys(
+        allocator,
+        user_id,
+        horizon_days,
+        horizon_session_cap,
+    );
+    defer {
+        for (agent_keys) |k| allocator.free(k);
+        allocator.free(agent_keys);
+    }
+
+    if (agent_keys.len == 0) {
+        log.info("boundary.extraction.coverage_filter agent_keys=0 — passive-only session", .{});
+        try out.appendSlice(allocator, edges);
+        return;
+    }
+
+    var key_set = std.StringHashMapUnmanaged(void){};
+    defer key_set.deinit(allocator);
+    for (agent_keys) |k| try key_set.put(allocator, k, {});
+
+    var skipped: usize = 0;
+    for (edges) |edge| {
+        const candidate_key = extraction_persist.deriveExtractionKey(
+            allocator,
+            edge.source_name,
+            edge.relation_type,
+            edge.target_name,
+        ) catch |err| {
+            log.warn("boundary.extraction.coverage_key_compute_failed err={s} subject={s}", .{ @errorName(err), edge.source_name });
+            // Conservative: keep on failure.
+            try out.append(allocator, edge);
+            continue;
+        };
+        defer allocator.free(candidate_key);
+        if (key_set.contains(candidate_key)) {
+            skipped += 1;
+        } else {
+            try out.append(allocator, edge);
+        }
+    }
+    log.info(
+        "boundary.extraction.coverage_filter agent_keys={d} input_edges={d} skipped={d} remaining={d}",
+        .{ agent_keys.len, edges.len, skipped, out.items.len },
+    );
+}
+
 /// Convert the structured ExtractionResult into ExtractedMemory[] and
 /// persist via the existing extraction_persist.persistExtracted path
 /// (entity coref + edge upsert + vector sync). This is where Layer 4
@@ -297,17 +704,82 @@ fn persistExtraction(
         return;
     }
 
-    // Convert each edge to an ExtractedMemory. The text/subject/predicate/
+    // V1.14.12 (M3) — coverage filter. Skip extracted edges whose
+    // canonical key matches one already written by the agent's
+    // memory_store tool. This is the architectural fix that prevents
+    // boundary re-extraction from creating duplicates of facts the
+    // agent already explicitly stored.
+    //
+    // Race-safety: extractAtBoundary fires AFTER the agent's turn loop
+    // completes. All memory_store tool calls in this session have
+    // already committed (synchronous within the turn) by the time
+    // we reach here. Cross-session writes are visible via the SQL
+    // query's user_id scope + horizon bounds.
+    //
+    // Failure mode: if the keys query fails (DB connection, etc.),
+    // we LOG + PROCEED — filtering is an optimization, not a correctness
+    // guarantee. Worst case: today's behavior (some duplicates, judge
+    // cleans up via M2 fast-path or contradiction detection).
+    //
+    // Bounds: 30 days horizon + 5000 key cap. Tunable later.
+    //
+    // Filter runs BEFORE the ExtractedMemory allocation so we avoid the
+    // partial-deinit / double-free hazard of in-place filtering a fixed
+    // slice. The kept-edges slice is what feeds the persist call.
+    //
+    // V1.14.12 (M3 review MED) — horizon bounds read from ctx so
+    // operators can tune per deployment (e.g., high-volume tenants may
+    // need a larger key cap or shorter horizon to keep memory bounded).
+    var kept_edges_buf = std.ArrayListUnmanaged(schema.Edge){};
+    defer kept_edges_buf.deinit(allocator);
+
+    // V1.14.12 (M3 review HIGH#3): wrap the coverage filter in a
+    // self-contained block that NEVER fails the persist path. Any
+    // error inside the filter (OOM, DB error, key compute failure)
+    // logs + falls back to "no filtering" so the persist path
+    // proceeds with all edges. Filtering is an optimization, not a
+    // correctness gate — it must not error-propagate to break boundary
+    // extraction.
+    var filter_succeeded = true;
+    if (ctx.coverage_filter_enabled) {
+        runCoverageFilter(
+            allocator,
+            smgr,
+            uid,
+            result.edges,
+            &kept_edges_buf,
+            ctx.coverage_horizon_days,
+            ctx.coverage_horizon_session_cap,
+        ) catch |err| {
+            log.warn("boundary.extraction.coverage_filter_failed err={s} — proceeding without filter", .{@errorName(err)});
+            filter_succeeded = false;
+        };
+    }
+    if (!ctx.coverage_filter_enabled or !filter_succeeded) {
+        // Filter disabled OR filter errored — pass all edges through
+        // (preserves pre-M3 behavior on failure).
+        kept_edges_buf.clearRetainingCapacity();
+        try kept_edges_buf.appendSlice(allocator, result.edges);
+    }
+
+    if (kept_edges_buf.items.len == 0) {
+        log.info("boundary.extraction.skip_persist reason=coverage_filter_kept_zero", .{});
+        return;
+    }
+
+    const kept_edges = kept_edges_buf.items;
+
+    // Convert each kept edge to an ExtractedMemory. text/subject/predicate/
     // object map directly. attributed_to defaults to "user" (boundary
     // extraction is implicitly user-attributed; the agent's own writes go
     // through memory_store, not this path).
-    const mems = try allocator.alloc(extraction_persist.ExtractedMemory, result.edges.len);
+    const mems = try allocator.alloc(extraction_persist.ExtractedMemory, kept_edges.len);
     defer {
         for (mems) |m| m.deinit(allocator);
         allocator.free(mems);
     }
 
-    for (result.edges, 0..) |edge, i| {
+    for (kept_edges, 0..) |edge, i| {
         mems[i] = .{
             .text = try allocator.dupe(u8, edge.fact),
             .subject = try allocator.dupe(u8, edge.source_name),
@@ -323,10 +795,27 @@ fn persistExtraction(
         };
     }
 
-    const judge_ctx = extraction_persist.JudgeContext{
-        .provider = ctx.judge_provider,
-        .model_name = ctx.judge_model,
-    };
+    // V1.14.12 (Path A) — judge_ctx is OPTIONAL. When ctx.judge_model is
+    // empty (operator hasn't configured a judge model), we pass null
+    // to persistExtracted which gracefully degrades to MD5+canonical-key
+    // dedup only (no LLM-based contradiction detection).
+    //
+    // Pre-Path-A this was unconditionally constructed, which forced
+    // every extractAtBoundary caller to gate on judge presence
+    // upstream (commands.zig:1475 + compaction.zig:768). After M5
+    // gated-code deletion, no-judge tenants would have silently lost
+    // session-end writes via the deleted legacy direct path. Optional
+    // judge_ctx restores graceful degradation through the
+    // extractAtBoundary path.
+    const judge_ctx: ?extraction_persist.JudgeContext =
+        if (ctx.judge_model.len > 0)
+            extraction_persist.JudgeContext{
+                .provider = ctx.judge_provider,
+                .model_name = ctx.judge_model,
+                .cardinality_fastpath_enabled = ctx.cardinality_fastpath_enabled,
+            }
+        else
+            null;
     const coref_ctx: ?extraction_persist.EntityResolution = if (ctx.coref_embed) |ep|
         extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 }
     else
@@ -341,6 +830,7 @@ fn persistExtraction(
         judge_ctx,
         coref_ctx,
         ctx.archive_mem_rt,
+        ctx.write_origin, // V1.14.12 (M1) — per-path telemetry tag from caller
     ) catch |err| {
         log.warn("boundary.extraction.persistExtracted_failed err={s} edges={d}", .{ @errorName(err), result.edges.len });
         return;

@@ -105,6 +105,13 @@ pub const CompactionConfig = struct {
     // sidecar model for latency.
     extraction_judge_provider: ?Provider = null,
     extraction_judge_model_name: ?[]const u8 = null,
+    // V1.14.12 (Path A) — extraction_legacy_direct_writes field removed
+    // from CompactionConfig. The gated Pass C direct write was deleted;
+    // Pass C extraction now flows entirely through extractAtBoundary.
+    /// V1.14.12 (M2 review CRITICAL) — cardinality fast-path flag,
+    /// threaded into JudgeContext at the Pass A + Pass C direct sites
+    /// so persistExtracted honors operator config.
+    extraction_cardinality_fastpath: bool = true,
     // V1.6 commit 8: optional embedding provider for entity coreference.
     // When set, extracted-fact object strings get cosine-resolved against
     // existing memory_entities rows (≥0.95 = same entity, reuse id; new
@@ -436,37 +443,44 @@ fn dropOldestPairsFromMiddle(
     // for that. So Pass A pays one LLM call per fire, not two. Pass C +
     // session-end keep both calls. Dedup at persistExtracted handles
     // overlap with downstream Pass C extraction of the surviving tail.
-    if (config.extraction_judge_provider) |jp| {
-        if (config.extraction_judge_model_name) |jm| if (jm.len > 0) {
-            const window = history.items[drop_start..drop_end];
-            var msgs_buf = std.ArrayListUnmanaged(ChatMessage).initCapacity(allocator, window.len) catch null;
-            if (msgs_buf) |*buf| {
-                defer buf.deinit(allocator);
-                for (window) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
-                const ctx = extraction_runner.ExtractionContext{
-                    .judge_provider = jp,
-                    .judge_model = jm,
-                    .state_mgr = config.extraction_state_mgr,
-                    .user_id = config.extraction_user_id,
-                    .session_id = config.archive_session_id,
-                    .coref_embed = config.extraction_coref_embed,
-                    .archive_mem = config.archive_memory,
-                    .archive_mem_rt = config.archive_mem_rt,
-                    .max_source_chars = config.max_source_chars,
-                    .enable_hydration = false, // Pass A is mid-session — extraction only.
-                };
-                const br = extraction_runner.extractAtBoundary(allocator, buf.items, ctx);
-                defer br.deinit(allocator);
-                log.info(
-                    "compaction.passA.unified_extract entities={d} edges={d} window_msgs={d}",
-                    .{
-                        if (br.extraction) |e| e.entities.len else 0,
-                        if (br.extraction) |e| e.edges.len else 0,
-                        window.len,
-                    },
-                );
-            }
-        };
+    // V1.14.12 (Path A) — Pass A judge guard removed. extractAtBoundary
+    // now handles null-judge gracefully via runner.zig:798 (constructs
+    // JudgeContext only when judge_model is non-empty). No-judge
+    // tenants get MD5+canonical-key dedup-only extraction at this
+    // mid-session drop boundary.
+    {
+        const window = history.items[drop_start..drop_end];
+        var msgs_buf = std.ArrayListUnmanaged(ChatMessage).initCapacity(allocator, window.len) catch null;
+        if (msgs_buf) |*buf| {
+            defer buf.deinit(allocator);
+            for (window) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
+            const judge_model_resolved = config.extraction_judge_model_name orelse "";
+            const ctx = extraction_runner.ExtractionContext{
+                .judge_provider = config.extraction_judge_provider orelse undefined,
+                .judge_model = judge_model_resolved,
+                .state_mgr = config.extraction_state_mgr,
+                .user_id = config.extraction_user_id,
+                .session_id = config.archive_session_id,
+                .coref_embed = config.extraction_coref_embed,
+                .archive_mem = config.archive_memory,
+                .archive_mem_rt = config.archive_mem_rt,
+                .max_source_chars = config.max_source_chars,
+                .enable_hydration = false, // Pass A is mid-session — extraction only.
+                .boundary_kind = .pass_a, // V1.14.9 L-01: explicit telemetry tag
+                .write_origin = .pass_a_drop, // V1.14.12 (M1) — per-path telemetry tag
+                .cardinality_fastpath_enabled = config.extraction_cardinality_fastpath, // V1.14.12 (M2 review CRITICAL)
+            };
+            const br = extraction_runner.extractAtBoundary(allocator, buf.items, ctx);
+            defer br.deinit(allocator);
+            log.info(
+                "compaction.passA.unified_extract entities={d} edges={d} window_msgs={d}",
+                .{
+                    if (br.extraction) |e| e.entities.len else 0,
+                    if (br.extraction) |e| e.edges.len else 0,
+                    window.len,
+                },
+            );
+        }
     }
 
     // Best-effort archive before deletion (continuity artifact). Mirrors
@@ -654,81 +668,13 @@ fn compactHistoryKeepingRecent(
     // V1.7a-4 review fix (V1.6 WR-04) — re-indented inner block so visual
     // structure matches logical structure (zig-fmt compliant). Was an
     // outdented inner block hiding 60+ lines under `if (extraction_tail...)`.
-    if (config.extraction_state_mgr) |state_mgr| {
-        if (config.extraction_user_id) |uid| {
-            if (extraction_tail) |tail_bytes| if (tail_bytes.len > 0) {
-                const session_id_for_extract: ?[]const u8 = config.archive_session_id;
-                const empty_slice: []extraction_persist.ExtractedMemory = &.{};
-                const extracted = extraction_persist.parseExtractedJson(allocator, tail_bytes) catch |err| blk: {
-                    log.warn("compaction: extraction parse failed err={s} tail_len={d}", .{ @errorName(err), tail_bytes.len });
-                    break :blk empty_slice;
-                };
-                // V1.7a-4 review fix (V1.6 WR-02) — drop the `if (extracted.len > 0)`
-                // guard. `freeExtractedMemories` handles empty slices safely
-                // (the for-loop is a no-op and `allocator.free` on a zero-
-                // length slice is defined). The prior guard leaked the
-                // zero-length heap allocation `parseExtractedJson` returns
-                // when the LLM emitted `[]`.
-                defer extraction_persist.freeExtractedMemories(allocator, extracted);
-
-                if (extracted.len > 0) {
-                    // V1.6 commit 6: build the contradiction-judge context.
-                    // Prefers explicit `extraction_judge_*` fields when set
-                    // (lets a future sidecar judge model override). Otherwise
-                    // falls back to the active summarization provider +
-                    // model_name — already in scope, already authenticated,
-                    // already configured; saves wiring two fields up through
-                    // SessionManager / Agent / TenantRuntime.
-                    const judge_provider: providers.Provider = config.extraction_judge_provider orelse provider;
-                    const judge_model: []const u8 = config.extraction_judge_model_name orelse model_name;
-                    const judge_ctx: ?extraction_persist.JudgeContext =
-                        extraction_persist.JudgeContext{
-                            .provider = judge_provider,
-                            .model_name = judge_model,
-                        };
-
-                    // V1.6 cmt8: coref context wraps the runtime embedding
-                    // provider when configured. Mem0's 0.95 cosine threshold.
-                    const coref_ctx: ?extraction_persist.EntityResolution =
-                        if (config.extraction_coref_embed) |ep|
-                            extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 }
-                        else
-                            null;
-
-                    const persist_result = extraction_persist.persistExtracted(
-                        allocator,
-                        state_mgr,
-                        uid,
-                        session_id_for_extract,
-                        extracted,
-                        judge_ctx,
-                        coref_ctx,
-                        config.archive_mem_rt, // V1.8-2: vector coverage
-                    ) catch |err| blk: {
-                        log.warn("compaction: extraction persist failed err={s}", .{@errorName(err)});
-                        break :blk extraction_persist.PersistResult{
-                            .written_count = 0,
-                            .skipped_blacklist = 0,
-                            .skipped_md5_dup = 0,
-                            .skipped_cosine_dup = 0,
-                            .skipped_semantic_dup = 0,
-                            .contradictions_resolved = 0,
-                            .failed_count = 0,
-                        };
-                    };
-                    log.info("compaction.extraction parsed={d} written={d} skipped_blacklist={d} skipped_md5_dup={d} skipped_semantic_dup={d} contradictions_resolved={d} failed={d}", .{
-                        extracted.len,
-                        persist_result.written_count,
-                        persist_result.skipped_blacklist,
-                        persist_result.skipped_md5_dup,
-                        persist_result.skipped_semantic_dup,
-                        persist_result.contradictions_resolved,
-                        persist_result.failed_count,
-                    });
-                }
-            };
-        }
-    }
+    // V1.14.12 (Path A) — Pass C JSON-tail parse + legacy direct write
+    // BOTH deleted. extraction_tail is captured by the summary call
+    // above and freed by its defer, but no longer parsed/persisted
+    // here. The Pass C extractAtBoundary call below (line ~770)
+    // handles structured extraction (entities + edges schema) from
+    // the same compaction window — single source of truth, single
+    // LLM call, graceful null-judge handling.
 
     // V1.14.8 C3 — unified boundary extraction (additive to legacy JSON-tail
     // path above). Fires the structured extraction (graphiti-shape JSON →
@@ -736,36 +682,42 @@ fn compactHistoryKeepingRecent(
     // <session>) using the configured judge provider. Failure-soft per layer;
     // existing JSON-tail path at lines 637-710 remains the primary edge writer
     // until C5 cleanup. Dedup at persistExtracted handles overlap.
-    if (config.extraction_judge_provider) |jp| {
-        if (config.extraction_judge_model_name) |jm| if (jm.len > 0) {
-            const window = history.items[start..compact_end];
-            var msgs_buf = std.ArrayListUnmanaged(ChatMessage).initCapacity(allocator, window.len) catch null;
-            if (msgs_buf) |*buf| {
-                defer buf.deinit(allocator);
-                for (window) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
-                const ctx = extraction_runner.ExtractionContext{
-                    .judge_provider = jp,
-                    .judge_model = jm,
-                    .state_mgr = config.extraction_state_mgr,
-                    .user_id = config.extraction_user_id,
-                    .session_id = config.archive_session_id,
-                    .coref_embed = config.extraction_coref_embed,
-                    .archive_mem = config.archive_memory,
-                    .archive_mem_rt = config.archive_mem_rt,
-                    .max_source_chars = config.max_source_chars,
-                };
-                const br = extraction_runner.extractAtBoundary(allocator, buf.items, ctx);
-                defer br.deinit(allocator);
-                log.info(
-                    "compaction.passC.unified_extract entities={d} edges={d} hydration_present={}",
-                    .{
-                        if (br.extraction) |e| e.entities.len else 0,
-                        if (br.extraction) |e| e.edges.len else 0,
-                        br.hydration != null,
-                    },
-                );
-            }
-        };
+    // V1.14.12 (Path A) — judge guard removed. extractAtBoundary now
+    // accepts null judge via runner.zig:798 (constructs JudgeContext
+    // only when judge_model is non-empty). No-judge tenants get
+    // graceful MD5+canonical-key dedup-only extraction.
+    {
+        const window = history.items[start..compact_end];
+        var msgs_buf = std.ArrayListUnmanaged(ChatMessage).initCapacity(allocator, window.len) catch null;
+        if (msgs_buf) |*buf| {
+            defer buf.deinit(allocator);
+            for (window) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
+            const judge_model_resolved = config.extraction_judge_model_name orelse "";
+            const ctx = extraction_runner.ExtractionContext{
+                .judge_provider = config.extraction_judge_provider orelse undefined,
+                .judge_model = judge_model_resolved,
+                .state_mgr = config.extraction_state_mgr,
+                .user_id = config.extraction_user_id,
+                .session_id = config.archive_session_id,
+                .coref_embed = config.extraction_coref_embed,
+                .archive_mem = config.archive_memory,
+                .archive_mem_rt = config.archive_mem_rt,
+                .max_source_chars = config.max_source_chars,
+                .boundary_kind = .pass_c, // V1.14.9 L-01: explicit telemetry tag
+                .write_origin = .pass_c_compaction_extract, // V1.14.12 (M1) — per-path telemetry tag
+                .cardinality_fastpath_enabled = config.extraction_cardinality_fastpath, // V1.14.12 (M2 review CRITICAL)
+            };
+            const br = extraction_runner.extractAtBoundary(allocator, buf.items, ctx);
+            defer br.deinit(allocator);
+            log.info(
+                "compaction.passC.unified_extract entities={d} edges={d} hydration_present={}",
+                .{
+                    if (br.extraction) |e| e.entities.len else 0,
+                    if (br.extraction) |e| e.edges.len else 0,
+                    br.hydration != null,
+                },
+            );
+        }
     }
 
     // Free old messages being compacted
@@ -1994,3 +1946,7 @@ test "dropOldestPairsFromMiddle no-op when total under keep_recent + protect pre
 // — its skip-path coverage lives in extraction/runner.zig's tests
 // ("extractAtBoundary skip path: empty window", "empty judge_model",
 // "no state mgr", "zero edges").
+
+// V1.14.12 (Path A) — `extraction_legacy_direct_writes defaults to true` test
+// REMOVED. Field deleted; the gated Pass C direct write block was deleted in
+// Path A (commit closing M5 sprint).

@@ -46,15 +46,26 @@ const FALLBACK_ENTRY_MAX_BYTES: usize = 320;
 // V1.7a-2 — graph-expand recall consumer.
 //
 // When a state_mgr is threaded through `loadTurnMemorySlot` AND
-// `NULLALIS_GRAPH_RECALL_MAX_HOPS` (default 1) is non-zero, an additional
-// `<graph_neighbors>` block is appended to the memory_for_turn slot. This
-// block lists 1-hop neighbors of the recall seeds that the legacy keyword/
-// vector recall would NOT have surfaced (because they don't textually
-// match the query, but they are graph-connected to a seed that does).
+// `NULLALIS_GRAPH_RECALL_MAX_HOPS` (default 2 — see V1.14.11 below) is
+// non-zero, an additional `<graph_neighbors>` block is appended to the
+// memory_for_turn slot. This block lists hop-1+ neighbors of the recall
+// seeds that the legacy keyword/vector recall would NOT have surfaced
+// (because they don't textually match the query, but they are graph-
+// connected to a seed that does).
 //
 // `max_hops=0` disables graph-mode entirely (legacy behavior — strict
 // backward compat). Operators set the env to 0 to roll back if needed.
-const DEFAULT_GRAPH_RECALL_MAX_HOPS: u8 = 1;
+//
+// V1.14.11 (Phase 3 R3 — Cat 3 multi-hop uplift). Default raised from
+// 1 → 2. LoCoMo Cat 3 (temporal/inference) often needs friend-of-
+// friend reach: "Mia mentioned a place; what cuisine does she like?"
+// requires Mia → mentioned_place (hop 1) → cuisine_type (hop 2).
+// At hop=1 we got only one of those bridges. The cost is bounded:
+// max_nodes_per_hop=20 caps the depth-2 frontier at ~40 nodes,
+// ~80 edges = 2 SQL round trips per turn. Block size unchanged
+// (1500 byte cap → still ~6-10 neighbors in the prompt; the cap
+// just gives the scorer a richer pool to pick from).
+const DEFAULT_GRAPH_RECALL_MAX_HOPS: u8 = 2;
 const DEFAULT_GRAPH_RECALL_SEEDS: usize = 5;
 const DEFAULT_GRAPH_RECALL_MAX_NODES_PER_HOP: usize = 20;
 /// Hard cap on the appended `<graph_neighbors>` block bytes. Keeps the
@@ -1401,6 +1412,19 @@ fn buildGraphNeighborsBlock(
     defer seed_set.deinit(allocator);
     for (recall.seeds) |s| try seed_set.put(allocator, s.key, {});
 
+    // V1.14.12 (Memory audit Finding 10 fix, 2026-05-19) — emit 2-hop
+    // neighbors via their 1-hop predecessor. Pre-fix, the BFS reached
+    // 2 hops (DEFAULT_GRAPH_RECALL_MAX_HOPS=2, motivated by Cat 3
+    // inference at lines 60-67) but the emit code only matched edges
+    // where the OTHER endpoint was a seed — so 2-hop nodes were
+    // silently dropped despite paying the SQL cost. Now we track the
+    // hop=1 frontier and let 2-hop nodes emit via their 1-hop bridge.
+    var hop1_set: std.StringHashMapUnmanaged(void) = .{};
+    defer hop1_set.deinit(allocator);
+    for (recall.neighborhood.nodes) |n| {
+        if (n.hop_distance == 1) try hop1_set.put(allocator, n.key, {});
+    }
+
     // For each non-seed node, find an edge that connects it to a seed
     // (so we can show the predicate + via-key context). If multiple edges
     // exist, the first match in `recall.neighborhood.edges` wins (already
@@ -1418,24 +1442,44 @@ fn buildGraphNeighborsBlock(
         if (seed_set.contains(node.key)) continue; // belt-and-suspenders dedup
         if (buf.items.len >= GRAPH_NEIGHBORS_BLOCK_MAX_BYTES) break;
 
-        // Find a connecting edge (any edge incident to this node where
-        // the OTHER endpoint is a seed).
-        var via_seed: ?[]const u8 = null;
+        // Find a connecting edge. For 1-hop nodes the OTHER endpoint
+        // is a seed. For 2-hop nodes the OTHER endpoint is a 1-hop
+        // node (the bridge). Prefer seed-connection when both exist —
+        // it's the more salient relationship for the LLM.
+        var via_key: ?[]const u8 = null;
         var via_predicate: ?[]const u8 = null;
         for (recall.neighborhood.edges) |e| {
             if (std.mem.eql(u8, e.source_key, node.key) and seed_set.contains(e.target_key)) {
-                via_seed = e.target_key;
+                via_key = e.target_key;
                 via_predicate = e.predicate;
                 break;
             } else if (std.mem.eql(u8, e.target_key, node.key) and seed_set.contains(e.source_key)) {
-                via_seed = e.source_key;
+                via_key = e.source_key;
                 via_predicate = e.predicate;
                 break;
             }
         }
-        // No connecting edge to any seed → skip (might be a 2-hop node;
-        // we don't emit those in the v1 ship to keep the block focused).
-        if (via_seed == null or via_predicate == null) continue;
+        // V1.14.12 (Finding 10 fix) — 2-hop fallback: if no direct seed
+        // connection, look for an edge to a 1-hop bridge node. Emit with
+        // the bridge as via=. The LLM sees "neighbor_key=X predicate=Y
+        // via=<1-hop bridge>" and can chain the inference.
+        if (via_key == null and node.hop_distance == 2) {
+            for (recall.neighborhood.edges) |e| {
+                if (std.mem.eql(u8, e.source_key, node.key) and hop1_set.contains(e.target_key)) {
+                    via_key = e.target_key;
+                    via_predicate = e.predicate;
+                    break;
+                } else if (std.mem.eql(u8, e.target_key, node.key) and hop1_set.contains(e.source_key)) {
+                    via_key = e.source_key;
+                    via_predicate = e.predicate;
+                    break;
+                }
+            }
+        }
+        // Still no connecting edge — skip (defensive; shouldn't happen
+        // for a node in the BFS neighborhood, but guards against orphans
+        // that slipped through edge filtering).
+        if (via_key == null or via_predicate == null) continue;
 
         // Fetch content for this neighbor key (one round trip per neighbor).
         const entry_opt = state_mgr.getMemory(allocator, user_id, node.key) catch null;
@@ -1443,17 +1487,19 @@ fn buildGraphNeighborsBlock(
             defer entry.deinit(allocator);
             const trimmed = truncateUtf8(std.mem.trim(u8, entry.content, " \t\n\r"), GRAPH_NEIGHBOR_CONTENT_MAX_BYTES);
             // Format: one line per neighbor for easy LLM scanning.
+            // hop=1|2 added per Finding 10 so the LLM can disambiguate
+            // direct seed-neighbors from inferred 2-hop chains.
             try w.print(
-                "neighbor_key={s} predicate={s} via={s} content={s}\n",
-                .{ node.key, via_predicate.?, via_seed.?, trimmed },
+                "neighbor_key={s} hop={d} predicate={s} via={s} content={s}\n",
+                .{ node.key, node.hop_distance, via_predicate.?, via_key.?, trimmed },
             );
             emitted += 1;
         } else {
             // Lookup failed (key vanished mid-flight) — emit a stub so the
             // edge isn't silently dropped from the agent's view.
             try w.print(
-                "neighbor_key={s} predicate={s} via={s} content=<unavailable>\n",
-                .{ node.key, via_predicate.?, via_seed.? },
+                "neighbor_key={s} hop={d} predicate={s} via={s} content=<unavailable>\n",
+                .{ node.key, node.hop_distance, via_predicate.?, via_key.? },
             );
             emitted += 1;
         }

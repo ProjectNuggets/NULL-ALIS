@@ -56,6 +56,7 @@ const log = std.log.scoped(.graph_expand);
 const zaki_state = @import("../zaki_state.zig");
 const memory_root = @import("../memory/root.zig");
 const importance = @import("../memory/importance.zig");
+const edge_resolution = @import("edge_resolution.zig");
 
 /// One node in the expanded neighborhood with its hop distance from the
 /// nearest seed and its composite score.
@@ -201,8 +202,29 @@ pub fn expandFromSeeds(
             allocator.free(hop_edges);
         }
 
-        // Sort by weight DESC so the cap drops the weakest edges first.
-        std.sort.pdq(memory_root.TypedEdge, hop_edges, {}, edgeWeightDesc);
+        // V1.14.11 (R3) — predicate-aware edge weighting via sort-time
+        // comparator (NOT in-place mutation). Single-valued predicates
+        // (LIVES_IN, MARRIED_TO, BIRTHDAY) propagate at full weight —
+        // they ARE the canonical truth. Set-valued predicates (LIKES,
+        // USES, IS_TYPE_OF, ATTENDED) propagate at 0.5x — many edges
+        // per node, each carries less semantic weight. Mirrors the
+        // cardinality split documented in
+        // src/agent/edge_resolution.zig::buildResolvePrompt.
+        //
+        // BUG FIX (post-review): the original implementation mutated
+        // `e.weight *= prior` in place. That leaked into
+        // gateway.zig:13767 which emits `e.weight` to the /brain/graph
+        // FE, surfacing priored weights (0.5 / 1.0) instead of true
+        // DB-stored weights. Sort with an adjusted-weight comparator
+        // instead so edge.weight stays intact for downstream readers.
+        std.sort.pdq(memory_root.TypedEdge, hop_edges, {}, edgeAdjustedWeightDesc);
+
+        // R3 per-hop telemetry: emits the frontier size + edge count
+        // per hop. Lets us see in production whether depth-2 expansion
+        // is actually producing additional reach on Cat 3 queries.
+        log.info("graph_expand.hop hop={d} frontier_size={d} edges={d} admitted_cap={d}", .{
+            hop, frontier.items.len, hop_edges.len, config.max_nodes_per_hop,
+        });
 
         // Build next frontier from edge targets that are NEW.
         var next_frontier: std.ArrayListUnmanaged([]const u8) = .{};
@@ -282,6 +304,44 @@ pub fn expandFromSeeds(
 
 fn edgeWeightDesc(_: void, a: memory_root.TypedEdge, b: memory_root.TypedEdge) bool {
     return a.weight > b.weight;
+}
+
+/// V1.14.11 (R3) — predicate-aware comparator. Computes the priored
+/// weight at compare-time without touching the underlying edge struct,
+/// so callers downstream (e.g. /brain/graph JSON emission at
+/// gateway.zig:13767) still see the true DB-stored weight, not the
+/// prior-multiplied value used internally for cap-eviction ordering.
+fn edgeAdjustedWeightDesc(_: void, a: memory_root.TypedEdge, b: memory_root.TypedEdge) bool {
+    return a.weight * predicateTypePrior(a.predicate) > b.weight * predicateTypePrior(b.predicate);
+}
+
+/// V1.14.11 (R3) — predicate-type prior for PPR-style edge weighting.
+///
+/// Set-valued predicates (a node can have many of them — IS_TYPE_OF,
+/// LIKES, USES, ATTENDED, etc.) propagate at 0.5x because each
+/// individual edge carries less semantic weight when many coexist.
+/// Single-valued predicates (LIVES_IN, MARRIED_TO, BIRTHDAY) propagate
+/// at full 1.0 because each IS the canonical fact for that subject.
+///
+/// Default for unknown predicates is 0.7 — a middle value that doesn't
+/// over-penalize unmapped vocab.
+///
+/// V1.14.12 (M2) — refactored to delegate to
+/// `edge_resolution.classifyPredicate` (single source of truth for
+/// cardinality vocab). Pre-M2 this function maintained an inline copy
+/// of the same predicate list as `buildResolvePrompt`'s SET-VALUED
+/// section; drift between them weakened correctness. Now both consult
+/// the same enum-returning helper.
+///
+/// Reference: HippoRAG (Gutiérrez et al. 2024) uses 0.5 / 0.85 as the
+/// propagation prior; we widened the gap (0.5 / 1.0) to amplify the
+/// signal on this corpus's predicate distribution.
+pub fn predicateTypePrior(predicate: []const u8) f64 {
+    return switch (edge_resolution.classifyPredicate(predicate)) {
+        .single_valued => 1.0,
+        .set_valued => 0.5,
+        .unknown => 0.7,
+    };
 }
 
 fn scoredNodeDesc(_: void, a: ScoredNode, b: ScoredNode) bool {
@@ -430,4 +490,67 @@ test "edgeWeightDesc orders by weight descending" {
     const b: memory_root.TypedEdge = .{ .source_key = "x", .target_key = "z", .predicate = "P", .weight = 0.5 };
     try std.testing.expect(edgeWeightDesc({}, a, b));
     try std.testing.expect(!edgeWeightDesc({}, b, a));
+}
+
+test "predicateTypePrior: single-valued identity predicates propagate at full weight" {
+    try std.testing.expectEqual(@as(f64, 1.0), predicateTypePrior("LIVES_IN"));
+    try std.testing.expectEqual(@as(f64, 1.0), predicateTypePrior("MARRIED_TO"));
+    try std.testing.expectEqual(@as(f64, 1.0), predicateTypePrior("BIRTHDAY"));
+    try std.testing.expectEqual(@as(f64, 1.0), predicateTypePrior("REPLACES"));
+}
+
+test "predicateTypePrior: set-valued predicates dampen to 0.5x" {
+    try std.testing.expectEqual(@as(f64, 0.5), predicateTypePrior("LIKES"));
+    try std.testing.expectEqual(@as(f64, 0.5), predicateTypePrior("USES"));
+    try std.testing.expectEqual(@as(f64, 0.5), predicateTypePrior("IS_TYPE_OF"));
+    try std.testing.expectEqual(@as(f64, 0.5), predicateTypePrior("ATTENDED"));
+    try std.testing.expectEqual(@as(f64, 0.5), predicateTypePrior("KNOWS"));
+}
+
+test "predicateTypePrior: case-insensitive lookup" {
+    try std.testing.expectEqual(@as(f64, 1.0), predicateTypePrior("lives_in"));
+    try std.testing.expectEqual(@as(f64, 0.5), predicateTypePrior("Likes"));
+}
+
+test "predicateTypePrior: unmapped predicates get sensible middle prior" {
+    try std.testing.expectEqual(@as(f64, 0.7), predicateTypePrior("CUSTOM_UNMAPPED"));
+    try std.testing.expectEqual(@as(f64, 0.7), predicateTypePrior(""));
+    // Oversize predicate — falls through without panic.
+    const big = "X" ** 100;
+    try std.testing.expectEqual(@as(f64, 0.7), predicateTypePrior(big));
+}
+
+test "predicateTypePrior: amplification ratio between single and set-valued is 2x" {
+    // R3 design invariant: single-valued predicates should propagate
+    // at 2x the weight of set-valued ones. If this ratio shifts, the
+    // PPR scoring intuition (canonical facts dominate over set members)
+    // breaks. Catches accidental weight changes during tuning.
+    const ratio = predicateTypePrior("LIVES_IN") / predicateTypePrior("LIKES");
+    try std.testing.expectEqual(@as(f64, 2.0), ratio);
+}
+
+test "edgeAdjustedWeightDesc: ranks single-valued above set-valued at equal raw weight" {
+    // The whole point of the predicate-aware sort. Two edges with
+    // identical DB-stored weight but different predicate cardinality
+    // should rank with the single-valued one first.
+    const single: memory_root.TypedEdge = .{ .source_key = "x", .target_key = "y", .predicate = "LIVES_IN", .weight = 1.0 };
+    const set_val: memory_root.TypedEdge = .{ .source_key = "x", .target_key = "z", .predicate = "LIKES", .weight = 1.0 };
+    try std.testing.expect(edgeAdjustedWeightDesc({}, single, set_val));
+    try std.testing.expect(!edgeAdjustedWeightDesc({}, set_val, single));
+}
+
+test "edgeAdjustedWeightDesc: does NOT mutate edge.weight (regression for /brain/graph leak)" {
+    // V1.14.11 post-review bug fix. Original implementation multiplied
+    // e.weight *= predicateTypePrior(...) in place, which leaked
+    // priored weights into gateway.zig:13767's /brain/graph JSON
+    // emission, surfacing 0.5 / 1.0 instead of true DB values.
+    // Now the prior applies only at compare-time. This test asserts
+    // the compare itself does not mutate.
+    const a: memory_root.TypedEdge = .{ .source_key = "x", .target_key = "y", .predicate = "LIKES", .weight = 0.8 };
+    const b: memory_root.TypedEdge = .{ .source_key = "x", .target_key = "z", .predicate = "LIVES_IN", .weight = 0.6 };
+    _ = edgeAdjustedWeightDesc({}, a, b);
+    _ = edgeAdjustedWeightDesc({}, b, a);
+    // Weights must be untouched after compare calls.
+    try std.testing.expectEqual(@as(f64, 0.8), a.weight);
+    try std.testing.expectEqual(@as(f64, 0.6), b.weight);
 }

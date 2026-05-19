@@ -1125,6 +1125,46 @@ test "json parse roundtrip" {
     allocator.free(cfg.runtime.kind);
 }
 
+test "V1.14.12 (M2/M3/M5 hardening): all three new gate flags default to true" {
+    // Locks the soak-safe default contract. If any of these flips to
+    // false by default, the deployment loses the M2 fast-path,
+    // M3 coverage filter, or M5 legacy direct-write coverage —
+    // potentially silently. The default-on contract is the soak
+    // safety net. Operators MUST explicitly opt out via config.json.
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expect(cfg.agent.extraction_cardinality_fastpath);
+    try std.testing.expect(cfg.agent.extraction_coverage_filter_enabled);
+    // V1.14.12 (Path A) — extraction_legacy_direct_writes field removed.
+}
+
+test "V1.14.12 (M2/M3 hardening): operator can override the two remaining flags via config.json" {
+    // Hardening test: parseJson MUST honor explicit overrides for
+    // each flag. The M5 legacy_direct_writes flag was deleted in
+    // Path A (no longer a feature flag — the gated paths were removed
+    // entirely after A/B bench validation).
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "agent": {
+        \\    "extraction_cardinality_fastpath": false,
+        \\    "extraction_coverage_filter_enabled": false
+        \\  }
+        \\}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    try std.testing.expect(!cfg.agent.extraction_cardinality_fastpath);
+    try std.testing.expect(!cfg.agent.extraction_coverage_filter_enabled);
+}
+
 test "gateway config defaults require explicit chat stream session key" {
     const cfg = Config{
         .workspace_dir = "/tmp/yc",

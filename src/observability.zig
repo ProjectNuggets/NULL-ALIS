@@ -152,6 +152,35 @@ pub const ObserverMetric = union(enum) {
 };
 
 /// Core observability interface — Zig vtable pattern.
+///
+/// V1.14.10 A — **THREAD-SAFETY CONTRACT** (review fix H-01):
+/// Implementations of `record_event` / `record_metric` / `flush`
+/// MUST be safe to call concurrently from multiple threads.
+///
+/// Rationale: V1.14.10 moved the lifecycle summarizer to a detached
+/// async worker, so a single Observer instance can now have
+/// `recordEvent` fired by both the agent's hot-path turn AND the
+/// async lifecycle worker concurrently. Pre-V1.14.10 this could not
+/// happen — every emit was serialized by `agent.turn()` being the
+/// sole writer.
+///
+/// All current impls (audited 2026-05-18) satisfy the contract:
+///   - `NoopObserver` — trivially safe (no state).
+///   - `LogObserver` — std.log is thread-safe (libc-stderr is
+///     line-buffered + lock-protected by the runtime).
+///   - `VerboseObserver` — uses stack-local format buffer per call.
+///   - `MultiObserver` — composes underlying observers; safe iff
+///     children are safe (all current children are).
+///   - `FileObserver` — POSIX `write(2)` is atomic for buffers
+///     under PIPE_BUF (4KB on macOS/Linux); log lines stay under.
+///   - `OtelObserver` — has its own `mutex: std.Thread.Mutex` +
+///     atomic counters.
+///   - `RunTraceStore` (run_trace_store.zig) — has its own mutex.
+///   - `SentryObserver` (sentry_runtime.zig) — uses atomic flag.
+///
+/// If you add a new Observer impl: hold a mutex around any mutable
+/// state, OR use atomics, OR ensure your operations are stateless
+/// per-call. Don't rely on caller serialization.
 pub const Observer = struct {
     ptr: *anyopaque,
     vtable: *const VTable,

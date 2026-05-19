@@ -405,6 +405,11 @@ pub const Agent = struct {
     /// MD5 dedup only, no semantic contradiction detection).
     extraction_judge_provider: ?providers.Provider = null,
     extraction_judge_model_name: []const u8 = "",
+    // V1.14.12 (Path A) — extraction_legacy_direct_writes field removed.
+    /// V1.14.12 (M2 review CRITICAL) — cardinality fast-path gate
+    /// threaded through to JudgeContext so persistExtracted honors
+    /// the operator-set value. Default true preserves M2 behavior.
+    extraction_cardinality_fastpath: bool = true,
     /// V1.14.7 — extraction trigger gates (per-turn enqueue, memory nudge,
     /// skills nudge). Defaults preserve V1.14.6 behavior. C2 wires structured
     /// extraction into compaction; C3 flips defaults to disabled and deletes
@@ -590,6 +595,14 @@ pub const Agent = struct {
 
     /// Whether compaction was performed during the last turn.
     last_turn_compacted: bool = false,
+
+    /// V1.14.10 A — in-flight guard for async lifecycle summarizer.
+    /// True while a background lifecycle thread is running. Hot-path
+    /// callers (compaction:auto, summary_seed:auto) skip enqueuing
+    /// when already in-flight — the next legitimate trigger picks
+    /// up whatever the in-flight one missed. Atomic so the spawned
+    /// thread can clear it safely from a non-agent thread.
+    lifecycle_in_flight: std.atomic.Value(bool) = .{ .raw = false },
 
     /// Whether context was force-compacted due to exhaustion during the current turn.
     context_was_compacted: bool = false,
@@ -868,7 +881,57 @@ pub const Agent = struct {
         return if (self.cached_config) |*cfg| cfg else null;
     }
 
+    /// V1.14.10 A — Wait for any in-flight async lifecycle worker to
+    /// complete. Bounded by `timeout_ms`. Returns true if drained,
+    /// false if timed out.
+    ///
+    /// Used by Agent.deinit (with a generous 30s timeout) so the
+    /// detached worker doesn't outlive the Agent it references.
+    /// Also exposed publicly so tests that assert on side-effects
+    /// (memory writes) of the lifecycle path can wait deterministically
+    /// before asserting.
+    pub fn waitForLifecycleIdle(self: *Agent, timeout_ms: i64) bool {
+        const wait_start_ms = std.time.milliTimestamp();
+        while (self.lifecycle_in_flight.load(.acquire)) {
+            const elapsed = std.time.milliTimestamp() - wait_start_ms;
+            if (elapsed > timeout_ms) return false;
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+        return true;
+    }
+
+    /// V1.14.10 A review fix (M-02): default Agent.deinit keeps the
+    /// 30s budget for shutdown contexts (process teardown — generous
+    /// because we want lifecycle data to land when the provider is
+    /// reachable). Hot-path callers (e.g. `recycleSessionInPlace` in
+    /// session.zig — H-02) should call `deinitWithTimeout` directly
+    /// with a tighter budget AND check the return value to skip the
+    /// destructive operation rather than UAF if the worker won't drain.
     pub fn deinit(self: *Agent) void {
+        _ = self.deinitWithTimeout(30_000);
+    }
+
+    /// V1.14.10 A review fix (M-02 + H-02): deinit with a custom
+    /// drain timeout. Returns `true` if the lifecycle worker drained
+    /// cleanly within the budget; `false` if it timed out.
+    ///
+    /// On `false`, the function STILL proceeds with the tear-down
+    /// because the alternative (hanging forever) is worse for
+    /// SessionManager / runtime shutdown. The detached worker may
+    /// segfault on subsequent allocator use — that's a known
+    /// trade-off, logged for operators.
+    ///
+    /// Hot-path callers (recycleSessionInPlace / TTL evict) should:
+    ///   1. Call `deinitWithTimeout(5_000)` with a tight budget.
+    ///   2. If returning `false`, SKIP whatever destructive next-step
+    ///      they had planned (recycle, replace) — the worker may
+    ///      still need the agent. Retry next loop iteration.
+    pub fn deinitWithTimeout(self: *Agent, timeout_ms: i64) bool {
+        const drained = self.waitForLifecycleIdle(timeout_ms);
+        if (!drained) {
+            log.warn("Agent.deinit: async lifecycle still in flight after {d}ms — proceeding (worker may segfault)", .{timeout_ms});
+        }
+
         self.clearCurrentTurnProviderOverride();
         if (self.cached_config) |*cfg| cfg.deinit();
         if (self.model_name_owned) self.allocator.free(self.model_name);
@@ -884,6 +947,7 @@ pub const Agent = struct {
         }
         self.history.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
+        return drained;
     }
 
     /// Estimate total tokens in conversation history.
@@ -919,36 +983,17 @@ pub const Agent = struct {
 
         const compact_provider = if (self.sidecar_provider) |sp| sp else self.provider;
         const compact_model = if (self.sidecar_provider != null) self.sidecar_model else self.model_name;
-        const cfg = compaction.CompactionConfig{
-            .keep_recent = self.compaction_keep_recent,
-            .max_summary_chars = self.compaction_max_summary_chars,
-            .max_source_chars = self.compaction_max_source_chars,
-            .token_limit = self.token_limit,
-            .max_tokens = self.max_tokens,
-            .message_timeout_secs = self.message_timeout_secs,
-            .max_history_messages = self.max_history_messages,
-            .workspace_dir = self.workspace_dir,
-            // iter29: let Pass C persist its emergency summary as a durable
-            // artifact via memory_timeline/memory_recall.
-            .archive_memory = self.mem,
-            .archive_session_id = self.memory_session_id,
-            // iter31: also index the summary into the vector store so it
-            // surfaces in semantic memory_recall, not just prefix-browse.
-            .archive_mem_rt = self.mem_rt,
-            // V1.6 commit 5b.3 — extraction wiring. When state_mgr +
-            // user_id are set on the agent, Pass C also persists atomic
-            // facts via extraction_persist. Defaults stay
-            // null/0 so V1.5 production (where these aren't yet wired
-            // at the gateway level) is unaffected.
-            .extraction_state_mgr = self.extraction_state_mgr,
-            .extraction_user_id = self.extraction_user_id,
-            .extraction_coref_embed = self.extraction_coref_embed,
-            .extraction_judge_provider = self.extraction_judge_provider,
-            .extraction_judge_model_name = if (self.extraction_judge_model_name.len > 0)
-                self.extraction_judge_model_name
-            else
-                compact_model,
-        };
+        // V1.14.9 review fix (H-01): single source of truth via
+        // buildCompactionConfig. Both auto + manual paths share it.
+        //
+        // Reconciliation merge 2026-05-19 with main's `d6b3221e fix: wire
+        // extraction judge into compaction`: that fix populated the same
+        // two judge fields inline with a `compact_model` fallback when no
+        // explicit extraction_judge_model_name was configured. The
+        // refactor preserves both intents — buildCompactionConfig accepts
+        // `compact_model` as the default-judge-model parameter, so the
+        // judge runs by default using the compact model unless overridden.
+        const cfg = self.buildCompactionConfig(compact_model);
 
         // iter22 (Nova's Medium finding): measure thrash savings in TOKENS,
         // not message count. Some compaction passes (Pass A cheap dedup,
@@ -990,7 +1035,63 @@ pub const Agent = struct {
     pub fn manualCompactHistory(self: *Agent) !bool {
         const compact_provider = if (self.sidecar_provider) |sp| sp else self.provider;
         const compact_model = if (self.sidecar_provider != null) self.sidecar_model else self.model_name;
-        return compaction.manualCompactHistory(self.allocator, &self.history, compact_provider, compact_model, .{
+        // V1.14.9 review fix (H-01): operator-triggered /compact must also
+        // benefit from the unified extractor wire (graph density, judge
+        // contradiction resolution, working-memory promotion). Pre-fix this
+        // path's literal CompactionConfig dropped every extraction field —
+        // silently degrading manual compactions back to V1.5 behavior even
+        // though autoCompactHistory worked correctly.
+        //
+        // 2026-05-19 reconcile-merge CORRECTION: pass `null` (not `compact_model`)
+        // as default_judge_model here. Rationale: d6b3221e's intent was
+        // specifically the AUTO compaction path. Extending the same fallback
+        // to manual was an overreach that broke the canonical `/compact`
+        // test — the test fixture doesn't wire `extraction_judge_provider`,
+        // so populating `extraction_judge_model_name` with `compact_model`
+        // makes the judge LOOK configured while `judge_provider` is null,
+        // leading to a null-vtable segfault in `runExtractionCall`. Manual
+        // /compact retains its prior degrade-gracefully behavior (judge off
+        // unless explicitly configured by operator).
+        return compaction.manualCompactHistory(
+            self.allocator,
+            &self.history,
+            compact_provider,
+            compact_model,
+            self.buildCompactionConfig(null),
+        );
+    }
+
+    /// V1.14.9 review fix (H-01): single source of truth for
+    /// CompactionConfig construction. `autoCompactHistory` and
+    /// `manualCompactHistory` both build their config via this helper, so
+    /// the extraction-wire fields can't get out of sync between paths.
+    /// `forceCompressHistory` deliberately does NOT use this — that path
+    /// runs when the LLM is unavailable; extraction calls would just fail
+    /// or pile up.
+    ///
+    /// `default_judge_model` is the fallback used when
+    /// `self.extraction_judge_model_name` is empty. Per the 2026-05-19
+    /// reconcile merge with main's `d6b3221e fix: wire extraction judge
+    /// into compaction`, callers pass their `compact_model` so the
+    /// judge runs by default using the compact model when no explicit
+    /// extraction-judge model is configured. Pass `null` (or "") if the
+    /// caller wants the Path A degrade-gracefully behavior (judge off
+    /// when not configured).
+    fn buildCompactionConfig(self: *Agent, default_judge_model: ?[]const u8) compaction.CompactionConfig {
+        // Defensive coupling: a non-null judge_model_name with a null
+        // judge_provider crashes `extraction/runner.zig:555` (null vtable
+        // dereference). Only set the model name if the provider is also
+        // present, regardless of what the caller asked for.
+        const resolved_judge_model: ?[]const u8 = blk: {
+            if (self.extraction_judge_provider == null) break :blk null;
+            if (self.extraction_judge_model_name.len > 0) break :blk self.extraction_judge_model_name;
+            if (default_judge_model) |dm| {
+                if (dm.len > 0) break :blk dm;
+            }
+            break :blk null;
+        };
+
+        return compaction.CompactionConfig{
             .keep_recent = self.compaction_keep_recent,
             .max_summary_chars = self.compaction_max_summary_chars,
             .max_source_chars = self.compaction_max_source_chars,
@@ -999,7 +1100,19 @@ pub const Agent = struct {
             .message_timeout_secs = self.message_timeout_secs,
             .max_history_messages = self.max_history_messages,
             .workspace_dir = self.workspace_dir,
-        });
+            .archive_memory = self.mem,
+            .archive_session_id = self.memory_session_id,
+            .archive_mem_rt = self.mem_rt,
+            .extraction_state_mgr = self.extraction_state_mgr,
+            .extraction_user_id = self.extraction_user_id,
+            .extraction_coref_embed = self.extraction_coref_embed,
+            .extraction_judge_provider = self.extraction_judge_provider,
+            .extraction_judge_model_name = resolved_judge_model,
+            // V1.14.12 (Path A) — extraction_legacy_direct_writes propagation removed.
+            // V1.14.12 (M2 review CRITICAL) — propagate the cardinality
+            // fast-path flag so Pass C judge_ctx honors operator config.
+            .extraction_cardinality_fastpath = self.extraction_cardinality_fastpath,
+        };
     }
 
     /// Force-compress history for context exhaustion recovery.
@@ -2782,6 +2895,49 @@ pub const Agent = struct {
         const enrich_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - enrich_start_ms));
         turn_memory_enrich_ms = enrich_duration_ms;
         log.info("turn.stage stage=memory_enrich duration_ms={d}", .{enrich_duration_ms});
+
+        // V1.14.9 #6 — Retrieval-side telemetry symmetric to R1
+        // boundary.metrics. R1 measures EXTRACTION (write side); this
+        // measures RECALL (read side). One structured log line per turn
+        // captures: did we serve any memory at all (available), how many
+        // candidates considered (candidate_count), how that decomposed
+        // by retrieval kind (durable_fact / timeline / search-match /
+        // global), and how many bytes/entries each bucket contributed.
+        // Operators can grep `recall.metrics` to spot per-user retrieval
+        // collapse (available=false on a populated user = R3 graph
+        // traversal opportunity OR R4 BM25 fusion gap).
+        const rstats = memory_slot_result.stats;
+        log.info(
+            "recall.metrics available={} candidates={d} global_candidates={d} durable_facts={d} timeline_summaries={d} search_matches={d} global_fallbacks={d} summary_latest_used={} context_anchor_used={} continuity_entries={d} continuity_bytes={d} semantic_entries={d} semantic_bytes={d} fallback_entries={d} fallback_bytes={d} enrich_ms={d}",
+            .{
+                rstats.available,
+                rstats.candidate_count,
+                rstats.global_candidate_count,
+                rstats.durable_fact_count,
+                rstats.timeline_summary_count,
+                rstats.search_match_count,
+                rstats.global_fallback_count,
+                rstats.summary_latest_used,
+                rstats.context_anchor_used,
+                rstats.continuity_bucket_entries,
+                rstats.continuity_bucket_bytes,
+                rstats.semantic_bucket_entries,
+                rstats.semantic_bucket_bytes,
+                rstats.fallback_bucket_entries,
+                rstats.fallback_bucket_bytes,
+                enrich_duration_ms,
+            },
+        );
+        // Retrieval-side alert (mirror of R1 boundary.zero_density):
+        // user has memory available but retrieval returned 0 candidates
+        // on a non-trivial user message. Surfaces stale embeddings,
+        // missing entity coref, or graph layer not yet populated.
+        if (self.mem != null and user_message.len > 32 and rstats.available and rstats.candidate_count == 0) {
+            log.warn(
+                "recall.zero_candidates user_msg_len={d} — retrieval pipeline returned no matches on a substantive query; check embeddings / coref / graph",
+                .{user_message.len},
+            );
+        }
         const memory_stage_event = ObserverEvent{ .turn_stage = .{
             .stage = "memory_enrich",
             .duration_ms = enrich_duration_ms,
@@ -4897,7 +5053,21 @@ pub const Agent = struct {
 
     fn refreshDurableContinuityAfterCompaction(self: *Agent) void {
         if (!self.last_turn_compacted) return;
-        self.last_turn_context.durable_continuity_refreshed = commands.persistSessionCheckpointDetailed(self, "compaction:auto");
+        // V1.14.10 A — async: this used to block the turn return for
+        // 30-180s on dense sessions (legacy lifecycle path fires
+        // 50-100+ contradiction-judge + entity-coref calls per
+        // compaction). The full battery on 2026-05-18 saw 9 of ~100
+        // session-load turns hit the 180s HTTP read timeout because
+        // of this — sample 4 dropped from 88% to 67% as a result.
+        //
+        // V1.14.10 A review fix (M-03): `durable_continuity_refreshed`
+        // now reflects ACTUAL spawn success — true only when the
+        // async worker accepted the job. When the in-flight guard
+        // skips the trigger (prior worker still running with stale
+        // data), telemetry no longer lies; downstream consumers see
+        // the truth and the next legitimate trigger picks it up.
+        self.last_turn_context.durable_continuity_refreshed =
+            commands.persistSessionCheckpointAsync(self, "compaction:auto");
     }
 
     fn ensureDurableContinuitySeed(self: *Agent) void {
@@ -4916,7 +5086,13 @@ pub const Agent = struct {
             return;
         }
 
-        _ = commands.persistSessionCheckpointDetailed(self, "summary_seed:auto");
+        // V1.14.10 A — async (see refreshDurableContinuityAfterCompaction
+        // above for rationale). summary_seed fires every turn that
+        // would have no summary yet — making it sync was extra
+        // contention on a path that didn't need to block. No truth-
+        // flag to update on this path (caller doesn't read a return
+        // value), so we just discard the spawn success bool.
+        _ = commands.persistSessionCheckpointAsync(self, "summary_seed:auto");
     }
 
     /// Run a single message through the agent and return the response.
@@ -7879,6 +8055,9 @@ test "auto compaction refreshes durable continuity artifacts" {
     try std.testing.expect(agent.last_turn_compacted);
     try std.testing.expect(agent.last_turn_context.durable_continuity_refreshed);
 
+    // V1.14.10 A — lifecycle persist is async; wait for it before
+    // asserting on the resulting memory write.
+    try std.testing.expect(agent.waitForLifecycleIdle(30_000));
     const anchor = (try mem.get(allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
     defer anchor.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=compaction:auto") != null);
@@ -7967,6 +8146,10 @@ test "message-count boundary no longer auto-compacts without token pressure" {
     try std.testing.expect(!agent.last_turn_compacted);
     try std.testing.expect(!agent.last_turn_context.durable_continuity_refreshed);
     try std.testing.expectEqual(@as(u32, 0), agent.last_turn_context.trim_events);
+
+    // V1.14.10 A — lifecycle persist is async; wait before asserting on
+    // the memory side-effects (anchor + latest summary).
+    try std.testing.expect(agent.waitForLifecycleIdle(30_000));
 
     const anchor = (try mem.get(allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
     defer anchor.deinit(allocator);
@@ -8118,6 +8301,10 @@ test "normal main-lane turn seeds summary_latest when compaction never runs" {
     defer allocator.free(response);
     try std.testing.expectEqualStrings("ok", response);
     try std.testing.expect(!agent.last_turn_compacted);
+
+    // V1.14.10 A — lifecycle persist is async; wait before asserting on
+    // the memory writes.
+    try std.testing.expect(agent.waitForLifecycleIdle(30_000));
 
     const latest = (try mem.get(allocator, "summary_latest/agent:test:user:1:main")) orelse return error.TestUnexpectedResult;
     defer latest.deinit(allocator);

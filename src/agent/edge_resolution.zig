@@ -90,6 +90,212 @@ pub const ResolveOutcome = struct {
 pub const MAX_RELATED_CANDIDATES: usize = 12;
 pub const MAX_BROADER_CANDIDATES: usize = 8;
 
+/// V1.14.12 (M2) — predicate cardinality classification.
+///
+/// Set-valued predicates (LIKES, USES, IS_TYPE_OF, ATTENDED) accept
+/// multiple coexisting values for the same subject. A new (subject,
+/// predicate, different_object) tuple is normally an ADDITIVE fact,
+/// NOT a contradiction.
+///
+/// Single-valued predicates (LIVES_IN, MARRIED_TO, BIRTHDAY) admit
+/// only one current value. A new (subject, predicate, different_object)
+/// IS a contradiction (the old value gets superseded).
+///
+/// Unknown predicates default to .unknown — caller routes to LLM judge
+/// for cardinality nuance.
+///
+/// This classification is the SINGLE SOURCE OF TRUTH consumed by:
+///   1. persistExtracted's cardinality fast-path (skip judge for
+///      set-valued + no negation — Captain Mochi fix follow-up)
+///   2. graph_expand.predicateTypePrior (PPR edge weight prior)
+///   3. The Llama judge prompt (kept during M2 soak; removed after)
+/// Drift between these three sites weakens correctness; this function
+/// is the canonical anchor.
+pub const PredicateCardinality = enum {
+    set_valued,
+    single_valued,
+    unknown,
+};
+
+/// Classify a predicate string. Case-insensitive (uppercase normalize).
+/// Vocab mirrors edge_resolution.zig's buildResolvePrompt SET-VALUED
+/// and SINGLE-VALUED sections + extraction_persist.linkTypeForPredicate
+/// supersession list.
+pub fn classifyPredicate(predicate: []const u8) PredicateCardinality {
+    if (predicate.len == 0) return .unknown;
+    // V1.14.12 (M3 review MED) — oversized predicate routes to
+    // .unknown. Log so the vocab gap surfaces (LLMs occasionally
+    // emit verbose multi-word predicates during failure modes).
+    // The 64-char buffer is conservative for canonical vocab
+    // (longest known: "COLLABORATES_WITH" = 18 chars).
+    if (predicate.len > 64) {
+        log.info("edge_resolution.predicate_oversized len={d}", .{predicate.len});
+        return .unknown;
+    }
+    var buf: [64]u8 = undefined;
+    for (predicate, 0..) |ch, i| buf[i] = std.ascii.toUpper(ch);
+    const norm = buf[0..predicate.len];
+
+    // Single-valued — new value supersedes old.
+    if (std.mem.eql(u8, norm, "LIVES_IN")) return .single_valued;
+    if (std.mem.eql(u8, norm, "WORKS_AT")) return .single_valued;
+    if (std.mem.eql(u8, norm, "MARRIED_TO")) return .single_valued;
+    if (std.mem.eql(u8, norm, "REPORTS_TO")) return .single_valued;
+    if (std.mem.eql(u8, norm, "BIRTHDAY")) return .single_valued;
+    if (std.mem.eql(u8, norm, "BORN_ON")) return .single_valued;
+    if (std.mem.eql(u8, norm, "CURRENT_PROJECT")) return .single_valued;
+    // Explicit supersession predicates — the predicate ITSELF is single-
+    // valued because it names a temporal transition.
+    if (std.mem.eql(u8, norm, "REPLACES")) return .single_valued;
+    if (std.mem.eql(u8, norm, "USED_TO_BE")) return .single_valued;
+    if (std.mem.eql(u8, norm, "FORMERLY")) return .single_valued;
+    if (std.mem.eql(u8, norm, "PREVIOUSLY")) return .single_valued;
+    if (std.mem.eql(u8, norm, "USED_TO_PREFER")) return .single_valued;
+    if (std.mem.eql(u8, norm, "USED_TO_USE")) return .single_valued;
+
+    // Set-valued — multiple values coexist.
+    // Membership.
+    if (std.mem.eql(u8, norm, "IS_TYPE_OF")) return .set_valued;
+    if (std.mem.eql(u8, norm, "INCLUDES")) return .set_valued;
+    if (std.mem.eql(u8, norm, "MEMBER_OF")) return .set_valued;
+    if (std.mem.eql(u8, norm, "PART_OF")) return .set_valued;
+    if (std.mem.eql(u8, norm, "FOLLOWS")) return .set_valued;
+    // Preference.
+    if (std.mem.eql(u8, norm, "LIKES")) return .set_valued;
+    if (std.mem.eql(u8, norm, "LOVES")) return .set_valued;
+    if (std.mem.eql(u8, norm, "HATES")) return .set_valued;
+    if (std.mem.eql(u8, norm, "AVOIDS")) return .set_valued;
+    if (std.mem.eql(u8, norm, "FAVORS")) return .set_valued;
+    if (std.mem.eql(u8, norm, "DISLIKES")) return .set_valued;
+    if (std.mem.eql(u8, norm, "ENJOYS")) return .set_valued;
+    if (std.mem.eql(u8, norm, "VALUES")) return .set_valued;
+    if (std.mem.eql(u8, norm, "PREFERS")) return .set_valued;
+    // Usage.
+    if (std.mem.eql(u8, norm, "USES")) return .set_valued;
+    if (std.mem.eql(u8, norm, "USED_FOR")) return .set_valued;
+    if (std.mem.eql(u8, norm, "OWNS")) return .set_valued;
+    if (std.mem.eql(u8, norm, "DEPENDS_ON")) return .set_valued;
+    if (std.mem.eql(u8, norm, "BUILDS_WITH")) return .set_valued;
+    if (std.mem.eql(u8, norm, "DEPLOYS_TO")) return .set_valued;
+    // Episode.
+    if (std.mem.eql(u8, norm, "ATTENDED")) return .set_valued;
+    if (std.mem.eql(u8, norm, "JOINED")) return .set_valued;
+    if (std.mem.eql(u8, norm, "VISITED")) return .set_valued;
+    if (std.mem.eql(u8, norm, "HAPPENED_ON")) return .set_valued;
+    if (std.mem.eql(u8, norm, "OCCURRED_AT")) return .set_valued;
+    if (std.mem.eql(u8, norm, "MENTIONS")) return .set_valued;
+    // Relationship (set-valued: a person KNOWS many people).
+    if (std.mem.eql(u8, norm, "KNOWS")) return .set_valued;
+    if (std.mem.eql(u8, norm, "FRIENDS_WITH")) return .set_valued;
+    if (std.mem.eql(u8, norm, "WORKS_WITH")) return .set_valued;
+    if (std.mem.eql(u8, norm, "COLLABORATES_WITH")) return .set_valued;
+    if (std.mem.eql(u8, norm, "MANAGES")) return .set_valued;
+    if (std.mem.eql(u8, norm, "RELATED_TO")) return .set_valued;
+    if (std.mem.eql(u8, norm, "MET")) return .set_valued;
+    // V1.14.12 (M2 review WARNING#2) — additional set-valued
+    // predicates the LLM extractor commonly emits. Pre-fix these all
+    // routed to .unknown → judge fired → Captain-Mochi-class misfire
+    // risk on Llama-3.3-70B. Adding them to the canonical vocab
+    // closes the gap.
+    //
+    // Activity/operation verbs (set-valued — a person/system can do
+    // multiple of these concurrently).
+    if (std.mem.eql(u8, norm, "RUNS")) return .set_valued;
+    if (std.mem.eql(u8, norm, "OPERATES")) return .set_valued;
+    if (std.mem.eql(u8, norm, "MAINTAINS")) return .set_valued;
+    if (std.mem.eql(u8, norm, "SUPPORTS")) return .set_valued;
+    if (std.mem.eql(u8, norm, "CONTRIBUTES_TO")) return .set_valued;
+    if (std.mem.eql(u8, norm, "USED_BY")) return .set_valued;
+    // Creation verbs (set-valued — an author can have many works).
+    if (std.mem.eql(u8, norm, "FOUNDED")) return .set_valued;
+    if (std.mem.eql(u8, norm, "CREATED")) return .set_valued;
+    if (std.mem.eql(u8, norm, "AUTHORED")) return .set_valued;
+    if (std.mem.eql(u8, norm, "WROTE")) return .set_valued;
+    // Media consumption verbs (set-valued — many things to read/watch).
+    if (std.mem.eql(u8, norm, "READS")) return .set_valued;
+    if (std.mem.eql(u8, norm, "WATCHES")) return .set_valued;
+    if (std.mem.eql(u8, norm, "LISTENS_TO")) return .set_valued;
+    if (std.mem.eql(u8, norm, "PLAYS")) return .set_valued;
+    // Skill/practice verbs (set-valued — knows many subjects/languages).
+    if (std.mem.eql(u8, norm, "STUDIES")) return .set_valued;
+    if (std.mem.eql(u8, norm, "TEACHES")) return .set_valued;
+    if (std.mem.eql(u8, norm, "SPEAKS")) return .set_valued;
+
+    return .unknown;
+}
+
+/// V1.14.12 (M2) — explicit-negation detection in a fact's TEXT.
+///
+/// When a fact text contains negation language ("no longer", "stopped",
+/// "instead of", "not anymore", "used to ... but now"), the cardinality
+/// fast-path is BYPASSED — even set-valued predicates with explicit
+/// negation should go through the judge (the user IS asserting
+/// supersession). Conservative; false-positives only mean an extra
+/// judge call, not an incorrect skip.
+///
+/// Case-insensitive. Truncates to 4KB to bound cost (typical facts
+/// are <500 chars).
+///
+/// V1.14.12 (M3 review HIGH#1) — broadened pattern coverage with
+/// word-boundary semantics via stem matching. Pre-fix patterns
+/// required trailing space (e.g. `"stopped "`) and failed to match
+/// `"stopped."` or end-of-string `"…I stopped"`. New approach:
+/// detect each stem and require the surrounding context is a word
+/// boundary (start-of-text, end-of-text, or non-alphabetic char).
+/// Pattern set also expanded with contractions (`don't`, `didn't`,
+/// `doesn't`) and verbs of transition (`switched`, `moved`, `quit`).
+pub fn textHasExplicitNegation(text: []const u8) bool {
+    if (text.len == 0) return false;
+    var lower_buf: [4096]u8 = undefined;
+    const slice_len = @min(text.len, lower_buf.len);
+    for (text[0..slice_len], 0..) |c, i| lower_buf[i] = std.ascii.toLower(c);
+    const lower = lower_buf[0..slice_len];
+
+    // Stems that, when present at a word boundary, indicate explicit
+    // negation/supersession. Each stem is matched then validated to
+    // have non-alpha char (or text edge) immediately before AND after.
+    //
+    // V1.14.12 (M2 review WARNING#3) — refined stem set:
+    //   - DROPPED "ex-" (effectively dead: trailing `-` followed by
+    //     alpha satisfies word-boundary check as non-alpha, but the
+    //     stem itself ends in non-alpha — the right-edge check then
+    //     looks at the alpha char AFTER the dash which fails the
+    //     boundary, making the pattern only fire on rare "ex- " or
+    //     end-of-text "ex-")
+    //   - DROPPED "moved from" (false positives on file-path narration
+    //     "the file moved from /tmp to /var")
+    //   - KEPT "used to" — known false-positive cost ("the room used
+    //     to store coats") accepted as conservative fail-open per
+    //     docstring philosophy
+    //   - Replaced "ex-" with explicit common terms ("ex-husband",
+    //     "ex-wife", "ex-employee", "ex-partner") that don't have the
+    //     boundary problem
+    const stems = [_][]const u8{
+        "no longer",   "stopped",     "instead of",
+        "not anymore", "used to",     "previously",
+        "formerly",    "but now",     "no more",
+        "don't",       "doesn't",     "didn't",
+        "never",       "switched",    "quit",
+        "ex-husband",  "ex-wife",     "ex-employee",
+        "ex-partner",
+    };
+    for (stems) |stem| {
+        var search_from: usize = 0;
+        while (std.mem.indexOfPos(u8, lower, search_from, stem)) |pos| {
+            const left_ok = pos == 0 or !isAlphaByte(lower[pos - 1]);
+            const end = pos + stem.len;
+            const right_ok = end == lower.len or !isAlphaByte(lower[end]);
+            if (left_ok and right_ok) return true;
+            search_from = pos + 1;
+        }
+    }
+    return false;
+}
+
+fn isAlphaByte(b: u8) bool {
+    return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z');
+}
+
 /// Resolve duplicate + contradiction status for one new fact against
 /// pre-fetched candidate lists.
 ///
@@ -375,7 +581,32 @@ fn buildResolvePrompt(
         \\EXISTING FACT: idx=2, "Bob ran 5 miles on Tuesday"
         \\NEW FACT: "Bob ran 3 miles on Wednesday"
         \\Result: duplicate_facts=[], contradicted_facts=[] (different events on different days — neither duplicate nor contradiction)
+        \\
+        \\EXISTING FACT: idx=3, "Layer 0 IS_TYPE_OF Working Memory"
+        \\NEW FACT: "Layer 0 IS_TYPE_OF Distillation Extraction"
+        \\Result: duplicate_facts=[], contradicted_facts=[]
+        \\(set-valued predicate — Layer 0 can have many type-members; both coexist. Only contradict if the NEW FACT explicitly negates, e.g. "Layer 0 IS_TYPE_OF Distillation Extraction, NOT Working Memory anymore" or "Layer 0 no longer IS_TYPE_OF Working Memory".)
+        \\
+        \\EXISTING FACT: idx=4, "Alice LIKES sushi"
+        \\NEW FACT: "Alice LIKES Indian food"
+        \\Result: duplicate_facts=[], contradicted_facts=[]
+        \\(set-valued predicate — Alice can like many cuisines; both coexist. Contradiction would require explicit negation: "Alice no longer likes sushi" or "Alice stopped liking sushi".)
         \\</EXAMPLE>
+        \\
+        \\SET-VALUED PREDICATES — multiple values CAN coexist without contradiction:
+        \\  Membership: IS_TYPE_OF, INCLUDES, MEMBER_OF, PART_OF, FOLLOWS
+        \\  Preference: LIKES, HATES, AVOIDS, FAVORS, DISLIKES, ENJOYS, VALUES
+        \\  Usage:      USES, USED_FOR, OWNS, DEPENDS_ON, BUILDS_WITH, DEPLOYS_TO
+        \\  Episode:    ATTENDED, JOINED, VISITED, HAPPENED_ON, OCCURRED_AT, MENTIONS
+        \\  Relationship: KNOWS, FRIENDS_WITH, WORKS_WITH, COLLABORATES_WITH, MANAGES, RELATED_TO
+        \\For these, the SAME subject + predicate + DIFFERENT object is normally a NEW fact, not a contradiction.
+        \\Flag a contradiction ONLY when the NEW FACT explicitly states the existing value is wrong, replaced, no longer true, or supersedes ("no longer X", "stopped X-ing", "instead of X", "used to X but now Y").
+        \\
+        \\SINGLE-VALUED PREDICATES — a new value DOES contradict the existing one:
+        \\  Identity: BIRTHDAY, LIVES_IN, WORKS_AT (current title/role)
+        \\  Status:   MARRIED_TO, REPORTS_TO, CURRENT_PROJECT
+        \\  Supersession (explicit): REPLACES, USED_TO_BE, FORMERLY, PREVIOUSLY, USED_TO_PREFER, USED_TO_USE
+        \\For these, the Alice/Acme/senior-engineer pattern above applies — same subject + predicate + different object = contradiction.
         \\
         \\Respond with EXACTLY this JSON shape (no prose, no code fence):
         \\{"duplicate_facts": [<idx>...], "contradicted_facts": [<idx>...]}
@@ -599,4 +830,109 @@ test "parseJudgeJson drops negative idx silently" {
     // drops them before idx lookup. This test pins the parser shape.
     try std.testing.expectEqual(@as(usize, 4), r.contradicted_facts.len);
     try std.testing.expectEqual(@as(i64, -1), r.contradicted_facts[0]);
+}
+
+test "V1.14.12 (M2): classifyPredicate set-valued vocabulary" {
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("LIKES"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("USES"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("IS_TYPE_OF"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("ATTENDED"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("KNOWS"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("OWNS"));
+}
+
+test "V1.14.12 (M2): classifyPredicate single-valued vocabulary" {
+    try std.testing.expectEqual(PredicateCardinality.single_valued, classifyPredicate("LIVES_IN"));
+    try std.testing.expectEqual(PredicateCardinality.single_valued, classifyPredicate("MARRIED_TO"));
+    try std.testing.expectEqual(PredicateCardinality.single_valued, classifyPredicate("BIRTHDAY"));
+    try std.testing.expectEqual(PredicateCardinality.single_valued, classifyPredicate("REPLACES"));
+    try std.testing.expectEqual(PredicateCardinality.single_valued, classifyPredicate("USED_TO_BE"));
+}
+
+test "V1.14.12 (M2): classifyPredicate case-insensitive" {
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("likes"));
+    try std.testing.expectEqual(PredicateCardinality.single_valued, classifyPredicate("lives_in"));
+}
+
+test "V1.14.12 (M2): classifyPredicate unknown predicates default to .unknown" {
+    try std.testing.expectEqual(PredicateCardinality.unknown, classifyPredicate("CUSTOM_VERB"));
+    try std.testing.expectEqual(PredicateCardinality.unknown, classifyPredicate(""));
+    const huge = "A" ** 100;
+    try std.testing.expectEqual(PredicateCardinality.unknown, classifyPredicate(huge));
+}
+
+test "V1.14.12 (M2): textHasExplicitNegation detects supersession patterns" {
+    try std.testing.expect(textHasExplicitNegation("I no longer like Thai food"));
+    try std.testing.expect(textHasExplicitNegation("User stopped using Zig last year"));
+    try std.testing.expect(textHasExplicitNegation("Alice lives in NYC instead of SF"));
+    try std.testing.expect(textHasExplicitNegation("Charlie likes Java but now prefers Rust"));
+    try std.testing.expect(textHasExplicitNegation("Bob used to play piano"));
+    try std.testing.expect(textHasExplicitNegation("Mia previously lived in Tokyo"));
+}
+
+test "V1.14.12 (M2): textHasExplicitNegation rejects additive facts" {
+    try std.testing.expect(!textHasExplicitNegation("User likes Thai food"));
+    try std.testing.expect(!textHasExplicitNegation("Captain Mochi uses a red collar"));
+    try std.testing.expect(!textHasExplicitNegation("Pacific Squad includes Admiral Whiskers"));
+    try std.testing.expect(!textHasExplicitNegation(""));
+}
+
+test "V1.14.12 (M2): textHasExplicitNegation is case-insensitive" {
+    try std.testing.expect(textHasExplicitNegation("NO LONGER LIKES IT"));
+    try std.testing.expect(textHasExplicitNegation("StOpPeD using it"));
+}
+
+test "V1.14.12 (M2 review WARNING#2): expanded vocab includes activity/creation/media verbs" {
+    // Vocab additions from the M2 review WARNING#2 — predicates the
+    // LLM extractor commonly emits that were routing to .unknown
+    // pre-fix and triggering the Captain-Mochi-class judge misfire.
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("FOUNDED"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("CREATED"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("AUTHORED"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("WROTE"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("RUNS"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("OPERATES"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("MAINTAINS"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("SUPPORTS"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("CONTRIBUTES_TO"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("READS"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("WATCHES"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("LISTENS_TO"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("PLAYS"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("STUDIES"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("TEACHES"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("SPEAKS"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("MET"));
+    try std.testing.expectEqual(PredicateCardinality.set_valued, classifyPredicate("USED_BY"));
+}
+
+test "V1.14.12 (M2 review WARNING#3): negation edge cases — punctuation + boundaries" {
+    // Word-boundary semantics must handle punctuation correctly.
+    // Pre-fix patterns required trailing space; post-fix accepts
+    // any non-alpha boundary.
+    try std.testing.expect(textHasExplicitNegation("I stopped."));
+    try std.testing.expect(textHasExplicitNegation("I stopped, finally."));
+    try std.testing.expect(textHasExplicitNegation("Done. stopped."));
+    try std.testing.expect(!textHasExplicitNegation("unstopped"));  // 'u' before 'stopped' is alpha → no boundary
+    try std.testing.expect(textHasExplicitNegation("don't like it"));  // apostrophe is non-alpha boundary
+}
+
+test "V1.14.12 (M2 review WARNING#3): ex- pattern dropped, explicit forms work" {
+    // Pre-fix "ex-" was effectively dead (right-edge alpha defeated
+    // boundary check). Post-fix uses explicit terms.
+    try std.testing.expect(textHasExplicitNegation("the ex-husband"));
+    try std.testing.expect(textHasExplicitNegation("her ex-wife"));
+    try std.testing.expect(textHasExplicitNegation("an ex-employee"));
+    try std.testing.expect(!textHasExplicitNegation("ex-something-else"));  // generic ex- no longer matches
+}
+
+test "V1.14.12 (M2 review CRITICAL): JudgeContext cardinality_fastpath_enabled defaults to true" {
+    // Soak-safe default: if a caller forgets to set the field, the
+    // M2 fast-path remains active (preserves behavior). Operators
+    // opt OUT via explicit config.
+    const ctx = @import("extraction_persist.zig").JudgeContext{
+        .provider = undefined,
+        .model_name = "test",
+    };
+    try std.testing.expect(ctx.cardinality_fastpath_enabled);
 }

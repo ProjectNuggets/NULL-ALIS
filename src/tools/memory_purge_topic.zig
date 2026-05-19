@@ -19,13 +19,21 @@ const Memory = mem_root.Memory;
 /// request, "forget everything you said about X") an explicit purge path:
 /// for a given topic string, delete all autosave_* and session_checkpoint_*
 /// entries whose content contains the topic. Continuity artifacts
-/// (timeline_summary, summary_latest, durable_fact) are also purged when
-/// their content mentions the topic, since they may contain laundered
-/// versions of the same hallucination.
+/// (timeline_summary, summary_latest) are also purged when their content
+/// mentions the topic, since they may contain laundered versions of the
+/// same hallucination.
 ///
 /// Scope is conservative: user-authored memory keys (memory_store output)
 /// are NEVER purged by this tool — only agent-generated audit/continuity
 /// artifacts and raw autosave chatter.
+///
+/// V1.14.12 (Memory audit Finding 9 fix, 2026-05-19) — `durable_fact/*`
+/// REMOVED from purgeable families. Pre-fix the tool's output claimed
+/// "User-authored memories untouched" while session-end extraction
+/// (commands.zig:1341) writes the user's own facts to durable_fact/<ts>/<idx>.
+/// The raw `m.forget()` call at execute() bypasses isEditableMemoryEntry's
+/// structural protection (isSystemManagedMemoryKey at memory/root.zig:1171),
+/// so a topic purge erased real user facts under a false safety claim.
 pub const MemoryPurgeTopicTool = struct {
     memory: ?Memory = null,
     mem_rt: ?*mem_root.MemoryRuntime = null,
@@ -48,13 +56,17 @@ pub const MemoryPurgeTopicTool = struct {
     /// Returns true when `key` belongs to an agent-generated artifact family
     /// that is safe to purge on demand. User-authored keys (memory_store
     /// output) are NOT in-scope and return false.
+    ///
+    /// V1.14.12 (Memory audit Finding 9 fix, 2026-05-19) — `durable_fact/*`
+    /// is NOT purgeable. Session-end extraction writes USER FACTS to that
+    /// prefix; pre-fix the tool would erase them while claiming user
+    /// memories were untouched. See module docstring for the full story.
     fn isPurgeableFamily(key: []const u8) bool {
         return std.mem.startsWith(u8, key, "autosave_assistant_") or
             std.mem.startsWith(u8, key, "autosave_user_") or
             std.mem.startsWith(u8, key, "session_checkpoint_") or
             std.mem.startsWith(u8, key, "timeline_summary/") or
             std.mem.startsWith(u8, key, "summary_latest/") or
-            std.mem.startsWith(u8, key, "durable_fact/") or
             // iter33: iter29 continuity families. Polluted content in these
             // namespaces must be scrubbable via the topic purge lever, same
             // as the older families. Without this the agent could not clean
@@ -85,11 +97,12 @@ pub const MemoryPurgeTopicTool = struct {
         defer mem_root.freeEntries(allocator, scoped);
 
         var purged: usize = 0;
-        // iter33: extended counters for the iter29 families so the agent's
-        // purge summary reports accurately.
-        var by_family = [_]usize{ 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-        // autosave_a, autosave_u, checkpoint, timeline, summary_latest,
-        // durable_fact, compaction_summary, summary_fallback, compaction_dropped
+        // V1.14.12 (Memory audit Finding 9 fix, 2026-05-19) — slot 5
+        // (durable_fact) removed since the family was dropped from
+        // isPurgeableFamily. 8 slots now: autosave_a, autosave_u,
+        // checkpoint, timeline, summary_latest, compaction_summary,
+        // summary_fallback, compaction_dropped.
+        var by_family = [_]usize{ 0, 0, 0, 0, 0, 0, 0, 0 };
         for (scoped) |entry| {
             if (!isPurgeableFamily(entry.key)) continue;
             if (std.ascii.indexOfIgnoreCase(entry.content, topic) == null) continue;
@@ -103,10 +116,9 @@ pub const MemoryPurgeTopicTool = struct {
             else if (std.mem.startsWith(u8, entry.key, "session_checkpoint_")) by_family[2] += 1
             else if (std.mem.startsWith(u8, entry.key, "timeline_summary/")) by_family[3] += 1
             else if (std.mem.startsWith(u8, entry.key, "summary_latest/")) by_family[4] += 1
-            else if (std.mem.startsWith(u8, entry.key, "durable_fact/")) by_family[5] += 1
-            else if (std.mem.startsWith(u8, entry.key, "compaction_summary/")) by_family[6] += 1
-            else if (std.mem.startsWith(u8, entry.key, "summary_fallback/")) by_family[7] += 1
-            else if (std.mem.startsWith(u8, entry.key, "compaction_dropped/")) by_family[8] += 1;
+            else if (std.mem.startsWith(u8, entry.key, "compaction_summary/")) by_family[5] += 1
+            else if (std.mem.startsWith(u8, entry.key, "summary_fallback/")) by_family[6] += 1
+            else if (std.mem.startsWith(u8, entry.key, "compaction_dropped/")) by_family[7] += 1;
 
             // Best-effort vector store cleanup
             if (self.mem_rt) |rt| rt.deleteFromVectorStore(entry.key);
@@ -114,8 +126,8 @@ pub const MemoryPurgeTopicTool = struct {
 
         const msg = try std.fmt.allocPrint(
             allocator,
-            "Purged {d} agent-generated entries matching topic \"{s}\" (autosave_assistant={d}, autosave_user={d}, session_checkpoint={d}, timeline_summary={d}, summary_latest={d}, durable_fact={d}, compaction_summary={d}, summary_fallback={d}, compaction_dropped={d}). User-authored memories untouched.",
-            .{ purged, topic, by_family[0], by_family[1], by_family[2], by_family[3], by_family[4], by_family[5], by_family[6], by_family[7], by_family[8] },
+            "Purged {d} agent-generated entries matching topic \"{s}\" (autosave_assistant={d}, autosave_user={d}, session_checkpoint={d}, timeline_summary={d}, summary_latest={d}, compaction_summary={d}, summary_fallback={d}, compaction_dropped={d}). User-authored memories (including durable_fact/*) untouched.",
+            .{ purged, topic, by_family[0], by_family[1], by_family[2], by_family[3], by_family[4], by_family[5], by_family[6], by_family[7] },
         );
         return ToolResult{ .success = true, .output = msg };
     }
@@ -167,10 +179,19 @@ test "isPurgeableFamily flags agent-generated keys only" {
     try std.testing.expect(MemoryPurgeTopicTool.isPurgeableFamily("session_checkpoint_789"));
     try std.testing.expect(MemoryPurgeTopicTool.isPurgeableFamily("timeline_summary/agent:x:user:1:main/123"));
     try std.testing.expect(MemoryPurgeTopicTool.isPurgeableFamily("summary_latest/agent:x:user:1:main"));
-    try std.testing.expect(MemoryPurgeTopicTool.isPurgeableFamily("durable_fact/123/0"));
 
     // User-authored keys (no matching prefix) must not be purgeable
     try std.testing.expect(!MemoryPurgeTopicTool.isPurgeableFamily("user_preference_theme"));
     try std.testing.expect(!MemoryPurgeTopicTool.isPurgeableFamily("my_custom_fact"));
     try std.testing.expect(!MemoryPurgeTopicTool.isPurgeableFamily("context_anchor_current"));
+}
+
+test "V1.14.12 (Memory audit Finding 9): durable_fact/* is NOT purgeable" {
+    // Pre-fix, this prefix was purgeable while the tool's output claimed
+    // "User-authored memories untouched." Session-end extraction writes
+    // user-authored facts to durable_fact/<ts>/<idx>, so a topic purge
+    // would silently erase them. Now protected: durable_fact rows survive
+    // memory_purge_topic regardless of content match.
+    try std.testing.expect(!MemoryPurgeTopicTool.isPurgeableFamily("durable_fact/123/0"));
+    try std.testing.expect(!MemoryPurgeTopicTool.isPurgeableFamily("durable_fact/1700000000/42"));
 }

@@ -411,6 +411,67 @@ pub const AgentConfig = struct {
     /// Not serialized; used to distinguish override vs default fallback chain.
     token_limit_explicit: bool = false,
     session_idle_timeout_secs: u64 = 1800, // evict idle sessions after 30 min
+    /// V1.14.8.1 (2026-05-10): override for the extraction sidecar model.
+    /// When empty (default), the gateway uses `default_model` for extraction
+    /// — which is wrong when the default model is a reasoning model like
+    /// Kimi K2.5 (we confirmed it burns its output budget on hidden
+    /// reasoning and returns empty `content`, so the unified extractor
+    /// produces 0 entities/0 edges). Set this to a non-reasoning instruct
+    /// model with strong JSON discipline + a context window large enough
+    /// for the boundary transcript (Llama-3.3-70B-Instruct-Turbo on
+    /// Together = $0.88/1M, 128K ctx, recommended default).
+    extraction_judge_model: []const u8 = "",
+    /// V1.14.12 (M2) — cardinality fast-path gate.
+    ///
+    /// When TRUE (default), persistExtracted's judge step is SKIPPED for
+    /// facts where (a) the predicate is set-valued (LIKES, USES,
+    /// IS_TYPE_OF, etc. — see edge_resolution.classifyPredicate) AND
+    /// (b) the fact's text contains no explicit negation language
+    /// ("no longer", "stopped", etc. — see
+    /// edge_resolution.textHasExplicitNegation). The MD5 content_hash
+    /// dedup + canonical-key dedup + entity coref still run; only the
+    /// LLM contradiction judge call is bypassed.
+    ///
+    /// Rationale: Captain Mochi investigation (2026-05-18) showed
+    /// Llama-3.3-70B-Instruct-Turbo over-fires contradictions on
+    /// set-valued additions (e.g., flags LIKES Indian as contradicting
+    /// LIKES Thai). The fast-path moves the cardinality rule from a
+    /// prompt instruction (Llama under-respects) to a code gate (always
+    /// honored).
+    ///
+    /// Reversibility: set to FALSE to restore V1.14.11 behavior (judge
+    /// fires on every write, including set-valued additives).
+    extraction_cardinality_fastpath: bool = true,
+    /// V1.14.12 (M3) — coverage filter gate.
+    ///
+    /// When TRUE (default), boundary extraction (Pass A drop, Pass C
+    /// compaction summary, session-end TTL) skips facts whose canonical
+    /// extraction_<hash> key matches one already written by the agent's
+    /// memory_store tool within the horizon (30 days, 5000-key cap).
+    ///
+    /// Rationale: pre-M3 the boundary batches re-extracted everything in
+    /// the conversation window, including facts the agent had ALREADY
+    /// explicitly stored via memory_store. Combined with case-variance
+    /// canonicalization issues (closed by V1.14.11 commit 06b07895),
+    /// this produced duplicate rows that the judge then cleaned up —
+    /// wasteful work + alarming "contradiction" log lines.
+    ///
+    /// With the coverage filter, agent-store'd facts are skipped at
+    /// extraction time. The judge still runs on legitimately new facts
+    /// the agent didn't memory_store (passive conversation extraction).
+    ///
+    /// Set to FALSE to restore pre-M3 behavior (every fact re-extracted
+    /// at boundary). Debug/migration use only.
+    extraction_coverage_filter_enabled: bool = true,
+    // V1.14.12 (Path A) — extraction_legacy_direct_writes FIELD REMOVED.
+    // M5 sprint flag-gated two redundant direct write paths during a
+    // soak window. Path A closes the M5 sprint by:
+    //   1. Making extractAtBoundary handle null judge gracefully (runner.zig:798)
+    //   2. Removing the judge-presence guards at the extractAtBoundary callers
+    //   3. Deleting the gated legacy direct paths (compaction.zig + commands.zig)
+    //   4. Removing this flag everywhere
+    // A/B bench confirmed zero architectural regression. See M5 review
+    // findings + Path A close-out in commit history for details.
     compaction_keep_recent: u32 = 20,
     compaction_max_summary_chars: u32 = 16_000,
     compaction_max_source_chars: u32 = 80_000,

@@ -1777,6 +1777,12 @@ pub fn bindMemoryRuntime(tools: []const Tool, mem_rt: ?*memory_mod.MemoryRuntime
         } else if (t.vtable == &memory_purge_topic.MemoryPurgeTopicTool.vtable) {
             const mt: *memory_purge_topic.MemoryPurgeTopicTool = @ptrCast(@alignCast(t.ptr));
             mt.mem_rt = mem_rt;
+        } else if (t.vtable == &memory_archive.MemoryArchiveTool.vtable) {
+            // V1.14.12 (Memory audit Finding 8 fix, 2026-05-19) — wire
+            // mem_rt so archive can call deleteFromVectorStore after
+            // soft-delete, matching memory_forget's vector cleanup.
+            const mt: *memory_archive.MemoryArchiveTool = @ptrCast(@alignCast(t.ptr));
+            mt.mem_rt = mem_rt;
         } else if (t.vtable == &transcript_read.TranscriptReadTool.vtable) {
             const trt: *transcript_read.TranscriptReadTool = @ptrCast(@alignCast(t.ptr));
             trt.session_store = if (mem_rt) |rt| rt.session_store else null;
@@ -1808,6 +1814,14 @@ pub fn bindStateMgrTenant(tools: []const Tool, state_mgr: ?*zaki_state.Manager, 
             // judge_provider + coref_embed wired separately via
             // bindMemoryStoreUnifiedContext.
             const mt: *memory_store.MemoryStoreTool = @ptrCast(@alignCast(t.ptr));
+            mt.state_mgr = state_mgr;
+            mt.user_id = user_id;
+        } else if (t.vtable == &compose_memory.ComposeMemoryTool.vtable) {
+            // V1.14.12 (Memory audit Finding 11 fix, 2026-05-19) —
+            // tenant context lets compose_memory call existsMemoryKeys
+            // for reference-existence validation, matching the
+            // HTTP /brain/compose contract.
+            const mt: *compose_memory.ComposeMemoryTool = @ptrCast(@alignCast(t.ptr));
             mt.state_mgr = state_mgr;
             mt.user_id = user_id;
         } else if (t.vtable == &wiki_link.WikiLinkTool.vtable) {
@@ -1866,6 +1880,7 @@ pub fn bindMemoryStoreUnifiedContext(
     judge_provider: ?@import("../providers/root.zig").Provider,
     judge_model_name: ?[]const u8,
     coref_embed: ?@import("../memory/vector/embeddings.zig").EmbeddingProvider,
+    cardinality_fastpath_enabled: bool, // V1.14.12 (M2 review CRITICAL)
 ) void {
     for (tools) |t| {
         if (t.vtable == &memory_store.MemoryStoreTool.vtable) {
@@ -1873,6 +1888,7 @@ pub fn bindMemoryStoreUnifiedContext(
             mt.judge_provider = judge_provider;
             mt.judge_model_name = judge_model_name;
             mt.coref_embed = coref_embed;
+            mt.cardinality_fastpath_enabled = cardinality_fastpath_enabled;
         }
     }
 }
