@@ -627,46 +627,87 @@ pub const ContextEngine = struct {
         };
     }
 
-    /// Phase 3: Compact — trigger compaction if token pressure requires it.
+    /// Phase 3: Compact — token-budget compaction (Pass A + Pass C).
     ///
-    /// Caller should check assemble_result.compaction_recommended first.
-    /// Tries auto-compaction first; falls back to force-compress if needed.
-    /// Note: anti-thrash guard is implemented inside Agent.autoCompactHistory
-    /// (the actual call site used by the turn loop). The gate here is just a
-    /// thin pass-through for callers that prefer the ContextEngine lifecycle.
+    /// v1.14.14 Phase 3 (CONTEXT-ENGINE audit-ledger row): owns the
+    /// auto-compaction call shape that previously inlined at 8 sites in
+    /// `Agent.turnOutcome` (cache-hit branches, response-cache hit branch,
+    /// main flow, tool-loop post-tool, exhausted-iteration recovery, etc.).
+    /// Each call site previously wrote 3-4 lines of `history_before` capture,
+    /// `autoCompactHistory()` call, `last_turn_compacted` set, and
+    /// `recordAutoCompaction()` record. This method consolidates them.
+    ///
+    /// The iter20 70/80/90 threshold escalation + iter19 anti-thrash guard
+    /// remain inside `Agent.autoCompactHistory` (root.zig) where the
+    /// thrash-ring state lives. This wrapper is the canonical entry point;
+    /// it does NOT bypass the guard, and site-specific post-compact actions
+    /// (continuity refresh, duration logging, observer events) continue to
+    /// fire at the call site after this method returns.
     pub fn compact(self: *ContextEngine, agent: anytype) CompactResult {
         self.phase = .compacting;
         defer self.phase = .idle;
 
-        const AgentType = @TypeOf(agent.*);
-        const before = if (@hasField(AgentType, "history")) agent.history.items.len else 0;
-
-        // Try auto-compaction first.
-        if (@hasDecl(AgentType, "autoCompactHistory")) {
-            if (agent.autoCompactHistory() catch false) {
-                const after = agent.history.items.len;
-                return .{
-                    .compacted = true,
-                    .messages_before = before,
-                    .messages_after = after,
-                    .method = .auto,
-                };
-            }
+        const before = agent.history.items.len;
+        const compacted = agent.autoCompactHistory() catch false;
+        if (compacted) {
+            // IMPORTANT: only set `last_turn_compacted = true` — never
+            // clobber to false. The guard at root.zig:3753
+            // (`if (... and !self.last_turn_compacted) { ... }`) uses this
+            // flag as "did this turn experience ANY successful compaction?"
+            // — overwriting a prior `true` from an earlier in-turn compact
+            // with the current call's `false` would defeat the guard and
+            // cause double-compaction attempts in the same turn.
+            agent.last_turn_compacted = true;
+            const after = agent.history.items.len;
+            agent.recordAutoCompaction(before, after);
+            return .{
+                .compacted = true,
+                .messages_before = before,
+                .messages_after = after,
+                .method = .auto,
+            };
         }
+        return .{
+            .compacted = false,
+            .messages_before = before,
+            .messages_after = before,
+            .method = .none,
+        };
+    }
 
-        // Fall back to force-compress if auto did not help.
-        if (@hasDecl(AgentType, "forceCompressHistory")) {
-            if (agent.forceCompressHistory()) {
-                const after = agent.history.items.len;
-                return .{
-                    .compacted = true,
-                    .messages_before = before,
-                    .messages_after = after,
-                    .method = .force_compress,
-                };
-            }
+    /// Phase 3 emergency path: force-compress history.
+    ///
+    /// v1.14.14 Phase 3: routes the 3 force-compress call sites in
+    /// `Agent.turnOutcome` (context-exhaustion recovery inside the tool loop
+    /// retry paths) through one method. Each call site previously wrote a
+    /// `history_before` capture, `forceCompressHistory()` call,
+    /// `recordForceCompression()` record, and two state-flag writes
+    /// (`context_was_compacted = true; context_force_compressed = true`).
+    /// This method consolidates all five.
+    ///
+    /// Unlike `compact()`, this path BYPASSES the iter19 anti-thrash guard
+    /// — force-compress is the emergency lever that fires when the model
+    /// has exceeded its budget and the only path forward is to drop content
+    /// from the middle of history. Anti-thrash is for "is it worth running
+    /// compaction this turn?"; force-compress is "we have no choice."
+    pub fn forceCompact(self: *ContextEngine, agent: anytype) CompactResult {
+        self.phase = .compacting;
+        defer self.phase = .idle;
+
+        const before = agent.history.items.len;
+        const compacted = agent.forceCompressHistory();
+        if (compacted) {
+            const after = agent.history.items.len;
+            agent.recordForceCompression(before, after);
+            agent.context_was_compacted = true;
+            agent.context_force_compressed = true;
+            return .{
+                .compacted = true,
+                .messages_before = before,
+                .messages_after = after,
+                .method = .force_compress,
+            };
         }
-
         return .{
             .compacted = false,
             .messages_before = before,
@@ -890,20 +931,115 @@ test "AssembleResult exposes stable_prefix_hash + bytes defaults" {
     try std.testing.expect(!r.prompt_refreshed);
 }
 
-test "compact with no-op agent returns compacted=false and method=none" {
+// v1.14.14 Phase 3: helper for the compact + forceCompact tests below. The
+// new compact/forceCompact methods own state writes on the agent
+// (last_turn_compacted, context_was_compacted, context_force_compressed,
+// compaction_savings_ring via recordAutoCompaction/recordForceCompression).
+// This fake records every call + state mutation deterministically so
+// unit tests can assert the route-through semantics without spinning up a
+// real Memory/Provider/history pipeline.
+const FakeCompactAgent = struct {
+    history: struct {
+        const FakeMsg = struct { role: enum { user, assistant }, content: []const u8 };
+        items: []const FakeMsg = &.{},
+    } = .{},
+    last_turn_compacted: bool = false,
+    context_was_compacted: bool = false,
+    context_force_compressed: bool = false,
+    // Behavior switches the fake agent exposes for the test.
+    auto_returns: bool = false, // value autoCompactHistory returns
+    force_returns: bool = false, // value forceCompressHistory returns
+    auto_calls: u32 = 0,
+    force_calls: u32 = 0,
+    auto_recorded: u32 = 0,
+    force_recorded: u32 = 0,
+
+    pub fn autoCompactHistory(self: *FakeCompactAgent) !bool {
+        self.auto_calls += 1;
+        return self.auto_returns;
+    }
+    pub fn forceCompressHistory(self: *FakeCompactAgent) bool {
+        self.force_calls += 1;
+        return self.force_returns;
+    }
+    pub fn recordAutoCompaction(self: *FakeCompactAgent, _: usize, _: usize) void {
+        self.auto_recorded += 1;
+    }
+    pub fn recordForceCompression(self: *FakeCompactAgent, _: usize, _: usize) void {
+        self.force_recorded += 1;
+    }
+};
+
+test "compact: no-op when autoCompactHistory returns false — method=none, no record, last_turn_compacted=false" {
     var engine = ContextEngine{};
-    const NoOpAgent = struct {
-        history: struct {
-            const FakeMsg = struct { role: enum { user }, content: []const u8 };
-            items: []const FakeMsg = &.{},
-        } = .{},
-    };
-    var fake_agent = NoOpAgent{};
+    var fake_agent = FakeCompactAgent{ .auto_returns = false };
     const result = engine.compact(&fake_agent);
+
     try std.testing.expect(!result.compacted);
     try std.testing.expectEqual(CompactResult.CompactMethod.none, result.method);
-    try std.testing.expectEqual(@as(usize, 0), result.messages_before);
-    try std.testing.expectEqual(@as(usize, 0), result.messages_after);
+    try std.testing.expectEqual(@as(u32, 1), fake_agent.auto_calls);
+    try std.testing.expectEqual(@as(u32, 0), fake_agent.auto_recorded);
+    try std.testing.expect(!fake_agent.last_turn_compacted);
+    try std.testing.expectEqual(LifecyclePhase.idle, engine.phase);
+}
+
+test "compact: success path — auto+record fire, last_turn_compacted=true, method=.auto" {
+    var engine = ContextEngine{};
+    var fake_agent = FakeCompactAgent{ .auto_returns = true };
+    const result = engine.compact(&fake_agent);
+
+    try std.testing.expect(result.compacted);
+    try std.testing.expectEqual(CompactResult.CompactMethod.auto, result.method);
+    try std.testing.expectEqual(@as(u32, 1), fake_agent.auto_calls);
+    try std.testing.expectEqual(@as(u32, 1), fake_agent.auto_recorded);
+    try std.testing.expect(fake_agent.last_turn_compacted);
+}
+
+test "forceCompact: no-op when forceCompressHistory returns false — method=none, no record, flags untouched" {
+    var engine = ContextEngine{};
+    var fake_agent = FakeCompactAgent{ .force_returns = false };
+    const result = engine.forceCompact(&fake_agent);
+
+    try std.testing.expect(!result.compacted);
+    try std.testing.expectEqual(CompactResult.CompactMethod.none, result.method);
+    try std.testing.expectEqual(@as(u32, 1), fake_agent.force_calls);
+    try std.testing.expectEqual(@as(u32, 0), fake_agent.force_recorded);
+    try std.testing.expect(!fake_agent.context_was_compacted);
+    try std.testing.expect(!fake_agent.context_force_compressed);
+}
+
+test "forceCompact: success path — record fires + both compact flags set, method=.force_compress" {
+    var engine = ContextEngine{};
+    var fake_agent = FakeCompactAgent{ .force_returns = true };
+    const result = engine.forceCompact(&fake_agent);
+
+    try std.testing.expect(result.compacted);
+    try std.testing.expectEqual(CompactResult.CompactMethod.force_compress, result.method);
+    try std.testing.expectEqual(@as(u32, 1), fake_agent.force_calls);
+    try std.testing.expectEqual(@as(u32, 1), fake_agent.force_recorded);
+    try std.testing.expect(fake_agent.context_was_compacted);
+    try std.testing.expect(fake_agent.context_force_compressed);
+}
+
+// Brief-required test: 15 rapid-fire compact() calls — when the fake
+// reports auto_returns=false (simulating thrash guard or any other rejection),
+// no recording fires from rounds 3-15. Validates the route-through doesn't
+// inadvertently double-fire recordAutoCompaction. The actual thrash-guard
+// log-line `compaction.skipped reason=thrash_guard` fires inside
+// Agent.autoCompactHistory (root.zig:973-982) which the fake stubs out;
+// this test guards the wrapper's "don't double-record" contract.
+test "compact: 15 rapid-fire false-returning calls record zero times (wrapper contract)" {
+    var engine = ContextEngine{};
+    var fake_agent = FakeCompactAgent{ .auto_returns = false };
+
+    var i: u32 = 0;
+    while (i < 15) : (i += 1) {
+        const result = engine.compact(&fake_agent);
+        try std.testing.expect(!result.compacted);
+    }
+    try std.testing.expectEqual(@as(u32, 15), fake_agent.auto_calls);
+    try std.testing.expectEqual(@as(u32, 0), fake_agent.auto_recorded);
+    try std.testing.expect(!fake_agent.last_turn_compacted);
 }
 
 test "afterTurn aggregates results and sets last_turn.available=true" {

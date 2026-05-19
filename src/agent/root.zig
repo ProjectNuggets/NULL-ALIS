@@ -2958,10 +2958,8 @@ pub const Agent = struct {
                         .content = history_copy,
                     });
                     if (self.compact_context_enabled) {
-                        const history_before_auto_compact = self.history.items.len;
-                        self.last_turn_compacted = self.autoCompactHistory() catch false;
-                        if (self.last_turn_compacted) {
-                            self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
+                        // v1.14.14 Phase 3 — route through ContextEngine.compact.
+                        if (self.context_engine_state.compact(self).compacted) {
                             self.refreshDurableContinuityAfterCompaction();
                         }
                     }
@@ -2989,10 +2987,8 @@ pub const Agent = struct {
                     .content = history_copy,
                 });
                 if (self.compact_context_enabled) {
-                    const history_before_auto_compact = self.history.items.len;
-                    self.last_turn_compacted = self.autoCompactHistory() catch false;
-                    if (self.last_turn_compacted) {
-                        self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
+                    // v1.14.14 Phase 3 — route through ContextEngine.compact.
+                    if (self.context_engine_state.compact(self).compacted) {
                         self.refreshDurableContinuityAfterCompaction();
                     }
                 }
@@ -3013,10 +3009,8 @@ pub const Agent = struct {
             // Run provider-backed auto-compaction against the full working
             // session so context boundaries create durable continuity objects.
             const auto_compact_start_ms = std.time.milliTimestamp();
-            const history_before_auto_compact = self.history.items.len;
-            self.last_turn_compacted = self.autoCompactHistory() catch false;
-            if (self.last_turn_compacted) {
-                self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
+            // v1.14.14 Phase 3 — route through ContextEngine.compact.
+            if (self.context_engine_state.compact(self).compacted) {
                 const auto_compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - auto_compact_start_ms));
                 turn_compaction_ms += auto_compact_duration_ms;
                 log.info("turn.stage stage=turn_auto_compaction duration_ms={d}", .{auto_compact_duration_ms});
@@ -3191,15 +3185,9 @@ pub const Agent = struct {
                     const err_name = @errorName(err);
                     if (providers.reliable.isContextExhausted(err_name) and
                         self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and
-                        blk: {
-                            const history_before = self.history.items.len;
-                            if (!self.forceCompressHistory()) break :blk false;
-                            self.recordForceCompression(history_before, self.history.items.len);
-                            break :blk true;
-                        })
+                        // v1.14.14 Phase 3 — route force-compress through ContextEngine.forceCompact.
+                        self.context_engine_state.forceCompact(self).compacted)
                     {
-                        self.context_was_compacted = true;
-                        self.context_force_compressed = true;
                         log.info("turn.stage stage=stream_context_recovery iteration={d} — force-compressed and retrying stream", .{iteration});
 
                         // Rebuild messages after compaction — the arena is
@@ -3313,15 +3301,9 @@ pub const Agent = struct {
                     const err_name = @errorName(err);
                     if (providers.reliable.isContextExhausted(err_name) and
                         self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and
-                        blk: {
-                            const history_before = self.history.items.len;
-                            if (!self.forceCompressHistory()) break :blk false;
-                            self.recordForceCompression(history_before, self.history.items.len);
-                            break :blk true;
-                        })
+                        // v1.14.14 Phase 3 — route force-compress through ContextEngine.forceCompact.
+                        self.context_engine_state.forceCompact(self).compacted)
                     {
-                        self.context_was_compacted = true;
-                        self.context_force_compressed = true;
                         turn_retry_attempts += 1;
                         turn_llm_calls += 1;
                         const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
@@ -3374,15 +3356,11 @@ pub const Agent = struct {
                         self.temperature,
                     ) catch |retry_err| {
                         // Context exhaustion recovery: if we have enough history,
-                        // force-compress and retry once more
-                        if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and blk: {
-                            const history_before = self.history.items.len;
-                            if (!self.forceCompressHistory()) break :blk false;
-                            self.recordForceCompression(history_before, self.history.items.len);
-                            break :blk true;
-                        }) {
-                            self.context_was_compacted = true;
-                            self.context_force_compressed = true;
+                        // force-compress and retry once more.
+                        // v1.14.14 Phase 3 — route force-compress through ContextEngine.forceCompact.
+                        if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and
+                            self.context_engine_state.forceCompact(self).compacted)
+                        {
                             turn_retry_attempts += 1;
                             turn_llm_calls += 1;
                             const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
@@ -3649,11 +3627,8 @@ pub const Agent = struct {
                         .content = try self.allocator.dupe(u8, follow_up_instruction),
                     });
                     if (self.compact_context_enabled) {
-                        const history_before_auto_compact = self.history.items.len;
-                        self.last_turn_compacted = self.autoCompactHistory() catch false;
-                        if (self.last_turn_compacted) {
-                            self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
-                        }
+                        // v1.14.14 Phase 3 — route through ContextEngine.compact.
+                        _ = self.context_engine_state.compact(self);
                     }
                     self.freeResponseFields(&response);
                     forced_follow_through_count += 1;
@@ -3751,11 +3726,8 @@ pub const Agent = struct {
 
                 const compact_start_ms = std.time.milliTimestamp();
                 if (self.compact_context_enabled and !self.last_turn_compacted) {
-                    const history_before_auto_compact = self.history.items.len;
-                    self.last_turn_compacted = self.autoCompactHistory() catch false;
-                    if (self.last_turn_compacted) {
-                        self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
-                    }
+                    // v1.14.14 Phase 3 — route through ContextEngine.compact.
+                    _ = self.context_engine_state.compact(self);
                 }
                 const compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compact_start_ms));
                 log.info("turn.stage stage=post_reply_compaction iteration={d} duration_ms={d} compacted={}", .{
@@ -4291,12 +4263,11 @@ pub const Agent = struct {
 
             const compact_start_ms = std.time.milliTimestamp();
             if (self.compact_context_enabled) {
-                const history_before_auto_compact = self.history.items.len;
-                const compacted_after_tools = self.autoCompactHistory() catch false;
-                if (compacted_after_tools) {
-                    self.last_turn_compacted = true;
-                    self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
-                }
+                // v1.14.14 Phase 3 — route through ContextEngine.compact. The
+                // wrapper preserves variant D's "only set last_turn_compacted
+                // to true on success" semantics (compact() never clobbers a
+                // prior true to false).
+                _ = self.context_engine_state.compact(self);
             }
             const compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compact_start_ms));
             log.info("turn.stage stage=history_maintenance_after_tools iteration={d} duration_ms={d}", .{ iteration, compact_duration_ms });
@@ -4433,10 +4404,8 @@ pub const Agent = struct {
         });
 
         // Compact history so the next turn can continue from a stable boundary.
-        const history_before_auto_compact = self.history.items.len;
-        self.last_turn_compacted = self.autoCompactHistory() catch false;
-        if (self.last_turn_compacted) {
-            self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
+        // v1.14.14 Phase 3 — route through ContextEngine.compact.
+        if (self.context_engine_state.compact(self).compacted) {
             self.refreshDurableContinuityAfterCompaction();
         }
         const complete_event = ObserverEvent{ .turn_complete = {} };
@@ -4759,11 +4728,14 @@ pub const Agent = struct {
         context_builder.recordTrimStats(&self.last_turn_context, trim_stats);
     }
 
-    fn recordAutoCompaction(self: *Agent, history_before: usize, history_after: usize) void {
+    // v1.14.14 Phase 3: promoted to `pub` so ContextEngine.compact +
+    // ContextEngine.forceCompact can call these from `agent: anytype` paths
+    // (Zig 0.15 method dispatch requires pub on anytype call sites).
+    pub fn recordAutoCompaction(self: *Agent, history_before: usize, history_after: usize) void {
         context_builder.recordAutoCompaction(&self.last_turn_context, history_before, history_after);
     }
 
-    fn recordForceCompression(self: *Agent, history_before: usize, history_after: usize) void {
+    pub fn recordForceCompression(self: *Agent, history_before: usize, history_after: usize) void {
         context_builder.recordForceCompression(&self.last_turn_context, history_before, history_after);
     }
 
