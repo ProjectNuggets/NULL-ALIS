@@ -807,6 +807,126 @@ const ManagerImpl = struct {
         released: bool = false,
     };
 
+    /// V1.14.12 (Memory audit Finding 3 fix, 2026-05-19) —
+    /// connection-pinned transaction.
+    ///
+    /// PostgreSQL transactions are connection-scoped. Before TxnLease,
+    /// the pattern `try self.exec("BEGIN")` + subsequent
+    /// `self.execParams(...)` calls each acquired AND RELEASED a pool
+    /// connection per call. Under any concurrent load:
+    ///   - BEGIN ran on conn-X, immediately returned conn-X to the pool
+    ///   - the next INSERT acquired conn-Y (auto-committing
+    ///     independently, no active transaction on conn-Y)
+    ///   - the `errdefer` ROLLBACK ran on conn-Z (no transaction there
+    ///     either — silent no-op)
+    ///
+    /// Default pool_max is 4 (memory backend) / 16 (state backend), so
+    /// the bug is real under any multi-goroutine load.
+    ///
+    /// TxnLease holds ONE connection across all statements between
+    /// begin and commit/rollback, restoring the atomicity contract.
+    /// Use it for any multi-statement transaction:
+    ///
+    ///     var txn = try mgr.beginTransaction();
+    ///     defer txn.deinit(); // rollback-if-not-committed safety
+    ///     const r1 = try txn.execParams(q1, &p1, &l1);
+    ///     c.PQclear(r1);
+    ///     // ... more statements on the same pinned conn ...
+    ///     try txn.commit();
+    ///
+    /// commit() and rollback() are idempotent — safe to call multiple
+    /// times. deinit() is a no-op after commit/rollback. The intended
+    /// idiom is `defer txn.deinit()` + explicit `try txn.commit()` at
+    /// the success path; on error the defer's rollback fires.
+    pub const TxnLease = struct {
+        mgr: *Self,
+        lease: ConnLease,
+        conn_healthy: bool = true,
+        finalized: bool = false,
+
+        /// Run a query on the pinned connection. NO pool acquire.
+        pub fn exec(self: *TxnLease, query: []const u8) !*c.PGresult {
+            const query_z = try self.mgr.allocator.dupeZ(u8, query);
+            defer self.mgr.allocator.free(query_z);
+            const result = c.PQexec(self.lease.conn, query_z) orelse {
+                self.conn_healthy = false;
+                return error.ExecFailed;
+            };
+            const status = c.PQresultStatus(result);
+            if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
+                if (c.PQstatus(self.lease.conn) != c.CONNECTION_OK) self.conn_healthy = false;
+                log.err("postgres txn exec failed: {s}", .{c.PQerrorMessage(self.lease.conn)});
+                c.PQclear(result);
+                return error.ExecFailed;
+            }
+            return result;
+        }
+
+        /// Run a parameterized query on the pinned connection. NO pool acquire.
+        pub fn execParams(self: *TxnLease, query: []const u8, params: []const ?[*:0]const u8, lengths: []const c_int) !*c.PGresult {
+            const query_z = try self.mgr.allocator.dupeZ(u8, query);
+            defer self.mgr.allocator.free(query_z);
+            const n: c_int = @intCast(params.len);
+            const result = c.PQexecParams(
+                self.lease.conn,
+                query_z,
+                n,
+                null,
+                params.ptr,
+                lengths.ptr,
+                null,
+                0,
+            ) orelse {
+                self.conn_healthy = false;
+                return error.ExecFailed;
+            };
+            const status = c.PQresultStatus(result);
+            if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
+                if (c.PQstatus(self.lease.conn) != c.CONNECTION_OK) self.conn_healthy = false;
+                log.err("postgres txn execParams failed: {s}", .{c.PQerrorMessage(self.lease.conn)});
+                c.PQclear(result);
+                return error.ExecFailed;
+            }
+            return result;
+        }
+
+        /// Commit the transaction and release the pinned connection.
+        /// Idempotent: subsequent commit/rollback/deinit calls are no-ops.
+        pub fn commit(self: *TxnLease) !void {
+            if (self.finalized) return;
+            const result = self.exec("COMMIT") catch |err| {
+                // COMMIT failed — attempt ROLLBACK so the conn returns
+                // clean (or unhealthy) instead of stuck in an open txn.
+                self.rollback();
+                return err;
+            };
+            c.PQclear(result);
+            self.finalized = true;
+            self.mgr.releaseConn(&self.lease, self.conn_healthy);
+        }
+
+        /// Rollback the transaction (best-effort) and release the conn.
+        /// Idempotent. If ROLLBACK itself fails, marks the conn unhealthy
+        /// so releaseConn closes it (don't return a poisoned conn to pool).
+        pub fn rollback(self: *TxnLease) void {
+            if (self.finalized) return;
+            if (self.exec("ROLLBACK")) |result| {
+                c.PQclear(result);
+            } else |_| {
+                self.conn_healthy = false;
+            }
+            self.finalized = true;
+            self.mgr.releaseConn(&self.lease, self.conn_healthy);
+        }
+
+        /// Defensive rollback-if-not-finalized. Always safe to call.
+        /// Designed for `defer txn.deinit()` paired with an explicit
+        /// `try txn.commit()` at the success path.
+        pub fn deinit(self: *TxnLease) void {
+            if (!self.finalized) self.rollback();
+        }
+    };
+
     pub const PoolDebugSnapshot = struct {
         pool_max: u32,
         open_conns: u32,
@@ -2612,17 +2732,13 @@ const ManagerImpl = struct {
     /// Idempotent: if zero rows match, returns success — caller can call this
     /// safely on already-absent sessions.
     pub fn deleteSession(self: *Self, user_id: i64, session_id: []const u8) !void {
-        // BEGIN transaction
-        const begin_result = try self.exec("BEGIN");
-        c.PQclear(begin_result);
-        errdefer {
-            // On any error in the transaction below, rollback. Best-effort:
-            // if rollback itself fails, postgres will clear on connection
-            // teardown. Cannot use `return` inside defer expression.
-            if (self.exec("ROLLBACK")) |rb| {
-                c.PQclear(rb);
-            } else |_| {}
-        }
+        // V1.14.12 (Memory audit Finding 3 fix) — pin all statements to
+        // one connection so BEGIN/COMMIT/ROLLBACK are atomic. Pre-fix,
+        // each exec/execParams call re-acquired from the pool, so a
+        // multi-statement txn split across N connections and a failure
+        // mid-flight committed partial state.
+        var txn = try self.beginTransaction();
+        defer txn.deinit();
 
         var user_buf: [32]u8 = undefined;
         const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
@@ -2635,7 +2751,7 @@ const ManagerImpl = struct {
         {
             const q = try self.buildQuery("DELETE FROM {schema}.messages WHERE user_id = $1 AND session_id = $2");
             defer self.allocator.free(q);
-            const r = try self.execParams(q, &params, &lengths);
+            const r = try txn.execParams(q, &params, &lengths);
             c.PQclear(r);
         }
 
@@ -2643,7 +2759,7 @@ const ManagerImpl = struct {
         {
             const q = try self.buildQuery("DELETE FROM {schema}.completion_events WHERE user_id = $1 AND session_id = $2");
             defer self.allocator.free(q);
-            const r = try self.execParams(q, &params, &lengths);
+            const r = try txn.execParams(q, &params, &lengths);
             c.PQclear(r);
         }
 
@@ -2655,7 +2771,7 @@ const ManagerImpl = struct {
                     "AND (key LIKE 'autosave_user_%' OR key LIKE 'autosave_assistant_%')",
             );
             defer self.allocator.free(q);
-            const r = try self.execParams(q, &params, &lengths);
+            const r = try txn.execParams(q, &params, &lengths);
             c.PQclear(r);
         }
 
@@ -2664,13 +2780,11 @@ const ManagerImpl = struct {
         {
             const q = try self.buildQuery("DELETE FROM {schema}.sessions WHERE user_id = $1 AND session_key = $2");
             defer self.allocator.free(q);
-            const r = try self.execParams(q, &params, &lengths);
+            const r = try txn.execParams(q, &params, &lengths);
             c.PQclear(r);
         }
 
-        // COMMIT
-        const commit_result = try self.exec("COMMIT");
-        c.PQclear(commit_result);
+        try txn.commit();
     }
 
     pub fn saveCompletionEvent(
@@ -4708,13 +4822,10 @@ const ManagerImpl = struct {
     /// matches supersession idiom + lets graph history queries surface
     /// the close-out). Revisit if eval surfaces an issue.
     pub fn forgetMemory(self: *Self, user_id: i64, key: []const u8) !bool {
-        const begin_result = try self.exec("BEGIN");
-        c.PQclear(begin_result);
-        errdefer {
-            if (self.exec("ROLLBACK")) |rb| {
-                c.PQclear(rb);
-            } else |_| {}
-        }
+        // V1.14.12 (Memory audit Finding 3 fix) — pin all statements to one
+        // connection so the cascade + DELETE are atomic. See deleteSession.
+        var txn = try self.beginTransaction();
+        defer txn.deinit();
 
         var user_buf: [32]u8 = undefined;
         const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
@@ -4747,7 +4858,7 @@ const ManagerImpl = struct {
                 "RETURNING source_key, target_key, predicate, COALESCE(confidence, 1.0)",
         );
         defer self.allocator.free(cascade_q);
-        const cascade_result = try self.execParams(cascade_q, &cascade_params, &cascade_lengths);
+        const cascade_result = try txn.execParams(cascade_q, &cascade_params, &cascade_lengths);
         defer c.PQclear(cascade_result);
 
         // Capture cascaded edges' metadata for events (emitted post-COMMIT
@@ -4802,7 +4913,7 @@ const ManagerImpl = struct {
         defer self.allocator.free(del_q);
         const del_params = [_]?[*:0]const u8{ user_s.ptr, key_z };
         const del_lengths = [_]c_int{ @intCast(user_s.len), @intCast(key.len) };
-        const del_result = try self.execParams(del_q, &del_params, &del_lengths);
+        const del_result = try txn.execParams(del_q, &del_params, &del_lengths);
         defer c.PQclear(del_result);
         const affected = c.PQcmdTuples(del_result);
         const memory_deleted: bool = if (affected == null)
@@ -4810,8 +4921,7 @@ const ManagerImpl = struct {
         else
             !std.mem.eql(u8, std.mem.span(affected), "0");
 
-        const commit_result = try self.exec("COMMIT");
-        c.PQclear(commit_result);
+        try txn.commit();
 
         // 3. Post-COMMIT: emit edge_closed events for each cascaded edge.
         //    Best-effort — the cascade is already durable; missing events
@@ -4906,13 +5016,10 @@ const ManagerImpl = struct {
         old_name: []const u8,
         new_name: []const u8,
     ) !memory_root.CascadeRenameResult {
-        const begin_result = try self.exec("BEGIN");
-        c.PQclear(begin_result);
-        errdefer {
-            if (self.exec("ROLLBACK")) |rb| {
-                c.PQclear(rb);
-            } else |_| {}
-        }
+        // V1.14.12 (Memory audit Finding 3 fix) — pin all statements to one
+        // connection so the entity lookup + upsert + edge cascade are atomic.
+        var txn = try self.beginTransaction();
+        defer txn.deinit();
 
         var user_buf: [32]u8 = undefined;
         const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
@@ -4927,7 +5034,7 @@ const ManagerImpl = struct {
         defer self.allocator.free(lookup_q);
         const lookup_params = [_]?[*:0]const u8{ user_s.ptr, old_name_z };
         const lookup_lengths = [_]c_int{ @intCast(user_s.len), @intCast(old_name.len) };
-        const lookup_result = try self.execParams(lookup_q, &lookup_params, &lookup_lengths);
+        const lookup_result = try txn.execParams(lookup_q, &lookup_params, &lookup_lengths);
         defer c.PQclear(lookup_result);
         if (c.PQntuples(lookup_result) == 0) {
             // No old entity → no cascade needed. COMMIT empty txn.
@@ -4935,8 +5042,7 @@ const ManagerImpl = struct {
             // owns its slices via the supplied allocator. Return
             // zero-length allocator-owned slices instead of `""`
             // string literals so the contract holds.
-            const commit = try self.exec("COMMIT");
-            c.PQclear(commit);
+            try txn.commit();
             return .{
                 .found_old = false,
                 .old_id = try allocator.alloc(u8, 0),
@@ -4968,7 +5074,7 @@ const ManagerImpl = struct {
             @intCast(user_s.len),
             @intCast(new_name.len),
         };
-        const upsert_result = try self.execParams(upsert_q, &upsert_params, &upsert_lengths);
+        const upsert_result = try txn.execParams(upsert_q, &upsert_params, &upsert_lengths);
         defer c.PQclear(upsert_result);
         const new_id_owned = try dupeResultValue(self.allocator, upsert_result, 0, 0);
         // V1.9-Rev finding #1: defer free at top level so success path
@@ -4980,8 +5086,7 @@ const ManagerImpl = struct {
         if (std.mem.eql(u8, old_id_owned, new_id_owned)) {
             // Note: defer above handles new_id_owned cleanup on this
             // return path too — no explicit free here.
-            const commit = try self.exec("COMMIT");
-            c.PQclear(commit);
+            try txn.commit();
             return .{
                 .found_old = true,
                 .old_id = try allocator.dupe(u8, old_id_owned),
@@ -5029,7 +5134,7 @@ const ManagerImpl = struct {
                 "ON CONFLICT (user_id, source_key, predicate, target_key) WHERE is_latest DO NOTHING",
         );
         defer self.allocator.free(insert_q);
-        const insert_result = try self.execParams(insert_q, &insert_params, &insert_lengths);
+        const insert_result = try txn.execParams(insert_q, &insert_params, &insert_lengths);
         const inserted_count: usize = blk: {
             const tag = c.PQcmdTuples(insert_result);
             const tag_str = std.mem.span(tag);
@@ -5052,7 +5157,7 @@ const ManagerImpl = struct {
                 "RETURNING source_key, target_key, predicate, COALESCE(confidence, 1.0)",
         );
         defer self.allocator.free(close_q);
-        const close_result = try self.execParams(close_q, &close_params, &close_lengths);
+        const close_result = try txn.execParams(close_q, &close_params, &close_lengths);
         defer c.PQclear(close_result);
         const closed_count_raw = c.PQntuples(close_result);
         const closed_count: usize = if (closed_count_raw < 0) 0 else @intCast(closed_count_raw);
@@ -5104,8 +5209,7 @@ const ManagerImpl = struct {
         }
 
         // Step 6 — COMMIT.
-        const commit_result = try self.exec("COMMIT");
-        c.PQclear(commit_result);
+        try txn.commit();
 
         // Step 7 — post-COMMIT event emission. Best-effort. Failure
         // here doesn't roll back the cascade.
@@ -5172,13 +5276,10 @@ const ManagerImpl = struct {
         object_name: []const u8,
         subject_name: ?[]const u8,
     ) !usize {
-        const begin_result = try self.exec("BEGIN");
-        c.PQclear(begin_result);
-        errdefer {
-            if (self.exec("ROLLBACK")) |rb| {
-                c.PQclear(rb);
-            } else |_| {}
-        }
+        // V1.14.12 (Memory audit Finding 3 fix) — pin all statements to one
+        // connection so the lookups + edge close + RETURNING are atomic.
+        var txn = try self.beginTransaction();
+        defer txn.deinit();
 
         var user_buf: [32]u8 = undefined;
         const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
@@ -5193,11 +5294,10 @@ const ManagerImpl = struct {
         defer self.allocator.free(lookup_q);
         const lookup_params = [_]?[*:0]const u8{ user_s.ptr, obj_z };
         const lookup_lengths = [_]c_int{ @intCast(user_s.len), @intCast(object_name.len) };
-        const lookup_result = try self.execParams(lookup_q, &lookup_params, &lookup_lengths);
+        const lookup_result = try txn.execParams(lookup_q, &lookup_params, &lookup_lengths);
         defer c.PQclear(lookup_result);
         if (c.PQntuples(lookup_result) == 0) {
-            const commit = try self.exec("COMMIT");
-            c.PQclear(commit);
+            try txn.commit();
             return 0;
         }
         const target_id = try dupeResultValue(self.allocator, lookup_result, 0, 0);
@@ -5211,7 +5311,7 @@ const ManagerImpl = struct {
             defer self.allocator.free(sn_z);
             const subj_params = [_]?[*:0]const u8{ user_s.ptr, sn_z };
             const subj_lengths = [_]c_int{ @intCast(user_s.len), @intCast(sn.len) };
-            const subj_result = try self.execParams(lookup_q, &subj_params, &subj_lengths);
+            const subj_result = try txn.execParams(lookup_q, &subj_params, &subj_lengths);
             defer c.PQclear(subj_result);
             if (c.PQntuples(subj_result) > 0) {
                 subject_id_owned = try dupeResultValue(self.allocator, subj_result, 0, 0);
@@ -5225,8 +5325,7 @@ const ManagerImpl = struct {
                 log.warn("invalidate_when subject_not_found user={d} subject={s} predicate={s} object={s} returning=0", .{
                     user_id, sn, predicate, object_name,
                 });
-                const commit = try self.exec("COMMIT");
-                c.PQclear(commit);
+                try txn.commit();
                 return 0;
             }
         }
@@ -5261,7 +5360,7 @@ const ManagerImpl = struct {
                 @intCast(ts_s.len),
                 @intCast(sid.len),
             };
-            close_result = try self.execParams(close_q, &close_params, &close_lengths);
+            close_result = try txn.execParams(close_q, &close_params, &close_lengths);
         } else {
             const close_q = try self.buildQuery(
                 "UPDATE {schema}.memory_edges SET " ++
@@ -5278,7 +5377,7 @@ const ManagerImpl = struct {
                 @intCast(target_id.len),
                 @intCast(ts_s.len),
             };
-            close_result = try self.execParams(close_q, &close_params, &close_lengths);
+            close_result = try txn.execParams(close_q, &close_params, &close_lengths);
         }
         defer c.PQclear(close_result);
         const closed_n_raw = c.PQntuples(close_result);
@@ -5331,8 +5430,7 @@ const ManagerImpl = struct {
         }
 
         // COMMIT.
-        const commit_result = try self.exec("COMMIT");
-        c.PQclear(commit_result);
+        try txn.commit();
 
         // Post-COMMIT events.
         for (closed_edges.items) |e| {
@@ -5494,13 +5592,11 @@ const ManagerImpl = struct {
         correction_key: []const u8,
         entity_pattern: []const u8,
     ) !memory_root.PropagateCorrectionResult {
-        const begin_result = try self.exec("BEGIN");
-        c.PQclear(begin_result);
-        errdefer {
-            if (self.exec("ROLLBACK")) |rb| {
-                c.PQclear(rb);
-            } else |_| {}
-        }
+        // V1.14.12 (Memory audit Finding 3 fix) — pin all statements to one
+        // connection so the existence check, flag-targets, and back-pointer
+        // are atomic.
+        var txn = try self.beginTransaction();
+        defer txn.deinit();
 
         var user_buf: [32]u8 = undefined;
         const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
@@ -5515,13 +5611,12 @@ const ManagerImpl = struct {
         defer self.allocator.free(exists_q);
         const exists_params = [_]?[*:0]const u8{ user_s.ptr, correction_z };
         const exists_lengths = [_]c_int{ @intCast(user_s.len), @intCast(correction_key.len) };
-        const exists_result = try self.execParams(exists_q, &exists_params, &exists_lengths);
+        const exists_result = try txn.execParams(exists_q, &exists_params, &exists_lengths);
         const correction_exists = c.PQntuples(exists_result) > 0;
         c.PQclear(exists_result);
 
         if (!correction_exists) {
-            const commit = try self.exec("COMMIT");
-            c.PQclear(commit);
+            try txn.commit();
             log.info("propagate_correction correction_missing user={d} correction_key={s}", .{
                 user_id, correction_key,
             });
@@ -5573,7 +5668,7 @@ const ManagerImpl = struct {
             @intCast(correction_json.len),
             @intCast(correction_key.len),
         };
-        const update_result = try self.execParams(update_q, &update_params, &update_lengths);
+        const update_result = try txn.execParams(update_q, &update_params, &update_lengths);
         defer c.PQclear(update_result);
         const flagged_n_raw = c.PQntuples(update_result);
         const flagged_n: usize = if (flagged_n_raw < 0) 0 else @intCast(flagged_n_raw);
@@ -5630,13 +5725,12 @@ const ManagerImpl = struct {
                 @intCast(correction_key.len),
                 @intCast(json_array.items.len),
             };
-            const back_result = try self.execParams(back_q, &back_params, &back_lengths);
+            const back_result = try txn.execParams(back_q, &back_params, &back_lengths);
             c.PQclear(back_result);
         }
 
         // COMMIT.
-        const commit_result = try self.exec("COMMIT");
-        c.PQclear(commit_result);
+        try txn.commit();
 
         log.info("propagate_correction user={d} correction={s} pattern={s} flagged={d}", .{
             user_id, correction_key, entity_pattern, flagged_n,
@@ -5883,13 +5977,10 @@ const ManagerImpl = struct {
         threshold_days: u32,
         half_life_days: u32,
     ) !memory_root.TemporalDecayResult {
-        const begin_result = try self.exec("BEGIN");
-        c.PQclear(begin_result);
-        errdefer {
-            if (self.exec("ROLLBACK")) |rb| {
-                c.PQclear(rb);
-            } else |_| {}
-        }
+        // V1.14.12 (Memory audit Finding 3 fix) — pin all statements to one
+        // connection so the decay UPDATE + aggregate SELECT are atomic.
+        var txn = try self.beginTransaction();
+        defer txn.deinit();
 
         var user_buf: [32]u8 = undefined;
         const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
@@ -5931,7 +6022,7 @@ const ManagerImpl = struct {
             @intCast(threshold_s.len),
             @intCast(halflife_s.len),
         };
-        const decay_result = try self.execParams(decay_q, &decay_params, &decay_lengths);
+        const decay_result = try txn.execParams(decay_q, &decay_params, &decay_lengths);
         defer c.PQclear(decay_result);
 
         var rows_decayed: usize = 0;
@@ -5946,8 +6037,7 @@ const ManagerImpl = struct {
         }
 
         // COMMIT.
-        const commit_result = try self.exec("COMMIT");
-        c.PQclear(commit_result);
+        try txn.commit();
 
         // avg_decay_amount estimation: (1 - avg_new) is roughly the
         // mean drop assuming starting confidence ~1.0. Honest enough
@@ -6218,13 +6308,10 @@ const ManagerImpl = struct {
         if (loser_key.len == 0 or winner_key.len == 0) return error.EmptyKey;
         if (std.mem.eql(u8, loser_key, winner_key)) return error.LoserEqualsWinner;
 
-        const begin_result = try self.exec("BEGIN");
-        c.PQclear(begin_result);
-        errdefer {
-            if (self.exec("ROLLBACK")) |rb| {
-                c.PQclear(rb);
-            } else |_| {}
-        }
+        // V1.14.12 (Memory audit Finding 3 fix) — pin all statements to one
+        // connection so the loser + winner metadata updates are atomic.
+        var txn = try self.beginTransaction();
+        defer txn.deinit();
 
         var user_buf: [32]u8 = undefined;
         const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
@@ -6257,7 +6344,7 @@ const ManagerImpl = struct {
             @intCast(loser_key.len),
             @intCast(winner_json.len),
         };
-        const loser_result = try self.execParams(loser_q, &loser_params, &loser_lengths);
+        const loser_result = try txn.execParams(loser_q, &loser_params, &loser_lengths);
         defer c.PQclear(loser_result);
 
         // PQcmdTuples returns "1" / "0" as a C string for UPDATE.
@@ -6269,8 +6356,7 @@ const ManagerImpl = struct {
         const loser_marked = !std.mem.eql(u8, loser_tuples_slice, "0") and loser_tuples_slice.len > 0;
 
         if (!loser_marked) {
-            const commit = try self.exec("COMMIT");
-            c.PQclear(commit);
+            try txn.commit();
             return false;
         }
 
@@ -6304,11 +6390,10 @@ const ManagerImpl = struct {
             @intCast(winner_key.len),
             @intCast(loser_key.len),
         };
-        const winner_result = try self.execParams(winner_q, &winner_params, &winner_lengths);
+        const winner_result = try txn.execParams(winner_q, &winner_params, &winner_lengths);
         c.PQclear(winner_result);
 
-        const commit = try self.exec("COMMIT");
-        c.PQclear(commit);
+        try txn.commit();
 
         log.info("mark_superseded user={d} loser={s} winner={s}", .{
             user_id, loser_key, winner_key,
@@ -9006,6 +9091,36 @@ const ManagerImpl = struct {
         return result;
     }
 
+    /// V1.14.12 (Memory audit Finding 3 fix, 2026-05-19) — start a
+    /// connection-pinned transaction. See TxnLease docs above for the
+    /// motivation. Pair with `defer txn.deinit()` + explicit
+    /// `try txn.commit()` at the success path.
+    pub fn beginTransaction(self: *Self) !TxnLease {
+        var lease = self.acquireConn(self.lock_timeout_ms) catch |err| switch (err) {
+            error.ConnectionPoolBusy => return error.ConnectionFailed,
+            else => return err,
+        };
+        errdefer self.releaseConn(&lease, false);
+
+        const query_z = try self.allocator.dupeZ(u8, "BEGIN");
+        defer self.allocator.free(query_z);
+        const result = c.PQexec(lease.conn, query_z) orelse {
+            return error.ExecFailed;
+        };
+        defer c.PQclear(result);
+        if (c.PQresultStatus(result) != c.PGRES_COMMAND_OK) {
+            log.err("postgres BEGIN failed: {s}", .{c.PQerrorMessage(lease.conn)});
+            return error.ExecFailed;
+        }
+
+        return TxnLease{
+            .mgr = self,
+            .lease = lease,
+            .conn_healthy = true,
+            .finalized = false,
+        };
+    }
+
     fn execMigrateStatement(self: *Self, template: []const u8, query: []const u8) !?*c.PGresult {
         var lease = self.acquireConn(self.lock_timeout_ms) catch |err| switch (err) {
             error.ConnectionPoolBusy => return error.ConnectionFailed,
@@ -9673,6 +9788,192 @@ fn initPostgresTestManagerWithPool(allocator: std.mem.Allocator, pool_max: u32, 
     }
     try mgr.migrate();
     return mgr;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// V1.14.12 (Memory audit Finding 3 fix, 2026-05-19) — TxnLease tests.
+//
+// These exercise the connection-pinned transaction primitive that
+// replaced the broken `exec("BEGIN") + execParams(...) + exec("COMMIT")`
+// pattern in 7 production sites. Each call previously acquired and
+// released a pool connection per statement, so multi-statement
+// transactions silently split across N connections and ROLLBACK ran
+// on a different conn (no-op). TxnLease holds one connection across
+// the entire BEGIN→COMMIT/ROLLBACK lifecycle.
+// ─────────────────────────────────────────────────────────────────────
+
+test "TxnLease: commit persists writes" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 4, 5000) catch return error.SkipZigTest;
+    defer mgr.deinit();
+
+    try mgr.upsertMemory(7777, "txn_commit_baseline", "before", .core, null);
+
+    {
+        var txn = try mgr.beginTransaction();
+        defer txn.deinit();
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const q = try std.fmt.allocPrintSentinel(allocator, "UPDATE {s}.memories SET content = $2 WHERE user_id = 7777 AND key = $1", .{schema_q}, 0);
+        defer allocator.free(q);
+        const key_z = try allocator.dupeZ(u8, "txn_commit_baseline");
+        defer allocator.free(key_z);
+        const val_z = try allocator.dupeZ(u8, "committed");
+        defer allocator.free(val_z);
+        const params = [_]?[*:0]const u8{ key_z, val_z };
+        const lengths = [_]c_int{ @intCast(@as(usize, "txn_commit_baseline".len)), @intCast(@as(usize, "committed".len)) };
+        const r = try txn.execParams(q, &params, &lengths);
+        c.PQclear(r);
+        try txn.commit();
+    }
+
+    const entry = (try mgr.getMemory(allocator, 7777, "txn_commit_baseline")) orelse return error.TestUnexpectedResult;
+    defer entry.deinit(allocator);
+    try std.testing.expectEqualStrings("committed", entry.content);
+}
+
+test "TxnLease: rollback discards writes" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 4, 5000) catch return error.SkipZigTest;
+    defer mgr.deinit();
+
+    try mgr.upsertMemory(7777, "txn_rollback_baseline", "before", .core, null);
+
+    {
+        var txn = try mgr.beginTransaction();
+        defer txn.deinit();
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const q = try std.fmt.allocPrintSentinel(allocator, "UPDATE {s}.memories SET content = $2 WHERE user_id = 7777 AND key = $1", .{schema_q}, 0);
+        defer allocator.free(q);
+        const key_z = try allocator.dupeZ(u8, "txn_rollback_baseline");
+        defer allocator.free(key_z);
+        const val_z = try allocator.dupeZ(u8, "should_not_persist");
+        defer allocator.free(val_z);
+        const params = [_]?[*:0]const u8{ key_z, val_z };
+        const lengths = [_]c_int{ @intCast(@as(usize, "txn_rollback_baseline".len)), @intCast(@as(usize, "should_not_persist".len)) };
+        const r = try txn.execParams(q, &params, &lengths);
+        c.PQclear(r);
+        txn.rollback();
+        // Explicit rollback — content must remain "before".
+    }
+
+    const entry = (try mgr.getMemory(allocator, 7777, "txn_rollback_baseline")) orelse return error.TestUnexpectedResult;
+    defer entry.deinit(allocator);
+    try std.testing.expectEqualStrings("before", entry.content);
+}
+
+test "TxnLease: deinit without commit rolls back (defensive)" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 4, 5000) catch return error.SkipZigTest;
+    defer mgr.deinit();
+
+    try mgr.upsertMemory(7777, "txn_deinit_baseline", "before", .core, null);
+
+    {
+        var txn = try mgr.beginTransaction();
+        defer txn.deinit(); // intentional: no explicit commit/rollback
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const q = try std.fmt.allocPrintSentinel(allocator, "UPDATE {s}.memories SET content = $2 WHERE user_id = 7777 AND key = $1", .{schema_q}, 0);
+        defer allocator.free(q);
+        const key_z = try allocator.dupeZ(u8, "txn_deinit_baseline");
+        defer allocator.free(key_z);
+        const val_z = try allocator.dupeZ(u8, "should_not_persist");
+        defer allocator.free(val_z);
+        const params = [_]?[*:0]const u8{ key_z, val_z };
+        const lengths = [_]c_int{ @intCast(@as(usize, "txn_deinit_baseline".len)), @intCast(@as(usize, "should_not_persist".len)) };
+        const r = try txn.execParams(q, &params, &lengths);
+        c.PQclear(r);
+        // Scope ends here; defer txn.deinit() fires → rollback.
+    }
+
+    const entry = (try mgr.getMemory(allocator, 7777, "txn_deinit_baseline")) orelse return error.TestUnexpectedResult;
+    defer entry.deinit(allocator);
+    try std.testing.expectEqualStrings("before", entry.content);
+}
+
+test "TxnLease: commit and rollback are idempotent" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 4, 5000) catch return error.SkipZigTest;
+    defer mgr.deinit();
+
+    var txn = try mgr.beginTransaction();
+    try txn.commit();
+    // Second commit is a no-op (finalized flag).
+    try txn.commit();
+    // Rollback after commit is a no-op.
+    txn.rollback();
+    // deinit after both is a no-op.
+    txn.deinit();
+}
+
+test "TxnLease: pool-split regression — overlapping txns each see their own state" {
+    // Regression test for the pre-fix bug. Pre-fix, the second
+    // `beginTransaction` (well, the broken `exec("BEGIN")` pattern)
+    // could land on the same connection that the first transaction
+    // had not yet returned a COMMIT for — and any subsequent
+    // execParams calls from the FIRST flow would land on a DIFFERENT
+    // pool conn, silently auto-committing.
+    //
+    // With TxnLease, each transaction holds its conn exclusively;
+    // pool_max=2 ensures two TxnLeases CAN exist concurrently without
+    // colliding. We sequentially run two leases, both committing
+    // distinct rows, both visible after.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 5000) catch return error.SkipZigTest;
+    defer mgr.deinit();
+
+    var txn_a = try mgr.beginTransaction();
+    defer txn_a.deinit();
+    var txn_b = try mgr.beginTransaction();
+    defer txn_b.deinit();
+
+    // Each txn writes its own row via a direct INSERT.
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+
+    inline for ([_]struct { txn_idx: u8, key: []const u8 }{
+        .{ .txn_idx = 0, .key = "txn_split_a" },
+        .{ .txn_idx = 1, .key = "txn_split_b" },
+    }) |spec| {
+        const id_buf = try std.fmt.allocPrint(allocator, "txn_split_id_{s}", .{spec.key});
+        defer allocator.free(id_buf);
+        const q = try std.fmt.allocPrintSentinel(allocator,
+            "INSERT INTO {s}.memories (id, user_id, key, content, memory_type) VALUES ($1, 7777, $2, $3, 'core')",
+            .{schema_q},
+            0,
+        );
+        defer allocator.free(q);
+        const id_z = try allocator.dupeZ(u8, id_buf);
+        defer allocator.free(id_z);
+        const key_z = try allocator.dupeZ(u8, spec.key);
+        defer allocator.free(key_z);
+        const val_z = try allocator.dupeZ(u8, "committed");
+        defer allocator.free(val_z);
+        const params = [_]?[*:0]const u8{ id_z, key_z, val_z };
+        const lengths = [_]c_int{ @intCast(@as(usize, id_buf.len)), @intCast(@as(usize, spec.key.len)), @intCast(@as(usize, "committed".len)) };
+        const r = if (spec.txn_idx == 0)
+            try txn_a.execParams(q, &params, &lengths)
+        else
+            try txn_b.execParams(q, &params, &lengths);
+        c.PQclear(r);
+    }
+
+    try txn_a.commit();
+    try txn_b.commit();
+
+    const a = (try mgr.getMemory(allocator, 7777, "txn_split_a")) orelse return error.TestUnexpectedResult;
+    defer a.deinit(allocator);
+    const b = (try mgr.getMemory(allocator, 7777, "txn_split_b")) orelse return error.TestUnexpectedResult;
+    defer b.deinit(allocator);
+    try std.testing.expectEqualStrings("committed", a.content);
+    try std.testing.expectEqualStrings("committed", b.content);
 }
 
 test "postgres claimed job one-shot completion preserves run history and disables job in management view" {
