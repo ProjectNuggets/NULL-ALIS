@@ -243,6 +243,47 @@ pub fn emitStepEvent(observer: Observer, plan: *const TaskPlan) void {
     observer.recordEvent(&event);
 }
 
+/// Emit a user-facing progress frame for a specific plan step.
+///
+/// The current public frame enum uses `.plan_step` for plan progress. Channel
+/// renderers route that type through the existing reasoning/progress hooks.
+pub fn emitStepProgress(observer: Observer, plan: *const TaskPlan, step_index: u32, tool_name: ?[]const u8) void {
+    if (step_index >= plan.steps.len) return;
+    const event = ObserverEvent{ .narration_frame = .{
+        .message = plan.steps[step_index].description,
+        .frame_type = NarrationFrameType.plan_step,
+        .tool_name = tool_name,
+        .step_index = step_index,
+        .step_total = plan.stepCount(),
+    } };
+    observer.recordEvent(&event);
+}
+
+/// Emit a frame when the current plan step has completed.
+pub fn emitStepDone(observer: Observer, plan: *const TaskPlan, step_index: u32, success: bool) void {
+    if (step_index >= plan.steps.len) return;
+    const event = ObserverEvent{ .narration_frame = .{
+        .message = plan.steps[step_index].description,
+        .frame_type = if (success) NarrationFrameType.tool_done else NarrationFrameType.error_recovery,
+        .tool_name = plan.steps[step_index].tool_used,
+        .step_index = step_index,
+        .step_total = plan.stepCount(),
+    } };
+    observer.recordEvent(&event);
+}
+
+/// Emit a frame when all steps in the plan have completed.
+pub fn emitPlanComplete(observer: Observer, plan: *const TaskPlan) void {
+    const event = ObserverEvent{ .narration_frame = .{
+        .message = plan.summary,
+        .frame_type = NarrationFrameType.thinking,
+        .tool_name = null,
+        .step_index = plan.stepCount(),
+        .step_total = plan.stepCount(),
+    } };
+    observer.recordEvent(&event);
+}
+
 // ─── Inline tests ─────────────────────────────────────────────────────────────
 
 test "parseTaskPlan with valid XML returns correct step count and descriptions" {
