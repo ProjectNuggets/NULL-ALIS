@@ -1816,6 +1816,14 @@ pub fn bindStateMgrTenant(tools: []const Tool, state_mgr: ?*zaki_state.Manager, 
             const mt: *memory_store.MemoryStoreTool = @ptrCast(@alignCast(t.ptr));
             mt.state_mgr = state_mgr;
             mt.user_id = user_id;
+        } else if (t.vtable == &compose_memory.ComposeMemoryTool.vtable) {
+            // V1.14.12 (Memory audit Finding 11 fix, 2026-05-19) —
+            // tenant context lets compose_memory call existsMemoryKeys
+            // for reference-existence validation, matching the
+            // HTTP /brain/compose contract.
+            const mt: *compose_memory.ComposeMemoryTool = @ptrCast(@alignCast(t.ptr));
+            mt.state_mgr = state_mgr;
+            mt.user_id = user_id;
         } else if (t.vtable == &wiki_link.WikiLinkTool.vtable) {
             // V1.12 — wiki_link needs tenant context to write
             // memory_entities + memory_edges. Provider + model + embedder

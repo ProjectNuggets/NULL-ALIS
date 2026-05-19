@@ -31,6 +31,7 @@ const mem_root = @import("../memory/root.zig");
 const Memory = mem_root.Memory;
 const MemoryCategory = mem_root.MemoryCategory;
 const security_secrets = @import("../security/secrets.zig");
+const zaki_state = @import("../zaki_state.zig");
 
 const log = std.log.scoped(.compose_memory_tool);
 
@@ -60,6 +61,17 @@ pub const MAX_REFERENCE_KEY_LEN = 256;
 
 pub const ComposeMemoryTool = struct {
     memory: ?Memory = null,
+    /// V1.14.12 (Memory audit Finding 11 fix, 2026-05-19) — tenant
+    /// context for server-side reference validation. When set, the
+    /// tool calls `state_mgr.existsMemoryKeys` to reject compose
+    /// writes with dangling references, matching the HTTP
+    /// /brain/compose path (gateway.zig:14292-14308). Pre-fix the
+    /// agent tool only validated reference SHAPE (string, non-empty,
+    /// length cap, no duplicates) but didn't check existence — so
+    /// agent-issued compose rows could carry dangling refs that
+    /// became invisible/broken provenance edges in /brain/graph.
+    state_mgr: ?*zaki_state.Manager = null,
+    user_id: ?i64 = null,
 
     pub const tool_name = "compose_memory";
     pub const tool_description =
@@ -97,7 +109,7 @@ pub const ComposeMemoryTool = struct {
             return ToolResult.fail("compose_memory tool requires memory backend (none configured)");
         };
 
-        if (std.mem.eql(u8, action, "create")) return executeCreate(allocator, m, args);
+        if (std.mem.eql(u8, action, "create")) return executeCreate(allocator, m, args, self.state_mgr, self.user_id);
         return ToolResult.fail("Unknown action — only 'create' is supported in V1.5");
     }
 };
@@ -108,6 +120,8 @@ fn executeCreate(
     allocator: std.mem.Allocator,
     m: Memory,
     args: JsonObjectMap,
+    state_mgr: ?*zaki_state.Manager,
+    user_id: ?i64,
 ) !ToolResult {
     // ── title ──
     const title = root.getString(args, "title") orelse
@@ -169,6 +183,44 @@ fn executeCreate(
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         }
         try seen.put(allocator, key, {});
+    }
+
+    // V1.14.12 (Memory audit Finding 11 fix, 2026-05-19) — server-side
+    // reference EXISTENCE validation, matching HTTP /brain/compose at
+    // gateway.zig:14292-14308. Pre-fix the tool only validated reference
+    // shape; agents could write compose rows pointing at keys that
+    // didn't exist, producing dangling provenance edges that the
+    // brain/graph reference-edge builder silently dropped. When tenant
+    // context is available, reject upfront. When unavailable (sqlite
+    // build / pre-tenant), the existing shape-only validation remains
+    // the floor — no regression.
+    if (state_mgr) |smgr| {
+        if (user_id) |uid| {
+            // Collect reference keys into a borrowed slice. The JSON
+            // value array's strings live as long as `args`, which
+            // outlives this scope.
+            var ref_keys: std.ArrayListUnmanaged([]const u8) = .{};
+            defer ref_keys.deinit(allocator);
+            for (refs) |r| ref_keys.append(allocator, r.string) catch return ToolResult.fail("compose_memory: OOM during reference validation");
+            var existing = smgr.existsMemoryKeys(allocator, uid, ref_keys.items) catch {
+                return ToolResult.fail("compose_memory: reference existence check failed");
+            };
+            defer {
+                var it = existing.iterator();
+                while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+                existing.deinit(allocator);
+            }
+            for (refs, 0..) |r, idx| {
+                if (!existing.contains(r.string)) {
+                    const msg = try std.fmt.allocPrint(
+                        allocator,
+                        "references[{d}] '{s}' does not resolve to an existing memory for this user. Compose only over keys that exist; check with memory_search before composing.",
+                        .{ idx, r.string },
+                    );
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                }
+            }
+        }
     }
 
     // ── category ──
