@@ -11708,6 +11708,33 @@ fn buildBrainReferenceEdges(
     return edges.toOwnedSlice(allocator);
 }
 
+/// V1.14.12 (Memory audit Finding 2 fix, 2026-05-19) — `entity_<hex>`
+/// targets are not stored in the `memories` table; they live in
+/// `memory_entities` (coref-resolved IDs) or are synthesized hashes
+/// (`deriveEntityKey` shape: `entity_<sha256(lower(name))[..16hex]>`).
+/// Recognize either shape so the typed-edge filter allows edges from a
+/// visible memory row to such a target; entity-side BrainNodes are
+/// synthesized by the caller after `buildBrainTypedEdges` returns.
+fn isEntityNodeKey(key: []const u8) bool {
+    // Shape 1: hash fallback `entity_<16 hex>` (deriveEntityKey).
+    if (std.mem.startsWith(u8, key, "entity_")) {
+        const tail = key[7..];
+        if (tail.len != 16) return false;
+        for (tail) |ch| {
+            const is_hex = (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f');
+            if (!is_hex) return false;
+        }
+        return true;
+    }
+    // Shape 2: coref-resolved random ID — 32 hex chars, no prefix.
+    if (key.len != 32) return false;
+    for (key) |ch| {
+        const is_hex = (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f');
+        if (!is_hex) return false;
+    }
+    return true;
+}
+
 /// V1.7a-3 — typed-edge builder, materialized-table variant.
 ///
 /// Reads typed edges from the canonical `memory_edges` table via
@@ -11717,6 +11744,15 @@ fn buildBrainReferenceEdges(
 /// rejected-predicate filter (defense-in-depth), and caps each source's
 /// outbound edges at `BRAIN_TYPED_EDGE_CAP_PER_SOURCE` for hub-node
 /// budget control.
+///
+/// V1.14.12 (Memory audit Finding 2 fix, 2026-05-19) — edges to
+/// entity-shape targets (entity_<16hex> or 32-hex coref IDs) are
+/// preserved instead of dropped. The caller synthesizes BrainNode-
+/// kind="entity" entries for these targets so the FE has both endpoints.
+/// Pre-fix, the strict "both endpoints in visible set" rule silently
+/// dropped all typed edges from visible memory rows to entity refs,
+/// making /brain/graph look empty even when extraction had populated
+/// the edge table.
 ///
 /// **Why findEdgesByKeys not listEdgesForUser:** post-cmt9.8 v1 used
 /// listEdgesForUser, which scales with the user's TOTAL edge count.
@@ -11810,10 +11846,17 @@ fn buildBrainTypedEdges(
     }
 
     for (incident_edges) |e| {
-        // Both endpoints must be in the rendered node set; an incident
-        // edge to an off-graph endpoint would dangle.
+        // Source endpoint MUST be a visible memory row — edges from
+        // hidden/off-graph sources would surface continuity-internal
+        // connections the user shouldn't see.
         if (!visible.contains(e.source_key)) continue;
-        if (!visible.contains(e.target_key)) continue;
+        // V1.14.12 (Memory audit Finding 2 fix, 2026-05-19) — target
+        // is allowed to be either a visible memory row OR an entity-
+        // shape key. Caller materializes the entity side as a
+        // BrainNode-kind="entity" so the FE has both endpoints. The
+        // old strict "both endpoints visible" rule dropped every typed
+        // edge from memory→entity_<hex>, making /brain/graph look empty.
+        if (!visible.contains(e.target_key) and !isEntityNodeKey(e.target_key)) continue;
 
         // Defense-in-depth predicate filter (matches old JSONB path).
         if (isRejectedExtractionPredicate(e.predicate)) continue;
@@ -12284,6 +12327,37 @@ fn handleBrainGraph(
     const typed_edges = buildBrainTypedEdges(allocator, nodes, state_mgr, numeric_user_id) catch empty_typed;
     defer freeBrainTypedEdges(allocator, typed_edges);
 
+    // ── V1.14.12 (Memory audit Finding 2 fix, 2026-05-19) ─────────────
+    // Synthesize entity-side BrainNodes for entity-shape targets in the
+    // typed-edge set. Pre-fix, edges from a visible memory row to an
+    // entity_<hex> target were dropped because the target wasn't in
+    // `nodes[]`. Now buildBrainTypedEdges keeps those edges; we look up
+    // each unique entity target's name via findEntitiesByKeys and emit
+    // a kind="entity" node so the FE has both endpoints to render.
+    //
+    // Hash-fallback shape (entity_<16hex> from extraction_persist.
+    // deriveEntityKey) has no memory_entities row — use the key itself
+    // as a synthetic label.
+    var entity_keys_dedupe: std.StringHashMapUnmanaged(void) = .{};
+    defer entity_keys_dedupe.deinit(allocator);
+    var entity_keys_list: std.ArrayListUnmanaged([]const u8) = .{};
+    defer entity_keys_list.deinit(allocator);
+    for (typed_edges) |e| {
+        if (!isEntityNodeKey(e.target)) continue;
+        const gop = entity_keys_dedupe.getOrPut(allocator, e.target) catch continue;
+        if (!gop.found_existing) entity_keys_list.append(allocator, e.target) catch continue;
+    }
+    const entity_rows_alloc = state_mgr.findEntitiesByKeys(allocator, numeric_user_id, entity_keys_list.items) catch &[_]memory_mod.EntityRow{};
+    defer {
+        for (entity_rows_alloc) |*r| r.deinit(allocator);
+        allocator.free(entity_rows_alloc);
+    }
+    // Map id → name for fast label lookup. Entity refs not present in the
+    // result fall back to the key itself as a label.
+    var entity_name_map: std.StringHashMapUnmanaged([]const u8) = .{};
+    defer entity_name_map.deinit(allocator);
+    for (entity_rows_alloc) |r| entity_name_map.put(allocator, r.id, r.name) catch {};
+
     // ── V1.6 commit 4 — compute per-node importance score ────────────
     //
     // Sized for FE node-radius rendering (M1 from spec §4.3). Count
@@ -12358,6 +12432,10 @@ fn handleBrainGraph(
             }
             displayed_keys.put(allocator, n.key, {}) catch {};
         }
+        // V1.14.12 (Memory audit Finding 2 fix) — entity refs are always
+        // displayed (they only exist as edge endpoints; degree=0 is
+        // impossible by construction). Skip the orphan filter for them.
+        for (entity_keys_list.items) |k| displayed_keys.put(allocator, k, {}) catch {};
     }
 
     // ── Build JSON response ──────────────────────────────────────
@@ -12447,6 +12525,26 @@ fn handleBrainGraph(
             w.writeAll("null,\"community_name\":null") catch return response_build_err;
         }
         w.writeAll("}") catch return response_build_err;
+    }
+
+    // V1.14.12 (Memory audit Finding 2 fix, 2026-05-19) — emit entity-
+    // side nodes for the targets of typed edges that don't have a
+    // memories-table row. Each gets kind="entity" so the FE can style
+    // them distinctly. Label is the entity's display name from
+    // memory_entities (when coref-resolved) or the key itself as a
+    // synthetic fallback (hash-shape entity_<16hex>). importance=0 and
+    // community fields null — entity refs are connection points, not
+    // first-class memory rows.
+    for (entity_keys_list.items) |ek| {
+        if (!displayed_keys.contains(ek)) continue;
+        if (!first_node_emitted) w.writeAll(",") catch return response_build_err;
+        first_node_emitted = false;
+        const label = entity_name_map.get(ek) orelse ek;
+        w.writeAll("{\"id\":\"") catch return response_build_err;
+        jsonEscapeInto(w, ek) catch return response_build_err;
+        w.writeAll("\",\"kind\":\"entity\",\"created_at\":0,\"session_id\":null,\"summary\":\"") catch return response_build_err;
+        jsonEscapeInto(w, label) catch return response_build_err;
+        w.writeAll("\",\"valid_to\":null,\"importance\":0.000,\"community_id\":null,\"community_name\":null}") catch return response_build_err;
     }
 
     w.writeAll("],\"edges\":[") catch return response_build_err;
@@ -26411,6 +26509,72 @@ test "brain: buildBrainTypedEdges (V1.7a-3) materialized path filters + caps + s
         if (std.mem.eql(u8, e.source, "node_d")) node_d_edge_count += 1;
     }
     try std.testing.expectEqual(BRAIN_TYPED_EDGE_CAP_PER_SOURCE, node_d_edge_count);
+}
+
+test "V1.14.12 (Memory audit Finding 2): isEntityNodeKey shape detection" {
+    // Hash-fallback shape: entity_<16 hex>
+    try std.testing.expect(isEntityNodeKey("entity_0123456789abcdef"));
+    try std.testing.expect(isEntityNodeKey("entity_aaaaaaaaaaaaaaaa"));
+    try std.testing.expect(!isEntityNodeKey("entity_short")); // not 16 hex
+    try std.testing.expect(!isEntityNodeKey("entity_0123456789abcdefXX")); // 18 chars
+    try std.testing.expect(!isEntityNodeKey("entity_ZZZZZZZZZZZZZZZZ")); // not hex
+
+    // Coref-resolved shape: 32 hex chars, no prefix
+    try std.testing.expect(isEntityNodeKey("0123456789abcdef0123456789abcdef"));
+    try std.testing.expect(!isEntityNodeKey("0123456789abcdef0123456789abcde")); // 31 chars
+    try std.testing.expect(!isEntityNodeKey("0123456789abcdef0123456789abcdeg")); // 'g' not hex
+
+    // Regular memory keys are NOT entity-shaped
+    try std.testing.expect(!isEntityNodeKey("user_lang"));
+    try std.testing.expect(!isEntityNodeKey("extracted_1700000000_abcdef12"));
+    try std.testing.expect(!isEntityNodeKey("durable_fact/1700000000/0"));
+    try std.testing.expect(!isEntityNodeKey("node_GHOST"));
+    try std.testing.expect(!isEntityNodeKey("")); // empty
+}
+
+test "V1.14.12 (Memory audit Finding 2): buildBrainTypedEdges keeps edges to entity targets" {
+    // Pre-fix this edge was silently dropped because the entity target
+    // wasn't in the visible memory node set, making /brain/graph appear
+    // empty even when extraction had populated the edge table.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_brain_entity_edge_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    defer mgr.dropSchemaForTests() catch {};
+    try mgr.provisionUser(2, "/tmp/nullalis-brain-entity-edge-user-2/workspace");
+
+    try mgr.upsertMemory(2, "extracted_user_pref", "user PREFERS Helix", .core, null);
+    // Entity-shape targets (both shapes the extraction pipeline emits).
+    try mgr.upsertMemoryEdge(2, "extracted_user_pref", "entity_abcdef1234567890", "PREFERS", "extraction_classifier", 0.95);
+    try mgr.upsertMemoryEdge(2, "extracted_user_pref", "fedcba9876543210fedcba9876543210", "PREFERS", "extraction_classifier", 0.95);
+    // Non-entity off-graph target — still must be filtered.
+    try mgr.upsertMemoryEdge(2, "extracted_user_pref", "node_OFFSCREEN", "RELATES_TO", "extraction", 0.5);
+
+    const nodes = [_]BrainNode{
+        .{ .key = "extracted_user_pref", .kind = "core", .session_id = null, .created_at = 0, .summary = "", .valid_to = null },
+    };
+    const edges = try buildBrainTypedEdges(allocator, &nodes, &mgr, 2);
+    defer freeBrainTypedEdges(allocator, edges);
+
+    // Expected: 2 entity-target edges kept, 1 non-entity off-graph edge dropped.
+    try std.testing.expectEqual(@as(usize, 2), edges.len);
+    var saw_hash_shape = false;
+    var saw_coref_shape = false;
+    for (edges) |e| {
+        if (std.mem.eql(u8, e.target, "entity_abcdef1234567890")) saw_hash_shape = true;
+        if (std.mem.eql(u8, e.target, "fedcba9876543210fedcba9876543210")) saw_coref_shape = true;
+    }
+    try std.testing.expect(saw_hash_shape);
+    try std.testing.expect(saw_coref_shape);
 }
 
 test "brain: buildBrainTypedEdges (V1.7a-3) returns empty for user with no edges" {

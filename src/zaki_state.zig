@@ -607,6 +607,12 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn findEdgesByKeys(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const []const u8) ![]memory_root.TypedEdge {
         return allocator.alloc(memory_root.TypedEdge, 0);
     }
+    /// V1.14.12 (Memory audit Finding 2 fix) — stub for non-postgres
+    /// builds. Entity lookup is a postgres feature; non-postgres returns
+    /// empty (caller falls back to using the entity key as its own label).
+    pub fn findEntitiesByKeys(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const []const u8) ![]memory_root.EntityRow {
+        return allocator.alloc(memory_root.EntityRow, 0);
+    }
     /// V1.6 commit 8 — stub for non-postgres builds. Entity coreference is
     /// a postgres-pgvector feature; non-postgres builds fall back to a
     /// hash-based stable key (entity_<hash(lower(name))>) computed by the
@@ -7310,6 +7316,74 @@ const ManagerImpl = struct {
                 .confidence = conf,
                 .weight = weight,
             });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// V1.14.12 (Memory audit Finding 2 fix, 2026-05-19) — batch entity
+    /// lookup by id, used by /brain/graph to render entity-side endpoints
+    /// of typed edges. Pre-fix, edges from a visible memory row to an
+    /// entity_<hex> target were dropped (gateway.zig:11815-11816 required
+    /// both endpoints in the rendered node set, and entity refs are NOT
+    /// memory rows). Now /brain looks up entity names via this function
+    /// and synthesizes BrainNode-kind="entity" entries for the response.
+    ///
+    /// Returns one EntityRow per key that has a matching memory_entities
+    /// row. Keys without a row (e.g. the entity_<16hex> hash-fallback
+    /// shape from extraction_persist when coref was unavailable) are
+    /// silently absent from the result — caller falls back to the key
+    /// itself as a label.
+    ///
+    /// Caller frees the returned slice via `EntityRow.deinit` per row.
+    pub fn findEntitiesByKeys(self: *Self, allocator: std.mem.Allocator, user_id: i64, keys: []const []const u8) ![]memory_root.EntityRow {
+        if (keys.len == 0) return allocator.alloc(memory_root.EntityRow, 0);
+
+        // NUL-defense (parallels findEdgesByKeys; see that function for full
+        // rationale on why we reject rather than silently truncate).
+        for (keys) |k| {
+            if (std.mem.indexOfScalar(u8, k, 0) != null) return error.InvalidKey;
+        }
+
+        // Build PG TEXT[] literal: ARRAY['k1', 'k2', ...]::text[]
+        var arr_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer arr_buf.deinit(allocator);
+        try arr_buf.appendSlice(allocator, "{");
+        for (keys, 0..) |k, i| {
+            if (i > 0) try arr_buf.append(allocator, ',');
+            try arr_buf.append(allocator, '"');
+            for (k) |ch| {
+                if (ch == '\\' or ch == '"') try arr_buf.append(allocator, '\\');
+                try arr_buf.append(allocator, ch);
+            }
+            try arr_buf.append(allocator, '"');
+        }
+        try arr_buf.appendSlice(allocator, "}");
+
+        const q = try self.buildQuery(
+            "SELECT id, name FROM {schema}.memory_entities " ++
+                "WHERE user_id = $1 AND id = ANY($2::text[])",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const arr_z = try allocator.dupeZ(u8, arr_buf.items);
+        defer allocator.free(arr_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, arr_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(arr_buf.items.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const tuples = c.PQntuples(result);
+        var out: std.ArrayListUnmanaged(memory_root.EntityRow) = .{};
+        errdefer {
+            for (out.items) |*r| r.deinit(allocator);
+            out.deinit(allocator);
+        }
+        var i: c_int = 0;
+        while (i < tuples) : (i += 1) {
+            const id = try dupeResultValue(allocator, result, i, 0);
+            errdefer allocator.free(id);
+            const name = try dupeResultValue(allocator, result, i, 1);
+            try out.append(allocator, .{ .id = id, .name = name });
         }
         return out.toOwnedSlice(allocator);
     }
