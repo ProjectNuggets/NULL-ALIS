@@ -137,7 +137,7 @@ src/
   health.zig            component health registry
   runtime.zig           runtime adapters (native, docker, wasm, cloudflare)
   tunnel.zig            tunnel providers (cloudflared, ngrok, tailscale, custom)
-  skills.zig            skill discovery and integration (successor to the archived `skillforge.zig` references)
+  skills.zig            skill discovery and integration
   migration.zig         memory migration from other backends
   hardware.zig          hardware discovery and management
   peripherals.zig       hardware peripherals (Arduino, STM32/Nucleo, RPi)
