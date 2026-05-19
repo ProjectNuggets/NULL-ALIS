@@ -29,7 +29,7 @@ Entitlement + secret-vault + cost-class surfaces (Sprint 2 / D8):
 - `src/gateway/secret_vault.zig` — two-phase mutation handshake with audit trail
 - `src/tools/metadata.zig` — cost classes A/B/C on `ToolMetadata`; weight-budget gate in preflight
 
-Current scale (2026-04-24, post-Sprint-6): **260 source files, ~214K Zig LoC (excluding vendored sqlite), 5,597 tests**.
+Current scale (2026-05-19, HEAD `365065b1`): **296 Zig files under `src/`, ~260K Zig LoC, 6,149 default build tests** (`zig build test --summary all`: 6,083 passed / 66 skipped). Treat these numbers as a snapshot, not a promise; refresh them when publishing a new roadmap/status lock.
 
 Build and test:
 
@@ -58,7 +58,7 @@ These codebase realities should drive every design decision:
 2. **Binary size and memory are hard product constraints**
    - `zig build -Doptimize=ReleaseSmall` is the release target. Every dependency and abstraction has a size cost.
    - Avoid adding libc calls, runtime allocations, or large data tables without justification.
-   - `MaxRSS` during `zig build test` must stay well under 50 MB.
+   - `MaxRSS` during `zig build test` should stay under 50 MB. Current HEAD (2026-05-19) reports 61M, so the RSS budget is an open performance debt, not a normalized baseline.
 
 3. **Security-critical surfaces are first-class**
    - `src/gateway.zig`, `src/security/`, `src/tools/`, `src/runtime.zig` carry high blast radius.
@@ -137,7 +137,7 @@ src/
   health.zig            component health registry
   runtime.zig           runtime adapters (native, docker, wasm, cloudflare)
   tunnel.zig            tunnel providers (cloudflared, ngrok, tailscale, custom)
-  skillforge.zig        skill discovery and integration
+  skills.zig            skill discovery and integration (successor to the archived `skillforge.zig` references)
   migration.zig         memory migration from other backends
   hardware.zig          hardware discovery and management
   peripherals.zig       hardware peripherals (Arduino, STM32/Nucleo, RPi)

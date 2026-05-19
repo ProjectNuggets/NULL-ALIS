@@ -9982,6 +9982,66 @@ fn initPostgresTestManagerWithPool(allocator: std.mem.Allocator, pool_max: u32, 
     return mgr;
 }
 
+test "setMemorySource preserves updated_at for attribution-only enrichment" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    const key = "source_no_recency_bump";
+    const metadata =
+        \\{"subject":"user","predicate":"PREFERS","object":"Helix"}
+    ;
+    try mgr.upsertMemoryWithMetadata(
+        2,
+        key,
+        "User prefers Helix",
+        .core,
+        "session-A",
+        metadata,
+    );
+
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+    const fixed_updated_at: i64 = 1_700_000_000;
+
+    {
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "UPDATE {s}.memories SET updated_at = TO_TIMESTAMP({d}) WHERE user_id = 2 AND key = '{s}'",
+            .{ schema_q, fixed_updated_at, key },
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        c.PQclear(result);
+    }
+
+    try mgr.setMemorySource(2, key, "session-A", "snippet A");
+
+    {
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint, 0) FROM {s}.memories WHERE user_id = 2 AND key = '{s}'",
+            .{ schema_q, key },
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+        const updated_at_text = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(updated_at_text);
+        const updated_at = try std.fmt.parseInt(i64, updated_at_text, 10);
+        try std.testing.expectEqual(fixed_updated_at, updated_at);
+    }
+
+    var source = (try mgr.getMemorySource(allocator, 2, key)).?;
+    defer source.deinit(allocator);
+    try std.testing.expectEqualStrings("session-A", source.session_id.?);
+    try std.testing.expectEqualStrings("snippet A", source.snippet.?);
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // V1.14.12 (Memory audit Finding 3 fix, 2026-05-19) — TxnLease tests.
 //

@@ -32,7 +32,7 @@ Each agent is a distinct execution lane. Identity is `Agent {LETTER}` (A, B, C, 
 | **I** | Frontend (zaki-prod) | zaki-prod repo only (separate); UI autonomy toggle, AskUserQuestion renderer, mode toggle, brain entity styling, memory inspector | NONE within nullalis |
 | **J** | Observability + SRE | `src/observability.zig`, `src/lane_metrics.zig`, `src/memory/lifecycle/hygiene.zig`, Grafana configs, OTEL collector setup, capacity model docs | LOW |
 
-**Scaling rule:** start with **3 agents (A, D, F)** for v1.14.13 to prove coordination works. Add B, C, E as work expands. G and H are SOLO-LOCK agents — only one block in flight per lock at any time.
+**Scaling rule:** v1.14.13 starts with **4 agents (A, D, E, F)** after PR #72 merges and ROADMAP.md is marked `→ IN FLIGHT`. E is included from the first wave because the doc-truth / false-confidence cluster is part of the launch gate. G and H are SOLO-LOCK agents — only one block in flight per lock at any time.
 
 ---
 
@@ -42,7 +42,7 @@ Each V block in `docs/ROADMAP.md` has one or more agents assigned. Agents work i
 
 | V block | Theme | Agents | Notes |
 |---|---|---|---|
-| **v1.14.13** | Sandbox close + τ-bench baseline + wire orphans | A (V8 sandbox + B1), D (τ-bench harness + B2 latency gate), E (Cluster B/C handlers + F-A2 strip + identity.zig decision), F (tools/schema + task_planner + narration) | 4-way parallel; converges in `sprint/v1.14.13` |
+| **v1.14.13** | Sandbox close + τ-bench baseline + wire orphans | A (V8 sandbox), D (τ-bench harness + B2 latency gate), E (B1 doc-truth + Cluster B/C handlers + F-A2 strip + identity.zig decision), F (tools/schema + task_planner + narration) | 4-way parallel; converges in `sprint/v1.14.13` |
 | **v1.14.14** | ContextEngine migration | **G (SOLO LOCK on root.zig)** | Phase-by-phase; bench gate between phases |
 | **v1.14.15** | Email channel | B (Email), H (auth_tokens extraction — Sprint A) | B + H can parallelize: B touches channels/, H touches gateway/ |
 | **v1.14.16** | Teams channel | B (Teams), H (channels extraction — Sprint C) | Same pattern |
@@ -93,7 +93,7 @@ release/v{block}                    e.g.  release/v1.14.13  (PR head into main �
 
 Each block has a status marker in the block heading:
 - `→ PLANNED` (default)
-- `→ IN FLIGHT (agents: A, D, F; sprint branch: sprint/v1.14.13)` — actively being worked
+- `→ IN FLIGHT (agents: A, D, E, F; sprint branch: sprint/v1.14.13)` — actively being worked
 - `→ BENCH GATE` — all agent sub-tasks merged, gate validation in progress
 - `→ TAGGED v1.14.13 (2026-05-23)` — done
 - `→ DEFERRED (reason: X; revisit: Y)` — paused with rationale
@@ -205,6 +205,11 @@ foundation harder to build on. There is no neutral commit.
 
 This is the first block to ship multi-agent. Concrete spawn assignments below.
 
+**Launch prerequisites for every v1.14.13 agent:**
+- PR #72 merged into `main`
+- ROADMAP.md v1.14.13 heading marked `→ IN FLIGHT`
+- Active audit ledger exists at `docs/audits/2026-05-19-file-by-file-audit-ledger.md`
+
 ### Agent A (Security) — v1.14.13 Step 0
 
 **Sub-tasks:**
@@ -243,12 +248,12 @@ This is the first block to ship multi-agent. Concrete spawn assignments below.
 ### Agent E (Audit-Sweep) — v1.14.13 Steps 4, 5, 6, 0.5
 
 **Sub-tasks:**
-- Step 0.5: B1 AGENTS.md skillforge contradiction fix (~5 min)
+- Step 0.5: B1 AGENTS.md skill/skillforge map verification (~5 min)
 - Step 4: F-A2 brain_graph directive strip (~15 min)
 - Step 5: False-confidence handler cluster — handleReady decision (rewire), EMPTY_TURN_PLACEHOLDER strip, BrowserTool honesty, BIRTHDAY contradiction (~1 day total)
 - Step 6: identity.zig decision — keep+document OR delete (Nova approves direction first)
 
-**Owns:** `src/agent/prompt.zig` (F-A2 lines only), `src/gateway.zig` (handleReady + EMPTY_TURN_PLACEHOLDER lines only — COORDINATE WITH H if H is active), `src/tools/browser.zig`, `src/agent/extraction_persist.zig:1106-1143` (BIRTHDAY docstring), `AGENTS.md` (skillforge line only), `src/identity.zig` (decide), `docs/deferred-register.md`
+**Owns:** `src/agent/prompt.zig` (F-A2 lines only), `src/gateway.zig` (handleReady + EMPTY_TURN_PLACEHOLDER lines only — COORDINATE WITH H if H is active), `src/tools/browser.zig`, `src/agent/extraction_persist.zig:1106-1143` (BIRTHDAY docstring), `AGENTS.md` (skills map line only), `src/identity.zig` (decide), `docs/deferred-register.md`
 
 **May not touch:** Agent A's, D's, F's owned files
 
@@ -356,7 +361,7 @@ When ALL agents' sub-tasks on block v{Y} are merged:
 ## 12. Status as of authoring (2026-05-19)
 
 - **Active agents:** none yet (awaiting greenlight from Nova)
-- **Next block to spawn:** v1.14.13
+- **Next block to spawn:** v1.14.13, after PR #72 merges and roadmap status is updated
 - **Recommended initial spawn:** Agents A, D, E, F (4-way parallel)
 - **PR #72 (v1.14.12) status:** open, must merge before v1.14.13 starts
 - **Sprint branch state:** `sprint/v1.14.13` open, currently 0 agents committing

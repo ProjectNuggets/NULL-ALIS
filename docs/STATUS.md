@@ -7,18 +7,20 @@ tags: [prose, prose/docs]
 Cold-readable operational truth source. Updated when waves close, not during.
 Last archive: `docs/archive/status-2026-03-06.md`.
 
-**Active roadmap:** [`docs/ROADMAP.md`](ROADMAP.md). Current sprint: **v1.14.13** (τ-bench baseline + wire what's built).
+**Active roadmap:** [`docs/ROADMAP.md`](ROADMAP.md). Next staged sprint: **v1.14.13** (τ-bench baseline + wire what's built). Agent work does **not** start until PR #72 merges and ROADMAP.md is marked `→ IN FLIGHT`.
 **Active standards:** [`AGENTS.md`](../AGENTS.md) §14 (Nullalis-grade Swiss-watch).
 
 ## Branch state
 
 - **Tag:** `v1.14.12` pushed to `origin`.
 - **PR open:** [#72](https://github.com/ProjectNuggets/NULL-ALIS/pull/72) — `release/v1.14.12-memory-audit` → `main`, 50 commits.
-- **Build status:** `zig build` clean. `zig build test` exit 0; all warnings are expected mock-provider failure paths from test scenarios.
+- **Build status:** `zig build` clean. `zig build test --summary all` exits 0 (6,083 passed / 66 skipped, 6,149 total). Current MaxRSS is 61M, above the AGENTS.md <50 MB budget; tracked in ROADMAP v1.14.13 B13.
 
 ## 2026-05-19 PM update — file-by-file audit
 
 Three parallel agents audited the codebase scoping by directory. **67 findings total** (9 HIGH, 31 MED, 27 LOW). Per AGENTS.md §14.2 / §14.4, the findings are not "delete candidates" — they are unfinished work. The roadmap (`docs/ROADMAP.md` v1.14.13 + v1.14.14 + v1.14.18) finishes them.
+
+Control ledger: [`docs/audits/2026-05-19-file-by-file-audit-ledger.md`](audits/2026-05-19-file-by-file-audit-ledger.md). Treat the 67-count summary as intake until every row has a commit reference or deferral rationale.
 
 Key clusters identified:
 - **Half-finished modules:** `task_planner.zig`, `narration.zig`, `context_engine.zig`, `tools/schema.zig` — built but never wired. v1.14.13 wires them.

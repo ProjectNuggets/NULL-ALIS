@@ -31,6 +31,8 @@ binds_to: AGENTS.md §14 (Nullalis-grade standards)
 
 **Audit findings still open** (post-v1.14.12, captured by 3-agent file-by-file audit 2026-05-19): **67 total** — 9 HIGH, 31 MED, 27 LOW. Concentrated in: orphaned modules that were half-finished (`task_planner`, `narration`, `context_engine`, `tools/schema`), config zombies (Email/Teams/Nostr), false-confidence handlers (`handleReady`, `EMPTY_TURN_PLACEHOLDER`), aspirational prompt directives (F-A2).
 
+**Audit ledger:** `docs/audits/2026-05-19-file-by-file-audit-ledger.md` is the active control ledger. The 67-count rollup is not closure evidence by itself; no block may be tagged until every relevant ledger row is closed by commit reference or explicitly deferred with rationale.
+
 **These are not "delete" candidates.** They are unfinished work (AGENTS.md §14.2 / §14.4). The roadmap below FINISHES them.
 
 ---
@@ -49,7 +51,7 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.13 — "Sandbox fail-closed + τ-bench baseline + wire what's built"
+## v1.14.13 — "Sandbox fail-closed + τ-bench baseline + wire what's built" → PLANNED (blocked on PR #72 merge; `sprint/v1.14.13` branch staged)
 
 **Theme:** Close the sandbox fail-open security hole FIRST (3-4 hours). Then lock the execution-quality measurement. Then wire the orphans the audit identified as half-finished.
 
@@ -66,8 +68,8 @@ A block does not "exit" until its bench gate passes. The next block does not sta
    - Commit: `fix(security): V1.14.9 — sandbox fail closed by default`
 
 0.5. **B1 — AGENTS.md contradiction fix** (5 minutes)
-   - `AGENTS.md §4` references `src/skillforge.zig` which doesn't exist at HEAD
-   - Either remove the reference OR document the file as deprecated/moved
+   - Historical issue: `AGENTS.md §4` referenced `src/skillforge.zig`, which does not exist at HEAD
+   - Correct the map to name `src/skills.zig` as the active successor and keep archived `skillforge` mentions out of active protocol
    - Block-internal commit: cleanup, no functional change
 
 1. **τ-bench Airline harness** (`.spike/external/tau_bench/`)
@@ -82,7 +84,7 @@ A block does not "exit" until its bench gate passes. The next block does not sta
    - Unblocks Gemini support
 
 3. **`task_planner.zig` + `narration.zig` paired wiring**
-   - Add system-prompt directive: when user request requires multiple tool calls, emit `<task_plan>` XML
+   - Keep the existing system-prompt directive honest: `prompt.zig` already emits `<task_plan>` instructions, but runtime parsing is not wired
    - Wire `parseTaskPlan` into `root.zig` turn loop after first model response
    - Wire `NarrationObserver` to channel renderer (Telegram inline frames, frontend SSE event)
    - Test: synthetic 3-step task emits 3 narration frames
@@ -110,12 +112,18 @@ A block does not "exit" until its bench gate passes. The next block does not sta
    - New `.spike/results.tsv` columns: `p50_ttft_ms`, `p95_ttft_ms`
    - Without this we can't catch latency regressions until customers complain
 
+8. **B13 — Test RSS budget remediation** (~0.5-1 day triage, fix size TBD)
+   - AGENTS.md budget is <50 MB MaxRSS during `zig build test`; current HEAD reports 61M
+   - Triage whether the regression is test fixture growth, sqlite build shape, or runtime allocation drift
+   - Fix if cheap; otherwise document the measured baseline + root cause in this ledger and make the next budget explicit
+
 **Bench gate:**
 - `zig build test` exit 0, 0 leaks
 - LoCoMo cold + polluted ≥ v1.14.12 numbers (no regression)
 - τ-bench Airline baseline committed to `.spike/results.tsv`
 - p95 TTFT ≤ 4.0s on canonical bench (new gate from B2)
 - All 7 audit Cluster A orphans either wired OR documented per AGENTS.md §14.4
+- Test MaxRSS budget either back under 50 MB OR documented with root cause + accepted replacement budget
 - Tag `v1.14.13`
 
 **Duration:** 5–7 working days
@@ -123,7 +131,7 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.14 — "ContextEngine migration"
+## v1.14.14 — "ContextEngine migration" → PLANNED
 
 **Theme:** Complete the lifecycle refactor started in iter18-20. Route `root.zig::turn()` through `ContextEngine.ingest/assemble/compact/afterTurn` so the 5,000-line turn loop becomes 4 testable phases.
 
@@ -153,7 +161,7 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.15 — "Channels finish: Email"
+## v1.14.15 — "Channels finish: Email" → PLANNED
 
 **Theme:** First of three channel-completion blocks. Email is widest user reach.
 
@@ -177,7 +185,7 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.16 — "Channels finish: Teams"
+## v1.14.16 — "Channels finish: Teams" → PLANNED
 
 **Theme:** Enterprise wedge. Bot Framework webhook-based.
 
@@ -200,7 +208,7 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.17 — "Channels finish: Nostr"
+## v1.14.17 — "Channels finish: Nostr" → PLANNED
 
 **Theme:** V-infinity differentiation. Censorship-resistant relay.
 
@@ -223,7 +231,7 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.18 — "Audit MED-tier sweep + state/memory polish"
+## v1.14.18 — "Audit MED-tier sweep + state/memory polish" → PLANNED
 
 **Theme:** Close the remaining 31 MED findings from the 2026-05-19 audit. ALSO closes V6 (state.zig deprecation), V7 (markdown mirror opt-in), and V4 (subagent ledger bridge default-on) from the architectural-debt audit.
 
@@ -272,7 +280,7 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.15.0 — "τ-bench iteration sprint (Karpathy loop)"
+## v1.15.0 — "τ-bench iteration sprint (Karpathy loop)" → PLANNED
 
 **Theme:** Now that the foundation is clean, drive τ-bench Airline numbers up the same way iter1-21 drove LoCoMo. Hypothesize → iterate → bench → keep or discard.
 
@@ -302,7 +310,7 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 
 ---
 
-## v1.16.0 — "Frontend integration wave" (requires zaki-prod coordination)
+## v1.16.0 — "Frontend integration wave" (requires zaki-prod coordination) → PLANNED
 
 **Theme:** The deferred backend features finally meet their renderers.
 
@@ -324,7 +332,7 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 
 ---
 
-## v1.17.0 — "Native connectors phase 1"
+## v1.17.0 — "Native connectors phase 1" → PLANNED
 
 **Theme:** Replace Composio for the top 3-5 integrations with per-user OAuth flows.
 
@@ -350,7 +358,7 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 
 ---
 
-## v1.17.5 — "Durability + auditability — enterprise blocker close" (NEW from 2026-05-19 architecture audit)
+## v1.17.5 — "Durability + auditability — enterprise blocker close" (NEW from 2026-05-19 architecture audit) → PLANNED
 
 **Theme:** Move ephemeral runtime state to durable backing stores. Closes V3 (approvals), V5 (event log), V4 trailing work. Enterprise / regulated industries / GDPR access requests UNBLOCKED. Must precede the per-cell canary deploy.
 
@@ -398,7 +406,7 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 
 ---
 
-## v1.18.0 — "Per-cell pod canary deploy"
+## v1.18.0 — "Per-cell pod canary deploy" → PLANNED
 
 **Theme:** First production cell on the per-cell-pod architecture. zaki-infra work.
 
@@ -429,7 +437,7 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 
 ---
 
-## v1.18.5 — "Disaster recovery + backup drill" (NEW from blind-spot B4)
+## v1.18.5 — "Disaster recovery + backup drill" (NEW from blind-spot B4) → PLANNED
 
 **Theme:** Tested restore drill against the canary cell. Customer trust gate before broader rollout.
 
@@ -455,7 +463,7 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 
 ---
 
-## v1.19.0 — "Observability + SRE maturity"
+## v1.19.0 — "Observability + SRE maturity" → PLANNED
 
 **Theme:** The dashboards and budgets that turn nullalis into a real operated system.
 
@@ -482,7 +490,7 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 
 ---
 
-## v1.19.5 — "Security + identity hardening — pre-commercial gate" (NEW from 2026-05-19 architecture audit)
+## v1.19.5 — "Security + identity hardening — pre-commercial gate" (NEW from 2026-05-19 architecture audit) → PLANNED
 
 **Theme:** Close the two-headed authorization model (H1) and eliminate identity fallback keys from canonical paths (V9). This is the security gate before commercial launch — no enterprise customer signs without a coherent auth model and clean per-user attribution.
 
@@ -521,7 +529,7 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 
 ---
 
-## v1.19.7 — "Unit economics baseline" (NEW from blind-spot B3)
+## v1.19.7 — "Unit economics baseline" (NEW from blind-spot B3) → PLANNED
 
 **Theme:** Measure the cost-per-turn / cost-per-tenant / cost-per-tool-call baseline that informs v2.0 pricing. Without this block, the payment design is design-in-the-dark.
 
@@ -548,7 +556,7 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 
 ---
 
-## v2.0.0 — "Commercial launch — payment + onboarding + first 100 paying users"
+## v2.0.0 — "Commercial launch — payment + onboarding + first 100 paying users" → PLANNED
 
 **Theme:** The transition from "technical product" to "commercial product." Strategy is Nova's; this block holds the slots and dependencies.
 
@@ -576,7 +584,7 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 
 ---
 
-## v2.1.0 — "Runtime / frontend boundary cleanup" (NEW from 2026-05-19 architecture audit — V10)
+## v2.1.0 — "Runtime / frontend boundary cleanup" (NEW from 2026-05-19 architecture audit — V10) → PLANNED
 
 **Theme:** Stop hardcoding `zaki_app` channel-specific behavior inside the runtime layer. Make the runtime emit ONE pure event-envelope shape; channel adapters do the shaping.
 
