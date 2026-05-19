@@ -1069,7 +1069,13 @@ pub const BRAIN_HIDDEN_PREFIXES = [_][]const u8{
     "summary_latest/",
     "session_summary/",
     "timeline_summary/",
-    "durable_fact/",
+    // V1.14.12 (Memory audit Finding 1 fix, 2026-05-19) — durable_fact/*
+    // was previously hidden under "continuity", but session-end extraction
+    // writes USER-AUTHORED facts to this prefix (commands.zig:1341).
+    // Combined with persistExtracted's MD5 dedup, the user's real facts
+    // ended up invisible in /brain AND suppressed the parallel
+    // extracted_<hash> visible-row write. Now brain-visible; edit/archive
+    // protection still holds via isSystemManagedMemoryKey at line ~1171.
     "compaction_summary/",
     "summary_fallback/",
     "compaction_dropped/",
@@ -2860,6 +2866,30 @@ test "classifyArtifactKey: continuity — timeline_summary" {
 
 test "classifyArtifactKey: continuity — context_anchor_current" {
     try std.testing.expectEqual(ArtifactRole.continuity, classifyArtifactKey("context_anchor_current"));
+}
+
+test "V1.14.12 (Memory audit Finding 1): durable_fact/* is brain-visible" {
+    // Pre-fix this prefix was in BRAIN_HIDDEN_PREFIXES, hiding user-authored
+    // session-end facts from /brain UI. Combined with persistExtracted's
+    // MD5 dedup, the parallel visible extracted_<hash> row was also skipped
+    // — net result: session-end user facts were invisible everywhere.
+    // Now visible.
+    try std.testing.expect(isBrainVisibleKey("durable_fact/1700000000/0"));
+    try std.testing.expect(isBrainVisibleKey("durable_fact/1700000000/42"));
+    // Edit-protection still holds via isSystemManagedMemoryKey at line ~1171
+    // — the hidden-vs-visible status is independent of the edit-protection
+    // status, by design.
+    try std.testing.expect(!isEditableMemoryEntry("durable_fact/1700000000/0", .core));
+}
+
+test "V1.14.12 (Memory audit Finding 1): existing hidden continuity stays hidden" {
+    // Regression: Finding 1 only unhides durable_fact/*. Other continuity
+    // prefixes (timeline_summary, summary_latest, etc.) remain hidden.
+    try std.testing.expect(!isBrainVisibleKey("timeline_summary/agent:zaki-bot:user:1:main/1700000000"));
+    try std.testing.expect(!isBrainVisibleKey("summary_latest/agent:zaki-bot:user:1:main"));
+    try std.testing.expect(!isBrainVisibleKey("compaction_summary/agent:zaki-bot:user:1:main/1"));
+    try std.testing.expect(!isBrainVisibleKey("autosave_user_123"));
+    try std.testing.expect(!isBrainVisibleKey("session_checkpoint_1700000000"));
 }
 
 test "classifyArtifactKey: continuity — durable_fact" {

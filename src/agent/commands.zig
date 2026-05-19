@@ -1369,13 +1369,20 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             // commands; future commit may collapse to single-write once
             // those tools migrate to extracted_* keys.
             //
+            // V1.14.12 (Memory audit Finding 1 fix, 2026-05-19) — the
+            // durable_fact/* prefix is now brain-VISIBLE (was previously
+            // hidden via BRAIN_HIDDEN_PREFIXES, which combined with the
+            // MD5 dedup below to make session-end facts invisible
+            // everywhere). The dedup below is now intentional, not a
+            // bug: durable_fact is THE visible user-facing row; the
+            // extracted_<hash> path is the (no-op'd) coref+judge enrich
+            // path. The edge write further below ALWAYS fires regardless
+            // of MD5 dedup — covers the graph half of unification.
+            //
             // MD5 dedup in persistExtracted will see the durable_fact row's
             // identical content_hash and silently skip the extracted_<hash>
-            // write. To make BOTH writes succeed, we'd need to bypass MD5
-            // for triple-bearing session-end writes — deferred. Today the
-            // edge write below ALWAYS fires (covers the graph half of
-            // unification); the persistExtracted call covers the coref +
-            // judge half when content is novel enough.
+            // write. This is the intended behavior post-Finding-1: one
+            // visible row per session-end fact, not two.
             if (fact.hasTriple()) {
                 if (self.extraction_state_mgr) |smgr| {
                     if (self.extraction_user_id) |uid| {

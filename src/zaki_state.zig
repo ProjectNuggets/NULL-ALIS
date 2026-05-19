@@ -9254,7 +9254,12 @@ test "BRAIN_USER_KEY_FILTER mirrors memory_root.isBrainVisibleKey" {
         .{ .key = "summary_latest/agent:zaki-bot:user:1:thread:main", .expect_visible = false },
         .{ .key = "session_summary/agent:zaki-bot:user:1:thread:main/1714521600", .expect_visible = false },
         .{ .key = "timeline_summary/agent:zaki-bot:user:1:thread:main/1714521600", .expect_visible = false },
-        .{ .key = "durable_fact/1714521600/0", .expect_visible = false },
+        // V1.14.12 (Memory audit Finding 1 fix, 2026-05-19) — durable_fact/*
+        // is now brain-VISIBLE. Session-end extraction writes user-authored
+        // facts here; previously hidden as "continuity" but actually carries
+        // user content. Edit/archive protection still holds via
+        // isSystemManagedMemoryKey, independent of brain visibility.
+        .{ .key = "durable_fact/1714521600/0", .expect_visible = true },
         .{ .key = "compaction_summary/foo", .expect_visible = false },
         .{ .key = "summary_fallback/foo", .expect_visible = false },
         .{ .key = "compaction_dropped/foo", .expect_visible = false },
