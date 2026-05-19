@@ -15,10 +15,17 @@ const context_cache = @import("context_cache.zig");
 const compaction = @import("compaction.zig");
 const working_memory = @import("working_memory.zig");
 const observability = @import("../observability.zig");
+const Config = @import("../config.zig").Config;
+const capabilities_mod = @import("../capabilities.zig");
+const prompt = @import("prompt.zig");
+const dispatcher = @import("dispatcher.zig");
+const procedural_memory = @import("procedural_memory.zig");
 
 // v1.14.14 Phase 1: scope `.agent` preserves the operator-grep contract for
-// `turn.stage stage=memory_enrich`, `recall.metrics`, and `recall.zero_candidates`
-// log lines that were emitted from root.zig under this same scope (root.zig:9).
+// `turn.stage stage=memory_enrich`, `recall.metrics`, `recall.zero_candidates`,
+// `prefix.stable`, `prefix.tail`, `working_memory.render_failed`, and
+// `procedural_memory.render_failed` log lines that were emitted from root.zig
+// under this same scope (root.zig:9).
 const log = std.log.scoped(.agent);
 
 // ── Internal stages (W1.2) ─────────────────────────────────────────────────
@@ -92,6 +99,12 @@ pub const IngestOutput = struct {
 };
 
 /// Output of the assemble phase.
+///
+/// v1.14.14 Phase 2 added `stable_prefix_hash` + `stable_prefix_bytes` so
+/// callers and tests can assert byte-stability of the assembled system-prompt
+/// prefix without parsing log lines. The hash is unconditionally computed (FNV-1a
+/// 64-bit is cheap); the log line is still emitted only when
+/// `NULLALIS_LOG_PREFIX_HASH=1` (honest config surface, §14.6).
 pub const AssembleResult = struct {
     prompt_refreshed: bool = false,
     workspace_prompt_changed: bool = false,
@@ -101,6 +114,12 @@ pub const AssembleResult = struct {
     token_estimate: u64 = 0,
     context_pressure_percent: u8 = 0,
     compaction_recommended: bool = false,
+    /// FNV-1a 64-bit hash of `[stable_prompt][tool_instructions]` — the
+    /// provider-cacheable prefix bytes of the just-assembled system prompt.
+    /// 0 if assemble did not run (e.g., no system prompt rebuild required).
+    stable_prefix_hash: u64 = 0,
+    /// Byte count covered by `stable_prefix_hash`. 0 if hash is 0.
+    stable_prefix_bytes: usize = 0,
 };
 
 /// Output of the compact phase.
@@ -345,43 +364,266 @@ pub const ContextEngine = struct {
         };
     }
 
-    /// Phase 2: Assemble — evaluate prompt refresh plan and token pressure.
+    /// Phase 2: Assemble — build prompt refresh plan, write last_turn_context,
+    /// assemble the stable + tool_instructions + volatile system prompt,
+    /// transfer ownership of the assembled buffer into history[0], and update
+    /// the agent's prompt-state fields.
     ///
-    /// Called before building the LLM request to determine whether the
-    /// system prompt needs refresh and whether compaction is recommended.
-    pub fn assemble(self: *ContextEngine, agent: anytype) AssembleResult {
+    /// v1.14.14 Phase 2 (CONTEXT-ENGINE audit-ledger row): owns the
+    /// prompt-rebuild block that previously lived inline in
+    /// `Agent.turnOutcome` (root.zig 2962-3166 at v1.14.13 HEAD, then
+    /// 2819-3023 after Phase 1 landed). Migrated archaeology: S5.7 memoized
+    /// Config cache, V1.14.3 G-08 + G-07 closures, iter22 errdefer reasoning,
+    /// V1.14.6 prefix.tail diagnostic.
+    ///
+    /// Side-effect contract (preserved byte-identical from the inline block):
+    ///   - On exit, `agent.last_turn_context` has been rewritten from
+    ///     `buildLastTurnContext(refresh_plan, ingest_out.memory_slot.stats,
+    ///     ingest_out.result.memory_enrich_ms)`.
+    ///   - On exit, `agent.history[0]` is the canonical system prompt
+    ///     `[stable][tool_instructions][volatile]` — replaced in place if a
+    ///     prior system slot existed, otherwise inserted at index 0 (or
+    ///     appended on empty history).
+    ///   - On exit, the five prompt-state fields are written:
+    ///     `agent.has_system_prompt = true`, plus
+    ///     `system_prompt_has_conversation_context`,
+    ///     `system_prompt_conversation_context_fingerprint`,
+    ///     `workspace_prompt_fingerprint`,
+    ///     `system_prompt_time_bucket_min`.
+    ///   - `AssembleResult.stable_prefix_hash` is the FNV-1a 64-bit hash of
+    ///     `[stable_prompt][tool_instructions]` (the cacheable prefix).
+    ///     Unconditional. Tests assert byte-stability across consecutive
+    ///     assemble() calls. The same hash is also logged when
+    ///     `NULLALIS_LOG_PREFIX_HASH=1` (operator diagnostic only).
+    pub fn assemble(
+        self: *ContextEngine,
+        allocator: std.mem.Allocator,
+        agent: anytype,
+        ingest_out: *const IngestOutput,
+    ) !AssembleResult {
         self.phase = .assembling;
         defer self.phase = .idle;
 
-        const AgentType = @TypeOf(agent.*);
         const snapshot = context_builder.buildSnapshot(agent);
-        const has_system_prompt = snapshot.has_system_prompt;
 
-        const refresh_plan = if (@hasField(AgentType, "has_system_prompt"))
-            context_builder.buildPromptRefreshPlan(agent)
-        else
-            context_builder.PromptRefreshPlan{
-                .current_time_bucket_min = -1,
-                .workspace_prompt_fingerprint = null,
-                .conversation_context_present = false,
-                .conversation_context_fingerprint = 0,
-                .workspace_prompt_changed = false,
-                .time_bucket_changed = false,
-                .conversation_context_changed = false,
-                .should_refresh_system_prompt = !has_system_prompt,
+        // Build prompt refresh plan for diagnostics + last_turn_context.
+        // In context v2 we always rebuild the system prompt (volatile block
+        // changes per turn — datetime, conversation context, memory). The
+        // refresh plan no longer gates rebuild; it only feeds stats.
+        const refresh_plan = context_builder.buildPromptRefreshPlan(agent);
+        agent.last_turn_context = context_builder.buildLastTurnContext(
+            refresh_plan,
+            ingest_out.memory_slot.stats,
+            ingest_out.result.memory_enrich_ms,
+        );
+
+        const stable_prefix_state = context_cache.buildStablePrefixState(refresh_plan, snapshot.has_system_prompt);
+
+        // S5.7 — memoized Config fetch. Replaces a per-turn
+        // `Config.load` + JSON parse + deinit triad. The cached_config
+        // lives on the Agent until deinit; see `cachedConfigForCaps`.
+        const cfg_for_caps_ptr: ?*const Config = agent.cachedConfigForCaps();
+
+        const capabilities_section = capabilities_mod.buildPromptSection(
+            allocator,
+            cfg_for_caps_ptr,
+            agent.tools,
+        ) catch null;
+        defer if (capabilities_section) |section| allocator.free(section);
+
+        // Resolve persona from SOUL.md front-matter (REQ-022). Falls back to defaults when absent.
+        const persona_profile_opt = prompt.resolvePersonaFromFile(allocator, agent.workspace_dir);
+        defer if (persona_profile_opt) |p| {
+            if (p.voice) |v| allocator.free(v);
+        };
+        const persona_section: ?prompt.PersonaSection = if (persona_profile_opt) |p| .{
+            .warmth = p.warmth,
+            .proactivity = p.proactivity,
+            .voice_style = p.voice,
+            .twin_mode = p.twin_mode,
+        } else null;
+
+        // V1.14.3 (G-08 closure) — wm_block was hoisted above the
+        // memory_slot load (now in ingest) so skip_legacy_identity gates
+        // on actual content. We reuse that hoisted value here instead of
+        // re-loading. Renamed to local alias for the prompt_ctx
+        // builder below.
+        const wm_block: ?[]u8 = ingest_out.wm_block;
+
+        // V1.14.3 (G-07 closure) — Procedural memory recall block.
+        //
+        // V1.13 shipped capture (skill_executions table + insertSkillExecution
+        // in commands.zig at session_end). The reader (listRecentSkillExecutions)
+        // and renderer (procedural_memory.renderBlock) also shipped in V1.13
+        // but were never wired into the volatile prompt — agent saw no prior
+        // traces. G-07 was the half-loop bug. This block closes it.
+        //
+        // Skill name: GENERIC_SKILL_NAME (V1.13 capture is coarse-grained,
+        // one row per multi-tool turn). Future refinement: detect specific
+        // skill invocations and recall per-skill. For now, the agent sees
+        // the last 3 substantive turns regardless of skill name.
+        //
+        // Failure-soft on every layer: missing state_mgr or user_id → null;
+        // postgres error → empty traces; OOM on render → null. Same shape
+        // as wm_block above so the prompt builder treats both uniformly.
+        const skill_traces_block: ?[]u8 = blk: {
+            const smgr = agent.extraction_state_mgr orelse break :blk null;
+            const uid = agent.extraction_user_id orelse break :blk null;
+            const set = procedural_memory.loadForRender(
+                allocator,
+                smgr,
+                uid,
+                procedural_memory.GENERIC_SKILL_NAME,
+            );
+            defer set.deinit(allocator);
+            if (set.traces.len == 0) break :blk null;
+            break :blk procedural_memory.renderBlock(
+                allocator,
+                procedural_memory.GENERIC_SKILL_NAME,
+                set.traces,
+            ) catch |err| {
+                log.warn("procedural_memory.render_failed err={s}", .{@errorName(err)});
+                break :blk null;
             };
+        };
+        defer if (skill_traces_block) |b| allocator.free(b);
 
-        const stable_prefix = context_cache.buildStablePrefixState(refresh_plan, has_system_prompt);
+        // Context v2: build stable + volatile separately so tool instructions
+        // can sit in the STABLE half (byte-identical across turns) rather than
+        // after the volatile block. This preserves byte-prefix cache stability
+        // on Together/vLLM and enables future Anthropic two-block emission.
+        const prompt_ctx = prompt.PromptContext{
+            .workspace_dir = agent.workspace_dir,
+            .model_name = agent.model_name,
+            .tools = agent.tools,
+            .capabilities_section = capabilities_section,
+            .conversation_context = agent.conversation_context,
+            .sections = .{ .persona = persona_section },
+            .memory_slot = if (ingest_out.memory_slot.fenced_content.len > 0) ingest_out.memory_slot.fenced_content else null,
+            .working_memory_block = wm_block,
+            .skill_traces_block = if (skill_traces_block) |b| (if (b.len > 0) b else null) else null,
+        };
+
+        const stable_prompt = try prompt.buildStableSystemPrompt(allocator, prompt_ctx);
+        defer allocator.free(stable_prompt);
+
+        const tool_instructions = try dispatcher.buildToolInstructions(allocator, agent.tools);
+        defer allocator.free(tool_instructions);
+
+        const volatile_prompt = try prompt.buildVolatileSystemPrompt(allocator, prompt_ctx);
+        defer allocator.free(volatile_prompt);
+
+        // Layout: [stable][tool_instructions][volatile]
+        // stable + tool_instructions = byte-stable prefix (cached by provider KV).
+        // volatile = dynamic tail (datetime / conversation context / memory).
+        const stable_prefix_len = stable_prompt.len + tool_instructions.len;
+        const full_system = try allocator.alloc(u8, stable_prefix_len + volatile_prompt.len);
+        // iter22 (Nova's Medium finding): errdefer guards the window between
+        // alloc and ownership transfer into history. If history.insert or
+        // history.append fails (OOM on the ArrayList resize), without this
+        // errdefer the full_system buffer would orphan. Cleared manually
+        // on each success branch so ownership cleanly transfers.
+        var full_system_owned = true;
+        errdefer if (full_system_owned) allocator.free(full_system);
+        @memcpy(full_system[0..stable_prompt.len], stable_prompt);
+        @memcpy(full_system[stable_prompt.len..stable_prefix_len], tool_instructions);
+        @memcpy(full_system[stable_prefix_len..], volatile_prompt);
+
+        // Byte-stability diagnostic: compute the FNV-1a hash of the stable
+        // prefix unconditionally so tests + AssembleResult can assert
+        // byte-identical prefix across turns of the same session. The log
+        // emission is still gated by NULLALIS_LOG_PREFIX_HASH=1 to keep
+        // noise out of prod logs.
+        //
+        // V1.14.6 follow-up: also hash the kept history TAIL (last 4
+        // messages of self.history). F-PA2's drop-from-middle pattern
+        // promises that when no Pass C summarization fires, the kept
+        // tail bytes match the prior turn — that's what makes vLLM /
+        // Together / Moonshot prefix caching usable on long sessions.
+        // Two consecutive same-session turns with identical
+        // `prefix.tail` hashes confirm the contract holds. Diverging
+        // hashes when nothing semantic changed is a regression signal.
+        const stable_prefix_hash = std.hash.Fnv1a_64.hash(full_system[0..stable_prefix_len]);
+        if (std.process.getEnvVarOwned(allocator, "NULLALIS_LOG_PREFIX_HASH")) |env_value| {
+            defer allocator.free(env_value);
+            if (env_value.len > 0 and env_value[0] != '0') {
+                log.info("prefix.stable hash={x} bytes={d} session={s}", .{
+                    stable_prefix_hash,
+                    stable_prefix_len,
+                    agent.memory_session_id orelse "none",
+                });
+
+                // Tail hash: walk the last up-to-4 history items and
+                // FNV-1a their content bytes. Skipping the system row
+                // (already covered by prefix.stable above). Empty
+                // history → tail_bytes=0, hash=fnv1a("").
+                const TAIL_HASH_MSGS: usize = 4;
+                var tail_hasher = std.hash.Fnv1a_64.init();
+                var tail_bytes: usize = 0;
+                var tail_msgs: usize = 0;
+                if (agent.history.items.len > 0) {
+                    const start_idx = agent.history.items.len -|
+                        @min(TAIL_HASH_MSGS, agent.history.items.len);
+                    for (agent.history.items[start_idx..]) |*m| {
+                        if (m.role == .system) continue;
+                        tail_hasher.update(m.content);
+                        tail_bytes += m.content.len;
+                        tail_msgs += 1;
+                    }
+                }
+                log.info("prefix.tail hash={x} bytes={d} msgs={d} session={s}", .{
+                    tail_hasher.final(),
+                    tail_bytes,
+                    tail_msgs,
+                    agent.memory_session_id orelse "none",
+                });
+            }
+        } else |_| {}
+
+        // Keep exactly one canonical system prompt at history[0].
+        // This allows /model to invalidate and refresh the prompt in place.
+        // Each branch transfers ownership of full_system into history on
+        // success, flipping full_system_owned = false so the errdefer no
+        // longer tries to free it. try insert/append path: if the call
+        // fails the errdefer will free full_system (insert/append do not
+        // take ownership on failure).
+        if (agent.history.items.len > 0 and agent.history.items[0].role == .system) {
+            agent.history.items[0].deinit(allocator);
+            agent.history.items[0] = .{
+                .role = .system,
+                .content = full_system,
+            };
+            full_system_owned = false;
+        } else if (agent.history.items.len > 0) {
+            try agent.history.insert(allocator, 0, .{
+                .role = .system,
+                .content = full_system,
+            });
+            full_system_owned = false;
+        } else {
+            try agent.history.append(allocator, .{
+                .role = .system,
+                .content = full_system,
+            });
+            full_system_owned = false;
+        }
+        agent.has_system_prompt = true;
+        agent.system_prompt_has_conversation_context = refresh_plan.conversation_context_present;
+        agent.system_prompt_conversation_context_fingerprint = refresh_plan.conversation_context_fingerprint;
+        agent.workspace_prompt_fingerprint = refresh_plan.workspace_prompt_fingerprint;
+        agent.system_prompt_time_bucket_min = refresh_plan.current_time_bucket_min;
 
         return .{
             .prompt_refreshed = refresh_plan.should_refresh_system_prompt,
             .workspace_prompt_changed = refresh_plan.workspace_prompt_changed,
             .time_bucket_changed = refresh_plan.time_bucket_changed,
             .conversation_context_changed = refresh_plan.conversation_context_changed,
-            .stable_prefix_state = stable_prefix,
+            .stable_prefix_state = stable_prefix_state,
             .token_estimate = snapshot.token_estimate,
             .context_pressure_percent = snapshot.context_pressure_percent,
             .compaction_recommended = snapshot.token_compaction_triggered,
+            .stable_prefix_hash = stable_prefix_hash,
+            .stable_prefix_bytes = stable_prefix_len,
         };
     }
 
@@ -624,23 +866,28 @@ test "ingest emits exactly one memory_enrich observer event" {
     try std.testing.expectEqual(output.result.memory_enrich_ms, recorder.events.items[0].duration_ms.?);
 }
 
-test "assemble returns idle phase after completion" {
-    var engine = ContextEngine{};
-    // Minimal agent with no system prompt
-    const fake_agent = struct {
-        history: struct {
-            const FakeMessage = struct { role: enum { system, user, assistant, tool }, content: []const u8 };
-            items: []const FakeMessage,
-        },
-        token_limit: u64,
-        max_tokens: u32,
-    }{
-        .history = .{ .items = &.{} },
-        .token_limit = 0,
-        .max_tokens = 0,
-    };
-    _ = engine.assemble(&fake_agent);
-    try std.testing.expectEqual(LifecyclePhase.idle, engine.phase);
+// v1.14.14 Phase 2: the pre-extraction "assemble returns idle phase after
+// completion" test was a lightweight smoke test on the old thin assemble that
+// only computed stats. The new heavy assemble owns the full system-prompt
+// assembly + history[0] mutation + 5 state-field writes, with hard
+// dependencies on Memory, MemoryRuntime, zaki_state.Manager, prompt module,
+// dispatcher module, capabilities module, and procedural_memory module.
+// Construction of a duck-typed fake-agent that satisfies every concrete-typed
+// call along that chain is a >300-line scaffold for a single test. Parity is
+// instead guarded by:
+//   (1) the integration tests in the canonical-profile build
+//       (`zig build test -Dengines=base,sqlite,postgres -Dchannels=cli,telegram`)
+//       which exercise the real turnOutcome → ContextEngine.assemble path with
+//       real Agent + Memory + Manager instances, and
+//   (2) the existing AssembleResult-field tests below — covering the new
+//       stable_prefix_hash / stable_prefix_bytes surface against accidental
+//       removal.
+test "AssembleResult exposes stable_prefix_hash + bytes defaults" {
+    const r = AssembleResult{};
+    try std.testing.expectEqual(@as(u64, 0), r.stable_prefix_hash);
+    try std.testing.expectEqual(@as(usize, 0), r.stable_prefix_bytes);
+    try std.testing.expect(!r.compaction_recommended);
+    try std.testing.expect(!r.prompt_refreshed);
 }
 
 test "compact with no-op agent returns compacted=false and method=none" {

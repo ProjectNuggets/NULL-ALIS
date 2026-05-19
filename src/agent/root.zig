@@ -2799,228 +2799,29 @@ pub const Agent = struct {
         // of being prepended to the user message. Load it first so we can
         // include it in the system prompt rebuild below.
         //
-        // v1.14.14 Phase 1 (CONTEXT-ENGINE audit-ledger row) — the ~163-line
-        // memory-enrichment block that previously inlined here now lives in
-        // ContextEngine.ingest with migrated archaeology comments. See
-        // src/agent/context_engine.zig::ingest for the full WM + memory_slot
-        // load flow, the recall.metrics + zero_candidates telemetry, and the
-        // memory_enrich observer event. Lifetimes: ingest_out owns the
-        // heap-allocated memory_slot.fenced_content + wm_render_set +
-        // wm_block; the deinit defer below frees them at turn end, which is
-        // AFTER the assemble phase has borrowed memory_slot.fenced_content
-        // into PromptContext.memory_slot below.
+        // v1.14.14 ContextEngine migration (CONTEXT-ENGINE audit-ledger row).
+        //   Phase 1 — INGEST: the ~163-line memory-enrichment block that
+        //   inlined here now lives in ContextEngine.ingest (WM render +
+        //   memory_slot load + recall.metrics telemetry + memory_enrich
+        //   observer event).
+        //   Phase 2 — ASSEMBLE: the ~205-line prompt-rebuild block that
+        //   followed (last_turn_context write + capabilities + persona +
+        //   procedural_memory + stable/tool/volatile prompt construction +
+        //   history[0] write + 5 prompt-state field updates +
+        //   prefix.stable_hash diagnostic) now lives in
+        //   ContextEngine.assemble.
+        //
+        // Lifetimes: ingest_out owns heap-allocated memory_slot.fenced_content
+        // + wm_render_set + wm_block. The deinit defer below frees them at
+        // turn end, AFTER assemble has borrowed memory_slot.fenced_content
+        // into PromptContext.memory_slot.
         var ingest_out = try self.context_engine_state.ingest(self.allocator, self, user_message);
         defer ingest_out.deinit(self.allocator);
         turn_memory_enrich_ms = ingest_out.result.memory_enrich_ms;
-        const enrich_duration_ms = ingest_out.result.memory_enrich_ms;
-        const turn_wm_block: ?[]u8 = ingest_out.wm_block;
-        const memory_slot_result = ingest_out.memory_slot;
 
-        // Build prompt refresh plan for diagnostics + last_turn_context.
-        // In context v2 we always rebuild the system prompt (volatile block
-        // changes per turn — datetime, conversation context, memory). The
-        // refresh plan no longer gates rebuild; it only feeds stats.
-        const prompt_refresh_plan = context_builder.buildPromptRefreshPlan(self);
-        self.last_turn_context = context_builder.buildLastTurnContext(
-            prompt_refresh_plan,
-            memory_slot_result.stats,
-            enrich_duration_ms,
-        );
+        const assemble_result = try self.context_engine_state.assemble(self.allocator, self, &ingest_out);
+        _ = assemble_result; // consumed by Phase 3 (compact) — bench-gated diagnostics surface stable_prefix_hash later.
 
-        {
-            // S5.7 — memoized Config fetch. Replaces a per-turn
-            // `Config.load` + JSON parse + deinit triad. The cached_config
-            // lives on the Agent until deinit; see `cachedConfigForCaps`.
-            const cfg_for_caps_ptr: ?*const Config = self.cachedConfigForCaps();
-
-            const capabilities_section = capabilities_mod.buildPromptSection(
-                self.allocator,
-                cfg_for_caps_ptr,
-                self.tools,
-            ) catch null;
-            defer if (capabilities_section) |section| self.allocator.free(section);
-
-            // Resolve persona from SOUL.md front-matter (REQ-022). Falls back to defaults when absent.
-            const persona_profile_opt = prompt.resolvePersonaFromFile(self.allocator, self.workspace_dir);
-            defer if (persona_profile_opt) |p| {
-                if (p.voice) |v| self.allocator.free(v);
-            };
-            const persona_section: ?prompt.PersonaSection = if (persona_profile_opt) |p| .{
-                .warmth = p.warmth,
-                .proactivity = p.proactivity,
-                .voice_style = p.voice,
-                .twin_mode = p.twin_mode,
-            } else null;
-
-            // V1.14.3 (G-08 closure) — wm_block was hoisted above the
-            // memory_slot load so skip_legacy_identity gates on actual
-            // content. We reuse that hoisted value here instead of
-            // re-loading. Renamed to local alias for the prompt_ctx
-            // builder below.
-            const wm_block: ?[]u8 = turn_wm_block;
-
-            // V1.14.3 (G-07 closure) — Procedural memory recall block.
-            //
-            // V1.13 shipped capture (skill_executions table + insertSkillExecution
-            // in commands.zig at session_end). The reader (listRecentSkillExecutions)
-            // and renderer (procedural_memory.renderBlock) also shipped in V1.13
-            // but were never wired into the volatile prompt — agent saw no prior
-            // traces. G-07 was the half-loop bug. This block closes it.
-            //
-            // Skill name: GENERIC_SKILL_NAME (V1.13 capture is coarse-grained,
-            // one row per multi-tool turn). Future refinement: detect specific
-            // skill invocations and recall per-skill. For now, the agent sees
-            // the last 3 substantive turns regardless of skill name.
-            //
-            // Failure-soft on every layer: missing state_mgr or user_id → null;
-            // postgres error → empty traces; OOM on render → null. Same shape
-            // as wm_block above so the prompt builder treats both uniformly.
-            const skill_traces_block: ?[]u8 = blk: {
-                const smgr = self.extraction_state_mgr orelse break :blk null;
-                const uid = self.extraction_user_id orelse break :blk null;
-                const set = procedural_memory.loadForRender(
-                    self.allocator,
-                    smgr,
-                    uid,
-                    procedural_memory.GENERIC_SKILL_NAME,
-                );
-                defer set.deinit(self.allocator);
-                if (set.traces.len == 0) break :blk null;
-                break :blk procedural_memory.renderBlock(
-                    self.allocator,
-                    procedural_memory.GENERIC_SKILL_NAME,
-                    set.traces,
-                ) catch |err| {
-                    log.warn("procedural_memory.render_failed err={s}", .{@errorName(err)});
-                    break :blk null;
-                };
-            };
-            defer if (skill_traces_block) |b| self.allocator.free(b);
-
-            // Context v2: build stable + volatile separately so tool instructions
-            // can sit in the STABLE half (byte-identical across turns) rather than
-            // after the volatile block. This preserves byte-prefix cache stability
-            // on Together/vLLM and enables future Anthropic two-block emission.
-            const prompt_ctx = prompt.PromptContext{
-                .workspace_dir = self.workspace_dir,
-                .model_name = self.model_name,
-                .tools = self.tools,
-                .capabilities_section = capabilities_section,
-                .conversation_context = self.conversation_context,
-                .sections = .{ .persona = persona_section },
-                .memory_slot = if (memory_slot_result.fenced_content.len > 0) memory_slot_result.fenced_content else null,
-                .working_memory_block = wm_block,
-                .skill_traces_block = if (skill_traces_block) |b| (if (b.len > 0) b else null) else null,
-            };
-
-            const stable_prompt = try prompt.buildStableSystemPrompt(self.allocator, prompt_ctx);
-            defer self.allocator.free(stable_prompt);
-
-            const tool_instructions = try dispatcher.buildToolInstructions(self.allocator, self.tools);
-            defer self.allocator.free(tool_instructions);
-
-            const volatile_prompt = try prompt.buildVolatileSystemPrompt(self.allocator, prompt_ctx);
-            defer self.allocator.free(volatile_prompt);
-
-            // Layout: [stable][tool_instructions][volatile]
-            // stable + tool_instructions = byte-stable prefix (cached by provider KV).
-            // volatile = dynamic tail (datetime / conversation context / memory).
-            const stable_prefix_len = stable_prompt.len + tool_instructions.len;
-            const full_system = try self.allocator.alloc(u8, stable_prefix_len + volatile_prompt.len);
-            // iter22 (Nova's Medium finding): errdefer guards the window between
-            // alloc and ownership transfer into history. If history.insert or
-            // history.append fails (OOM on the ArrayList resize), without this
-            // errdefer the full_system buffer would orphan. Cleared manually
-            // on each success branch so ownership cleanly transfers.
-            var full_system_owned = true;
-            errdefer if (full_system_owned) self.allocator.free(full_system);
-            @memcpy(full_system[0..stable_prompt.len], stable_prompt);
-            @memcpy(full_system[stable_prompt.len..stable_prefix_len], tool_instructions);
-            @memcpy(full_system[stable_prefix_len..], volatile_prompt);
-
-            // Byte-stability diagnostic: log a hash of the stable prefix so
-            // operators can confirm byte-identical prefix across turns of the
-            // same session. Gated by NULLALIS_LOG_PREFIX_HASH=1 to keep noise
-            // out of prod logs.
-            //
-            // V1.14.6 follow-up: also hash the kept history TAIL (last 4
-            // messages of self.history). F-PA2's drop-from-middle pattern
-            // promises that when no Pass C summarization fires, the kept
-            // tail bytes match the prior turn — that's what makes vLLM /
-            // Together / Moonshot prefix caching usable on long sessions.
-            // Two consecutive same-session turns with identical
-            // `prefix.tail` hashes confirm the contract holds. Diverging
-            // hashes when nothing semantic changed is a regression signal.
-            if (std.process.getEnvVarOwned(self.allocator, "NULLALIS_LOG_PREFIX_HASH")) |env_value| {
-                defer self.allocator.free(env_value);
-                if (env_value.len > 0 and env_value[0] != '0') {
-                    const stable_hash = std.hash.Fnv1a_64.hash(full_system[0..stable_prefix_len]);
-                    log.info("prefix.stable hash={x} bytes={d} session={s}", .{
-                        stable_hash,
-                        stable_prefix_len,
-                        self.memory_session_id orelse "none",
-                    });
-
-                    // Tail hash: walk the last up-to-4 history items and
-                    // FNV-1a their content bytes. Skipping the system row
-                    // (already covered by prefix.stable above). Empty
-                    // history → tail_bytes=0, hash=fnv1a("").
-                    const TAIL_HASH_MSGS: usize = 4;
-                    var tail_hasher = std.hash.Fnv1a_64.init();
-                    var tail_bytes: usize = 0;
-                    var tail_msgs: usize = 0;
-                    if (self.history.items.len > 0) {
-                        const start_idx = self.history.items.len -|
-                            @min(TAIL_HASH_MSGS, self.history.items.len);
-                        for (self.history.items[start_idx..]) |*m| {
-                            if (m.role == .system) continue;
-                            tail_hasher.update(m.content);
-                            tail_bytes += m.content.len;
-                            tail_msgs += 1;
-                        }
-                    }
-                    log.info("prefix.tail hash={x} bytes={d} msgs={d} session={s}", .{
-                        tail_hasher.final(),
-                        tail_bytes,
-                        tail_msgs,
-                        self.memory_session_id orelse "none",
-                    });
-                }
-            } else |_| {}
-
-            // Keep exactly one canonical system prompt at history[0].
-            // This allows /model to invalidate and refresh the prompt in place.
-            // Each branch transfers ownership of full_system into history on
-            // success, flipping full_system_owned = false so the errdefer no
-            // longer tries to free it. try insert/append path: if the call
-            // fails the errdefer will free full_system (insert/append do not
-            // take ownership on failure).
-            if (self.history.items.len > 0 and self.history.items[0].role == .system) {
-                self.history.items[0].deinit(self.allocator);
-                self.history.items[0] = .{
-                    .role = .system,
-                    .content = full_system,
-                };
-                full_system_owned = false;
-            } else if (self.history.items.len > 0) {
-                try self.history.insert(self.allocator, 0, .{
-                    .role = .system,
-                    .content = full_system,
-                });
-                full_system_owned = false;
-            } else {
-                try self.history.append(self.allocator, .{
-                    .role = .system,
-                    .content = full_system,
-                });
-                full_system_owned = false;
-            }
-            self.has_system_prompt = true;
-            self.system_prompt_has_conversation_context = prompt_refresh_plan.conversation_context_present;
-            self.system_prompt_conversation_context_fingerprint = prompt_refresh_plan.conversation_context_fingerprint;
-            self.workspace_prompt_fingerprint = prompt_refresh_plan.workspace_prompt_fingerprint;
-            self.system_prompt_time_bucket_min = prompt_refresh_plan.current_time_bucket_min;
-        }
 
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
         if (self.auto_save) {
