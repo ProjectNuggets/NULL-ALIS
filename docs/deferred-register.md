@@ -155,6 +155,14 @@ one-line reason.
 
 ---
 
+## From v1.14.13 (Audit Sweep — Agent E)
+
+| ID | Shape | Why deferred | Target | Status |
+|----|-------|--------------|--------|--------|
+| F-A2.1 | Auto-router classifier that selects `brain_graph local_graph` for entity-centric questions vs `memory_recall` for text-shaped recall — and re-emits the F-A2 directive only when the router is in place | The F-A2 system-prompt directive was bench-verified ignored (0 brain_graph calls vs 145 memory_recall calls on canonical bench). Per AGENTS.md §14.7 we strip directives the model doesn't act on rather than retain them "in hope." The structural intent (use the graph for entity questions) is real; the prompt-layer mechanism failed. Re-add F-A2 only when (a) F-A2.1 classifier exists, (b) bench shows brain_graph call counts climb from zero, and (c) the directive's presence is tied to the router's signal, not standalone wishfulness. | When entity-routing becomes a measured bottleneck on τ-bench or LoCoMo cohort | **open** — directive stripped at v1.14.13 Step 4; re-attach gated on router |
+
+---
+
 ## Retroactive reviews (process-gap)
 
 | ID | Shape | Why deferred | Target | Status |
