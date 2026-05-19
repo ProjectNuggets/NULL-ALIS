@@ -11986,6 +11986,7 @@ fn handleBrainGraph(
     const search_param = parseQueryParam(target, "search");
     const link_types_csv = parseQueryParam(target, "link_types");
     const exclude_orphans_param = parseQueryParam(target, "exclude_orphans");
+    const semantic_min_weight_param = parseQueryParam(target, "semantic_min_weight");
     const exclude_orphans: bool = if (exclude_orphans_param) |s|
         (std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "1"))
     else
@@ -11998,6 +11999,14 @@ fn handleBrainGraph(
         BRAIN_DEFAULT_MAX_NODES;
     if (max_nodes == 0) max_nodes = BRAIN_DEFAULT_MAX_NODES;
     if (max_nodes > BRAIN_MAX_MAX_NODES) max_nodes = BRAIN_MAX_MAX_NODES;
+    const semantic_threshold = blk: {
+        const requested = if (semantic_min_weight_param) |s|
+            std.fmt.parseFloat(f32, s) catch BRAIN_SEMANTIC_THRESHOLD
+        else
+            BRAIN_SEMANTIC_THRESHOLD;
+        if (!std.math.isFinite(requested)) break :blk BRAIN_SEMANTIC_THRESHOLD;
+        break :blk std.math.clamp(requested, BRAIN_SEMANTIC_THRESHOLD, 1.0);
+    };
 
     // ── Fetch nodes ───────────────────────────────────────────────
     // listMemoriesBrainVisible applies BOTH the bi-temporal validity
@@ -12195,7 +12204,7 @@ fn handleBrainGraph(
             allocator,
             numeric_user_id,
             keys,
-            BRAIN_SEMANTIC_THRESHOLD,
+            semantic_threshold,
             BRAIN_SEMANTIC_MAX_PAIRS,
         ) catch blk: {
             semantic_degraded = true;
@@ -17620,6 +17629,44 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
     ctx.response_body = "{\"status\":\"ok\"}";
 }
 
+const HTTP_RESPONSE_WRITE_TIMEOUT_MS: i32 = 30_000;
+
+fn waitForHttpResponseWritable(stream: anytype) !void {
+    const StreamType = @TypeOf(stream);
+    const DeclType = switch (@typeInfo(StreamType)) {
+        .pointer => |ptr| ptr.child,
+        else => StreamType,
+    };
+    if (@hasDecl(DeclType, "waitWritable")) {
+        return stream.waitWritable();
+    }
+
+    var fds = [_]std.posix.pollfd{.{
+        .fd = stream.handle,
+        .events = @intCast(std.posix.POLL.OUT),
+        .revents = 0,
+    }};
+    const ready = try std.posix.poll(&fds, HTTP_RESPONSE_WRITE_TIMEOUT_MS);
+    if (ready == 0) return error.ResponseWriteTimeout;
+    const failure_mask: i16 = @intCast(std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL);
+    if ((fds[0].revents & failure_mask) != 0) return error.BrokenPipe;
+}
+
+fn writeHttpResponseBytes(stream: anytype, bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const written = stream.write(bytes[offset..]) catch |err| {
+            if (@as(anyerror, err) == error.WouldBlock) {
+                try waitForHttpResponseWritable(stream);
+                continue;
+            }
+            return err;
+        };
+        if (written == 0) return error.BrokenPipe;
+        offset += written;
+    }
+}
+
 fn sendHttpResponse(stream: anytype, status: []const u8, content_type: []const u8, body: []const u8) !void {
     var header_buf: [512]u8 = undefined;
     const header = try std.fmt.bufPrint(
@@ -17627,8 +17674,8 @@ fn sendHttpResponse(stream: anytype, status: []const u8, content_type: []const u
         "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
         .{ status, content_type, body.len },
     );
-    try stream.writeAll(header);
-    if (body.len > 0) try stream.writeAll(body);
+    try writeHttpResponseBytes(stream, header);
+    if (body.len > 0) try writeHttpResponseBytes(stream, body);
 }
 
 fn sendHttpResponseRetryAfter(
@@ -17644,8 +17691,8 @@ fn sendHttpResponseRetryAfter(
         "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nRetry-After: {d}\r\nConnection: close\r\n\r\n",
         .{ status, content_type, body.len, @max(@as(u16, 1), retry_after_secs) },
     );
-    try stream.writeAll(header);
-    if (body.len > 0) try stream.writeAll(body);
+    try writeHttpResponseBytes(stream, header);
+    if (body.len > 0) try writeHttpResponseBytes(stream, body);
 }
 
 fn setListenerNonBlocking(server: *std.net.Server) void {
@@ -18186,9 +18233,22 @@ fn handleAcceptedConnection(
     }
 
     if (response_retry_after_secs) |retry_secs| {
-        sendHttpResponseRetryAfter(conn.stream, response_status, response_content_type, response_body, retry_secs) catch {};
+        sendHttpResponseRetryAfter(conn.stream, response_status, response_content_type, response_body, retry_secs) catch |err| {
+            log.warn("http response write failed status={s} body_len={d} retry_after={d} err={s}", .{
+                response_status,
+                response_body.len,
+                retry_secs,
+                @errorName(err),
+            });
+        };
     } else {
-        sendHttpResponse(conn.stream, response_status, response_content_type, response_body) catch {};
+        sendHttpResponse(conn.stream, response_status, response_content_type, response_body) catch |err| {
+            log.warn("http response write failed status={s} body_len={d} err={s}", .{
+                response_status,
+                response_body.len,
+                @errorName(err),
+            });
+        };
     }
 }
 
@@ -22760,6 +22820,79 @@ test "readHttpRequestFromReader maps WouldBlock to RequestTimeout" {
 
     var reader = TimeoutReader{};
     try std.testing.expectError(error.RequestTimeout, readHttpRequestFromReader(std.testing.allocator, &reader));
+}
+
+test "sendHttpResponse writes full large body across partial writes" {
+    const ChunkyStream = struct {
+        allocator: std.mem.Allocator,
+        max_chunk: usize,
+        out: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn write(self: *@This(), bytes: []const u8) error{OutOfMemory}!usize {
+            const n = @min(self.max_chunk, bytes.len);
+            try self.out.appendSlice(self.allocator, bytes[0..n]);
+            return n;
+        }
+
+        fn waitWritable(_: *@This()) !void {}
+
+        fn deinit(self: *@This()) void {
+            self.out.deinit(self.allocator);
+        }
+    };
+
+    const body = try std.testing.allocator.alloc(u8, 700 * 1024);
+    defer std.testing.allocator.free(body);
+    @memset(body, 'x');
+
+    var stream = ChunkyStream{
+        .allocator = std.testing.allocator,
+        .max_chunk = 8191,
+    };
+    defer stream.deinit();
+
+    try sendHttpResponse(&stream, "200 OK", "application/json", body);
+
+    const expected_header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 716800\r\nConnection: close\r\n\r\n";
+    try std.testing.expect(std.mem.startsWith(u8, stream.out.items, expected_header));
+    try std.testing.expectEqual(expected_header.len + body.len, stream.out.items.len);
+    try std.testing.expectEqualSlices(u8, body, stream.out.items[expected_header.len..]);
+}
+
+test "sendHttpResponse waits and resumes when response write would block" {
+    const WouldBlockStream = struct {
+        allocator: std.mem.Allocator,
+        blocked: bool = false,
+        wait_count: usize = 0,
+        out: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn write(self: *@This(), bytes: []const u8) error{ WouldBlock, OutOfMemory }!usize {
+            if (!self.blocked and self.out.items.len > 0) {
+                self.blocked = true;
+                return error.WouldBlock;
+            }
+            const n = @min(@as(usize, 7), bytes.len);
+            try self.out.appendSlice(self.allocator, bytes[0..n]);
+            return n;
+        }
+
+        fn waitWritable(self: *@This()) !void {
+            self.wait_count += 1;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.out.deinit(self.allocator);
+        }
+    };
+
+    var stream = WouldBlockStream{ .allocator = std.testing.allocator };
+    defer stream.deinit();
+
+    try sendHttpResponse(&stream, "200 OK", "application/json", "{\"ok\":true}");
+
+    try std.testing.expectEqual(@as(usize, 1), stream.wait_count);
+    try std.testing.expect(std.mem.endsWith(u8, stream.out.items, "{\"ok\":true}"));
+    try std.testing.expect(std.mem.indexOf(u8, stream.out.items, "Content-Length: 11") != null);
 }
 
 test "userFacingAgentError maps ProviderDoesNotSupportVision" {
