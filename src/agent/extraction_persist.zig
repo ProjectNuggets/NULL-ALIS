@@ -1654,5 +1654,19 @@ test "V1.14.12 (M1 + Path A): WriteOrigin enum count guards against silent addit
     // their callers. If a NEW persistExtracted callsite is added without
     // updating this count, the test fails — forces a conscious decision
     // about tagging for telemetry.
+    //
+    // Hygiene audit 2026-05-19: all 4 production callsites verified to set
+    // an explicit, distinct WriteOrigin (memory_store.zig:175,
+    // compaction.zig:470 + 707, commands.zig:1452). The `.unknown` default
+    // on ExtractionContext.write_origin is the M1 review HIGH#1 loud-signal
+    // pattern — do NOT change to a production tag. A forgotten field must
+    // surface as `.unknown` so it appears in the histogram as an outlier,
+    // not silently inflate the session_end bucket.
+    //
+    // Parallel write path: entity_pipeline (daemon.zig:1227,
+    // tools/wiki_link.zig:115) writes edges with attribution="wiki_link"
+    // and predicates MENTIONS/MENTIONED. Distinct from extraction
+    // (attribution="extraction_classifier") by metadata alone. Not a
+    // hygiene gap — different schema layer (memory_edges, not memories).
     try std.testing.expectEqual(@as(usize, 6), @typeInfo(WriteOrigin).@"enum".fields.len);
 }
