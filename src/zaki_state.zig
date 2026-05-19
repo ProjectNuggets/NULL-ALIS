@@ -3627,10 +3627,15 @@ const ManagerImpl = struct {
     /// prompts) never reaches the /brain/graph response. The agent retrieval
     /// path keeps using `listMemories` directly — it NEEDS continuity
     /// artifacts injected into context.
+    ///
+    /// Use `created_at` for the timestamp column because /brain/graph labels
+    /// and importance are "when ZAKI learned this", not "when maintenance last
+    /// touched this row". Source attribution, metadata repair, and edits can
+    /// update `updated_at` without changing the memory's original learned time.
     pub fn listMemoriesBrainVisible(self: *Self, allocator: std.mem.Allocator, user_id: i64) ![]memory_root.MemoryEntry {
         return self.queryMemories(
             allocator,
-            "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories WHERE user_id = $1 AND " ++ MEMORIES_VALIDITY_FILTER ++ " AND " ++ BRAIN_USER_KEY_FILTER ++ " ORDER BY updated_at DESC",
+            "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM created_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories WHERE user_id = $1 AND " ++ MEMORIES_VALIDITY_FILTER ++ " AND " ++ BRAIN_USER_KEY_FILTER ++ " ORDER BY created_at DESC, id DESC",
             user_id,
             null,
             null,
@@ -12822,4 +12827,3 @@ test "V1.7a-9c recomputeCommunitiesForUser — end-to-end pipeline + namer + cac
         try std.testing.expectEqual(@as(usize, 0), stats.communities_found);
     }
 }
-

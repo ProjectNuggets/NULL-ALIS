@@ -11974,10 +11974,6 @@ fn handleBrainGraph(
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
     };
 
-    const state_mgr = state.zaki_state orelse {
-        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
-    };
-
     // ── Parse query params ────────────────────────────────────────
     const since_param = parseQueryParam(target, "since");
     const max_nodes_param = parseQueryParam(target, "max_nodes");
@@ -11994,7 +11990,12 @@ fn handleBrainGraph(
 
     const since: ?i64 = if (since_param) |s| std.fmt.parseInt(i64, s, 10) catch null else null;
     var max_nodes: u32 = if (max_nodes_param) |s|
-        std.fmt.parseInt(u32, s, 10) catch BRAIN_DEFAULT_MAX_NODES
+        std.fmt.parseInt(u32, s, 10) catch {
+            // Fail closed on malformed explicit caps. A literal shell token
+            // like `max_nodes=$n` previously expanded to the 500-node default,
+            // making manual smoke tests much heavier than intended.
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_max_nodes\"}" };
+        }
     else
         BRAIN_DEFAULT_MAX_NODES;
     if (max_nodes == 0) max_nodes = BRAIN_DEFAULT_MAX_NODES;
@@ -12006,6 +12007,10 @@ fn handleBrainGraph(
             BRAIN_SEMANTIC_THRESHOLD;
         if (!std.math.isFinite(requested)) break :blk BRAIN_SEMANTIC_THRESHOLD;
         break :blk std.math.clamp(requested, BRAIN_SEMANTIC_THRESHOLD, 1.0);
+    };
+
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
     };
 
     // ── Fetch nodes ───────────────────────────────────────────────
@@ -26512,6 +26517,13 @@ test "handleBrainGraph rejects invalid user_id" {
     var dummy_state: GatewayState = undefined;
     const resp = handleBrainGraph(std.testing.allocator, "GET", "not_a_number", "/api/v1/users/not_a_number/brain/graph", &dummy_state);
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+test "handleBrainGraph rejects malformed max_nodes" {
+    var dummy_state: GatewayState = undefined;
+    const resp = handleBrainGraph(std.testing.allocator, "GET", "1", "/api/v1/users/1/brain/graph?max_nodes=$n", &dummy_state);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid_max_nodes") != null);
 }
 
 // ── /brain/timeline cursor pagination unit tests ───────────────────
