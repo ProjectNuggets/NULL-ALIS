@@ -795,13 +795,27 @@ fn persistExtraction(
         };
     }
 
-    const judge_ctx = extraction_persist.JudgeContext{
-        .provider = ctx.judge_provider,
-        .model_name = ctx.judge_model,
-        // V1.14.12 (M2 review CRITICAL) — honor operator-set fast-path
-        // flag threaded from caller via ExtractionContext.
-        .cardinality_fastpath_enabled = ctx.cardinality_fastpath_enabled,
-    };
+    // V1.14.12 (Path A) — judge_ctx is OPTIONAL. When ctx.judge_model is
+    // empty (operator hasn't configured a judge model), we pass null
+    // to persistExtracted which gracefully degrades to MD5+canonical-key
+    // dedup only (no LLM-based contradiction detection).
+    //
+    // Pre-Path-A this was unconditionally constructed, which forced
+    // every extractAtBoundary caller to gate on judge presence
+    // upstream (commands.zig:1475 + compaction.zig:768). After M5
+    // gated-code deletion, no-judge tenants would have silently lost
+    // session-end writes via the deleted legacy direct path. Optional
+    // judge_ctx restores graceful degradation through the
+    // extractAtBoundary path.
+    const judge_ctx: ?extraction_persist.JudgeContext =
+        if (ctx.judge_model.len > 0)
+            extraction_persist.JudgeContext{
+                .provider = ctx.judge_provider,
+                .model_name = ctx.judge_model,
+                .cardinality_fastpath_enabled = ctx.cardinality_fastpath_enabled,
+            }
+        else
+            null;
     const coref_ctx: ?extraction_persist.EntityResolution = if (ctx.coref_embed) |ep|
         extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 }
     else

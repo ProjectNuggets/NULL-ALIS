@@ -1138,22 +1138,20 @@ test "V1.14.12 (M2/M3/M5 hardening): all three new gate flags default to true" {
     };
     try std.testing.expect(cfg.agent.extraction_cardinality_fastpath);
     try std.testing.expect(cfg.agent.extraction_coverage_filter_enabled);
-    try std.testing.expect(cfg.agent.extraction_legacy_direct_writes);
+    // V1.14.12 (Path A) — extraction_legacy_direct_writes field removed.
 }
 
-test "V1.14.12 (M2/M3/M5 hardening): operator can override all three flags via config.json" {
+test "V1.14.12 (M2/M3 hardening): operator can override the two remaining flags via config.json" {
     // Hardening test: parseJson MUST honor explicit overrides for
-    // each flag. Pre-fix the config_parse.zig wire-up was missing —
-    // operators setting "extraction_*: false" in config would have
-    // silently no-op'd because the parser didn't read the field.
-    // This test catches that regression.
+    // each flag. The M5 legacy_direct_writes flag was deleted in
+    // Path A (no longer a feature flag — the gated paths were removed
+    // entirely after A/B bench validation).
     const allocator = std.testing.allocator;
     const json =
         \\{
         \\  "agent": {
         \\    "extraction_cardinality_fastpath": false,
-        \\    "extraction_coverage_filter_enabled": false,
-        \\    "extraction_legacy_direct_writes": false
+        \\    "extraction_coverage_filter_enabled": false
         \\  }
         \\}
     ;
@@ -1165,7 +1163,6 @@ test "V1.14.12 (M2/M3/M5 hardening): operator can override all three flags via c
     try cfg.parseJson(json);
     try std.testing.expect(!cfg.agent.extraction_cardinality_fastpath);
     try std.testing.expect(!cfg.agent.extraction_coverage_filter_enabled);
-    try std.testing.expect(!cfg.agent.extraction_legacy_direct_writes);
 }
 
 test "gateway config defaults require explicit chat stream session key" {

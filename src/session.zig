@@ -209,19 +209,8 @@ pub const SessionManager = struct {
     /// contradiction detection on session-end).
     extraction_judge_provider: ?Provider = null,
     extraction_judge_model_name: []const u8 = "",
-    /// V1.14.12 (M5) — legacy direct-write callsite gate. Threaded
-    /// from gateway config to per-session Agent. Default true preserves
-    /// pre-M5 behavior during the 1-week soak window.
-    ///
-    /// **Concurrency contract (M5 review MED):** this field is
-    /// **INIT-ONLY**. Set exactly once at TenantRuntime construction
-    /// (gateway.zig:1696), then read by `buildSessionAgent`
-    /// (session.zig:449) under each session's own lifecycle. No mutex
-    /// guards reads/writes because, by contract, no concurrent writers
-    /// exist after init. If config hot-reload is ever added, this
-    /// field MUST move under `SessionManager.mutex` to prevent torn
-    /// reads. Same contract applies to all `extraction_*` siblings.
-    extraction_legacy_direct_writes: bool = true,
+    // V1.14.12 (Path A) — extraction_legacy_direct_writes FIELD REMOVED.
+    // See config_types.zig for the close-out summary.
     /// V1.14.12 (M2 review CRITICAL) — cardinality fast-path gate
     /// threaded from gateway config to per-session Agent → JudgeContext.
     /// Same INIT-ONLY concurrency contract as the sibling fields.
@@ -466,9 +455,7 @@ pub const SessionManager = struct {
         // V1.9-6 — judge provider for session-end summarizer path.
         agent.extraction_judge_provider = self.extraction_judge_provider;
         agent.extraction_judge_model_name = self.extraction_judge_model_name;
-        // V1.14.12 (M5) — legacy direct-write gate, threaded from
-        // SessionManager (which gateway.zig sets from config).
-        agent.extraction_legacy_direct_writes = self.extraction_legacy_direct_writes;
+        // V1.14.12 (Path A) — extraction_legacy_direct_writes propagation removed.
         // V1.14.12 (M2 review CRITICAL) — cardinality fast-path gate,
         // same plumbing pattern.
         agent.extraction_cardinality_fastpath = self.extraction_cardinality_fastpath;

@@ -1695,37 +1695,21 @@ const TenantRuntime = struct {
                     // (1-week soak); operator flips to false in config
                     // after M1 telemetry confirms redundancy.
                     //
-                    // V1.14.12 (M5 review HIGH#3) — safety guard:
-                    // if the operator set the flag to FALSE but no
-                    // judge is wired, FORCE the flag back to TRUE
-                    // and emit a loud warn. Reason: extractAtBoundary
-                    // (the path that takes over when this flag is OFF)
-                    // requires judge_provider + judge_model. Without
-                    // them, flipping the flag silently stops all
-                    // session-end durable_fact writes. The legacy
-                    // direct path doesn't need a judge; it runs with
-                    // judge_ctx=null (MD5 dedup only). Refusing to
-                    // honor the flip here prevents data loss.
-                    const want_legacy = runtime.config.agent.extraction_legacy_direct_writes;
-                    const judge_wired = runtime.session_mgr.extraction_judge_model_name.len > 0;
-                    const safe_legacy = want_legacy or !judge_wired;
-                    if (!want_legacy and !judge_wired) {
-                        log.warn(
-                            "extraction.M5_flag_override user_id={d} requested=false enforced=true reason=judge_not_wired — flipping flag back to true to prevent silent data loss; configure extraction_judge_model before disabling legacy direct writes",
-                            .{numeric_user_id},
-                        );
-                    }
-                    runtime.session_mgr.extraction_legacy_direct_writes = safe_legacy;
+                    // V1.14.12 (Path A) — M5 safety guard + flag-flip override removed.
+                    // The legacy direct paths and their flag are deleted;
+                    // extractAtBoundary now handles null judge gracefully
+                    // (runner.zig:798), eliminating the silent-data-loss
+                    // vector the override protected against.
+                    //
                     // V1.14.12 (M2 review CRITICAL) — wire fast-path flag
                     // from config to session_mgr so each per-session Agent
                     // inherits it and propagates to JudgeContext.
                     runtime.session_mgr.extraction_cardinality_fastpath = runtime.config.agent.extraction_cardinality_fastpath;
-                    log.info("extraction.enabled user_id={d} coref={s} judge={s} legacy_direct_writes={s}{s}", .{
+                    log.info("extraction.enabled user_id={d} coref={s} judge={s} cardinality_fastpath={s}", .{
                         numeric_user_id,
                         if (coref_on) "on" else "off-no-embed",
                         "wired-session-end-v1.9-6",
-                        if (safe_legacy) "on" else "off",
-                        if (want_legacy != safe_legacy) " (operator-requested-off, enforced-on-no-judge)" else "",
+                        if (runtime.config.agent.extraction_cardinality_fastpath) "on" else "off",
                     });
                 }
             } else |_| {

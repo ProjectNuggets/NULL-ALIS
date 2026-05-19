@@ -405,13 +405,7 @@ pub const Agent = struct {
     /// MD5 dedup only, no semantic contradiction detection).
     extraction_judge_provider: ?providers.Provider = null,
     extraction_judge_model_name: []const u8 = "",
-    /// V1.14.12 (M5) — legacy direct-write callsite gate. Read by
-    /// commands.zig session-end durable_fact promotion path. When
-    /// false, the direct persistExtracted call at commands.zig:1440 is
-    /// SKIPPED; the same content flows through extractAtBoundary at
-    /// commands.zig:1494 (write_origin=session_end_extract). Default
-    /// true preserves pre-M5 behavior during 1-week soak.
-    extraction_legacy_direct_writes: bool = true,
+    // V1.14.12 (Path A) — extraction_legacy_direct_writes field removed.
     /// V1.14.12 (M2 review CRITICAL) — cardinality fast-path gate
     /// threaded through to JudgeContext so persistExtracted honors
     /// the operator-set value. Default true preserves M2 behavior.
@@ -1076,10 +1070,7 @@ pub const Agent = struct {
                 self.extraction_judge_model_name
             else
                 null,
-            // V1.14.12 (M5) — propagate the legacy direct-write flag
-            // from Agent → CompactionConfig so the Pass C parsed_facts
-            // direct path can honor the gate.
-            .extraction_legacy_direct_writes = self.extraction_legacy_direct_writes,
+            // V1.14.12 (Path A) — extraction_legacy_direct_writes propagation removed.
             // V1.14.12 (M2 review CRITICAL) — propagate the cardinality
             // fast-path flag so Pass C judge_ctx honors operator config.
             .extraction_cardinality_fastpath = self.extraction_cardinality_fastpath,

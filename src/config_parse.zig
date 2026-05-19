@@ -852,9 +852,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("extraction_coverage_filter_enabled")) |v| {
                 if (v == .bool) self.agent.extraction_coverage_filter_enabled = v.bool;
             }
-            if (ag.object.get("extraction_legacy_direct_writes")) |v| {
-                if (v == .bool) self.agent.extraction_legacy_direct_writes = v.bool;
-            }
+            // V1.14.12 (Path A) — extraction_legacy_direct_writes reader removed.
+            // Field deleted from AgentConfig; the M5 gated legacy paths
+            // no longer exist (deleted in commands.zig + compaction.zig).
             if (ag.object.get("compaction_keep_recent")) |v| {
                 if (v == .integer) self.agent.compaction_keep_recent = @intCast(v.integer);
             }

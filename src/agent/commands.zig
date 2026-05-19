@@ -1398,60 +1398,13 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                             triple_edges_written += 1;
                         }
 
-                        // V1.14.12 (M5 review HIGH#1) — early-return gate.
-                        // Placed BEFORE mems/coref_ctx allocation so no
-                        // wasted work happens when flag is off. Mirrors
-                        // compaction.zig:697 placement.
-                        if (!self.extraction_legacy_direct_writes) {
-                            log.info("session_end.legacy_direct_skipped reason=M5_flag_off key={s} — work flows through extractAtBoundary path", .{fact_key});
-                        } else {
-                            // V1.7 cmt9.6: route through persistExtracted for
-                            // coref + source attribution + judge.
-                            const mems = [_]extraction_persist.ExtractedMemory{.{
-                                .text = fact.content,
-                                .subject = fact.subject.?,
-                                .predicate = fact.predicate.?,
-                                .object = fact.object.?,
-                                .attributed_to = fact.attributed_to orelse "user",
-                                .confidence = fact.confidence orelse 0.9,
-                            }};
-                            const coref_ctx: ?extraction_persist.EntityResolution =
-                                if (self.extraction_coref_embed) |ep|
-                                    extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 }
-                                else
-                                    null;
-                            const judge_ctx: ?extraction_persist.JudgeContext = blk: {
-                                if (self.extraction_judge_provider) |jp| {
-                                    if (self.extraction_judge_model_name.len > 0) {
-                                        break :blk extraction_persist.JudgeContext{
-                                            .provider = jp,
-                                            .model_name = self.extraction_judge_model_name,
-                                            .cardinality_fastpath_enabled = self.extraction_cardinality_fastpath,
-                                        };
-                                    }
-                                }
-                                break :blk null;
-                            };
-                            _ = extraction_persist.persistExtracted(
-                                self.allocator,
-                                smgr,
-                                uid,
-                                session_id,
-                                &mems,
-                                judge_ctx,
-                                coref_ctx,
-                                self.mem_rt, // V1.8-2: vector coverage on session-end
-                                .session_end_durable_fact, // V1.14.12 (M1) — telemetry tag
-                            ) catch |err| {
-                                log.warn("session_end persistExtracted failed key={s} err={s}", .{
-                                    fact_key, @errorName(err),
-                                });
-                            };
-                            log.info("session_end.persistExtracted judge_ctx={s} key={s}", .{
-                                if (judge_ctx != null) "wired" else "null",
-                                fact_key,
-                            });
-                        }
+                        // V1.14.12 (Path A) — legacy direct write deleted.
+                        // Session-end durable_fact promotion flows entirely
+                        // through extractAtBoundary at the block below
+                        // (write_origin = .session_end_extract). The
+                        // extractAtBoundary path now handles null-judge
+                        // gracefully so this deletion doesn't regress
+                        // no-judge tenants.
                     }
                 }
             }
@@ -1472,36 +1425,44 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         // soft per layer; existing per-fact persist remains the legacy
         // primary writer until C5 cleanup. Dedup at persistExtracted handles
         // overlap between the two paths.
-        if (self.extraction_judge_provider) |jp| {
-            if (self.extraction_judge_model_name.len > 0 and self.history.items.len > 0) {
-                var msgs_buf = std.ArrayListUnmanaged(providers.ChatMessage).initCapacity(self.allocator, self.history.items.len) catch null;
-                if (msgs_buf) |*buf| {
-                    defer buf.deinit(self.allocator);
-                    for (self.history.items) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
-                    const ctx = extraction_runner.ExtractionContext{
-                        .judge_provider = jp,
-                        .judge_model = self.extraction_judge_model_name,
-                        .state_mgr = self.extraction_state_mgr,
-                        .user_id = self.extraction_user_id,
-                        .session_id = session_id,
-                        .coref_embed = self.extraction_coref_embed,
-                        .archive_mem = self.mem,
-                        .archive_mem_rt = self.mem_rt,
-                        .write_origin = .session_end_extract, // V1.14.12 (M1) — per-path telemetry tag
-                        .cardinality_fastpath_enabled = self.extraction_cardinality_fastpath, // V1.14.12 (M2 review CRITICAL)
-                    };
-                    const br = extraction_runner.extractAtBoundary(self.allocator, buf.items, ctx);
-                    defer br.deinit(self.allocator);
-                    log.info(
-                        "session_end.unified_extract entities={d} edges={d} hydration_present={} session={s}",
-                        .{
-                            if (br.extraction) |e| e.entities.len else 0,
-                            if (br.extraction) |e| e.edges.len else 0,
-                            br.hydration != null,
-                            session_id,
-                        },
-                    );
-                }
+        // V1.14.12 (Path A) — judge guard removed. extractAtBoundary now
+        // handles null-judge gracefully (judge_ctx becomes null inside
+        // runner.zig when judge_model is empty). No-judge tenants get
+        // MD5+canonical-key dedup only — same as the legacy direct
+        // path's pre-M5 behavior. This unblocks deletion of the gated
+        // legacy direct path at this file's session-end block.
+        if (self.history.items.len > 0) {
+            var msgs_buf = std.ArrayListUnmanaged(providers.ChatMessage).initCapacity(self.allocator, self.history.items.len) catch null;
+            if (msgs_buf) |*buf| {
+                defer buf.deinit(self.allocator);
+                for (self.history.items) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
+                const ctx = extraction_runner.ExtractionContext{
+                    // Provider may be null when no judge configured;
+                    // runner.zig:798 checks judge_model.len before
+                    // constructing JudgeContext, so this `orelse undefined`
+                    // is never read in the no-judge path.
+                    .judge_provider = self.extraction_judge_provider orelse undefined,
+                    .judge_model = self.extraction_judge_model_name,
+                    .state_mgr = self.extraction_state_mgr,
+                    .user_id = self.extraction_user_id,
+                    .session_id = session_id,
+                    .coref_embed = self.extraction_coref_embed,
+                    .archive_mem = self.mem,
+                    .archive_mem_rt = self.mem_rt,
+                    .write_origin = .session_end_extract, // V1.14.12 (M1) — per-path telemetry tag
+                    .cardinality_fastpath_enabled = self.extraction_cardinality_fastpath, // V1.14.12 (M2 review CRITICAL)
+                };
+                const br = extraction_runner.extractAtBoundary(self.allocator, buf.items, ctx);
+                defer br.deinit(self.allocator);
+                log.info(
+                    "session_end.unified_extract entities={d} edges={d} hydration_present={} session={s}",
+                    .{
+                        if (br.extraction) |e| e.entities.len else 0,
+                        if (br.extraction) |e| e.edges.len else 0,
+                        br.hydration != null,
+                        session_id,
+                    },
+                );
             }
         }
 
