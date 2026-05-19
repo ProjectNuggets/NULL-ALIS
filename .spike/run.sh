@@ -26,9 +26,11 @@
 #
 # Output contract:
 #   Last stdout line: TSV row for results.tsv:
-#     commit\tpass_rate\tmean_tool_calls\tmean_latency_ms\tstatus\tdescription
+#     commit\tpass_rate\tmean_tool_calls\tmean_latency_ms\tp50_ttft_ms\tp95_ttft_ms\tstatus\tdescription
 #   Exit code: 0 if all benchmarks returned (even if they failed grading),
 #              1 if a benchmark crashed (SSE error / gateway unreachable).
+#
+# p95 TTFT <= 4.0s is the SLO bench gate for every subsequent block.
 
 set -uo pipefail
 
@@ -62,6 +64,7 @@ TOOL_CALL_SUM=0
 LATENCY_SUM=0
 CRASHED=0
 DETAIL=()
+TTFT_VALUES=()
 
 # Per-category tallies — parallel arrays (bash 3.2 compat, macOS default).
 # CAT_NAMES[i] <-> CAT_PASSES[i] <-> CAT_TOTALS[i]
@@ -101,11 +104,14 @@ cat_bump_pass() {
 }
 
 # Runs one turn against the gateway. Populates:
-#   REPLY_TEXT, TOOLS_FIRED, TOOL_COUNT, LATENCY_MS, TURN_OK (0/1), TURN_REASON
+#   REPLY_TEXT, TOOLS_FIRED, TOOL_COUNT, LATENCY_MS, TTFT_MS,
+#   TURN_OK (0/1), TURN_REASON
 run_single_turn() {
   local outfile="$1" session_key="$2" prompt="$3"
-  local started
+  local started events_file
   started=$(date +%s%N)
+  events_file="${outfile}.events.tsv"
+  : > "$events_file"
 
   curl -sN -X POST "$URL" \
     -H "X-Internal-Token: $TOKEN" \
@@ -113,12 +119,30 @@ run_single_turn() {
     -H "Content-Type: application/json" \
     --max-time 180 \
     -d "$(jq -n --arg m "$prompt" --arg s "$session_key" '{message:$m, session_key:$s}')" \
-    > "$outfile" 2>&1
+    2>&1 \
+    | while IFS= read -r line; do
+        printf "%s\t%s\n" "$(date +%s%N)" "$line" >> "$events_file"
+        printf "%s\n" "$line"
+      done > "$outfile"
 
-  local rc=$?
+  local rc=${PIPESTATUS[0]}
   local ended
   ended=$(date +%s%N)
   LATENCY_MS=$(( (ended - started) / 1000000 ))
+  local first_token_ns
+  first_token_ns=$(awk -F '\t' '
+    $2 ~ /^data:/ &&
+    $2 ~ /"delta":"[^"]+/ &&
+    ($2 !~ /"stream_kind":/ || $2 ~ /"stream_kind":"final_reply"/) {
+      print $1
+      exit
+    }
+  ' "$events_file")
+  if [[ -n "$first_token_ns" ]]; then
+    TTFT_MS=$(( (first_token_ns - started) / 1000000 ))
+  else
+    TTFT_MS=0
+  fi
 
   if [[ $rc -ne 0 ]] || ! grep -q 'event: done' "$outfile"; then
     TURN_OK=0
@@ -126,6 +150,7 @@ run_single_turn() {
     REPLY_TEXT=""
     TOOLS_FIRED=""
     TOOL_COUNT=0
+    TTFT_MS=0
     return
   fi
 
@@ -135,6 +160,7 @@ run_single_turn() {
     REPLY_TEXT=""
     TOOLS_FIRED=""
     TOOL_COUNT=0
+    TTFT_MS=0
     return
   fi
 
@@ -248,6 +274,9 @@ grade_benchmark() {
     run_single_turn "$outfile" "$session_key" "$prompt"
     bench_latency=$((bench_latency + LATENCY_MS))
     bench_tool_count=$((bench_tool_count + TOOL_COUNT))
+    if [[ $TTFT_MS -gt 0 ]]; then
+      TTFT_VALUES+=("$TTFT_MS")
+    fi
 
     if [[ -z "$first_tools" ]]; then first_tools="$TOOLS_FIRED"; fi
 
@@ -308,9 +337,34 @@ if [[ $TOTAL -eq 0 ]]; then
   exit 2
 fi
 
+percentile_ms() {
+  local pct="$1"
+  shift
+  if [[ $# -eq 0 ]]; then
+    echo "na"
+    return
+  fi
+  printf "%s\n" "$@" | sort -n | awk -v pct="$pct" '
+    NF { values[++n] = $1 }
+    END {
+      if (n == 0) {
+        print "na"
+        exit
+      }
+      idx = int(pct * n)
+      if (idx < pct * n) idx++
+      if (idx < 1) idx = 1
+      if (idx > n) idx = n
+      printf "%.0f", values[idx]
+    }
+  '
+}
+
 PASS_RATE=$(awk -v p="$PASS" -v t="$TOTAL" 'BEGIN{printf "%.3f", p/t}')
 MEAN_TOOLS=$(awk -v s="$TOOL_CALL_SUM" -v t="$TOTAL" 'BEGIN{printf "%.2f", s/t}')
 MEAN_LAT=$(awk -v s="$LATENCY_SUM" -v t="$TOTAL" 'BEGIN{printf "%.0f", s/t}')
+P50_TTFT=$(percentile_ms 0.50 "${TTFT_VALUES[@]}")
+P95_TTFT=$(percentile_ms 0.95 "${TTFT_VALUES[@]}")
 STATUS="graded"
 [[ $CRASHED -gt 0 ]] && STATUS="partial-crash"
 
@@ -329,10 +383,10 @@ if [[ $QUIET -eq 0 ]]; then
         printf "  %-28s %d/%d  (%s)\n" "$cat" "$p" "$t" "$rate"
       done
   echo ""
-  echo "pass=$PASS/$TOTAL  pass_rate=$PASS_RATE  mean_tools=$MEAN_TOOLS  mean_latency_ms=$MEAN_LAT  status=$STATUS  crashes=$CRASHED"
+  echo "pass=$PASS/$TOTAL  pass_rate=$PASS_RATE  mean_tools=$MEAN_TOOLS  mean_latency_ms=$MEAN_LAT  p50_ttft_ms=$P50_TTFT  p95_ttft_ms=$P95_TTFT  status=$STATUS  crashes=$CRASHED"
   echo "SSE traces: $OUT_DIR"
 fi
 
-printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$COMMIT" "$PASS_RATE" "$MEAN_TOOLS" "$MEAN_LAT" "$STATUS" "baseline_or_keep"
+printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$COMMIT" "$PASS_RATE" "$MEAN_TOOLS" "$MEAN_LAT" "$P50_TTFT" "$P95_TTFT" "$STATUS" "baseline_or_keep"
 
 [[ $CRASHED -gt 0 ]] && exit 1 || exit 0

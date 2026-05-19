@@ -1,4 +1,4 @@
-commit	pass_rate	mean_tools	mean_latency_ms	status	description
+commit	pass_rate	mean_tools	mean_latency_ms	p50_ttft_ms	p95_ttft_ms	status	description
 7ff8777	0.000	0.00	0	baseline	pre-spike baseline harness bug hid tool calls
 8200d23	0.200	0.40	6589	keep	iter1 response protocol + anti-fabrication + harness fix
 c47776a	0.400	0.80	6162	baseline	updated benchmark b4/b5 to in-workspace paths
