@@ -63,7 +63,43 @@ Each V block in `docs/ROADMAP.md` has one or more agents assigned. Agents work i
 
 ---
 
-## 3. Branch + PR conventions
+## 3. Branch + worktree + PR conventions
+
+### 3.0 Worktree-per-agent (MANDATORY — added 2026-05-19 after Agent D shared-worktree incident)
+
+**Each agent works in its OWN git worktree at its OWN filesystem path. Branches alone are not sufficient — two agents on different branches but in the same working directory will stomp each other's files.**
+
+Before spawning Agent {X}, create their worktree:
+
+```bash
+# Run from any directory; Nova does this BEFORE pasting the agent's spawn prompt.
+git -C /Users/nova/Desktop/nullalis worktree add /Users/nova/Desktop/nullalis-agent-{X} sprint/v{block}
+```
+
+The spawn prompt MUST point the agent at their worktree directory:
+
+```
+Your working directory: /Users/nova/Desktop/nullalis-agent-{X}
+cd to it before running any git or build command.
+Do NOT work in /Users/nova/Desktop/nullalis (Nova's monitor worktree) or any other agent's directory.
+```
+
+After merge, clean up:
+
+```bash
+# Once Agent {X}'s PR merges into sprint, remove their worktree:
+git -C /Users/nova/Desktop/nullalis worktree remove /Users/nova/Desktop/nullalis-agent-{X}
+# Then prune the merged branch:
+git branch -d agent/{X}-v{block}
+git push origin --delete agent/{X}-v{block}
+```
+
+**Why this matters (the 2026-05-19 lesson):** Agent A worked in its dedicated worktree
+`/Users/nova/Desktop/nullalis-agent-A` and ran cleanly with zero coordination friction.
+Agent D worked in the same directory as Claude (Nova's monitor lane) — even though they
+were on different branches, every file edit in that shared filesystem state risked
+clashing. Reviewing D's PR required Nova's monitor to go read-only mid-flight. Don't
+repeat that pattern. One worktree per agent, every time.
 
 ### Branch naming
 
@@ -71,6 +107,16 @@ Each V block in `docs/ROADMAP.md` has one or more agents assigned. Agents work i
 agent/{A-J}-v{block}                e.g.  agent/A-v1.14.13, agent/D-v1.14.13
 sprint/v{block}                     e.g.  sprint/v1.14.13   (merge target for all agents on that block)
 release/v{block}                    e.g.  release/v1.14.13  (PR head into main — only when bench gate passes)
+```
+
+### Worktree paths (canonical)
+
+```
+/Users/nova/Desktop/nullalis              Nova's monitor / general work / main branch
+/Users/nova/Desktop/nullalis-agent-A      Agent A on agent/A-v{block}
+/Users/nova/Desktop/nullalis-agent-B      Agent B on agent/B-v{block}
+/Users/nova/Desktop/nullalis-agent-C      Agent C on agent/C-v{block}
+... etc through J
 ```
 
 ### PR convention (one PR per V tag, per Nova directive)
@@ -141,6 +187,38 @@ If an agent gets stuck (Zig API uncertainty, architectural ambiguity, blocked de
 
 No silent stuck states. The git log makes it visible.
 
+### 4.6 Branch divergence under an open PR (helper command)
+
+When a sprint moves forward (another agent's PR merges) while your PR is still open,
+your branch is now behind `sprint/v{block}` and the PR diff shows the just-merged
+work as "deleted" (misleading view that would revert the prior agent's work if
+naively merged).
+
+**The fix is one command on the reviewer side:**
+
+```bash
+gh pr update-branch <PR_NUMBER>
+```
+
+This merges current `sprint/v{block}` INTO the agent's PR branch, creating a merge
+commit on the agent's branch and updating the PR. The diff then shows only the
+agent's actual additions. No working-tree action required. Safe for the agent (their
+own commits are preserved).
+
+This pattern came up on 2026-05-19 when Agent D's PR (#74) was opened before
+Agent A's PR (#73) merged. `gh pr update-branch 74` resolved the apparent revert
+without disrupting either agent.
+
+### 4.7 GitHub self-approval limitation
+
+`gh pr review <N> --approve` returns "Can not approve your own pull request" when
+the GitHub user authenticated to `gh` is the same account that opened the PR.
+This is a GitHub policy, not a tooling bug.
+
+**Workaround:** the owner (Nova) merges directly via `gh pr merge <N> --merge`
+without going through the approve step. Or set up a separate reviewer account.
+Discovered 2026-05-19 reviewing Agent A's PR.
+
 ---
 
 ## 5. Per-block launch brief template
@@ -159,7 +237,17 @@ Read first (in this order):
   3. docs/MULTI_AGENT_PLAN.md → your track's section
   4. docs/STATUS.md (current state)
 
+Your working directory: /Users/nova/Desktop/nullalis-agent-{LETTER}
+  cd to this directory BEFORE running any git or build command. Do NOT work
+  in /Users/nova/Desktop/nullalis (Nova's monitor) or any other agent's
+  worktree. Your filesystem is isolated from other agents.
+
 Your branch: agent/{LETTER}-v{BLOCK_NUMBER}
+  This branch already exists in your worktree (created by Nova via
+  `git worktree add` before spawning you). Verify with `git branch --show-current`
+  — it should return `agent/{LETTER}-v{BLOCK_NUMBER}`. If it doesn't, STOP
+  and ask Nova; do not proceed.
+
 Your sub-tasks in this block (from ROADMAP):
   - Step X.Y: {brief}
   - Step X.Z: {brief}
