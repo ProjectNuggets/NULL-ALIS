@@ -34,6 +34,19 @@ pub const ZakiDualMemory = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &mem_vtable };
     }
 
+    /// V1.14.12 (Memory audit Finding 5 fix, 2026-05-19) — restore the
+    /// canonical-Postgres invariant the implStore comment promised but
+    /// the code violated. Pre-fix, syncFromMarkdown unconditionally
+    /// stored every Markdown entry into primary, so a stale or
+    /// hand-edited MEMORY.md could overwrite newer DB facts on restart.
+    /// Now: skip keys already present in primary (additive-only import).
+    /// Tombstones still propagate as forgets — that's an explicit user
+    /// signal to delete.
+    ///
+    /// Note: this changes the import semantics to "MEMORY.md adds keys
+    /// the DB doesn't know about" rather than "MEMORY.md replaces the
+    /// DB's view." For an intentional override, the user can delete
+    /// the row via /forget (or memory_archive), then re-run sync.
     pub fn syncFromMarkdown(self: *Self, allocator: std.mem.Allocator) !void {
         const tombstoned_keys = try self.markdown_impl.readTombstonedKeys(allocator);
         defer {
@@ -49,9 +62,27 @@ pub const ZakiDualMemory = struct {
         const entries = try self.markdown_impl.memory().list(allocator, null, null);
         defer root.freeEntries(allocator, entries);
 
+        var imported: usize = 0;
+        var skipped_already_present: usize = 0;
         for (entries) |entry| {
             if (!shouldSyncEntry(entry)) continue;
+            // V1.14.12 (Finding 5 fix) — additive-only: never overwrite
+            // an existing primary value with the Markdown copy. The
+            // Postgres row is canonical by construction (every runtime
+            // store path writes there first, see implStore).
+            const existing = self.primary.get(allocator, entry.key) catch null;
+            if (existing) |e| {
+                e.deinit(allocator);
+                skipped_already_present += 1;
+                continue;
+            }
             try self.primary.store(entry.key, entry.content, entry.category, entry.session_id);
+            imported += 1;
+        }
+        if (imported > 0 or skipped_already_present > 0) {
+            log.info("zaki_dual: syncFromMarkdown imported={d} skipped_already_present={d}", .{
+                imported, skipped_already_present,
+            });
         }
     }
 
@@ -346,7 +377,17 @@ test "zaki dual memory store clears tombstone for restored mutable key" {
     mem.deinit();
 }
 
-test "zaki dual memory runtime markdown edits do not override canonical primary state until explicit sync" {
+test "V1.14.12 (Memory audit Finding 5): syncFromMarkdown does NOT override canonical primary state" {
+    // Pre-fix: syncFromMarkdown unconditionally stored every Markdown
+    // entry into primary, so a stale MEMORY.md could overwrite newer
+    // DB facts on restart. The implStore comment at line ~72 explicitly
+    // said "must NOT override the Postgres value" but the code didn't
+    // enforce it; this test pre-fix asserted the WRONG behavior.
+    //
+    // Post-fix: syncFromMarkdown is additive-only — it imports keys
+    // the primary doesn't have, but never replaces a key that already
+    // exists. For intentional override, the user can /forget the row
+    // and re-sync.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -367,20 +408,52 @@ test "zaki dual memory runtime markdown edits do not override canonical primary 
         .data = "# MEMORY.md - Long-Term Memory\n\n- **favorite_color**: orange\n",
     });
 
+    // Pre-sync: primary holds the runtime value.
     const runtime_get = (try mem.get(allocator, "favorite_color")) orelse return error.TestUnexpectedResult;
     defer runtime_get.deinit(allocator);
     try std.testing.expectEqualStrings("teal", runtime_get.content);
 
-    const runtime_recall = try mem.recall(allocator, "favorite_color", 5, null);
-    defer root.freeEntries(allocator, runtime_recall);
-    try std.testing.expect(runtime_recall.len >= 1);
-    try std.testing.expectEqualStrings("teal", runtime_recall[0].content);
+    try dual.syncFromMarkdown(allocator);
+
+    // Post-sync: primary STILL holds the runtime value. Markdown's
+    // "orange" did NOT override.
+    const post_sync = (try mem.get(allocator, "favorite_color")) orelse return error.TestUnexpectedResult;
+    defer post_sync.deinit(allocator);
+    try std.testing.expectEqualStrings("teal", post_sync.content);
+
+    mem.deinit();
+}
+
+test "V1.14.12 (Memory audit Finding 5): syncFromMarkdown imports keys absent from primary (additive)" {
+    // The other side of the contract: a key in MEMORY.md that doesn't
+    // exist in primary IS imported on sync. This preserves the original
+    // intent of syncFromMarkdown (recover state from a fresh restart
+    // with a populated MEMORY.md), just without the overwrite footgun.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    const memory_path = try std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{workspace});
+    defer allocator.free(memory_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = memory_path,
+        .data = "# MEMORY.md - Long-Term Memory\n\n- **fresh_key**: imported\n",
+    });
+
+    var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
+    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
+    var mem = dual.memory();
+    // Primary starts empty for `fresh_key`.
+    try std.testing.expect((try mem.get(allocator, "fresh_key")) == null);
 
     try dual.syncFromMarkdown(allocator);
 
-    const imported_get = (try mem.get(allocator, "favorite_color")) orelse return error.TestUnexpectedResult;
-    defer imported_get.deinit(allocator);
-    try std.testing.expectEqualStrings("orange", imported_get.content);
+    const imported = (try mem.get(allocator, "fresh_key")) orelse return error.TestUnexpectedResult;
+    defer imported.deinit(allocator);
+    try std.testing.expectEqualStrings("imported", imported.content);
 
     mem.deinit();
 }
