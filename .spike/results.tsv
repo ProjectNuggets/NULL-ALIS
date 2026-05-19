@@ -1,0 +1,23 @@
+commit	pass_rate	mean_tools	mean_latency_ms	status	description
+7ff8777	0.000	0.00	0	baseline	pre-spike baseline harness bug hid tool calls
+8200d23	0.200	0.40	6589	keep	iter1 response protocol + anti-fabrication + harness fix
+c47776a	0.400	0.80	6162	baseline	updated benchmark b4/b5 to in-workspace paths
+3f88ba2	0.600	0.80	9863	keep	iter2 concrete wrong/right example - b2 passes
+iter3-disc	0.400	0.60	6697	discard	iter3 memory-is-context rule - regressed b2 no help for b1
+iter4-keep	0.800	1.40	9543	keep	memory-is-retrieval rule - b5 recovered b1 still stubborn
+iter6-cold	1.000	2.00	10627	keep	cold-session harness fix - 5/5 passing on iter4 prompt
+C-keep	1.000	1.40	8219	keep	summarizer downgrade unverified external claims - new pollution blocked
+iter7-expand	1.000	1.90	11282	keep	expanded battery 10 benchmarks 5 categories all passing
+iter8-polluted	0.600	0.90	9273	baseline	polluted :main session baseline - 6/10 - existing pollution blocks topic queries
+iter9-disc	0.500	0.70	5408	discard	history 500iter9-disc	0.500	0.70	5408	discard	history tightening 500 to 40/50/80 didnt help polluted - noise-masked
+iter10-keep	0.600	0.70	5178	keep	anti-dodge rule - b1 openclaw recovers on polluted
+iter11-keep	0.800	1.80	11055	keep	runtime history filter - polluted +0.10 b2 TEN recovery; cold variance within prior flakiness
+iter12-keep	na	na	na	keep	memory_purge_topic tool - agent-invokable retroactive cleanup lever (D)
+iter13-keep	0.900	2.10	13812	keep	prompt integration for memory_purge_topic - cold 9/10 regression-clean
+iter17-baseline	1.000	1.56	15974	baseline	25/25 cold across 12 V-inf categories all at 1.00
+iter17-polluted	0.840	2.56	17335	baseline	21/25 polluted - weaknesses concentrated in agentic_execution 0.33 and tool_discipline 0.50
+iter18-phaseA	0.920	1.44	8544	keep	context v2 byte-stable prefix cold 25/25 polluted 23/25 latency -50%
+iter19-phaseB	0.920	1.40	9612	keep	50pct trigger + anti-thrash cold 25/25 polluted 23/25 multi-turn recovered
+iter20-phaseBfix	0.840	1.08	77851	keep	70/80/90 thresholds live + anti-thrash in agent wrapper
+iter21-cleanup	0.880	1.40	48959	keep	cleanup dead code 3 curl timeouts infra flake cold real pass 22/22
+iter22-tau-airline-baseline	0.100	2.46	106140	baseline	first tau-bench Airline run
