@@ -1777,6 +1777,12 @@ pub fn bindMemoryRuntime(tools: []const Tool, mem_rt: ?*memory_mod.MemoryRuntime
         } else if (t.vtable == &memory_purge_topic.MemoryPurgeTopicTool.vtable) {
             const mt: *memory_purge_topic.MemoryPurgeTopicTool = @ptrCast(@alignCast(t.ptr));
             mt.mem_rt = mem_rt;
+        } else if (t.vtable == &memory_archive.MemoryArchiveTool.vtable) {
+            // V1.14.12 (Memory audit Finding 8 fix, 2026-05-19) — wire
+            // mem_rt so archive can call deleteFromVectorStore after
+            // soft-delete, matching memory_forget's vector cleanup.
+            const mt: *memory_archive.MemoryArchiveTool = @ptrCast(@alignCast(t.ptr));
+            mt.mem_rt = mem_rt;
         } else if (t.vtable == &transcript_read.TranscriptReadTool.vtable) {
             const trt: *transcript_read.TranscriptReadTool = @ptrCast(@alignCast(t.ptr));
             trt.session_store = if (mem_rt) |rt| rt.session_store else null;

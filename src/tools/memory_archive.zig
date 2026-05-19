@@ -37,6 +37,14 @@ pub const MemoryArchiveTool = struct {
     memory: ?Memory = null,
     state_mgr: ?*zaki_state.Manager = null,
     user_id: ?i64 = null,
+    /// V1.14.12 (Memory audit Finding 8 fix, 2026-05-19) — vector store
+    /// runtime, used to deactivate the archived key's vector embedding
+    /// so it stops surfacing in semantic recall. Pre-fix, archive
+    /// invalidated the SQL row + cascaded edges but left the vector
+    /// entry live, causing archived facts to still match vector
+    /// queries. memory_forget already does this cleanup
+    /// (memory_forget.zig:62) — archive now matches.
+    mem_rt: ?*mem_root.MemoryRuntime = null,
 
     pub const tool_name = "memory_archive";
     pub const tool_description =
@@ -101,7 +109,13 @@ pub const MemoryArchiveTool = struct {
             return ToolResult{ .success = false, .output = msg };
         };
 
-        const msg = try std.fmt.allocPrint(allocator, "Archived memory: {s} (soft-delete; row preserved as audit, edges cascaded)", .{key});
+        // V1.14.12 (Memory audit Finding 8 fix, 2026-05-19) — best-effort
+        // vector store cleanup. Pre-fix, archived rows survived in the
+        // vector index so semantic recall would still return them.
+        // memory_forget.zig:62 already does this; archive now matches.
+        if (self.mem_rt) |rt| rt.deleteFromVectorStore(key);
+
+        const msg = try std.fmt.allocPrint(allocator, "Archived memory: {s} (soft-delete; row preserved as audit, edges cascaded, vector deactivated)", .{key});
         return ToolResult{ .success = true, .output = msg };
     }
 };

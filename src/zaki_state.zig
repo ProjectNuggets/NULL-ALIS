@@ -6608,6 +6608,15 @@ const ManagerImpl = struct {
         invalid_at: i64,
         expired_at: i64,
     ) !void {
+        // V1.14.12 (Memory audit Finding 8 fix, 2026-05-19) — pin the
+        // memories UPDATE and the memory_edges cascade UPDATE to one
+        // connection so a partial failure rolls back atomically.
+        // Pre-fix both statements ran via the pool-acquiring exec helpers,
+        // so they could land on different conns and split-commit on
+        // failure (compounded by Finding 3's broken txn primitives).
+        var txn = try self.beginTransaction();
+        defer txn.deinit();
+
         const q = try self.buildQuery(
             "UPDATE {schema}.memories SET " ++
                 "valid_to = $3, " ++
@@ -6632,7 +6641,7 @@ const ManagerImpl = struct {
             @intCast(invalid_s.len),
             @intCast(expired_s.len),
         };
-        const result = try self.execParams(q, &params, &lengths);
+        const result = try txn.execParams(q, &params, &lengths);
         defer c.PQclear(result);
 
         // V1.6 commit 7 — cascade close-out to memory_edges. Any edge whose
@@ -6654,27 +6663,67 @@ const ManagerImpl = struct {
                 "RETURNING source_key, target_key, predicate, COALESCE(confidence, 1.0)",
         );
         defer self.allocator.free(cascade_q);
-        const cascade_result = try self.execParams(cascade_q, &params, &lengths);
+        const cascade_result = try txn.execParams(cascade_q, &params, &lengths);
         defer c.PQclear(cascade_result);
 
-        // Emit one edge_closed event per cascaded edge. Failure on any
-        // single event is non-fatal (the cascade UPDATE already succeeded;
-        // the event row is metadata for graph-history queries).
+        // Capture closed-edge metadata for post-COMMIT event emission.
+        // Edge_closed events are best-effort audit rows — emit them AFTER
+        // the txn commits so a failed event write doesn't roll back the
+        // cascade.
         const closed_count = c.PQntuples(cascade_result);
-        var i: c_int = 0;
-        while (i < closed_count) : (i += 1) {
-            const closed_src = dupeResultValue(self.allocator, cascade_result, i, 0) catch continue;
-            defer self.allocator.free(closed_src);
-            const closed_tgt = dupeResultValue(self.allocator, cascade_result, i, 1) catch continue;
-            defer self.allocator.free(closed_tgt);
-            const closed_pred = dupeResultValue(self.allocator, cascade_result, i, 2) catch continue;
-            defer self.allocator.free(closed_pred);
-            const conf_str = dupeResultValue(self.allocator, cascade_result, i, 3) catch continue;
+        var closed_edges: std.ArrayListUnmanaged(struct {
+            source_key: []u8,
+            target_key: []u8,
+            predicate: []u8,
+            confidence: f64,
+        }) = .empty;
+        defer {
+            for (closed_edges.items) |e| {
+                self.allocator.free(e.source_key);
+                self.allocator.free(e.target_key);
+                self.allocator.free(e.predicate);
+            }
+            closed_edges.deinit(self.allocator);
+        }
+        var ci: c_int = 0;
+        while (ci < closed_count) : (ci += 1) {
+            const src = dupeResultValue(self.allocator, cascade_result, ci, 0) catch continue;
+            errdefer self.allocator.free(src);
+            const tgt = dupeResultValue(self.allocator, cascade_result, ci, 1) catch {
+                self.allocator.free(src);
+                continue;
+            };
+            errdefer self.allocator.free(tgt);
+            const pred = dupeResultValue(self.allocator, cascade_result, ci, 2) catch {
+                self.allocator.free(src);
+                self.allocator.free(tgt);
+                continue;
+            };
+            const conf_str = dupeResultValue(self.allocator, cascade_result, ci, 3) catch {
+                self.allocator.free(src);
+                self.allocator.free(tgt);
+                self.allocator.free(pred);
+                continue;
+            };
             defer self.allocator.free(conf_str);
             const conf_val = std.fmt.parseFloat(f64, conf_str) catch 1.0;
-            self.insertEdgeEvent(user_id, closed_src, closed_tgt, closed_pred, "closed", conf_val) catch |err| {
+            try closed_edges.append(self.allocator, .{
+                .source_key = src,
+                .target_key = tgt,
+                .predicate = pred,
+                .confidence = conf_val,
+            });
+        }
+
+        try txn.commit();
+
+        // Post-COMMIT: emit edge_closed events. Failure here doesn't
+        // roll back the close-out — events are observability, not the
+        // source of truth.
+        for (closed_edges.items) |e| {
+            self.insertEdgeEvent(user_id, e.source_key, e.target_key, e.predicate, "closed", e.confidence) catch |err| {
                 log.warn("edge_event.close_failed err={s} source={s} predicate={s}", .{
-                    @errorName(err), closed_src, closed_pred,
+                    @errorName(err), e.source_key, e.predicate,
                 });
             };
         }
