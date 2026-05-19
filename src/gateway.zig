@@ -42,19 +42,13 @@ const subagent_mod = @import("subagent.zig");
 const observability = @import("observability.zig");
 const sentry_runtime = @import("sentry_runtime.zig");
 
-/// Placeholder body emitted when a turn returned an empty reply (tool-only
-/// turn — the model called spawn/delegate or a silent tool and produced no
-/// post-tool assistant text). Prior shipped versions emitted the literal
-/// "received" here, which users read as the actual reply and closed the
-/// session — missing the real subagent output that arrived on a later SSE
-/// frame. See project_subagent_received_bug.md for the full diagnosis and
-/// P2_subagent_delegate.md for the architectural TurnOutcome refactor that
-/// replaces this string path entirely (tracked separately).
-///
-/// The interim honest text makes the absence of a reply explicit so the
-/// user knows to wait for follow-up content rather than treating the
-/// fabricated string as the answer.
-pub const EMPTY_TURN_PLACEHOLDER = "[tools ran, no direct reply this turn — results may arrive on a follow-up.]";
+// EMPTY_TURN_PLACEHOLDER const removed v1.14.13 Step 5 (Agent E). The V1.14.4
+// TurnOutcome refactor and V1.11 (Move 6) `tool_only_summary` + `done.tool_only_turn`
+// SSE contract together replaced the prior fabricated-placeholder fallback. No
+// emission site remained at HEAD; the symbol existed only as dead surface and as
+// archaeology references in nearby docstrings. Comments below preserve the
+// historical record of why the placeholder existed and what supersedes it.
+
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const agent_routing = @import("agent_routing.zig");
@@ -8585,7 +8579,8 @@ fn sseDoneFrame(allocator: std.mem.Allocator, session_id: ?[]const u8, message_i
 /// V1.11 (2026-05-07) — `done` frame variant that signals "tools ran but
 /// no direct text reply this turn." Frontend uses the `tool_only_turn:true`
 /// flag to render a clean inline acknowledgment instead of the prior
-/// EMPTY_TURN_PLACEHOLDER prose. Same identity contract as `sseDoneFrame`
+/// fabricated-placeholder fallback (the dead "[tools ran, no direct reply…]"
+/// string removed v1.14.13). Same identity contract as `sseDoneFrame`
 /// (session_id + message_id optional) — only the extra flag differs.
 fn sseDoneFrameToolOnly(allocator: std.mem.Allocator, session_id: ?[]const u8, message_id: ?i64) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -8606,16 +8601,17 @@ fn sseDoneFrameToolOnly(allocator: std.mem.Allocator, session_id: ?[]const u8, m
 
 /// V1.11 (2026-05-07) — emitted when the model returned tool_calls without
 /// a final text reply (or the agent loop hit max_tool_iterations before
-/// producing text). Replaces the prior pattern of substituting
-/// `EMPTY_TURN_PLACEHOLDER` prose into the token stream, which surfaced as
+/// producing text). Replaces the prior pattern of substituting a
+/// fabricated placeholder string into the token stream, which surfaced as
 /// jarring placeholder text in the chat UI ("[tools ran, no direct
 /// reply…]"). The structured event lets the frontend render a small,
 /// honest "ZAKI ran tools" acknowledgment rather than fake assistant text.
 ///
-/// Why this is correct: the EMPTY_TURN_PLACEHOLDER string was being
+/// Why this is correct: the fabricated placeholder string was being
 /// inserted as if it were an assistant message. It wasn't — it was a UX
 /// papercut. Now the SSE contract carries the truth (tool_only_turn) and
-/// the frontend chooses how to render it.
+/// the frontend chooses how to render it. The dead placeholder const was
+/// removed at v1.14.13 Step 5.
 fn sseToolOnlySummaryFrame(allocator: std.mem.Allocator) ![]u8 {
     return allocator.dupe(u8, "event: tool_only_summary\ndata: {\"type\":\"tool_only_summary\"}\n\n");
 }
@@ -9751,13 +9747,14 @@ fn handleApiChatStreamSseConnection(
 
     // V1.11 (2026-05-07) — Tool-only-turn detection. When the agent loop
     // produced tool_calls but no final text reply (and the live stream
-    // didn't deliver any tokens), pre-V1.11 behavior was to substitute
-    // EMPTY_TURN_PLACEHOLDER prose into the token stream as if it were
+    // didn't deliver any tokens), pre-V1.11 behavior was to substitute a
+    // fabricated placeholder string into the token stream as if it were
     // assistant text. That surfaced as a jarring placeholder line in the
     // chat UI ("[tools ran, no direct reply…]"). New behavior: emit a
     // structured `tool_only_summary` SSE event + flag the `done` frame
     // with `tool_only_turn:true`. The frontend renders an honest,
     // minimal "ZAKI ran tools" acknowledgment instead of fake prose.
+    // The dead placeholder const was removed at v1.14.13 Step 5.
     //
     // Detection signal: empty reply on the success path. Genuine errors
     // hit the `.err` branch above, so an empty `.ok` reply is almost
@@ -17964,22 +17961,13 @@ fn handleAcceptedConnection(
                 response_status = "503 Service Unavailable";
                 response_body = "{\"status\":\"draining\"}";
             } else {
-                const readiness = health.checkRegistryReadiness(req_allocator) catch {
-                    response_status = "500 Internal Server Error";
-                    response_body = "{\"status\":\"not_ready\",\"checks\":[]}";
-                    sendHttpResponse(conn.stream, response_status, response_content_type, response_body) catch {};
-                    return;
-                };
-                const json_body = readiness.formatJson(req_allocator) catch {
-                    response_status = "500 Internal Server Error";
-                    response_body = "{\"status\":\"not_ready\",\"checks\":[]}";
-                    sendHttpResponse(conn.stream, response_status, response_content_type, response_body) catch {};
-                    return;
-                };
-                response_body = json_body;
-                if (readiness.status != .ready) {
-                    response_status = "503 Service Unavailable";
-                }
+                // v1.14.13 Step 5 — route /ready through the canonical
+                // handleReady implementation (tested at 23492+) instead of
+                // duplicating its logic inline. Allocations land in
+                // req_allocator's arena and are freed when the request ends.
+                const ready_resp = handleReady(req_allocator);
+                response_status = ready_resp.http_status;
+                response_body = ready_resp.body;
             }
         },
         .webhook => {
@@ -24873,9 +24861,10 @@ test "baseline: sseDoneFrame is always terminal with type:done" {
 }
 
 // V1.11 (2026-05-07) — Move 6 (no-placeholder UX). Two new SSE builders
-// replace the prior pattern of substituting EMPTY_TURN_PLACEHOLDER prose
-// into the token stream when the agent produced tool_calls but no final
-// text reply. Tests below pin the contract the frontend reads:
+// replace the prior pattern of substituting a fabricated placeholder
+// string into the token stream when the agent produced tool_calls but
+// no final text reply. (The dead placeholder const itself was removed
+// at v1.14.13 Step 5.) Tests below pin the contract the frontend reads:
 //   1. tool_only_summary frame fires before done on tool-only turns
 //   2. done frame on tool-only turns carries tool_only_turn:true flag
 //   3. done frame on regular turns does NOT carry the flag (regression

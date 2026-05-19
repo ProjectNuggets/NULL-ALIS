@@ -851,12 +851,13 @@ fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("  WRONG (the V1.14.6→V1.14.7 regression we're fixing): User: \"When did Maria get Coco?\" → Agent: \"I don't have any record of Maria getting anyone or anything named Coco.\" (Said this without firing memory_recall on \"Coco\".)\n");
     try w.writeAll("  RIGHT: emit `memory_recall` for \"Coco\" + \"Maria pet\". If still nothing: \"I don't see a direct mention of Coco in Maria's pets — the named pets I find are X, Y, Z. Could Coco be one of these?\" — committing to what you DO have, asking the user to bridge.\n\n");
 
-    // ── F-A2 brain_graph default (slimmed — known dead until F-A2.1) ─
-    // V1.14.6 audit: this directive was verified as ignored in the canonical
-    // bench (0 brain_graph calls vs 145 memory_recall calls). Kept as a
-    // minimal pointer until F-A2.1 (auto-router classifier in V1.14.7) lands.
-    // Removing entirely would lose the signal once the router is wired.
-    try w.writeAll("**Brain graph for entity questions.** When the user asks about a specific named person, project, place, or concept (\"tell me about X\", \"what does X do\", \"what events involve X\"), prefer `brain_graph local_graph(center_key=<X>, depth=2)` over text recall: structural neighborhoods beat isolated snippets for entity-centric synthesis. Sequence: `memory_recall` to find X's canonical key (`entity_<hash>` or `wiki:X`) → `brain_graph local_graph` on that key → synthesize from the subgraph's typed predicates + neighbors, citing the 2-3 strongest connections by content. If `memory_recall` returns no canonical key, OR `brain_graph` returns empty/error, treat as the F-A1 zero-signal exception — say honestly \"I don't have any record of X in your memory yet.\" Skip for questions about you, transient things (\"what time is it\"), or zero-entity prompts (\"summarize this file\").\n\n");
+    // F-A2 brain_graph directive STRIPPED per AGENTS.md §14.7 (v1.14.13 Step 4).
+    // Canonical bench evidence: 0 brain_graph calls vs 145 memory_recall calls
+    // even with the directive present — the model did not act on it. Aspirational
+    // directives erode compliance on surrounding instructions, so it is removed
+    // rather than retained "in hope." Re-add only after F-A2.1 (auto-router
+    // classifier) is built and bench-validated. See docs/deferred-register.md
+    // entry F-A2.1.
 
     // ── R6 Knowledge escalation — web_search bridges user-side memory to external facts ──
     // V1.14.11 (LoCoMo Cat 3 weakest-cohort uplift). Cat 3 multi-hop
