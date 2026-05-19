@@ -365,6 +365,11 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn upsertMemoryWithMetadata(_: *@This(), _: i64, _: []const u8, _: []const u8, _: memory_root.MemoryCategory, _: ?[]const u8, _: []const u8) !void {
         return error.PostgresNotEnabled;
     }
+    /// V1.14.12 (Memory audit Finding 6 fix) — fake-manager stub for the
+    /// event-typed variant.
+    pub fn upsertMemoryWithMetadataAndEventType(_: *@This(), _: i64, _: []const u8, _: []const u8, _: memory_root.MemoryCategory, _: ?[]const u8, _: []const u8, _: []const u8) !void {
+        return error.PostgresNotEnabled;
+    }
     pub fn listMemoriesMetadata(_: *@This(), _: std.mem.Allocator, _: i64, _: []const []const u8) !std.StringHashMapUnmanaged([]u8) {
         return .{};
     }
@@ -2926,6 +2931,13 @@ const ManagerImpl = struct {
     /// agent's per-turn cost identical to V1.5 day-2. Consumers that
     /// need metadata (the /brain/graph reference-edge builder) call
     /// `listMemoriesMetadata` separately.
+    /// V1.14.12 (Memory audit Finding 6 fix, 2026-05-19) — backwards-
+    /// compat wrapper. Existing callers (compose_memory, tests) keep
+    /// the 6-arg signature and get `event_type="compose"`. Extraction
+    /// writes route through `upsertMemoryWithMetadataAndEventType`
+    /// with `event_type="extraction"` so memory_events.event_type
+    /// distinguishes extraction from compose-tool writes — matches the
+    /// contract docstring at extraction_persist.zig:34.
     pub fn upsertMemoryWithMetadata(
         self: *Self,
         user_id: i64,
@@ -2934,6 +2946,27 @@ const ManagerImpl = struct {
         category: memory_root.MemoryCategory,
         session_id: ?[]const u8,
         metadata_json: []const u8,
+    ) !void {
+        return self.upsertMemoryWithMetadataAndEventType(
+            user_id, key, content, category, session_id, metadata_json, "compose",
+        );
+    }
+
+    /// V1.14.12 (Memory audit Finding 6 fix, 2026-05-19) — the variant
+    /// that accepts `event_type` for the memory_events audit row. Used
+    /// by `extraction_persist.persistExtracted` to emit
+    /// `event_type='extraction'` instead of the hardcoded 'compose'.
+    /// All other surface-level writes go through the wrapper above
+    /// which preserves the historical 'compose' default.
+    pub fn upsertMemoryWithMetadataAndEventType(
+        self: *Self,
+        user_id: i64,
+        key: []const u8,
+        content: []const u8,
+        category: memory_root.MemoryCategory,
+        session_id: ?[]const u8,
+        metadata_json: []const u8,
+        event_type: []const u8,
     ) !void {
         if (session_id) |sid| try self.ensureSession(user_id, sid);
         // V1.6 commit 3: also write `lemmatized` for BM25 retrieval (same
@@ -3046,7 +3079,7 @@ const ManagerImpl = struct {
 
         const stored_id = try dupeResultValue(self.allocator, result, 0, 0);
         defer self.allocator.free(stored_id);
-        try self.insertMemoryEvent(user_id, stored_id, "compose", key, content, mem_type, session_id);
+        try self.insertMemoryEvent(user_id, stored_id, event_type, key, content, mem_type, session_id);
 
         // HR-03: fire conflict marker when compose_memory overwrites a fact
         // from a different session. Promotion is intentionally skipped —

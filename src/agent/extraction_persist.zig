@@ -935,13 +935,20 @@ pub fn persistExtracted(
 
         const category = categoryForAttribution(m.attributed_to);
 
-        state_mgr.upsertMemoryWithMetadata(
+        // V1.14.12 (Memory audit Finding 6 fix, 2026-05-19) — route
+        // through the event-typed variant so memory_events.event_type
+        // = 'extraction' (not 'compose'). Matches the contract docstring
+        // at extraction_persist.zig:34 and makes timeline / audit
+        // analytics able to distinguish extraction-classifier writes
+        // from compose-tool writes.
+        state_mgr.upsertMemoryWithMetadataAndEventType(
             user_id,
             key,
             m.text,
             category,
             session_id,
             metadata_json,
+            "extraction",
         ) catch |err| {
             log.warn("extraction.write_failed key={s} err={s}", .{ key, @errorName(err) });
             result.failed_count += 1;
