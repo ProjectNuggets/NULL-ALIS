@@ -985,7 +985,15 @@ pub const Agent = struct {
         const compact_model = if (self.sidecar_provider != null) self.sidecar_model else self.model_name;
         // V1.14.9 review fix (H-01): single source of truth via
         // buildCompactionConfig. Both auto + manual paths share it.
-        const cfg = self.buildCompactionConfig();
+        //
+        // Reconciliation merge 2026-05-19 with main's `d6b3221e fix: wire
+        // extraction judge into compaction`: that fix populated the same
+        // two judge fields inline with a `compact_model` fallback when no
+        // explicit extraction_judge_model_name was configured. The
+        // refactor preserves both intents — buildCompactionConfig accepts
+        // `compact_model` as the default-judge-model parameter, so the
+        // judge runs by default using the compact model unless overridden.
+        const cfg = self.buildCompactionConfig(compact_model);
 
         // iter22 (Nova's Medium finding): measure thrash savings in TOKENS,
         // not message count. Some compaction passes (Pass A cheap dedup,
@@ -1033,12 +1041,17 @@ pub const Agent = struct {
         // path's literal CompactionConfig dropped every extraction field —
         // silently degrading manual compactions back to V1.5 behavior even
         // though autoCompactHistory worked correctly.
+        //
+        // 2026-05-19 reconcile-merge: pass `compact_model` as the default
+        // judge model so manual compactions also get the d6b3221e behavior
+        // (judge runs by default using the compact model when no explicit
+        // extraction-judge model is configured).
         return compaction.manualCompactHistory(
             self.allocator,
             &self.history,
             compact_provider,
             compact_model,
-            self.buildCompactionConfig(),
+            self.buildCompactionConfig(compact_model),
         );
     }
 
@@ -1049,7 +1062,23 @@ pub const Agent = struct {
     /// `forceCompressHistory` deliberately does NOT use this — that path
     /// runs when the LLM is unavailable; extraction calls would just fail
     /// or pile up.
-    fn buildCompactionConfig(self: *Agent) compaction.CompactionConfig {
+    ///
+    /// `default_judge_model` is the fallback used when
+    /// `self.extraction_judge_model_name` is empty. Per the 2026-05-19
+    /// reconcile merge with main's `d6b3221e fix: wire extraction judge
+    /// into compaction`, callers pass their `compact_model` so the
+    /// judge runs by default using the compact model when no explicit
+    /// extraction-judge model is configured. Pass `null` (or "") if the
+    /// caller wants the Path A degrade-gracefully behavior (judge off
+    /// when not configured).
+    fn buildCompactionConfig(self: *Agent, default_judge_model: ?[]const u8) compaction.CompactionConfig {
+        const resolved_judge_model: ?[]const u8 = if (self.extraction_judge_model_name.len > 0)
+            self.extraction_judge_model_name
+        else if (default_judge_model) |dm|
+            (if (dm.len > 0) dm else null)
+        else
+            null;
+
         return compaction.CompactionConfig{
             .keep_recent = self.compaction_keep_recent,
             .max_summary_chars = self.compaction_max_summary_chars,
@@ -1066,10 +1095,7 @@ pub const Agent = struct {
             .extraction_user_id = self.extraction_user_id,
             .extraction_coref_embed = self.extraction_coref_embed,
             .extraction_judge_provider = self.extraction_judge_provider,
-            .extraction_judge_model_name = if (self.extraction_judge_model_name.len > 0)
-                self.extraction_judge_model_name
-            else
-                null,
+            .extraction_judge_model_name = resolved_judge_model,
             // V1.14.12 (Path A) — extraction_legacy_direct_writes propagation removed.
             // V1.14.12 (M2 review CRITICAL) — propagate the cardinality
             // fast-path flag so Pass C judge_ctx honors operator config.
