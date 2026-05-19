@@ -1,0 +1,839 @@
+{
+  "timestamp": "20260509-125533",
+  "samples_run": [
+    0
+  ],
+  "scorer": "locomo_f1",
+  "rescored_from": "/Users/nova/Desktop/nullalis/.spike/external/baselines/locomo_conv0_2026-05-09.json",
+  "results": [
+    {
+      "sample_id": "conv-26",
+      "session_key": "agent:zaki-bot:user:1:task:locomo_s0_34d7d4",
+      "results": [
+        {
+          "qa_id": 0,
+          "category": 2,
+          "question": "When did Caroline go to the LGBTQ support group?",
+          "ground_truth": "7 May 2023",
+          "reply": "Caroline went to the LGBTQ support group on **May 7, 2023** \u00e2\u0080\u0094 the day before her conversation with Melanie at 1:56 pm on May 8, 2023 (Session 1).",
+          "evidence": [
+            "D1:3"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.33",
+          "f1": 0.333,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 1,
+          "category": 2,
+          "question": "When did Melanie paint a sunrise?",
+          "ground_truth": 2022,
+          "reply": "Melanie painted the lake sunrise in **2022** \u00e2\u0080\u0094 she mentions it during their conversation on June 27, 2023 (Session 4), saying she painted it \"last year.\"",
+          "evidence": [
+            "D1:12"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.12",
+          "f1": 0.118,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 2,
+          "category": 3,
+          "question": "What fields would Caroline be likely to pursue in her educaton?",
+          "ground_truth": "Psychology, counseling certification",
+          "reply": "Based on the conversations, Caroline would be likely to pursue **counseling or mental health work**, specifically focused on supporting the **LGBTQ+/transgender community**.\n\nShe mentions this repeatedly:\n- **Session 1 (May 8, 2023):** \"I'm keen on counseling or working in mental health \u00e2\u0080\u0094 I'd love to support those with similar issues.\"\n- **Session 4 (June 27, 2023):** \"Lately, I've been looking into counseling and mental health as a career. I want to help people who have gone through the same things as me.\"\n- **Session 7 (July 12, 2023):** \"I'm still looking into counseling and mental health jobs. It's important to me that people have someone to talk to, and I want to help make that happen.\"",
+          "evidence": [
+            "D1:9",
+            "D1:11"
+          ],
+          "score": 0,
+          "score_method": "locomo_recall_0.33_f1_0.08",
+          "f1": 0.077,
+          "recall": 0.333,
+          "em": false
+        },
+        {
+          "qa_id": 3,
+          "category": 1,
+          "question": "What did Caroline research?",
+          "ground_truth": "Adoption agencies",
+          "reply": "Caroline researched two main things:\n\n**1. Counseling / mental health careers** \u00e2\u0080\u0094 Starting from early May 2023, she looked into education and career options in counseling, specifically wanting to help LGBTQ+ and transgender individuals with their mental health and self-acceptance journeys.\n\n**2. Adoption agencies** \u00e2\u0080\u0094 Beginning by late May 2023, she researched adoption agencies, focusing on those that are inclusive and supportive of LGBTQ+ adopters. She attended adoption assistance groups and council meetings, and by October 2023 she was interviewing with agencies and preparing documents (references, financial info, medical checks) for the adoption process.",
+          "evidence": [
+            "D2:8"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.67",
+          "f1": 0.667,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 4,
+          "category": 1,
+          "question": "What is Caroline's identity?",
+          "ground_truth": "Transgender woman",
+          "reply": "Caroline is a **transgender woman** \u00e2\u0080\u0094 she mentions this explicitly across multiple sessions, noting she began transitioning roughly three years before May 2023.\n\nShe's also:\n- **Swedish** (moved from her home country)\n- An **artist** (painting, drawing, stained glass), creating work about her trans experience and LGBTQ+ themes\n- An **LGBTQ+ advocate** \u00e2\u0080\u0094 she mentors trans youth, speaks at schools and conferences, and volunteers at an LGBTQ+ youth center\n- A **musician** \u00e2\u0080\u0094 plays acoustic guitar (for about 5 years)\n- A future **adoptive mother** \u00e2\u0080\u0094 actively pursuing adoption to create a loving home for children in need\n- Pet owner of a guinea pig named **Oscar**",
+          "evidence": [
+            "D1:5"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.29",
+          "f1": 0.286,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 5,
+          "category": 2,
+          "question": "When did Melanie run a charity race?",
+          "ground_truth": "The sunday before 25 May 2023",
+          "reply": "Melanie ran a charity race for mental health on **Saturday, May 20, 2023** \u00e2\u0080\u0094 she mentions it during her conversation with Caroline on May 25, 2023 (Session 2).",
+          "evidence": [
+            "D2:1"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_0.60_f1_0.33",
+          "f1": 0.333,
+          "recall": 0.6,
+          "em": false
+        },
+        {
+          "qa_id": 6,
+          "category": 2,
+          "question": "When is Melanie planning on going camping?",
+          "ground_truth": "June 2023",
+          "reply": "Melanie was planning to go camping in **June 2023** \u00e2\u0080\u0094 she mentions it during her conversation with Caroline on May 25, 2023 (Session 2), saying, \"We're thinking about going camping next month.\"",
+          "evidence": [
+            "D2:7"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.40",
+          "f1": 0.4,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 7,
+          "category": 1,
+          "question": "What is Caroline's relationship status?",
+          "ground_truth": "Single",
+          "reply": "Caroline is **single**.\n\nShe mentions a **\"tough breakup\"** in the past during Session 1 (May 8, 2023), and explicitly describes herself as a **\"single parent\"** when discussing adoption plans in Session 2 (May 25, 2023). Throughout all 19 sessions, she never mentions a current romantic partner.",
+          "evidence": [
+            "D3:13",
+            "D2:14"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.13",
+          "f1": 0.133,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 8,
+          "category": 2,
+          "question": "When did Caroline give a speech at a school?",
+          "ground_truth": "The week before 9 June 2023",
+          "reply": "Caroline gave a speech at a school event the **week before June 9, 2023** \u00e2\u0080\u0094 she mentions it during that conversation (Session 3), saying she \"talked about my transgender journey and encouraged students to get involved in the LGBTQ community\" at a school event \"last week.\"",
+          "evidence": [
+            "D3:1"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.53",
+          "f1": 0.533,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 9,
+          "category": 2,
+          "question": "When did Caroline meet up with her friends, family, and mentors?",
+          "ground_truth": "The week before 9 June 2023",
+          "reply": "Caroline met up with her friends, family, and mentors in **early June 2023** \u00e2\u0080\u0094 she mentions it during the conversation on **June 9, 2023** (Session 3), saying, \"Here's a pic from when we met up last week!\" and that she's known those friends for about 4 years since moving from Sweden.",
+          "evidence": [
+            "D3:11"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_0.80_f1_0.32",
+          "f1": 0.316,
+          "recall": 0.8,
+          "em": false
+        },
+        {
+          "qa_id": 10,
+          "category": 2,
+          "question": "How long has Caroline had her current group of friends for?",
+          "ground_truth": "4 years",
+          "reply": "Caroline has had her current group of friends for **about 4 years** \u00e2\u0080\u0094 she mentions this on June 9, 2023 (Session 3), saying she's known them since she moved from her home country (Sweden).",
+          "evidence": [
+            "D3:13"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.19",
+          "f1": 0.19,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 11,
+          "category": 1,
+          "question": "Where did Caroline move from 4 years ago?",
+          "ground_truth": "Sweden",
+          "reply": "Caroline moved from **Sweden** \u00e2\u0080\u0094 she mentions it during the June 27, 2023 conversation (Session 4), referring to it as her \"home country.\" She also notes during the June 9, 2023 conversation (Session 3) that she's known her current friends for 4 years, since she moved from there.",
+          "evidence": [
+            "D3:13",
+            "D4:3"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.17",
+          "f1": 0.167,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 12,
+          "category": 2,
+          "question": "How long ago was Caroline's 18th birthday?",
+          "ground_truth": "10 years ago",
+          "reply": "Caroline's 18th birthday was **10 years before June 2023** \u00e2\u0080\u0094 so approximately in **2013**.\n\nShe mentions this on June 27, 2023 (Session 4), saying a friend made her a hand-painted bowl for her 18th birthday \"ten years ago.\"",
+          "evidence": [
+            "D4:5"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.25",
+          "f1": 0.25,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 13,
+          "category": 1,
+          "question": "What career path has Caroline decided to persue?",
+          "ground_truth": "counseling or mental health for Transgender people",
+          "reply": "Caroline has decided to pursue **counseling and mental health work**, specifically focused on supporting **transgender and LGBTQ+ individuals**.\n\nShe mentions this career path repeatedly across the sessions:\n- **May 8, 2023** (Session 1): \"I'm keen on counseling or working in mental health \u00e2\u0080\u0094 I'd love to support those with similar issues.\"\n- **June 27, 2023** (Session 4): \"Lately, I've been looking into counseling and mental health as a career. I want to help people who have gone through the same things as me.\" She also attended an LGBTQ+ counseling workshop to learn therapeutic methods.\n- **July 12, 2023** (Session 7): \"I'm still looking into counseling and mental health jobs. It's important to me that people have someone to talk to, and I want to help make that happen.\"",
+          "evidence": [
+            "D4:13",
+            "D1:11"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_0.86_f1_0.38",
+          "f1": 0.375,
+          "recall": 0.857,
+          "em": false
+        },
+        {
+          "qa_id": 14,
+          "category": 3,
+          "question": "Would Caroline still want to pursue counseling as a career if she hadn't received support growing up?",
+          "ground_truth": "Likely no",
+          "reply": "Based on the transcripts, it's **unlikely** she would have pursued counseling \u00e2\u0080\u0094 her motivation is explicitly tied to the support she received.\n\nCaroline states this directly multiple times:\n\n- **June 27, 2023:** *\"My own journey and the support I got made a huge difference. Now I want to help people go through it too. I saw how counseling and support groups improved my life, so I started caring more about mental health and understanding myself.\"*\n\n- **July 12, 2023:** *\"I struggled with mental health, and support I got was really helpful. It made me realize how important it is for others to have a support system.\"*\n\n- **October 22, 2023:** *\"The help I got from friends, family and people I looked up to was invaluable. They boosted me through tough times and helped me find out who I really am. That's why I want to pass that same support to anyone who needs it.\"*\n\nHer career choice appears to be a direct response to wanting to **pay forward** what she received. Without that support, she likely wouldn't have experienced the transformative impact of counseling firsthand, and therefore wouldn't have been drawn to that path.",
+          "evidence": [
+            "D4:15",
+            "D3:5"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_0.50_f1_0.17",
+          "f1": 0.167,
+          "recall": 0.5,
+          "em": false
+        },
+        {
+          "qa_id": 15,
+          "category": 1,
+          "question": "What activities does Melanie partake in?",
+          "ground_truth": "pottery, camping, painting, swimming",
+          "reply": "Based on the conversations, here are the activities Melanie partakes in:\n\n**Creative / Artistic:**\n- **Pottery** \u00e2\u0080\u0094 her main creative outlet; takes classes, makes bowls, plates, cups, and vases (mentions this frequently across multiple sessions)\n- **Painting** \u00e2\u0080\u0094 watercolors, landscapes, still life, animals (horses), and abstract pieces (also a frequent hobby)\n- **Playing clarinet** \u00e2\u0080\u0094 started when young, enjoys both classical (Bach, Mozart) and modern music\n- **Reading** \u00e2\u0080\u0094 mentioned as part of her self-care routine; read *Becoming Nicole* on Caroline's recommendation\n\n**Fitness / Outdoor:**\n- **Running** \u00e2\u0080\u0094 specifically for mental health and de-stressing; ran a charity race for mental health in May 2023\n- **Hiking** \u00e2\u0080\u0094 with her family in mountains and forests\n- **Camping** \u00e2\u0080\u0094 frequent family activity (beach, mountains, forest, Grand Canyon)\n- **Swimming** \u00e2\u0080\u0094 with her kids\n\n**Family / Social:**\n- **Taking her kids to places** \u00e2\u0080\u0094 museums, pottery workshops, parks, beach trips, concerts\n- **Volunteering** \u00e2\u0080\u0094 at a homeless shelter with her family\n- **Concerts** \u00e2\u0080\u0094 attended a Matt Patterson concert in August 2023\n\n**Self-care routine:**\n- Carves out \"me-time\" daily for running, reading, or playing violin (mentioned early on)\n\n**Pet time:**\n- Has a dog (Luna) and cats (Oliver, Bailey) \u00e2\u0080\u0094 mentioned in Session 7 and 13",
+          "evidence": [
+            "D5:4",
+            "D9:1",
+            "D1:12",
+            "D1:18"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.25",
+          "f1": 0.251,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 16,
+          "category": 2,
+          "question": "When did Melanie sign up for a pottery class?",
+          "ground_truth": "2 July 2023",
+          "reply": "Melanie signed up for a pottery class on **July 2, 2023** \u00e2\u0080\u0094 she mentions it during their conversation on July 3, 2023 (Session 5), saying, \"I just signed up for a pottery class yesterday.\"",
+          "evidence": [
+            "D5:4"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.33",
+          "f1": 0.333,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 17,
+          "category": 2,
+          "question": "When is Caroline going to the transgender conference?",
+          "ground_truth": "July 2023",
+          "reply": "Caroline is going to the transgender conference in **July 2023** \u00e2\u0080\u0094 she mentions it during their conversation on **July 3, 2023** (Session 5), saying, \"I'm going to a transgender conference **this month**.\"",
+          "evidence": [
+            "D5:13"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.40",
+          "f1": 0.4,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 18,
+          "category": 1,
+          "question": "Where has Melanie camped?",
+          "ground_truth": "beach, mountains, forest",
+          "reply": "Based on the conversations, Melanie has camped in several locations:\n\n1. **In the mountains** \u00e2\u0080\u0094 Session 4 (June 27, 2023): \"I just took my fam camping in the mountains last week.\"\n\n2. **At the beach** \u00e2\u0080\u0094 Session 6 (July 6, 2023): \"Here's a pic of my family camping at the beach.\"\n\n3. **In the forest** \u00e2\u0080\u0094 Session 8 (July 15, 2023): \"We even went on another camping trip in the forest.\" She mentions forest camping again in Session 16 (September 13, 2023).\n\n4. **During/after a road trip to the Grand Canyon** \u00e2\u0080\u0094 Session 18 (October 20, 2023): After a road trip where they visited the Grand Canyon, she mentions camping as a way to relax and recover from the drive.",
+          "evidence": [
+            "D6:16",
+            "D4:6",
+            "D8:32"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.12",
+          "f1": 0.119,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 19,
+          "category": 1,
+          "question": "What do Melanie's kids like?",
+          "ground_truth": "dinosaurs, nature",
+          "reply": "Based on the conversations, Melanie's kids' likes include:\n\n- **Nature and the outdoors** \u00e2\u0080\u0094 \"The 2 younger kids love nature.\" They enjoy camping, hiking, exploring forests and mountains, and playing at parks.\n\n- **Dinosaurs and animals** \u00e2\u0080\u0094 At the museum, they were \"stoked for the dinosaur exhibit\" and \"love learning about animals.\"\n\n- **Pottery / getting creative with clay** \u00e2\u0080\u0094 At the pottery workshop, they were \"so excited to get their hands dirty and make something with clay.\"\n\n- **Painting** \u00e2\u0080\u0094 Melanie mentions in Session 9 that they \"love painting together lately, especially nature-inspired ones.\"\n\n- **The beach** \u00e2\u0080\u0094 They had a blast during family beach trips and camping at the beach.\n\n- **Music / concerts** \u00e2\u0080\u0094 Melanie celebrated her daughter's birthday with a Matt Patterson concert, and the kids attended and enjoyed it.",
+          "evidence": [
+            "D6:6",
+            "D4:8"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.17",
+          "f1": 0.174,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 20,
+          "category": 2,
+          "question": "When did Melanie go to the museum?",
+          "ground_truth": "5 July 2023",
+          "reply": "Melanie took her kids to the museum on **July 5, 2023** \u00e2\u0080\u0094 she mentions it during their conversation on July 6, 2023 (Session 6), saying she went \"yesterday.\"",
+          "evidence": [
+            "D6:4"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.33",
+          "f1": 0.333,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 21,
+          "category": 2,
+          "question": "When did Caroline have a picnic?",
+          "ground_truth": "The week before 6 July 2023",
+          "reply": "Caroline had a picnic in **early June 2023** \u00e2\u0080\u0094 she mentions it during the conversation on **June 9, 2023** (Session 3), saying, \"We even had a picnic last week!\" So it was likely around **June 2\u00e2\u0080\u00933, 2023**.",
+          "evidence": [
+            "D6:11"
+          ],
+          "score": 0,
+          "score_method": "locomo_recall_0.40_f1_0.33",
+          "f1": 0.333,
+          "recall": 0.4,
+          "em": false
+        },
+        {
+          "qa_id": 22,
+          "category": 3,
+          "question": "Would Caroline likely have Dr. Seuss books on her bookshelf?",
+          "ground_truth": "Yes, since she collects classic children's books",
+          "reply": "Yes \u00e2\u0080\u0094 it's very likely. During the July 6, 2023 conversation (Session 6), Caroline says she's **\"creating a library for when I have kids\"** and specifically mentions stocking it with **\"lots of kids' books\u00e2\u0080\u0094classics, stories from different cultures, educational books, all of that.\"** Dr. Seuss fits squarely within the \"classics\" category she's actively collecting for her future family.",
+          "evidence": [
+            "D6:9"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_0.71_f1_0.24",
+          "f1": 0.242,
+          "recall": 0.714,
+          "em": false
+        },
+        {
+          "qa_id": 23,
+          "category": 1,
+          "question": "What books has Melanie read?",
+          "ground_truth": "\"Nothing is Impossible\", \"Charlotte's Web\"",
+          "reply": "Based on the conversations, Melanie has read:\n\n1. **\"Becoming Nicole\" by Amy Ellis Nutt** \u00e2\u0080\u0094 Caroline recommended it, and Melanie was reading it by October 2023 (Session 17).\n\n2. **\"Charlotte's Web\"** \u00e2\u0080\u0094 her childhood favorite, mentioned in July 2023 (Session 6).\n\n3. **A motivational book about pursuing dreams** \u00e2\u0080\u0094 she mentions a book she read \"last year\" in July 2023 (Session 7) that reminds her to always pursue her dreams, though the exact title isn't given.",
+          "evidence": [
+            "D7:8",
+            "D6:10"
+          ],
+          "score": 0,
+          "score_method": "locomo_recall_0.40_f1_0.11",
+          "f1": 0.111,
+          "recall": 0.4,
+          "em": false
+        },
+        {
+          "qa_id": 24,
+          "category": 1,
+          "question": "What does Melanie do to destress?",
+          "ground_truth": "Running, pottery",
+          "reply": "Based on the conversations, Melanie destresses through several activities:\n\n**Running** \u00e2\u0080\u0094 She started running longer distances specifically to de-stress and clear her mind (Session 7, July 12, 2023: *\"Been running longer since our last chat \u00e2\u0080\u0094 a great way to destress and clear my mind.\"*)\n\n**Pottery** \u00e2\u0080\u0094 Her go-to creative outlet; she describes it as therapeutic and calming (Session 5: *\"It's like therapy for me, letting me express myself and get creative.\"*)\n\n**Painting** \u00e2\u0080\u0094 She finds it relaxing and a form of self-expression\n\n**Reading** \u00e2\u0080\u0094 Part of her daily self-care routine\n\n**Music** \u00e2\u0080\u0094 Playing clarinet helps her relax and express herself\n\n**Nature / Camping** \u00e2\u0080\u0094 Family camping trips and being outdoors help her \"reset and recharge\" (Session 18: *\"Nature brings such peace and serenity.\"*)\n\n**Family time** \u00e2\u0080\u0094 Spending quality time with her husband and kids, especially doing outdoor activities together",
+          "evidence": [
+            "D7:22",
+            "D5:4"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.08",
+          "f1": 0.075,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 25,
+          "category": 2,
+          "question": "When did Caroline go to the LGBTQ conference?",
+          "ground_truth": "10 July 2023",
+          "reply": "Caroline went to the LGBTQ conference on **July 10, 2023** \u00e2\u0080\u0094 she mentions it during their conversation on **July 12, 2023** (Session 7), saying she went \"two days ago.\"",
+          "evidence": [
+            "D7:1"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.36",
+          "f1": 0.364,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 26,
+          "category": 2,
+          "question": "When did Melanie read the book \"nothing is impossible\"?",
+          "ground_truth": 2022,
+          "reply": "I can't find any mention of Melanie reading a book titled \"Nothing is Impossible\" in any of the 19 conversation sessions. \n\nThe closest reference is in **Session 7 (July 12, 2023)**, where Melanie says: *\"This book I read last year reminds me to always pursue my dreams, just like you are doing!\"* \u00e2\u0080\u0094 but she **doesn't name the title**.\n\nIf you have additional context about this book, let me know and I can look again.",
+          "evidence": [
+            "D7:8"
+          ],
+          "score": 0,
+          "score_method": "locomo_recall_0.00_f1_0.00",
+          "f1": 0.0,
+          "recall": 0.0,
+          "em": false
+        },
+        {
+          "qa_id": 27,
+          "category": 3,
+          "question": "Would Caroline pursue writing as a career option?",
+          "ground_truth": "LIkely no; though she likes reading, she wants to be a counselor",
+          "reply": "Based on the 19 conversation sessions, **no** \u00e2\u0080\u0094 there is no evidence that Caroline would pursue writing as a career.\n\nThroughout the transcripts, Caroline consistently and repeatedly states her career goal is **counseling and mental health work**, specifically to support the transgender and LGBTQ+ community. She mentions:\n\n- Looking into counseling education and career options\n- Attending an LGBTQ+ counseling workshop\n- Volunteering at an LGBTQ+ youth center\n- Mentoring a transgender teen\n\nWhile Caroline does engage in **public speaking** (giving talks at schools and conferences about her journey) and appreciates **reading** (she's building a children's library and enjoyed *Becoming Nicole*), she never expresses interest in writing professionally. Her creative outlets mentioned are **visual art** (painting, drawing, stained glass) and **music** (acoustic guitar), not writing.",
+          "evidence": [
+            "D7:5",
+            "D7:9"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_0.50_f1_0.12",
+          "f1": 0.118,
+          "recall": 0.5,
+          "em": false
+        },
+        {
+          "qa_id": 28,
+          "category": 2,
+          "question": "When did Caroline go to the adoption meeting?",
+          "ground_truth": "The friday before 15 July 2023",
+          "reply": "Caroline went to an adoption council meeting on **Friday, July 14, 2023** \u00e2\u0080\u0094 she mentions it during their conversation on **July 15, 2023** (Session 8), saying, *\"Last Friday I went to a council meeting for adoption.\"*",
+          "evidence": [
+            "D8:9"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_0.80_f1_0.37",
+          "f1": 0.375,
+          "recall": 0.8,
+          "em": false
+        },
+        {
+          "qa_id": 29,
+          "category": 2,
+          "question": "When did Melanie go to the pottery workshop?",
+          "ground_truth": "The Friday before 15 July 2023",
+          "reply": "Melanie took her kids to a pottery workshop on **Friday, July 7, 2023** \u00e2\u0080\u0094 she mentions it during their conversation on **July 15, 2023** (Session 8), saying, *\"Last Fri I finally took my kids to a pottery workshop.\"*",
+          "evidence": [
+            "D8:2"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_0.80_f1_0.37",
+          "f1": 0.375,
+          "recall": 0.8,
+          "em": false
+        },
+        {
+          "qa_id": 30,
+          "category": 3,
+          "question": "Would Melanie be considered a member of the LGBTQ community?",
+          "ground_truth": "Likely no, she does not refer to herself as part of it",
+          "reply": "Based on the 19 conversation sessions, **no** \u00e2\u0080\u0094 Melanie would not be considered a member of the LGBTQ community.\n\nThroughout the transcripts, Melanie consistently presents herself as a **cisgender woman married to a man** (her husband of 5+ years) with children. She never identifies as LGBTQ herself. She is, however, a **strong ally and supporter** \u00e2\u0080\u0094 she celebrates Caroline's journey, attends pride events with her, and actively supports LGBTQ rights and adoption inclusivity. But being an ally is distinct from being a community member.",
+          "evidence": [],
+          "score": 1,
+          "score_method": "locomo_recall_0.58_f1_0.21",
+          "f1": 0.21,
+          "recall": 0.583,
+          "em": false
+        },
+        {
+          "qa_id": 31,
+          "category": 2,
+          "question": "When did Melanie go camping in June?",
+          "ground_truth": "The week before 27 June 2023",
+          "reply": "Melanie went camping in the mountains in **late June 2023**, specifically the **week of June 20\u00e2\u0080\u009324, 2023** \u00e2\u0080\u0094 she mentions it during their conversation on **June 27, 2023** (Session 4), saying, *\"I just took my fam camping in the mountains last week.\"*",
+          "evidence": [
+            "D4:8"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_0.80_f1_0.40",
+          "f1": 0.4,
+          "recall": 0.8,
+          "em": false
+        },
+        {
+          "qa_id": 32,
+          "category": 1,
+          "question": "What LGBTQ+ events has Caroline participated in?",
+          "ground_truth": "Pride parade, school speech, support group",
+          "reply": "Here are the LGBTQ+ events Caroline participated in, chronologically:\n\n1. **LGBTQ support group** \u00e2\u0080\u0094 May 7, 2023 (mentioned May 8, Session 1)\n2. **School speaking event** \u00e2\u0080\u0094 early June 2023 (shared her transgender journey with students; mentioned June 9, Session 3)\n3. **LGBTQ+ counseling workshop** \u00e2\u0080\u0094 Friday, June 23, 2023 (mentioned June 27, Session 4)\n4. **LGBTQ+ pride parade** \u00e2\u0080\u0094 late June 2023 (mentioned July 3, Session 5)\n5. **Transgender conference** \u00e2\u0080\u0094 July 10, 2023 (mentioned July 12, Session 7)\n6. **LGBT pride event with her mentee** \u00e2\u0080\u0094 June 2023 (mentioned July 17, Session 9)\n7. **Joined \"Connected LGBTQ Activists\" group** \u00e2\u0080\u0094 July 18, 2023 (mentioned July 20, Session 10)\n8. **Pride parade** \u00e2\u0080\u0094 August 11, 2023 (mentioned August 14, Session 11)\n9. **LGBTQ art show** \u00e2\u0080\u0094 September 2023 (mentioned August 14 & 25, Sessions 11 & 14)\n10. **Volunteering at LGBTQ+ youth center** \u00e2\u0080\u0094 ongoing from late August 2023 (mentioned August 28, Session 15)\n11. **Talent show at the LGBTQ+ youth center** \u00e2\u0080\u0094 planned for \"next month\" from mid-October, so ~November 2023 (mentioned October 13, Session 17)\n12. **Transgender poetry reading** \u00e2\u0080\u0094 October 6, 2023 (mentioned October 13, Session 17)",
+          "evidence": [
+            "D5:1",
+            "D8:17",
+            "D3:1",
+            "D1:3"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_0.83_f1_0.30",
+          "f1": 0.298,
+          "recall": 0.833,
+          "em": false
+        },
+        {
+          "qa_id": 33,
+          "category": 2,
+          "question": "When did Caroline go to a pride parade during the summer?",
+          "ground_truth": "The week before 3 July 2023",
+          "reply": "Caroline went to pride parades on two occasions during the summer of 2023:\n\n1. **Late June 2023** \u00e2\u0080\u0094 around **June 26\u00e2\u0080\u009327, 2023** (mentioned July 3, Session 5)\n2. **August 11, 2023** (mentioned August 14, Session 11)",
+          "evidence": [
+            "D5:1"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_0.60_f1_0.67",
+          "f1": 0.667,
+          "recall": 0.6,
+          "em": false
+        },
+        {
+          "qa_id": 34,
+          "category": 1,
+          "question": "What events has Caroline participated in to help children?",
+          "ground_truth": "Mentoring program, school speech",
+          "reply": "Here are the events Caroline participated in to help children:\n\n1. **School speaking event** \u00e2\u0080\u0094 Early June 2023: Spoke to students about her transgender journey and encouraged them to get involved in the LGBTQ community.\n\n2. **Adoption council meeting** \u00e2\u0080\u0094 July 14, 2023: Attended a council meeting for adoption, where she heard from people wanting to create loving homes for children in need.\n\n3. **LGBTQ youth mentorship program** \u00e2\u0080\u0094 Started by July 17, 2023: Joined a mentorship program for LGBTQ youth, mentoring a transgender teen and taking them to a pride event.\n\n4. **Volunteering at an LGBTQ+ youth center** \u00e2\u0080\u0094 Late August 2023 onward: Volunteered at the center, guiding and supporting young people, sharing her story, and helping them build confidence.\n\n5. **Talent show at the LGBTQ+ youth center** \u00e2\u0080\u0094 Planning started by October 13, 2023: Helping organize a talent show for the kids to showcase their abilities and feel proud of themselves.\n\n6. **Adoption process** \u00e2\u0080\u0094 Throughout 2023: Researched adoption agencies, attended assistance groups, gathered documents, completed interviews, and passed adoption agency interviews by October 20, 2023 \u00e2\u0080\u0094 all aimed at providing a safe, loving home to children in need.",
+          "evidence": [
+            "D9:2",
+            "D3:3"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_0.75_f1_0.14",
+          "f1": 0.136,
+          "recall": 0.75,
+          "em": false
+        },
+        {
+          "qa_id": 35,
+          "category": 2,
+          "question": "When did Melanie go camping in July?",
+          "ground_truth": "two weekends before 17 July 2023",
+          "reply": "Melanie went camping in the forest in **early July 2023** \u00e2\u0080\u0094 she mentions it during their conversation on **July 15, 2023** (Session 8), saying, *\"We even went on another camping trip in the forest.\"* \n\nThe exact date isn't specified, but it was a separate trip from her late June mountain camping. She also shares a photo from a **beach camping trip** during the July 6, 2023 conversation (Session 6), though that trip may have been earlier.",
+          "evidence": [
+            "D9:1"
+          ],
+          "score": 0,
+          "score_method": "locomo_recall_0.33_f1_0.22",
+          "f1": 0.222,
+          "recall": 0.333,
+          "em": false
+        },
+        {
+          "qa_id": 36,
+          "category": 2,
+          "question": "When did Caroline join a mentorship program?",
+          "ground_truth": "The weekend before 17 July 2023",
+          "reply": "Caroline joined a mentorship program for LGBTQ youth on the weekend of **July 15\u00e2\u0080\u009316, 2023** \u00e2\u0080\u0094 she mentions it during their conversation on **July 17, 2023** (Session 9), saying, *\"Last weekend I joined a mentorship program for LGBTQ youth.\"*",
+          "evidence": [
+            "D9:2"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_0.80_f1_0.37",
+          "f1": 0.375,
+          "recall": 0.8,
+          "em": false
+        },
+        {
+          "qa_id": 37,
+          "category": 1,
+          "question": "What did Melanie paint recently?",
+          "ground_truth": "sunset",
+          "reply": "Based on the conversations, here are the paintings Melanie created recently:\n\n**Most recent (October 2023):**\n- **A sunset-inspired painting** \u00e2\u0080\u0094 \"inspired by the sunsets\" with calming colors that make her feel calm (Session 17, October 13, 2023)\n- **An abstract painting** \u00e2\u0080\u0094 with peaceful blue streaks representing tranquility and a serene vibe with vibrant colors (Session 17, October 13, 2023)\n\n**August 2023:**\n- **A horse painting** \u00e2\u0080\u0094 showing the horse's grace and strength; she painted it \"recently\" as of August 23, 2023 (Session 13)\n- **A landscape/still life painting** \u00e2\u0080\u0094 inspired by nature (Session 15, August 28, 2023)\n\n**July 2023:**\n- **Nature-inspired paintings with her kids** \u00e2\u0080\u0094 she and her children painted together, especially nature-themed works, in mid-July 2023 (Sessions 8 and 9)",
+          "evidence": [
+            "D8:6; D9:17"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.07",
+          "f1": 0.074,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 38,
+          "category": 1,
+          "question": "What activities has Melanie done with her family?",
+          "ground_truth": "Pottery, painting, camping, museum, swimming, hiking",
+          "reply": "Based on the conversations, Melanie has done the following activities with her family:\n\n**Outdoor / Nature Activities:**\n- **Camping** \u00e2\u0080\u0094 mountains (late June 2023), beach (July 2023), forest (July and September 2023), and after a road trip (October 2023)\n- **Hiking** \u00e2\u0080\u0094 explored trails during camping trips\n- **Beach trips** \u00e2\u0080\u0094 splashing in the waves and relaxing (July and August 2023)\n- **Park visits** \u00e2\u0080\u0094 took kids to play and explore outdoors (August 2023)\n- **Road trip to the Grand Canyon** \u00e2\u0080\u0094 October 2023 (unfortunately included a car accident, but the kids enjoyed the destination)\n- **Stargazing** \u00e2\u0080\u0094 watched the Perseid meteor shower during a camping trip (summer 2022)\n\n**Creative Activities:**\n- **Pottery workshop** \u00e2\u0080\u0094 took her kids to make their own pots with clay (July 7, 2023)\n- **Painting together** \u00e2\u0080\u0094 created nature-inspired paintings with her children (July 2023)\n\n**Educational / Cultural Outings:**\n- **Museum visit** \u00e2\u0080\u0094 took the kids to see a dinosaur exhibit (July 5, 2023)\n- **Concert** \u00e2\u0080\u0094 celebrated her daughter's birthday at a Matt Patterson concert (August 13, 2023)\n\n**Volunteering:**\n- **Homeless shelter** \u00e2\u0080\u0094 spent a day volunteering with her family (August 2023)\n\n**At-Home / Casual Time:**\n- **Playing games and sharing meals** \u00e2\u0080\u0094 quality time hanging out together\n- **Roasting marshmallows and telling stories** around the campfire during camping trips\n- **Caring for pets** \u00e2\u0080\u0094 family has a dog (Luna) and cats (Oliver and Bailey)",
+          "evidence": [
+            "D8:4",
+            "D8:6",
+            "D9:1",
+            "D6:4",
+            "D1:18",
+            "D3:14"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_0.83_f1_0.06",
+          "f1": 0.061,
+          "recall": 0.833,
+          "em": false
+        },
+        {
+          "qa_id": 39,
+          "category": 1,
+          "question": "In what ways is Caroline participating in the LGBTQ community?",
+          "ground_truth": "Joining activist group, going to pride parades, participating in an art show, mentoring program",
+          "reply": "Caroline participates in the LGBTQ community in several key ways:\n\n**Advocacy & Activism:**\n- **Joined \"Connected LGBTQ Activists\"** \u00e2\u0080\u0094 a group that plans events and campaigns for positive change (July 2023)\n- **Attends pride parades** \u00e2\u0080\u0094 marched and celebrated at multiple events throughout the summer (June, July, August 2023)\n- **Spoke at a school event** \u00e2\u0080\u0094 shared her transgender journey and encouraged students to engage with the LGBTQ community (June 2023)\n\n**Mentorship & Youth Support:**\n- **Volunteers at an LGBTQ+ youth center** \u00e2\u0080\u0094 mentors LGBTQ youth, particularly a transgender teen, helping them build confidence (starting July 2023, ongoing)\n- **Organizes a talent show** \u00e2\u0080\u0094 planning an event for LGBTQ+ youth to showcase their abilities and feel proud (planned for late 2023)\n\n**Education & Awareness:**\n- **Attends conferences** \u00e2\u0080\u0094 went to a transgender conference to connect with the community and learn about advocacy (July 2023)\n- **Participates in poetry readings** \u00e2\u0080\u0094 attended a transgender poetry reading with others sharing their stories (October 2023)\n- **Attended LGBTQ+ counseling workshop** \u00e2\u0080\u0094 learned therapeutic methods for supporting trans people (June 2023)\n\n**Artistic Expression:**\n- **Creates LGBTQ-themed art** \u00e2\u0080\u0094 paintings like \"Embracing Identity\" and others expressing trans experience and community unity\n- **Organizes/plans an LGBTQ art show** \u00e2\u0080\u0094 showcasing LGBTQ artists and their work to spread understanding\n\n**Personal Support:**\n- **Attends LGBTQ support groups** \u00e2\u0080\u0094 early in the timeline (May 2023)\n- **Mentors individuals** \u00e2\u0080\u0094 guides a transgender teen through challenges and takes them to pride events",
+          "evidence": [
+            "D10:3",
+            "D5:1",
+            "D9:12",
+            "D9:2"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_0.85_f1_0.10",
+          "f1": 0.099,
+          "recall": 0.846,
+          "em": false
+        },
+        {
+          "qa_id": 40,
+          "category": 1,
+          "question": "How many times has Melanie gone to the beach in 2023?",
+          "ground_truth": 2,
+          "reply": "Based on the conversations, Melanie went to the beach **twice** in 2023:\n\n1. **Early July 2023** \u00e2\u0080\u0094 A family camping trip at the beach (mentioned July 6, Session 6).\n2. **Mid-to-late July 2023** \u00e2\u0080\u0094 Another family beach outing, mentioned on July 20 (Session 10) as something that happened \"recently.\" Caroline responds as if hearing about it for the first time, and Melanie notes they usually go \"only once or twice a year.\"",
+          "evidence": [
+            "D10:8",
+            "D6:16"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.17",
+          "f1": 0.167,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 41,
+          "category": 2,
+          "question": "When did Caroline join a new activist group?",
+          "ground_truth": "The Tuesday before 20 July 2023",
+          "reply": "Caroline joined the new LGBTQ activist group \"Connected LGBTQ Activists\" on **Tuesday, July 18, 2023** \u00e2\u0080\u0094 she mentions it during their conversation on **July 20, 2023** (Session 10), saying, *\"I just joined a new LGBTQ activist group last Tues.\"*",
+          "evidence": [
+            "D10:3"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_0.80_f1_0.37",
+          "f1": 0.375,
+          "recall": 0.8,
+          "em": false
+        },
+        {
+          "qa_id": 42,
+          "category": 3,
+          "question": "Would Melanie be more interested in going to a national park or a theme park?",
+          "ground_truth": "National park; she likes the outdoors",
+          "reply": "Based on the conversations, Melanie would definitely prefer a **national park**.\n\nThroughout the transcripts, she consistently expresses a deep love of **nature, camping, and outdoor family time**:\n\n- She frequently goes **camping** in mountains, forests, and at the beach\n- Her family enjoys **hiking** in mountains and exploring forests\n- She describes nature as \"peaceful,\" \"refreshing,\" and something that \"resets and recharges\" her soul\n- She specifically mentions waking up to birds and fresh air as one of her favorite things\n- She took her kids to the **Grand Canyon** on a road trip\n\nShe never mentions theme parks, roller coasters, or thrill-seeking attractions at all. Her ideal outings involve **being present together in natural settings** \u00e2\u0080\u0094 bonding over campfires, stories, and scenic views rather than rides and crowds.",
+          "evidence": [
+            "D10:12",
+            "D10:14"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.40",
+          "f1": 0.4,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 43,
+          "category": 1,
+          "question": "What kind of art does Caroline make?",
+          "ground_truth": "abstract art",
+          "reply": "Based on the conversations, Caroline creates art in several mediums:\n\n**Painting (her primary artistic outlet):**\n- **LGBTQ-themed paintings** \u00e2\u0080\u0094 works like *\"Embracing Identity\"* about finding comfort in being oneself, and pieces showing community unity and strength\n- **Self-portraits** \u00e2\u0080\u0094 a blue self-portrait she described as making her feel \"liberated and empowered\"\n- **Sunset paintings** \u00e2\u0080\u0094 inspired by visiting the beach, aiming to capture serenity\n- **Abstract paintings** \u00e2\u0080\u0094 experimenting with abstract styles, putting feelings on canvas without a plan\n- **Symbolic paintings** \u00e2\u0080\u0094 one using red and blue to represent breaking the binary gender system, another called *\"Embracing Identity\"* showing self-acceptance\n\n**Drawing:**\n- **Flower drawings** \u00e2\u0080\u0094 one of her favorite subjects\n- **Symbolic drawings** \u00e2\u0080\u0094 including one representing \"freedom and being real,\" inspired by a transgender poetry reading\n\n**Stained glass:**\n- Created a stained glass window for a local church about time, change, and her journey as a transgender woman\n\n**Music:**\n- **Acoustic guitar** \u00e2\u0080\u0094 plays to express emotions and connect with others; has been playing for about 5 years\n- **Piano** \u00e2\u0080\u0094 recently started learning (as of July 2023)\n\n**Other creative work:**\n- **Organizing an LGBTQ art show** \u00e2\u0080\u0094 curating and showcasing her own paintings alongside other LGBTQ artists' work to spread understanding and acceptance",
+          "evidence": [
+            "D11:12",
+            "D11:8",
+            "D9:14"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.15",
+          "f1": 0.154,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 44,
+          "category": 2,
+          "question": "When is Melanie's daughter's birthday?",
+          "ground_truth": "13 August",
+          "reply": "Melanie celebrated her daughter's birthday on **August 13, 2023** \u00e2\u0080\u0094 she mentions it during their conversation on **August 14, 2023** (Session 11), saying, *\"Last night was amazing! We celebrated my daughter's birthday with a concert.\"*",
+          "evidence": [
+            "D11:1"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.40",
+          "f1": 0.4,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 45,
+          "category": 2,
+          "question": "When did Caroline attend a pride parade in August?",
+          "ground_truth": "The Friday before 14 August 2023",
+          "reply": "Caroline attended a pride parade on **Friday, August 11, 2023** \u00e2\u0080\u0094 she mentions it during their conversation on **August 14, 2023** (Session 11), saying, *\"I went to a pride parade last Friday.\"*",
+          "evidence": [
+            "D11:4"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_0.80_f1_0.37",
+          "f1": 0.375,
+          "recall": 0.8,
+          "em": false
+        },
+        {
+          "qa_id": 46,
+          "category": 3,
+          "question": "Would Melanie be considered an ally to the transgender community?",
+          "ground_truth": "Yes, she is supportive",
+          "reply": "Yes \u00e2\u0080\u0094 Melanie is a clear **ally** to the transgender community.\n\nThroughout the conversations, she consistently:\n- **Celebrates Caroline's journey** \u00e2\u0080\u0094 calls her brave, inspiring, and strong for transitioning and living authentically\n- **Attends pride events** \u00e2\u0080\u0094 she went to the Pride fest with Caroline and \"the whole gang\" (Session 12)\n- **Supports LGBTQ+ causes** \u00e2\u0080\u0094 she praises adoption agencies that help LGBTQ+ folks and cheers on Caroline's advocacy work\n- **Uses affirming language** \u00e2\u0080\u0094 she tells Caroline things like \"You've got guts,\" \"You're doing amazing,\" and \"I'm so proud of you\"\n- **Stands by her during setbacks** \u00e2\u0080\u0094 when Caroline faced harassment from religious conservatives on a hike, Melanie supported her and validated her feelings (Session 12)\n- **Celebrates trans art and expression** \u00e2\u0080\u0094 she admires Caroline's paintings about trans identity and identity acceptance, and encourages her LGBTQ art show\n\nMelanie is a cisgender woman married to a man with children, and she never claims to be part of the LGBTQ community herself. But she actively **listens, validates, celebrates, and shows up** \u00e2\u0080\u0094 which is exactly what allyship looks like.",
+          "evidence": [],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.17",
+          "f1": 0.167,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 47,
+          "category": 1,
+          "question": "Who supports Caroline when she has a negative experience?",
+          "ground_truth": "Her mentors, family, and friends",
+          "reply": "When Caroline has negative experiences, **Melanie** (her friend) is the primary person who supports her in these conversations.\n\nFor example:\n- **Session 12 (August 17, 2023):** When Caroline was harassed by religious conservatives on a hike, Melanie immediately responded with empathy: *\"Hey Caroline, sorry about the hike. It sucks when people are so closed-minded. Strong support really helps.\"*\n- **Session 14 (August 23, 2023):** When Caroline got into a \"bad spot\" with people on another hike, Melanie told her: *\"Wow, Caroline! Sorry that happened to you... it's great you apologized. Takes a lot of courage and maturity!\"*\n\nCaroline also has a broader support network she mentions across the sessions:\n- **Friends she's known for ~4 years** (since moving from Sweden)\n- **Family** (including her grandmother who gave her a special necklace)\n- **Mentors**\n\nShe explicitly says on **June 9, 2023** (Session 3): *\"My friends, family and mentors are my rocks \u00e2\u0080\u0093 they motivate me and give me the strength to push on.\"*",
+          "evidence": [
+            "D12:1",
+            "D3:11"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.26",
+          "f1": 0.264,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 48,
+          "category": 1,
+          "question": "What types of pottery have Melanie and her kids made?",
+          "ground_truth": "bowls, cup",
+          "reply": "Based on the conversations, Melanie and her kids have made:\n\n- **Bowls** \u00e2\u0080\u0094 Melanie made a bowl in her pottery class (Session 5) and another colorful one later (Session 12)\n- **Cups** \u00e2\u0080\u0094 Her kids made cups at the pottery workshop (Session 8)\n- **Pots** \u00e2\u0080\u0094 The whole family made their own pots at a pottery workshop (Session 8)\n- **Plates** \u00e2\u0080\u0094 Melanie made a plate in pottery class (Session 14)\n\nAdditionally, Caroline compliments a **blue vase** in one of Melanie's photos (Session 8), suggesting Melanie may have made vases as well.",
+          "evidence": [
+            "D12:14",
+            "D8:4",
+            "D5:6"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.03",
+          "f1": 0.034,
+          "recall": 1.0,
+          "em": false
+        },
+        {
+          "qa_id": 49,
+          "category": 2,
+          "question": "When did Caroline and Melanie go to a pride fesetival together?",
+          "ground_truth": 2022,
+          "reply": "Caroline and Melanie went to a Pride festival together **in 2022** \u00e2\u0080\u0094 Caroline mentions it during their conversation on **August 17, 2023** (Session 12), saying, *\"We had a blast last year at the Pride fest.\"* Melanie confirms: *\"That was a blast! So much fun with the whole gang!\"* No specific date in 2022 is given.",
+          "evidence": [
+            "D12:15"
+          ],
+          "score": 1,
+          "score_method": "locomo_recall_1.00_f1_0.10",
+          "f1": 0.1,
+          "recall": 1.0,
+          "em": false
+        }
+      ],
+      "summary": {
+        "overall_accuracy": 0.9,
+        "total_correct": 45,
+        "total_qa": 50,
+        "by_category": {
+          "2": {
+            "correct": 21,
+            "total": 24,
+            "accuracy": 0.875
+          },
+          "3": {
+            "correct": 6,
+            "total": 7,
+            "accuracy": 0.8571428571428571
+          },
+          "1": {
+            "correct": 18,
+            "total": 19,
+            "accuracy": 0.9473684210526315
+          }
+        }
+      }
+    }
+  ],
+  "overall": {
+    "overall_accuracy": 0.9,
+    "total_correct": 45,
+    "total_qa": 50,
+    "by_category": {
+      "2": {
+        "correct": 21,
+        "total": 24,
+        "accuracy": 0.875
+      },
+      "3": {
+        "correct": 6,
+        "total": 7,
+        "accuracy": 0.8571428571428571
+      },
+      "1": {
+        "correct": 18,
+        "total": 19,
+        "accuracy": 0.9473684210526315
+      }
+    }
+  }
+}
