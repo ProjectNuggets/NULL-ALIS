@@ -49,13 +49,21 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.13 — "Establish τ-bench baseline + wire what's built"
+## v1.14.13 — "Sandbox fail-closed + τ-bench baseline + wire what's built"
 
-**Theme:** Lock the execution-quality measurement before any code change. Then wire the orphans the original audit identified as half-finished.
+**Theme:** Close the sandbox fail-open security hole FIRST (3-4 hours). Then lock the execution-quality measurement. Then wire the orphans the audit identified as half-finished.
 
-**Why first:** Without τ-bench baseline we can't tell if subsequent work helps or harms execution quality. Same discipline LoCoMo gave us for memory.
+**Why first:** V8 (sandbox fail-open) is a security blocker — a misconfigured prod deploy with `fail_open_on_dev=true` runs tools UNSANDBOXED. This is non-negotiable to fix before any other code lands. Then τ-bench baseline so subsequent work has signal.
 
 **Steps:**
+
+0. **V8 — Sandbox fail-closed by default** (3-4 hours, MUST come first)
+   - Remove `fail_open_on_dev` silent passthrough at `tool_sandbox_v1.zig:162-168`
+   - Replacement: require both env var `NULLALIS_ALLOW_UNSANDBOXED_DEV=1` AND `exec_cfg.fail_open_on_dev=true` AND `log.err` (not warn) to fall through
+   - Startup banner if running with `NULLALIS_ALLOW_UNSANDBOXED_DEV=1`
+   - New test: `tests/security/sandbox_fail_closed_test.zig` proving missing backend → `error.SandboxUnavailable`, never raw argv
+   - Audit deployment configs: confirm no production tenant relies on the old behavior
+   - Commit: `fix(security): V1.14.9 — sandbox fail closed by default`
 
 1. **τ-bench Airline harness** (`.spike/external/tau_bench/`)
    - Pull `tau-bench` package; identify 50 Airline tasks
@@ -201,9 +209,9 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.18 — "Audit MED-tier sweep"
+## v1.14.18 — "Audit MED-tier sweep + state/memory polish"
 
-**Theme:** Close the remaining 31 MED findings from the 2026-05-19 audit.
+**Theme:** Close the remaining 31 MED findings from the 2026-05-19 audit. ALSO closes V6 (state.zig deprecation), V7 (markdown mirror opt-in), and V4 (subagent ledger bridge default-on) from the architectural-debt audit.
 
 **Steps (grouped, each is one or more commits per AGENTS.md §14.1):**
 
@@ -213,13 +221,31 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 4. **Stale-comment + dead-branch sweep** — `compaction.zig` recovery thresholds, `extraction_persist.zig` deriveEntityKey docstring, `snapshot.zig` valid_to lossy round-trip, `legacy_semantic_cache_bridge`, F-A2 prompt directive followup
 5. **Vector chunker decision** — `memory/vector/chunker.zig::chunkMarkdown` orphan: confirm V1.14.8 extraction switched away, delete with rationale OR document as legacy
 6. **Legacy hybrid-merge decision** — `memory/vector/math.zig::hybridMerge` superseded by RRF+MMR; delete with rationale
+7. **V4 — Subagent ledger bridge default-on**
+   - Audit every `SubagentManager` construction; find `task_delivery = null` usages
+   - Make bridge default-on; constructors without `task_delivery` get a default singleton
+   - Startup warning if `task_delivery` is nil at runtime
+   - Plan: remove `?` from field type in v1.15+ (deferred to follow-up)
+   - Test: `tests/runtime/task_lifecycle_test.zig` — subagent spawn → ledger has entry → completion → ledger reflects
+8. **V6 — state.zig deprecation path**
+   - Audit every read/write to `state.zig`; list callers
+   - Add deprecation warnings at every call site
+   - Startup check: if `~/.nullalis/state.json` exists AND Postgres configured → loud migration prompt
+   - Build `scripts/migrate-state-to-postgres.zig` utility (idempotent)
+   - Gate `state.zig` behind `--allow-legacy-state` CLI flag, default refuse
+9. **V7 — Markdown mirror opt-in**
+   - Refactor `zaki_dual.zig` → eliminate markdown mirror by default
+   - Add `--enable-markdown-mirror` opt-in flag for operators who rely on it
+   - Rename `zaki_dual.zig` → `zaki_postgres.zig` (the "dual" name is the architecture smell)
+   - Health check: if mirror enabled, log mirror-write latency / failure rate
+   - Test: write a memory → only Postgres row exists → no markdown file unless flag set
 
 **Bench gate:**
-- All MED findings either closed (commit reference) OR moved to `docs/deferred-register.md` with rationale + ETA
+- All MED findings + V4 + V6 + V7 either closed (commit reference) OR moved to `docs/deferred-register.md` with rationale + ETA
 - LoCoMo + τ-bench hold
 - Tag `v1.14.18`
 
-**Duration:** 5 working days
+**Duration:** 7-8 working days (added V4/V6/V7 work)
 **Dependencies:** v1.14.17
 
 ---
@@ -302,6 +328,47 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 
 ---
 
+## v1.17.5 — "Durability + auditability — enterprise blocker close" (NEW from 2026-05-19 architecture audit)
+
+**Theme:** Move ephemeral runtime state to durable backing stores. Closes V3 (approvals), V5 (event log), V4 trailing work. Enterprise / regulated industries / GDPR access requests UNBLOCKED. Must precede the per-cell canary deploy.
+
+**Why here:** A real customer onboarding with compliance requirements (auditable history, approval ledger, replayable runs) needs these durable. Canarying onto a production cell BEFORE these land means accepting "we can't answer audit questions about your past runs" — that's commercially unsafe.
+
+**Steps:**
+
+1. **V3 — Approval persistence**
+   - New migration `src/migrations/00XX_approvals.sql`: `approvals` table with `id UUID`, `run_id`, `tenant_id`, `user_id`, `tool_name`, `args_json JSONB`, `status` enum, `requested_at`, `resolved_at`, `resolver_actor`, `ttl_at`, `audit_metadata JSONB` + indexes on `(tenant_id, status)` and `(run_id)`
+   - New package `src/runtime/approvals/` with `store.zig` (Postgres CRUD), `service.zig` (request/resolve/expire/list), `types.zig`
+   - Wire `agent/root.zig:1791 setPendingToolApproval` to call `approvals.service.request()`; in-memory `pending_tool_approval` becomes a cache layer with explicit invalidation
+   - REST endpoint: `POST /api/v1/users/{user_id}/approvals/{id}/{resolve|deny}`
+   - TTL expiry as background job
+   - Test: agent restart mid-approval → approval still queryable from DB
+
+2. **V5 — Durable event log**
+   - Migration `src/migrations/00XY_run_events.sql`: `run_events` table with `id BIGSERIAL`, `run_id`, `tenant_id`, `user_id`, `event_type`, `event_version`, `occurred_at`, `causal_parent_id BIGINT`, `payload JSONB` + indexes; partition by month
+   - SQLite WAL mirror for hot writes (same schema, faster local persist)
+   - New package `src/runtime/events/` with `event_log.zig` (append-only writer), `replay.zig` (`replayRun(run_id) → iterator<Event>`), `subscription.zig`
+   - Wire `observability.zig` event bus to write to durable log
+   - Keep `run_trace_store.zig` as query cache for last-N runs
+   - Test: replay an old run from durable log → byte-identical event sequence
+
+3. **V4 follow-through — remove the optional from subagent ledger bridge**
+   - After 2 weeks of stable `task_delivery != null` everywhere, remove the `?` from the field type — make it required
+   - Compile-time guarantee that subagent task state is always ledger-mirrored
+
+**Bench gate:**
+- Approval state survives agent restart (proven by test)
+- Event replay byte-identical to original (proven by test)
+- `grep -r "pending_tool_approval = " src/` shows only the cache layer (not the source of truth)
+- `subagent.zig:134` field type is `*tasks_mod.TaskDelivery`, not `?*...`
+- LoCoMo + τ-bench hold
+- Tag `v1.17.5`
+
+**Duration:** 12–15 working days
+**Dependencies:** v1.17.0
+
+---
+
 ## v1.18.0 — "Per-cell pod canary deploy"
 
 **Theme:** First production cell on the per-cell-pod architecture. zaki-infra work.
@@ -348,6 +415,44 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 
 ---
 
+## v1.19.5 — "Security + identity hardening — pre-commercial gate" (NEW from 2026-05-19 architecture audit)
+
+**Theme:** Close the two-headed authorization model (H1) and eliminate identity fallback keys from canonical paths (V9). This is the security gate before commercial launch — no enterprise customer signs without a coherent auth model and clean per-user attribution.
+
+**Why here:** Commercial launch implies multi-tenant production traffic with audit obligations. Today's H1 finding (capability metadata exists but `security/policy.zig:71 default_allowed_commands` is still the primary allowlist) means we have two parallel authorization models. V9 (identity fallback keys `agent:zaki-bot:main` / `:cron` still propagate through some paths) means audit log entries can carry `user_id=unknown`. Both must close before v2.0.
+
+**Steps:**
+
+1. **H1 — Capability metadata becomes the source of truth**
+   - Extend `ToolMetadata` with `auth_requirements: []const AuthRequirement` (credential_id + scopes) and `side_effects: []const SideEffect` (.network, .filesystem_write, etc.)
+   - Wire `tools/root.zig` dispatcher to enforce metadata at execution time:
+     - `risk_level == .critical` → require explicit approval
+     - `mutating && agent.mode == .read_only` → refuse
+     - `auth_requirements` missing for credential-bearing tool → refuse early with clear error
+   - Migrate `security/policy.zig:71 default_allowed_commands` to derive from metadata
+   - Delete the flat allowlist
+   - Test: tool without metadata fails comptime check
+   - Exit verification: `grep "default_allowed_commands" src/` → zero matches
+
+2. **V9 — Identity strict mode for canonical paths**
+   - Add `parseUserIdFromSessionKeyStrict()` rejecting fallback keys and unrecognized shapes (current `parseUserIdFromSessionKey` already returns null for non-canonical; strict variant throws an error rather than returning null)
+   - Replace lenient calls in canonical paths (agent loop, memory writes, approval requests) with strict variant
+   - Keep lenient parser only at telemetry/diagnostics paths
+   - Metric: count of fallback-key usages per hour; should trend to zero
+   - Deprecate `fallbackMainSessionKey()` + `fallbackCronSessionKey()` behind feature flag
+   - Test: `tests/security/identity_attribution_test.zig` — every canonical write path requires real `user_id`; fallback keys raise
+
+**Bench gate:**
+- One unified authorization model (`grep "default_allowed_commands"` empty)
+- Zero fallback-key usage in canonical paths (metric counter at zero for 7 days)
+- LoCoMo + τ-bench hold
+- Tag `v1.19.5`
+
+**Duration:** 8–10 working days
+**Dependencies:** v1.19.0
+
+---
+
 ## v2.0.0 — "Commercial launch — payment + onboarding + first 100 paying users"
 
 **Theme:** The transition from "technical product" to "commercial product." Strategy is Nova's; this block holds the slots and dependencies.
@@ -367,7 +472,57 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 - Tag `v2.0.0`
 
 **Duration:** open — paced by payment-design decisions
-**Dependencies:** v1.19.0 + payment design lock-in with Nova
+**Dependencies:** v1.19.5 + payment design lock-in with Nova
+
+---
+
+## v2.1.0 — "Runtime / frontend boundary cleanup" (NEW from 2026-05-19 architecture audit — V10)
+
+**Theme:** Stop hardcoding `zaki_app` channel-specific behavior inside the runtime layer. Make the runtime emit ONE pure event-envelope shape; channel adapters do the shaping.
+
+**Why post-v2.0:** This is architectural debt that compounds with every new channel — but it doesn't block commercial launch, and the refactor risk is high. Better to do it AFTER v2.0 stabilizes with real traffic informing the boundary design.
+
+**Steps:**
+
+1. Create `src/runtime/event_envelope.zig` — pure event shape, no client-specific tagging
+2. Move channel-specific delivery/pacing into `src/channels/zaki_app/event_adapter.zig` (follow the existing channel adapter pattern)
+3. Refactor `gateway_run_events.zig` to emit pure envelopes; channel adapters do shaping
+4. The `"live"` vs `"buffered_replay"` decision becomes a channel adapter concern, not runtime concern (today: `gateway_run_events.zig:81,91`)
+5. SSE frame shaping with frontend-specific tags ("reasoning_summary" thinking-card source tagging at `gateway_run_events.zig:207-256`) moves to the zaki_app adapter
+6. Test: a new channel can be added without touching `gateway.zig` or `gateway_run_events.zig`
+
+**Bench gate:**
+- New channel surface added via adapter only, no runtime edits required (proven by a test that adds a dummy channel and asserts no gateway/runtime LoC changed)
+- LoCoMo + τ-bench hold
+- Tag `v2.1.0`
+
+**Duration:** 12–15 working days
+**Dependencies:** v2.0.0
+
+---
+
+## Background extraction stream — "gateway.zig monolith split" (V1 from 2026-05-19 architecture audit, ONGOING)
+
+**Theme:** `src/gateway.zig` is **26,990 LoC** at HEAD. Target: < 8K LoC. Extract one responsibility per sprint, distributed as background work across blocks v1.14.18 → v2.1.0. Each extraction is its own PR, keeps public API stable, slims `gateway.zig` by ~3-5K LoC.
+
+**Why background, not a single block:** This is a 3-month refactor done as one-extraction-per-sprint while other roadmap blocks proceed. Trying to do it all at once is the same mistake as the original assembly — instead we extract one responsibility at a time, each a clean PR with its own tests.
+
+**Extraction sprints (one per parent block, scheduled when extractor fits the parent block's theme):**
+
+1. **Sprint A — Auth-token management** → `src/gateway/auth_tokens.zig` (~3K LoC: telegram, whatsapp, line, lark token resolution). Targets parent block: v1.14.15 (Email channel finish — touches token surface anyway).
+2. **Sprint B — Tenant runtime cache** → `src/gateway/tenant_cache.zig` (~2K LoC: lifecycle, idle TTL, policy attach). Targets parent block: v1.17.5 (Durability/auditability — touches tenant state).
+3. **Sprint C — Webhook + channel queues** → `src/gateway/channels.zig` (~3K LoC). Targets parent block: v1.14.16 (Teams channel — touches webhook handler).
+4. **Sprint D — Rate limit + idempotency** → `src/gateway/quota.zig` (~1K LoC). Targets parent block: v1.19.0 (Observability — quota metrics are observability-adjacent).
+5. **Sprint E — Approval routing** → into `src/runtime/approvals/` package built in v1.17.5. Targets parent block: v1.17.5 itself.
+6. **Sprint F — Product-shaping (V10)** → into BFF adapter (`src/channels/zaki_app/event_adapter.zig`). Targets parent block: v2.1.0 itself.
+
+**Per-extraction invariants (per AGENTS.md §14.1):**
+- Public API stable (extraction is internal restructure, no breaking changes)
+- Each extraction lands as its own PR, with its own tests
+- Net `gateway.zig` LoC reduction: ~3-5K per extraction
+- LoCoMo + τ-bench hold per extraction (no regression)
+
+**Exit:** `wc -l src/gateway.zig` shows < 8K. Each cluster lives in its own file with explicit interface. Total work: ~3 months distributed across the roadmap blocks above.
 
 ---
 
