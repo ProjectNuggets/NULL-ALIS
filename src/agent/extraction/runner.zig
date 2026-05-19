@@ -150,6 +150,16 @@ pub const ExtractionContext = struct {
     /// fix for the Captain Mochi double-write problem — disable only
     /// for debugging or migration scenarios.
     coverage_filter_enabled: bool = true,
+    /// V1.14.12 (M3 review MED) — coverage filter horizon bounds.
+    /// Promoted from hardcoded local consts so high-volume tenants
+    /// can tune. Defaults match the reviewer-approved horizons.
+    /// horizon_days = 30 means agent-store'd facts older than 30 days
+    /// don't suppress re-extraction (allows cardinality drift to
+    /// surface). horizon_session_cap = 5000 bounds memory usage on
+    /// long-active users; the SQL ORDER BY created_at DESC ensures
+    /// eviction is recency-based (M3 review MEDIUM#5).
+    coverage_horizon_days: u32 = 30,
+    coverage_horizon_session_cap: u32 = 5000,
 };
 
 /// V1.14.9 — Episode-based boundary extraction. Replaces the V1.14.8
@@ -702,8 +712,10 @@ fn persistExtraction(
     // Filter runs BEFORE the ExtractedMemory allocation so we avoid the
     // partial-deinit / double-free hazard of in-place filtering a fixed
     // slice. The kept-edges slice is what feeds the persist call.
-    const COVERAGE_HORIZON_DAYS: u32 = 30;
-    const COVERAGE_KEY_CAP: u32 = 5000;
+    //
+    // V1.14.12 (M3 review MED) — horizon bounds read from ctx so
+    // operators can tune per deployment (e.g., high-volume tenants may
+    // need a larger key cap or shorter horizon to keep memory bounded).
     var kept_edges_buf = std.ArrayListUnmanaged(schema.Edge){};
     defer kept_edges_buf.deinit(allocator);
 
@@ -722,8 +734,8 @@ fn persistExtraction(
             uid,
             result.edges,
             &kept_edges_buf,
-            COVERAGE_HORIZON_DAYS,
-            COVERAGE_KEY_CAP,
+            ctx.coverage_horizon_days,
+            ctx.coverage_horizon_session_cap,
         ) catch |err| {
             log.warn("boundary.extraction.coverage_filter_failed err={s} — proceeding without filter", .{@errorName(err)});
             filter_succeeded = false;

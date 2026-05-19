@@ -652,6 +652,11 @@ pub const WriteOrigin = enum {
     session_end_extract,
     /// Test harness wire (zaki_state.zig:11905 + unit tests). Not production.
     test_wire,
+    /// V1.14.12 (M3 review MED) — defensive fallback when a future
+    /// caller is added without picking a precise tag. A `.unknown`
+    /// emission in the histogram is a LOUD signal to add a real tag.
+    /// Never use this in new callers; it exists only as a safety net.
+    unknown,
 
     pub fn toSlice(self: WriteOrigin) []const u8 {
         return @tagName(self);
@@ -1607,10 +1612,11 @@ test "V1.14.12 (M1): WriteOrigin tags are stable strings for log analyzers" {
 }
 
 test "V1.14.12 (M1): WriteOrigin enum count guards against silent additions" {
-    // The 7 enum values map to the 6 production callsites + 1 test wire.
-    // If a NEW persistExtracted callsite is added without updating this
-    // count, the test fails — forces a conscious decision about how to
-    // tag it for telemetry. M3/M5 redundancy gates depend on accurate
-    // tag distributions.
-    try std.testing.expectEqual(@as(usize, 7), @typeInfo(WriteOrigin).@"enum".fields.len);
+    // The 8 enum values: 6 production callsites + 1 test wire + 1
+    // .unknown defensive fallback (added in M3 review MED). If a NEW
+    // persistExtracted callsite is added without updating this count,
+    // the test fails — forces a conscious decision about how to tag it
+    // for telemetry. M3/M5 redundancy gates depend on accurate tag
+    // distributions.
+    try std.testing.expectEqual(@as(usize, 8), @typeInfo(WriteOrigin).@"enum".fields.len);
 }

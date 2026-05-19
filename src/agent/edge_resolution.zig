@@ -122,7 +122,16 @@ pub const PredicateCardinality = enum {
 /// and SINGLE-VALUED sections + extraction_persist.linkTypeForPredicate
 /// supersession list.
 pub fn classifyPredicate(predicate: []const u8) PredicateCardinality {
-    if (predicate.len == 0 or predicate.len > 64) return .unknown;
+    if (predicate.len == 0) return .unknown;
+    // V1.14.12 (M3 review MED) — oversized predicate routes to
+    // .unknown. Log so the vocab gap surfaces (LLMs occasionally
+    // emit verbose multi-word predicates during failure modes).
+    // The 64-char buffer is conservative for canonical vocab
+    // (longest known: "COLLABORATES_WITH" = 18 chars).
+    if (predicate.len > 64) {
+        log.info("edge_resolution.predicate_oversized len={d}", .{predicate.len});
+        return .unknown;
+    }
     var buf: [64]u8 = undefined;
     for (predicate, 0..) |ch, i| buf[i] = std.ascii.toUpper(ch);
     const norm = buf[0..predicate.len];

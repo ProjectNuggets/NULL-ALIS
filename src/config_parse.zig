@@ -841,6 +841,20 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("extraction_judge_model")) |v| {
                 if (v == .string) self.agent.extraction_judge_model = try self.allocator.dupe(u8, v.string);
             }
+            // V1.14.12 (M2/M3/M5 hardening pass) — wire the three new
+            // gate flags so operators can actually override them via
+            // config.json. Without these, the AgentConfig defaults are
+            // the only values reachable and a "set this to false in
+            // config" recommendation silently no-ops.
+            if (ag.object.get("extraction_cardinality_fastpath")) |v| {
+                if (v == .bool) self.agent.extraction_cardinality_fastpath = v.bool;
+            }
+            if (ag.object.get("extraction_coverage_filter_enabled")) |v| {
+                if (v == .bool) self.agent.extraction_coverage_filter_enabled = v.bool;
+            }
+            if (ag.object.get("extraction_legacy_direct_writes")) |v| {
+                if (v == .bool) self.agent.extraction_legacy_direct_writes = v.bool;
+            }
             if (ag.object.get("compaction_keep_recent")) |v| {
                 if (v == .integer) self.agent.compaction_keep_recent = @intCast(v.integer);
             }

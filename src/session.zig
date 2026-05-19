@@ -212,6 +212,15 @@ pub const SessionManager = struct {
     /// V1.14.12 (M5) — legacy direct-write callsite gate. Threaded
     /// from gateway config to per-session Agent. Default true preserves
     /// pre-M5 behavior during the 1-week soak window.
+    ///
+    /// **Concurrency contract (M5 review MED):** this field is
+    /// **INIT-ONLY**. Set exactly once at TenantRuntime construction
+    /// (gateway.zig:1696), then read by `buildSessionAgent`
+    /// (session.zig:449) under each session's own lifecycle. No mutex
+    /// guards reads/writes because, by contract, no concurrent writers
+    /// exist after init. If config hot-reload is ever added, this
+    /// field MUST move under `SessionManager.mutex` to prevent torn
+    /// reads. Same contract applies to all `extraction_*` siblings.
     extraction_legacy_direct_writes: bool = true,
 
     mutex: std.Thread.Mutex,
