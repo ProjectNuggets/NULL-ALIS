@@ -1799,6 +1799,17 @@ pub const MemoryRuntime = struct {
     _engine: ?*retrieval.RetrievalEngine,
     _allocator: std.mem.Allocator,
     _search_enabled: bool = true,
+    /// V1.14.12 (Memory audit Finding 12 fix, 2026-05-19) — serialize
+    /// access to the shared `_engine` during search(). The engine has
+    /// mutable state (`vector_user_id`, `top_k`) that the search path
+    /// writes per call. Pre-fix, concurrent searches from different
+    /// tenants could race on these fields: tenant A sets
+    /// `engine.vector_user_id=42`, tenant B overwrites with 99, tenant
+    /// A's `engine.search()` then runs under tenant B's user-id scope.
+    /// The mutex makes the mutate-call-restore block serial. top_k has
+    /// a `defer` restore but `vector_user_id` did not; both are now
+    /// protected by lifecycle.
+    _engine_mutex: std.Thread.Mutex = .{},
 
     /// **D1.15 finding 3 fix (2026-04-26):** per-session warmup
     /// tracking. Pre-fix this was a single `atomic.Value(bool)`
@@ -1956,6 +1967,12 @@ pub const MemoryRuntime = struct {
             .hybrid => {
                 // Use engine if available, else fall back
                 if (self._engine) |engine| {
+                    // V1.14.12 (Memory audit Finding 12 fix, 2026-05-19) —
+                    // serialize the mutate-call-restore block. Engine state
+                    // (vector_user_id, top_k) is per-call but lives on the
+                    // shared struct; pre-fix concurrent searches raced.
+                    self._engine_mutex.lock();
+                    defer self._engine_mutex.unlock();
                     engine.vector_user_id = self._vector_user_id;
                     const original_top_k = engine.top_k;
                     engine.top_k = effectiveEngineTopK(limit);
@@ -1978,6 +1995,10 @@ pub const MemoryRuntime = struct {
                 const keyword_results = try retrieval.entriesToCandidates(allocator, keyword_entries);
 
                 if (self._engine) |engine| {
+                    // V1.14.12 (Memory audit Finding 12 fix) — same mutex
+                    // protection as the hybrid branch above.
+                    self._engine_mutex.lock();
+                    defer self._engine_mutex.unlock();
                     engine.vector_user_id = self._vector_user_id;
                     const original_top_k = engine.top_k;
                     engine.top_k = effectiveEngineTopK(limit);
