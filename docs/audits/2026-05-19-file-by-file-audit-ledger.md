@@ -47,8 +47,8 @@ meaning is narrower: the items are roadmap-mapped, not code-closed.
 | BIRTHDAY-DOC | LOW | `predicateToSlotType` docs say BIRTHDAY does not promote, code promotes it to temporal. | `src/agent/extraction_persist.zig:1105-1143` | v1.14.13 Step 5 | E | OPEN |
 | IDENTITY-ORPHAN | LOW | `src/identity.zig` needs keep/document/delete disposition. | File exists; roadmap requires Nova decision. | v1.14.13 Step 6 | E | OPEN |
 | SCHEMA-WIRE | HIGH | `src/tools/schema.zig` exists but provider serialization does not call `cleanSchemaForProvider`. | `rg cleanSchemaForProvider src/providers` returns no provider usage. | v1.14.13 Step 2 | F | CLOSED 8a94fcc7 |
-| TASK-PLANNER-WIRE | HIGH | `<task_plan>` directive exists, parser module is only reexported, not used in turn loop. | `src/agent/root.zig:5396-5399`; no runtime parse call. | v1.14.13 Step 3 | F | OPEN |
-| NARRATION-WIRE | MED | `NarrationObserver` exists with tests but is not wired to channel/front-end rendering. | `src/agent/narration.zig`; only reexport in `root.zig`. | v1.14.13 Step 3 | F | OPEN |
+| TASK-PLANNER-WIRE | HIGH | `<task_plan>` directive exists, parser module is only reexported, not used in turn loop. | `src/agent/root.zig:5396-5399`; no runtime parse call. | v1.14.13 Step 3 | F | CLOSED 6cb4f9d5 |
+| NARRATION-WIRE | MED | `NarrationObserver` exists with tests but is not wired to channel/front-end rendering. | `src/agent/narration.zig`; only reexport in `root.zig`. | v1.14.13 Step 3 | F | CLOSED 6cb4f9d5 |
 | CONTEXT-ENGINE | HIGH | `ContextEngine` phases exist but production turn loop is still inline. | `src/agent/context_engine.zig`; roadmap migration needed. | v1.14.14 | G | OPEN |
 | EMAIL-ZOMBIE | HIGH | Email config/channel code exists but daemon/channel loop start path is not wired. | `src/config_types.zig:684`, `src/channels/email.zig`; channel loop imports only Telegram plus legacy surfaces. | v1.14.15 | B | OPEN |
 | TEAMS-ZOMBIE | HIGH | Teams config/channel code exists but full inbound/outbound daemon/gateway path is incomplete. | `src/channels/teams.zig`, config primary helpers. | v1.14.16 | B | OPEN |
