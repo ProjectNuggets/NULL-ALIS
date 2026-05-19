@@ -2798,166 +2798,23 @@ pub const Agent = struct {
         // Context v2: memory is now part of the volatile system block instead
         // of being prepended to the user message. Load it first so we can
         // include it in the system prompt rebuild below.
-        const enrich_start_ms = std.time.milliTimestamp();
-        // V1.13 DUP-1 RE-ENABLED (safe path).
         //
-        // session.zig::getOrCreateInternal now calls
-        // working_memory.pinIdentityFromUserState at session creation,
-        // which pins the user's identity facts to slot 0. The
-        // <working_memory> block in the volatile prompt renders that
-        // slot. So skipping the legacy <active_identity> block here
-        // is now safe — identity is rendered once via working_memory,
-        // not twice.
-        //
-        // Gate: only skip when ALL working_memory infrastructure is
-        // wired (state_mgr + user_id + session_id + the agent has
-        // a memory_runtime — without mem_rt, working_memory.loadForRender
-        // can't fetch the slots). Otherwise fall back to legacy
-        // <active_identity> for safety.
-        //
-        // V1.14.3 (G-08 closure) — Load Working Memory FIRST so
-        // skip_legacy_identity is gated on ACTUAL wm content, not
-        // predicted infrastructure presence.
-        //
-        // Pre-V1.14.3: the gate was 4 conditions (state_mgr + user_id
-        // + session_id + mem_rt all non-null). It said "if WM
-        // infrastructure is wired, skip legacy <active_identity>" —
-        // assuming pinIdentitySlot ran successfully and slot 0 holds
-        // identity content. But the gate didn't VERIFY the assumption.
-        // If pinIdentityFromUserState returned 0 facts (truly empty
-        // user, or postgres flake during session creation, or future
-        // refactor breaking the chain silently), the agent ended up
-        // with neither legacy <active_identity> NOR a usable
-        // <working_memory> identity block.
-        //
-        // V1.14.3: load wm here, render the block, THEN compute
-        // skip_legacy_identity from `wm_block != null and len > 0`.
-        // Identity is rendered exactly once: via WM if available, via
-        // legacy <active_identity> otherwise. No silent identity loss.
-        //
-        // Cost: WM load was already happening per turn (just later in
-        // the function). Moving it earlier is free (~50ms either way).
-        const turn_wm_render_set_opt = blk: {
-            if (self.extraction_state_mgr) |smgr| {
-                if (self.extraction_user_id) |uid| {
-                    const sid = self.memory_session_id orelse break :blk null;
-                    break :blk working_memory.loadForRender(self.allocator, smgr, uid, sid);
-                }
-            }
-            break :blk null;
-        };
-        defer if (turn_wm_render_set_opt) |s| s.deinit(self.allocator);
-        const turn_wm_block: ?[]u8 = blk: {
-            const set = turn_wm_render_set_opt orelse break :blk null;
-            if (set.slots.len == 0) break :blk null;
-            break :blk working_memory.renderBlock(self.allocator, set.slots) catch |err| {
-                log.warn("working_memory.render_failed err={s}", .{@errorName(err)});
-                break :blk null;
-            };
-        };
-        defer if (turn_wm_block) |b| self.allocator.free(b);
-
-        // The actual gate: WM owns identity iff a slot with
-        // slot_type == "identity" actually exists in the rendered set.
-        //
-        // V1.14.3 review HIGH-1 fix — the prior version checked only
-        // `wm_block.len > 0`, but extraction can promote `open_loop` /
-        // `active_goal` / `recent_entity` slots without ever pinning
-        // an identity slot (extraction_persist.zig:863, 899-911 fire
-        // promoteSlot for those types unconditionally). A user with
-        // empty pinIdentityFromUserState output AND extracted goals
-        // would have wm_block non-empty (containing the goals) but
-        // zero identity content, then skip_legacy_identity=true
-        // would suppress the legacy <active_identity> block —
-        // resulting in an agent prompt with NO identity at all.
-        //
-        // Iterating slot_type checks the actual presence of identity
-        // content. Ordering: working_memory.SlotType.identity matches
-        // the constant the writer side uses (working_memory.zig:59).
-        const wm_owns_identity: bool = blk: {
-            const set = turn_wm_render_set_opt orelse break :blk false;
-            for (set.slots) |s| {
-                if (std.mem.eql(u8, s.slot_type, working_memory.SlotType.identity)) {
-                    break :blk true;
-                }
-            }
-            break :blk false;
-        };
-        const memory_slot_result = if (self.mem) |mem|
-            memory_loader.loadTurnMemorySlotOpts(
-                self.allocator,
-                mem,
-                self.mem_rt,
-                user_message,
-                self.memory_session_id,
-                self.extraction_state_mgr,
-                self.extraction_user_id,
-                .{ .skip_legacy_identity = wm_owns_identity },
-            ) catch |err| blk: {
-                log.warn("memory.enrichment_failed error={s} — proceeding without memory slot", .{@errorName(err)});
-                break :blk memory_loader.MemorySlot{
-                    .fenced_content = try self.allocator.dupe(u8, ""),
-                    .stats = .{},
-                };
-            }
-        else
-            memory_loader.MemorySlot{
-                .fenced_content = try self.allocator.dupe(u8, ""),
-                .stats = .{},
-            };
-        defer self.allocator.free(memory_slot_result.fenced_content);
-        const enrich_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - enrich_start_ms));
-        turn_memory_enrich_ms = enrich_duration_ms;
-        log.info("turn.stage stage=memory_enrich duration_ms={d}", .{enrich_duration_ms});
-
-        // V1.14.9 #6 — Retrieval-side telemetry symmetric to R1
-        // boundary.metrics. R1 measures EXTRACTION (write side); this
-        // measures RECALL (read side). One structured log line per turn
-        // captures: did we serve any memory at all (available), how many
-        // candidates considered (candidate_count), how that decomposed
-        // by retrieval kind (durable_fact / timeline / search-match /
-        // global), and how many bytes/entries each bucket contributed.
-        // Operators can grep `recall.metrics` to spot per-user retrieval
-        // collapse (available=false on a populated user = R3 graph
-        // traversal opportunity OR R4 BM25 fusion gap).
-        const rstats = memory_slot_result.stats;
-        log.info(
-            "recall.metrics available={} candidates={d} global_candidates={d} durable_facts={d} timeline_summaries={d} search_matches={d} global_fallbacks={d} summary_latest_used={} context_anchor_used={} continuity_entries={d} continuity_bytes={d} semantic_entries={d} semantic_bytes={d} fallback_entries={d} fallback_bytes={d} enrich_ms={d}",
-            .{
-                rstats.available,
-                rstats.candidate_count,
-                rstats.global_candidate_count,
-                rstats.durable_fact_count,
-                rstats.timeline_summary_count,
-                rstats.search_match_count,
-                rstats.global_fallback_count,
-                rstats.summary_latest_used,
-                rstats.context_anchor_used,
-                rstats.continuity_bucket_entries,
-                rstats.continuity_bucket_bytes,
-                rstats.semantic_bucket_entries,
-                rstats.semantic_bucket_bytes,
-                rstats.fallback_bucket_entries,
-                rstats.fallback_bucket_bytes,
-                enrich_duration_ms,
-            },
-        );
-        // Retrieval-side alert (mirror of R1 boundary.zero_density):
-        // user has memory available but retrieval returned 0 candidates
-        // on a non-trivial user message. Surfaces stale embeddings,
-        // missing entity coref, or graph layer not yet populated.
-        if (self.mem != null and user_message.len > 32 and rstats.available and rstats.candidate_count == 0) {
-            log.warn(
-                "recall.zero_candidates user_msg_len={d} — retrieval pipeline returned no matches on a substantive query; check embeddings / coref / graph",
-                .{user_message.len},
-            );
-        }
-        const memory_stage_event = ObserverEvent{ .turn_stage = .{
-            .stage = "memory_enrich",
-            .duration_ms = enrich_duration_ms,
-            .run_id = self.current_run_id,
-        } };
-        self.observer.recordEvent(&memory_stage_event);
+        // v1.14.14 Phase 1 (CONTEXT-ENGINE audit-ledger row) — the ~163-line
+        // memory-enrichment block that previously inlined here now lives in
+        // ContextEngine.ingest with migrated archaeology comments. See
+        // src/agent/context_engine.zig::ingest for the full WM + memory_slot
+        // load flow, the recall.metrics + zero_candidates telemetry, and the
+        // memory_enrich observer event. Lifetimes: ingest_out owns the
+        // heap-allocated memory_slot.fenced_content + wm_render_set +
+        // wm_block; the deinit defer below frees them at turn end, which is
+        // AFTER the assemble phase has borrowed memory_slot.fenced_content
+        // into PromptContext.memory_slot below.
+        var ingest_out = try self.context_engine_state.ingest(self.allocator, self, user_message);
+        defer ingest_out.deinit(self.allocator);
+        turn_memory_enrich_ms = ingest_out.result.memory_enrich_ms;
+        const enrich_duration_ms = ingest_out.result.memory_enrich_ms;
+        const turn_wm_block: ?[]u8 = ingest_out.wm_block;
+        const memory_slot_result = ingest_out.memory_slot;
 
         // Build prompt refresh plan for diagnostics + last_turn_context.
         // In context v2 we always rebuild the system prompt (volatile block
