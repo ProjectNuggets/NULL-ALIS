@@ -3018,6 +3018,25 @@ const ManagerImpl = struct {
                 "  THEN {schema}.memories.seen_in_session_count + 1 " ++
                 "  ELSE {schema}.memories.seen_in_session_count " ++
                 "END " ++
+                // V1.14.12 (Memory audit Finding 7 fix, 2026-05-19) —
+                // no-op guard mirroring `upsertMemory` at line ~3243.
+                // Pre-fix, every call bumped updated_at = NOW() and emitted
+                // a memory_events row even when the incoming row was
+                // byte-identical to the existing one. Re-extraction of an
+                // unchanged fact inflated recency ranking and produced
+                // noisy events. Skip the write (and therefore skip the
+                // event + conflict-marker check below) when nothing
+                // meaningful changed. Metadata / link_type included so
+                // the guard fires for the compose+extraction paths that
+                // pass extra structure through this function.
+                "WHERE {schema}.memories.session_id IS DISTINCT FROM EXCLUDED.session_id " ++
+                "OR {schema}.memories.content IS DISTINCT FROM EXCLUDED.content " ++
+                "OR {schema}.memories.content_hash IS DISTINCT FROM EXCLUDED.content_hash " ++
+                "OR {schema}.memories.memory_type IS DISTINCT FROM EXCLUDED.memory_type " ++
+                "OR {schema}.memories.metadata IS DISTINCT FROM EXCLUDED.metadata " ++
+                "OR {schema}.memories.link_type IS DISTINCT FROM (EXCLUDED.metadata)->>'link_type' " ++
+                "OR {schema}.memories.valid_to IS NOT NULL " ++
+                "OR {schema}.memories.is_latest IS DISTINCT FROM TRUE " ++
                 "RETURNING id, seen_in_session_count, memory_type",
         );
         defer self.allocator.free(q);
