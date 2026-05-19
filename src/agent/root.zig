@@ -1042,16 +1042,22 @@ pub const Agent = struct {
         // silently degrading manual compactions back to V1.5 behavior even
         // though autoCompactHistory worked correctly.
         //
-        // 2026-05-19 reconcile-merge: pass `compact_model` as the default
-        // judge model so manual compactions also get the d6b3221e behavior
-        // (judge runs by default using the compact model when no explicit
-        // extraction-judge model is configured).
+        // 2026-05-19 reconcile-merge CORRECTION: pass `null` (not `compact_model`)
+        // as default_judge_model here. Rationale: d6b3221e's intent was
+        // specifically the AUTO compaction path. Extending the same fallback
+        // to manual was an overreach that broke the canonical `/compact`
+        // test — the test fixture doesn't wire `extraction_judge_provider`,
+        // so populating `extraction_judge_model_name` with `compact_model`
+        // makes the judge LOOK configured while `judge_provider` is null,
+        // leading to a null-vtable segfault in `runExtractionCall`. Manual
+        // /compact retains its prior degrade-gracefully behavior (judge off
+        // unless explicitly configured by operator).
         return compaction.manualCompactHistory(
             self.allocator,
             &self.history,
             compact_provider,
             compact_model,
-            self.buildCompactionConfig(compact_model),
+            self.buildCompactionConfig(null),
         );
     }
 
@@ -1072,12 +1078,18 @@ pub const Agent = struct {
     /// caller wants the Path A degrade-gracefully behavior (judge off
     /// when not configured).
     fn buildCompactionConfig(self: *Agent, default_judge_model: ?[]const u8) compaction.CompactionConfig {
-        const resolved_judge_model: ?[]const u8 = if (self.extraction_judge_model_name.len > 0)
-            self.extraction_judge_model_name
-        else if (default_judge_model) |dm|
-            (if (dm.len > 0) dm else null)
-        else
-            null;
+        // Defensive coupling: a non-null judge_model_name with a null
+        // judge_provider crashes `extraction/runner.zig:555` (null vtable
+        // dereference). Only set the model name if the provider is also
+        // present, regardless of what the caller asked for.
+        const resolved_judge_model: ?[]const u8 = blk: {
+            if (self.extraction_judge_provider == null) break :blk null;
+            if (self.extraction_judge_model_name.len > 0) break :blk self.extraction_judge_model_name;
+            if (default_judge_model) |dm| {
+                if (dm.len > 0) break :blk dm;
+            }
+            break :blk null;
+        };
 
         return compaction.CompactionConfig{
             .keep_recent = self.compaction_keep_recent,
