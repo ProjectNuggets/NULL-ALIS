@@ -38,7 +38,7 @@ meaning is narrower: the items are roadmap-mapped, not code-closed.
 |---|---|---|---|---|---|---|
 | V8 | HIGH | Sandbox can still run unsandboxed when backend resolves to `none` and `fail_open_on_dev=true`. | `src/tools/tool_sandbox_v1.zig:162-168` | v1.14.13 Step 0 | A | OPEN |
 | B1 | MED | AGENTS repository map named missing `src/skillforge.zig`. | Fixed in docs by naming `src/skills.zig`; verify before commit. | v1.14.13 Step 0.5 | E | OPEN |
-| B2 | MED | Bench harness lacks TTFT p50/p95 columns despite SLO target. | `.spike/results.tsv` header has no `p50_ttft_ms` / `p95_ttft_ms`; `.spike/run.sh` only reports mean latency. | v1.14.13 Step 7 | D | OPEN |
+| B2 | MED | Bench harness lacks TTFT p50/p95 columns despite SLO target. | `.spike/results.tsv` header has no `p50_ttft_ms` / `p95_ttft_ms`; `.spike/run.sh` only reports mean latency. | v1.14.13 Step 7 | D | CLOSED 015dc461 |
 | B13 | MED | Test MaxRSS budget currently exceeds AGENTS target. | `zig build test --summary all` on 2026-05-19 reports MaxRSS 61M; AGENTS budget is <50 MB. | v1.14.13 Step 8 | A/D/E as assigned | OPEN |
 | F-A2 | MED | `brain_graph` prompt directive is known ignored by bench and still emitted. | `src/agent/prompt.zig:854-859` | v1.14.13 Step 4 | E | OPEN |
 | HND-READY | MED | `handleReady` has tests but no production route caller. | `src/gateway.zig:2849`; references at test lines only. | v1.14.13 Step 5 | E | OPEN |
