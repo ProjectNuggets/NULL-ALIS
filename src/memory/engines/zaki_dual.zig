@@ -82,6 +82,26 @@ pub const ZakiDualMemory = struct {
         };
     }
 
+    /// V1.14.12 (Memory audit Finding 4 fix, 2026-05-19) — implement the
+    /// metadata-aware write so dual-mode tenants retain `references`,
+    /// `link_type`, and provenance JSONB. Pre-fix, this slot was missing
+    /// from the vtable, so memory/root.zig::storeWithMetadata fell back
+    /// to plain `store()` and silently dropped the metadata — agent
+    /// compose_memory + extraction writes lost their structural payload
+    /// in tenant/dual mode.
+    ///
+    /// Strategy mirrors implStore: primary (Postgres) gets the full
+    /// metadata write; markdown gets a content-only mirror (Markdown has
+    /// no metadata schema — there's nothing to encode the JSONB into).
+    fn implStoreWithMetadata(ptr: *anyopaque, key: []const u8, content: []const u8, category: root.MemoryCategory, session_id: ?[]const u8, metadata_json: []const u8) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        try self.primary.storeWithMetadata(key, content, category, session_id, metadata_json);
+        self.markdown_impl.memory().store(key, content, category, session_id) catch |err| {
+            log.warn("zaki_dual: markdown mirror metadata-write failed for key '{s}': {} — " ++
+                "Postgres has the canonical metadata; manual MEMORY.md sync may be needed", .{ key, err });
+        };
+    }
+
     fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]root.MemoryEntry {
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.primary.recall(allocator, query, limit, session_id);
@@ -142,8 +162,21 @@ pub const ZakiDualMemory = struct {
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
+        // V1.14.12 (Memory audit Finding 4 fix, 2026-05-19) — wire the
+        // metadata-aware write slot. Pre-fix this was unset, so
+        // memory/root.zig::storeWithMetadata fell back to plain `store()`
+        // and silently dropped metadata in tenant/dual mode.
+        .store_with_metadata = &implStoreWithMetadata,
     };
 };
+
+test "V1.14.12 (Memory audit Finding 4): zaki_dual vtable wires store_with_metadata" {
+    // Pre-fix the vtable's `store_with_metadata` slot was null, so
+    // memory/root.zig::storeWithMetadata fell back to plain `store()`
+    // and silently dropped metadata.references / link_type / provenance
+    // in tenant/dual mode. Lock the wiring.
+    try std.testing.expect(ZakiDualMemory.mem_vtable.store_with_metadata != null);
+}
 
 test "zaki dual memory syncs markdown into canonical memory" {
     var tmp = std.testing.tmpDir(.{});
