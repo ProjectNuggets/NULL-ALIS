@@ -1104,9 +1104,16 @@ pub fn persistExtracted(
 /// V1.13 Day 1 — map an extraction predicate to a Working Memory slot
 /// type, or null if the predicate doesn't warrant promotion. Conservative
 /// list — predicates that materially affect future turns get promoted;
-/// ordinary attributive facts (BIRTHDAY, WORKS_AT) don't take WM slots
-/// because they live in canonical memory and are recalled by hybrid
-/// search when relevant.
+/// ordinary attributive facts (e.g. WORKS_AT, LIVES_IN) don't take WM
+/// slots because they live in canonical memory and are recalled by
+/// hybrid search when relevant.
+///
+/// BIRTHDAY is the temporal-cluster exception: it IS promoted to the
+/// `temporal` slot (see line below) because the working-memory countdown
+/// surface needs upcoming dated events queryable without a hybrid recall
+/// round-trip. Docstring corrected at v1.14.13 Step 5 (BIRTHDAY-DOC) —
+/// previous docstring claimed BIRTHDAY did not promote; the code has
+/// always promoted it. The code is correct; the doc lied.
 fn predicateToSlotType(predicate: []const u8) ?[]const u8 {
     // Open loops — pending actions the user mentioned.
     if (std.ascii.eqlIgnoreCase(predicate, "TODO")) return working_memory.SlotType.open_loop;

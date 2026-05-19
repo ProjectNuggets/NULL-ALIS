@@ -84,8 +84,9 @@ pub const ObserverEvent = union(enum) {
     /// produced tool/spawn calls but no post-tool assistant text. Lets
     /// the gateway/BFF render a structured frame (e.g. "[2 tools ran;
     /// subagent results may arrive on a follow-up]") instead of falling
-    /// back to the historical fabricated EMPTY_TURN_PLACEHOLDER for the
-    /// reply text.
+    /// back to the historical fabricated placeholder string for the
+    /// reply text. (The dead placeholder const was removed from
+    /// gateway.zig at v1.14.13 Step 5.)
     ///
     /// `tool_calls_executed` is the count of tool calls fired across
     /// all tool-loop iterations of this turn (equivalent to the

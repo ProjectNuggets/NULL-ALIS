@@ -1,5 +1,31 @@
 const std = @import("std");
 
+// ─────────────────────────────────────────────────────────────────────────
+// STATUS — Substrate for a future "persona import / export" feature.
+// Re-exported once at src/root.zig:75. No production caller resolves to
+// any symbol here at HEAD; the active runtime persona surface lives in
+// MEMORY.md + SOUL.md + workspace markdown, not in this struct tree.
+//
+// Per AGENTS.md §14.2 (archaeology before deletion) and §14.4
+// (wire-or-document), this module is preserved as substrate for the
+// V-infinity persona pillar (candidate #4 in docs/ROADMAP.md):
+// portable AI-identity specification with structured psychology /
+// linguistics / motivations sections, originally mirroring ZeroClaw's
+// identity.rs. Parser + system-prompt formatter are correct-but-unused
+// and would be the entry points when persona-import is wired.
+//
+// See `docs/deferred-register.md` row IDENTITY-ORPHAN (v1.14.13 Audit
+// Sweep section) for the deferred entry, gating conditions, and the
+// reason the V-infinity pillar candidate selection determines whether
+// this module gets wired or replaced with a successor design.
+//
+// Touch protocol: do NOT add new callers to symbols here without first
+// updating the deferred-register entry and (if the feature is being
+// activated) the ROADMAP block that wires it. If the V-infinity pillar
+// selection lands on a different persona design, this module is the
+// candidate for delete-with-named-successor per §14.4.
+// ─────────────────────────────────────────────────────────────────────────
+
 /// AIEOS v1.1 identity structure — portable AI identity specification.
 /// Mirrors ZeroClaw's identity.rs with AIEOS JSON parsing and system prompt generation.
 pub const AieosIdentity = struct {
