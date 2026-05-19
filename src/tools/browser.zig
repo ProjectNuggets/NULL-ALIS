@@ -11,13 +11,16 @@ const MAX_READ_BYTES: usize = 8192;
 const MAX_FETCH_BYTES: usize = 65536;
 
 /// Browser tool — opens URLs in the system browser and fetches page content.
-/// Supports "open" (launch URL), "read" (fetch body via curl), and returns
-/// informative errors for CDP-only actions (click, type, scroll, screenshot).
+/// Supports "open" (launch URL in system browser) and "read" (fetch body via
+/// curl). CDP-driven actions (click, type, scroll, screenshot) are not
+/// implemented at HEAD and were stripped from the advertised catalog at
+/// v1.14.13 Step 5 (BROWSER-HONESTY) per AGENTS.md §14.5 — no tool
+/// description shall advertise an action the code can't perform.
 pub const BrowserTool = struct {
     pub const tool_name = "browser";
-    pub const tool_description = "Browse web pages. Actions: open, screenshot, click, type, scroll, read.";
+    pub const tool_description = "Browse web pages. Actions: open, read.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["open","screenshot","click","type","scroll","read"],"description":"Browser action to perform"},"url":{"type":"string","description":"URL to open"},"selector":{"type":"string","description":"CSS selector for click/type"},"text":{"type":"string","description":"Text to type"}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["open","read"],"description":"Browser action to perform"},"url":{"type":"string","description":"URL to open or read"}},"required":["action","url"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -37,20 +40,8 @@ pub const BrowserTool = struct {
             return executeOpen(allocator, args);
         } else if (std.mem.eql(u8, action, "read")) {
             return executeRead(allocator, args);
-        } else if (std.mem.eql(u8, action, "screenshot")) {
-            return ToolResult.fail("Use the screenshot tool instead");
-        } else if (std.mem.eql(u8, action, "click") or
-            std.mem.eql(u8, action, "type") or
-            std.mem.eql(u8, action, "scroll"))
-        {
-            const msg = try std.fmt.allocPrint(
-                allocator,
-                "Browser action '{s}' requires CDP (Chrome DevTools Protocol) which is not available. Use 'open' to launch in system browser or 'read' to fetch page content.",
-                .{action},
-            );
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
         } else {
-            const msg = try std.fmt.allocPrint(allocator, "Unknown browser action '{s}'", .{action});
+            const msg = try std.fmt.allocPrint(allocator, "Unknown browser action '{s}' — supported actions are 'open' and 'read'", .{action});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         }
     }
@@ -180,14 +171,18 @@ test "browser open rejects http" {
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "https") != null);
 }
 
-test "browser screenshot redirects to screenshot tool" {
+test "browser screenshot is rejected as unknown action (v1.14.13 BROWSER-HONESTY)" {
+    // CDP-driven actions (screenshot, click, type, scroll) are not implemented
+    // and were stripped from the advertised catalog at v1.14.13 Step 5. The
+    // honest response is "unknown action" — the catalog must match runtime.
     var bt = BrowserTool{};
     const t = bt.tool();
     const parsed = try root.parseTestArgs("{\"action\": \"screenshot\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "screenshot tool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Unknown browser action") != null);
 }
 
 // ── Additional browser tests ────────────────────────────────────
@@ -212,7 +207,12 @@ test "browser open missing url" {
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "url") != null);
 }
 
-test "browser click action requires CDP" {
+test "browser click is rejected as unknown action (v1.14.13 BROWSER-HONESTY)" {
+    // Pre-v1.14.13 the tool advertised click/type/scroll and returned an
+    // informative "needs CDP" message. The catalog→runtime gap was the
+    // dishonest part — actions advertised in tool_description that the
+    // code can't perform. v1.14.13 Step 5 stripped them; click now reads
+    // as a plain unknown action.
     var bt = BrowserTool{};
     const t = bt.tool();
     const parsed = try root.parseTestArgs("{\"action\": \"click\", \"selector\": \"#btn\"}");
@@ -220,8 +220,7 @@ test "browser click action requires CDP" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "CDP") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "click") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Unknown browser action") != null);
 }
 
 test "browser read missing url" {
@@ -247,14 +246,17 @@ test "browser open returns output with URL" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "Opened") != null);
 }
 
-test "browser schema has enum values" {
+test "browser schema enum is honest — open + read only (v1.14.13 BROWSER-HONESTY)" {
+    // The schema MUST match the runtime catalog. Unimplemented CDP actions
+    // (screenshot, click, type, scroll) were stripped at v1.14.13 Step 5.
     var bt = BrowserTool{};
     const t = bt.tool();
     const schema = t.parametersJson();
-    try std.testing.expect(std.mem.indexOf(u8, schema, "screenshot") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "open") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "click") != null);
-    try std.testing.expect(std.mem.indexOf(u8, schema, "scroll") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "screenshot") == null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "click") == null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "scroll") == null);
 }
 
 test "browser description mentions browse" {
