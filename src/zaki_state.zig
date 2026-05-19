@@ -6888,9 +6888,21 @@ const ManagerImpl = struct {
         else
             "source_snippet = $3";
 
+        // V1.14.12 (Memory audit Finding 13 fix, 2026-05-19) — do NOT
+        // bump updated_at for attribution-only enrichment. Pre-fix this
+        // UPDATE ran `updated_at = NOW()` even when only source_session_id
+        // or source_snippet changed. Two effects:
+        //   - On first extraction write, upsertMemoryWithMetadata bumped
+        //     updated_at, then setMemorySource bumped it again (double
+        //     timestamp) for the same logical write.
+        //   - Any later metadata-only enrichment (e.g. populating the
+        //     snippet on a previously-snippet-less row) would falsely
+        //     bump recency, distorting ORDER BY updated_at retrieval.
+        // Attribution is provenance metadata, not a content change. Leave
+        // updated_at to reflect actual content/state changes only.
         const q = try std.fmt.allocPrint(
             self.allocator,
-            "UPDATE {{schema}}.memories SET {s}, updated_at = NOW() WHERE user_id = $1 AND key = $2",
+            "UPDATE {{schema}}.memories SET {s} WHERE user_id = $1 AND key = $2",
             .{set_clause},
         );
         defer self.allocator.free(q);
