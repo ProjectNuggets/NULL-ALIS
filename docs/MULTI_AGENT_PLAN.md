@@ -219,6 +219,45 @@ This is a GitHub policy, not a tooling bug.
 without going through the approve step. Or set up a separate reviewer account.
 Discovered 2026-05-19 reviewing Agent A's PR.
 
+### 4.8 Audit-ledger SHA orphan — split your commits (MANDATORY)
+
+When closing an audit-ledger row, **never put the ledger update in the same commit
+as the code change you are referencing**. The ledger row needs the commit SHA, but
+the SHA is only known *after* the commit exists. If you write the ledger row in
+the same commit body, you have two bad choices:
+
+1. **Amend after commit** to insert the SHA → the SHA you just wrote is now stale
+   (amend produces a new commit). The ledger row now points at an orphan.
+2. **Use a placeholder** like `<SHA-TBD>` → another agent merges, the placeholder
+   ships, and the audit ledger is now a lie until someone backfills.
+
+**The canonical fix (proven on Agent F's v1.14.13 work, ratified 2026-05-19):**
+
+```
+git commit -m "feat(tools): SCHEMA-WIRE — wire schema cleaner..."   # the code
+# now the SHA exists. Capture it.
+SHA=$(git rev-parse HEAD)
+# Edit the ledger row in a SECOND, separate commit:
+$EDITOR docs/audits/2026-05-19-file-by-file-audit-ledger.md   # paste $SHA
+git commit docs/audits/2026-05-19-file-by-file-audit-ledger.md \
+  -m "docs(audit): close SCHEMA-WIRE ledger"
+```
+
+Two commits, never one. The code commit references nothing; the ledger commit
+references the code commit's now-immutable SHA. Both are atomic, both have a
+single reason to exist. Bisect stays clean. Audit ledger remains accurate even
+if the agent's branch is rebased before merge (the SHA points into the original
+chain, which the merge-commit preserves).
+
+**Why amend is wrong here:** amend rewrites history. If you amend the code commit
+to fix the ledger SHA, every subsequent ledger entry that references the *amended*
+SHA is also orphaned after the next force-push. Split commits avoid the problem
+structurally.
+
+**Agent E suffered this twice on v1.14.13 (commits 4d9d0529 + later orphan fix);
+Agent F never did, because Agent F split from the start.** This pattern is now
+mandatory for every ledger closure.
+
 ---
 
 ## 5. Per-block launch brief template
