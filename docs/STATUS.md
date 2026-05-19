@@ -7,14 +7,17 @@ tags: [prose, prose/docs]
 Cold-readable operational truth source. Updated when waves close, not during.
 Last archive: `docs/archive/status-2026-03-06.md`.
 
-**Active roadmap:** [`docs/ROADMAP.md`](ROADMAP.md). Next staged sprint: **v1.14.13** (τ-bench baseline + wire what's built). Agent work does **not** start until PR #72 merges and ROADMAP.md is marked `→ IN FLIGHT`.
+**Active roadmap:** [`docs/ROADMAP.md`](ROADMAP.md). Active sprint: **v1.14.13** (τ-bench baseline + wire what's built) — IN FLIGHT.
 **Active standards:** [`AGENTS.md`](../AGENTS.md) §14 (Nullalis-grade Swiss-watch).
+**Dispatch:** [`docs/MULTI_AGENT_PLAN.md`](MULTI_AGENT_PLAN.md) — which agent owns which sub-task.
 
-## Branch state
+## Branch state (post v1.14.12 land)
 
-- **Tag:** `v1.14.12` pushed to `origin`.
-- **PR open:** [#72](https://github.com/ProjectNuggets/NULL-ALIS/pull/72) — `release/v1.14.12-memory-audit` → `main`, 50 commits.
-- **Build status:** `zig build` clean. `zig build test --summary all` exits 0 (6,083 passed / 66 skipped, 6,149 total). Current MaxRSS is 61M, above the AGENTS.md <50 MB budget; tracked in ROADMAP v1.14.13 B13.
+- **Tag:** `v1.14.12` at `11c81e4b` (the memory-audit closure commit).
+- **PR #72 MERGED:** [closed](https://github.com/ProjectNuggets/NULL-ALIS/pull/72) — `e1df8562` is the merge commit on `main`. Includes the reconcile-merge with main's `d6b3221e` and the `fix(merge): judge-fallback overreach correction`.
+- **Active sprint branch:** `sprint/v1.14.13` — rebased onto new main, 4 docs/audit-ledger commits ahead.
+- **Build status:** `zig build` clean. `zig build test --summary all` exit 0. Canonical-profile test exit 0 (`-Dengines=base,sqlite,postgres -Dchannels=cli,telegram`). CI green on `release/v1.14.12-memory-audit` (5/5 jobs success, V-infinity battery skipped by design).
+- **MaxRSS:** 61M, above the AGENTS.md <50 MB budget; tracked in ROADMAP v1.14.13 B13.
 
 ## 2026-05-19 PM update — file-by-file audit
 
