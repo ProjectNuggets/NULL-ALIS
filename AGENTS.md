@@ -327,8 +327,14 @@ When working in fast iterative mode:
 
 Effective 2026-05-19. These rules apply to every agent (Claude, Codex, human) working in this
 repo. They are the lift from "running code" to "production-grade product." Violations are
-treated as defects, not preferences. The active roadmap that consumes these rules lives at
-`docs/ROADMAP.md`.
+treated as defects, not preferences.
+
+**Bound documents (read these before working):**
+- `docs/ROADMAP.md` — the versioned plan (which V block lands at which tag).
+- `docs/MULTI_AGENT_PLAN.md` — the agent dispatch matrix (which agent does what, file ownership,
+  branch conventions, bench gate convergence). When you are spawned as Agent A/B/C/..., your
+  scope, owned files, and closing standard come from this document.
+- `docs/STATUS.md` — current snapshot.
 
 ### 14.1 Per-finding discipline (mandatory)
 

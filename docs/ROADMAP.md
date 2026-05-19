@@ -65,6 +65,11 @@ A block does not "exit" until its bench gate passes. The next block does not sta
    - Audit deployment configs: confirm no production tenant relies on the old behavior
    - Commit: `fix(security): V1.14.9 — sandbox fail closed by default`
 
+0.5. **B1 — AGENTS.md contradiction fix** (5 minutes)
+   - `AGENTS.md §4` references `src/skillforge.zig` which doesn't exist at HEAD
+   - Either remove the reference OR document the file as deprecated/moved
+   - Block-internal commit: cleanup, no functional change
+
 1. **τ-bench Airline harness** (`.spike/external/tau_bench/`)
    - Pull `tau-bench` package; identify 50 Airline tasks
    - Build adapter: `nullalis` gateway as the agent target, `tau-bench`'s user simulator + scorer unchanged
@@ -98,10 +103,19 @@ A block does not "exit" until its bench gate passes. The next block does not sta
    - OR delete with rationale (commit body names successor: SOUL.md + workspace markdown)
    - Nova decides; document either way
 
+7. **B2 — Latency bench gate scaffold** (~2 hours)
+   - `SLO.md` defines p50 TTFT ≤ 1.5s, p95 ≤ 4s; `.spike/run.sh` currently only emits `mean_latency_ms`
+   - Extend `.spike/run.sh` to emit p50/p95 TTFT from SSE event timestamps
+   - Add bench gate criterion to every subsequent block: "p95 TTFT ≤ 4.0s" (the SLO commitment)
+   - New `.spike/results.tsv` columns: `p50_ttft_ms`, `p95_ttft_ms`
+   - Without this we can't catch latency regressions until customers complain
+
 **Bench gate:**
 - `zig build test` exit 0, 0 leaks
 - LoCoMo cold + polluted ≥ v1.14.12 numbers (no regression)
 - τ-bench Airline baseline committed to `.spike/results.tsv`
+- p95 TTFT ≤ 4.0s on canonical bench (new gate from B2)
+- All 7 audit Cluster A orphans either wired OR documented per AGENTS.md §14.4
 - Tag `v1.14.13`
 
 **Duration:** 5–7 working days
@@ -240,12 +254,20 @@ A block does not "exit" until its bench gate passes. The next block does not sta
    - Health check: if mirror enabled, log mirror-write latency / failure rate
    - Test: write a memory → only Postgres row exists → no markdown file unless flag set
 
+10. **B8 — Test coverage audit (one-off)**
+    - Integrate `kcov` or equivalent against `zig build test` binary
+    - Generate per-file coverage report → publish to `.spike/coverage/<ts>/`
+    - Surface untested production paths (the `handleReady` pattern — 7 tests, 0 prod callers)
+    - One-off audit; not a recurring gate (too slow). Re-run quarterly.
+
 **Bench gate:**
-- All MED findings + V4 + V6 + V7 either closed (commit reference) OR moved to `docs/deferred-register.md` with rationale + ETA
+- All 67 file-by-file audit findings + V4 + V6 + V7 either closed (commit reference) OR moved to `docs/deferred-register.md` with rationale + ETA
 - LoCoMo + τ-bench hold
+- p95 TTFT ≤ 4.0s
+- Coverage report published
 - Tag `v1.14.18`
 
-**Duration:** 7-8 working days (added V4/V6/V7 work)
+**Duration:** 8-9 working days (added V4/V6/V7 + B8 coverage audit)
 **Dependencies:** v1.14.17
 
 ---
@@ -356,15 +378,22 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
    - After 2 weeks of stable `task_delivery != null` everywhere, remove the `?` from the field type — make it required
    - Compile-time guarantee that subagent task state is always ledger-mirrored
 
+4. **B9 — GDPR purge E2E test**
+   - `src/gdpr.zig` + `lane_metrics.zig` purge counters exist; no proven E2E test
+   - New test: populate tenant with memories + edges + vectors + approvals + run_events, invoke `gdpr.purgeUser`, assert zero rows survive across ALL tables (memories, memory_edges, memory_entities, vectors, conversations, run_events, approvals)
+   - Couples naturally with new approval + event tables landing in this block
+
 **Bench gate:**
 - Approval state survives agent restart (proven by test)
 - Event replay byte-identical to original (proven by test)
 - `grep -r "pending_tool_approval = " src/` shows only the cache layer (not the source of truth)
 - `subagent.zig:134` field type is `*tasks_mod.TaskDelivery`, not `?*...`
+- GDPR purge E2E test passes (all tables zero rows post-purge)
 - LoCoMo + τ-bench hold
+- p95 TTFT ≤ 4.0s
 - Tag `v1.17.5`
 
-**Duration:** 12–15 working days
+**Duration:** 13–16 working days (added B9 GDPR E2E test)
 **Dependencies:** v1.17.0
 
 ---
@@ -372,6 +401,11 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 ## v1.18.0 — "Per-cell pod canary deploy"
 
 **Theme:** First production cell on the per-cell-pod architecture. zaki-infra work.
+
+**Prereq (before any deploy):**
+
+- **B5 — Platform-wide load test** — beyond the existing Telegram webhook stress at `deploy/k8s/zaki-bot/telegram_webhook_stress_local.sh`. New test: simulate N concurrent tenants with mixed channel traffic + tool use, measure: connection-pool exhaustion threshold, gateway QPS ceiling, memory peak RSS. Document the numbers as the per-cell capacity envelope.
+- **B12 — Capacity model documented** — `docs/capacity-model.md` with: max tenants per cell, max concurrent SSE streams per cell, peak QPS supported, Postgres connection pool sizing per cell, horizontal scaling triggers. This is the spec the canary deploy validates against.
 
 **Steps:**
 
@@ -386,10 +420,38 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 **Bench gate:**
 - Canary cell runs production traffic for 7 days, zero P1 incidents
 - LoCoMo + τ-bench hold against canary
+- Capacity model spec verified (canary cell matches predicted envelope ± 15%)
+- p95 TTFT ≤ 4.0s
 - Tag `v1.18.0`
 
-**Duration:** 5 working days deploy + 7 days soak
-**Dependencies:** v1.17.0
+**Duration:** 7 working days deploy + 7 days soak (added 2 days for B5 load test)
+**Dependencies:** v1.17.5
+
+---
+
+## v1.18.5 — "Disaster recovery + backup drill" (NEW from blind-spot B4)
+
+**Theme:** Tested restore drill against the canary cell. Customer trust gate before broader rollout.
+
+**Why here:** Customer asks "what's your RTO?" We need a number proven by a real restore drill, not a guess. Must precede the second cell going live.
+
+**Steps:**
+
+1. Document backup strategy: cadence, retention, location (DO-managed → confirm settings + cross-region copy?)
+2. Define RTO (recovery time objective) + RPO (recovery point objective) numbers
+3. Build automated backup health check (last backup age, restore-test status)
+4. Perform a real restore drill: snapshot the canary cell DB → spin up parallel restore env → verify data integrity → measure restore wall-clock time
+5. Document the drill outcome in `docs/dr-runbook.md`
+6. Optionally: cross-region failover plan (if commercial signals require)
+
+**Bench gate:**
+- Restore drill executed end-to-end, RTO measured + documented
+- `docs/dr-runbook.md` exists with concrete procedures
+- LoCoMo + τ-bench hold (no regression)
+- Tag `v1.18.5`
+
+**Duration:** 3 working days
+**Dependencies:** v1.18.0
 
 ---
 
@@ -404,14 +466,19 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 3. Latency budgets per turn phase (the `memory_enrich` 900ms variance from `project_agent_turn_audit_followups`)
 4. Background scheduler for memory hygiene (the lifecycle gap from `project_lifecycle_investigation_2026_04_20`)
 5. Alerting: P95 latency, error rate, cost-per-tenant outliers
+6. **B6 — Long-tenant recall benchmark** — synthetic 5-year tenant with 50K memory rows; measure recall p50/p95 under realistic load. Triggers `conversation_retention_days` policy decision.
+7. **B7 — OTEL collector setup** — `OtelObserver.fromEnv` already wires, but no collector receives spans in production. Document the collector deployment (Tempo / Jaeger / Honeycomb) + wire env vars in zaki-infra.
 
 **Bench gate:**
 - Dashboards live, alerts firing on synthetic incidents
+- Long-tenant benchmark documented (p95 recall ≤ acceptable threshold; threshold defined in this block)
+- OTEL spans visible in collector backend
 - LoCoMo + τ-bench hold
+- p95 TTFT ≤ 4.0s
 - Tag `v1.19.0`
 
-**Duration:** 5–7 working days
-**Dependencies:** v1.18.0
+**Duration:** 6–8 working days (added B6 + B7)
+**Dependencies:** v1.18.5
 
 ---
 
@@ -446,10 +513,38 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 - One unified authorization model (`grep "default_allowed_commands"` empty)
 - Zero fallback-key usage in canonical paths (metric counter at zero for 7 days)
 - LoCoMo + τ-bench hold
+- p95 TTFT ≤ 4.0s
 - Tag `v1.19.5`
 
 **Duration:** 8–10 working days
 **Dependencies:** v1.19.0
+
+---
+
+## v1.19.7 — "Unit economics baseline" (NEW from blind-spot B3)
+
+**Theme:** Measure the cost-per-turn / cost-per-tenant / cost-per-tool-call baseline that informs v2.0 pricing. Without this block, the payment design is design-in-the-dark.
+
+**Why here:** Pricing models (per-message vs per-token vs per-cell vs flat-subscription) need real cost data. v1.19.0 added per-tenant cost tracking infrastructure; this block USES that infrastructure to produce the numbers Nova needs for payment strategy.
+
+**Steps:**
+
+1. Run a 7-day cost measurement on the canary cell with real production traffic
+2. Aggregate by tenant / by channel / by tool family / by provider
+3. Compute: median cost-per-turn, p90 cost-per-turn, monthly cost-per-tenant distribution
+4. Compute storage growth rate (memories + vectors + run_events + conversations) per active tenant per month
+5. Document: `docs/unit-economics-2026-XX-XX.md` with the actual numbers
+6. Cross-reference against pricing models Nova is considering — flag where the model is upside-down (e.g., "$5/month flat at observed median cost would lose money on the p90 tenant")
+
+**Bench gate:**
+- `docs/unit-economics-*.md` published with real measured numbers
+- Nova has the data to lock the v2.0 pricing model
+- LoCoMo + τ-bench hold
+- p95 TTFT ≤ 4.0s
+- Tag `v1.19.7`
+
+**Duration:** 7 days measurement + 1 day analysis = 8 working days
+**Dependencies:** v1.19.5 + at least 5 active tenants on canary
 
 ---
 
@@ -466,13 +561,18 @@ Target: ≥ 60% pass@1 on Airline (industry SOTA reference: tau-bench paper clai
 5. Onboarding flow refresh (post-AGENTS.md §14 standards)
 6. First 100 paying users acquisition + retention measurement
 
+**Cross-coord with zaki-prod (B11):**
+- Frontend XSS / agent-content safety boundary — explicit contract test that a malicious memory containing `<script>` cannot escape zaki-prod's markdown renderer
+- Coordinated with v1.16.0 frontend wave; revisited at v2.0 onboarding refresh
+
 **Bench gate:**
 - ≥ 100 paying users
 - ≥ 95% MRR retention month-over-month
+- p95 TTFT ≤ 4.0s holds under paying-user load
 - Tag `v2.0.0`
 
 **Duration:** open — paced by payment-design decisions
-**Dependencies:** v1.19.5 + payment design lock-in with Nova
+**Dependencies:** v1.19.7 (unit economics) + payment design lock-in with Nova
 
 ---
 
@@ -544,6 +644,7 @@ Candidate pillar order (Nova-revisable):
 10. Coding pillar (GitNexus bookmark, SWE-bench integration)
 11. Multi-agent voice rooms (real-time conversation)
 12. The "secret weapon" — TBD by Nova
+13. **Local-first / on-premise deployment story (B10)** — make-target + config preset for fully local operation (Zig binary + optional sqlite + optional libpq, no cloud LLM dependency). Differentiator for privacy-first users. Position as V-infinity pillar candidate; not blocking commercial.
 
 **Critical sequencing rule:** never start a new pillar until the previous one has shipped to users AND received ≥ 1 cycle of real feedback. Karpathy keep/discard discipline.
 
