@@ -2696,6 +2696,16 @@ pub const Agent = struct {
         const turn_start_ms = std.time.milliTimestamp();
         self.cancellation_token.reset(); // Clear stale cancellation from previous turn
 
+        // v1.14.13 Agent F: route all per-turn observer events through the
+        // narration wrapper so channel/SSE observers receive progress frames.
+        const base_observer = self.observer;
+        var narration_observer = narration.NarrationObserver{ .inner = base_observer };
+        const wrap_narration = !std.mem.eql(u8, base_observer.getName(), "narration");
+        if (wrap_narration) self.observer = narration_observer.observer();
+        defer {
+            if (wrap_narration) self.observer = base_observer;
+        }
+
         // Bind the agent controller so self-control tools (set_execution_mode,
         // context_snapshot) can read/write our state during this turn.
         tools_mod.setAgentController(self.controller());
@@ -2729,6 +2739,10 @@ pub const Agent = struct {
         var turn_compaction_ms: u64 = 0;
         var turn_first_token_ms: ?u64 = null;
         var turn_first_token_upper_bound_ms: ?u64 = null;
+        var active_task_plan: ?task_planner.TaskPlan = null;
+        var task_plan_checked = false;
+        var task_plan_complete_emitted = false;
+        defer if (active_task_plan) |*plan| plan.deinit(self.allocator);
 
         // **D1.7** — accumulator for task_ids spawned during this turn
         // (via the `spawn` tool — `delegate` is synchronous and inlines
@@ -3806,7 +3820,24 @@ pub const Agent = struct {
                 );
             }
 
-            const response_text = response.contentOrEmpty();
+            const raw_response_text = response.contentOrEmpty();
+            var response_text = raw_response_text;
+            if (!task_plan_checked) {
+                task_plan_checked = true;
+                const extracted_plan = task_planner.extractTextAndPlan(raw_response_text);
+                if (extracted_plan.plan_xml) |plan_xml| {
+                    if (try task_planner.parseTaskPlan(self.allocator, plan_xml)) |parsed_plan| {
+                        active_task_plan = parsed_plan;
+                        if (extracted_plan.text.len > 0 and extracted_plan.text_after.len > 0) {
+                            response_text = try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ extracted_plan.text, extracted_plan.text_after });
+                        } else if (extracted_plan.text_after.len > 0) {
+                            response_text = extracted_plan.text_after;
+                        } else {
+                            response_text = extracted_plan.text;
+                        }
+                    }
+                }
+            }
             const use_native = response.hasToolCalls();
 
             // ── Native reasoning_content: kept for model's own context; NOT emitted as narration ──
@@ -4428,6 +4459,12 @@ pub const Agent = struct {
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
             defer results_buf.deinit(self.allocator);
             try results_buf.ensureTotalCapacity(self.allocator, parsed_calls.len);
+            if (active_task_plan) |*plan| {
+                for (parsed_calls, 0..) |call, call_idx| {
+                    const plan_index = plan.current_step + @as(u32, @intCast(call_idx));
+                    task_planner.emitStepProgress(self.observer, plan, plan_index, call.name);
+                }
+            }
             const dispatch_start_ms = std.time.milliTimestamp();
             const used_parallel_dispatch = self.shouldParallelDispatch(parsed_calls);
             if (used_parallel_dispatch) {
@@ -4442,6 +4479,27 @@ pub const Agent = struct {
                 if (used_parallel_dispatch) "parallel" else "serial",
                 parsed_calls.len,
             });
+
+            if (active_task_plan) |*plan| {
+                for (results_buf.items) |result| {
+                    if (plan.current_step >= plan.steps.len) break;
+                    const step_index = plan.current_step;
+                    if (plan.currentStep()) |step| {
+                        step.tool_used = result.name;
+                    }
+                    if (result.success) {
+                        plan.markStepDone("completed");
+                    } else {
+                        plan.markStepFailed();
+                    }
+                    task_planner.emitStepDone(self.observer, plan, step_index, result.success);
+                    plan.advanceStep();
+                }
+                if (!task_plan_complete_emitted and plan.isComplete()) {
+                    task_planner.emitPlanComplete(self.observer, plan);
+                    task_plan_complete_emitted = true;
+                }
+            }
 
             // **D1.7** — capture spawned task_ids from any `spawn` tool
             // calls in this iteration's results. Spawn's result format
@@ -9265,6 +9323,199 @@ test "Agent tool loop frees dynamic tool outputs" {
 
     try std.testing.expectEqualStrings("done", response);
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+}
+
+test "Agent parses task_plan and emits step narration frames during tool loop" {
+    const PlanProbeTool = struct {
+        const Self = @This();
+        pub const tool_name = "plan_probe";
+        pub const tool_description = "Synthetic tool for task-plan narration testing";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return .{
+                .success = true,
+                .output = try allocator.dupe(u8, "ok"),
+            };
+        }
+    };
+
+    const PlannedProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count <= 3) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try std.fmt.allocPrint(allocator, "call-{d}", .{self.call_count}),
+                    .name = try allocator.dupe(u8, "plan_probe"),
+                    .arguments = try std.fmt.allocPrint(allocator, "{{\"step\":{d}}}", .{self.call_count}),
+                };
+                const content = if (self.call_count == 1)
+                    try allocator.dupe(u8,
+                        \\<task_plan>
+                        \\<summary>Run the synthetic three-step task</summary>
+                        \\<step>Run alpha probe</step>
+                        \\<step>Run beta probe</step>
+                        \\<step>Run gamma probe</step>
+                        \\</task_plan>
+                    )
+                else
+                    try std.fmt.allocPrint(allocator, "step {d}", .{self.call_count});
+                return .{
+                    .content = content,
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "planned-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const CaptureObserver = struct {
+        const Self = @This();
+        plan_step_count: u32 = 0,
+        step_done_count: u32 = 0,
+        plan_complete_count: u32 = 0,
+        generic_tool_start_count: u32 = 0,
+        step_indices: [3]u32 = .{ 99, 99, 99 },
+
+        const vtable = Observer.VTable{
+            .record_event = recordEvent,
+            .record_metric = recordMetric,
+            .flush = flush,
+            .name = name,
+        };
+
+        fn observer(self: *Self) Observer {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        fn recordEvent(ptr: *anyopaque, event: *const ObserverEvent) void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            switch (event.*) {
+                .narration_frame => |frame| {
+                    if (frame.frame_type == .tool_start and frame.step_total == null) {
+                        self.generic_tool_start_count += 1;
+                    }
+                    if (frame.step_total != null and frame.step_total.? == 3) {
+                        switch (frame.frame_type) {
+                            .plan_step => {
+                                if (self.plan_step_count < self.step_indices.len) {
+                                    self.step_indices[self.plan_step_count] = frame.step_index orelse 99;
+                                }
+                                self.plan_step_count += 1;
+                            },
+                            .tool_done => self.step_done_count += 1,
+                            .thinking => {
+                                if (frame.step_index != null and frame.step_index.? == 3) {
+                                    self.plan_complete_count += 1;
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+        fn flush(_: *anyopaque) void {}
+        fn name(_: *anyopaque) []const u8 {
+            return "task-plan-capture";
+        }
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = PlannedProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = PlannedProvider.chatWithSystem,
+        .chat = PlannedProvider.chat,
+        .supportsNativeTools = PlannedProvider.supportsNativeTools,
+        .getName = PlannedProvider.getName,
+        .deinit = PlannedProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var tool_impl = PlanProbeTool{};
+    const tool_list = [_]Tool{tool_impl.tool()};
+
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var capture = CaptureObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = capture.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 6,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("run the planned task");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqual(@as(usize, 4), provider_state.call_count);
+    try std.testing.expectEqual(@as(u32, 3), capture.plan_step_count);
+    try std.testing.expectEqual(@as(u32, 3), capture.step_done_count);
+    try std.testing.expectEqual(@as(u32, 1), capture.plan_complete_count);
+    try std.testing.expectEqual(@as(u32, 0), capture.step_indices[0]);
+    try std.testing.expectEqual(@as(u32, 1), capture.step_indices[1]);
+    try std.testing.expectEqual(@as(u32, 2), capture.step_indices[2]);
+    try std.testing.expect(capture.generic_tool_start_count >= 3);
 }
 
 test "turn retries once when provider reliability is inactive" {
