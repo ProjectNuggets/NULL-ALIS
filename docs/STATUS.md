@@ -2,16 +2,29 @@
 tags: [prose, prose/docs]
 ---
 
-# nullalis Status Snapshot — 2026-05-19
+# nullalis Status Snapshot — 2026-05-19 (PM update)
 
 Cold-readable operational truth source. Updated when waves close, not during.
 Last archive: `docs/archive/status-2026-03-06.md`.
 
+**Active roadmap:** [`docs/ROADMAP.md`](ROADMAP.md). Current sprint: **v1.14.13** (τ-bench baseline + wire what's built).
+**Active standards:** [`AGENTS.md`](../AGENTS.md) §14 (Nullalis-grade Swiss-watch).
+
 ## Branch state
 
-- **Branch:** `main` — 37 commits ahead of `origin/main`, not pushed (per Nova's "no push until ready" directive).
-- **HEAD:** `3af8f6b8` — docs(extraction): record memory write hygiene audit verdict inline.
+- **Tag:** `v1.14.12` pushed to `origin`.
+- **PR open:** [#72](https://github.com/ProjectNuggets/NULL-ALIS/pull/72) — `release/v1.14.12-memory-audit` → `main`, 50 commits.
 - **Build status:** `zig build` clean. `zig build test` exit 0; all warnings are expected mock-provider failure paths from test scenarios.
+
+## 2026-05-19 PM update — file-by-file audit
+
+Three parallel agents audited the codebase scoping by directory. **67 findings total** (9 HIGH, 31 MED, 27 LOW). Per AGENTS.md §14.2 / §14.4, the findings are not "delete candidates" — they are unfinished work. The roadmap (`docs/ROADMAP.md` v1.14.13 + v1.14.14 + v1.14.18) finishes them.
+
+Key clusters identified:
+- **Half-finished modules:** `task_planner.zig`, `narration.zig`, `context_engine.zig`, `tools/schema.zig` — built but never wired. v1.14.13 wires them.
+- **Config zombies:** Email, Teams, Nostr accept config.json fields with no daemon wiring. v1.14.15/16/17 finishes the channels.
+- **False-confidence handlers:** `handleReady` (7 tests, 0 prod callers), `EMPTY_TURN_PLACEHOLDER` (V1.14.4 removed emission, doc still claims behavior). v1.14.13 rewires or strips.
+- **Aspirational prompt directive:** F-A2 brain_graph instruction ignored by model (0 calls vs 145). v1.14.13 strips per AGENTS.md §14.7.
 
 ## Scope landed in this branch (post-V1.14.4 booth-readiness)
 
@@ -55,28 +68,31 @@ Last archive: `docs/archive/status-2026-03-06.md`.
 | iter19 phaseB | 23/25 polluted | 50% trigger + anti-thrash, multi-turn recovered |
 | iter21 cleanup | 22/22 real (3 infra-flake curl timeouts) | dead-code removed |
 
-## Current Open Ends
+## Current Open Ends (each maps to a roadmap block)
 
-1. **37 commits unpushed.** Pending Nova's "ready to push backup branch" signal.
+1. **PR #72 review + merge** — releases v1.14.12 into `main`.
 
-2. **`searchHint` port — premature.** nullalis has no deferred-tool-discovery surface; model receives full tool catalog every turn. `ToolSpec` is 3 fields. Adding `search_hint` today = dead code. Re-evaluate when V-infinity adopts deferred discovery.
+2. **v1.14.13 sprint** — τ-bench Airline baseline + wire orphans (`tools/schema.zig`, `task_planner` + `narration`, `handleReady`, F-A2 strip, BrowserTool honesty, BIRTHDAY contradiction). 5-7 days. See ROADMAP.md.
 
-3. **`AskUserQuestion` port — blocked on zaki-prod renderer.** Backend tool ~50 LoC of boilerplate, but the value is the renderer (Telegram inline-keyboards + frontend multi-choice). Without renderer, tool emits JSON as wall of text — worse than asking in prose.
+3. **v1.14.14 ContextEngine migration** — route `root.zig::turn()` through the 4-phase lifecycle. Activates ~1K LoC of correct-but-unused code. 7-10 days.
 
-4. **UI autonomy toggle — blocked on zaki-prod.** Default flipped to `.full`; need frontend toggle so users can choose supervised/full without editing `config.json`.
+4. **v1.14.15/16/17 channel finishes** — Email, Teams, Nostr each get one block.
 
-5. **Native connectors (Composio replacement) — multi-day work.** Per-user OAuth/API/CLI wiring. Not started.
+5. **v1.14.18 MED-tier sweep** — close 31 remaining audit findings. QMD export wiring, Composio error sanitizer, CLI honesty, stale-comment sweep.
 
-6. **Per-cell pod canary deploy — infra work.** zaki-infra side. Not started.
+6. **v1.15.0 τ-bench iteration sprint** — Karpathy loop on execution quality.
 
-7. **agent turn audit followups** (from `project_agent_turn_audit_followups`):
-   - `memory_enrich` 900ms variance — not urgent, keep for post-profiling.
-   - `elideUnverifiedHistory` O(N) scan — not urgent.
+7. **v1.16.0 frontend wave** — UI autonomy toggle, AskUserQuestion renderer, mode toggle, brain entity styling. Needs zaki-prod.
 
-8. **Lifecycle followups** (from `project_lifecycle_investigation_2026_04_20`):
-   - Hygiene startup-only, no background scheduler.
-   - `conversation_retention_days = 0` default.
-   - Not tonight's latency cause; revisit post-canary.
+8. **v1.17.0 native connectors phase 1** — top 3-5 integrations via OAuth.
+
+9. **v1.18.0 per-cell pod canary** — zaki-infra. 7-day soak gate.
+
+10. **v1.19.0 observability + SRE** — Grafana, alerting, latency budgets.
+
+11. **v2.0.0 commercial launch** — payment + onboarding. Strategy locked with Nova post-cleanup.
+
+12. **V-infinity arc** — 12 pillars, one sprint each, paced by user signal.
 
 ## Verification anchors
 
