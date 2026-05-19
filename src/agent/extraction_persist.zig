@@ -647,29 +647,22 @@ fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
 /// callsite is added without picking a tag, the build breaks (no
 /// implicit `.unknown` fallback) — forces conscious decision.
 pub const WriteOrigin = enum {
-    /// Agent's memory_store tool (per-turn, agent-driven). Judge: K2.6.
+    /// Agent's memory_store tool (per-turn, agent-driven).
     memory_store_tool,
-    /// Pass A mid-session drop extraction (compaction.zig:459).
+    /// Mid-session compaction drop extraction (compaction.zig::compactHistory).
     pass_a_drop,
-    /// Pass C compaction summary — direct parsed_facts write (compaction.zig:699).
-    /// Candidate for M5 removal if telemetry shows redundancy with pass_c_extract.
-    pass_c_compaction_direct,
-    /// Pass C compaction summary — structural extraction via extractAtBoundary
-    /// (compaction.zig:759 → runner.zig:635).
+    /// End-of-compaction summary extraction via extractAtBoundary
+    /// (compaction.zig Pass C site → runner.zig::extractAtBoundary).
     pass_c_compaction_extract,
-    /// Session-end durable_fact promotion — direct write (commands.zig:1440).
-    /// Candidate for M5 removal if telemetry shows redundancy with
-    /// session_end_extract.
-    session_end_durable_fact,
     /// Session-end TTL extraction via extractAtBoundary
-    /// (commands.zig:1494 → runner.zig:635).
+    /// (commands.zig session_end site → runner.zig::extractAtBoundary).
     session_end_extract,
-    /// Test harness wire (zaki_state.zig:11905 + unit tests). Not production.
+    /// Test harness wire (zaki_state.zig test fixture + unit tests). Not production.
     test_wire,
-    /// V1.14.12 (M3 review MED) — defensive fallback when a future
-    /// caller is added without picking a precise tag. A `.unknown`
-    /// emission in the histogram is a LOUD signal to add a real tag.
-    /// Never use this in new callers; it exists only as a safety net.
+    /// V1.14.12 (M3 review MED) — defensive fallback for a future caller
+    /// added without picking a precise tag. A `.unknown` emission in the
+    /// histogram is a LOUD signal to add a real tag. Never use in new
+    /// callers; safety net only.
     unknown,
 
     pub fn toSlice(self: WriteOrigin) []const u8 {
@@ -1649,19 +1642,17 @@ test "V1.14.12 (M1): WriteOrigin tags are stable strings for log analyzers" {
     // breaks downstream analyzer scripts silently. Lock the wire format.
     try std.testing.expectEqualStrings("memory_store_tool", WriteOrigin.memory_store_tool.toSlice());
     try std.testing.expectEqualStrings("pass_a_drop", WriteOrigin.pass_a_drop.toSlice());
-    try std.testing.expectEqualStrings("pass_c_compaction_direct", WriteOrigin.pass_c_compaction_direct.toSlice());
     try std.testing.expectEqualStrings("pass_c_compaction_extract", WriteOrigin.pass_c_compaction_extract.toSlice());
-    try std.testing.expectEqualStrings("session_end_durable_fact", WriteOrigin.session_end_durable_fact.toSlice());
     try std.testing.expectEqualStrings("session_end_extract", WriteOrigin.session_end_extract.toSlice());
     try std.testing.expectEqualStrings("test_wire", WriteOrigin.test_wire.toSlice());
 }
 
-test "V1.14.12 (M1): WriteOrigin enum count guards against silent additions" {
-    // The 8 enum values: 6 production callsites + 1 test wire + 1
-    // .unknown defensive fallback (added in M3 review MED). If a NEW
-    // persistExtracted callsite is added without updating this count,
-    // the test fails — forces a conscious decision about how to tag it
-    // for telemetry. M3/M5 redundancy gates depend on accurate tag
-    // distributions.
-    try std.testing.expectEqual(@as(usize, 8), @typeInfo(WriteOrigin).@"enum".fields.len);
+test "V1.14.12 (M1 + Path A): WriteOrigin enum count guards against silent additions" {
+    // 6 variants: 4 production callsites + 1 test wire + 1 .unknown
+    // defensive fallback. Path A deleted the 2 legacy-direct variants
+    // (pass_c_compaction_direct, session_end_durable_fact) along with
+    // their callers. If a NEW persistExtracted callsite is added without
+    // updating this count, the test fails — forces a conscious decision
+    // about tagging for telemetry.
+    try std.testing.expectEqual(@as(usize, 6), @typeInfo(WriteOrigin).@"enum".fields.len);
 }
