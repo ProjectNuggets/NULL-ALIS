@@ -111,6 +111,10 @@ pub const CompactionConfig = struct {
     /// flows through `extractAtBoundary` at compaction.zig:759 only.
     /// See `config_types.AgentConfig.extraction_legacy_direct_writes`.
     extraction_legacy_direct_writes: bool = true,
+    /// V1.14.12 (M2 review CRITICAL) — cardinality fast-path flag,
+    /// threaded into JudgeContext at the Pass A + Pass C direct sites
+    /// so persistExtracted honors operator config.
+    extraction_cardinality_fastpath: bool = true,
     // V1.6 commit 8: optional embedding provider for entity coreference.
     // When set, extracted-fact object strings get cosine-resolved against
     // existing memory_entities rows (≥0.95 = same entity, reuse id; new
@@ -462,6 +466,7 @@ fn dropOldestPairsFromMiddle(
                     .enable_hydration = false, // Pass A is mid-session — extraction only.
                     .boundary_kind = .pass_a, // V1.14.9 L-01: explicit telemetry tag
                     .write_origin = .pass_a_drop, // V1.14.12 (M1) — per-path telemetry tag
+                    .cardinality_fastpath_enabled = config.extraction_cardinality_fastpath, // V1.14.12 (M2 review CRITICAL)
                 };
                 const br = extraction_runner.extractAtBoundary(allocator, buf.items, ctx);
                 defer br.deinit(allocator);
@@ -706,6 +711,7 @@ fn compactHistoryKeepingRecent(
                             extraction_persist.JudgeContext{
                                 .provider = judge_provider,
                                 .model_name = judge_model,
+                                .cardinality_fastpath_enabled = config.extraction_cardinality_fastpath,
                             };
 
                         // V1.6 cmt8: coref context wraps the runtime embedding
@@ -778,6 +784,7 @@ fn compactHistoryKeepingRecent(
                     .max_source_chars = config.max_source_chars,
                     .boundary_kind = .pass_c, // V1.14.9 L-01: explicit telemetry tag
                     .write_origin = .pass_c_compaction_extract, // V1.14.12 (M1) — per-path telemetry tag
+                    .cardinality_fastpath_enabled = config.extraction_cardinality_fastpath, // V1.14.12 (M2 review CRITICAL)
                 };
                 const br = extraction_runner.extractAtBoundary(allocator, buf.items, ctx);
                 defer br.deinit(allocator);

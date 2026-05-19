@@ -412,6 +412,10 @@ pub const Agent = struct {
     /// commands.zig:1494 (write_origin=session_end_extract). Default
     /// true preserves pre-M5 behavior during 1-week soak.
     extraction_legacy_direct_writes: bool = true,
+    /// V1.14.12 (M2 review CRITICAL) — cardinality fast-path gate
+    /// threaded through to JudgeContext so persistExtracted honors
+    /// the operator-set value. Default true preserves M2 behavior.
+    extraction_cardinality_fastpath: bool = true,
     /// V1.14.7 — extraction trigger gates (per-turn enqueue, memory nudge,
     /// skills nudge). Defaults preserve V1.14.6 behavior. C2 wires structured
     /// extraction into compaction; C3 flips defaults to disabled and deletes
@@ -1076,6 +1080,9 @@ pub const Agent = struct {
             // from Agent → CompactionConfig so the Pass C parsed_facts
             // direct path can honor the gate.
             .extraction_legacy_direct_writes = self.extraction_legacy_direct_writes,
+            // V1.14.12 (M2 review CRITICAL) — propagate the cardinality
+            // fast-path flag so Pass C judge_ctx honors operator config.
+            .extraction_cardinality_fastpath = self.extraction_cardinality_fastpath,
         };
     }
 

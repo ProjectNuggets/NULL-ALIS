@@ -222,6 +222,12 @@ pub const SessionManager = struct {
     /// field MUST move under `SessionManager.mutex` to prevent torn
     /// reads. Same contract applies to all `extraction_*` siblings.
     extraction_legacy_direct_writes: bool = true,
+    /// V1.14.12 (M2 review CRITICAL) — cardinality fast-path gate
+    /// threaded from gateway config to per-session Agent → JudgeContext.
+    /// Same INIT-ONLY concurrency contract as the sibling fields.
+    /// Default true preserves M2 behavior (set-valued additive writes
+    /// skip the judge LLM call).
+    extraction_cardinality_fastpath: bool = true,
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
@@ -463,6 +469,9 @@ pub const SessionManager = struct {
         // V1.14.12 (M5) — legacy direct-write gate, threaded from
         // SessionManager (which gateway.zig sets from config).
         agent.extraction_legacy_direct_writes = self.extraction_legacy_direct_writes;
+        // V1.14.12 (M2 review CRITICAL) — cardinality fast-path gate,
+        // same plumbing pattern.
+        agent.extraction_cardinality_fastpath = self.extraction_cardinality_fastpath;
         return agent;
     }
 

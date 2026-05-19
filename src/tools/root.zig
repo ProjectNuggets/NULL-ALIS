@@ -1866,6 +1866,7 @@ pub fn bindMemoryStoreUnifiedContext(
     judge_provider: ?@import("../providers/root.zig").Provider,
     judge_model_name: ?[]const u8,
     coref_embed: ?@import("../memory/vector/embeddings.zig").EmbeddingProvider,
+    cardinality_fastpath_enabled: bool, // V1.14.12 (M2 review CRITICAL)
 ) void {
     for (tools) |t| {
         if (t.vtable == &memory_store.MemoryStoreTool.vtable) {
@@ -1873,6 +1874,7 @@ pub fn bindMemoryStoreUnifiedContext(
             mt.judge_provider = judge_provider;
             mt.judge_model_name = judge_model_name;
             mt.coref_embed = coref_embed;
+            mt.cardinality_fastpath_enabled = cardinality_fastpath_enabled;
         }
     }
 }

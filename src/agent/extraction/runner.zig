@@ -136,8 +136,17 @@ pub const ExtractionContext = struct {
     /// Passed through to `persistExtracted` inside this runner. Each
     /// of the three production callers of extractAtBoundary must set
     /// the right tag (pass_a_drop / pass_c_compaction_extract /
-    /// session_end_extract). Default mirrors the boundary_kind default.
-    write_origin: @import("../extraction_persist.zig").WriteOrigin = .session_end_extract,
+    /// session_end_extract).
+    ///
+    /// V1.14.12 (M1 review HIGH#1 fix) — default changed from
+    /// .session_end_extract → .unknown. Pre-fix a forgotten field on
+    /// a new ExtractionContext construction silently inflated the
+    /// session_end histogram. Post-fix a forgotten field surfaces as
+    /// `.unknown` in the histogram — a LOUD signal that a new
+    /// callsite needs a precise tag. M3/M5 redundancy gates depend on
+    /// accurate per-path distributions; this default change protects
+    /// those gates from silent corruption.
+    write_origin: @import("../extraction_persist.zig").WriteOrigin = .unknown,
     /// V1.14.12 (M3) — coverage filter gate. When true (default),
     /// boundary extraction skips facts whose canonical key matches
     /// one already written by the agent's memory_store tool (per
@@ -160,6 +169,11 @@ pub const ExtractionContext = struct {
     /// eviction is recency-based (M3 review MEDIUM#5).
     coverage_horizon_days: u32 = 30,
     coverage_horizon_session_cap: u32 = 5000,
+    /// V1.14.12 (M2 review CRITICAL) — cardinality fast-path flag,
+    /// passed through to JudgeContext inside persistExtraction so
+    /// operator config actually controls M2 behavior. Default true
+    /// preserves M2 fast-path effects.
+    cardinality_fastpath_enabled: bool = true,
 };
 
 /// V1.14.9 — Episode-based boundary extraction. Replaces the V1.14.8
@@ -784,6 +798,9 @@ fn persistExtraction(
     const judge_ctx = extraction_persist.JudgeContext{
         .provider = ctx.judge_provider,
         .model_name = ctx.judge_model,
+        // V1.14.12 (M2 review CRITICAL) — honor operator-set fast-path
+        // flag threaded from caller via ExtractionContext.
+        .cardinality_fastpath_enabled = ctx.cardinality_fastpath_enabled,
     };
     const coref_ctx: ?extraction_persist.EntityResolution = if (ctx.coref_embed) |ep|
         extraction_persist.EntityResolution{ .embed_provider = ep, .threshold = 0.95 }

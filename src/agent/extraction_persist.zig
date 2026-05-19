@@ -126,6 +126,20 @@ pub const PersistResult = struct {
 pub const JudgeContext = struct {
     provider: providers.Provider,
     model_name: []const u8,
+    /// V1.14.12 (M2 review CRITICAL fix) — cardinality fast-path runtime
+    /// gate. When TRUE (default), persistExtracted skips the judge for
+    /// set-valued predicates without explicit negation (M2 behavior).
+    /// When FALSE, the judge fires on every write regardless of
+    /// cardinality (pre-M2 behavior).
+    ///
+    /// Wired from `agent.extraction_cardinality_fastpath` config field
+    /// through the 6 caller sites (memory_store, compaction Pass A/C,
+    /// commands session-end). Default true preserves M2 effects.
+    ///
+    /// Pre-fix: the config flag was parsed but never read at the gate
+    /// (persistExtracted ignored it). Operators couldn't disable M2 via
+    /// config — only via code revert. This restores the contract.
+    cardinality_fastpath_enabled: bool = true,
 };
 
 /// V1.6 commit 8 — optional embedding provider for entity coreference.
@@ -717,8 +731,15 @@ pub fn persistExtracted(
 
     // V1.14.12 (M1) — per-path telemetry. One log per persistExtracted
     // call; downstream baseline_analyzer.py builds the origin histogram.
+    //
+    // V1.14.12 (M1 review MEDIUM#2) — renamed `count` → `attempted` to
+    // reflect that this is INPUT cardinality, not write cardinality.
+    // Blacklist + MD5 + cardinality fast-path + judge skips can all
+    // reduce attempted → written. The trailing log line at end of
+    // batch reports `written` + `skipped_total` so M3/M5 redundancy
+    // decisions get accurate numerators/denominators.
     log.info(
-        "memory.write.batch origin={s} count={d} user_id={d} session={s} judge={s}",
+        "memory.write.batch origin={s} attempted={d} user_id={d} session={s} judge={s}",
         .{
             origin.toSlice(),
             memories.len,
@@ -790,7 +811,11 @@ pub fn persistExtracted(
         // net).
         const cardinality = edge_resolution.classifyPredicate(m.predicate);
         const has_negation = edge_resolution.textHasExplicitNegation(m.text);
-        if (cardinality == .set_valued and !has_negation) {
+        // V1.14.12 (M2 review CRITICAL): read the fast-path flag from
+        // the JudgeContext. Null judge → flag doesn't matter (no judge
+        // to skip), but we conservatively treat null as flag=true.
+        const fastpath_enabled = if (judge) |j| j.cardinality_fastpath_enabled else true;
+        if (fastpath_enabled and cardinality == .set_valued and !has_negation) {
             log.info(
                 "memory.write.cardinality_fastpath subject={s} predicate={s} reason=set_valued_no_negation",
                 .{ m.subject, m.predicate },
@@ -1052,6 +1077,26 @@ pub fn persistExtracted(
         });
         result.written_count += 1;
     }
+
+    // V1.14.12 (M1 review MEDIUM#2) — trailing summary log. Pairs with
+    // the leading `memory.write.batch attempted=N` line to give the
+    // baseline_analyzer.py histogram both attempted AND actually-
+    // written counts per origin. M3/M5 redundancy gates compare the
+    // WRITTEN counts (not attempted) to decide whether direct paths
+    // are subsumed by extract paths.
+    log.info(
+        "memory.write.batch_done origin={s} attempted={d} written={d} skipped_md5={d} skipped_semantic={d} skipped_blacklist={d} contradictions={d} failed={d}",
+        .{
+            origin.toSlice(),
+            memories.len,
+            result.written_count,
+            result.skipped_md5_dup,
+            result.skipped_semantic_dup,
+            result.skipped_blacklist,
+            result.contradictions_resolved,
+            result.failed_count,
+        },
+    );
 
     return result;
 }

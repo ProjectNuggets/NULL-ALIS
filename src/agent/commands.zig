@@ -1426,6 +1426,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                                         break :blk extraction_persist.JudgeContext{
                                             .provider = jp,
                                             .model_name = self.extraction_judge_model_name,
+                                            .cardinality_fastpath_enabled = self.extraction_cardinality_fastpath,
                                         };
                                     }
                                 }
@@ -1487,6 +1488,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                         .archive_mem = self.mem,
                         .archive_mem_rt = self.mem_rt,
                         .write_origin = .session_end_extract, // V1.14.12 (M1) — per-path telemetry tag
+                        .cardinality_fastpath_enabled = self.extraction_cardinality_fastpath, // V1.14.12 (M2 review CRITICAL)
                     };
                     const br = extraction_runner.extractAtBoundary(self.allocator, buf.items, ctx);
                     defer br.deinit(self.allocator);

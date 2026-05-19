@@ -30,6 +30,10 @@ pub const MemoryStoreTool = struct {
     user_id: ?i64 = null,
     judge_provider: ?@import("../providers/root.zig").Provider = null,
     judge_model_name: ?[]const u8 = null,
+    /// V1.14.12 (M2 review CRITICAL) — cardinality fast-path flag,
+    /// threaded from tool binding so memory_store's JudgeContext
+    /// honors operator config. Default true preserves M2 behavior.
+    cardinality_fastpath_enabled: bool = true,
     coref_embed: ?@import("../memory/vector/embeddings.zig").EmbeddingProvider = null,
 
     pub const tool_name = "memory_store";
@@ -155,7 +159,7 @@ pub const MemoryStoreTool = struct {
         const judge_ctx: ?extraction_persist.JudgeContext = blk: {
             if (self.judge_provider) |jp| {
                 if (self.judge_model_name) |jmn| {
-                    break :blk extraction_persist.JudgeContext{ .provider = jp, .model_name = jmn };
+                    break :blk extraction_persist.JudgeContext{ .provider = jp, .model_name = jmn, .cardinality_fastpath_enabled = self.cardinality_fastpath_enabled };
                 }
             }
             break :blk null;

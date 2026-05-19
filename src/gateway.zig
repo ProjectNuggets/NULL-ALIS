@@ -1612,6 +1612,7 @@ const TenantRuntime = struct {
             provider_i, // V1.8-1: judge_provider (was null)
             runtime.config.default_model, // V1.8-1: judge_model_name (was null)
             cmt96_coref_embed,
+            runtime.config.agent.extraction_cardinality_fastpath, // V1.14.12 (M2 review CRITICAL)
         );
 
         // V1.12 — wire wiki_link tool with the same provider+model+embedder
@@ -1715,6 +1716,10 @@ const TenantRuntime = struct {
                         );
                     }
                     runtime.session_mgr.extraction_legacy_direct_writes = safe_legacy;
+                    // V1.14.12 (M2 review CRITICAL) — wire fast-path flag
+                    // from config to session_mgr so each per-session Agent
+                    // inherits it and propagates to JudgeContext.
+                    runtime.session_mgr.extraction_cardinality_fastpath = runtime.config.agent.extraction_cardinality_fastpath;
                     log.info("extraction.enabled user_id={d} coref={s} judge={s} legacy_direct_writes={s}{s}", .{
                         numeric_user_id,
                         if (coref_on) "on" else "off-no-embed",
