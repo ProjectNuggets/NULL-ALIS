@@ -6,6 +6,15 @@
 //!
 //! Design invariant: narration frames flow ONLY through the Observer event bus.
 //! They must NEVER be appended to Agent.history (LLM message context).
+//!
+//! v1.14.18-B G3 (NARRATION-AS-CONTEXT) addition: a per-Agent
+//! `NarrationRingBuffer` records the recent narration frames so the agent
+//! can read its own prior thinking back into the next iteration's prompt.
+//! The buffer is owned by the Agent (so it persists across the per-turn
+//! `NarrationObserver` lifetime) and is referenced by pointer from the
+//! per-turn wrapper. `recallRecent` returns the last N entries oldest →
+//! newest for rendering into the `<recent_thoughts>` volatile block via
+//! `context_engine.assemble`.
 
 const std = @import("std");
 const observability = @import("../observability.zig");
@@ -25,6 +34,195 @@ pub const NarrationFrame = struct {
     step_total: ?u32 = null,
 };
 
+/// v1.14.18-B G3 — recorded ring-buffer frame. Owns its message + tool_name
+/// strings (heap-dup'd from NarrationFrame at push time) so the buffer is
+/// not aliasing the per-turn observer's stack frames or the channel
+/// formatters' transient buffers. Caller frees via `RingBuffer.deinit`.
+pub const RecordedFrame = struct {
+    message: []u8,
+    frame_type: FrameType,
+    tool_name: ?[]u8 = null,
+    iteration: u32 = 0,
+    unix_ms: i64 = 0,
+
+    pub fn deinit(self: *RecordedFrame, allocator: std.mem.Allocator) void {
+        allocator.free(self.message);
+        if (self.tool_name) |t| allocator.free(t);
+    }
+};
+
+/// Fixed-capacity ring buffer of recent narration frames. 16 slots fits
+/// 4-5 multi-tool iterations comfortably without bloating the agent struct.
+/// Eviction is FIFO (oldest dropped first).
+///
+/// Owned by `Agent`; the per-turn `NarrationObserver` holds a pointer back
+/// so `emitFrame` pushes through. `recallRecent` reads the last N in
+/// oldest→newest order for prompt injection.
+pub const RING_BUFFER_CAPACITY: usize = 16;
+
+pub const NarrationRingBuffer = struct {
+    frames: [RING_BUFFER_CAPACITY]RecordedFrame = undefined,
+    /// Number of valid frames currently stored (0..RING_BUFFER_CAPACITY).
+    len: usize = 0,
+    /// Next write index modulo capacity.
+    head: usize = 0,
+    /// Allocator used to dup message strings on push.
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) NarrationRingBuffer {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *NarrationRingBuffer) void {
+        var idx: usize = 0;
+        while (idx < self.len) : (idx += 1) {
+            self.frames[idx].deinit(self.allocator);
+        }
+        self.len = 0;
+        self.head = 0;
+    }
+
+    /// Push a frame. Dupes message + tool_name; on OOM the frame is silently
+    /// dropped (narration is observability — never crashes the agent).
+    pub fn push(self: *NarrationRingBuffer, frame: NarrationFrame, iteration: u32) void {
+        const msg = self.allocator.dupe(u8, frame.message) catch return;
+        const tool_owned: ?[]u8 = if (frame.tool_name) |t|
+            (self.allocator.dupe(u8, t) catch {
+                self.allocator.free(msg);
+                return;
+            })
+        else
+            null;
+
+        const recorded = RecordedFrame{
+            .message = msg,
+            .frame_type = frame.frame_type,
+            .tool_name = tool_owned,
+            .iteration = iteration,
+            .unix_ms = std.time.milliTimestamp(),
+        };
+
+        if (self.len < RING_BUFFER_CAPACITY) {
+            self.frames[self.len] = recorded;
+            self.len += 1;
+            self.head = self.len % RING_BUFFER_CAPACITY;
+        } else {
+            // Full: free the slot we're about to overwrite, then write.
+            self.frames[self.head].deinit(self.allocator);
+            self.frames[self.head] = recorded;
+            self.head = (self.head + 1) % RING_BUFFER_CAPACITY;
+        }
+    }
+
+    /// Return the last N frames in oldest → newest order. The returned slice
+    /// is allocated by `out_allocator` and references frames whose contents
+    /// remain owned by the ring buffer (do NOT free the inner strings).
+    /// Caller must free the returned slice (not its contents).
+    pub fn last(
+        self: *const NarrationRingBuffer,
+        out_allocator: std.mem.Allocator,
+        n: usize,
+    ) ![]RecordedFrame {
+        if (self.len == 0 or n == 0) return out_allocator.alloc(RecordedFrame, 0);
+        const take = @min(n, self.len);
+
+        // Reconstruct chronological order. When len < capacity, frames
+        // live at indices 0..len-1 in arrival order (no wrap yet). When
+        // saturated, the oldest sits at `head` and wraps around.
+        const out = try out_allocator.alloc(RecordedFrame, take);
+        if (self.len < RING_BUFFER_CAPACITY) {
+            // No wrap: newest is at self.len-1, oldest of `take` window
+            // is at self.len-take.
+            const start = self.len - take;
+            var i: usize = 0;
+            while (i < take) : (i += 1) {
+                out[i] = self.frames[start + i];
+            }
+        } else {
+            // Saturated: chronological start is at `head`; iterate forward
+            // wrapping. The last `take` frames are at positions
+            // (head + (capacity-take)) .. (head + capacity-1) modulo capacity.
+            const skip = RING_BUFFER_CAPACITY - take;
+            var i: usize = 0;
+            while (i < take) : (i += 1) {
+                const idx = (self.head + skip + i) % RING_BUFFER_CAPACITY;
+                out[i] = self.frames[idx];
+            }
+        }
+        return out;
+    }
+};
+
+/// v1.14.18-B G3 entry point — return the last N recorded narration frames.
+/// Oldest → newest order. Empty slice when the buffer is empty or null.
+///
+/// Wired into `context_engine.assemble` so the agent sees its own recent
+/// thinking as feedback in the next iteration's `<recent_thoughts>` block.
+pub fn recallRecent(
+    buffer_opt: ?*const NarrationRingBuffer,
+    out_allocator: std.mem.Allocator,
+    n: usize,
+) ![]RecordedFrame {
+    const buffer = buffer_opt orelse return out_allocator.alloc(RecordedFrame, 0);
+    return buffer.last(out_allocator, n);
+}
+
+/// Format a frame_type as a short tag for the `<recent_thoughts>` block.
+/// Kept terse so the prompt surface stays compact.
+fn frameTypeTag(ft: FrameType) []const u8 {
+    return switch (ft) {
+        .thinking => "thinking",
+        .tool_start => "action",
+        .tool_done => "result",
+        .error_recovery => "error",
+        .waiting => "waiting",
+        .plan_step => "plan",
+        .listening => "listen",
+        .speaking => "speak",
+    };
+}
+
+/// Render a slice of RecordedFrame as a `<recent_thoughts>` block string.
+/// Returns empty string when frames are empty. Caller frees.
+///
+/// Format (per dispatch spec):
+///   <recent_thoughts iteration="N" count="3">
+///   [iter 1, thinking]: Retrieving memory for entity
+///   [iter 2, action]: memory_recall (Joanna)
+///   [iter 2, thinking]: 4 hits, none match the constraint
+///   </recent_thoughts>
+pub fn renderRecentThoughtsBlock(
+    allocator: std.mem.Allocator,
+    frames: []const RecordedFrame,
+    current_iteration: u32,
+) ![]u8 {
+    if (frames.len == 0) return allocator.alloc(u8, 0);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.print(
+        "<recent_thoughts iteration=\"{d}\" count=\"{d}\">\n",
+        .{ current_iteration, frames.len },
+    );
+    for (frames) |f| {
+        if (f.tool_name) |tn| {
+            try w.print(
+                "[iter {d}, {s}]: {s} ({s})\n",
+                .{ f.iteration, frameTypeTag(f.frame_type), f.message, tn },
+            );
+        } else {
+            try w.print(
+                "[iter {d}, {s}]: {s}\n",
+                .{ f.iteration, frameTypeTag(f.frame_type), f.message },
+            );
+        }
+    }
+    try w.writeAll("</recent_thoughts>\n");
+    return buf.toOwnedSlice(allocator);
+}
+
 /// Callback fn pointer for direct frame delivery (optional, can be null).
 /// ctx is the caller-supplied context pointer passed at construction.
 pub const NarrationCallback = *const fn (ctx: *anyopaque, frame: NarrationFrame) void;
@@ -35,6 +233,14 @@ pub const NarrationObserver = struct {
     inner: Observer,
     callback: ?NarrationCallback = null,
     callback_ctx: ?*anyopaque = null,
+    /// v1.14.18-B G3 — optional pointer to the Agent's ring buffer so
+    /// emitted frames flow into per-iteration recall. Null in test
+    /// constructions and in subagent observers where recall isn't needed.
+    ring_buffer: ?*NarrationRingBuffer = null,
+    /// v1.14.18-B G3 — current tool-iteration the agent is on. Stamped
+    /// onto pushed frames so `<recent_thoughts>` lines carry their origin
+    /// iteration. The owning Agent bumps this between iterations.
+    current_iteration: u32 = 0,
 
     const vtable = Observer.VTable{
         .record_event = recordEvent,
@@ -93,6 +299,13 @@ pub const NarrationObserver = struct {
     }
 
     fn emitFrame(self: *NarrationObserver, frame: NarrationFrame) void {
+        // v1.14.18-B G3 — push into the Agent's ring buffer so recallRecent
+        // can surface this thought in the next iteration's volatile prompt
+        // block. Happens FIRST (before callback / inner observer) so the
+        // record reflects the model's own progress trail regardless of
+        // whether downstream observers crash. Failure-soft via push().
+        if (self.ring_buffer) |rb| rb.push(frame, self.current_iteration);
+
         // Deliver via callback if one is registered and has a valid context.
         if (self.callback) |cb| {
             if (self.callback_ctx) |ctx| {
@@ -251,4 +464,144 @@ test "turnStageToFrameType maps voice_listening to listening" {
 
 test "turnStageToFrameType maps voice_speaking to speaking" {
     try std.testing.expectEqual(FrameType.speaking, NarrationObserver.turnStageToFrameType("voice_speaking"));
+}
+
+// ── v1.14.18-B G3 ring buffer + recallRecent tests ─────────────────────────
+
+test "NarrationRingBuffer push + last returns frames in order" {
+    var rb = NarrationRingBuffer.init(std.testing.allocator);
+    defer rb.deinit();
+
+    rb.push(.{ .message = "first", .frame_type = .thinking }, 1);
+    rb.push(.{ .message = "second", .frame_type = .tool_start, .tool_name = "bash" }, 1);
+    rb.push(.{ .message = "third", .frame_type = .tool_done, .tool_name = "bash" }, 2);
+
+    const frames = try rb.last(std.testing.allocator, 3);
+    defer std.testing.allocator.free(frames);
+    try std.testing.expectEqual(@as(usize, 3), frames.len);
+    try std.testing.expectEqualStrings("first", frames[0].message);
+    try std.testing.expectEqualStrings("second", frames[1].message);
+    try std.testing.expectEqualStrings("third", frames[2].message);
+    try std.testing.expectEqualStrings("bash", frames[1].tool_name.?);
+    try std.testing.expectEqual(@as(u32, 2), frames[2].iteration);
+}
+
+test "NarrationRingBuffer.last(n) returns at most n newest" {
+    var rb = NarrationRingBuffer.init(std.testing.allocator);
+    defer rb.deinit();
+    rb.push(.{ .message = "a", .frame_type = .thinking }, 0);
+    rb.push(.{ .message = "b", .frame_type = .thinking }, 0);
+    rb.push(.{ .message = "c", .frame_type = .thinking }, 0);
+    rb.push(.{ .message = "d", .frame_type = .thinking }, 0);
+
+    const last2 = try rb.last(std.testing.allocator, 2);
+    defer std.testing.allocator.free(last2);
+    try std.testing.expectEqual(@as(usize, 2), last2.len);
+    try std.testing.expectEqualStrings("c", last2[0].message);
+    try std.testing.expectEqualStrings("d", last2[1].message);
+}
+
+test "NarrationRingBuffer never grows past RING_BUFFER_CAPACITY" {
+    var rb = NarrationRingBuffer.init(std.testing.allocator);
+    defer rb.deinit();
+    // Push 2x capacity; oldest must be evicted FIFO.
+    var i: usize = 0;
+    while (i < RING_BUFFER_CAPACITY * 2) : (i += 1) {
+        var buf: [16]u8 = undefined;
+        const msg = try std.fmt.bufPrint(&buf, "m{d}", .{i});
+        // dup so we can free locally; push dups again internally.
+        const owned = try std.testing.allocator.dupe(u8, msg);
+        defer std.testing.allocator.free(owned);
+        rb.push(.{ .message = owned, .frame_type = .thinking }, @intCast(i));
+    }
+    try std.testing.expectEqual(RING_BUFFER_CAPACITY, rb.len);
+
+    // last(capacity) must return the most recent capacity entries.
+    const all = try rb.last(std.testing.allocator, RING_BUFFER_CAPACITY);
+    defer std.testing.allocator.free(all);
+    try std.testing.expectEqual(RING_BUFFER_CAPACITY, all.len);
+    // Oldest of the kept window is m{capacity} (we pushed 0..2*capacity-1).
+    var first_buf: [16]u8 = undefined;
+    const first_expected = try std.fmt.bufPrint(&first_buf, "m{d}", .{RING_BUFFER_CAPACITY});
+    try std.testing.expectEqualStrings(first_expected, all[0].message);
+    // Newest = m{2*capacity - 1}.
+    var last_buf: [16]u8 = undefined;
+    const last_expected = try std.fmt.bufPrint(&last_buf, "m{d}", .{RING_BUFFER_CAPACITY * 2 - 1});
+    try std.testing.expectEqualStrings(last_expected, all[RING_BUFFER_CAPACITY - 1].message);
+}
+
+test "recallRecent null buffer returns empty slice" {
+    const frames = try recallRecent(null, std.testing.allocator, 3);
+    defer std.testing.allocator.free(frames);
+    try std.testing.expectEqual(@as(usize, 0), frames.len);
+}
+
+test "recallRecent empty buffer returns empty slice" {
+    var rb = NarrationRingBuffer.init(std.testing.allocator);
+    defer rb.deinit();
+    const frames = try recallRecent(&rb, std.testing.allocator, 3);
+    defer std.testing.allocator.free(frames);
+    try std.testing.expectEqual(@as(usize, 0), frames.len);
+}
+
+test "recallRecent returns last N oldest-to-newest" {
+    var rb = NarrationRingBuffer.init(std.testing.allocator);
+    defer rb.deinit();
+    rb.push(.{ .message = "alpha", .frame_type = .thinking }, 1);
+    rb.push(.{ .message = "beta", .frame_type = .tool_start, .tool_name = "memory_recall" }, 2);
+    rb.push(.{ .message = "gamma", .frame_type = .thinking }, 2);
+    rb.push(.{ .message = "delta", .frame_type = .tool_done, .tool_name = "memory_recall" }, 3);
+
+    const last3 = try recallRecent(&rb, std.testing.allocator, 3);
+    defer std.testing.allocator.free(last3);
+    try std.testing.expectEqual(@as(usize, 3), last3.len);
+    try std.testing.expectEqualStrings("beta", last3[0].message);
+    try std.testing.expectEqualStrings("gamma", last3[1].message);
+    try std.testing.expectEqualStrings("delta", last3[2].message);
+}
+
+test "renderRecentThoughtsBlock empty frames returns empty string" {
+    const out = try renderRecentThoughtsBlock(std.testing.allocator, &.{}, 5);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+}
+
+test "renderRecentThoughtsBlock formats frames with iteration tags" {
+    const frames = [_]RecordedFrame{
+        .{ .message = @constCast("Retrieving memory"), .frame_type = .thinking, .iteration = 1 },
+        .{
+            .message = @constCast("memory_recall"),
+            .frame_type = .tool_start,
+            .tool_name = @constCast("memory_recall"),
+            .iteration = 2,
+        },
+        .{ .message = @constCast("4 hits"), .frame_type = .thinking, .iteration = 2 },
+    };
+    const out = try renderRecentThoughtsBlock(std.testing.allocator, &frames, 3);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<recent_thoughts iteration=\"3\" count=\"3\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[iter 1, thinking]: Retrieving memory\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[iter 2, action]: memory_recall (memory_recall)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[iter 2, thinking]: 4 hits") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out, "</recent_thoughts>\n"));
+}
+
+test "NarrationObserver pushes into ring buffer when wired" {
+    var noop = observability.NoopObserver{};
+    var rb = NarrationRingBuffer.init(std.testing.allocator);
+    defer rb.deinit();
+    var narr = NarrationObserver{
+        .inner = noop.observer(),
+        .ring_buffer = &rb,
+        .current_iteration = 2,
+    };
+    const obs = narr.observer();
+    const evt = ObserverEvent{ .tool_call_start = .{ .tool = "bash", .activity_label = "Running tests" } };
+    obs.recordEvent(&evt);
+    try std.testing.expectEqual(@as(usize, 1), rb.len);
+    const frames = try rb.last(std.testing.allocator, 1);
+    defer std.testing.allocator.free(frames);
+    try std.testing.expectEqualStrings("Running tests", frames[0].message);
+    try std.testing.expectEqualStrings("bash", frames[0].tool_name.?);
+    try std.testing.expectEqual(@as(u32, 2), frames[0].iteration);
 }
