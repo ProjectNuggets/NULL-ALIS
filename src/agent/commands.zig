@@ -1553,12 +1553,13 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                     // WM slots (active_goal + decision with composite ≥ 0.5) to
                     // durable_facts BEFORE the procedural-memory capture below.
                     //
-                    // **Cross-agent ordering invariant:** this MUST run BEFORE
-                    // any reflection-trail write (Agent E G5 will insert
-                    // `reflection.serialize(...)` between promotion and
-                    // captureSession). Reason: transient_goal durable_facts
-                    // are referenced by the reflection trail; they must exist
-                    // first or the reflection's references dangle.
+                    // **Cross-agent ordering invariant (forward-looking):** when Agent E
+                    // ships G5, `reflection.serialize(...)` will be inserted BETWEEN this
+                    // promotion block and `procedural_memory.captureSession` below. The
+                    // invariant promotion-before-reflection ensures transient_goal
+                    // durable_facts exist before the reflection trail references them.
+                    // Today, only the promotion-before-captureSession ordering matters,
+                    // and that ordering is satisfied by the call sequence below.
                     //
                     // Per-finding scope: G16 only handles the promotion. The
                     // reverse direction (session-start recall of the promoted
