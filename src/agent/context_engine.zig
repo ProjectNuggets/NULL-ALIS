@@ -128,10 +128,27 @@ pub const AssembleResult = struct {
 };
 
 /// Output of the compact phase.
+///
+/// v1.14.14.1 Finding 4 (COMPACT-SENTINEL-RESOLVE): the original design
+/// carried `messages_before` + `messages_after` here so afterTurn could
+/// derive a per-call messages_delta into the returned TurnContextResult.
+/// Two facts made this redundant:
+///   1. The 11 compact callsites in turnOutcome are scattered across the
+///      tool loop; the Phase 4 defer-synthesis pattern doesn't have access
+///      to per-site counts (it had to hardcode `messages_before = 0` as a
+///      sentinel lie — see commit 843ca622 self-review).
+///   2. The source of truth for per-site counts already exists:
+///      `recordAutoCompaction` / `recordForceCompression` (called from
+///      ContextEngine.compact / forceCompact themselves) write
+///      `auto_compacted_messages` / `force_compressed_messages` /
+///      `history_messages_after_trim` DIRECTLY onto `agent.last_turn_context`.
+///      That populates `/context` reports + observer telemetry via the live
+///      agent state, never via the afterTurn return value (which production
+///      discards as `_ = ...afterTurn(...)`).
+/// Removed the two fields. The `.compacted` boolean + `.method` enum are
+/// the only signals callers actually inspect.
 pub const CompactResult = struct {
     compacted: bool = false,
-    messages_before: usize = 0,
-    messages_after: usize = 0,
     method: CompactMethod = .none,
 
     pub const CompactMethod = enum {
@@ -742,19 +759,9 @@ pub const ContextEngine = struct {
             agent.last_turn_compacted = true;
             const after = agent.history.items.len;
             agent.recordAutoCompaction(before, after);
-            return .{
-                .compacted = true,
-                .messages_before = before,
-                .messages_after = after,
-                .method = .auto,
-            };
+            return .{ .compacted = true, .method = .auto };
         }
-        return .{
-            .compacted = false,
-            .messages_before = before,
-            .messages_after = before,
-            .method = .none,
-        };
+        return .{ .compacted = false, .method = .none };
     }
 
     /// Phase 3 emergency path: force-compress history.
@@ -783,19 +790,9 @@ pub const ContextEngine = struct {
             agent.recordForceCompression(before, after);
             agent.context_was_compacted = true;
             agent.context_force_compressed = true;
-            return .{
-                .compacted = true,
-                .messages_before = before,
-                .messages_after = after,
-                .method = .force_compress,
-            };
+            return .{ .compacted = true, .method = .force_compress };
         }
-        return .{
-            .compacted = false,
-            .messages_before = before,
-            .messages_after = before,
-            .method = .none,
-        };
+        return .{ .compacted = false, .method = .none };
     }
 
     /// Phase 4: After Turn — record lifecycle stats + emit stability snapshot.
@@ -828,10 +825,6 @@ pub const ContextEngine = struct {
 
         const auto_compacted = compact_result.method == .auto;
         const force_compressed = compact_result.method == .force_compress;
-        const messages_delta = if (compact_result.messages_before > compact_result.messages_after)
-            compact_result.messages_before - compact_result.messages_after
-        else
-            0;
 
         // Stability snapshot (env-gated). after_turn_ms intentionally measured
         // BEFORE the file write so the duration captures lifecycle work only,
@@ -849,6 +842,17 @@ pub const ContextEngine = struct {
             .session = session,
         });
 
+        // v1.14.14.1 Finding 4: the per-site message counts
+        // (auto_compacted_messages / force_compressed_messages /
+        // history_messages_after_trim) used to derive from
+        // CompactResult.messages_before/after. Those fields are removed —
+        // the source of truth is `agent.last_turn_context`, populated by
+        // recordAutoCompaction / recordForceCompression inside
+        // compact()/forceCompact(). The TurnContextResult.last_turn
+        // returned here only carries the event-count signals (1/0) +
+        // assemble/ingest stats. Production discards this return value
+        // (`_ = afterTurn(...)`); the live agent.last_turn_context is
+        // the channel-facing surface.
         return .{
             .ingest = ingest_result,
             .assemble = assemble_result,
@@ -863,10 +867,7 @@ pub const ContextEngine = struct {
                 .memory_context_bytes = ingest_result.memory_context_bytes,
                 .memory_enrich_ms = ingest_result.memory_enrich_ms,
                 .auto_compaction_events = if (auto_compacted) 1 else 0,
-                .auto_compacted_messages = if (auto_compacted) messages_delta else 0,
                 .force_compression_events = if (force_compressed) 1 else 0,
-                .force_compressed_messages = if (force_compressed) messages_delta else 0,
-                .history_messages_after_trim = compact_result.messages_after,
             },
             .total_duration_ms = total_duration,
         };
@@ -1166,12 +1167,7 @@ test "afterTurn aggregates results and sets last_turn.available=true" {
         .context_pressure_percent = 50,
         .compaction_recommended = false,
     };
-    const compact_result = CompactResult{
-        .compacted = false,
-        .messages_before = 3,
-        .messages_after = 3,
-        .method = .none,
-    };
+    const compact_result = CompactResult{ .compacted = false, .method = .none };
     const start_ms = std.time.milliTimestamp() - 10;
     const result = engine.afterTurn(
         std.testing.allocator,
@@ -1197,12 +1193,7 @@ test "afterTurn records auto compaction events" {
     var engine = ContextEngine{};
     const ingest_result = IngestResult{};
     const assemble_result = AssembleResult{};
-    const compact_result = CompactResult{
-        .compacted = true,
-        .messages_before = 20,
-        .messages_after = 10,
-        .method = .auto,
-    };
+    const compact_result = CompactResult{ .compacted = true, .method = .auto };
     const result = engine.afterTurn(
         std.testing.allocator,
         ingest_result,
@@ -1213,22 +1204,19 @@ test "afterTurn records auto compaction events" {
         "test-session",
     );
 
+    // v1.14.14.1 Finding 4: auto_compacted_messages / history_messages_after_trim
+    // no longer flow through CompactResult — agent.last_turn_context is the
+    // source of truth (populated by recordAutoCompaction). The afterTurn
+    // return value only exposes event-count signals now.
     try std.testing.expectEqual(@as(usize, 1), result.last_turn.auto_compaction_events);
-    try std.testing.expectEqual(@as(usize, 10), result.last_turn.auto_compacted_messages);
     try std.testing.expectEqual(@as(usize, 0), result.last_turn.force_compression_events);
-    try std.testing.expectEqual(@as(usize, 10), result.last_turn.history_messages_after_trim);
 }
 
 test "afterTurn records force_compress events" {
     var engine = ContextEngine{};
     const ingest_result = IngestResult{};
     const assemble_result = AssembleResult{};
-    const compact_result = CompactResult{
-        .compacted = true,
-        .messages_before = 15,
-        .messages_after = 4,
-        .method = .force_compress,
-    };
+    const compact_result = CompactResult{ .compacted = true, .method = .force_compress };
     const result = engine.afterTurn(
         std.testing.allocator,
         ingest_result,
@@ -1241,6 +1229,4 @@ test "afterTurn records force_compress events" {
 
     try std.testing.expectEqual(@as(usize, 0), result.last_turn.auto_compaction_events);
     try std.testing.expectEqual(@as(usize, 1), result.last_turn.force_compression_events);
-    try std.testing.expectEqual(@as(usize, 11), result.last_turn.force_compressed_messages);
-    try std.testing.expectEqual(@as(usize, 4), result.last_turn.history_messages_after_trim);
 }
