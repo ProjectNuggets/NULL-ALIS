@@ -21,10 +21,6 @@ pub const AppProfile = config_types.AppProfile;
 pub const ModelFallbackEntry = config_types.ModelFallbackEntry;
 pub const ReliabilityConfig = config_types.ReliabilityConfig;
 pub const SchedulerConfig = config_types.SchedulerConfig;
-pub const AssistantModePresetAgentConfig = config_types.AssistantModePresetAgentConfig;
-pub const AssistantModePresetSummarizerConfig = config_types.AssistantModePresetSummarizerConfig;
-pub const AssistantModePresetConfig = config_types.AssistantModePresetConfig;
-pub const ProductPresetsConfig = config_types.ProductPresetsConfig;
 pub const AgentConfig = config_types.AgentConfig;
 pub const SidecarConfig = config_types.SidecarConfig;
 pub const ModelRouteConfig = config_types.ModelRouteConfig;
@@ -118,7 +114,6 @@ pub const Config = struct {
     network: NetworkConfig = .{},
     reliability: ReliabilityConfig = .{},
     scheduler: SchedulerConfig = .{},
-    product_presets: ProductPresetsConfig = .{},
     agent: AgentConfig = .{},
     sidecar: SidecarConfig = .{},
     heartbeat: HeartbeatConfig = .{},
@@ -785,7 +780,6 @@ pub const Config = struct {
         // Reliability
         try self.writeReliabilitySection(w);
         try w.print("  \"scheduler\": {f},\n", .{std.json.fmt(self.scheduler, .{})});
-        try w.print("  \"product_presets\": {f},\n", .{std.json.fmt(self.product_presets, .{})});
         try w.print("  \"agent\": {f},\n", .{std.json.fmt(.{
             .compact_context = self.agent.compact_context,
             .max_tool_iterations = self.agent.max_tool_iterations,
@@ -1533,7 +1527,7 @@ test "save roundtrip preserves extended config sections" {
     // max_tool_iterations: NOT set here — mode presets handle this (8/25/500).
     // max_history_messages: NOT set here — mode presets set 0 (uncapped).
     // Q1 (2026-04-27): message-count cap deprecated; compaction is the sole
-    // context governor. Per-mode product_presets all ship 0; user-config
+    // context governor. Mode-independent defaults apply; no per-mode overrides.
     // overrides accepted but forced to 0 at parse time (config_parse.zig).
     cfg.agent.parallel_tools = true;
     cfg.agent.parallel_tools_rollout_percent = 100;
