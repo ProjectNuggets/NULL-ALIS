@@ -39,6 +39,21 @@ BENCH_FILE=".spike/benchmark.json"
 OUT_DIR=".spike/runs/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT_DIR"
 
+# v1.14.14 Phase 5 — activate the stability JSONL diagnostic shipped by Phase 4
+# (commit e0d377ac, src/agent/context_engine.zig::writeStabilityJsonl). Each
+# turn against the gateway during this bench run writes one JSONL line with
+# the four phase durations + the assembled stable_prefix_hash + session.
+#
+# Bench-default-on; prod-default-off (§14.6 honest config). The production
+# gateway has NULLALIS_STABILITY_JSON_PATH unset → zero file growth, zero I/O
+# overhead. Operators can also pre-set this env var to override the in-harness
+# default (e.g., to redirect to a shared collection path during CI runs).
+#
+# Consumed by the drift-detection block at the END of this script — it reads
+# the JSONL and fails the bench run if any session_key shows >1 distinct
+# stable_prefix_hash across its turns.
+export NULLALIS_STABILITY_JSON_PATH="${NULLALIS_STABILITY_JSON_PATH:-$OUT_DIR/stability.jsonl}"
+
 QUIET=0
 ONLY=""
 POLLUTED=0
@@ -391,6 +406,35 @@ if [[ $QUIET -eq 0 ]]; then
   echo ""
   echo "pass=$PASS/$TOTAL  pass_rate=$PASS_RATE  mean_tools=$MEAN_TOOLS  mean_latency_ms=$MEAN_LAT  p50_ttft_ms=$P50_TTFT  p95_ttft_ms=$P95_TTFT  status=$STATUS  crashes=$CRASHED"
   echo "SSE traces: $OUT_DIR"
+fi
+
+# v1.14.14 Phase 5 — per-session prefix-stability CI assertion.
+# Activates the stability.jsonl diagnostic from Phase 4. Catches the silent
+# prefix-drift regression class: a prompt-construction change that increases
+# latency/cost by 1.5-3x via collapsed KV-cache hits but leaves agent answers
+# byte-identical. Invisible to LoCoMo/V-inf/τ-bench but lethal to production.
+#
+# Triggered only when NULLALIS_STABILITY_JSON_PATH was set during the bench
+# run. If the JSONL file is missing or empty, skip (back-compat with runs
+# before stability emission landed).
+#
+# Fails the bench (non-zero exit) if any single session_key shows >1 distinct
+# stable_prefix_hash across its turns. Hash drift mid-session = the bug.
+if [[ -n "${NULLALIS_STABILITY_JSON_PATH:-}" && -s "$NULLALIS_STABILITY_JSON_PATH" ]]; then
+  drift_sessions=$(jq -s 'group_by(.session) | map({
+      session: .[0].session,
+      hashes: ([.[].stable_prefix_hash] | unique),
+      turns: length
+    }) | map(select(.turns > 1 and (.hashes | length) > 1))' \
+    "$NULLALIS_STABILITY_JSON_PATH" 2>/dev/null)
+  if [[ -n "$drift_sessions" && "$drift_sessions" != "[]" ]]; then
+    echo "STABILITY_DRIFT_DETECTED — sessions with multiple prefix hashes:" >&2
+    echo "$drift_sessions" >&2
+    echo "Cause: a prompt construction change drifted the stable prefix mid-session." >&2
+    echo "Effect: KV-cache misses on every turn after the first → 1.5-3x latency + cost." >&2
+    echo "Fix: identify the prompt section that varies turn-to-turn; move to volatile half." >&2
+    exit 2
+  fi
 fi
 
 printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$COMMIT" "$PASS_RATE" "$MEAN_TOOLS" "$MEAN_LAT" "$P50_TTFT" "$P95_TTFT" "$STATUS" "baseline_or_keep"
