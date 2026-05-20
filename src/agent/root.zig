@@ -41,6 +41,7 @@ const ExecutionMode = execution_mode_mod.ExecutionMode;
 const tool_metadata = @import("../tools/metadata.zig");
 const abort_mod = @import("abort.zig");
 const CancellationToken = abort_mod.CancellationToken;
+const goal_loop = @import("goal_loop.zig");
 
 const cache = memory_mod.cache;
 pub const abort = @import("abort.zig");
@@ -620,6 +621,14 @@ pub const Agent = struct {
     turns_since_extraction: u32 = 0,
     /// Tool calls in the last completed turn (for skills auto-extraction).
     last_turn_tool_count: u32 = 0,
+    /// v1.14.18-A F3 — session-wide tool count for procedural-memory capture gate.
+    /// Accumulates across ALL turns of a session; read + reset at session-end.
+    /// Replaces the last_turn-only signal that left skill_executions empty.
+    session_total_tool_count: u32 = 0,
+    /// v1.14.18-A F3 — session-wide tool-name manifest for the capture trace.
+    session_tool_names: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// v1.14.18-A F3 — per-turn goal state for ReAct reflection loop.
+    active_goal_state: ?goal_loop.GoalState = null,
 
     /// **D1.8** — count of `durable_fact/behavior/*` entries this session
     /// has stored. Replaces the prior pattern (`mem.list` + filter scan
@@ -2737,6 +2746,7 @@ pub const Agent = struct {
         var turn_tool_iterations: u32 = 0;
         var turn_memory_enrich_ms: u64 = 0;
         var turn_compaction_ms: u64 = 0;
+        defer self.session_total_tool_count +%= turn_tool_calls_total; // v1.14.18-A F3
         var turn_first_token_ms: ?u64 = null;
         var turn_first_token_upper_bound_ms: ?u64 = null;
         var active_task_plan: ?task_planner.TaskPlan = null;
@@ -2818,6 +2828,24 @@ pub const Agent = struct {
         var ingest_out = try self.context_engine_state.ingest(self.allocator, self, user_message);
         defer ingest_out.deinit(self.allocator);
         turn_memory_enrich_ms = ingest_out.result.memory_enrich_ms;
+
+        // v1.14.18-A F3: Initialize goal-loop state from user message
+        // OPTION A: caller (turnOutcome) owns goal_text slice; struct borrows it.
+        // goal_text lives for the turn duration (user_message is stable).
+        // GoalState.deinit will NOT free goal_text — that's turnOutcome's responsibility.
+        const goal_text = try goal_loop.extractGoal(self.allocator, user_message);
+        // NOTE: goal_text is NOT freed here; it's borrowed by active_goal_state
+        // and freed implicitly when user_message goes out of scope (stack-allocated).
+        self.active_goal_state = goal_loop.GoalState{
+            .goal_text = goal_text,
+            .iteration_count = 0,
+            .status = .in_progress,
+            .no_progress_count = 0,
+            .progress_notes = .empty,
+        };
+        defer {
+            self.active_goal_state = null;
+        } // clear at turn end; does NOT free goal_text (borrowed slice)
 
         // v1.14.14 Phase 4 — time the assemble phase so afterTurn() can
         // record per-phase durations into stability.json.
@@ -3644,6 +3672,24 @@ pub const Agent = struct {
 
             // Determine display text
             const display_text = if (parsed_text.len > 0) parsed_text else response_text;
+
+            // v1.14.18-A F3: Parse goal-loop reflection from LLM response
+            // Update active goal state before continuing with tool dispatch
+            var should_exit_goal_loop = false;
+            if (self.active_goal_state) |*goal_state| {
+                const goal_reflection_verdict = goal_loop.parseReflection(display_text);
+                goal_state.status = goal_reflection_verdict;
+                goal_state.iteration_count += 1;
+
+                // Mark exit if goal is met or stuck (will break after tool results processed)
+                if (goal_reflection_verdict == .met or goal_reflection_verdict == .stuck) {
+                    log.info("turn.goal_loop iteration={d} status={s} — will exit after tools", .{
+                        goal_state.iteration_count,
+                        @tagName(goal_reflection_verdict),
+                    });
+                    should_exit_goal_loop = true;
+                }
+            }
             if (parsed_calls.len > 0) {
                 turn_tool_iterations += 1;
                 turn_tool_calls_total += @intCast(@min(parsed_calls.len, std.math.maxInt(u32)));
@@ -4257,6 +4303,36 @@ pub const Agent = struct {
                 .role = .user,
                 .content = try self.allocator.dupe(u8, with_reflection),
             });
+
+            // v1.14.18-A F3: Inject goal-loop reflection prompt for next iteration
+            // This SYSTEM message teaches the model to emit <reflection goal_status="...">
+            if (iteration > 0 and self.active_goal_state != null) {
+                var last_tool_name: ?[]const u8 = null;
+                var last_result_summary: ?[]const u8 = null;
+
+                if (results_buf.items.len > 0) {
+                    const last_result = results_buf.items[results_buf.items.len - 1];
+                    last_tool_name = last_result.name;
+                    // Truncate result to ~400 chars for context
+                    const result_len = @min(last_result.output.len, 400);
+                    last_result_summary = last_result.output[0..result_len];
+                }
+
+                const goal_reflection_prompt = try goal_loop.buildReflectionPrompt(
+                    self.allocator,
+                    self.active_goal_state.?.goal_text,
+                    @intCast(iteration + 1),
+                    last_tool_name,
+                    last_result_summary,
+                );
+                defer self.allocator.free(goal_reflection_prompt);
+
+                try self.history.append(self.allocator, .{
+                    .role = .system,
+                    .content = try self.allocator.dupe(u8, goal_reflection_prompt),
+                });
+            }
+
             const reflect_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - reflect_start_ms));
             log.info("turn.stage stage=tool_reflection iteration={d} duration_ms={d} results={d}", .{
                 iteration,
@@ -4327,6 +4403,12 @@ pub const Agent = struct {
                 .run_id = self.current_run_id,
             } };
             self.observer.recordEvent(&compact_stage_event);
+
+            // v1.14.18-A F3: Exit goal loop if goal is met or stuck
+            if (should_exit_goal_loop) {
+                log.info("turn.goal_loop exiting loop at iteration={d}", .{iteration});
+                break;
+            }
 
             // Free provider response fields now that all borrows are consumed.
             self.freeResponseFields(&response);

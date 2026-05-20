@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const learning = @import("learning.zig");
+const goal_loop = @import("goal_loop.zig");
 const prompt_mod = @import("prompt.zig");
 const providers = @import("../providers/root.zig");
 const extraction_persist = @import("extraction_persist.zig");
@@ -1573,21 +1574,33 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                     // acceptable for the V1.13 capture-only state;
                     // future Day 5.2+ refinement can track session-wide
                     // tool counts properly.
-                    const tool_count_real: u32 = if (@hasField(@TypeOf(self.*), "last_turn_tool_count"))
-                        self.last_turn_tool_count
+                    const tool_count_real: u32 = if (@hasField(@TypeOf(self.*), "session_total_tool_count"))
+                        self.session_total_tool_count
                     else
                         0;
                     if (tool_count_real >= procedural_memory.CAPTURE_TOOL_THRESHOLD) {
-                        const empty_names: []const []const u8 = &.{};
+                        const tool_names: []const []const u8 = if (@hasField(@TypeOf(self.*), "session_tool_names"))
+                            self.session_tool_names.items
+                        else
+                            &.{};
+                        const goal_status: ?goal_loop.GoalStatus = if (@hasField(@TypeOf(self.*), "active_goal_state") and self.active_goal_state != null)
+                            self.active_goal_state.?.status
+                        else
+                            null;
                         _ = procedural_memory.captureSession(
                             self.allocator,
                             smgr_ep,
                             uid_ep,
                             session_id,
                             task_text,
-                            empty_names,
+                            tool_names,
                             tool_count_real,
+                            goal_status,
                         );
+                        // Reset counter after capture (v1.14.18-A F3)
+                        if (@hasField(@TypeOf(self.*), "session_total_tool_count")) {
+                            self.session_total_tool_count = 0;
+                        }
                     }
                 }
             }
