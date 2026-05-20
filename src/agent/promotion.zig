@@ -118,26 +118,25 @@ pub fn promoteWMToDurableAtSessionEnd(
     // `!PromotionResult`. No `errdefer` can fire because no error escapes.
     // All cleanup MUST be explicit at each `catch ... continue` site below
     // — keep that pattern when adding new failure paths.
-    const empty = PromotionResult{ .promoted = allocator.alloc(PromotedSlot, 0) catch &.{} };
 
     const smgr = state_mgr orelse {
         log.info("promotion.skipped reason=no_state_mgr session={s}", .{session_id});
-        return empty;
+        return emptyResult(allocator);
     };
     const m = mem orelse {
         log.info("promotion.skipped reason=no_memory_backend session={s}", .{session_id});
-        return empty;
+        return emptyResult(allocator);
     };
 
     const slots = smgr.listWorkingMemorySlots(allocator, user_id, session_id) catch |err| {
         log.warn("promotion.list_failed err={s} session={s}", .{ @errorName(err), session_id });
-        return empty;
+        return emptyResult(allocator);
     };
     defer memory_root.freeWorkingMemorySlots(allocator, slots);
 
     if (slots.len == 0) {
         log.info("promotion.no_slots session={s}", .{session_id});
-        return empty;
+        return emptyResult(allocator);
     }
 
     const now = std.time.timestamp();
@@ -209,10 +208,18 @@ pub fn promoteWMToDurableAtSessionEnd(
         log.warn("promotion.final_alloc_failed session={s}", .{session_id});
         for (collected.items) |*p| p.deinit(allocator);
         collected.deinit(allocator);
-        return empty;
+        return emptyResult(allocator);
     };
     log.info("promotion.session_complete count={d} session={s}", .{ final.len, session_id });
     return .{ .promoted = final };
+}
+
+/// Lazy zero-length PromotionResult — only invoked at each early-return
+/// site, so the success path never pays for an unused zero-sized alloc.
+/// Strict leak-checking allocators that bookkeep zero-sized allocs would
+/// have flagged the prior `const empty = ...` at function entry.
+inline fn emptyResult(allocator: std.mem.Allocator) PromotionResult {
+    return .{ .promoted = allocator.alloc(PromotedSlot, 0) catch &.{} };
 }
 
 // ─────────────────────────────────────────────────────────────────
