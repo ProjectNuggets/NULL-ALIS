@@ -126,11 +126,11 @@ test "truncateUtf8: ASCII byte at boundary preserved (no step-2 drop)" {
 // set — keeps semantic content like "the", "a", "is", "and" out of the index
 // without stripping anything that might carry meaning ("not", "no" stay).
 const STOPWORDS = [_][]const u8{
-    "the", "a",   "an",   "and", "or",  "but", "if",   "then", "else",
-    "so",  "as",  "of",   "to",  "in",  "on",  "at",   "by",   "for",
-    "from", "with", "is",  "are", "was", "were", "be",  "been", "being",
-    "have", "has", "had",  "do",  "does", "did", "this", "that", "these",
-    "those", "i",   "you",  "he",  "she", "it",  "we",   "they",
+    "the",   "a",    "an",  "and", "or",   "but",  "if",   "then", "else",
+    "so",    "as",   "of",  "to",  "in",   "on",   "at",   "by",   "for",
+    "from",  "with", "is",  "are", "was",  "were", "be",   "been", "being",
+    "have",  "has",  "had", "do",  "does", "did",  "this", "that", "these",
+    "those", "i",    "you", "he",  "she",  "it",   "we",   "they",
 };
 
 /// Simple stopword check — linear scan since list is short and called per-token.

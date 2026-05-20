@@ -776,7 +776,7 @@ test "D5 — yearMonthOrdinal handles year boundaries correctly" {
     try std.testing.expectEqual(@as(i32, 24300), UsageRuntime.yearMonthOrdinal(1735689600));
     // Different days, same month → same ordinal
     try std.testing.expectEqual(
-        UsageRuntime.yearMonthOrdinal(1707955200),  // 2024-02-15
-        UsageRuntime.yearMonthOrdinal(1709251199),  // 2024-02-29 23:59:59 (leap year)
+        UsageRuntime.yearMonthOrdinal(1707955200), // 2024-02-15
+        UsageRuntime.yearMonthOrdinal(1709251199), // 2024-02-29 23:59:59 (leap year)
     );
 }

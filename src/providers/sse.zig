@@ -119,92 +119,92 @@ pub fn extractSseEvent(allocator: std.mem.Allocator, json_str: []const u8) !SseL
         if (choices_v == .array) {
             const choices_array = choices_v.array;
             for (choices_array.items) |choice| {
-        const choice_obj = switch (choice) {
-            .object => |object| object,
-            else => continue,
-        };
-
-        // Choice-level `reasoning` fallback (some providers put reasoning here
-        // at the choice level rather than inside delta).
-        if (choice_obj.get("reasoning")) |reasoning_value| {
-            if (reasoning_value == .string and reasoning_value.string.len > 0) {
-                try reasoning_builder.appendSlice(allocator, reasoning_value.string);
-            }
-        }
-
-        const delta = choice_obj.get("delta") orelse continue;
-        const delta_obj = switch (delta) {
-            .object => |object| object,
-            else => continue,
-        };
-
-        if (delta_obj.get("content")) |content| {
-            if (content == .string and content.string.len > 0) {
-                try text_builder.appendSlice(allocator, content.string);
-            }
-        }
-
-        // OpenAI-compatible reasoning streaming: Kimi/GLM/some OpenRouter
-        // models emit `delta.reasoning_content` per chunk. Without this path
-        // the thinking stream is silently dropped and the UI shows only
-        // generic stage labels.
-        if (delta_obj.get("reasoning_content")) |reasoning_value| {
-            if (reasoning_value == .string and reasoning_value.string.len > 0) {
-                try reasoning_builder.appendSlice(allocator, reasoning_value.string);
-            }
-        }
-        if (delta_obj.get("reasoning")) |reasoning_value| {
-            if (reasoning_value == .string and reasoning_value.string.len > 0) {
-                try reasoning_builder.appendSlice(allocator, reasoning_value.string);
-            }
-        }
-
-        if (delta_obj.get("tool_calls")) |tool_calls| {
-            const tool_calls_array = switch (tool_calls) {
-                .array => |array| array,
-                else => continue,
-            };
-
-            for (tool_calls_array.items) |tool_call| {
-                const tool_call_obj = switch (tool_call) {
+                const choice_obj = switch (choice) {
                     .object => |object| object,
                     else => continue,
                 };
 
-                const index_value = tool_call_obj.get("index") orelse continue;
-                const index = switch (index_value) {
-                    .integer => |value| if (value >= 0) @as(usize, @intCast(value)) else continue,
+                // Choice-level `reasoning` fallback (some providers put reasoning here
+                // at the choice level rather than inside delta).
+                if (choice_obj.get("reasoning")) |reasoning_value| {
+                    if (reasoning_value == .string and reasoning_value.string.len > 0) {
+                        try reasoning_builder.appendSlice(allocator, reasoning_value.string);
+                    }
+                }
+
+                const delta = choice_obj.get("delta") orelse continue;
+                const delta_obj = switch (delta) {
+                    .object => |object| object,
                     else => continue,
                 };
 
-                var tool_delta = SseToolCallDelta{ .index = index };
-                errdefer tool_delta.deinit(allocator);
-
-                if (tool_call_obj.get("id")) |id_value| {
-                    if (id_value == .string and id_value.string.len > 0) {
-                        tool_delta.id = try allocator.dupe(u8, id_value.string);
+                if (delta_obj.get("content")) |content| {
+                    if (content == .string and content.string.len > 0) {
+                        try text_builder.appendSlice(allocator, content.string);
                     }
                 }
 
-                if (tool_call_obj.get("function")) |function_value| {
-                    if (function_value == .object) {
-                        const function_obj = function_value.object;
-                        if (function_obj.get("name")) |name_value| {
-                            if (name_value == .string and name_value.string.len > 0) {
-                                tool_delta.name = try allocator.dupe(u8, name_value.string);
-                            }
-                        }
-                        if (function_obj.get("arguments")) |arguments_value| {
-                            if (arguments_value == .string and arguments_value.string.len > 0) {
-                                tool_delta.arguments = try allocator.dupe(u8, arguments_value.string);
-                            }
-                        }
+                // OpenAI-compatible reasoning streaming: Kimi/GLM/some OpenRouter
+                // models emit `delta.reasoning_content` per chunk. Without this path
+                // the thinking stream is silently dropped and the UI shows only
+                // generic stage labels.
+                if (delta_obj.get("reasoning_content")) |reasoning_value| {
+                    if (reasoning_value == .string and reasoning_value.string.len > 0) {
+                        try reasoning_builder.appendSlice(allocator, reasoning_value.string);
+                    }
+                }
+                if (delta_obj.get("reasoning")) |reasoning_value| {
+                    if (reasoning_value == .string and reasoning_value.string.len > 0) {
+                        try reasoning_builder.appendSlice(allocator, reasoning_value.string);
                     }
                 }
 
-                try tool_deltas.append(allocator, tool_delta);
-            }
-        }
+                if (delta_obj.get("tool_calls")) |tool_calls| {
+                    const tool_calls_array = switch (tool_calls) {
+                        .array => |array| array,
+                        else => continue,
+                    };
+
+                    for (tool_calls_array.items) |tool_call| {
+                        const tool_call_obj = switch (tool_call) {
+                            .object => |object| object,
+                            else => continue,
+                        };
+
+                        const index_value = tool_call_obj.get("index") orelse continue;
+                        const index = switch (index_value) {
+                            .integer => |value| if (value >= 0) @as(usize, @intCast(value)) else continue,
+                            else => continue,
+                        };
+
+                        var tool_delta = SseToolCallDelta{ .index = index };
+                        errdefer tool_delta.deinit(allocator);
+
+                        if (tool_call_obj.get("id")) |id_value| {
+                            if (id_value == .string and id_value.string.len > 0) {
+                                tool_delta.id = try allocator.dupe(u8, id_value.string);
+                            }
+                        }
+
+                        if (tool_call_obj.get("function")) |function_value| {
+                            if (function_value == .object) {
+                                const function_obj = function_value.object;
+                                if (function_obj.get("name")) |name_value| {
+                                    if (name_value == .string and name_value.string.len > 0) {
+                                        tool_delta.name = try allocator.dupe(u8, name_value.string);
+                                    }
+                                }
+                                if (function_obj.get("arguments")) |arguments_value| {
+                                    if (arguments_value == .string and arguments_value.string.len > 0) {
+                                        tool_delta.arguments = try allocator.dupe(u8, arguments_value.string);
+                                    }
+                                }
+                            }
+                        }
+
+                        try tool_deltas.append(allocator, tool_delta);
+                    }
+                }
             }
         }
     }
@@ -1670,8 +1670,7 @@ test "openai stream captures authoritative usage from final chunk" {
     try std.testing.expect(try handleOpenAiLine(&stream_ctx));
 
     // 2. Final usage chunk (empty choices, populated usage with reasoning + cache)
-    try stream_ctx.line_buf.appendSlice(allocator,
-        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":47,\"total_tokens\":167,\"completion_tokens_details\":{\"reasoning_tokens\":35},\"prompt_tokens_details\":{\"cached_tokens\":80}}}");
+    try stream_ctx.line_buf.appendSlice(allocator, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":47,\"total_tokens\":167,\"completion_tokens_details\":{\"reasoning_tokens\":35},\"prompt_tokens_details\":{\"cached_tokens\":80}}}");
     try std.testing.expect(try handleOpenAiLine(&stream_ctx));
 
     // 3. [DONE] sentinel
