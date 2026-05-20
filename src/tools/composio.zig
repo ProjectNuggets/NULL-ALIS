@@ -47,13 +47,13 @@ pub const ComposioTool = struct {
     pub const tool_name = "composio";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). \" ++        \"Use ac",
+        .what = "Execute actions on 1000+ apps via Composio (Gmail, Slack, etc.).",
         .use_when = &.{
             "first scenario",
             "second scenario",
         },
         .do_not_use_for = &.{
-            "web_search — for web queries",
+            "web_search — for external queries",
             "memory_store — for persistence",
         },
     };

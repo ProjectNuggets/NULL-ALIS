@@ -21,8 +21,9 @@ pub const BrowserTool = struct {
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
         .what = "Open and control a web browser for interactive automation.",
         .use_when = &.{
-            "scenario 1",
-            "scenario 2",
+            "Interactive web browsing and content extraction",
+            "Executing JavaScript on pages for dynamic data retrieval",
+            "Automating workflows across multiple URLs or pages",
         },
         .do_not_use_for = &.{
             "web_search — for external data",

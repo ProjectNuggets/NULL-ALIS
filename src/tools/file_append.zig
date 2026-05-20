@@ -25,9 +25,9 @@ pub const FileAppendTool = struct {
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
         .what = "Append content to the end of an existing file.",
         .use_when = &.{
-            "scenario 1",
-            "scenario 2",
-            "scenario 3",
+            "Adding new content to the end of existing files",
+            "Logging output to running transaction or session files",
+            "Accumulating multi-step results in a single file",
         },
         .do_not_use_for = &.{
             "web_search — for external data queries",

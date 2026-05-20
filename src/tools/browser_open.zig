@@ -16,8 +16,9 @@ pub const BrowserOpenTool = struct {
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
         .what = "Open a URL in the user's default browser.",
         .use_when = &.{
-            "scenario 1",
-            "scenario 2",
+            "Opening URLs in the user's default browser for viewing",
+            "Launching links for human review or manual interaction",
+            "Directing attention to web content outside agent scope",
         },
         .do_not_use_for = &.{
             "web_search — for external data",

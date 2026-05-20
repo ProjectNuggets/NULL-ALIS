@@ -84,9 +84,9 @@ pub const ImageGenerateTool = struct {
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
         .what = "Generate images from text descriptions via API.",
         .use_when = &.{
-            "scenario 1",
-            "scenario 2",
-            "scenario 3",
+            "Creating images from text descriptions via generative API",
+            "Synthesizing visual content for presentations or documents",
+            "Batch-generating multiple image variations from prompts",
         },
         .do_not_use_for = &.{
             "web_search — for external data queries",

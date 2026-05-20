@@ -44,9 +44,9 @@ pub const ShellTool = struct {
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
         .what = "Execute shell commands with proper authorization.",
         .use_when = &.{
-            "scenario 1",
-            "scenario 2",
-            "scenario 3",
+            "Executing commands that don't fit specialized tools (file, git, http)",
+            "Running shell scripts or pipelines requiring command composition",
+            "Querying system state or paths within security policy bounds",
         },
         .do_not_use_for = &.{
             "web_search — for external data queries",

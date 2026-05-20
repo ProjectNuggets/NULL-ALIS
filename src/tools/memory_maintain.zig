@@ -102,7 +102,7 @@ pub const MemoryMaintainTool = struct {
             "second scenario",
         },
         .do_not_use_for = &.{
-            "web_search — for web queries",
+            "web_search — for external queries",
             "memory_store — for persistence",
         },
     };

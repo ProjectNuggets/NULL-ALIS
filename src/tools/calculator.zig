@@ -14,9 +14,9 @@ pub const CalculatorTool = struct {
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
         .what = "Perform mathematical calculations and unit conversions.",
         .use_when = &.{
-            "scenario 1",
-            "scenario 2",
-            "scenario 3",
+            "Performing mathematical calculations with arbitrary precision",
+            "Converting between number systems or units",
+            "Validating numeric inputs before using in downstream tools",
         },
         .do_not_use_for = &.{
             "web_search — for external data queries",

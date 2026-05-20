@@ -37,9 +37,9 @@ pub const FileReadHashedTool = struct {
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
         .what = "file_read_hashed tool.",
         .use_when = &.{
-            "scenario 1",
-            "scenario 2",
-            "scenario 3",
+            "Reading files while verifying integrity via hash",
+            "Detecting accidental or malicious file modifications",
+            "Tracking file versions through hash-based snapshots",
         },
         .do_not_use_for = &.{
             "web_search — for external data queries",

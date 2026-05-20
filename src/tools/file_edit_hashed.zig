@@ -83,9 +83,9 @@ pub const FileEditHashedTool = struct {
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
         .what = "file_edit_hashed tool.",
         .use_when = &.{
-            "scenario 1",
-            "scenario 2",
-            "scenario 3",
+            "Editing files with automatic hash tracking",
+            "Detecting concurrent edits or unexpected file changes",
+            "Building audit trails of file modifications",
         },
         .do_not_use_for = &.{
             "web_search — for external data queries",

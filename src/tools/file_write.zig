@@ -17,9 +17,9 @@ pub const FileWriteTool = struct {
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
         .what = "Write or overwrite a file with the specified content.",
         .use_when = &.{
-            "scenario 1",
-            "scenario 2",
-            "scenario 3",
+            "Creating new files with structured data or configuration",
+            "Writing output results, logs, or generated content to disk",
+            "Persisting user-provided content with proper sanitization",
         },
         .do_not_use_for = &.{
             "web_search — for external data queries",

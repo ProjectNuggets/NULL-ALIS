@@ -143,9 +143,9 @@ pub const FileReadTool = struct {
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
         .what = "Read the complete contents of a text or binary file.",
         .use_when = &.{
-            "scenario 1",
-            "scenario 2",
-            "scenario 3",
+            "Reading entire file contents for analysis or processing",
+            "Retrieving configuration files or source code for inspection",
+            "Validating file existence and readability before operations",
         },
         .do_not_use_for = &.{
             "web_search — for external data queries",

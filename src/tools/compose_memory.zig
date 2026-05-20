@@ -77,8 +77,9 @@ pub const ComposeMemoryTool = struct {
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
         .what = "Combine multiple memory entries into a composite structured entry.",
         .use_when = &.{
-            "scenario 1",
-            "scenario 2",
+            "Combining related memory entries into a single composite fact",
+            "Building summary or aggregate memories from multiple sources",
+            "Creating derived facts from synthesis of existing knowledge",
         },
         .do_not_use_for = &.{
             "web_search — for external data",

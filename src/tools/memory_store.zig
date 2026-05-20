@@ -47,7 +47,7 @@ pub const MemoryStoreTool = struct {
         .do_not_use_for = &.{
             "memory_recall — for fact retrieval instead",
             "todo — for short-lived transient decisions",
-            "set_execution_mode — confirm scope",
+            "set_execution_mode — for proper scoping",
         },
         .cost_note = "No API cost; local write to memory backend.",
         .completion_hint = "Returns success with stored memory ID.",

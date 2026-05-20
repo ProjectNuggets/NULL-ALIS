@@ -61,8 +61,9 @@ pub const BrainGraphTool = struct {
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
         .what = "Visualize and navigate the knowledge graph of facts.",
         .use_when = &.{
-            "scenario 1",
-            "scenario 2",
+            "Visualizing relationships between stored facts and concepts",
+            "Exploring entity connections in the knowledge graph",
+            "Debugging contradictions or gaps in memory structure",
         },
         .do_not_use_for = &.{
             "web_search — for external data",
