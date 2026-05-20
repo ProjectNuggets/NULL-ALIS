@@ -21,3 +21,4 @@ iter19-phaseB	0.920	1.40	9612	keep	50pct trigger + anti-thrash cold 25/25 pollut
 iter20-phaseBfix	0.840	1.08	77851	keep	70/80/90 thresholds live + anti-thrash in agent wrapper
 iter21-cleanup	0.880	1.40	48959	keep	cleanup dead code 3 curl timeouts infra flake cold real pass 22/22
 iter22-tau-airline-baseline	0.100	2.46	106140	baseline	first tau-bench Airline run
+iter23-tau-airline-together-v11413	0.350	6.10	118984	4784	33354	baseline	iter23 v1.14.13 Together llama 70B baseline, 20-task subset, canonical postgres+pgvector

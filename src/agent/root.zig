@@ -2798,371 +2798,78 @@ pub const Agent = struct {
         // Context v2: memory is now part of the volatile system block instead
         // of being prepended to the user message. Load it first so we can
         // include it in the system prompt rebuild below.
-        const enrich_start_ms = std.time.milliTimestamp();
-        // V1.13 DUP-1 RE-ENABLED (safe path).
         //
-        // session.zig::getOrCreateInternal now calls
-        // working_memory.pinIdentityFromUserState at session creation,
-        // which pins the user's identity facts to slot 0. The
-        // <working_memory> block in the volatile prompt renders that
-        // slot. So skipping the legacy <active_identity> block here
-        // is now safe — identity is rendered once via working_memory,
-        // not twice.
+        // v1.14.14 ContextEngine migration (CONTEXT-ENGINE audit-ledger row).
+        //   Phase 1 — INGEST: the ~163-line memory-enrichment block that
+        //   inlined here now lives in ContextEngine.ingest (WM render +
+        //   memory_slot load + recall.metrics telemetry + memory_enrich
+        //   observer event).
+        //   Phase 2 — ASSEMBLE: the ~205-line prompt-rebuild block that
+        //   followed (last_turn_context write + capabilities + persona +
+        //   procedural_memory + stable/tool/volatile prompt construction +
+        //   history[0] write + 5 prompt-state field updates +
+        //   prefix.stable_hash diagnostic) now lives in
+        //   ContextEngine.assemble.
         //
-        // Gate: only skip when ALL working_memory infrastructure is
-        // wired (state_mgr + user_id + session_id + the agent has
-        // a memory_runtime — without mem_rt, working_memory.loadForRender
-        // can't fetch the slots). Otherwise fall back to legacy
-        // <active_identity> for safety.
-        //
-        // V1.14.3 (G-08 closure) — Load Working Memory FIRST so
-        // skip_legacy_identity is gated on ACTUAL wm content, not
-        // predicted infrastructure presence.
-        //
-        // Pre-V1.14.3: the gate was 4 conditions (state_mgr + user_id
-        // + session_id + mem_rt all non-null). It said "if WM
-        // infrastructure is wired, skip legacy <active_identity>" —
-        // assuming pinIdentitySlot ran successfully and slot 0 holds
-        // identity content. But the gate didn't VERIFY the assumption.
-        // If pinIdentityFromUserState returned 0 facts (truly empty
-        // user, or postgres flake during session creation, or future
-        // refactor breaking the chain silently), the agent ended up
-        // with neither legacy <active_identity> NOR a usable
-        // <working_memory> identity block.
-        //
-        // V1.14.3: load wm here, render the block, THEN compute
-        // skip_legacy_identity from `wm_block != null and len > 0`.
-        // Identity is rendered exactly once: via WM if available, via
-        // legacy <active_identity> otherwise. No silent identity loss.
-        //
-        // Cost: WM load was already happening per turn (just later in
-        // the function). Moving it earlier is free (~50ms either way).
-        const turn_wm_render_set_opt = blk: {
-            if (self.extraction_state_mgr) |smgr| {
-                if (self.extraction_user_id) |uid| {
-                    const sid = self.memory_session_id orelse break :blk null;
-                    break :blk working_memory.loadForRender(self.allocator, smgr, uid, sid);
-                }
-            }
-            break :blk null;
-        };
-        defer if (turn_wm_render_set_opt) |s| s.deinit(self.allocator);
-        const turn_wm_block: ?[]u8 = blk: {
-            const set = turn_wm_render_set_opt orelse break :blk null;
-            if (set.slots.len == 0) break :blk null;
-            break :blk working_memory.renderBlock(self.allocator, set.slots) catch |err| {
-                log.warn("working_memory.render_failed err={s}", .{@errorName(err)});
-                break :blk null;
-            };
-        };
-        defer if (turn_wm_block) |b| self.allocator.free(b);
+        // Lifetimes: ingest_out owns heap-allocated memory_slot.fenced_content
+        // + wm_render_set + wm_block. The deinit defer below frees them at
+        // turn end, AFTER assemble has borrowed memory_slot.fenced_content
+        // into PromptContext.memory_slot.
+        var ingest_out = try self.context_engine_state.ingest(self.allocator, self, user_message);
+        defer ingest_out.deinit(self.allocator);
+        turn_memory_enrich_ms = ingest_out.result.memory_enrich_ms;
 
-        // The actual gate: WM owns identity iff a slot with
-        // slot_type == "identity" actually exists in the rendered set.
+        // v1.14.14 Phase 4 — time the assemble phase so afterTurn() can
+        // record per-phase durations into stability.json.
+        const assemble_start_ms = std.time.milliTimestamp();
+        const assemble_result = try self.context_engine_state.assemble(self.allocator, self, &ingest_out);
+        const assemble_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - assemble_start_ms));
+
+        // v1.14.14 Phase 4 — afterTurn fires on EVERY post-assemble exit via
+        // this single defer. Reads agent state at exit time (last_turn_compacted,
+        // history.items.len, turn_compaction_ms) so the snapshot reflects the
+        // total post-turn state regardless of which return branch fired.
+        // Emits the JSONL stability record to NULLALIS_STABILITY_JSON_PATH
+        // (env-gated; no-op by default). Failures are silent — the snapshot
+        // is best-effort diagnostic, never a turn blocker.
         //
-        // V1.14.3 review HIGH-1 fix — the prior version checked only
-        // `wm_block.len > 0`, but extraction can promote `open_loop` /
-        // `active_goal` / `recent_entity` slots without ever pinning
-        // an identity slot (extraction_persist.zig:863, 899-911 fire
-        // promoteSlot for those types unconditionally). A user with
-        // empty pinIdentityFromUserState output AND extracted goals
-        // would have wm_block non-empty (containing the goals) but
-        // zero identity content, then skip_legacy_identity=true
-        // would suppress the legacy <active_identity> block —
-        // resulting in an agent prompt with NO identity at all.
+        // v1.14.14.1 Finding 4 follow-up: CompactResult no longer carries
+        // messages_before/messages_after. The synthesized CompactResult here
+        // only conveys `.compacted` + `.method` for the afterTurn event-count
+        // signals. Per-site accurate message_before/after pairs flow to
+        // `self.last_turn_context` via `recordAutoCompaction` /
+        // `recordForceCompression` inside `ContextEngine.compact` /
+        // `forceCompact`. afterTurn's returned `TurnContextResult` is still
+        // discarded by `_ = ...`; agent.last_turn_context is the live surface.
         //
-        // Iterating slot_type checks the actual presence of identity
-        // content. Ordering: working_memory.SlotType.identity matches
-        // the constant the writer side uses (working_memory.zig:59).
-        const wm_owns_identity: bool = blk: {
-            const set = turn_wm_render_set_opt orelse break :blk false;
-            for (set.slots) |s| {
-                if (std.mem.eql(u8, s.slot_type, working_memory.SlotType.identity)) {
-                    break :blk true;
-                }
-            }
-            break :blk false;
-        };
-        const memory_slot_result = if (self.mem) |mem|
-            memory_loader.loadTurnMemorySlotOpts(
+        // `compact_method` is the LAST-WIN classification when both auto and
+        // force-compress fired in the same turn (rare: only when the provider
+        // returned context-exhausted mid-turn and a subsequent auto-compact
+        // also succeeded). Reports `.force_compress` in that case — operator
+        // dashboards still see "compaction happened," just not the multiplicity.
+        defer {
+            const compact_method: context_engine.CompactResult.CompactMethod = if (!self.last_turn_compacted)
+                .none
+            else if (self.context_force_compressed)
+                .force_compress
+            else
+                .auto;
+            _ = self.context_engine_state.afterTurn(
                 self.allocator,
-                mem,
-                self.mem_rt,
-                user_message,
-                self.memory_session_id,
-                self.extraction_state_mgr,
-                self.extraction_user_id,
-                .{ .skip_legacy_identity = wm_owns_identity },
-            ) catch |err| blk: {
-                log.warn("memory.enrichment_failed error={s} — proceeding without memory slot", .{@errorName(err)});
-                break :blk memory_loader.MemorySlot{
-                    .fenced_content = try self.allocator.dupe(u8, ""),
-                    .stats = .{},
-                };
-            }
-        else
-            memory_loader.MemorySlot{
-                .fenced_content = try self.allocator.dupe(u8, ""),
-                .stats = .{},
-            };
-        defer self.allocator.free(memory_slot_result.fenced_content);
-        const enrich_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - enrich_start_ms));
-        turn_memory_enrich_ms = enrich_duration_ms;
-        log.info("turn.stage stage=memory_enrich duration_ms={d}", .{enrich_duration_ms});
-
-        // V1.14.9 #6 — Retrieval-side telemetry symmetric to R1
-        // boundary.metrics. R1 measures EXTRACTION (write side); this
-        // measures RECALL (read side). One structured log line per turn
-        // captures: did we serve any memory at all (available), how many
-        // candidates considered (candidate_count), how that decomposed
-        // by retrieval kind (durable_fact / timeline / search-match /
-        // global), and how many bytes/entries each bucket contributed.
-        // Operators can grep `recall.metrics` to spot per-user retrieval
-        // collapse (available=false on a populated user = R3 graph
-        // traversal opportunity OR R4 BM25 fusion gap).
-        const rstats = memory_slot_result.stats;
-        log.info(
-            "recall.metrics available={} candidates={d} global_candidates={d} durable_facts={d} timeline_summaries={d} search_matches={d} global_fallbacks={d} summary_latest_used={} context_anchor_used={} continuity_entries={d} continuity_bytes={d} semantic_entries={d} semantic_bytes={d} fallback_entries={d} fallback_bytes={d} enrich_ms={d}",
-            .{
-                rstats.available,
-                rstats.candidate_count,
-                rstats.global_candidate_count,
-                rstats.durable_fact_count,
-                rstats.timeline_summary_count,
-                rstats.search_match_count,
-                rstats.global_fallback_count,
-                rstats.summary_latest_used,
-                rstats.context_anchor_used,
-                rstats.continuity_bucket_entries,
-                rstats.continuity_bucket_bytes,
-                rstats.semantic_bucket_entries,
-                rstats.semantic_bucket_bytes,
-                rstats.fallback_bucket_entries,
-                rstats.fallback_bucket_bytes,
-                enrich_duration_ms,
-            },
-        );
-        // Retrieval-side alert (mirror of R1 boundary.zero_density):
-        // user has memory available but retrieval returned 0 candidates
-        // on a non-trivial user message. Surfaces stale embeddings,
-        // missing entity coref, or graph layer not yet populated.
-        if (self.mem != null and user_message.len > 32 and rstats.available and rstats.candidate_count == 0) {
-            log.warn(
-                "recall.zero_candidates user_msg_len={d} — retrieval pipeline returned no matches on a substantive query; check embeddings / coref / graph",
-                .{user_message.len},
+                ingest_out.result,
+                assemble_result,
+                .{
+                    .compacted = self.last_turn_compacted,
+                    .method = compact_method,
+                },
+                .{
+                    .ingest_ms = ingest_out.result.memory_enrich_ms,
+                    .assemble_ms = assemble_duration_ms,
+                    .compact_ms = turn_compaction_ms,
+                },
+                turn_start_ms,
+                self.memory_session_id orelse "none",
             );
-        }
-        const memory_stage_event = ObserverEvent{ .turn_stage = .{
-            .stage = "memory_enrich",
-            .duration_ms = enrich_duration_ms,
-            .run_id = self.current_run_id,
-        } };
-        self.observer.recordEvent(&memory_stage_event);
-
-        // Build prompt refresh plan for diagnostics + last_turn_context.
-        // In context v2 we always rebuild the system prompt (volatile block
-        // changes per turn — datetime, conversation context, memory). The
-        // refresh plan no longer gates rebuild; it only feeds stats.
-        const prompt_refresh_plan = context_builder.buildPromptRefreshPlan(self);
-        self.last_turn_context = context_builder.buildLastTurnContext(
-            prompt_refresh_plan,
-            memory_slot_result.stats,
-            enrich_duration_ms,
-        );
-
-        {
-            // S5.7 — memoized Config fetch. Replaces a per-turn
-            // `Config.load` + JSON parse + deinit triad. The cached_config
-            // lives on the Agent until deinit; see `cachedConfigForCaps`.
-            const cfg_for_caps_ptr: ?*const Config = self.cachedConfigForCaps();
-
-            const capabilities_section = capabilities_mod.buildPromptSection(
-                self.allocator,
-                cfg_for_caps_ptr,
-                self.tools,
-            ) catch null;
-            defer if (capabilities_section) |section| self.allocator.free(section);
-
-            // Resolve persona from SOUL.md front-matter (REQ-022). Falls back to defaults when absent.
-            const persona_profile_opt = prompt.resolvePersonaFromFile(self.allocator, self.workspace_dir);
-            defer if (persona_profile_opt) |p| {
-                if (p.voice) |v| self.allocator.free(v);
-            };
-            const persona_section: ?prompt.PersonaSection = if (persona_profile_opt) |p| .{
-                .warmth = p.warmth,
-                .proactivity = p.proactivity,
-                .voice_style = p.voice,
-                .twin_mode = p.twin_mode,
-            } else null;
-
-            // V1.14.3 (G-08 closure) — wm_block was hoisted above the
-            // memory_slot load so skip_legacy_identity gates on actual
-            // content. We reuse that hoisted value here instead of
-            // re-loading. Renamed to local alias for the prompt_ctx
-            // builder below.
-            const wm_block: ?[]u8 = turn_wm_block;
-
-            // V1.14.3 (G-07 closure) — Procedural memory recall block.
-            //
-            // V1.13 shipped capture (skill_executions table + insertSkillExecution
-            // in commands.zig at session_end). The reader (listRecentSkillExecutions)
-            // and renderer (procedural_memory.renderBlock) also shipped in V1.13
-            // but were never wired into the volatile prompt — agent saw no prior
-            // traces. G-07 was the half-loop bug. This block closes it.
-            //
-            // Skill name: GENERIC_SKILL_NAME (V1.13 capture is coarse-grained,
-            // one row per multi-tool turn). Future refinement: detect specific
-            // skill invocations and recall per-skill. For now, the agent sees
-            // the last 3 substantive turns regardless of skill name.
-            //
-            // Failure-soft on every layer: missing state_mgr or user_id → null;
-            // postgres error → empty traces; OOM on render → null. Same shape
-            // as wm_block above so the prompt builder treats both uniformly.
-            const skill_traces_block: ?[]u8 = blk: {
-                const smgr = self.extraction_state_mgr orelse break :blk null;
-                const uid = self.extraction_user_id orelse break :blk null;
-                const set = procedural_memory.loadForRender(
-                    self.allocator,
-                    smgr,
-                    uid,
-                    procedural_memory.GENERIC_SKILL_NAME,
-                );
-                defer set.deinit(self.allocator);
-                if (set.traces.len == 0) break :blk null;
-                break :blk procedural_memory.renderBlock(
-                    self.allocator,
-                    procedural_memory.GENERIC_SKILL_NAME,
-                    set.traces,
-                ) catch |err| {
-                    log.warn("procedural_memory.render_failed err={s}", .{@errorName(err)});
-                    break :blk null;
-                };
-            };
-            defer if (skill_traces_block) |b| self.allocator.free(b);
-
-            // Context v2: build stable + volatile separately so tool instructions
-            // can sit in the STABLE half (byte-identical across turns) rather than
-            // after the volatile block. This preserves byte-prefix cache stability
-            // on Together/vLLM and enables future Anthropic two-block emission.
-            const prompt_ctx = prompt.PromptContext{
-                .workspace_dir = self.workspace_dir,
-                .model_name = self.model_name,
-                .tools = self.tools,
-                .capabilities_section = capabilities_section,
-                .conversation_context = self.conversation_context,
-                .sections = .{ .persona = persona_section },
-                .memory_slot = if (memory_slot_result.fenced_content.len > 0) memory_slot_result.fenced_content else null,
-                .working_memory_block = wm_block,
-                .skill_traces_block = if (skill_traces_block) |b| (if (b.len > 0) b else null) else null,
-            };
-
-            const stable_prompt = try prompt.buildStableSystemPrompt(self.allocator, prompt_ctx);
-            defer self.allocator.free(stable_prompt);
-
-            const tool_instructions = try dispatcher.buildToolInstructions(self.allocator, self.tools);
-            defer self.allocator.free(tool_instructions);
-
-            const volatile_prompt = try prompt.buildVolatileSystemPrompt(self.allocator, prompt_ctx);
-            defer self.allocator.free(volatile_prompt);
-
-            // Layout: [stable][tool_instructions][volatile]
-            // stable + tool_instructions = byte-stable prefix (cached by provider KV).
-            // volatile = dynamic tail (datetime / conversation context / memory).
-            const stable_prefix_len = stable_prompt.len + tool_instructions.len;
-            const full_system = try self.allocator.alloc(u8, stable_prefix_len + volatile_prompt.len);
-            // iter22 (Nova's Medium finding): errdefer guards the window between
-            // alloc and ownership transfer into history. If history.insert or
-            // history.append fails (OOM on the ArrayList resize), without this
-            // errdefer the full_system buffer would orphan. Cleared manually
-            // on each success branch so ownership cleanly transfers.
-            var full_system_owned = true;
-            errdefer if (full_system_owned) self.allocator.free(full_system);
-            @memcpy(full_system[0..stable_prompt.len], stable_prompt);
-            @memcpy(full_system[stable_prompt.len..stable_prefix_len], tool_instructions);
-            @memcpy(full_system[stable_prefix_len..], volatile_prompt);
-
-            // Byte-stability diagnostic: log a hash of the stable prefix so
-            // operators can confirm byte-identical prefix across turns of the
-            // same session. Gated by NULLALIS_LOG_PREFIX_HASH=1 to keep noise
-            // out of prod logs.
-            //
-            // V1.14.6 follow-up: also hash the kept history TAIL (last 4
-            // messages of self.history). F-PA2's drop-from-middle pattern
-            // promises that when no Pass C summarization fires, the kept
-            // tail bytes match the prior turn — that's what makes vLLM /
-            // Together / Moonshot prefix caching usable on long sessions.
-            // Two consecutive same-session turns with identical
-            // `prefix.tail` hashes confirm the contract holds. Diverging
-            // hashes when nothing semantic changed is a regression signal.
-            if (std.process.getEnvVarOwned(self.allocator, "NULLALIS_LOG_PREFIX_HASH")) |env_value| {
-                defer self.allocator.free(env_value);
-                if (env_value.len > 0 and env_value[0] != '0') {
-                    const stable_hash = std.hash.Fnv1a_64.hash(full_system[0..stable_prefix_len]);
-                    log.info("prefix.stable hash={x} bytes={d} session={s}", .{
-                        stable_hash,
-                        stable_prefix_len,
-                        self.memory_session_id orelse "none",
-                    });
-
-                    // Tail hash: walk the last up-to-4 history items and
-                    // FNV-1a their content bytes. Skipping the system row
-                    // (already covered by prefix.stable above). Empty
-                    // history → tail_bytes=0, hash=fnv1a("").
-                    const TAIL_HASH_MSGS: usize = 4;
-                    var tail_hasher = std.hash.Fnv1a_64.init();
-                    var tail_bytes: usize = 0;
-                    var tail_msgs: usize = 0;
-                    if (self.history.items.len > 0) {
-                        const start_idx = self.history.items.len -|
-                            @min(TAIL_HASH_MSGS, self.history.items.len);
-                        for (self.history.items[start_idx..]) |*m| {
-                            if (m.role == .system) continue;
-                            tail_hasher.update(m.content);
-                            tail_bytes += m.content.len;
-                            tail_msgs += 1;
-                        }
-                    }
-                    log.info("prefix.tail hash={x} bytes={d} msgs={d} session={s}", .{
-                        tail_hasher.final(),
-                        tail_bytes,
-                        tail_msgs,
-                        self.memory_session_id orelse "none",
-                    });
-                }
-            } else |_| {}
-
-            // Keep exactly one canonical system prompt at history[0].
-            // This allows /model to invalidate and refresh the prompt in place.
-            // Each branch transfers ownership of full_system into history on
-            // success, flipping full_system_owned = false so the errdefer no
-            // longer tries to free it. try insert/append path: if the call
-            // fails the errdefer will free full_system (insert/append do not
-            // take ownership on failure).
-            if (self.history.items.len > 0 and self.history.items[0].role == .system) {
-                self.history.items[0].deinit(self.allocator);
-                self.history.items[0] = .{
-                    .role = .system,
-                    .content = full_system,
-                };
-                full_system_owned = false;
-            } else if (self.history.items.len > 0) {
-                try self.history.insert(self.allocator, 0, .{
-                    .role = .system,
-                    .content = full_system,
-                });
-                full_system_owned = false;
-            } else {
-                try self.history.append(self.allocator, .{
-                    .role = .system,
-                    .content = full_system,
-                });
-                full_system_owned = false;
-            }
-            self.has_system_prompt = true;
-            self.system_prompt_has_conversation_context = prompt_refresh_plan.conversation_context_present;
-            self.system_prompt_conversation_context_fingerprint = prompt_refresh_plan.conversation_context_fingerprint;
-            self.workspace_prompt_fingerprint = prompt_refresh_plan.workspace_prompt_fingerprint;
-            self.system_prompt_time_bucket_min = prompt_refresh_plan.current_time_bucket_min;
         }
 
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
@@ -3300,10 +3007,8 @@ pub const Agent = struct {
                         .content = history_copy,
                     });
                     if (self.compact_context_enabled) {
-                        const history_before_auto_compact = self.history.items.len;
-                        self.last_turn_compacted = self.autoCompactHistory() catch false;
-                        if (self.last_turn_compacted) {
-                            self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
+                        // v1.14.14 Phase 3 — route through ContextEngine.compact.
+                        if (self.context_engine_state.compact(self).compacted) {
                             self.refreshDurableContinuityAfterCompaction();
                         }
                     }
@@ -3331,10 +3036,8 @@ pub const Agent = struct {
                     .content = history_copy,
                 });
                 if (self.compact_context_enabled) {
-                    const history_before_auto_compact = self.history.items.len;
-                    self.last_turn_compacted = self.autoCompactHistory() catch false;
-                    if (self.last_turn_compacted) {
-                        self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
+                    // v1.14.14 Phase 3 — route through ContextEngine.compact.
+                    if (self.context_engine_state.compact(self).compacted) {
                         self.refreshDurableContinuityAfterCompaction();
                     }
                 }
@@ -3355,10 +3058,8 @@ pub const Agent = struct {
             // Run provider-backed auto-compaction against the full working
             // session so context boundaries create durable continuity objects.
             const auto_compact_start_ms = std.time.milliTimestamp();
-            const history_before_auto_compact = self.history.items.len;
-            self.last_turn_compacted = self.autoCompactHistory() catch false;
-            if (self.last_turn_compacted) {
-                self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
+            // v1.14.14 Phase 3 — route through ContextEngine.compact.
+            if (self.context_engine_state.compact(self).compacted) {
                 const auto_compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - auto_compact_start_ms));
                 turn_compaction_ms += auto_compact_duration_ms;
                 log.info("turn.stage stage=turn_auto_compaction duration_ms={d}", .{auto_compact_duration_ms});
@@ -3533,15 +3234,9 @@ pub const Agent = struct {
                     const err_name = @errorName(err);
                     if (providers.reliable.isContextExhausted(err_name) and
                         self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and
-                        blk: {
-                            const history_before = self.history.items.len;
-                            if (!self.forceCompressHistory()) break :blk false;
-                            self.recordForceCompression(history_before, self.history.items.len);
-                            break :blk true;
-                        })
+                        // v1.14.14 Phase 3 — route force-compress through ContextEngine.forceCompact.
+                        self.context_engine_state.forceCompact(self).compacted)
                     {
-                        self.context_was_compacted = true;
-                        self.context_force_compressed = true;
                         log.info("turn.stage stage=stream_context_recovery iteration={d} — force-compressed and retrying stream", .{iteration});
 
                         // Rebuild messages after compaction — the arena is
@@ -3655,15 +3350,9 @@ pub const Agent = struct {
                     const err_name = @errorName(err);
                     if (providers.reliable.isContextExhausted(err_name) and
                         self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and
-                        blk: {
-                            const history_before = self.history.items.len;
-                            if (!self.forceCompressHistory()) break :blk false;
-                            self.recordForceCompression(history_before, self.history.items.len);
-                            break :blk true;
-                        })
+                        // v1.14.14 Phase 3 — route force-compress through ContextEngine.forceCompact.
+                        self.context_engine_state.forceCompact(self).compacted)
                     {
-                        self.context_was_compacted = true;
-                        self.context_force_compressed = true;
                         turn_retry_attempts += 1;
                         turn_llm_calls += 1;
                         const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
@@ -3716,15 +3405,11 @@ pub const Agent = struct {
                         self.temperature,
                     ) catch |retry_err| {
                         // Context exhaustion recovery: if we have enough history,
-                        // force-compress and retry once more
-                        if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and blk: {
-                            const history_before = self.history.items.len;
-                            if (!self.forceCompressHistory()) break :blk false;
-                            self.recordForceCompression(history_before, self.history.items.len);
-                            break :blk true;
-                        }) {
-                            self.context_was_compacted = true;
-                            self.context_force_compressed = true;
+                        // force-compress and retry once more.
+                        // v1.14.14 Phase 3 — route force-compress through ContextEngine.forceCompact.
+                        if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and
+                            self.context_engine_state.forceCompact(self).compacted)
+                        {
                             turn_retry_attempts += 1;
                             turn_llm_calls += 1;
                             const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
@@ -3991,11 +3676,8 @@ pub const Agent = struct {
                         .content = try self.allocator.dupe(u8, follow_up_instruction),
                     });
                     if (self.compact_context_enabled) {
-                        const history_before_auto_compact = self.history.items.len;
-                        self.last_turn_compacted = self.autoCompactHistory() catch false;
-                        if (self.last_turn_compacted) {
-                            self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
-                        }
+                        // v1.14.14 Phase 3 — route through ContextEngine.compact.
+                        _ = self.context_engine_state.compact(self);
                     }
                     self.freeResponseFields(&response);
                     forced_follow_through_count += 1;
@@ -4093,11 +3775,8 @@ pub const Agent = struct {
 
                 const compact_start_ms = std.time.milliTimestamp();
                 if (self.compact_context_enabled and !self.last_turn_compacted) {
-                    const history_before_auto_compact = self.history.items.len;
-                    self.last_turn_compacted = self.autoCompactHistory() catch false;
-                    if (self.last_turn_compacted) {
-                        self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
-                    }
+                    // v1.14.14 Phase 3 — route through ContextEngine.compact.
+                    _ = self.context_engine_state.compact(self);
                 }
                 const compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compact_start_ms));
                 log.info("turn.stage stage=post_reply_compaction iteration={d} duration_ms={d} compacted={}", .{
@@ -4633,12 +4312,11 @@ pub const Agent = struct {
 
             const compact_start_ms = std.time.milliTimestamp();
             if (self.compact_context_enabled) {
-                const history_before_auto_compact = self.history.items.len;
-                const compacted_after_tools = self.autoCompactHistory() catch false;
-                if (compacted_after_tools) {
-                    self.last_turn_compacted = true;
-                    self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
-                }
+                // v1.14.14 Phase 3 — route through ContextEngine.compact. The
+                // wrapper preserves variant D's "only set last_turn_compacted
+                // to true on success" semantics (compact() never clobbers a
+                // prior true to false).
+                _ = self.context_engine_state.compact(self);
             }
             const compact_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compact_start_ms));
             log.info("turn.stage stage=history_maintenance_after_tools iteration={d} duration_ms={d}", .{ iteration, compact_duration_ms });
@@ -4775,10 +4453,8 @@ pub const Agent = struct {
         });
 
         // Compact history so the next turn can continue from a stable boundary.
-        const history_before_auto_compact = self.history.items.len;
-        self.last_turn_compacted = self.autoCompactHistory() catch false;
-        if (self.last_turn_compacted) {
-            self.recordAutoCompaction(history_before_auto_compact, self.history.items.len);
+        // v1.14.14 Phase 3 — route through ContextEngine.compact.
+        if (self.context_engine_state.compact(self).compacted) {
             self.refreshDurableContinuityAfterCompaction();
         }
         const complete_event = ObserverEvent{ .turn_complete = {} };
@@ -5101,11 +4777,14 @@ pub const Agent = struct {
         context_builder.recordTrimStats(&self.last_turn_context, trim_stats);
     }
 
-    fn recordAutoCompaction(self: *Agent, history_before: usize, history_after: usize) void {
+    // v1.14.14 Phase 3: promoted to `pub` so ContextEngine.compact +
+    // ContextEngine.forceCompact can call these from `agent: anytype` paths
+    // (Zig 0.15 method dispatch requires pub on anytype call sites).
+    pub fn recordAutoCompaction(self: *Agent, history_before: usize, history_after: usize) void {
         context_builder.recordAutoCompaction(&self.last_turn_context, history_before, history_after);
     }
 
-    fn recordForceCompression(self: *Agent, history_before: usize, history_after: usize) void {
+    pub fn recordForceCompression(self: *Agent, history_before: usize, history_after: usize) void {
         context_builder.recordForceCompression(&self.last_turn_context, history_before, history_after);
     }
 

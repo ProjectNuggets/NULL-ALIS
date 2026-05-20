@@ -454,3 +454,54 @@ understand exactly what we were thinking and why."**
 
 If a change can't pass that test, rewrite the commit message and inline comments until it
 can.
+
+### 14.10 Post-sprint Activation Audit Discipline (added 2026-05-20 retrospective)
+
+**Why this exists:** The v1.14.14 sprint shipped Agent G's ContextEngine migration as
+code-complete-but-behaviorally-inert. Only Nova's prompt about WM importance saturation
+surfaced the activatable follow-up work. Without that prompt, ~40% of in-flight agent
+value would have stayed latent. The pattern below installs the audit step as a coordinator
+discipline so latent value gets named before the next bench is paid for.
+
+**The rule:** After every multi-agent sprint, BEFORE running any new bench, the
+coordinator produces `docs/audits/<YYYY-MM-DD>-<sprint>-activation-audit.md` with:
+
+1. **Per-agent activation tier classification.** Each landed finding gets one of:
+   - 🟢 BEHAVIORAL — observable agent output / tool selection / context shape change
+   - 🟡 VISIBILITY — events / metrics / logs fire that weren't firing before, not seen by agent
+   - ⚪ HYGIENE — code reorganized, dead surface removed, docs updated; bench-invisible
+
+2. **Capability cascade.** For each BEHAVIORAL or VISIBILITY finding, list what downstream
+   capabilities it activates or enables (e.g., "ContextEngine.assemble unlocks per-phase
+   byte-stability assertions" or "Schema cleaner unlocks Anthropic two-block cache").
+
+3. **Latent-value scan.** Identify existing capabilities that COULD benefit from the new
+   work but DO NOT. This is the high-value step — these become the next sprint's findings.
+   Example: "v1.14.13 narration events fire but the agent doesn't see them in next iteration
+   → G3 narration-as-context for v1.14.18-B."
+
+4. **Proposed follow-up block.** If latent-value items exist, draft the next sprint's block
+   in `docs/ROADMAP.md` to capture them. The follow-up block is the audit's deliverable —
+   not just a list but a scoped, effort-estimated, file-assigned plan.
+
+**Bench gate:** The next bench run requires either (a) audit landed in `docs/audits/`
+AND ROADMAP block drafted, OR (b) explicit Nova override saying "skip audit, run bench
+now." This is a hard gate; the coordinator does not bypass it silently.
+
+**Tier discipline:** A sprint whose findings classify as >50% HYGIENE / VISIBILITY is not
+a "failed" sprint — substrate work is real. But it MUST produce a follow-up sprint block
+that captures the BEHAVIORAL value the substrate enables. Otherwise the sprint shipped
+"foundation for nothing," which violates §14.9 reputation contract.
+
+**Honest reporting:** Coordinator MUST distinguish in the audit between:
+- "Agent X's report said complete, branch verifies complete" (true completion)
+- "Agent X's report said complete, branch shows plan-only" (design completion, not implementation)
+- "Agent X's report said complete, branch shows working tree dirty" (uncommitted work)
+
+The pattern caught Agent E v1.14.18-A Finding 2 design-vs-implementation gap on
+2026-05-20. The discipline of reading the actual branch state (not just the agent's
+self-report) is the §14.10 specific contribution beyond §14.9's reputation contract.
+
+**Authority over §14.10:** Coordinator owns the audit. Nova can override the gate but
+the audit document still lands as historical record. The audit is the post-mortem; the
+ROADMAP block is the prescription.

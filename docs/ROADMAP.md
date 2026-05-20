@@ -280,6 +280,130 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
+## v1.14.18-B — "Learning loop closure + self-knowledge" → PLANNED
+
+**Theme:** Close the latent-value gaps surfaced by the 2026-05-20 post-v1.14.14 activation
+audit (`docs/audits/2026-05-20-v1.14.14-activation-audit.md`). v1.14.18-A (Agent E) gives
+nullalis goal-loop reflection + procedural memory capture; v1.14.18-B persists that
+reflection across sessions, surfaces nullalis's own bench self-knowledge, and adds the
+first cross-layer memory promotion rule.
+
+**Why this exists:** AGENTS.md §14.10 audit-discipline pattern produced this block.
+Without it, ~40% of v1.14.13 + v1.14.14 + v1.14.18-A combined value would have stayed
+latent (events firing, no read-back loop; reflection generated, no storage; bench data
+exists, agent doesn't see it).
+
+**Steps (each atomic per §14.1):**
+
+1. **G5 REFLECTION-STORE** — Agent E's reflection trail (turn-ephemeral in v1.14.18-A)
+   writes to `skill_executions.assumptions_made_json` at session-end. Loop closes; sessions
+   compound learning. File: new `src/agent/reflection.zig` (extract from `goal_loop.zig`).
+   Owner: Agent E (already in goal-loop context).
+
+2. **G3 NARRATION-AS-CONTEXT** — Iteration-start prompt injection: last 3 narration events
+   become `<recent_thoughts>` volatile-prompt block. Agent sees its own thinking trail
+   as feedback. File: extend `src/agent/narration.zig` with `recallRecent(N)` + wire at
+   ContextEngine.assemble entry. Owner: Agent G (already in narration + ContextEngine).
+
+3. **G7 BENCH-SELF-KNOWLEDGE** — Read `.spike/results.tsv` last 3 rows + LoCoMo
+   per-category latest. Surface as `<known_weakness>` volatile-prompt block. Agent reads
+   its own bench data and self-adjusts. File: new `src/agent/bench_self.zig`.
+   Owner: Agent E or fresh.
+
+4. **G16 WM-CROSS-SESSION** — At session-end, promote high-importance `active_goal` +
+   `decision` slots to durable_facts with `attribute=transient_goal`. Recall at
+   session-start via existing memory_loader path. File: new `src/agent/promotion.zig`
+   (first concrete cross-layer promotion rule; foundation for G6 broader graph in v1.14.19).
+   Owner: Agent G (already in working_memory pipeline).
+
+5. **G19 DAEMON-PROMPT-HONESTY** — Either implement the "nightly summaries" prompt promise
+   in `daemon.zig:3903` OR strip the prompt line per §14.6 honest-config. Recommend strip
+   in this block; the actual nightly summaries land in v1.14.19 sleep cycle. Owner: either.
+
+**Repo structure additions (locked per CTO/repo-designer review):**
+- `src/agent/reflection.zig` — standalone module for the reflection trail
+- `src/agent/bench_self.zig` — agent's self-knowledge from .spike/results.tsv
+- `src/agent/promotion.zig` — explicit memory layer promotion rules
+
+**Bench gate (after v1.14.18-A and v1.14.18-B both land):**
+- LoCoMo overall ≥ 0.78 (no regression vs v1.14.14 baseline 0.80)
+- LoCoMo Cat 3 ≥ 0.45 (v1.14.18-A goal-loop sets baseline; G3 narration-as-context + G5
+  reflection-storage compound on top)
+- V-inf polluted ≥ 0.72
+- Production postgres: `skill_executions` populating AND `durable_facts.attribute=transient_goal`
+  rows appearing across sessions (proves G16 works end-to-end)
+- Postgres: `<known_weakness>` block populated from real bench data (proves G7 wiring)
+
+**Duration:** 6-7 working days, 1-2 agents in parallel (E does G5 + G7; G does G3 + G16 + G19).
+**Dependencies:** v1.14.18-A (Agent E's goal-loop + procedural memory capture must be in place).
+
+---
+
+## v1.14.19 — "Sleep cycle / offline self-improvement (Voyager-class)" → PLANNED
+
+**Theme:** Turn the existing 12h hygiene cadence into a Voyager-style offline self-improvement
+loop. Compound learning across sessions during agent downtime. Replaces the "A/B prompt
+testing" approach with the self-improvement-from-real-data approach (no synthetic dual-runs;
+the agent learns from its actual usage).
+
+**Why this is SOTA:**
+- Voyager (Wang et al., NeurIPS 2023) — skill library accumulates over time; agent gets
+  better with use
+- Reflexion (Shinn et al., NeurIPS 2023) — negative-example storage prevents repeating
+  failed patterns
+- mem0 memory consolidation — semantic dedup keeps long-tail memory tractable
+- The sleep cycle is the substrate for all three
+
+**Existing plumbing this leverages:**
+- `src/memory/lifecycle/hygiene.zig` — 12h cadence already running; extend with consolidation
+- `src/agent/community_pipeline.zig::recomputeCommunitiesForUser` — exists, no scheduler
+- `src/agent/procedural_memory.zig` — captures traces; v1.14.18-A makes it actually populate
+
+**Steps:**
+
+1. **SC1 SKILL-CONSOLIDATION** — Every cycle, scan `skill_executions` rows added since last
+   consolidation. Identify patterns with `outcome_quality ≥ 0.8`. Distill as `durable_facts`
+   with predicate=`LEARNED_PATTERN` (e.g., "for entity-question goals, the memory_recall →
+   brain_graph chain succeeded 8/10 times"). File: new
+   `src/memory/lifecycle/skill_consolidation.zig`.
+
+2. **SC2 NEGATIVE-EXAMPLES** — Same pass captures failures (`outcome_quality ≤ 0.3`) as
+   `durable_facts` with predicate=`AVOID_PATTERN` (e.g., "for booking goals when reservation
+   already cancelled, transfer_to_human path failed 5/5 times — try alternative tool
+   sequence first"). Reflexion pattern.
+
+3. **SC3 MEMORY-DEDUP** — E5 semantic similarity over `durable_facts`; merge near-duplicates
+   above threshold 0.92. Preserve highest-confidence original. Long-tail memory tractability.
+
+4. **SC4 COMMUNITY-RECOMPUTE-SCHEDULER** — Wire `community_pipeline.recomputeCommunitiesForUser`
+   to daemon nightly tick (per-user, capped LLM-naming budget). Closes G17 from the
+   activation audit.
+
+5. **SC5 SLEEP-CYCLE-OBSERVABILITY** — JSONL log of every cycle: `ran_at`, `items_consolidated`,
+   `items_deduped`, `llm_calls`, `errors`. Same pattern as stability.jsonl. File:
+   `src/agent/sleep_cycle.zig` (orchestrator). This also serves as G9 continuous-canary
+   substitute — daily cycle = daily signal of whether agent improvement is compounding.
+
+**Repo structure additions:**
+- `src/agent/sleep_cycle.zig` — orchestrator (NEW)
+- `src/memory/lifecycle/skill_consolidation.zig` — consolidation logic (NEW)
+- extend `src/memory/lifecycle/hygiene.zig` — add sleep-cycle trigger point
+- extend `src/daemon.zig` — schedule sleep cycle at hygiene cadence
+
+**Bench gate (after 2 sleep cycles run on real data):**
+- `durable_facts.predicate = LEARNED_PATTERN` ≥ 10 rows after 2 weeks of normal use
+- `durable_facts.predicate = AVOID_PATTERN` ≥ 3 rows
+- LoCoMo + V-inf + τ-bench: no regression; Cat 3 ideally lifts (learned patterns inform
+  agent on similar future questions)
+- p95 sleep-cycle wall-clock ≤ 30s per user
+- Sleep-cycle JSONL emitting; operator can grep for consolidation events
+
+**Duration:** 7-10 working days.
+**Dependencies:** v1.14.18-A (skill_executions populating) + v1.14.18-B (reflection trail
+in skill_executions). Without these, consolidation has no material to work with.
+
+---
+
 ## v1.15.0 — "τ-bench iteration sprint (Karpathy loop)" → PLANNED
 
 **Theme:** Now that the foundation is clean, drive τ-bench Airline numbers up the same way iter1-21 drove LoCoMo. Hypothesize → iterate → bench → keep or discard.

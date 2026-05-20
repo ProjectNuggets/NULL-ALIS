@@ -82,15 +82,40 @@ pub fn slotTypeWeight(t: []const u8) f64 {
     return 0.5; // unknown / future types
 }
 
-/// Composite priority for eviction: importance × recency_decay × slot_type_weight.
+/// Composite priority for eviction: recency_decay × slot_type_weight.
 /// Recency uses 1-hour half-life — slots untouched for an hour decay to ~0.5.
 /// Result clamped to [0, 1].
+///
+/// v1.14.14.1 Finding 1 (WM-IMPORTANCE-CALIBRATION): the formula was
+/// originally `importance × recency × slot_type_weight`. Production postmortem
+/// (350 slots / 95 sessions, 2026-05) showed `importance` saturated at avg 0.99
+/// across every slot_type — the LLM extractor (extraction_persist.zig:1064
+/// `@max(m.confidence, 0.5)`) consistently emits ≥ 0.99 because (a) the
+/// extraction prompt asks for `<number 0.0-1.0>` with NO anchoring examples,
+/// (b) LLMs are systematically overconfident on self-rating, and (c) the
+/// persist-time default (extraction_persist.zig:282-286) maps null/non-numeric
+/// to 1.0. With importance saturated, the factor contributed zero discrimination —
+/// composite reduced to `~0.99 × recency × type_w`, which IS recency × type_w
+/// times a constant.
+///
+/// Option (b) per .planning/agent-G-v11414-1-phase0.md: drop importance from
+/// the formula. Importance column STAYS in the schema and is still written
+/// at every promotion site (zero migration). v1.14.18-B will reintroduce the
+/// multiplier with per-source calibration once a signal-strength column lands
+/// on ExtractedMemory (the SOTA option-(a) path). Until then, eviction is
+/// deterministic by recency × type_w with pinned-first row ordering.
+///
+/// Three other options surveyed and rejected: (a) per-source calibration
+/// blocked by missing signal column; (c) time-based decay duplicates this
+/// formula's recency factor; (d) prompt-anchoring fix blocked by §14.7
+/// "no prompt directive ships without bench evidence" and the zero-bench
+/// scope of this slice. Full survey at the Finding 1 phase-0 plan.
 pub fn compositePriority(slot: *const WorkingMemorySlot, now_unix: i64) f64 {
     const age_seconds: f64 = @floatFromInt(@max(0, now_unix - slot.last_touched_at_unix));
     // 1-hour half life: half_life_secs = 3600
     const recency = std.math.exp(-age_seconds * std.math.ln2 / 3600.0);
     const type_w = slotTypeWeight(slot.slot_type);
-    const composite = slot.importance * recency * type_w;
+    const composite = recency * type_w;
     return std.math.clamp(composite, 0.0, 1.0);
 }
 
@@ -430,11 +455,44 @@ test "compositePriority decays with age" {
     var stale = fresh;
     stale.last_touched_at_unix = now - 7200; // 2 hours ago, 2 half-lives = 0.25
 
+    // v1.14.14.1 Finding 1: formula is now `recency × type_w` (importance
+    // dropped from composite — see compositePriority doc). Expected values:
+    //   fresh: 1.0 × 0.9 = 0.90 (open_loop type_w = 0.9, recency ≈ 1.0)
+    //   stale: 0.25 × 0.9 = 0.225 (2-half-life recency = 0.25)
+    // The fresh > stale invariant the test exists to verify is preserved.
     const fresh_p = compositePriority(&fresh, now);
     const stale_p = compositePriority(&stale, now);
     try std.testing.expect(fresh_p > stale_p);
-    try std.testing.expect(fresh_p > 0.5); // 0.8 * 1.0 * 0.9 = 0.72
-    try std.testing.expect(stale_p < 0.3); // 0.8 * 0.25 * 0.9 = 0.18
+    try std.testing.expect(fresh_p > 0.5); // 1.0 * 0.9 = 0.90
+    try std.testing.expect(stale_p < 0.3); // 0.25 * 0.9 = 0.225
+}
+
+test "compositePriority is independent of importance after v1.14.14.1 Finding 1" {
+    const now: i64 = 1_700_000_000;
+    var low_imp = WorkingMemorySlot{
+        .user_id = 1,
+        .session_id = "test",
+        .slot_id = 0,
+        .slot_type = SlotType.open_loop,
+        .content = "test",
+        .source_key = null,
+        .importance = 0.5,
+        .pinned = false,
+        .created_at_unix = now,
+        .last_touched_at_unix = now,
+    };
+    var high_imp = low_imp;
+    high_imp.importance = 1.0;
+
+    // After Finding 1: importance no longer enters the formula. Two slots
+    // with identical recency + type but very different importance should
+    // produce identical composite scores. This guards the recovery path
+    // for v1.14.18-B — when per-source calibration lands and importance is
+    // re-enabled, this test should be DELETED (importance discrimination
+    // returns) rather than updated.
+    const low_p = compositePriority(&low_imp, now);
+    const high_p = compositePriority(&high_imp, now);
+    try std.testing.expectEqual(low_p, high_p);
 }
 
 test "renderBlock formats slots correctly" {
