@@ -94,8 +94,7 @@ pub const OwnershipPlane = enum {
 // summarizer_* (never read) and the dead `mappingFor` function.
 // Numeric values here are just snap SIGNAL — they reflect the pre-
 // context-v2 era's config shape so old configs still migrate cleanly.
-// Runtime behavior for each mode is driven by product_presets in
-// config_types.zig, NOT this table.
+// Legacy values used only for pre-context-v2 config migration.
 const ModeMapping = struct {
     mode: AssistantMode,
     queue_mode: []const u8,
@@ -399,72 +398,24 @@ pub fn normalizeTenantConfigJson(
 }
 
 pub fn applySettingsToConfig(cfg: *Config, settings: ProductSettings) void {
-    // Honor the user's selected assistant_mode. If the frontend chooses
-    // to lock the selector (e.g. only expose balanced in V1 UI), that's
-    // a frontend-side decision — the backend stays truthful: whatever
-    // mode is selected, that mode's preset is applied.
+    // MODE-UNIFICATION (v1.14.18-A F1): reasoning_effort is the single knob.
+    // User-set value (from config.json) wins; otherwise derive from assistant_mode.
     //
-    // Reverted 2026-04-28 (Nova directive): an earlier "single-mode gate"
-    // forced .balanced regardless of input, creating a truth mismatch
-    // between user selection and applied behavior. That's worse than
-    // complexity. Backend honesty > UI simplicity.
-    const preset = presetForMode(settings.assistant_mode, cfg.product_presets);
-
-    cfg.agent.compact_context = preset.agent.compact_context;
-    cfg.agent.max_history_messages = preset.agent.max_history_messages;
-    cfg.agent.queue_mode = preset.agent.queue_mode;
-    cfg.agent.queue_cap = preset.agent.queue_cap;
-    cfg.agent.queue_drop = preset.agent.queue_drop;
-    cfg.agent.queue_debounce_ms = preset.agent.queue_debounce_ms;
-
-    // Mode-specific quality/cost differentiation
-    if (preset.agent.temperature) |temp| {
-        cfg.default_temperature = temp;
+    // Mapping: fast → low, balanced → medium, deep → high.
+    // This closes the R-effort-override deferred item: user explicitly-set
+    // reasoning_effort now takes precedence over mode-derived value.
+    if (cfg.reasoning_effort == null) {
+        // User did not explicitly set reasoning_effort in config.json.
+        // Derive from assistant_mode (legacy UI selector).
+        const effort_value = switch (settings.assistant_mode) {
+            .fast => "low",
+            .balanced => "medium",
+            .deep => "high",
+        };
+        cfg.reasoning_effort = effort_value;
     }
-    if (preset.agent.max_tool_iterations > 0) {
-        cfg.agent.max_tool_iterations = preset.agent.max_tool_iterations;
-    }
-    // Per-mode model/provider selection — the core of mode differentiation.
-    // Fast=Gemma/Together, Balanced=K2.5/Together, Deep=GLM/OpenRouter.
-    // Empty string = keep the current config default (operator override).
-    //
-    // IMPORTANT: When the provider changes, the RuntimeProviderBundle MUST be
-    // rebuilt. The provider bundle is an HTTP client pointed at a specific API
-    // endpoint — changing cfg.default_provider without rebuilding the bundle
-    // sends the wrong model to the wrong provider (silent failure).
-    // Currently safe: applySettingsToConfig runs before bundle init at boot.
-    // If hot-reload is added later, bundle rebuild must follow config update.
-    if (preset.agent.model.len > 0) {
-        cfg.default_model = preset.agent.model;
-    }
-    if (preset.agent.provider.len > 0) {
-        cfg.default_provider = preset.agent.provider;
-    }
-    // Q3 (2026-04-27): mode-specific reasoning_effort. fast=low,
-    // balanced=medium, deep=high. Modes finally become behaviorally
-    // different at the wire level (server-side thinking depth) — not
-    // just queue caps. This is the lever that makes the mode selector
-    // worth its UX surface.
-    //
-    // Allocator note: preset reasoning_effort points to a const string
-    // literal; cfg.reasoning_effort lifecycle expects either null or
-    // a heap-owned string in some paths. Use the string literal as-is
-    // here — config_parse.zig and other paths that re-set it will
-    // free + dupe consistently. Operator JSON overrides retain
-    // precedence (parse-time set runs before mode-preset apply OR
-    // the inverse depending on call order; doc'd in plan-v02 §6).
-    if (preset.agent.reasoning_effort) |effort| {
-        cfg.reasoning_effort = effort;
-    }
-    // Note: max_response_tokens intentionally NOT applied from presets.
-    // Hard API caps truncate mid-response during agentic tasks (file writes, code gen).
-    // References (Claude Code, Cursor, Devin) use no per-mode response caps.
-    // Verbosity is controlled via persona voice_style (concise/verbose) instead.
-
-    cfg.memory.summarizer.enabled = preset.summarizer.enabled;
-    cfg.memory.summarizer.window_size_tokens = preset.summarizer.window_size_tokens;
-    cfg.memory.summarizer.summary_max_tokens = preset.summarizer.summary_max_tokens;
-    cfg.memory.summarizer.auto_extract_semantic = preset.summarizer.auto_extract_semantic;
+    // If cfg.reasoning_effort is already set (not null), user explicitly configured
+    // it and we honor that choice — do not override with mode-derived value.
 
     cfg.agent.activation_mode = settings.group_activation.toSlice();
     cfg.agent.send_mode = if (settings.proactive_updates) "inherit" else "off";
@@ -618,17 +569,6 @@ fn deriveNearestFromAgentObject(agent: std.json.ObjectMap) ProductSettings {
     return result;
 }
 
-fn presetForMode(
-    mode: AssistantMode,
-    presets: config_types.ProductPresetsConfig,
-) config_types.AssistantModePresetConfig {
-    return switch (mode) {
-        .fast => presets.fast,
-        .balanced => presets.balanced,
-        .deep => presets.deep,
-    };
-}
-
 fn clampSessionTimeoutMinutes(minutes: u32) u32 {
     return std.math.clamp(minutes, 5, 180);
 }
@@ -748,15 +688,13 @@ test "resolveSettingsFromConfigJson prefers canonical product settings" {
     try std.testing.expectEqual(@as(u32, 42), settings.session_timeout_minutes);
 }
 
-test "applySettingsToConfig fast input applies fast preset" {
+test "applySettingsToConfig fast input maps to low reasoning_effort" {
     var cfg = Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
         .default_model = "test/mock-model",
         .allocator = std.testing.allocator,
     };
-
-    try std.testing.expect(cfg.product_presets.fast.summarizer.enabled);
 
     applySettingsToConfig(&cfg, .{
         .assistant_mode = .fast,
@@ -766,24 +704,16 @@ test "applySettingsToConfig fast input applies fast preset" {
         .session_timeout_minutes = 30,
     });
 
-    try std.testing.expectEqualStrings("serial", cfg.agent.queue_mode);
-    try std.testing.expectEqual(@as(u32, 8), cfg.agent.queue_cap);
-    try std.testing.expectEqualStrings("summarize", cfg.agent.queue_drop);
-    try std.testing.expectEqual(@as(u32, 0), cfg.agent.max_history_messages);
-    try std.testing.expect(cfg.memory.summarizer.enabled);
-    try std.testing.expectEqual(@as(u32, 3000), cfg.memory.summarizer.window_size_tokens);
-    try std.testing.expectEqual(@as(u32, 300), cfg.memory.summarizer.summary_max_tokens);
-    try std.testing.expectEqual(@as(f64, 0.5), cfg.default_temperature);
-    try std.testing.expectEqual(@as(u32, 100), cfg.agent.max_tool_iterations);
-    try std.testing.expectEqual(@as(?u32, null), cfg.max_tokens);
-    // V1.11 hardening (2026-05-07): full switch to Kimi K2.6 across all
-    // 3 modes — multimodal vision + reasoning toggle, replaces the
-    // K2.5/V4-Pro split. See config_types.zig product_presets comment.
-    try std.testing.expectEqualStrings("moonshotai/Kimi-K2.6", cfg.default_model.?);
-    try std.testing.expectEqualStrings("together", cfg.default_provider);
+    // MODE-UNIFICATION: fast mode maps to low reasoning_effort
+    try std.testing.expectEqualStrings("low", cfg.reasoning_effort.?);
+    // Apply settings wires user preferences to config
+    try std.testing.expectEqualStrings("mention", cfg.agent.activation_mode);
+    try std.testing.expectEqualStrings("inherit", cfg.agent.send_mode);
+    try std.testing.expectEqualStrings("off", cfg.agent.tts_mode);
+    try std.testing.expectEqual(@as(u64, 1800), cfg.agent.session_idle_timeout_secs);
 }
 
-test "applySettingsToConfig deep input applies deep preset" {
+test "applySettingsToConfig deep input maps to high reasoning_effort" {
     var cfg = Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
@@ -799,18 +729,13 @@ test "applySettingsToConfig deep input applies deep preset" {
         .session_timeout_minutes = 60,
     });
 
-    try std.testing.expectEqual(@as(f64, 0.8), cfg.default_temperature);
-    try std.testing.expectEqual(@as(u32, 1000), cfg.agent.max_tool_iterations);
-    try std.testing.expectEqual(@as(?u32, null), cfg.max_tokens);
-    try std.testing.expectEqual(@as(u32, 0), cfg.agent.max_history_messages);
-    try std.testing.expectEqualStrings("serial", cfg.agent.queue_mode);
-    try std.testing.expectEqual(@as(u32, 8000), cfg.memory.summarizer.window_size_tokens);
-    // Mode-swap 2026-04-29: deep moved from GLM-5.1 → DeepSeek V4-Pro.
-    // V1.11 hardening 2026-05-07: full switch to Kimi K2.6 (multimodal,
-    // SWE-Bench Verified 80.2). All 3 modes share K2.6; reasoning_effort
-    // is the per-mode differentiator (low/medium/high).
-    try std.testing.expectEqualStrings("moonshotai/Kimi-K2.6", cfg.default_model.?);
-    try std.testing.expectEqualStrings("together", cfg.default_provider);
+    // MODE-UNIFICATION: deep mode maps to high reasoning_effort
+    try std.testing.expectEqualStrings("high", cfg.reasoning_effort.?);
+    // Apply settings wires user preferences to config
+    try std.testing.expectEqualStrings("always", cfg.agent.activation_mode);
+    try std.testing.expectEqualStrings("off", cfg.agent.send_mode);
+    try std.testing.expectEqualStrings("inbound", cfg.agent.tts_mode);
+    try std.testing.expectEqual(@as(u64, 3600), cfg.agent.session_idle_timeout_secs);
 }
 
 test "resolveSettingsFromConfigJson clamps huge canonical timeout" {

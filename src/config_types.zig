@@ -239,145 +239,6 @@ pub const AssistantModePresetConfig = struct {
     summarizer: AssistantModePresetSummarizerConfig,
 };
 
-pub const ProductPresetsConfig = struct {
-    fast: AssistantModePresetConfig = .{
-        .agent = .{
-            .compact_context = true,
-            // iter26: 0 = uncapped. Nova directive 2026-04-20 — all competitors
-            // (Claude Code, Hermes, OpenClaw) use pure token budgets. autoCompactHistory
-            // (70/80/90 token thresholds) owns compaction. Mechanism preserved but
-            // dormant.
-            .max_history_messages = 0,
-            .queue_mode = "serial",
-            .queue_cap = 8,
-            .queue_drop = "summarize",
-            .queue_debounce_ms = 0,
-            .temperature = 0.5,
-            // Raised 8→20 after field testing showed 8 truncated real tasks
-            // mid-flow (e.g. "read PDF + check memory + compare + summarize"
-            // is 5-7 tool calls; with overhead, 8 was a hard stop for users).
-            // Adaptive exit (repeated-call detector) prevents runaways, so a
-            // higher cap is safe. Still "fast" perceptually — most single-step
-            // queries finish in 1-3 iterations.
-            // R18 (2026-04-28, Nova directive): "we can't time out
-            // anything, what if the agent needed to work longer."
-            // Bumped 20 → 100 for fast. Adaptive exits (loop_detected
-            // + repeated-call detector) catch pathological loops; the
-            // cap is just a final safety valve. 100 still feels "fast"
-            // perceptually because most fast-mode queries finish in
-            // 1-5 iterations.
-            .max_tool_iterations = 100,
-            // Per-mode model assignment (2026-04-29 — Nova directive after
-            // V4-Pro audit + research):
-            //   Fast:     Kimi K2.6   (multimodal vision, reasoning low,  256K ctx, $1.20/$4.50)
-            //   Balanced: Kimi K2.6   (multimodal vision, reasoning med,  256K ctx, $1.20/$4.50)
-            //   Deep:     Kimi K2.6   (multimodal vision, reasoning high, 256K ctx, $1.20/$4.50)
-            //
-            // V1.11 hardening (2026-05-07): full switch from V4-Pro to
-            // Kimi K2.6. Rationale per research-kimi-multimodal-2026-05-07.md
-            // and research-together-2026-05-07.md:
-            //   - K2.6 is text + vision + video on Together (DeepSeek V4-Pro
-            //     is text-only; we couldn't see images).
-            //   - SWE-Bench Verified 80.2 — beats Opus 4.6 on SWE-Bench Pro.
-            //     V4-Pro's 80.6 was within margin; the multimodal lift wins.
-            //   - 256K context (V4-Pro on Together is 512K but we rarely
-            //     approach 100K; the headroom isn't earning value).
-            //   - Single model across all 3 modes → balanced↔deep cache
-            //     stays warm (same as our V4-Pro layout); fast→balanced
-            //     also cache-shares now that we no longer switch models.
-            //   - reasoning_effort low/medium/high differentiates the
-            //     modes at thinking depth, not at model identity.
-            //   - One Together model id end-to-end. No routing logic.
-            .model = "moonshotai/Kimi-K2.6",
-            .provider = "together",
-            // Q3 (2026-04-27): fast = low reasoning effort. Trades thinking
-            // depth for latency. Suits casual chat, quick lookups, single-step
-            // queries that don't need deep reasoning.
-            .reasoning_effort = "low",
-        },
-        .summarizer = .{
-            .enabled = true,
-            .window_size_tokens = 3000,
-            .summary_max_tokens = 300,
-            .auto_extract_semantic = true,
-        },
-    },
-    balanced: AssistantModePresetConfig = .{
-        .agent = .{
-            .compact_context = true,
-            .max_history_messages = 0,
-            .queue_mode = "serial",
-            .queue_cap = 12,
-            .queue_drop = "summarize",
-            .queue_debounce_ms = 0,
-            .temperature = 0.7,
-            // R18 (2026-04-28, Nova directive): bumped 35 → 200 for
-            // balanced. Adaptive exits catch loops; cap is safety
-            // valve only. Real workflows (research + code +
-            // multi-tool) regularly hit 30-50 iterations on hard
-            // problems; 200 leaves comfortable headroom.
-            .max_tool_iterations = 200,
-            // V1.11 hardening (2026-05-07) — Kimi K2.6 full switch.
-            // Multimodal vision + reasoning, 256K context, $1.20/$4.50.
-            // Same Together provider as Fast/Deep so prompt cache shares
-            // freely across modes when the user toggles between them.
-            // SWE-Bench Verified 80.2 (beats Opus 4.6 on SWE-Bench Pro).
-            .model = "moonshotai/Kimi-K2.6",
-            .provider = "together",
-            // Q3 (2026-04-27): balanced = medium reasoning effort. Default
-            // for most users. K2.6 accepts reasoning_effort per Moonshot
-            // docs — emitted via providers/helpers.zig isReasoningCapableModel
-            // detection (matches "kimi-k2" prefix).
-            .reasoning_effort = "medium",
-        },
-        .summarizer = .{
-            .enabled = true,
-            .window_size_tokens = 5000,
-            .summary_max_tokens = 500,
-            .auto_extract_semantic = true,
-        },
-    },
-    deep: AssistantModePresetConfig = .{
-        .agent = .{
-            .compact_context = true,
-            .max_history_messages = 0,
-            .queue_mode = "serial",
-            .queue_cap = 20,
-            .queue_drop = "summarize",
-            .queue_debounce_ms = 0,
-            .temperature = 0.8,
-            // R18 (2026-04-28, Nova directive): bumped 100 → 1000 for
-            // deep. SWE-Bench-class autonomous coding loops legitimately
-            // run 200+ iterations across an 8-hour autonomous session.
-            // 1000 is "effectively unbounded for legitimate work" while
-            // still being a safety valve against pathological loops.
-            // Adaptive exits (loop_detected, repeated-call, no-progress)
-            // are the real guardrail; this cap exists only to prevent
-            // worst-case runaway.
-            .max_tool_iterations = 1000,
-            // V1.11 hardening (2026-05-07) — Kimi K2.6 full switch (was
-            // V4-Pro). Same model as Fast/Balanced; reasoning_effort=high
-            // is the differentiator. K2.6 multimodal means deep mode now
-            // sees images + video too — useful for screenshot debugging,
-            // diagram analysis, video summarization workflows that were
-            // text-only-blind on V4-Pro.
-            .model = "moonshotai/Kimi-K2.6",
-            .provider = "together",
-            // Q3 (2026-04-27): deep = high reasoning effort. Trades latency
-            // for thinking depth. Suits multi-step research, code review,
-            // strategic planning, SWE-Bench-style work where the user
-            // explicitly opted into "give me the best answer, take your time."
-            .reasoning_effort = "high",
-        },
-        .summarizer = .{
-            .enabled = true,
-            .window_size_tokens = 8000,
-            .summary_max_tokens = 700,
-            .auto_extract_semantic = true,
-        },
-    },
-};
-
 pub const SidecarConfig = struct {
     /// Enable the sidecar provider for auxiliary LLM calls (narration, compaction).
     enabled: bool = true,
@@ -395,8 +256,8 @@ pub const SidecarConfig = struct {
 
 pub const AgentConfig = struct {
     compact_context: bool = false,
-    max_tool_iterations: u32 = 25,
-    // iter26: 0 = uncapped (pure token-based). See product_presets.
+    max_tool_iterations: u32 = 500,
+    // iter26: 0 = uncapped (pure token-based). Adaptive exits (loop_detected, repeated-call) are the real guardrails.
     max_history_messages: u32 = 0,
     /// Execute independent tool calls concurrently. Default true for per-pod
     /// deployments where there is no shared scheduler contention. Set to false

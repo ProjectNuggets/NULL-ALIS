@@ -772,20 +772,6 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
-    if (root.get("product_presets")) |presets_val| {
-        if (presets_val == .object) {
-            if (presets_val.object.get("fast")) |value| {
-                try parseAssistantModePresetConfig(self, &self.product_presets.fast, value);
-            }
-            if (presets_val.object.get("balanced")) |value| {
-                try parseAssistantModePresetConfig(self, &self.product_presets.balanced, value);
-            }
-            if (presets_val.object.get("deep")) |value| {
-                try parseAssistantModePresetConfig(self, &self.product_presets.deep, value);
-            }
-        }
-    }
-
     // Cron
     if (root.get("cron")) |cr| {
         if (cr == .object) {
