@@ -408,7 +408,7 @@ if [[ $QUIET -eq 0 ]]; then
   echo "SSE traces: $OUT_DIR"
 fi
 
-# v1.14.14 Phase 5 — per-session prefix-stability CI assertion.
+# v1.14.14 Phase 5 + v1.14.14.1 Finding 2 — per-session prefix-stability CI assertion.
 # Activates the stability.jsonl diagnostic from Phase 4. Catches the silent
 # prefix-drift regression class: a prompt-construction change that increases
 # latency/cost by 1.5-3x via collapsed KV-cache hits but leaves agent answers
@@ -418,21 +418,33 @@ fi
 # run. If the JSONL file is missing or empty, skip (back-compat with runs
 # before stability emission landed).
 #
-# Fails the bench (non-zero exit) if any single session_key shows >1 distinct
-# stable_prefix_hash across its turns. Hash drift mid-session = the bug.
+# Fails the bench (non-zero exit) if any session_key shows >1 distinct
+# stable_prefix_hash OR >1 distinct tail_hash across its turns. EITHER drifting
+# is a cache-collapse regression:
+#   - stable_prefix drift = provider re-tokenizes the system prompt
+#   - tail drift = provider re-tokenizes the kept history
+# Both bytes are part of the provider-cacheable prompt (F-PA2's drop-from-middle
+# pattern). Phase 5 (v1.14.14) covered the prefix half; v1.14.14.1 Finding 2
+# extends to the tail half.
 if [[ -n "${NULLALIS_STABILITY_JSON_PATH:-}" && -s "$NULLALIS_STABILITY_JSON_PATH" ]]; then
   drift_sessions=$(jq -s 'group_by(.session) | map({
       session: .[0].session,
-      hashes: ([.[].stable_prefix_hash] | unique),
+      prefix_hashes: ([.[].stable_prefix_hash] | unique),
+      tail_hashes: ([.[].tail_hash] | unique),
       turns: length
-    }) | map(select(.turns > 1 and (.hashes | length) > 1))' \
+    }) | map(select(
+      .turns > 1 and
+      ((.prefix_hashes | length) > 1 or (.tail_hashes | length) > 1)
+    ))' \
     "$NULLALIS_STABILITY_JSON_PATH" 2>/dev/null)
   if [[ -n "$drift_sessions" && "$drift_sessions" != "[]" ]]; then
-    echo "STABILITY_DRIFT_DETECTED — sessions with multiple prefix hashes:" >&2
+    echo "STABILITY_DRIFT_DETECTED — sessions with prefix or tail hash drift:" >&2
     echo "$drift_sessions" >&2
-    echo "Cause: a prompt construction change drifted the stable prefix mid-session." >&2
+    echo "Cause: a prompt-construction or history-tail change drifted bytes mid-session." >&2
     echo "Effect: KV-cache misses on every turn after the first → 1.5-3x latency + cost." >&2
-    echo "Fix: identify the prompt section that varies turn-to-turn; move to volatile half." >&2
+    echo "Fix:" >&2
+    echo "  - prefix drift: identify the system-prompt section that varies turn-to-turn; move to volatile half." >&2
+    echo "  - tail drift: check Pass-C summarization invariants (F-PA2 drop-from-middle)." >&2
     exit 2
   fi
 fi

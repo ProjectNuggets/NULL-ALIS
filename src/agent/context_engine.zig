@@ -110,6 +110,14 @@ pub const IngestOutput = struct {
 /// prefix without parsing log lines. The hash is unconditionally computed (FNV-1a
 /// 64-bit is cheap); the log line is still emitted only when
 /// `NULLALIS_LOG_PREFIX_HASH=1` (honest config surface, §14.6).
+///
+/// v1.14.14.1 Finding 2 (PREFIX-TAIL-SURFACE) added `tail_hash` + `tail_bytes`.
+/// The kept-history TAIL (last ≤4 non-system messages) is also part of the
+/// provider-cacheable prompt — F-PA2's drop-from-middle pattern preserves
+/// these bytes across turns when no Pass C summarization fires. Both halves
+/// must stay byte-stable for KV-cache hits on long sessions. The Phase 5
+/// drift assertion in `.spike/run.sh` now covers BOTH hashes; either drifting
+/// mid-session is a cache-collapse regression.
 pub const AssembleResult = struct {
     prompt_refreshed: bool = false,
     workspace_prompt_changed: bool = false,
@@ -125,6 +133,11 @@ pub const AssembleResult = struct {
     stable_prefix_hash: u64 = 0,
     /// Byte count covered by `stable_prefix_hash`. 0 if hash is 0.
     stable_prefix_bytes: usize = 0,
+    /// FNV-1a 64-bit hash of the kept-history tail (last ≤4 non-system
+    /// messages) at assemble time. v1.14.14.1 Finding 2.
+    tail_hash: u64 = 0,
+    /// Byte count covered by `tail_hash`. 0 when no non-system history.
+    tail_bytes: usize = 0,
 };
 
 /// Output of the compact phase.
@@ -179,6 +192,12 @@ pub const PhaseDurations = struct {
 /// `NULLALIS_STABILITY_JSON_PATH` per turn (when the env var is set).
 /// Operator dashboards can `jq -c .stable_prefix_hash` on the file to verify
 /// byte-stability across consecutive turns of the same session.
+///
+/// v1.14.14.1 Finding 2: `tail_hash` + `tail_bytes` added so the Phase 5
+/// drift assertion covers BOTH halves of the provider-cacheable prompt.
+/// `prefix.stable` drift = provider re-tokenizes the system prompt;
+/// `prefix.tail` drift = provider re-tokenizes the kept history. Either
+/// is a cache-collapse regression mid-session.
 pub const StabilityRecord = struct {
     turn_start_ms: i64,
     ingest_ms: u64,
@@ -188,6 +207,8 @@ pub const StabilityRecord = struct {
     total_turn_ms: u64,
     stable_prefix_hash: u64,
     stable_prefix_bytes: usize,
+    tail_hash: u64,
+    tail_bytes: usize,
     session: []const u8,
 };
 
@@ -214,13 +235,14 @@ pub fn writeStabilityJsonl(allocator: std.mem.Allocator, record: StabilityRecord
     defer allocator.free(env_path);
     if (env_path.len == 0) return;
 
-    // Buffer sized for the JSON skeleton (~270 chars) + a generous session
-    // identifier. Production session keys are bounded by the prefix +
-    // user-id + thread-id structure; ~256 is the conservative ceiling.
+    // Buffer sized for the JSON skeleton (~340 chars post-Finding-2) + a
+    // generous session identifier. Production session keys are bounded by
+    // the prefix + user-id + thread-id structure; ~256 is the conservative
+    // ceiling.
     var buf: [1024]u8 = undefined;
     const line = std.fmt.bufPrint(
         &buf,
-        "{{\"turn_start_ms\":{d},\"ingest_ms\":{d},\"assemble_ms\":{d},\"compact_ms\":{d},\"after_turn_ms\":{d},\"total_turn_ms\":{d},\"stable_prefix_hash\":\"{x}\",\"stable_prefix_bytes\":{d},\"session\":\"{s}\"}}\n",
+        "{{\"turn_start_ms\":{d},\"ingest_ms\":{d},\"assemble_ms\":{d},\"compact_ms\":{d},\"after_turn_ms\":{d},\"total_turn_ms\":{d},\"stable_prefix_hash\":\"{x}\",\"stable_prefix_bytes\":{d},\"tail_hash\":\"{x}\",\"tail_bytes\":{d},\"session\":\"{s}\"}}\n",
         .{
             record.turn_start_ms,
             record.ingest_ms,
@@ -230,6 +252,8 @@ pub fn writeStabilityJsonl(allocator: std.mem.Allocator, record: StabilityRecord
             record.total_turn_ms,
             record.stable_prefix_hash,
             record.stable_prefix_bytes,
+            record.tail_hash,
+            record.tail_bytes,
             record.session,
         },
     ) catch return;
@@ -629,10 +653,11 @@ pub const ContextEngine = struct {
         @memcpy(full_system[stable_prefix_len..], volatile_prompt);
 
         // Byte-stability diagnostic: compute the FNV-1a hash of the stable
-        // prefix unconditionally so tests + AssembleResult can assert
-        // byte-identical prefix across turns of the same session. The log
-        // emission is still gated by NULLALIS_LOG_PREFIX_HASH=1 to keep
-        // noise out of prod logs.
+        // prefix AND the kept history tail unconditionally so tests +
+        // AssembleResult + the JSONL diagnostic can assert byte-identical
+        // prefix + tail across turns of the same session. The log emission
+        // is still gated by NULLALIS_LOG_PREFIX_HASH=1 to keep noise out
+        // of prod logs.
         //
         // V1.14.6 follow-up: also hash the kept history TAIL (last 4
         // messages of self.history). F-PA2's drop-from-middle pattern
@@ -642,7 +667,30 @@ pub const ContextEngine = struct {
         // Two consecutive same-session turns with identical
         // `prefix.tail` hashes confirm the contract holds. Diverging
         // hashes when nothing semantic changed is a regression signal.
+        //
+        // v1.14.14.1 Finding 2 (PREFIX-TAIL-SURFACE): the tail hash now
+        // computes unconditionally (FNV-1a is ~50ns/KB; ≤4 messages × ≤8KB
+        // each = ~1.6μs total — undetectable) and flows through
+        // AssembleResult.tail_hash + tail_bytes. The Phase 5 .spike/run.sh
+        // drift assertion now covers BOTH halves.
         const stable_prefix_hash = std.hash.Fnv1a_64.hash(full_system[0..stable_prefix_len]);
+
+        const TAIL_HASH_MSGS: usize = 4;
+        var tail_hasher = std.hash.Fnv1a_64.init();
+        var tail_bytes: usize = 0;
+        var tail_msgs: usize = 0;
+        if (agent.history.items.len > 0) {
+            const start_idx = agent.history.items.len -|
+                @min(TAIL_HASH_MSGS, agent.history.items.len);
+            for (agent.history.items[start_idx..]) |*m| {
+                if (m.role == .system) continue;
+                tail_hasher.update(m.content);
+                tail_bytes += m.content.len;
+                tail_msgs += 1;
+            }
+        }
+        const tail_hash = tail_hasher.final();
+
         if (std.process.getEnvVarOwned(allocator, "NULLALIS_LOG_PREFIX_HASH")) |env_value| {
             defer allocator.free(env_value);
             if (env_value.len > 0 and env_value[0] != '0') {
@@ -651,27 +699,8 @@ pub const ContextEngine = struct {
                     stable_prefix_len,
                     agent.memory_session_id orelse "none",
                 });
-
-                // Tail hash: walk the last up-to-4 history items and
-                // FNV-1a their content bytes. Skipping the system row
-                // (already covered by prefix.stable above). Empty
-                // history → tail_bytes=0, hash=fnv1a("").
-                const TAIL_HASH_MSGS: usize = 4;
-                var tail_hasher = std.hash.Fnv1a_64.init();
-                var tail_bytes: usize = 0;
-                var tail_msgs: usize = 0;
-                if (agent.history.items.len > 0) {
-                    const start_idx = agent.history.items.len -|
-                        @min(TAIL_HASH_MSGS, agent.history.items.len);
-                    for (agent.history.items[start_idx..]) |*m| {
-                        if (m.role == .system) continue;
-                        tail_hasher.update(m.content);
-                        tail_bytes += m.content.len;
-                        tail_msgs += 1;
-                    }
-                }
                 log.info("prefix.tail hash={x} bytes={d} msgs={d} session={s}", .{
-                    tail_hasher.final(),
+                    tail_hash,
                     tail_bytes,
                     tail_msgs,
                     agent.memory_session_id orelse "none",
@@ -723,6 +752,8 @@ pub const ContextEngine = struct {
             .compaction_recommended = snapshot.token_compaction_triggered,
             .stable_prefix_hash = stable_prefix_hash,
             .stable_prefix_bytes = stable_prefix_len,
+            .tail_hash = tail_hash,
+            .tail_bytes = tail_bytes,
         };
     }
 
@@ -839,6 +870,8 @@ pub const ContextEngine = struct {
             .total_turn_ms = total_duration,
             .stable_prefix_hash = assemble_result.stable_prefix_hash,
             .stable_prefix_bytes = assemble_result.stable_prefix_bytes,
+            .tail_hash = assemble_result.tail_hash,
+            .tail_bytes = assemble_result.tail_bytes,
             .session = session,
         });
 
@@ -1032,10 +1065,13 @@ test "ingest emits exactly one memory_enrich observer event" {
 //   (2) the existing AssembleResult-field tests below — covering the new
 //       stable_prefix_hash / stable_prefix_bytes surface against accidental
 //       removal.
-test "AssembleResult exposes stable_prefix_hash + bytes defaults" {
+test "AssembleResult exposes prefix + tail hash defaults" {
     const r = AssembleResult{};
     try std.testing.expectEqual(@as(u64, 0), r.stable_prefix_hash);
     try std.testing.expectEqual(@as(usize, 0), r.stable_prefix_bytes);
+    // v1.14.14.1 Finding 2: PREFIX-TAIL-SURFACE added the tail fields.
+    try std.testing.expectEqual(@as(u64, 0), r.tail_hash);
+    try std.testing.expectEqual(@as(usize, 0), r.tail_bytes);
     try std.testing.expect(!r.compaction_recommended);
     try std.testing.expect(!r.prompt_refreshed);
 }
