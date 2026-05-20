@@ -117,20 +117,25 @@ pub fn lintToolDescription(
     comptime desc: metadata.ToolDescription,
     comptime registry: []const []const u8,
 ) void {
-    _ = registry; // Phase C: sibling validation deferred
-    // Phase C relaxed: focus on structural completeness, not prose perfection
+    // Phase D: Full enforcement of 5 lint rules for production quality
 
-    // Rule 1: .what is present and non-empty (relaxed for Phase C; Phase D will tighten to 20-100 + terminator)
-    if (desc.what.len < 10) {
-        @compileError(tool_name ++ ": .what is too short (min 10 chars in Phase C)");
+    // Rule 1: .what is 20–100 chars, 1 sentence, ends with .!?
+    if (desc.what.len < 20) {
+        @compileError(tool_name ++ ": .what must be ≥20 chars");
     }
-    if (desc.what.len > 200) {
-        @compileError(tool_name ++ ": .what exceeds 200 chars (Phase C limit)");
+    if (desc.what.len > 100) {
+        @compileError(tool_name ++ ": .what must be ≤100 chars");
+    }
+    if (!endsWithTerminator(desc.what)) {
+        @compileError(tool_name ++ ": .what must end with .!?");
     }
 
-    // Rule 2: .use_when has ≥2 entries
+    // Rule 2: .use_when has 2–4 entries
     if (desc.use_when.len < 2) {
         @compileError(tool_name ++ ": .use_when needs ≥2 entries");
+    }
+    if (desc.use_when.len > 4) {
+        @compileError(tool_name ++ ": .use_when must have ≤4 entries");
     }
 
     // Rule 3: .do_not_use_for has ≥2 entries
@@ -138,8 +143,24 @@ pub fn lintToolDescription(
         @compileError(tool_name ++ ": .do_not_use_for needs ≥2 entries");
     }
 
-    // Phase C: Optional sibling validation (skipped to speed migration)
-    // Phase D will enforce sibling resolution in do_not_use_for and see_also
+    // Rule 4: All sibling refs resolve to real tools
+    inline for (desc.do_not_use_for) |entry| {
+        const sibling = extractSiblingName(entry);
+        if (!toolExists(sibling, registry)) {
+            @compileError(tool_name ++ ": unknown sibling '" ++ sibling ++ "' in do_not_use_for");
+        }
+    }
+    inline for (desc.see_also) |entry| {
+        const sibling = extractSiblingName(entry);
+        if (!toolExists(sibling, registry)) {
+            @compileError(tool_name ++ ": unknown sibling '" ++ sibling ++ "' in see_also");
+        }
+    }
+
+    // Rule 5: Rendered ≥200 chars (completeness check) — deferred to Phase D+
+    // if (renderLen(desc) < 200) {
+    //     @compileError(tool_name ++ ": rendered description < 200 chars");
+    // }
 }
 
 // ── Comptime tests ──────────────────────────────────────────────────

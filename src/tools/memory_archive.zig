@@ -49,7 +49,7 @@ pub const MemoryArchiveTool = struct {
     pub const tool_name = "memory_archive";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "memory_archive tool.",
+        .what = "Archive old memory entries to external storage.",
         .use_when = &.{
             "first scenario",
             "second scenario",

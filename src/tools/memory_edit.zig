@@ -14,7 +14,7 @@ pub const MemoryEditTool = struct {
     pub const tool_name = "memory_edit";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Edit an existing mutable memory by key. Preserves the original category and scope.",
+        .what = "Edit the content or metadata of an existing memory entry.",
         .use_when = &.{
             "first scenario",
             "second scenario",

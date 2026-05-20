@@ -19,7 +19,7 @@ const MAX_FETCH_BYTES: usize = 65536;
 pub const BrowserTool = struct {
     pub const tool_name = "browser";
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Navigate and interact with web pages, extract content, and execute JavaScript.",
+        .what = "Open and control a web browser for interactive automation.",
         .use_when = &.{
             "scenario 1",
             "scenario 2",

@@ -36,7 +36,7 @@ pub const CronRunsTool = struct {
     pub const tool_name = "cron_runs";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Inspect recent execution history for a raw scheduled job. Low-level scheduler reporting surface.",
+        .what = "List historical runs of a cron job.",
         .use_when = &.{
             "first scenario",
             "second scenario",

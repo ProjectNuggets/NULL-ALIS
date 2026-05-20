@@ -14,7 +14,7 @@ pub const SkillRegistryTool = struct {
     pub const tool_name = "skill_registry";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Manage skills. Actions: list installed skills, search Decision Hub skills, install a skill from Deci",
+        .what = "Look up registered skills and capabilities.",
         .use_when = &.{
             "first scenario",
             "second scenario",

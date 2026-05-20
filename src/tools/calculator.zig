@@ -12,14 +12,16 @@ pub const CalculatorTool = struct {
 
     pub const tool_name = "calculator";
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Perform mathematical calculations and convert between number systems.",
+        .what = "Perform mathematical calculations and unit conversions.",
         .use_when = &.{
             "scenario 1",
             "scenario 2",
+            "scenario 3",
         },
         .do_not_use_for = &.{
-            "web_search — for external data",
-            "memory_store — for persistence",
+            "web_search — for external data queries",
+            "memory_store — for persistent storage",
+            "http_request — for specific API endpoints",
         },
     };
 

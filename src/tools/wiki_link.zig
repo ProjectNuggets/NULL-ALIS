@@ -67,7 +67,7 @@ pub const WikiLinkTool = struct {
     pub const tool_name = "wiki_link";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "wiki_link tool.",
+        .what = "Look up a Wikipedia article by title or search term.",
         .use_when = &.{
             "first scenario",
             "second scenario",

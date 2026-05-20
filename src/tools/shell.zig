@@ -42,14 +42,16 @@ pub const ShellTool = struct {
     pub const tool_name = "shell";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Execute a shell command when policy allows and no more specific tool is better.",
+        .what = "Execute shell commands with proper authorization.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "scenario 1",
+            "scenario 2",
+            "scenario 3",
         },
         .do_not_use_for = &.{
-            "web_search — for web queries",
-            "memory_store — for persistence",
+            "web_search — for external data queries",
+            "memory_store — for persistent storage",
+            "http_request — for specific API endpoints",
         },
     };
 

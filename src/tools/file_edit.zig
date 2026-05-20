@@ -18,14 +18,16 @@ pub const FileEditTool = struct {
     pub const tool_name = "file_edit";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Find and replace text in a file",
+        .what = "Edit a file by line number or search-and-replace pattern.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "scenario 1",
+            "scenario 2",
+            "scenario 3",
         },
         .do_not_use_for = &.{
-            "web_search — for web queries",
-            "memory_store — for persistence",
+            "web_search — for external data queries",
+            "memory_store — for persistent storage",
+            "http_request — for specific API endpoints",
         },
     };
 

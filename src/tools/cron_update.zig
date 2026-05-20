@@ -37,7 +37,7 @@ pub const CronUpdateTool = struct {
     pub const tool_name = "cron_update";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Low-level raw cron operator tool. Update a raw scheduled job's expression, command, or enabled state",
+        .what = "Update the schedule or command of an existing cron job.",
         .use_when = &.{
             "first scenario",
             "second scenario",

@@ -15,7 +15,7 @@ pub const MemoryForgetTool = struct {
     pub const tool_name = "memory_forget";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Remove a memory by key. Use to delete outdated facts or sensitive data.",
+        .what = "Delete a memory entry permanently.",
         .use_when = &.{
             "first scenario",
             "second scenario",

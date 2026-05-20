@@ -36,7 +36,7 @@ pub const CronListTool = struct {
     pub const tool_name = "cron_list";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Inspect raw cron jobs, their types, status, and next run time. Low-level scheduler inspection surfac",
+        .what = "List all active cron jobs and their schedules.",
         .use_when = &.{
             "first scenario",
             "second scenario",

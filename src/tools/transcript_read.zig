@@ -29,7 +29,7 @@ pub const TranscriptReadTool = struct {
     pub const tool_name = "transcript_read";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "transcript_read tool.",
+        .what = "Read conversation history or transcript data.",
         .use_when = &.{
             "first scenario",
             "second scenario",

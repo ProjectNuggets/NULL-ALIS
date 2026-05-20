@@ -14,7 +14,7 @@ pub const TaskStopTool = struct {
     pub const tool_name = "task_stop";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Cancel a queued task. Running tasks cannot be interrupted — returns an error if the task is already ",
+        .what = "Stop or cancel a running task or background job cleanly.",
         .use_when = &.{
             "first scenario",
             "second scenario",

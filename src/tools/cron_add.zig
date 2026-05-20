@@ -37,7 +37,7 @@ pub const CronAddTool = struct {
     pub const tool_name = "cron_add";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Low-level raw cron tool for operator or debug use. Create a scheduled raw command job with either 'e",
+        .what = "Add a new cron job with schedule and command.",
         .use_when = &.{
             "first scenario",
             "second scenario",

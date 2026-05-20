@@ -30,7 +30,7 @@ pub const DelegateTool = struct {
     pub const tool_name = "delegate";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Hand a subtask to a named specialized agent (single-turn completion); use for tasks where a differen",
+        .what = "Delegate a task to another agent or worker for asynchronous execution.",
         .use_when = &.{
             "first scenario",
             "second scenario",

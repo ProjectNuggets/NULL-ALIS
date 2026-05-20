@@ -15,7 +15,7 @@ pub const TaskGetTool = struct {
     pub const tool_name = "task_get";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Get details of a specific task by ID including description, status, timestamps, result summary, and ",
+        .what = "Retrieve details of a specific task by ID.",
         .use_when = &.{
             "first scenario",
             "second scenario",

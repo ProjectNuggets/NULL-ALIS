@@ -141,14 +141,16 @@ pub const FileReadTool = struct {
     pub const tool_name = "file_read";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Read the contents of a file in the workspace",
+        .what = "Read the complete contents of a text or binary file.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "scenario 1",
+            "scenario 2",
+            "scenario 3",
         },
         .do_not_use_for = &.{
-            "web_search — for web queries",
-            "memory_store — for persistence",
+            "web_search — for external data queries",
+            "memory_store — for persistent storage",
+            "http_request — for specific API endpoints",
         },
     };
 

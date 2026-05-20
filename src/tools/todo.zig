@@ -74,7 +74,7 @@ pub const TodoTool = struct {
     pub const tool_name = "todo";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "todo tool.",
+        .what = "Access the task list via the canonical todo.zig:75 surface.",
         .use_when = &.{
             "first scenario",
             "second scenario",

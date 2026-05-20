@@ -15,7 +15,7 @@ pub const HttpRequestTool = struct {
     pub const tool_name = "http_request";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Call a known external HTTP API directly. Prefer this over shell or curl for external endpoints.",
+        .what = "Perform HTTP requests (GET, POST, etc.) to APIs.",
         .use_when = &.{
             "first scenario",
             "second scenario",

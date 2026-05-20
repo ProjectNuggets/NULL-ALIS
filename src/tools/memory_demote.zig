@@ -41,7 +41,7 @@ pub const MemoryDemoteTool = struct {
     pub const tool_name = "memory_demote";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "memory_demote tool.",
+        .what = "Reduce the priority level of a memory entry in the knowledge graph.",
         .use_when = &.{
             "first scenario",
             "second scenario",

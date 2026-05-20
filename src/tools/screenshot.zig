@@ -14,7 +14,7 @@ pub const ScreenshotTool = struct {
     pub const tool_name = "screenshot";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Capture a screenshot of the current screen. Returns [IMAGE:path] marker — include it verbatim in you",
+        .what = "Capture the current screen or a specific window as an image.",
         .use_when = &.{
             "first scenario",
             "second scenario",

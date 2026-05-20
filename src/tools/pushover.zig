@@ -16,7 +16,7 @@ pub const PushoverTool = struct {
     pub const tool_name = "pushover";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Send a push notification via Pushover. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
+        .what = "Send notifications via the Pushover notification service.",
         .use_when = &.{
             "first scenario",
             "second scenario",

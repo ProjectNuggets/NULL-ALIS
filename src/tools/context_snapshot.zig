@@ -17,7 +17,7 @@ pub const ContextSnapshotTool = struct {
     pub const tool_name = "context_snapshot";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "context_snapshot tool.",
+        .what = "Capture and save the current execution context.",
         .use_when = &.{
             "first scenario",
             "second scenario",

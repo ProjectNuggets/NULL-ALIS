@@ -96,7 +96,7 @@ pub const MemoryMaintainTool = struct {
     pub const tool_name = "memory_maintain";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "memory_maintain tool.",
+        .what = "Maintain memory consistency and trigger periodic compaction.",
         .use_when = &.{
             "first scenario",
             "second scenario",

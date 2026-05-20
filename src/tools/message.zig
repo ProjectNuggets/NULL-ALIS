@@ -23,7 +23,7 @@ pub const MessageTool = struct {
     pub const tool_name = "message";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Send an explicit outbound message to a channel or the current conversation. Optionally attach an ima",
+        .what = "Send a message to the user or log output to conversation.",
         .use_when = &.{
             "first scenario",
             "second scenario",

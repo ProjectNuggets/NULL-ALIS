@@ -38,7 +38,7 @@ pub const CronRunTool = struct {
     pub const tool_name = "cron_run";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Low-level raw cron operator tool. Force-run a raw cron job immediately by ID; agent-managed jobs mus",
+        .what = "Trigger a cron job immediately.",
         .use_when = &.{
             "first scenario",
             "second scenario",

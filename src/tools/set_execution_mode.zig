@@ -14,7 +14,7 @@ pub const SetExecutionModeTool = struct {
     pub const tool_name = "set_execution_mode";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "set_execution_mode tool.",
+        .what = "Configure execution mode (sandbox, live, or dry-run).",
         .use_when = &.{
             "first scenario",
             "second scenario",

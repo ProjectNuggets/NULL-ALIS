@@ -37,7 +37,7 @@ pub const CronRemoveTool = struct {
     pub const tool_name = "cron_remove";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Low-level raw cron operator tool. Remove a raw scheduled job by ID.",
+        .what = "Remove an existing cron job by ID or pattern.",
         .use_when = &.{
             "first scenario",
             "second scenario",

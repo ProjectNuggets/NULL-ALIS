@@ -727,7 +727,7 @@ pub const ScheduleTool = struct {
     pub const tool_name = "schedule";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Manage scheduled tasks for the user. Preferred tool for reminders, briefs, recurring follow-ups, and",
+        .what = "Create, update, or list scheduled tasks to run at specific times.",
         .use_when = &.{
             "first scenario",
             "second scenario",

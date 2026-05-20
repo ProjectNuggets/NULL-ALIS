@@ -41,7 +41,7 @@ pub const MemoryPurgeTopicTool = struct {
     pub const tool_name = "memory_purge_topic";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Delete agent-generated memory entries (autosave, checkpoints, summaries) that mention a given topic.",
+        .what = "Remove all memories related to a specific topic.",
         .use_when = &.{
             "first scenario",
             "second scenario",

@@ -26,7 +26,7 @@ pub const TimeNowTool = struct {
     pub const tool_name = "time_now";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "time_now tool.",
+        .what = "Get the current date and time in the specified timezone.",
         .use_when = &.{
             "first scenario",
             "second scenario",

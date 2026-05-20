@@ -21,7 +21,7 @@ pub const WebFetchTool = struct {
     pub const tool_name = "web_fetch";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Fetch and extract readable text from a specific web page. Prefer this once you already know the URL.",
+        .what = "Fetch and parse content from a URL.",
         .use_when = &.{
             "first scenario",
             "second scenario",

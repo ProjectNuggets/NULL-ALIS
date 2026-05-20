@@ -20,7 +20,7 @@ pub const MemoryListTool = struct {
     pub const tool_name = "memory_list";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "List canonical memory entries in recency order. Defaults to the current session unless scope=global ",
+        .what = "List all stored memories with optional filtering by key or category.",
         .use_when = &.{
             "first scenario",
             "second scenario",

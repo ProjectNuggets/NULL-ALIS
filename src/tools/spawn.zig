@@ -17,7 +17,7 @@ pub const SpawnTool = struct {
     pub const tool_name = "spawn";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Start async work now and return immediately. Prefer `schedule` for future or recurring jobs.",
+        .what = "Launch a subprocess with arguments and environment.",
         .use_when = &.{
             "first scenario",
             "second scenario",

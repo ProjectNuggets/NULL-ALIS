@@ -58,7 +58,7 @@ pub const RuntimeInfoTool = struct {
     pub const tool_name = "runtime_info";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "runtime_info tool.",
+        .what = "Retrieve runtime configuration, environment, and execution context.",
         .use_when = &.{
             "first scenario",
             "second scenario",

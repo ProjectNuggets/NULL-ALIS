@@ -16,7 +16,7 @@ pub const TaskListTool = struct {
     pub const tool_name = "task_list";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "List spawned/detached tasks with optional status filter. Returns JSON array of task entries with id,",
+        .what = "List all tasks with filtering and sorting options.",
         .use_when = &.{
             "first scenario",
             "second scenario",
