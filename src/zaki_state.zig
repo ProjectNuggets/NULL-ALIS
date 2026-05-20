@@ -7643,8 +7643,20 @@ const ManagerImpl = struct {
     // upsertWorkingMemorySlot with that slot_id.
 
     /// List all slots for (user_id, session_id), ordered by composite
-    /// priority (pinned first, then importance × recency_decay desc).
+    /// priority (pinned first, then recency_decay desc).
     /// Returns owned slice — caller must call freeWorkingMemorySlots.
+    ///
+    /// v1.14.14.1 Finding 1 (WM-IMPORTANCE-CALIBRATION): the ORDER BY
+    /// previously included `importance * EXP(...)` but production data showed
+    /// importance saturated at avg 0.99 across all slot_types — see
+    /// `src/agent/working_memory.zig::compositePriority` for the full
+    /// archaeology + the 3-option survey. Dropped `importance` from this
+    /// formula too so the SQL surface and the Zig-side compositePriority
+    /// agree (previously the SQL formula omitted slot_type_weight while
+    /// the Zig formula included it — a pre-existing inconsistency we don't
+    /// fix here but we DO stop both surfaces from gating on the same
+    /// broken signal). v1.14.18-B re-enables importance once per-source
+    /// calibration provides a discriminating signal.
     pub fn listWorkingMemorySlots(
         self: *Self,
         allocator: std.mem.Allocator,
@@ -7657,7 +7669,7 @@ const ManagerImpl = struct {
                 "FROM {schema}.working_memory " ++
                 "WHERE user_id = $1 AND session_id = $2 " ++
                 "ORDER BY pinned DESC, " ++
-                "  (importance * EXP(-(EXTRACT(EPOCH FROM (NOW() - last_touched_at))/3600.0))) DESC " ++
+                "  EXP(-(EXTRACT(EPOCH FROM (NOW() - last_touched_at))/3600.0)) DESC " ++
                 "LIMIT 15",
         );
         defer self.allocator.free(q);

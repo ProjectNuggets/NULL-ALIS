@@ -110,6 +110,14 @@ pub const IngestOutput = struct {
 /// prefix without parsing log lines. The hash is unconditionally computed (FNV-1a
 /// 64-bit is cheap); the log line is still emitted only when
 /// `NULLALIS_LOG_PREFIX_HASH=1` (honest config surface, §14.6).
+///
+/// v1.14.14.1 Finding 2 (PREFIX-TAIL-SURFACE) added `tail_hash` + `tail_bytes`.
+/// The kept-history TAIL (last ≤4 non-system messages) is also part of the
+/// provider-cacheable prompt — F-PA2's drop-from-middle pattern preserves
+/// these bytes across turns when no Pass C summarization fires. Both halves
+/// must stay byte-stable for KV-cache hits on long sessions. The Phase 5
+/// drift assertion in `.spike/run.sh` now covers BOTH hashes; either drifting
+/// mid-session is a cache-collapse regression.
 pub const AssembleResult = struct {
     prompt_refreshed: bool = false,
     workspace_prompt_changed: bool = false,
@@ -125,13 +133,35 @@ pub const AssembleResult = struct {
     stable_prefix_hash: u64 = 0,
     /// Byte count covered by `stable_prefix_hash`. 0 if hash is 0.
     stable_prefix_bytes: usize = 0,
+    /// FNV-1a 64-bit hash of the kept-history tail (last ≤4 non-system
+    /// messages) at assemble time. v1.14.14.1 Finding 2.
+    tail_hash: u64 = 0,
+    /// Byte count covered by `tail_hash`. 0 when no non-system history.
+    tail_bytes: usize = 0,
 };
 
 /// Output of the compact phase.
+///
+/// v1.14.14.1 Finding 4 (COMPACT-SENTINEL-RESOLVE): the original design
+/// carried `messages_before` + `messages_after` here so afterTurn could
+/// derive a per-call messages_delta into the returned TurnContextResult.
+/// Two facts made this redundant:
+///   1. The 11 compact callsites in turnOutcome are scattered across the
+///      tool loop; the Phase 4 defer-synthesis pattern doesn't have access
+///      to per-site counts (it had to hardcode `messages_before = 0` as a
+///      sentinel lie — see commit 843ca622 self-review).
+///   2. The source of truth for per-site counts already exists:
+///      `recordAutoCompaction` / `recordForceCompression` (called from
+///      ContextEngine.compact / forceCompact themselves) write
+///      `auto_compacted_messages` / `force_compressed_messages` /
+///      `history_messages_after_trim` DIRECTLY onto `agent.last_turn_context`.
+///      That populates `/context` reports + observer telemetry via the live
+///      agent state, never via the afterTurn return value (which production
+///      discards as `_ = ...afterTurn(...)`).
+/// Removed the two fields. The `.compacted` boolean + `.method` enum are
+/// the only signals callers actually inspect.
 pub const CompactResult = struct {
     compacted: bool = false,
-    messages_before: usize = 0,
-    messages_after: usize = 0,
     method: CompactMethod = .none,
 
     pub const CompactMethod = enum {
@@ -152,9 +182,37 @@ pub const TurnContextResult = struct {
 
 /// v1.14.14 Phase 4: per-phase wall-clock durations captured by turnOutcome,
 /// piped through `afterTurn` into the stability snapshot.
+///
+/// v1.14.14.1 Finding 3 (COMPACT-MS-AGGREGATE) — honesty fix:
+/// The `compact_ms` field here still receives `turn_compaction_ms` from
+/// turnOutcome (caller in root.zig unchanged — Agent E owns root.zig for
+/// v1.14.18-A GOAL-LOOP work). What changes is the OPERATOR-FACING surface:
+/// the StabilityRecord field + JSONL key are renamed to
+/// `compact_ms_main_site_only` so operators reading the JSONL see the
+/// partial-coverage honestly. Production has 11 compact callsites inside
+/// `Agent.turnOutcome` (cache-hit branches, response-cache hit branch,
+/// main flow, tool-loop sites, exhausted-iteration recovery, force-compress
+/// recovery × 3, final compact); only the main-flow site at root.zig:3064
+/// measures its duration into `turn_compaction_ms`. The other 10 sites
+/// don't track timing.
+///
+/// Full aggregation across all 11 sites (option (a) per spawn brief) is
+/// blocked by the v1.14.14.1 hot-file lock: `turn_compaction_ms` is a
+/// stack-local in turnOutcome (root.zig:2739), and aggregation requires
+/// either promoting it to an Agent field or modifying each callsite —
+/// both touch src/agent/root.zig, which Agent E owns. Aggregation lands
+/// in v1.14.14.2 (or later slice) once the lock releases. This commit
+/// applies option (b): rename the operator surface to surface the truth.
 pub const PhaseDurations = struct {
     ingest_ms: u64 = 0,
     assemble_ms: u64 = 0,
+    /// Main-flow site only. Caller in turnOutcome passes
+    /// `turn_compaction_ms` (unchanged from v1.14.14 — single-site
+    /// instrumentation at root.zig:3064). The other 10 compact callsites
+    /// (tool-loop, cache-hit, force-compress) are not yet aggregated;
+    /// the StabilityRecord renames this field to `compact_ms_main_site_only`
+    /// when it crosses the operator boundary so the JSONL surface is
+    /// honest about the partial coverage.
     compact_ms: u64 = 0,
 };
 
@@ -162,15 +220,26 @@ pub const PhaseDurations = struct {
 /// `NULLALIS_STABILITY_JSON_PATH` per turn (when the env var is set).
 /// Operator dashboards can `jq -c .stable_prefix_hash` on the file to verify
 /// byte-stability across consecutive turns of the same session.
+///
+/// v1.14.14.1 Finding 2: `tail_hash` + `tail_bytes` added so the Phase 5
+/// drift assertion covers BOTH halves of the provider-cacheable prompt.
+/// `prefix.stable` drift = provider re-tokenizes the system prompt;
+/// `prefix.tail` drift = provider re-tokenizes the kept history. Either
+/// is a cache-collapse regression mid-session.
 pub const StabilityRecord = struct {
     turn_start_ms: i64,
     ingest_ms: u64,
     assemble_ms: u64,
-    compact_ms: u64,
+    /// v1.14.14.1 Finding 3: only the main-flow auto-compaction site's
+    /// duration. 10 other compact callsites aren't aggregated yet — see
+    /// PhaseDurations.compact_ms_main_site_only doc.
+    compact_ms_main_site_only: u64,
     after_turn_ms: u64,
     total_turn_ms: u64,
     stable_prefix_hash: u64,
     stable_prefix_bytes: usize,
+    tail_hash: u64,
+    tail_bytes: usize,
     session: []const u8,
 };
 
@@ -197,22 +266,25 @@ pub fn writeStabilityJsonl(allocator: std.mem.Allocator, record: StabilityRecord
     defer allocator.free(env_path);
     if (env_path.len == 0) return;
 
-    // Buffer sized for the JSON skeleton (~270 chars) + a generous session
-    // identifier. Production session keys are bounded by the prefix +
-    // user-id + thread-id structure; ~256 is the conservative ceiling.
+    // Buffer sized for the JSON skeleton (~340 chars post-Finding-2) + a
+    // generous session identifier. Production session keys are bounded by
+    // the prefix + user-id + thread-id structure; ~256 is the conservative
+    // ceiling.
     var buf: [1024]u8 = undefined;
     const line = std.fmt.bufPrint(
         &buf,
-        "{{\"turn_start_ms\":{d},\"ingest_ms\":{d},\"assemble_ms\":{d},\"compact_ms\":{d},\"after_turn_ms\":{d},\"total_turn_ms\":{d},\"stable_prefix_hash\":\"{x}\",\"stable_prefix_bytes\":{d},\"session\":\"{s}\"}}\n",
+        "{{\"turn_start_ms\":{d},\"ingest_ms\":{d},\"assemble_ms\":{d},\"compact_ms_main_site_only\":{d},\"after_turn_ms\":{d},\"total_turn_ms\":{d},\"stable_prefix_hash\":\"{x}\",\"stable_prefix_bytes\":{d},\"tail_hash\":\"{x}\",\"tail_bytes\":{d},\"session\":\"{s}\"}}\n",
         .{
             record.turn_start_ms,
             record.ingest_ms,
             record.assemble_ms,
-            record.compact_ms,
+            record.compact_ms_main_site_only,
             record.after_turn_ms,
             record.total_turn_ms,
             record.stable_prefix_hash,
             record.stable_prefix_bytes,
+            record.tail_hash,
+            record.tail_bytes,
             record.session,
         },
     ) catch return;
@@ -612,10 +684,11 @@ pub const ContextEngine = struct {
         @memcpy(full_system[stable_prefix_len..], volatile_prompt);
 
         // Byte-stability diagnostic: compute the FNV-1a hash of the stable
-        // prefix unconditionally so tests + AssembleResult can assert
-        // byte-identical prefix across turns of the same session. The log
-        // emission is still gated by NULLALIS_LOG_PREFIX_HASH=1 to keep
-        // noise out of prod logs.
+        // prefix AND the kept history tail unconditionally so tests +
+        // AssembleResult + the JSONL diagnostic can assert byte-identical
+        // prefix + tail across turns of the same session. The log emission
+        // is still gated by NULLALIS_LOG_PREFIX_HASH=1 to keep noise out
+        // of prod logs.
         //
         // V1.14.6 follow-up: also hash the kept history TAIL (last 4
         // messages of self.history). F-PA2's drop-from-middle pattern
@@ -625,7 +698,30 @@ pub const ContextEngine = struct {
         // Two consecutive same-session turns with identical
         // `prefix.tail` hashes confirm the contract holds. Diverging
         // hashes when nothing semantic changed is a regression signal.
+        //
+        // v1.14.14.1 Finding 2 (PREFIX-TAIL-SURFACE): the tail hash now
+        // computes unconditionally (FNV-1a is ~50ns/KB; ≤4 messages × ≤8KB
+        // each = ~1.6μs total — undetectable) and flows through
+        // AssembleResult.tail_hash + tail_bytes. The Phase 5 .spike/run.sh
+        // drift assertion now covers BOTH halves.
         const stable_prefix_hash = std.hash.Fnv1a_64.hash(full_system[0..stable_prefix_len]);
+
+        const TAIL_HASH_MSGS: usize = 4;
+        var tail_hasher = std.hash.Fnv1a_64.init();
+        var tail_bytes: usize = 0;
+        var tail_msgs: usize = 0;
+        if (agent.history.items.len > 0) {
+            const start_idx = agent.history.items.len -|
+                @min(TAIL_HASH_MSGS, agent.history.items.len);
+            for (agent.history.items[start_idx..]) |*m| {
+                if (m.role == .system) continue;
+                tail_hasher.update(m.content);
+                tail_bytes += m.content.len;
+                tail_msgs += 1;
+            }
+        }
+        const tail_hash = tail_hasher.final();
+
         if (std.process.getEnvVarOwned(allocator, "NULLALIS_LOG_PREFIX_HASH")) |env_value| {
             defer allocator.free(env_value);
             if (env_value.len > 0 and env_value[0] != '0') {
@@ -634,27 +730,8 @@ pub const ContextEngine = struct {
                     stable_prefix_len,
                     agent.memory_session_id orelse "none",
                 });
-
-                // Tail hash: walk the last up-to-4 history items and
-                // FNV-1a their content bytes. Skipping the system row
-                // (already covered by prefix.stable above). Empty
-                // history → tail_bytes=0, hash=fnv1a("").
-                const TAIL_HASH_MSGS: usize = 4;
-                var tail_hasher = std.hash.Fnv1a_64.init();
-                var tail_bytes: usize = 0;
-                var tail_msgs: usize = 0;
-                if (agent.history.items.len > 0) {
-                    const start_idx = agent.history.items.len -|
-                        @min(TAIL_HASH_MSGS, agent.history.items.len);
-                    for (agent.history.items[start_idx..]) |*m| {
-                        if (m.role == .system) continue;
-                        tail_hasher.update(m.content);
-                        tail_bytes += m.content.len;
-                        tail_msgs += 1;
-                    }
-                }
                 log.info("prefix.tail hash={x} bytes={d} msgs={d} session={s}", .{
-                    tail_hasher.final(),
+                    tail_hash,
                     tail_bytes,
                     tail_msgs,
                     agent.memory_session_id orelse "none",
@@ -706,6 +783,8 @@ pub const ContextEngine = struct {
             .compaction_recommended = snapshot.token_compaction_triggered,
             .stable_prefix_hash = stable_prefix_hash,
             .stable_prefix_bytes = stable_prefix_len,
+            .tail_hash = tail_hash,
+            .tail_bytes = tail_bytes,
         };
     }
 
@@ -742,19 +821,9 @@ pub const ContextEngine = struct {
             agent.last_turn_compacted = true;
             const after = agent.history.items.len;
             agent.recordAutoCompaction(before, after);
-            return .{
-                .compacted = true,
-                .messages_before = before,
-                .messages_after = after,
-                .method = .auto,
-            };
+            return .{ .compacted = true, .method = .auto };
         }
-        return .{
-            .compacted = false,
-            .messages_before = before,
-            .messages_after = before,
-            .method = .none,
-        };
+        return .{ .compacted = false, .method = .none };
     }
 
     /// Phase 3 emergency path: force-compress history.
@@ -783,19 +852,9 @@ pub const ContextEngine = struct {
             agent.recordForceCompression(before, after);
             agent.context_was_compacted = true;
             agent.context_force_compressed = true;
-            return .{
-                .compacted = true,
-                .messages_before = before,
-                .messages_after = after,
-                .method = .force_compress,
-            };
+            return .{ .compacted = true, .method = .force_compress };
         }
-        return .{
-            .compacted = false,
-            .messages_before = before,
-            .messages_after = before,
-            .method = .none,
-        };
+        return .{ .compacted = false, .method = .none };
     }
 
     /// Phase 4: After Turn — record lifecycle stats + emit stability snapshot.
@@ -828,10 +887,6 @@ pub const ContextEngine = struct {
 
         const auto_compacted = compact_result.method == .auto;
         const force_compressed = compact_result.method == .force_compress;
-        const messages_delta = if (compact_result.messages_before > compact_result.messages_after)
-            compact_result.messages_before - compact_result.messages_after
-        else
-            0;
 
         // Stability snapshot (env-gated). after_turn_ms intentionally measured
         // BEFORE the file write so the duration captures lifecycle work only,
@@ -841,14 +896,31 @@ pub const ContextEngine = struct {
             .turn_start_ms = turn_start_ms,
             .ingest_ms = durations.ingest_ms,
             .assemble_ms = durations.assemble_ms,
-            .compact_ms = durations.compact_ms,
+            // v1.14.14.1 Finding 3: caller (root.zig defer) still passes the
+            // main-flow-only `turn_compaction_ms` via durations.compact_ms;
+            // renamed to compact_ms_main_site_only when it crosses the
+            // operator boundary (StabilityRecord + JSONL).
+            .compact_ms_main_site_only = durations.compact_ms,
             .after_turn_ms = after_turn_ms,
             .total_turn_ms = total_duration,
             .stable_prefix_hash = assemble_result.stable_prefix_hash,
             .stable_prefix_bytes = assemble_result.stable_prefix_bytes,
+            .tail_hash = assemble_result.tail_hash,
+            .tail_bytes = assemble_result.tail_bytes,
             .session = session,
         });
 
+        // v1.14.14.1 Finding 4: the per-site message counts
+        // (auto_compacted_messages / force_compressed_messages /
+        // history_messages_after_trim) used to derive from
+        // CompactResult.messages_before/after. Those fields are removed —
+        // the source of truth is `agent.last_turn_context`, populated by
+        // recordAutoCompaction / recordForceCompression inside
+        // compact()/forceCompact(). The TurnContextResult.last_turn
+        // returned here only carries the event-count signals (1/0) +
+        // assemble/ingest stats. Production discards this return value
+        // (`_ = afterTurn(...)`); the live agent.last_turn_context is
+        // the channel-facing surface.
         return .{
             .ingest = ingest_result,
             .assemble = assemble_result,
@@ -863,10 +935,7 @@ pub const ContextEngine = struct {
                 .memory_context_bytes = ingest_result.memory_context_bytes,
                 .memory_enrich_ms = ingest_result.memory_enrich_ms,
                 .auto_compaction_events = if (auto_compacted) 1 else 0,
-                .auto_compacted_messages = if (auto_compacted) messages_delta else 0,
                 .force_compression_events = if (force_compressed) 1 else 0,
-                .force_compressed_messages = if (force_compressed) messages_delta else 0,
-                .history_messages_after_trim = compact_result.messages_after,
             },
             .total_duration_ms = total_duration,
         };
@@ -1031,10 +1100,13 @@ test "ingest emits exactly one memory_enrich observer event" {
 //   (2) the existing AssembleResult-field tests below — covering the new
 //       stable_prefix_hash / stable_prefix_bytes surface against accidental
 //       removal.
-test "AssembleResult exposes stable_prefix_hash + bytes defaults" {
+test "AssembleResult exposes prefix + tail hash defaults" {
     const r = AssembleResult{};
     try std.testing.expectEqual(@as(u64, 0), r.stable_prefix_hash);
     try std.testing.expectEqual(@as(usize, 0), r.stable_prefix_bytes);
+    // v1.14.14.1 Finding 2: PREFIX-TAIL-SURFACE added the tail fields.
+    try std.testing.expectEqual(@as(u64, 0), r.tail_hash);
+    try std.testing.expectEqual(@as(usize, 0), r.tail_bytes);
     try std.testing.expect(!r.compaction_recommended);
     try std.testing.expect(!r.prompt_refreshed);
 }
@@ -1166,12 +1238,7 @@ test "afterTurn aggregates results and sets last_turn.available=true" {
         .context_pressure_percent = 50,
         .compaction_recommended = false,
     };
-    const compact_result = CompactResult{
-        .compacted = false,
-        .messages_before = 3,
-        .messages_after = 3,
-        .method = .none,
-    };
+    const compact_result = CompactResult{ .compacted = false, .method = .none };
     const start_ms = std.time.milliTimestamp() - 10;
     const result = engine.afterTurn(
         std.testing.allocator,
@@ -1197,12 +1264,7 @@ test "afterTurn records auto compaction events" {
     var engine = ContextEngine{};
     const ingest_result = IngestResult{};
     const assemble_result = AssembleResult{};
-    const compact_result = CompactResult{
-        .compacted = true,
-        .messages_before = 20,
-        .messages_after = 10,
-        .method = .auto,
-    };
+    const compact_result = CompactResult{ .compacted = true, .method = .auto };
     const result = engine.afterTurn(
         std.testing.allocator,
         ingest_result,
@@ -1213,22 +1275,19 @@ test "afterTurn records auto compaction events" {
         "test-session",
     );
 
+    // v1.14.14.1 Finding 4: auto_compacted_messages / history_messages_after_trim
+    // no longer flow through CompactResult — agent.last_turn_context is the
+    // source of truth (populated by recordAutoCompaction). The afterTurn
+    // return value only exposes event-count signals now.
     try std.testing.expectEqual(@as(usize, 1), result.last_turn.auto_compaction_events);
-    try std.testing.expectEqual(@as(usize, 10), result.last_turn.auto_compacted_messages);
     try std.testing.expectEqual(@as(usize, 0), result.last_turn.force_compression_events);
-    try std.testing.expectEqual(@as(usize, 10), result.last_turn.history_messages_after_trim);
 }
 
 test "afterTurn records force_compress events" {
     var engine = ContextEngine{};
     const ingest_result = IngestResult{};
     const assemble_result = AssembleResult{};
-    const compact_result = CompactResult{
-        .compacted = true,
-        .messages_before = 15,
-        .messages_after = 4,
-        .method = .force_compress,
-    };
+    const compact_result = CompactResult{ .compacted = true, .method = .force_compress };
     const result = engine.afterTurn(
         std.testing.allocator,
         ingest_result,
@@ -1241,6 +1300,4 @@ test "afterTurn records force_compress events" {
 
     try std.testing.expectEqual(@as(usize, 0), result.last_turn.auto_compaction_events);
     try std.testing.expectEqual(@as(usize, 1), result.last_turn.force_compression_events);
-    try std.testing.expectEqual(@as(usize, 11), result.last_turn.force_compressed_messages);
-    try std.testing.expectEqual(@as(usize, 4), result.last_turn.history_messages_after_trim);
 }
