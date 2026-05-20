@@ -114,6 +114,10 @@ pub fn promoteWMToDurableAtSessionEnd(
     user_id: i64,
     session_id: []const u8,
 ) PromotionResult {
+    // **Failure-soft policy:** this function returns `PromotionResult`, not
+    // `!PromotionResult`. No `errdefer` can fire because no error escapes.
+    // All cleanup MUST be explicit at each `catch ... continue` site below
+    // — keep that pattern when adding new failure paths.
     const empty = PromotionResult{ .promoted = allocator.alloc(PromotedSlot, 0) catch &.{} };
 
     const smgr = state_mgr orelse {
@@ -138,10 +142,6 @@ pub fn promoteWMToDurableAtSessionEnd(
 
     const now = std.time.timestamp();
     var collected: std.ArrayListUnmanaged(PromotedSlot) = .{};
-    errdefer {
-        for (collected.items) |*p| p.deinit(allocator);
-        collected.deinit(allocator);
-    }
 
     for (slots) |*s| {
         if (!isPromotableSlotType(s.slot_type)) continue;
@@ -170,9 +170,8 @@ pub fn promoteWMToDurableAtSessionEnd(
             continue;
         };
         // Don't `defer free(key)` here — ownership transfers into the
-        // collected PromotedSlot on success. Free on error paths only.
-        var key_owned = true;
-        errdefer if (key_owned) allocator.free(key);
+        // collected PromotedSlot on success. Each `catch` branch below
+        // frees explicitly before `continue`.
 
         m.store(key, s.content, .core, session_id) catch |err| {
             log.warn(
@@ -180,7 +179,6 @@ pub fn promoteWMToDurableAtSessionEnd(
                 .{ @errorName(err), key, s.slot_id, session_id },
             );
             allocator.free(key);
-            key_owned = false;
             continue;
         };
 
@@ -194,10 +192,9 @@ pub fn promoteWMToDurableAtSessionEnd(
                 .{ @errorName(err), key },
             );
             allocator.free(key);
-            key_owned = false;
             continue;
         };
-        key_owned = false; // ownership transferred into collected.
+        // Ownership of `key` transferred into `collected` on append success.
 
         log.info(
             "promotion.promoted slot_id={d} type={s} composite={d:.3} key={s} session={s}",
