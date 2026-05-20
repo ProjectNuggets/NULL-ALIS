@@ -271,12 +271,12 @@ pub fn textHasExplicitNegation(text: []const u8) bool {
     //     "ex-wife", "ex-employee", "ex-partner") that don't have the
     //     boundary problem
     const stems = [_][]const u8{
-        "no longer",   "stopped",     "instead of",
-        "not anymore", "used to",     "previously",
-        "formerly",    "but now",     "no more",
-        "don't",       "doesn't",     "didn't",
-        "never",       "switched",    "quit",
-        "ex-husband",  "ex-wife",     "ex-employee",
+        "no longer",   "stopped",  "instead of",
+        "not anymore", "used to",  "previously",
+        "formerly",    "but now",  "no more",
+        "don't",       "doesn't",  "didn't",
+        "never",       "switched", "quit",
+        "ex-husband",  "ex-wife",  "ex-employee",
         "ex-partner",
     };
     for (stems) |stem| {
@@ -479,9 +479,9 @@ const JUDGE_SYSTEM_PROMPT =
 /// also unlikely to cooperate with injection from a single sentence.
 const PROMPT_FACT_CAP: usize = 512;
 const INJECTION_TOKENS = [_][]const u8{
-    "<EXISTING FACTS>", "</EXISTING FACTS>",
+    "<EXISTING FACTS>",               "</EXISTING FACTS>",
     "<FACT INVALIDATION CANDIDATES>", "</FACT INVALIDATION CANDIDATES>",
-    "<NEW FACT>", "</NEW FACT>",
+    "<NEW FACT>",                     "</NEW FACT>",
 };
 
 fn sanitizeFactForPrompt(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -913,8 +913,8 @@ test "V1.14.12 (M2 review WARNING#3): negation edge cases — punctuation + boun
     try std.testing.expect(textHasExplicitNegation("I stopped."));
     try std.testing.expect(textHasExplicitNegation("I stopped, finally."));
     try std.testing.expect(textHasExplicitNegation("Done. stopped."));
-    try std.testing.expect(!textHasExplicitNegation("unstopped"));  // 'u' before 'stopped' is alpha → no boundary
-    try std.testing.expect(textHasExplicitNegation("don't like it"));  // apostrophe is non-alpha boundary
+    try std.testing.expect(!textHasExplicitNegation("unstopped")); // 'u' before 'stopped' is alpha → no boundary
+    try std.testing.expect(textHasExplicitNegation("don't like it")); // apostrophe is non-alpha boundary
 }
 
 test "V1.14.12 (M2 review WARNING#3): ex- pattern dropped, explicit forms work" {
@@ -923,7 +923,7 @@ test "V1.14.12 (M2 review WARNING#3): ex- pattern dropped, explicit forms work" 
     try std.testing.expect(textHasExplicitNegation("the ex-husband"));
     try std.testing.expect(textHasExplicitNegation("her ex-wife"));
     try std.testing.expect(textHasExplicitNegation("an ex-employee"));
-    try std.testing.expect(!textHasExplicitNegation("ex-something-else"));  // generic ex- no longer matches
+    try std.testing.expect(!textHasExplicitNegation("ex-something-else")); // generic ex- no longer matches
 }
 
 test "V1.14.12 (M2 review CRITICAL): JudgeContext cardinality_fastpath_enabled defaults to true" {

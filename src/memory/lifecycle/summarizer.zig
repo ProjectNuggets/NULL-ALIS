@@ -975,4 +975,3 @@ test "V1.6 cmt9.5 parseSummaryResponse tolerates malformed JSON tail (graceful d
     try std.testing.expectEqual(@as(usize, 1), result.extracted_facts.len);
     try std.testing.expect(!result.extracted_facts[0].hasTriple());
 }
-

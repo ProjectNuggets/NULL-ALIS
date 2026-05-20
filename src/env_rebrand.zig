@@ -72,8 +72,7 @@ pub fn getEnvOwnedWithRebrand(
     primary: []const u8,
     fallback: []const u8,
 ) !?[]u8 {
-    if (std.process.getEnvVarOwned(allocator, primary)) |v| return v
-    else |err| switch (err) {
+    if (std.process.getEnvVarOwned(allocator, primary)) |v| return v else |err| switch (err) {
         error.EnvironmentVariableNotFound => {},
         else => return err,
     }

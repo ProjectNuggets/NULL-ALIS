@@ -8428,7 +8428,6 @@ fn SseProgressObserver(comptime StreamType: type) type {
     };
 }
 
-
 fn sseReplyStartFrame(
     allocator: std.mem.Allocator,
     stream_kind: []const u8,
@@ -8640,7 +8639,6 @@ fn sseChatPayload(allocator: std.mem.Allocator, text: []const u8, session_id: []
     try w.writeAll(done_frame);
     return buf.toOwnedSlice(allocator);
 }
-
 
 fn LockedSseStream(comptime StreamType: type) type {
     return struct {
@@ -11898,9 +11896,9 @@ fn buildBrainTypedEdges(
 /// (would create a cycle: agent → memory → gateway → agent).
 fn isRejectedExtractionPredicate(predicate: []const u8) bool {
     const rejected = [_][]const u8{
-        "GREETED", "SAID",      "ASKED",         "MENTIONED",          "REPLIED",
-        "ACKNOWLEDGED", "EXPRESSED", "INDICATED_READINESS", "IS_GETTING_STARTED", "OFFERED_TO_WAIT",
-        "PRIORITIZED",  "ADDRESSED_AS", "IS_UNKNOWN",  "EXPRESSED_READINESS", "INITIATED_CONVERSATION",
+        "GREETED",      "SAID",         "ASKED",               "MENTIONED",           "REPLIED",
+        "ACKNOWLEDGED", "EXPRESSED",    "INDICATED_READINESS", "IS_GETTING_STARTED",  "OFFERED_TO_WAIT",
+        "PRIORITIZED",  "ADDRESSED_AS", "IS_UNKNOWN",          "EXPRESSED_READINESS", "INITIATED_CONVERSATION",
     };
     for (rejected) |p| if (std.mem.eql(u8, p, predicate)) return true;
     return false;
@@ -13436,8 +13434,8 @@ fn handleBrainCommunitiesRecompute(
     defer out.deinit(allocator);
     const w = out.writer(allocator);
     w.print("{{\"stats\":{{\"edges_loaded\":{d},\"nodes_in_lpa\":{d},\"communities_found\":{d},\"members_assigned\":{d},\"llm_calls_succeeded\":{d},\"llm_calls_failed\":{d},\"fallback_names_written\":{d}}}}}", .{
-        stats.edges_loaded, stats.nodes_in_lpa, stats.communities_found,
-        stats.members_assigned, stats.llm_calls_succeeded, stats.llm_calls_failed,
+        stats.edges_loaded,           stats.nodes_in_lpa,        stats.communities_found,
+        stats.members_assigned,       stats.llm_calls_succeeded, stats.llm_calls_failed,
         stats.fallback_names_written,
     }) catch return response_build_err;
     return finalizeJsonBuf(allocator, &out);
@@ -20801,7 +20799,6 @@ test "ownership_lock_conflict_http_returns_structured_payload_and_retry_after" {
     try std.testing.expect(parsed.value.object.get("retry_after_ms").? == .integer);
 }
 
-
 test "ownership_lock_wait_budget_retries_then_conflicts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -20977,9 +20974,6 @@ test "user_cell users provision route rejects mismatched user" {
     try std.testing.expectEqualStrings("403 Forbidden", response.status);
     try std.testing.expectEqualStrings("{\"error\":\"wrong_user_cell\"}", response.body);
 }
-
-
-
 
 test "handleApiChatEventsSseConnection replays pending completions and clears them" {
     const FakeStream = struct {

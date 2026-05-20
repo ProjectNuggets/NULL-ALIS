@@ -2948,7 +2948,13 @@ const ManagerImpl = struct {
         metadata_json: []const u8,
     ) !void {
         return self.upsertMemoryWithMetadataAndEventType(
-            user_id, key, content, category, session_id, metadata_json, "compose",
+            user_id,
+            key,
+            content,
+            category,
+            session_id,
+            metadata_json,
+            "compose",
         );
     }
 
@@ -4669,8 +4675,8 @@ const ManagerImpl = struct {
 
         const params = [_]?[*:0]const u8{ user_s.ptr, cid_s.ptr, name_z, src_z, mc_s.ptr, hash_z };
         const lengths = [_]c_int{
-            @intCast(user_s.len), @intCast(cid_s.len), @intCast(name.len),
-            @intCast(name_source.len), @intCast(mc_s.len), @intCast(member_set_hash.len),
+            @intCast(user_s.len),      @intCast(cid_s.len), @intCast(name.len),
+            @intCast(name_source.len), @intCast(mc_s.len),  @intCast(member_set_hash.len),
         };
         const result = try self.execParams(q, &params, &lengths);
         c.PQclear(result);
@@ -4994,7 +5000,7 @@ const ManagerImpl = struct {
 
         if (closed_edges.items.len > 0) {
             log.info("forget.cascade user={d} key={s} edges_closed={d} memory_deleted={s}", .{
-                user_id, key, closed_edges.items.len,
+                user_id,                                 key, closed_edges.items.len,
                 if (memory_deleted) "true" else "false",
             });
         }
@@ -7783,8 +7789,8 @@ const ManagerImpl = struct {
         defer self.allocator.free(pinned_z);
 
         const params = [_]?[*:0]const u8{
-            user_s.ptr, sid_z,    slot_s.ptr,                          stype_z,
-            content_z,  if (source_key == null) null else sk_z, imp_s.ptr, pinned_z,
+            user_s.ptr, sid_z,                                  slot_s.ptr, stype_z,
+            content_z,  if (source_key == null) null else sk_z, imp_s.ptr,  pinned_z,
         };
         const lengths = [_]c_int{
             @intCast(user_s.len),
@@ -9569,13 +9575,14 @@ test "V1.6 schema migration applies cleanly + memory_entities round-trips" {
     // ── Verify all V1.6 columns exist on memories ─────────────────────
     const expected_columns = [_][]const u8{
         // V1.6 atomic-fact extraction
-        "subject", "predicate", "object_key", "link_type",
+        "subject",     "predicate",        "object_key",        "link_type",
         "attribution", "attributed_to",
         // V1.6 Graphiti six-field bi-temporal
-        "valid_at", "invalid_at", "expired_at",
-        "reference_time", "episodes",
+           "valid_at",          "invalid_at",
+        "expired_at",  "reference_time",   "episodes",
         // V1.6 retrieval + supersession
-        "lemmatized", "is_latest", "parent_memory_id",
+                 "lemmatized",
+        "is_latest",   "parent_memory_id",
         // V1.6 source attribution (M4)
         "source_session_id", "source_snippet",
     };
@@ -10208,7 +10215,8 @@ test "TxnLease: pool-split regression — overlapping txns each see their own st
     }) |spec| {
         const id_buf = try std.fmt.allocPrint(allocator, "txn_split_id_{s}", .{spec.key});
         defer allocator.free(id_buf);
-        const q = try std.fmt.allocPrintSentinel(allocator,
+        const q = try std.fmt.allocPrintSentinel(
+            allocator,
             "INSERT INTO {s}.memories (id, user_id, key, content, memory_type) VALUES ($1, 7777, $2, $3, 'core')",
             .{schema_q},
             0,
@@ -11321,7 +11329,8 @@ test "V1.6 commit 6 setMemoryInvalidation closes out memory + filters from retri
     // 3. The row IS still in the table — for audit. Direct SQL confirms
     //    valid_to + invalid_at + expired_at populated, is_latest = false.
     {
-        const audit_q = try std.fmt.allocPrint(allocator,
+        const audit_q = try std.fmt.allocPrint(
+            allocator,
             "SELECT valid_to, invalid_at, expired_at, is_latest FROM {s}.memories WHERE user_id = 2 AND key = 'extracted_old_pref'",
             .{schema},
         );
@@ -11400,27 +11409,19 @@ test "V1.6 commit 6 findRelatedExtractedMemories scopes by subject + attribution
     try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
 
     // Same subject="user", extraction-classifier attribution → MUST be returned
-    try mgr.upsertMemoryWithMetadata(2, "ec_user_helix",
-        "User uses Helix",
-        .core, null,
+    try mgr.upsertMemoryWithMetadata(2, "ec_user_helix", "User uses Helix", .core, null,
         \\{"subject":"user","predicate":"USES","object_key":"Helix","attributed_to":"user","attribution":"extraction_classifier","confidence":1.0}
     );
     // Same subject="user", DIFFERENT attribution ("agent_tool") → MUST NOT be returned
-    try mgr.upsertMemoryWithMetadata(2, "agent_tool_user_other",
-        "User session log",
-        .core, null,
+    try mgr.upsertMemoryWithMetadata(2, "agent_tool_user_other", "User session log", .core, null,
         \\{"subject":"user","predicate":"NOTE","object_key":"x","attributed_to":"user","attribution":"agent_tool","confidence":1.0}
     );
     // DIFFERENT subject="alex", extraction-classifier → MUST NOT be returned
-    try mgr.upsertMemoryWithMetadata(2, "ec_alex_birthday",
-        "Alex birthday May 15",
-        .core, null,
+    try mgr.upsertMemoryWithMetadata(2, "ec_alex_birthday", "Alex birthday May 15", .core, null,
         \\{"subject":"alex","predicate":"BIRTHDAY","object_key":"May 15","attributed_to":"user","attribution":"extraction_classifier","confidence":1.0}
     );
     // Same subject="user", extraction-classifier, but CLOSED OUT → MUST NOT be returned
-    try mgr.upsertMemoryWithMetadata(2, "ec_user_neovim_closed",
-        "User uses NeoVim",
-        .core, null,
+    try mgr.upsertMemoryWithMetadata(2, "ec_user_neovim_closed", "User uses NeoVim", .core, null,
         \\{"subject":"user","predicate":"USES","object_key":"NeoVim","attributed_to":"user","attribution":"extraction_classifier","confidence":1.0}
     );
     const closed_ts: i64 = std.time.timestamp();
@@ -11485,9 +11486,7 @@ test "V1.6 commit 6 × V1.7 W-INT-01 resurrect-on-upsert clears close-out cols" 
     // Use `.daily` (non-core) to exercise the resurrect-on-upsert path —
     // a `.core`-seeded row would hit the core-preserve branch instead,
     // which is the OTHER axis tested in step 6 below.
-    try mgr.upsertMemoryWithMetadata(2, "extracted_resurrect_test",
-        "User prefers NeoVim editor",
-        .daily, "session-A",
+    try mgr.upsertMemoryWithMetadata(2, "extracted_resurrect_test", "User prefers NeoVim editor", .daily, "session-A",
         \\{"subject":"user","predicate":"PREFERS","object_key":"NeoVim","attributed_to":"user","attribution":"extraction_classifier","confidence":1.0}
     );
 
@@ -11500,9 +11499,7 @@ test "V1.6 commit 6 × V1.7 W-INT-01 resurrect-on-upsert clears close-out cols" 
     }
 
     // ── Step 3: fresh re-statement from session B, SAME key, different content
-    try mgr.upsertMemoryWithMetadata(2, "extracted_resurrect_test",
-        "User uses NeoVim as their primary editor",
-        .daily, "session-B",
+    try mgr.upsertMemoryWithMetadata(2, "extracted_resurrect_test", "User uses NeoVim as their primary editor", .daily, "session-B",
         \\{"subject":"user","predicate":"USES","object_key":"NeoVim","attributed_to":"user","attribution":"extraction_classifier","confidence":1.0}
     );
 
@@ -11516,7 +11513,8 @@ test "V1.6 commit 6 × V1.7 W-INT-01 resurrect-on-upsert clears close-out cols" 
 
     // Audit columns also reset
     {
-        const audit_q = try std.fmt.allocPrint(allocator,
+        const audit_q = try std.fmt.allocPrint(
+            allocator,
             "SELECT valid_to, invalid_at, expired_at, is_latest FROM {s}.memories WHERE user_id = 2 AND key = 'extracted_resurrect_test'",
             .{schema},
         );
@@ -11592,9 +11590,7 @@ test "V1.6 commit 7 memory_edges insert + dedup + cascade-on-close" {
     try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
 
     // ── Seed a parent memory + an edge from it
-    try mgr.upsertMemoryWithMetadata(2, "extracted_helix_pref",
-        "User prefers Helix",
-        .daily, "session-A",
+    try mgr.upsertMemoryWithMetadata(2, "extracted_helix_pref", "User prefers Helix", .daily, "session-A",
         \\{"subject":"user","predicate":"PREFERS","object_key":"Helix","attributed_to":"user","attribution":"extraction_classifier","confidence":0.95}
     );
     try mgr.upsertMemoryEdge(2, "extracted_helix_pref", "entity_helix", "PREFERS", "extraction_classifier", 0.95);
@@ -11641,7 +11637,8 @@ test "V1.6 commit 7 memory_edges insert + dedup + cascade-on-close" {
 
     // ── Step F: cascade audit — direct SQL confirms is_latest=false on closed edges
     {
-        const audit_q = try std.fmt.allocPrint(allocator,
+        const audit_q = try std.fmt.allocPrint(
+            allocator,
             "SELECT COUNT(*) FROM {s}.memory_edges WHERE user_id = 2 AND is_latest = FALSE",
             .{schema},
         );
@@ -11766,16 +11763,15 @@ test "V1.6 commit 9 edge mutation events — added + closed via cascade" {
     try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
 
     // ── Seed parent memory + 2 edges ──────────────────────────────────
-    try mgr.upsertMemoryWithMetadata(2, "extracted_helix_pref",
-        "User prefers Helix",
-        .daily, "session-A",
+    try mgr.upsertMemoryWithMetadata(2, "extracted_helix_pref", "User prefers Helix", .daily, "session-A",
         \\{"subject":"user","predicate":"PREFERS","object_key":"Helix","attributed_to":"user","attribution":"extraction_classifier"}
     );
     try mgr.upsertMemoryEdge(2, "extracted_helix_pref", "entity_helix", "PREFERS", "extraction_classifier", 0.95);
     try mgr.upsertMemoryEdge(2, "extracted_helix_pref", "entity_neovim", "REPLACES", "extraction_classifier", 0.85);
 
     // ── Step A: 2 edge_added events recorded
-    const count_q = try std.fmt.allocPrint(allocator,
+    const count_q = try std.fmt.allocPrint(
+        allocator,
         "SELECT COUNT(*) FROM {s}.memory_events WHERE user_id = 2 AND event_type = 'edge_added'",
         .{schema},
     );
@@ -11790,7 +11786,8 @@ test "V1.6 commit 9 edge mutation events — added + closed via cascade" {
 
     // ── Step B: payload of the first edge_added event has the right shape
     {
-        const payload_q = try std.fmt.allocPrint(allocator,
+        const payload_q = try std.fmt.allocPrint(
+            allocator,
             "SELECT payload->>'source_key', payload->>'predicate', payload->>'op' " ++
                 "FROM {s}.memory_events WHERE user_id = 2 AND event_type = 'edge_added' " ++
                 "ORDER BY created_at ASC LIMIT 1",
@@ -11814,7 +11811,8 @@ test "V1.6 commit 9 edge mutation events — added + closed via cascade" {
     const close_ts: i64 = std.time.timestamp();
     try mgr.setMemoryInvalidation(2, "extracted_helix_pref", close_ts, close_ts);
     {
-        const close_count_q = try std.fmt.allocPrint(allocator,
+        const close_count_q = try std.fmt.allocPrint(
+            allocator,
             "SELECT COUNT(*) FROM {s}.memory_events WHERE user_id = 2 AND event_type = 'edge_closed'",
             .{schema},
         );
@@ -11828,7 +11826,8 @@ test "V1.6 commit 9 edge mutation events — added + closed via cascade" {
 
     // ── Step D: chronological event order — added first, closed after
     {
-        const order_q = try std.fmt.allocPrint(allocator,
+        const order_q = try std.fmt.allocPrint(
+            allocator,
             "SELECT event_type FROM {s}.memory_events " ++
                 "WHERE user_id = 2 AND event_type LIKE 'edge_%' " ++
                 "ORDER BY created_at ASC, id ASC",
@@ -12146,7 +12145,8 @@ test "V1.6 commit 11 demoteMemoryFromCore — releases immortality + emits audit
 
     // ── Step 5: audit event recorded
     {
-        const event_q = try std.fmt.allocPrint(allocator,
+        const event_q = try std.fmt.allocPrint(
+            allocator,
             "SELECT payload->>'from', payload->>'to' FROM {s}.memory_events " ++
                 "WHERE user_id = 2 AND event_type = 'demote' ORDER BY created_at DESC LIMIT 1",
             .{schema},
@@ -12209,9 +12209,7 @@ test "V1.6 commit 16 backfill populates memory_edges from JSONB triples" {
 
     // ── Seed a "legacy" memory directly (bypass extraction_persist) so the
     // edge wasn't auto-written. Simulates a pre-cmt7 row that needs backfill.
-    try mgr.upsertMemoryWithMetadata(2, "legacy_helix_pref",
-        "User prefers Helix",
-        .core, "session-A",
+    try mgr.upsertMemoryWithMetadata(2, "legacy_helix_pref", "User prefers Helix", .core, "session-A",
         \\{"subject":"user","predicate":"PREFERS","object":"Helix","attributed_to":"user","attribution":"extraction_classifier","confidence":0.9}
     );
 
@@ -12248,9 +12246,7 @@ test "V1.6 commit 16 backfill populates memory_edges from JSONB triples" {
     }
 
     // ── Closed-out memories don't get edges (cascade-consistency check)
-    try mgr.upsertMemoryWithMetadata(2, "legacy_archived",
-        "User used to prefer NeoVim",
-        .core, "session-A",
+    try mgr.upsertMemoryWithMetadata(2, "legacy_archived", "User used to prefer NeoVim", .core, "session-A",
         \\{"subject":"user","predicate":"USED_TO_PREFER","object":"NeoVim","attributed_to":"user","attribution":"extraction_classifier","confidence":0.9}
     );
     const close_ts: i64 = std.time.timestamp();
