@@ -363,9 +363,9 @@ fn looksLikePronoun(s: []const u8) bool {
         for (s, 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
         const lower = buf[0..s.len];
         const ascii_tokens = [_][]const u8{
-            "i",  "me",  "you",  "he",  "she", "it",  "we", "they",
-            "us", "him", "her",  "yo",  "tu",  "je",  "wo", "ni",
-            "ta", "ja",  "anche","mim", "ona", "esa",
+            "i",  "me",  "you",   "he",  "she", "it",  "we", "they",
+            "us", "him", "her",   "yo",  "tu",  "je",  "wo", "ni",
+            "ta", "ja",  "anche", "mim", "ona", "esa",
         };
         for (ascii_tokens) |t| if (std.mem.eql(u8, lower, t)) return true;
         return false;
@@ -376,14 +376,19 @@ fn looksLikePronoun(s: []const u8) bool {
     // semantic gate is the LLM, not this backstop.
     const utf8_tokens = [_][]const u8{
         // Spanish/French/Portuguese with diacritics
-        "él",  "Él",
-        "tú",  "Tú",
-        "à",   "À",
-        "ô",   "Ô",
+        "él",    "Él",
+        "tú",    "Tú",
+        "à",     "À",
+        "ô",     "Ô",
         // Arabic pronouns (commonly slipped by LLMs)
-        "أنا", "نحن", "هو",  "هي",  "هم",
+        "أنا", "نحن",
+        "هو",   "هي",
+        "هم",
         // Mandarin (already short)
-        "我",  "你",  "他",  "她",  "它",  "我们",
+          "我",
+        "你",    "他",
+        "她",    "它",
+        "我们",
         // Hindi
         "मैं",
     };

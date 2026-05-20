@@ -341,8 +341,8 @@ test "mergeEpisodeResults single non-null episode passes through" {
     const allocator = std.testing.allocator;
     const r = try makeResult(
         allocator,
-        &.{ .{ .name = "Sam", .t = .person } },
-        &.{ .{ .s = "Sam", .t = "Vault", .p = "RUNS", .f = "Sam runs Vault" } },
+        &.{.{ .name = "Sam", .t = .person }},
+        &.{.{ .s = "Sam", .t = "Vault", .p = "RUNS", .f = "Sam runs Vault" }},
     );
     defer r.deinit(allocator);
     const merged = try mergeEpisodeResults(allocator, &.{r}, null);
@@ -356,14 +356,14 @@ test "mergeEpisodeResults dedups identical edges across episodes" {
     const allocator = std.testing.allocator;
     const r1 = try makeResult(
         allocator,
-        &.{ .{ .name = "Sam", .t = .person } },
-        &.{ .{ .s = "Sam", .t = "Vault", .p = "RUNS", .f = "Sam runs Vault" } },
+        &.{.{ .name = "Sam", .t = .person }},
+        &.{.{ .s = "Sam", .t = "Vault", .p = "RUNS", .f = "Sam runs Vault" }},
     );
     defer r1.deinit(allocator);
     const r2 = try makeResult(
         allocator,
-        &.{ .{ .name = "Sam", .t = .person } },
-        &.{ .{ .s = "Sam", .t = "Vault", .p = "RUNS", .f = "Sam runs Vault (mentioned again)" } },
+        &.{.{ .name = "Sam", .t = .person }},
+        &.{.{ .s = "Sam", .t = "Vault", .p = "RUNS", .f = "Sam runs Vault (mentioned again)" }},
     );
     defer r2.deinit(allocator);
     const merged = try mergeEpisodeResults(allocator, &.{ r1, r2 }, null);
@@ -380,7 +380,7 @@ test "mergeEpisodeResults case-insensitive entity coref fallback" {
             .{ .name = "John", .t = .person },
             .{ .name = "Nike", .t = .organization },
         },
-        &.{ .{ .s = "John", .t = "Nike", .p = "SIGNED_DEAL_WITH", .f = "John signed with Nike" } },
+        &.{.{ .s = "John", .t = "Nike", .p = "SIGNED_DEAL_WITH", .f = "John signed with Nike" }},
     );
     defer r1.deinit(allocator);
     const r2 = try makeResult(
@@ -389,7 +389,7 @@ test "mergeEpisodeResults case-insensitive entity coref fallback" {
             .{ .name = "JOHN", .t = .person },
             .{ .name = "Seattle", .t = .place },
         },
-        &.{ .{ .s = "JOHN", .t = "Seattle", .p = "PLAYED_IN", .f = "JOHN played in Seattle" } },
+        &.{.{ .s = "JOHN", .t = "Seattle", .p = "PLAYED_IN", .f = "JOHN played in Seattle" }},
     );
     defer r2.deinit(allocator);
     const merged = try mergeEpisodeResults(allocator, &.{ r1, r2 }, null);
@@ -410,7 +410,7 @@ test "mergeEpisodeResults nulls are skipped, partial signal preserved" {
             .{ .name = "Alice", .t = .person },
             .{ .name = "Bob", .t = .person },
         },
-        &.{ .{ .s = "Alice", .t = "Bob", .p = "KNOWS", .f = "A knows B" } },
+        &.{.{ .s = "Alice", .t = "Bob", .p = "KNOWS", .f = "A knows B" }},
     );
     defer r1.deinit(allocator);
     const inputs: []const ?ExtractionResult = &.{ null, r1, null };

@@ -298,7 +298,7 @@ pub fn recomputeCommunitiesForUser(
     }
 
     log.info("communities.recompute user={d} edges={d} nodes={d} comms={d} llm_ok={d} llm_fail={d} fallback={d}", .{
-        user_id, stats.edges_loaded, stats.nodes_in_lpa, stats.communities_found,
+        user_id,                   stats.edges_loaded,     stats.nodes_in_lpa,           stats.communities_found,
         stats.llm_calls_succeeded, stats.llm_calls_failed, stats.fallback_names_written,
     });
     return stats;
