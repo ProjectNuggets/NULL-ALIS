@@ -171,6 +171,57 @@ pub const ToolMetadata = struct {
     }
 };
 
+// ── Tool descriptions (structured agent-facing documentation) ──
+
+/// Structured documentation for a tool — enforced via comptime linter.
+/// Distributed ownership: each tool file declares its own instance.
+/// No centralization. Sibling references use "tool_name — reason" convention.
+pub const ToolDescription = struct {
+    /// Brief one-sentence description (20–100 chars, ends with .!?).
+    /// Answers: "What does this tool do?"
+    what: []const u8,
+    /// When to use this tool (2–4 entries).
+    /// Each should be a concrete trigger or scenario.
+    use_when: []const []const u8,
+    /// When NOT to use this tool (≥2 entries).
+    /// Format: "Scenario or reason — related_tool_name" (em-dash).
+    /// Sibling references validate at compile time.
+    do_not_use_for: []const []const u8,
+    /// Optional cost note (e.g., "API quota consumed", "paid-only").
+    cost_note: ?[]const u8 = null,
+    /// Optional completion hint (e.g., "Returns structured data", "Long runtime").
+    completion_hint: ?[]const u8 = null,
+    /// Related tools (sibling references for discovery).
+    /// Format: "tool_name — reason" per sibling convention.
+    see_also: []const []const u8 = &.{},
+
+    /// Render deterministic prose for agent consumption.
+    /// Used by linter to validate completeness.
+    pub fn render(self: @This(), writer: std.io.AnyWriter) !void {
+        try writer.print("# {s}\n\n", .{self.what});
+        try writer.print("## Use When\n\n", .{});
+        for (self.use_when) |trigger| {
+            try writer.print("- {s}\n", .{trigger});
+        }
+        try writer.print("\n## Do Not Use For\n\n", .{});
+        for (self.do_not_use_for) |antiuse| {
+            try writer.print("- {s}\n", .{antiuse});
+        }
+        if (self.cost_note) |note| {
+            try writer.print("\n## Cost\n\n{s}\n", .{note});
+        }
+        if (self.completion_hint) |hint| {
+            try writer.print("\n## Completion\n\n{s}\n", .{hint});
+        }
+        if (self.see_also.len > 0) {
+            try writer.print("\n## See Also\n\n", .{});
+            for (self.see_also) |sibling| {
+                try writer.print("- {s}\n", .{sibling});
+            }
+        }
+    }
+};
+
 // ── Comptime metadata extraction ────────────────────────────────────
 
 /// Extract metadata from a tool type at compile time.
