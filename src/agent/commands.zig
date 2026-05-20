@@ -1548,6 +1548,47 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                     // as a heuristic proxy until session-wide counter
                     // ships.
                     const procedural_memory = @import("procedural_memory.zig");
+
+                    // v1.14.18-B G16 (WM-CROSS-SESSION) — promote high-importance
+                    // WM slots (active_goal + decision with composite ≥ 0.5) to
+                    // durable_facts BEFORE the procedural-memory capture below.
+                    //
+                    // **Cross-agent ordering invariant:** this MUST run BEFORE
+                    // any reflection-trail write (Agent E G5 will insert
+                    // `reflection.serialize(...)` between promotion and
+                    // captureSession). Reason: transient_goal durable_facts
+                    // are referenced by the reflection trail; they must exist
+                    // first or the reflection's references dangle.
+                    //
+                    // Per-finding scope: G16 only handles the promotion. The
+                    // reverse direction (session-start recall of the promoted
+                    // facts back into WM) is handled by the existing
+                    // memory_loader continuity path — the `durable_fact/`
+                    // prefix on the key makes them auto-recall at next
+                    // session start. See promotion.zig module doc for the
+                    // key-shape rationale.
+                    //
+                    // Failure-soft: returns count 0 on any setup error;
+                    // individual slot failures log but don't abort the
+                    // session-end path.
+                    const promotion = @import("promotion.zig");
+                    {
+                        var prom_result = promotion.promoteWMToDurableAtSessionEnd(
+                            self.allocator,
+                            self.extraction_state_mgr,
+                            self.mem,
+                            uid_ep,
+                            session_id,
+                        );
+                        defer prom_result.deinit(self.allocator);
+                        if (prom_result.count() > 0) {
+                            log.info(
+                                "session_end.wm_promotion count={d} session={s}",
+                                .{ prom_result.count(), session_id },
+                            );
+                        }
+                    }
+
                     var task_text: ?[]const u8 = null;
                     var i: usize = entries.len;
                     while (i > 0) {
