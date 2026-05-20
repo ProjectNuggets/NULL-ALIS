@@ -2915,6 +2915,28 @@ pub const Agent = struct {
         };
         defer active_reflection_trail.deinit(self.allocator);
 
+        // v1.14.18-B G5 coverage fix (coordinator review, 2026-05-20): serialize
+        // the reflection trail on EVERY turnOutcome exit path. The prior inline
+        // serialization sat in the post-tool-loop exit block (~root.zig:4656) and
+        // was SKIPPED by the in-loop early-returns (approval-pending, cached-
+        // response at 3120/3149, tool-driven exits at 4171/4186/4378) — so G5's
+        // reflection trail was captured only for turns that ran the tool loop to
+        // its natural exit. This defer is registered AFTER the deinit defer above,
+        // so by Zig's LIFO ordering it runs FIRST — reading the trail's final
+        // state before deinit frees the entries. Covers all 8 return paths.
+        defer {
+            const trail_json: ?[]const u8 = active_reflection_trail.serialize(self.allocator) catch |err| blk: {
+                log.warn("failed to serialize reflection trail: {s}", .{@errorName(err)});
+                break :blk self.allocator.dupe(u8, "[]") catch null;
+            };
+            if (trail_json) |j| {
+                // Free the prior turn's trail before overwriting — the field is
+                // reassigned every turn-end; a bare assign leaks the previous alloc.
+                if (self.session_reflection_trail_json) |old| self.allocator.free(old);
+                self.session_reflection_trail_json = j;
+            }
+        }
+
         // v1.14.14 Phase 4 — time the assemble phase so afterTurn() can
         // record per-phase durations into stability.json.
         const assemble_start_ms = std.time.milliTimestamp();
@@ -4653,17 +4675,10 @@ pub const Agent = struct {
             total_turn_ms,
         });
 
-        // v1.14.18-B G5: Serialize reflection trail for procedural memory
-        const reflection_trail_json = blk: {
-            break :blk active_reflection_trail.serialize(self.allocator) catch |err| {
-                log.warn("failed to serialize reflection trail: {s}", .{@errorName(err)});
-                break :blk try self.allocator.dupe(u8, "[]");
-            };
-        };
-        // v1.14.18-B G5 fix — free the prior turn's trail before overwriting. This
-        // field is reassigned every turn-end; a bare assign leaked the previous alloc.
-        if (self.session_reflection_trail_json) |old| self.allocator.free(old);
-        self.session_reflection_trail_json = reflection_trail_json;
+        // v1.14.18-B G5: reflection-trail serialization moved to a function-scoped
+        // defer at turn-start (search "G5 coverage fix") so it fires on every
+        // turnOutcome exit path, not just this post-tool-loop one. The inline
+        // block that lived here is intentionally gone — do not re-add it.
         // **D1.7 finding 2 fix (2026-04-26):** mark transferred AFTER
         // toOwnedSlice succeeds. See longer comment at the audio_reply path.
         const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
