@@ -145,6 +145,64 @@ pub const TurnContextResult = struct {
     total_duration_ms: u64 = 0,
 };
 
+/// v1.14.14 Phase 4: per-phase wall-clock durations captured by turnOutcome,
+/// piped through `afterTurn` into the stability snapshot.
+pub const PhaseDurations = struct {
+    ingest_ms: u64 = 0,
+    assemble_ms: u64 = 0,
+    compact_ms: u64 = 0,
+};
+
+/// v1.14.14 Phase 4: one-line JSON record appended to
+/// `NULLALIS_STABILITY_JSON_PATH` per turn (when the env var is set).
+/// Operator dashboards can `jq -c .stable_prefix_hash` on the file to verify
+/// byte-stability across consecutive turns of the same session.
+pub const StabilityRecord = struct {
+    turn_start_ms: i64,
+    ingest_ms: u64,
+    assemble_ms: u64,
+    compact_ms: u64,
+    after_turn_ms: u64,
+    total_turn_ms: u64,
+    stable_prefix_hash: u64,
+    stable_prefix_bytes: usize,
+    session: []const u8,
+};
+
+/// v1.14.14 Phase 4 helper. Appends one JSONL record to the path in
+/// `NULLALIS_STABILITY_JSON_PATH` if the env var is set and non-empty;
+/// otherwise no-ops. All filesystem errors are silently swallowed —
+/// stability emission is best-effort diagnostic, not a turn-blocking
+/// dependency. The operator is responsible for ensuring the parent
+/// directory exists (the helper does not call makePath).
+pub fn writeStabilityJsonl(allocator: std.mem.Allocator, record: StabilityRecord) void {
+    const env_path = std.process.getEnvVarOwned(allocator, "NULLALIS_STABILITY_JSON_PATH") catch return;
+    defer allocator.free(env_path);
+    if (env_path.len == 0) return;
+
+    var buf: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &buf,
+        "{{\"turn_start_ms\":{d},\"ingest_ms\":{d},\"assemble_ms\":{d},\"compact_ms\":{d},\"after_turn_ms\":{d},\"total_turn_ms\":{d},\"stable_prefix_hash\":\"{x}\",\"stable_prefix_bytes\":{d},\"session\":\"{s}\"}}\n",
+        .{
+            record.turn_start_ms,
+            record.ingest_ms,
+            record.assemble_ms,
+            record.compact_ms,
+            record.after_turn_ms,
+            record.total_turn_ms,
+            record.stable_prefix_hash,
+            record.stable_prefix_bytes,
+            record.session,
+        },
+    ) catch return;
+
+    const file = std.fs.cwd().createFile(env_path, .{ .truncate = false, .read = false }) catch return;
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+    _ = file.writeAll(line) catch return;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // ContextEngine
 // ═══════════════════════════════════════════════════════════════════════════
@@ -716,23 +774,33 @@ pub const ContextEngine = struct {
         };
     }
 
-    /// Phase 4: After Turn — record lifecycle stats for reporting.
+    /// Phase 4: After Turn — record lifecycle stats + emit stability snapshot.
     ///
-    /// Called after the LLM response has been received and processed.
-    /// Aggregates results from the three earlier phases into a
-    /// TurnContextResult which can be stored as last_turn_context.
+    /// v1.14.14 Phase 4 (CONTEXT-ENGINE audit-ledger row): the
+    /// production turn loop now calls this once per turn at the normal-exit
+    /// boundary. Receives the aggregated phase results + per-phase durations
+    /// + the assembled prefix hash, writes a one-line JSONL stability record
+    /// to `NULLALIS_STABILITY_JSON_PATH` (when set), and returns the
+    /// `TurnContextResult` aggregation for caller use.
+    ///
+    /// Filesystem emission is best-effort — failures are silent. Stability
+    /// emission must NEVER block the turn (operator dashboards are
+    /// diagnostic, not blocking).
     pub fn afterTurn(
         self: *ContextEngine,
+        allocator: std.mem.Allocator,
         ingest_result: IngestResult,
         assemble_result: AssembleResult,
         compact_result: CompactResult,
-        start_ms: i64,
+        durations: PhaseDurations,
+        turn_start_ms: i64,
+        session: []const u8,
     ) TurnContextResult {
         self.phase = .after_turn;
         defer self.phase = .idle;
 
-        const now = std.time.milliTimestamp();
-        const duration: u64 = @intCast(@max(0, now - start_ms));
+        const after_turn_start_ms = std.time.milliTimestamp();
+        const total_duration: u64 = @intCast(@max(0, after_turn_start_ms - turn_start_ms));
 
         const auto_compacted = compact_result.method == .auto;
         const force_compressed = compact_result.method == .force_compress;
@@ -740,6 +808,22 @@ pub const ContextEngine = struct {
             compact_result.messages_before - compact_result.messages_after
         else
             0;
+
+        // Stability snapshot (env-gated). after_turn_ms intentionally measured
+        // BEFORE the file write so the duration captures lifecycle work only,
+        // not diagnostic I/O.
+        const after_turn_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - after_turn_start_ms));
+        writeStabilityJsonl(allocator, .{
+            .turn_start_ms = turn_start_ms,
+            .ingest_ms = durations.ingest_ms,
+            .assemble_ms = durations.assemble_ms,
+            .compact_ms = durations.compact_ms,
+            .after_turn_ms = after_turn_ms,
+            .total_turn_ms = total_duration,
+            .stable_prefix_hash = assemble_result.stable_prefix_hash,
+            .stable_prefix_bytes = assemble_result.stable_prefix_bytes,
+            .session = session,
+        });
 
         return .{
             .ingest = ingest_result,
@@ -760,7 +844,7 @@ pub const ContextEngine = struct {
                 .force_compressed_messages = if (force_compressed) messages_delta else 0,
                 .history_messages_after_trim = compact_result.messages_after,
             },
-            .total_duration_ms = duration,
+            .total_duration_ms = total_duration,
         };
     }
 };
@@ -1065,7 +1149,15 @@ test "afterTurn aggregates results and sets last_turn.available=true" {
         .method = .none,
     };
     const start_ms = std.time.milliTimestamp() - 10;
-    const result = engine.afterTurn(ingest_result, assemble_result, compact_result, start_ms);
+    const result = engine.afterTurn(
+        std.testing.allocator,
+        ingest_result,
+        assemble_result,
+        compact_result,
+        .{},
+        start_ms,
+        "test-session",
+    );
 
     try std.testing.expect(result.last_turn.available);
     try std.testing.expect(result.last_turn.prompt_refreshed);
@@ -1087,7 +1179,15 @@ test "afterTurn records auto compaction events" {
         .messages_after = 10,
         .method = .auto,
     };
-    const result = engine.afterTurn(ingest_result, assemble_result, compact_result, std.time.milliTimestamp());
+    const result = engine.afterTurn(
+        std.testing.allocator,
+        ingest_result,
+        assemble_result,
+        compact_result,
+        .{},
+        std.time.milliTimestamp(),
+        "test-session",
+    );
 
     try std.testing.expectEqual(@as(usize, 1), result.last_turn.auto_compaction_events);
     try std.testing.expectEqual(@as(usize, 10), result.last_turn.auto_compacted_messages);
@@ -1105,7 +1205,15 @@ test "afterTurn records force_compress events" {
         .messages_after = 4,
         .method = .force_compress,
     };
-    const result = engine.afterTurn(ingest_result, assemble_result, compact_result, std.time.milliTimestamp());
+    const result = engine.afterTurn(
+        std.testing.allocator,
+        ingest_result,
+        assemble_result,
+        compact_result,
+        .{},
+        std.time.milliTimestamp(),
+        "test-session",
+    );
 
     try std.testing.expectEqual(@as(usize, 0), result.last_turn.auto_compaction_events);
     try std.testing.expectEqual(@as(usize, 1), result.last_turn.force_compression_events);

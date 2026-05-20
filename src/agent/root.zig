@@ -2819,8 +2819,45 @@ pub const Agent = struct {
         defer ingest_out.deinit(self.allocator);
         turn_memory_enrich_ms = ingest_out.result.memory_enrich_ms;
 
+        // v1.14.14 Phase 4 — time the assemble phase so afterTurn() can
+        // record per-phase durations into stability.json.
+        const assemble_start_ms = std.time.milliTimestamp();
         const assemble_result = try self.context_engine_state.assemble(self.allocator, self, &ingest_out);
-        _ = assemble_result; // consumed by Phase 3 (compact) — bench-gated diagnostics surface stable_prefix_hash later.
+        const assemble_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - assemble_start_ms));
+
+        // v1.14.14 Phase 4 — afterTurn fires on EVERY post-assemble exit via
+        // this single defer. Reads agent state at exit time (last_turn_compacted,
+        // history.items.len, turn_compaction_ms) so the snapshot reflects the
+        // total post-turn state regardless of which return branch fired.
+        // Emits the JSONL stability record to NULLALIS_STABILITY_JSON_PATH
+        // (env-gated; no-op by default). Failures are silent — the snapshot
+        // is best-effort diagnostic, never a turn blocker.
+        defer {
+            const compact_method: context_engine.CompactResult.CompactMethod = if (!self.last_turn_compacted)
+                .none
+            else if (self.context_force_compressed)
+                .force_compress
+            else
+                .auto;
+            _ = self.context_engine_state.afterTurn(
+                self.allocator,
+                ingest_out.result,
+                assemble_result,
+                .{
+                    .compacted = self.last_turn_compacted,
+                    .method = compact_method,
+                    .messages_before = 0,
+                    .messages_after = self.history.items.len,
+                },
+                .{
+                    .ingest_ms = ingest_out.result.memory_enrich_ms,
+                    .assemble_ms = assemble_duration_ms,
+                    .compact_ms = turn_compaction_ms,
+                },
+                turn_start_ms,
+                self.memory_session_id orelse "none",
+            );
+        }
 
 
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
