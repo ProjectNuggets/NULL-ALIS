@@ -505,3 +505,50 @@ self-report) is the §14.10 specific contribution beyond §14.9's reputation con
 **Authority over §14.10:** Coordinator owns the audit. Nova can override the gate but
 the audit document still lands as historical record. The audit is the post-mortem; the
 ROADMAP block is the prescription.
+
+### 14.11 §14.10 Addendum — three-gate completion criteria (added 2026-05-20 post-F3-retrospective)
+
+The v1.14.18-A Finding 3 sprint produced three consecutive §14.10 catches on a single
+PR: (1) "loop closed" claim with zero production callers of goal_loop functions,
+(2) "wire complete" claim with buildReflectionPrompt still uncalled, (3) "6178/6178
+tests pass" claim with canonical-CI gate failing on `[gpa] (err): Double free
+detected`. Each catch was real; each was caused by an agent self-report that diverged
+from branch state. The pattern reveals three sub-gates §14.10 must enforce alongside
+the audit document:
+
+**Sub-gate A — STATUS.md refresh on sprint close.** The activation audit is forward-
+looking (what to ship next); STATUS.md is operational-truth (what's live now). When
+a sprint closes, the audit lands AND STATUS.md updates AND the ROADMAP block for the
+next sprint drafts — all three together. STATUS.md going stale undermines the
+"cold-readable truth source" contract and produces fact-divergence between docs.
+
+**Sub-gate B — Canonical-CI gate is mandatory pre-push.** Agents MUST run
+`zig build test -Dengines=base,sqlite,postgres -Dchannels=cli,telegram` to exit-0
+BEFORE pushing any branch for review. The default `zig build test` profile has a
+smaller engine set and can mask ownership bugs that only surface when the postgres
+engine is active. This is non-negotiable: future agent self-reports that claim
+"tests pass" without showing the canonical-CI invocation output are invalid until
+the canonical run is shown.
+
+**Sub-gate C — Grep-verified production callers.** For every new module/function
+shipped, agents must run a grep that proves at least one production caller exists
+OUTSIDE the module's own file. Self-reports claiming a "feature is wired" without
+this grep-output are §14.5 no-loose-ends violations. The pattern is:
+`grep -rn "<symbol>" src/ | grep -v "<defining_file>"`. If the result is empty, the
+symbol is library-only and the §14.10 tier classification cannot be 🟢 BEHAVIORAL.
+
+**Honest reporting clause (extends §14.9):** agent self-reports MUST include:
+1. The exact grep outputs that prove production wiring (sub-gate C)
+2. The canonical-CI invocation output (sub-gate B), not just default-profile
+3. The §14.10 tier classification per actual code behavior, not aspirational design
+
+When any of these three is missing or wrong, the coordinator BLOCKS the PR per §14.10
+and corrects the report — the pattern is "discipline serves the agent" (catches the
+gap pre-merge instead of post-merge regression).
+
+**Bench-per-finding (optional but recommended):** when a single finding is the only
+behavioral change being measured, a 5-task micro-bench between findings gives clean
+attribution. Example: after Agent E F1 merges and BEFORE F3 lands, a 5-task τ-bench
+smoke isolates F1's contribution from F3's. This is OPTIONAL because it costs
+~15-30 min per finding, but RECOMMENDED for the τ-bench Karpathy-iteration loop
+(v1.15.0+) where per-finding attribution drives the iteration discipline.
