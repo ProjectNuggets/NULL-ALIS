@@ -182,9 +182,37 @@ pub const TurnContextResult = struct {
 
 /// v1.14.14 Phase 4: per-phase wall-clock durations captured by turnOutcome,
 /// piped through `afterTurn` into the stability snapshot.
+///
+/// v1.14.14.1 Finding 3 (COMPACT-MS-AGGREGATE) — honesty fix:
+/// The `compact_ms` field here still receives `turn_compaction_ms` from
+/// turnOutcome (caller in root.zig unchanged — Agent E owns root.zig for
+/// v1.14.18-A GOAL-LOOP work). What changes is the OPERATOR-FACING surface:
+/// the StabilityRecord field + JSONL key are renamed to
+/// `compact_ms_main_site_only` so operators reading the JSONL see the
+/// partial-coverage honestly. Production has 11 compact callsites inside
+/// `Agent.turnOutcome` (cache-hit branches, response-cache hit branch,
+/// main flow, tool-loop sites, exhausted-iteration recovery, force-compress
+/// recovery × 3, final compact); only the main-flow site at root.zig:3064
+/// measures its duration into `turn_compaction_ms`. The other 10 sites
+/// don't track timing.
+///
+/// Full aggregation across all 11 sites (option (a) per spawn brief) is
+/// blocked by the v1.14.14.1 hot-file lock: `turn_compaction_ms` is a
+/// stack-local in turnOutcome (root.zig:2739), and aggregation requires
+/// either promoting it to an Agent field or modifying each callsite —
+/// both touch src/agent/root.zig, which Agent E owns. Aggregation lands
+/// in v1.14.14.2 (or later slice) once the lock releases. This commit
+/// applies option (b): rename the operator surface to surface the truth.
 pub const PhaseDurations = struct {
     ingest_ms: u64 = 0,
     assemble_ms: u64 = 0,
+    /// Main-flow site only. Caller in turnOutcome passes
+    /// `turn_compaction_ms` (unchanged from v1.14.14 — single-site
+    /// instrumentation at root.zig:3064). The other 10 compact callsites
+    /// (tool-loop, cache-hit, force-compress) are not yet aggregated;
+    /// the StabilityRecord renames this field to `compact_ms_main_site_only`
+    /// when it crosses the operator boundary so the JSONL surface is
+    /// honest about the partial coverage.
     compact_ms: u64 = 0,
 };
 
@@ -202,7 +230,10 @@ pub const StabilityRecord = struct {
     turn_start_ms: i64,
     ingest_ms: u64,
     assemble_ms: u64,
-    compact_ms: u64,
+    /// v1.14.14.1 Finding 3: only the main-flow auto-compaction site's
+    /// duration. 10 other compact callsites aren't aggregated yet — see
+    /// PhaseDurations.compact_ms_main_site_only doc.
+    compact_ms_main_site_only: u64,
     after_turn_ms: u64,
     total_turn_ms: u64,
     stable_prefix_hash: u64,
@@ -242,12 +273,12 @@ pub fn writeStabilityJsonl(allocator: std.mem.Allocator, record: StabilityRecord
     var buf: [1024]u8 = undefined;
     const line = std.fmt.bufPrint(
         &buf,
-        "{{\"turn_start_ms\":{d},\"ingest_ms\":{d},\"assemble_ms\":{d},\"compact_ms\":{d},\"after_turn_ms\":{d},\"total_turn_ms\":{d},\"stable_prefix_hash\":\"{x}\",\"stable_prefix_bytes\":{d},\"tail_hash\":\"{x}\",\"tail_bytes\":{d},\"session\":\"{s}\"}}\n",
+        "{{\"turn_start_ms\":{d},\"ingest_ms\":{d},\"assemble_ms\":{d},\"compact_ms_main_site_only\":{d},\"after_turn_ms\":{d},\"total_turn_ms\":{d},\"stable_prefix_hash\":\"{x}\",\"stable_prefix_bytes\":{d},\"tail_hash\":\"{x}\",\"tail_bytes\":{d},\"session\":\"{s}\"}}\n",
         .{
             record.turn_start_ms,
             record.ingest_ms,
             record.assemble_ms,
-            record.compact_ms,
+            record.compact_ms_main_site_only,
             record.after_turn_ms,
             record.total_turn_ms,
             record.stable_prefix_hash,
@@ -865,7 +896,11 @@ pub const ContextEngine = struct {
             .turn_start_ms = turn_start_ms,
             .ingest_ms = durations.ingest_ms,
             .assemble_ms = durations.assemble_ms,
-            .compact_ms = durations.compact_ms,
+            // v1.14.14.1 Finding 3: caller (root.zig defer) still passes the
+            // main-flow-only `turn_compaction_ms` via durations.compact_ms;
+            // renamed to compact_ms_main_site_only when it crosses the
+            // operator boundary (StabilityRecord + JSONL).
+            .compact_ms_main_site_only = durations.compact_ms,
             .after_turn_ms = after_turn_ms,
             .total_turn_ms = total_duration,
             .stable_prefix_hash = assemble_result.stable_prefix_hash,
