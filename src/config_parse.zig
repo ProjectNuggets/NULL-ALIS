@@ -20,57 +20,6 @@ pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]co
     return try list.toOwnedSlice(allocator);
 }
 
-fn parseAssistantModePresetConfig(
-    self: *Config,
-    target: *types.AssistantModePresetConfig,
-    value: std.json.Value,
-) !void {
-    if (value != .object) return;
-    if (value.object.get("agent")) |agent_val| {
-        if (agent_val == .object) {
-            if (agent_val.object.get("compact_context")) |v| if (v == .bool) {
-                target.agent.compact_context = v.bool;
-            };
-            // SwissWatch (2026-04-28): `max_history_messages` parse path
-            // REMOVED at the JSON boundary. Q1 deprecated the field;
-            // R18+SwissWatch deletes the parse handler. Unknown fields
-            // are silently skipped by Zig's default JSON parser, so old
-            // BFF payloads containing `max_history_messages: N` parse
-            // cleanly with the field ignored. The struct field stays
-            // (default 0; compaction is sole context governor) for
-            // back-compat with internal serializers.
-            if (agent_val.object.get("queue_mode")) |v| if (v == .string) {
-                target.agent.queue_mode = try self.allocator.dupe(u8, v.string);
-            };
-            if (agent_val.object.get("queue_cap")) |v| if (v == .integer and v.integer >= 0) {
-                target.agent.queue_cap = @intCast(v.integer);
-            };
-            if (agent_val.object.get("queue_drop")) |v| if (v == .string) {
-                target.agent.queue_drop = try self.allocator.dupe(u8, v.string);
-            };
-            if (agent_val.object.get("queue_debounce_ms")) |v| if (v == .integer and v.integer >= 0) {
-                target.agent.queue_debounce_ms = @intCast(v.integer);
-            };
-        }
-    }
-    if (value.object.get("summarizer")) |sum_val| {
-        if (sum_val == .object) {
-            if (sum_val.object.get("enabled")) |v| if (v == .bool) {
-                target.summarizer.enabled = v.bool;
-            };
-            if (sum_val.object.get("window_size_tokens")) |v| if (v == .integer and v.integer >= 0) {
-                target.summarizer.window_size_tokens = @intCast(v.integer);
-            };
-            if (sum_val.object.get("summary_max_tokens")) |v| if (v == .integer and v.integer >= 0) {
-                target.summarizer.summary_max_tokens = @intCast(v.integer);
-            };
-            if (sum_val.object.get("auto_extract_semantic")) |v| if (v == .bool) {
-                target.summarizer.auto_extract_semantic = v.bool;
-            };
-        }
-    }
-}
-
 fn parseAudioMediaConfigObject(self: *Config, audio: std.json.Value) !void {
     if (audio != .object) return;
     const has_models = blk: {

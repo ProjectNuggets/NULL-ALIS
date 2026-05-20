@@ -201,43 +201,11 @@ pub const ExtractionConfig = struct {
     skills_nudge_enabled: bool = false,
 };
 
-pub const AssistantModePresetAgentConfig = struct {
-    compact_context: bool = true,
-    max_history_messages: u32,
-    queue_mode: []const u8,
-    queue_cap: u32,
-    queue_drop: []const u8,
-    queue_debounce_ms: u32 = 0,
-    /// Temperature override for this mode. null = use Config.default_temperature.
-    temperature: ?f64 = null,
-    /// Max tool iterations per turn. 0 = use AgentConfig.max_tool_iterations default.
-    max_tool_iterations: u32 = 0,
-    /// Max response tokens per turn. 0 = use resolved model default.
-    max_response_tokens: u32 = 0,
-    /// Model override for this mode. Empty string = use Config.default_model.
-    model: []const u8 = "",
-    /// Provider override for this mode. Empty string = use Config.default_provider.
-    provider: []const u8 = "",
-    /// **Q3 (2026-04-27)** — server-side reasoning depth for this mode.
-    /// Valid: "low" / "medium" / "high" / "none" / null. Null falls
-    /// back to Config.reasoning_effort or wire-level default. Together
-    /// with the model override, this is what makes fast/balanced/deep
-    /// behaviorally different — fast=low gets quick latency, deep=high
-    /// gets deeper thinking on complex tasks.
-    reasoning_effort: ?[]const u8 = null,
-};
+// Deleted: AssistantModePresetAgentConfig, AssistantModePresetSummarizerConfig,
+// AssistantModePresetConfig structs (lines 204-240 in v1.14.18-A F1 code commit).
+// ProductPresetsConfig was their only consumer (deleted in v1.14.18-A F1).
+// Removal per §14.5 no-loose-ends discipline (v1.14.18-A F1 cleanup commit).
 
-pub const AssistantModePresetSummarizerConfig = struct {
-    enabled: bool,
-    window_size_tokens: u32,
-    summary_max_tokens: u32,
-    auto_extract_semantic: bool = true,
-};
-
-pub const AssistantModePresetConfig = struct {
-    agent: AssistantModePresetAgentConfig,
-    summarizer: AssistantModePresetSummarizerConfig,
-};
 
 pub const SidecarConfig = struct {
     /// Enable the sidecar provider for auxiliary LLM calls (narration, compaction).
