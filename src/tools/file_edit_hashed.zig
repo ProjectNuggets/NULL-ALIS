@@ -79,6 +79,24 @@ pub const FileEditHashedTool = struct {
     max_file_size: u64 = DEFAULT_MAX_FILE_SIZE,
 
     pub const tool_name = "file_edit_hashed";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "file_edit_hashed tool.",
+        .use_when = &.{
+            "Editing files with automatic hash tracking",
+            "Detecting concurrent edits or unexpected file changes",
+            "Building audit trails of file modifications",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external data queries",
+            "memory_store — for persistent storage",
+            "http_request — for specific API endpoints",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("file_edit_hashed", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description =
         "Replace lines in a file using Hashline anchors from file_read_hashed. " ++
         "Tolerates line-number drift of up to ±50 lines. " ++
@@ -408,7 +426,10 @@ test "file_edit_hashed rejects absolute path outside allowed areas" {
     var esc_buf: [1024]u8 = undefined;
     var esc_len: usize = 0;
     for (outside_file) |c| {
-        if (c == '\\') { esc_buf[esc_len] = '\\'; esc_len += 1; }
+        if (c == '\\') {
+            esc_buf[esc_len] = '\\';
+            esc_len += 1;
+        }
         esc_buf[esc_len] = c;
         esc_len += 1;
     }

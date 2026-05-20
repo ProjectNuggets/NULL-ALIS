@@ -36,6 +36,22 @@ pub const CronRunTool = struct {
     config: ?*const config_mod.Config = null,
 
     pub const tool_name = "cron_run";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Trigger a cron job immediately.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("cron_run", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Low-level raw cron operator tool. Force-run a raw cron job immediately by ID; agent-managed jobs must run through the scheduler/runtime path.";
     pub const tool_params =
         \\{"type":"object","properties":{"job_id":{"type":"string","description":"The ID of the cron job to run"}},"required":["job_id"]}

@@ -35,6 +35,22 @@ pub const CronRemoveTool = struct {
     config: ?*const config_mod.Config = null,
 
     pub const tool_name = "cron_remove";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Remove an existing cron job by ID or pattern.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("cron_remove", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Low-level raw cron operator tool. Remove a raw scheduled job by ID.";
     pub const tool_params =
         \\{"type":"object","properties":{"job_id":{"type":"string","description":"ID of the cron job to remove"}},"required":["job_id"]}

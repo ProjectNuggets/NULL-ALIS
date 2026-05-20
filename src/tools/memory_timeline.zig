@@ -18,6 +18,22 @@ pub const MemoryTimelineTool = struct {
     user_id: ?i64 = null,
 
     pub const tool_name = "memory_timeline";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "memory_timeline tool.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("memory_timeline", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Browse or search session summaries and timeline continuity objects. This is the FIRST line of session recall — cheap, structured, and usually sufficient. If a summary lacks the exact detail you need (verbatim phrasing, precise tool arguments, content that was placeholder-truncated during compaction), fall back to `transcript_read` for raw message access.";
     pub const tool_params =
         \\{"type":"object","properties":{"session_id":{"type":"string","description":"Optional exact session lane to inspect"},"channel":{"type":"string","description":"Optional channel filter (app, telegram, discord, slack, etc.)"},"date_from":{"type":"string","description":"Optional lower date bound in YYYY-MM-DD"},"date_to":{"type":"string","description":"Optional upper date bound in YYYY-MM-DD"},"query":{"type":"string","description":"Optional case-insensitive substring match over summary content only"},"limit":{"type":"integer","description":"Max summaries to return (default: 5, max: 20)"}}}

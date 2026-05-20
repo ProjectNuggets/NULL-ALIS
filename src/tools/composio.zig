@@ -45,6 +45,22 @@ pub const ComposioTool = struct {
     }
 
     pub const tool_name = "composio";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Execute actions on 1000+ apps via Composio (Gmail, Slack, etc.).",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("composio", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). " ++
         "Use action='list' to see available actions, action='execute' with action_name/tool_slug and params, " ++
         "or action='connect' with app/auth_config_id to get OAuth URL.";

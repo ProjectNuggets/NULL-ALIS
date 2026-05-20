@@ -14,6 +14,22 @@ pub const PushoverTool = struct {
     allocator: std.mem.Allocator,
 
     pub const tool_name = "pushover";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Send notifications via the Pushover notification service.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("pushover", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Send a push notification via Pushover. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.";
     pub const tool_params =
         \\{"type":"object","properties":{"message":{"type":"string","description":"The notification message"},"title":{"type":"string","description":"Optional title"},"priority":{"type":"integer","description":"Priority -2..2 (default 0)"},"sound":{"type":"string","description":"Optional sound name"}},"required":["message"]}

@@ -33,15 +33,15 @@ const BINARY_SIGNATURES: []const BinarySignature = &.{
 };
 
 const EXTENSION_TYPES: []const struct { []const u8, []const u8 } = &.{
-    .{ ".png", "PNG image" },     .{ ".jpg", "JPEG image" },
-    .{ ".jpeg", "JPEG image" },   .{ ".gif", "GIF image" },
-    .{ ".webp", "WebP image" },   .{ ".avif", "AVIF image" },
-    .{ ".heic", "HEIC image" },   .{ ".heif", "HEIF image" },
-    .{ ".pdf", "PDF document" },  .{ ".zip", "ZIP archive" },
-    .{ ".mp4", "MP4 video" },     .{ ".mov", "QuickTime video" },
-    .{ ".mp3", "MP3 audio" },     .{ ".m4a", "M4A audio" },
-    .{ ".wav", "WAV audio" },     .{ ".exe", "Windows executable" },
-    .{ ".dll", "Windows DLL" },   .{ ".so", "Linux shared library" },
+    .{ ".png", "PNG image" },              .{ ".jpg", "JPEG image" },
+    .{ ".jpeg", "JPEG image" },            .{ ".gif", "GIF image" },
+    .{ ".webp", "WebP image" },            .{ ".avif", "AVIF image" },
+    .{ ".heic", "HEIC image" },            .{ ".heif", "HEIF image" },
+    .{ ".pdf", "PDF document" },           .{ ".zip", "ZIP archive" },
+    .{ ".mp4", "MP4 video" },              .{ ".mov", "QuickTime video" },
+    .{ ".mp3", "MP3 audio" },              .{ ".m4a", "M4A audio" },
+    .{ ".wav", "WAV audio" },              .{ ".exe", "Windows executable" },
+    .{ ".dll", "Windows DLL" },            .{ ".so", "Linux shared library" },
     .{ ".dylib", "macOS shared library" },
 };
 
@@ -120,9 +120,9 @@ fn hasDocExtension(path: []const u8, exts: []const []const u8) bool {
 /// Extensions handled by pandoc. Pandoc converts these to plain text via
 /// `pandoc <path> -t plain`. Requires pandoc binary in the container image.
 const PANDOC_EXTENSIONS = [_][]const u8{
-    ".docx", ".doc",   ".odt", ".rtf",
-    ".epub", ".pptx",  ".ppt",
-    ".html", ".htm",
+    ".docx", ".doc",  ".odt", ".rtf",
+    ".epub", ".pptx", ".ppt", ".html",
+    ".htm",
 };
 
 /// Extensions handled by xlsx2csv / libreoffice for spreadsheets. Pandoc's
@@ -139,6 +139,24 @@ pub const FileReadTool = struct {
     max_file_size: u64 = DEFAULT_MAX_FILE_SIZE,
 
     pub const tool_name = "file_read";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Read the complete contents of a text or binary file.",
+        .use_when = &.{
+            "Reading entire file contents for analysis or processing",
+            "Retrieving configuration files or source code for inspection",
+            "Validating file existence and readability before operations",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external data queries",
+            "memory_store — for persistent storage",
+            "http_request — for specific API endpoints",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("file_read", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Read the contents of a file in the workspace";
     pub const tool_params =
         \\{"type":"object","properties":{"path":{"type":"string","description":"Relative path to the file within the workspace"}},"required":["path"]}

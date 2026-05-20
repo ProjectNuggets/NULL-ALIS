@@ -24,6 +24,22 @@ const JsonObjectMap = root.JsonObjectMap;
 /// V1.9-4 temporal_decay output.
 pub const TimeNowTool = struct {
     pub const tool_name = "time_now";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Get the current date and time in the specified timezone.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("time_now", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description =
         "Get the current wall-clock time. Returns unix_seconds, ISO-8601 UTC, " ++
         "day of week, and a human-readable string. Use when reasoning about " ++

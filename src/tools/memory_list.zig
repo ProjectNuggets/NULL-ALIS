@@ -18,6 +18,22 @@ pub const MemoryListTool = struct {
     user_id: ?i64 = null,
 
     pub const tool_name = "memory_list";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "List all stored memories with optional filtering by key or category.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("memory_list", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "List canonical memory entries in recency order. Defaults to the current session unless scope=global is provided; use include_internal=true for transcript/autosave inspection. Note: scope=session filters strictly by session_id, so memories that were promoted to durable core (session_id=NULL after V1.7 promotion) will NOT appear in scope=session results — use scope=global to see promoted core memories.";
     pub const tool_params =
         \\{"type":"object","properties":{"limit":{"type":"integer","description":"Max entries to return (default: 5, max: 100)"},"category":{"type":"string","description":"Optional category filter (core|daily|conversation|custom)"},"scope":{"type":"string","enum":["session","global"],"description":"List scope (default: session). Use global for durable or cross-session records."},"session_id":{"type":"string","description":"Optional explicit session filter override"},"include_content":{"type":"boolean","description":"Include content preview (default: true)"},"include_internal":{"type":"boolean","description":"Include internal autosave/hygiene keys for transcript/audit inspection (default: false)"}}}

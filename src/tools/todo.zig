@@ -72,6 +72,22 @@ pub const TodoTool = struct {
     memory: ?Memory = null,
 
     pub const tool_name = "todo";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Access the task list via the canonical todo.zig:75 surface.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("todo", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description =
         "Create and manage structured task lists with status tracking. " ++
         "When the user requests 3+ distinct tasks (numbered, comma-separated, " ++

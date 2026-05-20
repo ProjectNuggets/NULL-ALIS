@@ -12,6 +12,22 @@ pub const TaskStopTool = struct {
     delivery: *TaskDelivery,
 
     pub const tool_name = "task_stop";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Stop or cancel a running task or background job cleanly.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("task_stop", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Cancel a queued task. Running tasks cannot be interrupted — returns an error if the task is already running or in a terminal state.";
     pub const tool_params =
         \\{"type":"object","properties":{"task_id":{"type":"string","description":"The task ID to cancel"}},"required":["task_id"]}

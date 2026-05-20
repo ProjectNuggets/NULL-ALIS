@@ -80,6 +80,24 @@ pub const ImageGenerateTool = struct {
     workspace_dir: []const u8 = "",
 
     pub const tool_name = "image_generate";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Generate images from text descriptions via API.",
+        .use_when = &.{
+            "Creating images from text descriptions via generative API",
+            "Synthesizing visual content for presentations or documents",
+            "Batch-generating multiple image variations from prompts",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external data queries",
+            "memory_store — for persistent storage",
+            "http_request — for specific API endpoints",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("image_generate", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description =
         "Generate an image from a text prompt, optionally using reference images for " ++
         "image-to-image generation. Use this when the user asks for a picture, image, " ++

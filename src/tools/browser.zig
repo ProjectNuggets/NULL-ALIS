@@ -18,6 +18,22 @@ const MAX_FETCH_BYTES: usize = 65536;
 /// description shall advertise an action the code can't perform.
 pub const BrowserTool = struct {
     pub const tool_name = "browser";
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Open and control a web browser for interactive automation.",
+        .use_when = &.{
+            "Interactive web browsing and content extraction",
+            "Executing JavaScript on pages for dynamic data retrieval",
+            "Automating workflows across multiple URLs or pages",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external data",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("browser", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Browse web pages. Actions: open, read.";
     pub const tool_params =
         \\{"type":"object","properties":{"action":{"type":"string","enum":["open","read"],"description":"Browser action to perform"},"url":{"type":"string","description":"URL to open or read"}},"required":["action","url"]}

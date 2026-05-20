@@ -56,6 +56,22 @@ pub const RuntimeInfoTool = struct {
     runtime_tools: ?[]const Tool = null,
 
     pub const tool_name = "runtime_info";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Retrieve runtime configuration, environment, and execution context.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("runtime_info", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Inspect runtime, session, integrations, scheduler, heartbeat, execution truth, and ops state as structured JSON. Use it to verify status before claiming it.";
     pub const tool_params =
         \\{"type":"object","properties":{"section":{"type":"string","enum":["summary","session","integrations","scheduler","heartbeat","execution_truth","ops"],"description":"Runtime section to inspect"},"user_id":{"type":"string","description":"Optional tenant user id override for reporting"},"verbose":{"type":"boolean","description":"Include larger summaries where available"}}}

@@ -62,6 +62,30 @@ pub const WebSearchTool = struct {
     brave_api_key_override: []const u8 = "",
 
     pub const tool_name = "web_search";
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Search the web for current facts, news, or information unavailable in training data.",
+        .use_when = &.{
+            "Answering questions about current events, recent developments, or time-sensitive topics",
+            "Finding real-time information like stock prices, weather, or live schedules",
+            "Retrieving URLs, company pages, or recent publications not covered in training",
+        },
+        .do_not_use_for = &.{
+            "http_request — for specific API calls instead of web search",
+            "memory_store — to cache recurring search results locally",
+            "runtime_info — for training data knowledge",
+        },
+        .cost_note = "Each search consumes API quota; use sparingly.",
+        .completion_hint = "Returns ranked results with titles, snippets, and URLs.",
+        .see_also = &.{
+            "http_request — fetch specific URLs or API endpoints",
+            "memory_store — cache search results for reuse",
+        },
+    };
+    // Comptime validation of tool_description_struct
+    comptime {
+        @import("lint.zig").lintToolDescription("web_search", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
+
     pub const tool_description = "Search the open web for external facts. Prefer `http_request` for known APIs and `runtime_info` for local runtime truth.";
     pub const tool_params =
         \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Search query"},"count":{"type":"integer","minimum":1,"maximum":10,"default":5,"description":"Number of results (1-10)"}},"required":["query"]}

@@ -34,6 +34,22 @@ pub const CronListTool = struct {
     config: ?*const config_mod.Config = null,
 
     pub const tool_name = "cron_list";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "List all active cron jobs and their schedules.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("cron_list", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Inspect raw cron jobs, their types, status, and next run time. Low-level scheduler inspection surface.";
     pub const tool_params =
         \\{"type":"object","properties":{}}

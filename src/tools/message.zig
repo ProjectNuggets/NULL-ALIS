@@ -21,6 +21,22 @@ pub const MessageTool = struct {
     outbound_allocator: ?std.mem.Allocator = null,
 
     pub const tool_name = "message";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Send a message to the user or log output to conversation.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("message", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Send an explicit outbound message to a channel or the current conversation. Optionally attach an image by public HTTPS URL. Do not treat as a heartbeat default.";
     pub const tool_params =
         \\{"type":"object","properties":{"content":{"type":"string","description":"Message text. When image_url is set, this becomes the caption (where the channel supports captions; Telegram caps at 1024 chars). May be empty when image_url is set."},"image_url":{"type":"string","description":"Optional public HTTPS URL of an image to attach. Today: Telegram supports this via sendPhoto (channel fetches the URL server-side). Other channels: not yet wired — prefer [IMAGE:/abs/path] markers in your reply text for those (see Channel Attachments section). For workspace-local files on any channel, use the marker approach."},"channel":{"type":"string","description":"Target channel (telegram, discord, slack, signal, mattermost, whatsapp, etc.). Defaults to current."},"account_id":{"type":"string","description":"Target account for multi-account channels. Defaults to current account."},"chat_id":{"type":"string","description":"Target chat/room ID. Defaults to current."}},"required":["content"]}

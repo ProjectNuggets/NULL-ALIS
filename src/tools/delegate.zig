@@ -28,6 +28,22 @@ pub const DelegateTool = struct {
     depth: u32 = 0,
 
     pub const tool_name = "delegate";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Delegate a task to another agent or worker for asynchronous execution.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("delegate", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Hand a subtask to a named specialized agent (single-turn completion); use for tasks where a different model or system prompt materially helps.";
     pub const tool_params =
         \\{"type":"object","properties":{"agent":{"type":"string","minLength":1,"description":"Name of the agent to delegate to"},"prompt":{"type":"string","minLength":1,"description":"The task/prompt to send to the sub-agent"},"context":{"type":"string","description":"Optional context to prepend"}},"required":["agent","prompt"]}

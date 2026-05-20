@@ -12,6 +12,22 @@ pub const SkillRegistryTool = struct {
     workspace_dir: []const u8,
 
     pub const tool_name = "skill_registry";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Look up registered skills and capabilities.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("skill_registry", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Manage skills. Actions: list installed skills, search Decision Hub skills, install a skill from Decision Hub, and remove locally installed skills.";
     pub const tool_params =
         \\{"type":"object","properties":{"action":{"type":"string","enum":["list","search","install","remove","uninstall"],"default":"list"},"query":{"type":"string","description":"Natural-language search query or install target query"},"skill_ref":{"type":"string","description":"Decision Hub reference org/skill for install"},"name":{"type":"string","description":"Local installed skill name for remove/uninstall"},"count":{"type":"integer","minimum":1,"maximum":20,"default":5},"spec":{"type":"string","description":"Version spec for install (default latest)"},"allow_risky":{"type":"boolean","default":false,"description":"Allow C-grade risky skills on install"}}}

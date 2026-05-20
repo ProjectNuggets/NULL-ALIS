@@ -40,6 +40,24 @@ pub const ShellTool = struct {
     audit_session_id: ?[]const u8 = null,
 
     pub const tool_name = "shell";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Execute shell commands with proper authorization.",
+        .use_when = &.{
+            "Executing commands that don't fit specialized tools (file, git, http)",
+            "Running shell scripts or pipelines requiring command composition",
+            "Querying system state or paths within security policy bounds",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external data queries",
+            "memory_store — for persistent storage",
+            "http_request — for specific API endpoints",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("shell", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Execute a shell command when policy allows and no more specific tool is better.";
     pub const tool_params =
         \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"cwd":{"type":"string","description":"Working directory (absolute path within allowed paths; defaults to workspace)"}},"required":["command"]}

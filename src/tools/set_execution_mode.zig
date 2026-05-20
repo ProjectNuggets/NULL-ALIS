@@ -12,6 +12,22 @@ const JsonObjectMap = root.JsonObjectMap;
 
 pub const SetExecutionModeTool = struct {
     pub const tool_name = "set_execution_mode";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Configure execution mode (sandbox, live, or dry-run).",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("set_execution_mode", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description =
         "Switch your own execution mode. " ++
         "`plan` = read-only exploration before committing to an approach (mutating tools blocked). " ++

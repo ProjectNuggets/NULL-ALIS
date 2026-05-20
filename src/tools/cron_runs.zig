@@ -34,6 +34,22 @@ pub const CronRunsTool = struct {
     config: ?*const config_mod.Config = null,
 
     pub const tool_name = "cron_runs";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "List historical runs of a cron job.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("cron_runs", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Inspect recent execution history for a raw scheduled job. Low-level scheduler reporting surface.";
     pub const tool_params =
         \\{"type":"object","properties":{"job_id":{"type":"string","description":"ID of the cron job"},"limit":{"type":"integer","description":"Max runs to show (default 10)"}},"required":["job_id"]}

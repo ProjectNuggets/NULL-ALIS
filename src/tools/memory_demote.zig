@@ -39,6 +39,22 @@ pub const MemoryDemoteTool = struct {
     user_id: ?i64 = null,
 
     pub const tool_name = "memory_demote";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Reduce the priority level of a memory entry in the knowledge graph.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("memory_demote", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description =
         "Demote a `core` memory back to a non-core type (daily / conversation / episodic). " ++
         "Required when a Tier-3-promoted memory needs to be edited or retired — " ++

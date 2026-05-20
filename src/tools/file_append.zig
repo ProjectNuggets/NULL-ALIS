@@ -21,6 +21,24 @@ pub const FileAppendTool = struct {
     max_file_size: usize = DEFAULT_MAX_FILE_SIZE,
 
     pub const tool_name = "file_append";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Append content to the end of an existing file.",
+        .use_when = &.{
+            "Adding new content to the end of existing files",
+            "Logging output to running transaction or session files",
+            "Accumulating multi-step results in a single file",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external data queries",
+            "memory_store — for persistent storage",
+            "http_request — for specific API endpoints",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("file_append", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Append content to the end of a file (creates the file if it doesn't exist)";
     pub const tool_params =
         \\{"type":"object","properties":{"path":{"type":"string","description":"Relative path to the file within the workspace"},"content":{"type":"string","description":"Content to append to the file"}},"required":["path","content"]}

@@ -39,6 +39,22 @@ pub const MemoryPurgeTopicTool = struct {
     mem_rt: ?*mem_root.MemoryRuntime = null,
 
     pub const tool_name = "memory_purge_topic";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Remove all memories related to a specific topic.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("memory_purge_topic", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Delete agent-generated memory entries (autosave, checkpoints, summaries) that mention a given topic. Use when the agent has been repeatedly wrong about something (prior hallucinations polluting future turns) and the user asks to 'forget' or 'start fresh' on that topic. Does NOT delete user-authored memories created via memory_store.";
     pub const tool_params =
         \\{"type":"object","properties":{"topic":{"type":"string","description":"The topic / entity / keyword to scrub from agent-generated memory. Case-insensitive substring match against content."}},"required":["topic"]}
@@ -111,14 +127,7 @@ pub const MemoryPurgeTopicTool = struct {
             if (!forgotten) continue;
             purged += 1;
 
-            if (std.mem.startsWith(u8, entry.key, "autosave_assistant_")) by_family[0] += 1
-            else if (std.mem.startsWith(u8, entry.key, "autosave_user_")) by_family[1] += 1
-            else if (std.mem.startsWith(u8, entry.key, "session_checkpoint_")) by_family[2] += 1
-            else if (std.mem.startsWith(u8, entry.key, "timeline_summary/")) by_family[3] += 1
-            else if (std.mem.startsWith(u8, entry.key, "summary_latest/")) by_family[4] += 1
-            else if (std.mem.startsWith(u8, entry.key, "compaction_summary/")) by_family[5] += 1
-            else if (std.mem.startsWith(u8, entry.key, "summary_fallback/")) by_family[6] += 1
-            else if (std.mem.startsWith(u8, entry.key, "compaction_dropped/")) by_family[7] += 1;
+            if (std.mem.startsWith(u8, entry.key, "autosave_assistant_")) by_family[0] += 1 else if (std.mem.startsWith(u8, entry.key, "autosave_user_")) by_family[1] += 1 else if (std.mem.startsWith(u8, entry.key, "session_checkpoint_")) by_family[2] += 1 else if (std.mem.startsWith(u8, entry.key, "timeline_summary/")) by_family[3] += 1 else if (std.mem.startsWith(u8, entry.key, "summary_latest/")) by_family[4] += 1 else if (std.mem.startsWith(u8, entry.key, "compaction_summary/")) by_family[5] += 1 else if (std.mem.startsWith(u8, entry.key, "summary_fallback/")) by_family[6] += 1 else if (std.mem.startsWith(u8, entry.key, "compaction_dropped/")) by_family[7] += 1;
 
             // Best-effort vector store cleanup
             if (self.mem_rt) |rt| rt.deleteFromVectorStore(entry.key);

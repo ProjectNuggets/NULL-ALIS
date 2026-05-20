@@ -27,6 +27,22 @@ pub const TranscriptReadTool = struct {
     session_store: ?SessionStore = null,
 
     pub const tool_name = "transcript_read";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Read conversation history or transcript data.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("transcript_read", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description =
         "Read raw session transcript messages (user/assistant/tool) directly " ++
         "from persisted storage. Use this as the SECOND line of session recall " ++

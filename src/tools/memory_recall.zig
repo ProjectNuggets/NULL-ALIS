@@ -44,6 +44,30 @@ pub const MemoryRecallTool = struct {
     user_id: ?i64 = null,
 
     pub const tool_name = "memory_recall";
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Retrieve facts, preferences, and decisions from long-term memory.",
+        .use_when = &.{
+            "Finding previously stored user facts or preferences by key or semantic search",
+            "Checking what decisions or preferences were recorded in earlier sessions",
+            "Validating whether a fact exists before taking action based on it",
+        },
+        .do_not_use_for = &.{
+            "memory_store — for persistence instead of retrieval",
+            "todo — for short-lived transient decisions",
+            "web_search — for current facts",
+        },
+        .cost_note = "Retrieval is free. Semantic search may incur embedding cost.",
+        .completion_hint = "Returns matched memories with timestamps.",
+        .see_also = &.{
+            "memory_store — persist new facts and preferences",
+            "memory_timeline — view fact change history",
+        },
+    };
+    // Comptime validation of tool_description_struct
+    comptime {
+        @import("lint.zig").lintToolDescription("memory_recall", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
+
     pub const tool_description = "Search canonical memory for relevant facts, preferences, or context. Defaults to the current session unless scope=global is provided.";
     pub const tool_params =
         \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in canonical memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"},"scope":{"type":"string","enum":["session","global"],"description":"Recall scope (default: session). Use global for durable or cross-session facts."},"session_id":{"type":"string","description":"Optional explicit session lane override"}},"required":["query"]}
