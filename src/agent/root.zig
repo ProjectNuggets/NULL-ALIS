@@ -630,6 +630,37 @@ pub const Agent = struct {
     /// v1.14.18-A F3 — per-turn goal state for ReAct reflection loop.
     active_goal_state: ?goal_loop.GoalState = null,
 
+    /// v1.14.18-B G3 (NARRATION-AS-CONTEXT) — agent-owned ring buffer
+    /// of recent narration frames. The per-turn `NarrationObserver`
+    /// (built fresh in `turnOutcome`) holds a pointer back so emitted
+    /// frames flow into recall. Surfaces as `<recent_thoughts>` in the
+    /// volatile prompt via `context_engine.assemble`. Size cap is
+    /// `narration.RING_BUFFER_CAPACITY` (16); FIFO eviction.
+    ///
+    /// **Initialization invariant:** the inner `allocator` field MUST be
+    /// re-bound to `self.allocator` before the agent runs its first turn.
+    /// `fromConfig` performs that re-bind. Direct-construction call sites
+    /// (tests) should call `initNarrationRingBuffer(self.allocator)` after
+    /// the Agent struct is fully wired but BEFORE any turn fires. The
+    /// default below uses a sentinel `failing_allocator` so any missed
+    /// initialization surfaces loudly — `push` logs a warn ("did you
+    /// forget to call NarrationRingBuffer.init?") on every dupe failure,
+    /// which fires for every frame against the sentinel. See
+    /// `narration.NarrationRingBuffer.push` for the loud-failure rationale.
+    narration_ring_buffer: narration.NarrationRingBuffer = .{ .allocator = std.testing.failing_allocator },
+    /// v1.14.18-B G3 — current tool iteration the agent is preparing
+    /// for. Stamped onto each pushed narration frame so the
+    /// `<recent_thoughts>` block carries historical iteration numbers,
+    /// not the current one. Bumped by `turnOutcome` between iterations.
+    ///
+    /// **Session-monotonic:** NOT reset per turn. Turn 2 may start at
+    /// iter=17 (resuming from turn 1's final iteration count + 1).
+    /// `<recent_thoughts iteration="N">` therefore displays session-wide
+    /// counts. The `+%=` bump on `u32` is wrapping (per Zig semantics);
+    /// at one iteration per ReAct step this wraps after ~4 billion
+    /// iterations, so wrap is not a practical concern.
+    iteration_counter: u32 = 0,
+
     /// **D1.8** — count of `durable_fact/behavior/*` entries this session
     /// has stored. Replaces the prior pattern (`mem.list` + filter scan
     /// on EVERY user message that tripped a learning signal — O(N) over
@@ -837,6 +868,12 @@ pub const Agent = struct {
             .total_tokens = 0,
             .has_system_prompt = false,
             .last_turn_compacted = false,
+            // v1.14.18-B G3 — bind the narration ring buffer to the agent's
+            // allocator so push() dups land in the right arena and deinit
+            // frees through the right path. Sentinel default
+            // (`failing_allocator`) on the field declaration ensures any
+            // construction path that forgets this re-bind surfaces loudly.
+            .narration_ring_buffer = narration.NarrationRingBuffer.init(allocator),
         };
     }
 
@@ -956,6 +993,10 @@ pub const Agent = struct {
         }
         self.history.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
+        // v1.14.18-B G3 — free recorded narration frames (dup'd messages
+        // + tool names). Safe even on agents whose ring buffer never
+        // received a push (len=0); the inner free-loop is a no-op then.
+        self.narration_ring_buffer.deinit();
         return drained;
     }
 
@@ -2707,8 +2748,23 @@ pub const Agent = struct {
 
         // v1.14.13 Agent F: route all per-turn observer events through the
         // narration wrapper so channel/SSE observers receive progress frames.
+        //
+        // v1.14.18-B G3 (NARRATION-AS-CONTEXT): bind the wrapper to the
+        // Agent's persistent narration ring buffer so emitted frames flow
+        // into recall. The buffer is Agent-owned (initialized in
+        // `fromConfig`) so it survives the per-turn wrapper. We seed
+        // `current_iteration` from `self.iteration_counter` here, which is
+        // session-monotonic (NOT reset per turn) — so turn 2 may start at
+        // iter=17, turn 3 at iter=33, etc. `<recent_thoughts iteration="N">`
+        // therefore displays session-wide counts. The counter is bumped
+        // per ReAct iteration below (search "iteration_counter +%=" in
+        // this function).
         const base_observer = self.observer;
-        var narration_observer = narration.NarrationObserver{ .inner = base_observer };
+        var narration_observer = narration.NarrationObserver{
+            .inner = base_observer,
+            .ring_buffer = &self.narration_ring_buffer,
+            .current_iteration = self.iteration_counter,
+        };
         const wrap_narration = !std.mem.eql(u8, base_observer.getName(), "narration");
         if (wrap_narration) self.observer = narration_observer.observer();
         defer {
@@ -3126,6 +3182,17 @@ pub const Agent = struct {
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
             _ = iter_arena.reset(.retain_capacity);
             const arena = iter_arena.allocator();
+
+            // v1.14.18-B G3 — stamp the iteration counter onto the
+            // NarrationObserver so any frames emitted during this
+            // iteration carry the right `iteration` field in the
+            // ring buffer (so `<recent_thoughts>` shows correct iter
+            // numbers next turn). Bumping by 1 (vs `iteration` raw)
+            // keeps the displayed value 1-based for humans.
+            self.iteration_counter +%= 1;
+            if (wrap_narration) {
+                narration_observer.current_iteration = self.iteration_counter;
+            }
 
             // ── Adaptive exit: loop detected last iteration ──────────────
             // If repeated-call detector flagged a loop in the previous

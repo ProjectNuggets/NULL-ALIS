@@ -257,6 +257,21 @@ pub const PromptContext = struct {
     /// when no traces exist or postgres unavailable. V1.13 schema +
     /// renderer existed; this field finally wires it into the prompt.
     skill_traces_block: ?[]const u8 = null,
+    /// v1.14.18-B G3 (NARRATION-AS-CONTEXT) — Recent narration frames
+    /// rendered as `<recent_thoughts>...</recent_thoughts>`. Pre-formatted
+    /// by `agent/narration.zig::renderRecentThoughtsBlock`. Sits FIRST in
+    /// the recall stack (volatile-block ordering documented in
+    /// `context_engine.assemble`) so the agent sees its own prior
+    /// thinking before any other recalled context. Empty when no frames
+    /// have been recorded yet (first iteration of a fresh turn).
+    recent_thoughts_block: ?[]const u8 = null,
+    /// v1.14.18-B G7 — placeholder field reserved for Agent E's
+    /// `<known_weakness>` block (bench self-knowledge). Rendered between
+    /// `recent_thoughts_block` and `skill_traces_block` to preserve the
+    /// volatile-block ordering contract documented in
+    /// `context_engine.assemble`. Agent G owns the assemble-order
+    /// scaffolding; Agent E populates the actual content.
+    known_weakness_block: ?[]const u8 = null,
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -472,12 +487,49 @@ pub fn buildVolatileSystemPrompt(
         }
     }
 
-    // V1.14.3 (G-07 closure) — Procedural memory recall block. Pre-
-    // fenced as <recent_skill_traces>...</recent_skill_traces> by
-    // agent/procedural_memory.zig::renderBlock. Sits LAST in the
-    // volatile section so the agent reads identity → working memory →
-    // semantic memory → procedural memory ("what worked last time for
-    // this kind of task"). Empty when no traces or postgres unavailable.
+    // v1.14.18-B (G3 + G7 + G-07) — Recall-stack ordering invariant.
+    //
+    // The three "recall" blocks below render in a FIXED ORDER so the
+    // volatile-prompt suffix stays byte-stable across the v1.14.18-B
+    // wiring. Provider byte-prefix caches (vLLM, Together) match on the
+    // stable+tool_instructions prefix only; this volatile tail does NOT
+    // need to be cached, but keeping a deterministic order here means
+    // future Anthropic two-block emission (cache_control on stable
+    // half + this volatile half as a single block) won't accidentally
+    // diverge between turns of the same session.
+    //
+    // Order (top → bottom):
+    //   1. recent_thoughts   (G3, v1.14.18-B) — agent's own narration
+    //      from prior iterations of THIS turn. Closest to identity in
+    //      the recall hierarchy: "what was I thinking 30 seconds ago".
+    //   2. known_weakness    (G7, v1.14.18-B, Agent E owns content) —
+    //      agent's bench self-knowledge. Sits between thoughts and
+    //      skill traces because it's metacognitive ("here is what
+    //      benchmarks say I'm bad at") and should anchor the
+    //      procedural-recall reading underneath it.
+    //   3. recent_skill_traces (G-07, V1.14.3) — "what worked last
+    //      time for this shape of task". The dominant procedural
+    //      memory surface. Sits LAST so the agent reads identity →
+    //      WM → semantic → metacognitive → procedural.
+    //
+    // Each block is failure-soft / nullable. When empty/null, the
+    // section is skipped entirely (no empty fences); subsequent
+    // sections shift up. Byte-stability across turns assumes the
+    // sources update at session boundaries, not per-turn.
+    if (ctx.recent_thoughts_block) |rt| {
+        if (rt.len > 0) {
+            try w.writeAll(rt);
+            if (rt[rt.len - 1] != '\n') try w.writeAll("\n");
+            try w.writeAll("\n");
+        }
+    }
+    if (ctx.known_weakness_block) |kw| {
+        if (kw.len > 0) {
+            try w.writeAll(kw);
+            if (kw[kw.len - 1] != '\n') try w.writeAll("\n");
+            try w.writeAll("\n");
+        }
+    }
     if (ctx.skill_traces_block) |traces| {
         if (traces.len > 0) {
             try w.writeAll(traces);
@@ -1803,6 +1855,44 @@ test "buildVolatileSystemPrompt G-07: skill_traces_block omitted when null" {
 
     // Empty/null skill_traces_block leaves no trace tag in the prompt.
     try std.testing.expect(std.mem.indexOf(u8, volatile_out, "<recent_skill_traces") == null);
+}
+
+test "buildVolatileSystemPrompt v1.14.18-B recall-stack ordering invariant" {
+    // Three orderings (PromptContext decl, context_engine assignment,
+    // prompt render) must stay synchronized for byte-stable prefix
+    // caching. Today no test asserts this; a drive-by refactor that
+    // reordered the `if` blocks in buildVolatileSystemPrompt would
+    // silently ship a cache-stability regression. This test materializes
+    // all three blocks and asserts their position order:
+    //   recent_thoughts < known_weakness < skill_traces.
+    const allocator = std.testing.allocator;
+
+    const rt_block =
+        "<recent_thoughts iteration=\"3\" count=\"2\">\n[iter 2, thinking]: thinking\n</recent_thoughts>\n";
+    const kw_block =
+        "<known_weakness>\nbench result placeholder\n</known_weakness>\n";
+    const st_block =
+        "<recent_skill_traces skill=\"generic_multi_tool\" count=\"1\">\n  [trace_id 7]: task=test\n</recent_skill_traces>\n";
+
+    const volatile_out = try buildVolatileSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .recent_thoughts_block = rt_block,
+        .known_weakness_block = kw_block,
+        .skill_traces_block = st_block,
+    });
+    defer allocator.free(volatile_out);
+
+    const rt = std.mem.indexOf(u8, volatile_out, "<recent_thoughts") orelse
+        return error.RecentThoughtsBlockMissing;
+    const kw = std.mem.indexOf(u8, volatile_out, "<known_weakness") orelse
+        return error.KnownWeaknessBlockMissing;
+    const st = std.mem.indexOf(u8, volatile_out, "<recent_skill_traces") orelse
+        return error.SkillTracesBlockMissing;
+
+    try std.testing.expect(rt < kw);
+    try std.testing.expect(kw < st);
 }
 
 test "buildVolatileSystemPrompt G-08: empty working_memory_block omits the <working_memory> tag" {

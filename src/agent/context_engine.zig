@@ -19,6 +19,7 @@ const capabilities_mod = @import("../capabilities.zig");
 const prompt = @import("prompt.zig");
 const dispatcher = @import("dispatcher.zig");
 const procedural_memory = @import("procedural_memory.zig");
+const narration = @import("narration.zig");
 // v1.14.14 Phase 3 originally added `const compaction = @import("compaction.zig");`
 // here, but the new `compact`/`forceCompact` methods reach compaction via the
 // agent's own `autoCompactHistory`/`forceCompressHistory` rather than calling
@@ -642,10 +643,83 @@ pub const ContextEngine = struct {
         };
         defer if (skill_traces_block) |b| allocator.free(b);
 
+        // v1.14.18-B G3 (NARRATION-AS-CONTEXT) — recent thoughts block.
+        //
+        // Pulls the last 3 narration frames the agent emitted (across
+        // iterations of this turn AND the prior turn's tail, since the
+        // ring buffer is Agent-owned and persists between turns until
+        // RING_BUFFER_CAPACITY=16 entries evict it). Closes the loop:
+        // v1.14.13 NarrationObserver fired events to channel UIs but the
+        // agent itself never saw its own narration in the next iteration's
+        // prompt. Now `recallRecent` surfaces it as `<recent_thoughts>`.
+        //
+        // Failure-soft: missing ring buffer (Agent built without
+        // `narration_ring_buffer` initialized) → null block, recall is a
+        // no-op. recallRecent error → drop the block, log a warn. Render
+        // error → drop the block, log a warn.
+        //
+        // Iteration count: agent.iteration_counter (Agent field, bumped
+        // by the agent loop) reflects the iteration this assemble call
+        // is preparing for. The frames carry their own `iteration` field
+        // stamped at push time so the block renders the historical iter
+        // numbers, not the current one.
+        const recent_thoughts_block: ?[]u8 = blk: {
+            const rb_ptr: ?*narration.NarrationRingBuffer = if (@hasField(@TypeOf(agent.*), "narration_ring_buffer"))
+                @as(?*narration.NarrationRingBuffer, &agent.narration_ring_buffer)
+            else
+                null;
+            const frames = narration.recallRecent(rb_ptr, allocator, narration.RECALL_DEPTH) catch |err| {
+                log.warn("narration.recall_failed err={s}", .{@errorName(err)});
+                break :blk null;
+            };
+            // v1.14.18-B G3 follow-up — `recallRecent` deep-copies each
+            // frame's `.message` / `.tool_name` into `allocator` (closes
+            // a HIGH concurrent use-after-free where the prior borrow
+            // contract aliased ring-buffer memory and a worker-thread
+            // `push()` could free the slot between `recallRecent` and
+            // `renderRecentThoughtsBlock`). `self.allocator` here is the
+            // Agent's GPA-backed allocator, NOT an arena, so we must
+            // explicitly free each frame's owned strings AND the outer
+            // slice on every exit path of this block.
+            defer {
+                for (frames) |f| {
+                    allocator.free(f.message);
+                    if (f.tool_name) |t| allocator.free(t);
+                }
+                allocator.free(frames);
+            }
+            if (frames.len == 0) break :blk null;
+            const current_iter: u32 = if (@hasField(@TypeOf(agent.*), "iteration_counter"))
+                agent.iteration_counter
+            else
+                0;
+            break :blk narration.renderRecentThoughtsBlock(
+                allocator,
+                frames,
+                current_iter,
+            ) catch |err| {
+                log.warn("narration.render_failed err={s}", .{@errorName(err)});
+                break :blk null;
+            };
+        };
+        defer if (recent_thoughts_block) |b| allocator.free(b);
+
         // Context v2: build stable + volatile separately so tool instructions
         // can sit in the STABLE half (byte-identical across turns) rather than
         // after the volatile block. This preserves byte-prefix cache stability
         // on Together/vLLM and enables future Anthropic two-block emission.
+        //
+        // v1.14.18-B coordination invariant — Recall-stack ordering:
+        //   1. recent_thoughts (G3, Agent G)   ← FIRST in PromptContext
+        //   2. known_weakness  (G7, Agent E)   ← SECOND (populated separately)
+        //   3. skill_traces    (G-07, existing) ← THIRD
+        //
+        // This three-block order is also baked into
+        // `prompt.buildVolatileSystemPrompt`. Byte-stability across turns
+        // assumes the upstream sources update at session boundaries.
+        // Re-ordering these fields here without also updating the prompt
+        // builder is a SILENT cache-stability regression. Do not edit
+        // without updating both.
         const prompt_ctx = prompt.PromptContext{
             .workspace_dir = agent.workspace_dir,
             .model_name = agent.model_name,
@@ -655,6 +729,8 @@ pub const ContextEngine = struct {
             .sections = .{ .persona = persona_section },
             .memory_slot = if (ingest_out.memory_slot.fenced_content.len > 0) ingest_out.memory_slot.fenced_content else null,
             .working_memory_block = wm_block,
+            .recent_thoughts_block = if (recent_thoughts_block) |b| (if (b.len > 0) b else null) else null,
+            .known_weakness_block = null, // populated by Agent E G7 (bench_self.zig) in this same window.
             .skill_traces_block = if (skill_traces_block) |b| (if (b.len > 0) b else null) else null,
         };
 

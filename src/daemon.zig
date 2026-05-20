@@ -3884,6 +3884,19 @@ test "default heartbeat templates are treated as effectively empty" {
         \\# Add tasks below when you want the agent to check something periodically.
     ));
 
+    // v1.14.18-B G19 (DAEMON-PROMPT-HONESTY) — the legacy ZAKI BOT
+    // HEARTBEAT.md template suggested a category that promised features
+    // the agent does not deliver today (deferred to v1.14.19 sleep-cycle
+    // SC4 territory). §14.6 honest-config: prompts and shipped templates
+    // MUST NOT advertise features the agent does not actually deliver.
+    // The unsupported "nightly summaries" suggestion line was stripped
+    // from this fixture; the surrounding template content remains because
+    // `isDefaultHeartbeatTemplate` keys off the "# HEARTBEAT.md - " prefix
+    // + "Suggested categories:" + "Keep only tasks the user actually
+    // wants automated." markers (daemon.zig:577-583), none of which is
+    // the stripped line. When v1.14.19 sleep-cycle ships actual nightly
+    // summary support, re-introducing the suggestion is fine — it will
+    // then describe a real capability.
     try std.testing.expect(isHeartbeatContentEffectivelyEmpty(
         \\# HEARTBEAT.md - ZAKI BOT
         \\
@@ -3900,7 +3913,6 @@ test "default heartbeat templates are treated as effectively empty" {
         \\- inbox or message triage after integrations are connected
         \\- project status follow-ups
         \\- reminders before deadlines
-        \\- nightly summaries and next-step planning
         \\
         \\Keep only tasks the user actually wants automated.
     ));
