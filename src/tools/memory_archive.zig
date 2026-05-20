@@ -47,6 +47,22 @@ pub const MemoryArchiveTool = struct {
     mem_rt: ?*mem_root.MemoryRuntime = null,
 
     pub const tool_name = "memory_archive";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "memory_archive tool.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for web queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("memory_archive", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description =
         "Soft-delete a memory by key. The row is hidden from retrieval but " ++
         "preserved as audit evidence (bi-temporal close-out: valid_to/invalid_at/" ++

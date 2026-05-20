@@ -12,6 +12,22 @@ pub const ScreenshotTool = struct {
     workspace_dir: []const u8,
 
     pub const tool_name = "screenshot";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Capture a screenshot of the current screen. Returns [IMAGE:path] marker — include it verbatim in you",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for web queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("screenshot", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Capture a screenshot of the current screen. Returns [IMAGE:path] marker — include it verbatim in your response to send the image to the user.";
     pub const tool_params =
         \\{"type":"object","properties":{"filename":{"type":"string","description":"Optional filename (default: screenshot.png). Saved in workspace."}}}

@@ -61,7 +61,6 @@ pub const MemoryStoreTool = struct {
         @import("lint.zig").lintToolDescription("memory_store", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
     }
 
-
     pub const tool_description =
         "Store durable user facts, preferences, and decisions in long-term memory. " ++
         "Use category 'core' for stable facts, 'daily' for session notes, 'conversation' " ++

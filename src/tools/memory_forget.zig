@@ -13,6 +13,22 @@ pub const MemoryForgetTool = struct {
     mem_rt: ?*mem_root.MemoryRuntime = null,
 
     pub const tool_name = "memory_forget";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Remove a memory by key. Use to delete outdated facts or sensitive data.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for web queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("memory_forget", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Remove a memory by key. Use to delete outdated facts or sensitive data.";
     pub const tool_params =
         \\{"type":"object","properties":{"key":{"type":"string","description":"The key of the memory to forget"}},"required":["key"]}

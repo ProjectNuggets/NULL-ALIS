@@ -11,6 +11,21 @@ pub const CalculatorTool = struct {
     const MIN_FIXED_NOTATION_ABS: f64 = 0.000001;
 
     pub const tool_name = "calculator";
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Perform mathematical calculations and convert between number systems.",
+        .use_when = &.{
+            "scenario 1",
+            "scenario 2",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external data",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("calculator", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Perform mathematical calculations accurately. Supports arithmetic (add, subtract, multiply, divide, mod, pow, sqrt), logarithms (log, log_base, ln, exp), rounding (abs, floor, ceil, round), and statistics (average, median, variance as population variance, stdev_population, stdev_sample, min, max, count, percentile).";
     pub const tool_params =
         \\{"type":"object","properties":{"operation":{"type":"string","enum":["add","subtract","multiply","divide","mod","pow","sqrt","log","log_base","ln","exp","average","median","variance","stdev_population","stdev_sample","min","max","count","percentile","abs","floor","ceil","round"],"description":"Calculation operation to perform"},"values":{"type":"array","items":{"type":"number"},"description":"Numeric values for the calculation. For ordered operations use left-to-right input order; log_base expects [value, base]."},"percentile_rank":{"type":"integer","description":"Percentile rank 0-100, required for percentile operation"}},"required":["operation","values"]}

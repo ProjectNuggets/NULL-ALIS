@@ -14,6 +14,22 @@ pub const TaskListTool = struct {
     delivery: *TaskDelivery,
 
     pub const tool_name = "task_list";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "List spawned/detached tasks with optional status filter. Returns JSON array of task entries with id,",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for web queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("task_list", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "List spawned/detached tasks with optional status filter. Returns JSON array of task entries with id, description, status, timestamps.";
     pub const tool_params =
         \\{"type":"object","properties":{"status":{"type":"string","enum":["queued","running","succeeded","failed","timed_out","cancelled","lost"],"description":"Filter by task status"}}}

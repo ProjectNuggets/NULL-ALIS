@@ -13,6 +13,22 @@ pub const FileWriteTool = struct {
     allowed_paths: []const []const u8 = &.{},
 
     pub const tool_name = "file_write";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Write contents to a file in the workspace",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for web queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("file_write", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Write contents to a file in the workspace";
     pub const tool_params =
         \\{"type":"object","properties":{"path":{"type":"string","description":"Relative path to the file within the workspace"},"content":{"type":"string","description":"Content to write to the file"}},"required":["path","content"]}

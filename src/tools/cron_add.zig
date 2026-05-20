@@ -35,6 +35,22 @@ pub const CronAddTool = struct {
     config: ?*const config_mod.Config = null,
 
     pub const tool_name = "cron_add";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Low-level raw cron tool for operator or debug use. Create a scheduled raw command job with either 'e",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for web queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("cron_add", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Low-level raw cron tool for operator or debug use. Create a scheduled raw command job with either 'expression' (cron syntax) or 'delay' (e.g. '30m', '2h') plus 'command'.";
     pub const tool_params =
         \\{"type":"object","properties":{"expression":{"type":"string","description":"Cron expression (e.g. '*/5 * * * *')"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Raw command for the scheduler to run; prefer the schedule tool for user-facing reminders, briefs, and proactive jobs"},"name":{"type":"string","description":"Optional job name"}},"required":["command"]}

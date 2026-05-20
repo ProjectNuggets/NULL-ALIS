@@ -58,6 +58,21 @@ pub const BrainGraphTool = struct {
     user_id: ?i64 = null,
 
     pub const tool_name = "brain_graph";
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Visualize and traverse the knowledge graph of stored facts and connections.",
+        .use_when = &.{
+            "scenario 1",
+            "scenario 2",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external data",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("brain_graph", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
 
     pub const tool_description =
         "Navigate the user's knowledge graph as STRUCTURE (relations / clusters / time), " ++

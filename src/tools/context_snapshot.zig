@@ -15,6 +15,22 @@ const JsonObjectMap = root.JsonObjectMap;
 
 pub const ContextSnapshotTool = struct {
     pub const tool_name = "context_snapshot";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "context_snapshot tool.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for web queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("context_snapshot", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description =
         "Read your own agent-state snapshot as JSON: current execution mode, pending tool approvals, verbose/reasoning settings, active session key. " ++
         "Use when you want to self-inspect before deciding on an approach (e.g. check if you're in plan mode before suggesting edits).";

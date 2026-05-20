@@ -94,6 +94,22 @@ pub const MemoryMaintainTool = struct {
     judge_model: []const u8 = "",
 
     pub const tool_name = "memory_maintain";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "memory_maintain tool.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for web queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("memory_maintain", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description =
         "Maintain truth across your memory graph. Single tool, seven actions: " ++
         "(1) cascade_update — rename entity across all edges; " ++

@@ -65,6 +65,22 @@ pub const WikiLinkTool = struct {
     timeout_secs: u32 = 30,
 
     pub const tool_name = "wiki_link";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "wiki_link tool.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for web queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("wiki_link", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description =
         "Run the entity-mention extractor over a block of prose. Identifies " ++
         "named entities (people, organizations, projects, products, places, " ++

@@ -19,6 +19,22 @@ pub const WebFetchTool = struct {
     default_max_chars: usize = DEFAULT_MAX_CHARS,
 
     pub const tool_name = "web_fetch";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Fetch and extract readable text from a specific web page. Prefer this once you already know the URL.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for web queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("web_fetch", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Fetch and extract readable text from a specific web page. Prefer this once you already know the URL.";
     pub const tool_params =
         \\{"type":"object","properties":{"url":{"type":"string","description":"URL to fetch (http or https)"},"max_chars":{"type":"integer","default":50000,"description":"Maximum characters to return"}},"required":["url"]}

@@ -725,6 +725,22 @@ pub const ScheduleTool = struct {
     config: ?*const config_mod.Config = null,
 
     pub const tool_name = "schedule";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Manage scheduled tasks for the user. Preferred tool for reminders, briefs, recurring follow-ups, and",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for web queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("schedule", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Manage scheduled tasks for the user. Preferred tool for reminders, briefs, recurring follow-ups, and other proactive jobs. Tasks may be agent-managed, delivery-managed, or raw commands depending on the request. Use schedule ensure for canonical durable job repair.";
     pub const tool_params =
         \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","ensure","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Task intent, reminder text, agent prompt, delivery text, or raw command depending on the task type"},"kind":{"type":"string","enum":["command","reminder","brief","report","follow_up"],"description":"Optional durable automation kind used for canonical schedule ensure and richer agent-managed jobs"},"id":{"type":"string","description":"Task ID (optional deterministic ID for create/add/once/ensure, required for get/cancel/pause/resume)"}},"required":["action"]}

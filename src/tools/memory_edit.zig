@@ -12,6 +12,22 @@ pub const MemoryEditTool = struct {
     mem_rt: ?*mem_root.MemoryRuntime = null,
 
     pub const tool_name = "memory_edit";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Edit an existing mutable memory by key. Preserves the original category and scope.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for web queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("memory_edit", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Edit an existing mutable memory by key. Preserves the original category and scope.";
     pub const tool_params =
         \\{"type":"object","properties":{"key":{"type":"string","description":"Existing memory key to edit"},"content":{"type":"string","description":"Replacement memory content"}},"required":["key","content"]}

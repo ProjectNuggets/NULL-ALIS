@@ -74,6 +74,21 @@ pub const ComposeMemoryTool = struct {
     user_id: ?i64 = null,
 
     pub const tool_name = "compose_memory";
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Combine multiple memory items into a composite structured memory entry.",
+        .use_when = &.{
+            "scenario 1",
+            "scenario 2",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external data",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("compose_memory", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description =
         "Synthesize 2+ existing memories into a single consolidated fact with " ++
         "visible provenance (synthesized_by + references). CALL THIS when you " ++

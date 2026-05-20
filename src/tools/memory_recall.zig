@@ -68,7 +68,6 @@ pub const MemoryRecallTool = struct {
         @import("lint.zig").lintToolDescription("memory_recall", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
     }
 
-
     pub const tool_description = "Search canonical memory for relevant facts, preferences, or context. Defaults to the current session unless scope=global is provided.";
     pub const tool_params =
         \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in canonical memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"},"scope":{"type":"string","enum":["session","global"],"description":"Recall scope (default: session). Use global for durable or cross-session facts."},"session_id":{"type":"string","description":"Optional explicit session lane override"}},"required":["query"]}

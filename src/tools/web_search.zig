@@ -86,7 +86,6 @@ pub const WebSearchTool = struct {
         @import("lint.zig").lintToolDescription("web_search", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
     }
 
-
     pub const tool_description = "Search the open web for external facts. Prefer `http_request` for known APIs and `runtime_info` for local runtime truth.";
     pub const tool_params =
         \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Search query"},"count":{"type":"integer","minimum":1,"maximum":10,"default":5,"description":"Number of results (1-10)"}},"required":["query"]}

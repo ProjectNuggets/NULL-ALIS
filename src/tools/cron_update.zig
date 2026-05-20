@@ -35,6 +35,22 @@ pub const CronUpdateTool = struct {
     config: ?*const config_mod.Config = null,
 
     pub const tool_name = "cron_update";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Low-level raw cron operator tool. Update a raw scheduled job's expression, command, or enabled state",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for web queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("cron_update", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Low-level raw cron operator tool. Update a raw scheduled job's expression, command, or enabled state.";
     pub const tool_params =
         \\{"type":"object","properties":{"job_id":{"type":"string","description":"ID of the cron job to update"},"expression":{"type":"string","description":"New cron expression"},"command":{"type":"string","description":"New command to execute"},"enabled":{"type":"boolean","description":"Enable or disable the job"}},"required":["job_id"]}

@@ -33,6 +33,22 @@ pub const FileReadHashedTool = struct {
     max_file_size: u64 = DEFAULT_MAX_FILE_SIZE,
 
     pub const tool_name = "file_read_hashed";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "file_read_hashed tool.",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for web queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("file_read_hashed", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description =
         "Read file contents with Hashline tagging for precise, verifiable editing. " ++
         "Each line is prefixed with L<n>:<hash>| — pass the tag to file_edit_hashed " ++

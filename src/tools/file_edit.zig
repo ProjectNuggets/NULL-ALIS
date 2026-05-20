@@ -16,6 +16,22 @@ pub const FileEditTool = struct {
     max_file_size: usize = DEFAULT_MAX_FILE_SIZE,
 
     pub const tool_name = "file_edit";
+
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Find and replace text in a file",
+        .use_when = &.{
+            "first scenario",
+            "second scenario",
+        },
+        .do_not_use_for = &.{
+            "web_search — for web queries",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("file_edit", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Find and replace text in a file";
     pub const tool_params =
         \\{"type":"object","properties":{"path":{"type":"string","description":"Relative path to the file within the workspace"},"old_text":{"type":"string","description":"Text to find in the file"},"new_text":{"type":"string","description":"Replacement text"}},"required":["path","old_text","new_text"]}

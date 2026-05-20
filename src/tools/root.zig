@@ -2728,9 +2728,9 @@ test "defaultMetadataRegistry flags all validate" {
 test "defaultMetadataRegistry classifies known read-only tools" {
     const registry = defaultMetadataRegistry();
     const read_only = [_][]const u8{
-        "runtime_info",   "file_read",      "image_info",       "memory_recall",
-        "memory_list",    "memory_timeline", "cron_list",       "cron_runs",
-        "task_list",      "task_get",        "web_fetch",       "web_search",
+        "runtime_info", "file_read",       "image_info", "memory_recall",
+        "memory_list",  "memory_timeline", "cron_list",  "cron_runs",
+        "task_list",    "task_get",        "web_fetch",  "web_search",
         "screenshot",
     };
     for (read_only) |name| {
@@ -2751,12 +2751,12 @@ test "defaultMetadataRegistry classifies known mutating tools" {
     // tools still classify" test below.
     const registry = defaultMetadataRegistry();
     const mutating = [_][]const u8{
-        "shell",         "file_write",    "file_edit",     "file_append",
-        "git_operations", "memory_store", "memory_edit",   "memory_forget",
-        "schedule",      "message",
-        "pushover",      "cron_add",      "cron_remove",   "cron_update",
-        "cron_run",      "http_request",  "browser",       "browser_open",
-        "composio",      "skill_registry", "task_stop",
+        "shell",          "file_write",   "file_edit",   "file_append",
+        "git_operations", "memory_store", "memory_edit", "memory_forget",
+        "schedule",       "message",      "pushover",    "cron_add",
+        "cron_remove",    "cron_update",  "cron_run",    "http_request",
+        "browser",        "browser_open", "composio",    "skill_registry",
+        "task_stop",
     };
     for (mutating) |name| {
         const m = metadata.lookupMetadata(name, registry) orelse {
@@ -2790,10 +2790,10 @@ test "multiagent-gated tools (delegate, spawn) still classify as mutating + non-
 test "defaultMetadataRegistry only whitelists expected background_safe tools" {
     const registry = defaultMetadataRegistry();
     const background_safe_names = [_][]const u8{
-        "runtime_info",    "file_read",      "memory_recall",
-        "memory_list",     "memory_timeline", "transcript_read",
-        "web_fetch",       "web_search",     "task_list",
-        "task_get",        "set_execution_mode", "context_snapshot",
+        "runtime_info", "file_read",          "memory_recall",
+        "memory_list",  "memory_timeline",    "transcript_read",
+        "web_fetch",    "web_search",         "task_list",
+        "task_get",     "set_execution_mode", "context_snapshot",
     };
 
     // Everything in the whitelist must be background_safe.

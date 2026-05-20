@@ -13,6 +13,21 @@ pub const BrowserOpenTool = struct {
     allowed_domains: []const []const u8,
 
     pub const tool_name = "browser_open";
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Open URLs in the user's default web browser for viewing.",
+        .use_when = &.{
+            "scenario 1",
+            "scenario 2",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external data",
+            "memory_store — for persistence",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("browser_open", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
     pub const tool_description = "Open an approved HTTPS URL in the default browser. Only allowlisted domains are permitted.";
     pub const tool_params =
         \\{"type":"object","properties":{"url":{"type":"string","description":"HTTPS URL to open in browser"}},"required":["url"]}
