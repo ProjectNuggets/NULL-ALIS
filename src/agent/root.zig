@@ -2829,6 +2829,20 @@ pub const Agent = struct {
         defer ingest_out.deinit(self.allocator);
         turn_memory_enrich_ms = ingest_out.result.memory_enrich_ms;
 
+        // v1.14.18-A F3: Initialize goal-loop state from user message
+        const goal_text = try goal_loop.extractGoal(self.allocator, user_message);
+        defer self.allocator.free(goal_text);
+        self.active_goal_state = goal_loop.GoalState{
+            .goal_text = goal_text,
+            .iteration_count = 0,
+            .status = .in_progress,
+            .no_progress_count = 0,
+            .progress_notes = .empty,
+        };
+        defer {
+            self.active_goal_state = null;
+        } // clear at turn end
+
         // v1.14.14 Phase 4 — time the assemble phase so afterTurn() can
         // record per-phase durations into stability.json.
         const assemble_start_ms = std.time.milliTimestamp();
@@ -3654,6 +3668,24 @@ pub const Agent = struct {
 
             // Determine display text
             const display_text = if (parsed_text.len > 0) parsed_text else response_text;
+
+            // v1.14.18-A F3: Parse goal-loop reflection from LLM response
+            // Update active goal state before continuing with tool dispatch
+            var should_exit_goal_loop = false;
+            if (self.active_goal_state) |*goal_state| {
+                const goal_reflection_verdict = goal_loop.parseReflection(display_text);
+                goal_state.status = goal_reflection_verdict;
+                goal_state.iteration_count += 1;
+
+                // Mark exit if goal is met or stuck (will break after tool results processed)
+                if (goal_reflection_verdict == .met or goal_reflection_verdict == .stuck) {
+                    log.info("turn.goal_loop iteration={d} status={s} — will exit after tools", .{
+                        goal_state.iteration_count,
+                        @tagName(goal_reflection_verdict),
+                    });
+                    should_exit_goal_loop = true;
+                }
+            }
             if (parsed_calls.len > 0) {
                 turn_tool_iterations += 1;
                 turn_tool_calls_total += @intCast(@min(parsed_calls.len, std.math.maxInt(u32)));
@@ -4337,6 +4369,12 @@ pub const Agent = struct {
                 .run_id = self.current_run_id,
             } };
             self.observer.recordEvent(&compact_stage_event);
+
+            // v1.14.18-A F3: Exit goal loop if goal is met or stuck
+            if (should_exit_goal_loop) {
+                log.info("turn.goal_loop exiting loop at iteration={d}", .{iteration});
+                break;
+            }
 
             // Free provider response fields now that all borrows are consumed.
             self.freeResponseFields(&response);

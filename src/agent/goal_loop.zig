@@ -100,9 +100,9 @@ pub fn parseReflection(reflection_text: []const u8) GoalStatus {
     return .in_progress;
 }
 
-/// SkillExecution minimal type for context building.
+/// ToolInvocation minimal type for context building.
 /// (Full definition in memory/root.zig; this is the subset we need.)
-pub const SkillExecution = struct {
+pub const ToolInvocation = struct {
     tool_name: []const u8,
     input: []const u8,
     output: []const u8,
@@ -116,7 +116,7 @@ pub const SkillExecution = struct {
 /// </prior_attempts>
 pub fn buildSkillTraceContext(
     allocator: std.mem.Allocator,
-    traces: []const SkillExecution,
+    traces: []const ToolInvocation,
     goal_text: []const u8,
 ) ![]const u8 {
     if (traces.len == 0) {
@@ -203,7 +203,7 @@ test "parseReflection defaults to in_progress when status missing" {
 
 test "buildSkillTraceContext formats traces with goal shape" {
     const allocator = std.testing.allocator;
-    var traces: [2]SkillExecution = .{
+    var traces: [2]ToolInvocation = .{
         .{ .tool_name = "file_read", .input = "config.json", .output = "json content" },
         .{ .tool_name = "grep", .input = "error", .output = "error found at line 42" },
     };

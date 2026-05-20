@@ -1,3 +1,30 @@
+//! V1.13 Day 4.2 — Procedural memory render + capture orchestrator.
+//!
+//! Layer 6 of the brain: skill execution traces. Maintains the session's
+//! SkillExecution table (postgres skill_executions), which logs every tool-call
+//! burst as a discrete skill execution with its tool manifest + outcome_quality
+//! score. The capture gate fires when total tool calls across a session exceed
+//! CAPTURE_TOOL_THRESHOLD, producing one SkillExecution record per capture.
+//!
+//! Used by Agent's turnOutcome to record procedural memory at
+//! session-end (turn ~N when capture fires). If skill_executions.outcome_quality
+//! is null or 0, memory eviction (v1.14.19 SC1) treats the record as low-value.
+//! Non-null outcome_quality enables proportional scoring in memory ranking:
+//! higher scores → longer retention; lower scores → earlier eviction.
+//!
+//! v1.14.18-A F3 update: outcome_quality is now driven by goal_loop.GoalStatus
+//! when available (met=0.9, stuck=0.3, max_iterations=0.4, in_progress=0.5).
+//! Falls back to tool-count heuristic when goal_status is null. The capture gate
+//! in commands.zig:1576-1605 was rewritten to track session-wide tool count
+//! (was last_turn_tool_count, which left skill_executions empty in production —
+//! postgres confirmed 0 rows before fix; root cause: per-turn tracking never
+//! accumulated to threshold when tools distributed across turns, e.g., 2/3/1/4
+//! pattern).
+//!
+//! Future refinement (Day 4.3): detect specific skill archetypes (e.g., "web search → summarize",
+//! "code review → refactor proposal") and label skill_name granularly instead of
+//! GENERIC_SKILL_NAME. Requires input/output summarization to extract the skill shape.
+
 const std = @import("std");
 const log = std.log.scoped(.procedural_memory);
 
