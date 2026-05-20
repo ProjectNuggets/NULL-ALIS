@@ -299,6 +299,13 @@ pub const NarrationObserver = struct {
     /// v1.14.18-B G3 — current tool-iteration the agent is on. Stamped
     /// onto pushed frames so `<recent_thoughts>` lines carry their origin
     /// iteration. The owning Agent bumps this between iterations.
+    ///
+    /// **Session-monotonic:** mirrors `Agent.iteration_counter`, which is
+    /// bumped per ReAct iteration and is NOT reset per turn. Turn-2
+    /// iterations therefore display continued numbers (e.g. iter=17, 18,
+    /// ... after turn 1 ended at iter=16). See the field doc on
+    /// `Agent.iteration_counter` in `src/agent/root.zig` for the
+    /// definitive wording.
     current_iteration: u32 = 0,
 
     const vtable = Observer.VTable{

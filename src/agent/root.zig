@@ -652,6 +652,13 @@ pub const Agent = struct {
     /// for. Stamped onto each pushed narration frame so the
     /// `<recent_thoughts>` block carries historical iteration numbers,
     /// not the current one. Bumped by `turnOutcome` between iterations.
+    ///
+    /// **Session-monotonic:** NOT reset per turn. Turn 2 may start at
+    /// iter=17 (resuming from turn 1's final iteration count + 1).
+    /// `<recent_thoughts iteration="N">` therefore displays session-wide
+    /// counts. The `+%=` bump on `u32` is wrapping (per Zig semantics);
+    /// at one iteration per ReAct step this wraps after ~4 billion
+    /// iterations, so wrap is not a practical concern.
     iteration_counter: u32 = 0,
 
     /// **D1.8** — count of `durable_fact/behavior/*` entries this session
@@ -2746,8 +2753,12 @@ pub const Agent = struct {
         // Agent's persistent narration ring buffer so emitted frames flow
         // into recall. The buffer is Agent-owned (initialized in
         // `fromConfig`) so it survives the per-turn wrapper. We seed
-        // `current_iteration` to 0 here and bump it per ReAct iteration
-        // below (search "iteration_counter +=" in this function).
+        // `current_iteration` from `self.iteration_counter` here, which is
+        // session-monotonic (NOT reset per turn) — so turn 2 may start at
+        // iter=17, turn 3 at iter=33, etc. `<recent_thoughts iteration="N">`
+        // therefore displays session-wide counts. The counter is bumped
+        // per ReAct iteration below (search "iteration_counter +%=" in
+        // this function).
         const base_observer = self.observer;
         var narration_observer = narration.NarrationObserver{
             .inner = base_observer,
