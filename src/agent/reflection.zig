@@ -25,11 +25,23 @@ pub const ReflectionTrail = struct {
         goal_status: []const u8,
         learning: []const u8,
     ) !void {
+        // v1.14.18-B G5 coordinator review fix (2026-05-20): dupe into locals
+        // with errdefer BEFORE the entries.append. The prior form evaluated all
+        // three dupes inside the struct literal, then called entries.append — if
+        // that append OOM'd (ArrayList growth failure), the three already-
+        // allocated dupes leaked with no owner. errdefer chains each dupe so a
+        // failure anywhere unwinds cleanly.
+        const tool_copy: ?[]const u8 = if (tool_name) |t| try allocator.dupe(u8, t) else null;
+        errdefer if (tool_copy) |t| allocator.free(t);
+        const status_copy = try allocator.dupe(u8, goal_status);
+        errdefer allocator.free(status_copy);
+        const learning_copy = try allocator.dupe(u8, learning);
+        errdefer allocator.free(learning_copy);
         try self.entries.append(allocator, .{
             .iteration = iteration,
-            .tool_name = if (tool_name) |t| try allocator.dupe(u8, t) else null,
-            .goal_status = try allocator.dupe(u8, goal_status),
-            .learning = try allocator.dupe(u8, learning),
+            .tool_name = tool_copy,
+            .goal_status = status_copy,
+            .learning = learning_copy,
         });
     }
 
@@ -47,16 +59,24 @@ pub const ReflectionTrail = struct {
             try w.writeAll("{\"iteration\":");
             try w.print("{d}", .{entry.iteration});
 
+            // v1.14.18-B G5 coordinator review fix (2026-05-20): JSON-escape
+            // every string value. tool_name/goal_status are controlled tokens,
+            // but `learning` is model-authored free text — a reflection
+            // containing a `"`, `\`, or newline produced malformed JSON, which
+            // either fails the skill_executions JSONB insert (capture silently
+            // lost) or breaks the v1.14.19 SC1 consolidation parser. std.json.fmt
+            // emits a properly-escaped JSON string literal incl. surrounding
+            // quotes — same idiom as procedural_memory.zig's steps_executed build.
             if (entry.tool_name) |tool| {
                 try w.writeAll(",\"tool\":");
-                try w.print("\"{s}\"", .{tool});
+                try w.print("{f}", .{std.json.fmt(tool, .{})});
             }
 
             try w.writeAll(",\"status\":");
-            try w.print("\"{s}\"", .{entry.goal_status});
+            try w.print("{f}", .{std.json.fmt(entry.goal_status, .{})});
 
             try w.writeAll(",\"learning\":");
-            try w.print("\"{s}\"", .{entry.learning});
+            try w.print("{f}", .{std.json.fmt(entry.learning, .{})});
 
             try w.writeAll("}");
         }
@@ -137,4 +157,33 @@ test "ReflectionTrail entry without tool_name serializes" {
 
     // Should not have "tool" key if tool_name is null
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tool\"") == null);
+}
+
+test "ReflectionTrail serialize escapes special chars in model-authored learning" {
+    // v1.14.18-B G5 coordinator review fix (2026-05-20): `learning` is
+    // model-authored free text. A reflection containing a double-quote,
+    // backslash, or newline must serialize to VALID JSON — the prior raw
+    // "{s}" interpolation produced malformed JSON that broke the
+    // skill_executions JSONB insert. This test locks the std.json.fmt fix.
+    const allocator = std.testing.allocator;
+    var trail = ReflectionTrail{ .goal_text = "Goal" };
+    defer trail.deinit(allocator);
+
+    // The user said "no" — a quote in the middle of model free text.
+    try trail.append(allocator, 0, "memory_recall", "stuck", "User said \"no\" and\nthen left; path C:\\tmp failed");
+
+    const json = try trail.serialize(allocator);
+    defer allocator.free(json);
+
+    // The raw double-quote must be escaped — a bare `"no"` would break JSON.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\\"no\\\"") != null);
+    // Newline and backslash escaped.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\\\") != null);
+
+    // Definitive check: the output must parse as valid JSON.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .array);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
 }
