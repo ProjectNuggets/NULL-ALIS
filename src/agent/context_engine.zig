@@ -12,7 +12,6 @@
 const std = @import("std");
 const context_builder = @import("context_builder.zig");
 const context_cache = @import("context_cache.zig");
-const compaction = @import("compaction.zig");
 const working_memory = @import("working_memory.zig");
 const observability = @import("../observability.zig");
 const Config = @import("../config.zig").Config;
@@ -20,6 +19,12 @@ const capabilities_mod = @import("../capabilities.zig");
 const prompt = @import("prompt.zig");
 const dispatcher = @import("dispatcher.zig");
 const procedural_memory = @import("procedural_memory.zig");
+// v1.14.14 Phase 3 originally added `const compaction = @import("compaction.zig");`
+// here, but the new `compact`/`forceCompact` methods reach compaction via the
+// agent's own `autoCompactHistory`/`forceCompressHistory` rather than calling
+// `compaction.*` directly — so the import had no code references (only a
+// comment mention). Removed in the self-review pass; the comment-only
+// reference is documentation and doesn't need the module bound.
 
 // v1.14.14 Phase 1: scope `.agent` preserves the operator-grep contract for
 // `turn.stage stage=memory_enrich`, `recall.metrics`, `recall.zero_candidates`,
@@ -175,12 +180,27 @@ pub const StabilityRecord = struct {
 /// stability emission is best-effort diagnostic, not a turn-blocking
 /// dependency. The operator is responsible for ensuring the parent
 /// directory exists (the helper does not call makePath).
+///
+/// Self-review fix (post-Phase-5): the pre-fix path opened the file without
+/// a lock, then did `seekFromEnd(0)` + `writeAll(line)` as TWO separate
+/// syscalls. Two concurrent writers (different sessions in the same gateway
+/// process, or two processes both pointed at the same file) would each
+/// seekFromEnd to position N before either's write completed → both write
+/// at offset N → second overwrites first → silent JSONL corruption.
+/// Bench-only sequential use was safe; multi-tenant / future-parallel use
+/// would race. Acquiring `.lock = .exclusive` at open serializes writers
+/// across processes on macOS/Linux (the lock is taken atomically with the
+/// file descriptor). The lock releases on `close()`. Serialization is fine
+/// here because stability emission is off-the-hot-path and env-gated.
 pub fn writeStabilityJsonl(allocator: std.mem.Allocator, record: StabilityRecord) void {
     const env_path = std.process.getEnvVarOwned(allocator, "NULLALIS_STABILITY_JSON_PATH") catch return;
     defer allocator.free(env_path);
     if (env_path.len == 0) return;
 
-    var buf: [512]u8 = undefined;
+    // Buffer sized for the JSON skeleton (~270 chars) + a generous session
+    // identifier. Production session keys are bounded by the prefix +
+    // user-id + thread-id structure; ~256 is the conservative ceiling.
+    var buf: [1024]u8 = undefined;
     const line = std.fmt.bufPrint(
         &buf,
         "{{\"turn_start_ms\":{d},\"ingest_ms\":{d},\"assemble_ms\":{d},\"compact_ms\":{d},\"after_turn_ms\":{d},\"total_turn_ms\":{d},\"stable_prefix_hash\":\"{x}\",\"stable_prefix_bytes\":{d},\"session\":\"{s}\"}}\n",
@@ -197,7 +217,11 @@ pub fn writeStabilityJsonl(allocator: std.mem.Allocator, record: StabilityRecord
         },
     ) catch return;
 
-    const file = std.fs.cwd().createFile(env_path, .{ .truncate = false, .read = false }) catch return;
+    const file = std.fs.cwd().createFile(env_path, .{
+        .truncate = false,
+        .read = false,
+        .lock = .exclusive,
+    }) catch return;
     defer file.close();
     file.seekFromEnd(0) catch return;
     _ = file.writeAll(line) catch return;

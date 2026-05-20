@@ -2832,6 +2832,27 @@ pub const Agent = struct {
         // Emits the JSONL stability record to NULLALIS_STABILITY_JSON_PATH
         // (env-gated; no-op by default). Failures are silent — the snapshot
         // is best-effort diagnostic, never a turn blocker.
+        //
+        // Honest contract about the synthesized CompactResult below:
+        //   - `messages_before = 0` is a SENTINEL, not a true count. Per-site
+        //     accurate message_before/after pairs already flow to
+        //     `self.last_turn_context` via `recordAutoCompaction` /
+        //     `recordForceCompression` inside `ContextEngine.compact` /
+        //     `forceCompact`. The defer-time synthesis exists only to feed
+        //     `writeStabilityJsonl` (which reads `assemble_result` +
+        //     `durations` + `turn_start_ms`, NOT the CompactResult).
+        //   - The `_ = ...afterTurn(...)` discards the returned
+        //     `TurnContextResult`. Its `last_turn` field would be wrong if
+        //     a future caller read it (auto_compacted_messages would compute
+        //     against messages_before=0). Leave alone for now; document so
+        //     a future activation of the return value knows to pipe accurate
+        //     per-site counts through.
+        //   - `compact_method` is the LAST-WIN classification when both auto
+        //     and force-compress fired in the same turn (rare: only when the
+        //     provider returned context-exhausted mid-turn and a subsequent
+        //     auto-compact also succeeded). Reports `.force_compress` in that
+        //     case — operator dashboards still see "compaction happened," just
+        //     not the multiplicity. Honest enough for a diagnostic surface.
         defer {
             const compact_method: context_engine.CompactResult.CompactMethod = if (!self.last_turn_compacted)
                 .none
@@ -2846,7 +2867,7 @@ pub const Agent = struct {
                 .{
                     .compacted = self.last_turn_compacted,
                     .method = compact_method,
-                    .messages_before = 0,
+                    .messages_before = 0, // sentinel — see contract comment above
                     .messages_after = self.history.items.len,
                 },
                 .{
@@ -2858,7 +2879,6 @@ pub const Agent = struct {
                 self.memory_session_id orelse "none",
             );
         }
-
 
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
         if (self.auto_save) {
