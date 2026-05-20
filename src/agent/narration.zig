@@ -60,6 +60,23 @@ pub const RecordedFrame = struct {
 /// oldest→newest order for prompt injection.
 pub const RING_BUFFER_CAPACITY: usize = 16;
 
+/// v1.14.18-B G3 — thread-safe ring buffer of recent narration frames.
+///
+/// **Thread-safety:** `push`, `last`, and `deinit` are mutex-guarded. Safe
+/// to call from any thread. The host `NarrationObserver` is reached from
+/// worker threads via `tools_mod.setToolObserver(...)` in
+/// `src/agent/root.zig` (parallel tool dispatch path), so any future
+/// worker-emitted event variant that lands in `emitFrame` immediately
+/// becomes a concurrent push. The mutex makes that safe by construction
+/// instead of by calling-convention discipline.
+///
+/// **Borrow contract for `last()`:** the returned slice borrows
+/// ring-buffer-owned strings. The caller must finish reading the inner
+/// `message`/`tool_name` slices BEFORE the next `push` (or deep-copy
+/// them if they need to be held across a yield point or a thread
+/// boundary). The mutex only protects the buffer's metadata + slot array
+/// during the read; once `last` returns, the lock is dropped and a
+/// subsequent push can recycle the slot the returned frames pointed at.
 pub const NarrationRingBuffer = struct {
     frames: [RING_BUFFER_CAPACITY]RecordedFrame = undefined,
     /// Number of valid frames currently stored (0..RING_BUFFER_CAPACITY).
@@ -68,12 +85,18 @@ pub const NarrationRingBuffer = struct {
     head: usize = 0,
     /// Allocator used to dup message strings on push.
     allocator: std.mem.Allocator,
+    /// v1.14.18-B G3 — guards `frames`/`len`/`head` against concurrent
+    /// push/last calls from worker threads (parallel tool dispatch path).
+    /// Uncontended in the common case; the cost is one atomic per frame.
+    mutex: std.Thread.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator) NarrationRingBuffer {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *NarrationRingBuffer) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var idx: usize = 0;
         while (idx < self.len) : (idx += 1) {
             self.frames[idx].deinit(self.allocator);
@@ -84,6 +107,7 @@ pub const NarrationRingBuffer = struct {
 
     /// Push a frame. Dupes message + tool_name; on OOM the frame is silently
     /// dropped (narration is observability — never crashes the agent).
+    /// Thread-safe via internal mutex.
     pub fn push(self: *NarrationRingBuffer, frame: NarrationFrame, iteration: u32) void {
         const msg = self.allocator.dupe(u8, frame.message) catch return;
         const tool_owned: ?[]u8 = if (frame.tool_name) |t|
@@ -102,6 +126,9 @@ pub const NarrationRingBuffer = struct {
             .unix_ms = std.time.milliTimestamp(),
         };
 
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (self.len < RING_BUFFER_CAPACITY) {
             self.frames[self.len] = recorded;
             self.len += 1;
@@ -118,11 +145,17 @@ pub const NarrationRingBuffer = struct {
     /// is allocated by `out_allocator` and references frames whose contents
     /// remain owned by the ring buffer (do NOT free the inner strings).
     /// Caller must free the returned slice (not its contents).
+    ///
+    /// Thread-safe via internal mutex. See `NarrationRingBuffer` doc-comment
+    /// for the borrow contract on the returned slice.
     pub fn last(
-        self: *const NarrationRingBuffer,
+        self: *NarrationRingBuffer,
         out_allocator: std.mem.Allocator,
         n: usize,
     ) ![]RecordedFrame {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (self.len == 0 or n == 0) return out_allocator.alloc(RecordedFrame, 0);
         const take = @min(n, self.len);
 
@@ -158,8 +191,13 @@ pub const NarrationRingBuffer = struct {
 ///
 /// Wired into `context_engine.assemble` so the agent sees its own recent
 /// thinking as feedback in the next iteration's `<recent_thoughts>` block.
+///
+/// Takes a mutable pointer because the underlying `last()` locks the
+/// buffer's mutex (thread-safety per `NarrationRingBuffer` doc). The
+/// caller-visible semantics are read-only — the buffer's contents are
+/// not mutated — but the mutex acquisition requires the non-const handle.
 pub fn recallRecent(
-    buffer_opt: ?*const NarrationRingBuffer,
+    buffer_opt: ?*NarrationRingBuffer,
     out_allocator: std.mem.Allocator,
     n: usize,
 ) ![]RecordedFrame {

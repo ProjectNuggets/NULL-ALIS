@@ -664,8 +664,8 @@ pub const ContextEngine = struct {
         // stamped at push time so the block renders the historical iter
         // numbers, not the current one.
         const recent_thoughts_block: ?[]u8 = blk: {
-            const rb_ptr: ?*const narration.NarrationRingBuffer = if (@hasField(@TypeOf(agent.*), "narration_ring_buffer"))
-                @as(?*const narration.NarrationRingBuffer, &agent.narration_ring_buffer)
+            const rb_ptr: ?*narration.NarrationRingBuffer = if (@hasField(@TypeOf(agent.*), "narration_ring_buffer"))
+                @as(?*narration.NarrationRingBuffer, &agent.narration_ring_buffer)
             else
                 null;
             const frames = narration.recallRecent(rb_ptr, allocator, 3) catch |err| {
