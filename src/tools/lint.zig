@@ -108,7 +108,7 @@ pub fn toolExists(name: []const u8, registry: []const []const u8) bool {
 pub fn renderLen(desc: metadata.ToolDescription) usize {
     var buf: [4096]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    desc.render(fbs.writer()) catch return 0;
+    desc.render(fbs.writer().any()) catch return 0;
     return fbs.pos;
 }
 

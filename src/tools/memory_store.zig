@@ -37,6 +37,31 @@ pub const MemoryStoreTool = struct {
     coref_embed: ?@import("../memory/vector/embeddings.zig").EmbeddingProvider = null,
 
     pub const tool_name = "memory_store";
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Store durable user facts, preferences, and decisions in long-term memory.",
+        .use_when = &.{
+            "Recording new user preferences or facts that should persist across sessions",
+            "Storing structured facts with subject/predicate/object for knowledge graph linkage",
+            "Capturing important context from conversation for future recall",
+        },
+        .do_not_use_for = &.{
+            "memory_recall — for fact retrieval instead",
+            "todo — for short-lived transient decisions",
+            "set_execution_mode — confirm scope",
+        },
+        .cost_note = "No API cost; local write to memory backend.",
+        .completion_hint = "Returns success with stored memory ID.",
+        .see_also = &.{
+            "memory_recall — retrieve stored facts and preferences",
+            "memory_timeline — view fact change history",
+        },
+    };
+    // Comptime validation of tool_description_struct
+    comptime {
+        @import("lint.zig").lintToolDescription("memory_store", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
+
+
     pub const tool_description =
         "Store durable user facts, preferences, and decisions in long-term memory. " ++
         "Use category 'core' for stable facts, 'daily' for session notes, 'conversation' " ++
