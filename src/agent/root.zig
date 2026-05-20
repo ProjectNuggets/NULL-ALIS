@@ -643,8 +643,10 @@ pub const Agent = struct {
     /// (tests) should call `initNarrationRingBuffer(self.allocator)` after
     /// the Agent struct is fully wired but BEFORE any turn fires. The
     /// default below uses a sentinel `failing_allocator` so any missed
-    /// initialization surfaces loudly via a leak rather than silently
-    /// writing into an unrelated allocator's arena.
+    /// initialization surfaces loudly — `push` logs a warn ("did you
+    /// forget to call NarrationRingBuffer.init?") on every dupe failure,
+    /// which fires for every frame against the sentinel. See
+    /// `narration.NarrationRingBuffer.push` for the loud-failure rationale.
     narration_ring_buffer: narration.NarrationRingBuffer = .{ .allocator = std.testing.failing_allocator },
     /// v1.14.18-B G3 — current tool iteration the agent is preparing
     /// for. Stamped onto each pushed narration frame so the

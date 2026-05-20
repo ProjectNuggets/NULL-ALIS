@@ -105,14 +105,30 @@ pub const NarrationRingBuffer = struct {
         self.head = 0;
     }
 
-    /// Push a frame. Dupes message + tool_name; on OOM the frame is silently
-    /// dropped (narration is observability — never crashes the agent).
+    /// Push a frame. Dupes message + tool_name; on dupe failure the frame
+    /// is dropped and a warn is logged (narration is observability —
+    /// never crashes the agent). The warn is critical for spotting an
+    /// uninitialized buffer (e.g. test fixture that forgot to call
+    /// `NarrationRingBuffer.init` and left the `failing_allocator`
+    /// sentinel from the struct default — see `Agent.narration_ring_buffer`
+    /// in `src/agent/root.zig`). Without the warn, missed init silently
+    /// drops every frame and tests pass with empty recall blocks.
     /// Thread-safe via internal mutex.
     pub fn push(self: *NarrationRingBuffer, frame: NarrationFrame, iteration: u32) void {
-        const msg = self.allocator.dupe(u8, frame.message) catch return;
+        const msg = self.allocator.dupe(u8, frame.message) catch {
+            std.log.warn(
+                "narration: dropped frame (allocator OOM or uninitialized: did you forget to call NarrationRingBuffer.init?)",
+                .{},
+            );
+            return;
+        };
         const tool_owned: ?[]u8 = if (frame.tool_name) |t|
             (self.allocator.dupe(u8, t) catch {
                 self.allocator.free(msg);
+                std.log.warn(
+                    "narration: dropped frame (allocator OOM or uninitialized: did you forget to call NarrationRingBuffer.init?)",
+                    .{},
+                );
                 return;
             })
         else
