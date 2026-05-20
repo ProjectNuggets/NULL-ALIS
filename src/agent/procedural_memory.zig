@@ -1,23 +1,3 @@
-//! V1.13 Day 4.2 — Procedural memory render + capture orchestrator.
-//!
-//! Layer 6 of the brain: skill execution traces. Captures the tool
-//! sequence + outcome of a turn so future invocations can recall what
-//! worked, what was assumed, what to do differently.
-//!
-//! Day 4.1 shipped the schema + CRUD (zaki_state.zig::insertSkillExecution
-//! + listRecentSkillExecutions). Day 4.2 (this module) wires:
-//!   - Capture: persisted from agent/commands.zig session-end, when the
-//!     session had ≥5 total tool calls
-//!   - Recall: rendered into the volatile prompt block as
-//!     <recent_skill_traces> so the agent sees prior execution context
-//!
-//! Skills today aren't single tool invocations — they're patterns of
-//! tool calls (the agent reads SKILL.md and follows its pattern). So
-//! capture is coarse-grained: ONE SkillExecution per multi-tool session,
-//! tagged with the user's most-recent message as task_summary. Future
-//! refinement (post-V1.13) can detect specific skill invocations via
-//! skill_registry tool calls and capture per-skill.
-
 const std = @import("std");
 const log = std.log.scoped(.procedural_memory);
 
@@ -25,6 +5,8 @@ const memory_root = @import("../memory/root.zig");
 const SkillExecution = memory_root.SkillExecution;
 const zaki_state = @import("../zaki_state.zig");
 const text_norm = @import("../memory/text_norm.zig");
+
+const goal_loop = @import("goal_loop.zig");
 
 /// Max recent skill traces to render in the prompt block. 3 gives the
 /// agent context without bloating the volatile section.
@@ -127,6 +109,7 @@ pub fn captureSession(
     task_summary: ?[]const u8,
     tool_call_names: []const []const u8,
     total_tool_calls: u32,
+    goal_status: ?goal_loop.GoalStatus,
 ) ?i64 {
     if (total_tool_calls < CAPTURE_TOOL_THRESHOLD) return null;
 
@@ -143,7 +126,12 @@ pub fn captureSession(
 
     // Heuristic outcome_quality: more tool calls usually = more
     // substantive task. Cap at 0.85 (initial; refined by feedback).
-    const oq: f64 = std.math.clamp(@as(f64, @floatFromInt(total_tool_calls)) / 20.0, 0.5, 0.85);
+    const oq: f64 = if (goal_status) |gs| switch (gs) {
+        .met => 0.9,
+        .stuck => 0.3,
+        .max_iterations => 0.4,
+        .in_progress => 0.5,
+    } else std.math.clamp(@as(f64, @floatFromInt(total_tool_calls)) / 20.0, 0.5, 0.85);
 
     const id = state_mgr.insertSkillExecution(
         user_id,

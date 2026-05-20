@@ -41,6 +41,7 @@ const ExecutionMode = execution_mode_mod.ExecutionMode;
 const tool_metadata = @import("../tools/metadata.zig");
 const abort_mod = @import("abort.zig");
 const CancellationToken = abort_mod.CancellationToken;
+const goal_loop = @import("goal_loop.zig");
 
 const cache = memory_mod.cache;
 pub const abort = @import("abort.zig");
@@ -620,6 +621,14 @@ pub const Agent = struct {
     turns_since_extraction: u32 = 0,
     /// Tool calls in the last completed turn (for skills auto-extraction).
     last_turn_tool_count: u32 = 0,
+    /// v1.14.18-A F3 — session-wide tool count for procedural-memory capture gate.
+    /// Accumulates across ALL turns of a session; read + reset at session-end.
+    /// Replaces the last_turn-only signal that left skill_executions empty.
+    session_total_tool_count: u32 = 0,
+    /// v1.14.18-A F3 — session-wide tool-name manifest for the capture trace.
+    session_tool_names: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// v1.14.18-A F3 — per-turn goal state for ReAct reflection loop.
+    active_goal_state: ?goal_loop.GoalState = null,
 
     /// **D1.8** — count of `durable_fact/behavior/*` entries this session
     /// has stored. Replaces the prior pattern (`mem.list` + filter scan
@@ -2737,6 +2746,7 @@ pub const Agent = struct {
         var turn_tool_iterations: u32 = 0;
         var turn_memory_enrich_ms: u64 = 0;
         var turn_compaction_ms: u64 = 0;
+        defer self.session_total_tool_count +%= turn_tool_calls_total; // v1.14.18-A F3
         var turn_first_token_ms: ?u64 = null;
         var turn_first_token_upper_bound_ms: ?u64 = null;
         var active_task_plan: ?task_planner.TaskPlan = null;
