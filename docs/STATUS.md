@@ -2,22 +2,61 @@
 tags: [prose, prose/docs]
 ---
 
-# nullalis Status Snapshot — 2026-05-19 (PM update)
+# nullalis Status Snapshot — 2026-05-20 (PM update — post v1.14.14.1 + v1.14.18-A F1/F2)
 
 Cold-readable operational truth source. Updated when waves close, not during.
 Last archive: `docs/archive/status-2026-03-06.md`.
 
-**Active roadmap:** [`docs/ROADMAP.md`](ROADMAP.md). Active sprint: **v1.14.13** (τ-bench baseline + wire what's built) — IN FLIGHT.
-**Active standards:** [`AGENTS.md`](../AGENTS.md) §14 (Nullalis-grade Swiss-watch).
+**Active roadmap:** [`docs/ROADMAP.md`](ROADMAP.md). Latest tag: **v1.14.14**. Active sprint: **v1.14.18-A** — Findings 1 + 2 MERGED, Finding 3 (GOAL-LOOP) in CI-rework on PR #82.
+**Active standards:** [`AGENTS.md`](../AGENTS.md) §14 (Nullalis-grade Swiss-watch) + §14.10 (Post-sprint Activation Audit Discipline).
 **Dispatch:** [`docs/MULTI_AGENT_PLAN.md`](MULTI_AGENT_PLAN.md) — which agent owns which sub-task.
 
-## Branch state (post v1.14.12 land)
+## Branch state (post v1.14.18-A Finding 1 + 2 land)
 
-- **Tag:** `v1.14.12` at `11c81e4b` (the memory-audit closure commit).
-- **PR #72 MERGED:** [closed](https://github.com/ProjectNuggets/NULL-ALIS/pull/72) — `e1df8562` is the merge commit on `main`. Includes the reconcile-merge with main's `d6b3221e` and the `fix(merge): judge-fallback overreach correction`.
-- **Active sprint branch:** `sprint/v1.14.13` — rebased onto new main, 4 docs/audit-ledger commits ahead.
-- **Build status:** `zig build` clean. `zig build test --summary all` exit 0. Canonical-profile test exit 0 (`-Dengines=base,sqlite,postgres -Dchannels=cli,telegram`). CI green on `release/v1.14.12-memory-audit` (5/5 jobs success, V-infinity battery skipped by design).
-- **MaxRSS:** 61M, above the AGENTS.md <50 MB budget; tracked in ROADMAP v1.14.13 B13.
+- **Tag:** `v1.14.14` at `9cfa6b37` (ContextEngine 4-phase migration + stability-JSONL drift CI gate).
+- **Main HEAD:** `a64aa262` carrying all merged work below.
+- **Recently merged PRs (2026-05-20 wave):**
+  - **#78** v1.14.14 ContextEngine migration (Agent G) — merged `9cfa6b37`
+  - **#79** discipline-install: v1.14.14 activation audit + v1.14.18-B/v1.14.19 ROADMAP + AGENTS.md §14.10 — merged `400008a5`
+  - **#80** v1.14.14.1 context-engineering polish (5 findings: WM-importance drop + tail-surface + compact aggregate + sentinel resolve + canary runbook) — merged `01c3a99c`
+  - **#81** v1.14.18-A Finding 2 — TOOL-DESC-AUDIT (52 tools to ToolDescription struct + comptime lint) — merged `40716334`
+  - **#83** v1.14.18-A Finding 1 — MODE-UNIFICATION (delete preset machinery + bump max_tool_iter 25→500 + §14.5 orphan cleanup) — merged `95f82aa3`
+  - **#84** chore(fmt): zig fmt src/ — clean 11 pre-existing fmt issues — merged `a64aa262`
+- **In-flight PR:** **#82** v1.14.18-A Finding 3 — GOAL-LOOP + procedural memory activation — BLOCKED on §14.10 audit catches (3 rounds of half-wires; coordinator-corrected dispatch + memory-ownership fix in progress).
+- **Build status:** `zig build` clean. Canonical-profile test exit 0 on main. Per-finding bench gate paused per §14.10 until v1.14.18-A + v1.14.18-B + v1.14.19 all land (real behavioral attribution).
+- **MaxRSS:** 62M (Agent E B13 deferred remediation; tracked in `docs/deferred-register.md`).
+
+## 2026-05-20 sprint state — what's now live on main
+
+**Behavioral additions on production code path:**
+- 52 agent-facing tools migrated to structured `ToolDescription` (Agent E F2) with comptime lint enforcing 4 of 5 quality rules on every build (Rule 5 rendered-length deferred)
+- `max_tool_iterations` default 25 → 500 (Agent E F1) — adaptive exits are the real guardrails; cap is safety valve only
+- `assistant_mode` → `reasoning_effort` mapping (fast→low, balanced→medium, deep→high); user-set `reasoning_effort` wins
+- WM `importance` dropped from composite eviction formula (Agent G v1.14.14.1 F1) — eviction now discriminates via `recency × slot_type_weight` only. Per-source calibration deferred to v1.14.18-B as the SOTA option-(a) path.
+
+**Visibility / diagnostic additions:**
+- `prefix.tail` hash exposed through `AssembleResult` + JSONL (Agent G v1.14.14.1 F2). `.spike/run.sh` jq drift detection covers BOTH cache halves.
+- `compact_ms_main_site_only` honestly renamed (Agent G v1.14.14.1 F3); option-(a) full aggregation deferred to v1.14.14.2.
+- `docs/ops/stability-jsonl-canary.md` runbook landed for prod deployment (operator action).
+
+**Hygiene completed:**
+- `CompactResult.messages_before/after` sentinel fields removed (Agent G v1.14.14.1 F4)
+- 11-file `zig fmt src/` cleanup (PR #84)
+- Pre-existing fmt debt cleared
+
+**Process discipline installed:**
+- AGENTS.md §14.10 — Post-sprint Activation Audit Discipline binding on all future sprints
+- `docs/audits/2026-05-20-v1.14.14-activation-audit.md` — inaugural execution; 19 latent-value gaps G1-G19 classified
+- ROADMAP v1.14.18-B + v1.14.19 blocks pre-scoped (no more "Nova flagged the gap" moments)
+
+**§14.10 effectiveness this sprint:** caught 3 issues on PR #82 pre-merge (design-vs-implementation gap on Agent E F2, §14.5 orphan structs on F1, reflection-loop-not-wired on F3 — twice). Each catch is a round-trip pre-merge instead of a regression post-merge.
+
+## Current open ends (2026-05-20)
+
+1. **PR #82 (F3 GOAL-LOOP) BLOCKED** — coordinator-corrected dispatch in progress (memory-ownership bug in original dispatch + missing buildReflectionPrompt injection + missing prompt.zig Goal Pursuit Protocol section). Three §14.10 catches; canonical-CI gate failing on double-free.
+2. **v1.14.18-B dispatch** ready to fire when PR #82 lands. 5 findings scoped: G3 narration-as-context + G5 reflection-store + G7 bench-self-knowledge + G16 WM-cross-session + G19 daemon-prompt-honesty.
+3. **v1.14.19 sleep cycle** ready post-v1.14.18-B. 5 findings scoped: SC1 skill-consolidation + SC2 negative-examples + SC3 memory-dedup + SC4 community-recompute-scheduler + SC5 sleep-cycle-observability.
+4. **Bench gate paid** post-v1.14.18-A + v1.14.18-B + v1.14.19 (per §14.10 — no bench until real behavioral attribution available).
 
 ## 2026-05-19 PM update — file-by-file audit
 
