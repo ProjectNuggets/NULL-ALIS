@@ -164,9 +164,15 @@ run_single_turn() {
     return
   fi
 
-  TOOLS_FIRED=$(grep -oE '"phase":"tool"[^}]*"tool":"[^"]+"' "$outfile" \
+  # v1.14.18 — match v1.14.13 NarrationObserver SSE shapes: tool_start / tool_done
+  # alongside legacy "phase":"tool". Before this fix, the parser ONLY matched the
+  # plain "phase":"tool" form and missed tool_start/tool_done events emitted by
+  # Agent F's wiring → V-inf b1/b2/b9 (proactive_research) reported fired="" even
+  # while gateway logs showed web_search firing. TOOL_COUNT uses the narrower
+  # tool_start-only pattern to avoid double-counting (start + done would 2x).
+  TOOLS_FIRED=$(grep -oE '"phase":"tool(_start|_done)?"[^}]*"tool":"[^"]+"' "$outfile" \
     | grep -oE '"tool":"[^"]+"' | sort -u | tr '\n' ',' | sed 's/,$//')
-  TOOL_COUNT=$(grep -oE '"phase":"tool"[^}]*"tool":"[^"]+"' "$outfile" | wc -l | tr -d ' ')
+  TOOL_COUNT=$(grep -oE '"phase":"tool(_start)?"[^}]*"tool":"[^"]+"' "$outfile" | wc -l | tr -d ' ')
   REPLY_TEXT=$(grep -oE '"delta":"[^"]*"' "$outfile" | sed 's/^"delta":"//;s/"$//' | tr -d '\n' | head -c 2000)
   TURN_OK=1
   TURN_REASON=""
