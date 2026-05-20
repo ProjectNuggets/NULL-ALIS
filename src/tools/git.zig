@@ -19,6 +19,23 @@ pub const GitTool = struct {
     sandbox_fail_open_on_dev: bool = false,
 
     pub const tool_name = "git_operations";
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Perform structured Git operations (status, diff, log, branch, commit).",
+        .use_when = &.{
+            "Executing git commands for version control operations",
+            "Checking repository status or viewing commit history",
+            "Creating branches, committing changes, or managing stash",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external data",
+            "memory_store — for persistent storage",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("git_operations", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
+
     pub const tool_description = "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash).";
     pub const tool_params =
         \\{"type":"object","properties":{"operation":{"type":"string","enum":["status","diff","log","branch","commit","add","checkout","stash"],"description":"Git operation to perform"},"message":{"type":"string","description":"Commit message (for commit)"},"paths":{"type":"string","description":"File paths (for add)"},"branch":{"type":"string","description":"Branch name (for checkout)"},"files":{"type":"string","description":"Files to diff"},"cached":{"type":"boolean","description":"Show staged changes (diff)"},"limit":{"type":"integer","description":"Log entry count (default: 10)"},"cwd":{"type":"string","description":"Repository directory (absolute path within allowed paths; defaults to workspace)"}},"required":["operation"]}

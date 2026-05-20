@@ -10,6 +10,23 @@ const MAX_IMAGE_BYTES: u64 = 5_242_880;
 /// Tool to read image metadata (format, dimensions, size).
 pub const ImageInfoTool = struct {
     pub const tool_name = "image_info";
+    pub const tool_description_struct = @import("metadata.zig").ToolDescription{
+        .what = "Read image file metadata (format, dimensions, size).",
+        .use_when = &.{
+            "Extracting metadata from image files",
+            "Checking image dimensions or format before processing",
+            "Retrieving base64-encoded image data",
+        },
+        .do_not_use_for = &.{
+            "web_search — for external data",
+            "memory_store — for persistent storage",
+        },
+    };
+
+    comptime {
+        @import("lint.zig").lintToolDescription("image_info", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
+    }
+
     pub const tool_description = "Read image file metadata (format, dimensions, size).";
     pub const tool_params =
         \\{"type":"object","properties":{"path":{"type":"string","description":"Path to the image file"},"include_base64":{"type":"boolean","description":"Include base64-encoded data (default: false)"}},"required":["path"]}
