@@ -20,6 +20,7 @@ const prompt = @import("prompt.zig");
 const dispatcher = @import("dispatcher.zig");
 const procedural_memory = @import("procedural_memory.zig");
 const narration = @import("narration.zig");
+const bench_self = @import("bench_self.zig");
 // v1.14.14 Phase 3 originally added `const compaction = @import("compaction.zig");`
 // here, but the new `compact`/`forceCompact` methods reach compaction via the
 // agent's own `autoCompactHistory`/`forceCompressHistory` rather than calling
@@ -641,6 +642,16 @@ pub const ContextEngine = struct {
                 break :blk null;
             };
         };
+
+        // v1.14.18-B G7 — Bench self-knowledge block from recent bench results.
+        const known_weakness_block: ?[]u8 = blk: {
+            break :blk bench_self.readKnownWeakness(allocator) catch |err| {
+                log.debug("bench_self.readKnownWeakness failed: {s}", .{@errorName(err)});
+                break :blk null;
+            };
+        };
+        defer if (known_weakness_block) |b| allocator.free(b);
+
         defer if (skill_traces_block) |b| allocator.free(b);
 
         // v1.14.18-B G3 (NARRATION-AS-CONTEXT) — recent thoughts block.
@@ -732,6 +743,7 @@ pub const ContextEngine = struct {
             .recent_thoughts_block = if (recent_thoughts_block) |b| (if (b.len > 0) b else null) else null,
             .known_weakness_block = null, // populated by Agent E G7 (bench_self.zig) in this same window.
             .skill_traces_block = if (skill_traces_block) |b| (if (b.len > 0) b else null) else null,
+            .known_weakness_block = if (known_weakness_block) |b| (if (b.len > 0) b else null) else null,
         };
 
         const stable_prompt = try prompt.buildStableSystemPrompt(allocator, prompt_ctx);

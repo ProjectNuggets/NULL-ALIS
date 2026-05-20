@@ -42,6 +42,7 @@ const tool_metadata = @import("../tools/metadata.zig");
 const abort_mod = @import("abort.zig");
 const CancellationToken = abort_mod.CancellationToken;
 const goal_loop = @import("goal_loop.zig");
+const reflection = @import("reflection.zig");
 
 const cache = memory_mod.cache;
 pub const abort = @import("abort.zig");
@@ -629,6 +630,9 @@ pub const Agent = struct {
     session_tool_names: std.ArrayListUnmanaged([]const u8) = .empty,
     /// v1.14.18-A F3 — per-turn goal state for ReAct reflection loop.
     active_goal_state: ?goal_loop.GoalState = null,
+    /// v1.14.18-B G5 — serialized reflection trail JSON for cross-session learning.
+    /// Serialized at turn-end from active_reflection_trail; passed to procedural_memory.captureSession.
+    session_reflection_trail_json: ?[]const u8 = null,
 
     /// v1.14.18-B G3 (NARRATION-AS-CONTEXT) — agent-owned ring buffer
     /// of recent narration frames. The per-turn `NarrationObserver`
@@ -2903,6 +2907,12 @@ pub const Agent = struct {
             self.active_goal_state = null;
         } // clear at turn end; does NOT free goal_text (borrowed slice)
 
+        // v1.14.18-B G5: Initialize reflection trail for capturing iteration-level learning
+        var active_reflection_trail = reflection.ReflectionTrail{
+            .goal_text = goal_text, // BORROW from user_message
+        };
+        defer active_reflection_trail.deinit(self.allocator);
+
         // v1.14.14 Phase 4 — time the assemble phase so afterTurn() can
         // record per-phase durations into stability.json.
         const assemble_start_ms = std.time.milliTimestamp();
@@ -3756,6 +3766,20 @@ pub const Agent = struct {
                     });
                     should_exit_goal_loop = true;
                 }
+
+                // v1.14.18-B G5: Capture iteration learning to reflection trail
+                const learning_summary = try std.fmt.allocPrint(self.allocator, "{d} tool calls processed", .{parsed_calls.len});
+                defer self.allocator.free(learning_summary);
+                const first_tool_name: ?[]const u8 = if (parsed_calls.len > 0) parsed_calls[0].name else null;
+                active_reflection_trail.append(
+                    self.allocator,
+                    goal_state.iteration_count - 1, // iteration 0-indexed
+                    first_tool_name,
+                    @tagName(goal_reflection_verdict),
+                    learning_summary,
+                ) catch |err| {
+                    log.warn("reflection_trail.append failed: {s}", .{@errorName(err)});
+                };
             }
             if (parsed_calls.len > 0) {
                 turn_tool_iterations += 1;
@@ -4627,6 +4651,14 @@ pub const Agent = struct {
             total_turn_ms,
         });
 
+        // v1.14.18-B G5: Serialize reflection trail for procedural memory
+        const reflection_trail_json = blk: {
+            break :blk active_reflection_trail.serialize(self.allocator) catch |err| {
+                log.warn("failed to serialize reflection trail: {s}", .{@errorName(err)});
+                break :blk try self.allocator.dupe(u8, "[]");
+            };
+        };
+        self.session_reflection_trail_json = reflection_trail_json;
         // **D1.7 finding 2 fix (2026-04-26):** mark transferred AFTER
         // toOwnedSlice succeeds. See longer comment at the audio_reply path.
         const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
