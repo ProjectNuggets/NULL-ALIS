@@ -645,7 +645,7 @@ pub const ContextEngine = struct {
 
         // v1.14.18-B G7 — Bench self-knowledge block from recent bench results.
         const known_weakness_block: ?[]u8 = blk: {
-            break :blk bench_self.readKnownWeakness(allocator) catch |err| {
+            break :blk bench_self.readKnownWeakness(allocator, ".spike/results.tsv") catch |err| {
                 log.debug("bench_self.readKnownWeakness failed: {s}", .{@errorName(err)});
                 break :blk null;
             };
@@ -741,9 +741,8 @@ pub const ContextEngine = struct {
             .memory_slot = if (ingest_out.memory_slot.fenced_content.len > 0) ingest_out.memory_slot.fenced_content else null,
             .working_memory_block = wm_block,
             .recent_thoughts_block = if (recent_thoughts_block) |b| (if (b.len > 0) b else null) else null,
-            .known_weakness_block = null, // populated by Agent E G7 (bench_self.zig) in this same window.
-            .skill_traces_block = if (skill_traces_block) |b| (if (b.len > 0) b else null) else null,
             .known_weakness_block = if (known_weakness_block) |b| (if (b.len > 0) b else null) else null,
+            .skill_traces_block = if (skill_traces_block) |b| (if (b.len > 0) b else null) else null,
         };
 
         const stable_prompt = try prompt.buildStableSystemPrompt(allocator, prompt_ctx);

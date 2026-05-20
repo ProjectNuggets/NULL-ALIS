@@ -5,7 +5,7 @@
 const std = @import("std");
 const log = std.log.scoped(.agent);
 
-/// Read recent bench results from .spike/results.tsv (last 3 rows + LoCoMo category analysis).
+/// Read recent bench results from `results_path` (production: .spike/results.tsv); last 3 rows + LoCoMo category analysis.
 /// Returns formatted <known_weakness> block for injection into volatile prompt.
 /// Fail-soft: returns empty string if file absent or parse fails.
 ///
@@ -14,12 +14,11 @@ const log = std.log.scoped(.agent);
 ///   1234567890  run_001   airline_bench   overall         0.450
 ///   1234567890  run_001   locomo_bench    cat_1           0.800
 ///   1234567890  run_001   locomo_bench    cat_3           0.333
-pub fn readKnownWeakness(allocator: std.mem.Allocator) ![]u8 {
+pub fn readKnownWeakness(allocator: std.mem.Allocator, results_path: []const u8) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
-    // Try to open .spike/results.tsv
-    const results_path = ".spike/results.tsv";
+    // Open the bench results file (production call site passes ".spike/results.tsv").
     const file = std.fs.cwd().openFile(results_path, .{}) catch {
         // Fail-soft: file not found or inaccessible
         log.debug("bench_self.readKnownWeakness: {s} not found or inaccessible", .{results_path});
@@ -31,7 +30,7 @@ pub fn readKnownWeakness(allocator: std.mem.Allocator) ![]u8 {
     const file_size = try file.getEndPos();
     const max_size = 1024 * 1024; // 1 MB max
     if (file_size > max_size) {
-        log.warn("bench_self.readKnownWeakness: {s} too large ({d} > {d})", .{ results_path, file_size, max_size });
+        if (!@import("builtin").is_test) log.warn("bench_self.readKnownWeakness: {s} too large ({d} > {d})", .{ results_path, file_size, max_size });
         return try allocator.dupe(u8, "");
     }
 
@@ -150,8 +149,16 @@ pub fn readKnownWeakness(allocator: std.mem.Allocator) ![]u8 {
 test "readKnownWeakness with no results.tsv returns empty" {
     const allocator = std.testing.allocator;
 
-    // This will fail-soft since .spike/results.tsv won't exist in test dir
-    const result = try readKnownWeakness(allocator);
+    // Hermetic: point at an absent file inside a fresh temp dir, so the
+    // result is independent of the repo's real .spike/results.tsv.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const dir_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const absent_path = try std.fs.path.join(allocator, &.{ dir_path, "results.tsv" });
+    defer allocator.free(absent_path);
+
+    const result = try readKnownWeakness(allocator, absent_path);
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 0), result.len);
@@ -160,22 +167,22 @@ test "readKnownWeakness with no results.tsv returns empty" {
 test "readKnownWeakness formats known_weakness block" {
     const allocator = std.testing.allocator;
 
-    // Create a temporary test file
-    var tmp_dir = try std.fs.cwd().makeOpenPath(".spike", .{});
-    defer tmp_dir.close();
+    // Hermetic temp fixture — never touches the repo's real .spike/results.tsv.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
 
     const test_content = "timestamp\trun_name\tmetric\tcategory\tvalue\n" ++
         "1234567890\trun_001\tlocomo_bench\tcat_1\t0.800\n" ++
         "1234567890\trun_001\tlocomo_bench\tcat_3\t0.333\n" ++
         "1234567890\trun_001\tlocomo_bench\toverall\t0.600\n";
+    try tmp_dir.dir.writeFile(.{ .sub_path = "results.tsv", .data = test_content });
 
-    var file = try tmp_dir.createFile("results.tsv", .{});
-    try file.writeAll(test_content);
-    file.close();
+    const dir_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const results_path = try std.fs.path.join(allocator, &.{ dir_path, "results.tsv" });
+    defer allocator.free(results_path);
 
-    defer tmp_dir.deleteFile("results.tsv") catch {};
-
-    const result = try readKnownWeakness(allocator);
+    const result = try readKnownWeakness(allocator, results_path);
     defer allocator.free(result);
 
     try std.testing.expect(std.mem.indexOf(u8, result, "<known_weakness") != null);
