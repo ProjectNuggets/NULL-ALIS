@@ -672,7 +672,22 @@ pub const ContextEngine = struct {
                 log.warn("narration.recall_failed err={s}", .{@errorName(err)});
                 break :blk null;
             };
-            defer allocator.free(frames);
+            // v1.14.18-B G3 follow-up — `recallRecent` deep-copies each
+            // frame's `.message` / `.tool_name` into `allocator` (closes
+            // a HIGH concurrent use-after-free where the prior borrow
+            // contract aliased ring-buffer memory and a worker-thread
+            // `push()` could free the slot between `recallRecent` and
+            // `renderRecentThoughtsBlock`). `self.allocator` here is the
+            // Agent's GPA-backed allocator, NOT an arena, so we must
+            // explicitly free each frame's owned strings AND the outer
+            // slice on every exit path of this block.
+            defer {
+                for (frames) |f| {
+                    allocator.free(f.message);
+                    if (f.tool_name) |t| allocator.free(t);
+                }
+                allocator.free(frames);
+            }
             if (frames.len == 0) break :blk null;
             const current_iter: u32 = if (@hasField(@TypeOf(agent.*), "iteration_counter"))
                 agent.iteration_counter

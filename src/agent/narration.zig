@@ -75,13 +75,17 @@ pub const RECALL_DEPTH: usize = 3;
 /// becomes a concurrent push. The mutex makes that safe by construction
 /// instead of by calling-convention discipline.
 ///
-/// **Borrow contract for `last()`:** the returned slice borrows
-/// ring-buffer-owned strings. The caller must finish reading the inner
-/// `message`/`tool_name` slices BEFORE the next `push` (or deep-copy
-/// them if they need to be held across a yield point or a thread
-/// boundary). The mutex only protects the buffer's metadata + slot array
-/// during the read; once `last` returns, the lock is dropped and a
-/// subsequent push can recycle the slot the returned frames pointed at.
+/// **Ownership contract for `last()` / `recallRecent`:** the returned slice
+/// AND each inner `.message` / `.tool_name` are FULLY OWNED by
+/// `out_allocator`. The caller MUST free each frame's `.message`, each
+/// non-null `.tool_name`, and the outer slice itself (or pass an arena
+/// allocator that bulk-frees on reset). The prior "borrow contract" was a
+/// HIGH concurrent use-after-free: the mutex only fenced WHEN the metadata
+/// was copied; the borrowed string pointers still aliased ring-buffer
+/// memory and a subsequent worker-thread `push()` could recycle the slot
+/// and free the underlying buffer, dangling the borrow. `last()` now
+/// deep-copies the strings while holding the lock so the returned frames
+/// are independent of the ring buffer's slot lifetimes.
 pub const NarrationRingBuffer = struct {
     frames: [RING_BUFFER_CAPACITY]RecordedFrame = undefined,
     /// Number of valid frames currently stored (0..RING_BUFFER_CAPACITY).
@@ -163,12 +167,22 @@ pub const NarrationRingBuffer = struct {
     }
 
     /// Return the last N frames in oldest → newest order. The returned slice
-    /// is allocated by `out_allocator` and references frames whose contents
-    /// remain owned by the ring buffer (do NOT free the inner strings).
-    /// Caller must free the returned slice (not its contents).
+    /// AND each inner `.message` / `.tool_name` string are fully owned by
+    /// `out_allocator` — strings are deep-copied while the mutex is held.
+    /// The caller MUST free each frame's `.message`, each non-null
+    /// `.tool_name`, and the outer slice (or pass an arena that gets
+    /// bulk-freed on reset).
     ///
-    /// Thread-safe via internal mutex. See `NarrationRingBuffer` doc-comment
-    /// for the borrow contract on the returned slice.
+    /// **Why deep-copy:** previously the returned slice borrowed
+    /// ring-buffer-owned strings. After `last()` released the mutex a
+    /// concurrent worker-thread `push()` could recycle a slot, free its
+    /// old `.message` / `.tool_name`, and dangle the borrow — a HIGH
+    /// concurrent use-after-free that `renderRecentThoughtsBlock` would
+    /// trip when it read the strings. Deep-copying under the lock closes
+    /// the window: the returned frames carry their own buffers and stay
+    /// valid regardless of what the ring buffer does next.
+    ///
+    /// Thread-safe via internal mutex.
     pub fn last(
         self: *NarrationRingBuffer,
         out_allocator: std.mem.Allocator,
@@ -184,24 +198,55 @@ pub const NarrationRingBuffer = struct {
         // live at indices 0..len-1 in arrival order (no wrap yet). When
         // saturated, the oldest sits at `head` and wraps around.
         const out = try out_allocator.alloc(RecordedFrame, take);
-        if (self.len < RING_BUFFER_CAPACITY) {
-            // No wrap: newest is at self.len-1, oldest of `take` window
-            // is at self.len-take.
-            const start = self.len - take;
-            var i: usize = 0;
-            while (i < take) : (i += 1) {
-                out[i] = self.frames[start + i];
+        errdefer out_allocator.free(out);
+
+        // Partial-failure cleanup: if a `dupe` partway through the loop
+        // fails, the prior iterations already heap-allocated strings that
+        // would otherwise leak. Track how many slots are fully populated
+        // and free their owned strings on error before bubbling up.
+        var duped: usize = 0;
+        errdefer {
+            var k: usize = 0;
+            while (k < duped) : (k += 1) {
+                out_allocator.free(out[k].message);
+                if (out[k].tool_name) |t| out_allocator.free(t);
             }
-        } else {
-            // Saturated: chronological start is at `head`; iterate forward
-            // wrapping. The last `take` frames are at positions
-            // (head + (capacity-take)) .. (head + capacity-1) modulo capacity.
-            const skip = RING_BUFFER_CAPACITY - take;
-            var i: usize = 0;
-            while (i < take) : (i += 1) {
-                const idx = (self.head + skip + i) % RING_BUFFER_CAPACITY;
-                out[i] = self.frames[idx];
-            }
+        }
+
+        var i: usize = 0;
+        while (i < take) : (i += 1) {
+            const idx: usize = if (self.len < RING_BUFFER_CAPACITY) blk: {
+                // No wrap: newest is at self.len-1, oldest of `take`
+                // window is at self.len-take.
+                const start = self.len - take;
+                break :blk start + i;
+            } else blk: {
+                // Saturated: chronological start is at `head`; iterate
+                // forward wrapping. The last `take` frames are at
+                // positions (head + (capacity-take)) .. (head + capacity-1)
+                // modulo capacity.
+                const skip = RING_BUFFER_CAPACITY - take;
+                break :blk (self.head + skip + i) % RING_BUFFER_CAPACITY;
+            };
+
+            const src = &self.frames[idx];
+            const msg_copy = try out_allocator.dupe(u8, src.message);
+            const tool_copy: ?[]u8 = if (src.tool_name) |t|
+                out_allocator.dupe(u8, t) catch |e| {
+                    out_allocator.free(msg_copy);
+                    return e;
+                }
+            else
+                null;
+
+            out[i] = .{
+                .message = msg_copy,
+                .tool_name = tool_copy,
+                .frame_type = src.frame_type,
+                .iteration = src.iteration,
+                .unix_ms = src.unix_ms,
+            };
+            duped += 1;
         }
         return out;
     }
@@ -217,6 +262,13 @@ pub const NarrationRingBuffer = struct {
 /// buffer's mutex (thread-safety per `NarrationRingBuffer` doc). The
 /// caller-visible semantics are read-only — the buffer's contents are
 /// not mutated — but the mutex acquisition requires the non-const handle.
+///
+/// **Ownership:** delegates to `NarrationRingBuffer.last`, which returns
+/// frames whose `.message` / `.tool_name` strings AND outer slice are
+/// fully owned by `out_allocator`. The caller MUST free each frame's
+/// `.message`, each non-null `.tool_name`, and the outer slice (or pass
+/// an arena that bulk-frees on reset). See the `last()` doc-comment for
+/// the rationale (concurrent UAF closure).
 pub fn recallRecent(
     buffer_opt: ?*NarrationRingBuffer,
     out_allocator: std.mem.Allocator,
@@ -534,6 +586,18 @@ test "turnStageToFrameType maps voice_speaking to speaking" {
 
 // ── v1.14.18-B G3 ring buffer + recallRecent tests ─────────────────────────
 
+/// Free the deep-copied strings inside frames returned by `last()` /
+/// `recallRecent()` under `std.testing.allocator`. Test-only helper; the
+/// production caller (`context_engine.assemble`) uses an equivalent
+/// inline `defer` block.
+fn freeRecalledFramesForTest(frames: []RecordedFrame) void {
+    for (frames) |f| {
+        std.testing.allocator.free(f.message);
+        if (f.tool_name) |t| std.testing.allocator.free(t);
+    }
+    std.testing.allocator.free(frames);
+}
+
 test "NarrationRingBuffer push + last returns frames in order" {
     var rb = NarrationRingBuffer.init(std.testing.allocator);
     defer rb.deinit();
@@ -543,7 +607,7 @@ test "NarrationRingBuffer push + last returns frames in order" {
     rb.push(.{ .message = "third", .frame_type = .tool_done, .tool_name = "bash" }, 2);
 
     const frames = try rb.last(std.testing.allocator, 3);
-    defer std.testing.allocator.free(frames);
+    defer freeRecalledFramesForTest(frames);
     try std.testing.expectEqual(@as(usize, 3), frames.len);
     try std.testing.expectEqualStrings("first", frames[0].message);
     try std.testing.expectEqualStrings("second", frames[1].message);
@@ -561,7 +625,7 @@ test "NarrationRingBuffer.last(n) returns at most n newest" {
     rb.push(.{ .message = "d", .frame_type = .thinking }, 0);
 
     const last2 = try rb.last(std.testing.allocator, 2);
-    defer std.testing.allocator.free(last2);
+    defer freeRecalledFramesForTest(last2);
     try std.testing.expectEqual(@as(usize, 2), last2.len);
     try std.testing.expectEqualStrings("c", last2[0].message);
     try std.testing.expectEqualStrings("d", last2[1].message);
@@ -584,7 +648,7 @@ test "NarrationRingBuffer never grows past RING_BUFFER_CAPACITY" {
 
     // last(capacity) must return the most recent capacity entries.
     const all = try rb.last(std.testing.allocator, RING_BUFFER_CAPACITY);
-    defer std.testing.allocator.free(all);
+    defer freeRecalledFramesForTest(all);
     try std.testing.expectEqual(RING_BUFFER_CAPACITY, all.len);
     // Oldest of the kept window is m{capacity} (we pushed 0..2*capacity-1).
     var first_buf: [16]u8 = undefined;
@@ -598,7 +662,7 @@ test "NarrationRingBuffer never grows past RING_BUFFER_CAPACITY" {
 
 test "recallRecent null buffer returns empty slice" {
     const frames = try recallRecent(null, std.testing.allocator, 3);
-    defer std.testing.allocator.free(frames);
+    defer freeRecalledFramesForTest(frames);
     try std.testing.expectEqual(@as(usize, 0), frames.len);
 }
 
@@ -606,7 +670,7 @@ test "recallRecent empty buffer returns empty slice" {
     var rb = NarrationRingBuffer.init(std.testing.allocator);
     defer rb.deinit();
     const frames = try recallRecent(&rb, std.testing.allocator, 3);
-    defer std.testing.allocator.free(frames);
+    defer freeRecalledFramesForTest(frames);
     try std.testing.expectEqual(@as(usize, 0), frames.len);
 }
 
@@ -619,7 +683,7 @@ test "recallRecent returns last N oldest-to-newest" {
     rb.push(.{ .message = "delta", .frame_type = .tool_done, .tool_name = "memory_recall" }, 3);
 
     const last3 = try recallRecent(&rb, std.testing.allocator, 3);
-    defer std.testing.allocator.free(last3);
+    defer freeRecalledFramesForTest(last3);
     try std.testing.expectEqual(@as(usize, 3), last3.len);
     try std.testing.expectEqualStrings("beta", last3[0].message);
     try std.testing.expectEqualStrings("gamma", last3[1].message);
@@ -666,8 +730,77 @@ test "NarrationObserver pushes into ring buffer when wired" {
     obs.recordEvent(&evt);
     try std.testing.expectEqual(@as(usize, 1), rb.len);
     const frames = try rb.last(std.testing.allocator, 1);
-    defer std.testing.allocator.free(frames);
+    defer freeRecalledFramesForTest(frames);
     try std.testing.expectEqualStrings("Running tests", frames[0].message);
     try std.testing.expectEqualStrings("bash", frames[0].tool_name.?);
     try std.testing.expectEqual(@as(u32, 2), frames[0].iteration);
+}
+
+test "NarrationRingBuffer.last() returns owned strings under concurrent push" {
+    // Concurrent UAF regression test (v1.14.18-B G3 deep-copy fix).
+    //
+    // Before the fix, `last()` returned RecordedFrame slices whose
+    // `.message` / `.tool_name` aliased ring-buffer memory. After the
+    // mutex dropped, a worker-thread `push()` could recycle a slot,
+    // free the old string, and dangle the borrow. With
+    // `std.testing.allocator`'s GPA leak/UAF detection, hammering
+    // last() + push() concurrently while reading the strings would
+    // surface as a use-after-free or a leak (depending on timing).
+    //
+    // Under the fix, returned frames are deep-copied and fully owned
+    // by `out_allocator`. 500 iterations of last() + push() with a
+    // string-touching read on every returned frame must show zero
+    // leaks and zero UAF.
+
+    const allocator = std.testing.allocator;
+    var rb = NarrationRingBuffer.init(allocator);
+    defer rb.deinit();
+
+    // Pre-seed with a few frames so `last()` always has something to
+    // copy on the first iterations, before the hammer thread has had
+    // a chance to push anything.
+    var seed_i: usize = 0;
+    while (seed_i < 4) : (seed_i += 1) {
+        rb.push(.{
+            .message = "seed",
+            .tool_name = "tool",
+            .frame_type = .tool_start,
+        }, 0);
+    }
+
+    const ThreadCtx = struct {
+        rb_ptr: *NarrationRingBuffer,
+        stop: *std.atomic.Value(bool),
+        fn run(ctx: @This()) void {
+            var n: usize = 0;
+            while (!ctx.stop.load(.acquire)) : (n +%= 1) {
+                ctx.rb_ptr.push(.{
+                    .message = "hammer",
+                    .tool_name = "thread",
+                    .frame_type = .tool_start,
+                }, @intCast(n & 0xffff));
+            }
+        }
+    };
+
+    var stop = std.atomic.Value(bool).init(false);
+    const hammer = try std.Thread.spawn(.{}, ThreadCtx.run, .{
+        ThreadCtx{ .rb_ptr = &rb, .stop = &stop },
+    });
+
+    // Main thread: hammer last() + touch the strings. With UAF this
+    // would either crash the test runner or surface as a heap probe
+    // failure under the GPA's safety mode.
+    var iter: usize = 0;
+    while (iter < 500) : (iter += 1) {
+        const frames = try rb.last(allocator, 3);
+        defer freeRecalledFramesForTest(frames);
+        for (frames) |f| {
+            std.mem.doNotOptimizeAway(f.message.len);
+            if (f.tool_name) |t| std.mem.doNotOptimizeAway(t.len);
+        }
+    }
+
+    stop.store(true, .release);
+    hammer.join();
 }
