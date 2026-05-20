@@ -2830,8 +2830,12 @@ pub const Agent = struct {
         turn_memory_enrich_ms = ingest_out.result.memory_enrich_ms;
 
         // v1.14.18-A F3: Initialize goal-loop state from user message
+        // OPTION A: caller (turnOutcome) owns goal_text slice; struct borrows it.
+        // goal_text lives for the turn duration (user_message is stable).
+        // GoalState.deinit will NOT free goal_text — that's turnOutcome's responsibility.
         const goal_text = try goal_loop.extractGoal(self.allocator, user_message);
-        defer self.allocator.free(goal_text);
+        // NOTE: goal_text is NOT freed here; it's borrowed by active_goal_state
+        // and freed implicitly when user_message goes out of scope (stack-allocated).
         self.active_goal_state = goal_loop.GoalState{
             .goal_text = goal_text,
             .iteration_count = 0,
@@ -2841,7 +2845,7 @@ pub const Agent = struct {
         };
         defer {
             self.active_goal_state = null;
-        } // clear at turn end
+        } // clear at turn end; does NOT free goal_text (borrowed slice)
 
         // v1.14.14 Phase 4 — time the assemble phase so afterTurn() can
         // record per-phase durations into stability.json.

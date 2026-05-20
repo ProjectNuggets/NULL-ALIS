@@ -11,6 +11,8 @@ pub const GoalStatus = enum {
 
 /// Per-turn goal state. Lifetime = single turnOutcome call.
 /// Accumulates progress notes across iterations within a turn.
+/// Per-turn goal state. Ownership: goal_text is BORROWED from caller (not freed by deinit).
+/// Only progress_notes are owned and freed by deinit. goal_text lifetime is caller's responsibility.
 pub const GoalState = struct {
     goal_text: []const u8,
     progress_notes: std.ArrayListUnmanaged([]const u8) = .empty,
