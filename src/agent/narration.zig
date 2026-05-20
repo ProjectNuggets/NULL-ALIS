@@ -60,6 +60,11 @@ pub const RecordedFrame = struct {
 /// oldest→newest order for prompt injection.
 pub const RING_BUFFER_CAPACITY: usize = 16;
 
+/// Number of recent narration frames surfaced in the <recent_thoughts>
+/// recall block. v1.14.18-B G3 tuning knob — referenced by
+/// `context_engine.assemble` when it calls `recallRecent`.
+pub const RECALL_DEPTH: usize = 3;
+
 /// v1.14.18-B G3 — thread-safe ring buffer of recent narration frames.
 ///
 /// **Thread-safety:** `push`, `last`, and `deinit` are mutex-guarded. Safe

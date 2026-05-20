@@ -668,7 +668,7 @@ pub const ContextEngine = struct {
                 @as(?*narration.NarrationRingBuffer, &agent.narration_ring_buffer)
             else
                 null;
-            const frames = narration.recallRecent(rb_ptr, allocator, 3) catch |err| {
+            const frames = narration.recallRecent(rb_ptr, allocator, narration.RECALL_DEPTH) catch |err| {
                 log.warn("narration.recall_failed err={s}", .{@errorName(err)});
                 break :blk null;
             };
