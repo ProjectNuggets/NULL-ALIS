@@ -1857,6 +1857,44 @@ test "buildVolatileSystemPrompt G-07: skill_traces_block omitted when null" {
     try std.testing.expect(std.mem.indexOf(u8, volatile_out, "<recent_skill_traces") == null);
 }
 
+test "buildVolatileSystemPrompt v1.14.18-B recall-stack ordering invariant" {
+    // Three orderings (PromptContext decl, context_engine assignment,
+    // prompt render) must stay synchronized for byte-stable prefix
+    // caching. Today no test asserts this; a drive-by refactor that
+    // reordered the `if` blocks in buildVolatileSystemPrompt would
+    // silently ship a cache-stability regression. This test materializes
+    // all three blocks and asserts their position order:
+    //   recent_thoughts < known_weakness < skill_traces.
+    const allocator = std.testing.allocator;
+
+    const rt_block =
+        "<recent_thoughts iteration=\"3\" count=\"2\">\n[iter 2, thinking]: thinking\n</recent_thoughts>\n";
+    const kw_block =
+        "<known_weakness>\nbench result placeholder\n</known_weakness>\n";
+    const st_block =
+        "<recent_skill_traces skill=\"generic_multi_tool\" count=\"1\">\n  [trace_id 7]: task=test\n</recent_skill_traces>\n";
+
+    const volatile_out = try buildVolatileSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .recent_thoughts_block = rt_block,
+        .known_weakness_block = kw_block,
+        .skill_traces_block = st_block,
+    });
+    defer allocator.free(volatile_out);
+
+    const rt = std.mem.indexOf(u8, volatile_out, "<recent_thoughts") orelse
+        return error.RecentThoughtsBlockMissing;
+    const kw = std.mem.indexOf(u8, volatile_out, "<known_weakness") orelse
+        return error.KnownWeaknessBlockMissing;
+    const st = std.mem.indexOf(u8, volatile_out, "<recent_skill_traces") orelse
+        return error.SkillTracesBlockMissing;
+
+    try std.testing.expect(rt < kw);
+    try std.testing.expect(kw < st);
+}
+
 test "buildVolatileSystemPrompt G-08: empty working_memory_block omits the <working_memory> tag" {
     // V1.14.3 (G-08 partial closure) — Rendering invariant test only.
     //
