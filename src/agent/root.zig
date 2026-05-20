@@ -4299,6 +4299,36 @@ pub const Agent = struct {
                 .role = .user,
                 .content = try self.allocator.dupe(u8, with_reflection),
             });
+
+            // v1.14.18-A F3: Inject goal-loop reflection prompt for next iteration
+            // This SYSTEM message teaches the model to emit <reflection goal_status="...">
+            if (iteration > 0 and self.active_goal_state != null) {
+                var last_tool_name: ?[]const u8 = null;
+                var last_result_summary: ?[]const u8 = null;
+
+                if (results_buf.items.len > 0) {
+                    const last_result = results_buf.items[results_buf.items.len - 1];
+                    last_tool_name = last_result.name;
+                    // Truncate result to ~400 chars for context
+                    const result_len = @min(last_result.output.len, 400);
+                    last_result_summary = last_result.output[0..result_len];
+                }
+
+                const goal_reflection_prompt = try goal_loop.buildReflectionPrompt(
+                    self.allocator,
+                    self.active_goal_state.?.goal_text,
+                    @intCast(iteration + 1),
+                    last_tool_name,
+                    last_result_summary,
+                );
+                defer self.allocator.free(goal_reflection_prompt);
+
+                try self.history.append(self.allocator, .{
+                    .role = .system,
+                    .content = try self.allocator.dupe(u8, goal_reflection_prompt),
+                });
+            }
+
             const reflect_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - reflect_start_ms));
             log.info("turn.stage stage=tool_reflection iteration={d} duration_ms={d} results={d}", .{
                 iteration,

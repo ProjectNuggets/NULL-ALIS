@@ -870,6 +870,25 @@ fn buildResponseProtocolSection(w: anytype) !void {
     // this one says don't trust memory's INSUFFICIENCY without firing
     // the tool that could ground it.
     try w.writeAll("**Knowledge escalation — bridge memory to the world via `web_search`.** When memory contains the user-side signal (preferences, history, context) but the QUESTION requires external facts the agent cannot derive from memory or training (restaurant names, recent events, third-party attributes, prices, schedules, current state), reach for `web_search` BEFORE answering. Pattern: \"<user> likes <category>\" (from memory) + \"What's the best <category> near <place>?\" (external) → `web_search` for \"best <category> near <place>\", then ground the answer in BOTH signals (\"You enjoy Thai food; based on current results, <restaurant> is well-reviewed and matches your usual style — casual, low-key.\"). The hedge \"I don't have current information on that\" is the WRONG answer when `web_search` is available; it's a hedge, not honesty. Skip only when (a) the question is purely about the user themselves with no external bridge, OR (b) `web_search` was already tried this turn and failed.\n\n");
+    // v1.14.18-A F3 — Goal Pursuit Protocol (ReAct-style reflection)
+    // Teaches the model to emit structured reflection blocks.
+    try w.writeAll("## Goal Pursuit Protocol (ReAct-style)\n\n");
+    try w.writeAll("You are not just responding to messages; you are pursuing the user's GOAL. After every tool result, before deciding the next action, briefly reflect.\n\n");
+    try w.writeAll("**Emit a structured reflection BLOCK as part of your response when iteration > 0:**\n\n");
+    try w.writeAll("<reflection iteration=\"N\" tool=\"last_tool_name\" goal_status=\"in_progress|met|stuck|max_iterations\">\n");
+    try w.writeAll("What I learned: <one concrete sentence>\n");
+    try w.writeAll("Goal progress: <closer | same | further>\n");
+    try w.writeAll("Next action: <tool_name with params | finalize>\n");
+    try w.writeAll("</reflection>\n\n");
+    try w.writeAll("Then continue with your normal reply or next tool call.\n\n");
+    try w.writeAll("**Set goal_status:**\n");
+    try w.writeAll("- `in_progress` (default) — more work to do; another tool call coming\n");
+    try w.writeAll("- `met` — goal achieved; you're about to finalize the reply\n");
+    try w.writeAll("- `stuck` — same tool tier 2+ times with no new signal; finalize honestly with calibrated hedge\n");
+    try w.writeAll("- `max_iterations` — approaching iteration ceiling; cut losses\n\n");
+    try w.writeAll("The reflection block is for the system, not the user — keep it terse (2-3 lines).\n\n");
+    try w.writeAll("**Anti-pattern:** 5+ `memory_recall` calls with similar results, then give up. **Right pattern:** structured escalation — recall → graph → web_search → calibrated hedge.\n\n");
+    try w.writeAll("**Honest goal disposition:** When you detect you're going in circles (same tool, same params, same result 3+ times), emit goal_status=`stuck`. Don't pretend one more retry will help. The system notes this verdict and helps the user pivot.\n\n");
 }
 
 fn appendChannelAttachmentsSection(w: anytype) !void {
