@@ -1001,6 +1001,8 @@ pub const Agent = struct {
         // + tool names). Safe even on agents whose ring buffer never
         // received a push (len=0); the inner free-loop is a no-op then.
         self.narration_ring_buffer.deinit();
+        // v1.14.18-B G5 fix — free the last turn's serialized reflection trail.
+        if (self.session_reflection_trail_json) |j| self.allocator.free(j);
         return drained;
     }
 
@@ -4658,6 +4660,9 @@ pub const Agent = struct {
                 break :blk try self.allocator.dupe(u8, "[]");
             };
         };
+        // v1.14.18-B G5 fix — free the prior turn's trail before overwriting. This
+        // field is reassigned every turn-end; a bare assign leaked the previous alloc.
+        if (self.session_reflection_trail_json) |old| self.allocator.free(old);
         self.session_reflection_trail_json = reflection_trail_json;
         // **D1.7 finding 2 fix (2026-04-26):** mark transferred AFTER
         // toOwnedSlice succeeds. See longer comment at the audio_reply path.
