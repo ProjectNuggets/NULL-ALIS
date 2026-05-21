@@ -19,7 +19,7 @@
 //! Failure-soft at every layer: any LLM/parse/persist error is logged and
 //! the corresponding output null'd; the boundary's primary write proceeds.
 //! Skips silently when extraction context lacks the required plumbing
-//! (no judge_provider, no state_mgr, etc.).
+//! (no extract provider/model, no state_mgr, etc.).
 
 const std = @import("std");
 const log = std.log.scoped(.extraction_runner);
@@ -60,14 +60,19 @@ const ChatMessage = providers.ChatMessage;
 const Provider = providers.Provider;
 
 /// All inputs the runner needs to fire both LLM calls and persist results.
-/// Required fields: judge_provider, judge_model, state_mgr, user_id.
-/// Optional: session_id, coref_embed, archive_mem, archive_mem_rt.
+/// Required for extraction: extract_provider + extract_model, or the legacy
+/// judge_provider + judge_model pair as a fallback.
+/// Required for persistence: state_mgr + user_id.
+/// Optional: judge_provider + judge_model for contradiction/cardinality checks,
+/// session_id, coref_embed, archive_mem, archive_mem_rt.
 ///
 /// When required fields are missing, the corresponding output is silently
 /// skipped — the runner does NOT error.
 pub const ExtractionContext = struct {
-    judge_provider: Provider,
-    judge_model: []const u8,
+    extract_provider: ?Provider = null,
+    extract_model: []const u8 = "",
+    judge_provider: ?Provider = null,
+    judge_model: []const u8 = "",
     state_mgr: ?*zaki_state.Manager = null,
     user_id: ?i64 = null,
     session_id: ?[]const u8 = null,
@@ -204,8 +209,8 @@ pub fn extractAtBoundary(
         log.info("boundary.skip reason=empty_window", .{});
         return .{ .extraction = null, .hydration = null };
     }
-    if (ctx.judge_model.len == 0) {
-        log.info("boundary.skip reason=no_judge_model", .{});
+    if (resolveExtractionProvider(ctx) == null or resolveExtractionModel(ctx).len == 0) {
+        log.info("boundary.skip reason=no_extraction_model", .{});
         return .{ .extraction = null, .hydration = null };
     }
 
@@ -540,19 +545,23 @@ fn runExtractionCall(
     transcript: []const u8,
     ctx: ExtractionContext,
 ) !?schema.ExtractionResult {
+    const provider = resolveExtractionProvider(ctx) orelse return null;
+    const model = resolveExtractionModel(ctx);
+    if (model.len == 0) return null;
+
     var messages = [_]ChatMessage{
         .{ .role = .system, .content = prompts.extractionSystemPrompt() },
         .{ .role = .user, .content = transcript },
     };
     const request = providers.ChatRequest{
         .messages = messages[0..],
-        .model = ctx.judge_model,
+        .model = model,
         .temperature = 0.2,
         .tools = null,
         .timeout_secs = ctx.timeout_secs,
     };
 
-    const response = ctx.judge_provider.chat(allocator, request, ctx.judge_model, 0.2) catch |err| {
+    const response = provider.chat(allocator, request, model, 0.2) catch |err| {
         log.warn("boundary.extraction.llm_failed err={s}", .{@errorName(err)});
         return null;
     };
@@ -575,19 +584,23 @@ fn runHydrationCall(
     transcript: []const u8,
     ctx: ExtractionContext,
 ) !?schema.HydrationSummary {
+    const provider = resolveExtractionProvider(ctx) orelse return null;
+    const model = resolveExtractionModel(ctx);
+    if (model.len == 0) return null;
+
     var messages = [_]ChatMessage{
         .{ .role = .system, .content = prompts.hydrationSystemPrompt() },
         .{ .role = .user, .content = transcript },
     };
     const request = providers.ChatRequest{
         .messages = messages[0..],
-        .model = ctx.judge_model,
+        .model = model,
         .temperature = 0.3,
         .tools = null,
         .timeout_secs = ctx.timeout_secs,
     };
 
-    const response = ctx.judge_provider.chat(allocator, request, ctx.judge_model, 0.3) catch |err| {
+    const response = provider.chat(allocator, request, model, 0.3) catch |err| {
         log.warn("boundary.hydration.llm_failed err={s}", .{@errorName(err)});
         return null;
     };
@@ -601,6 +614,15 @@ fn runHydrationCall(
         return null;
     };
     return result;
+}
+
+fn resolveExtractionProvider(ctx: ExtractionContext) ?Provider {
+    return ctx.extract_provider orelse ctx.judge_provider;
+}
+
+fn resolveExtractionModel(ctx: ExtractionContext) []const u8 {
+    if (ctx.extract_model.len > 0) return ctx.extract_model;
+    return ctx.judge_model;
 }
 
 /// Free response fields owned by the provider.chat callee. Mirrors the
@@ -808,9 +830,9 @@ fn persistExtraction(
     // judge_ctx restores graceful degradation through the
     // extractAtBoundary path.
     const judge_ctx: ?extraction_persist.JudgeContext =
-        if (ctx.judge_model.len > 0)
+        if (ctx.judge_model.len > 0 and ctx.judge_provider != null)
             extraction_persist.JudgeContext{
-                .provider = ctx.judge_provider,
+                .provider = ctx.judge_provider.?,
                 .model_name = ctx.judge_model,
                 .cardinality_fastpath_enabled = ctx.cardinality_fastpath_enabled,
             }
@@ -886,6 +908,46 @@ fn persistHydration(
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
+const TestExtractionProvider = struct {
+    calls: usize = 0,
+
+    fn chatWithSystem(_: *anyopaque, _: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return "";
+    }
+
+    fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        const self: *TestExtractionProvider = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        return .{
+            .content = try allocator.dupe(u8,
+                \\{"entities":[{"name":"Nova","type":"person"},{"name":"nullALIS","type":"project"}],"edges":[{"source":"Nova","target":"nullALIS","predicate":"builds","fact":"Nova builds nullALIS","confidence":0.9}]}
+            ),
+        };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "test-extraction";
+    }
+
+    fn deinit(_: *anyopaque) void {}
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinit,
+    };
+
+    fn provider(self: *TestExtractionProvider) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+};
+
 test "buildTranscript respects per-message + total caps" {
     const allocator = std.testing.allocator;
     const big_content = try allocator.alloc(u8, 5000);
@@ -909,8 +971,7 @@ test "extractAtBoundary skip path: empty window" {
     const allocator = std.testing.allocator;
     const empty_window: []const ChatMessage = &.{};
     const ctx = ExtractionContext{
-        .judge_provider = undefined,
-        .judge_model = "test-model",
+        .extract_model = "test-model",
     };
     const result = extractAtBoundary(allocator, empty_window, ctx);
     defer result.deinit(allocator);
@@ -918,16 +979,33 @@ test "extractAtBoundary skip path: empty window" {
     try std.testing.expect(result.hydration == null);
 }
 
-test "extractAtBoundary skip path: empty judge_model" {
+test "extractAtBoundary skip path: empty extraction model" {
     const allocator = std.testing.allocator;
     const msgs = [_]ChatMessage{.{ .role = .user, .content = "test" }};
-    const ctx = ExtractionContext{
-        .judge_provider = undefined,
-        .judge_model = "",
-    };
+    const ctx = ExtractionContext{};
     const result = extractAtBoundary(allocator, &msgs, ctx);
     defer result.deinit(allocator);
     try std.testing.expect(result.extraction == null);
+    try std.testing.expect(result.hydration == null);
+}
+
+test "extractAtBoundary runs extraction without judge model" {
+    const allocator = std.testing.allocator;
+    var provider_state = TestExtractionProvider{};
+    const msgs = [_]ChatMessage{.{ .role = .user, .content = "Nova is building nullALIS." }};
+    const ctx = ExtractionContext{
+        .extract_provider = provider_state.provider(),
+        .extract_model = "extract-model",
+        .judge_model = "",
+        .enable_hydration = false,
+    };
+    const result = extractAtBoundary(allocator, &msgs, ctx);
+    defer result.deinit(allocator);
+
+    try std.testing.expect(provider_state.calls > 0);
+    try std.testing.expect(result.extraction != null);
+    try std.testing.expect(result.extraction.?.entities.len == 2);
+    try std.testing.expect(result.extraction.?.edges.len == 1);
     try std.testing.expect(result.hydration == null);
 }
 
@@ -940,7 +1018,6 @@ test "persistExtraction skip path: no state mgr (no edges to persist)" {
     const result = try schema.ExtractionResult.empty(allocator);
     defer result.deinit(allocator);
     const ctx = ExtractionContext{
-        .judge_provider = undefined,
         .judge_model = "test-model",
         // state_mgr null; user_id null
     };
@@ -954,7 +1031,6 @@ test "persistExtraction skip path: zero edges" {
 
     var fake_mgr: zaki_state.Manager = undefined;
     const ctx = ExtractionContext{
-        .judge_provider = undefined,
         .judge_model = "test-model",
         .state_mgr = &fake_mgr,
         .user_id = 42,
@@ -968,7 +1044,6 @@ test "ExtractionContext.enable_hydration default = true" {
     // Pass A wires `enable_hydration = false` explicitly; Pass C +
     // session-end rely on the default `true` for hydration summaries.
     const ctx = ExtractionContext{
-        .judge_provider = undefined,
         .judge_model = "test-model",
     };
     try std.testing.expect(ctx.enable_hydration == true);
