@@ -87,6 +87,7 @@ pub const ContentPart = union(enum) {
     text: []const u8,
     image_url: ImageUrl,
     image_base64: ImageBase64,
+    video_base64: VideoBase64,
 
     pub const ImageUrl = struct {
         url: []const u8,
@@ -94,6 +95,26 @@ pub const ContentPart = union(enum) {
     };
 
     pub const ImageBase64 = struct {
+        /// Pure base64 payload — NO `data:` prefix. Provider serializers
+        /// append it verbatim into a JSON string, so it must contain only
+        /// the base64 alphabet ([A-Za-z0-9+/=]). Callers own this invariant.
+        data: []const u8,
+        media_type: []const u8,
+    };
+
+    /// Base64-encoded video. Serialized for providers that natively accept
+    /// video — Moonshot/Kimi (`video_url` data URI) and Gemini (`inlineData`).
+    /// Anthropic, which has no video content block, degrades it to a text
+    /// placeholder.
+    ///
+    /// Constructed by multimodal.zig from `[VIDEO:...]` markers (P3b). The
+    /// agent strips these parts for non-video-capable models, and emits a
+    /// `video_unsupported` system_notice, via `routeVideoForModel`
+    /// (agent/root.zig, P3c).
+    pub const VideoBase64 = struct {
+        /// Pure base64 payload — NO `data:` prefix. Provider serializers
+        /// append it verbatim into a JSON string, so it must contain only
+        /// the base64 alphabet ([A-Za-z0-9+/=]). Callers own this invariant.
         data: []const u8,
         media_type: []const u8,
     };
@@ -112,6 +133,11 @@ pub fn makeImageUrlPart(url: []const u8) ContentPart {
 /// Create a base64-encoded image content part.
 pub fn makeBase64ImagePart(data: []const u8, media_type: []const u8) ContentPart {
     return .{ .image_base64 = .{ .data = data, .media_type = media_type } };
+}
+
+/// Create a base64-encoded video content part.
+pub fn makeBase64VideoPart(data: []const u8, media_type: []const u8) ContentPart {
+    return .{ .video_base64 = .{ .data = data, .media_type = media_type } };
 }
 
 /// Roles a message can have in a conversation.

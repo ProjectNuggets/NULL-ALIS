@@ -3077,6 +3077,11 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     const trans = config.audio_media;
     const whisper_ptr: ?*yc.voice.WhisperTranscriber = blk: {
         if (!trans.enabled) break :blk null;
+        // Audio routing is capability-driven: a model with native audio skips
+        // the Whisper sidecar. Every current model is text-only for audio, so
+        // this always evaluates `.transcription_sidecar` and the sidecar is
+        // attached as before — confirmed unchanged for kimi-k2.6.
+        if (yc.model_capabilities.audioInputRoute(model) == .native) break :blk null;
         if (config.getProviderKey(trans.provider)) |key| {
             const wt = try allocator.create(yc.voice.WhisperTranscriber);
             wt.* = .{
