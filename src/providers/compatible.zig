@@ -461,8 +461,13 @@ pub const OpenAiCompatibleProvider = struct {
                 }
 
                 // Parse reasoning/thinking content from models that support it.
-                // OpenRouter/GLM/Kimi return it as "reasoning_content" in the message.
-                // Some providers use "reasoning" at the choice level.
+                // Field name + nesting varies by provider — checked in order:
+                //   1. message-level `reasoning_content` (GLM, some OpenRouter)
+                //   2. message-level `reasoning` (Together's Kimi K2.5/K2.6 —
+                //      live-probed 2026-05-21; this is the production path)
+                //   3. choice-level `reasoning` (other OpenAI-compatible hosts)
+                // Pre-fix this only checked (1) and (3), silently dropping the
+                // native CoT of the production model (Kimi-on-Together uses (2)).
                 var reasoning_content: ?[]const u8 = null;
                 if (msg_obj.get("reasoning_content")) |rc| {
                     if (rc == .string and rc.string.len > 0) {
@@ -470,7 +475,14 @@ pub const OpenAiCompatibleProvider = struct {
                     }
                 }
                 if (reasoning_content == null) {
-                    // Fallback: check choice-level "reasoning" field
+                    if (msg_obj.get("reasoning")) |rc| {
+                        if (rc == .string and rc.string.len > 0) {
+                            reasoning_content = try allocator.dupe(u8, rc.string);
+                        }
+                    }
+                }
+                if (reasoning_content == null) {
+                    // Fallback: choice-level "reasoning" field
                     if (choices.array.items[0].object.get("reasoning")) |rc| {
                         if (rc == .string and rc.string.len > 0) {
                             reasoning_content = try allocator.dupe(u8, rc.string);
