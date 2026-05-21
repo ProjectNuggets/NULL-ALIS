@@ -294,7 +294,8 @@ pub fn appendGenerationFields(
 /// OpenAI format: text → {"type":"text","text":"..."}, image_url → {"type":"image_url","image_url":{"url":"...","detail":"..."}},
 /// image_base64 → {"type":"image_url","image_url":{"url":"data:mime;base64,..."}}.
 /// Used by OpenAI, OpenRouter, and Compatible providers.
-/// Serialize a single content part (text, image_url, or image_base64) to a JSON string.
+/// video_base64 → {"type":"video_url","video_url":{"url":"data:video/mime;base64,..."}}.
+/// Serialize a single content part (text, image_url, image_base64, video_base64) to a JSON string.
 pub fn serializeContentPart(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, part: root.ContentPart) !void {
     switch (part) {
         .text => |text| {
@@ -324,6 +325,21 @@ pub fn serializeContentPart(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem
             }
             try buf.appendSlice(allocator, ";base64,");
             try buf.appendSlice(allocator, img.data);
+            try buf.appendSlice(allocator, "\"}}");
+        },
+        .video_base64 => |vid| {
+            // Moonshot/Kimi accepts video as a data URI inside a video_url
+            // part: {"type":"video_url","video_url":{"url":"data:video/..;base64,.."}}.
+            try buf.appendSlice(allocator, "{\"type\":\"video_url\",\"video_url\":{\"url\":\"data:");
+            for (vid.media_type) |c| {
+                switch (c) {
+                    '"' => try buf.appendSlice(allocator, "\\\""),
+                    '\\' => try buf.appendSlice(allocator, "\\\\"),
+                    else => try buf.append(allocator, c),
+                }
+            }
+            try buf.appendSlice(allocator, ";base64,");
+            try buf.appendSlice(allocator, vid.data);
             try buf.appendSlice(allocator, "\"}}");
         },
     }
@@ -531,6 +547,17 @@ test "Q2 — OpenAI o1/o3 path unchanged (drops temperature unless effort=none)"
     try std.testing.expect(std.mem.indexOf(u8, out, "\"max_completion_tokens\":32768") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"reasoning_effort\":\"high\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"temperature\"") == null);
+}
+
+test "serializeContentPart emits a video_url data URI for video_base64" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    try serializeContentPart(&buf, allocator, .{ .video_base64 = .{ .data = "AAAA", .media_type = "video/mp4" } });
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"video_url\",\"video_url\":{\"url\":\"data:video/mp4;base64,AAAA\"}}",
+        buf.items,
+    );
 }
 
 test "convertToolsOpenAI produces valid JSON" {

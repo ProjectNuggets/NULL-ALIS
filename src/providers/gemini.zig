@@ -766,6 +766,14 @@ fn buildChatRequestBody(
                         try root.appendJsonString(&buf, allocator, text_buf.items);
                         try buf.append(allocator, '}');
                     },
+                    .video_base64 => |vid| {
+                        // Gemini ingests video as inlineData, same shape as images.
+                        try buf.appendSlice(allocator, "{\"inlineData\":{\"mimeType\":");
+                        try root.appendJsonString(&buf, allocator, vid.media_type);
+                        try buf.appendSlice(allocator, ",\"data\":\"");
+                        try buf.appendSlice(allocator, vid.data);
+                        try buf.appendSlice(allocator, "\"}}");
+                    },
                 }
             }
         } else {

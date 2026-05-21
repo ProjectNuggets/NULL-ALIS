@@ -87,6 +87,7 @@ pub const ContentPart = union(enum) {
     text: []const u8,
     image_url: ImageUrl,
     image_base64: ImageBase64,
+    video_base64: VideoBase64,
 
     pub const ImageUrl = struct {
         url: []const u8,
@@ -94,6 +95,16 @@ pub const ContentPart = union(enum) {
     };
 
     pub const ImageBase64 = struct {
+        data: []const u8,
+        media_type: []const u8,
+    };
+
+    /// Base64-encoded video. Serialized for providers that natively accept
+    /// video — Moonshot/Kimi (`video_url` data URI) and Gemini (`inlineData`).
+    /// Providers without native video support degrade it to a text
+    /// placeholder; the agent's routing drops video for non-video models
+    /// before it reaches serialization.
+    pub const VideoBase64 = struct {
         data: []const u8,
         media_type: []const u8,
     };
@@ -112,6 +123,11 @@ pub fn makeImageUrlPart(url: []const u8) ContentPart {
 /// Create a base64-encoded image content part.
 pub fn makeBase64ImagePart(data: []const u8, media_type: []const u8) ContentPart {
     return .{ .image_base64 = .{ .data = data, .media_type = media_type } };
+}
+
+/// Create a base64-encoded video content part.
+pub fn makeBase64VideoPart(data: []const u8, media_type: []const u8) ContentPart {
+    return .{ .video_base64 = .{ .data = data, .media_type = media_type } };
 }
 
 /// Roles a message can have in a conversation.
