@@ -21,6 +21,7 @@ const dispatcher = @import("dispatcher.zig");
 const procedural_memory = @import("procedural_memory.zig");
 const narration = @import("narration.zig");
 const bench_self = @import("bench_self.zig");
+const task_planner = @import("task_planner.zig");
 // v1.14.14 Phase 3 originally added `const compaction = @import("compaction.zig");`
 // here, but the new `compact`/`forceCompact` methods reach compaction via the
 // agent's own `autoCompactHistory`/`forceCompressHistory` rather than calling
@@ -719,17 +720,36 @@ pub const ContextEngine = struct {
         };
         defer if (recent_thoughts_block) |b| allocator.free(b);
 
+        // v1.14.18-A G4 (TASK-PLANNER READ-BACK) — render the agent's retained
+        // task plan as a `<task_plan>` block. The plan is an Agent field
+        // (persist-until-replaced) so this surfaces the plan + live step
+        // progress from the most recent turn that emitted one. Failure-soft:
+        // a render error drops the block, never fails assembly.
+        const task_plan_block: ?[]u8 = blk: {
+            const plan_ptr: ?*const task_planner.TaskPlan = if (@hasField(@TypeOf(agent.*), "active_task_plan"))
+                (if (agent.active_task_plan) |*p| p else null)
+            else
+                null;
+            const p = plan_ptr orelse break :blk null;
+            break :blk task_planner.renderPlanBlock(allocator, p) catch |err| {
+                log.warn("task_planner.render_failed err={s}", .{@errorName(err)});
+                break :blk null;
+            };
+        };
+        defer if (task_plan_block) |b| allocator.free(b);
+
         // Context v2: build stable + volatile separately so tool instructions
         // can sit in the STABLE half (byte-identical across turns) rather than
         // after the volatile block. This preserves byte-prefix cache stability
         // on Together/vLLM and enables future Anthropic two-block emission.
         //
         // v1.14.18-B coordination invariant — Recall-stack ordering:
-        //   1. recent_thoughts (G3, Agent G)   ← FIRST in PromptContext
-        //   2. known_weakness  (G7, Agent E)   ← SECOND (populated separately)
-        //   3. skill_traces    (G-07, existing) ← THIRD
+        //   1. recent_thoughts (G3, Agent G)    ← FIRST in PromptContext
+        //   2. known_weakness  (G7, Agent E)    ← SECOND (populated separately)
+        //   3. task_plan       (G4, v1.14.18-A) ← THIRD (agent's plan + progress)
+        //   4. skill_traces    (G-07, existing) ← FOURTH
         //
-        // This three-block order is also baked into
+        // This four-block order is also baked into
         // `prompt.buildVolatileSystemPrompt`. Byte-stability across turns
         // assumes the upstream sources update at session boundaries.
         // Re-ordering these fields here without also updating the prompt
@@ -746,6 +766,7 @@ pub const ContextEngine = struct {
             .working_memory_block = wm_block,
             .recent_thoughts_block = if (recent_thoughts_block) |b| (if (b.len > 0) b else null) else null,
             .known_weakness_block = if (known_weakness_block) |b| (if (b.len > 0) b else null) else null,
+            .task_plan_block = if (task_plan_block) |b| (if (b.len > 0) b else null) else null,
             .skill_traces_block = if (skill_traces_block) |b| (if (b.len > 0) b else null) else null,
         };
 

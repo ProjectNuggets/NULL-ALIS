@@ -272,6 +272,13 @@ pub const PromptContext = struct {
     /// ordering invariant in `buildVolatileSystemPrompt`. Empty when no
     /// bench results are available (`.spike/results.tsv` absent).
     known_weakness_block: ?[]const u8 = null,
+    /// v1.14.18-A G4 (TASK-PLANNER READ-BACK) — the agent's retained task
+    /// plan rendered as `<task_plan>...</task_plan>` by
+    /// `agent/task_planner.zig::renderPlanBlock`. Surfaces the plan + live
+    /// step progress in the volatile prompt. Renders after
+    /// `known_weakness_block` and before `skill_traces_block`. Empty until
+    /// the agent emits a `<task_plan>`.
+    task_plan_block: ?[]const u8 = null,
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -527,6 +534,16 @@ pub fn buildVolatileSystemPrompt(
         if (kw.len > 0) {
             try w.writeAll(kw);
             if (kw[kw.len - 1] != '\n') try w.writeAll("\n");
+            try w.writeAll("\n");
+        }
+    }
+    // v1.14.18-A G4 (TASK-PLANNER READ-BACK) — the agent's plan + live step
+    // progress, after known_weakness and before skill traces (recall-stack
+    // ordering invariant; see context_engine.assemble).
+    if (ctx.task_plan_block) |tp| {
+        if (tp.len > 0) {
+            try w.writeAll(tp);
+            if (tp[tp.len - 1] != '\n') try w.writeAll("\n");
             try w.writeAll("\n");
         }
     }

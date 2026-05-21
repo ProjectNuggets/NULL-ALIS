@@ -91,6 +91,35 @@ pub const TaskPlan = struct {
     }
 };
 
+/// v1.14.18-A G4 (TASK-PLANNER READ-BACK) — render the current plan as a
+/// `<task_plan>` prompt block so the agent sees its own plan + live step
+/// progress carried back into the volatile system prompt. Before this, the
+/// planner only EMITTED observer telemetry; the agent never re-read its plan.
+///
+/// Caller owns the returned slice. Returns a zero-length slice for a plan
+/// with no steps (the prompt builder treats empty as "skip the block").
+/// Failure-soft at the call site: assemble() catches errors and drops the
+/// block rather than failing prompt assembly.
+pub fn renderPlanBlock(allocator: std.mem.Allocator, plan: *const TaskPlan) ![]u8 {
+    if (plan.steps.len == 0) return allocator.alloc(u8, 0);
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("<task_plan>\n");
+    try w.print("Goal: {s}\n", .{plan.summary});
+    for (plan.steps, 0..) |step, i| {
+        // `» ` marks the current step; two spaces keep the others aligned.
+        try w.print("  {s}[{s}] {d}. {s}\n", .{
+            if (i == plan.current_step) "\u{00BB} " else "  ",
+            step.status.toSlice(),
+            i + 1,
+            step.description,
+        });
+    }
+    try w.writeAll("</task_plan>");
+    return buf.toOwnedSlice(allocator);
+}
+
 /// Result of splitting response text from its embedded <task_plan> block.
 pub const ExtractResult = struct {
     /// Text before the <task_plan> block, trimmed.
@@ -454,4 +483,35 @@ test "StepStatus toSlice covers all variants" {
     try std.testing.expectEqualStrings("running", StepStatus.running.toSlice());
     try std.testing.expectEqualStrings("done", StepStatus.done.toSlice());
     try std.testing.expectEqualStrings("failed", StepStatus.failed.toSlice());
+}
+
+test "renderPlanBlock surfaces summary, per-step status, and current marker" {
+    // v1.14.18-A G4 (TASK-PLANNER READ-BACK) — locks the prompt-block shape.
+    const allocator = std.testing.allocator;
+    var steps = [_]TaskStep{
+        .{ .index = 0, .description = "research the API", .status = .done },
+        .{ .index = 1, .description = "write the adapter", .status = .running },
+        .{ .index = 2, .description = "add tests", .status = .pending },
+    };
+    var plan = TaskPlan{ .summary = "ship the feature", .steps = &steps, .current_step = 1 };
+
+    const block = try renderPlanBlock(allocator, &plan);
+    defer allocator.free(block);
+
+    try std.testing.expect(std.mem.startsWith(u8, block, "<task_plan>"));
+    try std.testing.expect(std.mem.endsWith(u8, block, "</task_plan>"));
+    try std.testing.expect(std.mem.indexOf(u8, block, "Goal: ship the feature") != null);
+    try std.testing.expect(std.mem.indexOf(u8, block, "[done] 1. research the API") != null);
+    try std.testing.expect(std.mem.indexOf(u8, block, "[running] 2. write the adapter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, block, "[pending] 3. add tests") != null);
+    // The current step (current_step == 1) carries the `»` marker.
+    try std.testing.expect(std.mem.indexOf(u8, block, "\u{00BB} [running] 2.") != null);
+}
+
+test "renderPlanBlock returns empty for a plan with no steps" {
+    const allocator = std.testing.allocator;
+    var plan = TaskPlan{ .summary = "empty", .steps = &.{}, .current_step = 0 };
+    const block = try renderPlanBlock(allocator, &plan);
+    defer allocator.free(block);
+    try std.testing.expectEqual(@as(usize, 0), block.len);
 }
