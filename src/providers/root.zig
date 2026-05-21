@@ -95,16 +95,26 @@ pub const ContentPart = union(enum) {
     };
 
     pub const ImageBase64 = struct {
+        /// Pure base64 payload — NO `data:` prefix. Provider serializers
+        /// append it verbatim into a JSON string, so it must contain only
+        /// the base64 alphabet ([A-Za-z0-9+/=]). Callers own this invariant.
         data: []const u8,
         media_type: []const u8,
     };
 
     /// Base64-encoded video. Serialized for providers that natively accept
     /// video — Moonshot/Kimi (`video_url` data URI) and Gemini (`inlineData`).
-    /// Providers without native video support degrade it to a text
-    /// placeholder; the agent's routing drops video for non-video models
-    /// before it reaches serialization.
+    /// Anthropic, which has no video content block, degrades it to a text
+    /// placeholder.
+    ///
+    /// SCAFFOLDING (P3a, 2026-05-21): the serialization path exists, but no
+    /// code constructs a video_base64 part yet, and no agent routing inspects
+    /// video capability. Capability-aware video ingest + routing land in a
+    /// later phase — until then this variant is unreachable from real input.
     pub const VideoBase64 = struct {
+        /// Pure base64 payload — NO `data:` prefix. Provider serializers
+        /// append it verbatim into a JSON string, so it must contain only
+        /// the base64 alphabet ([A-Za-z0-9+/=]). Callers own this invariant.
         data: []const u8,
         media_type: []const u8,
     };

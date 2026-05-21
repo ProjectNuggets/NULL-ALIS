@@ -49,8 +49,9 @@ const MODEL_TABLE = [_]ModelEntry{
     .{ .key = "claude-sonnet-4-6", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true } },
     .{ .key = "claude-sonnet-4.6", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true } },
     .{ .key = "claude-haiku-4-5", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true } },
-    // OpenAI — GPT-4o/4.1/4.5/5.x accept image input; no native video/audio on
-    // the chat completions API. o3-mini is text-only (left at defaults).
+    // OpenAI — GPT-4o/4.1/4.5/5.x accept image input. This table marks vision
+    // only; audio-capable variants (e.g. gpt-4o-audio) are not wired here.
+    // o3-mini is text-only (left at defaults).
     .{ .key = "gpt-5.2", .caps = .{ .context_window = 128_000, .max_output = 8_192, .vision = true } },
     .{ .key = "gpt-5.2-codex", .caps = .{ .context_window = 128_000, .max_output = 8_192, .vision = true } },
     .{ .key = "gpt-4.5-preview", .caps = .{ .context_window = 128_000, .max_output = 8_192, .vision = true } },
@@ -180,6 +181,11 @@ fn lookupProviderTable(key: []const u8) ?ModelCapabilities {
 }
 
 fn inferFromPattern(model_id: []const u8) ?ModelCapabilities {
+    // Note: pattern matches intentionally leave vision/video/audio at the
+    // conservative default (false). The exact MODEL_TABLE is the source of
+    // truth for modality; a model recognized only by a broad name prefix
+    // routes through the sidecar rather than guessing it is multimodal.
+
     // Kimi large-context variants
     if (std.mem.indexOf(u8, model_id, "k2p5") != null or
         startsWithIgnoreCase(model_id, "kimi-k2"))

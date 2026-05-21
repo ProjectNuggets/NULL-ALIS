@@ -467,10 +467,15 @@ fn serializeAnthropicContent(
                     try buf.append(allocator, '}');
                 },
                 .video_base64 => {
-                    // The Anthropic Messages API has no video content block.
-                    // The agent's routing drops video for non-video-capable
-                    // models before serialization, so this is a defensive
-                    // placeholder — emit a text block, never raw video bytes.
+                    // The Anthropic Messages API has no video content block —
+                    // emit a text placeholder, never raw video bytes.
+                    //
+                    // Defensive only: as of P3a (2026-05-21) nothing
+                    // constructs video_base64 parts, and there is no
+                    // agent-side video routing (images have
+                    // shouldRouteToVisionFallback; video has no analogue
+                    // yet). If a video producer + routing land later, this
+                    // remains the final safety net for a non-video model.
                     try buf.appendSlice(allocator, "{\"type\":\"text\",\"text\":");
                     try root.appendJsonString(buf, allocator, "[video omitted: this model has no native video support]");
                     if (cache_breakpoint and is_last) {
