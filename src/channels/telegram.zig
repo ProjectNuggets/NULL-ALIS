@@ -1275,7 +1275,8 @@ pub const TelegramChannel = struct {
     }
 
     /// Process a single Telegram update: extract message content (voice, photo,
-    /// document, or text), check authorization, and append to the messages list.
+    /// video, document, or text), check authorization, and append to the
+    /// messages list.
     /// Called from both the main poll loop and the follow-up media group re-poll.
     fn processUpdate(
         self: *TelegramChannel,
@@ -1428,6 +1429,49 @@ pub const TelegramChannel = struct {
                                 break :blk_content null;
                             };
                         }
+                    }
+                }
+            }
+
+            // Check for video messages — download and inject a [VIDEO:] marker,
+            // mirroring the photo path above. multimodal.zig base64-encodes the
+            // file and the agent routes it by the model's video capability.
+            if (message.object.get("video")) |video_val| {
+                if (video_val == .object) {
+                    const video_fid_val = video_val.object.get("file_id") orelse break :blk_content null;
+                    const video_fid = if (video_fid_val == .string) video_fid_val.string else break :blk_content null;
+                    const video_fname: ?[]const u8 = if (video_val.object.get("file_name")) |fn_val|
+                        (if (fn_val == .string) fn_val.string else null)
+                    else
+                        null;
+
+                    if (downloadTelegramFile(allocator, self.bot_token, video_fid, video_fname, self.proxy)) |local_path| {
+                        var result: std.ArrayListUnmanaged(u8) = .empty;
+                        result.appendSlice(allocator, "[VIDEO:") catch {
+                            allocator.free(local_path);
+                            break :blk_content null;
+                        };
+                        result.appendSlice(allocator, local_path) catch {
+                            allocator.free(local_path);
+                            result.deinit(allocator);
+                            break :blk_content null;
+                        };
+                        result.appendSlice(allocator, "]") catch {
+                            allocator.free(local_path);
+                            result.deinit(allocator);
+                            break :blk_content null;
+                        };
+                        allocator.free(local_path);
+                        if (message.object.get("caption")) |cap_val| {
+                            if (cap_val == .string) {
+                                result.appendSlice(allocator, " ") catch {};
+                                result.appendSlice(allocator, cap_val.string) catch {};
+                            }
+                        }
+                        break :blk_content result.toOwnedSlice(allocator) catch {
+                            result.deinit(allocator);
+                            break :blk_content null;
+                        };
                     }
                 }
             }
