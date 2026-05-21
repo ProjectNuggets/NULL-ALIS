@@ -85,6 +85,28 @@ jobs:
     defaults:
       run:
         shell: bash
+    # Finding #1 (coordinator review, 2026-05-21): a live Postgres service so
+    # the ~60 postgres-gated integration tests actually RUN in CI. Previously
+    # this job compiled the postgres engine but set no NULLALIS_POSTGRES_TEST_URL
+    # and provided no database, so every postgres test hit `error.SkipZigTest` —
+    # letting postgres-only regressions (FK-violation test bugs, GPA under-free
+    # panics, test-runner trips) accumulate undetected. pgvector/pgvector:pg16
+    # matches the local dev image and ships both the `vector` and `pgcrypto`
+    # extensions the migrations require.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: zaki
+          POSTGRES_PASSWORD: zaki
+          POSTGRES_DB: zaki
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zaki -d zaki"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -97,6 +119,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libpq-dev
 
       - name: Run tests (canonical production engines)
+        env:
+          # Drives the postgres-gated integration tests against the service
+          # container above. Without this they SkipZigTest. See Finding #1.
+          NULLALIS_POSTGRES_TEST_URL: postgresql://zaki:zaki@localhost:5432/zaki
         run: zig build test --summary all -Dengines=base,sqlite,postgres -Dchannels=cli,telegram
 
       - name: Build ReleaseSmall (canonical production engines)
