@@ -39,6 +39,11 @@ const CompatProvider = struct {
     merge_system_into_user: bool = false,
     /// Authentication style (default: Bearer token).
     auth_style: compatible.AuthStyle = .bearer,
+    /// When true, emit Kimi's native `thinking` request field
+    /// (`{"type":"enabled","keep":"all"}`) instead of `reasoning_effort`,
+    /// and round-trip historical assistant `reasoning_content` so the
+    /// model retains its cross-turn chain of thought. Moonshot-only.
+    emit_kimi_thinking: bool = false,
 };
 
 const compat_providers = [_]CompatProvider{
@@ -72,8 +77,13 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "poe", .url = "https://api.poe.com/v1", .display = "Poe" },
 
     // ── China Providers — general ─────────────────────────────────────────
-    .{ .name = "moonshot", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
-    .{ .name = "kimi", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
+    //
+    // Moonshot's native global API. `kimi-k2.6` is served here under its
+    // bare model ID. `emit_kimi_thinking` switches the request shape to
+    // Kimi's native `thinking` field (cross-turn CoT via `keep:"all"`).
+    // CN-region users should use the `moonshot-cn` / `kimi-cn` aliases.
+    .{ .name = "moonshot", .url = "https://api.moonshot.ai/v1", .display = "Moonshot AI", .emit_kimi_thinking = true },
+    .{ .name = "kimi", .url = "https://api.moonshot.ai/v1", .display = "Moonshot AI", .emit_kimi_thinking = true },
     .{ .name = "glm", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
     .{ .name = "zhipu", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
     .{ .name = "zai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI" },
@@ -326,6 +336,7 @@ pub const ProviderHolder = union(enum) {
                 if (cp) |c| {
                     if (c.no_responses_fallback) prov.supports_responses_fallback = false;
                     if (c.merge_system_into_user) prov.merge_system_into_user = true;
+                    if (c.emit_kimi_thinking) prov.emit_kimi_thinking = true;
                 }
 
                 // Apply config-level native_tools override.
@@ -417,9 +428,10 @@ test "compatibleProviderUrl returns correct URLs" {
 }
 
 test "compatibleProviderUrl fixed URLs" {
-    // These 5 URLs were corrected from the original values.
-    try std.testing.expectEqualStrings("https://api.moonshot.cn/v1", compatibleProviderUrl("moonshot").?);
-    try std.testing.expectEqualStrings("https://api.moonshot.cn/v1", compatibleProviderUrl("kimi").?);
+    // `moonshot` / `kimi` resolve to Moonshot's native global API
+    // (`api.moonshot.ai`); CN-region users use the `-cn` aliases.
+    try std.testing.expectEqualStrings("https://api.moonshot.ai/v1", compatibleProviderUrl("moonshot").?);
+    try std.testing.expectEqualStrings("https://api.moonshot.ai/v1", compatibleProviderUrl("kimi").?);
     try std.testing.expectEqualStrings("https://api.synthetic.new/openai/v1", compatibleProviderUrl("synthetic").?);
     try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/v1", compatibleProviderUrl("vercel").?);
     try std.testing.expectEqualStrings("https://opencode.ai/zen/v1", compatibleProviderUrl("opencode").?);
@@ -515,6 +527,29 @@ test "findCompatProvider returns correct flags" {
     const minimax_cn = findCompatProvider("minimax-cn").?;
     try std.testing.expect(minimax_cn.no_responses_fallback);
     try std.testing.expect(minimax_cn.merge_system_into_user);
+
+    // Moonshot native: emit_kimi_thinking enabled for moonshot + kimi.
+    try std.testing.expect(findCompatProvider("moonshot").?.emit_kimi_thinking);
+    try std.testing.expect(findCompatProvider("kimi").?.emit_kimi_thinking);
+    // Together must NOT emit the Kimi-native thinking field.
+    try std.testing.expect(!findCompatProvider("together").?.emit_kimi_thinking);
+    // CN-region aliases keep the default (no thinking field) — verified
+    // here to guard against accidental flag bleed into the -cn entries.
+    try std.testing.expect(!findCompatProvider("moonshot-cn").?.emit_kimi_thinking);
+}
+
+test "fromConfig applies emit_kimi_thinking flag" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "moonshot", "key", null, true);
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expect(h.compatible.emit_kimi_thinking);
+
+    // Together stays off.
+    var t = ProviderHolder.fromConfig(alloc, "together", "key", null, true);
+    defer t.deinit();
+    try std.testing.expect(t == .compatible);
+    try std.testing.expect(!t.compatible.emit_kimi_thinking);
 }
 
 test "fromConfig applies no_responses_fallback flag" {

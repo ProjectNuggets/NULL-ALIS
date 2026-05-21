@@ -52,6 +52,12 @@ pub const OpenAiCompatibleProvider = struct {
     /// Whether this provider supports native OpenAI-style tool_calls.
     /// When false, the agent uses XML tool format via system prompt.
     native_tools: bool = true,
+    /// When true, emit Kimi's native `thinking` request field
+    /// (`{"type":"enabled","keep":"all"}`) in place of `reasoning_effort`,
+    /// and round-trip historical assistant `reasoning_content` so the
+    /// model keeps its cross-turn chain of thought. Moonshot-only — set
+    /// from the `emit_kimi_thinking` entry in factory.zig's provider table.
+    emit_kimi_thinking: bool = false,
     allocator: std.mem.Allocator,
 
     pub fn init(
