@@ -152,6 +152,12 @@ pub const ChatMessage = struct {
     /// Optional multimodal content parts (images, etc.). When set, providers
     /// serialize these instead of the plain `content` field.
     content_parts: ?[]const ContentPart = null,
+    /// Optional reasoning trace for an assistant message. Kimi's native
+    /// cross-turn thinking (`thinking.keep:"all"`) requires the client to
+    /// send each historical assistant turn's `reasoning_content` back in
+    /// the `messages` array; the Moonshot-compatible request builder emits
+    /// this field when set. Borrowed (not owned by ChatMessage).
+    reasoning_content: ?[]const u8 = null,
 
     pub fn system(content: []const u8) ChatMessage {
         return .{ .role = .system, .content = content };

@@ -30,6 +30,14 @@ pub const AuthStyle = enum {
     }
 };
 
+/// Kimi-specific top-level request field. `type:"enabled"` turns
+/// reasoning on; `keep:"all"` preserves the model's chain of thought
+/// across turns (the client must round-trip each historical assistant
+/// message's `reasoning_content` for this to take effect). Emitted only
+/// on the Moonshot native route — see `emit_kimi_thinking`. The leading
+/// comma lets it be appended directly after `appendGenerationFields`.
+const KIMI_THINKING_FIELD = ",\"thinking\":{\"type\":\"enabled\",\"keep\":\"all\"}";
+
 /// A provider that speaks the OpenAI-compatible chat completions API.
 ///
 /// Used by: Venice, Vercel, Cloudflare, Moonshot, Synthetic, OpenCode,
@@ -287,12 +295,17 @@ pub const OpenAiCompatibleProvider = struct {
     }
 
     /// Build a chat request JSON body.
+    ///
+    /// `emit_kimi_thinking` — when true (Moonshot native route), emit
+    /// Kimi's top-level `thinking` field and suppress `reasoning_effort`
+    /// (Moonshot rejects the latter).
     pub fn buildRequestBody(
         allocator: std.mem.Allocator,
         system_prompt: ?[]const u8,
         message: []const u8,
         model: []const u8,
         temperature: f64,
+        emit_kimi_thinking: bool,
     ) ![]const u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
@@ -314,7 +327,8 @@ pub const OpenAiCompatibleProvider = struct {
         }
 
         try buf.append(allocator, ']');
-        try root.appendGenerationFields(&buf, allocator, model, temperature, null, null);
+        try root.appendGenerationFields(&buf, allocator, model, temperature, null, null, emit_kimi_thinking);
+        if (emit_kimi_thinking) try buf.appendSlice(allocator, KIMI_THINKING_FIELD);
         try buf.appendSlice(allocator, ",\"stream\":false}");
 
         return try buf.toOwnedSlice(allocator);
@@ -545,7 +559,7 @@ pub const OpenAiCompatibleProvider = struct {
         const url = try self.chatCompletionsUrl(allocator);
         defer allocator.free(url);
 
-        const body = try buildStreamingChatRequestBody(allocator, request, effective_model, temperature, self.merge_system_into_user);
+        const body = try buildStreamingChatRequestBody(allocator, request, effective_model, temperature, self.merge_system_into_user, self.emit_kimi_thinking);
         defer allocator.free(body);
 
         const auth = try self.authHeaderValue(allocator);
@@ -592,7 +606,7 @@ pub const OpenAiCompatibleProvider = struct {
             }
         }
 
-        const body = try buildRequestBody(allocator, eff_system, merged_msg orelse message, effective_model, temperature);
+        const body = try buildRequestBody(allocator, eff_system, merged_msg orelse message, effective_model, temperature, self.emit_kimi_thinking);
         defer allocator.free(body);
 
         const auth = try self.authHeaderValue(allocator);
@@ -646,7 +660,7 @@ pub const OpenAiCompatibleProvider = struct {
         const url = try self.chatCompletionsUrl(allocator);
         defer allocator.free(url);
 
-        const body = try buildChatRequestBody(allocator, request, effective_model, temperature, self.merge_system_into_user);
+        const body = try buildChatRequestBody(allocator, request, effective_model, temperature, self.merge_system_into_user, self.emit_kimi_thinking);
         defer allocator.free(body);
 
         const auth = try self.authHeaderValue(allocator);
@@ -706,6 +720,7 @@ fn serializeMessagesInto(
     allocator: std.mem.Allocator,
     messages: []const ChatMessage,
     merge_system: bool,
+    emit_kimi_thinking: bool,
 ) !void {
     if (!merge_system) {
         // Standard path: serialize all messages as-is.
@@ -719,6 +734,7 @@ fn serializeMessagesInto(
                 try buf.appendSlice(allocator, ",\"tool_call_id\":");
                 try root.appendJsonString(buf, allocator, tc_id);
             }
+            try appendReasoningContentField(buf, allocator, msg, emit_kimi_thinking);
             try buf.append(allocator, '}');
         }
         return;
@@ -774,17 +790,45 @@ fn serializeMessagesInto(
             try buf.appendSlice(allocator, ",\"tool_call_id\":");
             try root.appendJsonString(buf, allocator, tc_id);
         }
+        try appendReasoningContentField(buf, allocator, msg, emit_kimi_thinking);
         try buf.append(allocator, '}');
     }
 }
 
+/// Emit `"reasoning_content":"<escaped>"` for an assistant message that
+/// carries a non-empty reasoning trace, gated on `emit_kimi_thinking`.
+///
+/// Kimi's `thinking.keep:"all"` requires the client to round-trip each
+/// historical assistant turn's reasoning back in the request; this is
+/// what makes the model retain its cross-turn chain of thought. Gated on
+/// the flag so non-Moonshot providers never see an unexpected field.
+fn appendReasoningContentField(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    msg: ChatMessage,
+    emit_kimi_thinking: bool,
+) !void {
+    if (!emit_kimi_thinking) return;
+    if (msg.role != .assistant) return;
+    const rc = msg.reasoning_content orelse return;
+    if (rc.len == 0) return;
+    try buf.appendSlice(allocator, ",\"reasoning_content\":");
+    try root.appendJsonString(buf, allocator, rc);
+}
+
 /// Build a full chat request JSON body from a ChatRequest (OpenAI-compatible format).
+///
+/// `emit_kimi_thinking` — when true (Moonshot native route), emit Kimi's
+/// top-level `thinking` field (cross-turn CoT), round-trip historical
+/// assistant `reasoning_content`, and suppress `reasoning_effort` (which
+/// Moonshot rejects for K2.6).
 fn buildChatRequestBody(
     allocator: std.mem.Allocator,
     request: ChatRequest,
     model: []const u8,
     temperature: f64,
     merge_system: bool,
+    emit_kimi_thinking: bool,
 ) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -793,10 +837,11 @@ fn buildChatRequestBody(
     try buf.appendSlice(allocator, model);
     try buf.appendSlice(allocator, "\",\"messages\":[");
 
-    try serializeMessagesInto(&buf, allocator, request.messages, merge_system);
+    try serializeMessagesInto(&buf, allocator, request.messages, merge_system, emit_kimi_thinking);
 
     try buf.append(allocator, ']');
-    try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
+    try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort, emit_kimi_thinking);
+    if (emit_kimi_thinking) try buf.appendSlice(allocator, KIMI_THINKING_FIELD);
     if (request.tools) |tools| {
         if (tools.len > 0) {
             try buf.appendSlice(allocator, ",\"tools\":");
@@ -811,12 +856,15 @@ fn buildChatRequestBody(
 }
 
 /// Build a streaming chat request JSON body (identical to buildChatRequestBody but with "stream":true).
+///
+/// `emit_kimi_thinking` — see `buildChatRequestBody`.
 fn buildStreamingChatRequestBody(
     allocator: std.mem.Allocator,
     request: ChatRequest,
     model: []const u8,
     temperature: f64,
     merge_system: bool,
+    emit_kimi_thinking: bool,
 ) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -825,10 +873,11 @@ fn buildStreamingChatRequestBody(
     try buf.appendSlice(allocator, model);
     try buf.appendSlice(allocator, "\",\"messages\":[");
 
-    try serializeMessagesInto(&buf, allocator, request.messages, merge_system);
+    try serializeMessagesInto(&buf, allocator, request.messages, merge_system, emit_kimi_thinking);
 
     try buf.append(allocator, ']');
-    try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
+    try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort, emit_kimi_thinking);
+    if (emit_kimi_thinking) try buf.appendSlice(allocator, KIMI_THINKING_FIELD);
     if (request.tools) |tools| {
         if (tools.len > 0) {
             try buf.appendSlice(allocator, ",\"tools\":");
@@ -889,6 +938,7 @@ test "buildRequestBody with system" {
         "hello",
         "llama-3.3-70b",
         0.4,
+        false,
     );
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "llama-3.3-70b") != null);
@@ -903,6 +953,7 @@ test "buildRequestBody escapes JSON strings" {
         "user \\ path \"quoted\"",
         "model\"x",
         0.4,
+        false,
     );
     defer std.testing.allocator.free(body);
 
@@ -1003,6 +1054,7 @@ test "buildRequestBody without system" {
         "hello",
         "model",
         0.7,
+        false,
     );
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "system") == null);
@@ -1249,7 +1301,7 @@ test "buildStreamingChatRequestBody contains stream true" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
     const req = root.ChatRequest{ .messages = &msgs, .model = "test-model" };
 
-    const body = try buildStreamingChatRequestBody(allocator, req, "test-model", 0.7, false);
+    const body = try buildStreamingChatRequestBody(allocator, req, "test-model", 0.7, false, false);
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
@@ -1277,10 +1329,10 @@ test "streaming body has same messages as non-streaming" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("test message")};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const non_stream = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
+    const non_stream = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false);
     defer allocator.free(non_stream);
 
-    const stream = try buildStreamingChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
+    const stream = try buildStreamingChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false);
     defer allocator.free(stream);
 
     // Both should contain the message
@@ -1297,7 +1349,7 @@ test "streaming body has model field" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
     const req = root.ChatRequest{ .messages = &msgs, .model = "custom-model" };
 
-    const body = try buildStreamingChatRequestBody(allocator, req, "custom-model", 0.5, false);
+    const body = try buildStreamingChatRequestBody(allocator, req, "custom-model", 0.5, false, false);
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "custom-model") != null);
@@ -1312,7 +1364,7 @@ test "buildChatRequestBody without content_parts serializes plain string" {
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("plain text")};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false);
     defer allocator.free(body);
 
     // Verify it's valid JSON
@@ -1339,7 +1391,7 @@ test "buildChatRequestBody with image_url content_parts serializes OpenAI array"
     }};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false);
     defer allocator.free(body);
 
     // Verify it's valid JSON
@@ -1377,7 +1429,7 @@ test "buildChatRequestBody with base64 image serializes as data URI" {
     }};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false);
     defer allocator.free(body);
 
     // Should contain the data URI
@@ -1396,7 +1448,7 @@ test "buildChatRequestBody with high detail image_url" {
     }};
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
 
-    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false);
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -1409,7 +1461,7 @@ test "buildChatRequestBody with high detail image_url" {
 }
 
 test "buildRequestBody reasoning model omits temperature" {
-    const body = try OpenAiCompatibleProvider.buildRequestBody(std.testing.allocator, null, "hello", "gpt-5", 0.5);
+    const body = try OpenAiCompatibleProvider.buildRequestBody(std.testing.allocator, null, "hello", "gpt-5", 0.5, false);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":false") != null);
@@ -1425,7 +1477,7 @@ test "buildChatRequestBody o1 omits temperature" {
         .max_tokens = 100,
     };
 
-    const body = try buildChatRequestBody(allocator, req, "o1", 0.7, false);
+    const body = try buildChatRequestBody(allocator, req, "o1", 0.7, false, false);
     defer allocator.free(body);
 
     // Reasoning model: no temperature, uses max_completion_tokens
@@ -1444,7 +1496,7 @@ test "buildStreamingChatRequestBody reasoning model omits temperature" {
         .max_tokens = 200,
     };
 
-    const body = try buildStreamingChatRequestBody(allocator, req, "gpt-5.2", 0.5, false);
+    const body = try buildStreamingChatRequestBody(allocator, req, "gpt-5.2", 0.5, false, false);
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
@@ -1464,7 +1516,7 @@ test "merge_system_into_user merges system into first user message" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true);
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -1486,7 +1538,7 @@ test "merge_system_into_user with no system messages passes through" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true);
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -1505,7 +1557,7 @@ test "merge_system_into_user false keeps system messages" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildChatRequestBody(allocator, req, "test", 0.7, false);
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, false, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -1531,7 +1583,7 @@ test "merge_system_into_user with multiple system messages concatenates" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true);
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -1555,7 +1607,7 @@ test "merge_system_into_user preserves assistant messages" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true);
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -1582,7 +1634,7 @@ test "merge_system_into_user streaming body also merges" {
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
 
-    const body = try buildStreamingChatRequestBody(allocator, req, "test", 0.7, true);
+    const body = try buildStreamingChatRequestBody(allocator, req, "test", 0.7, true, false);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -1602,4 +1654,91 @@ pub fn requestTimeoutMs(timeout_secs: u64) u32 {
 test "mapRequestError preserves timeout" {
     try std.testing.expect(OpenAiCompatibleProvider.mapRequestError(error.Timeout) == error.Timeout);
     try std.testing.expect(OpenAiCompatibleProvider.mapRequestError(error.CurlFailed) == error.CompatibleApiError);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Moonshot native — `thinking` field + cross-turn `reasoning_content`
+// ════════════════════════════════════════════════════════════════════════════
+
+test "buildChatRequestBody emits Kimi thinking field when emit_kimi_thinking" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "kimi-k2.6", .reasoning_effort = "high" };
+
+    const body = try buildChatRequestBody(allocator, req, "kimi-k2.6", 0.7, false, true);
+    defer allocator.free(body);
+
+    // thinking field present, reasoning_effort suppressed.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\",\"keep\":\"all\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
+
+    // Valid JSON.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+}
+
+test "buildChatRequestBody omits Kimi thinking field when flag off" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "kimi-k2.6", .reasoning_effort = "high" };
+
+    const body = try buildChatRequestBody(allocator, req, "kimi-k2.6", 0.7, false, false);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":") == null);
+    // Non-Moonshot Kimi route still emits reasoning_effort (Together shape).
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
+}
+
+test "buildChatRequestBody round-trips assistant reasoning_content on Moonshot route" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{
+        root.ChatMessage.user("question"),
+        .{ .role = .assistant, .content = "answer", .reasoning_content = "step \"one\"\nstep two" },
+        root.ChatMessage.user("follow-up"),
+    };
+    const req = root.ChatRequest{ .messages = &msgs, .model = "kimi-k2.6" };
+
+    const body = try buildChatRequestBody(allocator, req, "kimi-k2.6", 0.7, false, true);
+    defer allocator.free(body);
+
+    // reasoning_content is present and properly JSON-escaped.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("messages").?.array;
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    const asst = messages.items[1].object;
+    try std.testing.expectEqualStrings("assistant", asst.get("role").?.string);
+    try std.testing.expectEqualStrings("step \"one\"\nstep two", asst.get("reasoning_content").?.string);
+    // User messages carry no reasoning_content.
+    try std.testing.expect(messages.items[0].object.get("reasoning_content") == null);
+    try std.testing.expect(messages.items[2].object.get("reasoning_content") == null);
+}
+
+test "buildChatRequestBody never emits reasoning_content when flag off" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{
+        .{ .role = .assistant, .content = "answer", .reasoning_content = "hidden trace" },
+    };
+    const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o" };
+
+    const body = try buildChatRequestBody(allocator, req, "gpt-4o", 0.7, false, false);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_content") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "hidden trace") == null);
+}
+
+test "buildRequestBody emits Kimi thinking field on Moonshot text route" {
+    const body = try OpenAiCompatibleProvider.buildRequestBody(
+        std.testing.allocator,
+        "be brief",
+        "hello",
+        "kimi-k2.6",
+        0.7,
+        true,
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\",\"keep\":\"all\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
 }

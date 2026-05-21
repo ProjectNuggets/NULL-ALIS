@@ -70,7 +70,7 @@ pub const OpenRouterProvider = struct {
         }
 
         try buf.append(allocator, ']');
-        try root.appendGenerationFields(&buf, allocator, model, temperature, null, null);
+        try root.appendGenerationFields(&buf, allocator, model, temperature, null, null, false);
         try buf.append(allocator, '}');
 
         return try buf.toOwnedSlice(allocator);
@@ -486,7 +486,7 @@ pub const OpenRouterProvider = struct {
         }
 
         try buf.append(allocator, ']');
-        try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
+        try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort, false);
 
         if (request.tools) |tools| {
             if (tools.len > 0) {
@@ -528,7 +528,7 @@ pub const OpenRouterProvider = struct {
         }
 
         try buf.append(allocator, ']');
-        try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
+        try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort, false);
 
         if (request.tools) |tools| {
             if (tools.len > 0) {
