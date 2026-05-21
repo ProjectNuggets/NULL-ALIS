@@ -29,9 +29,9 @@ pub const HttpRequestTool = struct {
     comptime {
         @import("lint.zig").lintToolDescription("http_request", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
     }
-    pub const tool_description = "Call a known external HTTP API directly. Prefer this over shell or curl for external endpoints.";
+    pub const tool_description = "Call a known external HTTPS API directly. Prefer this over shell or curl for external endpoints.";
     pub const tool_params =
-        \\{"type":"object","properties":{"url":{"type":"string","description":"HTTP or HTTPS URL to request"},"method":{"type":"string","description":"HTTP method (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS)","default":"GET"},"headers":{"type":"object","description":"Optional HTTP headers as key-value pairs"},"body":{"type":"string","description":"Optional request body"}},"required":["url"]}
+        \\{"type":"object","properties":{"url":{"type":"string","description":"HTTPS URL to request"},"method":{"type":"string","description":"HTTP method (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS)","default":"GET"},"headers":{"type":"object","description":"Optional HTTP headers as key-value pairs"},"body":{"type":"string","description":"Optional request body"}},"required":["url"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -49,16 +49,16 @@ pub const HttpRequestTool = struct {
 
         const method_str = root.getString(args, "method") orelse "GET";
 
-        // Validate URL scheme
-        if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
-            return ToolResult.fail("Only http:// and https:// URLs are allowed");
+        // Validate URL scheme. Outbound tool traffic is HTTPS-only by policy.
+        if (!std.mem.startsWith(u8, url, "https://")) {
+            return ToolResult.fail("Only https:// URLs are allowed");
         }
 
         // Build URI
         const uri = std.Uri.parse(url) catch
             return ToolResult.fail("Invalid URL format");
 
-        const default_port: u16 = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
+        const default_port: u16 = 443;
         const resolved_port: u16 = uri.port orelse default_port;
 
         // SSRF protection and DNS-rebinding hardening:
@@ -433,13 +433,23 @@ test "execute rejects non-http scheme" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "http") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "https") != null);
+}
+
+test "execute rejects plain http scheme" {
+    var ht = HttpRequestTool{};
+    const t = ht.tool();
+    const parsed = try root.parseTestArgs("{\"url\": \"http://example.com\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Only https:// URLs are allowed", result.error_msg.?);
 }
 
 test "execute rejects localhost SSRF" {
     var ht = HttpRequestTool{};
     const t = ht.tool();
-    const parsed = try root.parseTestArgs("{\"url\": \"http://127.0.0.1:8080/admin\"}");
+    const parsed = try root.parseTestArgs("{\"url\": \"https://127.0.0.1:8080/admin\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
@@ -449,7 +459,7 @@ test "execute rejects localhost SSRF" {
 test "execute rejects localhost SSRF with URL userinfo" {
     var ht = HttpRequestTool{};
     const t = ht.tool();
-    const parsed = try root.parseTestArgs("{\"url\": \"http://user:pass@127.0.0.1:8080/admin\"}");
+    const parsed = try root.parseTestArgs("{\"url\": \"https://user:pass@127.0.0.1:8080/admin\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
@@ -459,7 +469,7 @@ test "execute rejects localhost SSRF with URL userinfo" {
 test "execute rejects localhost SSRF with unbracketed ipv6 authority" {
     var ht = HttpRequestTool{};
     const t = ht.tool();
-    const parsed = try root.parseTestArgs("{\"url\": \"http://::1:8080/admin\"}");
+    const parsed = try root.parseTestArgs("{\"url\": \"https://::1:8080/admin\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
@@ -469,7 +479,7 @@ test "execute rejects localhost SSRF with unbracketed ipv6 authority" {
 test "execute rejects private IP SSRF" {
     var ht = HttpRequestTool{};
     const t = ht.tool();
-    const parsed = try root.parseTestArgs("{\"url\": \"http://192.168.1.1/admin\"}");
+    const parsed = try root.parseTestArgs("{\"url\": \"https://192.168.1.1/admin\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
@@ -478,7 +488,7 @@ test "execute rejects private IP SSRF" {
 test "execute rejects 10.x private range" {
     var ht = HttpRequestTool{};
     const t = ht.tool();
-    const parsed = try root.parseTestArgs("{\"url\": \"http://10.0.0.1/secret\"}");
+    const parsed = try root.parseTestArgs("{\"url\": \"https://10.0.0.1/secret\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
@@ -487,7 +497,7 @@ test "execute rejects 10.x private range" {
 test "execute rejects loopback decimal alias SSRF" {
     var ht = HttpRequestTool{};
     const t = ht.tool();
-    const parsed = try root.parseTestArgs("{\"url\": \"http://2130706433/admin\"}");
+    const parsed = try root.parseTestArgs("{\"url\": \"https://2130706433/admin\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
@@ -508,7 +518,7 @@ test "execute rejects unsupported method" {
 test "execute rejects invalid URL format" {
     var ht = HttpRequestTool{};
     const t = ht.tool();
-    const parsed = try root.parseTestArgs("{\"url\": \"http://\"}");
+    const parsed = try root.parseTestArgs("{\"url\": \"https://\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);

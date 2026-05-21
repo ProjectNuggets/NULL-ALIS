@@ -37,7 +37,7 @@ pub const WebFetchTool = struct {
     }
     pub const tool_description = "Fetch and extract readable text from a specific web page. Prefer this once you already know the URL.";
     pub const tool_params =
-        \\{"type":"object","properties":{"url":{"type":"string","description":"URL to fetch (http or https)"},"max_chars":{"type":"integer","default":50000,"description":"Maximum characters to return"}},"required":["url"]}
+        \\{"type":"object","properties":{"url":{"type":"string","description":"HTTPS URL to fetch"},"max_chars":{"type":"integer","default":50000,"description":"Maximum characters to return"}},"required":["url"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -53,14 +53,14 @@ pub const WebFetchTool = struct {
         const url = root.getString(args, "url") orelse
             return ToolResult.fail("Missing required 'url' parameter");
 
-        // Validate URL scheme
-        if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
-            return ToolResult.fail("Only http:// and https:// URLs are allowed");
+        // Validate URL scheme. Outbound tool traffic is HTTPS-only by policy.
+        if (!std.mem.startsWith(u8, url, "https://")) {
+            return ToolResult.fail("Only https:// URLs are allowed");
         }
 
         const uri = std.Uri.parse(url) catch
             return ToolResult.fail("Invalid URL format");
-        const default_port: u16 = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
+        const default_port: u16 = 443;
         const resolved_port: u16 = uri.port orelse default_port;
 
         // SSRF protection and DNS-rebinding hardening:
@@ -442,12 +442,21 @@ test "WebFetchTool non-http url fails" {
     defer parsed.deinit();
     const result = try wft.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
-    try testing.expectEqualStrings("Only http:// and https:// URLs are allowed", result.error_msg.?);
+    try testing.expectEqualStrings("Only https:// URLs are allowed", result.error_msg.?);
+}
+
+test "WebFetchTool plain http url fails" {
+    var wft = WebFetchTool{};
+    const parsed = try root.parseTestArgs("{\"url\":\"http://example.com\"}");
+    defer parsed.deinit();
+    const result = try wft.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expectEqualStrings("Only https:// URLs are allowed", result.error_msg.?);
 }
 
 test "WebFetchTool localhost blocked" {
     var wft = WebFetchTool{};
-    const parsed = try root.parseTestArgs("{\"url\":\"http://localhost:8080/api\"}");
+    const parsed = try root.parseTestArgs("{\"url\":\"https://localhost:8080/api\"}");
     defer parsed.deinit();
     const result = try wft.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
@@ -456,15 +465,15 @@ test "WebFetchTool localhost blocked" {
 
 test "WebFetchTool private IP blocked" {
     var wft = WebFetchTool{};
-    const p1 = try root.parseTestArgs("{\"url\":\"http://192.168.1.1/\"}");
+    const p1 = try root.parseTestArgs("{\"url\":\"https://192.168.1.1/\"}");
     defer p1.deinit();
     const r1 = try wft.execute(testing.allocator, p1.value.object);
     try testing.expect(!r1.success);
-    const p2 = try root.parseTestArgs("{\"url\":\"http://10.0.0.1/\"}");
+    const p2 = try root.parseTestArgs("{\"url\":\"https://10.0.0.1/\"}");
     defer p2.deinit();
     const r2 = try wft.execute(testing.allocator, p2.value.object);
     try testing.expect(!r2.success);
-    const p3 = try root.parseTestArgs("{\"url\":\"http://127.0.0.1/\"}");
+    const p3 = try root.parseTestArgs("{\"url\":\"https://127.0.0.1/\"}");
     defer p3.deinit();
     const r3 = try wft.execute(testing.allocator, p3.value.object);
     try testing.expect(!r3.success);
@@ -472,7 +481,7 @@ test "WebFetchTool private IP blocked" {
 
 test "WebFetchTool loopback decimal alias blocked" {
     var wft = WebFetchTool{};
-    const parsed = try root.parseTestArgs("{\"url\":\"http://2130706433/\"}");
+    const parsed = try root.parseTestArgs("{\"url\":\"https://2130706433/\"}");
     defer parsed.deinit();
     const result = try wft.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
