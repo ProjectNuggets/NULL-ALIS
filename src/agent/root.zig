@@ -4690,10 +4690,7 @@ pub const Agent = struct {
             // The assistant message + tool results for this iteration are
             // already in history (post-dispatch), so only the directive is
             // appended.
-            if (escalate_on_stuck and
-                stuck_escalation_count < 1 and
-                iteration + 1 < self.max_tool_iterations)
-            {
+            if (shouldEscalateOnStuck(escalate_on_stuck, stuck_escalation_count, iteration, self.max_tool_iterations)) {
                 const recall_directive =
                     "SYSTEM: You reported being stuck. Before concluding, you are " ++
                     "likely missing context that already exists in memory. Issue a " ++
@@ -5056,6 +5053,21 @@ pub const Agent = struct {
             };
         }
         return false;
+    }
+
+    /// G11 — whether the goal-loop should escalate a `stuck` verdict to a
+    /// memory-recall directive instead of exiting the turn. True only when the
+    /// model self-reported `stuck`, the one-shot escalation has not already
+    /// fired this turn (`escalation_count < 1`), and at least one tool
+    /// iteration remains for the recall to run in. A still-`stuck` verdict on
+    /// the next iteration falls through to the normal exit — no infinite loop.
+    fn shouldEscalateOnStuck(
+        escalate_on_stuck: bool,
+        escalation_count: u32,
+        iteration: usize,
+        max_iterations: usize,
+    ) bool {
+        return escalate_on_stuck and escalation_count < 1 and iteration + 1 < max_iterations;
     }
 
     /// Whether an image-bearing turn must be diverted to the configured
@@ -5459,6 +5471,19 @@ test "shouldRouteToVisionFallback: native-vision primary keeps the image" {
     try std.testing.expect(!Agent.shouldRouteToVisionFallback("kimi-k2.5", "", true));
     // Primary already IS the sidecar → no-op (no self-swap).
     try std.testing.expect(!Agent.shouldRouteToVisionFallback("llama-vision", "llama-vision", true));
+}
+
+test "shouldEscalateOnStuck: G11 one-shot stuck-escalation gate" {
+    // Stuck verdict, not yet escalated, iterations remain → escalate.
+    try std.testing.expect(Agent.shouldEscalateOnStuck(true, 0, 0, 10));
+    // Not a stuck verdict → never escalate.
+    try std.testing.expect(!Agent.shouldEscalateOnStuck(false, 0, 0, 10));
+    // One-shot: an escalation already fired this turn → no second escalation.
+    try std.testing.expect(!Agent.shouldEscalateOnStuck(true, 1, 0, 10));
+    // Last iteration (iteration + 1 == max) → no iteration left to recall in.
+    try std.testing.expect(!Agent.shouldEscalateOnStuck(true, 0, 9, 10));
+    // Penultimate iteration → one iteration remains, escalate.
+    try std.testing.expect(Agent.shouldEscalateOnStuck(true, 0, 8, 10));
 }
 
 test "hasVideoContentParts detects video parts" {

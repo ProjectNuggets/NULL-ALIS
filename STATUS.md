@@ -1,8 +1,24 @@
 # nullALIS — STATUS
 
-**Hydrated:** 2026-05-10 from code truth (git log, source tree, bench artifacts, fresh field research). Not memory.
+**Hydrated:** 2026-05-10 from code truth. **Partial refresh:** 2026-05-21 (current-state section + open queue; full bench-standings hydration pending the K2.6 bench run below).
 
 This is the single cold-start document. If it disagrees with `.planning/STATE.md`, `PROJECT_LEDGER.md` (archived), or anything in `docs/archive/`, **this wins**.
+
+---
+
+## 2026-05-21 — current state (partial refresh)
+
+Code truth as of `ed1e84ae` on `main`. The 2026-05-10 sections below are retained for the bench history but predate everything in this block.
+
+**LLM provider — switched to Moonshot Kimi K2.6 native.** The primary route is Moonshot's native API (`kimi-k2.6`), Together (`moonshotai/Kimi-K2.6`) as a cross-provider fallback with a per-provider model override. Native cross-turn reasoning (`thinking.keep:"all"` + `reasoning_content` round-trip) is wired and verified end-to-end. PRs #94 (native-CoT narration), #95 (Moonshot provider).
+
+**Runtime hardening.** PR #96 — UTF-8 write guard at the two `PQexecParams` chokepoints: a stray non-UTF-8 byte in agent/memory content no longer bricks tenant runtime init (it degrades one character to U+FFFD).
+
+**Multimodal — native image + video.** PR #97 — Kimi K2.6 sees images and video natively; capability-aware routing (`model_capabilities.zig` vision/video/audio flags) sends assets to the native model and falls back to the vision sidecar only for text-only models. `[VIDEO:]` channel intake (Telegram, WhatsApp). Audio stays on the Whisper sidecar (no model has native audio yet) via capability-driven routing.
+
+**Activation status (§14.10 trace, 2026-05-21).** G1/G5/G16 (learning loop) re-activated — `a2892e69`, hoisted out of the C3-dead `per_turn_enqueue_enabled` gate. **G4** (task-planner read-back) and **G11** (brain-graph escalation) traced **behaviorally active** — full call chains, production callers, reachable in default config (the 2026-05-21 activation-audit doc predates their completion and is superseded on these two items). No known merged-inert capability remains.
+
+**Bench standings below are pre-K2.6.** A LoCoMo conv-0 + τ-bench airline subset on the Moonshot/K2.6 runtime is queued (bench tenants cleared, harness smoke-verified). Numbers and a full hydration land after that run.
 
 ---
 
@@ -153,7 +169,7 @@ If R2 + R3 + R4 land: LoCoMo temporal +5-10pp, LongMemEval 75-80% overall — pu
 | 2 | **F5 — rerun conv-43** with patched scorer to confirm/deny Cat 4 −9pp regression | Me, this session | next |
 | 3 | **R1 — graph-density telemetry** (above) | Next session | queued |
 | 4 | **R2 — bi-temporal invalidation** (above) | Next session | queued |
-| 5 | Approval-drop bug — user clicks approve, tool drops instead of executing | Nova-scheduled (after gateway HTTP endpoints) | deferred |
+| 5 | ~~Approval-drop bug — user clicks approve, tool drops~~ | — | **RESOLVED** — `approval_continues_turn` (default on) + gateway `handleSessionApprove` + `executeApprovedPendingTool` run the tool and continue the turn; verified by call-chain trace 2026-05-21 |
 | 6 | Modes post-context-v2 pass — fast/balanced/deep presets sized for old 12K budget | Me, low effort | queued |
 | 7 | Refresh `.planning/STATE.md` to point at STATUS.md OR delete | Me, doc pass | queued |
 
