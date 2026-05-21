@@ -427,9 +427,10 @@ test "shell allows in tenant runtime when sandbox is enabled" {
         .allowed_commands = &.{"echo"},
     };
     var st = ShellTool{
-        .workspace_dir = ".",
+        .workspace_dir = "/tmp",
         .policy = &pol,
         .sandbox_enabled = true, // sandbox provides the filesystem jail
+        .sandbox_backend = .none,
     };
     const t = st.tool();
 
@@ -443,7 +444,6 @@ test "shell allows in tenant runtime when sandbox is enabled" {
     // that path may fail in the test env without a real sandbox backend.
     // We only care here that the workspace_only guard did NOT trigger.
     if (result.error_msg) |msg| {
-        defer std.testing.allocator.free(msg);
         try std.testing.expect(std.mem.indexOf(u8, msg, "multi-tenant") == null);
     }
     if (result.output.len > 0) std.testing.allocator.free(result.output);

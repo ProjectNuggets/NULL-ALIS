@@ -179,7 +179,6 @@ pub fn currentStateSnapshot() SandboxStateSnapshot {
 
 fn recordWorkspaceValidationFailure(reason: WorkspaceValidationReason) void {
     _ = workspace_validation_failed_total.fetchAdd(1, .monotonic);
-    _ = workspace_fallback_none_total.fetchAdd(1, .monotonic);
     workspace_validation_last_reason.store(@intFromEnum(reason), .monotonic);
 }
 
@@ -204,11 +203,11 @@ pub fn resolve_sandboxed_argv(
         if (!validation.isValid()) {
             const reason = WorkspaceValidationReason.fromValidationResult(validation);
             recordWorkspaceValidationFailure(reason);
-            log.warn("sandbox workspace validation failed backend={s} reason={s}; falling back to none", .{
+            log.warn("sandbox workspace validation failed backend={s} reason={s}; refusing execution", .{
                 @tagName(exec_cfg.backend),
                 reason.toString(),
             });
-            return argv;
+            return error.SandboxUnavailable;
         }
     }
 
@@ -224,6 +223,7 @@ pub fn resolve_sandboxed_argv(
         // `fail_open_on_dev=true` AND env `NULLALIS_ALLOW_UNSANDBOXED_DEV=1`
         // must hold. Logged at err level (not warn) so alerting picks it up.
         if (exec_cfg.fail_open_on_dev and unsandboxedDevEnvAuthorized()) {
+            _ = workspace_fallback_none_total.fetchAdd(1, .monotonic);
             // AGENTS.md §3.6: gate the audit log on `!is_test`. The bypass
             // path is intentionally exercised by tests; the log line is a
             // runtime audit signal, not a test assertion.
@@ -300,11 +300,11 @@ test "resolve_sandboxed_argv enabled none backend fails closed" {
     try std.testing.expectError(error.SandboxUnavailable, result);
 }
 
-test "resolve_sandboxed_argv invalid docker workspace falls back to passthrough and records diagnostics" {
+test "resolve_sandboxed_argv invalid docker workspace fails closed and records diagnostics" {
     var buf: [MAX_WRAPPED_ARGV][]const u8 = undefined;
     const argv = &[_][]const u8{ "echo", "hello" };
     const before = diagnosticsSnapshot();
-    const resolved = try resolve_sandboxed_argv(
+    const result = resolve_sandboxed_argv(
         std.testing.allocator,
         .{
             .enabled = true,
@@ -315,10 +315,9 @@ test "resolve_sandboxed_argv invalid docker workspace falls back to passthrough 
         &buf,
     );
     const after = diagnosticsSnapshot();
-    try std.testing.expectEqual(@as(usize, argv.len), resolved.len);
-    try std.testing.expectEqualStrings("echo", resolved[0]);
+    try std.testing.expectError(error.SandboxUnavailable, result);
     try std.testing.expect(after.workspace_validation_failed_total >= before.workspace_validation_failed_total + 1);
-    try std.testing.expect(after.workspace_fallback_none_total >= before.workspace_fallback_none_total + 1);
+    try std.testing.expectEqual(before.workspace_fallback_none_total, after.workspace_fallback_none_total);
     try std.testing.expectEqualStrings("dangerous_mount", after.workspace_validation_last_reason);
 }
 
