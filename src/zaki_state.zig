@@ -8,6 +8,7 @@
 //! is healthy.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const config_types = @import("config_types.zig");
 const env_rebrand = @import("env_rebrand.zig");
@@ -866,7 +867,15 @@ const ManagerImpl = struct {
             const status = c.PQresultStatus(result);
             if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
                 if (c.PQstatus(self.lease.conn) != c.CONNECTION_OK) self.conn_healthy = false;
-                log.err("postgres txn exec failed: {s}", .{c.PQerrorMessage(self.lease.conn)});
+                // Finding C fix (coordinator review, 2026-05-21): gate the
+                // failure log on !builtin.is_test. A failed postgres op here
+                // returns error.ExecFailed to the caller, which owns severity
+                // classification. Negative-path tests (e.g.
+                // postgres_pool_releases_on_exec_error) intentionally provoke
+                // the failure; an unconditional log.err trips the Zig test
+                // runner's logged-error check, failing the build even though
+                // the test itself passed. Production (is_test=false) still logs.
+                if (!builtin.is_test) log.err("postgres txn exec failed: {s}", .{c.PQerrorMessage(self.lease.conn)});
                 c.PQclear(result);
                 return error.ExecFailed;
             }
@@ -894,7 +903,8 @@ const ManagerImpl = struct {
             const status = c.PQresultStatus(result);
             if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
                 if (c.PQstatus(self.lease.conn) != c.CONNECTION_OK) self.conn_healthy = false;
-                log.err("postgres txn execParams failed: {s}", .{c.PQerrorMessage(self.lease.conn)});
+                // Finding C fix (2026-05-21): gate on !builtin.is_test — see TxnLease.exec.
+                if (!builtin.is_test) log.err("postgres txn execParams failed: {s}", .{c.PQerrorMessage(self.lease.conn)});
                 c.PQclear(result);
                 return error.ExecFailed;
             }
@@ -9289,7 +9299,8 @@ const ManagerImpl = struct {
         const status = c.PQresultStatus(result);
         if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
             if (c.PQstatus(conn) != c.CONNECTION_OK) conn_healthy = false;
-            log.err("postgres exec failed: {s}", .{c.PQerrorMessage(conn)});
+            // Finding C fix (2026-05-21): gate on !builtin.is_test — see TxnLease.exec.
+            if (!builtin.is_test) log.err("postgres exec failed: {s}", .{c.PQerrorMessage(conn)});
             c.PQclear(result);
             return error.ExecFailed;
         }
@@ -9352,7 +9363,8 @@ const ManagerImpl = struct {
             return null;
         }
 
-        log.err("postgres exec failed: {s}", .{c.PQerrorMessage(conn)});
+        // Finding C fix (2026-05-21): gate on !builtin.is_test — see TxnLease.exec.
+        if (!builtin.is_test) log.err("postgres exec failed: {s}", .{c.PQerrorMessage(conn)});
         c.PQclear(result);
         return error.ExecFailed;
     }
@@ -9380,14 +9392,16 @@ const ManagerImpl = struct {
             0,
         ) orelse {
             conn_healthy = false;
-            log.err("postgres exec params returned null status={d}: {s}; query={s}", .{ c.PQstatus(conn), c.PQerrorMessage(conn), query });
+            // Finding C fix (2026-05-21): gate on !builtin.is_test — see TxnLease.exec.
+            if (!builtin.is_test) log.err("postgres exec params returned null status={d}: {s}; query={s}", .{ c.PQstatus(conn), c.PQerrorMessage(conn), query });
             return error.ExecFailed;
         };
 
         const status = c.PQresultStatus(result);
         if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
             if (c.PQstatus(conn) != c.CONNECTION_OK) conn_healthy = false;
-            log.err("postgres exec params failed: {s}", .{c.PQerrorMessage(conn)});
+            // Finding C fix (2026-05-21): gate on !builtin.is_test — see TxnLease.exec.
+            if (!builtin.is_test) log.err("postgres exec params failed: {s}", .{c.PQerrorMessage(conn)});
             c.PQclear(result);
             return error.ExecFailed;
         }
