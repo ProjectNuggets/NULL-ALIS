@@ -3265,6 +3265,8 @@ pub const Agent = struct {
 
         var iteration: u32 = 0;
         var forced_follow_through_count: u32 = 0;
+        // v1.14.18-B G11: one-shot guard for the stuck→recall escalation.
+        var stuck_escalation_count: u32 = 0;
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
             _ = iter_arena.reset(.retain_capacity);
             const arena = iter_arena.allocator();
@@ -3829,6 +3831,9 @@ pub const Agent = struct {
             // v1.14.18-A F3: Parse goal-loop reflection from LLM response
             // Update active goal state before continuing with tool dispatch
             var should_exit_goal_loop = false;
+            // v1.14.18-B G11: set when the model self-reports `stuck`, so the
+            // break site can escalate to memory recall before giving up.
+            var escalate_on_stuck = false;
             if (self.active_goal_state) |*goal_state| {
                 const goal_reflection_verdict = goal_loop.parseReflection(display_text);
                 goal_state.status = goal_reflection_verdict;
@@ -3841,6 +3846,14 @@ pub const Agent = struct {
                         @tagName(goal_reflection_verdict),
                     });
                     should_exit_goal_loop = true;
+                }
+                // v1.14.18-B G11 (BRAIN_GRAPH ESCALATION): a `stuck` verdict
+                // is not a clean exit — the agent is frequently just missing
+                // context that already exists in memory. Flag it so the
+                // break site escalates to memory_recall/brain_graph once
+                // before the loop actually exits.
+                if (goal_reflection_verdict == .stuck) {
+                    escalate_on_stuck = true;
                 }
 
                 // v1.14.18-B G5: Capture iteration learning to reflection trail
@@ -4571,6 +4584,39 @@ pub const Agent = struct {
                 .run_id = self.current_run_id,
             } };
             self.observer.recordEvent(&compact_stage_event);
+
+            // v1.14.18-B G11 (BRAIN_GRAPH ESCALATION): before exiting on a
+            // `stuck` verdict, escalate ONCE — inject a SYSTEM directive to
+            // call memory_recall (and brain_graph if relational lookup
+            // helps) and continue the loop. An agent that self-reports stuck
+            // is frequently missing context already in memory; this turns a
+            // dead-end into a recall attempt. One-shot via
+            // stuck_escalation_count, so a still-stuck verdict on the next
+            // iteration falls through to the normal exit — no infinite loop.
+            // The assistant message + tool results for this iteration are
+            // already in history (post-dispatch), so only the directive is
+            // appended.
+            if (escalate_on_stuck and
+                stuck_escalation_count < 1 and
+                iteration + 1 < self.max_tool_iterations)
+            {
+                const recall_directive =
+                    "SYSTEM: You reported being stuck. Before concluding, you are " ++
+                    "likely missing context that already exists in memory. Issue a " ++
+                    "`memory_recall` tool call now with a query derived from the " ++
+                    "current goal — and if structured/relational lookup would help, " ++
+                    "also call `brain_graph`. Use what recall returns to make " ++
+                    "progress. If recall genuinely surfaces nothing useful, then " ++
+                    "state your conclusion plainly.";
+                try self.history.append(self.allocator, .{
+                    .role = .user,
+                    .content = try self.allocator.dupe(u8, recall_directive),
+                });
+                log.info("turn.goal_loop stuck-escalation iteration={d} — injected recall directive", .{iteration});
+                stuck_escalation_count += 1;
+                self.freeResponseFields(&response);
+                continue;
+            }
 
             // v1.14.18-A F3: Exit goal loop if goal is met or stuck
             if (should_exit_goal_loop) {
