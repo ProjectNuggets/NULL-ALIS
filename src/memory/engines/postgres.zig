@@ -90,22 +90,36 @@ const PostgresMemoryImpl = struct {
     schema_q: []const u8, // validated+quoted schema name
     table_q: []const u8, // validated+quoted table name
 
-    // Pre-built query templates
-    q_store: []const u8,
-    q_get: []const u8,
-    q_list_cat: []const u8,
-    q_list_all: []const u8,
-    q_recall: []const u8,
-    q_forget: []const u8,
-    q_count: []const u8,
-    q_save_msg: []const u8,
-    q_load_msgs: []const u8,
-    q_clear_msgs: []const u8,
-    q_clear_auto: []const u8,
-    q_clear_auto_sid: []const u8,
-    q_recall_sid: []const u8,
-    q_list_cat_sid: []const u8,
-    q_list_sid: []const u8,
+    // Pre-built query templates.
+    //
+    // v1.14.18-B Finding A fix (coordinator review, 2026-05-21): these are
+    // `[:0]const u8`, NOT `[]const u8`. `buildQuery` returns `[:0]u8` —
+    // sentinel-terminated, so the backing allocation is N+1 bytes. The fields
+    // were previously typed `[]const u8`: the `[:0]u8` return coerced down to a
+    // plain slice of length N, and `deinit`'s `allocator.free` then freed N
+    // bytes against an N+1 allocation — an under-free. Harmless under libc
+    // `free` (size-ignoring) but a hard panic under any size-checking allocator
+    // (GeneralPurposeAllocator / std.testing.allocator). Latent because
+    // production wires `ZakiPostgresMemory`, not this engine, and no canonical
+    // test exercised it under GPA. Typing the fields `[:0]const u8` makes the
+    // free sentinel-aware (frees N+1) and is a strict improvement at the call
+    // sites too — the query strings are passed to libpq, which wants
+    // null-terminated C strings; `[:0]` carries that guarantee in the type.
+    q_store: [:0]const u8,
+    q_get: [:0]const u8,
+    q_list_cat: [:0]const u8,
+    q_list_all: [:0]const u8,
+    q_recall: [:0]const u8,
+    q_forget: [:0]const u8,
+    q_count: [:0]const u8,
+    q_save_msg: [:0]const u8,
+    q_load_msgs: [:0]const u8,
+    q_clear_msgs: [:0]const u8,
+    q_clear_auto: [:0]const u8,
+    q_clear_auto_sid: [:0]const u8,
+    q_recall_sid: [:0]const u8,
+    q_list_cat_sid: [:0]const u8,
+    q_list_sid: [:0]const u8,
 
     const Self = @This();
 
