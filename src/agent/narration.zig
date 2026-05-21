@@ -1,7 +1,8 @@
 //! Liveness narration engine — converts observer events into user-facing progress frames.
 //!
 //! NarrationObserver wraps an inner Observer, translates tool_call_start and turn_stage
-//! events into semantic NarrationFrame structs, and delivers them through a callback.
+//! events into semantic NarrationFrame structs, captures forwarded narration_frame
+//! events, and delivers them through a callback.
 //! This is the "thinking out loud" infrastructure for real-time user-facing status.
 //!
 //! Design invariant: narration frames flow ONLY through the Observer event bus.
@@ -412,16 +413,23 @@ pub const NarrationObserver = struct {
                     });
                 }
             },
+            .narration_frame => |e| {
+                self.captureFrame(.{
+                    .message = e.message,
+                    .frame_type = e.frame_type,
+                    .tool_name = e.tool_name,
+                    .step_index = e.step_index,
+                    .step_total = e.step_total,
+                });
+            },
             else => {},
         }
     }
 
-    fn emitFrame(self: *NarrationObserver, frame: NarrationFrame) void {
+    fn captureFrame(self: *NarrationObserver, frame: NarrationFrame) void {
         // v1.14.18-B G3 — push into the Agent's ring buffer so recallRecent
         // can surface this thought in the next iteration's volatile prompt
-        // block. Happens FIRST (before callback / inner observer) so the
-        // record reflects the model's own progress trail regardless of
-        // whether downstream observers crash. Failure-soft via push().
+        // block. Failure-soft via push().
         if (self.ring_buffer) |rb| rb.push(frame, self.current_iteration);
 
         // Deliver via callback if one is registered and has a valid context.
@@ -431,6 +439,14 @@ pub const NarrationObserver = struct {
             }
             // Skip callback if no context — avoid passing pointer to unrelated data.
         }
+    }
+
+    fn emitFrame(self: *NarrationObserver, frame: NarrationFrame) void {
+        // Generated narration frames are captured locally before downstream
+        // forwarding so a crashing observer cannot erase the agent's own
+        // progress trail.
+        self.captureFrame(frame);
+
         // Also emit as an observer event so downstream consumers (SSE, channels) receive it.
         const narration_event = ObserverEvent{ .narration_frame = .{
             .message = frame.message,
@@ -734,6 +750,35 @@ test "NarrationObserver pushes into ring buffer when wired" {
     try std.testing.expectEqualStrings("Running tests", frames[0].message);
     try std.testing.expectEqualStrings("bash", frames[0].tool_name.?);
     try std.testing.expectEqual(@as(u32, 2), frames[0].iteration);
+}
+
+test "NarrationObserver captures forwarded narration_frame events" {
+    var noop = observability.NoopObserver{};
+    var rb = NarrationRingBuffer.init(std.testing.allocator);
+    defer rb.deinit();
+    var narr = NarrationObserver{
+        .inner = noop.observer(),
+        .ring_buffer = &rb,
+        .current_iteration = 7,
+    };
+    const obs = narr.observer();
+    const evt = ObserverEvent{ .narration_frame = .{
+        .message = "Read the current sprint plan",
+        .frame_type = .plan_step,
+        .tool_name = "file_read",
+        .step_index = 1,
+        .step_total = 3,
+    } };
+
+    obs.recordEvent(&evt);
+
+    try std.testing.expectEqual(@as(usize, 1), rb.len);
+    const frames = try rb.last(std.testing.allocator, 1);
+    defer freeRecalledFramesForTest(frames);
+    try std.testing.expectEqualStrings("Read the current sprint plan", frames[0].message);
+    try std.testing.expectEqual(FrameType.plan_step, frames[0].frame_type);
+    try std.testing.expectEqualStrings("file_read", frames[0].tool_name.?);
+    try std.testing.expectEqual(@as(u32, 7), frames[0].iteration);
 }
 
 test "NarrationRingBuffer.last() returns owned strings under concurrent push" {
