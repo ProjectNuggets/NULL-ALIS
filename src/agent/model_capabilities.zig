@@ -20,6 +20,16 @@ pub const ModelCapabilities = struct {
     context_window: u64,
     /// Maximum generation output tokens. Used for reply-reserve budgeting.
     max_output: u32,
+    /// Native image understanding. When true, image content parts may be sent
+    /// directly to this model instead of routing through a vision sidecar
+    /// (reliability.vision_fallback). When false, callers fall back.
+    vision: bool = false,
+    /// Native video understanding. When true, video content parts may be sent
+    /// directly to this model.
+    video: bool = false,
+    /// Native audio understanding. When true, audio may be sent directly
+    /// instead of routing through a speech-to-text sidecar.
+    audio: bool = false,
 };
 
 // ── Per-model table ─────────────────────────────────────────────────────────
@@ -33,33 +43,34 @@ const ModelEntry = struct {
 };
 
 const MODEL_TABLE = [_]ModelEntry{
-    // Anthropic
-    .{ .key = "claude-opus-4-6", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
-    .{ .key = "claude-opus-4.6", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
-    .{ .key = "claude-sonnet-4-6", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
-    .{ .key = "claude-sonnet-4.6", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
-    .{ .key = "claude-haiku-4-5", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
-    // OpenAI
-    .{ .key = "gpt-5.2", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
-    .{ .key = "gpt-5.2-codex", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
-    .{ .key = "gpt-4.5-preview", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
-    .{ .key = "gpt-4.1", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
-    .{ .key = "gpt-4.1-mini", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
-    .{ .key = "gpt-4o", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
-    .{ .key = "gpt-4o-mini", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
+    // Anthropic — Claude 4.x is vision-capable (images), no native video/audio.
+    .{ .key = "claude-opus-4-6", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true } },
+    .{ .key = "claude-opus-4.6", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true } },
+    .{ .key = "claude-sonnet-4-6", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true } },
+    .{ .key = "claude-sonnet-4.6", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true } },
+    .{ .key = "claude-haiku-4-5", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true } },
+    // OpenAI — GPT-4o/4.1/4.5/5.x accept image input; no native video/audio on
+    // the chat completions API. o3-mini is text-only (left at defaults).
+    .{ .key = "gpt-5.2", .caps = .{ .context_window = 128_000, .max_output = 8_192, .vision = true } },
+    .{ .key = "gpt-5.2-codex", .caps = .{ .context_window = 128_000, .max_output = 8_192, .vision = true } },
+    .{ .key = "gpt-4.5-preview", .caps = .{ .context_window = 128_000, .max_output = 8_192, .vision = true } },
+    .{ .key = "gpt-4.1", .caps = .{ .context_window = 128_000, .max_output = 8_192, .vision = true } },
+    .{ .key = "gpt-4.1-mini", .caps = .{ .context_window = 128_000, .max_output = 8_192, .vision = true } },
+    .{ .key = "gpt-4o", .caps = .{ .context_window = 128_000, .max_output = 8_192, .vision = true } },
+    .{ .key = "gpt-4o-mini", .caps = .{ .context_window = 128_000, .max_output = 8_192, .vision = true } },
     .{ .key = "o3-mini", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
-    // Google
-    .{ .key = "gemini-2.5-pro", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
-    .{ .key = "gemini-2.5-flash", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
-    .{ .key = "gemini-2.0-flash", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
-    // Moonshot / Kimi
+    // Google — Gemini 2.x natively understands images AND video.
+    .{ .key = "gemini-2.5-pro", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true, .video = true } },
+    .{ .key = "gemini-2.5-flash", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true, .video = true } },
+    .{ .key = "gemini-2.0-flash", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true, .video = true } },
+    // Moonshot / Kimi — K2.5 is text-only; K2.6 is multimodal (vision + video).
     .{ .key = "kimi-k2.5", .caps = .{ .context_window = 262_144, .max_output = 32_768 } },
     .{ .key = "k2p5", .caps = .{ .context_window = 262_144, .max_output = 32_768 } },
     // V1.11 hardening (2026-05-07) — K2.6 full switch. Multimodal (vision +
     // video), 256K context, SWE-Bench Verified 80.2. Same context window as
     // K2.5; Moonshot kept it at 256K rather than expanding.
-    .{ .key = "kimi-k2.6", .caps = .{ .context_window = 262_144, .max_output = 32_768 } },
-    .{ .key = "k2p6", .caps = .{ .context_window = 262_144, .max_output = 32_768 } },
+    .{ .key = "kimi-k2.6", .caps = .{ .context_window = 262_144, .max_output = 32_768, .vision = true, .video = true } },
+    .{ .key = "k2p6", .caps = .{ .context_window = 262_144, .max_output = 32_768, .vision = true, .video = true } },
     // DeepSeek
     .{ .key = "deepseek-v3.2", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
     .{ .key = "deepseek-chat", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
@@ -277,7 +288,62 @@ pub fn resolveContextTokens(override: ?u64, model_ref: []const u8) u64 {
     return DEFAULT_CONTEXT_WINDOW;
 }
 
+// ── Modality capability helpers ─────────────────────────────────────────────
+//
+// Used by the agent's asset-routing logic: when the active model natively
+// understands a modality, the asset is sent straight to it; otherwise the
+// caller falls back to a sidecar (vision_fallback for images, a speech-to-text
+// sidecar for audio). Unknown models return false — conservative: an unknown
+// model routes through the sidecar rather than risking a dropped asset.
+
+/// Whether `model_ref` natively understands image input.
+pub fn modelSupportsVision(model_ref: []const u8) bool {
+    return if (lookupCapabilities(model_ref)) |c| c.vision else false;
+}
+
+/// Whether `model_ref` natively understands video input.
+pub fn modelSupportsVideo(model_ref: []const u8) bool {
+    return if (lookupCapabilities(model_ref)) |c| c.video else false;
+}
+
+/// Whether `model_ref` natively understands audio input.
+pub fn modelSupportsAudio(model_ref: []const u8) bool {
+    return if (lookupCapabilities(model_ref)) |c| c.audio else false;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+test "modelSupportsVision: Kimi K2.6 is multimodal, K2.5 is not" {
+    try std.testing.expect(modelSupportsVision("kimi-k2.6"));
+    try std.testing.expect(modelSupportsVision("moonshot/kimi-k2.6"));
+    try std.testing.expect(modelSupportsVision("k2p6"));
+    try std.testing.expect(!modelSupportsVision("kimi-k2.5"));
+    try std.testing.expect(!modelSupportsVision("k2p5"));
+}
+
+test "modelSupportsVideo: Kimi K2.6 and Gemini have native video; others do not" {
+    try std.testing.expect(modelSupportsVideo("kimi-k2.6"));
+    try std.testing.expect(modelSupportsVideo("gemini-2.5-pro"));
+    // Vision-only models are not video-capable.
+    try std.testing.expect(!modelSupportsVideo("claude-sonnet-4.6"));
+    try std.testing.expect(!modelSupportsVideo("gpt-4o"));
+    try std.testing.expect(!modelSupportsVideo("kimi-k2.5"));
+}
+
+test "modelSupports* : unknown model is conservatively non-multimodal" {
+    try std.testing.expect(!modelSupportsVision("some-unknown-model-xyz"));
+    try std.testing.expect(!modelSupportsVideo("some-unknown-model-xyz"));
+    try std.testing.expect(!modelSupportsAudio("some-unknown-model-xyz"));
+    // No model is marked audio-capable yet.
+    try std.testing.expect(!modelSupportsAudio("kimi-k2.6"));
+}
+
+test "vision flag does not disturb context/output capability lookups" {
+    const k26 = lookupCapabilities("kimi-k2.6").?;
+    try std.testing.expectEqual(@as(u64, 262_144), k26.context_window);
+    try std.testing.expectEqual(@as(u32, 32_768), k26.max_output);
+    try std.testing.expect(k26.vision and k26.video and !k26.audio);
+}
 
 test "resolveMaxTokens honors explicit override" {
     try std.testing.expectEqual(@as(u32, 512), resolveMaxTokens(512, "openai/gpt-4.1-mini"));
