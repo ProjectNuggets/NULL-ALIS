@@ -886,14 +886,17 @@ const ManagerImpl = struct {
         pub fn execParams(self: *TxnLease, query: []const u8, params: []const ?[*:0]const u8, lengths: []const c_int) !*c.PGresult {
             const query_z = try self.mgr.allocator.dupeZ(u8, query);
             defer self.mgr.allocator.free(query_z);
-            const n: c_int = @intCast(params.len);
+            // Postgres UTF-8 write guard — see sanitizeParamsForUtf8.
+            var safe = try sanitizeParamsForUtf8(self.mgr.allocator, params, lengths);
+            defer safe.deinit();
+            const n: c_int = @intCast(safe.params.len);
             const result = c.PQexecParams(
                 self.lease.conn,
                 query_z,
                 n,
                 null,
-                params.ptr,
-                lengths.ptr,
+                safe.params.ptr,
+                safe.lengths.ptr,
                 null,
                 0,
             ) orelse {
@@ -9380,14 +9383,17 @@ const ManagerImpl = struct {
         const conn = lease.conn;
         const query_z = try self.allocator.dupeZ(u8, query);
         defer self.allocator.free(query_z);
-        const n: c_int = @intCast(params.len);
+        // Postgres UTF-8 write guard — see sanitizeParamsForUtf8.
+        var safe = try sanitizeParamsForUtf8(self.allocator, params, lengths);
+        defer safe.deinit();
+        const n: c_int = @intCast(safe.params.len);
         const result = c.PQexecParams(
             conn,
             query_z,
             n,
             null,
-            @ptrCast(params.ptr),
-            lengths.ptr,
+            @ptrCast(safe.params.ptr),
+            safe.lengths.ptr,
             null,
             0,
         ) orelse {
@@ -9415,6 +9421,170 @@ const ManagerImpl = struct {
         c.PQclear(result);
     }
 };
+
+// === Postgres UTF-8 write guard (2026-05-21) ===
+//
+// Postgres rejects any bind parameter that is not valid UTF-8 with
+// `ERROR: invalid byte sequence for encoding "UTF8"`. A single stray
+// byte — e.g. a bare CP1252 0x94 left behind when a multi-byte UTF-8
+// sequence is sliced mid-character — fails the entire statement.
+//
+// When that statement runs during tenant runtime init (the markdown ->
+// Postgres memory sync, upsertMemory with $5 = content), the failure
+// propagates all the way out as a hard "tenant runtime init failed" and
+// the agent cannot reply at all. Observed 2026-05-21: a memory markdown
+// file held a bare 0x94 byte (an em-dash that lost its `e2 80` lead).
+//
+// This guard validates every bind parameter and, only when one is
+// invalid, substitutes each malformed byte with U+FFFD. Valid input —
+// the overwhelmingly common case (ASCII ids, well-formed UTF-8 text) —
+// takes a zero-allocation fast path. A bad byte now degrades a single
+// character instead of bricking the runtime.
+
+/// Copy `input` with every invalid UTF-8 byte replaced by U+FFFD.
+/// The result is always valid UTF-8 and NUL-terminated.
+fn sanitizeUtf8AllocZ(allocator: std.mem.Allocator, input: []const u8) ![:0]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < input.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(input[i]) catch {
+            // Invalid leading byte (continuation byte or illegal range).
+            try out.appendSlice(allocator, "\u{FFFD}");
+            i += 1;
+            continue;
+        };
+        if (i + seq_len > input.len) {
+            // Truncated trailing sequence — not enough bytes remain.
+            try out.appendSlice(allocator, "\u{FFFD}");
+            i += 1;
+            continue;
+        }
+        if (std.unicode.utf8Decode(input[i .. i + seq_len])) |_| {
+            try out.appendSlice(allocator, input[i .. i + seq_len]);
+            i += seq_len;
+        } else |_| {
+            // Valid leading byte but malformed continuation/overlong.
+            try out.appendSlice(allocator, "\u{FFFD}");
+            i += 1;
+        }
+    }
+    return out.toOwnedSliceSentinel(allocator, 0);
+}
+
+/// Result of sanitizeParamsForUtf8. On the fast path (every parameter
+/// already valid UTF-8) `params`/`lengths` alias the caller's slices and
+/// no memory is owned. On the slow path they point at sanitized copies
+/// owned here. Either way the caller MUST call deinit().
+const SanitizedParams = struct {
+    params: []const ?[*:0]const u8,
+    lengths: []const c_int,
+    allocator: std.mem.Allocator,
+    // Populated only when at least one parameter needed sanitizing.
+    owned_params: ?[]?[*:0]const u8 = null,
+    owned_lengths: ?[]c_int = null,
+    owned_bufs: std.ArrayListUnmanaged([:0]u8) = .empty,
+
+    fn deinit(self: *SanitizedParams) void {
+        for (self.owned_bufs.items) |buf| self.allocator.free(buf);
+        self.owned_bufs.deinit(self.allocator);
+        if (self.owned_params) |p| self.allocator.free(p);
+        if (self.owned_lengths) |l| self.allocator.free(l);
+    }
+};
+
+/// Validate every bind parameter; substitute U+FFFD for any invalid
+/// UTF-8. Allocates only when a parameter is actually malformed.
+fn sanitizeParamsForUtf8(
+    allocator: std.mem.Allocator,
+    params: []const ?[*:0]const u8,
+    lengths: []const c_int,
+) !SanitizedParams {
+    var result = SanitizedParams{
+        .params = params,
+        .lengths = lengths,
+        .allocator = allocator,
+    };
+    errdefer result.deinit();
+    for (params, 0..) |param_opt, idx| {
+        const param = param_opt orelse continue;
+        const len: usize = @intCast(lengths[idx]);
+        if (std.unicode.utf8ValidateSlice(param[0..len])) continue;
+        if (result.owned_params == null) {
+            result.owned_params = try allocator.dupe(?[*:0]const u8, params);
+            result.owned_lengths = try allocator.dupe(c_int, lengths);
+            result.params = result.owned_params.?;
+            result.lengths = result.owned_lengths.?;
+        }
+        const clean = try sanitizeUtf8AllocZ(allocator, param[0..len]);
+        try result.owned_bufs.append(allocator, clean);
+        result.owned_params.?[idx] = clean.ptr;
+        result.owned_lengths.?[idx] = @intCast(clean.len);
+        // Gate on !builtin.is_test to keep canonical CI output clean —
+        // same convention as the exec failure logs in this file.
+        if (!builtin.is_test) log.warn(
+            "postgres write: replaced invalid UTF-8 in bind parameter ${d} ({d} bytes -> {d})",
+            .{ idx + 1, len, clean.len },
+        );
+    }
+    return result;
+}
+
+test "sanitizeUtf8AllocZ: valid input passes through unchanged" {
+    const a = std.testing.allocator;
+    const valid = "hello — world ☕ 日本語";
+    const out = try sanitizeUtf8AllocZ(a, valid);
+    defer a.free(out);
+    try std.testing.expectEqualStrings(valid, out);
+}
+
+test "sanitizeUtf8AllocZ: bare CP1252 0x94 byte becomes U+FFFD" {
+    const a = std.testing.allocator;
+    // The exact incident: a markdown memory line with a stray 0x94 byte
+    // (an em-dash that lost its `e2 80` lead) bricked tenant runtime init.
+    const corrupt = "deep work.\n  \n\x94 keep shipping.";
+    const out = try sanitizeUtf8AllocZ(a, corrupt);
+    defer a.free(out);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+    try std.testing.expectEqualStrings("deep work.\n  \n\u{FFFD} keep shipping.", out);
+}
+
+test "sanitizeUtf8AllocZ: truncated trailing multi-byte sequence" {
+    const a = std.testing.allocator;
+    // "—" is e2 80 94; drop the trailing byte -> dangling lead.
+    const corrupt = "tail\xe2\x80";
+    const out = try sanitizeUtf8AllocZ(a, corrupt);
+    defer a.free(out);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+}
+
+test "sanitizeParamsForUtf8: all-valid input takes zero-allocation fast path" {
+    const a = std.testing.allocator;
+    const p0: [*:0]const u8 = "abc";
+    const p1: [*:0]const u8 = "valid — utf8";
+    const params = [_]?[*:0]const u8{ p0, p1 };
+    const lengths = [_]c_int{ 3, @intCast(std.mem.span(p1).len) };
+    var safe = try sanitizeParamsForUtf8(a, &params, &lengths);
+    defer safe.deinit();
+    try std.testing.expect(safe.owned_params == null);
+    try std.testing.expectEqual(@as(usize, 2), safe.params.len);
+}
+
+test "sanitizeParamsForUtf8: invalid parameter is sanitized, valid one untouched" {
+    const a = std.testing.allocator;
+    const good: [*:0]const u8 = "id-123";
+    const bad: [*:0]const u8 = "bad\x94byte";
+    const params = [_]?[*:0]const u8{ good, bad };
+    const lengths = [_]c_int{ 6, 8 };
+    var safe = try sanitizeParamsForUtf8(a, &params, &lengths);
+    defer safe.deinit();
+    try std.testing.expect(safe.owned_params != null);
+    // Valid parameter is left aliasing the caller's pointer.
+    try std.testing.expectEqual(good, safe.params[0].?);
+    // Invalid parameter is replaced with a sanitized, valid-UTF-8 copy.
+    try std.testing.expect(safe.params[1].? != bad);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(std.mem.span(safe.params[1].?)));
+}
 
 fn dupeResultValue(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int, col: c_int) ![]u8 {
     if (c.PQgetisnull(result, row, col) != 0) return allocator.dupe(u8, "");
