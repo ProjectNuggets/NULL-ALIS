@@ -178,6 +178,12 @@ pub fn isReasoningCapableModel(model: []const u8) bool {
 /// - reasoning + reasoning_effort=="none": `temperature` + `max_completion_tokens`
 /// - reasoning (otherwise): `max_completion_tokens` only (no temperature)
 /// Always emits `reasoning_effort` when set on a reasoning model.
+///
+/// `suppress_reasoning_effort` — when true, never emits the
+/// `reasoning_effort` field (not even the Kimi/Moonshot "medium"
+/// default). Used by the Moonshot native route, which controls
+/// reasoning via the Kimi-specific top-level `thinking` field instead
+/// and rejects `reasoning_effort`. All other fields are unchanged.
 pub fn appendGenerationFields(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
@@ -185,6 +191,7 @@ pub fn appendGenerationFields(
     temperature: f64,
     max_tokens: ?u32,
     reasoning_effort: ?[]const u8,
+    suppress_reasoning_effort: bool,
 ) !void {
     // Q2 (2026-04-27): three request shapes total —
     //   (a) Non-reasoning model: temperature + max_tokens
@@ -234,10 +241,13 @@ pub fn appendGenerationFields(
 
         // Emit reasoning_effort: explicit user value, or default "medium".
         // Matches Moonshot/Together server default + keeps context_snapshot
-        // report honest (we report what we actually send).
-        const effort = reasoning_effort orelse "medium";
-        try buf.appendSlice(allocator, ",\"reasoning_effort\":");
-        try json_util.appendJsonString(buf, allocator, effort);
+        // report honest (we report what we actually send). Skipped entirely
+        // on the Moonshot native route, which uses the `thinking` field.
+        if (!suppress_reasoning_effort) {
+            const effort = reasoning_effort orelse "medium";
+            try buf.appendSlice(allocator, ",\"reasoning_effort\":");
+            try json_util.appendJsonString(buf, allocator, effort);
+        }
         return;
     }
 
@@ -258,10 +268,12 @@ pub fn appendGenerationFields(
         try buf.appendSlice(allocator, max_str);
     }
 
-    // Emit reasoning_effort when set (JSON-escaped for safety)
-    if (reasoning_effort) |re| {
-        try buf.appendSlice(allocator, ",\"reasoning_effort\":");
-        try json_util.appendJsonString(buf, allocator, re);
+    // Emit reasoning_effort when set (JSON-escaped for safety).
+    if (!suppress_reasoning_effort) {
+        if (reasoning_effort) |re| {
+            try buf.appendSlice(allocator, ",\"reasoning_effort\":");
+            try json_util.appendJsonString(buf, allocator, re);
+        }
     }
 }
 
@@ -453,7 +465,7 @@ test "Q2 — appendGenerationFields emits reasoning_effort for Kimi with tempera
     defer buf.deinit(alloc);
 
     // Kimi K2.5 + explicit reasoning_effort
-    try appendGenerationFields(&buf, alloc, "moonshotai/Kimi-K2.5", 0.7, 32_768, "high");
+    try appendGenerationFields(&buf, alloc, "moonshotai/Kimi-K2.5", 0.7, 32_768, "high", false);
     const out = buf.items;
 
     // Kimi-shape: BOTH temperature AND max_tokens AND reasoning_effort present
@@ -469,7 +481,7 @@ test "Q2 — appendGenerationFields defaults Kimi reasoning_effort to medium whe
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(alloc);
 
-    try appendGenerationFields(&buf, alloc, "moonshotai/Kimi-K2.5", 0.7, 32_768, null);
+    try appendGenerationFields(&buf, alloc, "moonshotai/Kimi-K2.5", 0.7, 32_768, null, false);
     const out = buf.items;
 
     // Default = "medium" (matches Together/Moonshot server default)
@@ -478,12 +490,28 @@ test "Q2 — appendGenerationFields defaults Kimi reasoning_effort to medium whe
     try std.testing.expect(std.mem.indexOf(u8, out, "\"temperature\":0.70") != null);
 }
 
+test "appendGenerationFields suppresses reasoning_effort for Moonshot native route" {
+    const alloc = std.testing.allocator;
+
+    // Kimi K2.6 with suppression on: NO reasoning_effort, not even default.
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+    try appendGenerationFields(&buf, alloc, "kimi-k2.6", 0.7, 32_768, "high", true);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "reasoning_effort") == null);
+
+    // OpenAI o-series with suppression on: also drops reasoning_effort.
+    var buf2: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf2.deinit(alloc);
+    try appendGenerationFields(&buf2, alloc, "o1-preview", 0.7, 32_768, "high", true);
+    try std.testing.expect(std.mem.indexOf(u8, buf2.items, "reasoning_effort") == null);
+}
+
 test "Q2 — OpenAI o1/o3 path unchanged (drops temperature unless effort=none)" {
     const alloc = std.testing.allocator;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(alloc);
 
-    try appendGenerationFields(&buf, alloc, "o1-preview", 0.7, 32_768, "high");
+    try appendGenerationFields(&buf, alloc, "o1-preview", 0.7, 32_768, "high", false);
     const out = buf.items;
 
     // OpenAI-shape: max_completion_tokens (NOT max_tokens), no temperature, reasoning_effort
