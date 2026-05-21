@@ -62,9 +62,16 @@ pub const RecordedFrame = struct {
 pub const RING_BUFFER_CAPACITY: usize = 16;
 
 /// Number of recent narration frames surfaced in the <recent_thoughts>
-/// recall block. v1.14.18-B G3 tuning knob — referenced by
-/// `context_engine.assemble` when it calls `recallRecent`.
-pub const RECALL_DEPTH: usize = 3;
+/// recall block. Referenced by `context_engine.assemble` via `recallRecent`.
+///
+/// v1.14.x NATIVE-COT-NARRATION: depth is 1. Pre-change, frames were
+/// terse sidecar one-liners and depth 3 was cheap. Frames are now the
+/// model's full native chain-of-thought (~700–1400 chars/iteration) — the
+/// single most-recent CoT is the agent's "where my head was last" guidance;
+/// 3× full CoTs would be prompt-budget-unsafe. The full reasoning *arc*
+/// (multi-iteration) is the job of the planned CoT-distiller middle layer,
+/// not raw depth. No content cap on the frame itself (per Nova).
+pub const RECALL_DEPTH: usize = 1;
 
 /// v1.14.18-B G3 — thread-safe ring buffer of recent narration frames.
 ///
