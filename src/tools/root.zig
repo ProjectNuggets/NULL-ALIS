@@ -235,6 +235,9 @@ pub fn ToolVTable(comptime T: type) Tool.VTable {
         }.f,
         .description = &struct {
             fn f(_: *anyopaque) []const u8 {
+                if (comptime @hasDecl(T, "tool_description_struct")) {
+                    return metadata.renderDescriptionComptime(T.tool_description_struct);
+                }
                 return T.tool_description;
             }
         }.f,
@@ -2386,6 +2389,37 @@ test "tool spec generation" {
         try std.testing.expectEqualStrings(t.description(), s.description);
         try std.testing.expect(s.parameters_json.len > 0);
     }
+}
+
+test "ToolVTable uses structured description when declared" {
+    const ExampleTool = struct {
+        pub const tool_name = "example_tool";
+        pub const tool_description_struct = metadata.ToolDescription{
+            .what = "Perform a structured description example.",
+            .use_when = &.{
+                "The test needs structured tool prose",
+                "The vtable should expose rendered sections",
+            },
+            .do_not_use_for = &.{
+                "Unrelated shell work - shell",
+                "Persistent memory writes - memory_store",
+            },
+        };
+        pub const tool_description = "legacy flat description";
+        pub const tool_params = "{}";
+        const vtable = ToolVTable(@This());
+
+        pub fn execute(_: *@This(), _: std.mem.Allocator, _: JsonObjectMap) !ToolResult {
+            return ToolResult.ok("");
+        }
+    };
+
+    var example = ExampleTool{};
+    const t = Tool{ .ptr = @ptrCast(&example), .vtable = &ExampleTool.vtable };
+    const desc = t.description();
+    try std.testing.expect(std.mem.indexOf(u8, desc, "## Use When") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desc, "The test needs structured tool prose") != null);
+    try std.testing.expect(!std.mem.eql(u8, desc, ExampleTool.tool_description));
 }
 
 test "all tools includes extras when enabled" {
