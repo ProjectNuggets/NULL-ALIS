@@ -259,8 +259,23 @@ pub const Config = struct {
         switch (AppProfile.fromString(self.profile)) {
             .standard => {},
             .zaki_bot => {
+                // Primary provider is Moonshot's native API; Kimi K2.6's
+                // bare model ID on Moonshot is `kimi-k2.6` (Together's ID
+                // `moonshotai/Kimi-K2.6` is used only on the Together
+                // fallback route, wired via `model_fallbacks` below).
+                //
+                // `default_provider` has no nullable "unset" state — its
+                // struct default is `"openrouter"`. Treat that sentinel as
+                // "operator did not pin a provider" and switch it to
+                // `moonshot`; an explicit `agents.defaults.model.primary`
+                // with any other provider prefix overrides it (parse sets
+                // `default_provider` before `applyProfileDefaults` runs).
+                const provider_unset = std.mem.eql(u8, self.default_provider, "openrouter");
                 if (self.default_model == null) {
-                    self.default_model = try self.allocator.dupe(u8, "moonshotai/Kimi-K2.6");
+                    self.default_model = try self.allocator.dupe(u8, "kimi-k2.6");
+                    if (provider_unset) {
+                        self.default_provider = try self.allocator.dupe(u8, "moonshot");
+                    }
                 }
                 // `reasoning_effort` is the unified mode knob (fast/balanced/
                 // deep → low/medium/high); `medium` = the "balanced" default.
@@ -271,11 +286,43 @@ pub const Config = struct {
                 // This default is intent-correct and takes effect if/when the
                 // provider honors it (or the model/provider changes); the
                 // mode-knob no-op is tracked separately, not wired here.
+                //
+                // On the Moonshot native route the request shape switches
+                // to Kimi's `thinking` field (see compatible.zig); the
+                // provider drops `reasoning_effort` there. This default is
+                // still set so the Together fallback route and any
+                // context_snapshot report stay consistent.
                 if (self.reasoning_effort == null) {
                     self.reasoning_effort = try self.allocator.dupe(u8, "medium");
                 }
-                if (std.mem.eql(u8, self.default_provider, "openrouter") and self.reliability.fallback_providers.len == 0) {
+                // Together stays a fallback: register it in
+                // `fallback_providers`, and map the Together route to
+                // Together's own model ID (`moonshotai/Kimi-K2.6`) via
+                // `model_fallbacks` keyed on the Moonshot-native model.
+                if ((provider_unset or std.mem.eql(u8, self.default_provider, "moonshot")) and
+                    self.reliability.fallback_providers.len == 0)
+                {
                     self.reliability.fallback_providers = &.{"together"};
+                }
+                // `model_fallbacks` maps the Moonshot-native model
+                // (`kimi-k2.6`) to its fallback route. The fallback ref uses
+                // the `provider/model` form so the Together route carries
+                // Together's own model ID (`moonshotai/Kimi-K2.6`) — the two
+                // providers disagree on the model identifier. Only injected
+                // when the agent is actually on the kimi-k2.6 default — an
+                // operator who pinned a different model keeps an empty map.
+                if (self.reliability.model_fallbacks.len == 0 and
+                    self.default_model != null and
+                    std.mem.eql(u8, self.default_model.?, "kimi-k2.6"))
+                {
+                    const fallbacks = try self.allocator.alloc([]const u8, 1);
+                    fallbacks[0] = try self.allocator.dupe(u8, "together/moonshotai/Kimi-K2.6");
+                    const entries = try self.allocator.alloc(ModelFallbackEntry, 1);
+                    entries[0] = .{
+                        .model = try self.allocator.dupe(u8, "kimi-k2.6"),
+                        .fallbacks = fallbacks,
+                    };
+                    self.reliability.model_fallbacks = entries;
                 }
                 if (std.mem.eql(u8, self.memory.profile, "markdown_only")) {
                     self.memory.profile = "postgres_hybrid";
@@ -3649,10 +3696,20 @@ test "profile zaki_bot enables http request defaults" {
     try std.testing.expectEqualStrings("zaki_bot", cfg.profile);
     try std.testing.expect(cfg.http_request.enabled);
     try std.testing.expect(!cfg.browser.enabled);
-    try std.testing.expectEqualStrings("openrouter", cfg.default_provider);
-    try std.testing.expectEqualStrings("moonshotai/Kimi-K2.6", cfg.default_model.?);
+    // Primary route: Moonshot native API with the bare `kimi-k2.6` ID.
+    try std.testing.expectEqualStrings("moonshot", cfg.default_provider);
+    try std.testing.expectEqualStrings("kimi-k2.6", cfg.default_model.?);
+    // Together stays a fallback provider.
     try std.testing.expectEqual(@as(usize, 1), cfg.reliability.fallback_providers.len);
     try std.testing.expectEqualStrings("together", cfg.reliability.fallback_providers[0]);
+    // model_fallbacks maps kimi-k2.6 → Together's model ID.
+    try std.testing.expectEqual(@as(usize, 1), cfg.reliability.model_fallbacks.len);
+    try std.testing.expectEqualStrings("kimi-k2.6", cfg.reliability.model_fallbacks[0].model);
+    try std.testing.expectEqual(@as(usize, 1), cfg.reliability.model_fallbacks[0].fallbacks.len);
+    try std.testing.expectEqualStrings(
+        "together/moonshotai/Kimi-K2.6",
+        cfg.reliability.model_fallbacks[0].fallbacks[0],
+    );
     try std.testing.expectEqualStrings("postgres_hybrid", cfg.memory.profile);
     try std.testing.expectEqualStrings("postgres", cfg.memory.backend);
     try std.testing.expectEqualStrings("together", cfg.memory.search.provider);
@@ -3673,7 +3730,8 @@ test "profile defaults do not override explicit http request disable" {
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expect(!cfg.http_request.enabled);
-    try std.testing.expectEqualStrings("moonshotai/Kimi-K2.6", cfg.default_model.?);
+    try std.testing.expectEqualStrings("moonshot", cfg.default_provider);
+    try std.testing.expectEqualStrings("kimi-k2.6", cfg.default_model.?);
     try std.testing.expectEqual(@as(usize, 1), cfg.reliability.fallback_providers.len);
     try std.testing.expectEqualStrings("together", cfg.reliability.fallback_providers[0]);
 }
