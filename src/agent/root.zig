@@ -3351,20 +3351,24 @@ pub const Agent = struct {
             } };
             self.observer.recordEvent(&build_stage_event);
 
-            // Vision routing. If any message carries image content AND a
-            // vision fallback model is configured, swap to it for THIS
-            // turn. Previously we gated on `provider.supportsVisionForModel`,
-            // but OpenAI-compatible providers return `true` unconditionally
-            // (they don't know which specific models are vision-capable),
-            // so the gate never fired for text-only models like Kimi K2.5
-            // and GLM-5.1 — images silently got dropped. Trust the
-            // operator's config: if they've wired a vision fallback, use
-            // it whenever images arrive. Skip the swap only if the
-            // effective default IS the fallback model (no-op).
+            // Vision routing. When a turn carries image content, the model
+            // that handles it must be vision-capable. A native-multimodal
+            // primary (Kimi K2.6, etc. — see model_capabilities) keeps the
+            // image and processes it directly: full agent context + tools,
+            // one provider, no hop. Only a text-only primary is diverted to
+            // the configured vision sidecar (reliability.vision_fallback).
+            //
+            // The capability check is a positive allowlist in
+            // model_capabilities — OpenAI-compatible providers report
+            // supports_vision=true for every model, so a provider-level gate
+            // is useless. An unknown model is treated as text-only and routes
+            // through the sidecar, so images are never silently dropped.
             var effective_model: []const u8 = self.model_name;
-            if (self.vision_fallback_model.len > 0 and hasImageContentParts(messages) and
-                !std.mem.eql(u8, self.model_name, self.vision_fallback_model))
-            {
+            if (shouldRouteToVisionFallback(
+                self.model_name,
+                self.vision_fallback_model,
+                hasImageContentParts(messages),
+            )) {
                 effective_model = self.vision_fallback_model;
                 log.info("turn.stage stage=vision_fallback iteration={d} from={s} to={s}", .{
                     iteration, self.model_name, self.vision_fallback_model,
@@ -4762,9 +4766,11 @@ pub const Agent = struct {
         // turn that had been running on vision-fallback would summarize
         // via the wrong model — likely hallucinating or erroring.
         const summary_model: []const u8 = blk: {
-            if (self.vision_fallback_model.len > 0 and hasImageContentParts(summary_messages) and
-                !std.mem.eql(u8, self.model_name, self.vision_fallback_model))
-            {
+            if (shouldRouteToVisionFallback(
+                self.model_name,
+                self.vision_fallback_model,
+                hasImageContentParts(summary_messages),
+            )) {
                 break :blk self.vision_fallback_model;
             }
             break :blk self.model_name;
@@ -5014,6 +5020,28 @@ pub const Agent = struct {
             };
         }
         return false;
+    }
+
+    /// Whether an image-bearing turn must be diverted to the configured
+    /// vision sidecar (reliability.vision_fallback).
+    ///
+    /// True only when ALL hold: images are present, a sidecar is configured,
+    /// the active model is not already that sidecar, AND the active model has
+    /// no native vision. A vision-capable primary (e.g. Kimi K2.6) keeps the
+    /// image and handles it directly — full agent context + tools, one
+    /// provider, no hop. An unknown model is treated as text-only (routes
+    /// through the sidecar) so images are never silently dropped.
+    fn shouldRouteToVisionFallback(
+        model_name: []const u8,
+        vision_fallback_model: []const u8,
+        has_images: bool,
+    ) bool {
+        if (!has_images) return false;
+        if (vision_fallback_model.len == 0) return false;
+        if (std.mem.eql(u8, model_name, vision_fallback_model)) return false;
+        const model_capabilities = @import("model_capabilities.zig");
+        if (model_capabilities.modelSupportsVision(model_name)) return false;
+        return true;
     }
 
     fn appendMultimodalAllowedDir(
@@ -5318,6 +5346,20 @@ pub const run = cli.run;
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
+
+test "shouldRouteToVisionFallback: native-vision primary keeps the image" {
+    // Kimi K2.6 is vision-capable — image stays on the primary, no sidecar hop.
+    try std.testing.expect(!Agent.shouldRouteToVisionFallback("kimi-k2.6", "llama-vision", true));
+    try std.testing.expect(!Agent.shouldRouteToVisionFallback("moonshot/kimi-k2.6", "llama-vision", true));
+    // Text-only primary (K2.5) with images → divert to the configured sidecar.
+    try std.testing.expect(Agent.shouldRouteToVisionFallback("kimi-k2.5", "llama-vision", true));
+    // No images → never divert, regardless of model.
+    try std.testing.expect(!Agent.shouldRouteToVisionFallback("kimi-k2.5", "llama-vision", false));
+    // No sidecar configured → cannot divert (image rides the primary as-is).
+    try std.testing.expect(!Agent.shouldRouteToVisionFallback("kimi-k2.5", "", true));
+    // Primary already IS the sidecar → no-op (no self-swap).
+    try std.testing.expect(!Agent.shouldRouteToVisionFallback("llama-vision", "llama-vision", true));
+}
 
 test "Agent.OwnedMessage toChatMessage" {
     const msg = Agent.OwnedMessage{
