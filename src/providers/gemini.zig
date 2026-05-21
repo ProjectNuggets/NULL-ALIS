@@ -296,15 +296,22 @@ pub const GeminiProvider = struct {
         message: []const u8,
         temperature: f64,
     ) ![]const u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        try buf.appendSlice(allocator, "{\"contents\":[{\"role\":\"user\",\"parts\":[{\"text\":");
+        try root.appendJsonString(&buf, allocator, message);
+        try buf.appendSlice(allocator, "}]}]");
         if (system_prompt) |sys| {
-            return std.fmt.allocPrint(allocator,
-                \\{{"contents":[{{"role":"user","parts":[{{"text":"{s}"}}]}}],"system_instruction":{{"parts":[{{"text":"{s}"}}]}},"generationConfig":{{"temperature":{d:.2},"maxOutputTokens":{d}}}}}
-            , .{ message, sys, temperature, DEFAULT_MAX_OUTPUT_TOKENS });
-        } else {
-            return std.fmt.allocPrint(allocator,
-                \\{{"contents":[{{"role":"user","parts":[{{"text":"{s}"}}]}}],"generationConfig":{{"temperature":{d:.2},"maxOutputTokens":{d}}}}}
-            , .{ message, temperature, DEFAULT_MAX_OUTPUT_TOKENS });
+            try buf.appendSlice(allocator, ",\"system_instruction\":{\"parts\":[{\"text\":");
+            try root.appendJsonString(&buf, allocator, sys);
+            try buf.appendSlice(allocator, "}]}");
         }
+        try buf.writer(allocator).print(
+            ",\"generationConfig\":{{\"temperature\":{d:.2},\"maxOutputTokens\":{d}}}}}",
+            .{ temperature, DEFAULT_MAX_OUTPUT_TOKENS },
+        );
+        return try buf.toOwnedSlice(allocator);
     }
 
     /// Parse text content from a Gemini generateContent response.
@@ -864,6 +871,27 @@ test "buildRequestBody without system" {
     const body = try GeminiProvider.buildRequestBody(std.testing.allocator, null, "Hello", 0.7);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "system_instruction") == null);
+}
+
+test "buildRequestBody escapes JSON strings" {
+    const body = try GeminiProvider.buildRequestBody(
+        std.testing.allocator,
+        "system \"quoted\"\nline",
+        "user \\ path \"quoted\"",
+        0.7,
+    );
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    const root_obj = parsed.value.object;
+    const contents = root_obj.get("contents").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), contents.len);
+    const user_parts = contents[0].object.get("parts").?.array.items;
+    try std.testing.expectEqualStrings("user \\ path \"quoted\"", user_parts[0].object.get("text").?.string);
+    const system_parts = root_obj.get("system_instruction").?.object.get("parts").?.array.items;
+    try std.testing.expectEqualStrings("system \"quoted\"\nline", system_parts[0].object.get("text").?.string);
 }
 
 test "parseResponse extracts text" {
