@@ -1565,6 +1565,35 @@ const TenantRuntime = struct {
             runtime.session_mgr.sidecar_model = runtime.provider_bundle.sidecarModelName();
         }
 
+        // Finding #2 fix (2026-05-22): structured extraction + the
+        // contradiction judge must run on a provider/model PAIR that
+        // actually agree. Pre-fix, `extraction_judge_provider` was hardwired
+        // to the primary provider while `extraction_judge_model` carried a
+        // Together-only model ID — under a Moonshot primary the pair desynced
+        // and every boundary extraction (Pass A/C, session-end) returned
+        // empty `content`: 0 entities / 0 edges, silently.
+        //
+        // The sidecar block is a matched provider+model pair purpose-built
+        // for cheap structured extraction (config_types.zig AgentConfig
+        // sidecar doc: "narration, structured extraction, and compaction
+        // summarization"). Route ALL extraction/judge work through it so the
+        // provider and model can never desync — they arrive together from
+        // one config block. Falls back to primary + default_model only when
+        // no sidecar is configured (non-sidecar deploys).
+        const extract_provider_i: providers.Provider =
+            if (runtime.provider_bundle.sidecarProvider()) |sp| sp else provider_i;
+        const extract_model_i: ?[]const u8 = blk: {
+            if (runtime.provider_bundle.sidecarProvider() != null) {
+                const sm = runtime.provider_bundle.sidecarModelName();
+                if (sm.len > 0) break :blk sm;
+            }
+            // No sidecar configured: honor the legacy extraction_judge_model
+            // override if set, else the agent's default model.
+            if (runtime.config.agent.extraction_judge_model.len > 0)
+                break :blk runtime.config.agent.extraction_judge_model;
+            break :blk runtime.config.default_model;
+        };
+
         if (runtime.mem_rt) |*rt| {
             runtime.session_mgr.mem_rt = rt;
             tools_mod.bindMemoryRuntime(runtime.tools, rt);
@@ -1588,13 +1617,13 @@ const TenantRuntime = struct {
         // for vector retrieval.
         //
         // V1.8-1: wire judge_provider + judge_model_name (closes G-B —
-        // contradiction judge dead in production). Uses the same primary
-        // provider + default_model the agent uses for its main turns, so
-        // the judge sees the same routing/cache as the user's session.
-        // When default_model is null (test fixtures, missing config),
-        // judge degrades gracefully to MD5-only dedup at extraction
-        // time (extraction_persist tolerates judge=null per cmt6
-        // contract).
+        // contradiction judge dead in production).
+        // Finding #2 fix (2026-05-22): judge now uses the matched
+        // extraction-sidecar pair (extract_provider_i + extract_model_i),
+        // not primary + default_model — the primary may be a reasoning model
+        // (empty JSON output) or desynced from the judge model ID. When no
+        // sidecar/model is configured, judge degrades gracefully to MD5-only
+        // dedup (extraction_persist tolerates judge=null per cmt6 contract).
         const cmt96_coref_embed: ?@import("memory/vector/embeddings.zig").EmbeddingProvider = blk: {
             if (runtime.mem_rt) |*mrt| {
                 if (mrt._embedding_provider) |ep| break :blk ep;
@@ -1603,8 +1632,8 @@ const TenantRuntime = struct {
         };
         tools_mod.bindMemoryStoreUnifiedContext(
             runtime.tools,
-            provider_i, // V1.8-1: judge_provider (was null)
-            runtime.config.default_model, // V1.8-1: judge_model_name (was null)
+            extract_provider_i, // Finding #2: matched extraction-sidecar pair
+            extract_model_i, // Finding #2: matched extraction-sidecar pair
             cmt96_coref_embed,
             runtime.config.agent.extraction_cardinality_fastpath, // V1.14.12 (M2 review CRITICAL)
         );
@@ -1615,10 +1644,13 @@ const TenantRuntime = struct {
         // is for explicit tool invocation: agent calling wiki_link("...")
         // on user demand, the /brain "Re-link this session" button (Day 3),
         // and `nullalis admin wiki-relink` CLI (Day 3).
+        // Finding #2 fix (2026-05-22): wiki_link does structured extraction —
+        // route it through the non-reasoning extraction sidecar, not the
+        // primary (which may be a reasoning model that emits empty content).
         tools_mod.bindWikiLinkContext(
             runtime.tools,
-            provider_i,
-            runtime.config.default_model,
+            extract_provider_i,
+            extract_model_i,
             cmt96_coref_embed,
         );
 
@@ -1669,21 +1701,18 @@ const TenantRuntime = struct {
                     // memory_store + compaction Pass C (lines 1568-1569).
                     // Closes the third callsite where contradictions
                     // could land but didn't (commands.zig session-end).
-                    runtime.session_mgr.extraction_judge_provider = provider_i;
-                    // V1.14.8.1 (2026-05-10): prefer the dedicated
-                    // extraction sidecar override when set. Falls back to
-                    // default_model only when no override is configured.
-                    // Kimi K2.5 (a typical default_model on the zaki_bot
-                    // profile) is a reasoning model and produces empty
-                    // `content` on JSON-extraction prompts because it burns
-                    // its output budget on hidden reasoning — the override
-                    // lets ops pin a non-reasoning model like
-                    // Llama-3.3-70B-Instruct-Turbo without changing the
-                    // primary chat model.
-                    runtime.session_mgr.extraction_judge_model_name = if (runtime.config.agent.extraction_judge_model.len > 0)
-                        runtime.config.agent.extraction_judge_model
-                    else
-                        runtime.config.default_model orelse "";
+                    // Finding #2 fix (2026-05-22): judge_provider and
+                    // judge_model_name MUST be a matched pair. Pre-fix the
+                    // provider was hardwired to `provider_i` (primary) while
+                    // the model came from `extraction_judge_model` (often a
+                    // Together-only ID) — under a Moonshot primary the pair
+                    // desynced, the extractor called Moonshot with a Llama
+                    // model ID, got empty `content`, and every Pass A/C +
+                    // session-end boundary extraction yielded 0 entities/0
+                    // edges. Both fields now come from the single matched
+                    // extraction-sidecar pair computed above.
+                    runtime.session_mgr.extraction_judge_provider = extract_provider_i;
+                    runtime.session_mgr.extraction_judge_model_name = extract_model_i orelse "";
                     // V1.14.12 (M5) — thread the legacy direct-write
                     // flag from config to session manager. Default true
                     // (1-week soak); operator flips to false in config
