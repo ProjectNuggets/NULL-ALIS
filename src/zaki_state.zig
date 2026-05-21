@@ -10079,6 +10079,13 @@ test "TxnLease: commit persists writes" {
     var mgr = initPostgresTestManagerWithPool(allocator, 4, 5000) catch return error.SkipZigTest;
     defer mgr.deinit();
 
+    // Finding B fix (coordinator review, 2026-05-21): user 7777 must be
+    // provisioned before any memories write — memories.user_id carries an FK
+    // to users(user_id) (0001_initial_schema.sql). Without provisionUser,
+    // upsertMemory fails with `error.ExecFailed` (FK violation), failing the
+    // test. Latent: pg tests skip unless NULLALIS_POSTGRES_TEST_URL is set,
+    // so this never ran green against a live DB.
+    try mgr.provisionUser(7777, "/tmp/nullalis-zaki-bot-test-user-7777/workspace");
     try mgr.upsertMemory(7777, "txn_commit_baseline", "before", .core, null);
 
     {
@@ -10110,6 +10117,9 @@ test "TxnLease: rollback discards writes" {
     var mgr = initPostgresTestManagerWithPool(allocator, 4, 5000) catch return error.SkipZigTest;
     defer mgr.deinit();
 
+    // Finding B fix (coordinator review, 2026-05-21): provision user 7777
+    // before the memories write — see "TxnLease: commit persists writes".
+    try mgr.provisionUser(7777, "/tmp/nullalis-zaki-bot-test-user-7777/workspace");
     try mgr.upsertMemory(7777, "txn_rollback_baseline", "before", .core, null);
 
     {
@@ -10142,6 +10152,9 @@ test "TxnLease: deinit without commit rolls back (defensive)" {
     var mgr = initPostgresTestManagerWithPool(allocator, 4, 5000) catch return error.SkipZigTest;
     defer mgr.deinit();
 
+    // Finding B fix (coordinator review, 2026-05-21): provision user 7777
+    // before the memories write — see "TxnLease: commit persists writes".
+    try mgr.provisionUser(7777, "/tmp/nullalis-zaki-bot-test-user-7777/workspace");
     try mgr.upsertMemory(7777, "txn_deinit_baseline", "before", .core, null);
 
     {
@@ -10199,6 +10212,12 @@ test "TxnLease: pool-split regression — overlapping txns each see their own st
     const allocator = std.testing.allocator;
     var mgr = initPostgresTestManagerWithPool(allocator, 2, 5000) catch return error.SkipZigTest;
     defer mgr.deinit();
+
+    // Finding B fix (coordinator review, 2026-05-21): the inline-for below
+    // INSERTs rows into {schema}.memories with a literal user_id of 7777.
+    // memories.user_id has an FK to users(user_id) — provision 7777 first
+    // or both INSERTs fail with `error.ExecFailed` (FK violation).
+    try mgr.provisionUser(7777, "/tmp/nullalis-zaki-bot-test-user-7777/workspace");
 
     var txn_a = try mgr.beginTransaction();
     defer txn_a.deinit();
