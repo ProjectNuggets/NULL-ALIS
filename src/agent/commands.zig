@@ -1536,119 +1536,104 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                     } };
                     self.observer.recordEvent(&ep_event);
 
-                    // V1.13 Day 4.2 — capture procedural memory trace.
-                    // Coarse-grained: one trace per session if it
-                    // crossed the tool-count threshold. Future Day 4.3
-                    // will refine via per-skill detection.
-                    //
-                    // task_summary: derive from the most-recent user
-                    // entry. tool_call_names: empty for now (would
-                    // require session-wide tracking; left as future
-                    // refinement). total_tool_calls: use entry count
-                    // as a heuristic proxy until session-wide counter
-                    // ships.
-                    const procedural_memory = @import("procedural_memory.zig");
+                }
+            }
+        }
 
-                    // v1.14.18-B G16 (WM-CROSS-SESSION) — promote high-importance
-                    // WM slots (active_goal + decision with composite ≥ 0.5) to
-                    // durable_facts BEFORE the procedural-memory capture below.
-                    //
-                    // **Cross-agent ordering invariant (forward-looking):** when Agent E
-                    // ships G5, `reflection.serialize(...)` will be inserted BETWEEN this
-                    // promotion block and `procedural_memory.captureSession` below. The
-                    // invariant promotion-before-reflection ensures transient_goal
-                    // durable_facts exist before the reflection trail references them.
-                    // Today, only the promotion-before-captureSession ordering matters,
-                    // and that ordering is satisfied by the call sequence below.
-                    //
-                    // Per-finding scope: G16 only handles the promotion. The
-                    // reverse direction (session-start recall of the promoted
-                    // facts back into WM) is handled by the existing
-                    // memory_loader continuity path — the `durable_fact/`
-                    // prefix on the key makes them auto-recall at next
-                    // session start. See promotion.zig module doc for the
-                    // key-shape rationale.
-                    //
-                    // Failure-soft: returns count 0 on any setup error;
-                    // individual slot failures log but don't abort the
-                    // session-end path.
-                    const promotion = @import("promotion.zig");
-                    {
-                        var prom_result = promotion.promoteWMToDurableAtSessionEnd(
-                            self.allocator,
-                            self.extraction_state_mgr,
-                            self.mem,
-                            uid_ep,
-                            session_id,
-                        );
-                        defer prom_result.deinit(self.allocator);
-                        if (prom_result.count() > 0) {
-                            log.info(
-                                "session_end.wm_promotion count={d} session={s}",
-                                .{ prom_result.count(), session_id },
-                            );
-                        }
-                    }
+        // v1.14.18-B re-activation fix (coordinator activation audit,
+        // 2026-05-21): G16 (WM→durable promotion) and G1/G5 (procedural-
+        // memory + reflection-trail capture) were mis-scoped INSIDE the
+        // `per_turn_enqueue_enabled` gate above. captureSession was placed
+        // there in V1.13 Day 4.2 when that gate defaulted true (C1); C3
+        // (V1.14.7) then flipped the gate false to kill the legacy
+        // extraction_QUEUE enqueue — silently taking captureSession down
+        // as collateral. v1.14.18-A/B later added the promotion + reflection
+        // trail into the same dead block. Neither promotion nor
+        // captureSession touches extraction_queue — promotion writes
+        // durable_facts via mem.store, captureSession writes
+        // skill_executions — so the enqueue gate never logically applied.
+        // Left gated, the entire cross-session learning loop (procedural
+        // memory, reflection storage, WM promotion) was behaviorally inert
+        // in every default deployment. Hoisted here: ungated, guarded only
+        // by state-manager availability, failure-soft. See
+        // docs/audits/2026-05-21-v1.14.18-B-activation-audit.md.
+        if (self.extraction_state_mgr != null and self.extraction_user_id != null) {
+            const smgr_se = self.extraction_state_mgr.?;
+            const uid_se = self.extraction_user_id.?;
+            const procedural_memory = @import("procedural_memory.zig");
 
-                    var task_text: ?[]const u8 = null;
-                    var i: usize = entries.len;
-                    while (i > 0) {
-                        i -= 1;
-                        if (std.mem.eql(u8, entries[i].role, "user")) {
-                            task_text = entries[i].content;
-                            break;
-                        }
+            // G16 (WM-CROSS-SESSION) — promote high-importance WM slots
+            // (active_goal + decision, composite ≥ threshold) to
+            // durable_facts BEFORE the procedural-memory capture below.
+            // Ordering invariant: promotion-before-capture ensures the
+            // transient_goal durable_facts exist before the reflection
+            // trail references them. Failure-soft: returns count 0 on any
+            // setup error; per-slot failures log without aborting.
+            {
+                const promotion = @import("promotion.zig");
+                var prom_result = promotion.promoteWMToDurableAtSessionEnd(
+                    self.allocator,
+                    self.extraction_state_mgr,
+                    self.mem,
+                    uid_se,
+                    session_id,
+                );
+                defer prom_result.deinit(self.allocator);
+                if (prom_result.count() > 0) {
+                    log.info(
+                        "session_end.wm_promotion count={d} session={s}",
+                        .{ prom_result.count(), session_id },
+                    );
+                }
+            }
+
+            // G1/G5 — capture one procedural-memory trace per session that
+            // crossed the tool-count threshold, carrying the reflection
+            // trail into skill_executions.assumptions_made_json. The inner
+            // CAPTURE_TOOL_THRESHOLD check is a legitimate triviality
+            // filter (skip pure-conversation sessions) and is retained.
+            var task_text: ?[]const u8 = null;
+            {
+                var i: usize = entries.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (std.mem.eql(u8, entries[i].role, "user")) {
+                        task_text = entries[i].content;
+                        break;
                     }
-                    // MD-01 fix (REVIEW V1.13 final): use the agent's
-                    // last_turn_tool_count signal, not entries.len. The
-                    // proxy was over-capturing — any 5+ message
-                    // conversation triggered a procedural trace,
-                    // polluting skill_executions with junk rows from
-                    // pure conversational turns.
-                    //
-                    // last_turn_tool_count tracks the actual count of
-                    // tool calls in the most-recent turn (set by the
-                    // agent loop). For a multi-tool skill execution
-                    // we expect ≥5 tool calls in a single turn. This
-                    // is conservative — sessions with sustained tool
-                    // activity across multiple turns won't capture
-                    // unless one of them crossed the threshold. That's
-                    // acceptable for the V1.13 capture-only state;
-                    // future Day 5.2+ refinement can track session-wide
-                    // tool counts properly.
-                    const tool_count_real: u32 = if (@hasField(@TypeOf(self.*), "session_total_tool_count"))
-                        self.session_total_tool_count
-                    else
-                        0;
-                    if (tool_count_real >= procedural_memory.CAPTURE_TOOL_THRESHOLD) {
-                        const tool_names: []const []const u8 = if (@hasField(@TypeOf(self.*), "session_tool_names"))
-                            self.session_tool_names.items
-                        else
-                            &.{};
-                        const goal_status: ?goal_loop.GoalStatus = if (@hasField(@TypeOf(self.*), "active_goal_state") and self.active_goal_state != null)
-                            self.active_goal_state.?.status
-                        else
-                            null;
-                        const reflection_trail_json: []const u8 = if (@hasField(@TypeOf(self.*), "session_reflection_trail_json") and self.session_reflection_trail_json != null)
-                            self.session_reflection_trail_json.?
-                        else
-                            "[]";
-                        _ = procedural_memory.captureSession(
-                            self.allocator,
-                            smgr_ep,
-                            uid_ep,
-                            session_id,
-                            task_text,
-                            tool_names,
-                            tool_count_real,
-                            goal_status,
-                            reflection_trail_json, // v1.14.18-B G5
-                        );
-                        // Reset counter after capture (v1.14.18-A F3)
-                        if (@hasField(@TypeOf(self.*), "session_total_tool_count")) {
-                            self.session_total_tool_count = 0;
-                        }
-                    }
+                }
+            }
+            const tool_count_real: u32 = if (@hasField(@TypeOf(self.*), "session_total_tool_count"))
+                self.session_total_tool_count
+            else
+                0;
+            if (tool_count_real >= procedural_memory.CAPTURE_TOOL_THRESHOLD) {
+                const tool_names: []const []const u8 = if (@hasField(@TypeOf(self.*), "session_tool_names"))
+                    self.session_tool_names.items
+                else
+                    &.{};
+                const goal_status: ?goal_loop.GoalStatus = if (@hasField(@TypeOf(self.*), "active_goal_state") and self.active_goal_state != null)
+                    self.active_goal_state.?.status
+                else
+                    null;
+                const reflection_trail_json: []const u8 = if (@hasField(@TypeOf(self.*), "session_reflection_trail_json") and self.session_reflection_trail_json != null)
+                    self.session_reflection_trail_json.?
+                else
+                    "[]";
+                _ = procedural_memory.captureSession(
+                    self.allocator,
+                    smgr_se,
+                    uid_se,
+                    session_id,
+                    task_text,
+                    tool_names,
+                    tool_count_real,
+                    goal_status,
+                    reflection_trail_json, // v1.14.18-B G5
+                );
+                // Reset counter after capture (v1.14.18-A F3)
+                if (@hasField(@TypeOf(self.*), "session_total_tool_count")) {
+                    self.session_total_tool_count = 0;
                 }
             }
         }
