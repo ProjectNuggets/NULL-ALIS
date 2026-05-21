@@ -5072,14 +5072,6 @@ pub const Agent = struct {
         return true;
     }
 
-    /// Video routing for a turn's provider messages. Unlike images — which
-    /// can divert to the vision sidecar — there is no video sidecar (the
-    /// vision fallback model is image-only). So when `effective_model` has
-    /// no native video understanding, the video content parts are dropped
-    /// from `messages` and the user is told via a `system_notice`; the turn
-    /// is never errored. A video-capable model (Kimi K2.6, Gemini) keeps the
-    /// video parts untouched. Mutates `messages` in place, replacing affected
-    /// `content_parts` arrays with arena-allocated copies that omit the video.
     /// Remove every `video_base64` content part from `messages`, replacing
     /// each affected `content_parts` array with an arena-allocated copy that
     /// omits the video. A message left with no parts drops back to
@@ -5111,6 +5103,13 @@ pub const Agent = struct {
         return stripped;
     }
 
+    /// Video routing for a turn's provider messages. Unlike images — which
+    /// can divert to the vision sidecar — there is no video sidecar (the
+    /// vision fallback model is image-only). So when `effective_model` has
+    /// no native video understanding, the video content parts are dropped
+    /// from `messages` (via `stripVideoContentParts`) and the user is told
+    /// via a `system_notice`; the turn is never errored. A video-capable
+    /// model (Kimi K2.6, Gemini) keeps the video parts untouched.
     fn routeVideoForModel(
         self: *Agent,
         arena: std.mem.Allocator,

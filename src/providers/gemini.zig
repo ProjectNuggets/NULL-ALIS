@@ -1251,6 +1251,28 @@ test "gemini buildChatRequestBody with content_parts inlineData" {
     try std.testing.expectEqualStrings("iVBOR", inline_data.get("data").?.string);
 }
 
+test "gemini buildChatRequestBody with video_base64 inlineData" {
+    const alloc = std.testing.allocator;
+    const cp = &[_]root.ContentPart{
+        .{ .text = "Describe this clip" },
+        .{ .video_base64 = .{ .data = "AAAAIGZ0", .media_type = "video/mp4" } },
+    };
+    var msgs = [_]root.ChatMessage{
+        .{ .role = .user, .content = "Describe this clip", .content_parts = cp },
+    };
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs }, 0.7);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const contents = parsed.value.object.get("contents").?.array;
+    const parts = contents.items[0].object.get("parts").?.array;
+    try std.testing.expectEqual(@as(usize, 2), parts.items.len);
+    // Video serializes as inlineData, same shape as an image.
+    const inline_data = parts.items[1].object.get("inlineData").?.object;
+    try std.testing.expectEqualStrings("video/mp4", inline_data.get("mimeType").?.string);
+    try std.testing.expectEqualStrings("AAAAIGZ0", inline_data.get("data").?.string);
+}
+
 test "gemini buildChatRequestBody with image_url special chars" {
     const alloc = std.testing.allocator;
     const cp = &[_]root.ContentPart{

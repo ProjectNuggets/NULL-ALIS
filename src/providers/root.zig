@@ -107,10 +107,10 @@ pub const ContentPart = union(enum) {
     /// Anthropic, which has no video content block, degrades it to a text
     /// placeholder.
     ///
-    /// Constructed by multimodal.zig from `[VIDEO:...]` markers (P3b,
-    /// 2026-05-21). The agent does not yet inspect video capability to strip
-    /// these parts for non-video-capable models — that routing lands in a
-    /// later phase (agent/root.zig).
+    /// Constructed by multimodal.zig from `[VIDEO:...]` markers (P3b). The
+    /// agent strips these parts for non-video-capable models, and emits a
+    /// `video_unsupported` system_notice, via `routeVideoForModel`
+    /// (agent/root.zig, P3c).
     pub const VideoBase64 = struct {
         /// Pure base64 payload — NO `data:` prefix. Provider serializers
         /// append it verbatim into a JSON string, so it must contain only
