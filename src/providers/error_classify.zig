@@ -27,6 +27,22 @@ pub fn kindToError(kind: ApiErrorKind) anyerror {
     };
 }
 
+/// Classify purely from the HTTP status code — the most authoritative
+/// error signal. The status code is unambiguous where error-body text is
+/// not: e.g. Groq's 429 rate-limit body says "Rate limit reached … tokens
+/// per minute … Limit 6000", which the text heuristics would otherwise
+/// mis-read as `context_exhausted` ("token" + "limit"). Honouring the
+/// status first prevents a retryable rate-limit from being mistaken for a
+/// fatal context-overflow (finding #4, 2026-05-22). Returns null for 2xx
+/// and for statuses with no specific mapping (caller falls back to
+/// body-based classification).
+pub fn classifyHttpStatus(status_code: u16) ?ApiErrorKind {
+    if (status_code == 429 or status_code == 408) return .rate_limited;
+    if (status_code == 413) return .context_exhausted;
+    if (status_code == 503) return .transient_overload;
+    return null;
+}
+
 /// V1.11 hardening (2026-05-07) — server-side overload detection. Patterns
 /// drawn from Together (503 / "overloaded" / "model is loading"), Anthropic
 /// ("overloaded_error" type), and OpenRouter ("upstream model unavailable").

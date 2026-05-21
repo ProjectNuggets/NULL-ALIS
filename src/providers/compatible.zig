@@ -4,6 +4,8 @@ const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
 const NNGTs_prefix_order = @import("NNGTs_prefix_order.zig");
 
+const log = std.log.scoped(.providers);
+
 const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
 const ChatRequest = root.ChatRequest;
@@ -689,6 +691,29 @@ pub const OpenAiCompatibleProvider = struct {
             .subsystem = .providers,
         }) catch |err| return mapRequestError(err);
         defer allocator.free(response.body);
+
+        // Finding #4 (2026-05-22): compatible.zig discarded the HTTP status
+        // entirely — a 4xx/5xx body was parsed as if it were a 200, and the
+        // error was classified from body text alone. That mis-read Groq's
+        // 429 rate-limit ("Rate limit reached … tokens … Limit 6000") as
+        // `context_exhausted`, turning a retryable throttle into a fatal
+        // ContextLengthExceeded that wrongly triggered compaction truncation.
+        // Honour the status: log it, and classify retryable conditions
+        // (429/408 rate-limit, 413 context, 503 overload) from the status
+        // code — the authoritative signal — before any body heuristics.
+        if (response.status_code < 200 or response.status_code >= 300) {
+            const snippet = response.body[0..@min(response.body.len, 480)];
+            log.warn("compatible.http_non2xx status={d} model={s} url={s} req_bytes={d} body_snippet={s}", .{
+                response.status_code,
+                effective_model,
+                url,
+                body.len,
+                snippet,
+            });
+            if (error_classify.classifyHttpStatus(response.status_code)) |kind| {
+                return error_classify.kindToError(kind);
+            }
+        }
 
         return parseNativeResponse(allocator, response.body);
     }

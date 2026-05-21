@@ -741,6 +741,34 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    // Sidecar — the cheap auxiliary LLM for narration, structured extraction,
+    // and compaction summarization.
+    //
+    // Finding #4 (2026-05-22): this block had a `SidecarConfig` struct, a
+    // config_types field, operator-ownership wiring, and docstrings calling
+    // it configurable — but NO parser. `Config.sidecar` was therefore
+    // permanently the struct default (groq/llama-3.1-8b-instant) regardless
+    // of config.json. That silently pinned every deploy's extraction sidecar
+    // to Groq's free tier (6000 TPM); the compaction call-burst exhausted it
+    // and every boundary extraction past the first failed. Parsing the block
+    // lets the operator actually pick the sidecar provider/model.
+    if (root.get("sidecar")) |sc| {
+        if (sc == .object) {
+            if (sc.object.get("enabled")) |v| {
+                if (v == .bool) self.sidecar.enabled = v.bool;
+            }
+            if (sc.object.get("provider")) |v| {
+                if (v == .string) self.sidecar.provider = try self.allocator.dupe(u8, v.string);
+            }
+            if (sc.object.get("model")) |v| {
+                if (v == .string) self.sidecar.model = try self.allocator.dupe(u8, v.string);
+            }
+            if (sc.object.get("narration_interval")) |v| {
+                if (v == .integer) self.sidecar.narration_interval = @intCast(v.integer);
+            }
+        }
+    }
+
     // Agent
     if (root.get("agent")) |ag| {
         if (ag == .object) {
