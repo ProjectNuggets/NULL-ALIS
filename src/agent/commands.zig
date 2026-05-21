@@ -1433,23 +1433,17 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         // soft per layer; existing per-fact persist remains the legacy
         // primary writer until C5 cleanup. Dedup at persistExtracted handles
         // overlap between the two paths.
-        // V1.14.12 (Path A) — judge guard removed. extractAtBoundary now
-        // handles null-judge gracefully (judge_ctx becomes null inside
-        // runner.zig when judge_model is empty). No-judge tenants get
-        // MD5+canonical-key dedup only — same as the legacy direct
-        // path's pre-M5 behavior. This unblocks deletion of the gated
-        // legacy direct path at this file's session-end block.
+        // The runner can use a dedicated extraction provider/model without
+        // a contradiction judge, but this legacy session-end path only has
+        // judge-backed extraction config available. Avoid routing arbitrary
+        // chat providers through the structured extraction parser.
         if (self.history.items.len > 0) {
             var msgs_buf = std.ArrayListUnmanaged(providers.ChatMessage).initCapacity(self.allocator, self.history.items.len) catch null;
             if (msgs_buf) |*buf| {
                 defer buf.deinit(self.allocator);
                 for (self.history.items) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
                 const ctx = extraction_runner.ExtractionContext{
-                    // Provider may be null when no judge configured;
-                    // runner.zig:798 checks judge_model.len before
-                    // constructing JudgeContext, so this `orelse undefined`
-                    // is never read in the no-judge path.
-                    .judge_provider = self.extraction_judge_provider orelse undefined,
+                    .judge_provider = self.extraction_judge_provider,
                     .judge_model = self.extraction_judge_model_name,
                     .state_mgr = self.extraction_state_mgr,
                     .user_id = self.extraction_user_id,
