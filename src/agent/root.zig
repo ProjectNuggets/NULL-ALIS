@@ -646,6 +646,15 @@ pub const Agent = struct {
     /// Serialized at turn-end from active_reflection_trail; passed to procedural_memory.captureSession.
     session_reflection_trail_json: ?[]const u8 = null,
 
+    /// v1.14.18-A G4 (TASK-PLANNER READ-BACK) — the agent's most-recent
+    /// task plan. Promoted from a turnOutcome loop-local to an Agent field
+    /// so `context_engine.assemble` can render it as a `<task_plan>`
+    /// volatile-prompt block (plan + live step progress carried back into
+    /// the next turn's prompt). Persist-until-replaced: a new `<task_plan>`
+    /// in a later turn deinits this and stores the new one; freed at
+    /// Agent.deinit. Null until the agent first emits a plan.
+    active_task_plan: ?task_planner.TaskPlan = null,
+
     /// v1.14.18-B G3 (NARRATION-AS-CONTEXT) — agent-owned ring buffer
     /// of recent narration frames. The per-turn `NarrationObserver`
     /// (built fresh in `turnOutcome`) holds a pointer back so emitted
@@ -1027,6 +1036,8 @@ pub const Agent = struct {
         self.narration_ring_buffer.deinit();
         // v1.14.18-B G5 fix — free the last turn's serialized reflection trail.
         if (self.session_reflection_trail_json) |j| self.allocator.free(j);
+        // v1.14.18-A G4 — free the retained task plan (persist-until-replaced).
+        if (self.active_task_plan) |*plan| plan.deinit(self.allocator);
         return drained;
     }
 
@@ -2863,10 +2874,11 @@ pub const Agent = struct {
         defer self.session_total_tool_count +%= turn_tool_calls_total; // v1.14.18-A F3
         var turn_first_token_ms: ?u64 = null;
         var turn_first_token_upper_bound_ms: ?u64 = null;
-        var active_task_plan: ?task_planner.TaskPlan = null;
+        // v1.14.18-A G4 — active_task_plan is now an Agent field (see decl);
+        // it persists across turns so context_engine.assemble can render it
+        // as a <task_plan> prompt block. These two flags stay turn-local.
         var task_plan_checked = false;
         var task_plan_complete_emitted = false;
-        defer if (active_task_plan) |*plan| plan.deinit(self.allocator);
 
         // **D1.7** — accumulator for task_ids spawned during this turn
         // (via the `spawn` tool — `delegate` is synchronous and inlines
@@ -3695,7 +3707,10 @@ pub const Agent = struct {
                 const extracted_plan = task_planner.extractTextAndPlan(raw_response_text);
                 if (extracted_plan.plan_xml) |plan_xml| {
                     if (try task_planner.parseTaskPlan(self.allocator, plan_xml)) |parsed_plan| {
-                        active_task_plan = parsed_plan;
+                        // v1.14.18-A G4 — replace the retained plan: free the
+                        // prior turn's plan before storing this turn's.
+                        if (self.active_task_plan) |*old_plan| old_plan.deinit(self.allocator);
+                        self.active_task_plan = parsed_plan;
                         if (extracted_plan.text.len > 0 and extracted_plan.text_after.len > 0) {
                             response_text = try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ extracted_plan.text, extracted_plan.text_after });
                         } else if (extracted_plan.text_after.len > 0) {
@@ -4365,7 +4380,7 @@ pub const Agent = struct {
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
             defer results_buf.deinit(self.allocator);
             try results_buf.ensureTotalCapacity(self.allocator, parsed_calls.len);
-            if (active_task_plan) |*plan| {
+            if (self.active_task_plan) |*plan| {
                 for (parsed_calls, 0..) |call, call_idx| {
                     const plan_index = plan.current_step + @as(u32, @intCast(call_idx));
                     task_planner.emitStepProgress(self.observer, plan, plan_index, call.name);
@@ -4386,7 +4401,7 @@ pub const Agent = struct {
                 parsed_calls.len,
             });
 
-            if (active_task_plan) |*plan| {
+            if (self.active_task_plan) |*plan| {
                 for (results_buf.items) |result| {
                     if (plan.current_step >= plan.steps.len) break;
                     const step_index = plan.current_step;
