@@ -206,15 +206,25 @@ pub const OllamaProvider = struct {
         model: []const u8,
         temperature: f64,
     ) ![]const u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        try buf.appendSlice(allocator, "{\"model\":");
+        try root.appendJsonString(&buf, allocator, model);
+        try buf.appendSlice(allocator, ",\"messages\":[");
         if (system_prompt) |sys| {
-            return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","messages":[{{"role":"system","content":"{s}"}},{{"role":"user","content":"{s}"}}],"stream":false,"options":{{"temperature":{d:.2}}}}}
-            , .{ model, sys, message, temperature });
+            try buf.appendSlice(allocator, "{\"role\":\"system\",\"content\":");
+            try root.appendJsonString(&buf, allocator, sys);
+            try buf.appendSlice(allocator, "},{\"role\":\"user\",\"content\":");
+            try root.appendJsonString(&buf, allocator, message);
+            try buf.append(allocator, '}');
         } else {
-            return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","messages":[{{"role":"user","content":"{s}"}}],"stream":false,"options":{{"temperature":{d:.2}}}}}
-            , .{ model, message, temperature });
+            try buf.appendSlice(allocator, "{\"role\":\"user\",\"content\":");
+            try root.appendJsonString(&buf, allocator, message);
+            try buf.append(allocator, '}');
         }
+        try buf.writer(allocator).print("],\"stream\":false,\"options\":{{\"temperature\":{d:.2}}}}}", .{temperature});
+        return try buf.toOwnedSlice(allocator);
     }
 
     /// Parse an Ollama response, handling tool calls, thinking-only, and plain text.
@@ -433,6 +443,27 @@ test "buildRequestBody without system" {
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "mistral") != null);
+}
+
+test "buildRequestBody escapes JSON strings" {
+    const body = try OllamaProvider.buildRequestBody(
+        std.testing.allocator,
+        "system \"quoted\"\nline",
+        "user \\ path \"quoted\"",
+        "llama\"3",
+        0.25,
+    );
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    const root_obj = parsed.value.object;
+    try std.testing.expectEqualStrings("llama\"3", root_obj.get("model").?.string);
+    const messages = root_obj.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("system \"quoted\"\nline", messages[0].object.get("content").?.string);
+    try std.testing.expectEqualStrings("user \\ path \"quoted\"", messages[1].object.get("content").?.string);
 }
 
 test "parseResponse extracts content" {
