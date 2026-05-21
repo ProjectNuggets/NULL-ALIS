@@ -3578,19 +3578,22 @@ pub const Agent = struct {
                         turn_llm_calls += 1;
                         const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
                         // Rebuild re-adds video parts — re-apply video routing.
-                        try self.routeVideoForModel(arena, recovery_msgs, self.model_name, iteration);
+                        try self.routeVideoForModel(arena, recovery_msgs, effective_model, iteration);
+                        // effective_model (not self.model_name) — honor the
+                        // turn's vision-fallback routing on the recovery call,
+                        // matching the initial blocking call and streaming path.
                         break :retry_blk self.provider.chat(
                             self.allocator,
                             .{
                                 .messages = recovery_msgs,
-                                .model = self.model_name,
+                                .model = effective_model,
                                 .temperature = self.temperature,
                                 .max_tokens = self.max_tokens,
                                 .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
                             },
-                            self.model_name,
+                            effective_model,
                             self.temperature,
                         ) catch return err;
                     }
@@ -3613,18 +3616,21 @@ pub const Agent = struct {
                     // a magic-number sleep.
                     turn_retry_attempts += 1;
                     turn_llm_calls += 1;
+                    // effective_model (not self.model_name) — `messages` was
+                    // already vision/video-routed for effective_model above;
+                    // the retry must dispatch to the same model.
                     break :retry_blk self.provider.chat(
                         self.allocator,
                         .{
                             .messages = messages,
-                            .model = self.model_name,
+                            .model = effective_model,
                             .temperature = self.temperature,
                             .max_tokens = self.max_tokens,
                             .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
                             .timeout_secs = self.message_timeout_secs,
                             .reasoning_effort = self.reasoning_effort,
                         },
-                        self.model_name,
+                        effective_model,
                         self.temperature,
                     ) catch |retry_err| {
                         // Context exhaustion recovery: if we have enough history,
@@ -3637,19 +3643,21 @@ pub const Agent = struct {
                             turn_llm_calls += 1;
                             const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
                             // Rebuild re-adds video parts — re-apply video routing.
-                            try self.routeVideoForModel(arena, recovery_msgs, self.model_name, iteration);
+                            try self.routeVideoForModel(arena, recovery_msgs, effective_model, iteration);
+                            // effective_model (not self.model_name) — honor the
+                            // turn's vision-fallback routing on the recovery call.
                             break :retry_blk self.provider.chat(
                                 self.allocator,
                                 .{
                                     .messages = recovery_msgs,
-                                    .model = self.model_name,
+                                    .model = effective_model,
                                     .temperature = self.temperature,
                                     .max_tokens = self.max_tokens,
                                     .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
                                     .timeout_secs = self.message_timeout_secs,
                                     .reasoning_effort = self.reasoning_effort,
                                 },
-                                self.model_name,
+                                effective_model,
                                 self.temperature,
                             ) catch return retry_err;
                         }
