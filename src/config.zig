@@ -262,7 +262,8 @@ pub const Config = struct {
                 // Primary provider is Moonshot's native API; Kimi K2.6's
                 // bare model ID on Moonshot is `kimi-k2.6` (Together's ID
                 // `moonshotai/Kimi-K2.6` is used only on the Together
-                // fallback route, wired via `model_fallbacks` below).
+                // fallback route, carried via the `provider/model` ref form
+                // in `fallback_providers` below).
                 //
                 // `default_provider` has no nullable "unset" state — its
                 // struct default is `"openrouter"`. Treat that sentinel as

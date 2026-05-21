@@ -82,8 +82,8 @@ const compat_providers = [_]CompatProvider{
     // bare model ID. `emit_kimi_thinking` switches the request shape to
     // Kimi's native `thinking` field (cross-turn CoT via `keep:"all"`).
     // CN-region users should use the `moonshot-cn` / `kimi-cn` aliases.
-    .{ .name = "moonshot", .url = "https://api.moonshot.ai/v1", .display = "Moonshot AI", .emit_kimi_thinking = true },
-    .{ .name = "kimi", .url = "https://api.moonshot.ai/v1", .display = "Moonshot AI", .emit_kimi_thinking = true },
+    .{ .name = "moonshot", .url = "https://api.moonshot.ai/v1", .display = "Moonshot AI", .emit_kimi_thinking = true, .no_responses_fallback = true },
+    .{ .name = "kimi", .url = "https://api.moonshot.ai/v1", .display = "Moonshot AI", .emit_kimi_thinking = true, .no_responses_fallback = true },
     .{ .name = "glm", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
     .{ .name = "zhipu", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
     .{ .name = "zai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI" },
@@ -116,10 +116,13 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "minimaxi", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
 
     // ── International variants ────────────────────────────────────────────
-    .{ .name = "moonshot-intl", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
-    .{ .name = "moonshot-global", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
-    .{ .name = "kimi-intl", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
-    .{ .name = "kimi-global", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
+    // moonshot-intl/-global share Moonshot's native global `.ai` endpoint
+    // with `moonshot`/`kimi` — identical endpoint ⇒ identical request shape:
+    // they carry `emit_kimi_thinking` and the "no /v1/responses" fact too.
+    .{ .name = "moonshot-intl", .url = "https://api.moonshot.ai/v1", .display = "Moonshot", .emit_kimi_thinking = true, .no_responses_fallback = true },
+    .{ .name = "moonshot-global", .url = "https://api.moonshot.ai/v1", .display = "Moonshot", .emit_kimi_thinking = true, .no_responses_fallback = true },
+    .{ .name = "kimi-intl", .url = "https://api.moonshot.ai/v1", .display = "Moonshot", .emit_kimi_thinking = true, .no_responses_fallback = true },
+    .{ .name = "kimi-global", .url = "https://api.moonshot.ai/v1", .display = "Moonshot", .emit_kimi_thinking = true, .no_responses_fallback = true },
     .{ .name = "glm-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
     .{ .name = "zhipu-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
     .{ .name = "zai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI" },
@@ -536,6 +539,13 @@ test "findCompatProvider returns correct flags" {
     // CN-region aliases keep the default (no thinking field) — verified
     // here to guard against accidental flag bleed into the -cn entries.
     try std.testing.expect(!findCompatProvider("moonshot-cn").?.emit_kimi_thinking);
+    // International aliases share the native `.ai` endpoint — they MUST
+    // carry the flag (a request via them to a Kimi model would otherwise
+    // send `reasoning_effort`, which Moonshot's native API rejects).
+    try std.testing.expect(findCompatProvider("moonshot-intl").?.emit_kimi_thinking);
+    try std.testing.expect(findCompatProvider("moonshot-global").?.emit_kimi_thinking);
+    try std.testing.expect(findCompatProvider("kimi-intl").?.emit_kimi_thinking);
+    try std.testing.expect(findCompatProvider("kimi-global").?.emit_kimi_thinking);
 }
 
 test "fromConfig applies emit_kimi_thinking flag" {

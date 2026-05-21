@@ -116,7 +116,13 @@ pub const RuntimeProviderBundle = struct {
                 // name (no `/`) yields a null override — unchanged behavior.
                 const slash = std.mem.indexOfScalar(u8, fb_entry, '/');
                 const provider_name = if (slash) |s| fb_entry[0..s] else fb_entry;
-                const model_override: ?[]const u8 = if (slash) |s| fb_entry[s + 1 ..] else null;
+                // A trailing `/` (empty model segment) is operator
+                // misconfiguration — treat it as "no override" rather than
+                // sending an empty model ID to the fallback provider.
+                const model_override: ?[]const u8 = if (slash) |s| blk: {
+                    const ov = fb_entry[s + 1 ..];
+                    break :blk if (ov.len > 0) ov else null;
+                } else null;
                 const fb_key = api_key.resolveApiKeyFromConfig(
                     allocator,
                     provider_name,
