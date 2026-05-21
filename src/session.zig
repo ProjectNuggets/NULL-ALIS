@@ -543,19 +543,18 @@ pub const SessionManager = struct {
         session.agent.persistSessionCheckpoint("ttl_recycle");
 
         var previous_agent = session.agent;
-        session.agent = replacement_agent;
-        syncSessionOriginToAgent(session);
-        // Tight drain budget. If the just-fired "ttl_recycle" or any
-        // prior async worker is still in flight, we proceed but log —
-        // the worker holds a ref to `previous_agent` which is about
-        // to be freed. With a 5s budget on a healthy provider this
-        // should always drain; on an unhealthy provider we accept
-        // the worker may UAF (better than hanging the manager loop).
+        // Tight drain budget. If a lifecycle worker is still in flight,
+        // keep the existing session alive and retry on the next eviction
+        // cycle. The replacement is discarded before it becomes visible.
         const drained = previous_agent.deinitWithTimeout(5_000);
         if (!drained) {
-            log.warn("session.recycle.deinit_timeout session={s} — proceeding (lifecycle worker may UAF)", .{session.session_key});
+            replacement_agent.deinit();
+            log.warn("session.recycle.deinit_timeout session={s} — keeping existing agent until lifecycle drains", .{session.session_key});
+            return;
         }
 
+        session.agent = replacement_agent;
+        syncSessionOriginToAgent(session);
         session.created_at = now;
         session.last_active = now;
         session.last_consolidated = 0;
@@ -2380,6 +2379,7 @@ test "ttl recycle persists session checkpoint before replacement" {
     defer testing.allocator.free(warmup);
 
     const first = try sm.getOrCreate("ttl:checkpoint");
+    try testing.expect(first.agent.waitForLifecycleIdle(30_000));
     first.agent.session_ttl_secs = 1;
     first.last_active = std.time.timestamp() - 60;
 
@@ -2437,6 +2437,7 @@ test "ttl recycle persists summary objects in fast mode" {
     defer testing.allocator.free(warmup);
 
     const first = try sm.getOrCreate("ttl:fast");
+    try testing.expect(first.agent.waitForLifecycleIdle(30_000));
     first.agent.session_ttl_secs = 1;
     first.last_active = std.time.timestamp() - 60;
 
@@ -2490,6 +2491,7 @@ test "ttl recycle keeps stored telegram origin on summary writes" {
     defer testing.allocator.free(warmup);
 
     const session = try sm.getOrCreate("agent:zaki-bot:user:1:thread:telegram:thread:1110331014");
+    try testing.expect(session.agent.waitForLifecycleIdle(30_000));
     session.agent.session_ttl_secs = 1;
     session.last_active = std.time.timestamp() - 60;
 
@@ -2520,6 +2522,7 @@ test "evictIdle with expired ttl writes summary objects before removal" {
     try testing.expectEqualStrings("ok", first_reply);
 
     const session = try sm.getOrCreate("ttl:evict");
+    try testing.expect(session.agent.waitForLifecycleIdle(30_000));
     session.agent.session_ttl_secs = 1;
     session.last_active = std.time.timestamp() - 1000;
 

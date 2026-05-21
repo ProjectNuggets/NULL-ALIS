@@ -1652,7 +1652,7 @@ pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
 
 /// V1.14.10 A — Async lifecycle checkpoint.
 ///
-/// Spawns a detached worker thread that runs
+/// Spawns a joinable worker thread that runs
 /// `persistSessionCheckpointDetailed` off the agent's hot path. Used
 /// by hot-path callers (compaction:auto, summary_seed:auto in
 /// root.zig) to prevent the 30-180s post-reply lifecycle from
@@ -1696,6 +1696,9 @@ pub fn persistSessionCheckpointAsync(self: anytype, reason: []const u8) bool {
         log.info("lifecycle.async.skip_in_flight reason={s} session={s}", .{ reason, session_id_for_log });
         return false;
     }
+    // Reap a completed prior worker before storing a new join handle.
+    self.joinLifecycleThreadIfPresent();
+
     // Heap-allocate the worker context. Owned by the spawned thread;
     // freed in `Worker.run`'s deferred cleanup (in the correct order:
     // allocator work first, in-flight flag LAST — see review fix H-04
@@ -1756,7 +1759,9 @@ pub fn persistSessionCheckpointAsync(self: anytype, reason: []const u8) bool {
         log.warn("lifecycle.async.spawn_failed reason={s} session={s} — dropping (next trigger will retry)", .{ reason, session_id_for_log });
         return false;
     };
-    thread.detach();
+    self.lifecycle_thread_mu.lock();
+    self.lifecycle_thread = thread;
+    self.lifecycle_thread_mu.unlock();
     log.info("lifecycle.async.spawned reason={s} session={s}", .{ reason, session_id_for_log });
     return true;
 }
