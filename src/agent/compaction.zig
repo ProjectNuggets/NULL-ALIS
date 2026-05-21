@@ -183,10 +183,14 @@ pub fn buildTokenBudgetPolicy(token_limit: u64, max_tokens: u32) TokenBudgetPoli
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Estimate total tokens in conversation history using heuristic: (total_chars + 3) / 4.
+/// Includes assistant `reasoning` traces — they are replayed to the
+/// provider on the Moonshot route (`thinking.keep:"all"`) and therefore
+/// consume context window like any other message content.
 pub fn tokenEstimate(history: []const OwnedMessage) u64 {
     var total_chars: u64 = 0;
     for (history) |*msg| {
         total_chars += msg.content.len;
+        if (msg.reasoning) |r| total_chars += r.len;
     }
     return (total_chars + 3) / 4;
 }
