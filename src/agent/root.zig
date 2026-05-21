@@ -716,13 +716,25 @@ pub const Agent = struct {
     pub const OwnedMessage = struct {
         role: providers.Role,
         content: []const u8,
+        /// Optional reasoning trace for an assistant turn. Captured from
+        /// the model's `reasoning_content` (Kimi native CoT) and replayed
+        /// to the provider so Moonshot's `thinking.keep:"all"` retains the
+        /// model's cross-turn chain of thought. Allocator-owned when set;
+        /// freed by `deinit`. Null for user/system/tool messages and for
+        /// assistant turns where the model emitted no reasoning.
+        reasoning: ?[]const u8 = null,
 
         pub fn deinit(self: *const OwnedMessage, allocator: std.mem.Allocator) void {
             allocator.free(self.content);
+            if (self.reasoning) |r| allocator.free(r);
         }
 
         fn toChatMessage(self: *const OwnedMessage) ChatMessage {
-            return .{ .role = self.role, .content = self.content };
+            return .{
+                .role = self.role,
+                .content = self.content,
+                .reasoning_content = self.reasoning,
+            };
         }
     };
 
@@ -4009,11 +4021,23 @@ pub const Agent = struct {
                     });
                 }
 
-                // Dupe from display_text directly (not from final_text) to avoid double-dupe
-                try self.history.append(self.allocator, .{
-                    .role = .assistant,
-                    .content = try self.allocator.dupe(u8, safe_display_text),
-                });
+                // Dupe from display_text directly (not from final_text) to avoid double-dupe.
+                // Carry the model's native reasoning_content so Moonshot's
+                // `thinking.keep:"all"` can replay it on the next turn.
+                {
+                    const hist_content = try self.allocator.dupe(u8, safe_display_text);
+                    errdefer self.allocator.free(hist_content);
+                    const hist_reasoning: ?[]const u8 = if (response.reasoning_content) |rc|
+                        if (rc.len > 0) try self.allocator.dupe(u8, rc) else null
+                    else
+                        null;
+                    errdefer if (hist_reasoning) |r| self.allocator.free(r);
+                    try self.history.append(self.allocator, .{
+                        .role = .assistant,
+                        .content = hist_content,
+                        .reasoning = hist_reasoning,
+                    });
+                }
 
                 const compact_start_ms = std.time.milliTimestamp();
                 if (self.compact_context_enabled and !self.last_turn_compacted) {
@@ -4371,9 +4395,18 @@ pub const Agent = struct {
             } else try self.allocator.dupe(u8, assistant_history_content);
             errdefer self.allocator.free(assistant_content);
 
+            // Carry the model's native reasoning_content so Moonshot's
+            // `thinking.keep:"all"` can replay it on the next turn.
+            const assistant_reasoning: ?[]const u8 = if (response.reasoning_content) |rc|
+                if (rc.len > 0) try self.allocator.dupe(u8, rc) else null
+            else
+                null;
+            errdefer if (assistant_reasoning) |r| self.allocator.free(r);
+
             try self.history.append(self.allocator, .{
                 .role = .assistant,
                 .content = assistant_content,
+                .reasoning = assistant_reasoning,
             });
 
             // Execute tool calls (serial by default, optional parallel dispatcher)
@@ -5294,6 +5327,33 @@ test "Agent.OwnedMessage toChatMessage" {
     const chat = msg.toChatMessage();
     try std.testing.expect(chat.role == .user);
     try std.testing.expectEqualStrings("hello", chat.content);
+    // User messages carry no reasoning.
+    try std.testing.expect(chat.reasoning_content == null);
+}
+
+test "Agent.OwnedMessage carries reasoning through toChatMessage" {
+    const msg = Agent.OwnedMessage{
+        .role = .assistant,
+        .content = "answer",
+        .reasoning = "let me think step by step",
+    };
+    const chat = msg.toChatMessage();
+    try std.testing.expect(chat.role == .assistant);
+    try std.testing.expectEqualStrings("answer", chat.content);
+    try std.testing.expect(chat.reasoning_content != null);
+    try std.testing.expectEqualStrings("let me think step by step", chat.reasoning_content.?);
+}
+
+test "Agent.OwnedMessage deinit frees reasoning without leaking" {
+    const allocator = std.testing.allocator;
+    const msg = Agent.OwnedMessage{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "answer"),
+        .reasoning = try allocator.dupe(u8, "reasoning trace"),
+    };
+    // deinit must free both content and reasoning — leak-checked by the
+    // testing allocator.
+    msg.deinit(allocator);
 }
 
 test "Agent trim history preserves system prompt" {
