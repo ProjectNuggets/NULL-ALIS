@@ -198,6 +198,13 @@ pub fn parseRetryAfterMs(err_msg: []const u8) ?u64 {
 pub const ProviderEntry = struct {
     name: []const u8,
     provider: Provider,
+    /// Per-provider model-ID override for cross-provider fallback. When a
+    /// fallback provider serves the same logical model under a different ID
+    /// (e.g. Moonshot `kimi-k2.6` vs Together `moonshotai/Kimi-K2.6`), this
+    /// holds the ID to use when failing over to THIS provider. `null` = use
+    /// the chain's current model unchanged. Populated by runtime_bundle.zig
+    /// from the `provider/model` ref form in `fallback_providers`.
+    model_override: ?[]const u8 = null,
 };
 
 /// A model fallback mapping: when `model` fails, try `fallbacks` in order.
@@ -563,7 +570,7 @@ pub const ReliableProvider = struct {
                     allocator,
                     system_prompt,
                     message,
-                    current_model,
+                    entry.model_override orelse current_model,
                 )) |result| {
                     return result;
                 }
@@ -603,7 +610,7 @@ pub const ReliableProvider = struct {
                     entry.provider,
                     allocator,
                     request,
-                    current_model,
+                    entry.model_override orelse current_model,
                 )) |result| {
                     return result;
                 }
@@ -688,7 +695,7 @@ pub const ReliableProvider = struct {
                     entry.provider,
                     allocator,
                     request,
-                    current_model,
+                    entry.model_override orelse current_model,
                     callback,
                     callback_ctx,
                 )) |tagged| {

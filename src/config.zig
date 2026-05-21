@@ -295,34 +295,23 @@ pub const Config = struct {
                 if (self.reasoning_effort == null) {
                     self.reasoning_effort = try self.allocator.dupe(u8, "medium");
                 }
-                // Together stays a fallback: register it in
-                // `fallback_providers`, and map the Together route to
-                // Together's own model ID (`moonshotai/Kimi-K2.6`) via
-                // `model_fallbacks` keyed on the Moonshot-native model.
+                // Together stays a cross-provider fallback. The entry uses
+                // the `provider/model` ref form: Moonshot and Together
+                // disagree on the model ID (`kimi-k2.6` vs
+                // `moonshotai/Kimi-K2.6`), so the ref carries Together's own
+                // ID after the provider name. runtime_bundle.zig splits it
+                // into a provider name + a per-provider model override, and
+                // the reliability layer applies that override when it fails
+                // over to Together — so Together receives ITS model ID, not
+                // Moonshot's. Only injected on the `kimi-k2.6` default; an
+                // operator who pinned a different model gets no auto-fallback
+                // (the ref's hard-coded Together ID would not match).
                 if ((provider_unset or std.mem.eql(u8, self.default_provider, "moonshot")) and
-                    self.reliability.fallback_providers.len == 0)
-                {
-                    self.reliability.fallback_providers = &.{"together"};
-                }
-                // `model_fallbacks` maps the Moonshot-native model
-                // (`kimi-k2.6`) to its fallback route. The fallback ref uses
-                // the `provider/model` form so the Together route carries
-                // Together's own model ID (`moonshotai/Kimi-K2.6`) — the two
-                // providers disagree on the model identifier. Only injected
-                // when the agent is actually on the kimi-k2.6 default — an
-                // operator who pinned a different model keeps an empty map.
-                if (self.reliability.model_fallbacks.len == 0 and
+                    self.reliability.fallback_providers.len == 0 and
                     self.default_model != null and
                     std.mem.eql(u8, self.default_model.?, "kimi-k2.6"))
                 {
-                    const fallbacks = try self.allocator.alloc([]const u8, 1);
-                    fallbacks[0] = try self.allocator.dupe(u8, "together/moonshotai/Kimi-K2.6");
-                    const entries = try self.allocator.alloc(ModelFallbackEntry, 1);
-                    entries[0] = .{
-                        .model = try self.allocator.dupe(u8, "kimi-k2.6"),
-                        .fallbacks = fallbacks,
-                    };
-                    self.reliability.model_fallbacks = entries;
+                    self.reliability.fallback_providers = &.{"together/moonshotai/Kimi-K2.6"};
                 }
                 if (std.mem.eql(u8, self.memory.profile, "markdown_only")) {
                     self.memory.profile = "postgres_hybrid";
@@ -3699,17 +3688,12 @@ test "profile zaki_bot enables http request defaults" {
     // Primary route: Moonshot native API with the bare `kimi-k2.6` ID.
     try std.testing.expectEqualStrings("moonshot", cfg.default_provider);
     try std.testing.expectEqualStrings("kimi-k2.6", cfg.default_model.?);
-    // Together stays a fallback provider.
+    // Together stays a cross-provider fallback via the `provider/model` ref
+    // form — runtime_bundle splits it into a per-provider model override
+    // (Together's `moonshotai/Kimi-K2.6` ID). No `model_fallbacks` entry.
     try std.testing.expectEqual(@as(usize, 1), cfg.reliability.fallback_providers.len);
-    try std.testing.expectEqualStrings("together", cfg.reliability.fallback_providers[0]);
-    // model_fallbacks maps kimi-k2.6 → Together's model ID.
-    try std.testing.expectEqual(@as(usize, 1), cfg.reliability.model_fallbacks.len);
-    try std.testing.expectEqualStrings("kimi-k2.6", cfg.reliability.model_fallbacks[0].model);
-    try std.testing.expectEqual(@as(usize, 1), cfg.reliability.model_fallbacks[0].fallbacks.len);
-    try std.testing.expectEqualStrings(
-        "together/moonshotai/Kimi-K2.6",
-        cfg.reliability.model_fallbacks[0].fallbacks[0],
-    );
+    try std.testing.expectEqualStrings("together/moonshotai/Kimi-K2.6", cfg.reliability.fallback_providers[0]);
+    try std.testing.expectEqual(@as(usize, 0), cfg.reliability.model_fallbacks.len);
     try std.testing.expectEqualStrings("postgres_hybrid", cfg.memory.profile);
     try std.testing.expectEqualStrings("postgres", cfg.memory.backend);
     try std.testing.expectEqualStrings("together", cfg.memory.search.provider);
@@ -3733,7 +3717,7 @@ test "profile defaults do not override explicit http request disable" {
     try std.testing.expectEqualStrings("moonshot", cfg.default_provider);
     try std.testing.expectEqualStrings("kimi-k2.6", cfg.default_model.?);
     try std.testing.expectEqual(@as(usize, 1), cfg.reliability.fallback_providers.len);
-    try std.testing.expectEqualStrings("together", cfg.reliability.fallback_providers[0]);
+    try std.testing.expectEqualStrings("together/moonshotai/Kimi-K2.6", cfg.reliability.fallback_providers[0]);
 }
 
 test "profile defaults do not override explicit model primary" {
