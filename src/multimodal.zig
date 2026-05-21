@@ -79,8 +79,19 @@ pub const MultimodalConfig = struct {
     /// videos are skipped (a text note replaces them); the provider's
     /// large-file upload API is not wired here.
     max_video_size_bytes: u64 = 73_400_320, // 70 MiB
-    /// Allow passing remote image URLs (`https://...`) through to providers.
-    /// Disabled by default for secure-by-default behavior.
+    /// Allow passing remote image URLs (`https://...`) through to providers
+    /// as an `image_url` content part. Disabled by default for
+    /// secure-by-default behavior.
+    ///
+    /// LIMITATION (Finding F2, 2026-05-21): when enabled, a remote image
+    /// becomes a plain `image_url` part — the URL is forwarded verbatim, not
+    /// fetched here. Providers that accept ONLY base64 data URIs (Moonshot/
+    /// Kimi — see providers/helpers.zig `serializeContentPart`) will reject
+    /// such a part. Remote-URL images therefore work only with URL-accepting
+    /// providers (OpenAI, Anthropic). nullalis deliberately does not fetch +
+    /// base64-encode remote images server-side: that adds an SSRF surface and
+    /// is left to a future phase. Local files and `data:` URIs always become
+    /// base64 parts and work with every provider, including Moonshot/Kimi.
     allow_remote_fetch: bool = false,
     /// Directories from which local image reads are allowed.
     /// If empty, all local file reads are rejected (only URLs pass through).
@@ -621,6 +632,10 @@ pub fn prepareMessagesForProvider(
                     try parts.append(arena, .{ .text = note });
                     continue;
                 }
+                // Finding F2: this forwards the URL verbatim as an image_url
+                // part. Base64-only providers (Moonshot/Kimi) reject it — see
+                // the `allow_remote_fetch` doc above. The URL is not fetched
+                // and re-encoded here.
                 try parts.append(arena, .{ .image_url = .{ .url = ref } });
                 markImagePartPrepared();
             } else {
