@@ -626,6 +626,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (dk.object.get("memory_limit_mb")) |v| {
                         if (v == .integer) self.runtime.docker.memory_limit_mb = @intCast(v.integer);
                     }
+                    if (dk.object.get("cpu_limit")) |v| {
+                        if (v == .float) self.runtime.docker.cpu_limit = v.float;
+                        if (v == .integer) self.runtime.docker.cpu_limit = @floatFromInt(v.integer);
+                        if (v == .null) self.runtime.docker.cpu_limit = null;
+                    }
                     if (dk.object.get("read_only_rootfs")) |v| {
                         if (v == .bool) self.runtime.docker.read_only_rootfs = v.bool;
                     }
@@ -1657,6 +1662,13 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (br.object.get("allowed_domains")) |v| {
                 if (v == .array) self.browser.allowed_domains = try parseStringArray(self.allocator, v.array);
             }
+            if (br.object.get("computer_use")) |v| {
+                if (v == .object) {
+                    if (parseTypedValue(types.BrowserComputerUseConfig, self.allocator, v)) |computer_use| {
+                        self.browser.computer_use = computer_use;
+                    }
+                }
+            }
         }
     }
 
@@ -1693,6 +1705,13 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (per.object.get("datasheet_dir")) |v| {
                 if (v == .string) self.peripherals.datasheet_dir = try self.allocator.dupe(u8, v.string);
             }
+            if (per.object.get("boards")) |v| {
+                if (v == .array) {
+                    if (parseTypedValue([]const types.PeripheralBoardConfig, self.allocator, v)) |boards| {
+                        self.peripherals.boards = boards;
+                    }
+                }
+            }
         }
     }
 
@@ -1724,6 +1743,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             }
                         }
                     }
+                    if (sb.object.get("firejail_args")) |v| {
+                        if (v == .array) self.security.sandbox.firejail_args = try parseStringArray(self.allocator, v.array);
+                    }
                 }
             }
             if (sec.object.get("resources")) |res| {
@@ -1752,6 +1774,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 if (aud == .object) {
                     if (aud.object.get("enabled")) |v| {
                         if (v == .bool) self.security.audit.enabled = v.bool;
+                    }
+                    if (aud.object.get("log_file")) |v| {
+                        if (v == .string) self.security.audit.log_file = try self.allocator.dupe(u8, v.string);
+                        if (v == .null) self.security.audit.log_file = null;
                     }
                     if (aud.object.get("log_path")) |v| {
                         if (v == .string) self.security.audit.log_path = try self.allocator.dupe(u8, v.string);
