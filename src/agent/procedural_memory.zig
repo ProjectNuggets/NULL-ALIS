@@ -137,6 +137,7 @@ pub fn captureSession(
     tool_call_names: []const []const u8,
     total_tool_calls: u32,
     goal_status: ?goal_loop.GoalStatus,
+    reflection_trail_json: []const u8,
 ) ?i64 {
     if (total_tool_calls < CAPTURE_TOOL_THRESHOLD) return null;
 
@@ -166,7 +167,7 @@ pub fn captureSession(
         GENERIC_SKILL_NAME,
         task_summary,
         steps_buf.items,
-        "[]", // assumptions_made — empty until extractor pass shipped
+        reflection_trail_json, // v1.14.18-B G5: pass reflection trail
         oq,
     ) catch |err| {
         log.warn("procedural_memory.capture_failed err={s}", .{@errorName(err)});

@@ -1629,6 +1629,10 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                             self.active_goal_state.?.status
                         else
                             null;
+                        const reflection_trail_json: []const u8 = if (@hasField(@TypeOf(self.*), "session_reflection_trail_json") and self.session_reflection_trail_json != null)
+                            self.session_reflection_trail_json.?
+                        else
+                            "[]";
                         _ = procedural_memory.captureSession(
                             self.allocator,
                             smgr_ep,
@@ -1638,6 +1642,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                             tool_names,
                             tool_count_real,
                             goal_status,
+                            reflection_trail_json, // v1.14.18-B G5
                         );
                         // Reset counter after capture (v1.14.18-A F3)
                         if (@hasField(@TypeOf(self.*), "session_total_tool_count")) {

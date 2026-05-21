@@ -265,12 +265,12 @@ pub const PromptContext = struct {
     /// thinking before any other recalled context. Empty when no frames
     /// have been recorded yet (first iteration of a fresh turn).
     recent_thoughts_block: ?[]const u8 = null,
-    /// v1.14.18-B G7 — placeholder field reserved for Agent E's
-    /// `<known_weakness>` block (bench self-knowledge). Rendered between
-    /// `recent_thoughts_block` and `skill_traces_block` to preserve the
-    /// volatile-block ordering contract documented in
-    /// `context_engine.assemble`. Agent G owns the assemble-order
-    /// scaffolding; Agent E populates the actual content.
+    /// v1.14.18-B G7 (BENCH-SELF-KNOWLEDGE) — Bench self-knowledge block,
+    /// pre-formatted as `<known_weakness>...</known_weakness>` by
+    /// `agent/bench_self.zig::readKnownWeakness`. Renders between
+    /// `recent_thoughts_block` and `skill_traces_block` per the recall-stack
+    /// ordering invariant in `buildVolatileSystemPrompt`. Empty when no
+    /// bench results are available (`.spike/results.tsv` absent).
     known_weakness_block: ?[]const u8 = null,
 };
 

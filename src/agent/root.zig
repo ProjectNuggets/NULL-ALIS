@@ -42,6 +42,7 @@ const tool_metadata = @import("../tools/metadata.zig");
 const abort_mod = @import("abort.zig");
 const CancellationToken = abort_mod.CancellationToken;
 const goal_loop = @import("goal_loop.zig");
+pub const reflection = @import("reflection.zig");
 
 const cache = memory_mod.cache;
 pub const abort = @import("abort.zig");
@@ -81,6 +82,10 @@ pub const working_memory = @import("working_memory.zig");
 /// traces for recall on next invocation. Schema lives in
 /// zaki_state.skill_executions; Day 4.2 adds render + capture.
 pub const procedural_memory = @import("procedural_memory.zig");
+/// v1.14.18-B G16 (WM-CROSS-SESSION) — session-end promotion of
+/// high-importance working-memory slots to durable_facts. See
+/// agent/promotion.zig.
+pub const promotion = @import("promotion.zig");
 /// V1.13 Day 5 — Dream state (Layer 7). 3 AM cron-driven idle-time
 /// consolidation: brain hygiene, importance recompute, dream_log
 /// reflection. Pattern extraction + narrative synthesis (LLM steps)
@@ -629,6 +634,9 @@ pub const Agent = struct {
     session_tool_names: std.ArrayListUnmanaged([]const u8) = .empty,
     /// v1.14.18-A F3 — per-turn goal state for ReAct reflection loop.
     active_goal_state: ?goal_loop.GoalState = null,
+    /// v1.14.18-B G5 — serialized reflection trail JSON for cross-session learning.
+    /// Serialized at turn-end from active_reflection_trail; passed to procedural_memory.captureSession.
+    session_reflection_trail_json: ?[]const u8 = null,
 
     /// v1.14.18-B G3 (NARRATION-AS-CONTEXT) — agent-owned ring buffer
     /// of recent narration frames. The per-turn `NarrationObserver`
@@ -997,6 +1005,8 @@ pub const Agent = struct {
         // + tool names). Safe even on agents whose ring buffer never
         // received a push (len=0); the inner free-loop is a no-op then.
         self.narration_ring_buffer.deinit();
+        // v1.14.18-B G5 fix — free the last turn's serialized reflection trail.
+        if (self.session_reflection_trail_json) |j| self.allocator.free(j);
         return drained;
     }
 
@@ -2903,6 +2913,34 @@ pub const Agent = struct {
             self.active_goal_state = null;
         } // clear at turn end; does NOT free goal_text (borrowed slice)
 
+        // v1.14.18-B G5: Initialize reflection trail for capturing iteration-level learning
+        var active_reflection_trail = reflection.ReflectionTrail{
+            .goal_text = goal_text, // BORROW from user_message
+        };
+        defer active_reflection_trail.deinit(self.allocator);
+
+        // v1.14.18-B G5 coverage fix (coordinator review, 2026-05-20): serialize
+        // the reflection trail on EVERY turnOutcome exit path. The prior inline
+        // serialization sat in the post-tool-loop exit block (~root.zig:4656) and
+        // was SKIPPED by the in-loop early-returns (approval-pending, cached-
+        // response at 3120/3149, tool-driven exits at 4171/4186/4378) — so G5's
+        // reflection trail was captured only for turns that ran the tool loop to
+        // its natural exit. This defer is registered AFTER the deinit defer above,
+        // so by Zig's LIFO ordering it runs FIRST — reading the trail's final
+        // state before deinit frees the entries. Covers all 8 return paths.
+        defer {
+            const trail_json: ?[]const u8 = active_reflection_trail.serialize(self.allocator) catch |err| blk: {
+                log.warn("failed to serialize reflection trail: {s}", .{@errorName(err)});
+                break :blk self.allocator.dupe(u8, "[]") catch null;
+            };
+            if (trail_json) |j| {
+                // Free the prior turn's trail before overwriting — the field is
+                // reassigned every turn-end; a bare assign leaks the previous alloc.
+                if (self.session_reflection_trail_json) |old| self.allocator.free(old);
+                self.session_reflection_trail_json = j;
+            }
+        }
+
         // v1.14.14 Phase 4 — time the assemble phase so afterTurn() can
         // record per-phase durations into stability.json.
         const assemble_start_ms = std.time.milliTimestamp();
@@ -3756,6 +3794,20 @@ pub const Agent = struct {
                     });
                     should_exit_goal_loop = true;
                 }
+
+                // v1.14.18-B G5: Capture iteration learning to reflection trail
+                const learning_summary = try std.fmt.allocPrint(self.allocator, "{d} tool calls processed", .{parsed_calls.len});
+                defer self.allocator.free(learning_summary);
+                const first_tool_name: ?[]const u8 = if (parsed_calls.len > 0) parsed_calls[0].name else null;
+                active_reflection_trail.append(
+                    self.allocator,
+                    goal_state.iteration_count - 1, // iteration 0-indexed
+                    first_tool_name,
+                    @tagName(goal_reflection_verdict),
+                    learning_summary,
+                ) catch |err| {
+                    log.warn("reflection_trail.append failed: {s}", .{@errorName(err)});
+                };
             }
             if (parsed_calls.len > 0) {
                 turn_tool_iterations += 1;
@@ -4627,6 +4679,10 @@ pub const Agent = struct {
             total_turn_ms,
         });
 
+        // v1.14.18-B G5: reflection-trail serialization moved to a function-scoped
+        // defer at turn-start (search "G5 coverage fix") so it fires on every
+        // turnOutcome exit path, not just this post-tool-loop one. The inline
+        // block that lived here is intentionally gone — do not re-add it.
         // **D1.7 finding 2 fix (2026-04-26):** mark transferred AFTER
         // toOwnedSlice succeeds. See longer comment at the audio_reply path.
         const ids = spawned_task_ids_acc.toOwnedSlice(self.allocator) catch &.{};
