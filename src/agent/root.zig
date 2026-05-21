@@ -4553,16 +4553,34 @@ pub const Agent = struct {
             // response-parse site above).
             // `narration_interval == 0` still disables narration entirely
             // (kept as a kill switch); any non-zero value means "every burst".
-            if (self.sidecar_provider == null) {
-                log.info("narration.sidecar_skipped reason=no_provider iteration={d} tool_iterations={d}", .{ iteration, turn_tool_iterations });
-            } else if (self.narration_interval == 0) {
-                log.info("narration.sidecar_skipped reason=disabled iteration={d}", .{iteration});
-            } else if (turn_tool_iterations < 1 or results_buf.items.len == 0) {
-                log.info("narration.sidecar_skipped reason=no_tool_results tool_iterations={d} results={d}", .{ turn_tool_iterations, results_buf.items.len });
-            }
-            if (self.sidecar_provider != null and self.narration_interval > 0 and
+            // v1.14.x NATIVE-COT-NARRATION — the `.thinking` narration frame
+            // (which feeds both the UX and, via the ring buffer, the agent's
+            // own `<recent_thoughts>`) is sourced from the model's OWN native
+            // reasoning / chain-of-thought, not a sidecar ghostwriter.
+            //
+            // When the model emitted reasoning this iteration (Kimi K2.6 does,
+            // every non-trivial turn — live-probed 2026-05-21), emit it
+            // directly. The sidecar — a separate cheap LLM that confabulates a
+            // first-person narration from the transcript — is now the
+            // FALLBACK ONLY: for non-thinking models, or iterations that
+            // produced no native reasoning. Either/or, native preferred
+            // (per Nova). This is also the §14.7 honesty fix for G3: the
+            // agent's `<recent_thoughts>` is now genuinely its own reasoning.
+            const native_cot: ?[]const u8 = if (response.reasoning_content) |rc|
+                (if (rc.len > 0) rc else null)
+            else
+                null;
+            if (native_cot) |cot| {
+                const thinking_event = ObserverEvent{ .narration_frame = .{
+                    .message = cot,
+                    .frame_type = .thinking,
+                } };
+                self.observer.recordEvent(&thinking_event);
+                log.info("turn.stage stage=narration_native_cot iteration={d} len={d}", .{ iteration, cot.len });
+            } else if (self.sidecar_provider != null and self.narration_interval > 0 and
                 turn_tool_iterations >= 1 and results_buf.items.len > 0)
             {
+                // Fallback: the model emitted no native reasoning this turn.
                 const narration_thinking = @import("narration_thinking.zig");
                 if (narration_thinking.generateThinkingNarration(
                     self.allocator,
@@ -4578,8 +4596,10 @@ pub const Agent = struct {
                         .frame_type = .thinking,
                     } };
                     self.observer.recordEvent(&thinking_event);
-                    log.info("turn.stage stage=narration_thinking_sidecar iteration={d} len={d}", .{ iteration, thinking_text.len });
+                    log.info("turn.stage stage=narration_sidecar_fallback iteration={d} len={d}", .{ iteration, thinking_text.len });
                 }
+            } else {
+                log.info("narration.skipped reason=no_native_cot_no_sidecar iteration={d}", .{iteration});
             }
 
             const compact_start_ms = std.time.milliTimestamp();
