@@ -106,7 +106,17 @@ pub const RuntimeProviderBundle = struct {
 
             var extra_i: usize = 0;
 
-            for (cfg.reliability.fallback_providers) |provider_name| {
+            for (cfg.reliability.fallback_providers) |fb_entry| {
+                // `fallback_providers` entries support the `provider/model`
+                // ref form. Split on the FIRST `/`: the part before is the
+                // provider name (drives key / base-url / holder resolution),
+                // the part after is a per-provider model-ID override — the
+                // model itself may contain `/`
+                // (e.g. `together/moonshotai/Kimi-K2.6`). A bare provider
+                // name (no `/`) yields a null override — unchanged behavior.
+                const slash = std.mem.indexOfScalar(u8, fb_entry, '/');
+                const provider_name = if (slash) |s| fb_entry[0..s] else fb_entry;
+                const model_override: ?[]const u8 = if (slash) |s| fb_entry[s + 1 ..] else null;
                 const fb_key = api_key.resolveApiKeyFromConfig(
                     allocator,
                     provider_name,
@@ -124,6 +134,7 @@ pub const RuntimeProviderBundle = struct {
                 bundle.reliable_entries.?[extra_i] = .{
                     .name = provider_name,
                     .provider = bundle.extra_holders.?[extra_i].provider(),
+                    .model_override = model_override,
                 };
                 extra_i += 1;
             }
