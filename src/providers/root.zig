@@ -107,10 +107,10 @@ pub const ContentPart = union(enum) {
     /// Anthropic, which has no video content block, degrades it to a text
     /// placeholder.
     ///
-    /// SCAFFOLDING (P3a, 2026-05-21): the serialization path exists, but no
-    /// code constructs a video_base64 part yet, and no agent routing inspects
-    /// video capability. Capability-aware video ingest + routing land in a
-    /// later phase — until then this variant is unreachable from real input.
+    /// Constructed by multimodal.zig from `[VIDEO:...]` markers (P3b,
+    /// 2026-05-21). The agent does not yet inspect video capability to strip
+    /// these parts for non-video-capable models — that routing lands in a
+    /// later phase (agent/root.zig).
     pub const VideoBase64 = struct {
         /// Pure base64 payload — NO `data:` prefix. Provider serializers
         /// append it verbatim into a JSON string, so it must contain only
