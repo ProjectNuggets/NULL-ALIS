@@ -506,8 +506,42 @@ pub fn build(b: *std.Build) void {
         security_sandbox_tests.root_module.linkSystemLibrary("pq", .{});
     }
 
+    // v1.14.18-B Fix C — promotion + reflection-store postgres integration
+    // test. Lives outside src/ (like the security tests above) because it
+    // pins a cross-module session-end flow (working_memory → promotion →
+    // durable_fact, reflection → procedural_memory → skill_executions).
+    // Postgres-gated at runtime, so it compiles — and cleanly skips — under
+    // every engine profile.
+    const agent_pg_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/agent/promotion_reflection_pg_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nullalis", .module = lib_mod },
+                .{ .name = "build_options", .module = build_options_module },
+            },
+        }),
+    });
+    if (sqlite3) |lib| {
+        agent_pg_tests.linkLibrary(lib);
+    }
+    if (enable_postgres) {
+        addHomebrewLibpqPaths(agent_pg_tests);
+        addHomebrewLibpqPaths(agent_pg_tests.root_module);
+        agent_pg_tests.root_module.linkSystemLibrary("pq", .{});
+    }
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     test_step.dependOn(&b.addRunArtifact(security_sandbox_tests).step);
+    test_step.dependOn(&b.addRunArtifact(agent_pg_tests).step);
+
+    // Focused step: run only the v1.14.18-B Fix C integration test —
+    // exercises the postgres round-trip without rebuilding/running the
+    // full suite. Set NULLALIS_POSTGRES_TEST_URL to run it for real; it
+    // skips cleanly otherwise.
+    const agent_pg_step = b.step("test-agent-pg", "Run only the promotion + reflection-store postgres integration test");
+    agent_pg_step.dependOn(&b.addRunArtifact(agent_pg_tests).step);
 }

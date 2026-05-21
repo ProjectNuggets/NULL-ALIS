@@ -70,6 +70,12 @@ pub const NoneMemory = none.NoneMemory;
 pub const InMemoryLruMemory = memory_lru.InMemoryLruMemory;
 pub const LucidMemory = lucid.LucidMemory;
 pub const PostgresMemory = if (build_options.enable_postgres) postgres.PostgresMemory else struct {};
+/// Production postgres memory backend — a thin `Memory` adapter over a
+/// `zaki_state.Manager` (the path `gateway.zig` wires for postgres
+/// deployments). Unconditionally available: the engine is pure Zig and
+/// delegates all storage to the manager, so it carries no libpq
+/// dependency of its own.
+pub const ZakiPostgresMemory = @import("engines/zaki_postgres.zig").ZakiPostgresMemory;
 pub const RedisMemory = redis.RedisMemory;
 pub const LanceDbMemory = lancedb.LanceDbMemory;
 pub const ApiMemory = api.ApiMemory;
