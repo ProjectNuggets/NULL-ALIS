@@ -639,6 +639,9 @@ pub const Agent = struct {
     session_tool_names: std.ArrayListUnmanaged([]const u8) = .empty,
     /// v1.14.18-A F3 — per-turn goal state for ReAct reflection loop.
     active_goal_state: ?goal_loop.GoalState = null,
+    /// Last completed turn goal-loop verdict, retained after active_goal_state
+    /// is cleared so session-end procedural capture can score the outcome.
+    session_last_goal_status: ?goal_loop.GoalStatus = null,
     /// v1.14.18-B G5 — serialized reflection trail JSON for cross-session learning.
     /// Serialized at turn-end from active_reflection_trail; passed to procedural_memory.captureSession.
     session_reflection_trail_json: ?[]const u8 = null,
@@ -1016,6 +1019,8 @@ pub const Agent = struct {
         }
         self.history.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
+        self.clearSessionToolNames();
+        self.session_tool_names.deinit(self.allocator);
         // v1.14.18-B G3 — free recorded narration frames (dup'd messages
         // + tool names). Safe even on agents whose ring buffer never
         // received a push (len=0); the inner free-loop is a no-op then.
@@ -1816,6 +1821,34 @@ pub const Agent = struct {
         // refineMetadata.
         const meta = tools_mod.canonicalMetadataForCall(self.allocator, call.name, call.arguments_json);
         return meta.flags.concurrency_safe;
+    }
+
+    fn recordSessionToolNames(self: *Agent, parsed_calls: []const ParsedToolCall) void {
+        for (parsed_calls) |call| {
+            const owned_name = self.allocator.dupe(u8, call.name) catch |err| {
+                log.warn("procedural_memory.tool_name_dupe_failed tool={s} err={s}", .{ call.name, @errorName(err) });
+                continue;
+            };
+            self.session_tool_names.append(self.allocator, owned_name) catch |err| {
+                log.warn("procedural_memory.tool_name_append_failed tool={s} err={s}", .{ call.name, @errorName(err) });
+                self.allocator.free(owned_name);
+            };
+        }
+    }
+
+    fn clearSessionToolNames(self: *Agent) void {
+        for (self.session_tool_names.items) |name| {
+            self.allocator.free(name);
+        }
+        self.session_tool_names.clearRetainingCapacity();
+    }
+
+    fn snapshotAndClearActiveGoalState(self: *Agent) void {
+        if (self.active_goal_state) |*goal_state| {
+            self.session_last_goal_status = goal_state.status;
+            goal_state.deinit(self.allocator);
+        }
+        self.active_goal_state = null;
     }
 
     /// Resolve tool metadata for a call via the canonical helper in
@@ -2924,9 +2957,9 @@ pub const Agent = struct {
             .no_progress_count = 0,
             .progress_notes = .empty,
         };
-        defer {
-            self.active_goal_state = null;
-        } // clear at turn end; does NOT free goal_text (borrowed slice)
+        // Snapshot status for session-end procedural capture before
+        // clearing the turn-scoped state. Goal text is borrowed.
+        defer self.snapshotAndClearActiveGoalState();
 
         // v1.14.18-B G5: Initialize reflection trail for capturing iteration-level learning
         var active_reflection_trail = reflection.ReflectionTrail{
@@ -3827,6 +3860,7 @@ pub const Agent = struct {
             if (parsed_calls.len > 0) {
                 turn_tool_iterations += 1;
                 turn_tool_calls_total += @intCast(@min(parsed_calls.len, std.math.maxInt(u32)));
+                self.recordSessionToolNames(parsed_calls);
             }
 
             if (parsed_calls.len == 0) {
@@ -6086,6 +6120,45 @@ fn makeTestAgent(allocator: std.mem.Allocator) !Agent {
     };
 }
 
+test "recordSessionToolNames stores owned tool manifest" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    const calls = [_]ParsedToolCall{
+        .{ .name = "memory_recall", .arguments_json = "{}", .tool_call_id = null },
+        .{ .name = "web_search", .arguments_json = "{}", .tool_call_id = null },
+    };
+
+    agent.recordSessionToolNames(&calls);
+
+    try std.testing.expectEqual(@as(usize, 2), agent.session_tool_names.items.len);
+    try std.testing.expectEqualStrings("memory_recall", agent.session_tool_names.items[0]);
+    try std.testing.expectEqualStrings("web_search", agent.session_tool_names.items[1]);
+
+    agent.clearSessionToolNames();
+    try std.testing.expectEqual(@as(usize, 0), agent.session_tool_names.items.len);
+}
+
+test "snapshotAndClearActiveGoalState retains status for session capture" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    var goal_state = goal_loop.GoalState{
+        .goal_text = "ship the audit fixes",
+        .status = .met,
+        .progress_notes = .empty,
+    };
+    try goal_state.progress_notes.append(allocator, try allocator.dupe(u8, "tests passed"));
+    agent.active_goal_state = goal_state;
+
+    agent.snapshotAndClearActiveGoalState();
+
+    try std.testing.expect(agent.active_goal_state == null);
+    try std.testing.expectEqual(goal_loop.GoalStatus.met, agent.session_last_goal_status.?);
+}
+
 test "deinitWithTimeout leaves agent intact when lifecycle worker is active" {
     var agent = try makeTestAgent(std.testing.allocator);
     agent.model_name = try std.testing.allocator.dupe(u8, "owned-model");
@@ -6286,6 +6359,23 @@ test "slash /new clears history" {
     try std.testing.expectEqualStrings("Session cleared.", response);
     try std.testing.expectEqual(@as(usize, 0), agent.historyLen());
     try std.testing.expect(!agent.has_system_prompt);
+}
+
+test "slash /new clears procedural session capture state" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.session_total_tool_count = 3;
+    try agent.session_tool_names.append(allocator, try allocator.dupe(u8, "shell"));
+    agent.session_last_goal_status = .stuck;
+
+    const response = (try agent.handleSlashCommand("/new")).?;
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(@as(u32, 0), agent.session_total_tool_count);
+    try std.testing.expectEqual(@as(usize, 0), agent.session_tool_names.items.len);
+    try std.testing.expect(agent.session_last_goal_status == null);
 }
 
 test "slash /context detail preserves last turn context snapshot" {
