@@ -176,7 +176,18 @@ fn collectOutputAndWaitPosix(
         if (term == null) {
             const wait_res = std.posix.waitpid(child.id, std.posix.W.NOHANG);
             if (wait_res.pid != 0) {
-                term = statusToTerm(wait_res.status);
+                const reaped_term = statusToTerm(wait_res.status);
+                term = reaped_term;
+                // Codex-branch review fix (2026-05-21): mirror the reaped
+                // status onto child.term BEFORE invalidating child.id. If a
+                // later poll slice returns error.Std{out,err}StreamTooLong,
+                // run()'s `errdefer child.kill()` fires — and killPosix
+                // early-returns when .term is already set, instead of
+                // posix.kill()-ing the now-`undefined` child.id (a garbage
+                // PID). Without this, the errdefer signals an arbitrary
+                // process. (child.term is ?(SpawnError!Term); a plain Term
+                // value coerces in.)
+                child.term = reaped_term;
                 child.id = undefined;
             }
         }
