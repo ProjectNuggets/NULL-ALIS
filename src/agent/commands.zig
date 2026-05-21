@@ -1606,8 +1606,12 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                     self.session_tool_names.items
                 else
                     &.{};
+                // Codex 6b6c22b9: fall back to the snapshotted goal status
+                // when the live active_goal_state has already been cleared.
                 const goal_status: ?goal_loop.GoalStatus = if (@hasField(@TypeOf(self.*), "active_goal_state") and self.active_goal_state != null)
                     self.active_goal_state.?.status
+                else if (@hasField(@TypeOf(self.*), "session_last_goal_status"))
+                    self.session_last_goal_status
                 else
                     null;
                 const reflection_trail_json: []const u8 = if (@hasField(@TypeOf(self.*), "session_reflection_trail_json") and self.session_reflection_trail_json != null)
@@ -1625,10 +1629,10 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                     goal_status,
                     reflection_trail_json, // v1.14.18-B G5
                 );
-                // Reset counter after capture (v1.14.18-A F3)
-                if (@hasField(@TypeOf(self.*), "session_total_tool_count")) {
-                    self.session_total_tool_count = 0;
-                }
+                // Codex 6b6c22b9: reset captured procedural session state
+                // (tool count + tool-name manifest + last goal verdict)
+                // after the skill trace has consumed them.
+                clearProceduralSessionState(self);
             }
         }
     }
@@ -1843,11 +1847,25 @@ fn clearSessionState(self: anytype, reason: []const u8) void {
     persistSessionCheckpoint(self, reason);
     self.clearHistory();
     clearPendingExecCommand(self);
+    clearProceduralSessionState(self);
 
     if (self.session_store) |store| {
         if (self.memory_session_id) |sid| { // CR-04: guard optional before passing to clearAutoSaved
             store.clearAutoSaved(sid) catch {};
         }
+    }
+}
+
+fn clearProceduralSessionState(self: anytype) void {
+    if (@hasField(@TypeOf(self.*), "session_total_tool_count")) {
+        self.session_total_tool_count = 0;
+    }
+    if (@hasField(@TypeOf(self.*), "session_tool_names")) {
+        for (self.session_tool_names.items) |name| self.allocator.free(name);
+        self.session_tool_names.clearRetainingCapacity();
+    }
+    if (@hasField(@TypeOf(self.*), "session_last_goal_status")) {
+        self.session_last_goal_status = null;
     }
 }
 
