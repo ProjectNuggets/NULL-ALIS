@@ -609,6 +609,11 @@ pub const Agent = struct {
     /// up whatever the in-flight one missed. Atomic so the spawned
     /// thread can clear it safely from a non-agent thread.
     lifecycle_in_flight: std.atomic.Value(bool) = .{ .raw = false },
+    /// Join handle for the lifecycle worker. The worker still clears
+    /// `lifecycle_in_flight`; the owning Agent joins the handle before
+    /// teardown so the worker cannot outlive Agent-owned memory.
+    lifecycle_thread_mu: std.Thread.Mutex = .{},
+    lifecycle_thread: ?std.Thread = null,
 
     /// Whether context was force-compacted due to exhaustion during the current turn.
     context_was_compacted: bool = false,
@@ -939,8 +944,8 @@ pub const Agent = struct {
     /// complete. Bounded by `timeout_ms`. Returns true if drained,
     /// false if timed out.
     ///
-    /// Used by Agent.deinit (with a generous 30s timeout) so the
-    /// detached worker doesn't outlive the Agent it references.
+    /// Used by Agent.deinit and session recycle paths so the lifecycle
+    /// worker is joined before Agent-owned memory is released.
     /// Also exposed publicly so tests that assert on side-effects
     /// (memory writes) of the lifecycle path can wait deterministically
     /// before asserting.
@@ -948,32 +953,41 @@ pub const Agent = struct {
         const wait_start_ms = std.time.milliTimestamp();
         while (self.lifecycle_in_flight.load(.acquire)) {
             const elapsed = std.time.milliTimestamp() - wait_start_ms;
-            if (elapsed > timeout_ms) return false;
+            if (elapsed >= timeout_ms) return false;
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }
+        self.joinLifecycleThreadIfPresent();
         return true;
     }
 
-    /// V1.14.10 A review fix (M-02): default Agent.deinit keeps the
-    /// 30s budget for shutdown contexts (process teardown — generous
-    /// because we want lifecycle data to land when the provider is
-    /// reachable). Hot-path callers (e.g. `recycleSessionInPlace` in
-    /// session.zig — H-02) should call `deinitWithTimeout` directly
-    /// with a tighter budget AND check the return value to skip the
-    /// destructive operation rather than UAF if the worker won't drain.
+    pub fn joinLifecycleThreadIfPresent(self: *Agent) void {
+        var thread: ?std.Thread = null;
+        self.lifecycle_thread_mu.lock();
+        thread = self.lifecycle_thread;
+        self.lifecycle_thread = null;
+        self.lifecycle_thread_mu.unlock();
+        if (thread) |t| t.join();
+    }
+
+    /// Default Agent.deinit waits in 30s chunks until lifecycle work
+    /// drains. Shutdown may take longer under provider contention, but
+    /// this path must not release memory while a worker still has a
+    /// live Agent pointer.
     pub fn deinit(self: *Agent) void {
-        _ = self.deinitWithTimeout(30_000);
+        while (!self.deinitWithTimeout(30_000)) {
+            log.warn("Agent.deinit: lifecycle worker still active; waiting before teardown", .{});
+        }
     }
 
     /// V1.14.10 A review fix (M-02 + H-02): deinit with a custom
     /// drain timeout. Returns `true` if the lifecycle worker drained
     /// cleanly within the budget; `false` if it timed out.
     ///
-    /// On `false`, the function STILL proceeds with the tear-down
-    /// because the alternative (hanging forever) is worse for
-    /// SessionManager / runtime shutdown. The detached worker may
-    /// segfault on subsequent allocator use — that's a known
-    /// trade-off, logged for operators.
+    /// On `false`, the function leaves Agent-owned memory intact and
+    /// returns without tearing down. That can intentionally leak the
+    /// old Agent object if the caller discards it anyway. Callers that
+    /// pass a finite timeout must retain the Agent and retry later when
+    /// this returns false.
     ///
     /// Hot-path callers (recycleSessionInPlace / TTL evict) should:
     ///   1. Call `deinitWithTimeout(5_000)` with a tight budget.
@@ -983,7 +997,8 @@ pub const Agent = struct {
     pub fn deinitWithTimeout(self: *Agent, timeout_ms: i64) bool {
         const drained = self.waitForLifecycleIdle(timeout_ms);
         if (!drained) {
-            log.warn("Agent.deinit: async lifecycle still in flight after {d}ms — proceeding (worker may segfault)", .{timeout_ms});
+            log.warn("Agent.deinit: async lifecycle still in flight after {d}ms — skipping teardown to avoid dangling worker pointers", .{timeout_ms});
+            return false;
         }
 
         self.clearCurrentTurnProviderOverride();
@@ -6069,6 +6084,41 @@ fn makeTestAgent(allocator: std.mem.Allocator) !Agent {
         .total_tokens = 0,
         .has_system_prompt = false,
     };
+}
+
+test "deinitWithTimeout leaves agent intact when lifecycle worker is active" {
+    var agent = try makeTestAgent(std.testing.allocator);
+    agent.model_name = try std.testing.allocator.dupe(u8, "owned-model");
+    agent.model_name_owned = true;
+
+    agent.lifecycle_in_flight.store(true, .release);
+    try std.testing.expect(!agent.deinitWithTimeout(0));
+    try std.testing.expect(agent.model_name_owned);
+    try std.testing.expectEqualStrings("owned-model", agent.model_name);
+
+    agent.lifecycle_in_flight.store(false, .release);
+    agent.deinit();
+}
+
+test "waitForLifecycleIdle joins completed lifecycle worker" {
+    var agent = try makeTestAgent(std.testing.allocator);
+    defer agent.deinit();
+
+    const Worker = struct {
+        fn run(done: *std.atomic.Value(bool)) void {
+            done.store(true, .release);
+        }
+    };
+
+    var done = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&done});
+    agent.lifecycle_thread_mu.lock();
+    agent.lifecycle_thread = thread;
+    agent.lifecycle_thread_mu.unlock();
+
+    try std.testing.expect(agent.waitForLifecycleIdle(1_000));
+    try std.testing.expect(done.load(.acquire));
+    try std.testing.expect(agent.lifecycle_thread == null);
 }
 
 fn find_tool_by_name(tools: []const Tool, name: []const u8) ?Tool {
