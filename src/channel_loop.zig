@@ -21,6 +21,7 @@ const daemon = @import("daemon.zig");
 const security = @import("security/policy.zig");
 const subagent_mod = @import("subagent.zig");
 const agent_routing = @import("agent_routing.zig");
+const model_capabilities = @import("agent/model_capabilities.zig");
 const zaki_session = @import("session/root.zig");
 const provider_runtime = @import("providers/runtime_bundle.zig");
 const bus_mod = @import("bus.zig");
@@ -745,9 +746,13 @@ pub fn runTelegramLoop(
     loop_state: *TelegramLoopState,
     tg_ptr: *telegram.TelegramChannel,
 ) void {
-    // Set up transcription — key comes from providers.{audio_media.provider}
+    // Set up transcription — key comes from providers.{audio_media.provider}.
+    // Audio routing is capability-driven: a model with native audio skips the
+    // Whisper sidecar. Every current model is text-only for audio, so the
+    // route is always `.transcription_sidecar` and the sidecar is attached.
     const trans = config.audio_media;
-    if (trans.enabled) {
+    const audio_native = model_capabilities.audioInputRoute(config.default_model orelse "") == .native;
+    if (trans.enabled and !audio_native) {
         if (config.getProviderKey(trans.provider)) |key| {
             const wt = allocator.create(voice.WhisperTranscriber) catch {
                 log.warn("Failed to allocate WhisperTranscriber", .{});

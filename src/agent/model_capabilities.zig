@@ -317,6 +317,25 @@ pub fn modelSupportsAudio(model_ref: []const u8) bool {
     return if (lookupCapabilities(model_ref)) |c| c.audio else false;
 }
 
+/// How a turn's audio input reaches the model.
+pub const AudioInputRoute = enum {
+    /// The model understands audio natively — audio is sent straight to it.
+    native,
+    /// The model is text-only for audio — route through the speech-to-text
+    /// (Whisper) sidecar, which transcribes audio to text before the turn.
+    transcription_sidecar,
+};
+
+/// Decide how audio input should reach `model_ref`. Every model in the table
+/// is currently text-only for audio (`audio = false`), so this always returns
+/// `.transcription_sidecar` — the existing Whisper-sidecar behaviour. The
+/// `.native` arm is reachable only once an audio-capable model is added to
+/// the table; such a model must also have a native audio-input path wired
+/// (none exists today — audio always arrives already transcribed to text).
+pub fn audioInputRoute(model_ref: []const u8) AudioInputRoute {
+    return if (modelSupportsAudio(model_ref)) .native else .transcription_sidecar;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 test "modelSupportsVision: Kimi K2.6 is multimodal, K2.5 is not" {
@@ -342,6 +361,18 @@ test "modelSupports* : unknown model is conservatively non-multimodal" {
     try std.testing.expect(!modelSupportsAudio("some-unknown-model-xyz"));
     // No model is marked audio-capable yet.
     try std.testing.expect(!modelSupportsAudio("kimi-k2.6"));
+}
+
+test "audioInputRoute: every current model routes to the transcription sidecar" {
+    // No model in the table has native audio, so audio input always routes
+    // through the Whisper sidecar. This test pins that no-op behaviour —
+    // adding an audio-capable model must fail it deliberately.
+    try std.testing.expectEqual(AudioInputRoute.transcription_sidecar, audioInputRoute("kimi-k2.6"));
+    try std.testing.expectEqual(AudioInputRoute.transcription_sidecar, audioInputRoute("claude-sonnet-4.6"));
+    try std.testing.expectEqual(AudioInputRoute.transcription_sidecar, audioInputRoute("gemini-2.5-pro"));
+    try std.testing.expectEqual(AudioInputRoute.transcription_sidecar, audioInputRoute("gpt-4o"));
+    try std.testing.expectEqual(AudioInputRoute.transcription_sidecar, audioInputRoute("some-unknown-model"));
+    try std.testing.expectEqual(AudioInputRoute.transcription_sidecar, audioInputRoute(""));
 }
 
 test "vision flag does not disturb context/output capability lookups" {
