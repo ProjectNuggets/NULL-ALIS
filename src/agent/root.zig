@@ -3383,6 +3383,14 @@ pub const Agent = struct {
                 self.observer.recordEvent(&notice);
             }
 
+            // Video routing. A turn can carry video content parts (built by
+            // multimodal.zig from [VIDEO:] markers). There is no video
+            // sidecar, so if the effective model has no native video support
+            // the video is dropped + a system_notice is emitted; a
+            // video-capable model keeps it. Runs on `messages`, the slice
+            // shared by the streaming and blocking provider calls below.
+            try self.routeVideoForModel(arena, messages, effective_model, iteration);
+
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.provider.supportsStreaming();
             var saw_stream_first_token = false;
@@ -3454,6 +3462,8 @@ pub const Agent = struct {
                         // still live for this iteration, so buildProviderMessages
                         // reuses it without leaking.
                         const retry_messages = self.buildProviderMessages(arena) catch |build_err| return build_err;
+                        // Rebuild re-adds video parts — re-apply video routing.
+                        try self.routeVideoForModel(arena, retry_messages, effective_model, iteration);
                         const retry_result = self.provider.streamChat(
                             self.allocator,
                             .{
@@ -3567,6 +3577,8 @@ pub const Agent = struct {
                         turn_retry_attempts += 1;
                         turn_llm_calls += 1;
                         const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
+                        // Rebuild re-adds video parts — re-apply video routing.
+                        try self.routeVideoForModel(arena, recovery_msgs, self.model_name, iteration);
                         break :retry_blk self.provider.chat(
                             self.allocator,
                             .{
@@ -3624,6 +3636,8 @@ pub const Agent = struct {
                             turn_retry_attempts += 1;
                             turn_llm_calls += 1;
                             const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
+                            // Rebuild re-adds video parts — re-apply video routing.
+                            try self.routeVideoForModel(arena, recovery_msgs, self.model_name, iteration);
                             break :retry_blk self.provider.chat(
                                 self.allocator,
                                 .{
@@ -5022,6 +5036,20 @@ pub const Agent = struct {
         return false;
     }
 
+    /// Returns true if any message in the slice carries a video content part.
+    /// Used to decide whether the turn's effective model needs native video
+    /// support (see the video routing in `turn`).
+    fn hasVideoContentParts(messages: []const ChatMessage) bool {
+        for (messages) |msg| {
+            const parts = msg.content_parts orelse continue;
+            for (parts) |part| switch (part) {
+                .video_base64 => return true,
+                else => {},
+            };
+        }
+        return false;
+    }
+
     /// Whether an image-bearing turn must be diverted to the configured
     /// vision sidecar (reliability.vision_fallback).
     ///
@@ -5042,6 +5070,71 @@ pub const Agent = struct {
         const model_capabilities = @import("model_capabilities.zig");
         if (model_capabilities.modelSupportsVision(model_name)) return false;
         return true;
+    }
+
+    /// Video routing for a turn's provider messages. Unlike images — which
+    /// can divert to the vision sidecar — there is no video sidecar (the
+    /// vision fallback model is image-only). So when `effective_model` has
+    /// no native video understanding, the video content parts are dropped
+    /// from `messages` and the user is told via a `system_notice`; the turn
+    /// is never errored. A video-capable model (Kimi K2.6, Gemini) keeps the
+    /// video parts untouched. Mutates `messages` in place, replacing affected
+    /// `content_parts` arrays with arena-allocated copies that omit the video.
+    /// Remove every `video_base64` content part from `messages`, replacing
+    /// each affected `content_parts` array with an arena-allocated copy that
+    /// omits the video. A message left with no parts drops back to
+    /// `content_parts = null` so the provider serializes the plain `content`
+    /// string instead of an empty array. Returns true if any part was removed.
+    fn stripVideoContentParts(arena: std.mem.Allocator, messages: []ChatMessage) !bool {
+        var stripped = false;
+        for (messages) |*msg| {
+            const parts = msg.content_parts orelse continue;
+            var has_video = false;
+            for (parts) |p| {
+                if (p == .video_base64) {
+                    has_video = true;
+                    break;
+                }
+            }
+            if (!has_video) continue;
+
+            var kept: std.ArrayListUnmanaged(providers.ContentPart) = .empty;
+            for (parts) |p| {
+                if (p == .video_base64) {
+                    stripped = true;
+                    continue;
+                }
+                try kept.append(arena, p);
+            }
+            msg.content_parts = if (kept.items.len == 0) null else try kept.toOwnedSlice(arena);
+        }
+        return stripped;
+    }
+
+    fn routeVideoForModel(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        messages: []ChatMessage,
+        effective_model: []const u8,
+        iteration: usize,
+    ) !void {
+        const model_capabilities = @import("model_capabilities.zig");
+        if (!hasVideoContentParts(messages)) return;
+        if (model_capabilities.modelSupportsVideo(effective_model)) return;
+
+        // hasVideoContentParts was true and the model is not video-capable,
+        // so this strips at least one part — drop them and notify the user.
+        _ = try stripVideoContentParts(arena, messages);
+
+        log.info("turn.stage stage=video_unsupported iteration={d} model={s}", .{ iteration, effective_model });
+        const notice = ObserverEvent{ .system_notice = .{
+            .kind = "video_unsupported",
+            .severity = "info",
+            .message = "Video attachment dropped — the active model has no native video support.",
+            .detail = effective_model,
+            .run_id = self.current_run_id,
+        } };
+        self.observer.recordEvent(&notice);
     }
 
     fn appendMultimodalAllowedDir(
@@ -5359,6 +5452,79 @@ test "shouldRouteToVisionFallback: native-vision primary keeps the image" {
     try std.testing.expect(!Agent.shouldRouteToVisionFallback("kimi-k2.5", "", true));
     // Primary already IS the sidecar → no-op (no self-swap).
     try std.testing.expect(!Agent.shouldRouteToVisionFallback("llama-vision", "llama-vision", true));
+}
+
+test "hasVideoContentParts detects video parts" {
+    const text_parts = [_]providers.ContentPart{.{ .text = "hi" }};
+    const no_video = [_]ChatMessage{
+        ChatMessage.user("plain"),
+        .{ .role = .user, .content = "", .content_parts = &text_parts },
+    };
+    try std.testing.expect(!Agent.hasVideoContentParts(&no_video));
+
+    const video_parts = [_]providers.ContentPart{
+        .{ .text = "watch" },
+        .{ .video_base64 = .{ .data = "AAAA", .media_type = "video/mp4" } },
+    };
+    const with_video = [_]ChatMessage{
+        .{ .role = .user, .content = "", .content_parts = &video_parts },
+    };
+    try std.testing.expect(Agent.hasVideoContentParts(&with_video));
+}
+
+test "stripVideoContentParts removes video, keeps other parts" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const parts = [_]providers.ContentPart{
+        .{ .text = "describe" },
+        .{ .image_base64 = .{ .data = "img", .media_type = "image/png" } },
+        .{ .video_base64 = .{ .data = "vid", .media_type = "video/mp4" } },
+    };
+    var msgs = [_]ChatMessage{
+        .{ .role = .user, .content = "describe", .content_parts = &parts },
+    };
+    try std.testing.expect(try Agent.stripVideoContentParts(arena, &msgs));
+    try std.testing.expect(msgs[0].content_parts != null);
+    try std.testing.expectEqual(@as(usize, 2), msgs[0].content_parts.?.len);
+    for (msgs[0].content_parts.?) |p| {
+        try std.testing.expect(p != .video_base64);
+    }
+}
+
+test "stripVideoContentParts video-only message drops to null content_parts" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const parts = [_]providers.ContentPart{
+        .{ .video_base64 = .{ .data = "vid", .media_type = "video/mp4" } },
+    };
+    var msgs = [_]ChatMessage{
+        .{ .role = .user, .content = "[VIDEO:/tmp/c.mp4]", .content_parts = &parts },
+    };
+    try std.testing.expect(try Agent.stripVideoContentParts(arena, &msgs));
+    // Video-only message: no parts remain, falls back to plain content.
+    try std.testing.expect(msgs[0].content_parts == null);
+}
+
+test "stripVideoContentParts no-op when no video present" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const parts = [_]providers.ContentPart{
+        .{ .text = "describe" },
+        .{ .image_base64 = .{ .data = "img", .media_type = "image/png" } },
+    };
+    var msgs = [_]ChatMessage{
+        .{ .role = .user, .content = "describe", .content_parts = &parts },
+    };
+    const stripped = try Agent.stripVideoContentParts(arena, &msgs);
+    try std.testing.expect(!stripped);
+    try std.testing.expect(msgs[0].content_parts != null);
+    try std.testing.expectEqual(@as(usize, 2), msgs[0].content_parts.?.len);
 }
 
 test "Agent.OwnedMessage toChatMessage" {
