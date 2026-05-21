@@ -537,6 +537,24 @@ this grep-output are §14.5 no-loose-ends violations. The pattern is:
 `grep -rn "<symbol>" src/ | grep -v "<defining_file>"`. If the result is empty, the
 symbol is library-only and the §14.10 tier classification cannot be 🟢 BEHAVIORAL.
 
+**Sub-gate C reachability extension (added 2026-05-21, post-v1.14.18-B activation
+audit).** A production caller *existing* is necessary but NOT sufficient. The
+2026-05-21 audit found G1/G5/G16 each had a real production caller that grep
+finds — yet all three were behaviorally inert, because the caller sat inside an
+`if (cfg.<flag>)` block whose flag defaults `false` (and whose enabling sites had
+been deleted in an unrelated sprint). The first activation audit (2026-05-20)
+declared them "closed" because it bucketed gaps by which PR targets them and
+never traced the call chain to a runtime gate. That is a code-completion audit
+masquerading as an activation audit. Therefore: an activation claim ("this gap is
+closed", tier 🟢 BEHAVIORAL) requires proving the production caller is **reachable
+in default configuration** — no `cfg`/env flag defaulting it off, no test-only
+call path. The verification is not just "grep finds a caller" but "trace from the
+agent's turn loop / session lifecycle to the call site and confirm every
+enclosing condition is satisfiable under shipped defaults." A test that calls the
+function directly proves the function works; it never proves the agent reaches
+it. When the only reachable callers are tests, the verdict is MERGED-INERT, not
+ACTIVATED — regardless of green CI.
+
 **Honest reporting clause (extends §14.9):** agent self-reports MUST include:
 1. The exact grep outputs that prove production wiring (sub-gate C)
 2. The canonical-CI invocation output (sub-gate B), not just default-profile
