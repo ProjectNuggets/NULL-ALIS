@@ -179,11 +179,16 @@ pub fn isReasoningCapableModel(model: []const u8) bool {
 /// - reasoning (otherwise): `max_completion_tokens` only (no temperature)
 /// Always emits `reasoning_effort` when set on a reasoning model.
 ///
-/// `suppress_reasoning_effort` — when true, never emits the
-/// `reasoning_effort` field (not even the Kimi/Moonshot "medium"
-/// default). Used by the Moonshot native route, which controls
-/// reasoning via the Kimi-specific top-level `thinking` field instead
-/// and rejects `reasoning_effort`. All other fields are unchanged.
+/// `kimi_native_route` — true when the request targets Moonshot's
+/// native Kimi API. That API differs from lenient OpenAI-compatible
+/// hosts in two ways this function must honor:
+///   - it controls reasoning via the top-level `thinking` field and
+///     ignores `reasoning_effort` — so `reasoning_effort` is omitted;
+///   - it HARD-REJECTS a custom `temperature` for Kimi K2.x
+///     (`invalid temperature: only 1 is allowed for this model` —
+///     probe-confirmed 2026-05-21) — so `temperature` is omitted and
+///     the model applies its fixed default (1.0 in thinking mode).
+/// All other (lenient) hosts are unaffected.
 pub fn appendGenerationFields(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
@@ -191,16 +196,16 @@ pub fn appendGenerationFields(
     temperature: f64,
     max_tokens: ?u32,
     reasoning_effort: ?[]const u8,
-    suppress_reasoning_effort: bool,
+    kimi_native_route: bool,
 ) !void {
     // Q2 (2026-04-27): three request shapes total —
     //   (a) Non-reasoning model: temperature + max_tokens
     //   (b) OpenAI reasoning (o1/o3/gpt-5/codex-mini): max_completion_tokens
     //       only when effort != "none"; temperature dropped unless explicit
     //       "none" override; `reasoning_effort` always appended when set
-    //   (c) Kimi/Moonshot reasoning-capable: temperature + max_tokens +
-    //       reasoning_effort (Kimi accepts temperature alongside reasoning,
-    //       unlike OpenAI's o-series strict convention)
+    //   (c) Kimi/Moonshot reasoning-capable: max_tokens + reasoning_effort,
+    //       plus temperature on lenient hosts ONLY — Moonshot's native
+    //       Kimi API rejects a custom temperature (see kimi_native_route)
     //
     // Default for reasoning-capable models when reasoning_effort is null:
     // emit "medium" — matches Moonshot/Together's documented server
@@ -224,13 +229,21 @@ pub fn appendGenerationFields(
     }
 
     if (isReasoningCapableModel(model) and !isReasoningModel(model)) {
-        // (c) Kimi/Moonshot reasoning-capable: temperature + max_tokens +
-        // reasoning_effort. Kimi accepts temperature alongside reasoning;
-        // do NOT drop it like OpenAI o-series.
-        try buf.appendSlice(allocator, ",\"temperature\":");
-        var temp_buf: [16]u8 = undefined;
-        const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.FormatError;
-        try buf.appendSlice(allocator, temp_str);
+        // (c) Kimi/Moonshot reasoning-capable: max_tokens + temperature +
+        // reasoning_effort.
+        //
+        // Temperature: lenient OpenAI-compatible hosts (e.g. Together)
+        // tolerate a custom temperature alongside reasoning, but Moonshot's
+        // NATIVE Kimi API hard-rejects it — `invalid temperature: only 1
+        // is allowed for this model` (probe-confirmed 2026-05-21). On the
+        // Moonshot native route we OMIT temperature entirely; the model
+        // applies its fixed default (1.0 in thinking mode).
+        if (!kimi_native_route) {
+            try buf.appendSlice(allocator, ",\"temperature\":");
+            var temp_buf: [16]u8 = undefined;
+            const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.FormatError;
+            try buf.appendSlice(allocator, temp_str);
+        }
 
         if (max_tokens) |max_tok| {
             try buf.appendSlice(allocator, ",\"max_tokens\":");
@@ -239,11 +252,11 @@ pub fn appendGenerationFields(
             try buf.appendSlice(allocator, max_str);
         }
 
-        // Emit reasoning_effort: explicit user value, or default "medium".
-        // Matches Moonshot/Together server default + keeps context_snapshot
-        // report honest (we report what we actually send). Skipped entirely
-        // on the Moonshot native route, which uses the `thinking` field.
-        if (!suppress_reasoning_effort) {
+        // reasoning_effort: explicit user value, or default "medium" —
+        // keeps the context_snapshot report honest with the wire request.
+        // Skipped on the Moonshot native route, which uses the top-level
+        // `thinking` field and ignores `reasoning_effort`.
+        if (!kimi_native_route) {
             const effort = reasoning_effort orelse "medium";
             try buf.appendSlice(allocator, ",\"reasoning_effort\":");
             try json_util.appendJsonString(buf, allocator, effort);
@@ -269,7 +282,7 @@ pub fn appendGenerationFields(
     }
 
     // Emit reasoning_effort when set (JSON-escaped for safety).
-    if (!suppress_reasoning_effort) {
+    if (!kimi_native_route) {
         if (reasoning_effort) |re| {
             try buf.appendSlice(allocator, ",\"reasoning_effort\":");
             try json_util.appendJsonString(buf, allocator, re);
