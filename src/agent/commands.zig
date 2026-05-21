@@ -1433,23 +1433,17 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         // soft per layer; existing per-fact persist remains the legacy
         // primary writer until C5 cleanup. Dedup at persistExtracted handles
         // overlap between the two paths.
-        // V1.14.12 (Path A) — judge guard removed. extractAtBoundary now
-        // handles null-judge gracefully (judge_ctx becomes null inside
-        // runner.zig when judge_model is empty). No-judge tenants get
-        // MD5+canonical-key dedup only — same as the legacy direct
-        // path's pre-M5 behavior. This unblocks deletion of the gated
-        // legacy direct path at this file's session-end block.
+        // The runner can use a dedicated extraction provider/model without
+        // a contradiction judge, but this legacy session-end path only has
+        // judge-backed extraction config available. Avoid routing arbitrary
+        // chat providers through the structured extraction parser.
         if (self.history.items.len > 0) {
             var msgs_buf = std.ArrayListUnmanaged(providers.ChatMessage).initCapacity(self.allocator, self.history.items.len) catch null;
             if (msgs_buf) |*buf| {
                 defer buf.deinit(self.allocator);
                 for (self.history.items) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
                 const ctx = extraction_runner.ExtractionContext{
-                    // Provider may be null when no judge configured;
-                    // runner.zig:798 checks judge_model.len before
-                    // constructing JudgeContext, so this `orelse undefined`
-                    // is never read in the no-judge path.
-                    .judge_provider = self.extraction_judge_provider orelse undefined,
+                    .judge_provider = self.extraction_judge_provider,
                     .judge_model = self.extraction_judge_model_name,
                     .state_mgr = self.extraction_state_mgr,
                     .user_id = self.extraction_user_id,
@@ -1627,6 +1621,8 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                             &.{};
                         const goal_status: ?goal_loop.GoalStatus = if (@hasField(@TypeOf(self.*), "active_goal_state") and self.active_goal_state != null)
                             self.active_goal_state.?.status
+                        else if (@hasField(@TypeOf(self.*), "session_last_goal_status"))
+                            self.session_last_goal_status
                         else
                             null;
                         const reflection_trail_json: []const u8 = if (@hasField(@TypeOf(self.*), "session_reflection_trail_json") and self.session_reflection_trail_json != null)
@@ -1644,10 +1640,10 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                             goal_status,
                             reflection_trail_json, // v1.14.18-B G5
                         );
-                        // Reset counter after capture (v1.14.18-A F3)
-                        if (@hasField(@TypeOf(self.*), "session_total_tool_count")) {
-                            self.session_total_tool_count = 0;
-                        }
+                        // Reset captured procedural session state after the
+                        // skill trace has consumed the count, manifest, and
+                        // last goal verdict.
+                        clearProceduralSessionState(self);
                     }
                 }
             }
@@ -1667,7 +1663,7 @@ pub fn persistSessionCheckpoint(self: anytype, reason: []const u8) void {
 
 /// V1.14.10 A — Async lifecycle checkpoint.
 ///
-/// Spawns a detached worker thread that runs
+/// Spawns a joinable worker thread that runs
 /// `persistSessionCheckpointDetailed` off the agent's hot path. Used
 /// by hot-path callers (compaction:auto, summary_seed:auto in
 /// root.zig) to prevent the 30-180s post-reply lifecycle from
@@ -1711,6 +1707,9 @@ pub fn persistSessionCheckpointAsync(self: anytype, reason: []const u8) bool {
         log.info("lifecycle.async.skip_in_flight reason={s} session={s}", .{ reason, session_id_for_log });
         return false;
     }
+    // Reap a completed prior worker before storing a new join handle.
+    self.joinLifecycleThreadIfPresent();
+
     // Heap-allocate the worker context. Owned by the spawned thread;
     // freed in `Worker.run`'s deferred cleanup (in the correct order:
     // allocator work first, in-flight flag LAST — see review fix H-04
@@ -1771,7 +1770,9 @@ pub fn persistSessionCheckpointAsync(self: anytype, reason: []const u8) bool {
         log.warn("lifecycle.async.spawn_failed reason={s} session={s} — dropping (next trigger will retry)", .{ reason, session_id_for_log });
         return false;
     };
-    thread.detach();
+    self.lifecycle_thread_mu.lock();
+    self.lifecycle_thread = thread;
+    self.lifecycle_thread_mu.unlock();
     log.info("lifecycle.async.spawned reason={s} session={s}", .{ reason, session_id_for_log });
     return true;
 }
@@ -1859,11 +1860,25 @@ fn clearSessionState(self: anytype, reason: []const u8) void {
     persistSessionCheckpoint(self, reason);
     self.clearHistory();
     clearPendingExecCommand(self);
+    clearProceduralSessionState(self);
 
     if (self.session_store) |store| {
         if (self.memory_session_id) |sid| { // CR-04: guard optional before passing to clearAutoSaved
             store.clearAutoSaved(sid) catch {};
         }
+    }
+}
+
+fn clearProceduralSessionState(self: anytype) void {
+    if (@hasField(@TypeOf(self.*), "session_total_tool_count")) {
+        self.session_total_tool_count = 0;
+    }
+    if (@hasField(@TypeOf(self.*), "session_tool_names")) {
+        for (self.session_tool_names.items) |name| self.allocator.free(name);
+        self.session_tool_names.clearRetainingCapacity();
+    }
+    if (@hasField(@TypeOf(self.*), "session_last_goal_status")) {
+        self.session_last_goal_status = null;
     }
 }
 

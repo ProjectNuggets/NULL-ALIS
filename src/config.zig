@@ -437,7 +437,7 @@ pub const Config = struct {
     }
 
     fn writeChannelAccounts(allocator: std.mem.Allocator, w: *std.Io.Writer, channel_name: []const u8, accounts: anytype) !void {
-        try w.print("    \"{s}\": {{\n      \"accounts\": {{", .{channel_name});
+        try w.print("    {f}: {{\n      \"accounts\": {{", .{std.json.fmt(channel_name, .{})});
         for (accounts, 0..) |account, i| {
             if (i == 0) {
                 try w.print("\n", .{});
@@ -448,7 +448,7 @@ pub const Config = struct {
                 account.account_id
             else
                 "default";
-            try w.print("        \"{s}\": ", .{account_id});
+            try w.print("        {f}: ", .{std.json.fmt(account_id, .{})});
             try writePrettyJsonInline(allocator, w, account, "        ");
         }
         try w.print("\n      }}\n    }}", .{});
@@ -479,7 +479,7 @@ pub const Config = struct {
                 .optional => {
                     if (channel_value) |val| {
                         try writeChannelFieldSeparator(w, wrote_any);
-                        try w.print("    \"{s}\": ", .{field.name});
+                        try w.print("    {f}: ", .{std.json.fmt(field.name, .{})});
                         try writePrettyJsonInline(self.allocator, w, val, "    ");
                         wrote_any = true;
                     }
@@ -499,7 +499,7 @@ pub const Config = struct {
         try w.print("[", .{});
         for (values, 0..) |value, i| {
             if (i > 0) try w.print(", ", .{});
-            try w.print("\"{s}\"", .{value});
+            try w.print("{f}", .{std.json.fmt(value, .{})});
         }
         try w.print("]", .{});
     }
@@ -524,7 +524,7 @@ pub const Config = struct {
         try w.print("    \"model_fallbacks\": [", .{});
         for (self.reliability.model_fallbacks, 0..) |entry, i| {
             if (i > 0) try w.print(", ", .{});
-            try w.print("{{\"model\": \"{s}\", \"fallbacks\": ", .{entry.model});
+            try w.print("{{\"model\": {f}, \"fallbacks\": ", .{std.json.fmt(entry.model, .{})});
             try writeStringArray(w, entry.fallbacks);
             try w.print("}}", .{});
         }
@@ -655,25 +655,25 @@ pub const Config = struct {
         try w.print("{{\n", .{});
 
         // Top-level fields
-        try w.print("  \"profile\": \"{s}\",\n", .{self.profile});
+        try w.print("  \"profile\": {f},\n", .{std.json.fmt(self.profile, .{})});
         try w.print("  \"default_temperature\": {d:.1},\n", .{self.default_temperature});
         if (self.reasoning_effort) |value| {
-            try w.print("  \"reasoning_effort\": \"{s}\",\n", .{value});
+            try w.print("  \"reasoning_effort\": {f},\n", .{std.json.fmt(value, .{})});
         }
 
         // models.providers
         if (self.providers.len > 0) {
             try w.print("  \"models\": {{\n    \"providers\": {{\n", .{});
             for (self.providers, 0..) |entry, i| {
-                try w.print("      \"{s}\": {{", .{entry.name});
+                try w.print("      {f}: {{", .{std.json.fmt(entry.name, .{})});
                 var has_field = false;
                 if (entry.api_key) |key| {
-                    try w.print("\"api_key\": \"{s}\"", .{key});
+                    try w.print("\"api_key\": {f}", .{std.json.fmt(key, .{})});
                     has_field = true;
                 }
                 if (entry.base_url) |base| {
                     if (has_field) try w.print(", ", .{});
-                    try w.print("\"base_url\": \"{s}\"", .{base});
+                    try w.print("\"base_url\": {f}", .{std.json.fmt(base, .{})});
                     has_field = true;
                 }
                 if (comptime @hasField(ProviderEntry, "native_tools")) {
@@ -707,7 +707,9 @@ pub const Config = struct {
                     wrote_agent_field = true;
                 }
                 if (self.default_model) |model| {
-                    try w.print("      \"model\": {{\"primary\": \"{s}/{s}\"}}", .{ self.default_provider, model });
+                    const primary = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.default_provider, model });
+                    defer self.allocator.free(primary);
+                    try w.print("      \"model\": {{\"primary\": {f}}}", .{std.json.fmt(primary, .{})});
                     if (has_heartbeat) try w.print(",", .{});
                     try w.print("\n", .{});
                 }
@@ -749,33 +751,24 @@ pub const Config = struct {
 
         // Diagnostics (with nested otel)
         try w.print("  \"diagnostics\": {{\n", .{});
-        try w.print("    \"backend\": \"{s}\"", .{self.diagnostics.backend});
+        try w.print("    \"backend\": {f}", .{std.json.fmt(self.diagnostics.backend, .{})});
         if (self.diagnostics.otel_endpoint != null or self.diagnostics.otel_service_name != null) {
             try w.print(",\n    \"otel\": {{", .{});
             var otel_first = true;
             if (self.diagnostics.otel_endpoint) |ep| {
-                try w.print("\"endpoint\": \"{s}\"", .{ep});
+                try w.print("\"endpoint\": {f}", .{std.json.fmt(ep, .{})});
                 otel_first = false;
             }
             if (self.diagnostics.otel_service_name) |sn| {
                 if (!otel_first) try w.print(", ", .{});
-                try w.print("\"service_name\": \"{s}\"", .{sn});
+                try w.print("\"service_name\": {f}", .{std.json.fmt(sn, .{})});
             }
             try w.print("}}", .{});
         }
         try w.print("\n  }},\n", .{});
 
         try w.print("  \"autonomy\": {f},\n", .{std.json.fmt(self.autonomy, .{})});
-        try w.print("  \"runtime\": {f},\n", .{std.json.fmt(.{
-            .kind = self.runtime.kind,
-            .docker = .{
-                .image = self.runtime.docker.image,
-                .network = self.runtime.docker.network,
-                .memory_limit_mb = self.runtime.docker.memory_limit_mb,
-                .read_only_rootfs = self.runtime.docker.read_only_rootfs,
-                .mount_workspace = self.runtime.docker.mount_workspace,
-            },
-        }, .{})});
+        try w.print("  \"runtime\": {f},\n", .{std.json.fmt(self.runtime, .{})});
 
         // Reliability
         try self.writeReliabilitySection(w);
@@ -816,44 +809,12 @@ pub const Config = struct {
         try w.print("  \"tunnel\": {f},\n", .{std.json.fmt(self.tunnel, .{})});
         try w.print("  \"composio\": {f},\n", .{std.json.fmt(self.composio, .{})});
         try w.print("  \"secrets\": {f},\n", .{std.json.fmt(self.secrets, .{})});
-        try w.print("  \"browser\": {f},\n", .{std.json.fmt(.{
-            .enabled = self.browser.enabled,
-            .session_name = self.browser.session_name,
-            .backend = self.browser.backend,
-            .native_headless = self.browser.native_headless,
-            .native_webdriver_url = self.browser.native_webdriver_url,
-            .native_chrome_path = self.browser.native_chrome_path,
-            .allowed_domains = self.browser.allowed_domains,
-        }, .{})});
-        try w.print("  \"http_request\": {f},\n", .{std.json.fmt(.{
-            .enabled = self.http_request.enabled,
-            .max_response_size = self.http_request.max_response_size,
-            .timeout_secs = self.http_request.timeout_secs,
-        }, .{})});
+        try w.print("  \"browser\": {f},\n", .{std.json.fmt(self.browser, .{})});
+        try w.print("  \"http_request\": {f},\n", .{std.json.fmt(self.http_request, .{})});
         try w.print("  \"identity\": {f},\n", .{std.json.fmt(self.identity, .{})});
         try w.print("  \"cost\": {f},\n", .{std.json.fmt(self.cost, .{})});
-        try w.print("  \"security\": {f},\n", .{std.json.fmt(.{
-            .sandbox = .{
-                .enabled = self.security.sandbox.enabled,
-                .backend = self.security.sandbox.backend,
-            },
-            .resources = .{
-                .max_memory_mb = self.security.resources.max_memory_mb,
-                .max_cpu_time_seconds = self.security.resources.max_cpu_time_seconds,
-                .max_subprocesses = self.security.resources.max_subprocesses,
-                .memory_monitoring = self.security.resources.memory_monitoring,
-            },
-            .audit = .{
-                .enabled = self.security.audit.enabled,
-                .log_path = self.security.audit.log_path,
-                .max_size_mb = self.security.audit.max_size_mb,
-                .sign_events = self.security.audit.sign_events,
-            },
-        }, .{})});
-        try w.print("  \"peripherals\": {f},\n", .{std.json.fmt(.{
-            .enabled = self.peripherals.enabled,
-            .datasheet_dir = self.peripherals.datasheet_dir,
-        }, .{})});
+        try w.print("  \"security\": {f},\n", .{std.json.fmt(self.security, .{})});
+        try w.print("  \"peripherals\": {f},\n", .{std.json.fmt(self.peripherals, .{})});
 
         // Tools (with media.audio)
         try w.print("  \"tools\": {{\n", .{});
@@ -862,13 +823,13 @@ pub const Config = struct {
         try w.print("    \"max_file_size_bytes\": {d},\n", .{self.tools.max_file_size_bytes});
         try w.print("    \"web_fetch_max_chars\": {d}", .{self.tools.web_fetch_max_chars});
         if (self.tools.web_search_provider.len > 0) {
-            try w.print(",\n    \"web_search_provider\": \"{s}\"", .{self.tools.web_search_provider});
+            try w.print(",\n    \"web_search_provider\": {f}", .{std.json.fmt(self.tools.web_search_provider, .{})});
         }
         if (self.tools.web_search_exa_api_key.len > 0) {
-            try w.print(",\n    \"web_search_exa_api_key\": \"{s}\"", .{self.tools.web_search_exa_api_key});
+            try w.print(",\n    \"web_search_exa_api_key\": {f}", .{std.json.fmt(self.tools.web_search_exa_api_key, .{})});
         }
         if (self.tools.web_search_brave_api_key.len > 0) {
-            try w.print(",\n    \"web_search_brave_api_key\": \"{s}\"", .{self.tools.web_search_brave_api_key});
+            try w.print(",\n    \"web_search_brave_api_key\": {f}", .{std.json.fmt(self.tools.web_search_brave_api_key, .{})});
         }
         // tools.media.audio
         {
@@ -881,11 +842,11 @@ pub const Config = struct {
                 try w.print(",\n    \"media\": {{\n      \"audio\": {{\n", .{});
                 try w.print("        \"enabled\": {s}", .{if (am.enabled) "true" else "false"});
                 if (am.language) |lang| {
-                    try w.print(",\n        \"language\": \"{s}\"", .{lang});
+                    try w.print(",\n        \"language\": {f}", .{std.json.fmt(lang, .{})});
                 }
-                try w.print(",\n        \"models\": [{{\"provider\": \"{s}\", \"model\": \"{s}\"", .{ am.provider, am.model });
+                try w.print(",\n        \"models\": [{{\"provider\": {f}, \"model\": {f}", .{ std.json.fmt(am.provider, .{}), std.json.fmt(am.model, .{}) });
                 if (am.base_url) |bu| {
-                    try w.print(", \"base_url\": \"{s}\"", .{bu});
+                    try w.print(", \"base_url\": {f}", .{std.json.fmt(bu, .{})});
                 }
                 try w.print("}}]\n      }}\n    }}", .{});
             }
@@ -1516,6 +1477,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.runtime.docker.image = "alpine:3.20";
     cfg.runtime.docker.network = "bridge";
     cfg.runtime.docker.memory_limit_mb = 768;
+    cfg.runtime.docker.cpu_limit = 0.75;
     cfg.runtime.docker.read_only_rootfs = false;
     cfg.runtime.docker.mount_workspace = false;
 
@@ -1573,11 +1535,18 @@ test "save roundtrip preserves extended config sections" {
     cfg.browser.native_headless = false;
     cfg.browser.native_webdriver_url = "http://127.0.0.1:9515";
     cfg.browser.native_chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+    cfg.browser.computer_use.endpoint = "http://127.0.0.1:8788/v1/actions";
+    cfg.browser.computer_use.api_key = "computer-use-key";
+    cfg.browser.computer_use.timeout_ms = 42_000;
+    cfg.browser.computer_use.allow_remote_endpoint = true;
+    cfg.browser.computer_use.max_coordinate_x = 1920;
+    cfg.browser.computer_use.max_coordinate_y = 1080;
     cfg.browser.allowed_domains = &.{ "github.com", "docs.rs" };
 
     cfg.http_request.enabled = true;
     cfg.http_request.max_response_size = 12345;
     cfg.http_request.timeout_secs = 8;
+    cfg.http_request.allowed_domains = &.{"api.github.com"};
 
     cfg.identity.format = "aieos";
     cfg.identity.aieos_path = "id.json";
@@ -1588,17 +1557,31 @@ test "save roundtrip preserves extended config sections" {
 
     cfg.security.sandbox.enabled = true;
     cfg.security.sandbox.backend = .firejail;
+    cfg.security.sandbox.fail_open_on_dev = true;
+    cfg.security.sandbox.firejail_args = &.{ "--private", "--net=none" };
     cfg.security.resources.max_memory_mb = 1024;
+    cfg.security.resources.max_cpu_percent = 55;
+    cfg.security.resources.max_disk_mb = 2048;
     cfg.security.resources.max_cpu_time_seconds = 120;
     cfg.security.resources.max_subprocesses = 20;
     cfg.security.resources.memory_monitoring = false;
     cfg.security.audit.enabled = false;
+    cfg.security.audit.log_file = "audit-file.log";
     cfg.security.audit.log_path = "custom.log";
+    cfg.security.audit.retention_days = 14;
     cfg.security.audit.max_size_mb = 9;
     cfg.security.audit.sign_events = true;
 
     cfg.peripherals.enabled = true;
     cfg.peripherals.datasheet_dir = "/tmp/ds";
+    cfg.peripherals.boards = &.{
+        .{
+            .board = "arduino-uno",
+            .transport = "serial",
+            .path = "/dev/ttyACM0",
+            .baud = 57_600,
+        },
+    };
 
     // hardware.* fixture writes removed D19 (2026-04-25).
 
@@ -1644,6 +1627,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", loaded.mcp_servers[0].env[0].key);
 
     try std.testing.expectEqualStrings("docker", loaded.runtime.kind);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), loaded.runtime.docker.cpu_limit.?, 0.0001);
     try std.testing.expectEqual(@as(u32, 32), loaded.scheduler.max_tasks);
     try std.testing.expect(loaded.agent.parallel_tools);
     try std.testing.expectEqual(@as(u8, 100), loaded.agent.parallel_tools_rollout_percent);
@@ -1657,11 +1641,27 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expect(!loaded.secrets.encrypt);
     try std.testing.expect(loaded.browser.enabled);
     try std.testing.expectEqual(@as(usize, 2), loaded.browser.allowed_domains.len);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8788/v1/actions", loaded.browser.computer_use.endpoint);
+    try std.testing.expectEqualStrings("computer-use-key", loaded.browser.computer_use.api_key.?);
+    try std.testing.expectEqual(@as(u64, 42_000), loaded.browser.computer_use.timeout_ms);
+    try std.testing.expect(loaded.browser.computer_use.allow_remote_endpoint);
+    try std.testing.expectEqual(@as(i64, 1920), loaded.browser.computer_use.max_coordinate_x.?);
     try std.testing.expect(loaded.http_request.enabled);
+    try std.testing.expectEqual(@as(usize, 1), loaded.http_request.allowed_domains.len);
+    try std.testing.expectEqualStrings("api.github.com", loaded.http_request.allowed_domains[0]);
     try std.testing.expectEqualStrings("aieos", loaded.identity.format);
     try std.testing.expectEqual(@as(u8, 70), loaded.cost.warn_at_percent);
     try std.testing.expectEqual(config_types.SandboxBackend.firejail, loaded.security.sandbox.backend);
+    try std.testing.expect(loaded.security.sandbox.fail_open_on_dev);
+    try std.testing.expectEqual(@as(usize, 2), loaded.security.sandbox.firejail_args.len);
+    try std.testing.expectEqual(@as(u32, 55), loaded.security.resources.max_cpu_percent);
+    try std.testing.expectEqual(@as(u32, 2048), loaded.security.resources.max_disk_mb);
+    try std.testing.expectEqualStrings("audit-file.log", loaded.security.audit.log_file.?);
+    try std.testing.expectEqual(@as(u32, 14), loaded.security.audit.retention_days);
     try std.testing.expect(loaded.peripherals.enabled);
+    try std.testing.expectEqual(@as(usize, 1), loaded.peripherals.boards.len);
+    try std.testing.expectEqualStrings("arduino-uno", loaded.peripherals.boards[0].board);
+    try std.testing.expectEqualStrings("/dev/ttyACM0", loaded.peripherals.boards[0].path.?);
     // hardware.* roundtrip assertion removed D19 (2026-04-25).
     try std.testing.expectEqual(config_types.DmScope.per_peer, loaded.session.dm_scope);
     try std.testing.expectEqual(@as(usize, 1), loaded.session.identity_links.len);
@@ -1725,6 +1725,100 @@ test "save escapes mcp_servers strings safely" {
     try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers[0].env.len);
     try std.testing.expectEqualStrings("OPEN\"KEY", loaded.mcp_servers[0].env[0].key);
     try std.testing.expectEqualStrings("ab\\cd\"ef\nz", loaded.mcp_servers[0].env[0].value);
+}
+
+test "save escapes manually serialized config strings safely" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.profile = "std\"ard\\profile";
+    cfg.reasoning_effort = "high";
+    cfg.default_provider = "prov\"ider";
+    cfg.default_model = "model\\name";
+    cfg.providers = &.{
+        .{
+            .name = "prov\"ider",
+            .api_key = "key\\\"line\nnext",
+            .base_url = "https://example.com/v1?name=\"model\"",
+        },
+    };
+    cfg.diagnostics.backend = "otel\"json";
+    cfg.diagnostics.otel_endpoint = "https://otel.example/v1?x=\"y\"";
+    cfg.diagnostics.otel_service_name = "null\\alis";
+    cfg.reliability.fallback_providers = &.{ "fallback\"one", "fallback\\two" };
+    cfg.reliability.api_keys = &.{"api\"key"};
+    cfg.reliability.model_fallbacks = &.{
+        .{
+            .model = "primary\"model",
+            .fallbacks = &.{"fallback\nmodel"},
+        },
+    };
+    cfg.channels.telegram = &.{
+        .{
+            .account_id = "acct\"one",
+            .bot_token = "tok\\en\nnext",
+        },
+    };
+    cfg.tools.web_search_provider = "exa\"provider";
+    cfg.tools.web_search_exa_api_key = "exa\\key";
+    cfg.tools.web_search_brave_api_key = "brave\"key";
+    cfg.audio_media.enabled = true;
+    cfg.audio_media.provider = "groq\"audio";
+    cfg.audio_media.model = "whisper\\model";
+    cfg.audio_media.base_url = "https://audio.example/v1?x=\"y\"";
+    cfg.audio_media.language = "en\"US";
+
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expectEqualStrings("std\"ard\\profile", loaded.profile);
+    try std.testing.expectEqualStrings("high", loaded.reasoning_effort.?);
+    try std.testing.expectEqualStrings("prov\"ider", loaded.default_provider);
+    try std.testing.expectEqualStrings("model\\name", loaded.default_model.?);
+    try std.testing.expectEqual(@as(usize, 1), loaded.providers.len);
+    try std.testing.expectEqualStrings("key\\\"line\nnext", loaded.providers[0].api_key.?);
+    try std.testing.expectEqualStrings("https://example.com/v1?name=\"model\"", loaded.providers[0].base_url.?);
+    try std.testing.expectEqualStrings("otel\"json", loaded.diagnostics.backend);
+    try std.testing.expectEqualStrings("https://otel.example/v1?x=\"y\"", loaded.diagnostics.otel_endpoint.?);
+    try std.testing.expectEqualStrings("null\\alis", loaded.diagnostics.otel_service_name.?);
+    try std.testing.expectEqualStrings("fallback\"one", loaded.reliability.fallback_providers[0]);
+    try std.testing.expectEqualStrings("api\"key", loaded.reliability.api_keys[0]);
+    try std.testing.expectEqualStrings("primary\"model", loaded.reliability.model_fallbacks[0].model);
+    try std.testing.expectEqualStrings("fallback\nmodel", loaded.reliability.model_fallbacks[0].fallbacks[0]);
+    try std.testing.expectEqual(@as(usize, 1), loaded.channels.telegram.len);
+    try std.testing.expectEqualStrings("acct\"one", loaded.channels.telegram[0].account_id);
+    try std.testing.expectEqualStrings("tok\\en\nnext", loaded.channels.telegram[0].bot_token);
+    try std.testing.expectEqualStrings("exa\"provider", loaded.tools.web_search_provider);
+    try std.testing.expectEqualStrings("exa\\key", loaded.tools.web_search_exa_api_key);
+    try std.testing.expectEqualStrings("brave\"key", loaded.tools.web_search_brave_api_key);
+    try std.testing.expectEqualStrings("groq\"audio", loaded.audio_media.provider);
+    try std.testing.expectEqualStrings("whisper\\model", loaded.audio_media.model);
+    try std.testing.expectEqualStrings("https://audio.example/v1?x=\"y\"", loaded.audio_media.base_url.?);
+    try std.testing.expectEqualStrings("en\"US", loaded.audio_media.language.?);
 }
 
 test "parseJson accepts integer semantic cache similarity threshold" {

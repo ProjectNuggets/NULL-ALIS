@@ -148,15 +148,20 @@ pub const OpenAiCompatibleProvider = struct {
         message: []const u8,
         model: []const u8,
     ) ![]const u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        try buf.appendSlice(allocator, "{\"model\":");
+        try root.appendJsonString(&buf, allocator, model);
+        try buf.appendSlice(allocator, ",\"input\":[{\"role\":\"user\",\"content\":");
+        try root.appendJsonString(&buf, allocator, message);
+        try buf.appendSlice(allocator, "}]");
         if (system_prompt) |sys| {
-            return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","input":[{{"role":"user","content":"{s}"}}],"instructions":"{s}","stream":false}}
-            , .{ model, message, sys });
-        } else {
-            return std.fmt.allocPrint(allocator,
-                \\{{"model":"{s}","input":[{{"role":"user","content":"{s}"}}],"stream":false}}
-            , .{ model, message });
+            try buf.appendSlice(allocator, ",\"instructions\":");
+            try root.appendJsonString(&buf, allocator, sys);
         }
+        try buf.appendSlice(allocator, ",\"stream\":false}");
+        return try buf.toOwnedSlice(allocator);
     }
 
     /// Extract text from a Responses API JSON response.
@@ -286,9 +291,9 @@ pub const OpenAiCompatibleProvider = struct {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
 
-        try buf.appendSlice(allocator, "{\"model\":\"");
-        try buf.appendSlice(allocator, model);
-        try buf.appendSlice(allocator, "\",\"messages\":[");
+        try buf.appendSlice(allocator, "{\"model\":");
+        try root.appendJsonString(&buf, allocator, model);
+        try buf.appendSlice(allocator, ",\"messages\":[");
 
         if (system_prompt) |sys| {
             try buf.appendSlice(allocator, "{\"role\":\"system\",\"content\":");
@@ -873,6 +878,27 @@ test "buildRequestBody with system" {
     try std.testing.expect(std.mem.indexOf(u8, body, "user") != null);
 }
 
+test "buildRequestBody escapes JSON strings" {
+    const body = try OpenAiCompatibleProvider.buildRequestBody(
+        std.testing.allocator,
+        "system \"quoted\"\nline",
+        "user \\ path \"quoted\"",
+        "model\"x",
+        0.4,
+    );
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    const root_obj = parsed.value.object;
+    try std.testing.expectEqualStrings("model\"x", root_obj.get("model").?.string);
+    const messages = root_obj.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("system \"quoted\"\nline", messages[0].object.get("content").?.string);
+    try std.testing.expectEqualStrings("user \\ path \"quoted\"", messages[1].object.get("content").?.string);
+}
+
 test "parseTextResponse extracts content" {
     const body =
         \\{"choices":[{"message":{"content":"Hello from Venice!"}}]}
@@ -1152,6 +1178,26 @@ test "buildResponsesRequestBody without system" {
     try std.testing.expect(std.mem.indexOf(u8, body, "gpt-4o") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "instructions") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
+}
+
+test "buildResponsesRequestBody escapes JSON strings" {
+    const body = try OpenAiCompatibleProvider.buildResponsesRequestBody(
+        std.testing.allocator,
+        "system \"quoted\"\nline",
+        "user \\ path \"quoted\"",
+        "gpt\"4o",
+    );
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    const root_obj = parsed.value.object;
+    try std.testing.expectEqualStrings("gpt\"4o", root_obj.get("model").?.string);
+    const input = root_obj.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), input.len);
+    try std.testing.expectEqualStrings("user \\ path \"quoted\"", input[0].object.get("content").?.string);
+    try std.testing.expectEqualStrings("system \"quoted\"\nline", root_obj.get("instructions").?.string);
 }
 
 test "AuthStyle custom headerName fallback" {

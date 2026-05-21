@@ -443,11 +443,10 @@ fn dropOldestPairsFromMiddle(
     // for that. So Pass A pays one LLM call per fire, not two. Pass C +
     // session-end keep both calls. Dedup at persistExtracted handles
     // overlap with downstream Pass C extraction of the surviving tail.
-    // V1.14.12 (Path A) — Pass A judge guard removed. extractAtBoundary
-    // now handles null-judge gracefully via runner.zig:798 (constructs
-    // JudgeContext only when judge_model is non-empty). No-judge
-    // tenants get MD5+canonical-key dedup-only extraction at this
-    // mid-session drop boundary.
+    // The runner can use a dedicated extraction provider/model without a
+    // contradiction judge, but this legacy path only has the judge-backed
+    // extraction config available. Avoid routing arbitrary compaction
+    // providers through the structured extraction parser.
     {
         const window = history.items[drop_start..drop_end];
         var msgs_buf = std.ArrayListUnmanaged(ChatMessage).initCapacity(allocator, window.len) catch null;
@@ -456,7 +455,7 @@ fn dropOldestPairsFromMiddle(
             for (window) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
             const judge_model_resolved = config.extraction_judge_model_name orelse "";
             const ctx = extraction_runner.ExtractionContext{
-                .judge_provider = config.extraction_judge_provider orelse undefined,
+                .judge_provider = config.extraction_judge_provider,
                 .judge_model = judge_model_resolved,
                 .state_mgr = config.extraction_state_mgr,
                 .user_id = config.extraction_user_id,
@@ -682,10 +681,10 @@ fn compactHistoryKeepingRecent(
     // <session>) using the configured judge provider. Failure-soft per layer;
     // existing JSON-tail path at lines 637-710 remains the primary edge writer
     // until C5 cleanup. Dedup at persistExtracted handles overlap.
-    // V1.14.12 (Path A) — judge guard removed. extractAtBoundary now
-    // accepts null judge via runner.zig:798 (constructs JudgeContext
-    // only when judge_model is non-empty). No-judge tenants get
-    // graceful MD5+canonical-key dedup-only extraction.
+    // The runner can use a dedicated extraction provider/model without a
+    // contradiction judge, but this legacy path only has the judge-backed
+    // extraction config available. Avoid routing arbitrary compaction
+    // providers through the structured extraction parser.
     {
         const window = history.items[start..compact_end];
         var msgs_buf = std.ArrayListUnmanaged(ChatMessage).initCapacity(allocator, window.len) catch null;
@@ -694,7 +693,7 @@ fn compactHistoryKeepingRecent(
             for (window) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
             const judge_model_resolved = config.extraction_judge_model_name orelse "";
             const ctx = extraction_runner.ExtractionContext{
-                .judge_provider = config.extraction_judge_provider orelse undefined,
+                .judge_provider = config.extraction_judge_provider,
                 .judge_model = judge_model_resolved,
                 .state_mgr = config.extraction_state_mgr,
                 .user_id = config.extraction_user_id,
@@ -1944,7 +1943,7 @@ test "dropOldestPairsFromMiddle no-op when total under keep_recent + protect pre
 // V1.14.8 C6: extractFromDropWindow skip-path tests removed alongside the
 // function. Pass A is now wired through extraction_runner.extractAtBoundary
 // — its skip-path coverage lives in extraction/runner.zig's tests
-// ("extractAtBoundary skip path: empty window", "empty judge_model",
+// ("extractAtBoundary skip path: empty window", "empty extraction model",
 // "no state mgr", "zero edges").
 
 // V1.14.12 (Path A) — `extraction_legacy_direct_writes defaults to true` test

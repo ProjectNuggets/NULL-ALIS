@@ -4,6 +4,7 @@
 //! and the same path safety checks as file_edit.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -13,6 +14,7 @@ const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed
 
 /// Default maximum file size to read before appending (10MB).
 const DEFAULT_MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
+const UNAVAILABLE_WORKSPACE_SENTINEL = "\x00";
 
 /// Append content to the end of a file with workspace path scoping.
 pub const FileAppendTool = struct {
@@ -77,14 +79,32 @@ pub const FileAppendTool = struct {
         // Resolve workspace path (may fail if workspace doesn't exist yet)
         const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
         defer if (ws_resolved) |wr| allocator.free(wr);
-        const ws_str = ws_resolved orelse "";
+        const ws_str = ws_resolved orelse UNAVAILABLE_WORKSPACE_SENTINEL;
+
+        const resolved_target: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, full_path) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => {
+                const msg = try std.fmt.allocPrint(allocator, "Failed to resolve path: {}", .{err});
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            },
+        };
+        defer if (resolved_target) |rt| allocator.free(rt);
+
+        const parent_to_check = std.fs.path.dirname(full_path) orelse full_path;
+        const resolved_ancestor = resolveNearestExistingAncestor(allocator, parent_to_check) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Failed to resolve path: {}", .{err});
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        };
+        defer allocator.free(resolved_ancestor);
+
+        if (!isResolvedPathAllowed(allocator, resolved_ancestor, ws_str, self.allowed_paths)) {
+            return ToolResult.fail("Path is outside allowed areas");
+        }
 
         // Try to read existing content
         const existing = blk: {
-            const resolved = std.fs.cwd().realpathAlloc(allocator, full_path) catch {
+            const resolved = resolved_target orelse
                 break :blk @as(?[]const u8, null);
-            };
-            defer allocator.free(resolved);
 
             if (!isResolvedPathAllowed(allocator, resolved, ws_str, self.allowed_paths)) {
                 return ToolResult.fail("Path is outside allowed areas");
@@ -111,17 +131,98 @@ pub const FileAppendTool = struct {
             try allocator.dupe(u8, content);
         defer allocator.free(new_contents);
 
-        // Write back
-        const file_w = std.fs.cwd().createFile(full_path, .{ .truncate = true }) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to create/open file: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        const existing_is_symlink = if (resolved_target != null) blk: {
+            if (comptime builtin.os.tag == .windows) break :blk false;
+            break :blk isSymlinkPath(full_path) catch |err| {
+                const msg = try std.fmt.allocPrint(allocator, "Failed to resolve path: {}", .{err});
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            };
+        } else false;
+
+        const write_path = if (existing_is_symlink)
+            try allocator.dupe(u8, resolved_target.?)
+        else
+            try allocator.dupe(u8, full_path);
+        defer allocator.free(write_path);
+
+        const existing_mode: ?std.fs.File.Mode = blk: {
+            const st = std.fs.cwd().statFile(write_path) catch |err| switch (err) {
+                error.FileNotFound => break :blk null,
+                else => {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to stat file: {}", .{err});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                },
+            };
+            break :blk st.mode;
         };
+
+        const parent = std.fs.path.dirname(write_path) orelse write_path;
+        const basename = std.fs.path.basename(write_path);
+        var parent_dir = if (std.fs.path.isAbsolute(parent))
+            std.fs.openDirAbsolute(parent, .{}) catch |err| {
+                const msg = try std.fmt.allocPrint(allocator, "Failed to open directory: {}", .{err});
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            }
+        else
+            std.fs.cwd().openDir(parent, .{}) catch |err| {
+                const msg = try std.fmt.allocPrint(allocator, "Failed to open directory: {}", .{err});
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            };
+        defer parent_dir.close();
+
+        var tmp_name_buf: [128]u8 = undefined;
+        var tmp_name_len: usize = 0;
+        var tmp_file: ?std.fs.File = null;
+        var attempt: usize = 0;
+        while (attempt < 32) : (attempt += 1) {
+            const tmp_name = std.fmt.bufPrint(
+                &tmp_name_buf,
+                ".nullalis-append-{d}-{d}.tmp",
+                .{ std.time.nanoTimestamp(), attempt },
+            ) catch unreachable;
+            tmp_file = parent_dir.createFile(tmp_name, .{ .exclusive = true }) catch |err| switch (err) {
+                error.PathAlreadyExists => continue,
+                else => {
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to create file: {}", .{err});
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                },
+            };
+            tmp_name_len = tmp_name.len;
+            break;
+        }
+        if (tmp_file == null) {
+            return ToolResult.fail("Failed to create temporary file");
+        }
+
+        var file_w = tmp_file.?;
         defer file_w.close();
+
+        if (comptime std.fs.has_executable_bit) {
+            if (existing_mode) |mode| {
+                if (mode != 0) {
+                    file_w.chmod(mode) catch |err| {
+                        const msg = try std.fmt.allocPrint(allocator, "Failed to preserve file mode: {}", .{err});
+                        return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                    };
+                }
+            }
+        }
+
+        var committed = false;
+        defer if (!committed and tmp_name_len > 0) {
+            parent_dir.deleteFile(tmp_name_buf[0..tmp_name_len]) catch {};
+        };
 
         file_w.writeAll(new_contents) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to write file: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
+
+        parent_dir.rename(tmp_name_buf[0..tmp_name_len], basename) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "Failed to replace file: {}", .{err});
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        };
+        committed = true;
 
         // Verify newly created files are within allowed areas
         if (existing == null) {
@@ -140,6 +241,35 @@ pub const FileAppendTool = struct {
         return ToolResult{ .success = true, .output = msg };
     }
 };
+
+fn resolveNearestExistingAncestor(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    return std.fs.cwd().realpathAlloc(allocator, path) catch |err| switch (err) {
+        error.FileNotFound => {
+            const parent = std.fs.path.dirname(path) orelse return err;
+            if (std.mem.eql(u8, parent, path)) return err;
+            return resolveNearestExistingAncestor(allocator, parent);
+        },
+        else => return err,
+    };
+}
+
+fn isSymlinkPath(path: []const u8) !bool {
+    const dir_path = std.fs.path.dirname(path) orelse ".";
+    const entry_name = std.fs.path.basename(path);
+    var dir = if (std.fs.path.isAbsolute(dir_path))
+        try std.fs.openDirAbsolute(dir_path, .{})
+    else
+        try std.fs.cwd().openDir(dir_path, .{});
+    defer dir.close();
+
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = dir.readLink(entry_name, &link_buf) catch |err| switch (err) {
+        error.NotLink => return false,
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
 
 // ── Tests ───────────────────────────────────────────────────────────
 
@@ -222,6 +352,69 @@ test "FileAppendTool creates new file" {
     const actual = try tmp_dir.dir.readFileAlloc(testing.allocator, "new.txt", 4096);
     defer testing.allocator.free(actual);
     try testing.expectEqualStrings("hello", actual);
+}
+
+test "FileAppendTool blocks parent symlink escape before creating file" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var ws_tmp = testing.tmpDir(.{});
+    defer ws_tmp.cleanup();
+    var outside_tmp = testing.tmpDir(.{});
+    defer outside_tmp.cleanup();
+
+    const ws_path = try ws_tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(ws_path);
+    const outside_path = try outside_tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(outside_path);
+
+    try ws_tmp.dir.symLink(outside_path, "escape_dir", .{});
+
+    var fat = FileAppendTool{ .workspace_dir = ws_path };
+    const parsed = try root.parseTestArgs("{\"path\":\"escape_dir/pwned.txt\",\"content\":\"pwned\"}");
+    defer parsed.deinit();
+    const result = try fat.execute(testing.allocator, parsed.value.object);
+
+    try testing.expect(!result.success);
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "outside allowed areas") != null);
+    try testing.expectError(error.FileNotFound, outside_tmp.dir.openFile("pwned.txt", .{}));
+}
+
+test "FileAppendTool does not mutate outside inode through hard link" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var ws_tmp = testing.tmpDir(.{});
+    defer ws_tmp.cleanup();
+    var outside_tmp = testing.tmpDir(.{});
+    defer outside_tmp.cleanup();
+
+    const ws_path = try ws_tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(ws_path);
+    const outside_path = try outside_tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(outside_path);
+
+    try outside_tmp.dir.writeFile(.{ .sub_path = "outside.txt", .data = "SAFE" });
+    const outside_file = try std.fs.path.join(testing.allocator, &.{ outside_path, "outside.txt" });
+    defer testing.allocator.free(outside_file);
+    const hardlink_path = try std.fs.path.join(testing.allocator, &.{ ws_path, "hl.txt" });
+    defer testing.allocator.free(hardlink_path);
+
+    try std.posix.link(outside_file, hardlink_path);
+
+    var fat = FileAppendTool{ .workspace_dir = ws_path };
+    const parsed = try root.parseTestArgs("{\"path\":\"hl.txt\",\"content\":\"!\"}");
+    defer parsed.deinit();
+    const result = try fat.execute(testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| testing.allocator.free(e);
+    try testing.expect(result.success);
+
+    const workspace_actual = try ws_tmp.dir.readFileAlloc(testing.allocator, "hl.txt", 1024);
+    defer testing.allocator.free(workspace_actual);
+    try testing.expectEqualStrings("SAFE!", workspace_actual);
+
+    const outside_actual = try outside_tmp.dir.readFileAlloc(testing.allocator, "outside.txt", 1024);
+    defer testing.allocator.free(outside_actual);
+    try testing.expectEqualStrings("SAFE", outside_actual);
 }
 
 test "FileAppendTool appends to empty file" {

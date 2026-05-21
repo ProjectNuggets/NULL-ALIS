@@ -222,6 +222,33 @@ pub const ToolDescription = struct {
     }
 };
 
+/// Render a ToolDescription into deterministic prose at comptime.
+/// This bridges structured descriptions into the runtime tool vtable so
+/// the LLM-visible tool docs cannot drift from lint-only metadata.
+pub fn renderDescriptionComptime(comptime desc: ToolDescription) []const u8 {
+    comptime var out: []const u8 = "# " ++ desc.what ++ "\n\n## Use When\n\n";
+    inline for (desc.use_when) |trigger| {
+        out = out ++ "- " ++ trigger ++ "\n";
+    }
+    out = out ++ "\n## Do Not Use For\n\n";
+    inline for (desc.do_not_use_for) |antiuse| {
+        out = out ++ "- " ++ antiuse ++ "\n";
+    }
+    if (desc.cost_note) |note| {
+        out = out ++ "\n## Cost\n\n" ++ note ++ "\n";
+    }
+    if (desc.completion_hint) |hint| {
+        out = out ++ "\n## Completion\n\n" ++ hint ++ "\n";
+    }
+    if (desc.see_also.len > 0) {
+        out = out ++ "\n## See Also\n\n";
+        inline for (desc.see_also) |sibling| {
+            out = out ++ "- " ++ sibling ++ "\n";
+        }
+    }
+    return out;
+}
+
 // ── Comptime metadata extraction ────────────────────────────────────
 
 /// Extract metadata from a tool type at compile time.
@@ -304,6 +331,26 @@ test "lookupMetadata returns null for unknown" {
         .{ .name = "alpha" },
     };
     try std.testing.expect(lookupMetadata("nonexistent", &reg) == null);
+}
+
+test "renderDescriptionComptime includes structured sections" {
+    const rendered = comptime renderDescriptionComptime(.{
+        .what = "Perform a deterministic example operation.",
+        .use_when = &.{
+            "A structured trigger applies",
+            "The example operation is requested",
+        },
+        .do_not_use_for = &.{
+            "Unrelated work — shell",
+            "Persistent storage — memory_store",
+        },
+        .completion_hint = "Returns structured prose.",
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "## Use When") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "A structured trigger applies") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "## Do Not Use For") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Returns structured prose.") != null);
 }
 
 test "RiskLevel toSlice returns correct strings" {

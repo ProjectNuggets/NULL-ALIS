@@ -268,28 +268,8 @@ pub fn writeStabilityJsonl(allocator: std.mem.Allocator, record: StabilityRecord
     defer allocator.free(env_path);
     if (env_path.len == 0) return;
 
-    // Buffer sized for the JSON skeleton (~340 chars post-Finding-2) + a
-    // generous session identifier. Production session keys are bounded by
-    // the prefix + user-id + thread-id structure; ~256 is the conservative
-    // ceiling.
-    var buf: [1024]u8 = undefined;
-    const line = std.fmt.bufPrint(
-        &buf,
-        "{{\"turn_start_ms\":{d},\"ingest_ms\":{d},\"assemble_ms\":{d},\"compact_ms_main_site_only\":{d},\"after_turn_ms\":{d},\"total_turn_ms\":{d},\"stable_prefix_hash\":\"{x}\",\"stable_prefix_bytes\":{d},\"tail_hash\":\"{x}\",\"tail_bytes\":{d},\"session\":\"{s}\"}}\n",
-        .{
-            record.turn_start_ms,
-            record.ingest_ms,
-            record.assemble_ms,
-            record.compact_ms_main_site_only,
-            record.after_turn_ms,
-            record.total_turn_ms,
-            record.stable_prefix_hash,
-            record.stable_prefix_bytes,
-            record.tail_hash,
-            record.tail_bytes,
-            record.session,
-        },
-    ) catch return;
+    const line = formatStabilityJsonlLine(allocator, record) catch return;
+    defer allocator.free(line);
 
     const file = std.fs.cwd().createFile(env_path, .{
         .truncate = false,
@@ -299,6 +279,30 @@ pub fn writeStabilityJsonl(allocator: std.mem.Allocator, record: StabilityRecord
     defer file.close();
     file.seekFromEnd(0) catch return;
     _ = file.writeAll(line) catch return;
+}
+
+fn formatStabilityJsonlLine(allocator: std.mem.Allocator, record: StabilityRecord) ![]u8 {
+    const stable_prefix_hash = try std.fmt.allocPrint(allocator, "{x}", .{record.stable_prefix_hash});
+    defer allocator.free(stable_prefix_hash);
+    const tail_hash = try std.fmt.allocPrint(allocator, "{x}", .{record.tail_hash});
+    defer allocator.free(tail_hash);
+
+    const json = try std.json.Stringify.valueAlloc(allocator, .{
+        .turn_start_ms = record.turn_start_ms,
+        .ingest_ms = record.ingest_ms,
+        .assemble_ms = record.assemble_ms,
+        .compact_ms_main_site_only = record.compact_ms_main_site_only,
+        .after_turn_ms = record.after_turn_ms,
+        .total_turn_ms = record.total_turn_ms,
+        .stable_prefix_hash = stable_prefix_hash,
+        .stable_prefix_bytes = record.stable_prefix_bytes,
+        .tail_hash = tail_hash,
+        .tail_bytes = record.tail_bytes,
+        .session = record.session,
+    }, .{});
+    defer allocator.free(json);
+
+    return try std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1196,6 +1200,65 @@ test "AssembleResult exposes prefix + tail hash defaults" {
     try std.testing.expectEqual(@as(usize, 0), r.tail_bytes);
     try std.testing.expect(!r.compaction_recommended);
     try std.testing.expect(!r.prompt_refreshed);
+}
+
+test "formatStabilityJsonlLine escapes session and preserves hash strings" {
+    const allocator = std.testing.allocator;
+    const session = "agent:\"zaki\"\nmain\\tail";
+    const line = try formatStabilityJsonlLine(allocator, .{
+        .turn_start_ms = 11,
+        .ingest_ms = 1,
+        .assemble_ms = 2,
+        .compact_ms_main_site_only = 3,
+        .after_turn_ms = 4,
+        .total_turn_ms = 10,
+        .stable_prefix_hash = 0xabc,
+        .stable_prefix_bytes = 123,
+        .tail_hash = 0x2a,
+        .tail_bytes = 45,
+        .session = session,
+    });
+    defer allocator.free(line);
+
+    try std.testing.expect(line.len > 0);
+    try std.testing.expectEqual(@as(u8, '\n'), line[line.len - 1]);
+
+    const json = line[0 .. line.len - 1];
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    try std.testing.expectEqualStrings(session, obj.get("session").?.string);
+    try std.testing.expectEqualStrings("abc", obj.get("stable_prefix_hash").?.string);
+    try std.testing.expectEqualStrings("2a", obj.get("tail_hash").?.string);
+    try std.testing.expectEqual(@as(i64, 11), obj.get("turn_start_ms").?.integer);
+}
+
+test "formatStabilityJsonlLine handles long session identifiers" {
+    const allocator = std.testing.allocator;
+    const session = try allocator.alloc(u8, 1500);
+    defer allocator.free(session);
+    @memset(session, 's');
+
+    const line = try formatStabilityJsonlLine(allocator, .{
+        .turn_start_ms = 1,
+        .ingest_ms = 0,
+        .assemble_ms = 0,
+        .compact_ms_main_site_only = 0,
+        .after_turn_ms = 0,
+        .total_turn_ms = 0,
+        .stable_prefix_hash = 0,
+        .stable_prefix_bytes = 0,
+        .tail_hash = 0,
+        .tail_bytes = 0,
+        .session = session,
+    });
+    defer allocator.free(line);
+
+    try std.testing.expect(line.len > 1024);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line[0 .. line.len - 1], .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1500), parsed.value.object.get("session").?.string.len);
 }
 
 // v1.14.14 Phase 3: helper for the compact + forceCompact tests below. The

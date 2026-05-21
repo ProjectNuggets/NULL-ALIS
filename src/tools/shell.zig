@@ -165,6 +165,7 @@ pub const ShellTool = struct {
                 .cwd = effective_cwd,
                 .env_map = &env,
                 .max_output_bytes = self.max_output_bytes,
+                .timeout_ns = self.timeout_ns,
             },
         ) catch |err| {
             return switch (err) {
@@ -177,6 +178,13 @@ pub const ShellTool = struct {
 
         // Audit trail: log command execution to memory (best-effort)
         self.recordAuditEntry(allocator, command, effective_cwd, result.success, result.exit_code);
+
+        if (result.timed_out) {
+            allocator.free(result.stdout);
+            const timeout_ms = self.timeout_ns / std.time.ns_per_ms;
+            const err_out = try std.fmt.allocPrint(allocator, "Command timed out after {d} ms", .{timeout_ms});
+            return ToolResult{ .success = false, .output = "", .error_msg = err_out };
+        }
 
         if (result.success) {
             if (result.stdout.len > 0) return ToolResult{ .success = true, .output = result.stdout };
@@ -427,9 +435,10 @@ test "shell allows in tenant runtime when sandbox is enabled" {
         .allowed_commands = &.{"echo"},
     };
     var st = ShellTool{
-        .workspace_dir = ".",
+        .workspace_dir = "/tmp",
         .policy = &pol,
         .sandbox_enabled = true, // sandbox provides the filesystem jail
+        .sandbox_backend = .none,
     };
     const t = st.tool();
 
@@ -443,7 +452,6 @@ test "shell allows in tenant runtime when sandbox is enabled" {
     // that path may fail in the test env without a real sandbox backend.
     // We only care here that the workspace_only guard did NOT trigger.
     if (result.error_msg) |msg| {
-        defer std.testing.allocator.free(msg);
         try std.testing.expect(std.mem.indexOf(u8, msg, "multi-tenant") == null);
     }
     if (result.output.len > 0) std.testing.allocator.free(result.output);
@@ -562,6 +570,25 @@ test "shell cwd with allowed_paths runs in cwd" {
 
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, tmp_path) != null);
+}
+
+test "shell enforces configured timeout" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var st = ShellTool{
+        .workspace_dir = "/tmp",
+        .allowed_paths = &.{"/tmp"},
+        .timeout_ns = 50 * std.time.ns_per_ms,
+    };
+    const parsed = try root.parseTestArgs("{\"command\":\"sleep 2; printf late\",\"cwd\":\"/tmp\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "timed out") != null);
 }
 
 test "shell cwd outside explicit tenant allowed_paths is rejected" {
