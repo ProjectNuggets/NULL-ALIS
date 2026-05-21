@@ -167,22 +167,32 @@ pub const WhatsAppChannel = struct {
         return result.toOwnedSlice(allocator);
     }
 
+    /// Extract a media object's optional `caption` field. WhatsApp Cloud API
+    /// nests a media caption inside the `image`/`video` object (it is not a
+    /// top-level text body). Returns a slice borrowed from the parsed JSON,
+    /// or null when there is no non-empty caption.
+    fn captionOf(media_obj: std.json.ObjectMap) ?[]const u8 {
+        const c = media_obj.get("caption") orelse return null;
+        return if (c == .string and c.string.len > 0) c.string else null;
+    }
+
     /// Pick the inbound media object — image or video — from a parsed WhatsApp
-    /// message object. Returns its media id plus the marker prefix multimodal.zig
-    /// expects (`[IMAGE:` or `[VIDEO:`), or null when the message carries
-    /// neither. `id` borrows from the caller's parsed JSON.
-    fn locateMediaRef(msg_obj: std.json.ObjectMap) ?struct { id: []const u8, marker_open: []const u8 } {
+    /// message object. Returns its media id, the marker prefix multimodal.zig
+    /// expects (`[IMAGE:` or `[VIDEO:`), and the media's optional caption, or
+    /// null when the message carries neither. All fields borrow from the
+    /// caller's parsed JSON.
+    fn locateMediaRef(msg_obj: std.json.ObjectMap) ?struct { id: []const u8, marker_open: []const u8, caption: ?[]const u8 } {
         if (msg_obj.get("image")) |o| {
             if (o == .object) {
                 if (o.object.get("id")) |idv| {
-                    if (idv == .string) return .{ .id = idv.string, .marker_open = "[IMAGE:" };
+                    if (idv == .string) return .{ .id = idv.string, .marker_open = "[IMAGE:", .caption = captionOf(o.object) };
                 }
             }
         }
         if (msg_obj.get("video")) |o| {
             if (o == .object) {
                 if (o.object.get("id")) |idv| {
-                    if (idv == .string) return .{ .id = idv.string, .marker_open = "[VIDEO:" };
+                    if (idv == .string) return .{ .id = idv.string, .marker_open = "[VIDEO:", .caption = captionOf(o.object) };
                 }
             }
         }
@@ -258,11 +268,17 @@ pub const WhatsAppChannel = struct {
             };
             file.close();
 
-            // Format as an [IMAGE:path] / [VIDEO:path] marker.
+            // Format as an [IMAGE:path] / [VIDEO:path] marker, appending the
+            // media caption when present so the agent sees it — mirroring the
+            // Telegram video path (telegram.zig processUpdate).
             var out_buf: std.ArrayListUnmanaged(u8) = .empty;
             out_buf.appendSlice(allocator, media_ref.marker_open) catch return null;
             out_buf.appendSlice(allocator, local_path) catch return null;
             out_buf.appendSlice(allocator, "]") catch return null;
+            if (media_ref.caption) |cap| {
+                out_buf.appendSlice(allocator, " ") catch return null;
+                out_buf.appendSlice(allocator, cap) catch return null;
+            }
             return out_buf.toOwnedSlice(allocator) catch null;
         } else |_| {
             return null;
@@ -596,6 +612,23 @@ test "whatsapp locateMediaRef prefers image when both present" {
     defer parsed.deinit();
     const ref = WhatsAppChannel.locateMediaRef(parsed.value.object).?;
     try std.testing.expectEqualStrings("[IMAGE:", ref.marker_open);
+}
+
+test "whatsapp locateMediaRef extracts a video caption" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"video\":{\"id\":\"v\",\"caption\":\"my clip\"}}", .{});
+    defer parsed.deinit();
+    const ref = WhatsAppChannel.locateMediaRef(parsed.value.object).?;
+    try std.testing.expectEqualStrings("my clip", ref.caption.?);
+}
+
+test "whatsapp locateMediaRef caption is null when absent or empty" {
+    var p1 = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"image\":{\"id\":\"i\"}}", .{});
+    defer p1.deinit();
+    try std.testing.expect(WhatsAppChannel.locateMediaRef(p1.value.object).?.caption == null);
+
+    var p2 = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"image\":{\"id\":\"i\",\"caption\":\"\"}}", .{});
+    defer p2.deinit();
+    try std.testing.expect(WhatsAppChannel.locateMediaRef(p2.value.object).?.caption == null);
 }
 
 test "whatsapp parse missing from field" {
