@@ -260,7 +260,19 @@ pub const Config = struct {
             .standard => {},
             .zaki_bot => {
                 if (self.default_model == null) {
-                    self.default_model = try self.allocator.dupe(u8, "moonshotai/kimi-k2.5");
+                    self.default_model = try self.allocator.dupe(u8, "moonshotai/Kimi-K2.6");
+                }
+                // `reasoning_effort` is the unified mode knob (fast/balanced/
+                // deep → low/medium/high); `medium` = the "balanced" default.
+                //
+                // HONEST NOTE (probed 2026-05-21, 6 live calls): Together does
+                // NOT currently honor `reasoning_effort` OR `thinking` for
+                // Kimi K2.6 — it reasons at a model-decided depth regardless.
+                // This default is intent-correct and takes effect if/when the
+                // provider honors it (or the model/provider changes); the
+                // mode-knob no-op is tracked separately, not wired here.
+                if (self.reasoning_effort == null) {
+                    self.reasoning_effort = try self.allocator.dupe(u8, "medium");
                 }
                 if (std.mem.eql(u8, self.default_provider, "openrouter") and self.reliability.fallback_providers.len == 0) {
                     self.reliability.fallback_providers = &.{"together"};
@@ -3638,7 +3650,7 @@ test "profile zaki_bot enables http request defaults" {
     try std.testing.expect(cfg.http_request.enabled);
     try std.testing.expect(!cfg.browser.enabled);
     try std.testing.expectEqualStrings("openrouter", cfg.default_provider);
-    try std.testing.expectEqualStrings("moonshotai/kimi-k2.5", cfg.default_model.?);
+    try std.testing.expectEqualStrings("moonshotai/Kimi-K2.6", cfg.default_model.?);
     try std.testing.expectEqual(@as(usize, 1), cfg.reliability.fallback_providers.len);
     try std.testing.expectEqualStrings("together", cfg.reliability.fallback_providers[0]);
     try std.testing.expectEqualStrings("postgres_hybrid", cfg.memory.profile);
@@ -3661,7 +3673,7 @@ test "profile defaults do not override explicit http request disable" {
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expect(!cfg.http_request.enabled);
-    try std.testing.expectEqualStrings("moonshotai/kimi-k2.5", cfg.default_model.?);
+    try std.testing.expectEqualStrings("moonshotai/Kimi-K2.6", cfg.default_model.?);
     try std.testing.expectEqual(@as(usize, 1), cfg.reliability.fallback_providers.len);
     try std.testing.expectEqualStrings("together", cfg.reliability.fallback_providers[0]);
 }
@@ -3691,7 +3703,7 @@ test "zaki_bot validation requires provider entry token and postgres" {
         .allocator = allocator,
         .profile = "zaki_bot",
         .default_provider = "together-ai",
-        .default_model = "moonshotai/kimi-k2.5",
+        .default_model = "moonshotai/Kimi-K2.6",
     };
 
     cfg.providers = &.{
@@ -3717,7 +3729,7 @@ test "zaki_bot validation rejects missing provider config" {
         .allocator = allocator,
         .profile = "zaki_bot",
         .default_provider = "together-ai",
-        .default_model = "moonshotai/kimi-k2.5",
+        .default_model = "moonshotai/Kimi-K2.6",
     };
     cfg.state.backend = "postgres";
     cfg.applySecretRuntimeOverrides(
@@ -3739,7 +3751,7 @@ test "zaki_bot validation rejects missing together api key" {
         .allocator = allocator,
         .profile = "zaki_bot",
         .default_provider = "together-ai",
-        .default_model = "moonshotai/kimi-k2.5",
+        .default_model = "moonshotai/Kimi-K2.6",
     };
 
     cfg.providers = &.{
@@ -3765,7 +3777,7 @@ test "zaki_bot validation rejects placeholder internal service token" {
         .allocator = allocator,
         .profile = "zaki_bot",
         .default_provider = "together-ai",
-        .default_model = "moonshotai/kimi-k2.5",
+        .default_model = "moonshotai/Kimi-K2.6",
     };
 
     cfg.providers = &.{
@@ -3791,7 +3803,7 @@ test "zaki_bot validation rejects placeholder postgres connection string" {
         .allocator = allocator,
         .profile = "zaki_bot",
         .default_provider = "together-ai",
-        .default_model = "moonshotai/kimi-k2.5",
+        .default_model = "moonshotai/Kimi-K2.6",
     };
 
     cfg.providers = &.{
