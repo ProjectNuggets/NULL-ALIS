@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
+const http_native = @import("../http_native/root.zig");
 
 const log = std.log.scoped(.email);
 
@@ -319,9 +320,28 @@ pub const EmailChannel = struct {
     }
 
     /// Initialize implicit TLS over an established TCP stream.
-    /// `server_name` is used for SNI + certificate hostname verification.
-    /// Mirrors the `irc.zig` initTls pattern.
+    ///
+    /// `server_name` is used both for SNI and for certificate hostname
+    /// verification. The connection carries the mailbox password (IMAP
+    /// `LOGIN`, SMTP `AUTH LOGIN`), so the certificate chain is verified
+    /// against the process-wide system CA bundle — an unverified
+    /// connection here would let an active MITM harvest credentials.
+    ///
+    /// FAIL-CLOSED: if the system CA bundle cannot be loaded, or if no
+    /// `server_name` is supplied (hostname verification would be
+    /// impossible), this returns an error and refuses the connection.
+    /// There is deliberately no `.no_verification` fallback.
+    ///
+    /// `allow_truncation_attacks = true` is retained: a truncation attack
+    /// can only cut a session short (a denial-of-service the polling loop
+    /// already tolerates by retrying), it cannot forge or read traffic,
+    /// so it is a far lesser concern than certificate verification.
     fn initTls(self: *EmailChannel, stream: std.net.Stream, server_name: []const u8) !*TlsState {
+        if (server_name.len == 0) return error.TlsInitializationFailed;
+
+        // Verified system trust anchor — fail closed if it cannot load.
+        const ca_bundle = http_native.sharedCaBundle() catch return error.TlsInitializationFailed;
+
         const tls_buf_len = std.crypto.tls.Client.min_buffer_len;
 
         const read_buf = try self.allocator.alloc(u8, tls_buf_len);
@@ -348,8 +368,8 @@ pub const EmailChannel = struct {
             tls.stream_reader.interface(),
             &tls.stream_writer.interface,
             .{
-                .host = if (server_name.len > 0) .{ .explicit = server_name } else .no_verification,
-                .ca = .no_verification,
+                .host = .{ .explicit = server_name },
+                .ca = .{ .bundle = ca_bundle },
                 .read_buffer = tls_read_buf,
                 .write_buffer = tls_write_buf,
                 .allow_truncation_attacks = true,

@@ -122,6 +122,16 @@ const shared_ca_bundle = struct {
     }
 };
 
+/// Process-wide verified CA bundle, lazily scanned from the system trust
+/// store and cached. Returns `error.CaBundleLoadFailed` if the system
+/// certificate store cannot be loaded — callers MUST fail closed rather
+/// than fall back to unverified TLS. Used by non-HTTP TLS clients (e.g.
+/// the email channel's IMAP/SMTP connections) so they verify certificates
+/// against the same trust anchor as the HTTP transport.
+pub fn sharedCaBundle() RequestError!Certificate.Bundle {
+    return shared_ca_bundle.get();
+}
+
 pub const RequestError = error{
     UnsupportedScheme,
     MissingHost,
