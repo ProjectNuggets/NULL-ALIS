@@ -22,7 +22,14 @@ pub const config = @import("config.zig");
 pub const util = @import("util.zig");
 pub const platform = @import("platform.zig");
 pub const version = @import("version.zig");
-pub const state = @import("state.zig");
+// v1.14.18 Step 8 (V6) — `state.zig` deleted. The legacy file-backed
+// runtime-state helper (`~/.nullalis/state.json`) had zero production
+// callers at audit time; everything tenant-Postgres reads/writes goes
+// through `zaki_state` (re-exported below). The audit's prescriptive
+// deprecation steps (warnings, migration script, --allow-legacy-state
+// gate) were predicated on live callers — with none, there is nothing
+// to deprecate. An operator with a stale `~/.nullalis/state.json` on
+// disk can safely delete it; no current code reads it.
 /// **S10.1** versioned schema-migrations framework. Replaces the
 /// boot-time `for (statements) |s| exec(s)` pattern in
 /// `zaki_state.zig::migrate`. See `src/migrations.zig` header for
