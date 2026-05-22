@@ -20398,7 +20398,7 @@ test "handleApiRoute GET settings ignores heartbeat state" {
     try std.testing.expectEqual(true, parsed.value.object.get("proactive_updates").?.bool);
 }
 
-test "handleApiRoute PATCH settings writes canonical tenant preferences and preserves unknown keys" {
+test "handleApiRoute PATCH settings writes canonical tenant preferences and strips non-product_settings keys" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -20465,7 +20465,11 @@ test "handleApiRoute PATCH settings writes canonical tenant preferences and pres
     try std.testing.expectEqualStrings("200 OK", get_response.status);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, get_response.body, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("bar", parsed.value.object.get("foo").?.string);
+    // Allowlist inversion (2026-05-22): the GET /config view normalizes the
+    // tenant config to the strict allowlist — only `product_settings`
+    // survives. The seeded unknown key `foo` and the operator block `agent`
+    // are both stripped (pre-inversion `foo` leaked through).
+    try std.testing.expect(parsed.value.object.get("foo") == null);
     const product = parsed.value.object.get("product_settings").?.object;
     try std.testing.expectEqualStrings("deep", product.get("assistant_mode").?.string);
     try std.testing.expectEqual(false, product.get("proactive_updates").?.bool);

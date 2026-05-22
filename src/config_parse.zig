@@ -708,6 +708,21 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (rel.object.get("scheduler_retries")) |v| {
                 if (v == .integer) self.reliability.scheduler_retries = @intCast(v.integer);
             }
+            // Finding-#4-class fix (2026-05-22): vision_fallback had a struct
+            // (VisionFallbackConfig) and its docstring even calls the unset
+            // state "a current regression" — but no parser, so `provider`/
+            // `model` were permanently empty and vision routing
+            // (root.zig:5088 `if (model.len == 0) return false`) was dead.
+            if (rel.object.get("vision_fallback")) |vf| {
+                if (vf == .object) {
+                    if (vf.object.get("provider")) |v| {
+                        if (v == .string) self.reliability.vision_fallback.provider = try self.allocator.dupe(u8, v.string);
+                    }
+                    if (vf.object.get("model")) |v| {
+                        if (v == .string) self.reliability.vision_fallback.model = try self.allocator.dupe(u8, v.string);
+                    }
+                }
+            }
         }
     }
 
