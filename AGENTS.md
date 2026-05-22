@@ -334,7 +334,7 @@ treated as defects, not preferences.
 - `docs/MULTI_AGENT_PLAN.md` — the agent dispatch matrix (which agent does what, file ownership,
   branch conventions, bench gate convergence). When you are spawned as Agent A/B/C/..., your
   scope, owned files, and closing standard come from this document.
-- `docs/STATUS.md` — current snapshot.
+- `STATUS.md` — current snapshot (repo root; `docs/STATUS.md` archived 2026-05-22).
 
 ### 14.1 Per-finding discipline (mandatory)
 

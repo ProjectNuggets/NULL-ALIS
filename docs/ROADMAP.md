@@ -1,39 +1,73 @@
 ---
 tags: [prose, prose/docs, prose/roadmap]
 authored: 2026-05-19
+reconciled: 2026-05-22
 author: Claude (father, full ownership per Nova directive)
+status: CANONICAL — the single roadmap/plan/map doc. No other plan doc exists.
 supersedes:
   - docs/v1.9-v2.0-product-roadmap.md (archived)
   - docs/zaki-product-roadmap.md (archived)
+  - .planning/ROADMAP.md (GSD v1.0-sota roadmap — archived 2026-05-22)
+  - the "Sprints 0-4" task-list re-cut (folded into "Near-term road" below)
+  - 8 FOLD docs reconciled here 2026-05-22 (see docs/archive/2026-05-22/)
+pairs_with: STATUS.md (the state doc — "where we are now"; this is "where we go")
 binds_to: AGENTS.md §14 (Nullalis-grade standards)
 ---
 
-# nullalis Roadmap — V1.14.13 → V2.0 → V-infinity
+# nullalis Roadmap — the canonical map
 
-**Authored:** 2026-05-19 (post v1.14.12 — memory audit closed, PR #72 in review)
+**THE single source of truth for the plan.** STATUS.md is the state doc (current code truth); this is the plan doc (the road ahead). There is no other roadmap, sprint-plan, or map doc — every prior one is archived or folded here (reconcile 2026-05-22).
+
 **Standard:** Swiss-watch build (`AGENTS.md` §14). No loose ends. No regressions. Bench-gated transitions.
 **Operating loop:** plan → recon → fix → review per finding. Atomic commits. Bench gate per block.
-**Versioning convention:** `v1.14.X` for patches within the current memory/extraction series. `v1.15+` for the next minor (τ-bench cycle). `v2.0` for commercial launch. `V-infinity` for the long arc.
+**Versioning:** `v1.14.X` patches within the memory/extraction series · `v1.15+` next minor · `v2.0` commercial launch · `V-infinity` the long arc.
+
+**Standing rules** (carried from the retired `.planning/ROADMAP.md`, still binding):
+1. **UI/UX activation is mandatory per shipped feature** — a backend capability with no surface is not "done."
+2. **Multi-session by default** — the agent is a persistent brain, not a per-conversation tool; design for memory across sessions.
+3. **Code truth beats docs** — when a doc disagrees with the code, the code wins; fix the doc (§14.9).
 
 ---
 
-## Where we are — code-truth state, 2026-05-19
+## Where we are — code-truth state, 2026-05-22
+
+`main` @ `6336bbf5`. Tags: `v1.14.12`, `v1.14.13`, `v1.14.14` shipped; `v1.14.18-A/B` merged by PR (#87/#98), not yet tagged.
 
 | Layer | State | Evidence |
 |---|---|---|
-| Memory | Sound + audited | v1.14.12 closed 13 findings; TxnLease primitive; entity-node rendering |
-| Extraction | Single funnel | V1.14.12 M1–M5 + Path A; 6 WriteOrigin variants; coverage filter live |
-| Context | Byte-stable | iter18-20 (Phase A/B/C); 70/80/90 thresholds; anti-thrash |
-| Approval | Closed | `approval_continues_turn=true`; regression test at root.zig:10711 |
-| Subagent receive | Closed | TurnOutcome refactor + V1.14.4 booth-readiness |
-| LoCoMo | 25/25 cold · 22-23/25 polluted | iter21 baseline |
-| τ-bench | Not yet baselined | **Sprint v1.14.13 baseline** |
+| Memory pipeline | **Repaired + verified end-to-end (2026-05-22)** | 4 stacked regressions fixed (findings #1–#4); Pass A/C extract, hydration + summaries persist |
+| Extraction | Single funnel, live | `extractAtBoundary`; boundary extractor now on a matched sidecar pair |
+| Compaction | Live (was silently OFF ~2 days) | `compact_context` default restored true; Pass A/C fire |
+| Config control plane | **Hardened** | Strict tenant allowlist; comptime exhaustiveness guard — Class-D bugs can't merge |
+| Context (ContextEngine) | Migrated (v1.14.14) | `ContextEngine.compact` is the live path |
+| Approval / Subagent receive | Closed | `approval_continues_turn=true`; TurnOutcome refactor |
+| Architecture | **Shared multi-tenant runtime** (decision 2026-05-22) | one pod, many users; per-cell pods deferred to v1.18 |
+| LoCoMo / τ-bench | **No clean K2.6 number** | the ~94% LoCoMo conv-0 was long-context recall on a then-dead pipeline; re-bench deferred (must be a multi-session / over-window test) |
 
-**Audit findings still open** (post-v1.14.12, captured by 3-agent file-by-file audit 2026-05-19): **67 total** — 9 HIGH, 31 MED, 27 LOW. Concentrated in: orphaned modules that were half-finished (`task_planner`, `narration`, `context_engine`, `tools/schema`), config zombies (Email/Teams/Nostr), false-confidence handlers (`handleReady`, `EMPTY_TURN_PLACEHOLDER`), aspirational prompt directives (F-A2).
+**What 2026-05-19 → 2026-05-22 actually did:** v1.14.13 + v1.14.14 tagged; the channel blocks (v1.14.15/.16/.17 Email/Teams/Nostr) were **deferred**, re-cut as "Sprint 2" below; v1.14.18-A/B (learning loop) merged. Then an **unplanned fire**: the memory pipeline was found silently dead (4 config/wiring regressions) and repaired, and the config control plane was audited + hardened. None of that was on this roadmap — it is now a closed block (`docs/CONFIG_CONTROL_PLANE_AUDIT.md`).
 
-**Audit ledger:** `docs/audits/2026-05-19-file-by-file-audit-ledger.md` is the active control ledger. The 67-count rollup is not closure evidence by itself; no block may be tagged until every relevant ledger row is closed by commit reference or explicitly deferred with rationale.
+**Audit ledger:** `docs/audits/2026-05-19-file-by-file-audit-ledger.md` remains the active control ledger (67 findings: 9 HIGH / 31 MED / 27 LOW — half-finished orphans, config zombies, false-confidence handlers). No block tags until its rows close. **These are unfinished work, not delete candidates (§14.2/§14.4) — the blocks below finish them.**
 
-**These are not "delete" candidates.** They are unfinished work (AGENTS.md §14.2 / §14.4). The roadmap below FINISHES them.
+---
+
+## Near-term road — the Sprints (P1)
+
+The active near-term sequence. "Sprints 0–4" was a tactical re-cut; reconciled here, it maps onto the version blocks:
+
+| Sprint | Scope | Maps to | State |
+|---|---|---|---|
+| Sprint 0 | Multimodal — native image + video | (PR #97) | ✅ done |
+| Sprint 1 | Learning-loop activation + §14.10 audit | v1.14.18-A/B (PR #87/#98) | ✅ done |
+| — | **Memory-pipeline repair + config hardening** | unplanned block (this session) | ✅ done 2026-05-22 |
+| **Sprint 2** | **Channels V1 + MCP V1** | v1.14.15 Email · .16 Teams · .17 Nostr + MCP | **P1 — next** |
+| **Sprint 3** | **Agent universal-environment access** (Swagger → access) | new — slots before v1.17 connectors | **P1** |
+| **Sprint 4** | **UI/UX activation + feature-freeze** | overlaps v1.16 frontend wave | **P1** |
+
+After the Sprints, the version blocks below carry the road to v2.0. **Deferred follow-ups** (tracked in `docs/CONFIG_CONTROL_PLANE_AUDIT.md`, not lost): `network` config parser+wiring · `agent.extraction` parse-or-delete · sentinel-collision profile pattern · streaming-path error mapping. **LoCoMo Cat-3 lift** (the R6/R3/R4/R2 lever set — temporal/inference 56–77% → 80%+) is folded into the v1.15.0 bench-iteration block.
+
+**Folded from retired plan docs (2026-05-22 reconcile)** — captured here so nothing is lost when the source docs archive: the **F-A2.1** (`brain_graph` as the real default for entity questions) / **F-T1** (strip `memory_recall` bloat from history) / **F-PA1** (information-preserving Pass A) fixes — verify shipped-status against code, carry any still-open one into `docs/deferred-register.md`; the **cognitive-layers track** (Working / Procedural / Dream-consolidation memory — partly landed, the v1.14.19 sleep cycle is its home); the **SOTA append-only context end-state** (ContextEngine migration at v1.14.14 covered the bulk).
+
+**Dangling references:** this doc cites `docs/capacity-model.md`, `docs/dr-runbook.md`, `docs/unit-economics-2026-XX-XX.md` — those are *outputs* of blocks v1.18/v1.18.5/v1.19.7, authored when those blocks run, not pre-existing files.
 
 ---
 
@@ -51,7 +85,7 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.13 — "Sandbox fail-closed + τ-bench baseline + wire what's built" → PLANNED (blocked on PR #72 merge; `sprint/v1.14.13` branch staged)
+## v1.14.13 — "Sandbox fail-closed + τ-bench baseline + wire what's built" → TAGGED v1.14.13
 
 **Theme:** Close the sandbox fail-open security hole FIRST (3-4 hours). Then lock the execution-quality measurement. Then wire the orphans the audit identified as half-finished.
 
@@ -131,7 +165,7 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.14 — "ContextEngine migration" → PLANNED
+## v1.14.14 — "ContextEngine migration" → TAGGED v1.14.14
 
 **Theme:** Complete the lifecycle refactor started in iter18-20. Route `root.zig::turn()` through `ContextEngine.ingest/assemble/compact/afterTurn` so the 5,000-line turn loop becomes 4 testable phases.
 
@@ -161,7 +195,7 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.15 — "Channels finish: Email" → PLANNED
+## v1.14.15 — "Channels finish: Email" → DEFERRED → Sprint 2 (Channels V1)
 
 **Theme:** First of three channel-completion blocks. Email is widest user reach.
 
@@ -185,7 +219,7 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.16 — "Channels finish: Teams" → PLANNED
+## v1.14.16 — "Channels finish: Teams" → DEFERRED → Sprint 2 (Channels V1)
 
 **Theme:** Enterprise wedge. Bot Framework webhook-based.
 
@@ -208,7 +242,7 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.17 — "Channels finish: Nostr" → PLANNED
+## v1.14.17 — "Channels finish: Nostr" → DEFERRED → Sprint 2 (Channels V1)
 
 **Theme:** V-infinity differentiation. Censorship-resistant relay.
 
@@ -280,7 +314,7 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.18-B — "Learning loop closure + self-knowledge" → PLANNED
+## v1.14.18-B — "Learning loop closure + self-knowledge" → MERGED (PR #98, awaiting tag)
 
 **Theme:** Close the latent-value gaps surfaced by the 2026-05-20 post-v1.14.14 activation
 audit (`docs/audits/2026-05-20-v1.14.14-activation-audit.md`). v1.14.18-A (Agent E) gives
@@ -807,10 +841,13 @@ Candidate pillar order (Nova-revisable):
 
 ---
 
-## Status as of authoring (2026-05-19)
+## Status as of 2026-05-22 reconcile
 
-- **v1.14.12** — TAGGED, PR #72 open for review
-- **v1.14.13** — NEXT (this is the active sprint)
-- Everything after — planned, awaiting v1.14.13 close
+- **v1.14.12 / .13 / .14** — TAGGED.
+- **v1.14.15 / .16 / .17** (Email/Teams/Nostr channels) — DEFERRED, re-cut as **Sprint 2 — Channels V1 + MCP V1**.
+- **v1.14.18-A / -B** (learning loop) — MERGED via PR #87 / #98; awaiting a `v1.14.18` tag.
+- **Memory-pipeline repair + config-control-plane hardening** — unplanned block, done 2026-05-22 (`docs/CONFIG_CONTROL_PLANE_AUDIT.md`).
+- **NEXT:** Sprint 2 (Channels V1 + MCP V1) → Sprint 3 (universal-environment access) → Sprint 4 (UI/UX + freeze), then the v1.15+ blocks to v2.0.
+- **v1.14.18 MED-tier sweep** — partially addressed by the §14.10 activation audit; the full 31-MED sweep is still open against the audit ledger.
 
 **The promise:** every block ships at the standard in AGENTS.md §14. Or it doesn't ship.

@@ -274,7 +274,7 @@ Read first (in this order):
   1. AGENTS.md §14 (Swiss-watch standards — these are MANDATORY)
   2. docs/ROADMAP.md → block v{BLOCK_NUMBER}
   3. docs/MULTI_AGENT_PLAN.md → your track's section
-  4. docs/STATUS.md (current state)
+  4. STATUS.md (current state — repo root)
 
 Your working directory: /Users/nova/Desktop/nullalis-agent-{LETTER}
   cd to this directory BEFORE running any git or build command. Do NOT work
