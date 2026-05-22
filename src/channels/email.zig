@@ -310,7 +310,9 @@ pub const EmailChannel = struct {
 
         try dw.writeAll("Content-Type: text/plain; charset=utf-8\r\n");
         try dw.writeAll("\r\n");
-        try dw.writeAll(body);
+        // RFC 5321 §4.5.2 dot-stuffing — a body line beginning with '.'
+        // must not be read as the end-of-data terminator.
+        try writeDotStuffed(dw, body);
         try dw.writeAll("\r\n.\r\n");
         try self.smtpWrite(stream, tls_state, data.items);
         // Final dot — expect 250 (message accepted for delivery).
@@ -945,6 +947,24 @@ pub fn smtpReplyCode(resp: []const u8) ?u16 {
 /// True when an SMTP reply code is the one expected for a command stage.
 pub fn smtpCodeIs(resp: []const u8, expected: u16) bool {
     return (smtpReplyCode(resp) orelse return false) == expected;
+}
+
+/// Write `body` into an SMTP DATA payload with RFC 5321 §4.5.2 dot-stuffing:
+/// any line that begins with `.` is sent with an extra leading `.`, so a
+/// body line of exactly `.` cannot be mistaken for the end-of-data
+/// terminator and a line like `.gitignore` is not silently corrupted (the
+/// receiving server strips the added dot). Lines are split on `\n`; the
+/// `\r` of a CRLF pair stays with its line.
+pub fn writeDotStuffed(w: anytype, body: []const u8) !void {
+    var start: usize = 0;
+    while (start < body.len) {
+        const nl = std.mem.indexOfScalarPos(u8, body, start, '\n');
+        const end = if (nl) |p| p + 1 else body.len;
+        const line = body[start..end];
+        if (line.len > 0 and line[0] == '.') try w.writeAll(".");
+        try w.writeAll(line);
+        start = end;
+    }
 }
 
 /// Parse a raw RFC 5322 message into a `ParsedEmail`.
@@ -1784,6 +1804,29 @@ test "smtpCodeIs matches expected stage codes" {
     try std.testing.expect(!smtpCodeIs("421 Service not available\r\n", 250));
     // Garbage never matches.
     try std.testing.expect(!smtpCodeIs("", 250));
+}
+
+test "writeDotStuffed escapes lines beginning with a dot" {
+    const allocator = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    // A lone "." line and a line starting with "." each gain a leading dot;
+    // ordinary lines, and a dot mid-line, are untouched.
+    try writeDotStuffed(w, "hello\r\n.\r\n.gitignore\r\nmid.dot\r\n");
+    try std.testing.expectEqualStrings(
+        "hello\r\n..\r\n..gitignore\r\nmid.dot\r\n",
+        out.items,
+    );
+}
+
+test "writeDotStuffed handles a trailing line without a newline" {
+    const allocator = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    try writeDotStuffed(w, ".trailing");
+    try std.testing.expectEqualStrings("..trailing", out.items);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
