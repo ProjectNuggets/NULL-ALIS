@@ -1,6 +1,15 @@
-//! Vector operations — cosine similarity, normalization, hybrid merge.
+//! Vector operations — cosine similarity and f32 vector serialization.
 //!
 //! Mirrors ZeroClaw's vector module for semantic search support.
+//!
+//! NOTE (v1.14.18, HYBRID-MERGE-DECISION): the legacy weighted-fusion
+//! `hybridMerge` (plus its `ScoredResult` / `IdScore` types) was removed
+//! here. It was fully superseded by Reciprocal Rank Fusion in
+//! `retrieval/rrf.zig::rrfMerge`, which is the production fusion stage of
+//! the documented pipeline (keyword → vector → RRF → min_relevance →
+//! temporal_decay → MMR → LLM_rerank → limit, see `retrieval/llm_reranker.zig`).
+//! `hybridMerge` had zero production callers — only its own tests and a
+//! dead re-export in `memory/root.zig`.
 
 const std = @import("std");
 
@@ -59,111 +68,6 @@ pub fn bytesToVec(allocator: std.mem.Allocator, bytes: []const u8) ![]f32 {
         result[i] = @bitCast(chunk.*);
     }
     return result;
-}
-
-// ── Scored result ─────────────────────────────────────────────────
-
-pub const ScoredResult = struct {
-    id: []const u8,
-    vector_score: ?f32 = null,
-    keyword_score: ?f32 = null,
-    final_score: f32 = 0.0,
-};
-
-// ── Hybrid merge ──────────────────────────────────────────────────
-
-pub const IdScore = struct {
-    id: []const u8,
-    score: f32,
-};
-
-/// Hybrid merge: combine vector and keyword results with weighted fusion.
-///
-/// Normalizes keyword scores to [0, 1]. Vector scores (cosine similarity)
-/// are assumed to already be in [0, 1].
-///
-/// final_score = vector_weight * vector_score + keyword_weight * keyword_score
-///
-/// Deduplicates by id. Results sorted by final_score descending.
-/// Caller owns the returned slice and must free it.
-pub fn hybridMerge(
-    allocator: std.mem.Allocator,
-    vector_results: []const IdScore,
-    keyword_results: []const IdScore,
-    vector_weight: f32,
-    keyword_weight: f32,
-    limit: usize,
-) ![]ScoredResult {
-    // Use a simple approach: collect all unique ids, track scores
-    var ids: std.ArrayList([]const u8) = .empty;
-    defer ids.deinit(allocator);
-
-    var vec_scores = std.StringHashMap(f32).init(allocator);
-    defer vec_scores.deinit();
-
-    var kw_scores = std.StringHashMap(f32).init(allocator);
-    defer kw_scores.deinit();
-
-    for (vector_results) |vr| {
-        const entry = try vec_scores.getOrPut(vr.id);
-        if (!entry.found_existing) {
-            entry.value_ptr.* = vr.score;
-            try ids.append(allocator, vr.id);
-        } else {
-            // Keep best score
-            entry.value_ptr.* = @max(entry.value_ptr.*, vr.score);
-        }
-    }
-
-    // Normalize keyword scores
-    var max_kw: f32 = 0.0;
-    for (keyword_results) |kr| {
-        max_kw = @max(max_kw, kr.score);
-    }
-    if (max_kw < std.math.floatEps(f32)) max_kw = 1.0;
-
-    for (keyword_results) |kr| {
-        const normalized = kr.score / max_kw;
-        const entry = try kw_scores.getOrPut(kr.id);
-        if (!entry.found_existing) {
-            entry.value_ptr.* = normalized;
-            // Check if this id already exists in vector results
-            if (!vec_scores.contains(kr.id)) {
-                try ids.append(allocator, kr.id);
-            }
-        } else {
-            entry.value_ptr.* = @max(entry.value_ptr.*, normalized);
-        }
-    }
-
-    // Build scored results
-    var results: std.ArrayList(ScoredResult) = .empty;
-    defer results.deinit(allocator);
-
-    for (ids.items) |id| {
-        const vs = vec_scores.get(id);
-        const ks = kw_scores.get(id);
-        const vs_val = vs orelse 0.0;
-        const ks_val = ks orelse 0.0;
-        const final = vector_weight * vs_val + keyword_weight * ks_val;
-        try results.append(allocator, .{
-            .id = id,
-            .vector_score = vs,
-            .keyword_score = ks,
-            .final_score = final,
-        });
-    }
-
-    // Sort by final_score descending
-    std.mem.sortUnstable(ScoredResult, results.items, {}, struct {
-        fn lessThan(_: void, lhs: ScoredResult, rhs: ScoredResult) bool {
-            return lhs.final_score > rhs.final_score;
-        }
-    }.lessThan);
-
-    // Truncate to limit
-    const actual_limit = @min(limit, results.items.len);
-    return allocator.dupe(ScoredResult, results.items[0..actual_limit]);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -266,90 +170,6 @@ test "bytes to vec three bytes returns empty" {
     const result = try bytesToVec(std.testing.allocator, &bytes);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqual(@as(usize, 0), result.len);
-}
-
-test "hybrid merge vector only" {
-    const vec_results = [_]IdScore{
-        .{ .id = "a", .score = 0.9 },
-        .{ .id = "b", .score = 0.5 },
-    };
-    const merged = try hybridMerge(std.testing.allocator, &vec_results, &.{}, 0.7, 0.3, 10);
-    defer std.testing.allocator.free(merged);
-
-    try std.testing.expectEqual(@as(usize, 2), merged.len);
-    try std.testing.expectEqualStrings("a", merged[0].id);
-    try std.testing.expect(merged[0].final_score > merged[1].final_score);
-}
-
-test "hybrid merge keyword only" {
-    const kw_results = [_]IdScore{
-        .{ .id = "x", .score = 10.0 },
-        .{ .id = "y", .score = 5.0 },
-    };
-    const merged = try hybridMerge(std.testing.allocator, &.{}, &kw_results, 0.7, 0.3, 10);
-    defer std.testing.allocator.free(merged);
-
-    try std.testing.expectEqual(@as(usize, 2), merged.len);
-    try std.testing.expectEqualStrings("x", merged[0].id);
-}
-
-test "hybrid merge deduplicates" {
-    const vec_results = [_]IdScore{
-        .{ .id = "a", .score = 0.9 },
-    };
-    const kw_results = [_]IdScore{
-        .{ .id = "a", .score = 10.0 },
-    };
-    const merged = try hybridMerge(std.testing.allocator, &vec_results, &kw_results, 0.7, 0.3, 10);
-    defer std.testing.allocator.free(merged);
-
-    try std.testing.expectEqual(@as(usize, 1), merged.len);
-    try std.testing.expectEqualStrings("a", merged[0].id);
-    try std.testing.expect(merged[0].vector_score != null);
-    try std.testing.expect(merged[0].keyword_score != null);
-    // Final score should be higher than vector alone
-    try std.testing.expect(merged[0].final_score > 0.7 * 0.9);
-}
-
-test "hybrid merge respects limit" {
-    var vec_results: [20]IdScore = undefined;
-    var id_bufs: [20][8]u8 = undefined;
-    for (0..20) |i| {
-        const id = std.fmt.bufPrint(&id_bufs[i], "item_{d}", .{i}) catch "?";
-        vec_results[i] = .{ .id = id, .score = 1.0 - @as(f32, @floatFromInt(i)) * 0.05 };
-    }
-    const merged = try hybridMerge(std.testing.allocator, &vec_results, &.{}, 1.0, 0.0, 5);
-    defer std.testing.allocator.free(merged);
-    try std.testing.expectEqual(@as(usize, 5), merged.len);
-}
-
-test "hybrid merge empty inputs" {
-    const merged = try hybridMerge(std.testing.allocator, &.{}, &.{}, 0.7, 0.3, 10);
-    defer std.testing.allocator.free(merged);
-    try std.testing.expectEqual(@as(usize, 0), merged.len);
-}
-
-test "hybrid merge limit zero" {
-    const vec_results = [_]IdScore{
-        .{ .id = "a", .score = 0.9 },
-    };
-    const merged = try hybridMerge(std.testing.allocator, &vec_results, &.{}, 0.7, 0.3, 0);
-    defer std.testing.allocator.free(merged);
-    try std.testing.expectEqual(@as(usize, 0), merged.len);
-}
-
-test "hybrid merge zero weights" {
-    const vec_results = [_]IdScore{
-        .{ .id = "a", .score = 0.9 },
-    };
-    const kw_results = [_]IdScore{
-        .{ .id = "b", .score = 10.0 },
-    };
-    const merged = try hybridMerge(std.testing.allocator, &vec_results, &kw_results, 0.0, 0.0, 10);
-    defer std.testing.allocator.free(merged);
-    for (merged) |r| {
-        try std.testing.expect(@abs(r.final_score) < std.math.floatEps(f32));
-    }
 }
 
 // ── R3 regression tests ───────────────────────────────────────────
