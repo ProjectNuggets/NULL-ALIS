@@ -587,7 +587,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 // Missing key keeps the struct default (30s); 0 disables
                 // the timeout for explicit opt-out.
                 if (val.object.get("read_line_timeout_secs")) |tv| {
-                    if (tv == .integer) mcp_cfg.read_line_timeout_secs = @intCast(tv.integer);
+                    // Guard the range: a negative integer would panic the
+                    // @intCast into u32 in a safe build. A non-integer or
+                    // out-of-range value is ignored, keeping the default.
+                    if (tv == .integer and tv.integer >= 0)
+                        mcp_cfg.read_line_timeout_secs = @intCast(tv.integer);
                 }
 
                 try mcp_list.append(self.allocator, mcp_cfg);
