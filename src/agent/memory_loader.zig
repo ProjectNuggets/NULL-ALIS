@@ -1430,13 +1430,22 @@ fn entityOverlapImpl(
     const max_count: f64 = @floatFromInt(rows[0].match_count);
 
     var out = try allocator.alloc(memory_mod.RetrievalCandidate, rows.len);
-    errdefer allocator.free(out);
+    var out_len: usize = 0; // tracks how many entries are fully initialised
+    errdefer {
+        // deinit only the fully-initialised entries to avoid freeing unset fields
+        for (out[0..out_len]) |*c| c.deinit(allocator);
+        allocator.free(out);
+    }
     for (rows, 0..) |row, i| {
         const score: f64 = if (max_count > 0.0)
             @as(f64, @floatFromInt(row.match_count)) / max_count
         else 0.0;
+        // Heap-allocate every field that RetrievalCandidate.deinit() will free.
+        // String literals must NOT be passed to allocator.free() — only the
+        // zero-length "" is safe (free returns early on len==0), but "entity_overlap"
+        // (len=14) would UB against a static segment pointer.
         out[i] = memory_mod.RetrievalCandidate{
-            .id           = "",
+            .id           = try allocator.dupe(u8, ""),
             .key          = try allocator.dupe(u8, row.memory_key),
             .content      = try allocator.dupe(u8, row.snippet), // MUST be non-empty
             .snippet      = try allocator.dupe(u8, row.snippet),
@@ -1444,13 +1453,14 @@ fn entityOverlapImpl(
             .keyword_rank = null,
             .vector_score = null,
             .final_score  = score,
-            .source       = "entity_overlap",
-            .source_path  = "",
+            .source       = try allocator.dupe(u8, "entity_overlap"),
+            .source_path  = try allocator.dupe(u8, ""),
             .start_line   = 0,
             .end_line     = 0,
             .created_at   = 0,
             .lane         = "",
         };
+        out_len = i + 1;
     }
     return out;
 }

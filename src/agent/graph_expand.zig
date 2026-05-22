@@ -203,11 +203,13 @@ fn expandFromSeedsPPR(
         log.warn("ppr.edges_fetch_failed err={s} — neighbors render without 'via' context", .{@errorName(err)});
         break :blk try allocator.alloc(memory_root.TypedEdge, 0);
     };
+    errdefer {
+        for (edges) |*e| e.deinit(allocator);
+        allocator.free(edges);
+    }
 
-    return .{
-        .nodes = try scored.toOwnedSlice(allocator),
-        .edges = edges,
-    };
+    const nodes = try scored.toOwnedSlice(allocator);
+    return .{ .nodes = nodes, .edges = edges };
 }
 
 /// BFS expansion (legacy path, also the PPR fallback).
