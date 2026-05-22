@@ -1,8 +1,34 @@
 # nullALIS — STATUS
 
-**Hydrated:** 2026-05-10 from code truth. **Partial refresh:** 2026-05-21 (current-state section + open queue; full bench-standings hydration pending the K2.6 bench run below).
+**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-22 — memory-pipeline repair + config/control-plane hardening (top section). Prior partial refresh 2026-05-21.
 
 This is the single cold-start document. If it disagrees with `.planning/STATE.md`, `PROJECT_LEDGER.md` (archived), or anything in `docs/archive/`, **this wins**.
+
+---
+
+## 2026-05-22 — current state (memory-pipeline repair + config hardening)
+
+Code truth as of `7874226c` on `main`. This session found the agent memory pipeline silently broken end-to-end and repaired it, then audited and hardened the config/control plane. Three merges to `main`.
+
+**The memory pipeline was dead — four stacked config/wiring regressions.** A forensic probe (triggered by the K2.6 bench below showing an empty knowledge graph) found boundary extraction, the graph layer, and the vector plane silently non-functional:
+
+- **#1 — compaction globally disabled.** `agent.compact_context` regressed `true→false`: the MODE-UNIFICATION refactor `46769391` (2026-05-20) deleted the mode-preset machinery that set it true and never migrated the default. Pass A / Pass C had not run for ~2 days (`compaction.auto: evaluating` logged 0×). Fixed — default restored to `true`.
+- **#2 — extractor provider/model mismatch.** The boundary extractor was wired to the *primary* provider (Moonshot) paired with a *Together*-only model ID → empty `content` → 0 entities / 0 edges every fire. Fixed — extraction routed through a matched sidecar provider+model pair.
+- **#3 — `sidecar` was tenant-settable.** `sidecar` was missing from the operator-owned config keys; a stale tenant block could shadow the operator's choice. Fixed — `sidecar` is operator-owned.
+- **#4 — the `sidecar` block was never parsed.** `config_parse.zig` had no parser for it at all — `Config.sidecar` was permanently the struct default (Groq free tier, 6000 TPM). A compaction's call-burst exhausted the tier; the 429 was misclassified as a context overflow, killing every boundary extraction past the first. Fixed — parse the `sidecar` block + honor HTTP status codes.
+
+All four fixed, merged, **verified live**: Pass A and Pass C fire and extract real entities/edges, hydration produces continuity summaries, compaction summaries persist and are agent-recallable. The memory engine, graph, and vectors are functional end-to-end.
+
+**Config/control-plane hardened.** A repo-wide audit (`docs/CONFIG_CONTROL_PLANE_AUDIT.md`) found all four regressions share one class — *config surfaces that exist but are not enforced*. Hardening landed:
+- Tenant config inverted to a **strict allowlist** (only `product_settings` survives) — a tenant can no longer choose the model or toggle compaction; deny-by-default closes the finding-#3 leak class.
+- A **comptime exhaustiveness guard** — every `Config` field must be registered (`json_parsed` / `runtime_or_derived` / `decorative_pending`); adding a field with no parser is now a compile error. The finding-#3/#4 "struct field, no parser" class cannot merge silently again.
+- `reliability.vision_fallback` parser added (another dead-config bug fixed); enforcement tests for the `compact_context` default and `sidecar` round-trip; `zaki_bot` profile now defaults a capable extraction sidecar (Together/Llama-3.3-70B).
+
+**§14.10 correction.** The 2026-05-21 block below states "No known merged-inert capability remains" — that was **false**: Pass A/C auto-compaction was merged-inert (finding #1). It is now active and verified.
+
+**The K2.6 LoCoMo result is not a clean memory number.** The conv-0 run scored ~94%, but on a dead memory pipeline — that was long-context recall (the conversation fit K2.6's 262K window), not the memory engine. A clean re-bench is warranted now the pipeline is repaired.
+
+**Deferred follow-ups** (all tracked in `docs/CONFIG_CONTROL_PLANE_AUDIT.md`, none a live fire): `network` config parser + HTTP-layer wiring; `agent.extraction` parse-or-delete; eliminate the sentinel-collision profile-default pattern; the streaming-path blunt error mapping.
 
 ---
 
