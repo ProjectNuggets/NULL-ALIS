@@ -193,6 +193,14 @@ Surfaced by the Sprint 2 four-agent build, its independent post-merge audits, th
 
 ---
 
+## From the memory-intelligence sprint (P1–P5, PR #104)
+
+| ID | Shape | Why deferred | Target | Status |
+|----|-------|--------------|--------|--------|
+| D48 | P4 tier-sufficiency gate ships **opt-in** — `NULLALIS_TIER_GATE_MIN_SCORE` defaults to `0.0` (gate off). Director directive is "feature on", but flipping the default to the calibrated `0.005` demonstrably changes retrieval: 4 `loadContextWithRuntime` tests fail because their fixture candidates score `0.0` and the gate removes them, and the keyword-fallback retrieval path can itself produce low-score candidates — a blind `0.005` default risks over-gating real memories | The threshold is "calibrated" — it must be set by measurement, not guessed. The sprint needs a LoCoMo bench anyway to confirm its +3–5pp / +20% claims; P4's default-flip belongs in that bench pass | flip the default to the bench-calibrated threshold during the memory-intelligence LoCoMo bench; make the 4 fixture tests gate-agnostic | **open** — P4-on gated on the bench (ties to D44 clean re-bench) |
+
+---
+
 ## Retroactive reviews (process-gap)
 
 | ID | Shape | Why deferred | Target | Status |
