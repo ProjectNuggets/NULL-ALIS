@@ -2,7 +2,16 @@ const std = @import("std");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 
-/// Email channel — IMAP polling for inbound, SMTP for outbound.
+/// Email channel — SMTP outbound (send-only).
+///
+/// Activation status (Sprint 2): wired into channel_manager via the generic
+/// `send_only` listener path — `EmailChannel.initFromConfig` + `channel()` are
+/// picked up by `collectConfiguredChannels`, so outbound `send` is live and
+/// operator-configurable. The `EmailConfig` carries `imap_*` fields for a
+/// future inbound path, but no IMAP client is implemented: there is no
+/// `pollMessages`, no `channel_loop` polling thread, and the channel catalog
+/// classifies email as `send_only` (not `polling`) to reflect that. Inbound
+/// IMAP receive is a separate feature build, not a wiring gap.
 pub const EmailChannel = struct {
     allocator: std.mem.Allocator,
     config: config_types.EmailConfig,
@@ -178,7 +187,8 @@ pub const EmailChannel = struct {
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         _ = ptr;
-        // Email uses polling for IMAP; no persistent connection to start.
+        // Send-only channel: SMTP connections are opened per-message in
+        // sendMessage, so there is no persistent connection to start.
     }
 
     fn vtableStop(ptr: *anyopaque) void {
@@ -798,4 +808,42 @@ test "markMessageSeen method exists" {
     defer ch.deinit();
     const info = @typeInfo(@TypeOf(EmailChannel.markMessageSeen));
     try std.testing.expect(info == .@"fn");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Channel Activation Contract Tests
+// ════════════════════════════════════════════════════════════════════════════
+//
+// channel_manager.collectConfiguredChannels picks up Email through the generic
+// path: it requires initFromConfig + channel() and uses the `send_only`
+// listener mode. These tests pin that contract so the channel cannot silently
+// drift out of the generic registration path.
+
+test "email exposes initFromConfig + channel for generic registration" {
+    // channelTypeForModule in channel_manager.zig selects the channel type by
+    // looking for these two decls — guard them here.
+    try std.testing.expect(@hasDecl(EmailChannel, "initFromConfig"));
+    try std.testing.expect(@hasDecl(EmailChannel, "channel"));
+}
+
+test "email channel vtable name reports email" {
+    var ch = EmailChannel.initFromConfig(std.testing.allocator, .{
+        .account_id = "main",
+        .from_address = "bot@example.com",
+    });
+    defer ch.deinit();
+    const c = ch.channel();
+    try std.testing.expectEqualStrings("email", c.name());
+}
+
+test "email channel start and stop are safe for send_only lifecycle" {
+    // channel_manager's send_only path calls channel.start() then channel.stop().
+    var ch = EmailChannel.initFromConfig(std.testing.allocator, .{
+        .account_id = "main",
+        .from_address = "bot@example.com",
+    });
+    defer ch.deinit();
+    const c = ch.channel();
+    try c.start();
+    c.stop();
 }
