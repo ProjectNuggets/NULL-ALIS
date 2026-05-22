@@ -181,7 +181,6 @@ const operator_owned_top_level_config_keys = [_][]const u8{
     "tools",
     "session",
     "models",
-    "product_presets",
 };
 
 const tenant_preference_product_settings_keys = [_][]const u8{
@@ -377,9 +376,33 @@ pub fn normalizeTenantConfigJson(
     const root_obj = ensureObject(&root, a);
     const settings = resolveSettingsFromConfigJson(allocator, existing_config_json) catch defaults();
 
+    // Allowlist inversion (Finding #3 follow-up, 2026-05-22): a tenant
+    // config may carry exactly ONE top-level key — `product_settings`.
+    // Everything else at the top level is operator infrastructure and is
+    // stripped. The prior design iterated `operator_owned_top_level_config_keys`
+    // and removed listed keys — deny-by-omission: a key NOT on the list
+    // (e.g. `sidecar` — finding #3) leaked straight through to the tenant.
+    // A strict allowlist makes "strip" the safe default: a newly added
+    // operator key is locked down automatically, and typo'd / unknown keys
+    // are removed too. `operator_owned_top_level_config_keys` /
+    // `topLevelKeyOwnership` remain for OwnershipPlane diagnostics — they
+    // are no longer the enforcement mechanism.
+    const tenant_allowed_top_level_keys = [_][]const u8{"product_settings"};
     var ignored_override_count: usize = 0;
-    inline for (operator_owned_top_level_config_keys) |key| {
-        if (topLevelKeyOwnership(key) == .operator) {
+    {
+        // Collect keys first — cannot swapRemove while iterating the map.
+        var keys_to_strip: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer keys_to_strip.deinit(a);
+        var it = root_obj.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            var allowed = false;
+            inline for (tenant_allowed_top_level_keys) |ak| {
+                if (std.mem.eql(u8, key, ak)) allowed = true;
+            }
+            if (!allowed) try keys_to_strip.append(a, key);
+        }
+        for (keys_to_strip.items) |key| {
             if (root_obj.swapRemove(key)) ignored_override_count += 1;
         }
     }
@@ -838,19 +861,26 @@ test "mergeSettingsIntoConfigJson preserves unknown keys and writes canonical pr
     try std.testing.expect(parsed.value.object.get("memory") == null);
 }
 
-test "normalizeTenantConfigJson strips operator-owned overrides and preserves tenant metadata" {
+test "normalizeTenantConfigJson strips every non-product_settings key (strict allowlist)" {
+    // Enforcement test #3 (catches finding #3): under the strict tenant
+    // allowlist, a tenant config keeps ONLY `product_settings`. Operator
+    // blocks (agent/memory/default_provider/models/product_presets) AND
+    // unknown/typo'd keys (`foo`) are all stripped — deny-by-default.
     const existing =
         \\{"foo":"bar","agent":{"queue_mode":"latest","queue_cap":8},"memory":{"summarizer":{"enabled":false}},"default_provider":"openai","models":{"providers":{"openai":{"api_key":"test-key"}}},"product_presets":{"fast":{"agent":{"queue_mode":"latest"}}}}
     ;
     const normalized = try normalizeTenantConfigJson(std.testing.allocator, existing);
     defer std.testing.allocator.free(normalized.json);
 
-    try std.testing.expectEqual(@as(usize, 5), normalized.ignored_override_count);
+    // 6 non-allowlisted top-level keys stripped: foo, agent, memory,
+    // default_provider, models, product_presets. Pre-inversion `foo`
+    // leaked (count was 5) — that leak is exactly finding #3's class.
+    try std.testing.expectEqual(@as(usize, 6), normalized.ignored_override_count);
     try std.testing.expect(normalized.settings.assistant_mode == .fast);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, normalized.json, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("bar", parsed.value.object.get("foo").?.string);
+    try std.testing.expect(parsed.value.object.get("foo") == null);
     try std.testing.expect(parsed.value.object.get("agent") == null);
     try std.testing.expect(parsed.value.object.get("memory") == null);
     try std.testing.expect(parsed.value.object.get("default_provider") == null);
@@ -860,10 +890,26 @@ test "normalizeTenantConfigJson strips operator-owned overrides and preserves te
     try std.testing.expectEqualStrings("fast", product.get("assistant_mode").?.string);
 }
 
+test "normalizeTenantConfigJson strips a tenant sidecar block (finding #3 regression guard)" {
+    // A tenant sidecar block must never reach the runtime — it would
+    // shadow the operator's extraction-model choice. Pre-inversion this
+    // leaked because `sidecar` was absent from the operator deny-list.
+    const existing =
+        \\{"sidecar":{"provider":"groq","model":"llama-3.1-8b-instant"},"product_settings":{"assistant_mode":"balanced"}}
+    ;
+    const normalized = try normalizeTenantConfigJson(std.testing.allocator, existing);
+    defer std.testing.allocator.free(normalized.json);
+    try std.testing.expectEqual(@as(usize, 1), normalized.ignored_override_count);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, normalized.json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("sidecar") == null);
+    try std.testing.expect(parsed.value.object.get("product_settings") != null);
+}
+
 test "ownership registry classifies operator and tenant preference keys" {
     try std.testing.expect(topLevelKeyOwnership("memory") == .operator);
     try std.testing.expect(topLevelKeyOwnership("models") == .operator);
-    try std.testing.expect(topLevelKeyOwnership("product_presets") == .operator);
+    try std.testing.expect(topLevelKeyOwnership("sidecar") == .operator);
     try std.testing.expect(topLevelKeyOwnership("product_settings") == .tenant_preference);
     try std.testing.expect(topLevelKeyOwnership("foo") == .unknown);
     try std.testing.expect(productSettingsFieldOwnership("assistant_mode") == .tenant_preference);
