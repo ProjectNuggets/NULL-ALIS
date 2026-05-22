@@ -638,6 +638,25 @@ pub const OpenAiCompatibleProvider = struct {
         }) catch |err| return mapRequestError(err);
         defer allocator.free(response.body);
 
+        // Finding #4 (2026-05-22): honor the HTTP status — same fix as
+        // chatImpl. Without it a 4xx/5xx body is classified from text
+        // alone, so a 429 rate-limit ("...tokens...Limit 6000") is
+        // mis-read as context_exhausted. Classify retryable conditions
+        // from the status code before any body heuristics.
+        if (response.status_code < 200 or response.status_code >= 300) {
+            const snippet = response.body[0..@min(response.body.len, 480)];
+            log.warn("compatible.http_non2xx status={d} model={s} url={s} req_bytes={d} body_snippet={s}", .{
+                response.status_code,
+                effective_model,
+                url,
+                body.len,
+                snippet,
+            });
+            if (error_classify.classifyHttpStatus(response.status_code)) |kind| {
+                return error_classify.kindToError(kind);
+            }
+        }
+
         return parseTextResponse(allocator, response.body) catch |err| {
             // If chat completions failed and responses fallback is enabled, try the responses API
             if (self.supports_responses_fallback) {
