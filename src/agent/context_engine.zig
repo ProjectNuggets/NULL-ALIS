@@ -512,6 +512,20 @@ pub const ContextEngine = struct {
         } };
         agent.observer.recordEvent(&memory_stage_event);
 
+        if (rstats.available) {
+            const summary = bucketSummary(allocator, rstats) catch null;
+            defer if (summary) |s| allocator.free(s);
+            const retrieval_event = observability.ObserverEvent{ .memory_retrieval = .{
+                .run_id = agent.current_run_id,
+                .status = if (summary) |s| s else "unavailable",
+                .success = rstats.injected,
+                .usage_tokens = @intCast(rstats.context_bytes),
+                .iteration = @intCast(rstats.candidate_count),
+                .duration_ms = enrich_duration_ms,
+            } };
+            agent.observer.recordEvent(&retrieval_event);
+        }
+
         return IngestOutput{
             .result = .{
                 .memory_enriched = rstats.available,
@@ -1053,6 +1067,26 @@ pub const ContextEngine = struct {
         };
     }
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Format a compact per-bucket entry summary for the memory_retrieval trace
+/// event's status field. Caller owns the returned slice and must free it with
+/// the same allocator.
+fn bucketSummary(allocator: std.mem.Allocator, stats: memory_loader.SelectionStats) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "continuity:{d},semantic:{d},fallback:{d},graph:{d}",
+        .{
+            stats.continuity_bucket_entries,
+            stats.semantic_bucket_entries,
+            stats.fallback_bucket_entries,
+            stats.graph_recall_neighbor_count,
+        },
+    );
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
