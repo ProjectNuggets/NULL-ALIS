@@ -150,12 +150,17 @@ pub const McpServer = struct {
         self.next_id = 1;
 
         const t = transport_mod.create(self.allocator, self.config) catch return error.TransportInit;
+        // Publish the transport immediately so exactly one owner (the
+        // errdefer below) tears it down on any failure past this point.
+        // Without clearing `self.transport`, a later deinit() would close +
+        // destroy an already-freed transport — a double-free.
+        self.transport = t;
         errdefer {
             t.close();
             t.destroy(self.allocator);
+            self.transport = null;
         }
         t.connect() catch return error.ConnectFailed;
-        self.transport = t;
 
         // initialize handshake
         const init_params = try std.fmt.allocPrint(

@@ -287,6 +287,9 @@ pub const StdioTransport = struct {
         else
             0;
 
+        // One deadline covers the whole call, including any blank lines
+        // skipped between frames — a server spewing endless blank lines hits
+        // ReadTimeout rather than recursing the stack.
         while (true) {
             if (use_timeout) {
                 const remaining_ns = deadline_ns - std.time.nanoTimestamp();
@@ -306,17 +309,15 @@ pub const StdioTransport = struct {
                 if (line_buf.items.len > 0) return line_buf.toOwnedSlice(self.allocator);
                 return error.EndOfStream;
             }
-            if (byte[0] == '\n') break;
+            if (byte[0] == '\n') {
+                if (line_buf.items.len == 0) continue; // blank line between frames
+                return line_buf.toOwnedSlice(self.allocator);
+            }
             if (byte[0] != '\r') {
                 if (line_buf.items.len >= RESPONSE_LINE_MAX) return error.ReadFailed;
                 line_buf.append(self.allocator, byte[0]) catch return error.OutOfMemory;
             }
         }
-        if (line_buf.items.len == 0) {
-            // Blank line between frames — keep reading.
-            return self.readLine();
-        }
-        return line_buf.toOwnedSlice(self.allocator);
     }
 
     /// S7.12 — background reader for the child's stderr pipe.
