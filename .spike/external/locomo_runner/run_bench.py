@@ -510,6 +510,18 @@ def main():
         default=None,
         help="re-score an existing results.json file with the chosen scorer (skip running)",
     )
+    ap.add_argument(
+        "--cold-qa",
+        action="store_true",
+        help=(
+            "probe QA in a FRESH session key (same tenant user_id), so the QA "
+            "turns start with an empty in-context transcript and can only "
+            "answer from the per-user memory engine. This is the correct way "
+            "to bench memory: without it, the loaded transcript stays in "
+            "context and the model answers from it rather than from recall. "
+            "D44 memory bench."
+        ),
+    )
     args = ap.parse_args()
 
     # Re-score path: load prior results, apply new scorer, write new file.
@@ -542,7 +554,14 @@ def main():
         # Brief pause for extraction queue to drain
         print(f"  draining extraction queue (10s)...", flush=True)
         time.sleep(10)
-        results = probe_qa(sample["qa"], sk, s_idx, args.max_qa)
+        # --cold-qa: probe QA in a fresh session (same tenant). The QA turns
+        # then start with no in-context transcript, so the agent must answer
+        # from the per-user memory engine — the actual thing being benched.
+        qa_sk = sk
+        if args.cold_qa:
+            qa_sk = session_key_for(s_idx, run_id + "_qa")
+            print(f"  cold-qa: probing in fresh session {qa_sk}", flush=True)
+        results = probe_qa(sample["qa"], qa_sk, s_idx, args.max_qa)
         scorer = locomo_score if args.scorer == "locomo_f1" else simple_score
         scored = [scorer(r) for r in results]
         agg = aggregate(scored)

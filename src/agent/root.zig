@@ -109,6 +109,25 @@ const DEFAULT_MAX_HISTORY: u32 = 50;
 /// against repeated LLM summary calls on a tightly-packed session saving little.
 const COMPACTION_MIN_SAVINGS_PERCENT: u8 = 10;
 
+/// Bench-only escape hatch for the anti-thrash guard.
+///
+/// When `NULLALIS_BENCH_DISABLE_THRASH_GUARD` is set to a non-"0" value,
+/// `autoCompactHistory` keeps running Pass A/Pass C every turn even when the
+/// last two compactions saved little. This exists for the LoCoMo memory bench
+/// (D44): LoCoMo session transcripts are adversarially dense, so each Pass C
+/// summary is nearly as large as what it drops — savings stay under the 10%
+/// floor and the guard would otherwise disable compaction (and the Pass-C
+/// extraction that rides on it) after ~2 sessions, leaving most of the
+/// conversation un-extracted into memory.
+///
+/// Absent or "0" → guard active (production default). Never set in production:
+/// the guard is a real cost protection against burning LLM summary calls on a
+/// tightly-packed session for diminishing returns.
+fn benchThrashGuardDisabled() bool {
+    const val = std.posix.getenv("NULLALIS_BENCH_DISABLE_THRASH_GUARD") orelse return false;
+    return !std.mem.eql(u8, val, "0");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Agent
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1073,8 +1092,9 @@ pub const Agent = struct {
     /// for diminishing returns. Force-compress (emergency path) bypasses this
     /// guard via `forceCompressHistory` which calls `compaction.*` directly.
     pub fn autoCompactHistory(self: *Agent) !bool {
-        // Thrash guard
-        if (self.compaction_savings_ring[0] < COMPACTION_MIN_SAVINGS_PERCENT and
+        // Thrash guard — skippable only via the bench escape hatch (D44).
+        if (!benchThrashGuardDisabled() and
+            self.compaction_savings_ring[0] < COMPACTION_MIN_SAVINGS_PERCENT and
             self.compaction_savings_ring[1] < COMPACTION_MIN_SAVINGS_PERCENT)
         {
             log.info("compaction.skipped reason=thrash_guard ring=[{d},{d}]", .{
