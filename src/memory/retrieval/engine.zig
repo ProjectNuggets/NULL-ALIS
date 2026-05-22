@@ -270,6 +270,22 @@ pub const PrimaryAdapter = struct {
     };
 };
 
+// ── EntityOverlapCallCtx ───────────────────────────────────────────
+
+/// Callback context for entity-overlap RRF signal (P1).
+/// Callers set `entity_overlap` on RetrievalEngine to provide a
+/// third ranked source: memories that share named-entity edges with
+/// the query. The function is called once per search(); errors are
+/// treated as empty (search continues without entity signal).
+pub const EntityOverlapCallCtx = struct {
+    ptr: *anyopaque,
+    func: *const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        query: []const u8,
+    ) anyerror![]RetrievalCandidate,
+};
+
 // ── RetrievalEngine ────────────────────────────────────────────────
 
 pub const RetrievalEngine = struct {
@@ -300,6 +316,11 @@ pub const RetrievalEngine = struct {
     /// the engine calls this with a prompt and expects ranked indices in response.
     /// Signature: fn(allocator, prompt) -> response_text or error
     llm_rerank_fn: ?*const fn (Allocator, []const u8) anyerror![]const u8 = null,
+
+    /// Optional entity-overlap callback (P1). When set, the engine calls this
+    /// as a 3rd RRF source alongside keyword and vector. Errors are gracefully
+    /// swallowed — the search continues with keyword (+optional vector) only.
+    entity_overlap: ?EntityOverlapCallCtx = null,
 
     const Self = @This();
 
@@ -1278,6 +1299,26 @@ test "Engine with MMR config" {
 
     try std.testing.expect(engine.mmr_cfg.enabled);
     try std.testing.expect(@abs(engine.mmr_cfg.lambda - 0.5) < 0.001);
+}
+
+test "entity_overlap field compiles on RetrievalEngine" {
+    var dummy: u8 = 0;
+    const e = RetrievalEngine{
+        .allocator = std.testing.allocator,
+        .sources = .{},
+        .merge_k = 60,
+        .top_k = 10,
+        .min_score = 0.0,
+        .entity_overlap = .{
+            .ptr = &dummy,
+            .func = struct {
+                fn f(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror![]RetrievalCandidate {
+                    return &.{};
+                }
+            }.f,
+        },
+    };
+    try std.testing.expect(e.entity_overlap != null);
 }
 
 test {
