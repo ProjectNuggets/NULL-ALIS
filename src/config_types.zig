@@ -223,7 +223,25 @@ pub const SidecarConfig = struct {
 };
 
 pub const AgentConfig = struct {
-    compact_context: bool = false,
+    /// Auto-compaction master switch. Gates Pass A (drop-from-middle, 70%)
+    /// and Pass C (LLM summarization, 90%) in `Agent.autoCompactHistory` —
+    /// the in-session extraction boundaries that feed the graph + vector
+    /// planes.
+    ///
+    /// §14.2 archaeology — default restored false→true 2026-05-22.
+    /// Pre-2026-05-20 every mode preset (fast/balanced/deep) carried
+    /// `compact_context = true` and `presetForMode` copied it onto this
+    /// field every turn, so compaction was universally ON. The
+    /// MODE-UNIFICATION refactor `46769391` (2026-05-20) deleted the preset
+    /// machinery and the `cfg.agent.compact_context = preset...` line —
+    /// migrating reasoning_effort and max_tool_iterations forward but
+    /// silently dropping compact_context. The field then fell back to its
+    /// `false` struct default, disabling Pass A/C for ~2 days (confirmed:
+    /// `compaction.auto: evaluating` logged 0× post-regression). The honest
+    /// default is `true` — no preset ever had compaction off. An operator
+    /// can still disable it explicitly via `compact_context` in config JSON
+    /// (config_parse.zig honors an explicit bool).
+    compact_context: bool = true,
     max_tool_iterations: u32 = 500,
     // iter26: 0 = uncapped (pure token-based). Adaptive exits (loop_detected, repeated-call) are the real guardrails.
     max_history_messages: u32 = 0,

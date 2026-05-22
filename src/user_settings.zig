@@ -153,6 +153,14 @@ const operator_owned_top_level_config_keys = [_][]const u8{
     "reliability",
     "scheduler",
     "agent",
+    // Finding #3 (2026-05-22): the sidecar model is the cheap auxiliary
+    // LLM for structured extraction, compaction summarization, and the
+    // narration fallback — operator infrastructure, exactly like `agent`
+    // and `reliability`. It must NOT be tenant-settable: a stale tenant
+    // `sidecar` block (e.g. bench-seeded groq/llama-3.1-8b-instant) would
+    // shadow the operator's extraction-model choice and silently route
+    // every boundary extraction through the wrong provider/tier.
+    "sidecar",
     "heartbeat",
     "cron",
     "channels",
