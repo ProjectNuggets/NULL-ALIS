@@ -556,11 +556,37 @@ pub fn build(b: *std.Build) void {
         mcp_live_tests.root_module.linkSystemLibrary("pq", .{});
     }
 
+    // v1.14.18 Step 7 (V4) — subagent → task-ledger lifecycle integration.
+    // Lives outside src/ (like the security tests) because it pins a
+    // cross-module contract: that a `SubagentManager` built without an
+    // explicit `attachTaskDelivery` still mirrors subagent lifecycle into a
+    // real `TaskLedger` via the default-on bridge. Pure in-memory, no
+    // backend — runs under every engine profile.
+    const task_lifecycle_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/runtime/task_lifecycle_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nullalis", .module = lib_mod },
+            },
+        }),
+    });
+    if (sqlite3) |lib| {
+        task_lifecycle_tests.linkLibrary(lib);
+    }
+    if (enable_postgres) {
+        addHomebrewLibpqPaths(task_lifecycle_tests);
+        addHomebrewLibpqPaths(task_lifecycle_tests.root_module);
+        task_lifecycle_tests.root_module.linkSystemLibrary("pq", .{});
+    }
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     test_step.dependOn(&b.addRunArtifact(security_sandbox_tests).step);
     test_step.dependOn(&b.addRunArtifact(agent_pg_tests).step);
+    test_step.dependOn(&b.addRunArtifact(task_lifecycle_tests).step);
     // mcp_live_tests is compiled (so it can never bit-rot) but only its
     // skip-path runs here; the real exercise is the test-mcp-live step.
     test_step.dependOn(&b.addRunArtifact(mcp_live_tests).step);

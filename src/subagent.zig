@@ -127,11 +127,29 @@ pub const SubagentManager = struct {
     completion_delivery: ?CompletionDeliveryFn = null,
     completion_delivery_ctx: ?*anyopaque = null,
 
-    /// Optional bridge (WP2.1): when attached, subagent lifecycle transitions
-    /// are mirrored into the canonical TaskLedger via TaskDelivery so clients
-    /// observing task_update events see real subagent state. Null keeps
-    /// detached behavior unchanged.
+    /// Canonical-ledger bridge (WP2.1): subagent lifecycle transitions are
+    /// mirrored into a TaskLedger via TaskDelivery so clients observing
+    /// task_update events see real subagent state.
+    ///
+    /// v1.14.18 Step 7 (V4) — this is now **default-on**. `init` seeds it
+    /// with a manager-owned `OwnedFallback` (heap-allocated in-memory
+    /// ledger + noop observer + delivery) so even standalone CLI /
+    /// channel-loop managers are bridged; the gateway path overrides it
+    /// with the real per-tenant delivery via `attachTaskDelivery` and the
+    /// owned fallback remains allocated-but-unused for the manager's
+    /// lifetime (freed by `deinit`). Two managers in the same process
+    /// never share a ledger, so canonical task IDs (which restart at 1
+    /// per manager) cannot collide.
+    ///
+    /// The field keeps its `?` type only because the one-time fallback
+    /// allocation can fail under extreme pressure; in v1.15+ the bridge
+    /// becomes infallible and `?` is dropped (V4 follow-up).
     task_delivery: ?*tasks_mod.TaskDelivery = null,
+
+    /// V4 — owned-by-manager fallback bundle, freed in `deinit`. Non-null
+    /// when no explicit `attachTaskDelivery` has been called; an attached
+    /// delivery still leaves this allocated (its destructor runs anyway).
+    _owned_fallback: ?tasks_mod.delivery.OwnedFallback = null,
 
     pub fn init(
         allocator: Allocator,
@@ -140,6 +158,13 @@ pub const SubagentManager = struct {
         subagent_config: SubagentConfig,
     ) SubagentManager {
         const ledger_path = std.fs.path.join(allocator, &.{ cfg.workspace_dir, "state", TASK_LEDGER_FILE_NAME }) catch "";
+        // V4 — default-on ledger bridge. A null here only happens if the
+        // fallback allocation failed; warn loudly so the operator knows
+        // task_list/task_get will be blind for this manager.
+        const owned = tasks_mod.delivery.createOwnedFallback(allocator);
+        if (owned == null) {
+            log.warn("subagent: task-delivery fallback unavailable — subagent lifecycle will NOT be mirrored to the task ledger for this manager", .{});
+        }
         var manager = SubagentManager{
             .allocator = allocator,
             .tasks = .{},
@@ -150,6 +175,8 @@ pub const SubagentManager = struct {
             .config_ref = cfg,
             .ledger_path = ledger_path,
             .ledger_recovery_pending = cfg.tenant.enabled and std.mem.eql(u8, cfg.state.backend, "postgres"),
+            .task_delivery = if (owned) |o| o.delivery else null,
+            ._owned_fallback = owned,
         };
         if (!manager.ledger_recovery_pending) {
             manager.recoverDurableState() catch |err| {
@@ -180,6 +207,14 @@ pub const SubagentManager = struct {
         }
         self.tasks.deinit(self.allocator);
         if (self.ledger_path.len > 0) self.allocator.free(self.ledger_path);
+        // V4 — free the owned-fallback bundle (lifetime tied to the
+        // manager). Safe even if an `attachTaskDelivery` override pointed
+        // `task_delivery` elsewhere; we never freed the override, only
+        // the manager's own allocation.
+        if (self._owned_fallback) |*owned| {
+            owned.deinit();
+            self._owned_fallback = null;
+        }
     }
 
     pub fn attachPostgresLedger(self: *SubagentManager, state_mgr: *zaki_state.Manager, user_id: i64) void {
@@ -1919,7 +1954,11 @@ test "SubagentManager attached TaskDelivery mirrors failed status" {
     try std.testing.expectEqual(tasks_mod.TaskStatus.failed, entry.status);
 }
 
-test "SubagentManager detached TaskDelivery leaves ledger untouched" {
+test "V4: SubagentManager defaults to the owned ledger bridge (default-on)" {
+    // v1.14.18 Step 7 (V4) — a manager built without an explicit
+    // `attachTaskDelivery` is no longer detached: `init` seeds
+    // `task_delivery` from a manager-owned in-memory fallback so its
+    // subagent lifecycle IS mirrored to a real TaskLedger.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
@@ -1930,18 +1969,24 @@ test "SubagentManager detached TaskDelivery leaves ledger untouched" {
         .allocator = std.testing.allocator,
     };
 
-    var ledger_inst = tasks_mod.TaskLedger.init(std.testing.allocator);
-    defer ledger_inst.deinit();
-
     var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
     mgr.completion_runner = immediateCompletionRunner;
     defer mgr.deinit();
 
-    const task_id = try mgr.spawn("no bridge", "solo", "session:solo", "agent", "session:solo");
-    try waitForTaskTerminal(&mgr, task_id, 2_000);
+    // The bridge is wired by default, pointing at the manager's owned fallback.
+    const delivery = mgr.task_delivery orelse return error.TestUnexpectedResult;
+    try std.testing.expect(mgr._owned_fallback != null);
+    try std.testing.expectEqual(mgr._owned_fallback.?.delivery, delivery);
 
-    try std.testing.expectEqual(@as(usize, 0), ledger_inst.listTasks().len);
+    const task_id = try mgr.spawn("default bridge", "solo", "session:solo", "agent", "session:solo");
+    try waitForTaskTerminal(&mgr, task_id, 2_000);
     try std.testing.expectEqual(TaskStatus.completed, mgr.getTaskStatus(task_id).?);
+
+    // The task landed in the owned ledger.
+    var id_buf: [tasks_mod.ledger.TASK_ID_LEN]u8 = undefined;
+    const id_slice = try std.fmt.bufPrint(&id_buf, "task_{x:0>11}", .{task_id});
+    const entry = delivery.ledger.getTask(id_slice) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(tasks_mod.TaskStatus.succeeded, entry.status);
 }
 
 // ── WP2.4: honest queued-only cancellation ─────────────────────────

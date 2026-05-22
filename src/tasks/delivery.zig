@@ -25,6 +25,64 @@ const ObserverEvent = observability.ObserverEvent;
 
 const MAX_DETAIL_LEN: usize = 256;
 
+const log = std.log.scoped(.tasks);
+
+// ── Owned in-memory TaskDelivery fallback (V4) ─────────────────────
+//
+// v1.14.18 Step 7 (V4) — the subagent ledger bridge used to be optional:
+// `SubagentManager.task_delivery` defaulted to null, so the standalone
+// CLI / channel-loop construction paths spawned subagents whose lifecycle
+// was never mirrored into a TaskLedger. `task_list` / `task_get` then
+// showed nothing for those tasks.
+//
+// `createOwnedFallback` returns a heap-owned `OwnedFallback` bundle (a
+// fresh in-memory `TaskLedger`, a `NoopObserver`, and a `TaskDelivery`
+// pointing at them). The `SubagentManager` owns it for its lifetime and
+// destroys it in `deinit`. The gateway path overrides via
+// `attachTaskDelivery`, at which point the owned fallback remains
+// allocated but unused — the manager still owns and frees it. Two managers
+// in the same process never share a ledger, so canonical task IDs (which
+// restart at 1 per manager) cannot collide.
+
+pub const OwnedFallback = struct {
+    allocator: std.mem.Allocator,
+    ledger: *TaskLedger,
+    noop: *observability.NoopObserver,
+    delivery: *TaskDelivery,
+
+    pub fn deinit(self: *OwnedFallback) void {
+        self.ledger.deinit();
+        self.allocator.destroy(self.ledger);
+        self.allocator.destroy(self.noop);
+        self.allocator.destroy(self.delivery);
+    }
+};
+
+/// Build a heap-owned fallback bundle for a SubagentManager that has no
+/// canonical TaskDelivery attached. Returns null on allocation failure —
+/// the caller logs and continues without a bridge.
+pub fn createOwnedFallback(allocator: std.mem.Allocator) ?OwnedFallback {
+    const led = allocator.create(TaskLedger) catch return null;
+    led.* = TaskLedger.init(allocator);
+    const noop = allocator.create(observability.NoopObserver) catch {
+        allocator.destroy(led);
+        return null;
+    };
+    noop.* = .{};
+    const del = allocator.create(TaskDelivery) catch {
+        allocator.destroy(noop);
+        allocator.destroy(led);
+        return null;
+    };
+    del.* = .{ .ledger = led, .observer = noop.observer() };
+    return .{
+        .allocator = allocator,
+        .ledger = led,
+        .noop = noop,
+        .delivery = del,
+    };
+}
+
 pub const TaskDelivery = struct {
     /// Outcome of an atomic queued-only cancel attempt. See cancelQueued.
     pub const CancelOutcome = enum {
