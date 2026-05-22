@@ -165,6 +165,26 @@ one-line reason.
 
 ---
 
+## From v1.14.19 / v1.14.20 — memory-pipeline repair, Sprint 2 (Channels + MCP), MCP V1.1, Slice 2 (Email)
+
+Surfaced by the Sprint 2 four-agent build, its independent post-merge audits, the MCP V1.1 follow-up, and the Slice 2 (Email inbound) two-pass review. Every MAJOR finding from those reviews was fixed before merge — only the genuinely-deferred items land here.
+
+| ID | Shape | Why deferred | Target | Status |
+|----|-------|--------------|--------|--------|
+| D36 | `curlPost` (`http_util.zig`) does not thread the HTTP status code, so `logDiscordApiErrorIfAny` / `logSlackApiErrorIfAny` still silently swallow non-JSON error bodies (Cloudflare HTML 429s, empty 5xx) | PR #99 post-merge audit MINOR. JSON-body API errors ARE now surfaced; threading `-w "%{http_code}"` through `curlPost` is a shared-surface change touching every caller | `http_util` follow-up PR | **open** |
+| D37 | MCP server HTTP/SSE transport — `nullalis mcp serve` is stdio-only | stdio is the complete, shipped transport and matches `claude mcp serve`; HTTP/SSE is a remote-serving enhancement, not a gap | when remote MCP serving is needed | **open** |
+| D38 | Memory exposed over MCP as `resources` (not only tools) | MCP V1.1 wired memory as `tools` (`memory_recall/list/timeline/store`), which already delivers the composable-brain payload; `resources` is a cleaner-modeled alternative | MCP V1.2 | **open** |
+| D39 | MCP `sampling` — let a connected MCP server call back into nullalis's own LLM | exposing the agent's LLM outward is a larger surface + security question than the client/server tool plane | unscheduled | **open** |
+| D40 | Email inbound IMAP IDLE (server push) — `pollMessages` polls on `poll_interval_secs` | matches the matrix/signal polling shape shipped in Slice 2; IDLE (server-held long-poll) is a latency enhancement | email V1.2 | **open** |
+| D41 | `email.zig imapResponseComplete` re-walks the whole accumulated buffer on every 16 KiB read chunk — O(chunks × buffer) | bounded by the 4 MiB `IMAP_RESPONSE_CAP`; only bites on pathologically large mail. A streaming/incremental frame parser is the proper fix | email perf follow-up | **open** |
+| D42 | `irc.zig` + `websocket.zig` use `std.crypto.tls.Client` with `.ca = .no_verification` — encrypted but unauthenticated TLS, MITM-exposed | surfaced by the Slice 2 / email TLS fix (PR #103). `email.zig`'s fix (`http_native.sharedCaBundle()`, fail-closed) is the template. irc needs its existing `tls_verify` operator flag made functional; websocket should always verify (Discord/Slack/Mattermost have proper certs) | task #22 — planned 2026-05-22 | **open** |
+| D43 | Nostr channel (NIP-04 DM relay) | no current user uses Nostr; Sprint 2 explicitly scoped it out. ROADMAP v1.14.17 block holds the build steps | when censorship-resistant relay becomes a differentiator | **open** |
+| D44 | Clean K2.6 LoCoMo re-bench — a genuine multi-session / over-window test | the conv-0 ~94% was long-context recall on a then-dead memory pipeline; a clean number needs a test that exceeds the model window so the memory engine is actually exercised | v1.15.0 bench-iteration block | **open** |
+| D45 | Sprint 2 audit cosmetic nits — Teams sync-reply `running.store` is functionally inert; `parseWebhookPayload` malformed body → `200 ok` not `parse_error`; MCP server `callerAuthorized()` is unreachable defense-in-depth | PR #100 / #101 post-merge audit NITs. None affect production paths (Teams runs the event-bus path; MCP auth is enforced at `initialize`) | opportunistic, on next touch of those files | **open** |
+| D46 | Config-plane deferrals — `network` config parser+wiring (CLASS D), `agent.extraction` parse-or-delete, sentinel-collision profile-default pattern, streaming-path blunt error mapping | tracked in full in `docs/CONFIG_CONTROL_PLANE_AUDIT.md`; this row is the register's index pointer | per the config audit doc | **open** |
+
+---
+
 ## Retroactive reviews (process-gap)
 
 | ID | Shape | Why deferred | Target | Status |
@@ -180,4 +200,4 @@ one-line reason.
 - **Superseding an item:** change `open` → `obsolete` with a one-line reason. Do NOT delete the row.
 - **Reviewing "what's still open":** `grep 'open' docs/deferred-register.md | wc -l` gives the live count.
 
-Last audit: **2026-04-26** at D28-Day-1 close + S9 park — 19 items open (D35 added for Sprint-9 park), 9 shipped, 1 obsolete. D28 cross-repo PRs are open and ready (nullalis #30 + zaki-infra #14 + zaki-prod #6); sunset deadline 2026-05-15 honored ahead of schedule. Sprint-9-as-debt-item D35 added with explicit unpark triggers (external audit / second committer / public release / supply-chain CVE).
+Last audit: **2026-05-22** at v1.14.20 + Slice 2 close — added section "From v1.14.19 / v1.14.20" with **D36–D46** (11 new rows) covering the Sprint 2 / MCP V1.1 / Slice 2 deferrals: `curlPost` status threading, MCP HTTP-SSE / `resources` / `sampling`, Email IMAP IDLE, the `imapResponseComplete` perf walk, the irc/websocket unverified-TLS gap (D42 → task #22, planned), Nostr, the clean K2.6 re-bench, Sprint-2 cosmetic nits, and the config-plane index pointer. Every MAJOR review finding from Sprint 2 + Slice 2 was fixed before merge; only true deferrals are registered. Prior audit: 2026-04-26 (D28-Day-1 close + S9 park).
