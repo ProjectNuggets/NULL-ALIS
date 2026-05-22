@@ -199,7 +199,9 @@ pub const Agent = struct {
         }
 
         const buffered_line = Agent.firstNonEmptyLine(ctx.buffered_text.items) orelse return;
-        if (Agent.looksLikeStreamingStatusPrefix(buffered_line)) {
+        if (Agent.looksLikeStreamingStatusPrefix(buffered_line) or
+            Agent.looksLikeToolCallMarkupPrefix(buffered_line))
+        {
             ctx.emission_mode = .hold_for_validation;
             return;
         }
@@ -1582,6 +1584,18 @@ pub const Agent = struct {
     fn startsWithToolCallMarkup(text: []const u8) bool {
         const trimmed = std.mem.trimLeft(u8, text, " \t\r\n");
         return std.mem.startsWith(u8, trimmed, "<tool_call>");
+    }
+
+    /// True when the streaming buffer's first line is `<tool_call>` markup —
+    /// either the complete `<tool_call>` opener or a partial prefix of it
+    /// ("<", "<t", "<tool_c"…). The streaming callback uses this to switch to
+    /// `hold_for_validation` so tool-call markup never leaks into the
+    /// user-facing reply stream as `final_reply` tokens. The held text is
+    /// parsed for tool calls post-completion (markup stripped from display via
+    /// `startsWithToolCallMarkup`). Mirrors the `looksLikeStreamingStatusPrefix`
+    /// hold path. `line` is expected pre-trimmed (from `firstNonEmptyLine`).
+    fn looksLikeToolCallMarkupPrefix(line: []const u8) bool {
+        return matchesAsciiPrefixPartially(line, "<tool_call>");
     }
 
     fn startsWithAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -10683,6 +10697,24 @@ test "Agent startsWithToolCallMarkup detects malformed tool output" {
 test "Agent startsWithToolCallMarkup ignores normal text" {
     try std.testing.expect(!Agent.startsWithToolCallMarkup("Here is the result."));
     try std.testing.expect(!Agent.startsWithToolCallMarkup("Use <tool_call> tags like this in docs."));
+}
+
+test "Agent looksLikeToolCallMarkupPrefix holds streaming tool-call markup" {
+    // Full opener and every partial prefix must trigger the streaming hold —
+    // the leak (`ool_call>` in a reply) happened because a partial `<tool…`
+    // chunk flushed before the full `<tool_call>` accumulated.
+    try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("<tool_call>"));
+    try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("<tool_call>\n{\"name\":\"memory_recall\"}"));
+    try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("<"));
+    try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("<t"));
+    try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("<tool_c"));
+}
+
+test "Agent looksLikeToolCallMarkupPrefix lets normal replies stream" {
+    try std.testing.expect(!Agent.looksLikeToolCallMarkupPrefix("From memory, I can confirm"));
+    try std.testing.expect(!Agent.looksLikeToolCallMarkupPrefix("<3 a heart, not a tool"));
+    try std.testing.expect(!Agent.looksLikeToolCallMarkupPrefix("Here is the answer."));
+    try std.testing.expect(!Agent.looksLikeToolCallMarkupPrefix(""));
 }
 
 test "tts_audio_enabled_does_not_mutate_assistant_text" {
