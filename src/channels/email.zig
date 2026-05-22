@@ -433,13 +433,21 @@ pub const EmailChannel = struct {
     /// Send an IMAP `UID STORE +FLAGS (\Seen)` command on an already-open
     /// connection and consume the tagged response. `stream`/`tls` is the
     /// active IMAP connection; exactly one is non-null.
+    ///
+    /// The server's tagged completion is checked: a `NO`/`BAD` is logged as
+    /// a warning but does NOT fail the poll cycle — a STORE failure only
+    /// means the message may be re-delivered to the agent next cycle (the
+    /// in-process BoundedSeenSet still de-dups it), which is far less bad
+    /// than aborting the whole poll.
     pub fn markMessageSeen(self: *EmailChannel, stream: std.net.Stream, tls: ?*TlsState, uid: []const u8) !void {
         const tag = self.nextTag();
         var cmd_buf: [256]u8 = undefined;
         const cmd = try std.fmt.bufPrint(&cmd_buf, "A{d:0>4} UID STORE {s} +FLAGS (\\Seen)\r\n", .{ tag, uid });
-        try self.smtpWrite(stream, tls, cmd);
-        var resp_buf: [2048]u8 = undefined;
-        _ = self.smtpRead(stream, tls, &resp_buf) catch return error.ImapError;
+        const resp = self.imapCommand(self.allocator, stream, tls, tag, cmd) catch return error.ImapError;
+        defer self.allocator.free(resp);
+        if (!responseIsOk(resp, tag)) {
+            log.warn("IMAP UID STORE \\Seen for uid={s} not OK: {s}", .{ uid, resp[0..@min(resp.len, 256)] });
+        }
     }
 
     /// Hard cap on a single IMAP response read. IMAP framing means we read
