@@ -1399,22 +1399,26 @@ fn readGraphRecallMaxHops() u8 {
 /// Minimum RRF final_score for fallback-bucket candidates.
 /// 0.0 disables the gate entirely; any positive value enables it.
 ///
-/// Score ranges at default rrf_k=60, top_k=25 (WITHOUT temporal decay):
+/// Score ranges at default rrf_k=60, top_k=25 (raw RRF, before temporal decay):
 ///   single-source  rank  1 → 1/61  ≈ 0.01639
-///   single-source  rank 16 → 1/76  ≈ 0.01316  (passes at 0.013)
-///   single-source  rank 17 → 1/77  ≈ 0.01299  (blocked at 0.013)
-///   two-source     rank  1 → 2/61  ≈ 0.03279  (always passes)
+///   single-source  rank 17 → 1/77  ≈ 0.01299
+///   two-source     rank  1 → 2/61  ≈ 0.03279  (always passes at any sane threshold)
 ///   three-source   rank  1 → 3/61  ≈ 0.04918  (always passes)
 ///
-/// Recommended default: 0.013 (set NULLALIS_TIER_GATE_MIN_SCORE=0.013).
+/// With temporal decay ON (half_life_days=30, default for zaki_bot profile):
+///   score *= exp(-ln(2)/30 * age_days)
+///   threshold 0.005 → single-source rank-1 blocked after ~72 days
+///   threshold 0.013 → single-source rank-1 blocked after ~11 days (too aggressive)
+///
+/// Recommended default: 0.005 when temporal decay is ON (zaki_bot profile).
+///                       0.013 when temporal decay is OFF.
 /// Only applies to the runtime (hybrid/shadow_hybrid) path candidates.
 /// Semantic-bucket entries (isSemanticContinuityKey path) are never gated.
 /// Values above 1.0 are rejected (returns 0.0) to prevent silent blanket-blocking.
 ///
 /// Note: when llm_reranker is enabled the pipeline overwrites final_score with
-/// 1/(rank+1) — minimum score with top_k=25 is 1/25=0.04, so 0.013 has no
-/// effect in that configuration (gate becomes a no-op, which is correct: LLM
-/// reranked candidates are already quality-selected).
+/// 1/(rank+1) — minimum score with top_k=25 is 1/25=0.04, so 0.005 has no
+/// effect in that configuration (gate becomes a no-op, which is correct).
 fn readTierGateMinScore() f64 {
     const val = std.posix.getenv("NULLALIS_TIER_GATE_MIN_SCORE") orelse return 0.0;
     const parsed = std.fmt.parseFloat(f64, val) catch return 0.0;
