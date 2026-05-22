@@ -203,6 +203,19 @@ pub const TaskSnapshot = struct {
     }
 };
 
+/// P2 — a node scored by findEdgesPPR.
+/// Defined at top-level so both ManagerImpl and the non-postgres stub
+/// can reference it without depending on postgres headers.
+pub const PPRNode = struct {
+    key: []u8,
+    ppr_score: f64,
+    min_depth: u8,
+
+    pub fn deinit(self: PPRNode, allocator: std.mem.Allocator) void {
+        allocator.free(self.key);
+    }
+};
+
 /// P1 — result row from findEdgesEntityOverlap.
 /// Defined at top-level so both ManagerImpl and the non-postgres stub
 /// can reference it without depending on postgres headers.
@@ -633,6 +646,10 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     /// P1 — stub for non-postgres builds. Entity overlap is postgres-only.
     pub fn findEdgesEntityOverlap(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const []const u8, _: usize) ![]EntityOverlapRow {
         return allocator.alloc(EntityOverlapRow, 0);
+    }
+    /// P2 — stub for non-postgres builds. PPR is postgres-only.
+    pub fn findEdgesPPR(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const []const u8, _: u8, _: usize) ![]PPRNode {
+        return allocator.alloc(PPRNode, 0);
     }
     /// V1.14.12 (Memory audit Finding 2 fix) — stub for non-postgres
     /// builds. Entity lookup is a postgres feature; non-postgres returns
@@ -7576,6 +7593,127 @@ const ManagerImpl = struct {
                 .memory_key  = key,
                 .match_count = try std.fmt.parseInt(i64, cnt_str, 10),
                 .snippet     = snippet,
+            });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    // ── P2: Personalized PageRank ───────────────────────────────────────────
+
+    /// PPR predicate priors — keep in sync with edge_resolution.classifyPredicate.
+    /// Single-valued predicates → 1.0 (supersede semantics, high information density).
+    const PPR_SINGLE_VALUED =
+        "'LIVES_IN','WORKS_AT','MARRIED_TO','REPORTS_TO','BIRTHDAY','BORN_ON'," ++
+        "'CURRENT_PROJECT','REPLACES','USED_TO_BE','FORMERLY','PREVIOUSLY'," ++
+        "'USED_TO_PREFER','USED_TO_USE'";
+    /// Set-valued predicates → 0.5 (multiple coexist, lower per-edge weight).
+    const PPR_SET_VALUED =
+        "'IS_TYPE_OF','INCLUDES','MEMBER_OF','PART_OF','FOLLOWS','LIKES','LOVES'," ++
+        "'HATES','AVOIDS','FAVORS','DISLIKES','ENJOYS','VALUES','PREFERS','USES'," ++
+        "'USED_FOR','OWNS','DEPENDS_ON','BUILDS_WITH','DEPLOYS_TO','ATTENDED'," ++
+        "'JOINED','VISITED','HAPPENED_ON','OCCURRED_AT','MENTIONS','KNOWS'," ++
+        "'FRIENDS_WITH','WORKS_WITH','COLLABORATES_WITH','MANAGES','RELATED_TO'," ++
+        "'MET','RUNS','OPERATES','MAINTAINS','SUPPORTS','CONTRIBUTES_TO'," ++
+        "'USED_BY','FOUNDED','CREATED','AUTHORED','WROTE','READS','WATCHES'," ++
+        "'LISTENS_TO','PLAYS','STUDIES','TEACHES','SPEAKS'";
+
+    /// Personalized PageRank over `memory_edges`.
+    /// Returns nodes ordered by accumulated PPR score DESC, capped at `limit`.
+    /// Seeds get score = 1/N (uniform prior); scores decay by predicate-type
+    /// prior × 0.85 damping per hop, mirroring HippoRAG (NeurIPS 2024).
+    /// Caller frees: for (nodes) |n| n.deinit(allocator); allocator.free(nodes);
+    pub fn findEdgesPPR(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        seed_keys: []const []const u8,
+        max_hops: u8,
+        limit: usize,
+    ) ![]PPRNode {
+        if (seed_keys.len == 0) return allocator.alloc(PPRNode, 0);
+
+        // Build seed TEXT[] literal: {"key1","key2",...}
+        var seed_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer seed_buf.deinit(allocator);
+        try seed_buf.appendSlice(allocator, "{");
+        for (seed_keys, 0..) |k, i| {
+            if (i > 0) try seed_buf.append(allocator, ',');
+            try seed_buf.append(allocator, '"');
+            for (k) |ch| {
+                if (ch == '\\' or ch == '"') try seed_buf.append(allocator, '\\');
+                try seed_buf.append(allocator, ch);
+            }
+            try seed_buf.append(allocator, '"');
+        }
+        try seed_buf.appendSlice(allocator, "}");
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const seeds_z = try allocator.dupeZ(u8, seed_buf.items);
+        defer allocator.free(seeds_z);
+        var hops_buf: [8]u8 = undefined;
+        const hops_s = try std.fmt.bufPrintZ(&hops_buf, "{d}", .{max_hops});
+        var limit_buf: [32]u8 = undefined;
+        const limit_s = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
+
+        const q_template =
+            "WITH RECURSIVE " ++
+            "ppr(key, score, depth) AS (" ++
+            "  SELECT unnest($2::text[]) AS key, " ++
+            "         1.0 / GREATEST(array_length($2::text[], 1), 1) AS score, " ++
+            "         0 AS depth " ++
+            "  UNION ALL " ++
+            "  SELECT CASE WHEN e.source_key = p.key THEN e.target_key ELSE e.source_key END, " ++
+            "         p.score * CASE WHEN UPPER(e.predicate) IN (" ++ PPR_SINGLE_VALUED ++ ") THEN 1.0 " ++
+            "                        WHEN UPPER(e.predicate) IN (" ++ PPR_SET_VALUED ++ ") THEN 0.5 " ++
+            "                        ELSE 0.7 END * 0.85, " ++
+            "         p.depth + 1 " ++
+            "  FROM ppr p " ++
+            "  JOIN {schema}.memory_edges e " ++
+            "    ON (e.source_key = p.key OR e.target_key = p.key) " ++
+            "    AND e.user_id = $1 AND e.is_latest " ++
+            "  WHERE p.depth < $3" ++
+            ") " ++
+            "SELECT key, SUM(score) AS ppr_score, MIN(depth)::int AS min_depth " ++
+            "FROM ppr " ++
+            "GROUP BY key " ++
+            "HAVING SUM(score) > 0.01 " ++
+            "ORDER BY ppr_score DESC " ++
+            "LIMIT $4";
+
+        const q = try self.buildQuery(q_template);
+        defer self.allocator.free(q);
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, seeds_z, hops_s.ptr, limit_s.ptr };
+        const lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(seed_buf.items.len),
+            @intCast(hops_s.len),
+            @intCast(limit_s.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const tuples = c.PQntuples(result);
+        var out: std.ArrayListUnmanaged(PPRNode) = .{};
+        errdefer {
+            for (out.items) |n| n.deinit(allocator);
+            out.deinit(allocator);
+        }
+        var i: c_int = 0;
+        while (i < tuples) : (i += 1) {
+            const key   = try dupeResultValue(allocator, result, i, 0);
+            errdefer allocator.free(key);
+            const score_str = try dupeResultValue(allocator, result, i, 1);
+            defer allocator.free(score_str);
+            const depth_str = try dupeResultValue(allocator, result, i, 2);
+            defer allocator.free(depth_str);
+            const ppr_score = std.fmt.parseFloat(f64, score_str) catch 0.0;
+            const depth_i32 = std.fmt.parseInt(i32, depth_str, 10) catch 0;
+            try out.append(allocator, .{
+                .key       = key,
+                .ppr_score = if (std.math.isFinite(ppr_score)) ppr_score else 0.0,
+                .min_depth = @intCast(@min(@as(i32, 255), @max(0, depth_i32))),
             });
         }
         return out.toOwnedSlice(allocator);
