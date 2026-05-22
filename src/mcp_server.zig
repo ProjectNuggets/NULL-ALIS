@@ -24,6 +24,7 @@
 const std = @import("std");
 const tools_mod = @import("tools/root.zig");
 const config_mod = @import("config.zig");
+const memory_mod = @import("memory/root.zig");
 const protocol = @import("mcp/server_protocol.zig");
 const policy = @import("mcp/server_policy.zig");
 const auth = @import("mcp/server_auth.zig");
@@ -49,6 +50,10 @@ pub const Server = struct {
     tools: []const tools_mod.Tool,
     /// Resolved once at startup: is the full-registry escape hatch on?
     expose_all: bool,
+    /// Resolved once at startup: is a memory backend bound? Gates the
+    /// memory_* tools in the exposure policy (server_policy.shouldExpose) —
+    /// when false they are hidden so tools/list never lists a broken tool.
+    memory_available: bool,
     /// Caller auth boundary.
     auth_config: auth.AuthConfig,
     /// Set true once a valid `initialize` request has been processed.
@@ -62,12 +67,14 @@ pub const Server = struct {
         allocator: Allocator,
         tools: []const tools_mod.Tool,
         expose_all: bool,
+        memory_available: bool,
         auth_config: auth.AuthConfig,
     ) Server {
         return .{
             .allocator = allocator,
             .tools = tools,
             .expose_all = expose_all,
+            .memory_available = memory_available,
             .auth_config = auth_config,
         };
     }
@@ -137,13 +144,13 @@ pub const Server = struct {
         }
 
         if (std.mem.eql(u8, msg.method, "tools/list")) {
-            const result = try handlers.buildToolsListResult(a, self.tools, self.expose_all);
+            const result = try handlers.buildToolsListResult(a, self.tools, self.expose_all, self.memory_available);
             defer a.free(result);
             return try protocol.buildResponse(a, msg.id_int, msg.id_str, result);
         }
 
         if (std.mem.eql(u8, msg.method, "tools/call")) {
-            const outcome = try handlers.handleToolsCall(a, self.tools, self.expose_all, msg.params);
+            const outcome = try handlers.handleToolsCall(a, self.tools, self.expose_all, self.memory_available, msg.params);
             defer if (outcome.result_json) |r| a.free(r);
             if (outcome.err) |e| {
                 return try protocol.buildError(a, msg.id_int, msg.id_str, e.code, e.message);
@@ -382,16 +389,36 @@ fn runServeCommand(allocator: Allocator, sub_args: []const []const u8) !void {
         allocator.free(tools);
     }
 
+    // Wire a memory backend so the exposed memory_* tools function — the
+    // "composable brain over MCP" payload. Standalone single-process bind,
+    // mirroring the CLI path: initRuntimeWithOptions + bindMemoryTools +
+    // bindMemoryRuntime. Optional — a missing or disabled backend degrades
+    // to compute/file/web tools only, and the exposure policy hides the
+    // memory_* tools to match (server_policy.shouldExpose's memory_available).
+    var mem_rt: ?memory_mod.MemoryRuntime = if (cfg_opt) |*c|
+        memory_mod.initRuntimeWithOptions(allocator, &c.memory, workspace_dir, .{
+            .providers = c.providers,
+        })
+    else
+        null;
+    defer if (mem_rt) |*rt| rt.deinit();
+    if (mem_rt) |*rt| {
+        tools_mod.bindMemoryTools(tools, rt.memory);
+        tools_mod.bindMemoryRuntime(tools, rt);
+    }
+    const memory_available = mem_rt != null;
+
     // Startup log goes to stderr (stdout is the JSON-RPC channel — it must
     // carry nothing but protocol messages).
     log.info(
-        "nullalis MCP server starting: version={s} workspace={s} expose_all={any} auth_required={any} exposed_tools~={d}",
+        "nullalis MCP server starting: version={s} workspace={s} expose_all={any} auth_required={any} memory={any} exposed_tools~={d}",
         .{
             version.string,
             workspace_dir,
             expose_all,
             auth_config.required(),
-            if (expose_all) tools.len else policy.safeSubsetCount(),
+            memory_available,
+            if (expose_all) tools.len else policy.safeSubsetCount(memory_available),
         },
     );
     if (!auth_config.required()) {
@@ -400,8 +427,11 @@ fn runServeCommand(allocator: Allocator, sub_args: []const []const u8) !void {
     if (expose_all) {
         log.warn("MCP server exposing the FULL tool registry (includes shell/file-write/etc.) — escape hatch is active", .{});
     }
+    if (!memory_available) {
+        log.warn("MCP server: no memory backend bound — memory_* tools are not exposed; set config.memory.backend to enable the composable-brain payload", .{});
+    }
 
-    var server = Server.init(allocator, tools, expose_all, auth_config);
+    var server = Server.init(allocator, tools, expose_all, memory_available, auth_config);
     try runStdioLoop(&server);
 }
 
@@ -411,7 +441,7 @@ const testing = std.testing;
 
 // Build a Server with an empty registry and no auth, for handshake tests.
 fn testServer(tools: []const tools_mod.Tool) Server {
-    return Server.init(testing.allocator, tools, false, .{ .token = null, .allocator = testing.allocator });
+    return Server.init(testing.allocator, tools, false, false, .{ .token = null, .allocator = testing.allocator });
 }
 
 fn parse(line: []const u8) !std.json.Parsed(std.json.Value) {
@@ -499,7 +529,7 @@ test "mcp_server: unknown method after initialize is method_not_found" {
 }
 
 test "mcp_server: initialize with auth required rejects a missing token" {
-    var srv = Server.init(testing.allocator, &.{}, false, .{
+    var srv = Server.init(testing.allocator, &.{}, false, false, .{
         .token = try testing.allocator.dupe(u8, "a-long-enough-token-here"),
         .allocator = testing.allocator,
     });
@@ -516,7 +546,7 @@ test "mcp_server: initialize with auth required rejects a missing token" {
 }
 
 test "mcp_server: initialize with auth required accepts the correct token" {
-    var srv = Server.init(testing.allocator, &.{}, false, .{
+    var srv = Server.init(testing.allocator, &.{}, false, false, .{
         .token = try testing.allocator.dupe(u8, "a-long-enough-token-here"),
         .allocator = testing.allocator,
     });

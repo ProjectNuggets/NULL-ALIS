@@ -20,8 +20,12 @@ const std = @import("std");
 ///   - read-only / introspection: bounded, no side effects, safe to expose.
 ///   - web_search / web_fetch: outbound but read-only and rate-bounded;
 ///     net_security egress filtering still applies at the tool layer.
+///   - memory read + non-destructive append (`memory_tool_names`): the
+///     "composable brain over MCP" payload — exposed ONLY when `mcp serve`
+///     has bound a memory backend (`shouldExpose`'s `memory_available`);
+///     destructive memory ops stay excluded regardless.
 ///
-/// Everything NOT in this list is excluded by default. Notable exclusions
+/// Everything NOT in these lists is excluded by default. Notable exclusions
 /// and why:
 ///   shell, git_operations               — arbitrary code execution
 ///   file_write/edit/append/*_hashed      — filesystem mutation
@@ -35,11 +39,6 @@ const std = @import("std");
 ///     purge_topic/maintain, compose_memory,
 ///     wiki_link, brain_graph, todo,
 ///     transcript_read                    — destructive or agent-private
-///   memory_recall/list/timeline/store    — DEFERRED, not unsafe: `nullalis
-///     mcp serve` does not bind a memory backend yet, so exposing these
-///     would advertise non-functional tools in tools/list. The roadmap
-///     follow-up that wires the memory runtime into `mcp serve` returns
-///     them here — that is the "composable brain over MCP" payload.
 const safe_tool_names = [_][]const u8{
     // Introspection / compute — pure, bounded.
     "calculator",
@@ -52,18 +51,35 @@ const safe_tool_names = [_][]const u8{
     // Web — outbound but read-only; net_security egress filter still gates.
     "web_search",
     "web_fetch",
-    // NOTE: memory_recall/list/timeline/store are intentionally NOT here —
-    // see the exclusions comment above (deferred until `mcp serve` binds a
-    // memory backend; they would otherwise list as non-functional tools).
+};
+
+/// Memory tools — read + non-destructive append. Exposed only when the
+/// server has bound a memory backend (`memory_available`); listing them
+/// unbound would advertise non-functional tools. Destructive memory ops
+/// (edit/forget/archive/demote/purge) are deliberately NOT here.
+const memory_tool_names = [_][]const u8{
+    "memory_recall",
+    "memory_list",
+    "memory_timeline",
+    "memory_store",
 };
 
 /// Environment variable that opts an operator into exposing the *entire*
 /// tool registry, bypassing the curated subset. Off unless set to "1".
 pub const expose_all_env = "NULLALIS_MCP_EXPOSE_ALL";
 
-/// Returns true when `tool_name` is in the curated safe subset.
+/// Returns true when `tool_name` is in the always-safe compute/file/web subset.
 pub fn isSafeToExpose(tool_name: []const u8) bool {
     for (safe_tool_names) |n| {
+        if (std.mem.eql(u8, n, tool_name)) return true;
+    }
+    return false;
+}
+
+/// Returns true when `tool_name` is a memory tool — exposed conditionally
+/// on a bound memory backend (see `shouldExpose`).
+pub fn isMemoryTool(tool_name: []const u8) bool {
+    for (memory_tool_names) |n| {
         if (std.mem.eql(u8, n, tool_name)) return true;
     }
     return false;
@@ -78,15 +94,21 @@ pub fn exposeAllEnabled(allocator: std.mem.Allocator) bool {
     return std.mem.eql(u8, std.mem.trim(u8, raw, " \t\r\n"), "1");
 }
 
-/// The exposure decision for one tool, given the resolved `expose_all` flag.
-pub fn shouldExpose(tool_name: []const u8, expose_all: bool) bool {
+/// The exposure decision for one tool.
+///   - `expose_all` (the escape hatch) bypasses every restriction.
+///   - memory tools require `memory_available` — a backend bound into
+///     `mcp serve`; listing them unbound would advertise broken tools.
+///   - otherwise: the always-safe compute/file/web subset.
+pub fn shouldExpose(tool_name: []const u8, expose_all: bool, memory_available: bool) bool {
     if (expose_all) return true;
+    if (isMemoryTool(tool_name)) return memory_available;
     return isSafeToExpose(tool_name);
 }
 
-/// Count of tools in the curated subset — used in tests and the startup log.
-pub fn safeSubsetCount() usize {
-    return safe_tool_names.len;
+/// Count of curated tools exposed by default — used in the startup log.
+/// Includes the memory tools only when a backend is bound.
+pub fn safeSubsetCount(memory_available: bool) usize {
+    return safe_tool_names.len + if (memory_available) memory_tool_names.len else 0;
 }
 
 // ── Tests ───────────────────────────────────────────────────────
@@ -100,14 +122,21 @@ test "server_policy: safe subset includes read-only compute, file, and web tools
     try testing.expect(isSafeToExpose("web_fetch"));
 }
 
-test "server_policy: memory tools are not exposed pending mcp-serve backend wiring" {
-    // `nullalis mcp serve` does not bind a memory backend yet; these are
-    // excluded so tools/list never advertises a non-functional tool. The
-    // roadmap follow-up that wires the backend returns them to the subset.
-    try testing.expect(!isSafeToExpose("memory_recall"));
-    try testing.expect(!isSafeToExpose("memory_list"));
-    try testing.expect(!isSafeToExpose("memory_timeline"));
+test "server_policy: memory tools are exposed only when a backend is bound" {
+    // Classified as memory tools.
+    try testing.expect(isMemoryTool("memory_recall"));
+    try testing.expect(isMemoryTool("memory_list"));
+    try testing.expect(isMemoryTool("memory_timeline"));
+    try testing.expect(isMemoryTool("memory_store"));
+    try testing.expect(!isMemoryTool("calculator"));
+    // Not in the always-safe subset...
     try testing.expect(!isSafeToExpose("memory_store"));
+    // ...shouldExpose gates them on memory_available: unbound → hidden,
+    // bound → exposed (the "composable brain over MCP" payload).
+    try testing.expect(!shouldExpose("memory_store", false, false));
+    try testing.expect(shouldExpose("memory_store", false, true));
+    try testing.expect(!shouldExpose("memory_recall", false, false));
+    try testing.expect(shouldExpose("memory_recall", false, true));
 }
 
 test "server_policy: dangerous tools are excluded from the safe subset" {
@@ -127,18 +156,20 @@ test "server_policy: dangerous tools are excluded from the safe subset" {
 
 test "server_policy: shouldExpose honors the expose_all escape hatch" {
     // Default posture: only the safe subset.
-    try testing.expect(shouldExpose("calculator", false));
-    try testing.expect(!shouldExpose("shell", false));
-    // Escape hatch: everything passes.
-    try testing.expect(shouldExpose("shell", true));
-    try testing.expect(shouldExpose("calculator", true));
+    try testing.expect(shouldExpose("calculator", false, false));
+    try testing.expect(!shouldExpose("shell", false, false));
+    // Escape hatch: everything passes, even with no memory backend bound.
+    try testing.expect(shouldExpose("shell", true, false));
+    try testing.expect(shouldExpose("calculator", true, false));
+    try testing.expect(shouldExpose("memory_store", true, false));
 }
 
 test "server_policy: unknown tool name is not exposed by default" {
     try testing.expect(!isSafeToExpose("some_future_tool"));
-    try testing.expect(!shouldExpose("some_future_tool", false));
+    try testing.expect(!shouldExpose("some_future_tool", false, true));
 }
 
-test "server_policy: safe subset is non-empty" {
-    try testing.expect(safeSubsetCount() > 0);
+test "server_policy: safe subset is non-empty and grows with a memory backend" {
+    try testing.expect(safeSubsetCount(false) > 0);
+    try testing.expect(safeSubsetCount(true) > safeSubsetCount(false));
 }

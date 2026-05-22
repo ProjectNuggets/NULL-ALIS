@@ -37,6 +37,7 @@ pub fn buildToolsListResult(
     allocator: Allocator,
     tools: []const tools_mod.Tool,
     expose_all: bool,
+    memory_available: bool,
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -45,7 +46,7 @@ pub fn buildToolsListResult(
     var first = true;
     for (tools) |t| {
         const tname = t.name();
-        if (!policy.shouldExpose(tname, expose_all)) continue;
+        if (!policy.shouldExpose(tname, expose_all, memory_available)) continue;
         if (!first) try buf.append(allocator, ',');
         first = false;
 
@@ -97,6 +98,7 @@ pub fn handleToolsCall(
     allocator: Allocator,
     tools: []const tools_mod.Tool,
     expose_all: bool,
+    memory_available: bool,
     params: ?std.json.Value,
 ) !CallOutcome {
     const p = params orelse return .{ .err = .{
@@ -119,7 +121,7 @@ pub fn handleToolsCall(
     const tool_name = name_val.string;
 
     // Exposure gate first: do not reveal that an unsafe tool exists.
-    if (!policy.shouldExpose(tool_name, expose_all)) {
+    if (!policy.shouldExpose(tool_name, expose_all, memory_available)) {
         return .{ .err = .{
             .code = .method_not_found,
             .message = "unknown or unavailable tool",
@@ -254,7 +256,7 @@ test "server_handlers: buildToolsListResult filters by exposure policy" {
     const list = [_]tools_mod.Tool{ safe.tool(), unsafe.tool() };
 
     // Default policy: only the safe tool appears.
-    const out = try buildToolsListResult(testing.allocator, &list, false);
+    const out = try buildToolsListResult(testing.allocator, &list, false, false);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "calculator") != null);
     try testing.expect(std.mem.indexOf(u8, out, "shell") == null);
@@ -269,10 +271,27 @@ test "server_handlers: buildToolsListResult expose_all includes everything" {
     var safe = FakeTool{ .name_str = "calculator" };
     var unsafe = FakeTool{ .name_str = "shell" };
     const list = [_]tools_mod.Tool{ safe.tool(), unsafe.tool() };
-    const out = try buildToolsListResult(testing.allocator, &list, true);
+    const out = try buildToolsListResult(testing.allocator, &list, true, false);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "calculator") != null);
     try testing.expect(std.mem.indexOf(u8, out, "shell") != null);
+}
+
+test "server_handlers: buildToolsListResult gates memory tools on memory_available" {
+    var compute = FakeTool{ .name_str = "calculator" };
+    var mem = FakeTool{ .name_str = "memory_store" };
+    const list = [_]tools_mod.Tool{ compute.tool(), mem.tool() };
+
+    // No memory backend bound → memory_store hidden, calculator shown.
+    const without = try buildToolsListResult(testing.allocator, &list, false, false);
+    defer testing.allocator.free(without);
+    try testing.expect(std.mem.indexOf(u8, without, "calculator") != null);
+    try testing.expect(std.mem.indexOf(u8, without, "memory_store") == null);
+
+    // Memory backend bound → memory_store appears.
+    const with = try buildToolsListResult(testing.allocator, &list, false, true);
+    defer testing.allocator.free(with);
+    try testing.expect(std.mem.indexOf(u8, with, "memory_store") != null);
 }
 
 test "server_handlers: handleToolsCall executes a permitted tool" {
@@ -282,7 +301,7 @@ test "server_handlers: handleToolsCall executes a permitted tool" {
         \\{"name":"calculator","arguments":{}}
     , .{});
     defer p.deinit();
-    const outcome = try handleToolsCall(testing.allocator, &list, false, p.value);
+    const outcome = try handleToolsCall(testing.allocator, &list, false, false, p.value);
     defer if (outcome.result_json) |r| testing.allocator.free(r);
     try testing.expect(outcome.err == null);
     try testing.expect(std.mem.indexOf(u8, outcome.result_json.?, "fake output") != null);
@@ -296,7 +315,7 @@ test "server_handlers: handleToolsCall denies an unsafe tool as method_not_found
         \\{"name":"shell","arguments":{"command":"rm -rf /"}}
     , .{});
     defer p.deinit();
-    const outcome = try handleToolsCall(testing.allocator, &list, false, p.value);
+    const outcome = try handleToolsCall(testing.allocator, &list, false, false, p.value);
     defer if (outcome.result_json) |r| testing.allocator.free(r);
     try testing.expect(outcome.err != null);
     try testing.expectEqual(protocol.ErrorCode.method_not_found, outcome.err.?.code);
@@ -309,7 +328,7 @@ test "server_handlers: handleToolsCall reports a failing tool via isError, not p
         \\{"name":"calculator","arguments":{}}
     , .{});
     defer p.deinit();
-    const outcome = try handleToolsCall(testing.allocator, &list, false, p.value);
+    const outcome = try handleToolsCall(testing.allocator, &list, false, false, p.value);
     defer if (outcome.result_json) |r| testing.allocator.free(r);
     try testing.expect(outcome.err == null); // not a protocol error
     try testing.expect(std.mem.indexOf(u8, outcome.result_json.?, "\"isError\":true") != null);
@@ -323,7 +342,7 @@ test "server_handlers: handleToolsCall surfaces an internal tool error as isErro
         \\{"name":"calculator","arguments":{}}
     , .{});
     defer p.deinit();
-    const outcome = try handleToolsCall(testing.allocator, &list, false, p.value);
+    const outcome = try handleToolsCall(testing.allocator, &list, false, false, p.value);
     defer if (outcome.result_json) |r| testing.allocator.free(r);
     try testing.expect(outcome.err == null);
     try testing.expect(std.mem.indexOf(u8, outcome.result_json.?, "\"isError\":true") != null);
@@ -336,7 +355,7 @@ test "server_handlers: handleToolsCall rejects missing name" {
         \\{"arguments":{}}
     , .{});
     defer p.deinit();
-    const outcome = try handleToolsCall(testing.allocator, &list, false, p.value);
+    const outcome = try handleToolsCall(testing.allocator, &list, false, false, p.value);
     defer if (outcome.result_json) |r| testing.allocator.free(r);
     try testing.expect(outcome.err != null);
     try testing.expectEqual(protocol.ErrorCode.invalid_params, outcome.err.?.code);
@@ -349,7 +368,7 @@ test "server_handlers: handleToolsCall rejects unknown permitted-name tool" {
         \\{"name":"calculator","arguments":{}}
     , .{});
     defer p.deinit();
-    const outcome = try handleToolsCall(testing.allocator, &list, false, p.value);
+    const outcome = try handleToolsCall(testing.allocator, &list, false, false, p.value);
     defer if (outcome.result_json) |r| testing.allocator.free(r);
     try testing.expect(outcome.err != null);
     try testing.expectEqual(protocol.ErrorCode.method_not_found, outcome.err.?.code);
