@@ -206,7 +206,6 @@ pub const ExtractionConfig = struct {
 // ProductPresetsConfig was their only consumer (deleted in v1.14.18-A F1).
 // Removal per §14.5 no-loose-ends discipline (v1.14.18-A F1 cleanup commit).
 
-
 pub const SidecarConfig = struct {
     /// Enable the sidecar provider for auxiliary LLM calls (narration, compaction).
     enabled: bool = true,
@@ -1262,10 +1261,29 @@ pub const NamedAgentConfig = struct {
 // ── MCP Server Config ──────────────────────────────────────────
 
 pub const McpServerConfig = struct {
+    /// Transport selector. `stdio` spawns `command` as a child process and
+    /// speaks newline-delimited JSON-RPC over its stdin/stdout. `http` POSTs
+    /// JSON-RPC to `url` (Streamable HTTP / MCP 2025-03-26); responses may be
+    /// a single JSON body or an SSE stream — both are handled.
+    pub const Transport = enum { stdio, http };
+
     name: []const u8,
-    command: []const u8,
+    /// Transport kind. When omitted in config it is inferred: a `url` present
+    /// implies `http`, otherwise `stdio`.
+    transport: Transport = .stdio,
+
+    // ── stdio transport fields ──────────────────────────────────
+    /// Executable to spawn (stdio transport only). Empty for http transport.
+    command: []const u8 = "",
     args: []const []const u8 = &.{},
     env: []const McpEnvEntry = &.{},
+
+    // ── http transport fields ───────────────────────────────────
+    /// MCP endpoint URL (http transport only). Empty for stdio transport.
+    url: []const u8 = "",
+    /// Extra HTTP headers sent on every request, e.g. `Authorization`.
+    headers: []const McpEnvEntry = &.{},
+
     /// S7.11 — max seconds to wait for a single newline-terminated response
     /// line from the MCP server's stdout. Applied per `readLine` call, not
     /// per tool invocation — a hung server (no bytes, no EOF) is detected
@@ -1273,6 +1291,7 @@ pub const McpServerConfig = struct {
     /// Default 30s matches the longest realistic "slow MCP tool" budget
     /// without forcing every deployment to set the key. Zero disables the
     /// timeout (blocking behavior, same as pre-S7.11 semantics).
+    /// For http transport this is the per-request curl `--max-time`.
     read_line_timeout_secs: u32 = 30,
 
     pub const McpEnvEntry = struct {

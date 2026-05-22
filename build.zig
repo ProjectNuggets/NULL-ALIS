@@ -532,11 +532,38 @@ pub fn build(b: *std.Build) void {
         agent_pg_tests.root_module.linkSystemLibrary("pq", .{});
     }
 
+    // Sprint 2 — MCP client live integration test. Drives the real
+    // McpServer client against an external MCP server (stdio + HTTP). NOT in
+    // the canonical `test` step's real exercise: it needs `npx` on PATH and
+    // is opt-in behind NULLALIS_MCP_LIVE_TEST. Compiles everywhere; the test
+    // body skips cleanly when the env var is unset.
+    const mcp_live_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/mcp/live_server_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nullalis", .module = lib_mod },
+            },
+        }),
+    });
+    if (sqlite3) |lib| {
+        mcp_live_tests.linkLibrary(lib);
+    }
+    if (enable_postgres) {
+        addHomebrewLibpqPaths(mcp_live_tests);
+        addHomebrewLibpqPaths(mcp_live_tests.root_module);
+        mcp_live_tests.root_module.linkSystemLibrary("pq", .{});
+    }
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     test_step.dependOn(&b.addRunArtifact(security_sandbox_tests).step);
     test_step.dependOn(&b.addRunArtifact(agent_pg_tests).step);
+    // mcp_live_tests is compiled (so it can never bit-rot) but only its
+    // skip-path runs here; the real exercise is the test-mcp-live step.
+    test_step.dependOn(&b.addRunArtifact(mcp_live_tests).step);
 
     // Focused step: run only the v1.14.18-B Fix C integration test —
     // exercises the postgres round-trip without rebuilding/running the
@@ -544,4 +571,9 @@ pub fn build(b: *std.Build) void {
     // skips cleanly otherwise.
     const agent_pg_step = b.step("test-agent-pg", "Run only the promotion + reflection-store postgres integration test");
     agent_pg_step.dependOn(&b.addRunArtifact(agent_pg_tests).step);
+
+    // Focused step: run only the MCP client live integration test. Run with
+    // NULLALIS_MCP_LIVE_TEST=1 zig build test-mcp-live
+    const mcp_live_step = b.step("test-mcp-live", "Run only the MCP client live integration test (needs npx)");
+    mcp_live_step.dependOn(&b.addRunArtifact(mcp_live_tests).step);
 }

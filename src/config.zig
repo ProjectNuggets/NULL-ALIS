@@ -600,17 +600,35 @@ pub const Config = struct {
     fn writeMcpServersSection(self: *const Config, w: *std.Io.Writer) !void {
         try w.print("  \"mcp_servers\": {{\n", .{});
         for (self.mcp_servers, 0..) |server, i| {
-            try w.print("    {f}: {{\"command\": {f}", .{
-                std.json.fmt(server.name, .{}),
-                std.json.fmt(server.command, .{}),
-            });
-            if (server.args.len > 0) {
-                try w.print(", \"args\": {f}", .{std.json.fmt(server.args, .{})});
+            try w.print("    {f}: {{", .{std.json.fmt(server.name, .{})});
+            // transport is emitted explicitly so a saved http server reloads
+            // as http even though it has no `command`.
+            switch (server.transport) {
+                .stdio => {
+                    try w.print("\"command\": {f}", .{std.json.fmt(server.command, .{})});
+                    if (server.args.len > 0) {
+                        try w.print(", \"args\": {f}", .{std.json.fmt(server.args, .{})});
+                    }
+                },
+                .http => {
+                    try w.print("\"transport\": \"http\", \"url\": {f}", .{std.json.fmt(server.url, .{})});
+                },
             }
             if (server.env.len > 0) {
                 try w.print(", \"env\": {{", .{});
                 for (server.env, 0..) |entry, env_i| {
                     if (env_i > 0) try w.print(", ", .{});
+                    try w.print("{f}: {f}", .{
+                        std.json.fmt(entry.key, .{}),
+                        std.json.fmt(entry.value, .{}),
+                    });
+                }
+                try w.print("}}", .{});
+            }
+            if (server.headers.len > 0) {
+                try w.print(", \"headers\": {{", .{});
+                for (server.headers, 0..) |entry, hdr_i| {
+                    if (hdr_i > 0) try w.print(", ", .{});
                     try w.print("{f}: {f}", .{
                         std.json.fmt(entry.key, .{}),
                         std.json.fmt(entry.value, .{}),
