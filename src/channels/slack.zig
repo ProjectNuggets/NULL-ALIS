@@ -629,28 +629,66 @@ pub const SlackChannel = struct {
 
     // ── Channel vtable ──────────────────────────────────────────────
 
+    /// Inspect a chat.postMessage response body and log the Slack-side error
+    /// when `ok` is false. Slack returns HTTP 200 with `{"ok":false,"error":...}`
+    /// for application-level failures (bad token, missing scope, channel not
+    /// found), so a transport-level success does not imply delivery.
+    fn logSlackApiErrorIfAny(self: *SlackChannel, resp: []const u8) void {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        const ok_val = parsed.value.object.get("ok") orelse return;
+        if (ok_val == .bool and ok_val.bool) return;
+        const err_code: []const u8 = if (parsed.value.object.get("error")) |e|
+            (if (e == .string) e.string else "unknown")
+        else
+            "unknown";
+        log.warn("Slack API returned ok=false: {s}", .{err_code});
+    }
+
+    /// Build the chat.postMessage JSON body. `text` is standard Markdown and is
+    /// converted to Slack mrkdwn before serialization so it renders correctly
+    /// under `"mrkdwn":true`. Caller owns the returned slice.
+    /// Pure (no I/O) so the markdown-conversion wiring is unit-testable.
+    fn buildPostMessageBody(
+        allocator: std.mem.Allocator,
+        channel_id: []const u8,
+        text: []const u8,
+        thread_ts: ?[]const u8,
+    ) ![]u8 {
+        // Convert standard Markdown (**bold**, [text](url), # headers, …) to
+        // Slack mrkdwn. Fall back to the raw text if conversion fails (OOM).
+        const rendered = markdownToSlackMrkdwn(allocator, text) catch null;
+        defer if (rendered) |r| allocator.free(r);
+        const body_text: []const u8 = rendered orelse text;
+
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(allocator);
+
+        try body_list.appendSlice(allocator, "{\"channel\":\"");
+        try body_list.appendSlice(allocator, channel_id);
+        try body_list.appendSlice(allocator, "\",\"mrkdwn\":true,\"text\":");
+        try root.json_util.appendJsonString(&body_list, allocator, body_text);
+        if (thread_ts) |tts| {
+            try body_list.appendSlice(allocator, ",\"thread_ts\":\"");
+            try body_list.appendSlice(allocator, tts);
+            try body_list.append(allocator, '"');
+        }
+        try body_list.append(allocator, '}');
+        return body_list.toOwnedSlice(allocator);
+    }
+
     /// Send a message to a Slack channel via chat.postMessage API.
     /// The target may contain "channel_id:thread_ts" for threaded replies.
+    /// Standard Markdown in `text` is converted to Slack mrkdwn before sending.
     pub fn sendMessage(self: *SlackChannel, target_channel: []const u8, text: []const u8) !void {
         const url = API_BASE ++ "/chat.postMessage";
 
         // Parse target for thread_ts (channel_id:thread_ts)
         const actual_channel = self.parseTarget(target_channel);
 
-        // Build JSON body
-        var body_list: std.ArrayListUnmanaged(u8) = .empty;
-        defer body_list.deinit(self.allocator);
-
-        try body_list.appendSlice(self.allocator, "{\"channel\":\"");
-        try body_list.appendSlice(self.allocator, actual_channel);
-        try body_list.appendSlice(self.allocator, "\",\"mrkdwn\":true,\"text\":");
-        try root.json_util.appendJsonString(&body_list, self.allocator, text);
-        if (self.thread_ts) |tts| {
-            try body_list.appendSlice(self.allocator, ",\"thread_ts\":\"");
-            try body_list.appendSlice(self.allocator, tts);
-            try body_list.append(self.allocator, '"');
-        }
-        try body_list.append(self.allocator, '}');
+        const body = try buildPostMessageBody(self.allocator, actual_channel, text, self.thread_ts);
+        defer self.allocator.free(body);
 
         // Build auth header: "Authorization: Bearer xoxb-..."
         var auth_buf: [512]u8 = undefined;
@@ -658,11 +696,12 @@ pub const SlackChannel = struct {
         try auth_fbs.writer().print("Authorization: Bearer {s}", .{self.bot_token});
         const auth_header = auth_fbs.getWritten();
 
-        const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
+        const resp = root.http_util.curlPost(self.allocator, url, body, &.{auth_header}) catch |err| {
             log.err("Slack API POST failed: {}", .{err});
             return error.SlackApiError;
         };
-        self.allocator.free(resp);
+        defer self.allocator.free(resp);
+        self.logSlackApiErrorIfAny(resp);
     }
 
     /// Set Slack Assistant thread status (best-effort, errors ignored).
@@ -1525,4 +1564,63 @@ test "parseSocketConnectParts extracts host port and path" {
     try std.testing.expectEqualStrings("wss-primary.slack.com", parts.host);
     try std.testing.expectEqual(@as(u16, 443), parts.port);
     try std.testing.expectEqualStrings("/link/?ticket=abc123", parts.path);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// chat.postMessage body construction tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "buildPostMessageBody converts standard markdown to slack mrkdwn" {
+    const alloc = std.testing.allocator;
+    const body = try SlackChannel.buildPostMessageBody(alloc, "C123", "This is **bold** text", null);
+    defer alloc.free(body);
+    // **bold** must be converted to *bold* — raw GitHub markdown would render
+    // literally in Slack under "mrkdwn":true.
+    try std.testing.expect(std.mem.indexOf(u8, body, "*bold*") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "**bold**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"channel\":\"C123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"mrkdwn\":true") != null);
+}
+
+test "buildPostMessageBody converts markdown links" {
+    const alloc = std.testing.allocator;
+    const body = try SlackChannel.buildPostMessageBody(alloc, "C1", "see [docs](https://x.com)", null);
+    defer alloc.free(body);
+    // [text](url) -> <url|text>
+    try std.testing.expect(std.mem.indexOf(u8, body, "<https://x.com|docs>") != null);
+}
+
+test "buildPostMessageBody includes thread_ts when set" {
+    const alloc = std.testing.allocator;
+    const body = try SlackChannel.buildPostMessageBody(alloc, "C1", "hi", "1700000000.000100");
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thread_ts\":\"1700000000.000100\"") != null);
+}
+
+test "buildPostMessageBody omits thread_ts when null" {
+    const alloc = std.testing.allocator;
+    const body = try SlackChannel.buildPostMessageBody(alloc, "C1", "hi", null);
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "thread_ts") == null);
+}
+
+test "buildPostMessageBody escapes special json characters in text" {
+    const alloc = std.testing.allocator;
+    const body = try SlackChannel.buildPostMessageBody(alloc, "C1", "quote \" and newline\n", null);
+    defer alloc.free(body);
+    // The body must remain valid JSON after escaping.
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expectEqualStrings("quote \" and newline\n", parsed.value.object.get("text").?.string);
+}
+
+test "logSlackApiErrorIfAny tolerates ok-true and malformed responses" {
+    const allowed = [_][]const u8{};
+    var ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
+    // None of these should crash or leak; ok=true and non-JSON are silent.
+    ch.logSlackApiErrorIfAny("{\"ok\":true,\"ts\":\"1.2\"}");
+    ch.logSlackApiErrorIfAny("not json at all");
+    ch.logSlackApiErrorIfAny("{\"ok\":false,\"error\":\"channel_not_found\"}");
+    ch.logSlackApiErrorIfAny("");
 }
