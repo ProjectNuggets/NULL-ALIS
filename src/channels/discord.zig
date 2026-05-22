@@ -848,13 +848,16 @@ pub const DiscordChannel = struct {
         // system messages (channel pin, member join, boost, thread-created,
         // etc.). Only DEFAULT (0) and REPLY (19) carry genuine user content;
         // process anything else would feed system noise to the agent.
-        // Absent "type" is treated as DEFAULT for forward-compatibility.
+        // Absent "type" is treated as DEFAULT for forward-compatibility. A
+        // present but non-integer "type" is a malformed/spoofed payload —
+        // Discord always sends an integer — so it is dropped rather than
+        // allowed to slip past the system-message filter.
         if (d_obj.get("type")) |type_val| {
             switch (type_val) {
                 .integer => |t| {
                     if (t != 0 and t != 19) return;
                 },
-                else => {},
+                else => return,
             }
         }
 
