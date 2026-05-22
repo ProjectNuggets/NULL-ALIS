@@ -20,10 +20,12 @@ This is the **A2A core**: nullalis can both consume external MCP servers and *be
 
 **Independent audit verdict:** #99/#100/#101 nits-only; #102 had one MAJOR (config round-trip silently dropped `read_line_timeout_secs`). All actioned — 5 fix-forward commits at `99db4ea8`: config round-trip + negative-value guard, MCP memory-tool exposure trimmed, protocol-version comment, Discord non-integer-`type` drop. **Verified:** canonical CI gate green on the integrated tree and again post-fix-forward, with all Sprint 2 channels (`-Dchannels=cli,telegram,email,teams,discord,slack`).
 
-**Honest gaps / final-shape items (NOT done — these are the next hardening targets):**
-- **MCP client is built but dormant** — the operator config still names `_mcp_servers_disabled_pending_stability_fix`; the stability bug is fixed, but the key must be renamed to `mcp_servers` to actually enable it.
-- **Memory-over-MCP deferred** — `mcp serve` does not bind a memory backend, so the MCP server exposes compute/file/web tools only, not memory. The "composable brain over MCP" needs the memory runtime wired into `mcp serve` — the #1 MCP follow-up.
-- **Email is send-only** — inbound IMAP is unbuilt (honestly labelled in `email.zig`).
+**MCP V1.1 (post-v1.14.20, `b598c431`) — the two MCP gaps are CLOSED:**
+- `mcp serve` now binds a memory backend (`initRuntimeWithOptions` + `bindMemory*`). The four memory tools are exposed when a backend is bound and hidden when it is not — `tools/list` never advertises a broken tool. Verified end-to-end: a real MCP client drove `mcp serve` over stdio and a `memory_store` → `memory_recall` round-trip returned the stored fact; `tools/call shell` stayed denied (`-32601`).
+- MCP client de-scaffolded — `mcp_servers` is a first-class config key (`config.example.json` ships it), enabled by default; the `_disabled` rename is now historical guidance only.
+
+**Honest gaps / final-shape items (NOT done):**
+- **Email is send-only** — inbound IMAP is unbuilt (honestly labelled in `email.zig`). This is the next slice.
 - MCP server is stdio-only (no HTTP/SSE); memory-as-MCP-`resources` deferred.
 - **Nostr deferred** — no user demand; explicitly scoped out of Sprint 2.
 
