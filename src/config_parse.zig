@@ -1110,6 +1110,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (mem.object.get("citations")) |v| {
                 if (v == .string) self.memory.citations = try self.allocator.dupe(u8, v.string);
             }
+            if (mem.object.get("enable_markdown_mirror")) |v| {
+                if (v == .bool) self.memory.enable_markdown_mirror = v.bool;
+            }
 
             // search
             if (mem.object.get("search")) |search_val| {

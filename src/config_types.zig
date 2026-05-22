@@ -743,6 +743,14 @@ pub const MemoryConfig = struct {
     backend: []const u8 = DEFAULT_MEMORY_BACKEND,
     auto_save: bool = true,
     citations: []const u8 = "auto",
+    /// v1.14.18 Step 9 (V7) — opt-in markdown mirror for the
+    /// `zaki_dual` runtime wrapper. When false (default), the
+    /// tenant-Postgres wrap writes ONLY to Postgres; when true, every
+    /// store is mirrored to `MEMORY.md` for human inspection /
+    /// restart-sync. Default-off matches the §14 honest-surface rule:
+    /// the architecture is Postgres-canonical, so the mirror is a
+    /// human-facing convenience, not a default invariant.
+    enable_markdown_mirror: bool = false,
     search: MemorySearchConfig = .{},
     qmd: MemoryQmdConfig = .{},
     lifecycle: MemoryLifecycleConfig = .{},

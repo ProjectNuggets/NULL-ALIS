@@ -1370,7 +1370,15 @@ const TenantRuntime = struct {
                 primary_impl.* = zaki_postgres_memory.ZakiPostgresMemory.init(allocator, state_mgr.?, numeric_user_id);
                 primary_impl.owns_self = true;
 
-                const dual = try zaki_dual_memory.ZakiDualMemory.init(allocator, primary_impl.memory(), runtime.config.workspace_dir);
+                // V7 (v1.14.18 Step 9) — markdown mirror is opt-in; pass
+                // the operator-set flag through. Default false means a
+                // pure-Postgres runtime (no MEMORY.md written / synced).
+                const dual = try zaki_dual_memory.ZakiDualMemory.init(
+                    allocator,
+                    primary_impl.memory(),
+                    runtime.config.workspace_dir,
+                    runtime.config.memory.enable_markdown_mirror,
+                );
                 try dual.syncFromMarkdown(allocator);
                 old_memory.deinit();
                 rt.memory = dual.memory();
