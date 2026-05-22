@@ -2,9 +2,14 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement five targeted memory quality improvements — entity overlap fusion, PPR graph traversal, provenance fields, tier sufficiency gate, and retrieval trace events — all on existing primitives with no new infrastructure.
+**Goal:** Implement four targeted memory quality improvements — entity overlap fusion, PPR graph traversal, provenance fields, and retrieval trace events — all on existing primitives with no new infrastructure. (P4 tier gate removed per design decision.)
 
-**Architecture:** All five changes are additive and independent; each ships with an env-var kill switch. Implementation order is P3→P5→P1→P2→P4, from lowest risk to highest behavioral impact. P3 (schema) and P5 (observability) land first so the bench can measure the behavioral changes from P1/P2/P4 with full telemetry.
+**Architecture:** All four changes are additive and independent; each ships with an env-var kill switch. Implementation order is P3→P5→P1→P2, from lowest risk to highest behavioral impact. P3 (schema) and P5 (observability) land first so the bench can measure the behavioral changes from P1/P2 with full telemetry.
+
+**Pre-flight recon corrections (applied 2026-05-22):**
+- P1: `entityOverlapImpl` must fetch `SUBSTRING(m.content,1,420)` from memories table — empty snippet produces blank bucket lines
+- P2: Do NOT create `edge_priors.zig` — `edge_resolution.zig` is already the single source of truth for predicate classification; PPR CTE mirrors its three tiers
+- P2: After `findEdgesPPR` scores nodes, call `findEdgesByKeys(ppr_node_keys)` to fetch edges for rendering — `buildGraphNeighborsBlock` silently drops all nodes if `.edges` is empty
 
 **Tech Stack:** Zig 0.15.2, PostgreSQL (libpq via `zaki_state.zig`), SQLite FTS5, inline `test "..."` blocks, `zig build test -Dchannels=cli`
 
@@ -17,11 +22,10 @@
 | `src/agent/zaki_state.zig` | P3: 2 ALTER TABLE migrations + `upsertMemoryEdgeRich` signature; P1: `findEdgesEntityOverlap()`; P2: `findEdgesPPR()` + `PPRNode` type |
 | `src/agent/extraction_persist.zig` | P3: `extraction_pass` mapping + `session_boundary_id` threading; update `persistExtracted` signature |
 | `src/agent/compaction.zig` *(or caller of `persistExtracted`)* | P3: generate `session_boundary_id` at boundary, pass to `persistExtracted` |
-| `src/agent/edge_priors.zig` *(new)* | P2: shared predicate prior table (single source of truth for BFS + PPR CTE) |
-| `src/agent/graph_expand.zig` | P2: PPR path in `expandFromSeeds`; import from `edge_priors.zig`; keep BFS fallback |
+| `src/agent/graph_expand.zig` | P2: PPR path in `expandFromSeeds`; import from `edge_resolution.zig` (already exists); keep BFS fallback |
 | `src/memory/retrieval/engine.zig` | P1: `EntityOverlapCallCtx` type + `entity_overlap` field; call in `search()` |
 | `src/agent/memory_loader.zig` | P1: `EntityOverlapCtx` + `entityOverlapImpl`; wire callback; P4: sufficiency gate + trim + env reads |
-| `src/agent/context_builder.zig` | P4: mirror `tier_gate_fired` + `tier_gate_trimmed_bytes` in `MemorySelection` |
+| `src/agent/context_builder.zig` | No changes (P4 removed) |
 | `src/run_trace_store.zig` | P5: add `.memory_retrieval` to `TraceEventKind` + `toSlice()` case |
 | `src/agent/context_engine.zig` | P5: `bucketSummary()` helper + emit `memory_retrieval` event after `loadTurnMemorySlotOpts` |
 
@@ -629,9 +633,11 @@ Near the `findEdgesByKeys` function in `zaki_state.zig`, add:
 pub const EntityOverlapRow = struct {
     memory_key: []u8,
     match_count: i64,
+    snippet: []u8,     // SUBSTRING(m.content, 1, 420) — needed for bucket rendering
 
     pub fn deinit(self: EntityOverlapRow, allocator: std.mem.Allocator) void {
         allocator.free(self.memory_key);
+        allocator.free(self.snippet);
     }
 };
 
@@ -644,16 +650,19 @@ pub fn findEdgesEntityOverlap(
 ) ![]EntityOverlapRow {
     if (token_patterns.len == 0) return &.{};
 
-    // Build the query with {schema} substitution
+    // Build the query with {schema} substitution.
+    // IMPORTANT: SELECT includes SUBSTRING(m.content,1,420) so candidates have
+    // non-empty snippet — empty snippets produce blank bucket lines.
     const q = try self.buildQuery(
-        "SELECT DISTINCT m.key, COUNT(e.id)::bigint AS match_count " ++
+        "SELECT DISTINCT m.key, COUNT(e.id)::bigint AS match_count, " ++
+        "  COALESCE(SUBSTRING(m.content, 1, 420), '') AS snippet " ++
         "FROM {schema}.memories m " ++
         "JOIN {schema}.memory_edges e " ++
         "  ON e.user_id = $1 AND e.is_latest " ++
         "  AND (e.source_key ILIKE ANY($2) OR e.target_key ILIKE ANY($2)) " ++
-        "  AND m.key IN (e.source_key, e.target_key) " ++
         "WHERE m.user_id = $1 " ++
-        "GROUP BY m.key " ++
+        "  AND m.key IN (e.source_key, e.target_key) " ++
+        "GROUP BY m.key, m.content " ++
         "ORDER BY match_count DESC " ++
         "LIMIT $3",
     );
@@ -695,11 +704,13 @@ pub fn findEdgesEntityOverlap(
     }
 
     for (0..@intCast(nrows)) |i| {
-        const key_raw = c.PQgetvalue(res, @intCast(i), 0);
-        const cnt_raw = c.PQgetvalue(res, @intCast(i), 1);
+        const key_raw     = c.PQgetvalue(res, @intCast(i), 0);
+        const cnt_raw     = c.PQgetvalue(res, @intCast(i), 1);
+        const snippet_raw = c.PQgetvalue(res, @intCast(i), 2);
         rows[i] = .{
             .memory_key = try allocator.dupe(u8, std.mem.span(key_raw)),
             .match_count = try std.fmt.parseInt(i64, std.mem.span(cnt_raw), 10),
+            .snippet    = try allocator.dupe(u8, std.mem.span(snippet_raw)),
         };
     }
     return rows;
@@ -790,9 +801,9 @@ fn entityOverlapImpl(
         else 0.0;
         candidates[i] = engine_mod.RetrievalCandidate{
             .id = 0,
-            .key = try allocator.dupe(u8, row.memory_key),
-            .content = try allocator.dupe(u8, ""),
-            .snippet = try allocator.dupe(u8, ""),
+            .key     = try allocator.dupe(u8, row.memory_key),
+            .content = try allocator.dupe(u8, row.snippet),  // MUST be populated — empty produces blank bucket lines
+            .snippet = try allocator.dupe(u8, row.snippet),
             .category = .daily,
             .keyword_rank = null,
             .vector_score = null,
@@ -866,109 +877,49 @@ git commit -m "feat(memory): wire entity overlap callback in memory_loader (P1)"
 
 ---
 
-### Task 11: Create `src/agent/edge_priors.zig`
+### Task 11: Verify `edge_resolution.zig` exposes predicate classification
 
 **Files:**
-- Create: `src/agent/edge_priors.zig`
+- Read: `src/agent/edge_resolution.zig`
+- No new file needed — `edge_resolution.zig` is already the single source of truth
 
-- [ ] **Step 1: Create the file with the shared prior table**
-
-```zig
-//! Shared predicate prior weights for graph traversal.
-//! Single source of truth used by both BFS (graph_expand.zig) and PPR CTE (zaki_state.zig).
-
-pub const EdgePrior = struct {
-    predicate: []const u8,
-    prior: f64,
-};
-
-/// Predicates with known prior weights.
-/// Unknown predicates use DEFAULT_PRIOR.
-pub const KNOWN_PRIORS: []const EdgePrior = &[_]EdgePrior{
-    // Single-valued (high precision, one true value)
-    .{ .predicate = "LIVES_IN",     .prior = 1.0 },
-    .{ .predicate = "MARRIED_TO",   .prior = 1.0 },
-    .{ .predicate = "BIRTHDAY",     .prior = 1.0 },
-    .{ .predicate = "WORKS_AT",     .prior = 1.0 },
-    .{ .predicate = "IS_A",         .prior = 1.0 },
-    .{ .predicate = "FULL_NAME",    .prior = 1.0 },
-    .{ .predicate = "NATIONALITY",  .prior = 1.0 },
-    // Set-valued (lower precision, many valid values)
-    .{ .predicate = "LIKES",        .prior = 0.5 },
-    .{ .predicate = "USES",         .prior = 0.5 },
-    .{ .predicate = "IS_TYPE_OF",   .prior = 0.5 },
-    .{ .predicate = "ATTENDED",     .prior = 0.5 },
-    .{ .predicate = "KNOWS",        .prior = 0.5 },
-    .{ .predicate = "WANTS_TO",     .prior = 0.5 },
-    .{ .predicate = "FAN_OF",       .prior = 0.5 },
-    .{ .predicate = "MENTIONED",    .prior = 0.3 },
-};
-
-pub const DEFAULT_PRIOR: f64 = 0.7;
-
-/// Look up the prior for a predicate. Returns DEFAULT_PRIOR if not found.
-pub fn priorForPredicate(predicate: []const u8) f64 {
-    for (KNOWN_PRIORS) |ep| {
-        if (std.mem.eql(u8, ep.predicate, predicate)) return ep.prior;
-    }
-    return DEFAULT_PRIOR;
-}
-
-const std = @import("std");
-
-test "priorForPredicate known single-valued returns 1.0" {
-    const std_ = @import("std");
-    try std_.testing.expectApproxEqAbs(1.0, priorForPredicate("LIVES_IN"), 0.001);
-    try std_.testing.expectApproxEqAbs(1.0, priorForPredicate("MARRIED_TO"), 0.001);
-}
-
-test "priorForPredicate known set-valued returns 0.5" {
-    const std_ = @import("std");
-    try std_.testing.expectApproxEqAbs(0.5, priorForPredicate("LIKES"), 0.001);
-}
-
-test "priorForPredicate unknown returns DEFAULT_PRIOR" {
-    const std_ = @import("std");
-    try std_.testing.expectApproxEqAbs(DEFAULT_PRIOR, priorForPredicate("INVENTED_PREDICATE"), 0.001);
-}
-```
-
-- [ ] **Step 2: Run tests**
+- [ ] **Step 1: Read `edge_resolution.zig` to confirm `classifyPredicate` API**
 
 ```bash
-cd /Users/nova/Desktop/nullalis && zig build test -Dchannels=cli 2>&1 | grep -E "priorForPredicate|PASS|FAIL"
+grep -n "classifyPredicate\|PredicateType\|single_valued\|set_valued" \
+  /Users/nova/Desktop/nullalis/src/agent/edge_resolution.zig | head -30
 ```
 
-Expected: all 3 tests pass.
+Confirm the function exists and returns an enum with `.single_valued`, `.set_valued`, `.unknown` (or equivalent). Note the exact function signature and return type — you will reference it in the PPR CTE SQL comment and in `graph_expand.zig`.
 
-- [ ] **Step 3: Update `graph_expand.zig` to import from `edge_priors.zig`**
-
-Find the hardcoded predicate prior values in `graph_expand.zig` (lines 314–345). Replace the hardcoded switch/array with calls to `edge_priors.priorForPredicate(predicate)`. Add the import:
-
-```zig
-const edge_priors = @import("edge_priors.zig");
-```
-
-Replace any local prior lookup with:
-
-```zig
-const prior = edge_priors.priorForPredicate(edge.predicate);
-```
-
-- [ ] **Step 4: Build and run graph_expand tests**
+- [ ] **Step 2: Confirm `graph_expand.zig` already imports `edge_resolution.zig`**
 
 ```bash
-cd /Users/nova/Desktop/nullalis && zig build test -Dchannels=cli 2>&1 | grep -E "graph_expand|PASS|FAIL"
+grep -n "edge_resolution\|classifyPredicate" \
+  /Users/nova/Desktop/nullalis/src/agent/graph_expand.zig | head -10
 ```
 
-Expected: all existing graph_expand tests pass (BFS behavior unchanged).
+Expected: import already present (added in commit 2dddb860). If missing, add:
+```zig
+const edge_resolution = @import("edge_resolution.zig");
+```
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 3: Note the three PPR weight tiers that mirror `classifyPredicate`**
+
+The PPR CTE SQL uses these values — they MUST stay in sync with `edge_resolution.classifyPredicate`:
+- `.single_valued` → prior `1.0`
+- `.set_valued` → prior `0.5`
+- `.unknown` / default → prior `0.7`
+
+No file changes needed in this task. Proceed to Task 12.
+
+- [ ] **Step 4: Build to confirm current state is clean**
 
 ```bash
-git add src/agent/edge_priors.zig src/agent/graph_expand.zig
-git commit -m "feat(graph): extract edge predicate priors to shared edge_priors.zig (P2)"
+cd /Users/nova/Desktop/nullalis && zig build -Dchannels=cli 2>&1 | head -10
 ```
+
+Expected: clean build.
 
 ---
 
@@ -1273,9 +1224,21 @@ fn expandFromSeedsPPR(
         fn lessThan(_: void, a: ScoredNode, b: ScoredNode) bool { return a.score > b.score; }
     }.lessThan);
 
+    // CRITICAL: buildGraphNeighborsBlock requires .edges to render neighbors.
+    // If edges is empty, every node is silently dropped (skipped at line 1482 in memory_loader.zig).
+    // Fetch edges for the discovered node keys using the existing findEdgesByKeys.
+    const all_keys = try allocator.alloc([]const u8, scored.len);
+    defer allocator.free(all_keys);
+    for (scored, 0..) |n, i| all_keys[i] = n.key;
+
+    const edges = state_mgr.findEdgesByKeys(allocator, user_id, all_keys) catch |err| blk: {
+        std.log.scoped(.graph_expand).warn("ppr.edges_fetch_failed err={}", .{err});
+        break :blk &.{};  // degrade gracefully — neighbors render without "via" context
+    };
+
     return GraphNeighborhood{
         .nodes = scored,
-        .edges = &.{}, // edges not returned by PPR CTE in V1; use BFS for edge rendering if needed
+        .edges = edges,
     };
 }
 ```
