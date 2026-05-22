@@ -516,6 +516,28 @@ pub const ComposioTool = struct {
                     allocator.free(result.stdout);
                     continue;
                 }
+                // COMPOSIO-SANITIZER: curl `-sS`/`-sL` does not fail the
+                // process on an HTTP 4xx/5xx — the error JSON arrives as a
+                // 200-shaped `stdout`. If the body is a JSON `{"error":…}`
+                // envelope, surface it as a *failed* result with the clean
+                // human message (run through `sanitizeErrorMessage` so a
+                // token echoed inside the message is redacted) instead of
+                // dumping the raw error body to the LLM. A bare
+                // `{"message":…}` is left alone — success payloads can also
+                // carry `message`, so only the unambiguous `error`
+                // envelope is reclassified.
+                if (bodyHasErrorEnvelope(result.stdout)) {
+                    if (extractApiErrorMessage(allocator, result.stdout) catch null) |raw_msg| {
+                        defer allocator.free(raw_msg);
+                        const clean = sanitizeErrorMessage(allocator, raw_msg) catch {
+                            // Sanitizer OOM — fall through to the raw body
+                            // rather than dropping the response entirely.
+                            return ToolResult{ .success = true, .output = result.stdout };
+                        };
+                        allocator.free(result.stdout);
+                        return ToolResult{ .success = false, .output = "", .error_msg = clean };
+                    }
+                }
                 return ToolResult{ .success = true, .output = result.stdout };
             }
             // Non-success process exit: return on the LAST attempt; otherwise
@@ -527,7 +549,14 @@ pub const ComposioTool = struct {
             }
             defer allocator.free(result.stderr);
             if (result.exit_code != null) {
-                const err_out = try allocator.dupe(u8, if (result.stderr.len > 0) result.stderr else "curl failed with non-zero exit code");
+                // SECURITY (COMPOSIO-SANITIZER): curl stderr can echo the
+                // request — including the `x-api-key:` header — on verbose
+                // or connection-level failures. Run it through
+                // `sanitizeErrorMessage` so long token-shaped runs are
+                // redacted before the message reaches the LLM / logs.
+                const raw_err = if (result.stderr.len > 0) result.stderr else "curl failed with non-zero exit code";
+                const err_out = sanitizeErrorMessage(allocator, raw_err) catch
+                    try allocator.dupe(u8, "curl failed with non-zero exit code");
                 return ToolResult{ .success = false, .output = "", .error_msg = err_out };
             }
             return ToolResult{ .success = false, .output = "", .error_msg = "curl terminated by signal" };
@@ -766,6 +795,26 @@ fn looksLikeRateLimit(body: []const u8) bool {
     if (std.mem.indexOf(u8, body, "Too Many") != null) return true;
     if (std.mem.indexOf(u8, body, "too_many") != null) return true;
     return false;
+}
+
+/// COMPOSIO-SANITIZER — true only when `body` is a JSON object carrying
+/// an `{"error": …}` member. Used by `runCurl` to tell an HTTP-error body
+/// (which curl returns as a 200-shaped stdout) apart from a real success
+/// payload. The bare `{"message": …}` shape is deliberately NOT treated as
+/// an error: success payloads can carry a `message` too.
+fn bodyHasErrorEnvelope(body: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    return parsed.value.object.get("error") != null;
+}
+
+test "bodyHasErrorEnvelope distinguishes error from success payloads" {
+    try std.testing.expect(bodyHasErrorEnvelope("{\"error\":{\"message\":\"bad key\"}}"));
+    try std.testing.expect(!bodyHasErrorEnvelope("{\"data\":[],\"successful\":true}"));
+    try std.testing.expect(!bodyHasErrorEnvelope("{\"message\":\"ok\"}"));
+    try std.testing.expect(!bodyHasErrorEnvelope("[1,2,3]"));
+    try std.testing.expect(!bodyHasErrorEnvelope("not-json"));
 }
 
 test "looksLikeRateLimit detects common 429 shapes" {
@@ -1132,6 +1181,10 @@ pub fn extractApiErrorMessage(allocator: std.mem.Allocator, body: []const u8) !?
     defer parsed.deinit();
 
     const root_val = parsed.value;
+    // `parseFromSlice` succeeds on any well-formed JSON, including arrays
+    // and scalars; `.object` access on those would panic. Only an object
+    // root can carry an error envelope.
+    if (root_val != .object) return null;
 
     // Try {"error":{"message":"..."}}
     if (root_val.object.get("error")) |err_val| {
@@ -1549,4 +1602,23 @@ test "composio sanitizeErrorMessage truncates at 240 chars" {
     defer alloc.free(result);
     try std.testing.expect(result.len == 243); // 240 + "..."
     try std.testing.expect(std.mem.endsWith(u8, result, "..."));
+}
+
+test "composio extractApiErrorMessage returns null for json array root" {
+    // COMPOSIO-SANITIZER: a JSON array is valid JSON but not an error
+    // envelope; `.object` access on it would panic pre-fix.
+    const alloc = std.testing.allocator;
+    const result = try extractApiErrorMessage(alloc, "[1,2,3]");
+    try std.testing.expect(result == null);
+}
+
+test "composio sanitizeErrorMessage redacts token-shaped runs" {
+    // COMPOSIO-SANITIZER: a leaked x-api-key value (long alphanumeric run)
+    // must be redacted before the message can surface to the LLM / logs.
+    const alloc = std.testing.allocator;
+    const leaky = "curl header x-api-key ck_livesecrettoken1234567890abcdef failed";
+    const result = try sanitizeErrorMessage(alloc, leaky);
+    defer alloc.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "ck_livesecrettoken1234567890abcdef") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "[REDACTED]") != null);
 }
