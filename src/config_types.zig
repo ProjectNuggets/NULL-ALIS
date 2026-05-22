@@ -889,9 +889,10 @@ pub const MemoryChunkingConfig = struct {
     max_tokens: u32 = 512,
     overlap: u32 = 64,
 
-    /// Approximate bytes per token used consistently across the chunker and the
-    /// embedding gate. Must match chunker.zig's estimate so entries that pass
-    /// shouldEmbedMemoryEntry also fit within a single chunk.
+    /// Approximate bytes per token used by the embedding gate
+    /// (`memory/root.zig::shouldEmbedMemoryEntry`) so entries that pass the
+    /// gate fit within a single embedding chunk. Kept consistent with the
+    /// token estimate in `agent/extraction/chunker.zig`.
     pub const CHARS_PER_TOKEN: u32 = 4;
 };
 
