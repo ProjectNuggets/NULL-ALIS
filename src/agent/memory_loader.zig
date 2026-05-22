@@ -92,6 +92,9 @@ pub const SelectionStats = struct {
     semantic_bucket_bytes: usize = 0,
     fallback_bucket_entries: usize = 0,
     fallback_bucket_bytes: usize = 0,
+    /// P4 — candidates blocked by the tier gate (score < NULLALIS_TIER_GATE_MIN_SCORE).
+    /// 0 when gate is disabled (default) or no candidates were filtered.
+    tier_gated_count: usize = 0,
     context_bytes: usize = 0,
     injected: bool = false,
     // V1.7a-2 — graph-expand recall consumer telemetry.
@@ -668,6 +671,8 @@ fn loadContextWithRuntimeDetailed(
     user_id_for_supersede: ?i64,
 ) !ContextResult {
     var stats = SelectionStats{ .available = true };
+    // P4: tier gate — read once per call; 0.0 = disabled.
+    const tier_gate_min_score = readTierGateMinScore();
 
     // P1: wire entity-overlap callback for this search call.
     // eo_ctx lives on the stack; rt.setEntityOverlapCallback clears it after.
@@ -816,6 +821,12 @@ fn loadContextWithRuntimeDetailed(
         } else {
             const estimated_bytes = @min(cand.snippet.len, FALLBACK_ENTRY_MAX_BYTES) + cand.key.len + 8;
             if (!canAppendToBucket(buf.items.len, fallback_bytes, stats.fallback_bucket_entries, SEARCH_FALLBACK_BUCKET_MAX_BYTES, SEARCH_FALLBACK_BUCKET_MAX_ENTRIES, estimated_bytes)) continue;
+            // P4: tier gate — skip low-confidence RRF hits from the fallback bucket.
+            // The isSemanticContinuityKey branch above is never gated (quality risk).
+            if (tier_gate_min_score > 0.0 and cand.final_score < tier_gate_min_score) {
+                stats.tier_gated_count += 1;
+                continue;
+            }
             try appendBucketEntry(allocator, &buf, &wrote_header, cand.key, cand.snippet, FALLBACK_ENTRY_MAX_BYTES, &fallback_bytes);
             stats.fallback_bucket_entries += 1;
             stats.fallback_bucket_bytes = fallback_bytes;
@@ -1375,6 +1386,19 @@ fn readGraphRecallMaxHops() u8 {
     const raw = std.posix.getenv("NULLALIS_GRAPH_RECALL_MAX_HOPS") orelse return DEFAULT_GRAPH_RECALL_MAX_HOPS;
     const parsed = std.fmt.parseInt(u8, raw, 10) catch return DEFAULT_GRAPH_RECALL_MAX_HOPS;
     return @min(parsed, 3);
+}
+
+// ── P4: Tier Gate ───────────────────────────────────────────────────────────
+
+/// Minimum RRF final_score for fallback-bucket candidates.
+/// 0.0 (default) disables the gate entirely.
+/// Set NULLALIS_TIER_GATE_MIN_SCORE=0.10 to filter low-confidence hits.
+/// Only applies to the runtime (hybrid/shadow_hybrid) path candidates.
+/// Semantic-bucket entries (isSemanticContinuityKey path) are never gated.
+fn readTierGateMinScore() f64 {
+    const val = std.posix.getenv("NULLALIS_TIER_GATE_MIN_SCORE") orelse return 0.0;
+    const parsed = std.fmt.parseFloat(f64, val) catch return 0.0;
+    return if (parsed >= 0.0) parsed else 0.0;
 }
 
 // ── P1: Entity Overlap Callback ────────────────────────────────────────────
@@ -2519,4 +2543,16 @@ test "loadContextWithRuntime caps fallback bucket and preserves semantic budget"
     try std.testing.expect(result.stats.fallback_bucket_bytes <= FALLBACK_BUCKET_MAX_BYTES);
     try std.testing.expect(std.mem.indexOf(u8, result.context, "timeline_summary/agent:test:user:1:other/1") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.context, "durable_fact/project_owner") != null);
+}
+
+test "tier gate: readTierGateMinScore returns 0.0 when env var absent" {
+    // NULLALIS_TIER_GATE_MIN_SCORE must not be set in the test environment.
+    // Gate is OFF (0.0) by default — zero behaviour change unless opt-in.
+    const score = readTierGateMinScore();
+    try std.testing.expectEqual(@as(f64, 0.0), score);
+}
+
+test "tier gate: SelectionStats.tier_gated_count initialises to zero" {
+    const s = SelectionStats{};
+    try std.testing.expectEqual(@as(usize, 0), s.tier_gated_count);
 }

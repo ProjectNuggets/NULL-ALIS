@@ -1078,12 +1078,13 @@ pub const ContextEngine = struct {
 fn bucketSummary(allocator: std.mem.Allocator, stats: memory_loader.SelectionStats) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "continuity:{d},semantic:{d},fallback:{d},graph:{d}",
+        "continuity:{d},semantic:{d},fallback:{d},graph:{d},gated:{d}",
         .{
             stats.continuity_bucket_entries,
             stats.semantic_bucket_entries,
             stats.fallback_bucket_entries,
             stats.graph_recall_neighbor_count,
+            stats.tier_gated_count,
         },
     );
 }
@@ -1505,4 +1506,22 @@ test "afterTurn records force_compress events" {
 
     try std.testing.expectEqual(@as(usize, 0), result.last_turn.auto_compaction_events);
     try std.testing.expectEqual(@as(usize, 1), result.last_turn.force_compression_events);
+}
+
+test "bucketSummary includes gated field" {
+    const allocator = std.testing.allocator;
+    const stats = memory_loader.SelectionStats{
+        .available = true,
+        .continuity_bucket_entries = 1,
+        .semantic_bucket_entries = 3,
+        .fallback_bucket_entries = 2,
+        .graph_recall_neighbor_count = 4,
+        .tier_gated_count = 5,
+    };
+    const s = try bucketSummary(allocator, stats);
+    defer allocator.free(s);
+    try std.testing.expectEqualStrings(
+        "continuity:1,semantic:3,fallback:2,graph:4,gated:5",
+        s,
+    );
 }
