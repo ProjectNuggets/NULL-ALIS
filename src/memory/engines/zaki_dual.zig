@@ -6,7 +6,13 @@ const log = std.log.scoped(.zaki_dual);
 pub const ZakiDualMemory = struct {
     allocator: std.mem.Allocator,
     primary: root.Memory,
-    markdown_impl: *root.MarkdownMemory,
+    /// v1.14.18 Step 9 (V7) — null when the markdown mirror is OFF
+    /// (`memory.enable_markdown_mirror=false`, the new default). When
+    /// null, every store/forget/sync hook below short-circuits — only
+    /// Postgres sees writes. The "dual" name predates the opt-in; a
+    /// rename to `zaki_postgres.zig` is deferred (D49) because the
+    /// touch radius (every `@import`) is out of scope for this sprint.
+    markdown_impl: ?*root.MarkdownMemory,
 
     const Self = @This();
 
@@ -14,13 +20,18 @@ pub const ZakiDualMemory = struct {
         allocator: std.mem.Allocator,
         primary: root.Memory,
         workspace_dir: []const u8,
+        enable_markdown_mirror: bool,
     ) !*Self {
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
 
-        const markdown_impl = try allocator.create(root.MarkdownMemory);
-        errdefer allocator.destroy(markdown_impl);
-        markdown_impl.* = try root.MarkdownMemory.init(allocator, workspace_dir);
+        var markdown_impl: ?*root.MarkdownMemory = null;
+        if (enable_markdown_mirror) {
+            const md = try allocator.create(root.MarkdownMemory);
+            errdefer allocator.destroy(md);
+            md.* = try root.MarkdownMemory.init(allocator, workspace_dir);
+            markdown_impl = md;
+        }
 
         self.* = .{
             .allocator = allocator,
@@ -48,7 +59,10 @@ pub const ZakiDualMemory = struct {
     /// DB's view." For an intentional override, the user can delete
     /// the row via /forget (or memory_archive), then re-run sync.
     pub fn syncFromMarkdown(self: *Self, allocator: std.mem.Allocator) !void {
-        const tombstoned_keys = try self.markdown_impl.readTombstonedKeys(allocator);
+        // V7 — mirror OFF means there is no markdown source to sync from.
+        const md = self.markdown_impl orelse return;
+
+        const tombstoned_keys = try md.readTombstonedKeys(allocator);
         defer {
             for (tombstoned_keys) |key| allocator.free(key);
             allocator.free(tombstoned_keys);
@@ -59,7 +73,7 @@ pub const ZakiDualMemory = struct {
             };
         }
 
-        const entries = try self.markdown_impl.memory().list(allocator, null, null);
+        const entries = try md.memory().list(allocator, null, null);
         defer root.freeEntries(allocator, entries);
 
         var imported: usize = 0;
@@ -102,15 +116,19 @@ pub const ZakiDualMemory = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         // Postgres (primary) is canonical — write it first and fail hard if it errors.
         try self.primary.store(key, content, category, session_id);
-        // Markdown is a write-through mirror for human inspection and restart sync.
-        // If it fails, log a warning: on the next restart syncFromMarkdown will see
-        // a stale (or absent) entry for this key and must NOT override the Postgres
-        // value. This is a known limitation — a future timestamp-based merge would
-        // handle it gracefully. For now, surfacing the failure is the safe path.
-        self.markdown_impl.memory().store(key, content, category, session_id) catch |err| {
-            log.warn("zaki_dual: markdown mirror write failed for key '{s}': {} — " ++
-                "Postgres is authoritative; manual MEMORY.md sync may be needed", .{ key, err });
-        };
+        // V7 — Markdown is an opt-in write-through mirror for human
+        // inspection / restart sync. When OFF (the default), Postgres
+        // is the only writer. When ON: if the mirror fails, log a
+        // warning — on the next restart syncFromMarkdown will see a
+        // stale (or absent) entry for this key and MUST NOT override
+        // the Postgres value (additive-only). A future timestamp-based
+        // merge would handle this gracefully.
+        if (self.markdown_impl) |md| {
+            md.memory().store(key, content, category, session_id) catch |err| {
+                log.warn("zaki_dual: markdown mirror write failed for key '{s}': {} — " ++
+                    "Postgres is authoritative; manual MEMORY.md sync may be needed", .{ key, err });
+            };
+        }
     }
 
     /// V1.14.12 (Memory audit Finding 4 fix, 2026-05-19) — implement the
@@ -127,10 +145,12 @@ pub const ZakiDualMemory = struct {
     fn implStoreWithMetadata(ptr: *anyopaque, key: []const u8, content: []const u8, category: root.MemoryCategory, session_id: ?[]const u8, metadata_json: []const u8) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         try self.primary.storeWithMetadata(key, content, category, session_id, metadata_json);
-        self.markdown_impl.memory().store(key, content, category, session_id) catch |err| {
-            log.warn("zaki_dual: markdown mirror metadata-write failed for key '{s}': {} — " ++
-                "Postgres has the canonical metadata; manual MEMORY.md sync may be needed", .{ key, err });
-        };
+        if (self.markdown_impl) |md| {
+            md.memory().store(key, content, category, session_id) catch |err| {
+                log.warn("zaki_dual: markdown mirror metadata-write failed for key '{s}': {} — " ++
+                    "Postgres has the canonical metadata; manual MEMORY.md sync may be needed", .{ key, err });
+            };
+        }
     }
 
     fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]root.MemoryEntry {
@@ -154,12 +174,14 @@ pub const ZakiDualMemory = struct {
         if (root.isInternalMemoryKey(key) or root.isMarkdownLineKey(key) or root.isSystemManagedMemoryKey(key)) {
             return forgotten_primary;
         }
+        // V7 — mirror OFF: Postgres is the only source of truth.
+        const md = self.markdown_impl orelse return forgotten_primary;
 
-        const markdown_entry = self.markdown_impl.memory().get(self.allocator, key) catch null;
+        const markdown_entry = md.memory().get(self.allocator, key) catch null;
         defer if (markdown_entry) |*entry| entry.deinit(self.allocator);
 
         if (forgotten_primary or markdown_entry != null) {
-            try self.markdown_impl.appendTombstone(key, self.allocator);
+            try md.appendTombstone(key, self.allocator);
             return true;
         }
         return false;
@@ -178,8 +200,10 @@ pub const ZakiDualMemory = struct {
     fn implDeinit(ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.primary.deinit();
-        self.markdown_impl.deinit();
-        self.allocator.destroy(self.markdown_impl);
+        if (self.markdown_impl) |md| {
+            md.deinit();
+            self.allocator.destroy(md);
+        }
         self.allocator.destroy(self);
     }
 
@@ -209,7 +233,7 @@ test "V1.14.12 (Memory audit Finding 4): zaki_dual vtable wires store_with_metad
     try std.testing.expect(ZakiDualMemory.mem_vtable.store_with_metadata != null);
 }
 
-test "zaki dual memory syncs markdown into canonical memory" {
+test "zaki dual memory syncs markdown into canonical memory (mirror ON)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -219,7 +243,7 @@ test "zaki dual memory syncs markdown into canonical memory" {
 
     var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
 
-    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
+    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace, true);
     var mem = dual.memory();
 
     try mem.store("user_name", "Nova", .core, null);
@@ -236,7 +260,7 @@ test "zaki dual memory syncs markdown into canonical memory" {
     mem.deinit();
 }
 
-test "zaki dual memory ingests manual markdown edits into canonical memory" {
+test "zaki dual memory ingests manual markdown edits into canonical memory (mirror ON)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -252,7 +276,7 @@ test "zaki dual memory ingests manual markdown edits into canonical memory" {
     });
 
     var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
-    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
+    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace, true);
     var mem = dual.memory();
     try dual.syncFromMarkdown(allocator);
 
@@ -261,6 +285,49 @@ test "zaki dual memory ingests manual markdown edits into canonical memory" {
     try std.testing.expectEqualStrings("teal", got.content);
 
     mem.deinit();
+}
+
+test "V7: zaki dual memory writes ONLY to primary when mirror is OFF (default)" {
+    // v1.14.18 Step 9 (V7) — `enable_markdown_mirror=false` (the new
+    // default) must produce a pure-primary runtime: no MEMORY.md is
+    // written, syncFromMarkdown is a no-op, and forget does not need
+    // tombstone bookkeeping. Locks the default-off honesty contract.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
+
+    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace, false);
+    var mem = dual.memory();
+    defer mem.deinit();
+
+    // The mirror is not constructed at all.
+    try std.testing.expect(dual.markdown_impl == null);
+
+    try mem.store("user_color", "violet", .core, null);
+
+    // Primary saw the write…
+    const got = (try mem.get(allocator, "user_color")).?;
+    defer got.deinit(allocator);
+    try std.testing.expectEqualStrings("violet", got.content);
+
+    // …but no MEMORY.md was written on disk.
+    const memory_path = try std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{workspace});
+    defer allocator.free(memory_path);
+    const stat_result = std.fs.cwd().statFile(memory_path);
+    try std.testing.expectError(error.FileNotFound, stat_result);
+
+    // syncFromMarkdown is a no-op (must not error even though MEMORY.md is absent).
+    try dual.syncFromMarkdown(allocator);
+
+    // forget on a non-system key still works through the primary.
+    try mem.store("ephemeral", "value", .core, null);
+    const forgotten = try mem.forget("ephemeral");
+    try std.testing.expect(forgotten);
 }
 
 test "zaki dual memory skips scaffold core lines during sync" {
