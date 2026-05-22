@@ -132,13 +132,16 @@ pub fn hydrateFromSnapshot(allocator: std.mem.Allocator, mem: Memory, workspace_
         }
 
         mem.store(key, entry_content, category, null) catch continue;
-        // V1.6 TODO — when the correction classifier ships, hydrate
-        // path needs to read `valid_to` from the JSON object (already
-        // written by the snapshot path at line 50–55) and apply it via
-        // a future `mem.storeWithValidTo(...)` API or direct DB write.
-        // For V1.5 the always-null path means snapshots round-trip
-        // losslessly via `mem.store` regardless.
-        _ = obj.get("valid_to"); // referenced for future read path
+        // Bi-temporal `valid_to` asymmetry — KNOWN, parked (deferred D48).
+        // The export path emits `valid_to` when populated, but `mem.store`
+        // has no `valid_to` parameter, so hydrate cannot replay it. This
+        // is loss-free *today*: `MemoryEntry.valid_to` is V1.5-always-null
+        // (no backend populates it — the correction classifier is V1.6,
+        // unbuilt; see `src/memory/root.zig` MemoryEntry.valid_to doc).
+        // The asymmetry only becomes a real lossy round-trip once V1.6
+        // lands the classifier, at which point hydrate needs a
+        // `valid_to`-aware store API. Tracked in `docs/deferred-register.md`
+        // row D48 so it is not silently forgotten when V1.6 starts.
         hydrated += 1;
     }
 
