@@ -20,13 +20,13 @@ This is the **A2A core**: nullalis can both consume external MCP servers and *be
 
 **Independent audit verdict:** #99/#100/#101 nits-only; #102 had one MAJOR (config round-trip silently dropped `read_line_timeout_secs`). All actioned — 5 fix-forward commits at `99db4ea8`: config round-trip + negative-value guard, MCP memory-tool exposure trimmed, protocol-version comment, Discord non-integer-`type` drop. **Verified:** canonical CI gate green on the integrated tree and again post-fix-forward, with all Sprint 2 channels (`-Dchannels=cli,telegram,email,teams,discord,slack`).
 
-**MCP V1.1 (post-v1.14.20, `b598c431`) — the two MCP gaps are CLOSED:**
-- `mcp serve` now binds a memory backend (`initRuntimeWithOptions` + `bindMemory*`). The four memory tools are exposed when a backend is bound and hidden when it is not — `tools/list` never advertises a broken tool. Verified end-to-end: a real MCP client drove `mcp serve` over stdio and a `memory_store` → `memory_recall` round-trip returned the stored fact; `tools/call shell` stayed denied (`-32601`).
-- MCP client de-scaffolded — `mcp_servers` is a first-class config key (`config.example.json` ships it), enabled by default; the `_disabled` rename is now historical guidance only.
+**Gap-closing — post-v1.14.20 hardening (`main` @ `95f0af78`). The three real gaps are CLOSED:**
+- **MCP V1.1** — `mcp serve` now binds a memory backend (`initRuntimeWithOptions` + `bindMemory*`); the four memory tools are exposed when a backend is bound and hidden when it is not, so `tools/list` never advertises a broken tool. Verified end-to-end: a real MCP client drove `mcp serve` over stdio and a `memory_store` → `memory_recall` round-trip returned the stored fact; `tools/call shell` stayed denied (`-32601`). MCP client de-scaffolded — `mcp_servers` is a first-class config key, enabled by default.
+- **Email V1.1 (Slice 2, PR #103)** — Email is now a genuine **bidirectional** `polling` channel. Inbound IMAP-over-TLS (`pollMessages`: LOGIN → SELECT → UID SEARCH UNSEEN → literal-length-framed FETCH → RFC 2047 + HTML-strip parse → allowlist → `\Seen`), driven by `channel_loop.runEmailLoop`. Outbound SMTP fixed: implicit TLS on 465 / STARTTLS on 587, **certificate-verified** against the system CA bundle (was unverified — a credential-exposure hole the review caught), reply codes checked, RFC 5321 dot-stuffing. Two-pass review (2 MAJOR + 5 MINOR found and fixed before merge) + a fix agent + a dot-stuffing fix-forward.
 
 **Honest gaps / final-shape items (NOT done):**
-- **Email is send-only** — inbound IMAP is unbuilt (honestly labelled in `email.zig`). This is the next slice.
 - MCP server is stdio-only (no HTTP/SSE); memory-as-MCP-`resources` deferred.
+- `irc.zig` / `websocket.zig` still use unverified TLS (`.ca = .no_verification`) — tracked security follow-up; email's fix is the template.
 - **Nostr deferred** — no user demand; explicitly scoped out of Sprint 2.
 
 ---
