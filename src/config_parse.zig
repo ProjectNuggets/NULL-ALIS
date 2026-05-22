@@ -514,13 +514,35 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 const server_name = entry.key_ptr.*;
                 const val = entry.value_ptr.*;
                 if (val != .object) continue;
-                const cmd = val.object.get("command") orelse continue;
-                if (cmd != .string) continue;
+
+                // A server is valid with either a `command` (stdio) or a
+                // `url` (http). The `transport` key may force one explicitly;
+                // when absent the presence of `url` implies http.
+                const cmd_val = val.object.get("command");
+                const url_val = val.object.get("url");
+                const has_cmd = cmd_val != null and cmd_val.? == .string;
+                const has_url = url_val != null and url_val.? == .string;
+                if (!has_cmd and !has_url) continue;
 
                 var mcp_cfg = types.McpServerConfig{
                     .name = try self.allocator.dupe(u8, server_name),
-                    .command = try self.allocator.dupe(u8, cmd.string),
                 };
+
+                // transport: explicit "stdio" | "http", else inferred from url.
+                if (val.object.get("transport")) |tv| {
+                    if (tv == .string) {
+                        if (std.mem.eql(u8, tv.string, "http")) {
+                            mcp_cfg.transport = .http;
+                        } else if (std.mem.eql(u8, tv.string, "stdio")) {
+                            mcp_cfg.transport = .stdio;
+                        }
+                    }
+                } else if (has_url) {
+                    mcp_cfg.transport = .http;
+                }
+
+                if (has_cmd) mcp_cfg.command = try self.allocator.dupe(u8, cmd_val.?.string);
+                if (has_url) mcp_cfg.url = try self.allocator.dupe(u8, url_val.?.string);
 
                 // args: string array
                 if (val.object.get("args")) |a| {
@@ -541,6 +563,23 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             }
                         }
                         mcp_cfg.env = try env_list.toOwnedSlice(self.allocator);
+                    }
+                }
+
+                // headers: object of string→string (http transport).
+                if (val.object.get("headers")) |h| {
+                    if (h == .object) {
+                        var hdr_list: std.ArrayListUnmanaged(types.McpServerConfig.McpEnvEntry) = .empty;
+                        var hit = h.object.iterator();
+                        while (hit.next()) |he| {
+                            if (he.value_ptr.* == .string) {
+                                try hdr_list.append(self.allocator, .{
+                                    .key = try self.allocator.dupe(u8, he.key_ptr.*),
+                                    .value = try self.allocator.dupe(u8, he.value_ptr.string),
+                                });
+                            }
+                        }
+                        mcp_cfg.headers = try hdr_list.toOwnedSlice(self.allocator);
                     }
                 }
 
