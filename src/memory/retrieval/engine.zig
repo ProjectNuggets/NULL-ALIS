@@ -549,8 +549,34 @@ pub const RetrievalEngine = struct {
             }
         }
 
+        // ── Entity overlap: 3rd RRF source (P1) ──
+        // Fetch entity-overlap candidates from the callback if set.
+        // Errors are gracefully swallowed; the search proceeds with
+        // keyword (+optional vector) only.
+        var entity_candidates: ?[]RetrievalCandidate = null;
+        defer if (entity_candidates) |ec| {
+            for (ec) |*c_| c_.deinit(allocator);
+            allocator.free(ec);
+        };
+        if (self.entity_overlap) |eo| {
+            entity_candidates = eo.func(eo.ptr, allocator, query) catch |err| blk: {
+                log.warn("entity_overlap fetch_failed err={}", .{err});
+                break :blk null;
+            };
+            // Treat empty-slice return as null so the RRF source count is accurate.
+            if (entity_candidates) |ec| {
+                if (ec.len == 0) {
+                    allocator.free(ec);
+                    entity_candidates = null;
+                }
+            }
+        }
+        const has_entity = entity_candidates != null;
+
         // Single source with results → set final_score from keyword_rank, skip RRF
-        if (valid_count <= 1 and (vector_candidates == null or vector_candidates.?.len == 0)) {
+        // Bypass this fast-path when entity_overlap produced candidates so they
+        // participate in the multi-source RRF merge below.
+        if (valid_count <= 1 and (vector_candidates == null or vector_candidates.?.len == 0) and !has_entity) {
             // Find the one with results
             for (source_results, 0..) |sr, sri| {
                 if (sr.len > 0) {
@@ -602,16 +628,21 @@ pub const RetrievalEngine = struct {
         }
 
         // Multiple sources → RRF merge
-        // Build const slices for rrf (include vector candidates if available)
+        // Build const slices for rrf (include vector + entity_overlap candidates if available)
         const has_vec = vector_candidates != null and vector_candidates.?.len > 0;
-        const extra_sources: usize = if (has_vec) 1 else 0;
+        const extra_sources: usize = (if (has_vec) @as(usize, 1) else 0) + (if (has_entity) @as(usize, 1) else 0);
         var rrf_sources = try allocator.alloc([]const RetrievalCandidate, source_results.len + extra_sources);
         defer allocator.free(rrf_sources);
         for (source_results, 0..) |sr, i| {
             rrf_sources[i] = sr;
         }
+        var extra_idx: usize = source_results.len;
         if (has_vec) {
-            rrf_sources[source_results.len] = vector_candidates.?;
+            rrf_sources[extra_idx] = vector_candidates.?;
+            extra_idx += 1;
+        }
+        if (has_entity) {
+            rrf_sources[extra_idx] = entity_candidates.?;
         }
 
         var merged = try rrf.rrfMerge(allocator, rrf_sources, self.merge_k, self.top_k * 4);
