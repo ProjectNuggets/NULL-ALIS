@@ -335,7 +335,36 @@ pub const DiscordChannel = struct {
             log.err("Discord API POST failed: {}", .{err});
             return error.DiscordApiError;
         };
-        self.allocator.free(resp);
+        defer self.allocator.free(resp);
+        logDiscordApiErrorIfAny(self.allocator, resp);
+    }
+
+    /// Inspect a Discord REST response body and log any application-level
+    /// error. A successful message POST returns the created message object
+    /// (which has an "id" but no "code"); failures return
+    /// `{"code":NNNNN,"message":"..."}` — and rate limits add
+    /// `"retry_after"`. curlPost reports only transport failures, so without
+    /// this an HTTP 429/400/403 would be silently swallowed.
+    fn logDiscordApiErrorIfAny(allocator: std.mem.Allocator, resp: []const u8) void {
+        if (resp.len == 0) return;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        // A created-message response has no "code" field.
+        const code_val = parsed.value.object.get("code") orelse return;
+        const code: i64 = switch (code_val) {
+            .integer => |c| c,
+            else => return,
+        };
+        const message: []const u8 = if (parsed.value.object.get("message")) |m|
+            (if (m == .string) m.string else "")
+        else
+            "";
+        if (parsed.value.object.get("retry_after")) |_| {
+            log.warn("Discord API rate limited (code={d}): {s}", .{ code, message });
+        } else {
+            log.warn("Discord API error (code={d}): {s}", .{ code, message });
+        }
     }
 
     // ── Gateway ──────────────────────────────────────────────────────
@@ -815,12 +844,36 @@ pub const DiscordChannel = struct {
             else => false,
         } else false;
 
-        // Filter 1: bot author
+        // Filter 0: message type. Discord MESSAGE_CREATE carries non-user
+        // system messages (channel pin, member join, boost, thread-created,
+        // etc.). Only DEFAULT (0) and REPLY (19) carry genuine user content;
+        // process anything else would feed system noise to the agent.
+        // Absent "type" is treated as DEFAULT for forward-compatibility.
+        if (d_obj.get("type")) |type_val| {
+            switch (type_val) {
+                .integer => |t| {
+                    if (t != 0 and t != 19) return;
+                },
+                else => {},
+            }
+        }
+
+        // Filter 1: self-authored messages. Without this, a bot with
+        // allow_bots=true would react to its own outbound messages and spin
+        // an infinite echo loop. Always drop messages from the bot itself,
+        // independent of the allow_bots setting.
+        if (self.bot_user_id) |bot_uid| {
+            if (std.mem.eql(u8, author_id, bot_uid)) {
+                return;
+            }
+        }
+
+        // Filter 2: bot author
         if (author_is_bot and !self.allow_bots) {
             return;
         }
 
-        // Filter 2: require_mention for guild (non-DM) messages
+        // Filter 3: require_mention for guild (non-DM) messages
         if (self.require_mention and guild_id != null) {
             const bot_uid = self.bot_user_id orelse "";
             if (!isMentioned(content, bot_uid)) {
@@ -828,7 +881,7 @@ pub const DiscordChannel = struct {
             }
         }
 
-        // Filter 3: allow_from allowlist
+        // Filter 4: allow_from allowlist
         if (self.allow_from.len > 0) {
             if (!root.isAllowed(self.allow_from, author_id)) {
                 return;
@@ -1307,4 +1360,127 @@ test "discord intent bitmask guilds" {
     try std.testing.expectEqual(@as(u32, 4096), 4096);
     // Default intents = 1|512|32768|4096 = 37377
     try std.testing.expectEqual(@as(u32, 37377), 1 | 512 | 32768 | 4096);
+}
+
+test "discord handleMessageCreate drops self-authored messages even when allow_bots is true" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .allow_bots = true,
+    });
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-self");
+    defer alloc.free(ch.bot_user_id.?);
+
+    // Message authored by the bot itself — must not be republished even
+    // though allow_bots=true, otherwise the bot echoes its own output.
+    const msg_json =
+        \\{"d":{"channel_id":"c-1","guild_id":"g-1","content":"my own reply","author":{"id":"bot-self","bot":true}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
+}
+
+test "discord handleMessageCreate allows other bots when allow_bots is true" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .allow_bots = true,
+    });
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-self");
+    defer alloc.free(ch.bot_user_id.?);
+
+    // A different bot's message must still flow through when allow_bots=true.
+    const msg_json =
+        \\{"d":{"channel_id":"c-1","guild_id":"g-1","content":"other bot","author":{"id":"bot-other","bot":true}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    var msg = event_bus.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("bot-other", msg.sender_id);
+}
+
+test "discord handleMessageCreate drops non-default system message types" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+    });
+    ch.setBus(&event_bus);
+
+    // type 6 = CHANNEL_PINNED_MESSAGE (a system message, not user content).
+    const msg_json =
+        \\{"d":{"type":6,"channel_id":"c-1","guild_id":"g-1","content":"pinned a message","author":{"id":"u-1","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
+}
+
+test "discord logDiscordApiErrorIfAny tolerates success and error bodies" {
+    const alloc = std.testing.allocator;
+    // A created-message response (no "code") and malformed input must not
+    // crash; error bodies are logged only.
+    DiscordChannel.logDiscordApiErrorIfAny(alloc, "{\"id\":\"123\",\"content\":\"hi\"}");
+    DiscordChannel.logDiscordApiErrorIfAny(alloc, "{\"code\":50013,\"message\":\"Missing Permissions\"}");
+    DiscordChannel.logDiscordApiErrorIfAny(alloc, "{\"code\":20028,\"message\":\"rate limited\",\"retry_after\":1.5}");
+    DiscordChannel.logDiscordApiErrorIfAny(alloc, "not json");
+    DiscordChannel.logDiscordApiErrorIfAny(alloc, "");
+}
+
+test "discord handleMessageCreate accepts default and reply message types" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+    });
+    ch.setBus(&event_bus);
+
+    // type 0 = DEFAULT.
+    {
+        const msg_json =
+            \\{"d":{"type":0,"channel_id":"c-1","guild_id":"g-1","content":"plain","author":{"id":"u-1","bot":false}}}
+        ;
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+        defer parsed.deinit();
+        try ch.handleMessageCreate(parsed.value);
+        var msg = event_bus.consumeInbound() orelse return try std.testing.expect(false);
+        defer msg.deinit(alloc);
+        try std.testing.expectEqualStrings("plain", msg.content);
+    }
+    // type 19 = REPLY.
+    {
+        const msg_json =
+            \\{"d":{"type":19,"channel_id":"c-1","guild_id":"g-1","content":"a reply","author":{"id":"u-1","bot":false}}}
+        ;
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+        defer parsed.deinit();
+        try ch.handleMessageCreate(parsed.value);
+        var msg = event_bus.consumeInbound() orelse return try std.testing.expect(false);
+        defer msg.deinit(alloc);
+        try std.testing.expectEqualStrings("a reply", msg.content);
+    }
 }
