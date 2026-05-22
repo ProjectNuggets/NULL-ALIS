@@ -668,6 +668,18 @@ fn loadContextWithRuntimeDetailed(
     user_id_for_supersede: ?i64,
 ) !ContextResult {
     var stats = SelectionStats{ .available = true };
+
+    // P1: wire entity-overlap callback for this search call.
+    // eo_ctx lives on the stack; rt.setEntityOverlapCallback clears it after.
+    var eo_ctx: EntityOverlapCtx = undefined;
+    if (readEntityOverlapEnabled()) {
+        if (state_mgr_for_supersede) |sm| if (user_id_for_supersede) |uid| {
+            eo_ctx = .{ .state_mgr = sm, .user_id = uid, .allocator = allocator };
+            rt.setEntityOverlapCallback(.{ .ptr = &eo_ctx, .func = entityOverlapImpl });
+        };
+    }
+    defer rt.setEntityOverlapCallback(null);
+
     const candidates = rt.search(allocator, user_message, WARM_CANDIDATE_FETCH_LIMIT, session_id) catch {
         return .{ .context = try allocator.dupe(u8, ""), .stats = stats };
     };
@@ -1363,6 +1375,84 @@ fn readGraphRecallMaxHops() u8 {
     const raw = std.posix.getenv("NULLALIS_GRAPH_RECALL_MAX_HOPS") orelse return DEFAULT_GRAPH_RECALL_MAX_HOPS;
     const parsed = std.fmt.parseInt(u8, raw, 10) catch return DEFAULT_GRAPH_RECALL_MAX_HOPS;
     return @min(parsed, 3);
+}
+
+// ── P1: Entity Overlap Callback ────────────────────────────────────────────
+
+/// Kill switch: set NULLALIS_ENTITY_OVERLAP=0 to disable entity overlap.
+fn readEntityOverlapEnabled() bool {
+    const val = std.posix.getenv("NULLALIS_ENTITY_OVERLAP") orelse return true;
+    return !std.mem.eql(u8, val, "0");
+}
+
+/// Context bag threaded through the type-erased EntityOverlapCallCtx.
+const EntityOverlapCtx = struct {
+    state_mgr: *zaki_state.Manager,
+    user_id: i64,
+    allocator: std.mem.Allocator,
+};
+
+/// Called by the retrieval engine as the 3rd RRF source.
+/// Tokenises `query`, matches token patterns against `memory_edges`, and
+/// returns normalised `RetrievalCandidate` slices ranked by match_count.
+/// Snippet is populated so bucket rendering never emits blank lines.
+fn entityOverlapImpl(
+    ctx: *anyopaque,
+    allocator: std.mem.Allocator,
+    query: []const u8,
+) anyerror![]memory_mod.RetrievalCandidate {
+    const eo: *EntityOverlapCtx = @ptrCast(@alignCast(ctx));
+
+    // Build ILIKE patterns from query tokens (skip tokens shorter than 3 chars)
+    var patterns: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (patterns.items) |p| allocator.free(p);
+        patterns.deinit(allocator);
+    }
+    var it = std.mem.tokenizeAny(u8, query, " \t\n.,;:!?\"'()[]{}");
+    while (it.next()) |tok| {
+        if (tok.len < 3) continue;
+        const lower = try std.ascii.allocLowerString(allocator, tok);
+        defer allocator.free(lower);
+        const pat = try std.fmt.allocPrint(allocator, "%{s}%", .{lower});
+        try patterns.append(allocator, pat);
+    }
+    if (patterns.items.len == 0) return allocator.alloc(memory_mod.RetrievalCandidate, 0);
+
+    const rows = try eo.state_mgr.findEdgesEntityOverlap(allocator, eo.user_id, patterns.items, 10);
+    defer {
+        for (rows) |r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+    if (rows.len == 0) return allocator.alloc(memory_mod.RetrievalCandidate, 0);
+
+    // Normalise scores: highest match_count → 1.0
+    const max_count: f64 = @floatFromInt(rows[0].match_count);
+
+    var out = try allocator.alloc(memory_mod.RetrievalCandidate, rows.len);
+    errdefer allocator.free(out);
+    for (rows, 0..) |row, i| {
+        const score: f64 = if (max_count > 0.0)
+            @as(f64, @floatFromInt(row.match_count)) / max_count
+        else 0.0;
+        out[i] = memory_mod.RetrievalCandidate{
+            .id           = "",
+            .key          = try allocator.dupe(u8, row.memory_key),
+            .content      = try allocator.dupe(u8, row.snippet), // MUST be non-empty
+            .snippet      = try allocator.dupe(u8, row.snippet),
+            .category     = .daily,
+            .keyword_rank = null,
+            .vector_score = null,
+            .final_score  = score,
+            .source       = "entity_overlap",
+            .source_path  = "",
+            .start_line   = 0,
+            .end_line     = 0,
+            .created_at   = 0,
+            .lane         = "",
+        };
+    }
+    return out;
 }
 
 /// Build the `<graph_neighbors>` block for the current turn.

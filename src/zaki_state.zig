@@ -203,6 +203,21 @@ pub const TaskSnapshot = struct {
     }
 };
 
+/// P1 — result row from findEdgesEntityOverlap.
+/// Defined at top-level so both ManagerImpl and the non-postgres stub
+/// can reference it without depending on postgres headers.
+pub const EntityOverlapRow = struct {
+    memory_key: []u8,
+    match_count: i64,
+    /// SUBSTRING(m.content, 1, 420) — non-empty; needed for bucket rendering.
+    snippet: []u8,
+
+    pub fn deinit(self: EntityOverlapRow, allocator: std.mem.Allocator) void {
+        allocator.free(self.memory_key);
+        allocator.free(self.snippet);
+    }
+};
+
 pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn init(_: std.mem.Allocator, _: config_types.StateConfig) !@This() {
         return error.PostgresNotEnabled;
@@ -614,6 +629,10 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     /// is a postgres-only feature; non-postgres returns empty.
     pub fn findEdgesByKeys(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const []const u8) ![]memory_root.TypedEdge {
         return allocator.alloc(memory_root.TypedEdge, 0);
+    }
+    /// P1 — stub for non-postgres builds. Entity overlap is postgres-only.
+    pub fn findEdgesEntityOverlap(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const []const u8, _: usize) ![]EntityOverlapRow {
+        return allocator.alloc(EntityOverlapRow, 0);
     }
     /// V1.14.12 (Memory audit Finding 2 fix) — stub for non-postgres
     /// builds. Entity lookup is a postgres feature; non-postgres returns
@@ -7477,19 +7496,6 @@ const ManagerImpl = struct {
     }
 
     // ── P1: Entity Overlap ──────────────────────────────────────────────────
-
-    /// One row from `findEdgesEntityOverlap`. Caller frees via `deinit`.
-    pub const EntityOverlapRow = struct {
-        memory_key: []u8,
-        match_count: i64,
-        /// SUBSTRING(m.content, 1, 420) — non-empty; needed for bucket rendering.
-        snippet: []u8,
-
-        pub fn deinit(self: EntityOverlapRow, allocator: std.mem.Allocator) void {
-            allocator.free(self.memory_key);
-            allocator.free(self.snippet);
-        }
-    };
 
     /// Find memories whose edges share token patterns from the query.
     /// `token_patterns` are PG ILIKE patterns (e.g. `"%nova%"`).
