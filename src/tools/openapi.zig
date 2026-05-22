@@ -177,6 +177,12 @@ pub const OpenApiTool = struct {
     }
 
     pub fn execute(self: *OpenApiTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+        // Defensive: the slot cache must be sized to `specs` via `initSlots`.
+        // `allTools` always calls it; this guards a misuse where the tool is
+        // built with specs but left uninitialized — never index a slot OOB.
+        if (self.slots.len != self.specs.len) {
+            return ToolResult.fail("openapi tool is not initialized");
+        }
         const operation = root.getString(args, "operation") orelse
             return ToolResult.fail("Missing 'operation' parameter (use 'list', 'describe', or 'invoke')");
 
@@ -466,7 +472,10 @@ pub const OpenApiTool = struct {
         // model context.
         var header_list: std.ArrayListUnmanaged([]const u8) = .empty;
         defer {
-            for (header_list.items) |h| allocator.free(h);
+            // Some entries carry the credential (the injected auth header).
+            // Zero every header before free so a credential never lingers
+            // in freed heap; zeroing a non-secret header too is harmless.
+            for (header_list.items) |h| freeSecret(allocator, h);
             header_list.deinit(allocator);
         }
         // Copy the builder's (non-secret) headers first.
@@ -477,7 +486,9 @@ pub const OpenApiTool = struct {
         // The URL may need an auth query parameter appended.
         var final_url: []const u8 = built.url;
         var final_url_owned: ?[]const u8 = null;
-        defer if (final_url_owned) |u| allocator.free(u);
+        // For apiKey-in-query auth this rewritten URL embeds the credential —
+        // zero it on free, same hygiene as the auth headers.
+        defer if (final_url_owned) |u| freeSecret(allocator, u);
 
         if (cfg.auth_ref.len > 0) {
             const auth_result = try applyAuth(allocator, spec, op, cfg, &header_list, built.url);
@@ -631,6 +642,7 @@ pub const OpenApiTool = struct {
                 switch (sec.api_key_in) {
                     .header => {
                         const hdr = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ sec.api_key_name, cred });
+                        errdefer freeSecret(allocator, hdr);
                         try header_list.append(allocator, hdr);
                         return .{ .ok = null };
                     },
@@ -640,6 +652,7 @@ pub const OpenApiTool = struct {
                     },
                     .cookie => {
                         const hdr = try std.fmt.allocPrint(allocator, "Cookie: {s}={s}", .{ sec.api_key_name, cred });
+                        errdefer freeSecret(allocator, hdr);
                         try header_list.append(allocator, hdr);
                         return .{ .ok = null };
                     },
@@ -651,6 +664,7 @@ pub const OpenApiTool = struct {
             .http => {
                 if (std.ascii.eqlIgnoreCase(sec.http_scheme, "bearer")) {
                     const hdr = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{cred});
+                    errdefer freeSecret(allocator, hdr);
                     try header_list.append(allocator, hdr);
                     return .{ .ok = null };
                 } else if (std.ascii.eqlIgnoreCase(sec.http_scheme, "basic")) {
@@ -660,6 +674,7 @@ pub const OpenApiTool = struct {
                     defer freeSecret(allocator, enc_buf);
                     _ = encoder.encode(enc_buf, cred);
                     const hdr = try std.fmt.allocPrint(allocator, "Authorization: Basic {s}", .{enc_buf});
+                    errdefer freeSecret(allocator, hdr);
                     try header_list.append(allocator, hdr);
                     return .{ .ok = null };
                 }
@@ -696,6 +711,7 @@ pub const OpenApiTool = struct {
         defer freeSecret(allocator, cred);
 
         const hdr = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{cred});
+        errdefer freeSecret(allocator, hdr);
         try header_list.append(allocator, hdr);
         return .{ .ok = null };
     }
@@ -1155,6 +1171,63 @@ test "read_only mode HARD-GATES write operations" {
     try testing.expect(!res.success);
     try testing.expect(std.mem.indexOf(u8, res.error_msg.?, "read_only") != null);
     try testing.expect(std.mem.indexOf(u8, res.error_msg.?, "refused") != null);
+}
+
+test "invoke against a local/private base_url is SSRF-refused" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const name = try writeTempSpec(tmp, "spec.json");
+    const abs_path = try tmp.dir.realpathAlloc(testing.allocator, name);
+    defer testing.allocator.free(abs_path);
+
+    // The base_url override points the request at a loopback address; the
+    // SSRF / DNS-pinning gate must refuse it before any HTTP is attempted.
+    const specs = [_]ApiSpecConfig{
+        .{ .id = "ssrf", .spec_path = abs_path, .base_url = "https://127.0.0.1/v1", .mode = .read_write },
+    };
+    var t = OpenApiTool{ .specs = &specs };
+    try t.initSlots(testing.allocator);
+    defer t.deinitState();
+    const tl = t.tool();
+
+    const parsed = try root.parseTestArgs(
+        "{\"operation\":\"invoke\",\"spec\":\"ssrf\",\"operation_id\":\"getItem\"," ++
+            "\"path_params\":{\"id\":\"1\"}}",
+    );
+    defer parsed.deinit();
+    const res = try tl.execute(testing.allocator, parsed.value.object);
+    defer if (res.error_msg) |e| testing.allocator.free(e);
+    defer if (res.output.len > 0) testing.allocator.free(res.output);
+    try testing.expect(!res.success);
+    try testing.expect(std.mem.indexOf(u8, res.error_msg.?, "local") != null or
+        std.mem.indexOf(u8, res.error_msg.?, "Blocked") != null);
+}
+
+test "invoke against a non-https base_url is rejected" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const name = try writeTempSpec(tmp, "spec.json");
+    const abs_path = try tmp.dir.realpathAlloc(testing.allocator, name);
+    defer testing.allocator.free(abs_path);
+
+    const specs = [_]ApiSpecConfig{
+        .{ .id = "plain", .spec_path = abs_path, .base_url = "http://api.example.com/v1", .mode = .read_write },
+    };
+    var t = OpenApiTool{ .specs = &specs };
+    try t.initSlots(testing.allocator);
+    defer t.deinitState();
+    const tl = t.tool();
+
+    const parsed = try root.parseTestArgs(
+        "{\"operation\":\"invoke\",\"spec\":\"plain\",\"operation_id\":\"getItem\"," ++
+            "\"path_params\":{\"id\":\"1\"}}",
+    );
+    defer parsed.deinit();
+    const res = try tl.execute(testing.allocator, parsed.value.object);
+    defer if (res.error_msg) |e| testing.allocator.free(e);
+    defer if (res.output.len > 0) testing.allocator.free(res.output);
+    try testing.expect(!res.success);
+    try testing.expect(std.mem.indexOf(u8, res.error_msg.?, "https") != null);
 }
 
 test "classifyInvoke read vs write" {
