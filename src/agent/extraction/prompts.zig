@@ -47,6 +47,7 @@ const EXTRACTION_SYSTEM_PROMPT =
     \\      "predicate": "<RELATION_TYPE_SCREAMING_SNAKE>",
     \\      "fact": "<self-contained natural language, paraphrased from the source>",
     \\      "slot_intent": "open_loop|active_goal|decision|preference|identity|temporal|null",
+    \\      "valid_at": "<ISO-8601 date the fact became true (YYYY-MM-DD), or null>",
     \\      "confidence": <number 0.0-1.0>
     \\    }
     \\  ]
@@ -63,7 +64,10 @@ const EXTRACTION_SYSTEM_PROMPT =
     \\5. predicate MUST be SCREAMING_SNAKE_CASE. NEVER use SAID, MENTIONED, ASKED, GREETED,
     \\   ACKNOWLEDGED, EXPRESSED, REPLIED — those are conversational meta, not facts.
     \\6. fact MUST be SELF-CONTAINED — readable without the original conversation.
-    \\   Use entity names, not pronouns. Preserve specific details (brands, counts, locations).
+    \\   Use entity names, not pronouns. Preserve specific details (brands, counts,
+    \\   locations, DATES). When the conversation gives WHEN something happened,
+    \\   the date belongs INSIDE the fact text ("Caroline joined the group on
+    \\   7 May 2023") — a fact retrieved later is useless if "when" is missing.
     \\7. slot_intent: set when the edge represents a working-memory-worthy fact:
     \\     open_loop      = TODO, PROMISED, REMINDS_ME_TO, WILL_DO, NEEDS_TO
     \\     active_goal    = WORKING_ON, BUILDING, GOAL, FOCUSING_ON
@@ -72,8 +76,14 @@ const EXTRACTION_SYSTEM_PROMPT =
     \\     identity       = IS, AM, HAS (durable self-attribution)
     \\     temporal       = BIRTHDAY, SCHEDULED_FOR, HAPPENS_ON
     \\   Otherwise null (most facts).
-    \\8. Extract from EVERY turn in the window — not just the most recent.
-    \\9. Skip content-free utterances ("Hi!", "Bye!", "Thanks!"). Don't extract them.
+    \\8. valid_at: the ISO-8601 date the fact became true or happened, when the
+    \\   conversation states or implies it — an explicit date, a session date
+    \\   header, or a resolvable reference ("last summer", "in 2022"). Format
+    \\   YYYY-MM-DD; a year alone is acceptable ("2022"). null when no time
+    \\   information is available. This is in ADDITION to keeping the date in
+    \\   the fact text (rule 6) — valid_at feeds time-ordered recall.
+    \\9. Extract from EVERY turn in the window — not just the most recent.
+    \\10. Skip content-free utterances ("Hi!", "Bye!", "Thanks!"). Don't extract them.
     \\
     \\Output STRICT JSON ONLY. Anything else will be discarded.
 ;
@@ -128,7 +138,16 @@ test "extraction system prompt mentions all required schema fields" {
     try std.testing.expect(std.mem.indexOf(u8, p, "\"predicate\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, p, "\"fact\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, p, "\"slot_intent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "\"valid_at\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, p, "SCREAMING_SNAKE_CASE") != null);
+}
+
+test "extraction prompt instructs the model to capture dates" {
+    const p = extractionSystemPrompt();
+    // Finding #1 fix — date capture both in fact text and the valid_at field.
+    try std.testing.expect(std.mem.indexOf(u8, p, "valid_at") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "ISO-8601") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "DATES") != null);
 }
 
 test "hydration system prompt contains all five XML tags" {
