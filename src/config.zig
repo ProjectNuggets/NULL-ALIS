@@ -636,6 +636,11 @@ pub const Config = struct {
                 }
                 try w.print("}}", .{});
             }
+            // S7.11 — emit read_line_timeout_secs unconditionally so an
+            // operator's non-default value survives a Config.save round-trip
+            // (Config.save is reachable from the onboarding flow). Omitting it
+            // silently reverted the field to the 30s struct default on reload.
+            try w.print(", \"read_line_timeout_secs\": {d}", .{server.read_line_timeout_secs});
             try w.print("}}", .{});
             if (i + 1 < self.mcp_servers.len) try w.print(",", .{});
             try w.print("\n", .{});
@@ -1905,6 +1910,8 @@ test "save escapes mcp_servers strings safely" {
                     .value = "ab\\cd\"ef\nz",
                 },
             },
+            // Non-default value: must survive the save→load round-trip.
+            .read_line_timeout_secs = 120,
         },
     };
 
@@ -1933,6 +1940,8 @@ test "save escapes mcp_servers strings safely" {
     try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers[0].env.len);
     try std.testing.expectEqualStrings("OPEN\"KEY", loaded.mcp_servers[0].env[0].key);
     try std.testing.expectEqualStrings("ab\\cd\"ef\nz", loaded.mcp_servers[0].env[0].value);
+    // S7.11 round-trip: a non-default read_line_timeout_secs must persist.
+    try std.testing.expectEqual(@as(u32, 120), loaded.mcp_servers[0].read_line_timeout_secs);
 }
 
 test "save escapes manually serialized config strings safely" {
