@@ -185,6 +185,14 @@ Surfaced by the Sprint 2 four-agent build, its independent post-merge audits, th
 
 ---
 
+## From Sprint 3 — Universal API Connector (OpenAPI tool)
+
+| ID | Shape | Why deferred | Target | Status |
+|----|-------|--------------|--------|--------|
+| D47 | OpenAPI connector `auth_ref` resolves the static credential directly from an environment variable (`std.process.getEnvVarOwned`). Full secret-vault integration — resolving `auth_ref` through the `secrets` subsystem so credentials are managed alongside other operator secrets — is not wired | V1 scope deliberately kept auth resolution to env vars: it ships the connector end-to-end (api_key header/query/cookie, http bearer/basic) without coupling to the secret-vault surface. The credential never leaks (zeroed before free, never in args/output/logs); the only gap is *where* it is stored. Env vars are an accepted operator-secret channel today | when the secret-vault becomes the canonical operator-credential store | **open** — env-var auth is functional; vault integration is the enhancement |
+
+---
+
 ## Retroactive reviews (process-gap)
 
 | ID | Shape | Why deferred | Target | Status |
@@ -200,4 +208,4 @@ Surfaced by the Sprint 2 four-agent build, its independent post-merge audits, th
 - **Superseding an item:** change `open` → `obsolete` with a one-line reason. Do NOT delete the row.
 - **Reviewing "what's still open":** `grep 'open' docs/deferred-register.md | wc -l` gives the live count.
 
-Last audit: **2026-05-22** at v1.14.20 + Slice 2 close — added section "From v1.14.19 / v1.14.20" with **D36–D46** (11 new rows) covering the Sprint 2 / MCP V1.1 / Slice 2 deferrals: `curlPost` status threading, MCP HTTP-SSE / `resources` / `sampling`, Email IMAP IDLE, the `imapResponseComplete` perf walk, the irc/websocket unverified-TLS gap (D42 → task #22, planned), Nostr, the clean K2.6 re-bench, Sprint-2 cosmetic nits, and the config-plane index pointer. Every MAJOR review finding from Sprint 2 + Slice 2 was fixed before merge; only true deferrals are registered. Prior audit: 2026-04-26 (D28-Day-1 close + S9 park).
+Last audit: **2026-05-22** at Sprint 3 (Universal API Connector) close — added section "From Sprint 3 — Universal API Connector" with **D47** (OpenAPI connector ships with env-var credential resolution; full secret-vault integration deferred). Prior audit: 2026-05-22 at v1.14.20 + Slice 2 close — added section "From v1.14.19 / v1.14.20" with **D36–D46** (11 new rows) covering the Sprint 2 / MCP V1.1 / Slice 2 deferrals: `curlPost` status threading, MCP HTTP-SSE / `resources` / `sampling`, Email IMAP IDLE, the `imapResponseComplete` perf walk, the irc/websocket unverified-TLS gap (D42 → task #22, planned), Nostr, the clean K2.6 re-bench, Sprint-2 cosmetic nits, and the config-plane index pointer. Every MAJOR review finding from Sprint 2 + Slice 2 was fixed before merge; only true deferrals are registered. Prior audit: 2026-04-26 (D28-Day-1 close + S9 park).
