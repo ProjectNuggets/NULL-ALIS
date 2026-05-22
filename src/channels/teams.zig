@@ -1,11 +1,10 @@
-// ⚠️ V1.7-cherrypick PENDING WIRING (CR-WIP-02 from REVIEW.md 2026-05-02):
-// This channel is fully implemented but not yet instantiated in
-// `src/channel_manager.zig`. It IS gated — `enable_channel_teams` build
-// flag defaults false; only `-Dchannels=all` or explicit `-Dchannels=teams`
-// pulls this file in. The catalog at `src/channel_catalog.zig` declares
-// Teams as `webhook_only` so once channel_manager learns to instantiate
-// webhook-only channels, this slots in. Do NOT delete; the impl is faithful
-// + tests pass. Final wire-up is queued as a follow-up commit.
+// Activation status (Sprint 2 — agent-A): Teams is fully wired.
+// channel_manager.collectConfiguredChannels instantiates it through the
+// generic `webhook_only` listener path (initFromConfig + channel() + setBus);
+// `enable_channel_teams` gates it into the build (`-Dchannels=all` or
+// `-Dchannels=teams`). Inbound Bot Framework Activities are routed by
+// gateway.zig at `POST /api/messages` (handleTeamsWebhookRoute). Outbound
+// send + typing indicators go through the Bot Framework REST API below.
 const std = @import("std");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
@@ -845,4 +844,52 @@ test "parseWebhookPayload returns empty when text field missing" {
     const msgs = try TeamsChannel.parseWebhookPayload(std.testing.allocator, body);
     defer std.testing.allocator.free(msgs);
     try std.testing.expectEqual(@as(usize, 0), msgs.len);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Channel Activation Contract Tests
+// ════════════════════════════════════════════════════════════════════════════
+//
+// channel_manager.collectConfiguredChannels picks up Teams through the generic
+// `webhook_only` path: it requires initFromConfig + channel() and (optionally)
+// setBus. The gateway routes inbound Activities to /api/messages. These tests
+// pin the channel-side contract so it cannot drift out of the generic path.
+
+test "teams exposes initFromConfig + channel for generic registration" {
+    try std.testing.expect(@hasDecl(TeamsChannel, "initFromConfig"));
+    try std.testing.expect(@hasDecl(TeamsChannel, "channel"));
+    try std.testing.expect(@hasDecl(TeamsChannel, "setBus"));
+}
+
+test "teams initFromConfig copies credentials and account_id" {
+    var ch = TeamsChannel.initFromConfig(std.testing.allocator, .{
+        .account_id = "default",
+        .client_id = "cid-123",
+        .client_secret = "secret-xyz",
+        .tenant_id = "tid-789",
+        .webhook_secret = "wh-secret",
+    });
+    try std.testing.expectEqualStrings("default", ch.account_id);
+    try std.testing.expectEqualStrings("cid-123", ch.client_id);
+    try std.testing.expectEqualStrings("tid-789", ch.tenant_id);
+    try std.testing.expect(ch.webhook_secret != null);
+    try std.testing.expectEqualStrings("teams", (ch.channel()).name());
+}
+
+test "teams channel vtable start sets running and stop clears it" {
+    // channel_manager's webhook_only path calls channel.start(); the gateway
+    // webhook handler relies on `running` being set for startTyping to fire.
+    var ch = TeamsChannel.initFromConfig(std.testing.allocator, .{
+        .account_id = "default",
+        .client_id = "cid",
+        .client_secret = "secret",
+        .tenant_id = "tid",
+    });
+    const c = ch.channel();
+    // start() attempts a token fetch; with bogus creds it logs a warning and
+    // continues — running must still flip true.
+    try c.start();
+    try std.testing.expect(ch.running.load(.acquire));
+    c.stop();
+    try std.testing.expect(!ch.running.load(.acquire));
 }
