@@ -4,6 +4,7 @@ const channel_loop = @import("channel_loop.zig");
 const channels_root = @import("channels/root.zig");
 const telegram = @import("channels/telegram.zig");
 const signal = @import("channels/signal.zig");
+const email = @import("channels/email.zig");
 const agent_routing = @import("agent_routing.zig");
 
 pub const PollingSpawnFn = *const fn (
@@ -34,6 +35,17 @@ fn signalPollingSourceKey(allocator: std.mem.Allocator, channel: channels_root.C
     return std.fmt.allocPrint(allocator, "{s}|{s}", .{ sg_ptr.http_url, sg_ptr.account }) catch null;
 }
 
+/// Source key for email — dedups by IMAP host + mailbox username so two
+/// configs polling the same inbox do not fight over UNSEEN flags.
+fn emailPollingSourceKey(allocator: std.mem.Allocator, channel: channels_root.Channel) ?[]u8 {
+    const em_ptr: *const email.EmailChannel = @ptrCast(@alignCast(channel.ptr));
+    return std.fmt.allocPrint(allocator, "{s}:{d}|{s}", .{
+        em_ptr.config.imap_host,
+        em_ptr.config.imap_port,
+        em_ptr.config.username,
+    }) catch null;
+}
+
 pub const polling_descriptors = [_]PollingDescriptor{
     .{
         .channel_name = "telegram",
@@ -48,6 +60,11 @@ pub const polling_descriptors = [_]PollingDescriptor{
     .{
         .channel_name = "matrix",
         .spawn = channel_loop.spawnMatrixPolling,
+    },
+    .{
+        .channel_name = "email",
+        .spawn = channel_loop.spawnEmailPolling,
+        .source_key = emailPollingSourceKey,
     },
 };
 
@@ -276,6 +293,7 @@ test "findPollingDescriptor returns known polling adapters" {
     try std.testing.expect(findPollingDescriptor("telegram") != null);
     try std.testing.expect(findPollingDescriptor("signal") != null);
     try std.testing.expect(findPollingDescriptor("matrix") != null);
+    try std.testing.expect(findPollingDescriptor("email") != null);
     try std.testing.expect(findPollingDescriptor("discord") == null);
 }
 

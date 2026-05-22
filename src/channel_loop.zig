@@ -29,6 +29,7 @@ const appendJsonEscaped = @import("util.zig").appendJsonEscaped;
 
 const signal = @import("channels/signal.zig");
 const matrix = @import("channels/matrix.zig");
+const email = @import("channels/email.zig");
 const channels_mod = @import("channels/root.zig");
 
 const log = std.log.scoped(.channel_loop);
@@ -1025,10 +1026,31 @@ pub const MatrixLoopState = struct {
     }
 };
 
+// ════════════════════════════════════════════════════════════════════════════
+// EmailLoopState — shared state between supervisor and IMAP polling thread
+// ════════════════════════════════════════════════════════════════════════════
+
+pub const EmailLoopState = struct {
+    /// Updated after each pollMessages() — epoch seconds.
+    last_activity: std.atomic.Value(i64),
+    /// Supervisor sets this to ask the polling thread to stop.
+    stop_requested: std.atomic.Value(bool),
+    /// Thread handle for join().
+    thread: ?std.Thread = null,
+
+    pub fn init() EmailLoopState {
+        return .{
+            .last_activity = std.atomic.Value(i64).init(std.time.timestamp()),
+            .stop_requested = std.atomic.Value(bool).init(false),
+        };
+    }
+};
+
 pub const PollingState = union(enum) {
     telegram: *TelegramLoopState,
     signal: *SignalLoopState,
     matrix: *MatrixLoopState,
+    email: *EmailLoopState,
 };
 
 pub const PollingSpawnResult = struct {
@@ -1105,6 +1127,30 @@ pub fn spawnMatrixPolling(
     return .{
         .thread = thread,
         .state = .{ .matrix = mx_ls },
+    };
+}
+
+pub fn spawnEmailPolling(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    channel: channels_mod.Channel,
+) !PollingSpawnResult {
+    const em_ls = try allocator.create(EmailLoopState);
+    errdefer allocator.destroy(em_ls);
+    em_ls.* = EmailLoopState.init();
+
+    const em_ptr: *email.EmailChannel = @ptrCast(@alignCast(channel.ptr));
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = 512 * 1024 },
+        runEmailLoop,
+        .{ allocator, config, runtime, em_ls, em_ptr },
+    );
+    em_ls.thread = thread;
+
+    return .{
+        .thread = thread,
+        .state = .{ .email = em_ls },
     };
 }
 
@@ -1233,6 +1279,163 @@ pub fn runMatrixLoop(
         }
 
         health.markComponentOk("matrix");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// runEmailLoop — IMAP polling thread function
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Build the inbound metadata JSON for an email message.
+/// Email peers are always direct (1:1) — there is no group concept.
+fn buildEmailInboundMetadata(
+    allocator: std.mem.Allocator,
+    account_id: []const u8,
+    peer_id: []const u8,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\"account_id\":\"");
+    try appendJsonEscaped(&buf, allocator, account_id);
+    try buf.appendSlice(allocator, "\",\"peer_kind\":\"direct\",\"peer_id\":\"");
+    try appendJsonEscaped(&buf, allocator, peer_id);
+    try buf.appendSlice(allocator, "\",\"is_group\":false,\"is_dm\":true}");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Thread-entry function for the Email IMAP polling loop.
+/// Mirrors runMatrixLoop but uses IMAP-over-TLS (channels/email.zig). Unlike
+/// long-poll channels, IMAP has no server-held wait, so the loop sleeps for
+/// `poll_interval_secs` between cycles. Checks `loop_state.stop_requested`
+/// and `daemon.isShutdownRequested()` for graceful shutdown.
+pub fn runEmailLoop(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    loop_state: *EmailLoopState,
+    em_ptr: *email.EmailChannel,
+) void {
+    loop_state.last_activity.store(std.time.timestamp(), .release);
+
+    const account_id = em_ptr.config.account_id;
+    // Clamp the poll interval to a sane minimum so a misconfigured 0 does
+    // not spin the IMAP server.
+    const poll_interval: u64 = @max(@as(u64, 5), em_ptr.config.poll_interval_secs);
+
+    var evict_counter: u32 = 0;
+
+    while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+        const messages = em_ptr.pollMessages(allocator) catch |err| {
+            log.warn("Email poll error: {}", .{err});
+            loop_state.last_activity.store(std.time.timestamp(), .release);
+            sleepInterruptible(loop_state, poll_interval);
+            continue;
+        };
+
+        loop_state.last_activity.store(std.time.timestamp(), .release);
+
+        for (messages) |msg| {
+            // Email peers are always direct; the session key is per-sender.
+            var key_buf: [192]u8 = undefined;
+            var routed_session_key: ?[]const u8 = null;
+            defer if (routed_session_key) |key| allocator.free(key);
+
+            const session_key = blk: {
+                const route = agent_routing.resolveRouteWithSession(allocator, .{
+                    .channel = "email",
+                    .account_id = account_id,
+                    .peer = .{ .kind = .direct, .id = msg.sender },
+                }, config.agent_bindings, config.agents, config.session) catch
+                    break :blk std.fmt.bufPrint(&key_buf, "email:{s}:{s}", .{ account_id, msg.sender }) catch msg.sender;
+
+                allocator.free(route.main_session_key);
+                routed_session_key = route.session_key;
+                break :blk route.session_key;
+            };
+
+            const email_target = msg.reply_target orelse msg.sender;
+
+            if (runtime.event_bus) |event_bus| {
+                const metadata_json = buildEmailInboundMetadata(
+                    allocator,
+                    account_id,
+                    msg.sender,
+                ) catch |err| {
+                    log.warn("email metadata build failed: {}", .{err});
+                    continue;
+                };
+                defer allocator.free(metadata_json);
+
+                _ = publishInboundFromPolling(
+                    allocator,
+                    event_bus,
+                    "email",
+                    msg.sender,
+                    email_target,
+                    msg.content,
+                    session_key,
+                    metadata_json,
+                );
+                continue;
+            }
+
+            setTenantContextForSessionKey(config, session_key);
+            defer tools_mod.clearTenantContext();
+
+            const reply = runtime.session_mgr.processMessageWithToolContext(session_key, msg.content, null, .{
+                .channel = "email",
+                .account_id = account_id,
+                .chat_id = email_target,
+                .is_group = false,
+                .is_dm = true,
+            }) catch |err| {
+                log.err("Email agent error: {}", .{err});
+                const err_msg: []const u8 = switch (err) {
+                    error.Timeout => "The model request timed out. Please try again.",
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+                    error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
+                    error.NoResponseContent => "Model returned an empty response. Please try again.",
+                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
+                    error.OutOfMemory => "Out of memory.",
+                    else => "An error occurred. Try again.",
+                };
+                em_ptr.sendMessage(email_target, err_msg) catch |send_err| log.err("failed to send email error reply: {}", .{send_err});
+                continue;
+            };
+            defer allocator.free(reply);
+
+            em_ptr.sendMessage(email_target, reply) catch |err| {
+                log.warn("Email send error: {}", .{err});
+            };
+        }
+
+        if (messages.len > 0) {
+            for (messages) |msg| {
+                msg.deinit(allocator);
+            }
+            allocator.free(messages);
+        }
+
+        evict_counter += 1;
+        if (evict_counter >= 100) {
+            evict_counter = 0;
+            _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
+        }
+
+        health.markComponentOk("email");
+        sleepInterruptible(loop_state, poll_interval);
+    }
+}
+
+/// Sleep for `secs` seconds in 1-second slices, returning early if a stop
+/// or shutdown is requested. IMAP has no server-held long-poll, so the loop
+/// paces itself between cycles without blocking shutdown for the full delay.
+fn sleepInterruptible(loop_state: *EmailLoopState, secs: u64) void {
+    var remaining = secs;
+    while (remaining > 0) : (remaining -= 1) {
+        if (loop_state.stop_requested.load(.acquire) or daemon.isShutdownRequested()) return;
+        std.Thread.sleep(std.time.ns_per_s);
     }
 }
 
