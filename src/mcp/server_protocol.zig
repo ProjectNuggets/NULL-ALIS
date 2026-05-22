@@ -17,9 +17,10 @@ const std = @import("std");
 const json_util = @import("../json_util.zig");
 const Allocator = std.mem.Allocator;
 
-/// MCP protocol version this server advertises. Matches the version the
-/// client in `src/mcp.zig` requests, so a nullalis-to-nullalis pairing
-/// negotiates cleanly.
+/// MCP protocol version this server advertises. The client in `src/mcp.zig`
+/// requests a newer revision (`2025-03-26`); MCP negotiates the effective
+/// version at `initialize` and both revisions interoperate over stdio, so a
+/// nullalis-to-nullalis pairing still connects cleanly.
 pub const protocol_version = "2024-11-05";
 
 // ── JSON-RPC error codes ────────────────────────────────────────
