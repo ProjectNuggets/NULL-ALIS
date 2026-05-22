@@ -31,7 +31,7 @@ binds_to: AGENTS.md §14 (Nullalis-grade standards)
 
 ## Where we are — code-truth state, 2026-05-22
 
-Tags: `v1.14.12` · `v1.14.13` · `v1.14.14` · `v1.14.18` (the v1.14.18-A/B block — tagged 2026-05-22). The 2026-05-22 memory-pipeline repair + config hardening sits on `main` post-`v1.14.18`, untagged (in-flight series).
+Tags: `v1.14.12` · `v1.14.13` · `v1.14.14` · `v1.14.18` (v1.14.18-A/B block) · `v1.14.19` (memory-pipeline repair + config-control-plane hardening) · `v1.14.20` (Sprint 2 — Channels V1 + MCP V1, the A2A core) — all tagged 2026-05-22. `main` is at `v1.14.20`.
 
 | Layer | State | Evidence |
 |---|---|---|
@@ -42,9 +42,10 @@ Tags: `v1.14.12` · `v1.14.13` · `v1.14.14` · `v1.14.18` (the v1.14.18-A/B blo
 | Context (ContextEngine) | Migrated (v1.14.14) | `ContextEngine.compact` is the live path |
 | Approval / Subagent receive | Closed | `approval_continues_turn=true`; TurnOutcome refactor |
 | Architecture | **Shared multi-tenant runtime** (decision 2026-05-22) | one pod, many users; per-cell pods deferred to v1.18 |
+| Channels / MCP | **Sprint 2 shipped (v1.14.20)** | Discord+Slack finished, Email+Teams activated; MCP client hardened + MCP server built (A2A core). Memory-over-MCP + Nostr deferred |
 | LoCoMo / τ-bench | **No clean K2.6 number** | the ~94% LoCoMo conv-0 was long-context recall on a then-dead pipeline; re-bench deferred (must be a multi-session / over-window test) |
 
-**What 2026-05-19 → 2026-05-22 actually did:** v1.14.13 + v1.14.14 tagged; the channel blocks (v1.14.15/.16/.17 Email/Teams/Nostr) were **deferred**, re-cut as "Sprint 2" below; v1.14.18-A/B (learning loop) merged. Then an **unplanned fire**: the memory pipeline was found silently dead (4 config/wiring regressions) and repaired, and the config control plane was audited + hardened. None of that was on this roadmap — it is now a closed block (`docs/CONFIG_CONTROL_PLANE_AUDIT.md`).
+**What 2026-05-19 → 2026-05-22 actually did:** v1.14.13 + v1.14.14 tagged; the channel blocks (v1.14.15/.16/.17 Email/Teams/Nostr) were **deferred**, re-cut as "Sprint 2"; v1.14.18-A/B (learning loop) merged. Then an **unplanned fire**: the memory pipeline was found silently dead (4 config/wiring regressions) and repaired, the config control plane was audited + hardened — closed as **v1.14.19** (`docs/CONFIG_CONTROL_PLANE_AUDIT.md`). Then **Sprint 2 shipped** as 4 parallel agents — Discord/Slack finished, Email/Teams activated, MCP client hardened, MCP server built — merged, independently audited, fix-forward'd, closed as **v1.14.20**.
 
 **Audit ledger:** `docs/audits/2026-05-19-file-by-file-audit-ledger.md` remains the active control ledger (67 findings: 9 HIGH / 31 MED / 27 LOW — half-finished orphans, config zombies, false-confidence handlers). No block tags until its rows close. **These are unfinished work, not delete candidates (§14.2/§14.4) — the blocks below finish them.**
 
@@ -59,13 +60,13 @@ The active near-term sequence. "Sprints 0–4" was a tactical re-cut; reconciled
 | Sprint 0 | Multimodal — native image + video | (PR #97) | ✅ done |
 | Sprint 1 | Learning-loop activation + §14.10 audit | v1.14.18-A/B (PR #87/#98) | ✅ done |
 | — | **Memory-pipeline repair + config hardening** | unplanned block (this session) | ✅ done 2026-05-22 |
-| **Sprint 2** | **Channels V1 + MCP V1** | v1.14.15 Email · .16 Teams · .17 Nostr + MCP | **P1 — next** |
-| **Sprint 3** | **Agent universal-environment access** (Swagger → access) | new — slots before v1.17 connectors | **P1** |
+| **Sprint 2** | **Channels V1 + MCP V1** | v1.14.15 Email · .16 Teams + MCP → **v1.14.20** | **✅ done 2026-05-22** |
+| **Sprint 3** | **Agent universal-environment access** (Swagger → access) | new — slots before v1.17 connectors | **P1 — next** |
 | **Sprint 4** | **UI/UX activation + feature-freeze** | overlaps v1.16 frontend wave | **P1** |
 
 After the Sprints, the version blocks below carry the road to v2.0. **Deferred follow-ups** (tracked in `docs/CONFIG_CONTROL_PLANE_AUDIT.md`, not lost): `network` config parser+wiring · `agent.extraction` parse-or-delete · sentinel-collision profile pattern · streaming-path error mapping. **LoCoMo Cat-3 lift** (the R6/R3/R4/R2 lever set — temporal/inference 56–77% → 80%+) is folded into the v1.15.0 bench-iteration block.
 
-**Folded from retired plan docs (2026-05-22 reconcile)** — captured here so nothing is lost when the source docs archive: the **F-A2.1 / F-T1 / F-PA1** fixes are **verified shipped 2026-05-22** — F-A2.1 via prompt-level `brain_graph` routing for entity questions (`prompt.zig`), F-T1 via `elideUnverifiedHistory` (`root.zig:5204`), F-PA1 via `archiveDroppedMessages` (Pass A archives to `compaction_dropped/` before deletion). The **cognitive-layers track** (Working / Procedural / Dream-consolidation memory — partly landed, the v1.14.19 sleep cycle is its home) and the **SOTA append-only context end-state** (ContextEngine migration at v1.14.14 covered the bulk) remain the open carry-forward items.
+**Folded from retired plan docs (2026-05-22 reconcile)** — captured here so nothing is lost when the source docs archive: the **F-A2.1 / F-T1 / F-PA1** fixes are **verified shipped 2026-05-22** — F-A2.1 via prompt-level `brain_graph` routing for entity questions (`prompt.zig`), F-T1 via `elideUnverifiedHistory` (`root.zig:5204`), F-PA1 via `archiveDroppedMessages` (Pass A archives to `compaction_dropped/` before deletion). The **cognitive-layers track** (Working / Procedural / Dream-consolidation memory — partly landed, the v1.14.21 sleep cycle is its home) and the **SOTA append-only context end-state** (ContextEngine migration at v1.14.14 covered the bulk) remain the open carry-forward items.
 
 **Dangling references:** this doc cites `docs/capacity-model.md`, `docs/dr-runbook.md`, `docs/unit-economics-2026-XX-XX.md` — those are *outputs* of blocks v1.18/v1.18.5/v1.19.7, authored when those blocks run, not pre-existing files.
 
@@ -195,7 +196,9 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.15 — "Channels finish: Email" → DEFERRED → Sprint 2 (Channels V1)
+## v1.14.15 — "Channels finish: Email" → DELIVERED via Sprint 2 → v1.14.20
+
+**DELIVERED 2026-05-22 (PR #100):** Email activated as a `send_only` channel through `channel_manager`'s generic listener path. SMTP outbound is live; **inbound IMAP is NOT built** — the original Steps below assumed an IMAP poller; that scope is deferred (honestly labelled in `src/channels/email.zig`). Discord + Slack were also finished in the same sprint (PR #99) — echo-loop fix, system-message filtering, markdown conversion.
 
 **Theme:** First of three channel-completion blocks. Email is widest user reach.
 
@@ -219,7 +222,9 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.16 — "Channels finish: Teams" → DEFERRED → Sprint 2 (Channels V1)
+## v1.14.16 — "Channels finish: Teams" → DELIVERED via Sprint 2 → v1.14.20
+
+**DELIVERED 2026-05-22 (PR #100):** Teams fully wired — inbound Bot Framework Activities arrive at `POST /api/messages` (`handleTeamsWebhookRoute` in `gateway.zig`, constant-time `webhook_secret` gate), outbound + typing via the Bot Framework REST API; registered through `channel_manager`'s `webhook_only` path. Plus MCP V1 (PR #101 server, #102 client) shipped under the same sprint.
 
 **Theme:** Enterprise wedge. Bot Framework webhook-based.
 
@@ -242,7 +247,9 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.17 — "Channels finish: Nostr" → DEFERRED → Sprint 2 (Channels V1)
+## v1.14.17 — "Channels finish: Nostr" → DEFERRED (no user demand)
+
+**DEFERRED 2026-05-22:** Sprint 2 explicitly scoped Nostr out — no current user uses Nostr, and the enterprise/consumer channels (Email/Teams/Discord/Slack) carry the launch. The block stays here for when censorship-resistant relay becomes a differentiator; it is NOT a v1.14.20 deliverable.
 
 **Theme:** V-infinity differentiation. Censorship-resistant relay.
 
@@ -347,12 +354,12 @@ exists, agent doesn't see it).
 4. **G16 WM-CROSS-SESSION** — At session-end, promote high-importance `active_goal` +
    `decision` slots to durable_facts with `attribute=transient_goal`. Recall at
    session-start via existing memory_loader path. File: new `src/agent/promotion.zig`
-   (first concrete cross-layer promotion rule; foundation for G6 broader graph in v1.14.19).
+   (first concrete cross-layer promotion rule; foundation for G6 broader graph in v1.14.21).
    Owner: Agent G (already in working_memory pipeline).
 
 5. **G19 DAEMON-PROMPT-HONESTY** — Either implement the "nightly summaries" prompt promise
    in `daemon.zig:3903` OR strip the prompt line per §14.6 honest-config. Recommend strip
-   in this block; the actual nightly summaries land in v1.14.19 sleep cycle. Owner: either.
+   in this block; the actual nightly summaries land in v1.14.21 sleep cycle. Owner: either.
 
 **Repo structure additions (locked per CTO/repo-designer review):**
 - `src/agent/reflection.zig` — standalone module for the reflection trail
@@ -373,7 +380,9 @@ exists, agent doesn't see it).
 
 ---
 
-## v1.14.19 — "Sleep cycle / offline self-improvement (Voyager-class)" → PLANNED
+## v1.14.21 — "Sleep cycle / offline self-improvement (Voyager-class)" → PLANNED
+
+*(Renumbered from v1.14.19 on the 2026-05-22 reconcile — .19 and .20 were consumed by the memory-pipeline-repair and Sprint 2 blocks.)*
 
 **Theme:** Turn the existing 12h hygiene cadence into a Voyager-style offline self-improvement
 loop. Compound learning across sessions during agent downtime. Replaces the "A/B prompt
@@ -844,10 +853,11 @@ Candidate pillar order (Nova-revisable):
 ## Status as of 2026-05-22 reconcile
 
 - **v1.14.12 / .13 / .14** — TAGGED.
-- **v1.14.15 / .16 / .17** (Email/Teams/Nostr channels) — DEFERRED, re-cut as **Sprint 2 — Channels V1 + MCP V1**.
+- **v1.14.15 / .16** (Email/Teams channels) — DELIVERED via **Sprint 2**, folded into the `v1.14.20` tag. **.17** (Nostr) — still DEFERRED (no user demand).
 - **v1.14.18-A / -B** (learning loop) — MERGED via PR #87 / #98; **TAGGED `v1.14.18`** (2026-05-22, at block-completion commit `79094848`).
-- **Memory-pipeline repair + config-control-plane hardening** — unplanned block, done 2026-05-22 (`docs/CONFIG_CONTROL_PLANE_AUDIT.md`).
-- **NEXT:** Sprint 2 (Channels V1 + MCP V1) → Sprint 3 (universal-environment access) → Sprint 4 (UI/UX + freeze), then the v1.15+ blocks to v2.0.
+- **v1.14.19** — Memory-pipeline repair + config-control-plane hardening; **TAGGED `v1.14.19`** (2026-05-22, `docs/CONFIG_CONTROL_PLANE_AUDIT.md`).
+- **v1.14.20** — **Sprint 2: Channels V1 + MCP V1 (the A2A core).** 4 PRs (#99–#102) merged, independently audited, 5 fix-forward commits; **TAGGED `v1.14.20`** (2026-05-22 at `99db4ea8`). MCP follow-ups: enable the MCP client (config key rename), wire a memory backend into `mcp serve`.
+- **NEXT:** Sprint 3 (universal-environment access) → Sprint 4 (UI/UX + freeze), then the v1.15+ blocks to v2.0. The "Sleep cycle" block is renumbered v1.14.19 → **v1.14.21**.
 - **v1.14.18 MED-tier sweep** — partially addressed by the §14.10 activation audit; the full 31-MED sweep is still open against the audit ledger.
 
 **The promise:** every block ships at the standard in AGENTS.md §14. Or it doesn't ship.

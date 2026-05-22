@@ -1,12 +1,35 @@
 # nullALIS — STATUS
 
-**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-22 — memory-pipeline repair + config/control-plane hardening (top section). Prior partial refresh 2026-05-21.
+**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-22 — Sprint 2 shipped (Channels V1 + MCP V1, the A2A core); memory-pipeline repair + config hardening. Prior partial refresh 2026-05-21.
 
 This is the single cold-start document. If it disagrees with `.planning/STATE.md`, `PROJECT_LEDGER.md` (archived), or anything in `docs/archive/`, **this wins**.
 
 ---
 
-## 2026-05-22 — current state (memory-pipeline repair + config hardening)
+## 2026-05-22 — Sprint 2 shipped: Channels V1 + MCP V1 (the A2A core) → v1.14.20
+
+Code truth as of `99db4ea8` on `main`. Sprint 2 ran as 4 parallel fresh-context agents, each landing one PR; all 4 merged after a coordinator review + a green canonical CI gate, then an independent fresh-context post-merge audit (4 more agents) drove 5 fix-forward commits.
+
+**What shipped (4 PRs):**
+- **#99 — Discord + Slack finished.** Echo-loop fix (self-author filter), system-message filtering, markdown→mrkdwn conversion, API error logging.
+- **#100 — Email + Teams activated.** Teams inbound via a `/api/messages` Bot Framework webhook (constant-time shared-secret gate); Email wired as `send_only`. Both register through `channel_manager`'s generic listener path.
+- **#101 — MCP server built.** `nullalis mcp serve`: nullalis now *is* an MCP server, exposing its tools over JSON-RPC 2.0 (stdio). Deny-by-default exposure policy, constant-time caller auth, 4 MiB DoS cap.
+- **#102 — MCP client hardened.** Multi-turn crash root-caused (a notification frame was mistaken for the response) → id-correlated frame routing + per-server mutex; HTTP transport added; double-free + unbounded-recursion bugs fixed.
+
+This is the **A2A core**: nullalis can both consume external MCP servers and *be* one.
+
+**Independent audit verdict:** #99/#100/#101 nits-only; #102 had one MAJOR (config round-trip silently dropped `read_line_timeout_secs`). All actioned — 5 fix-forward commits at `99db4ea8`: config round-trip + negative-value guard, MCP memory-tool exposure trimmed, protocol-version comment, Discord non-integer-`type` drop. **Verified:** canonical CI gate green on the integrated tree and again post-fix-forward, with all Sprint 2 channels (`-Dchannels=cli,telegram,email,teams,discord,slack`).
+
+**Honest gaps / final-shape items (NOT done — these are the next hardening targets):**
+- **MCP client is built but dormant** — the operator config still names `_mcp_servers_disabled_pending_stability_fix`; the stability bug is fixed, but the key must be renamed to `mcp_servers` to actually enable it.
+- **Memory-over-MCP deferred** — `mcp serve` does not bind a memory backend, so the MCP server exposes compute/file/web tools only, not memory. The "composable brain over MCP" needs the memory runtime wired into `mcp serve` — the #1 MCP follow-up.
+- **Email is send-only** — inbound IMAP is unbuilt (honestly labelled in `email.zig`).
+- MCP server is stdio-only (no HTTP/SSE); memory-as-MCP-`resources` deferred.
+- **Nostr deferred** — no user demand; explicitly scoped out of Sprint 2.
+
+---
+
+## 2026-05-22 — current state (memory-pipeline repair + config hardening) → v1.14.19
 
 Code truth as of `7874226c` on `main`. This session found the agent memory pipeline silently broken end-to-end and repaired it, then audited and hardened the config/control plane. Three merges to `main`.
 
@@ -71,6 +94,8 @@ Single-binary Zig agent runtime (`src/main.zig`). **Shared multi-tenant runtime*
 
 | Version | Theme | Status |
 |---|---|---|
+| **v1.14.20** (2026-05-22) | **Sprint 2 — Channels V1 + MCP V1 (the A2A core).** Discord + Slack finished; Email + Teams activated (Teams `/api/messages` webhook); MCP client hardened (multi-turn crash fixed); MCP server built (`nullalis mcp serve`). 4 PRs (#99–#102), independent post-merge audit, 5 fix-forward commits. | **Shipped + CI-green** |
+| **v1.14.19** (2026-05-22) | **Memory-pipeline repair + config-control-plane hardening.** 4 stacked regressions that had silently killed boundary extraction repaired + verified live; tenant config inverted to a strict allowlist; comptime config exhaustiveness guard. | **Shipped + verified** |
 | **V1.14.10 A** (2026-05-18) | **Async lifecycle persist.** `persistSessionCheckpointDetailed` no longer blocks `agent.turn()` — detached worker thread + atomic in-flight guard + bounded deinit-wait. Root cause of the 9 session-load HTTP 180s timeouts on the full battery (sample 4 dropped 88%→67% from 3 timeouts; sample 9 totally failed). Re-bench expected to lift overall ~10pp by eliminating timeout-induced session-context losses. | **Shipped, awaiting bench rerun** |
 | V1.14.10 B / R2 | **Bi-temporal invalidation — core was already shipping.** Schema has `invalid_at`+`expired_at`; `setMemoryInvalidation` cascades on contradiction; read queries default `WHERE is_latest`. Tonight: **253 of 1,010 edges** (25%) are cascade-closed via 308 contradiction events. Remaining `superseded_by_edge_id` link + `as_of` time-travel are LongMemEval-relevant, not LoCoMo — deferred to R5 sprint. | Core operational; polish deferred |
 | **V1.14.9** (2026-05-18) | **Episode-based boundary extraction.** New `src/agent/extraction/{chunker,merger,telemetry}.zig` (~780 LOC) replaces "one giant LLM call per boundary" with semantic-chunk → parallel fan-out (Thread.Pool 8-way) → coref+dedup merge. Industry-aligned with Graphiti episodes / mem0 chunks / Zep auto-boundary / HippoRAG. R1 graph-density telemetry shipped. Pass A wire fix (CompactionConfig propagation H-01). | **Shipped + acceptance gate met** |
