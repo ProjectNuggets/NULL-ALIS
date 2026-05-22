@@ -146,6 +146,11 @@ const operator_owned_top_level_config_keys = [_][]const u8{
     "agents",
     "bindings",
     "mcp_servers",
+    // Sprint 3 — operator-owned, NOT tenant-settable. An api_specs entry
+    // declares an outbound integration plus a credential reference; a
+    // tenant must not be able to point the agent at an arbitrary API or
+    // swap a spec's auth_ref. Same posture as mcp_servers.
+    "api_specs",
     "diagnostics",
     "autonomy",
     "runtime",

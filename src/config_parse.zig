@@ -20,6 +20,65 @@ pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]co
     return try list.toOwnedSlice(allocator);
 }
 
+/// Parse one `api_specs` entry. `id` is the object key (object form) or
+/// the explicit `id` field (array form). Returns null when the entry is
+/// invalid — missing both `spec_url` and `spec_path`, or supplying both.
+/// An invalid entry is skipped, not fatal: a single bad spec must not
+/// abort config load (the registry loader is fail-soft per spec too).
+fn parseApiSpecEntry(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    obj: std.json.ObjectMap,
+) !?types.ApiSpecConfig {
+    if (id.len == 0) return null;
+
+    const strField = struct {
+        fn get(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+            const v = o.get(key) orelse return null;
+            return switch (v) {
+                .string => |s| s,
+                else => null,
+            };
+        }
+    }.get;
+
+    const spec_url = strField(obj, "spec_url") orelse "";
+    const spec_path = strField(obj, "spec_path") orelse "";
+    // Exactly one source must be set.
+    if (spec_url.len == 0 and spec_path.len == 0) {
+        std.log.scoped(.config).warn(
+            "api_specs entry '{s}' skipped: needs spec_url or spec_path",
+            .{id},
+        );
+        return null;
+    }
+    if (spec_url.len > 0 and spec_path.len > 0) {
+        std.log.scoped(.config).warn(
+            "api_specs entry '{s}' skipped: set only one of spec_url / spec_path",
+            .{id},
+        );
+        return null;
+    }
+
+    var cfg = types.ApiSpecConfig{
+        .id = try allocator.dupe(u8, id),
+    };
+    if (spec_url.len > 0) cfg.spec_url = try allocator.dupe(u8, spec_url);
+    if (spec_path.len > 0) cfg.spec_path = try allocator.dupe(u8, spec_path);
+    if (strField(obj, "base_url")) |b| cfg.base_url = try allocator.dupe(u8, b);
+    if (strField(obj, "auth_ref")) |a| cfg.auth_ref = try allocator.dupe(u8, a);
+    if (strField(obj, "mode")) |m| {
+        cfg.mode = types.ApiSpecConfig.Mode.fromSlice(m) orelse blk: {
+            std.log.scoped(.config).warn(
+                "api_specs entry '{s}': unknown mode '{s}', defaulting to read_only",
+                .{ id, m },
+            );
+            break :blk .read_only;
+        };
+    }
+    return cfg;
+}
+
 fn parseAudioMediaConfigObject(self: *Config, audio: std.json.Value) !void {
     if (audio != .object) return;
     const has_models = blk: {
@@ -597,6 +656,40 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 try mcp_list.append(self.allocator, mcp_cfg);
             }
             self.mcp_servers = try mcp_list.toOwnedSlice(self.allocator);
+        }
+    }
+
+    // OpenAPI specs (Sprint 3). Accepted in two shapes for ergonomics:
+    //   - object-of-objects: { "<id>": { "spec_url": ..., ... }, ... }
+    //   - array-of-objects:  [ { "id": "<id>", "spec_url": ..., ... }, ... ]
+    // The id is the object key in the first form, an explicit `id` field
+    // in the second. Each entry needs exactly one of spec_url / spec_path.
+    if (root.get("api_specs")) |specs_val| {
+        var spec_list: std.ArrayListUnmanaged(types.ApiSpecConfig) = .empty;
+
+        if (specs_val == .object) {
+            var it = specs_val.object.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* != .object) continue;
+                if (try parseApiSpecEntry(self.allocator, entry.key_ptr.*, entry.value_ptr.object)) |cfg| {
+                    try spec_list.append(self.allocator, cfg);
+                }
+            }
+        } else if (specs_val == .array) {
+            for (specs_val.array.items) |item| {
+                if (item != .object) continue;
+                const id_val = item.object.get("id");
+                const id = if (id_val != null and id_val.? == .string) id_val.?.string else continue;
+                if (try parseApiSpecEntry(self.allocator, id, item.object)) |cfg| {
+                    try spec_list.append(self.allocator, cfg);
+                }
+            }
+        }
+
+        if (spec_list.items.len > 0) {
+            self.api_specs = try spec_list.toOwnedSlice(self.allocator);
+        } else {
+            spec_list.deinit(self.allocator);
         }
     }
 
