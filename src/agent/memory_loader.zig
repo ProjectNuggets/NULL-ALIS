@@ -823,6 +823,12 @@ fn loadContextWithRuntimeDetailed(
             if (!canAppendToBucket(buf.items.len, fallback_bytes, stats.fallback_bucket_entries, SEARCH_FALLBACK_BUCKET_MAX_BYTES, SEARCH_FALLBACK_BUCKET_MAX_ENTRIES, estimated_bytes)) continue;
             // P4: tier gate — skip low-confidence RRF hits from the fallback bucket.
             // The isSemanticContinuityKey branch above is never gated (quality risk).
+            // NOTE: gated candidates intentionally skip markSeenKey below, so they are
+            // NOT added to seen_keys.  containsCandidateKey (used in global_keyword_entries
+            // loop) still finds them in `candidates` so they won't double-inject via that
+            // path.  They CAN resurface through the global_entries path (containsString on
+            // seen_keys), which is correct: the gate suppresses a candidate from the premium
+            // RRF fallback slot but does not permanently exclude it from the turn.
             if (tier_gate_min_score > 0.0 and cand.final_score < tier_gate_min_score) {
                 stats.tier_gated_count += 1;
                 continue;
@@ -1391,14 +1397,29 @@ fn readGraphRecallMaxHops() u8 {
 // ── P4: Tier Gate ───────────────────────────────────────────────────────────
 
 /// Minimum RRF final_score for fallback-bucket candidates.
-/// 0.0 (default) disables the gate entirely.
-/// Set NULLALIS_TIER_GATE_MIN_SCORE=0.10 to filter low-confidence hits.
+/// 0.0 disables the gate entirely; any positive value enables it.
+///
+/// Score ranges at default rrf_k=60, top_k=25 (WITHOUT temporal decay):
+///   single-source  rank  1 → 1/61  ≈ 0.01639
+///   single-source  rank 16 → 1/76  ≈ 0.01316  (passes at 0.013)
+///   single-source  rank 17 → 1/77  ≈ 0.01299  (blocked at 0.013)
+///   two-source     rank  1 → 2/61  ≈ 0.03279  (always passes)
+///   three-source   rank  1 → 3/61  ≈ 0.04918  (always passes)
+///
+/// Recommended default: 0.013 (set NULLALIS_TIER_GATE_MIN_SCORE=0.013).
 /// Only applies to the runtime (hybrid/shadow_hybrid) path candidates.
 /// Semantic-bucket entries (isSemanticContinuityKey path) are never gated.
+/// Values above 1.0 are rejected (returns 0.0) to prevent silent blanket-blocking.
+///
+/// Note: when llm_reranker is enabled the pipeline overwrites final_score with
+/// 1/(rank+1) — minimum score with top_k=25 is 1/25=0.04, so 0.013 has no
+/// effect in that configuration (gate becomes a no-op, which is correct: LLM
+/// reranked candidates are already quality-selected).
 fn readTierGateMinScore() f64 {
     const val = std.posix.getenv("NULLALIS_TIER_GATE_MIN_SCORE") orelse return 0.0;
     const parsed = std.fmt.parseFloat(f64, val) catch return 0.0;
-    return if (parsed >= 0.0) parsed else 0.0;
+    // Reject out-of-range values rather than silently blocking everything.
+    return if (parsed >= 0.0 and parsed <= 1.0) parsed else 0.0;
 }
 
 // ── P1: Entity Overlap Callback ────────────────────────────────────────────
@@ -2555,4 +2576,27 @@ test "tier gate: readTierGateMinScore returns 0.0 when env var absent" {
 test "tier gate: SelectionStats.tier_gated_count initialises to zero" {
     const s = SelectionStats{};
     try std.testing.expectEqual(@as(usize, 0), s.tier_gated_count);
+}
+
+test "tier gate: score-range arithmetic at rrf_k=60 top_k=25" {
+    // Verify the score-range assumptions baked into the recommended 0.013 default.
+    // RRF formula: score = 1 / (0-indexed_rank + 1 + k)
+    const k: f64 = 60.0;
+    // Single source: worst case (rank 25, 0-indexed 24) must be above any sane gate.
+    const single_worst = 1.0 / (24.0 + 1.0 + k); // 1/85 ≈ 0.01176
+    try std.testing.expect(single_worst > 0.011);
+    try std.testing.expect(single_worst < 0.013); // blocked by 0.013 threshold
+    // Single source: rank-16 (0-indexed 15) must pass.
+    const single_rank16 = 1.0 / (15.0 + 1.0 + k); // 1/76 ≈ 0.01316
+    try std.testing.expect(single_rank16 > 0.013);
+    // Two-source: even at rank 25 each, easily clears the gate.
+    const two_source_worst = 2.0 / (24.0 + 1.0 + k); // 2/85 ≈ 0.02353
+    try std.testing.expect(two_source_worst > 0.013);
+    // Upper-bound clamp: value > 1.0 must NOT become the gate threshold
+    // (tested indirectly — verify the clamp arithmetic is correct).
+    const clamped = blk: {
+        const parsed: f64 = 2.5; // simulate bad env value
+        break :blk if (parsed >= 0.0 and parsed <= 1.0) parsed else @as(f64, 0.0);
+    };
+    try std.testing.expectEqual(@as(f64, 0.0), clamped);
 }
