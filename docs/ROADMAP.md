@@ -31,7 +31,7 @@ binds_to: AGENTS.md §14 (Nullalis-grade standards)
 
 ## Where we are — code-truth state, 2026-05-22
 
-`main` @ `6336bbf5`. Tags: `v1.14.12`, `v1.14.13`, `v1.14.14` shipped; `v1.14.18-A/B` merged by PR (#87/#98), not yet tagged.
+Tags: `v1.14.12` · `v1.14.13` · `v1.14.14` · `v1.14.18` (the v1.14.18-A/B block — tagged 2026-05-22). The 2026-05-22 memory-pipeline repair + config hardening sits on `main` post-`v1.14.18`, untagged (in-flight series).
 
 | Layer | State | Evidence |
 |---|---|---|
@@ -65,7 +65,7 @@ The active near-term sequence. "Sprints 0–4" was a tactical re-cut; reconciled
 
 After the Sprints, the version blocks below carry the road to v2.0. **Deferred follow-ups** (tracked in `docs/CONFIG_CONTROL_PLANE_AUDIT.md`, not lost): `network` config parser+wiring · `agent.extraction` parse-or-delete · sentinel-collision profile pattern · streaming-path error mapping. **LoCoMo Cat-3 lift** (the R6/R3/R4/R2 lever set — temporal/inference 56–77% → 80%+) is folded into the v1.15.0 bench-iteration block.
 
-**Folded from retired plan docs (2026-05-22 reconcile)** — captured here so nothing is lost when the source docs archive: the **F-A2.1** (`brain_graph` as the real default for entity questions) / **F-T1** (strip `memory_recall` bloat from history) / **F-PA1** (information-preserving Pass A) fixes — verify shipped-status against code, carry any still-open one into `docs/deferred-register.md`; the **cognitive-layers track** (Working / Procedural / Dream-consolidation memory — partly landed, the v1.14.19 sleep cycle is its home); the **SOTA append-only context end-state** (ContextEngine migration at v1.14.14 covered the bulk).
+**Folded from retired plan docs (2026-05-22 reconcile)** — captured here so nothing is lost when the source docs archive: the **F-A2.1 / F-T1 / F-PA1** fixes are **verified shipped 2026-05-22** — F-A2.1 via prompt-level `brain_graph` routing for entity questions (`prompt.zig`), F-T1 via `elideUnverifiedHistory` (`root.zig:5204`), F-PA1 via `archiveDroppedMessages` (Pass A archives to `compaction_dropped/` before deletion). The **cognitive-layers track** (Working / Procedural / Dream-consolidation memory — partly landed, the v1.14.19 sleep cycle is its home) and the **SOTA append-only context end-state** (ContextEngine migration at v1.14.14 covered the bulk) remain the open carry-forward items.
 
 **Dangling references:** this doc cites `docs/capacity-model.md`, `docs/dr-runbook.md`, `docs/unit-economics-2026-XX-XX.md` — those are *outputs* of blocks v1.18/v1.18.5/v1.19.7, authored when those blocks run, not pre-existing files.
 
@@ -314,7 +314,7 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ---
 
-## v1.14.18-B — "Learning loop closure + self-knowledge" → MERGED (PR #98, awaiting tag)
+## v1.14.18-B — "Learning loop closure + self-knowledge" → TAGGED v1.14.18 (covers A+B)
 
 **Theme:** Close the latent-value gaps surfaced by the 2026-05-20 post-v1.14.14 activation
 audit (`docs/audits/2026-05-20-v1.14.14-activation-audit.md`). v1.14.18-A (Agent E) gives
@@ -845,7 +845,7 @@ Candidate pillar order (Nova-revisable):
 
 - **v1.14.12 / .13 / .14** — TAGGED.
 - **v1.14.15 / .16 / .17** (Email/Teams/Nostr channels) — DEFERRED, re-cut as **Sprint 2 — Channels V1 + MCP V1**.
-- **v1.14.18-A / -B** (learning loop) — MERGED via PR #87 / #98; awaiting a `v1.14.18` tag.
+- **v1.14.18-A / -B** (learning loop) — MERGED via PR #87 / #98; **TAGGED `v1.14.18`** (2026-05-22, at block-completion commit `79094848`).
 - **Memory-pipeline repair + config-control-plane hardening** — unplanned block, done 2026-05-22 (`docs/CONFIG_CONTROL_PLANE_AUDIT.md`).
 - **NEXT:** Sprint 2 (Channels V1 + MCP V1) → Sprint 3 (universal-environment access) → Sprint 4 (UI/UX + freeze), then the v1.15+ blocks to v2.0.
 - **v1.14.18 MED-tier sweep** — partially addressed by the §14.10 activation audit; the full 31-MED sweep is still open against the audit ledger.
