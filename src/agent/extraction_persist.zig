@@ -691,8 +691,30 @@ pub const WriteOrigin = enum {
 /// fact shouldn't kill the run. Judge LLM failures are non-fatal: they
 /// degrade to MD5-only behavior for that fact.
 ///
+/// P3 — map a WriteOrigin to the short extraction_pass label stored in
+/// memory_edges.extraction_pass. Callers that fire at a compaction or
+/// session-end boundary get a descriptive label; the entity pipeline and
+/// test wire get "tool" / "test" / "unknown" so the column is never NULL
+/// for rows that have a real origin.
+fn originToExtractionPass(origin: WriteOrigin) []const u8 {
+    return switch (origin) {
+        .pass_a_drop               => "pass_a",
+        .pass_c_compaction_extract => "pass_c",
+        .session_end_extract       => "session_end",
+        .memory_store_tool         => "tool",
+        .test_wire                 => "test",
+        else                       => "unknown",
+    };
+}
+
 /// V1.14.12 (M1) — `origin` parameter labels the call for per-path
 /// telemetry. See WriteOrigin docstring.
+///
+/// P3 — `session_boundary_id` is a milliTimestamp captured by the caller
+/// immediately before firing a compaction or session-end boundary. Pass 0
+/// for non-boundary callers (memory_store_tool, test_wire). The value is
+/// stored in memory_edges.session_boundary_id so boundary-scoped edges can
+/// be grouped without parsing timestamps.
 pub fn persistExtracted(
     allocator: std.mem.Allocator,
     state_mgr: *zaki_state.Manager,
@@ -711,6 +733,7 @@ pub fn persistExtracted(
     // fixtures, non-postgres deploys).
     mem_rt: ?*memory_root.MemoryRuntime,
     origin: WriteOrigin,
+    session_boundary_id: i64, // P3: milliTimestamp at boundary fire; 0 for non-boundary callers
 ) !PersistResult {
     var result = PersistResult{
         .written_count = 0,
@@ -1022,6 +1045,8 @@ pub fn persistExtracted(
                 m.text,
                 m.temporal_anchor_unix,
                 key,
+                originToExtractionPass(origin), // P3: extraction pass label
+                if (session_boundary_id == 0) null else session_boundary_id, // P3: boundary ID; null for non-boundary
             ) catch |err| {
                 log.warn("extraction.edge_write_failed source={s} target={s} predicate={s} err={s}", .{
                     key, tk, m.predicate, @errorName(err),
@@ -1659,6 +1684,15 @@ test "V1.14.12 (M1): WriteOrigin tags are stable strings for log analyzers" {
     try std.testing.expectEqualStrings("pass_c_compaction_extract", WriteOrigin.pass_c_compaction_extract.toSlice());
     try std.testing.expectEqualStrings("session_end_extract", WriteOrigin.session_end_extract.toSlice());
     try std.testing.expectEqualStrings("test_wire", WriteOrigin.test_wire.toSlice());
+}
+
+test "originToExtractionPass maps all expected origins" {
+    try std.testing.expectEqualStrings("pass_a",      originToExtractionPass(.pass_a_drop));
+    try std.testing.expectEqualStrings("pass_c",      originToExtractionPass(.pass_c_compaction_extract));
+    try std.testing.expectEqualStrings("session_end", originToExtractionPass(.session_end_extract));
+    try std.testing.expectEqualStrings("tool",        originToExtractionPass(.memory_store_tool));
+    try std.testing.expectEqualStrings("test",        originToExtractionPass(.test_wire));
+    try std.testing.expectEqualStrings("unknown",     originToExtractionPass(.unknown));
 }
 
 test "V1.14.12 (M1 + Path A): WriteOrigin enum count guards against silent additions" {

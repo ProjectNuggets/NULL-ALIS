@@ -619,6 +619,8 @@ pub fn emitCooccurrenceEdges(
                 fact_buf,
                 null, // co-occurrence has no temporal anchor
                 episode_key, // V1.14.3 (G-03): provenance from caller
+                null, // extraction_pass (P3: entity pipeline, not extraction boundary)
+                null, // session_boundary_id (P3)
             ) catch |err| {
                 log.warn("entity_pipeline: edge emit failed err={s} src={s} tgt={s}", .{
                     @errorName(err), src_id, tgt_id,
@@ -672,6 +674,8 @@ pub fn emitSpeakerEdges(
             fact_buf,
             null,
             episode_key, // V1.14.3 (G-03): provenance from caller
+            null, // extraction_pass (P3: entity pipeline, not extraction boundary)
+            null, // session_boundary_id (P3)
         ) catch |err| {
             log.warn("entity_pipeline: speaker edge failed err={s} entity={s}", .{
                 @errorName(err), r.entity_id,

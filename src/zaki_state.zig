@@ -599,6 +599,8 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
         _: ?[]const u8,
         _: ?i64,
         _: ?[]const u8,
+        _: ?[]const u8, // extraction_pass (P3)
+        _: ?i64,        // session_boundary_id (P3)
     ) !void {
         return;
     }
@@ -1648,6 +1650,8 @@ const ManagerImpl = struct {
             "ALTER TABLE {schema}.memory_edges ADD COLUMN IF NOT EXISTS fact TEXT",
             "ALTER TABLE {schema}.memory_edges ADD COLUMN IF NOT EXISTS temporal_anchor_unix BIGINT",
             "ALTER TABLE {schema}.memory_edges ADD COLUMN IF NOT EXISTS episodes TEXT[] DEFAULT '{}'",
+            "ALTER TABLE {schema}.memory_edges ADD COLUMN IF NOT EXISTS extraction_pass TEXT",
+            "ALTER TABLE {schema}.memory_edges ADD COLUMN IF NOT EXISTS session_boundary_id BIGINT",
 
             // V1.6 commit 16 — one-shot backfill: populate memory_edges from
             // existing JSONB triples on legacy memories. Idempotent via the
@@ -7085,7 +7089,7 @@ const ManagerImpl = struct {
         // V1.14 backwards-compat wrapper: existing callers stay on the
         // legacy 6-arg API. New 9-arg variant below carries fact +
         // temporal_anchor + episode_key.
-        return self.upsertMemoryEdgeRich(user_id, source_key, target_key, predicate, attribution, confidence, null, null, null);
+        return self.upsertMemoryEdgeRich(user_id, source_key, target_key, predicate, attribution, confidence, null, null, null, null, null);
     }
 
     /// V1.14 — rich edge upsert with fact prose + temporal anchor +
@@ -7101,6 +7105,8 @@ const ManagerImpl = struct {
     ///   - temporal_anchor_unix = COALESCE(old, new) — keep oldest known anchor
     ///   - episodes = array_append(episodes, new_episode_key) IF not already present
     ///     (idempotent; re-mention adds new source memory to the chain)
+    /// P3 — extraction_pass (TEXT) + session_boundary_id (BIGINT) provenance.
+    /// Both are write-once: COALESCE(existing, new) so the first writer wins.
     pub fn upsertMemoryEdgeRich(
         self: *Self,
         user_id: i64,
@@ -7112,13 +7118,16 @@ const ManagerImpl = struct {
         fact: ?[]const u8,
         temporal_anchor_unix: ?i64,
         episode_key: ?[]const u8,
+        extraction_pass: ?[]const u8,   // P3: pass label (e.g. "pass_a", "pass_c")
+        session_boundary_id: ?i64,      // P3: milliTimestamp at boundary fire
     ) !void {
         const q = try self.buildQuery(
             "INSERT INTO {schema}.memory_edges " ++
                 "(user_id, source_key, target_key, predicate, attribution, confidence, valid_from, " ++
-                " fact, temporal_anchor_unix, episodes) " ++
+                " fact, temporal_anchor_unix, episodes, extraction_pass, session_boundary_id) " ++
                 "VALUES ($1, $2, $3, $4, $5, $6, EXTRACT(EPOCH FROM NOW())::bigint, " ++
-                " $7, $8, CASE WHEN $9::text IS NULL THEN '{}'::text[] ELSE ARRAY[$9::text] END) " ++
+                " $7, $8, CASE WHEN $9::text IS NULL THEN '{}'::text[] ELSE ARRAY[$9::text] END, " ++
+                " $10, $11::bigint) " ++
                 "ON CONFLICT (user_id, source_key, predicate, target_key) WHERE is_latest " ++
                 "DO UPDATE SET " ++
                 "confidence = COALESCE(EXCLUDED.confidence, {schema}.memory_edges.confidence), " ++
@@ -7130,7 +7139,9 @@ const ManagerImpl = struct {
                 "  WHEN $9::text IS NULL THEN {schema}.memory_edges.episodes " ++
                 "  WHEN $9::text = ANY({schema}.memory_edges.episodes) THEN {schema}.memory_edges.episodes " ++
                 "  ELSE array_append({schema}.memory_edges.episodes, $9::text) " ++
-                "END",
+                "END, " ++
+                "extraction_pass = COALESCE({schema}.memory_edges.extraction_pass, EXCLUDED.extraction_pass), " ++
+                "session_boundary_id = COALESCE({schema}.memory_edges.session_boundary_id, EXCLUDED.session_boundary_id)",
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
@@ -7161,6 +7172,15 @@ const ManagerImpl = struct {
         const ep_z = try self.allocator.dupeZ(u8, ep_text);
         defer self.allocator.free(ep_z);
 
+        // P3 — extraction_pass + session_boundary_id params.
+        const pass_text = extraction_pass orelse "";
+        const pass_z = try self.allocator.dupeZ(u8, pass_text);
+        defer self.allocator.free(pass_z);
+        var sbid_buf: [32]u8 = undefined;
+        const sbid_text = if (session_boundary_id) |sv| try std.fmt.bufPrintZ(&sbid_buf, "{d}", .{sv}) else "";
+        const sbid_z = try self.allocator.dupeZ(u8, sbid_text);
+        defer self.allocator.free(sbid_z);
+
         // MD-02 fix (REVIEW V1.14): treat empty strings as NULL for
         // consistency with how `attribution` is handled (line above).
         // Otherwise an empty-string fact gets written as '' rather
@@ -7176,6 +7196,8 @@ const ManagerImpl = struct {
             if (fact == null or fact_text.len == 0) null else fact_z,
             if (temporal_anchor_unix == null) null else anchor_z,
             if (episode_key == null or ep_text.len == 0) null else ep_z,
+            if (extraction_pass == null or pass_text.len == 0) null else pass_z,
+            if (session_boundary_id == null) null else sbid_z,
         };
         const lengths = [_]c_int{
             @intCast(user_s.len),
@@ -7187,6 +7209,8 @@ const ManagerImpl = struct {
             @intCast(fact_text.len),
             @intCast(anchor_text.len),
             @intCast(ep_text.len),
+            @intCast(pass_text.len),
+            @intCast(sbid_text.len),
         };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
@@ -12762,6 +12786,7 @@ test "V1.7a-5 link_type rich wiring — column populated from metadata + backfil
         null,
         null, // V1.8-2: mem_rt — test fixture, no runtime
         .test_wire, // V1.14.12 (M1) — per-path telemetry tag
+        0, // P3: test wire — no boundary ID
     );
     try std.testing.expect(persist_result.written_count == 1);
     {
