@@ -1243,6 +1243,20 @@ fn resolveEntityKey(
     return new_id;
 }
 
+/// Hash-fallback entity key for an `object` surface form.
+///
+/// Used by `resolveEntityKey` when no coreference embedding provider is
+/// available, when an embed call fails, or when entity upsert fails — i.e.
+/// the deterministic path that needs no DB round-trip. Returns
+/// `entity_<hex>` where `<hex>` is the first 8 bytes of the SHA-256 of the
+/// canonicalized object.
+///
+/// The `lowerForEntityKey` canonicalization is load-bearing: it is the
+/// SAME helper `commands.deriveSessionEndEntityKey` and the PG cmt16
+/// backfill SQL route their input through, so all three paths produce
+/// byte-identical keys for the same surface form regardless of casing —
+/// re-extraction then collides on the primary key (`ON CONFLICT DO
+/// NOTHING`) instead of writing a duplicate row. Caller frees the slice.
 fn deriveEntityKey(allocator: std.mem.Allocator, object: []const u8) ![]u8 {
     const lower = try lowerForEntityKey(allocator, object);
     defer allocator.free(lower);
