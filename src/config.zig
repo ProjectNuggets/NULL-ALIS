@@ -320,6 +320,22 @@ pub const Config = struct {
                 if (std.mem.eql(u8, self.memory.search.provider, "none")) {
                     self.memory.search.provider = "together";
                 }
+                // Finding #4 footgun guard: the SidecarConfig struct default
+                // (groq/llama-3.1-8b-instant) is Groq's free 6000-TPM tier —
+                // a compaction fires ~15 sidecar calls in seconds, exhausts
+                // the TPM budget, and every boundary extraction past the
+                // first fails. zaki_bot already runs on Together (see
+                // fallback_providers + memory.search above), so default the
+                // extraction sidecar to a capable Together model unless the
+                // operator pinned their own `sidecar` block. An operator who
+                // genuinely wants a different sidecar sets provider/model in
+                // config.json and this guard does not fire.
+                if (std.mem.eql(u8, self.sidecar.provider, "groq") and
+                    std.mem.eql(u8, self.sidecar.model, "llama-3.1-8b-instant"))
+                {
+                    self.sidecar.provider = try self.allocator.dupe(u8, "together");
+                    self.sidecar.model = try self.allocator.dupe(u8, "meta-llama/Llama-3.3-70B-Instruct-Turbo");
+                }
             },
         }
         self.memory.applyProfileDefaults();
@@ -2125,6 +2141,38 @@ test "json parse agent token_limit explicit remains false when omitted" {
     try cfg.parseJson(json);
     try std.testing.expectEqual(config_types.DEFAULT_AGENT_TOKEN_LIMIT, cfg.agent.token_limit);
     try std.testing.expect(!cfg.agent.token_limit_explicit);
+}
+
+// Enforcement test #1 (catches finding #1): the prior "json parse agent
+// section" test passes `compact_context: true` EXPLICITLY — it pins the
+// parse path, not the default. The compact_context regression was a
+// silently-flipped DEFAULT; only a test that parses `{}` and asserts the
+// default catches that class.
+test "config hardening: agent.compact_context defaults to true" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson("{}");
+    try std.testing.expect(cfg.agent.compact_context);
+}
+
+// Enforcement test #2 (catches finding #4): the `sidecar` block must
+// round-trip through the parser. Finding #4 was a struct + field +
+// docstrings with NO parser — `Config.sidecar` was permanently the
+// struct default. A test that parses a non-default sidecar block and
+// asserts every field survives catches that class.
+test "config hardening: sidecar block parses provider/model/enabled/narration_interval" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"sidecar": {"enabled": false, "provider": "together", "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo", "narration_interval": 7}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(!cfg.sidecar.enabled);
+    try std.testing.expectEqualStrings("together", cfg.sidecar.provider);
+    try std.testing.expectEqualStrings("meta-llama/Llama-3.3-70B-Instruct-Turbo", cfg.sidecar.model);
+    try std.testing.expectEqual(@as(u32, 7), cfg.sidecar.narration_interval);
+    allocator.free(cfg.sidecar.provider);
+    allocator.free(cfg.sidecar.model);
 }
 
 test "json parse composio section" {
