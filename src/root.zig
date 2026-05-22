@@ -82,6 +82,10 @@ pub const runtime = @import("runtime.zig");
 
 // Phase 4b: MCP (Model Context Protocol)
 pub const mcp = @import("mcp.zig");
+/// Sprint 2 — nullalis AS an MCP server: exposes the tool registry over
+/// JSON-RPC 2.0 stdio so external clients can use nullalis as a tool
+/// provider. The inverse of `mcp` (the client). Entry: `nullalis mcp serve`.
+pub const mcp_server = @import("mcp_server.zig");
 pub const subagent = @import("subagent.zig");
 
 // Phase 4c: Auth
