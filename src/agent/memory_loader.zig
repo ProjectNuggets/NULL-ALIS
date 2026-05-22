@@ -92,6 +92,9 @@ pub const SelectionStats = struct {
     semantic_bucket_bytes: usize = 0,
     fallback_bucket_entries: usize = 0,
     fallback_bucket_bytes: usize = 0,
+    /// P4 — candidates blocked by the tier gate (score < NULLALIS_TIER_GATE_MIN_SCORE).
+    /// 0 when gate is disabled (default) or no candidates were filtered.
+    tier_gated_count: usize = 0,
     context_bytes: usize = 0,
     injected: bool = false,
     // V1.7a-2 — graph-expand recall consumer telemetry.
@@ -668,6 +671,20 @@ fn loadContextWithRuntimeDetailed(
     user_id_for_supersede: ?i64,
 ) !ContextResult {
     var stats = SelectionStats{ .available = true };
+    // P4: tier gate — read once per call; 0.0 = disabled.
+    const tier_gate_min_score = readTierGateMinScore();
+
+    // P1: wire entity-overlap callback for this search call.
+    // eo_ctx lives on the stack; rt.setEntityOverlapCallback clears it after.
+    var eo_ctx: EntityOverlapCtx = undefined;
+    if (readEntityOverlapEnabled()) {
+        if (state_mgr_for_supersede) |sm| if (user_id_for_supersede) |uid| {
+            eo_ctx = .{ .state_mgr = sm, .user_id = uid, .allocator = allocator };
+            rt.setEntityOverlapCallback(.{ .ptr = &eo_ctx, .func = entityOverlapImpl });
+        };
+    }
+    defer rt.setEntityOverlapCallback(null);
+
     const candidates = rt.search(allocator, user_message, WARM_CANDIDATE_FETCH_LIMIT, session_id) catch {
         return .{ .context = try allocator.dupe(u8, ""), .stats = stats };
     };
@@ -804,6 +821,18 @@ fn loadContextWithRuntimeDetailed(
         } else {
             const estimated_bytes = @min(cand.snippet.len, FALLBACK_ENTRY_MAX_BYTES) + cand.key.len + 8;
             if (!canAppendToBucket(buf.items.len, fallback_bytes, stats.fallback_bucket_entries, SEARCH_FALLBACK_BUCKET_MAX_BYTES, SEARCH_FALLBACK_BUCKET_MAX_ENTRIES, estimated_bytes)) continue;
+            // P4: tier gate — skip low-confidence RRF hits from the fallback bucket.
+            // The isSemanticContinuityKey branch above is never gated (quality risk).
+            // NOTE: gated candidates intentionally skip markSeenKey below, so they are
+            // NOT added to seen_keys.  containsCandidateKey (used in global_keyword_entries
+            // loop) still finds them in `candidates` so they won't double-inject via that
+            // path.  They CAN resurface through the global_entries path (containsString on
+            // seen_keys), which is correct: the gate suppresses a candidate from the premium
+            // RRF fallback slot but does not permanently exclude it from the turn.
+            if (tier_gate_min_score > 0.0 and cand.final_score < tier_gate_min_score) {
+                stats.tier_gated_count += 1;
+                continue;
+            }
             try appendBucketEntry(allocator, &buf, &wrote_header, cand.key, cand.snippet, FALLBACK_ENTRY_MAX_BYTES, &fallback_bytes);
             stats.fallback_bucket_entries += 1;
             stats.fallback_bucket_bytes = fallback_bytes;
@@ -1363,6 +1392,142 @@ fn readGraphRecallMaxHops() u8 {
     const raw = std.posix.getenv("NULLALIS_GRAPH_RECALL_MAX_HOPS") orelse return DEFAULT_GRAPH_RECALL_MAX_HOPS;
     const parsed = std.fmt.parseInt(u8, raw, 10) catch return DEFAULT_GRAPH_RECALL_MAX_HOPS;
     return @min(parsed, 3);
+}
+
+// ── P4: Tier Gate ───────────────────────────────────────────────────────────
+
+/// Minimum RRF final_score for fallback-bucket candidates.
+/// 0.0 disables the gate entirely; any positive value enables it.
+///
+/// Score ranges at default rrf_k=60, top_k=25 (raw RRF, before temporal decay):
+///   single-source  rank  1 → 1/61  ≈ 0.01639
+///   single-source  rank 17 → 1/77  ≈ 0.01299
+///   two-source     rank  1 → 2/61  ≈ 0.03279  (always passes at any sane threshold)
+///   three-source   rank  1 → 3/61  ≈ 0.04918  (always passes)
+///
+/// With temporal decay ON (half_life_days=30, default for zaki_bot profile):
+///   score *= exp(-ln(2)/30 * age_days)
+///   threshold 0.005 → single-source rank-1 blocked after ~72 days
+///   threshold 0.013 → single-source rank-1 blocked after ~11 days (too aggressive)
+///
+/// Recommended default: 0.005 when temporal decay is ON (zaki_bot profile).
+///                       0.013 when temporal decay is OFF.
+/// Only applies to the runtime (hybrid/shadow_hybrid) path candidates.
+/// Semantic-bucket entries (isSemanticContinuityKey path) are never gated.
+/// Values above 1.0 are rejected (returns 0.0) to prevent silent blanket-blocking.
+///
+/// Note: when llm_reranker is enabled the pipeline overwrites final_score with
+/// 1/(rank+1) — minimum score with top_k=25 is 1/25=0.04, so 0.005 has no
+/// effect in that configuration (gate becomes a no-op, which is correct).
+fn readTierGateMinScore() f64 {
+    const val = std.posix.getenv("NULLALIS_TIER_GATE_MIN_SCORE") orelse return 0.0;
+    const parsed = std.fmt.parseFloat(f64, val) catch return 0.0;
+    // Reject out-of-range values rather than silently blocking everything.
+    return if (parsed >= 0.0 and parsed <= 1.0) parsed else 0.0;
+}
+
+// ── P1: Entity Overlap Callback ────────────────────────────────────────────
+
+/// Kill switch: set NULLALIS_ENTITY_OVERLAP=0 to disable entity overlap.
+fn readEntityOverlapEnabled() bool {
+    const val = std.posix.getenv("NULLALIS_ENTITY_OVERLAP") orelse return true;
+    return !std.mem.eql(u8, val, "0");
+}
+
+/// Context bag threaded through the type-erased EntityOverlapCallCtx.
+const EntityOverlapCtx = struct {
+    state_mgr: *zaki_state.Manager,
+    user_id: i64,
+    allocator: std.mem.Allocator,
+};
+
+/// Called by the retrieval engine as the 3rd RRF source.
+/// Tokenises `query`, matches token patterns against `memory_edges`, and
+/// returns normalised `RetrievalCandidate` slices ranked by match_count.
+/// Snippet is populated so bucket rendering never emits blank lines.
+fn entityOverlapImpl(
+    ctx: *anyopaque,
+    allocator: std.mem.Allocator,
+    query: []const u8,
+) anyerror![]memory_mod.RetrievalCandidate {
+    const eo: *EntityOverlapCtx = @ptrCast(@alignCast(ctx));
+
+    // Build ILIKE patterns from query tokens (skip tokens shorter than 3 chars)
+    var patterns: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (patterns.items) |p| allocator.free(p);
+        patterns.deinit(allocator);
+    }
+    var it = std.mem.tokenizeAny(u8, query, " \t\n.,;:!?\"'()[]{}");
+    while (it.next()) |tok| {
+        if (tok.len < 3) continue;
+        const lower = try std.ascii.allocLowerString(allocator, tok);
+        defer allocator.free(lower);
+        const pat = try std.fmt.allocPrint(allocator, "%{s}%", .{lower});
+        try patterns.append(allocator, pat);
+    }
+    if (patterns.items.len == 0) return allocator.alloc(memory_mod.RetrievalCandidate, 0);
+
+    const rows = try eo.state_mgr.findEdgesEntityOverlap(allocator, eo.user_id, patterns.items, 10);
+    defer {
+        for (rows) |r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+    if (rows.len == 0) return allocator.alloc(memory_mod.RetrievalCandidate, 0);
+
+    // Normalise scores: highest match_count → 1.0
+    const max_count: f64 = @floatFromInt(rows[0].match_count);
+
+    var out = try allocator.alloc(memory_mod.RetrievalCandidate, rows.len);
+    var out_len: usize = 0; // tracks how many entries are fully initialised
+    errdefer {
+        // deinit only the fully-initialised entries to avoid freeing unset fields
+        for (out[0..out_len]) |*c| c.deinit(allocator);
+        allocator.free(out);
+    }
+    for (rows, 0..) |row, i| {
+        const score: f64 = if (max_count > 0.0)
+            @as(f64, @floatFromInt(row.match_count)) / max_count
+        else 0.0;
+        // Heap-allocate every field that RetrievalCandidate.deinit() will free.
+        // String literals must NOT be passed to allocator.free() — only the
+        // zero-length "" is safe (free returns early on len==0), but "entity_overlap"
+        // (len=14) would UB against a static segment pointer.
+        //
+        // Each allocation gets its own errdefer so a mid-struct OOM doesn't
+        // leak the fields already allocated in this iteration. Matches the
+        // pattern used by entriesToCandidates and vectorResultsToCandidates.
+        const id_dup = try allocator.dupe(u8, "");
+        errdefer allocator.free(id_dup);
+        const key_dup = try allocator.dupe(u8, row.memory_key);
+        errdefer allocator.free(key_dup);
+        const content_dup = try allocator.dupe(u8, row.snippet); // MUST be non-empty
+        errdefer allocator.free(content_dup);
+        const snippet_dup = try allocator.dupe(u8, row.snippet);
+        errdefer allocator.free(snippet_dup);
+        const source_dup = try allocator.dupe(u8, "entity_overlap");
+        errdefer allocator.free(source_dup);
+        const source_path_dup = try allocator.dupe(u8, "");
+        errdefer allocator.free(source_path_dup);
+        out[i] = memory_mod.RetrievalCandidate{
+            .id           = id_dup,
+            .key          = key_dup,
+            .content      = content_dup,
+            .snippet      = snippet_dup,
+            .category     = .daily,
+            .keyword_rank = null,
+            .vector_score = null,
+            .final_score  = score,
+            .source       = source_dup,
+            .source_path  = source_path_dup,
+            .start_line   = 0,
+            .end_line     = 0,
+            .created_at   = 0,
+            .lane         = "",
+        };
+        out_len = i + 1;
+    }
+    return out;
 }
 
 /// Build the `<graph_neighbors>` block for the current turn.
@@ -2403,4 +2568,39 @@ test "loadContextWithRuntime caps fallback bucket and preserves semantic budget"
     try std.testing.expect(result.stats.fallback_bucket_bytes <= FALLBACK_BUCKET_MAX_BYTES);
     try std.testing.expect(std.mem.indexOf(u8, result.context, "timeline_summary/agent:test:user:1:other/1") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.context, "durable_fact/project_owner") != null);
+}
+
+test "tier gate: readTierGateMinScore returns 0.0 when env var absent" {
+    // NULLALIS_TIER_GATE_MIN_SCORE must not be set in the test environment.
+    // Gate is OFF (0.0) by default — zero behaviour change unless opt-in.
+    const score = readTierGateMinScore();
+    try std.testing.expectEqual(@as(f64, 0.0), score);
+}
+
+test "tier gate: SelectionStats.tier_gated_count initialises to zero" {
+    const s = SelectionStats{};
+    try std.testing.expectEqual(@as(usize, 0), s.tier_gated_count);
+}
+
+test "tier gate: score-range arithmetic at rrf_k=60 top_k=25" {
+    // Verify the score-range assumptions baked into the recommended 0.013 default.
+    // RRF formula: score = 1 / (0-indexed_rank + 1 + k)
+    const k: f64 = 60.0;
+    // Single source: worst case (rank 25, 0-indexed 24) must be above any sane gate.
+    const single_worst = 1.0 / (24.0 + 1.0 + k); // 1/85 ≈ 0.01176
+    try std.testing.expect(single_worst > 0.011);
+    try std.testing.expect(single_worst < 0.013); // blocked by 0.013 threshold
+    // Single source: rank-16 (0-indexed 15) must pass.
+    const single_rank16 = 1.0 / (15.0 + 1.0 + k); // 1/76 ≈ 0.01316
+    try std.testing.expect(single_rank16 > 0.013);
+    // Two-source: even at rank 25 each, easily clears the gate.
+    const two_source_worst = 2.0 / (24.0 + 1.0 + k); // 2/85 ≈ 0.02353
+    try std.testing.expect(two_source_worst > 0.013);
+    // Upper-bound clamp: value > 1.0 must NOT become the gate threshold
+    // (tested indirectly — verify the clamp arithmetic is correct).
+    const clamped = blk: {
+        const parsed: f64 = 2.5; // simulate bad env value
+        break :blk if (parsed >= 0.0 and parsed <= 1.0) parsed else @as(f64, 0.0);
+    };
+    try std.testing.expectEqual(@as(f64, 0.0), clamped);
 }

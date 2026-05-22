@@ -203,6 +203,34 @@ pub const TaskSnapshot = struct {
     }
 };
 
+/// P2 — a node scored by findEdgesPPR.
+/// Defined at top-level so both ManagerImpl and the non-postgres stub
+/// can reference it without depending on postgres headers.
+pub const PPRNode = struct {
+    key: []u8,
+    ppr_score: f64,
+    min_depth: u8,
+
+    pub fn deinit(self: PPRNode, allocator: std.mem.Allocator) void {
+        allocator.free(self.key);
+    }
+};
+
+/// P1 — result row from findEdgesEntityOverlap.
+/// Defined at top-level so both ManagerImpl and the non-postgres stub
+/// can reference it without depending on postgres headers.
+pub const EntityOverlapRow = struct {
+    memory_key: []u8,
+    match_count: i64,
+    /// SUBSTRING(m.content, 1, 420) — non-empty; needed for bucket rendering.
+    snippet: []u8,
+
+    pub fn deinit(self: EntityOverlapRow, allocator: std.mem.Allocator) void {
+        allocator.free(self.memory_key);
+        allocator.free(self.snippet);
+    }
+};
+
 pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn init(_: std.mem.Allocator, _: config_types.StateConfig) !@This() {
         return error.PostgresNotEnabled;
@@ -599,6 +627,8 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
         _: ?[]const u8,
         _: ?i64,
         _: ?[]const u8,
+        _: ?[]const u8, // extraction_pass (P3)
+        _: ?i64,        // session_boundary_id (P3)
     ) !void {
         return;
     }
@@ -612,6 +642,14 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     /// is a postgres-only feature; non-postgres returns empty.
     pub fn findEdgesByKeys(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const []const u8) ![]memory_root.TypedEdge {
         return allocator.alloc(memory_root.TypedEdge, 0);
+    }
+    /// P1 — stub for non-postgres builds. Entity overlap is postgres-only.
+    pub fn findEdgesEntityOverlap(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const []const u8, _: usize) ![]EntityOverlapRow {
+        return allocator.alloc(EntityOverlapRow, 0);
+    }
+    /// P2 — stub for non-postgres builds. PPR is postgres-only.
+    pub fn findEdgesPPR(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const []const u8, _: u8, _: usize) ![]PPRNode {
+        return allocator.alloc(PPRNode, 0);
     }
     /// V1.14.12 (Memory audit Finding 2 fix) — stub for non-postgres
     /// builds. Entity lookup is a postgres feature; non-postgres returns
@@ -1648,6 +1686,8 @@ const ManagerImpl = struct {
             "ALTER TABLE {schema}.memory_edges ADD COLUMN IF NOT EXISTS fact TEXT",
             "ALTER TABLE {schema}.memory_edges ADD COLUMN IF NOT EXISTS temporal_anchor_unix BIGINT",
             "ALTER TABLE {schema}.memory_edges ADD COLUMN IF NOT EXISTS episodes TEXT[] DEFAULT '{}'",
+            "ALTER TABLE {schema}.memory_edges ADD COLUMN IF NOT EXISTS extraction_pass TEXT",
+            "ALTER TABLE {schema}.memory_edges ADD COLUMN IF NOT EXISTS session_boundary_id BIGINT",
 
             // V1.6 commit 16 — one-shot backfill: populate memory_edges from
             // existing JSONB triples on legacy memories. Idempotent via the
@@ -7085,7 +7125,7 @@ const ManagerImpl = struct {
         // V1.14 backwards-compat wrapper: existing callers stay on the
         // legacy 6-arg API. New 9-arg variant below carries fact +
         // temporal_anchor + episode_key.
-        return self.upsertMemoryEdgeRich(user_id, source_key, target_key, predicate, attribution, confidence, null, null, null);
+        return self.upsertMemoryEdgeRich(user_id, source_key, target_key, predicate, attribution, confidence, null, null, null, null, null);
     }
 
     /// V1.14 — rich edge upsert with fact prose + temporal anchor +
@@ -7101,6 +7141,8 @@ const ManagerImpl = struct {
     ///   - temporal_anchor_unix = COALESCE(old, new) — keep oldest known anchor
     ///   - episodes = array_append(episodes, new_episode_key) IF not already present
     ///     (idempotent; re-mention adds new source memory to the chain)
+    /// P3 — extraction_pass (TEXT) + session_boundary_id (BIGINT) provenance.
+    /// Both are write-once: COALESCE(existing, new) so the first writer wins.
     pub fn upsertMemoryEdgeRich(
         self: *Self,
         user_id: i64,
@@ -7112,13 +7154,16 @@ const ManagerImpl = struct {
         fact: ?[]const u8,
         temporal_anchor_unix: ?i64,
         episode_key: ?[]const u8,
+        extraction_pass: ?[]const u8,   // P3: pass label (e.g. "pass_a", "pass_c")
+        session_boundary_id: ?i64,      // P3: milliTimestamp at boundary fire
     ) !void {
         const q = try self.buildQuery(
             "INSERT INTO {schema}.memory_edges " ++
                 "(user_id, source_key, target_key, predicate, attribution, confidence, valid_from, " ++
-                " fact, temporal_anchor_unix, episodes) " ++
+                " fact, temporal_anchor_unix, episodes, extraction_pass, session_boundary_id) " ++
                 "VALUES ($1, $2, $3, $4, $5, $6, EXTRACT(EPOCH FROM NOW())::bigint, " ++
-                " $7, $8, CASE WHEN $9::text IS NULL THEN '{}'::text[] ELSE ARRAY[$9::text] END) " ++
+                " $7, $8, CASE WHEN $9::text IS NULL THEN '{}'::text[] ELSE ARRAY[$9::text] END, " ++
+                " $10, $11::bigint) " ++
                 "ON CONFLICT (user_id, source_key, predicate, target_key) WHERE is_latest " ++
                 "DO UPDATE SET " ++
                 "confidence = COALESCE(EXCLUDED.confidence, {schema}.memory_edges.confidence), " ++
@@ -7130,7 +7175,9 @@ const ManagerImpl = struct {
                 "  WHEN $9::text IS NULL THEN {schema}.memory_edges.episodes " ++
                 "  WHEN $9::text = ANY({schema}.memory_edges.episodes) THEN {schema}.memory_edges.episodes " ++
                 "  ELSE array_append({schema}.memory_edges.episodes, $9::text) " ++
-                "END",
+                "END, " ++
+                "extraction_pass = COALESCE({schema}.memory_edges.extraction_pass, EXCLUDED.extraction_pass), " ++
+                "session_boundary_id = COALESCE({schema}.memory_edges.session_boundary_id, EXCLUDED.session_boundary_id)",
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
@@ -7161,6 +7208,15 @@ const ManagerImpl = struct {
         const ep_z = try self.allocator.dupeZ(u8, ep_text);
         defer self.allocator.free(ep_z);
 
+        // P3 — extraction_pass + session_boundary_id params.
+        const pass_text = extraction_pass orelse "";
+        const pass_z = try self.allocator.dupeZ(u8, pass_text);
+        defer self.allocator.free(pass_z);
+        var sbid_buf: [32]u8 = undefined;
+        const sbid_text = if (session_boundary_id) |sv| try std.fmt.bufPrintZ(&sbid_buf, "{d}", .{sv}) else "";
+        const sbid_z = try self.allocator.dupeZ(u8, sbid_text);
+        defer self.allocator.free(sbid_z);
+
         // MD-02 fix (REVIEW V1.14): treat empty strings as NULL for
         // consistency with how `attribution` is handled (line above).
         // Otherwise an empty-string fact gets written as '' rather
@@ -7176,6 +7232,8 @@ const ManagerImpl = struct {
             if (fact == null or fact_text.len == 0) null else fact_z,
             if (temporal_anchor_unix == null) null else anchor_z,
             if (episode_key == null or ep_text.len == 0) null else ep_z,
+            if (extraction_pass == null or pass_text.len == 0) null else pass_z,
+            if (session_boundary_id == null) null else sbid_z,
         };
         const lengths = [_]c_int{
             @intCast(user_s.len),
@@ -7187,6 +7245,8 @@ const ManagerImpl = struct {
             @intCast(fact_text.len),
             @intCast(anchor_text.len),
             @intCast(ep_text.len),
+            @intCast(pass_text.len),
+            @intCast(sbid_text.len),
         };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
@@ -7447,6 +7507,213 @@ const ManagerImpl = struct {
                 .predicate = pred,
                 .confidence = conf,
                 .weight = weight,
+            });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    // ── P1: Entity Overlap ──────────────────────────────────────────────────
+
+    /// Find memories whose edges share token patterns from the query.
+    /// `token_patterns` are PG ILIKE patterns (e.g. `"%nova%"`).
+    /// Returns rows ordered by match_count DESC; caller frees with:
+    ///   for (rows) |r| r.deinit(allocator); allocator.free(rows);
+    pub fn findEdgesEntityOverlap(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        token_patterns: []const []const u8,
+        limit: usize,
+    ) ![]EntityOverlapRow {
+        if (token_patterns.len == 0) return allocator.alloc(EntityOverlapRow, 0);
+
+        // Build PG TEXT[] literal: {"pat1","pat2",...}
+        var arr_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer arr_buf.deinit(allocator);
+        try arr_buf.appendSlice(allocator, "{");
+        for (token_patterns, 0..) |pat, i| {
+            if (i > 0) try arr_buf.append(allocator, ',');
+            try arr_buf.append(allocator, '"');
+            for (pat) |ch| {
+                if (ch == '\\' or ch == '"') try arr_buf.append(allocator, '\\');
+                try arr_buf.append(allocator, ch);
+            }
+            try arr_buf.append(allocator, '"');
+        }
+        try arr_buf.appendSlice(allocator, "}");
+
+        const q = try self.buildQuery(
+            "SELECT DISTINCT m.key, COUNT(e.id)::bigint AS match_count, " ++
+                "  COALESCE(SUBSTRING(m.content, 1, 420), '') AS snippet " ++
+                "FROM {schema}.memories m " ++
+                "JOIN {schema}.memory_edges e " ++
+                "  ON e.user_id = $1 AND e.is_latest " ++
+                "  AND (e.source_key ILIKE ANY($2::text[]) OR e.target_key ILIKE ANY($2::text[])) " ++
+                "WHERE m.user_id = $1 " ++
+                "  AND m.key IN (e.source_key, e.target_key) " ++
+                "GROUP BY m.key, m.content " ++
+                "ORDER BY match_count DESC " ++
+                "LIMIT $3",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+
+        const arr_z = try allocator.dupeZ(u8, arr_buf.items);
+        defer allocator.free(arr_z);
+
+        var limit_buf: [32]u8 = undefined;
+        const limit_s = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, arr_z, limit_s.ptr };
+        const lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(arr_buf.items.len),
+            @intCast(limit_s.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const tuples = c.PQntuples(result);
+        var out: std.ArrayListUnmanaged(EntityOverlapRow) = .{};
+        errdefer {
+            for (out.items) |r| r.deinit(allocator);
+            out.deinit(allocator);
+        }
+        var i: c_int = 0;
+        while (i < tuples) : (i += 1) {
+            const key = try dupeResultValue(allocator, result, i, 0);
+            errdefer allocator.free(key);
+            const cnt_str = try dupeResultValue(allocator, result, i, 1);
+            defer allocator.free(cnt_str);
+            const snippet = try dupeResultValue(allocator, result, i, 2);
+            errdefer allocator.free(snippet);
+            try out.append(allocator, .{
+                .memory_key  = key,
+                .match_count = try std.fmt.parseInt(i64, cnt_str, 10),
+                .snippet     = snippet,
+            });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    // ── P2: Personalized PageRank ───────────────────────────────────────────
+
+    /// PPR predicate priors — keep in sync with edge_resolution.classifyPredicate.
+    /// Single-valued predicates → 1.0 (supersede semantics, high information density).
+    const PPR_SINGLE_VALUED =
+        "'LIVES_IN','WORKS_AT','MARRIED_TO','REPORTS_TO','BIRTHDAY','BORN_ON'," ++
+        "'CURRENT_PROJECT','REPLACES','USED_TO_BE','FORMERLY','PREVIOUSLY'," ++
+        "'USED_TO_PREFER','USED_TO_USE'";
+    /// Set-valued predicates → 0.5 (multiple coexist, lower per-edge weight).
+    const PPR_SET_VALUED =
+        "'IS_TYPE_OF','INCLUDES','MEMBER_OF','PART_OF','FOLLOWS','LIKES','LOVES'," ++
+        "'HATES','AVOIDS','FAVORS','DISLIKES','ENJOYS','VALUES','PREFERS','USES'," ++
+        "'USED_FOR','OWNS','DEPENDS_ON','BUILDS_WITH','DEPLOYS_TO','ATTENDED'," ++
+        "'JOINED','VISITED','HAPPENED_ON','OCCURRED_AT','MENTIONS','KNOWS'," ++
+        "'FRIENDS_WITH','WORKS_WITH','COLLABORATES_WITH','MANAGES','RELATED_TO'," ++
+        "'MET','RUNS','OPERATES','MAINTAINS','SUPPORTS','CONTRIBUTES_TO'," ++
+        "'USED_BY','FOUNDED','CREATED','AUTHORED','WROTE','READS','WATCHES'," ++
+        "'LISTENS_TO','PLAYS','STUDIES','TEACHES','SPEAKS'";
+
+    /// Personalized PageRank over `memory_edges`.
+    /// Returns nodes ordered by accumulated PPR score DESC, capped at `limit`.
+    /// Seeds get score = 1/N (uniform prior); scores decay by predicate-type
+    /// prior × 0.85 damping per hop, mirroring HippoRAG (NeurIPS 2024).
+    /// Caller frees: for (nodes) |n| n.deinit(allocator); allocator.free(nodes);
+    pub fn findEdgesPPR(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        seed_keys: []const []const u8,
+        max_hops: u8,
+        limit: usize,
+    ) ![]PPRNode {
+        if (seed_keys.len == 0) return allocator.alloc(PPRNode, 0);
+
+        // Build seed TEXT[] literal: {"key1","key2",...}
+        var seed_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer seed_buf.deinit(allocator);
+        try seed_buf.appendSlice(allocator, "{");
+        for (seed_keys, 0..) |k, i| {
+            if (i > 0) try seed_buf.append(allocator, ',');
+            try seed_buf.append(allocator, '"');
+            for (k) |ch| {
+                if (ch == '\\' or ch == '"') try seed_buf.append(allocator, '\\');
+                try seed_buf.append(allocator, ch);
+            }
+            try seed_buf.append(allocator, '"');
+        }
+        try seed_buf.appendSlice(allocator, "}");
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const seeds_z = try allocator.dupeZ(u8, seed_buf.items);
+        defer allocator.free(seeds_z);
+        var hops_buf: [8]u8 = undefined;
+        const hops_s = try std.fmt.bufPrintZ(&hops_buf, "{d}", .{max_hops});
+        var limit_buf: [32]u8 = undefined;
+        const limit_s = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
+
+        const q_template =
+            "WITH RECURSIVE " ++
+            "ppr(key, score, depth) AS (" ++
+            "  SELECT unnest($2::text[]) AS key, " ++
+            "         1.0 / GREATEST(array_length($2::text[], 1), 1) AS score, " ++
+            "         0 AS depth " ++
+            "  UNION ALL " ++
+            "  SELECT CASE WHEN e.source_key = p.key THEN e.target_key ELSE e.source_key END, " ++
+            "         p.score * CASE WHEN UPPER(e.predicate) IN (" ++ PPR_SINGLE_VALUED ++ ") THEN 1.0 " ++
+            "                        WHEN UPPER(e.predicate) IN (" ++ PPR_SET_VALUED ++ ") THEN 0.5 " ++
+            "                        ELSE 0.7 END * 0.85, " ++
+            "         p.depth + 1 " ++
+            "  FROM ppr p " ++
+            "  JOIN {schema}.memory_edges e " ++
+            "    ON (e.source_key = p.key OR e.target_key = p.key) " ++
+            "    AND e.user_id = $1 AND e.is_latest " ++
+            "  WHERE p.depth < $3" ++
+            ") " ++
+            "SELECT key, SUM(score) AS ppr_score, MIN(depth)::int AS min_depth " ++
+            "FROM ppr " ++
+            "GROUP BY key " ++
+            "HAVING SUM(score) > 0.01 " ++
+            "ORDER BY ppr_score DESC " ++
+            "LIMIT $4";
+
+        const q = try self.buildQuery(q_template);
+        defer self.allocator.free(q);
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, seeds_z, hops_s.ptr, limit_s.ptr };
+        const lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(seed_buf.items.len),
+            @intCast(hops_s.len),
+            @intCast(limit_s.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const tuples = c.PQntuples(result);
+        var out: std.ArrayListUnmanaged(PPRNode) = .{};
+        errdefer {
+            for (out.items) |n| n.deinit(allocator);
+            out.deinit(allocator);
+        }
+        var i: c_int = 0;
+        while (i < tuples) : (i += 1) {
+            const key   = try dupeResultValue(allocator, result, i, 0);
+            errdefer allocator.free(key);
+            const score_str = try dupeResultValue(allocator, result, i, 1);
+            defer allocator.free(score_str);
+            const depth_str = try dupeResultValue(allocator, result, i, 2);
+            defer allocator.free(depth_str);
+            const ppr_score = std.fmt.parseFloat(f64, score_str) catch 0.0;
+            const depth_i32 = std.fmt.parseInt(i32, depth_str, 10) catch 0;
+            try out.append(allocator, .{
+                .key       = key,
+                .ppr_score = if (std.math.isFinite(ppr_score)) ppr_score else 0.0,
+                .min_depth = @intCast(@min(@as(i32, 255), @max(0, depth_i32))),
             });
         }
         return out.toOwnedSlice(allocator);
@@ -12762,6 +13029,7 @@ test "V1.7a-5 link_type rich wiring — column populated from metadata + backfil
         null,
         null, // V1.8-2: mem_rt — test fixture, no runtime
         .test_wire, // V1.14.12 (M1) — per-path telemetry tag
+        0, // P3: test wire — no boundary ID
     );
     try std.testing.expect(persist_result.written_count == 1);
     {

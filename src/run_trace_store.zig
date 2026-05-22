@@ -40,6 +40,7 @@ pub const TraceEventKind = enum {
     task_update,
     approval_required,
     agent_end,
+    memory_retrieval,
 
     pub fn toSlice(self: TraceEventKind) []const u8 {
         return switch (self) {
@@ -51,6 +52,7 @@ pub const TraceEventKind = enum {
             .task_update => "task_update",
             .approval_required => "approval_required",
             .agent_end => "agent_end",
+            .memory_retrieval => "memory_retrieval",
         };
     }
 };
@@ -527,6 +529,20 @@ fn deriveTraceEvent(event: *const ObserverEvent) ?DerivedEvent {
                 .usage_tokens = e.tokens_used,
             };
         },
+        .memory_retrieval => |e| blk: {
+            const rid = e.run_id orelse break :blk null;
+            break :blk .{
+                .kind = .memory_retrieval,
+                .run_id = rid,
+                .ts_ms = ts_ms,
+                .status = e.status,
+                .label = "memory_retrieval",
+                .success = e.success,
+                .usage_tokens = e.usage_tokens,
+                .iteration = e.iteration,
+                .duration_ms = e.duration_ms,
+            };
+        },
         else => null,
     };
 }
@@ -696,6 +712,11 @@ test "RunTraceStore deinit frees all retained runs without leaks" {
         obs.recordEvent(&evt2);
     }
     store.deinit();
+}
+
+test "memory_retrieval kind serializes to correct slice" {
+    const kind = TraceEventKind.memory_retrieval;
+    try std.testing.expectEqualStrings("memory_retrieval", kind.toSlice());
 }
 
 test "RunTraceStore snapshot outlives subsequent mutations" {

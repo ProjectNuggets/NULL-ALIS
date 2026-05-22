@@ -1844,6 +1844,9 @@ pub const MemoryRuntime = struct {
     _semantic_cache_db_path: ?[*:0]const u8 = null,
     _vector_user_id: ?i64 = null,
 
+    // P1: entity overlap callback (set per-turn by memory_loader before search)
+    _entity_overlap: ?retrieval.EntityOverlapCallCtx = null,
+
     // P3: vector plane components (all optional)
     _embedding_provider: ?embeddings.EmbeddingProvider = null,
     _vector_store: ?vector_store.VectorStore = null,
@@ -1983,6 +1986,10 @@ pub const MemoryRuntime = struct {
                     const original_top_k = engine.top_k;
                     engine.top_k = effectiveEngineTopK(limit);
                     defer engine.top_k = original_top_k;
+                    // P1: entity overlap — set per-call, restore to null after.
+                    const orig_eo = engine.entity_overlap;
+                    engine.entity_overlap = self._entity_overlap;
+                    defer engine.entity_overlap = orig_eo;
                     const candidates = try engine.search(allocator, query, session_id);
                     const trimmed = try trimCandidatesToLimit(allocator, candidates, limit);
                     self.hydrateThinCandidatesFromPrimary(allocator, trimmed);
@@ -2009,6 +2016,10 @@ pub const MemoryRuntime = struct {
                     const original_top_k = engine.top_k;
                     engine.top_k = effectiveEngineTopK(limit);
                     defer engine.top_k = original_top_k;
+                    // P1: entity overlap — same per-call pattern as hybrid branch.
+                    const orig_eo_sh = engine.entity_overlap;
+                    engine.entity_overlap = self._entity_overlap;
+                    defer engine.entity_overlap = orig_eo_sh;
                     const hybrid_results = engine.search(allocator, query, session_id) catch |err| {
                         log.warn("shadow hybrid search failed: {}", .{err});
                         return keyword_results;
@@ -2068,6 +2079,12 @@ pub const MemoryRuntime = struct {
         if (self._engine) |engine| {
             engine.vector_user_id = user_id;
         }
+    }
+
+    /// P1 — set (or clear) the entity-overlap callback used during search().
+    /// The callback and its backing context must outlive the next search() call.
+    pub fn setEntityOverlapCallback(self: *MemoryRuntime, ctx: ?retrieval.EntityOverlapCallCtx) void {
+        self._entity_overlap = ctx;
     }
 
     /// Best-effort vector sync after a store() call.

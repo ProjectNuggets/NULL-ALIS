@@ -310,6 +310,9 @@ pub const SessionManager = struct {
             const session = entry.value_ptr.*;
             session.mutex.lock();
             syncSessionOriginToAgent(session);
+            // Join any in-flight async lifecycle worker before writing the authoritative
+            // shutdown checkpoint so the final anchor content reflects the shutdown reason.
+            session.agent.joinLifecycleThreadIfPresent();
             session.agent.persistSessionCheckpoint(reason);
             session.mutex.unlock();
             flushed += 1;
@@ -1013,6 +1016,10 @@ pub const SessionManager = struct {
         for (candidates.items) |session| {
             defer session.mutex.unlock();
             syncSessionOriginToAgent(session);
+            // Join any async lifecycle worker spawned by a previous processMessage before
+            // writing the authoritative evict checkpoint.  Without this, a worker that
+            // finished after our write would overwrite the "idle_evict"/"ttl_evict" anchor.
+            session.agent.joinLifecycleThreadIfPresent();
             if (sessionIsTtlExpired(session, now)) {
                 session.agent.persistSessionCheckpoint("ttl_evict");
             } else {

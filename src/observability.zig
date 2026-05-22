@@ -142,6 +142,22 @@ pub const ObserverEvent = union(enum) {
         detail: ?[]const u8 = null,
         run_id: ?[]const u8 = null,
     },
+    /// Emitted by context_engine.ingest() after each turn's memory load.
+    /// Surfaces SelectionStats data through the run trace store so it
+    /// appears in /api/v1/users/{user_id}/traces/{run_id} responses.
+    memory_retrieval: struct {
+        /// Per-bucket entry counts as a compact summary string.
+        status: ?[]const u8 = null,
+        /// True when memory was injected into the prompt this turn.
+        success: bool = false,
+        /// Total context bytes contributed by memory.
+        usage_tokens: ?u64 = null,
+        /// Number of candidates considered by the retrieval pipeline.
+        iteration: ?u32 = null,
+        /// Wall-clock duration of the memory enrichment phase.
+        duration_ms: ?u64 = null,
+        run_id: ?[]const u8 = null,
+    },
 };
 
 /// Numeric metrics.
@@ -297,6 +313,7 @@ pub const LogObserver = struct {
             .task_update => |e| std.log.info("task.update task_id={s} status={s}", .{ e.task_id, e.status }),
             .approval_required => |e| std.log.info("approval.required tool={s} reason={s} risk_level={s}", .{ e.tool, e.reason, e.risk_level }),
             .system_notice => |e| std.log.info("system.notice kind={s} severity={s} message={s}", .{ e.kind, e.severity, e.message }),
+            .memory_retrieval => |e| std.log.info("memory.retrieval available=true injected={} context_bytes={?d} candidates={?d} duration_ms={?d}", .{ e.success, e.usage_tokens, e.iteration, e.duration_ms }),
         }
     }
 
@@ -496,6 +513,7 @@ pub const FileObserver = struct {
             .task_update => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"task_update\",\"task_id\":\"{s}\",\"status\":\"{s}\"}}", .{ e.task_id, e.status }) catch return,
             .approval_required => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"approval_required\",\"tool\":\"{s}\",\"reason\":\"{s}\",\"risk_level\":\"{s}\"}}", .{ e.tool, e.reason, e.risk_level }) catch return,
             .system_notice => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"system_notice\",\"kind\":\"{s}\",\"severity\":\"{s}\",\"message\":\"{s}\"}}", .{ e.kind, e.severity, e.message }) catch return,
+            .memory_retrieval => return,
         };
         self.appendToFile(line);
     }
@@ -841,6 +859,7 @@ pub const OtelObserver = struct {
                     .{ .key = "message", .value = e.message },
                 });
             },
+            .memory_retrieval => {},
         }
     }
 

@@ -843,6 +843,12 @@ fn persistExtraction(
     else
         null;
 
+    // P3: capture boundary timestamp immediately before persist so all
+    // edges written in this batch share a stable grouping key. All three
+    // boundary callers (pass_a_drop, pass_c_compaction_extract,
+    // session_end_extract) flow through here, so a single capture point
+    // is sufficient. Non-boundary callers don't reach extractAtBoundary.
+    const boundary_id = std.time.milliTimestamp();
     const persist_result = extraction_persist.persistExtracted(
         allocator,
         smgr,
@@ -853,6 +859,7 @@ fn persistExtraction(
         coref_ctx,
         ctx.archive_mem_rt,
         ctx.write_origin, // V1.14.12 (M1) — per-path telemetry tag from caller
+        boundary_id,      // P3: milliTimestamp at boundary fire
     ) catch |err| {
         log.warn("boundary.extraction.persistExtracted_failed err={s} edges={d}", .{ @errorName(err), result.edges.len });
         return;

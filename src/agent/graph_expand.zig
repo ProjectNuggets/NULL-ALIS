@@ -58,6 +58,20 @@ const memory_root = @import("../memory/root.zig");
 const importance = @import("../memory/importance.zig");
 const edge_resolution = @import("edge_resolution.zig");
 
+// ── P2: Algorithm selection ─────────────────────────────────────────────────
+
+/// Graph traversal algorithm. PPR is default; BFS is the legacy path and
+/// the fallback when PPR fails (e.g. non-postgres builds, PG timeout).
+pub const GraphAlgorithm = enum { ppr, bfs };
+
+/// Read algorithm from env. Default: .ppr.
+/// Set NULLALIS_GRAPH_ALGORITHM=bfs to force BFS (e.g. for A/B comparison).
+pub fn readGraphAlgorithm() GraphAlgorithm {
+    const val = std.posix.getenv("NULLALIS_GRAPH_ALGORITHM") orelse return .ppr;
+    if (std.mem.eql(u8, val, "bfs")) return .bfs;
+    return .ppr;
+}
+
 /// One node in the expanded neighborhood with its hop distance from the
 /// nearest seed and its composite score.
 pub const ScoredNode = struct {
@@ -107,12 +121,105 @@ pub const ExpandConfig = struct {
 
 /// Expand a seed set into a scored graph neighborhood.
 ///
+/// Dispatches to PPR (default) or BFS based on NULLALIS_GRAPH_ALGORITHM env.
+/// PPR falls back to BFS automatically on any error (e.g. non-postgres build).
+pub fn expandFromSeeds(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state.Manager,
+    user_id: i64,
+    seed_keys: []const []const u8,
+    config: ExpandConfig,
+) !GraphNeighborhood {
+    return switch (readGraphAlgorithm()) {
+        .ppr => expandFromSeedsPPR(allocator, state_mgr, user_id, seed_keys, config),
+        .bfs => expandFromSeedsBFS(allocator, state_mgr, user_id, seed_keys, config),
+    };
+}
+
+/// P2 — Personalized PageRank expansion. Falls back to BFS on any error.
+///
+/// Runs a single recursive CTE in Postgres that propagates score from seeds
+/// along typed edges with predicate-type priors (1.0/0.5/0.7) × 0.85 damping.
+/// After scoring, fetches edges via findEdgesByKeys so that buildGraphNeighborsBlock
+/// can render the "via <predicate>" context for each neighbor.
+fn expandFromSeedsPPR(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state.Manager,
+    user_id: i64,
+    seed_keys: []const []const u8,
+    config: ExpandConfig,
+) !GraphNeighborhood {
+    if (seed_keys.len == 0) return .{
+        .nodes = try allocator.alloc(ScoredNode, 0),
+        .edges = try allocator.alloc(memory_root.TypedEdge, 0),
+    };
+
+    const limit = config.max_hops * config.max_nodes_per_hop + seed_keys.len;
+    const ppr_nodes = state_mgr.findEdgesPPR(allocator, user_id, seed_keys, config.max_hops, limit) catch |err| {
+        log.warn("ppr.fetch_failed err={s} — falling back to BFS", .{@errorName(err)});
+        return expandFromSeedsBFS(allocator, state_mgr, user_id, seed_keys, config);
+    };
+    defer {
+        for (ppr_nodes) |n| n.deinit(allocator);
+        allocator.free(ppr_nodes);
+    }
+
+    if (ppr_nodes.len == 0) return .{
+        .nodes = try allocator.alloc(ScoredNode, 0),
+        .edges = try allocator.alloc(memory_root.TypedEdge, 0),
+    };
+
+    // Normalise PPR scores → [0, 1] so scoreFromComponents can use ppr as centrality.
+    var max_ppr: f64 = 0.0;
+    for (ppr_nodes) |n| if (n.ppr_score > max_ppr) { max_ppr = n.ppr_score; };
+
+    var scored: std.ArrayListUnmanaged(ScoredNode) = .{};
+    errdefer {
+        for (scored.items) |*n| n.deinit(allocator);
+        scored.deinit(allocator);
+    }
+
+    for (ppr_nodes) |n| {
+        // Recency: PPR row has no created_at — default to 1.0 (no decay).
+        // A follow-up can JOIN memories.created_at in findEdgesPPR.
+        const ppr_norm: f64 = if (max_ppr > 0.0) n.ppr_score / max_ppr else 0.0;
+        try scored.append(allocator, .{
+            .key          = try allocator.dupe(u8, n.key),
+            .hop_distance = n.min_depth,
+            .score        = scoreFromComponents(1.0, ppr_norm, n.min_depth),
+        });
+    }
+
+    std.sort.pdq(ScoredNode, scored.items, {}, scoredNodeDesc);
+
+    // CRITICAL: buildGraphNeighborsBlock silently skips every node when
+    // edges is empty (memory_loader.zig line ~1482). Fetch edges for all
+    // discovered nodes so the "via <predicate>" context renders correctly.
+    const all_keys = try allocator.alloc([]const u8, scored.items.len);
+    defer allocator.free(all_keys);
+    for (scored.items, 0..) |n, i| all_keys[i] = n.key;
+
+    const edges = state_mgr.findEdgesByKeys(allocator, user_id, all_keys) catch |err| blk: {
+        log.warn("ppr.edges_fetch_failed err={s} — neighbors render without 'via' context", .{@errorName(err)});
+        break :blk try allocator.alloc(memory_root.TypedEdge, 0);
+    };
+    errdefer {
+        for (edges) |*e| e.deinit(allocator);
+        allocator.free(edges);
+    }
+
+    const nodes = try scored.toOwnedSlice(allocator);
+    return .{ .nodes = nodes, .edges = edges };
+}
+
+/// BFS expansion (legacy path, also the PPR fallback).
+///
 /// `seed_keys` are typically the top-N vector-similarity hits from a
 /// memory_recall query. Caller is responsible for choosing those upstream;
 /// this function only walks the edges.
 ///
 /// Returns an empty neighborhood when seed_keys is empty.
-pub fn expandFromSeeds(
+fn expandFromSeedsBFS(
     allocator: std.mem.Allocator,
     state_mgr: *zaki_state.Manager,
     user_id: i64,
