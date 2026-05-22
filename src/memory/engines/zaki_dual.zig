@@ -346,7 +346,7 @@ test "zaki dual memory skips scaffold core lines during sync" {
     });
 
     var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
-    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
+    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace, true);
     var mem = dual.memory();
     try dual.syncFromMarkdown(allocator);
 
@@ -378,7 +378,7 @@ test "zaki dual memory ignores internal markdown entries during sync" {
     });
 
     var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
-    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
+    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace, true);
     var mem = dual.memory();
     try dual.syncFromMarkdown(allocator);
 
@@ -401,7 +401,7 @@ test "zaki dual memory forget writes tombstone and prevents resurrection" {
     defer allocator.free(workspace);
 
     var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
-    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
+    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace, true);
     var mem = dual.memory();
 
     try mem.store("user_name", "Nova", .core, null);
@@ -423,7 +423,7 @@ test "zaki dual memory store clears tombstone for restored mutable key" {
     defer allocator.free(workspace);
 
     var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
-    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
+    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace, true);
     var mem = dual.memory();
 
     try mem.store("user_name", "Nova", .core, null);
@@ -434,7 +434,8 @@ test "zaki dual memory store clears tombstone for restored mutable key" {
     defer entry.deinit(allocator);
     try std.testing.expectEqualStrings("Nova Restored", entry.content);
 
-    const tombstoned = try dual.markdown_impl.readTombstonedKeys(allocator);
+    const md = dual.markdown_impl orelse return error.TestUnexpectedResult;
+    const tombstoned = try md.readTombstonedKeys(allocator);
     defer {
         for (tombstoned) |key| allocator.free(key);
         allocator.free(tombstoned);
@@ -463,7 +464,7 @@ test "V1.14.12 (Memory audit Finding 5): syncFromMarkdown does NOT override cano
     defer allocator.free(workspace);
 
     var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
-    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
+    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace, true);
     var mem = dual.memory();
 
     try mem.store("favorite_color", "teal", .core, null);
@@ -511,7 +512,7 @@ test "V1.14.12 (Memory audit Finding 5): syncFromMarkdown imports keys absent fr
     });
 
     var mem_impl = root.InMemoryLruMemory.init(allocator, 128);
-    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace);
+    const dual = try ZakiDualMemory.init(allocator, mem_impl.memory(), workspace, true);
     var mem = dual.memory();
     // Primary starts empty for `fresh_key`.
     try std.testing.expect((try mem.get(allocator, "fresh_key")) == null);
