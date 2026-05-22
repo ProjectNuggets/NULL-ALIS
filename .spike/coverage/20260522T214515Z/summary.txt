@@ -1,0 +1,26 @@
+ROADMAP v1.14.18 Step 10 (B8) — test-reference coverage audit
+Timestamp: 20260522T214515Z (UTC)
+Branch:    sprint/v1.14.18-audit-sweep
+HEAD:      dacadc9b57b1a96efe33879034539ebcfee7b692
+
+Totals
+  pub fn declarations (file:line):  2633
+  unique pub fn names:              1665
+  tested (at least one ref):        870
+  untested (zero refs):             795
+  tested-by-name rate:              52.3%
+
+Top-10 files by untested pub-fn count
+  (count   file)
+  193 src/zaki_state.zig
+  49 src/memory/root.zig
+  44 src/tools/root.zig
+  30 src/cron.zig
+  22 src/memory/engines/sqlite_disabled.zig
+  18 src/config_types.zig
+  17 src/channels/dispatch.zig
+  16 src/bus.zig
+  14 src/channels/signal.zig
+  14 src/agent/root.zig
+
+Methodology + limitations: see .spike/coverage/README.md
