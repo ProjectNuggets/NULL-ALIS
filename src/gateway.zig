@@ -15,7 +15,8 @@
 //!   Control plane    — /health, /ready, /pair, /settings, /metrics,
 //!                      /internal/entitlements/revoke
 //!   Channel inbound  — /webhook, /whatsapp, /telegram, /line, /lark,
-//!                      /slack/events, /facebook, /viber, /discord
+//!                      /api/messages (Teams), /slack/events, /facebook,
+//!                      /viber, /discord
 //!   API v1           — /api/v1/users/:id/{chat/stream, secrets/:key, ...},
 //!                      /api/v1/users/provision, /api/v1/users/:id/attachments
 //!
@@ -5325,6 +5326,19 @@ fn selectLarkConfig(
     }
 
     return &cfg.channels.lark[0];
+}
+
+/// Select the Teams account config for an inbound /api/messages request.
+/// Teams Activity payloads carry no per-account discriminator the bot can
+/// trust before auth, so this resolves to the primary configured account.
+fn selectTeamsConfig(cfg_opt: ?*const Config) ?*const config_types.TeamsConfig {
+    if (!build_options.enable_channel_teams) return null;
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.teams.len == 0) return null;
+    for (cfg.channels.teams) |*teams_cfg| {
+        if (std.mem.eql(u8, teams_cfg.account_id, "default")) return teams_cfg;
+    }
+    return &cfg.channels.teams[0];
 }
 
 fn webhookBasePath(target: []const u8) []const u8 {
@@ -16412,6 +16426,8 @@ const webhook_route_descriptors = [_]WebhookRouteDescriptor{
     .{ .path = "/slack/events", .handler = handleSlackWebhookRoute },
     .{ .path = "/line", .handler = handleLineWebhookRoute },
     .{ .path = "/lark", .handler = handleLarkWebhookRoute },
+    // Teams Bot Framework delivers inbound Activities to /api/messages.
+    .{ .path = "/api/messages", .handler = handleTeamsWebhookRoute },
 };
 
 fn findWebhookRouteDescriptor(path: []const u8) ?*const WebhookRouteDescriptor {
@@ -17740,6 +17756,131 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
     ctx.response_body = "{\"status\":\"ok\"}";
 }
 
+/// Teams Bot Framework inbound webhook (`POST /api/messages`).
+///
+/// Bot Framework POSTs an Activity JSON payload for every inbound message.
+/// When `webhook_secret` is configured, the request must carry a matching
+/// `Authorization` header (compared in constant time) — this is a coarse
+/// shared-secret gate, not full Bot Framework JWT validation. Each parsed
+/// message is routed to the agent: published to the event bus when one is
+/// attached, otherwise processed synchronously and replied to via the Bot
+/// Framework REST API. The reply target is `serviceUrl|conversationId`,
+/// matching TeamsChannel.vtableSend's expected format.
+fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_teams) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"teams channel disabled in this build\"}";
+        return;
+    }
+
+    const is_post = std.mem.eql(u8, ctx.method, "POST");
+    if (!is_post) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "teams")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const teams_cfg = selectTeamsConfig(ctx.config_opt) orelse {
+        ctx.response_status = "403 Forbidden";
+        ctx.response_body = "{\"error\":\"teams channel not configured\"}";
+        return;
+    };
+
+    // Shared-secret gate: when webhook_secret is set, require a matching
+    // Authorization header. Constant-time compare to avoid timing leaks.
+    if (teams_cfg.webhook_secret) |secret| {
+        const auth = extractHeader(ctx.raw_request, "Authorization") orelse {
+            ctx.response_status = "403 Forbidden";
+            ctx.response_body = "{\"error\":\"missing authorization\"}";
+            return;
+        };
+        const bearer = if (std.mem.startsWith(u8, auth, "Bearer "))
+            auth["Bearer ".len..]
+        else
+            auth;
+        if (!constantTimeEqual(secret, bearer)) {
+            ctx.response_status = "403 Forbidden";
+            ctx.response_body = "{\"error\":\"invalid authorization\"}";
+            return;
+        }
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_body = "{\"status\":\"received\"}";
+        return;
+    };
+
+    const messages = channels.teams.TeamsChannel.parseWebhookPayload(ctx.req_allocator, body) catch {
+        ctx.response_body = "{\"status\":\"parse_error\"}";
+        return;
+    };
+    defer {
+        for (messages) |*m| m.deinit(ctx.req_allocator);
+        ctx.req_allocator.free(messages);
+    }
+
+    for (messages) |msg| {
+        // Teams threads are groups; DMs use a personal conversation id.
+        const is_group = std.mem.indexOf(u8, msg.conversation_id, "@thread") != null;
+        const peer_kind: agent_routing.ChatType = if (is_group) .group else .direct;
+        var fallback_buf: [192]u8 = undefined;
+        const fallback_sk = std.fmt.bufPrint(&fallback_buf, "teams:{s}:{s}", .{
+            teams_cfg.account_id,
+            msg.conversation_id,
+        }) catch "teams:unknown";
+        const sk = resolveRouteSessionKey(
+            ctx.req_allocator,
+            ctx.config_opt,
+            "teams",
+            teams_cfg.account_id,
+            .{ .kind = peer_kind, .id = msg.conversation_id },
+            fallback_sk,
+        );
+
+        // Reply target: "serviceUrl|conversationId" — TeamsChannel.vtableSend format.
+        var target_buf: [512]u8 = undefined;
+        const teams_target = std.fmt.bufPrint(&target_buf, "{s}|{s}", .{
+            msg.service_url,
+            msg.conversation_id,
+        }) catch msg.conversation_id;
+
+        if (ctx.state.event_bus) |eb| {
+            var meta_buf: [512]u8 = undefined;
+            const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
+                teams_cfg.account_id,
+                if (is_group) "group" else "direct",
+                msg.conversation_id,
+            }) catch null;
+            _ = publishToBus(eb, ctx.state.allocator, "teams", msg.sender_id, teams_target, msg.text, sk, meta);
+        } else if (ctx.session_mgr_opt) |sm| {
+            var teams_ch = channels.teams.TeamsChannel.initFromConfig(ctx.req_allocator, teams_cfg.*);
+            teams_ch.running.store(true, .release);
+            defer (teams_ch.channel()).stop();
+
+            const reply: ?[]const u8 = sm.processMessageWithToolContext(sk, msg.text, null, .{
+                .channel = "teams",
+                .account_id = teams_cfg.account_id,
+                .chat_id = teams_target,
+                .is_group = is_group,
+                .is_dm = !is_group,
+            }) catch |err| blk: {
+                (teams_ch.channel()).send(teams_target, userFacingAgentError(err), &.{}) catch {};
+                break :blk null;
+            };
+            if (reply) |r| {
+                defer ctx.root_allocator.free(r);
+                (teams_ch.channel()).send(teams_target, r, &.{}) catch {};
+            }
+        }
+    }
+    ctx.response_body = "{\"status\":\"ok\"}";
+}
+
 const HTTP_RESPONSE_WRITE_TIMEOUT_MS: i32 = 30_000;
 
 fn waitForHttpResponseWritable(stream: anytype) !void {
@@ -18426,7 +18567,7 @@ fn gatewayWorkerMain(ctx: *GatewayWorkerContext) void {
 }
 
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, POST /api/messages (Teams)
 /// If config_ptr is null, loads config internally (for backward compatibility).
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr: ?*const Config, event_bus: ?*bus_mod.Bus) !void {
     return runWithRole(allocator, host, port, config_ptr, event_bus, .shared, null, null, null);
@@ -18997,6 +19138,7 @@ test "findWebhookRouteDescriptor resolves known webhook paths" {
     try std.testing.expect(findWebhookRouteDescriptor("/slack/events") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/line") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/lark") != null);
+    try std.testing.expect(findWebhookRouteDescriptor("/api/messages") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/health") == null);
 }
 
