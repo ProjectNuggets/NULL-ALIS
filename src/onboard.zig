@@ -1052,8 +1052,14 @@ fn configureSingleChannel(
         .mattermost => configureMattermostChannel(cfg, out, input_buf, prefix),
         .signal => configureSignalChannel(cfg, out, input_buf, prefix),
         .webhook => configureWebhookChannel(cfg, out, input_buf, prefix),
+        // Defensive: `configureChannelsInteractive` only ever passes
+        // channels for which `isWizardInteractiveChannel` is true, and the
+        // arms above cover exactly that set. This arm is unreachable in
+        // practice; it exists so that adding a channel to
+        // `isWizardInteractiveChannel` without a matching arm here fails
+        // loud-but-safe (skip + manual-edit hint) instead of a panic.
         else => blk: {
-            try out.print("{s}  {s}: interactive setup not implemented yet. Edit {s} manually.\n", .{ prefix, meta.label, cfg.config_path });
+            try out.print("{s}  {s}: no interactive setup arm — edit {s} manually.\n", .{ prefix, meta.label, cfg.config_path });
             break :blk false;
         },
     };

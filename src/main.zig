@@ -1220,8 +1220,9 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             \\  list                          List configured channels
             \\  start [channel]               Start a channel (default: first available)
             \\  status                        Show channel health/status
-            \\  add <type>                    Manual config-only (not implemented in CLI)
-            \\  remove <name>                 Manual config-only (not implemented in CLI)
+            \\
+            \\To add or remove a channel, run `nullalis onboard --channels-only`
+            \\(interactive wizard) or edit the config file directly.
             \\
         , .{});
         std.process.exit(1);
@@ -1252,30 +1253,16 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             if (!yc.channel_catalog.isConfigured(&cfg, meta.id)) continue;
             std.debug.print("  {s}: configured (use `channel start` to verify)\n", .{meta.label});
         }
-    } else if (std.mem.eql(u8, subcmd, "add")) {
-        if (sub_args.len < 2) {
-            std.debug.print("Usage: nullalis channel add <type>\n", .{});
-            std.debug.print("Types:", .{});
-            for (yc.channel_catalog.known_channels) |meta| {
-                if (meta.id == .cli) continue;
-                std.debug.print(" {s}", .{meta.key});
-            }
-            std.debug.print("\n", .{});
-            std.process.exit(1);
-        }
-        std.debug.print("Not implemented: nullalis channel add\n", .{});
-        std.debug.print("To add a '{s}' channel, edit your config file:\n  {s}\n", .{ sub_args[1], cfg.config_path });
-        std.debug.print("Add a \"{s}\" object under \"channels\" with the required fields.\n", .{sub_args[1]});
-        std.process.exit(2);
-    } else if (std.mem.eql(u8, subcmd, "remove")) {
-        if (sub_args.len < 2) {
-            std.debug.print("Usage: nullalis channel remove <name>\n", .{});
-            std.process.exit(1);
-        }
-        std.debug.print("Not implemented: nullalis channel remove\n", .{});
-        std.debug.print("To remove the '{s}' channel, edit your config file:\n  {s}\n", .{ sub_args[1], cfg.config_path });
-        std.debug.print("Remove or set the \"{s}\" object to null under \"channels\".\n", .{sub_args[1]});
-        std.process.exit(2);
+    } else if (std.mem.eql(u8, subcmd, "add") or std.mem.eql(u8, subcmd, "remove")) {
+        // v1.14.18 Step 3 (CLI-HONESTY) — `channel add`/`remove` were
+        // registered subcommands that only printed "Not implemented" and
+        // exited 2. Per AGENTS.md §14.6 a registered command with no
+        // behavior is a false-confidence surface; channel mutation has a
+        // real home in the `onboard --channels-only` interactive wizard.
+        std.debug.print("`nullalis channel {s}` is not a CLI command.\n", .{subcmd});
+        std.debug.print("Run `nullalis onboard --channels-only` for the interactive channel\n", .{});
+        std.debug.print("wizard, or edit the \"channels\" block in {s} directly.\n", .{cfg.config_path});
+        std.process.exit(1);
     } else {
         std.debug.print("Unknown channel command: {s}\n", .{subcmd});
         std.process.exit(1);
@@ -2194,7 +2181,6 @@ fn runModels(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\Commands:
             \\  list                          List available models
             \\  info <model>                  Show model details
-            \\  benchmark                     Not implemented
             \\  refresh                       Refresh model catalog
             \\
         , .{});
@@ -2231,9 +2217,14 @@ fn runModels(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         std.debug.print("  Context: varies by provider\n", .{});
         std.debug.print("  Pricing: see provider dashboard\n", .{});
     } else if (std.mem.eql(u8, subcmd, "benchmark")) {
-        std.debug.print("Not implemented: nullalis models benchmark\n", .{});
-        std.debug.print("Use `nullalis models list` and provider dashboards for latency verification.\n", .{});
-        std.process.exit(2);
+        // v1.14.18 Step 3 (CLI-HONESTY) — `models benchmark` was a
+        // registered subcommand that only printed "Not implemented".
+        // Removed from the registry per AGENTS.md §14.6. Provider-latency
+        // measurement lives in the `.spike/` bench harness.
+        std.debug.print("`nullalis models benchmark` is not a CLI command.\n", .{});
+        std.debug.print("Latency measurement lives in the `.spike/` bench harness; run\n", .{});
+        std.debug.print("`.spike/run.sh` for p50/p95 TTFT, or check provider dashboards.\n", .{});
+        std.process.exit(1);
     } else if (std.mem.eql(u8, subcmd, "refresh")) {
         try yc.onboard.runModelsRefresh(allocator);
     } else {
