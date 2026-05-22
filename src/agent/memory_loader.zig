@@ -1444,17 +1444,33 @@ fn entityOverlapImpl(
         // String literals must NOT be passed to allocator.free() — only the
         // zero-length "" is safe (free returns early on len==0), but "entity_overlap"
         // (len=14) would UB against a static segment pointer.
+        //
+        // Each allocation gets its own errdefer so a mid-struct OOM doesn't
+        // leak the fields already allocated in this iteration. Matches the
+        // pattern used by entriesToCandidates and vectorResultsToCandidates.
+        const id_dup = try allocator.dupe(u8, "");
+        errdefer allocator.free(id_dup);
+        const key_dup = try allocator.dupe(u8, row.memory_key);
+        errdefer allocator.free(key_dup);
+        const content_dup = try allocator.dupe(u8, row.snippet); // MUST be non-empty
+        errdefer allocator.free(content_dup);
+        const snippet_dup = try allocator.dupe(u8, row.snippet);
+        errdefer allocator.free(snippet_dup);
+        const source_dup = try allocator.dupe(u8, "entity_overlap");
+        errdefer allocator.free(source_dup);
+        const source_path_dup = try allocator.dupe(u8, "");
+        errdefer allocator.free(source_path_dup);
         out[i] = memory_mod.RetrievalCandidate{
-            .id           = try allocator.dupe(u8, ""),
-            .key          = try allocator.dupe(u8, row.memory_key),
-            .content      = try allocator.dupe(u8, row.snippet), // MUST be non-empty
-            .snippet      = try allocator.dupe(u8, row.snippet),
+            .id           = id_dup,
+            .key          = key_dup,
+            .content      = content_dup,
+            .snippet      = snippet_dup,
             .category     = .daily,
             .keyword_rank = null,
             .vector_score = null,
             .final_score  = score,
-            .source       = try allocator.dupe(u8, "entity_overlap"),
-            .source_path  = try allocator.dupe(u8, ""),
+            .source       = source_dup,
+            .source_path  = source_path_dup,
             .start_line   = 0,
             .end_line     = 0,
             .created_at   = 0,
