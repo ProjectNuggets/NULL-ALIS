@@ -18,9 +18,6 @@ const std = @import("std");
 
 /// The curated safe subset. Selection rationale:
 ///   - read-only / introspection: bounded, no side effects, safe to expose.
-///   - memory read + non-destructive write: the "composable brain" play —
-///     an external agent can query and append, but cannot forget/archive/
-///     demote/purge (destructive ops stay agent-only).
 ///   - web_search / web_fetch: outbound but read-only and rate-bounded;
 ///     net_security egress filtering still applies at the tool layer.
 ///
@@ -38,6 +35,11 @@ const std = @import("std");
 ///     purge_topic/maintain, compose_memory,
 ///     wiki_link, brain_graph, todo,
 ///     transcript_read                    — destructive or agent-private
+///   memory_recall/list/timeline/store    — DEFERRED, not unsafe: `nullalis
+///     mcp serve` does not bind a memory backend yet, so exposing these
+///     would advertise non-functional tools in tools/list. The roadmap
+///     follow-up that wires the memory runtime into `mcp serve` returns
+///     them here — that is the "composable brain over MCP" payload.
 const safe_tool_names = [_][]const u8{
     // Introspection / compute — pure, bounded.
     "calculator",
@@ -47,15 +49,12 @@ const safe_tool_names = [_][]const u8{
     // Filesystem — read only. file_read is path-sandboxed by the tool
     // itself (workspace_dir + allowed_paths); no write counterpart exposed.
     "file_read",
-    // Memory — read + non-destructive append. Destructive memory ops
-    // (forget/archive/demote/purge/maintain/edit) are deliberately absent.
-    "memory_recall",
-    "memory_list",
-    "memory_timeline",
-    "memory_store",
     // Web — outbound but read-only; net_security egress filter still gates.
     "web_search",
     "web_fetch",
+    // NOTE: memory_recall/list/timeline/store are intentionally NOT here —
+    // see the exclusions comment above (deferred until `mcp serve` binds a
+    // memory backend; they would otherwise list as non-functional tools).
 };
 
 /// Environment variable that opts an operator into exposing the *entire*
@@ -94,12 +93,21 @@ pub fn safeSubsetCount() usize {
 
 const testing = std.testing;
 
-test "server_policy: safe subset includes read-only and memory tools" {
+test "server_policy: safe subset includes read-only compute, file, and web tools" {
     try testing.expect(isSafeToExpose("calculator"));
     try testing.expect(isSafeToExpose("file_read"));
-    try testing.expect(isSafeToExpose("memory_recall"));
-    try testing.expect(isSafeToExpose("memory_store"));
     try testing.expect(isSafeToExpose("web_search"));
+    try testing.expect(isSafeToExpose("web_fetch"));
+}
+
+test "server_policy: memory tools are not exposed pending mcp-serve backend wiring" {
+    // `nullalis mcp serve` does not bind a memory backend yet; these are
+    // excluded so tools/list never advertises a non-functional tool. The
+    // roadmap follow-up that wires the backend returns them to the subset.
+    try testing.expect(!isSafeToExpose("memory_recall"));
+    try testing.expect(!isSafeToExpose("memory_list"));
+    try testing.expect(!isSafeToExpose("memory_timeline"));
+    try testing.expect(!isSafeToExpose("memory_store"));
 }
 
 test "server_policy: dangerous tools are excluded from the safe subset" {
