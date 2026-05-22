@@ -2,6 +2,7 @@ const std = @import("std");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus_mod = @import("../bus.zig");
+const http_native = @import("../http_native/root.zig");
 
 const log = std.log.scoped(.irc);
 
@@ -355,6 +356,12 @@ pub const IrcChannel = struct {
     }
 
     /// Initialize TLS over an existing TCP stream.
+    ///
+    /// The server certificate chain is verified against the system CA
+    /// bundle when the operator's `tls_verify` flag is set (the default),
+    /// and the connection fails closed if that bundle cannot load — there
+    /// is no silent downgrade to unverified TLS. `tls_verify=false` is an
+    /// explicit opt-out for IRC servers that present self-signed certs.
     fn initTls(self: *IrcChannel, stream: std.net.Stream) !void {
         const tls_buf_len = std.crypto.tls.Client.min_buffer_len;
 
@@ -379,12 +386,22 @@ pub const IrcChannel = struct {
         tls.stream_reader = stream.reader(read_buf);
         tls.stream_writer = stream.writer(write_buf);
 
+        // TLS verification posture. `self.tls` is the operator's tls_verify
+        // flag (default true). When set, the certificate chain is verified
+        // against the system CA bundle and the connection fails closed if
+        // that bundle cannot load — no silent downgrade. tls_verify=false is
+        // an explicit opt-out for IRC servers with self-signed certificates.
+        const ca_bundle: ?std.crypto.Certificate.Bundle = if (self.tls)
+            (http_native.sharedCaBundle() catch return error.TlsInitializationFailed)
+        else
+            null;
+
         tls.tls_client = std.crypto.tls.Client.init(
             tls.stream_reader.interface(),
             &tls.stream_writer.interface,
             .{
                 .host = if (self.tls) .{ .explicit = self.host } else .no_verification,
-                .ca = .no_verification,
+                .ca = if (ca_bundle) |b| .{ .bundle = b } else .no_verification,
                 .read_buffer = tls_read_buf,
                 .write_buffer = tls_write_buf,
                 .allow_truncation_attacks = true,
