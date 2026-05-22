@@ -70,6 +70,7 @@ pub const SecurityConfig = config_types.SecurityConfig;
 pub const DelegateAgentConfig = config_types.DelegateAgentConfig;
 pub const NamedAgentConfig = config_types.NamedAgentConfig;
 pub const McpServerConfig = config_types.McpServerConfig;
+pub const ApiSpecConfig = config_types.ApiSpecConfig;
 pub const ModelPricing = config_types.ModelPricing;
 pub const ToolsConfig = config_types.ToolsConfig;
 pub const ProviderEntry = config_types.ProviderEntry;
@@ -106,6 +107,11 @@ pub const Config = struct {
     agents: []const NamedAgentConfig = &.{},
     agent_bindings: []const @import("agent_routing.zig").AgentBinding = &.{},
     mcp_servers: []const McpServerConfig = &.{},
+    /// Sprint 3 — operator-registered OpenAPI 3.x specs. The agent
+    /// reaches these via the `openapi` tool. Operator-owned (NOT
+    /// tenant-settable) for the same reason as `mcp_servers`: a spec
+    /// declares an outbound integration + a credential reference.
+    api_specs: []const ApiSpecConfig = &.{},
 
     // Nested sub-configs
     diagnostics: DiagnosticsConfig = .{},
@@ -648,6 +654,32 @@ pub const Config = struct {
         try w.print("  }},\n", .{});
     }
 
+    /// Sprint 3 — serialize the `api_specs` block in the object-of-objects
+    /// form (keyed by id) so a Config.save round-trip preserves operator
+    /// OpenAPI registrations.
+    fn writeApiSpecsSection(self: *const Config, w: *std.Io.Writer) !void {
+        try w.print("  \"api_specs\": {{\n", .{});
+        for (self.api_specs, 0..) |s, i| {
+            try w.print("    {f}: {{", .{std.json.fmt(s.id, .{})});
+            if (s.spec_url.len > 0) {
+                try w.print("\"spec_url\": {f}", .{std.json.fmt(s.spec_url, .{})});
+            } else {
+                try w.print("\"spec_path\": {f}", .{std.json.fmt(s.spec_path, .{})});
+            }
+            if (s.base_url.len > 0) {
+                try w.print(", \"base_url\": {f}", .{std.json.fmt(s.base_url, .{})});
+            }
+            if (s.auth_ref.len > 0) {
+                try w.print(", \"auth_ref\": {f}", .{std.json.fmt(s.auth_ref, .{})});
+            }
+            try w.print(", \"mode\": \"{s}\"", .{s.mode.toSlice()});
+            try w.print("}}", .{});
+            if (i + 1 < self.api_specs.len) try w.print(",", .{});
+            try w.print("\n", .{});
+        }
+        try w.print("  }},\n", .{});
+    }
+
     /// Apply NULLALIS_* environment variable overrides (with NULLCLAW_*
     /// fallback through D28 sunset on 2026-05-15).
     pub fn applyEnvOverrides(self: *Config) void {
@@ -835,6 +867,9 @@ pub const Config = struct {
         }
         if (self.mcp_servers.len > 0) {
             try self.writeMcpServersSection(w);
+        }
+        if (self.api_specs.len > 0) {
+            try self.writeApiSpecsSection(w);
         }
 
         // Diagnostics (with nested otel)
@@ -1141,6 +1176,7 @@ const config_field_accounting = [_]ConfigFieldAccount{
     .{ .name = "agents", .disposition = .json_parsed },
     .{ .name = "agent_bindings", .disposition = .json_parsed },
     .{ .name = "mcp_servers", .disposition = .json_parsed },
+    .{ .name = "api_specs", .disposition = .json_parsed },
     .{ .name = "diagnostics", .disposition = .json_parsed },
     .{ .name = "autonomy", .disposition = .json_parsed },
     .{ .name = "runtime", .disposition = .json_parsed },

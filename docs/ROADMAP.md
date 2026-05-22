@@ -61,7 +61,7 @@ The active near-term sequence. "Sprints 0–4" was a tactical re-cut; reconciled
 | Sprint 1 | Learning-loop activation + §14.10 audit | v1.14.18-A/B (PR #87/#98) | ✅ done |
 | — | **Memory-pipeline repair + config hardening** | unplanned block (this session) | ✅ done 2026-05-22 |
 | **Sprint 2** | **Channels V1 + MCP V1** | v1.14.15 Email · .16 Teams + MCP → **v1.14.20** | **✅ done 2026-05-22** |
-| **Sprint 3** | **Agent universal-environment access** (Swagger → access) | new — slots before v1.17 connectors | **P1 — next** |
+| **Sprint 3** | **Universal API Connector** (OpenAPI → agent tools) | new — slots before v1.17 connectors; see block below | **🔨 IN PROGRESS 2026-05-22** |
 | **Sprint 4** | **UI/UX activation + feature-freeze** | overlaps v1.16 frontend wave | **P1** |
 
 After the Sprints, the version blocks below carry the road to v2.0. **Deferred follow-ups** (tracked in `docs/CONFIG_CONTROL_PLANE_AUDIT.md`, not lost): `network` config parser+wiring · `agent.extraction` parse-or-delete · sentinel-collision profile pattern · streaming-path error mapping. **LoCoMo Cat-3 lift** (the R6/R3/R4/R2 lever set — temporal/inference 56–77% → 80%+) is folded into the v1.15.0 bench-iteration block.
@@ -69,6 +69,35 @@ After the Sprints, the version blocks below carry the road to v2.0. **Deferred f
 **Folded from retired plan docs (2026-05-22 reconcile)** — captured here so nothing is lost when the source docs archive: the **F-A2.1 / F-T1 / F-PA1** fixes are **verified shipped 2026-05-22** — F-A2.1 via prompt-level `brain_graph` routing for entity questions (`prompt.zig`), F-T1 via `elideUnverifiedHistory` (`root.zig:5204`), F-PA1 via `archiveDroppedMessages` (Pass A archives to `compaction_dropped/` before deletion). The **cognitive-layers track** (Working / Procedural / Dream-consolidation memory — partly landed, the v1.14.21 sleep cycle is its home) and the **SOTA append-only context end-state** (ContextEngine migration at v1.14.14 covered the bulk) remain the open carry-forward items.
 
 **Dangling references:** this doc cites `docs/capacity-model.md`, `docs/dr-runbook.md`, `docs/unit-economics-2026-XX-XX.md` — those are *outputs* of blocks v1.18/v1.18.5/v1.19.7, authored when those blocks run, not pre-existing files.
+
+---
+
+## Sprint 3 — "Universal API Connector (OpenAPI → agent tools)" → IN PROGRESS
+
+**Theme:** Point nullalis at any API's OpenAPI 3.x spec → the agent gains structured, auth-handled access to that API. Zero per-API code, zero third-party platform, no MCP server required. The no-dependency long-tail companion to v1.17's hand-built OAuth connectors (deferred) and to Composio.
+
+**Why this shape (research-backed, 2026-05-22):** the industry standardized on "OpenAPI spec → agent tools" (Google ADK, Gentoro, Speakeasy, Stainless). The documented anti-pattern is 1:1 endpoint→tool mapping — it blows the context window, confuses tool selection, and forces the LLM to act as a dumb REST client. nullalis sidesteps it with a `list/describe/invoke` **meta-tool**: the agent discovers operations and invokes on demand; its own intelligence does selection at call-time. Smaller build, robust at any spec size.
+
+**Scope line:** static-credential auth only (API key / bearer / basic) — OAuth2 flows are v1.17's job. Operator-registered specs only — no runtime arbitrary-URL ingestion in V1 (exfiltration surface). OpenAPI 3.x JSON; Swagger 2.0 deferred. The API half of "universal access" — the CLI / arbitrary-environment half is deferred to the per-cell pod (v1.18) / the installable app.
+
+**Steps:**
+
+1. `src/openapi/` — OpenAPI 3.x parser: fetch (URL/file), parse, resolve `$ref`, extract `OperationSpec[]` (id, method, path, params, requestBody, per-op security) + `securitySchemes` + `servers`. Pure, unit-tested.
+2. Config — `api_specs` block (`config_types` + `config_parse` + the operator-owned allowlist + the comptime exhaustiveness table): `{ id, spec_url|spec_path, base_url?, auth_ref, mode: read_only|read_write }`. Operator-owned, NOT tenant-settable.
+3. Spec registry/loader — load + parse each configured spec at startup; fail-soft per spec (a bad spec logs + skips, never kills startup).
+4. The `openapi` tool — modes `list` / `describe` / `invoke`. `invoke` builds the request from the operation + args, applies auth, enforces the per-spec mode, calls via `http_native` + `net_security` egress filtering, response size-capped.
+5. Auth — resolve `securityScheme` → credential from the encrypted vault by `auth_ref`, injected at the tool layer, never in the model's context. OAuth2 → explicit "use v1.17 connectors" error.
+6. Approval — classify each operation at invoke-time (GET/HEAD → `read_only` metadata · POST/PUT/PATCH/DELETE → `mutating`) and feed the existing `ApprovalPolicy.forTool` engine: reads auto-run; writes → `confirm_once` in supervised. Hard gate above the mode: a spec not opted into `read_write` cannot write regardless of approval level. Thin-spec guardrail: on a write the agent surfaces the request it built for approval before firing.
+7. Tests + operator doc (`docs/openapi-access.md`) + a manual E2E walkthrough against a real public spec (httpbin / GitHub API).
+
+**Bench gate:**
+- E2E: register a real public OpenAPI spec, agent `list` → `describe` → `invoke` a GET; a write op triggers `confirm_once` in supervised mode
+- Canonical CI gate green
+- LoCoMo + τ-bench hold
+- Tag at block exit (Nova's call — likely the v1.14.2x line)
+
+**Duration:** 3–4 working days
+**Dependencies:** Sprint 2 — the encrypted vault, the MCP/tool machinery, and the `ApprovalPolicy` engine are all already in place.
 
 ---
 

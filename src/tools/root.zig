@@ -100,6 +100,9 @@ pub const browser = @import("browser.zig");
 pub const image = @import("image.zig");
 pub const image_generate = @import("image_generate.zig");
 pub const composio = @import("composio.zig");
+/// Sprint 3 — Universal API Connector. ONE tool exposing operator-
+/// registered OpenAPI 3.x specs via list/describe/invoke modes.
+pub const openapi = @import("openapi.zig");
 /// **D1.14** generalized tool-result cache. Tools opt in via
 /// `ToolMetadata.flags.cacheable + cache_ttl_secs`. Module is
 /// imported here so its 6 unit tests run with the rest of the suite.
@@ -618,6 +621,18 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .cost_class = .c,
     },
     .{
+        // OpenAPI connector is action-dependent: list/describe are
+        // read-only, invoke can mutate third-party state. Conservative
+        // mutating base here; `refineMetadata` downgrades list/describe.
+        // An `invoke` stays mutating so a write op gets `confirm_once`
+        // in supervised autonomy — the tool's own read-only-mode HARD
+        // GATE refuses writes against a read_only-registered spec.
+        .name = openapi.OpenApiTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .high,
+        .cost_class = .c,
+    },
+    .{
         .name = skill_registry.SkillRegistryTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
@@ -770,6 +785,18 @@ fn isReadOnlyComposioCall(args: JsonObjectMap) bool {
     return isReadOnlyComposioExecute(args);
 }
 
+/// `openapi` list/describe are pure discovery — read-only. `invoke` is
+/// conservatively kept mutating: the dispatcher cannot see whether the
+/// targeted spec operation is a GET or a POST without parsing the spec,
+/// so a write op correctly gets `confirm_once` in supervised autonomy.
+/// The tool's runtime `classifyInvoke` + the read_only-mode HARD GATE
+/// do the per-operation refinement inside `execute`.
+fn isReadOnlyOpenApiCall(args: JsonObjectMap) bool {
+    const operation = getString(args, "operation") orelse "invoke";
+    return std.ascii.eqlIgnoreCase(operation, "list") or
+        std.ascii.eqlIgnoreCase(operation, "describe");
+}
+
 /// Look up base metadata for a tool by name using the default registry.
 /// Returns a conservative `mutating=true / risk=high` entry when the name is
 /// unknown (MCP/dynamic tools). This is the one-step lookup used by reporting
@@ -828,6 +855,7 @@ pub fn refineMetadata(base: metadata.ToolMetadata, args: JsonObjectMap) metadata
     const is_read_only = blk: {
         if (std.mem.eql(u8, base.name, schedule.ScheduleTool.tool_name)) break :blk isReadOnlyScheduleAction(args);
         if (std.mem.eql(u8, base.name, composio.ComposioTool.tool_name)) break :blk isReadOnlyComposioCall(args);
+        if (std.mem.eql(u8, base.name, openapi.OpenApiTool.tool_name)) break :blk isReadOnlyOpenApiCall(args);
         if (std.mem.eql(u8, base.name, git.GitTool.tool_name)) break :blk isReadOnlyGitOperation(args);
         if (std.mem.eql(u8, base.name, http_request.HttpRequestTool.tool_name)) break :blk isReadOnlyHttpMethod(args);
         if (std.mem.eql(u8, base.name, skill_registry.SkillRegistryTool.tool_name)) break :blk isReadOnlySkillRegistryAction(args);
@@ -1303,6 +1331,23 @@ pub fn allTools(
         const ct = try allocator.create(composio.ComposioTool);
         ct.* = .{ .api_key = api_key, .entity_id = opts.composio_entity_id orelse "default" };
         try list.append(allocator, ct.tool());
+    }
+
+    // Sprint 3 — OpenAPI connector. Registered only when the operator has
+    // declared at least one `api_specs` entry. The tool struct outlives
+    // the returned `[]Tool` because it is heap-allocated via the same
+    // `allocator` as `list`; its `initSlots` cache uses that allocator
+    // and is freed by the tool's bespoke vtable `deinit`.
+    if (opts.config) |cfg| {
+        if (cfg.api_specs.len > 0) {
+            const oat = try allocator.create(openapi.OpenApiTool);
+            oat.* = .{ .specs = cfg.api_specs };
+            oat.initSlots(allocator) catch |err| {
+                allocator.destroy(oat);
+                return err;
+            };
+            try list.append(allocator, oat.tool());
+        }
     }
 
     if (opts.browser_open_domains) |domains| {
