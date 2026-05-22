@@ -1,8 +1,10 @@
 //! Generic RFC 6455 WebSocket client over TLS.
 //! Used by Discord, Lark, QQ gateway channels.
-//! All connections are TLS-only (wss://).
+//! All connections are TLS-only (wss://) and certificate-verified — the
+//! server chain is checked against the system CA bundle, fail-closed.
 
 const std = @import("std");
+const http_native = @import("http_native/root.zig");
 
 const log = std.log.scoped(.websocket);
 
@@ -95,12 +97,18 @@ pub const WsClient = struct {
         tls_state.stream_reader = stream.reader(read_buf);
         tls_state.stream_writer = stream.writer(write_buf);
 
+        // Verify the server certificate chain against the system CA bundle.
+        // Every websocket peer (Discord/Slack/Mattermost gateways) is a
+        // public service with a CA-signed cert — there is no self-signed
+        // scenario, so verification is unconditional and fails closed.
+        const ca_bundle = http_native.sharedCaBundle() catch return error.TlsInitializationFailed;
+
         tls_state.tls_client = std.crypto.tls.Client.init(
             tls_state.stream_reader.interface(),
             &tls_state.stream_writer.interface,
             .{
                 .host = .{ .explicit = host },
-                .ca = .no_verification,
+                .ca = .{ .bundle = ca_bundle },
                 .read_buffer = tls_read_buf,
                 .write_buffer = tls_write_buf,
                 .allow_truncation_attacks = true,
