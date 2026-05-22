@@ -212,21 +212,31 @@ pub const EmailChannel = struct {
         // Read server greeting (220).
         _ = self.smtpRead(stream, tls_state, &greeting_buf) catch return error.SmtpError;
 
-        // EHLO
+        // EHLO — expect 250.
         try self.smtpWrite(stream, tls_state, "EHLO nullalis\r\n");
-        _ = self.smtpRead(stream, tls_state, &greeting_buf) catch return error.SmtpError;
+        {
+            const n = self.smtpRead(stream, tls_state, &greeting_buf) catch return error.SmtpError;
+            if (!smtpCodeIs(greeting_buf[0..n], 250)) {
+                log.warn("SMTP EHLO rejected: {s}", .{greeting_buf[0..@min(n, 256)]});
+                return error.SmtpEhloRejected;
+            }
+        }
 
         // ── STARTTLS upgrade ───────────────────────────────────────
         if (mode == .starttls) {
             try self.smtpWrite(stream, tls_state, "STARTTLS\r\n");
             const n = self.smtpRead(stream, tls_state, &greeting_buf) catch return error.SmtpError;
-            if (n < 3 or !std.mem.startsWith(u8, greeting_buf[0..n], "220")) {
+            if (!smtpCodeIs(greeting_buf[0..n], 220)) {
                 return error.SmtpStartTlsRejected;
             }
             tls_state = try self.initTls(stream, self.config.smtp_host);
-            // Re-issue EHLO over the encrypted channel.
+            // Re-issue EHLO over the encrypted channel — expect 250.
             try self.smtpWrite(stream, tls_state, "EHLO nullalis\r\n");
-            _ = self.smtpRead(stream, tls_state, &greeting_buf) catch return error.SmtpError;
+            const n2 = self.smtpRead(stream, tls_state, &greeting_buf) catch return error.SmtpError;
+            if (!smtpCodeIs(greeting_buf[0..n2], 250)) {
+                log.warn("SMTP EHLO (post-STARTTLS) rejected: {s}", .{greeting_buf[0..@min(n2, 256)]});
+                return error.SmtpEhloRejected;
+            }
         }
 
         // ── AUTH LOGIN (when credentials are configured) ───────────
@@ -249,26 +259,45 @@ pub const EmailChannel = struct {
             }
         }
 
-        // MAIL FROM
+        // MAIL FROM — expect 250.
         var from_buf: [512]u8 = undefined;
         const from_line = try std.fmt.bufPrint(&from_buf, "MAIL FROM:<{s}>\r\n", .{self.config.from_address});
         try self.smtpWrite(stream, tls_state, from_line);
-        _ = self.smtpRead(stream, tls_state, &greeting_buf) catch return error.SmtpError;
+        {
+            const n = self.smtpRead(stream, tls_state, &greeting_buf) catch return error.SmtpError;
+            if (!smtpCodeIs(greeting_buf[0..n], 250)) {
+                log.warn("SMTP MAIL FROM rejected: {s}", .{greeting_buf[0..@min(n, 256)]});
+                return error.SmtpMailFromRejected;
+            }
+        }
 
-        // RCPT TO
+        // RCPT TO — expect 250.
         var rcpt_buf: [512]u8 = undefined;
         const rcpt_line = try std.fmt.bufPrint(&rcpt_buf, "RCPT TO:<{s}>\r\n", .{recipient});
         try self.smtpWrite(stream, tls_state, rcpt_line);
-        _ = self.smtpRead(stream, tls_state, &greeting_buf) catch return error.SmtpError;
+        {
+            const n = self.smtpRead(stream, tls_state, &greeting_buf) catch return error.SmtpError;
+            if (!smtpCodeIs(greeting_buf[0..n], 250)) {
+                log.warn("SMTP RCPT TO rejected: {s}", .{greeting_buf[0..@min(n, 256)]});
+                return error.SmtpRcptToRejected;
+            }
+        }
 
-        // DATA
+        // DATA — expect 354 (server ready to receive the message body).
         try self.smtpWrite(stream, tls_state, "DATA\r\n");
-        _ = self.smtpRead(stream, tls_state, &greeting_buf) catch return error.SmtpError;
+        {
+            const n = self.smtpRead(stream, tls_state, &greeting_buf) catch return error.SmtpError;
+            if (!smtpCodeIs(greeting_buf[0..n], 354)) {
+                log.warn("SMTP DATA rejected (no 354): {s}", .{greeting_buf[0..@min(n, 256)]});
+                return error.SmtpDataRejected;
+            }
+        }
 
-        // Build email headers + body
-        var data_buf: [16384]u8 = undefined;
-        var data_fbs = std.io.fixedBufferStream(&data_buf);
-        const dw = data_fbs.writer();
+        // Build email headers + body in a growable heap buffer — a reply
+        // longer than any fixed buffer must still send.
+        var data: std.ArrayListUnmanaged(u8) = .empty;
+        defer data.deinit(self.allocator);
+        const dw = data.writer(self.allocator);
         try dw.print("From: {s}\r\n", .{self.config.from_address});
         try dw.print("To: {s}\r\n", .{recipient});
         try dw.print("Subject: {s}\r\n", .{subject});
@@ -283,8 +312,15 @@ pub const EmailChannel = struct {
         try dw.writeAll("\r\n");
         try dw.writeAll(body);
         try dw.writeAll("\r\n.\r\n");
-        try self.smtpWrite(stream, tls_state, data_fbs.getWritten());
-        _ = self.smtpRead(stream, tls_state, &greeting_buf) catch return error.SmtpError;
+        try self.smtpWrite(stream, tls_state, data.items);
+        // Final dot — expect 250 (message accepted for delivery).
+        {
+            const n = self.smtpRead(stream, tls_state, &greeting_buf) catch return error.SmtpError;
+            if (!smtpCodeIs(greeting_buf[0..n], 250)) {
+                log.warn("SMTP message rejected after DATA: {s}", .{greeting_buf[0..@min(n, 256)]});
+                return error.SmtpMessageRejected;
+            }
+        }
 
         // QUIT
         try self.smtpWrite(stream, tls_state, "QUIT\r\n");
@@ -379,16 +415,19 @@ pub const EmailChannel = struct {
         return tls;
     }
 
-    /// Send a reply email — applies Re: prefix to subject and includes threading headers.
+    /// Send a reply email — applies Re: prefix to subject and includes
+    /// threading headers. The subject+body is assembled in a growable heap
+    /// buffer so a reply longer than any fixed buffer still sends.
     pub fn sendReply(self: *EmailChannel, recipient: []const u8, original_subject: []const u8, message: []const u8) !void {
-        var buf: [16384]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        const w = buf.writer(self.allocator);
         if (hasReplyPrefix(original_subject)) {
-            try fbs.writer().print("Subject: {s}\n{s}", .{ original_subject, message });
+            try w.print("Subject: {s}\n{s}", .{ original_subject, message });
         } else {
-            try fbs.writer().print("Subject: Re: {s}\n{s}", .{ original_subject, message });
+            try w.print("Subject: Re: {s}\n{s}", .{ original_subject, message });
         }
-        try self.sendMessage(recipient, fbs.getWritten());
+        try self.sendMessage(recipient, buf.items);
     }
 
     /// Send an IMAP `UID STORE +FLAGS (\Seen)` command on an already-open
@@ -878,6 +917,26 @@ pub fn joinFetchLiterals(allocator: std.mem.Allocator, resp: []const u8) !?[]u8 
         return null;
     }
     return try out.toOwnedSlice(allocator);
+}
+
+/// Parse the 3-digit reply code from an SMTP response.
+///
+/// An SMTP reply is one or more lines: `NNN-text` for continuation lines
+/// and `NNN text` (space after the code) for the final line. Every line of
+/// one reply carries the same code, so the leading 3 digits of the buffer
+/// are sufficient. Returns null if the buffer does not begin with a
+/// 3-digit code.
+pub fn smtpReplyCode(resp: []const u8) ?u16 {
+    if (resp.len < 3) return null;
+    for (resp[0..3]) |c| {
+        if (!std.ascii.isDigit(c)) return null;
+    }
+    return std.fmt.parseInt(u16, resp[0..3], 10) catch null;
+}
+
+/// True when an SMTP reply code is the one expected for a command stage.
+pub fn smtpCodeIs(resp: []const u8, expected: u16) bool {
+    return (smtpReplyCode(resp) orelse return false) == expected;
 }
 
 /// Parse a raw RFC 5322 message into a `ParsedEmail`.
@@ -1683,6 +1742,40 @@ test "smtpTlsMode starttls on non-standard tls port" {
         EmailChannel.SmtpTlsMode.starttls,
         EmailChannel.smtpTlsMode(.{ .smtp_tls = true, .smtp_port = 2525 }),
     );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SMTP Reply Code Parsing Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "smtpReplyCode parses single-line reply" {
+    try std.testing.expectEqual(@as(?u16, 250), smtpReplyCode("250 OK\r\n"));
+    try std.testing.expectEqual(@as(?u16, 354), smtpReplyCode("354 Start mail input\r\n"));
+    try std.testing.expectEqual(@as(?u16, 550), smtpReplyCode("550 No such user\r\n"));
+}
+
+test "smtpReplyCode parses multiline reply (continuation form)" {
+    // EHLO replies are multiline: "250-..." lines then a final "250 ..." line.
+    const ehlo = "250-mail.example.com\r\n250-SIZE 35882577\r\n250 STARTTLS\r\n";
+    try std.testing.expectEqual(@as(?u16, 250), smtpReplyCode(ehlo));
+}
+
+test "smtpReplyCode rejects malformed input" {
+    try std.testing.expect(smtpReplyCode("") == null);
+    try std.testing.expect(smtpReplyCode("OK") == null);
+    try std.testing.expect(smtpReplyCode("2x0 OK") == null);
+    try std.testing.expect(smtpReplyCode("\r\n") == null);
+}
+
+test "smtpCodeIs matches expected stage codes" {
+    try std.testing.expect(smtpCodeIs("250 OK\r\n", 250));
+    try std.testing.expect(smtpCodeIs("354 go ahead\r\n", 354));
+    try std.testing.expect(!smtpCodeIs("550 rejected\r\n", 250));
+    try std.testing.expect(!smtpCodeIs("250 OK\r\n", 354));
+    // A non-2xx/3xx reject is not the expected code.
+    try std.testing.expect(!smtpCodeIs("421 Service not available\r\n", 250));
+    // Garbage never matches.
+    try std.testing.expect(!smtpCodeIs("", 250));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
