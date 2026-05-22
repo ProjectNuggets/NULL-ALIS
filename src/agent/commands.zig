@@ -1840,7 +1840,41 @@ pub fn persistSessionCheckpointDetailed(self: anytype, reason: []const u8) bool 
     if (self.mem_rt) |rt| {
         _ = rt.syncVectorAfterStore(self.allocator, "context_anchor_current", anchor_content);
     }
+
+    exportSessionToQmd(self, session_id);
+
     return summary_written;
+}
+
+/// v1.14.18 Step 1 (QMD-WIRE) — session-end QMD markdown export.
+///
+/// When `memory.qmd.sessions.enabled` is set, the operator has asked for
+/// finished sessions to be mirrored as markdown into `export_dir` so the
+/// QMD index can recall them. Before this wire, the config flag was parsed
+/// and `QmdAdapter.exportSessions` / `pruneExportedSessions` existed with
+/// tests but had no production caller — a false-confidence surface.
+///
+/// Runs at session-end (off the hot path via the async lifecycle worker).
+/// Best-effort: every failure is logged and swallowed; export is an
+/// observability convenience, never load-bearing for a turn.
+fn exportSessionToQmd(self: anytype, session_id: []const u8) void {
+    const cfg = self.cachedConfigForCaps() orelse return;
+    if (!cfg.memory.qmd.sessions.enabled) return;
+
+    const store = self.session_store orelse return;
+
+    var qmd = memory_mod.QmdAdapter.init(self.allocator, cfg.memory.qmd, self.workspace_dir);
+    const ids = [_][]const u8{session_id};
+    const written = qmd.exportSessions(self.allocator, store, &ids) catch |err| {
+        log.warn("qmd.session_export failed err={s} session={s}", .{ @errorName(err), session_id });
+        return;
+    };
+    const pruned = qmd.pruneExportedSessions(self.allocator) catch |err| {
+        log.warn("qmd.session_prune failed err={s}", .{@errorName(err)});
+        log.info("qmd.session_export written={d} pruned=0", .{written});
+        return;
+    };
+    log.info("qmd.session_export written={d} pruned={d}", .{ written, pruned });
 }
 
 fn clearSessionState(self: anytype, reason: []const u8) void {
