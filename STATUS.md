@@ -50,7 +50,9 @@ Code truth as of `ed1e84ae` on `main`. The 2026-05-10 sections below are retaine
 
 ## What nullALIS is right now
 
-Single-binary Zig agent runtime (`src/main.zig`). Per-user cell-pod architecture, 15 LLM providers, 48 tools, 20 channel integrations, 9-stage memory retrieval over 4 storage backends + vector plane. Postgres canonical, SQLite + markdown mirror, filesystem workspace first-class.
+Single-binary Zig agent runtime (`src/main.zig`). **Shared multi-tenant runtime** — one gateway process, many users, with logical per-user isolation via `TenantRuntime` (per-user config, postgres schema, workspace, memory). 15 LLM providers, 48 tools, 20 channel integrations, 9-stage memory retrieval over 4 storage backends + vector plane. Postgres canonical, SQLite + markdown mirror, filesystem workspace first-class.
+
+**Architecture decision (2026-05-22):** ship the shared runtime for launch — one pod, many users. Per-user cell-pod *process* isolation is deferred (already roadmapped at v1.18 "per-cell pod canary"). Trade-off accepted: shared blast radius + no per-tenant resource caps, in exchange for far simpler ops and a faster path to launch. Logical isolation already exists; process isolation is a scale-up concern, not a launch blocker.
 
 | Surface | Count | Where |
 |---|---|---|
