@@ -52,7 +52,10 @@ pub const store_qdrant = @import("vector/store_qdrant.zig");
 pub const store_pgvector = @import("vector/store_pgvector.zig");
 pub const circuit_breaker = @import("vector/circuit_breaker.zig");
 pub const outbox = @import("vector/outbox.zig");
-pub const chunker = @import("vector/chunker.zig");
+// vector/chunker.zig removed (v1.14.18, CHUNKER-DECISION): the markdown
+// chunker was orphaned when v1.14.8 extraction switched to episode-based
+// chunking (`src/agent/extraction/chunker.zig::chunkIntoEpisodes`). It had
+// zero production callers — only its own tests and dead re-exports here.
 
 // lifecycle/ (Layer D: Runtime Orchestrator)
 pub const cache = @import("lifecycle/cache.zig");
@@ -80,13 +83,12 @@ pub const RedisMemory = redis.RedisMemory;
 pub const LanceDbMemory = lancedb.LanceDbMemory;
 pub const ApiMemory = api.ApiMemory;
 pub const ResponseCache = cache.ResponseCache;
-pub const Chunk = chunker.Chunk;
-pub const chunkMarkdown = chunker.chunkMarkdown;
 pub const EmbeddingProvider = embeddings.EmbeddingProvider;
 pub const NoopEmbedding = embeddings.NoopEmbedding;
 pub const cosineSimilarity = vector.cosineSimilarity;
-pub const ScoredResult = vector.ScoredResult;
-pub const hybridMerge = vector.hybridMerge;
+// vector.hybridMerge + vector.ScoredResult removed (v1.14.18,
+// HYBRID-MERGE-DECISION): superseded by `rrfMerge` (retrieval/rrf.zig),
+// the production fusion stage. Had zero callers beyond these re-exports.
 pub const HygieneReport = hygiene.HygieneReport;
 pub const exportSnapshot = snapshot.exportSnapshot;
 pub const hydrateFromSnapshot = snapshot.hydrateFromSnapshot;
@@ -4207,7 +4209,6 @@ test {
     _ = store_pgvector;
     _ = circuit_breaker;
     _ = outbox;
-    _ = chunker;
 
     // lifecycle/ (Layer D)
     _ = cache;
