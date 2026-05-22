@@ -1071,6 +1071,131 @@ pub const Config = struct {
     }
 };
 
+// ── Config field-exhaustiveness guard (findings #3/#4 follow-up) ──
+//
+// Findings #3 and #4 were the same class: a config surface (`sidecar`,
+// `network`) that exists as a struct AND a `Config` field — but with NO
+// parser in config_parse.zig, and nothing detecting the gap.
+// `Config.sidecar` was permanently the struct default for months;
+// finding #4 (the boundary-extraction cascade) traced straight back to it.
+//
+// This comptime guard makes that class un-mergeable: every top-level
+// `Config` field MUST be registered below. Add a field without
+// registering it and the build fails — forcing the author to decide
+// whether it needs a parser (.json_parsed), is runtime/derived state
+// (.runtime_or_derived), or is a known-unwired gap (.decorative_pending,
+// which is tracked in docs/CONFIG_CONTROL_PLANE_AUDIT.md — not silent).
+//
+// Scope: TOP-LEVEL fields only. Nested-struct Class-D bugs (e.g.
+// AgentConfig.extraction) are out of scope — a recursive walk is a
+// separate, larger effort. The top-level walk catches the #3/#4 class.
+const ConfigFieldDisposition = enum {
+    /// config_parse.zig reads this from config.json.
+    json_parsed,
+    /// Set at construction, or derived/synced from a nested block at
+    /// runtime, or a parse-detected flag — never read directly from JSON.
+    runtime_or_derived,
+    /// KNOWN unparsed config surface — a tracked follow-up, not a silent
+    /// gap. See docs/CONFIG_CONTROL_PLANE_AUDIT.md.
+    decorative_pending,
+};
+
+const ConfigFieldAccount = struct { name: []const u8, disposition: ConfigFieldDisposition };
+
+const config_field_accounting = [_]ConfigFieldAccount{
+    .{ .name = "workspace_dir", .disposition = .runtime_or_derived },
+    .{ .name = "config_path", .disposition = .runtime_or_derived },
+    .{ .name = "profile", .disposition = .json_parsed },
+    .{ .name = "providers", .disposition = .json_parsed },
+    .{ .name = "audio_media", .disposition = .json_parsed },
+    .{ .name = "default_provider", .disposition = .json_parsed },
+    .{ .name = "default_model", .disposition = .json_parsed },
+    .{ .name = "legacy_default_provider_detected", .disposition = .runtime_or_derived },
+    .{ .name = "legacy_default_model_detected", .disposition = .runtime_or_derived },
+    .{ .name = "default_temperature", .disposition = .json_parsed },
+    .{ .name = "reasoning_effort", .disposition = .json_parsed },
+    .{ .name = "model_routes", .disposition = .json_parsed },
+    .{ .name = "agents", .disposition = .json_parsed },
+    .{ .name = "agent_bindings", .disposition = .json_parsed },
+    .{ .name = "mcp_servers", .disposition = .json_parsed },
+    .{ .name = "diagnostics", .disposition = .json_parsed },
+    .{ .name = "autonomy", .disposition = .json_parsed },
+    .{ .name = "runtime", .disposition = .json_parsed },
+    .{ .name = "network", .disposition = .decorative_pending },
+    .{ .name = "reliability", .disposition = .json_parsed },
+    .{ .name = "scheduler", .disposition = .json_parsed },
+    .{ .name = "agent", .disposition = .json_parsed },
+    .{ .name = "sidecar", .disposition = .json_parsed },
+    .{ .name = "heartbeat", .disposition = .json_parsed },
+    .{ .name = "cron", .disposition = .json_parsed },
+    .{ .name = "channels", .disposition = .json_parsed },
+    .{ .name = "memory", .disposition = .json_parsed },
+    .{ .name = "tunnel", .disposition = .json_parsed },
+    .{ .name = "gateway", .disposition = .json_parsed },
+    .{ .name = "tenant", .disposition = .json_parsed },
+    .{ .name = "state", .disposition = .json_parsed },
+    .{ .name = "composio", .disposition = .json_parsed },
+    .{ .name = "secrets", .disposition = .json_parsed },
+    .{ .name = "browser", .disposition = .json_parsed },
+    .{ .name = "http_request", .disposition = .json_parsed },
+    .{ .name = "identity", .disposition = .json_parsed },
+    .{ .name = "cost", .disposition = .json_parsed },
+    .{ .name = "peripherals", .disposition = .json_parsed },
+    .{ .name = "security", .disposition = .json_parsed },
+    .{ .name = "tools", .disposition = .json_parsed },
+    .{ .name = "session", .disposition = .json_parsed },
+    .{ .name = "temperature", .disposition = .runtime_or_derived },
+    .{ .name = "max_tokens", .disposition = .runtime_or_derived },
+    .{ .name = "memory_backend", .disposition = .runtime_or_derived },
+    .{ .name = "memory_auto_save", .disposition = .runtime_or_derived },
+    .{ .name = "heartbeat_enabled", .disposition = .runtime_or_derived },
+    .{ .name = "heartbeat_interval_minutes", .disposition = .runtime_or_derived },
+    .{ .name = "gateway_host", .disposition = .runtime_or_derived },
+    .{ .name = "gateway_port", .disposition = .runtime_or_derived },
+    .{ .name = "workspace_only", .disposition = .runtime_or_derived },
+    .{ .name = "max_actions_per_hour", .disposition = .runtime_or_derived },
+    .{ .name = "allocator", .disposition = .runtime_or_derived },
+    .{ .name = "arena", .disposition = .runtime_or_derived },
+};
+
+comptime {
+    // ~53 fields × ~53 accounting entries × per-char std.mem.eql exceeds
+    // the default 1000-backwards-branch comptime budget.
+    @setEvalBranchQuota(100_000);
+    // Forward: every Config field must be registered.
+    for (std.meta.fields(Config)) |field| {
+        var accounted = false;
+        for (config_field_accounting) |entry| {
+            if (std.mem.eql(u8, field.name, entry.name)) {
+                accounted = true;
+                break;
+            }
+        }
+        if (!accounted) {
+            @compileError("Config field '" ++ field.name ++ "' is UNACCOUNTED. " ++
+                "Register it in `config_field_accounting` (config.zig): if it is read " ++
+                "from config.json add a parser in config_parse.zig and tag .json_parsed; " ++
+                "if it is runtime/derived state tag .runtime_or_derived; if it is a " ++
+                "known-unwired gap tag .decorative_pending. This guard exists because " ++
+                "findings #3/#4 were Config fields with no parser, undetected for months.");
+        }
+    }
+    // Reverse: no stale accounting entries for removed fields.
+    for (config_field_accounting) |entry| {
+        var exists = false;
+        for (std.meta.fields(Config)) |field| {
+            if (std.mem.eql(u8, entry.name, field.name)) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) {
+            @compileError("config_field_accounting has a stale entry '" ++ entry.name ++
+                "' — no such Config field. Remove it.");
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 test "json parse roundtrip" {
