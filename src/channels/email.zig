@@ -403,30 +403,60 @@ pub const EmailChannel = struct {
         _ = self.smtpRead(stream, tls, &resp_buf) catch return error.ImapError;
     }
 
-    /// Send an IMAP command with the given tag and read the response into
-    /// `out`. Returns the number of bytes read. Reads until a line beginning
-    /// with the command tag is seen (the IMAP tagged completion) or the
-    /// buffer is full.
-    fn imapCommand(self: *EmailChannel, stream: std.net.Stream, tls: ?*TlsState, tag: u32, cmd: []const u8, out: []u8) !usize {
+    /// Hard cap on a single IMAP response read. IMAP framing means we read
+    /// exactly the bytes the server frames (literal lengths + protocol
+    /// lines), so this only bounds a pathological / hostile server. A few
+    /// MiB comfortably covers a stripped-text message body; whole-MIME
+    /// messages with attachments are never fetched (BODY.PEEK[TEXT]).
+    pub const IMAP_RESPONSE_CAP: usize = 4 * 1024 * 1024;
+
+    /// Send an IMAP command with the given tag and read the framed response
+    /// into a heap-allocated, growable buffer. The returned slice is owned
+    /// by `allocator` — the caller must free it. Reading is IMAP-framing
+    /// aware: `{LEN}` literal markers are honoured (exactly `LEN` octets are
+    /// consumed as opaque literal data), so a tagged-completion-looking line
+    /// inside an email body cannot terminate the read early, and a message
+    /// larger than any fixed buffer is read in full up to `IMAP_RESPONSE_CAP`.
+    fn imapCommand(
+        self: *EmailChannel,
+        allocator: std.mem.Allocator,
+        stream: std.net.Stream,
+        tls: ?*TlsState,
+        tag: u32,
+        cmd: []const u8,
+    ) ![]u8 {
         try self.smtpWrite(stream, tls, cmd);
-        return self.imapReadResponse(stream, tls, tag, out);
+        return self.imapReadResponse(allocator, stream, tls, tag);
     }
 
     /// Read an IMAP server response until the tagged completion line for
-    /// `tag` is seen. Accumulates into `out`; stops when full.
-    fn imapReadResponse(self: *EmailChannel, stream: std.net.Stream, tls: ?*TlsState, tag: u32, out: []u8) !usize {
+    /// `tag` is seen, honouring `{LEN}` literal framing. Accumulates into a
+    /// growable heap buffer owned by `allocator` (caller frees). Stops at
+    /// `IMAP_RESPONSE_CAP` to bound a hostile server.
+    fn imapReadResponse(
+        self: *EmailChannel,
+        allocator: std.mem.Allocator,
+        stream: std.net.Stream,
+        tls: ?*TlsState,
+        tag: u32,
+    ) ![]u8 {
         var tag_buf: [8]u8 = undefined;
         const tag_str = std.fmt.bufPrint(&tag_buf, "A{d:0>4}", .{tag}) catch return error.ImapError;
 
-        var total: usize = 0;
-        while (total < out.len) {
-            const n = self.smtpRead(stream, tls, out[total..]) catch return error.ImapError;
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        var chunk: [16 * 1024]u8 = undefined;
+        while (buf.items.len < IMAP_RESPONSE_CAP) {
+            // If the response is already framed-complete, stop before
+            // blocking on another read.
+            if (imapResponseComplete(buf.items, tag_str)) break;
+
+            const n = self.smtpRead(stream, tls, &chunk) catch return error.ImapError;
             if (n == 0) break;
-            total += n;
-            // The tagged completion is a line: "<tag> OK|NO|BAD ...".
-            if (responseHasTaggedCompletion(out[0..total], tag_str)) break;
+            try buf.appendSlice(allocator, chunk[0..n]);
         }
-        return total;
+        return buf.toOwnedSlice(allocator);
     }
 
     /// Run one IMAP poll cycle: connect, LOGIN, SELECT, SEARCH UNSEEN,
@@ -450,18 +480,19 @@ pub const EmailChannel = struct {
             tls.deinit(self.allocator);
         }
 
-        var resp_buf: [65536]u8 = undefined;
+        var greeting_buf: [4096]u8 = undefined;
 
         // Server greeting (untagged "* OK ...").
-        _ = self.smtpRead(stream, tls, &resp_buf) catch return error.ImapError;
+        _ = self.smtpRead(stream, tls, &greeting_buf) catch return error.ImapError;
 
         // LOGIN
         {
             const tag = self.nextTag();
             var cmd_buf: [768]u8 = undefined;
             const cmd = try std.fmt.bufPrint(&cmd_buf, "A{d:0>4} LOGIN {s} {s}\r\n", .{ tag, self.config.username, self.config.password });
-            const n = try self.imapCommand(stream, tls, tag, cmd, &resp_buf);
-            if (!responseIsOk(resp_buf[0..n], tag)) return error.ImapLoginFailed;
+            const resp = try self.imapCommand(allocator, stream, tls, tag, cmd);
+            defer allocator.free(resp);
+            if (!responseIsOk(resp, tag)) return error.ImapLoginFailed;
         }
 
         // SELECT folder
@@ -469,8 +500,9 @@ pub const EmailChannel = struct {
             const tag = self.nextTag();
             var cmd_buf: [512]u8 = undefined;
             const cmd = try std.fmt.bufPrint(&cmd_buf, "A{d:0>4} SELECT {s}\r\n", .{ tag, self.config.imap_folder });
-            const n = try self.imapCommand(stream, tls, tag, cmd, &resp_buf);
-            if (!responseIsOk(resp_buf[0..n], tag)) return error.ImapSelectFailed;
+            const resp = try self.imapCommand(allocator, stream, tls, tag, cmd);
+            defer allocator.free(resp);
+            if (!responseIsOk(resp, tag)) return error.ImapSelectFailed;
         }
 
         // SEARCH UNSEEN
@@ -481,9 +513,10 @@ pub const EmailChannel = struct {
             const tag = self.nextTag();
             var cmd_buf: [64]u8 = undefined;
             const cmd = try std.fmt.bufPrint(&cmd_buf, "A{d:0>4} UID SEARCH UNSEEN\r\n", .{tag});
-            const n = try self.imapCommand(stream, tls, tag, cmd, &resp_buf);
-            if (!responseIsOk(resp_buf[0..n], tag)) return error.ImapSearchFailed;
-            parseSearchUids(resp_buf[0..n], &uid_storage, &uids, allocator) catch {};
+            const resp = try self.imapCommand(allocator, stream, tls, tag, cmd);
+            defer allocator.free(resp);
+            if (!responseIsOk(resp, tag)) return error.ImapSearchFailed;
+            parseSearchUids(resp, &uid_storage, &uids, allocator) catch {};
         }
 
         var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
@@ -501,11 +534,33 @@ pub const EmailChannel = struct {
 
             const tag = self.nextTag();
             var cmd_buf: [128]u8 = undefined;
-            const cmd = std.fmt.bufPrint(&cmd_buf, "A{d:0>4} UID FETCH {s} (BODY.PEEK[])\r\n", .{ tag, uid }) catch continue;
-            const n = self.imapCommand(stream, tls, tag, cmd, &resp_buf) catch continue;
-            if (!responseIsOk(resp_buf[0..n], tag)) continue;
+            // BODY.PEEK[HEADER] + BODY.PEEK[TEXT]: the agent only consumes
+            // the stripped text (plus the From/Subject/Message-ID headers
+            // for allowlisting + threading) — fetching the whole raw MIME
+            // with BODY.PEEK[] is waste. PEEK leaves \Seen for us to set.
+            const cmd = std.fmt.bufPrint(&cmd_buf, "A{d:0>4} UID FETCH {s} (BODY.PEEK[HEADER] BODY.PEEK[TEXT])\r\n", .{ tag, uid }) catch continue;
+            const resp = self.imapCommand(allocator, stream, tls, tag, cmd) catch continue;
+            defer allocator.free(resp);
 
-            const raw = extractFetchLiteral(resp_buf[0..n]) orelse continue;
+            // A response that never reached the tagged completion within the
+            // cap is an oversized message (the literal is larger than
+            // IMAP_RESPONSE_CAP). Mark it \Seen so it is not re-fetched every
+            // cycle forever, then move on.
+            var tag_buf: [8]u8 = undefined;
+            const tag_str = std.fmt.bufPrint(&tag_buf, "A{d:0>4}", .{tag}) catch continue;
+            if (!imapResponseComplete(resp, tag_str)) {
+                log.warn("IMAP message uid={s} exceeds {d}-byte cap — marking \\Seen and skipping", .{ uid, IMAP_RESPONSE_CAP });
+                _ = self.seen.insert(uid) catch {};
+                self.markMessageSeen(stream, tls, uid) catch {};
+                continue;
+            }
+            if (!responseIsOk(resp, tag)) continue;
+
+            // Reassemble "header\r\nbody" from the two fetched literals so
+            // parseEmailMessage sees a normal RFC 5322 message. A FETCH with
+            // no literal at all (e.g. the UID vanished) is skipped.
+            const raw = joinFetchLiterals(allocator, resp) catch continue orelse continue;
+            defer allocator.free(raw);
             const parsed = parseEmailMessage(allocator, raw) catch continue;
             defer parsed.deinit(allocator);
 
@@ -534,12 +589,15 @@ pub const EmailChannel = struct {
             fetched += 1;
         }
 
-        // LOGOUT (best effort)
+        // LOGOUT — drain the tagged response best-effort, mirroring
+        // sendMessage's clean SMTP shutdown.
         {
             const tag = self.nextTag();
             var cmd_buf: [32]u8 = undefined;
             const cmd = std.fmt.bufPrint(&cmd_buf, "A{d:0>4} LOGOUT\r\n", .{tag}) catch return toOwnedMessages(allocator, &messages);
-            self.smtpWrite(stream, tls, cmd) catch {};
+            if (self.imapCommand(allocator, stream, tls, tag, cmd)) |resp| {
+                allocator.free(resp);
+            } else |_| {}
         }
 
         return toOwnedMessages(allocator, &messages);
@@ -657,6 +715,59 @@ pub fn responseHasTaggedCompletion(resp: []const u8, tag: []const u8) bool {
     return false;
 }
 
+/// If `line` (a single CRLF-stripped protocol line) ends with an IMAP
+/// literal marker `{NNN}` — optionally `{NNN+}` for a non-synchronizing
+/// literal — return `NNN`. Otherwise null. The literal's `NNN` octets
+/// follow the line's terminating CRLF as opaque data.
+fn imapLiteralLen(line: []const u8) ?usize {
+    if (line.len < 3 or line[line.len - 1] != '}') return null;
+    const open = std.mem.lastIndexOfScalar(u8, line, '{') orelse return null;
+    var digits = line[open + 1 .. line.len - 1];
+    // Tolerate the LITERAL+ non-synchronizing form "{NNN+}".
+    if (digits.len > 0 and digits[digits.len - 1] == '+') digits = digits[0 .. digits.len - 1];
+    if (digits.len == 0) return null;
+    return std.fmt.parseInt(usize, digits, 10) catch null;
+}
+
+/// True when `resp` holds a complete IMAP response for `tag` — i.e. the
+/// tagged completion line ("<tag> OK|NO|BAD ...") has been received.
+///
+/// Unlike `responseHasTaggedCompletion`, this walks the response with IMAP
+/// literal framing: when a protocol line ends in a `{LEN}` literal marker,
+/// exactly `LEN` octets following the CRLF are skipped as opaque literal
+/// data. This is what prevents two false matches:
+///  - an email body that contains a line like "A0042 OK ..." is inside a
+///    literal block and is therefore never scanned as a protocol line;
+///  - the read does not stop until the *real* tagged completion arrives,
+///    so a message larger than any single buffer is still read in full.
+///
+/// If the buffer ends partway through a literal (the declared `LEN` octets
+/// have not all arrived yet) the response is treated as incomplete.
+pub fn imapResponseComplete(resp: []const u8, tag: []const u8) bool {
+    var i: usize = 0;
+    while (i < resp.len) {
+        // Find the end of the current protocol line.
+        const nl_rel = std.mem.indexOfScalarPos(u8, resp, i, '\n') orelse {
+            // No complete line yet — response cannot be complete.
+            return false;
+        };
+        const line = std.mem.trimRight(u8, resp[i..nl_rel], "\r");
+
+        if (std.mem.startsWith(u8, line, tag)) return true;
+
+        // Advance past the CRLF.
+        var next = nl_rel + 1;
+
+        // A trailing literal marker means the next LEN octets are opaque.
+        if (imapLiteralLen(line)) |lit_len| {
+            if (next + lit_len > resp.len) return false; // literal incomplete
+            next += lit_len;
+        }
+        i = next;
+    }
+    return false;
+}
+
 /// True when the IMAP response's tagged completion line for `tag` is `OK`.
 pub fn responseIsOk(resp: []const u8, tag: u32) bool {
     var tag_buf: [8]u8 = undefined;
@@ -712,29 +823,61 @@ pub fn parseSearchUids(
     }
 }
 
-/// Extract the message body literal from an IMAP `UID FETCH ... BODY[]`
-/// response. The server sends `* N FETCH (... BODY[] {LEN}\r\n<LEN bytes>)`.
-/// Returns the slice of exactly `LEN` bytes following the literal marker,
-/// or null if no literal is present.
+/// Extract the first message literal from an IMAP `UID FETCH` response.
+///
+/// IMAP framing: a protocol line ending in `{LEN}` declares that the next
+/// `LEN` octets (after the line's CRLF) are opaque literal data. This walks
+/// the response line-by-line with that framing — it only treats a `{LEN}`
+/// at the *end of a protocol line* as a literal marker, so a `{` inside the
+/// literal body cannot false-match. Returns the first literal's bytes, or
+/// null if the response carries no literal.
 pub fn extractFetchLiteral(resp: []const u8) ?[]const u8 {
-    // Find the literal-length marker "{NNN}\r\n".
-    var search_from: usize = 0;
-    while (std.mem.indexOfPos(u8, resp, search_from, "{")) |brace| {
-        const close = std.mem.indexOfPos(u8, resp, brace + 1, "}") orelse return null;
-        const len_str = resp[brace + 1 .. close];
-        const literal_len = std.fmt.parseInt(usize, len_str, 10) catch {
-            search_from = close + 1;
-            continue;
-        };
-        // The literal data starts right after "}\r\n".
-        var data_start = close + 1;
-        if (data_start < resp.len and resp[data_start] == '\r') data_start += 1;
-        if (data_start < resp.len and resp[data_start] == '\n') data_start += 1;
-        const avail = resp.len - data_start;
-        const take = @min(literal_len, avail);
-        return resp[data_start .. data_start + take];
+    var i: usize = 0;
+    while (i < resp.len) {
+        const nl_rel = std.mem.indexOfScalarPos(u8, resp, i, '\n') orelse return null;
+        const line = std.mem.trimRight(u8, resp[i..nl_rel], "\r");
+        const data_start = nl_rel + 1;
+        if (imapLiteralLen(line)) |lit_len| {
+            const avail = resp.len - data_start;
+            const take = @min(lit_len, avail);
+            return resp[data_start .. data_start + take];
+        }
+        i = data_start;
     }
     return null;
+}
+
+/// Concatenate every literal block in an IMAP `UID FETCH` response, in
+/// order, into one heap-allocated buffer (caller frees). For a
+/// `(BODY.PEEK[HEADER] BODY.PEEK[TEXT])` fetch this yields `header ++ text`
+/// — a complete RFC 5322 message ready for `parseEmailMessage` (IMAP's
+/// `[HEADER]` section already includes the blank line that separates
+/// headers from body). Returns null when the response carries no literal.
+pub fn joinFetchLiterals(allocator: std.mem.Allocator, resp: []const u8) !?[]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var found = false;
+    var i: usize = 0;
+    while (i < resp.len) {
+        const nl_rel = std.mem.indexOfScalarPos(u8, resp, i, '\n') orelse break;
+        const line = std.mem.trimRight(u8, resp[i..nl_rel], "\r");
+        var next = nl_rel + 1;
+        if (imapLiteralLen(line)) |lit_len| {
+            const avail = resp.len - next;
+            const take = @min(lit_len, avail);
+            try out.appendSlice(allocator, resp[next .. next + take]);
+            found = true;
+            next += take;
+        }
+        i = next;
+    }
+
+    if (!found) {
+        out.deinit(allocator);
+        return null;
+    }
+    return try out.toOwnedSlice(allocator);
 }
 
 /// Parse a raw RFC 5322 message into a `ParsedEmail`.
@@ -1640,6 +1783,110 @@ test "extractFetchLiteral truncated literal returns available bytes" {
     const resp = "* 1 FETCH (BODY[] {50}\r\nshort";
     const lit = extractFetchLiteral(resp).?;
     try std.testing.expectEqualStrings("short", lit);
+}
+
+test "extractFetchLiteral ignores a brace inside the literal body" {
+    // The literal body itself contains "{99}" — must NOT be re-interpreted
+    // as a second literal marker; the framed read returns the first literal.
+    const resp = "* 1 FETCH (BODY[] {18}\r\nbody has a {99} ok)\r\nA0004 OK\r\n";
+    const lit = extractFetchLiteral(resp).?;
+    try std.testing.expectEqualStrings("body has a {99} ok", lit);
+}
+
+// ── imapLiteralLen ──────────────────────────────────────────────────────────
+
+test "imapLiteralLen parses trailing literal marker" {
+    try std.testing.expectEqual(@as(?usize, 11), imapLiteralLen("* 1 FETCH (BODY[] {11}"));
+    try std.testing.expectEqual(@as(?usize, 0), imapLiteralLen("x {0}"));
+}
+
+test "imapLiteralLen accepts non-synchronizing literal form" {
+    try std.testing.expectEqual(@as(?usize, 42), imapLiteralLen("a {42+}"));
+}
+
+test "imapLiteralLen rejects non-literal lines" {
+    try std.testing.expect(imapLiteralLen("A0004 OK FETCH completed") == null);
+    try std.testing.expect(imapLiteralLen("* 1 FETCH (UID 7)") == null);
+    try std.testing.expect(imapLiteralLen("{12} not at end") == null);
+    try std.testing.expect(imapLiteralLen("{}") == null);
+    try std.testing.expect(imapLiteralLen("") == null);
+}
+
+// ── imapResponseComplete (literal-length-aware framing) ─────────────────────
+
+test "imapResponseComplete true when tagged completion present" {
+    const resp = "* 1 FETCH (FLAGS (\\Seen))\r\nA0004 OK FETCH completed\r\n";
+    try std.testing.expect(imapResponseComplete(resp, "A0004"));
+}
+
+test "imapResponseComplete false before tagged completion arrives" {
+    const resp = "* 1 FETCH (FLAGS (\\Seen))\r\n";
+    try std.testing.expect(!imapResponseComplete(resp, "A0004"));
+}
+
+test "imapResponseComplete ignores tagged-completion-looking line inside a literal" {
+    // The email body literal contains a line that looks exactly like a
+    // tagged completion. Literal framing must skip it — the read is NOT
+    // complete until the real A0042 line outside the literal.
+    const body = "X-Header: hi\r\nA0042 OK this is inside the body\r\n";
+    const resp = std.fmt.comptimePrint(
+        "* 1 FETCH (BODY[] {{{d}}}\r\n{s})\r\n",
+        .{ body.len, body },
+    );
+    // No real tagged completion yet — must report incomplete.
+    try std.testing.expect(!imapResponseComplete(resp, "A0042"));
+    // Append the genuine tagged completion: now complete.
+    const full = resp ++ "A0042 OK FETCH completed\r\n";
+    try std.testing.expect(imapResponseComplete(full, "A0042"));
+}
+
+test "imapResponseComplete false when literal is not yet fully received" {
+    // Server declared {100} but only 4 octets arrived — incomplete.
+    const resp = "* 1 FETCH (BODY[] {100}\r\nfour";
+    try std.testing.expect(!imapResponseComplete(resp, "A0004"));
+}
+
+test "imapResponseComplete handles literal then tagged completion" {
+    const resp = "* 1 FETCH (BODY[] {5}\r\nhello)\r\nA0007 OK done\r\n";
+    try std.testing.expect(imapResponseComplete(resp, "A0007"));
+}
+
+// ── joinFetchLiterals (HEADER + TEXT reassembly) ────────────────────────────
+
+test "joinFetchLiterals concatenates header and text literals" {
+    const allocator = std.testing.allocator;
+    const header = "From: a@b.com\r\nSubject: Hi\r\n\r\n";
+    const text = "the body text";
+    const resp = std.fmt.comptimePrint(
+        "* 1 FETCH (BODY[HEADER] {{{d}}}\r\n{s} BODY[TEXT] {{{d}}}\r\n{s})\r\nA0009 OK\r\n",
+        .{ header.len, header, text.len, text },
+    );
+    const joined = (try joinFetchLiterals(allocator, resp)).?;
+    defer allocator.free(joined);
+    try std.testing.expectEqualStrings(header ++ text, joined);
+}
+
+test "joinFetchLiterals returns null when no literal present" {
+    const allocator = std.testing.allocator;
+    const resp = "* 1 FETCH (UID 7 FLAGS (\\Seen))\r\nA0009 OK\r\n";
+    try std.testing.expect((try joinFetchLiterals(allocator, resp)) == null);
+}
+
+test "joinFetchLiterals output round-trips through parseEmailMessage" {
+    const allocator = std.testing.allocator;
+    const header = "From: Alice <alice@example.com>\r\nSubject: Reassembled\r\n\r\n";
+    const text = "literal-framed body";
+    const resp = std.fmt.comptimePrint(
+        "* 1 FETCH (BODY[HEADER] {{{d}}}\r\n{s} BODY[TEXT] {{{d}}}\r\n{s})\r\nA0011 OK\r\n",
+        .{ header.len, header, text.len, text },
+    );
+    const joined = (try joinFetchLiterals(allocator, resp)).?;
+    defer allocator.free(joined);
+    const parsed = try parseEmailMessage(allocator, joined);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqualStrings("alice@example.com", parsed.from_addr);
+    try std.testing.expectEqualStrings("Reassembled", parsed.subject);
+    try std.testing.expectEqualStrings("literal-framed body", parsed.body);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
