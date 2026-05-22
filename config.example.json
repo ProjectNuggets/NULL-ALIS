@@ -179,5 +179,7 @@
     "audit": {
       "enabled": true
     }
-  }
+  },
+
+  "mcp_servers": {}
 }

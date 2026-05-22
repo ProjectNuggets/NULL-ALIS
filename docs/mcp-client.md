@@ -76,14 +76,18 @@ reconnect-on-crash. Verified with an 8-turn live test against the reference
 server (`tests/mcp/live_server_test.zig`, run via
 `NULLALIS_MCP_LIVE_TEST=1 zig build test-mcp-live`).
 
-### Recommendation: re-enable
+### Enabling MCP servers
 
-The stability blocker is resolved. Operators may rename the config key back:
+MCP is enabled by default — populate the `mcp_servers` block in your config
+to register servers (`config.example.json` ships it as an empty `{}`).
+
+Operators whose config still carries the historical disable key from before
+the v1.14.20 stability fix should rename it back:
 
 ```diff
 -  "_mcp_servers_disabled_pending_stability_fix": { ... }
 +  "mcp_servers": { ... }
 ```
 
-This change is left to the operator — nullalis does not rewrite
-`~/.nullalis/config.json` automatically.
+nullalis does not rewrite `~/.nullalis/config.json` automatically — this is
+an operator action.
