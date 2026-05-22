@@ -198,7 +198,9 @@ A block does not "exit" until its bench gate passes. The next block does not sta
 
 ## v1.14.15 — "Channels finish: Email" → DELIVERED via Sprint 2 → v1.14.20
 
-**DELIVERED 2026-05-22 (PR #100):** Email activated as a `send_only` channel through `channel_manager`'s generic listener path. SMTP outbound is live; **inbound IMAP is NOT built** — the original Steps below assumed an IMAP poller; that scope is deferred (honestly labelled in `src/channels/email.zig`). Discord + Slack were also finished in the same sprint (PR #99) — echo-loop fix, system-message filtering, markdown conversion.
+**DELIVERED 2026-05-22 (PR #100):** Email activated as a `send_only` channel through `channel_manager`'s generic listener path. SMTP outbound was live; inbound IMAP was deferred at that point.
+
+**COMPLETED 2026-05-22 (Slice 2):** Email is now a genuine bidirectional `polling` channel. Inbound IMAP-over-TLS client built in `src/channels/email.zig` (`pollMessages`: implicit-TLS connect to port 993, LOGIN → SELECT → UID SEARCH UNSEEN → UID FETCH, RFC 2047 + HTML-strip parsing, `allow_from` allowlist filter, `BoundedSeenSet` de-dup, `\Seen` marking). Outbound SMTP TLS fixed: implicit TLS on 465, STARTTLS on 587/other, plaintext only when `smtp_tls=false`. `channel_loop.runEmailLoop` drives the poll thread; `channel_catalog` listener_mode flipped `send_only` → `polling`. Discord + Slack were also finished in an earlier sprint (PR #99) — echo-loop fix, system-message filtering, markdown conversion.
 
 **Theme:** First of three channel-completion blocks. Email is widest user reach.
 
