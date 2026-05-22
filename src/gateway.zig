@@ -23514,6 +23514,198 @@ test "handleSlackWebhookRoute compat mode accepts unmapped ingress" {
     try std.testing.expectEqualStrings("{\"status\":\"ok\"}", ctx.response_body);
 }
 
+// ── Teams webhook (/api/messages) ───────────────────────────────
+
+fn buildTeamsWebhookRequest(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    auth: ?[]const u8,
+) ![]const u8 {
+    var req: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer req.deinit(allocator);
+    const w = req.writer(allocator);
+    try w.writeAll("POST /api/messages HTTP/1.1\r\n");
+    try w.writeAll("Content-Type: application/json\r\n");
+    if (auth) |a| try w.print("Authorization: {s}\r\n", .{a});
+    try w.print("Content-Length: {d}\r\n", .{body.len});
+    try w.writeAll("\r\n");
+    try w.writeAll(body);
+    return req.toOwnedSlice(allocator);
+}
+
+test "handleTeamsWebhookRoute rejects non-POST" {
+    if (!build_options.enable_channel_teams) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = allocator,
+        .req_allocator = allocator,
+        .raw_request = "GET /api/messages HTTP/1.1\r\n\r\n",
+        .method = "GET",
+        .target = "/api/messages",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleTeamsWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", ctx.response_status);
+}
+
+test "handleTeamsWebhookRoute rejects when teams not configured" {
+    if (!build_options.enable_channel_teams) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+    };
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+
+    const raw = try buildTeamsWebhookRequest(allocator, "{\"type\":\"message\"}", null);
+    var ctx = WebhookHandlerContext{
+        .root_allocator = allocator,
+        .req_allocator = allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/api/messages",
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleTeamsWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("403 Forbidden", ctx.response_status);
+}
+
+test "handleTeamsWebhookRoute enforces webhook_secret" {
+    if (!build_options.enable_channel_teams) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const teams_accounts = [_]config_types.TeamsConfig{
+        .{
+            .account_id = "default",
+            .client_id = "cid",
+            .client_secret = "csecret",
+            .tenant_id = "tid",
+            .webhook_secret = "shared-secret",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{ .teams = &teams_accounts },
+    };
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+
+    const body =
+        \\{"type":"message","text":"hi","from":{"id":"29:user"},"conversation":{"id":"a:conv"},"serviceUrl":"https://smba.trafficmanager.net/teams/"}
+    ;
+
+    // Missing Authorization header → 403
+    {
+        const raw = try buildTeamsWebhookRequest(allocator, body, null);
+        var ctx = WebhookHandlerContext{
+            .root_allocator = allocator,
+            .req_allocator = allocator,
+            .raw_request = raw,
+            .method = "POST",
+            .target = "/api/messages",
+            .config_opt = &cfg,
+            .state = &state,
+            .session_mgr_opt = null,
+        };
+        handleTeamsWebhookRoute(&ctx);
+        try std.testing.expectEqualStrings("403 Forbidden", ctx.response_status);
+    }
+
+    // Wrong secret → 403
+    {
+        const raw = try buildTeamsWebhookRequest(allocator, body, "Bearer wrong-secret");
+        var ctx = WebhookHandlerContext{
+            .root_allocator = allocator,
+            .req_allocator = allocator,
+            .raw_request = raw,
+            .method = "POST",
+            .target = "/api/messages",
+            .config_opt = &cfg,
+            .state = &state,
+            .session_mgr_opt = null,
+        };
+        handleTeamsWebhookRoute(&ctx);
+        try std.testing.expectEqualStrings("403 Forbidden", ctx.response_status);
+    }
+}
+
+test "handleTeamsWebhookRoute publishes inbound message to bus" {
+    if (!build_options.enable_channel_teams) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const teams_accounts = [_]config_types.TeamsConfig{
+        .{
+            .account_id = "default",
+            .client_id = "cid",
+            .client_secret = "csecret",
+            .tenant_id = "tid",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{ .teams = &teams_accounts },
+    };
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    var event_bus = bus_mod.Bus.init();
+    state.event_bus = &event_bus;
+
+    const body =
+        \\{"type":"message","text":"Hello Teams","from":{"id":"29:user-abc"},"conversation":{"id":"a:conv-xyz"},"serviceUrl":"https://smba.trafficmanager.net/teams/"}
+    ;
+    const raw = try buildTeamsWebhookRequest(allocator, body, null);
+    var ctx = WebhookHandlerContext{
+        .root_allocator = allocator,
+        .req_allocator = allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/api/messages",
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleTeamsWebhookRoute(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    try std.testing.expectEqualStrings("{\"status\":\"ok\"}", ctx.response_body);
+
+    const inbound = event_bus.consumeInbound();
+    try std.testing.expect(inbound != null);
+    const msg = inbound.?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("teams", msg.channel);
+    try std.testing.expectEqualStrings("Hello Teams", msg.content);
+    try std.testing.expectEqualStrings("29:user-abc", msg.sender_id);
+    try std.testing.expectEqualStrings("https://smba.trafficmanager.net/teams/|a:conv-xyz", msg.chat_id);
+}
+
 test "verifySlackSignature rejects stale timestamp" {
     const body = "{\"type\":\"event_callback\"}";
     const secret = "slack_signing_secret";
