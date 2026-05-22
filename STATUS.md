@@ -1,8 +1,22 @@
 # nullALIS — STATUS
 
-**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-22 — Sprint 2 shipped (Channels V1 + MCP V1, the A2A core); memory-pipeline repair + config hardening. Prior partial refresh 2026-05-21.
+**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-22 — Sprint 3 shipped (Universal API Connector); Sprint 2 (Channels V1 + MCP V1); memory-intelligence sprint in flight. Prior: memory-pipeline repair + config hardening.
 
 This is the single cold-start document. If it disagrees with `.planning/STATE.md`, `PROJECT_LEDGER.md` (archived), or anything in `docs/archive/`, **this wins**.
+
+---
+
+## 2026-05-22 — Sprint 3 shipped (Universal API Connector); memory-intelligence sprint in flight
+
+**Sprint 3 — Universal API Connector → DONE (PR #105, on `main`).** The `openapi` tool: point nullalis at any operator-registered OpenAPI 3.x spec, the agent gets `list` / `describe` / `invoke`. Lazy spec registry; env-var credential auth (api_key / http bearer / basic — zeroed-on-free, never in the model's context); SSRF-pinned `https`-only egress on both spec-fetch and invoke; per-operation approval classification; the `read_only`-mode HARD GATE that refuses writes regardless of autonomy. Two-pass reviewed (independent audit: NITS-ONLY — SSRF airtight, read-only gate unbypassable, parser hostile-spec-safe, no credential leak); 5 fix-forward findings closed before merge; merged `main` re-verified building. Deferred: **D47** — full secret-vault credential storage (V1 ships env-var auth).
+
+**Memory-intelligence sprint — IN FLIGHT** on `feat/memory-intelligence-sprint` (a parallel agent; ~910 LoC / 16 commits; not merged; behind `main` by Sprint 3). A research-grounded 5-change sprint — design at `docs/superpowers/specs/2026-05-22-memory-intelligence-sprint-design.md`:
+- **P1** — entity overlap as a 3rd RRF retrieval signal (+3–5pp; Mem0-2026-grounded).
+- **P2** — PPR-weighted graph traversal (Personalized PageRank recursive-CTE + BFS fallback) — the HippoRAG R3 lever the 2026-05-10 graph-density research called for (+20% multi-hop / Cat 2).
+- **P3** — provenance fields (`extraction_pass`, `session_boundary_id`) on `memory_edges`.
+- **P4** — tier sufficiency gate (score-threshold gate on the fallback bucket; prevents context pollution).
+- **P5** — `memory_retrieval` trace events per turn.
+All five are feature-flag-disablable. **Coordinator assessment:** high value — it executes the graph-density push the roadmap research identified; all 5 phases have feat-commits plus hardening/review-fix commits, and the branch is **canonical-CI-gate green on its base** (`REAL_EXIT=0`, verified 2026-05-22). Before merge it needs only: a rebase onto `main` (it predates Sprint 3), a re-gate after rebase, and a 2-pass review. Owned by the parallel agent — coordinator is tracking, not merging.
 
 ---
 

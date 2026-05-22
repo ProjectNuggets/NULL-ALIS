@@ -1300,6 +1300,55 @@ pub const McpServerConfig = struct {
     };
 };
 
+// ── OpenAPI connector config (Sprint 3) ────────────────────────
+
+/// One operator-registered OpenAPI 3.x spec. The agent gains structured
+/// access to the spec's operations via the `openapi` tool — it does NOT
+/// ingest arbitrary spec URLs at runtime; every spec is declared here.
+pub const ApiSpecConfig = struct {
+    /// Per-spec access posture. `read_only` is a HARD GATE above the
+    /// approval engine: a `read_only` spec refuses every write operation
+    /// (POST/PUT/PATCH/DELETE) regardless of the agent's autonomy level.
+    pub const Mode = enum {
+        read_only,
+        read_write,
+
+        pub fn fromSlice(s: []const u8) ?Mode {
+            if (std.mem.eql(u8, s, "read_only")) return .read_only;
+            if (std.mem.eql(u8, s, "read_write")) return .read_write;
+            return null;
+        }
+
+        pub fn toSlice(self: Mode) []const u8 {
+            return switch (self) {
+                .read_only => "read_only",
+                .read_write => "read_write",
+            };
+        }
+    };
+
+    /// Stable identifier the agent uses to select this spec in the
+    /// `openapi` tool (the `spec` argument).
+    id: []const u8,
+    /// HTTPS URL to fetch the spec JSON from. Mutually exclusive with
+    /// `spec_path`; exactly one must be set.
+    spec_url: []const u8 = "",
+    /// Local filesystem path to a spec JSON file. Mutually exclusive
+    /// with `spec_url`.
+    spec_path: []const u8 = "",
+    /// Optional base URL override. When empty, the spec's first
+    /// `servers[].url` is used.
+    base_url: []const u8 = "",
+    /// Secret-vault key (or env-var name) under which the static
+    /// credential for this API is stored. The credential is resolved at
+    /// the tool layer and injected into the request — it never appears
+    /// in the tool's args, output, or the model's context. Empty means
+    /// the API needs no auth.
+    auth_ref: []const u8 = "",
+    /// Per-spec access posture. Defaults to the safest value.
+    mode: Mode = .read_only,
+};
+
 // ── Model Pricing ──────────────────────────────────────────────
 
 pub const ModelPricing = struct {

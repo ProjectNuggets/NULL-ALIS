@@ -61,7 +61,7 @@ The active near-term sequence. "Sprints 0–4" was a tactical re-cut; reconciled
 | Sprint 1 | Learning-loop activation + §14.10 audit | v1.14.18-A/B (PR #87/#98) | ✅ done |
 | — | **Memory-pipeline repair + config hardening** | unplanned block (this session) | ✅ done 2026-05-22 |
 | **Sprint 2** | **Channels V1 + MCP V1** | v1.14.15 Email · .16 Teams + MCP → **v1.14.20** | **✅ done 2026-05-22** |
-| **Sprint 3** | **Universal API Connector** (OpenAPI → agent tools) | new — slots before v1.17 connectors; see block below | **🔨 IN PROGRESS 2026-05-22** |
+| **Sprint 3** | **Universal API Connector** (OpenAPI → agent tools) | new — slots before v1.17 connectors; see block below | **✅ done 2026-05-22 (PR #105)** |
 | **Sprint 4** | **UI/UX activation + feature-freeze** | overlaps v1.16 frontend wave | **P1** |
 
 After the Sprints, the version blocks below carry the road to v2.0. **Deferred follow-ups** (tracked in `docs/CONFIG_CONTROL_PLANE_AUDIT.md`, not lost): `network` config parser+wiring · `agent.extraction` parse-or-delete · sentinel-collision profile pattern · streaming-path error mapping. **LoCoMo Cat-3 lift** (the R6/R3/R4/R2 lever set — temporal/inference 56–77% → 80%+) is folded into the v1.15.0 bench-iteration block.
@@ -72,7 +72,9 @@ After the Sprints, the version blocks below carry the road to v2.0. **Deferred f
 
 ---
 
-## Sprint 3 — "Universal API Connector (OpenAPI → agent tools)" → IN PROGRESS
+## Sprint 3 — "Universal API Connector (OpenAPI → agent tools)" → DONE 2026-05-22
+
+**DELIVERED 2026-05-22 (PR #105):** the `openapi` tool ships — `list`/`describe`/`invoke` over operator-registered OpenAPI 3.x specs. Lazy spec registry, env-var credential auth (api_key / http bearer / basic — zeroed-on-free, never in the model's context), SSRF-pinned `https`-only egress on both spec-fetch and invoke, the per-operation approval classification, and the `read_only`-mode HARD GATE. Built across two prior dropped attempts (transient infra) + a finishing agent; 2-pass reviewed (NITS-ONLY), 5 fix-forward findings closed. Full secret-vault credential storage is deferred — register entry D47.
 
 **Theme:** Point nullalis at any API's OpenAPI 3.x spec → the agent gains structured, auth-handled access to that API. Zero per-API code, zero third-party platform, no MCP server required. The no-dependency long-tail companion to v1.17's hand-built OAuth connectors (deferred) and to Composio.
 
