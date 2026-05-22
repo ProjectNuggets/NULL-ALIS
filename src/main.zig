@@ -48,6 +48,7 @@ const Command = enum {
     models,
     auth,
     update,
+    mcp,
     help,
 };
 
@@ -73,6 +74,7 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "models", .models },
         .{ "auth", .auth },
         .{ "update", .update },
+        .{ "mcp", .mcp },
         .{ "help", .help },
         .{ "--help", .help },
         .{ "-h", .help },
@@ -442,6 +444,7 @@ fn runMain(allocator: std.mem.Allocator) !void {
         .models => try runModels(allocator, sub_args),
         .auth => try runAuth(allocator, sub_args),
         .update => try runUpdate(allocator, sub_args),
+        .mcp => try yc.mcp_server.runMcpCommand(allocator, sub_args),
     }
 }
 
@@ -3660,6 +3663,7 @@ fn printUsage() void {
         \\  models      Manage provider model catalogs
         \\  auth        Manage OAuth authentication (OpenAI Codex)
         \\  update      Check for and install updates
+        \\  mcp         Run nullalis as an MCP server (expose tools over JSON-RPC)
         \\  help        Show this help
         \\
         \\OPTIONS:
@@ -3682,6 +3686,7 @@ fn printUsage() void {
         \\  models refresh
         \\  auth <login|status|logout> <provider> [--import-codex]
         \\  update [--check] [--yes]
+        \\  mcp serve [--expose-all]
         \\
     ;
     // V1.8-16: route help to stdout (matches printVersion pattern at
