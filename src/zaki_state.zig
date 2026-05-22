@@ -7476,6 +7476,105 @@ const ManagerImpl = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    // ── P1: Entity Overlap ──────────────────────────────────────────────────
+
+    /// One row from `findEdgesEntityOverlap`. Caller frees via `deinit`.
+    pub const EntityOverlapRow = struct {
+        memory_key: []u8,
+        match_count: i64,
+        /// SUBSTRING(m.content, 1, 420) — non-empty; needed for bucket rendering.
+        snippet: []u8,
+
+        pub fn deinit(self: EntityOverlapRow, allocator: std.mem.Allocator) void {
+            allocator.free(self.memory_key);
+            allocator.free(self.snippet);
+        }
+    };
+
+    /// Find memories whose edges share token patterns from the query.
+    /// `token_patterns` are PG ILIKE patterns (e.g. `"%nova%"`).
+    /// Returns rows ordered by match_count DESC; caller frees with:
+    ///   for (rows) |r| r.deinit(allocator); allocator.free(rows);
+    pub fn findEdgesEntityOverlap(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        token_patterns: []const []const u8,
+        limit: usize,
+    ) ![]EntityOverlapRow {
+        if (token_patterns.len == 0) return allocator.alloc(EntityOverlapRow, 0);
+
+        // Build PG TEXT[] literal: {"pat1","pat2",...}
+        var arr_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer arr_buf.deinit(allocator);
+        try arr_buf.appendSlice(allocator, "{");
+        for (token_patterns, 0..) |pat, i| {
+            if (i > 0) try arr_buf.append(allocator, ',');
+            try arr_buf.append(allocator, '"');
+            for (pat) |ch| {
+                if (ch == '\\' or ch == '"') try arr_buf.append(allocator, '\\');
+                try arr_buf.append(allocator, ch);
+            }
+            try arr_buf.append(allocator, '"');
+        }
+        try arr_buf.appendSlice(allocator, "}");
+
+        const q = try self.buildQuery(
+            "SELECT DISTINCT m.key, COUNT(e.id)::bigint AS match_count, " ++
+                "  COALESCE(SUBSTRING(m.content, 1, 420), '') AS snippet " ++
+                "FROM {schema}.memories m " ++
+                "JOIN {schema}.memory_edges e " ++
+                "  ON e.user_id = $1 AND e.is_latest " ++
+                "  AND (e.source_key ILIKE ANY($2::text[]) OR e.target_key ILIKE ANY($2::text[])) " ++
+                "WHERE m.user_id = $1 " ++
+                "  AND m.key IN (e.source_key, e.target_key) " ++
+                "GROUP BY m.key, m.content " ++
+                "ORDER BY match_count DESC " ++
+                "LIMIT $3",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+
+        const arr_z = try allocator.dupeZ(u8, arr_buf.items);
+        defer allocator.free(arr_z);
+
+        var limit_buf: [32]u8 = undefined;
+        const limit_s = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, arr_z, limit_s.ptr };
+        const lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(arr_buf.items.len),
+            @intCast(limit_s.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const tuples = c.PQntuples(result);
+        var out: std.ArrayListUnmanaged(EntityOverlapRow) = .{};
+        errdefer {
+            for (out.items) |r| r.deinit(allocator);
+            out.deinit(allocator);
+        }
+        var i: c_int = 0;
+        while (i < tuples) : (i += 1) {
+            const key = try dupeResultValue(allocator, result, i, 0);
+            errdefer allocator.free(key);
+            const cnt_str = try dupeResultValue(allocator, result, i, 1);
+            defer allocator.free(cnt_str);
+            const snippet = try dupeResultValue(allocator, result, i, 2);
+            errdefer allocator.free(snippet);
+            try out.append(allocator, .{
+                .memory_key  = key,
+                .match_count = try std.fmt.parseInt(i64, cnt_str, 10),
+                .snippet     = snippet,
+            });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
     /// V1.14.12 (Memory audit Finding 2 fix, 2026-05-19) — batch entity
     /// lookup by id, used by /brain/graph to render entity-side endpoints
     /// of typed edges. Pre-fix, edges from a visible memory row to an
