@@ -189,11 +189,21 @@ fn shouldValidateDockerWorkspacePath(backend: config_types.SandboxBackend) bool 
     };
 }
 
+/// Resolve the sandboxed argv. The caller MUST own `sandbox_storage` for the
+/// lifetime of the returned slice — `wrapCommand` for backends like docker
+/// returns a slice that points into `sandbox_storage.<backend>.mount_arg_buf`
+/// (e.g. the docker `-v WORKSPACE:WORKSPACE` mount argument lives inside the
+/// DockerSandbox struct, NOT in `wrapped_buf`). Returning the slice past a
+/// stack-frame that owned the storage produces undefined bytes —
+/// historically docker stderr'd `invalid empty volume spec` because the
+/// dangling buf was zeroed by the next frame's stack use. See
+/// `run_with_optional_sandbox` for the canonical lifetime pattern.
 pub fn resolve_sandboxed_argv(
     allocator: std.mem.Allocator,
     exec_cfg: SandboxExecConfig,
     argv: []const []const u8,
     wrapped_buf: *[MAX_WRAPPED_ARGV][]const u8,
+    sandbox_storage: *security.SandboxStorage,
 ) ![]const []const u8 {
     if (!exec_cfg.enabled) return argv;
 
@@ -211,12 +221,11 @@ pub fn resolve_sandboxed_argv(
         }
     }
 
-    var sandbox_storage: security.SandboxStorage = .{};
     const sandbox = security.createSandbox(
         allocator,
         to_detect_backend(exec_cfg.backend),
         exec_cfg.workspace_dir,
-        &sandbox_storage,
+        sandbox_storage,
     );
     if (std.mem.eql(u8, sandbox.name(), "none")) {
         // V8 (v1.14.13 Step 0): double-gate the dev-bypass. Both
@@ -266,18 +275,27 @@ pub fn run_with_optional_sandbox(
     opts: process_util.RunOptions,
 ) !process_util.RunResult {
     var wrapped_buf: [MAX_WRAPPED_ARGV][]const u8 = undefined;
-    const effective_argv = try resolve_sandboxed_argv(allocator, exec_cfg, argv, &wrapped_buf);
+    // sandbox_storage MUST live until process_util.run finishes — the
+    // wrapped argv slice (e.g. docker's `-v WORKSPACE:WORKSPACE` mount
+    // argument) points into this struct's per-backend buffers. Previously
+    // declared inside resolve_sandboxed_argv, which destroyed it on return
+    // and let docker read garbage bytes for the mount spec → recurring
+    // `docker: invalid empty volume spec` errors on every shell call.
+    var sandbox_storage: security.SandboxStorage = .{};
+    const effective_argv = try resolve_sandboxed_argv(allocator, exec_cfg, argv, &wrapped_buf, &sandbox_storage);
     return process_util.run(allocator, effective_argv, opts);
 }
 
 test "resolve_sandboxed_argv disabled passthrough" {
     var buf: [MAX_WRAPPED_ARGV][]const u8 = undefined;
+    var storage: security.SandboxStorage = .{};
     const argv = &[_][]const u8{ "echo", "hello" };
     const resolved = try resolve_sandboxed_argv(
         std.testing.allocator,
         .{ .enabled = false, .workspace_dir = "/tmp" },
         argv,
         &buf,
+        &storage,
     );
     try std.testing.expectEqual(@as(usize, argv.len), resolved.len);
     try std.testing.expectEqualStrings("echo", resolved[0]);
@@ -286,6 +304,7 @@ test "resolve_sandboxed_argv disabled passthrough" {
 
 test "resolve_sandboxed_argv enabled none backend fails closed" {
     var buf: [MAX_WRAPPED_ARGV][]const u8 = undefined;
+    var storage: security.SandboxStorage = .{};
     const argv = &[_][]const u8{ "echo", "hello" };
     const result = resolve_sandboxed_argv(
         std.testing.allocator,
@@ -296,12 +315,14 @@ test "resolve_sandboxed_argv enabled none backend fails closed" {
         },
         argv,
         &buf,
+        &storage,
     );
     try std.testing.expectError(error.SandboxUnavailable, result);
 }
 
 test "resolve_sandboxed_argv invalid docker workspace fails closed and records diagnostics" {
     var buf: [MAX_WRAPPED_ARGV][]const u8 = undefined;
+    var storage: security.SandboxStorage = .{};
     const argv = &[_][]const u8{ "echo", "hello" };
     const before = diagnosticsSnapshot();
     const result = resolve_sandboxed_argv(
@@ -313,6 +334,7 @@ test "resolve_sandboxed_argv invalid docker workspace fails closed and records d
         },
         argv,
         &buf,
+        &storage,
     );
     const after = diagnosticsSnapshot();
     try std.testing.expectError(error.SandboxUnavailable, result);
@@ -323,6 +345,7 @@ test "resolve_sandboxed_argv invalid docker workspace fails closed and records d
 
 test "resolve_sandboxed_argv docker wrapper composition" {
     var buf: [MAX_WRAPPED_ARGV][]const u8 = undefined;
+    var storage: security.SandboxStorage = .{};
     const argv = &[_][]const u8{ "echo", "hello" };
     const resolved = try resolve_sandboxed_argv(
         std.testing.allocator,
@@ -333,6 +356,7 @@ test "resolve_sandboxed_argv docker wrapper composition" {
         },
         argv,
         &buf,
+        &storage,
     );
     try std.testing.expectEqualStrings("docker", resolved[0]);
     try std.testing.expectEqualStrings("run", resolved[1]);

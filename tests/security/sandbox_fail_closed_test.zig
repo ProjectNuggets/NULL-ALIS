@@ -20,6 +20,7 @@
 const std = @import("std");
 const nullalis = @import("nullalis");
 const tool_sandbox = nullalis.tools.tool_sandbox_v1;
+const SandboxStorage = nullalis.security.SandboxStorage;
 
 const MAX_WRAPPED_ARGV = tool_sandbox.MAX_WRAPPED_ARGV;
 
@@ -30,6 +31,7 @@ test "V8 fail-closed: none backend + fail_open_on_dev=true + env UNSET → Sandb
     defer tool_sandbox.unsandboxed_dev_env_test_override = null;
 
     var buf: [MAX_WRAPPED_ARGV][]const u8 = undefined;
+    var storage: SandboxStorage = .{};
     const argv = &[_][]const u8{ "echo", "hello" };
     const result = tool_sandbox.resolve_sandboxed_argv(
         std.testing.allocator,
@@ -41,6 +43,7 @@ test "V8 fail-closed: none backend + fail_open_on_dev=true + env UNSET → Sandb
         },
         argv,
         &buf,
+        &storage,
     );
     try std.testing.expectError(error.SandboxUnavailable, result);
 }
@@ -50,6 +53,7 @@ test "V8 fail-open path: none backend + fail_open_on_dev=true + env SET → retu
     defer tool_sandbox.unsandboxed_dev_env_test_override = null;
 
     var buf: [MAX_WRAPPED_ARGV][]const u8 = undefined;
+    var storage: SandboxStorage = .{};
     const argv = &[_][]const u8{ "echo", "hello" };
     const resolved = try tool_sandbox.resolve_sandboxed_argv(
         std.testing.allocator,
@@ -61,6 +65,7 @@ test "V8 fail-open path: none backend + fail_open_on_dev=true + env SET → retu
         },
         argv,
         &buf,
+        &storage,
     );
     // This is the only authorized unsandboxed path. log.err fires
     // alongside (see runtime), making it auditable.
@@ -75,6 +80,7 @@ test "V8 fail-closed: none backend + fail_open_on_dev=FALSE + env SET → Sandbo
     defer tool_sandbox.unsandboxed_dev_env_test_override = null;
 
     var buf: [MAX_WRAPPED_ARGV][]const u8 = undefined;
+    var storage: SandboxStorage = .{};
     const argv = &[_][]const u8{ "echo", "hello" };
     const result = tool_sandbox.resolve_sandboxed_argv(
         std.testing.allocator,
@@ -86,6 +92,7 @@ test "V8 fail-closed: none backend + fail_open_on_dev=FALSE + env SET → Sandbo
         },
         argv,
         &buf,
+        &storage,
     );
     try std.testing.expectError(error.SandboxUnavailable, result);
 }
@@ -99,6 +106,7 @@ test "V8 real backend: docker resolves to wrapped argv regardless of env var" {
         defer tool_sandbox.unsandboxed_dev_env_test_override = null;
 
         var buf: [MAX_WRAPPED_ARGV][]const u8 = undefined;
+        var storage: SandboxStorage = .{};
         const argv = &[_][]const u8{ "echo", "hello" };
         const resolved = try tool_sandbox.resolve_sandboxed_argv(
             std.testing.allocator,
@@ -109,6 +117,7 @@ test "V8 real backend: docker resolves to wrapped argv regardless of env var" {
             },
             argv,
             &buf,
+            &storage,
         );
         // First arg of the wrapped argv must be the real backend's
         // command, not the original "echo". Wrapping happened.
