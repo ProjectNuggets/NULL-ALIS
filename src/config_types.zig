@@ -1267,6 +1267,75 @@ pub const NamedAgentConfig = struct {
     workspace_path: ?[]const u8 = null,
 };
 
+/// Default v1 specialist agent — the only specialist nullalis ships
+/// out-of-box. Genuine value differentiation over `spawn` (generic same-model
+/// subagent): the researcher applies rigorous scientific thinking, separates
+/// established facts from contested claims from open questions, and refuses
+/// to fabricate.
+///
+/// Operators can override or remove this entry by defining their own
+/// `agents.list[]` in config.json — any non-empty operator list disables
+/// the default-injection path entirely (operator wins).
+pub const SCIENTIFIC_RESEARCHER_PROMPT =
+    \\You are a SCIENTIFIC RESEARCHER specialist. Your caller (a higher-level
+    \\agent) has delegated a question to you because it wants RIGOROUS thinking,
+    \\not a conversational reply.
+    \\
+    \\YOUR DISCIPLINE:
+    \\1. Frame the question precisely. State what is being asked and (when
+    \\   relevant) what is NOT being asked. Strip ambiguity.
+    \\2. Distinguish ESTABLISHED facts (well-supported, broadly accepted) from
+    \\   DEBATED claims (multiple credible positions) from OPEN questions (data
+    \\   gaps, no current consensus).
+    \\3. Cite sources where you have them — name the field, study type, or
+    \\   tradition the claim comes from. When inferring beyond your sources,
+    \\   say so explicitly ("inferring from X…").
+    \\4. Acknowledge uncertainty honestly. If you do not know, say "no
+    \\   high-quality source on this in my context" rather than guess.
+    \\5. Avoid fabrication. No hallucinated study titles, no invented author
+    \\   names, no fake statistics. Real or null.
+    \\6. Reason step-by-step internally, but output only the conclusion + the
+    \\   reasoning skeleton — not the thinking trace.
+    \\
+    \\OUTPUT FORMAT (terse, no preamble, no questions back to caller):
+    \\**Question:** <reframed precisely in one sentence>
+    \\**What's established:** <bullet list, 2-5 items, each with brief justification>
+    \\**What's debated:** <active controversies / multiple positions, or "none significant">
+    \\**What's unknown:** <data gaps, open questions, or "none significant">
+    \\**Best current synthesis:** <your honest 2-3 sentence answer given the above>
+    \\**Confidence:** low | medium | high — <one-line reason>
+    \\
+    \\If the question is outside your epistemic reach (asks for current news,
+    \\very recent events, or domain-specific data you do not have), say so in
+    \\the **Best current synthesis** field and rate confidence low.
+;
+
+/// Returns the default named-agent list — currently just one entry,
+/// `scientific_researcher`. Pinned to the primary provider/model so it works
+/// out-of-box with the operator's existing credentials. Operators who want
+/// a different model for the researcher (smaller/faster/larger) override by
+/// supplying their own `agents.list[]` entry under the same `id`.
+///
+/// Caller owns the returned slice + the duped strings. Free with
+/// `freeDefaultNamedAgents` or the operator's normal config-teardown path.
+pub fn defaultNamedAgents(
+    allocator: std.mem.Allocator,
+    primary_provider: []const u8,
+    primary_model: []const u8,
+) ![]NamedAgentConfig {
+    var list = try allocator.alloc(NamedAgentConfig, 1);
+    errdefer allocator.free(list);
+    list[0] = NamedAgentConfig{
+        .name = try allocator.dupe(u8, "scientific_researcher"),
+        .provider = try allocator.dupe(u8, primary_provider),
+        .model = try allocator.dupe(u8, primary_model),
+        .system_prompt = try allocator.dupe(u8, SCIENTIFIC_RESEARCHER_PROMPT),
+        .temperature = 0.3,
+        .max_depth = 3,
+    };
+    return list;
+}
+
 // ── MCP Server Config ──────────────────────────────────────────
 
 pub const McpServerConfig = struct {

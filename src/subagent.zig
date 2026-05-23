@@ -61,7 +61,18 @@ pub const SubagentConfig = struct {
     /// genuine room to complete hard work; the parent's adaptive-exit
     /// detectors still catch pathological loops.
     max_iterations: u32 = 50,
-    max_concurrent: u32 = 4,
+    /// Maximum concurrent subagents per SubagentManager.
+    ///
+    /// 2026-05-23 raised 4 → 8 for the v1 commercial baseline. Spawn is the
+    /// agent's parallelism primitive — real research workflows fan out into
+    /// 5-8 parallel branches comfortably, and a cap of 4 was firing in
+    /// power-user scenarios. 8 gives genuine parallelism without inviting
+    /// host-OOM (each subagent ≈ 50-100 MB resident; 8 × ≈ 400-800 MB worst
+    /// case, manageable on any modern host) or saturating provider rate
+    /// limits (most providers handle 5-10 concurrent calls per key fine).
+    /// Operators on fatter hosts can raise the cap via SubagentConfig
+    /// override at SubagentManager construction.
+    max_concurrent: u32 = 8,
 };
 
 // ── ThreadContext — passed to each spawned thread ────────────────
@@ -1230,9 +1241,11 @@ test "SubagentConfig defaults" {
     // V1.11 (2026-05-07): max_iterations raised 15 → 50 to give delegated
     // subagent tasks (research, multi-step analysis, document synthesis)
     // genuine room to complete instead of cutting off mid-thought.
+    // 2026-05-23: max_concurrent raised 4 → 8 for the v1 commercial
+    // baseline — see the SubagentConfig field doc for full rationale.
     const sc = SubagentConfig{};
     try std.testing.expectEqual(@as(u32, 50), sc.max_iterations);
-    try std.testing.expectEqual(@as(u32, 4), sc.max_concurrent);
+    try std.testing.expectEqual(@as(u32, 8), sc.max_concurrent);
 }
 
 test "TaskStatus enum values" {
@@ -1847,9 +1860,12 @@ test "baseline: SubagentConfig defaults max_iterations to 50 (V1.11 raised from 
     try std.testing.expectEqual(@as(u32, 50), cfg.max_iterations);
 }
 
-test "baseline: SubagentConfig defaults max_concurrent to 4" {
+test "baseline: SubagentConfig defaults max_concurrent to 8 (v1 raised 4→8)" {
+    // 2026-05-23: raised 4 → 8 for the v1 commercial baseline. Spawn is the
+    // agent's parallelism primitive — 4 was firing in power-user research
+    // workflows that fan out to 5-8 parallel branches.
     const cfg = SubagentConfig{};
-    try std.testing.expectEqual(@as(u32, 4), cfg.max_concurrent);
+    try std.testing.expectEqual(@as(u32, 8), cfg.max_concurrent);
 }
 
 test "baseline: TaskStatus has exactly 5 states" {

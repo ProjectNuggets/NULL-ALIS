@@ -2101,5 +2101,32 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         self.http_request.enabled = true;
     }
 
+    // Default named agent: inject `scientific_researcher` when the operator
+    // hasn't defined any agents.list[] entries AND a primary model is set.
+    // Operator-defined list wins entirely (no merging) — set agents.list = []
+    // to opt out, or supply your own entries to override.
+    //
+    // Gated on `self.arena != null` so the duped name/system_prompt strings
+    // get cleaned up by the arena teardown in production. Tests using
+    // `std.testing.allocator` (no arena) skip the injection — they're
+    // exercising parser behaviour, not the production-default contract.
+    // Production paths always wire an arena (see `Config.parseFromContent`
+    // call sites in main.zig / gateway.zig), so this gate doesn't gate out
+    // any real operator path.
+    if (self.agents.len == 0 and self.arena != null) {
+        if (self.default_model) |primary_model| {
+            if (self.default_provider.len > 0) {
+                self.agents = types.defaultNamedAgents(
+                    self.allocator,
+                    self.default_provider,
+                    primary_model,
+                ) catch |err| blk: {
+                    std.log.warn("named-agent default injection skipped: {s}", .{@errorName(err)});
+                    break :blk self.agents;
+                };
+            }
+        }
+    }
+
     try self.applyProfileDefaults();
 }
