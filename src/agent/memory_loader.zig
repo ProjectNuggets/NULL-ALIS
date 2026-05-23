@@ -829,7 +829,16 @@ fn loadContextWithRuntimeDetailed(
             // path.  They CAN resurface through the global_entries path (containsString on
             // seen_keys), which is correct: the gate suppresses a candidate from the premium
             // RRF fallback slot but does not permanently exclude it from the turn.
-            if (tier_gate_min_score > 0.0 and cand.final_score < tier_gate_min_score) {
+            // Only gate candidates that were actually scored by a ranker
+            // (final_score > 0). `final_score == 0` means "no ranking was
+            // applied" (keyword-only path, no RRF, no llm_reranker) — those
+            // candidates are NOT low-confidence RRF hits and gating them
+            // would be a category error. The gate's purpose is to suppress
+            // low-confidence RRF hits, not to suppress unranked candidates.
+            // This also lets `readTierGateMinScore`'s code default be a
+            // production-safe positive value (0.005) without breaking the
+            // keyword-only test paths that never set final_score.
+            if (tier_gate_min_score > 0.0 and cand.final_score > 0.0 and cand.final_score < tier_gate_min_score) {
                 stats.tier_gated_count += 1;
                 continue;
             }
@@ -1396,8 +1405,13 @@ fn readGraphRecallMaxHops() u8 {
 
 // ── P4: Tier Gate ───────────────────────────────────────────────────────────
 
-/// Minimum RRF final_score for fallback-bucket candidates.
-/// 0.0 disables the gate entirely; any positive value enables it.
+/// Minimum RRF final_score for fallback-bucket candidates that were ranked.
+/// Set explicitly to `0` to disable the gate entirely.
+///
+/// **Default: 0.005** — the calibrated production value for the zaki_bot
+/// profile (temporal_decay ON, half_life_days=30). At this threshold a
+/// single-source rank-1 fact is blocked only after ~72 days of decay;
+/// multi-source / recent facts always pass.
 ///
 /// Score ranges at default rrf_k=60, top_k=25 (raw RRF, before temporal decay):
 ///   single-source  rank  1 → 1/61  ≈ 0.01639
@@ -1410,20 +1424,26 @@ fn readGraphRecallMaxHops() u8 {
 ///   threshold 0.005 → single-source rank-1 blocked after ~72 days
 ///   threshold 0.013 → single-source rank-1 blocked after ~11 days (too aggressive)
 ///
-/// Recommended default: 0.005 when temporal decay is ON (zaki_bot profile).
-///                       0.013 when temporal decay is OFF.
+/// When temporal decay is OFF, 0.013 is a safer threshold (tighter on rank-17+).
 /// Only applies to the runtime (hybrid/shadow_hybrid) path candidates.
 /// Semantic-bucket entries (isSemanticContinuityKey path) are never gated.
-/// Values above 1.0 are rejected (returns 0.0) to prevent silent blanket-blocking.
+/// The gate further requires `final_score > 0` (a ranker actually ran) —
+/// unranked candidates bypass it (see comment at the application site).
+/// Values out of [0,1] fall back to the production default rather than
+/// silently disabling or blanket-blocking.
 ///
 /// Note: when llm_reranker is enabled the pipeline overwrites final_score with
 /// 1/(rank+1) — minimum score with top_k=25 is 1/25=0.04, so 0.005 has no
 /// effect in that configuration (gate becomes a no-op, which is correct).
+const DEFAULT_TIER_GATE_MIN_SCORE: f64 = 0.005;
 fn readTierGateMinScore() f64 {
-    const val = std.posix.getenv("NULLALIS_TIER_GATE_MIN_SCORE") orelse return 0.0;
-    const parsed = std.fmt.parseFloat(f64, val) catch return 0.0;
-    // Reject out-of-range values rather than silently blocking everything.
-    return if (parsed >= 0.0 and parsed <= 1.0) parsed else 0.0;
+    const val = std.posix.getenv("NULLALIS_TIER_GATE_MIN_SCORE") orelse return DEFAULT_TIER_GATE_MIN_SCORE;
+    const parsed = std.fmt.parseFloat(f64, val) catch return DEFAULT_TIER_GATE_MIN_SCORE;
+    // Out-of-range values fall back to the calibrated default rather than
+    // silently disabling the gate or (worse) blanket-blocking. An operator
+    // who wants the gate off must set `NULLALIS_TIER_GATE_MIN_SCORE=0`
+    // explicitly — that is a legal value in the [0, 1] range.
+    return if (parsed >= 0.0 and parsed <= 1.0) parsed else DEFAULT_TIER_GATE_MIN_SCORE;
 }
 
 // ── P1: Entity Overlap Callback ────────────────────────────────────────────
@@ -2570,11 +2590,13 @@ test "loadContextWithRuntime caps fallback bucket and preserves semantic budget"
     try std.testing.expect(std.mem.indexOf(u8, result.context, "durable_fact/project_owner") != null);
 }
 
-test "tier gate: readTierGateMinScore returns 0.0 when env var absent" {
+test "tier gate: readTierGateMinScore returns the calibrated default when env var absent" {
     // NULLALIS_TIER_GATE_MIN_SCORE must not be set in the test environment.
-    // Gate is OFF (0.0) by default — zero behaviour change unless opt-in.
+    // Gate ships ON at the calibrated default (DEFAULT_TIER_GATE_MIN_SCORE,
+    // 0.005 for the zaki_bot temporal-decay profile). Operators wanting it
+    // off must set the env to "0" explicitly.
     const score = readTierGateMinScore();
-    try std.testing.expectEqual(@as(f64, 0.0), score);
+    try std.testing.expectEqual(DEFAULT_TIER_GATE_MIN_SCORE, score);
 }
 
 test "tier gate: SelectionStats.tier_gated_count initialises to zero" {
