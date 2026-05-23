@@ -1586,16 +1586,33 @@ pub const Agent = struct {
         return std.mem.startsWith(u8, trimmed, "<tool_call>");
     }
 
-    /// True when the streaming buffer's first line is `<tool_call>` markup —
-    /// either the complete `<tool_call>` opener or a partial prefix of it
-    /// ("<", "<t", "<tool_c"…). The streaming callback uses this to switch to
-    /// `hold_for_validation` so tool-call markup never leaks into the
-    /// user-facing reply stream as `final_reply` tokens. The held text is
-    /// parsed for tool calls post-completion (markup stripped from display via
-    /// `startsWithToolCallMarkup`). Mirrors the `looksLikeStreamingStatusPrefix`
-    /// hold path. `line` is expected pre-trimmed (from `firstNonEmptyLine`).
+    /// True when the streaming buffer's first line looks like tool-call
+    /// markup we want to hold off the user-visible stream. Matches:
+    ///
+    ///   * `<tool_call>` and any partial prefix of it (`<`, `<t`, `<tool_c`…) —
+    ///     the canonical opener; the streaming callback may see only the first
+    ///     few bytes in chunk 1 and the rest in chunk 2.
+    ///   * `tool_call>` — the residue we see when an upstream stage (provider
+    ///     normaliser, codex tool-payload pass) ate the leading `<` while
+    ///     trying to recognise the opener.
+    ///   * `ool_call>` — the residue when the leading `<t` was eaten (the
+    ///     exact QA T4a / T6 leak shape).
+    ///
+    /// The streaming callback uses this to switch to `hold_for_validation` so
+    /// none of these shapes flow to `final_reply` tokens. The held text is
+    /// parsed/stripped post-completion (see `startsWithToolCallMarkup` for
+    /// malformed-startup handling and `stripToolCallMarkup` for the final-text
+    /// belt-and-suspenders).
+    ///
+    /// `line` is expected pre-trimmed (from `firstNonEmptyLine`).
     fn looksLikeToolCallMarkupPrefix(line: []const u8) bool {
-        return matchesAsciiPrefixPartially(line, "<tool_call>");
+        // Canonical opener — full or partial prefix.
+        if (matchesAsciiPrefixPartially(line, "<tool_call>")) return true;
+        // Residue shapes — must be exact-prefix matches so a stray substring
+        // mid-sentence doesn't hold a legitimate reply.
+        if (std.mem.startsWith(u8, line, "tool_call>")) return true;
+        if (std.mem.startsWith(u8, line, "ool_call>")) return true;
+        return false;
     }
 
     /// Defensive scrub of tool-call markup from text that's about to be emitted
@@ -10841,6 +10858,13 @@ test "Agent looksLikeToolCallMarkupPrefix holds streaming tool-call markup" {
     try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("<"));
     try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("<t"));
     try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("<tool_c"));
+
+    // Residue shapes from upstream normalisers eating the leading bytes —
+    // QA 2026-05-23 T4a/T6 leak. Each must hold so the user never sees them.
+    try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("tool_call>"));
+    try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("tool_call>\n{\"name\":\"spawn\"}"));
+    try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("ool_call>"));
+    try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("ool_call>\nGot it..."));
 }
 
 test "Agent looksLikeToolCallMarkupPrefix lets normal replies stream" {
@@ -10848,6 +10872,9 @@ test "Agent looksLikeToolCallMarkupPrefix lets normal replies stream" {
     try std.testing.expect(!Agent.looksLikeToolCallMarkupPrefix("<3 a heart, not a tool"));
     try std.testing.expect(!Agent.looksLikeToolCallMarkupPrefix("Here is the answer."));
     try std.testing.expect(!Agent.looksLikeToolCallMarkupPrefix(""));
+    // Residue substrings mid-line must NOT hold — only exact-prefix matches.
+    try std.testing.expect(!Agent.looksLikeToolCallMarkupPrefix("Use tool_call> markup like this in docs."));
+    try std.testing.expect(!Agent.looksLikeToolCallMarkupPrefix("see ool_call> appendix"));
 }
 
 test "Agent stripToolCallMarkup removes complete blocks" {
