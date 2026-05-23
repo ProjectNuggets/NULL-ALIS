@@ -85,6 +85,41 @@ const EXTRACTION_SYSTEM_PROMPT =
     \\9. Extract from EVERY turn in the window — not just the most recent.
     \\10. Skip content-free utterances ("Hi!", "Bye!", "Thanks!"). Don't extract them.
     \\
+    \\EXAMPLE — shows valid_at populated for an explicit date AND null for
+    \\an undated preference (rule 8). Match this shape exactly:
+    \\
+    \\INPUT:
+    \\# Session 1 — 2026-05-05
+    \\Caroline: I started the Phoenix project today.
+    \\Caroline: It's a memory engine. I prefer Zig for it.
+    \\
+    \\OUTPUT:
+    \\{
+    \\  "entities": [
+    \\    {"name": "Caroline", "type": "person"},
+    \\    {"name": "Phoenix project", "type": "project"},
+    \\    {"name": "memory engine", "type": "concept"},
+    \\    {"name": "Zig", "type": "concept"}
+    \\  ],
+    \\  "edges": [
+    \\    {"source": "Caroline", "target": "Phoenix project",
+    \\     "predicate": "STARTED_PROJECT",
+    \\     "fact": "Caroline started the Phoenix project on 2026-05-05.",
+    \\     "slot_intent": "active_goal",
+    \\     "valid_at": "2026-05-05", "confidence": 0.95},
+    \\    {"source": "Phoenix project", "target": "memory engine",
+    \\     "predicate": "IS_A",
+    \\     "fact": "The Phoenix project is a memory engine.",
+    \\     "slot_intent": null,
+    \\     "valid_at": "2026-05-05", "confidence": 0.9},
+    \\    {"source": "Caroline", "target": "Zig",
+    \\     "predicate": "PREFERS",
+    \\     "fact": "Caroline prefers Zig for the Phoenix project.",
+    \\     "slot_intent": "preference",
+    \\     "valid_at": null, "confidence": 0.85}
+    \\  ]
+    \\}
+    \\
     \\Output STRICT JSON ONLY. Anything else will be discarded.
 ;
 
@@ -148,6 +183,19 @@ test "extraction prompt instructs the model to capture dates" {
     try std.testing.expect(std.mem.indexOf(u8, p, "valid_at") != null);
     try std.testing.expect(std.mem.indexOf(u8, p, "ISO-8601") != null);
     try std.testing.expect(std.mem.indexOf(u8, p, "DATES") != null);
+}
+
+test "extraction prompt includes a one-shot example with valid_at populated" {
+    // P2 fix — without an example the model reliably emitted edges WITHOUT
+    // the new optional valid_at field, leaving memory_edges.temporal_anchor_unix
+    // NULL even on conversations with explicit dates. One shot showing both
+    // a populated and a null valid_at teaches the shape.
+    const p = extractionSystemPrompt();
+    try std.testing.expect(std.mem.indexOf(u8, p, "EXAMPLE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "INPUT:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "OUTPUT:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "\"valid_at\": \"2026-05-05\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "\"valid_at\": null") != null);
 }
 
 test "hydration system prompt contains all five XML tags" {
