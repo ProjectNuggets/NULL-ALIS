@@ -1,8 +1,43 @@
 # nullALIS — STATUS
 
-**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-22 — Sprint 3 (Universal API Connector) + memory-intelligence sprint (P1–P5) both shipped; Sprint 2 (Channels V1 + MCP V1). Prior: memory-pipeline repair + config hardening.
+**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-23 — v1.14.18 audit MED-tier sweep merged (PR #106, closes 9 ledger rows); P4 tier gate default flipped to 0.005 (`55726e3a`); LoCoMo D44 bench findings #1 (temporal extraction) + #4 (tool_call XML leak) fixed. Prior: Sprint 3 (Universal API Connector) + memory-intelligence sprint (P1–P5); Sprint 2 (Channels V1 + MCP V1); memory-pipeline repair + config hardening.
 
 This is the single cold-start document. If it disagrees with `.planning/STATE.md`, `PROJECT_LEDGER.md` (archived), or anything in `docs/archive/`, **this wins**.
+
+---
+
+## 2026-05-23 — v1.14.18 audit MED-tier sweep merged + P4 live + bench fixes
+
+**v1.14.18 — Audit MED-tier sweep → DONE (PR #106, on `main` @ `91b2d298`).** The "Audit MED-tier sweep + state/memory polish" block on the ROADMAP — `PLANNED` since 2026-05-19, never executed — landed in one dispatched sprint. **All 10 steps closed**, 9 audit-ledger rows now CLOSED with commit refs:
+
+- **QMD-WIRE** (`exportSessionToQmd` wired into session-end checkpoint, honors `memory.qmd.sessions.enabled`)
+- **COMPOSIO-SANITIZER** (closes the `x-api-key` leak path on curl process-failure + HTTP-error JSON; also fixes a latent `.object` panic on non-object JSON root)
+- **CLI-HONESTY** (false-confidence `channel add/remove` + `models benchmark` stub registrations removed; `gateway --role broker/user_cell` + onboard wizard channel branch confirmed real)
+- **Stale-comment + dead-branch sweep** (4 verified clean, 1 corrected + D49 deferral)
+- **CHUNKER-DECISION + HYBRID-MERGE-DECISION** — DELETE (both orphaned; zero callers verified; superseded by `agent/extraction/chunker.zig::chunkIntoEpisodes` and `retrieval/rrf.zig::rrfMerge`)
+- **V4** — subagent ledger bridge default-on (`SubagentManager.init` seeds an in-memory `TaskLedger` + delivery; gateway override still wins; new `tests/runtime/task_lifecycle_test.zig`)
+- **V6** — DELETE (`state.zig` audit found zero production callers; §14.6 delete-not-deprecate)
+- **V7** — markdown mirror is opt-in (default-off `memory.enable_markdown_mirror`; the `ZakiDualMemory` mirror gated on it; rename / health metric / CLI alias deferred D50)
+- **B8** — static-analysis test-reference baseline (`.spike/coverage/run.sh`; 2633 pub fns, 52.3% tested-by-name, 795 untested with `zaki_state.zig` top concentration at 193; LLVM line-coverage deferred D51)
+
+Coordinator 2-pass review: rebased onto current main; 3 deferred-register conflicts resolved by renumbering (sprint's D48/D49/D50 → D49/D50/D51 since main's `c8721c5e` had taken D48 for P4 bench-gate). One non-blocker flagged: commit `f31b2a6b` is bisect-unfriendly in isolation (accidentally drops `chunker.zig` while re-exports linger until the next commit); fix-forward verified at `47ea82cd`; tip green. Rebase-merged.
+
+**P4 tier gate — default flipped ON (`55726e3a`).** Two-layer fix that lets the calibrated `0.005` ship as the code default:
+1. Gate now requires `cand.final_score > 0.0` to apply — unranked candidates (keyword-only path, no RRF, no `llm_reranker`) bypass it. Gating them was a category error: the gate's job is suppressing low-confidence *RRF* hits, not unranked candidates. Real RRF / `llm_reranker` scores are strictly positive at default config, so production behaviour is unchanged.
+2. `readTierGateMinScore()` default flipped to `DEFAULT_TIER_GATE_MIN_SCORE = 0.005`. Operator opt-out is explicit `NULLALIS_TIER_GATE_MIN_SCORE=0` (still legal in [0,1]). The `.env` entry is now redundant — kept for explicit-over-implicit. D48 closed.
+
+Net: **5 of 5 memory-intelligence features (P1–P5) ON by default** at the code level — no env hookup required, no `.env` dependency.
+
+**LoCoMo D44 bench findings — fixed.** Two of the three findings the (cancelled) capped-window bench surfaced are now closed:
+- **#1 temporal-extraction gap** (`8f7fe032`) — the extraction edge JSON schema (`prompts.zig`) gained a `valid_at` field + a rule to capture dates from the conversation. The full plumbing — `Edge.valid_at`, parser `parseIsoToUnix`, persist `temporal_anchor_unix` — already existed; only the prompt was missing the ask. The `fact` rule was also amended to require dates in the fact text (recall surfaces fact prose to the agent; that's what lets it answer "when").
+- **#4 `<tool_call>` XML leak** (`c6d9b8ea`) — the streaming callback now holds emission via the existing `hold_for_validation` path when the buffered first line matches `<tool_call>` markup (full or partial prefix). Tool-call markup can no longer reach the user-facing reply stream as `final_reply` tokens. New helper + 4 tests.
+- **#2 cold-QA over-recall loop** — investigated, root cause documented: largely downstream of #1 (date question → recall returns dateless fact → agent re-queries with reworded queries; the loop detector at `root.zig:2912` catches byte-identical repeats but not semantically-equivalent reworded queries). Fixing #1 reduces the trigger. The narrow loop-detector behaviour is a secondary hardening item, not closed yet.
+
+**Repo cleanup.** 89 stale local branches deleted (87 ancestry-merged + 2 squash-merged-confirmed-shipped); /tmp bench scratch cleared; PR #90's 14 audit/security fixes verified all-on-main via `git range-diff` (PR currently redundant; awaiting Nova's "rebase" directive to codex). 14 local branches remain — `main`, `codex/full-audit-fixes` (kept per Nova), `bench/locomo-d44-scaffolding` (Nova-aware safety), 2 Claude worktree branches, 9 unmerged old branches left for Nova to triage.
+
+**Deferred-register state:** highest row is now **D51** (B8 LLVM line-coverage tail). The new v1.14.18 section adds D49 (snapshot valid_to V1.6 dependency), D50 (V7 rename + metric + CLI alias polish), D51 (B8 LLVM line-coverage). D48 (P4) promoted to `shipped at 55726e3a`.
+
+**Audit ledger state:** 47 verified rows — **32 CLOSED**, 1 DEFERRED, 14 OPEN (all 14 are future-block rows targeting v1.17.5 → V-infinity; each gated on an unbuilt block — correctly open, not closeable now). The v1.14.18 audit-sweep block is fully CLOSED. The 9 near-term rows that were the "real remaining ledger debt below v1.17.5" are all closed.
 
 ---
 
