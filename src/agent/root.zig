@@ -1598,6 +1598,123 @@ pub const Agent = struct {
         return matchesAsciiPrefixPartially(line, "<tool_call>");
     }
 
+    /// Defensive scrub of tool-call markup from text that's about to be emitted
+    /// as a user-facing reply. Handles three cases the streaming hold-path
+    /// can't catch on its own:
+    ///
+    ///   1. **Complete blocks** — `<tool_call>{…}</tool_call>` embedded
+    ///      mid-text (model emitted text → markup → text in the SAME
+    ///      response chunk, so the streamer was already in pass_through).
+    ///   2. **Stray fragments** — `<tool_call>`, `</tool_call>`,
+    ///      `<tool_call` (incomplete open), `tool_call>` and `ool_call>`
+    ///      (the partial-prefix residue when the streamer held the leading
+    ///      `<t` or `<` and then flushValidatedReply emitted the rest of
+    ///      `final_text` verbatim). The QA T6 leak (`ool_call>` prefix
+    ///      ahead of a clean answer) is exactly this case.
+    ///   3. **Trailing whitespace runs** left by the strip — two or more
+    ///      consecutive blank lines collapse to one.
+    ///
+    /// Returns an owned slice. On allocator OOM, returns the original
+    /// (caller-owned) text unchanged — the leak is cosmetic and we'd rather
+    /// emit the raw answer than fail the turn.
+    fn stripToolCallMarkup(allocator: std.mem.Allocator, text: []const u8) []u8 {
+        // Fast path: nothing to strip if the text doesn't mention "tool_call"
+        // at all (the trailing `_call` is the rarest substring so check
+        // partial first to short-circuit).
+        if (std.mem.indexOf(u8, text, "tool_call") == null and
+            std.mem.indexOf(u8, text, "ool_call>") == null)
+        {
+            return allocator.dupe(u8, text) catch return @constCast(text);
+        }
+
+        var out: std.ArrayListUnmanaged(u8) = .{};
+        errdefer out.deinit(allocator);
+
+        var rest = text;
+        while (rest.len > 0) {
+            // Find the next markup remnant: prefer the longest match so an
+            // open tag isn't half-consumed by a fragment match.
+            const opens = std.mem.indexOf(u8, rest, "<tool_call>");
+            const closes = std.mem.indexOf(u8, rest, "</tool_call>");
+            const open_partial = std.mem.indexOf(u8, rest, "<tool_call"); // missing >
+            const tag_frag = std.mem.indexOf(u8, rest, "tool_call>"); // missing <
+            const partial_frag = std.mem.indexOf(u8, rest, "ool_call>"); // missing <t
+
+            // Earliest hit wins.
+            var hit: ?usize = null;
+            var hit_len: usize = 0;
+            inline for (.{
+                .{ opens, "<tool_call>".len, true },
+                .{ closes, "</tool_call>".len, false },
+                .{ open_partial, "<tool_call".len, false },
+                .{ tag_frag, "tool_call>".len, false },
+                .{ partial_frag, "ool_call>".len, false },
+            }) |entry| {
+                if (entry[0]) |idx| {
+                    if (hit == null or idx < hit.?) {
+                        hit = idx;
+                        hit_len = entry[1];
+                        // Marker: if it's a true `<tool_call>` opener, also
+                        // try to consume up to the matching `</tool_call>`.
+                        if (entry[2]) {
+                            if (std.mem.indexOfPos(u8, rest, idx + entry[1], "</tool_call>")) |close_idx| {
+                                hit_len = (close_idx + "</tool_call>".len) - idx;
+                            }
+                            // No matching close — drop just the opener; the
+                            // dangling JSON body will be cleaned up by the
+                            // bracket-balance heuristic on the next loop
+                            // iteration (or stays as harmless prose).
+                        }
+                    }
+                }
+            }
+
+            if (hit == null) {
+                out.appendSlice(allocator, rest) catch return @constCast(text);
+                break;
+            }
+            out.appendSlice(allocator, rest[0..hit.?]) catch return @constCast(text);
+            rest = rest[hit.? + hit_len ..];
+        }
+
+        // Collapse runs of >=2 blank lines down to one.
+        const collapsed = collapseBlankLineRuns(allocator, out.items) catch {
+            return out.toOwnedSlice(allocator) catch return @constCast(text);
+        };
+        out.deinit(allocator);
+        return collapsed;
+    }
+
+    /// Helper for `stripToolCallMarkup`. Collapses runs of consecutive empty
+    /// lines (≥3 newlines in a row → 2 newlines).
+    fn collapseBlankLineRuns(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .{};
+        errdefer out.deinit(allocator);
+        var i: usize = 0;
+        var newline_run: usize = 0;
+        while (i < text.len) : (i += 1) {
+            const c = text[i];
+            if (c == '\n') {
+                newline_run += 1;
+                if (newline_run <= 2) try out.append(allocator, c);
+            } else if (c == ' ' or c == '\t' or c == '\r') {
+                if (newline_run > 0) {
+                    // skip whitespace inside a newline run
+                } else {
+                    try out.append(allocator, c);
+                }
+            } else {
+                newline_run = 0;
+                try out.append(allocator, c);
+            }
+        }
+        // Trim leading whitespace introduced by the strip.
+        const trimmed = std.mem.trimLeft(u8, out.items, " \t\r\n");
+        const result = try allocator.dupe(u8, trimmed);
+        out.deinit(allocator);
+        return result;
+    }
+
     fn startsWithAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (needle.len == 0 or haystack.len < needle.len) return false;
         var i: usize = 0;
@@ -3978,11 +4095,27 @@ pub const Agent = struct {
                     continue;
                 }
 
-                // No tool calls — final response
+                // No tool calls — final response.
+                //
+                // Defensive scrub: strip any residual `<tool_call>...</tool_call>`
+                // blocks or stray fragments (`tool_call>`, `ool_call>`) that
+                // slipped past the streaming hold path. The leak QA T6 found
+                // (mid-stream markup landing in the streamed `final_reply`
+                // tokens) lives here — flushValidatedReply emits `final_text`
+                // verbatim and `final_text` is built from `display_text`, so
+                // sanitising display_text before composeFinalReply is the
+                // right belt-and-suspenders boundary.
+                //
+                // The malformed-startup case still routes through the existing
+                // safe-text replacement (a clean error message, not the raw
+                // markup), so we keep that branch untouched.
+                const scrubbed_display_text: []u8 = stripToolCallMarkup(self.allocator, display_text);
+                defer if (scrubbed_display_text.ptr != display_text.ptr) self.allocator.free(scrubbed_display_text);
+
                 const safe_display_text = if (malformed_tool_markup)
                     "I hit an internal tool-call formatting error before execution. Please retry."
                 else
-                    display_text;
+                    scrubbed_display_text;
                 const finalize_start_ms = std.time.milliTimestamp();
                 const base_text = if (self.context_was_compacted) blk: {
                     const was_force = self.context_force_compressed;
@@ -10715,6 +10848,48 @@ test "Agent looksLikeToolCallMarkupPrefix lets normal replies stream" {
     try std.testing.expect(!Agent.looksLikeToolCallMarkupPrefix("<3 a heart, not a tool"));
     try std.testing.expect(!Agent.looksLikeToolCallMarkupPrefix("Here is the answer."));
     try std.testing.expect(!Agent.looksLikeToolCallMarkupPrefix(""));
+}
+
+test "Agent stripToolCallMarkup removes complete blocks" {
+    const allocator = std.testing.allocator;
+    const out = Agent.stripToolCallMarkup(allocator, "Before <tool_call>{\"name\":\"x\"}</tool_call> After");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<tool_call>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "</tool_call>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Before") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "After") != null);
+}
+
+test "Agent stripToolCallMarkup removes the ool_call> partial residue (QA T6 leak)" {
+    const allocator = std.testing.allocator;
+    // QA T6 captured this exact shape: model emitted markup, streaming
+    // held the leading `<t`, flushValidatedReply emitted final_text which
+    // started with the rest of the opener.
+    const leak = "ool_call>\n\nThe subagent (`sum_1_to_100`) completed successfully";
+    const out = Agent.stripToolCallMarkup(allocator, leak);
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ool_call>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "tool_call>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "The subagent") != null);
+}
+
+test "Agent stripToolCallMarkup is a noop on clean text" {
+    const allocator = std.testing.allocator;
+    const clean = "Here is the answer. Nothing fancy here.";
+    const out = Agent.stripToolCallMarkup(allocator, clean);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(clean, out);
+}
+
+test "Agent stripToolCallMarkup removes multiple stray fragments" {
+    const allocator = std.testing.allocator;
+    // QA T4a had TWO leaked markup blocks (one per memory_store call) followed
+    // by the final answer. Strip all of them, keep the answer.
+    const leak = "ool_call>\nool_call>\nGot it, alaa.";
+    const out = Agent.stripToolCallMarkup(allocator, leak);
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ool_call>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Got it, alaa.") != null);
 }
 
 test "tts_audio_enabled_does_not_mutate_assistant_text" {
