@@ -570,3 +570,44 @@ attribution. Example: after Agent E F1 merges and BEFORE F3 lands, a 5-task τ-b
 smoke isolates F1's contribution from F3's. This is OPTIONAL because it costs
 ~15-30 min per finding, but RECOMMENDED for the τ-bench Karpathy-iteration loop
 (v1.15.0+) where per-finding attribution drives the iteration discipline.
+
+### 14.12 Subagent dispatch hygiene (added 2026-05-23 post-collision)
+
+**Any code-writing background subagent gets `isolation: "worktree"`. Always.**
+
+The coordinator (or any agent) dispatching a child agent that will run `git`
+operations, edit files, or commit MUST pass `isolation: "worktree"` so the child
+checks out the repo in its own isolated directory. Without it, the child shares
+the coordinator's working tree and:
+- `git checkout -b <branch>` in the child switches the coordinator's branch too
+  (HEAD is process-wide for a worktree).
+- Uncommitted edits by the coordinator are at the mercy of `git add -A` / `git
+  clean` / `git checkout --` calls the child might make.
+- Two writers on one index race on `.git/index.lock`; under thrash the loser
+  silently drops a commit.
+- Mid-rebase or mid-merge state in the shared tree is observed by the child
+  mid-step, leading to confusing "the tree changed under me" recoveries.
+
+Surfaced by the v1.14.18 audit-sweep dispatch on 2026-05-23: the coordinator
+ran the agent without worktree isolation, then accidentally spawned a second
+agent on the same tree when trying to send a protective message. No corruption
+landed (both agents used file-specific `git add`), but recovery required
+constructing an isolated worktree post-hoc to land the coordinator's own work
+on a clean main. The collision cost ~30 minutes of recovery overhead and was
+fully preventable.
+
+**Rules:**
+1. `Agent({ ..., run_in_background: true })` for a code-writing task → MUST
+   include `isolation: "worktree"`. The runtime auto-cleans the worktree if the
+   child makes no changes, otherwise it returns the worktree path + branch.
+2. To message a running agent, use `SendMessage with to: '<agentId>'`. **Never**
+   call the `Agent` tool a second time hoping it will resume — that spawns a
+   fresh agent with no context.
+3. The coordinator may share the working tree with read-only / planning agents
+   (Explore, Plan, gsd-codebase-mapper, gsd-doc-verifier, etc.) — those don't
+   write source files or commit.
+
+**Detection:** if you find yourself doing `git stash` / `git checkout other` /
+emergency-archive of uncommitted work to "get out of the subagent's way," the
+dispatch was missing `isolation: "worktree"`. Recovery is `git worktree add` for
+your own work, not destructive ops on the shared tree.
