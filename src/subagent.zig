@@ -705,16 +705,44 @@ pub const SubagentManager = struct {
         // so the frontend knows the run succeeded but produced no
         // text, and can show a check-mark / "task done" badge instead
         // of an empty bubble.
+        // S-tier hardening (2026-05-23): include task_id in every delivered
+        // message so the parent agent can correlate this delivery with the
+        // task_id it received from `spawn`'s return value, and so the
+        // parent's later `task_get(task_id)` lookup is unambiguous. The
+        // "no output" framing is also rewritten so the parent has a clear
+        // recovery path ("re-run with a more specific task, or compute
+        // directly") instead of silently relaying an empty bubble.
         const has_real_result = if (owned_result) |r| r.len > 0 else false;
         const content = if (has_real_result)
-            std.fmt.allocPrint(self.allocator, "[Subagent '{s}' completed]\n{s}", .{ label, owned_result.? }) catch return
+            std.fmt.allocPrint(
+                self.allocator,
+                "[Subagent '{s}' task_id={d} completed]\n{s}",
+                .{ label, task_id, owned_result.? },
+            ) catch return
         else if (owned_err) |e|
-            std.fmt.allocPrint(self.allocator, "[Subagent '{s}' failed]\n{s}", .{ label, e }) catch return
+            std.fmt.allocPrint(
+                self.allocator,
+                "[Subagent '{s}' task_id={d} failed]\n{s}",
+                .{ label, task_id, e },
+            ) catch return
         else if (owned_result) |_|
             // Non-null but empty — subagent ran cleanly, no text output.
-            std.fmt.allocPrint(self.allocator, "[Subagent '{s}' completed with no output]", .{label}) catch return
+            // Tell the parent agent what to do next so the user doesn't
+            // see an empty bubble.
+            std.fmt.allocPrint(
+                self.allocator,
+                "[Subagent '{s}' task_id={d} completed with no output]\n" ++
+                    "The subagent finished without emitting a plain-text final answer. " ++
+                    "Options for the parent agent: (a) re-spawn with a more specific task brief, " ++
+                    "(b) compute or answer directly without the subagent.",
+                .{ label, task_id },
+            ) catch return
         else
-            std.fmt.allocPrint(self.allocator, "[Subagent '{s}' finished]", .{label}) catch return;
+            std.fmt.allocPrint(
+                self.allocator,
+                "[Subagent '{s}' task_id={d} finished — no result captured]",
+                .{ label, task_id },
+            ) catch return;
 
         if (self.completion_delivery) |delivery| {
             defer self.allocator.free(content);
@@ -917,9 +945,45 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
     var session_buf: [128]u8 = undefined;
     const session_key = deriveTaskRuntimeSessionKey(&session_buf, ctx.request_session_key, ctx.task_id);
 
+    // Subagent framing (S-tier hardening, 2026-05-23).
+    //
+    // The runtime here is a generic ChannelRuntime — without an explicit
+    // subagent system-prompt override, the subagent inherits the full
+    // parent-agent persona and tries to act as the main agent. In
+    // practice this produced two failure modes (QA3 / QA4):
+    //   1. The subagent loops on tool calls and ends without emitting a
+    //      plain-text final answer → `[Subagent 'X' completed with no
+    //      output]` reaches the parent, which can't relay anything useful.
+    //   2. The subagent's "final reply" is a thinking trace ("I will…")
+    //      not a self-contained answer the parent can paste.
+    //
+    // The fix: prepend a SUBAGENT TASK header to the user message that
+    // tells the model exactly what role it's playing and what shape its
+    // final answer must take. This works regardless of which system
+    // prompt the runtime defaults to, doesn't require touching every
+    // ChannelRuntime caller, and gives the parent agent a reliable
+    // "answer-ready" string back. Bounded allocation, freed alongside
+    // the result via the outer arena.
+    const framed_task = std.fmt.allocPrint(
+        ctx.manager.allocator,
+        "[SUBAGENT TASK — task_id={d}]\n" ++
+            "You are a background subagent. Do the work below in this single session, " ++
+            "then close with a CLEAR, SELF-CONTAINED final-answer message in plain text " ++
+            "(no thinking-trace, no `<tool_call>` markup). The parent agent will receive " ++
+            "your final reply verbatim as a system message — write it so it can be relayed " ++
+            "to the user without further editing. If you cannot complete the task, end with " ++
+            "a one-line plain-text explanation starting with \"Could not complete: \".\n\n" ++
+            "TASK:\n{s}",
+        .{ ctx.task_id, ctx.task },
+    ) catch |err| {
+        ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
+        return;
+    };
+    defer ctx.manager.allocator.free(framed_task);
+
     const result = runtime.session_mgr.processMessageWithContext(
         session_key,
-        ctx.task,
+        framed_task,
         null,
         .{ .turn_origin = .proactive },
     ) catch |err| {

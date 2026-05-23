@@ -30,23 +30,30 @@ pub const DelegateTool = struct {
     pub const tool_name = "delegate";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Delegate a task to another agent or worker for asynchronous execution.",
+        .what = "Synchronously call a NAMED pre-configured sub-agent for a single-turn completion; returns inline.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "you have a domain-specialist sub-agent configured (math, code, legal, summarize) and want its expertise on a self-contained question",
+            "a different model would materially help (smaller/faster model for a simple task, larger model for a hard one, vision model for an image)",
+            "you want the response inline (synchronous) — for background work use spawn instead",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "spawn — for open-ended or multi-step background work; delegate is single-turn only (no agent loop, no tools)",
+            "web_search — for external queries (no sub-agent needed; call web_search directly)",
+            "memory_recall — for facts already in memory (no sub-agent needed; call memory_recall directly)",
         },
     };
 
     comptime {
         @import("lint.zig").lintToolDescription("delegate", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
     }
-    pub const tool_description = "Hand a subtask to a named specialized agent (single-turn completion); use for tasks where a different model or system prompt materially helps.";
+    pub const tool_description =
+        "SYNCHRONOUSLY call a NAMED, pre-configured sub-agent for a single-turn completion. " ++
+        "Blocks until the named agent answers (≤120s) and returns its reply inline. " ++
+        "The named agent's provider/model/system_prompt come from config.agents.named[name]. " ++
+        "Single-turn only — no agent loop, no tools for the sub-agent. For multi-step work, use spawn. " ++
+        "If you need a generic background subagent (no special config), use spawn instead — delegate is for domain specialists.";
     pub const tool_params =
-        \\{"type":"object","properties":{"agent":{"type":"string","minLength":1,"description":"Name of the agent to delegate to"},"prompt":{"type":"string","minLength":1,"description":"The task/prompt to send to the sub-agent"},"context":{"type":"string","description":"Optional context to prepend"}},"required":["agent","prompt"]}
+        \\{"type":"object","properties":{"agent":{"type":"string","minLength":1,"description":"Name of the pre-configured agent (from config.agents.named) — e.g. 'math-specialist', 'code-reviewer'. Unknown names return an error; ask the user to configure the agent first."},"prompt":{"type":"string","minLength":1,"description":"The task/prompt for the named sub-agent. Self-contained — the sub-agent inherits no conversation context."},"context":{"type":"string","description":"Optional background context prepended to the prompt as 'Context: ...\\n\\n{prompt}'. Use when the sub-agent needs facts beyond the prompt itself."}},"required":["agent","prompt"]}
     ;
 
     const vtable = root.ToolVTable(@This());

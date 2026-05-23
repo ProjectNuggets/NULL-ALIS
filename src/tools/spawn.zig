@@ -17,23 +17,31 @@ pub const SpawnTool = struct {
     pub const tool_name = "spawn";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Launch a subprocess with arguments and environment.",
+        .what = "Spawn a background subagent on a task; returns task_id, delivers result as system message.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "work that doesn't need to block the conversation — research, multi-step analysis, document synthesis, batch jobs",
+            "self-contained tasks the subagent can complete with only the task string as context (no parent-conversation memory inheritance)",
+            "parallel work where you want to keep talking to the user while something runs",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "schedule — for future-dated or recurring jobs (spawn runs immediately, once)",
+            "delegate — when you want a synchronous single-turn call to a pre-configured named agent",
+            "web_search — for external queries (answer directly with web_search; no subagent needed)",
+            "memory_recall — for facts already stored in memory (call memory_recall yourself; no subagent needed)",
         },
     };
 
     comptime {
         @import("lint.zig").lintToolDescription("spawn", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
     }
-    pub const tool_description = "Start async work now and return immediately. Prefer `schedule` for future or recurring jobs.";
+    pub const tool_description =
+        "Spawn a background subagent to work on a self-contained task asynchronously. " ++
+        "Returns task_id immediately. After spawning, EITHER (a) keep talking to the user and the subagent's answer arrives as a system message later, " ++
+        "OR (b) call task_get(task_id) to retrieve the final answer once its status=succeeded. " ++
+        "Write the task as a complete, self-contained brief — the subagent inherits no conversation context. " ++
+        "Recursive spawn/delegate/message are blocked in the subagent's tool catalog. Prefer schedule for future or recurring jobs.";
     pub const tool_params =
-        \\{"type":"object","properties":{"task":{"type":"string","minLength":1,"description":"The task/prompt for the subagent"},"label":{"type":"string","description":"Optional human-readable label for tracking"}},"required":["task"]}
+        \\{"type":"object","properties":{"task":{"type":"string","minLength":1,"description":"COMPLETE, self-contained task brief for the subagent. The subagent inherits NO context from this conversation — include everything it needs (background, success criteria, what output format you want back). A vague task gets a vague answer."},"label":{"type":"string","description":"Short human-readable label (e.g. 'research-zig-async', 'summarize-doc') for tracking in task_list. Optional."}},"required":["task"]}
     ;
 
     const vtable = root.ToolVTable(@This());
