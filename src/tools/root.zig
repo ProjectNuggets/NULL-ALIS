@@ -667,29 +667,32 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
 /// Callers must still fall back to `ToolMetadata.conservative(name)` when
 /// `lookupMetadata` returns null (MCP tools, dynamic tools, future additions).
 ///
-/// S6.3 — delegate/spawn entries are kept in `DEFAULT_TOOL_METADATA` but
-/// filtered out at lookup time when `NULLALIS_ENABLE_MULTIAGENT` is not set
-/// to "1". Runtime tool registration at `buildDefaultTools` already gates
-/// the tool instances behind the same env; without this filter the metadata
-/// registry claimed classification for tools that weren't installed, which
-/// confused `classifyTool` callers when a model hallucinated a `delegate`
-/// call-by-name.
+/// S6.3 — delegate/spawn entries live in `DEFAULT_TOOL_METADATA`. Runtime
+/// tool registration at `buildDefaultTools` is in lockstep with this
+/// metadata view; without that, a `classifyTool` call by name for a tool
+/// the runtime didn't install confused callers when a model hallucinated
+/// a `delegate` invocation.
 pub fn defaultMetadataRegistry() []const metadata.ToolMetadata {
     if (multiagentEnabledEnv()) return &DEFAULT_TOOL_METADATA;
     return &CORE_TOOL_METADATA;
 }
 
-/// Read `NULLALIS_ENABLE_MULTIAGENT` from the process env. Returns true
-/// only for exact value "1" (allows whitespace trim). Mirrors the gate at
-/// `buildDefaultTools` so metadata stays in lockstep with registration.
+/// Read `NULLALIS_ENABLE_MULTIAGENT` from the process env.
 ///
-/// Post-review fix (MED-3 from sprint-4-5-6-review): cache the result
-/// in a module-scoped atomic so the answer is determined once per
-/// process. Without the cache the registry reader and the runtime-tool
-/// registration reader could in principle disagree if third-party code
-/// inside the process called `setenv()` between them. Nullalis doesn't
-/// setenv today, but the drift would be invisible and hard to debug —
-/// first-reader-wins is cheap insurance.
+/// **Default: true** (delegate + spawn are exposed in the default tool
+/// catalog). The v1 critical-path criterion is that the agent can spawn
+/// subagents and get their work back safely — the V4 `SubagentManager`
+/// default-on ledger bridge (PR #106) is the runtime plumbing; this is
+/// the surface that makes the tools visible to the model.
+///
+/// Operator opt-out is explicit `NULLALIS_ENABLE_MULTIAGENT=0` (legal).
+/// Any other value (unset, "1", "true", garbage) is treated as ON. We
+/// fail-open here because v1 needs delegation by default; an operator
+/// who wants subagents disabled must say so deliberately.
+///
+/// Cached in a module-scoped atomic so the answer is determined once
+/// per process (mirrored across the registry and runtime-registration
+/// readers, in case third-party code ever called `setenv` between them).
 ///
 /// Encoding: 0 = unread (first caller populates), 1 = false, 2 = true.
 /// Acquire-release ordering keeps the string-read visible before the
@@ -701,16 +704,16 @@ fn multiagentEnabledEnv() bool {
     if (cached != 0) return cached == 2;
 
     // First caller performs the actual env read. 16-byte FBA is enough for
-    // realistic values ("0" / "1" / "true" / "false"); longer values fall
-    // through to `catch return false` which is semantically correct (fail
-    // closed on multiagent when we can't confirm the enable flag).
+    // realistic values ("0" / "1" / "true" / "false"); longer / unreadable
+    // values fall through to ON (the new default).
     var fba_buf: [16]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
     const allocator = fba.allocator();
     const enabled = blk: {
-        const raw = std.process.getEnvVarOwned(allocator, "NULLALIS_ENABLE_MULTIAGENT") catch break :blk false;
+        const raw = std.process.getEnvVarOwned(allocator, "NULLALIS_ENABLE_MULTIAGENT") catch break :blk true;
         defer allocator.free(raw);
-        break :blk std.mem.eql(u8, std.mem.trim(u8, raw, " \t\r\n"), "1");
+        // Explicit opt-out only via "0". Everything else is ON.
+        break :blk !std.mem.eql(u8, std.mem.trim(u8, raw, " \t\r\n"), "0");
     };
 
     // Racy first-write is fine: two first-readers would write the same
@@ -1183,15 +1186,18 @@ pub fn allTools(
     wlt.* = .{};
     try list.append(allocator, wlt.tool());
 
-    // Delegate + spawn: dormant by default for V1. Both are coded but have
-    // incomplete end-to-end behavior (subagent result visibility on follow-up
-    // turns, delegation agent config prereqs). Showing them in the catalog
-    // creates a broken-capability feel. Opt-in via NULLALIS_ENABLE_MULTIAGENT=1.
-    const multiagent_enabled = blk: {
-        const raw = std.process.getEnvVarOwned(allocator, "NULLALIS_ENABLE_MULTIAGENT") catch break :blk false;
-        defer allocator.free(raw);
-        break :blk std.mem.eql(u8, std.mem.trim(u8, raw, " \t\r\n"), "1");
-    };
+    // Delegate + spawn: ON by default for v1 (the "agent spawns subagents
+    // and gets work back safely" criterion). V4 default-on ledger bridge
+    // (PR #106) is the runtime plumbing; this is the surface. Opt-out via
+    // NULLALIS_ENABLE_MULTIAGENT=0. Note: `delegate` without configured
+    // named agents will return an honest "Unknown delegate agent <name>"
+    // error — the agent's tool catalog tells the model `agent` is required
+    // so the agent can ask before calling. `spawn` works out of the box.
+    //
+    // Routed through the cached `multiagentEnabledEnv()` so registry +
+    // runtime registration stay in lockstep (no allocator dependency
+    // inside this branch).
+    const multiagent_enabled = multiagentEnabledEnv();
     if (opts.tool_profile == .main and multiagent_enabled) {
         const dlt = try allocator.create(delegate.DelegateTool);
         dlt.* = .{
@@ -1275,7 +1281,8 @@ pub fn allTools(
     skrt.* = .{ .workspace_dir = workspace_dir };
     try list.append(allocator, skrt.tool());
 
-    // Spawn tool (async subagent) — dormant by default, same env gate as delegate.
+    // Spawn tool (async subagent) — ON by default for v1, same env gate as
+    // delegate. Opt-out via NULLALIS_ENABLE_MULTIAGENT=0.
     if (opts.tool_profile == .main and multiagent_enabled) {
         const sp = try allocator.create(spawn.SpawnTool);
         sp.* = .{ .manager = opts.subagent_manager };
@@ -2468,6 +2475,12 @@ test "ToolVTable uses structured description when declared" {
 }
 
 test "all tools includes extras when enabled" {
+    // Force a fresh env read — `NULLALIS_ENABLE_MULTIAGENT` cache could be
+    // populated by a prior test; the count below assumes the production
+    // default (ON), which holds when the env var is absent or set to
+    // anything other than "0".
+    resetMultiagentEnvCacheForTest();
+
     const Config = @import("../config.zig").Config;
     const cfg = Config{
         .workspace_dir = "/tmp/yc_test",
@@ -2480,18 +2493,25 @@ test "all tools includes extras when enabled" {
         .browser_enabled = true,
     });
     defer deinitTools(std.testing.allocator, tools);
-    // base 36 (delegate + spawn dormant by default; +1 for V1.5 todo,
-    // +1 for V1.5 day-3 compose_memory; +1 calculator + 1 file_read_hashed
-    // + 1 file_edit_hashed from nullclaw cherry-pick; +1 memory_archive
-    // + 1 memory_demote from V1.6 cmt11) + http_request + web_fetch +
-    // web_search + browser + brain_graph (V1.7-ship S2a)
+    // base 36 + delegate + spawn (both v1 default-on as of 2026-05-23,
+    // ROADMAP "agent spawns subagents and gets work back safely" criterion)
+    // + 1 V1.5 todo + 1 V1.5 day-3 compose_memory + 1 calculator
+    // + 1 file_read_hashed + 1 file_edit_hashed (nullclaw cherry-pick)
+    // + 1 memory_archive + 1 memory_demote (V1.6 cmt11)
+    // + http_request + web_fetch + web_search + browser
+    // + brain_graph (V1.7-ship S2a)
     // + memory_maintain (V1.9-5 truth-maintenance toolkit)
     // + time_now (V1.9-DX1 wall-clock tool)
-    // + wiki_link (V1.12 entity-mention extractor) = 44.
-    try std.testing.expectEqual(@as(usize, 44), tools.len);
+    // + wiki_link (V1.12 entity-mention extractor) = 46.
+    try std.testing.expectEqual(@as(usize, 46), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
+    // v1 default-on contract: delegate + spawn appear unless
+    // NULLALIS_ENABLE_MULTIAGENT=0. Force a fresh env read so the cached
+    // gate reflects the current process env.
+    resetMultiagentEnvCacheForTest();
+
     const Config = @import("../config.zig").Config;
     const cfg = Config{
         .workspace_dir = "/tmp/yc_test",
@@ -2500,7 +2520,8 @@ test "all tools excludes extras when disabled" {
     };
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{ .config = &cfg });
     defer deinitTools(std.testing.allocator, tools);
-    // Core tool catalog (delegate + spawn gated behind NULLALIS_ENABLE_MULTIAGENT):
+    // Core tool catalog WITHOUT optional extras (http/web/browser/brain_graph
+    // disabled), but WITH delegate + spawn (v1 default-on as of 2026-05-23):
     // shell + file_read + file_write + file_edit + file_append + git + image_info + image_generate
     // + memory_store + memory_edit + memory_recall + memory_list + memory_timeline + transcript_read + memory_forget + memory_purge_topic + schedule + todo + compose_memory
     // + cron_add + cron_list + cron_remove + cron_runs + cron_run + cron_update + pushover
@@ -2509,8 +2530,9 @@ test "all tools excludes extras when disabled" {
     // + memory_archive + memory_demote (V1.6 cmt11) + brain_graph (V1.7-ship S2a)
     // + memory_maintain (V1.9-5 truth-maintenance toolkit)
     // + time_now (V1.9-DX1 wall-clock tool)
-    // + wiki_link (V1.12 entity-mention extractor) = 40
-    try std.testing.expectEqual(@as(usize, 40), tools.len);
+    // + wiki_link (V1.12 entity-mention extractor) = 40 base
+    // + delegate + spawn (v1 default-on, B1 fix 2026-05-23) = 42
+    try std.testing.expectEqual(@as(usize, 42), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -2621,6 +2643,8 @@ test "all tools binds runtime_info to finalized tool slice" {
 }
 
 test "all tools includes message when event bus is available" {
+    resetMultiagentEnvCacheForTest();
+
     const Config = @import("../config.zig").Config;
     const cfg = Config{
         .workspace_dir = "/tmp/yc_test",
@@ -2639,12 +2663,12 @@ test "all tools includes message when event bus is available" {
     // 36 core tools (was 30 — V1.5 day-3 added `compose_memory`; nullclaw
     // cherry-pick added calculator + file_read_hashed + file_edit_hashed;
     // V1.6 cmt11 added memory_archive + memory_demote);
-    // delegate + spawn gated behind NULLALIS_ENABLE_MULTIAGENT.
     // V1.7-ship S2a added brain_graph → 37.
     // V1.9-5 added memory_maintain (truth-maintenance toolkit) → 38.
     // V1.9-DX1 added time_now (wall-clock awareness) → 39.
     // V1.12 added wiki_link (entity-mention extractor) → 40.
-    try std.testing.expectEqual(@as(usize, 40), tools.len);
+    // 2026-05-23 B1: delegate + spawn flipped on by default → 42.
+    try std.testing.expectEqual(@as(usize, 42), tools.len);
 
     var found_message = false;
     for (tools) |t| {
@@ -2685,7 +2709,7 @@ test "all tools excludes spawn delegate and message in subagent profile" {
     }
 }
 
-test "spawn + delegate are dormant by default in main profile" {
+test "spawn + delegate are registered by default in main profile (v1)" {
     const Config = @import("../config.zig").Config;
     const subagent_mod = @import("../subagent.zig");
 
@@ -2699,6 +2723,11 @@ test "spawn + delegate are dormant by default in main profile" {
     var event_bus = bus.Bus.init();
     defer event_bus.close();
 
+    // The cache may have been populated by a prior test; force re-read so
+    // we reflect the current process env (which must not have
+    // NULLALIS_ENABLE_MULTIAGENT=0 — see test-env contract below).
+    resetMultiagentEnvCacheForTest();
+
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
         .config = &cfg,
         .tool_profile = .main,
@@ -2707,8 +2736,9 @@ test "spawn + delegate are dormant by default in main profile" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    // delegate + spawn are gated behind NULLALIS_ENABLE_MULTIAGENT. Absent
-    // the env var, neither should register. message must stay present.
+    // v1 default-on contract: delegate + spawn appear unless
+    // NULLALIS_ENABLE_MULTIAGENT=0 is set in the test env. Both must
+    // register; `message` continues to register too.
     var found_spawn = false;
     var found_delegate = false;
     var found_message = false;
@@ -2718,12 +2748,12 @@ test "spawn + delegate are dormant by default in main profile" {
         if (std.mem.eql(u8, t.name(), "message")) found_message = true;
     }
 
-    try std.testing.expect(!found_spawn);
-    try std.testing.expect(!found_delegate);
+    try std.testing.expect(found_spawn);
+    try std.testing.expect(found_delegate);
     try std.testing.expect(found_message);
 }
 
-test "all tools: spawn not registered when NULLALIS_ENABLE_MULTIAGENT unset" {
+test "all tools: spawn IS registered by default (v1 default-on)" {
     const Config = @import("../config.zig").Config;
     const subagent_mod = @import("../subagent.zig");
 
@@ -2735,6 +2765,10 @@ test "all tools: spawn not registered when NULLALIS_ENABLE_MULTIAGENT unset" {
     var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
     defer manager.deinit();
 
+    // Force a fresh env read — `NULLALIS_ENABLE_MULTIAGENT` is the explicit
+    // opt-out; absent the env var, spawn registers.
+    resetMultiagentEnvCacheForTest();
+
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
         .config = &cfg,
         .tool_profile = .main,
@@ -2742,10 +2776,12 @@ test "all tools: spawn not registered when NULLALIS_ENABLE_MULTIAGENT unset" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    // Verify the dormant-by-default gate holds: spawn absent from catalog.
+    // Verify the v1 default-on contract: spawn is in the default catalog.
+    var found_spawn = false;
     for (tools) |t| {
-        try std.testing.expect(!std.mem.eql(u8, t.name(), "spawn"));
+        if (std.mem.eql(u8, t.name(), "spawn")) found_spawn = true;
     }
+    try std.testing.expect(found_spawn);
 }
 
 test "bindMemoryTools matches by vtable, not by colliding tool name" {
