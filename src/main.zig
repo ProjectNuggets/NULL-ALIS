@@ -370,6 +370,87 @@ fn invalidateTenantRuntimeCaches(
     if (result.status != .ok) return error.CacheInvalidationRejected;
 }
 
+// ── .env auto-load ──────────────────────────────────────────────────────────
+//
+// Loads `./.env` at startup, populating env vars that are NOT already set in
+// the parent shell. Operators expect this from Node/Python ecosystems; the
+// silent-off pattern that bit P4 (tier gate) and B1 (multiagent gate) was
+// rooted in the binary NOT auto-loading `.env`. Today we close that gap.
+//
+// Format: shell-compatible `KEY=value` (or `export KEY=value`), one per line.
+// Blank lines and lines starting with `#` are ignored. Optional surrounding
+// double-quotes on the value are stripped. Parent-shell exports always
+// take precedence — we never overwrite a key that already has a value.
+//
+// Best-effort: a missing or unreadable `.env` is a noop. Per-line parse
+// failures skip the line and continue. Cap at 64 KiB to bound runaway files.
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+fn loadDotEnvIfPresent(allocator: std.mem.Allocator) void {
+    if (comptime builtin.os.tag == .windows) return; // setenv() is POSIX
+
+    const file = std.fs.cwd().openFile(".env", .{}) catch return;
+    defer file.close();
+    const stat = file.stat() catch return;
+    if (stat.size == 0 or stat.size > 64 * 1024) {
+        if (stat.size > 64 * 1024) {
+            std.log.warn(".env file too large ({d} bytes); skipping auto-load — export vars via the parent shell instead", .{stat.size});
+        }
+        return;
+    }
+    const content = file.readToEndAlloc(allocator, @intCast(stat.size)) catch return;
+    defer allocator.free(content);
+
+    var loaded: usize = 0;
+    var skipped_existing: usize = 0;
+
+    var line_it = std.mem.splitScalar(u8, content, '\n');
+    while (line_it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        const after_export = if (std.mem.startsWith(u8, line, "export "))
+            std.mem.trim(u8, line[7..], " \t")
+        else
+            line;
+        const eq = std.mem.indexOfScalar(u8, after_export, '=') orelse continue;
+        const key = std.mem.trim(u8, after_export[0..eq], " \t");
+        if (key.len == 0 or key.len > 255) continue;
+        var value = std.mem.trim(u8, after_export[eq + 1 ..], " \t");
+        // Strip surrounding double-quotes (single-quote handling kept simple
+        // — single-quoted values aren't a documented .env idiom we support).
+        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+            value = value[1 .. value.len - 1];
+        }
+
+        // Parent-shell wins: don't overwrite an already-set var.
+        if (std.posix.getenv(key) != null) {
+            skipped_existing += 1;
+            continue;
+        }
+
+        // setenv needs null-terminated strings.
+        var key_buf: [256]u8 = undefined;
+        var val_buf: [4096]u8 = undefined;
+        if (value.len > val_buf.len - 1) continue;
+        @memcpy(key_buf[0..key.len], key);
+        key_buf[key.len] = 0;
+        @memcpy(val_buf[0..value.len], value);
+        val_buf[value.len] = 0;
+        const key_z: [*:0]const u8 = @ptrCast(&key_buf);
+        const val_z: [*:0]const u8 = @ptrCast(&val_buf);
+        if (setenv(key_z, val_z, 0) == 0) {
+            loaded += 1;
+            // Log key but NEVER value — .env commonly contains secrets.
+            std.log.info("dotenv: loaded {s} from .env", .{key});
+        }
+    }
+
+    if (loaded > 0 or skipped_existing > 0) {
+        std.log.info("dotenv: .env auto-load done — loaded={d} skipped_existing={d}", .{ loaded, skipped_existing });
+    }
+}
+
 pub fn main() !void {
     // Enable UTF-8 output on Windows console (fixes Cyrillic/Unicode garbling)
     if (comptime builtin.os.tag == .windows) {
@@ -381,6 +462,14 @@ pub fn main() !void {
     log_fmt.init();
 
     const allocator = std.heap.smp_allocator;
+
+    // Auto-load `.env` from CWD before any code reads env vars. Operators
+    // expect this from the Node/Python ecosystems; the silent-off pattern
+    // that bit P4 (tier gate) and B1 (multiagent) was rooted in NOT having
+    // this. Parent-shell exports take precedence (we never overwrite).
+    // Best-effort: missing/unreadable .env is a noop, not a failure.
+    loadDotEnvIfPresent(allocator);
+
     var runtime = yc.sentry_runtime.Runtime.init(allocator);
     defer runtime.deinit();
     sentry_runtime = &runtime;
