@@ -34,6 +34,14 @@ pub const ObserverEvent = union(enum) {
         duration_ms: u64,
         tokens_used: ?u64,
         run_id: ?[]const u8 = null,
+        /// 2026-05-24: per-turn cost-weight summed over tools the agent
+        /// dispatched this turn. Pairs with session_weight to feed the
+        /// zaki-prod central usage meter. null when UsageRuntime wasn't
+        /// wired (CLI / standalone test paths).
+        turn_weight: ?u64 = null,
+        /// 2026-05-24: cumulative cost-weight across the session so far.
+        /// null when UsageRuntime wasn't wired.
+        session_weight: ?u64 = null,
     },
     tool_call_start: struct {
         tool: []const u8,

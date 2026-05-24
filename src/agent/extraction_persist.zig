@@ -93,6 +93,89 @@ pub fn freeExtractedMemories(allocator: std.mem.Allocator, mems: []ExtractedMemo
     allocator.free(mems);
 }
 
+/// Parse an optional ISO-8601 date / datetime string to a unix epoch in
+/// seconds (start-of-day UTC for date-only inputs). Returns null on any
+/// parse failure or out-of-range value (failure-soft: downstream treats
+/// null as "no temporal anchor known; use write-time fallback"). Accepts:
+///   - `YYYY-MM-DD`              (start-of-day UTC)
+///   - `YYYY-MM-DDThh:mm:ss[Z]`  (date portion used; time portion ignored)
+/// Validates day against month with leap-year handling so 2020-02-30
+/// returns null rather than silently rolling to March 1.
+///
+/// Lifted from the inline extractor parser (V1.14) so the agent-facing
+/// memory_store tool can share the same shape via the new `valid_at`
+/// parameter (D55, 2026-05-24).
+pub fn parseValidAtIso(iso_opt: ?[]const u8) ?i64 {
+    const iso = iso_opt orelse return null;
+    if (iso.len < 10) return null;
+    const year = std.fmt.parseInt(i32, iso[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(u8, iso[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(u8, iso[8..10], 10) catch return null;
+    if (year < 1970 or year > 2100) return null;
+    if (month < 1 or month > 12) return null;
+    if (day < 1 or day > 31) return null;
+    const leap_now = (@mod(year, 4) == 0 and @mod(year, 100) != 0) or (@mod(year, 400) == 0);
+    const max_day_per_month = [_]u8{
+        31,                       // Jan
+        if (leap_now) 29 else 28, // Feb
+        31,                       // Mar
+        30,                       // Apr
+        31,                       // May
+        30,                       // Jun
+        31,                       // Jul
+        31,                       // Aug
+        30,                       // Sep
+        31,                       // Oct
+        30,                       // Nov
+        31,                       // Dec
+    };
+    if (day > max_day_per_month[@as(usize, @intCast(month)) - 1]) return null;
+    const days_per_month = [_]u32{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    var days: i64 = 0;
+    const y_offset: i32 = year - 1970;
+    var y: i32 = 0;
+    while (y < y_offset) : (y += 1) {
+        const yy = 1970 + y;
+        const leap = (@mod(yy, 4) == 0 and @mod(yy, 100) != 0) or (@mod(yy, 400) == 0);
+        days += if (leap) 366 else 365;
+    }
+    var mi: usize = 0;
+    while (mi < @as(usize, @intCast(month)) - 1) : (mi += 1) {
+        days += days_per_month[mi];
+        if (mi == 1) {
+            const leap = (@mod(year, 4) == 0 and @mod(year, 100) != 0) or (@mod(year, 400) == 0);
+            if (leap) days += 1;
+        }
+    }
+    days += @as(i64, @intCast(day)) - 1;
+    return days * 86400;
+}
+
+test "parseValidAtIso accepts YYYY-MM-DD" {
+    const out = parseValidAtIso("2026-05-24");
+    try std.testing.expect(out != null);
+    // 2026-05-24 → 56 years + months. Sanity-check: not the epoch.
+    try std.testing.expect(out.? > 1_700_000_000);
+}
+
+test "parseValidAtIso rejects impossible dates" {
+    try std.testing.expectEqual(@as(?i64, null), parseValidAtIso("2020-02-30")); // not a leap day Feb 30
+    try std.testing.expectEqual(@as(?i64, null), parseValidAtIso("2021-13-01")); // month 13
+    try std.testing.expectEqual(@as(?i64, null), parseValidAtIso("2021-06-31")); // June has 30 days
+    try std.testing.expectEqual(@as(?i64, null), parseValidAtIso("1969-06-15")); // pre-epoch
+}
+
+test "parseValidAtIso accepts leap day Feb 29" {
+    try std.testing.expect(parseValidAtIso("2020-02-29") != null);
+    try std.testing.expectEqual(@as(?i64, null), parseValidAtIso("2021-02-29")); // non-leap
+}
+
+test "parseValidAtIso returns null on too-short input" {
+    try std.testing.expectEqual(@as(?i64, null), parseValidAtIso(null));
+    try std.testing.expectEqual(@as(?i64, null), parseValidAtIso(""));
+    try std.testing.expectEqual(@as(?i64, null), parseValidAtIso("2026-05"));
+}
+
 pub const PersistResult = struct {
     written_count: usize,
     skipped_blacklist: usize,
@@ -288,62 +371,14 @@ pub fn parseExtractedJson(
         // V1.14 — parse optional `valid_at` ISO-8601 datetime to unix
         // epoch. Failure-soft: any parse issue → null (downstream treats
         // null as "no temporal anchor; use write-time fallback").
+        // D55 (2026-05-24): parser extracted as `parseValidAtIso` above so
+        // memory_store can share the same shape via its new `valid_at`
+        // parameter; this site is now a thin wrapper that pulls the value
+        // out of the LLM JSON.
         const valid_at_unix: ?i64 = blk: {
             const va = item.object.get("valid_at") orelse break :blk null;
             if (va != .string) break :blk null;
-            const iso = va.string;
-            if (iso.len < 10) break :blk null; // need at least YYYY-MM-DD
-            // Minimal ISO-8601 parser: YYYY-MM-DD[Thh:mm:ss[Z]]
-            // Defer to a simple year-month-day extraction for now;
-            // full ISO-8601 parsing is V1.15 work.
-            const year = std.fmt.parseInt(i32, iso[0..4], 10) catch break :blk null;
-            const month = std.fmt.parseInt(u8, iso[5..7], 10) catch break :blk null;
-            const day = std.fmt.parseInt(u8, iso[8..10], 10) catch break :blk null;
-            if (year < 1970 or year > 2100) break :blk null;
-            if (month < 1 or month > 12) break :blk null;
-            if (day < 1 or day > 31) break :blk null;
-            // MD-04 fix (REVIEW V1.14): reject impossible dates per
-            // month. Pre-fix: 2020-02-30 silently became March 1 via
-            // overflow. Now: validate day against month-specific max,
-            // accounting for leap year on Feb. Reject → null
-            // (write-time falls back).
-            const leap_now = (@mod(year, 4) == 0 and @mod(year, 100) != 0) or (@mod(year, 400) == 0);
-            const max_day_per_month = [_]u8{
-                31, // Jan
-                if (leap_now) 29 else 28, // Feb
-                31, // Mar
-                30, // Apr
-                31, // May
-                30, // Jun
-                31, // Jul
-                31, // Aug
-                30, // Sep
-                31, // Oct
-                30, // Nov
-                31, // Dec
-            };
-            if (day > max_day_per_month[@as(usize, @intCast(month)) - 1]) break :blk null;
-            // Days-since-epoch via simple table; sufficient for
-            // brain-graph time anchoring (not financial-grade).
-            const days_per_month = [_]u32{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-            var days: i64 = 0;
-            const y_offset: i32 = year - 1970;
-            var y: i32 = 0;
-            while (y < y_offset) : (y += 1) {
-                const yy = 1970 + y;
-                const leap = (@mod(yy, 4) == 0 and @mod(yy, 100) != 0) or (@mod(yy, 400) == 0);
-                days += if (leap) 366 else 365;
-            }
-            var mi: usize = 0;
-            while (mi < @as(usize, @intCast(month)) - 1) : (mi += 1) {
-                days += days_per_month[mi];
-                if (mi == 1) {
-                    const leap = (@mod(year, 4) == 0 and @mod(year, 100) != 0) or (@mod(year, 400) == 0);
-                    if (leap) days += 1;
-                }
-            }
-            days += @as(i64, @intCast(day)) - 1;
-            break :blk days * 86400;
+            break :blk parseValidAtIso(va.string);
         };
 
         const m = ExtractedMemory{

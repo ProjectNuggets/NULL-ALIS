@@ -69,7 +69,7 @@ pub const MemoryStoreTool = struct {
         "subject/predicate/object fields too — the brain will run contradiction detection " ++
         "against existing facts and link the new fact into the knowledge graph.";
     pub const tool_params =
-        \\{"type":"object","properties":{"key":{"type":"string","description":"Unique key for this memory"},"content":{"type":"string","description":"The information to remember"},"category":{"type":"string","enum":["core","daily","conversation"],"description":"Memory category"},"scope":{"type":"string","enum":["session","global"],"description":"Memory scope (default: session)"},"session_id":{"type":"string","description":"Optional explicit session lane override"},"subject":{"type":"string","description":"Optional fact subject (e.g. 'user'). When all three of subject/predicate/object present, routes through the contradiction-judge + graph-edge pipeline."},"predicate":{"type":"string","description":"Optional fact predicate in SCREAMING_SNAKE_CASE (e.g. 'PREFERS', 'BIRTHDAY')."},"object":{"type":"string","description":"Optional fact object (e.g. 'Helix')."}},"required":["key","content"]}
+        \\{"type":"object","properties":{"key":{"type":"string","description":"Unique key for this memory"},"content":{"type":"string","description":"The information to remember"},"category":{"type":"string","enum":["core","daily","conversation"],"description":"Memory category"},"scope":{"type":"string","enum":["session","global"],"description":"Memory scope (default: session)"},"session_id":{"type":"string","description":"Optional explicit session lane override"},"subject":{"type":"string","description":"Optional fact subject (e.g. 'user'). When all three of subject/predicate/object present, routes through the contradiction-judge + graph-edge pipeline."},"predicate":{"type":"string","description":"Optional fact predicate in SCREAMING_SNAKE_CASE (e.g. 'PREFERS', 'BIRTHDAY')."},"object":{"type":"string","description":"Optional fact object (e.g. 'Helix')."},"valid_at":{"type":"string","description":"Optional ISO-8601 date (YYYY-MM-DD) when this fact became true. Persisted as memory_edges.temporal_anchor_unix; enables time-range queries like 'what did I do in March?'. Only applied when subject/predicate/object are also supplied (the inline path doesn't write graph edges). Invalid dates are silently ignored — write-time is the fallback anchor."}},"required":["key","content"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -108,10 +108,18 @@ pub const MemoryStoreTool = struct {
         const has_triple = subj != null and pred != null and obj != null and
             subj.?.len > 0 and pred.?.len > 0 and obj.?.len > 0;
 
+        // D55 (2026-05-24): optional ISO-8601 date for "when this fact
+        // became true" — populates memory_edges.temporal_anchor_unix on
+        // the triple path. Failure-soft: invalid/missing → null (write-
+        // time fallback). Only applies when the triple path is taken;
+        // the inline path doesn't write graph edges, so valid_at has no
+        // attachment surface there.
+        const valid_at_unix: ?i64 = extraction_persist.parseValidAtIso(root.getString(args, "valid_at"));
+
         if (has_triple) {
             if (self.state_mgr) |smgr| {
                 if (self.user_id) |uid| {
-                    return self.executeUnifiedWrite(allocator, smgr, uid, content, subj.?, pred.?, obj.?, session_id);
+                    return self.executeUnifiedWrite(allocator, smgr, uid, content, subj.?, pred.?, obj.?, session_id, valid_at_unix);
                 }
             }
             // Triple supplied but no tenant context → fall through to inline
@@ -170,6 +178,7 @@ pub const MemoryStoreTool = struct {
         predicate: []const u8,
         object: []const u8,
         session_id: ?[]const u8,
+        valid_at_unix: ?i64,
     ) !ToolResult {
         const mems = [_]extraction_persist.ExtractedMemory{.{
             .text = content,
@@ -178,6 +187,11 @@ pub const MemoryStoreTool = struct {
             .object = object,
             .attributed_to = "user", // memory_store is user-attributed by default
             .confidence = 0.95,
+            // D55 (2026-05-24): pass-through of the agent-supplied
+            // valid_at. null when caller didn't provide; the existing
+            // memory_edges.temporal_anchor_unix persist plumbing
+            // handles both cases.
+            .temporal_anchor_unix = valid_at_unix,
         }};
 
         const judge_ctx: ?extraction_persist.JudgeContext = blk: {

@@ -7993,7 +7993,7 @@ fn internalDiagnosticsPayload(
 fn sseErrorEvent(allocator: std.mem.Allocator, code: []const u8, msg: []const u8) ![]u8 {
     const error_frame = try sseErrorFrame(allocator, code, msg);
     defer allocator.free(error_frame);
-    const done_frame = try sseDoneFrame(allocator, null, null);
+    const done_frame = try sseDoneFrame(allocator, null, null, .{});
     defer allocator.free(done_frame);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -8061,7 +8061,7 @@ fn sendSseOwnershipLockConflictResponse(stream: anytype, allocator: std.mem.Allo
     sendChunkedSseFrame(stream, error_frame) catch return;
 
     const done_fallback = "event: done\ndata: {\"type\":\"done\"}\n\n";
-    const done_owned = sseDoneFrame(allocator, null, null) catch null;
+    const done_owned = sseDoneFrame(allocator, null, null, .{}) catch null;
     defer if (done_owned) |frame| allocator.free(frame);
     const done_frame: []const u8 = if (done_owned) |frame| frame else done_fallback;
     sendChunkedSseFrame(stream, done_frame) catch return;
@@ -8082,7 +8082,7 @@ fn ownershipLockConflictSseRouteResponse(allocator: std.mem.Allocator, conflict:
     const fallback = "event: error\ndata: {\"type\":\"error\",\"code\":\"ownership_lock_conflict\",\"message\":\"ownership lock conflict\",\"retry_after_ms\":250,\"owner_instance_id\":null,\"lease_until_s\":null}\n\nevent: done\ndata: {\"type\":\"done\"}\n\n";
     const event_owned = sseOwnershipLockConflictEvent(allocator, conflict) catch null;
     defer if (event_owned) |value| allocator.free(value);
-    const done_owned = sseDoneFrame(allocator, null, null) catch null;
+    const done_owned = sseDoneFrame(allocator, null, null, .{}) catch null;
     defer if (done_owned) |value| allocator.free(value);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -8627,7 +8627,12 @@ fn extractAudioReplyMarker(reply: []const u8) ?AudioReplyMarker {
     return .{ .audio_path = path_slice, .visible_text = visible };
 }
 
-fn sseDoneFrame(allocator: std.mem.Allocator, session_id: ?[]const u8, message_id: ?i64) ![]u8 {
+fn sseDoneFrame(
+    allocator: std.mem.Allocator,
+    session_id: ?[]const u8,
+    message_id: ?i64,
+    spend: SpendSummary,
+) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
@@ -8640,6 +8645,7 @@ fn sseDoneFrame(allocator: std.mem.Allocator, session_id: ?[]const u8, message_i
     if (message_id) |mid| {
         try w.print(",\"message_id\":\"{d}\"", .{mid});
     }
+    try writeSpendFields(w, spend);
     try w.writeAll("}\n\n");
     return buf.toOwnedSlice(allocator);
 }
@@ -8650,7 +8656,12 @@ fn sseDoneFrame(allocator: std.mem.Allocator, session_id: ?[]const u8, message_i
 /// fabricated-placeholder fallback (the dead "[tools ran, no direct reply…]"
 /// string removed v1.14.13). Same identity contract as `sseDoneFrame`
 /// (session_id + message_id optional) — only the extra flag differs.
-fn sseDoneFrameToolOnly(allocator: std.mem.Allocator, session_id: ?[]const u8, message_id: ?i64) ![]u8 {
+fn sseDoneFrameToolOnly(
+    allocator: std.mem.Allocator,
+    session_id: ?[]const u8,
+    message_id: ?i64,
+    spend: SpendSummary,
+) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
@@ -8663,8 +8674,35 @@ fn sseDoneFrameToolOnly(allocator: std.mem.Allocator, session_id: ?[]const u8, m
     if (message_id) |mid| {
         try w.print(",\"message_id\":\"{d}\"", .{mid});
     }
+    try writeSpendFields(w, spend);
     try w.writeAll("}\n\n");
     return buf.toOwnedSlice(allocator);
+}
+
+/// 2026-05-24 (v1.14.20): spend-meter feed for the zaki-prod central
+/// usage meter (5-hour + weekly windows aggregated across products). The
+/// done frame carries this so the FE can render a per-turn cost pill and
+/// the central meter can accumulate without per-tool emission noise.
+///
+/// `turn_weight`: sum of tool cost-classes dispatched this turn (delta
+/// from session_weight at turn start). null when UsageRuntime wasn't
+/// wired or no tools ran.
+/// `session_weight`: cumulative session weight at the moment of emit.
+/// null when UsageRuntime wasn't wired.
+pub const SpendSummary = struct {
+    turn_weight: ?u64 = null,
+    session_weight: ?u64 = null,
+
+    pub const none: SpendSummary = .{};
+};
+
+fn writeSpendFields(w: anytype, spend: SpendSummary) !void {
+    if (spend.turn_weight) |tw| {
+        try w.print(",\"turn_weight\":{d}", .{tw});
+    }
+    if (spend.session_weight) |sw| {
+        try w.print(",\"session_weight\":{d}", .{sw});
+    }
 }
 
 /// V1.11 (2026-05-07) — emitted when the model returned tool_calls without
@@ -8703,7 +8741,7 @@ fn sseChatPayload(allocator: std.mem.Allocator, text: []const u8, session_id: []
         try w.writeAll(token_frame);
         seq += 1;
     }
-    const done_frame = try sseDoneFrame(allocator, session_id, message_id);
+    const done_frame = try sseDoneFrame(allocator, session_id, message_id, .{});
     defer allocator.free(done_frame);
     try w.writeAll(done_frame);
     return buf.toOwnedSlice(allocator);
@@ -8832,7 +8870,7 @@ fn sendSseErrorFrames(stream: anytype, allocator: std.mem.Allocator, code: []con
     sendChunkedSseFrame(stream, error_frame) catch return;
 
     const done_fallback = "event: done\ndata: {\"type\":\"done\"}\n\n";
-    const done_owned = sseDoneFrame(allocator, null, null) catch null;
+    const done_owned = sseDoneFrame(allocator, null, null, .{}) catch null;
     defer if (done_owned) |frame| allocator.free(frame);
     const done_frame: []const u8 = if (done_owned) |frame| frame else done_fallback;
     sendChunkedSseFrame(stream, done_frame) catch return;
@@ -8851,7 +8889,7 @@ fn sendLockedSseErrorFrames(stream: anytype, allocator: std.mem.Allocator, code:
     };
 
     const done_fallback = "event: done\ndata: {\"type\":\"done\"}\n\n";
-    const done_owned = sseDoneFrame(allocator, null, null) catch null;
+    const done_owned = sseDoneFrame(allocator, null, null, .{}) catch null;
     defer if (done_owned) |frame| allocator.free(frame);
     const done_frame: []const u8 = if (done_owned) |frame| frame else done_fallback;
     stream.sendFrame(done_frame) catch {
@@ -9737,6 +9775,14 @@ fn handleApiChatStreamSseConnection(
         ok: []const u8,
         err: struct { code: []const u8, msg: []const u8 },
     };
+    // 2026-05-24 (v1.14.20) — spend-meter feed for the zaki-prod central
+    // usage meter. Captured BEFORE processMessage so the done frame can
+    // emit turn_weight = session_weight_after - session_weight_before.
+    // Defaults to null on paths that don't have a UsageRuntime
+    // (file-tenant or CLI-style fallback); the done frame omits the
+    // fields when null.
+    var spend_usage_rt: ?*usage_runtime_mod.UsageRuntime = null;
+    var session_weight_before: u64 = 0;
     const outcome: ReplyOutcome = blk: {
         if (state.tenant_enabled) {
             const cfg = config_opt orelse {
@@ -9751,6 +9797,8 @@ fn handleApiChatStreamSseConnection(
                     break :blk .{ .err = .{ .code = "tenant_runtime_failed", .msg = "tenant runtime init failed" } };
                 }
             };
+            spend_usage_rt = tenant_runtime.usage_rt;
+            session_weight_before = tenant_runtime.usage_rt.sessionWeight();
             // Tenant runtime path: stream tokens directly to SSE for live delivery.
             break :blk .{ .ok = tenant_runtime.processMessage(
                 session_key,
@@ -9943,11 +9991,21 @@ fn handleApiChatStreamSseConnection(
         "event: done\ndata: {\"type\":\"done\",\"tool_only_turn\":true}\n\n"
     else
         "event: done\ndata: {\"type\":\"done\"}\n\n";
+    // 2026-05-24 (v1.14.20): compute spend summary for the done frame so
+    // the zaki-prod central meter sees per-turn + cumulative session
+    // weight. spend_usage_rt is set in the tenant blk above; the file-
+    // tenant / CLI fallback paths leave it null and the done frame omits
+    // the fields cleanly.
+    const spend: SpendSummary = if (spend_usage_rt) |urt| spend_blk: {
+        const after = urt.sessionWeight();
+        const turn = if (after >= session_weight_before) after - session_weight_before else 0;
+        break :spend_blk .{ .turn_weight = turn, .session_weight = after };
+    } else .{};
     const done_owned = blk: {
         if (is_tool_only) {
-            break :blk sseDoneFrameToolOnly(req_allocator, session_key, std.time.milliTimestamp()) catch null;
+            break :blk sseDoneFrameToolOnly(req_allocator, session_key, std.time.milliTimestamp(), spend) catch null;
         }
-        break :blk sseDoneFrame(req_allocator, session_key, std.time.milliTimestamp()) catch null;
+        break :blk sseDoneFrame(req_allocator, session_key, std.time.milliTimestamp(), spend) catch null;
     };
     defer if (done_owned) |frame| req_allocator.free(frame);
     const done_frame: []const u8 = if (done_owned) |frame| frame else done_fallback;
@@ -25227,7 +25285,7 @@ test "baseline: sseReadyFrame emits event:ready with session key" {
 }
 
 test "baseline: sseDoneFrame is always terminal with type:done" {
-    const frame_full = try sseDoneFrame(std.testing.allocator, "sess-1", 42);
+    const frame_full = try sseDoneFrame(std.testing.allocator, "sess-1", 42, .{});
     defer std.testing.allocator.free(frame_full);
     try std.testing.expect(std.mem.startsWith(u8, frame_full, "event: done\ndata: "));
     try std.testing.expect(std.mem.indexOf(u8, frame_full, "\"type\":\"done\"") != null);
@@ -25235,7 +25293,7 @@ test "baseline: sseDoneFrame is always terminal with type:done" {
     try std.testing.expect(std.mem.endsWith(u8, frame_full, "\n\n"));
 
     // Without optional fields
-    const frame_minimal = try sseDoneFrame(std.testing.allocator, null, null);
+    const frame_minimal = try sseDoneFrame(std.testing.allocator, null, null, .{});
     defer std.testing.allocator.free(frame_minimal);
     try std.testing.expect(std.mem.indexOf(u8, frame_minimal, "\"type\":\"done\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame_minimal, "session_id") == null);
@@ -25260,7 +25318,7 @@ test "sseToolOnlySummaryFrame emits the contract the frontend renders" {
 }
 
 test "sseDoneFrameToolOnly carries tool_only_turn:true plus identity" {
-    const frame_full = try sseDoneFrameToolOnly(std.testing.allocator, "sess-7", 99);
+    const frame_full = try sseDoneFrameToolOnly(std.testing.allocator, "sess-7", 99, .{});
     defer std.testing.allocator.free(frame_full);
     try std.testing.expect(std.mem.startsWith(u8, frame_full, "event: done\ndata: "));
     try std.testing.expect(std.mem.indexOf(u8, frame_full, "\"type\":\"done\"") != null);
@@ -25271,14 +25329,14 @@ test "sseDoneFrameToolOnly carries tool_only_turn:true plus identity" {
 
     // Without optional fields, flag must still appear so the frontend
     // can distinguish empty-tool-only-turn from genuine empty done.
-    const frame_minimal = try sseDoneFrameToolOnly(std.testing.allocator, null, null);
+    const frame_minimal = try sseDoneFrameToolOnly(std.testing.allocator, null, null, .{});
     defer std.testing.allocator.free(frame_minimal);
     try std.testing.expect(std.mem.indexOf(u8, frame_minimal, "\"tool_only_turn\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame_minimal, "session_id") == null);
 }
 
 test "sseDoneFrame regression: regular done frame does NOT carry tool_only_turn flag" {
-    const frame = try sseDoneFrame(std.testing.allocator, "sess-1", 42);
+    const frame = try sseDoneFrame(std.testing.allocator, "sess-1", 42, .{});
     defer std.testing.allocator.free(frame);
     // Critical regression test — accidentally flagging regular turns as
     // tool_only_turn would cause the frontend to render every reply as

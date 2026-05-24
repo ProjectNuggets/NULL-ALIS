@@ -119,6 +119,15 @@ pub const DonePayload = struct {
     cost_usd: ?f64 = null,
     duration_ms: ?u64 = null,
     run_id: ?[]const u8 = null,
+    /// 2026-05-24 (v1.14.20) — spend-meter feed for the zaki-prod
+    /// central usage meter (5-hour + weekly windows aggregated across
+    /// products). `turn_weight` is the sum of tool cost-classes
+    /// dispatched this turn; `session_weight` is the cumulative
+    /// across the session so far. Both null when UsageRuntime isn't
+    /// wired (standalone CLI / test paths). The FE can render these
+    /// as a per-turn "cost" pill + lifetime session total.
+    turn_weight: ?u64 = null,
+    session_weight: ?u64 = null,
 };
 
 /// Binding principle: no silent fallback. When nullalis degrades or has a
@@ -336,6 +345,12 @@ pub fn toSseFrame(allocator: std.mem.Allocator, event: RunEvent) ![]u8 {
             }
             if (p.duration_ms) |d| {
                 try w.print(",\"duration_ms\":{d}", .{d});
+            }
+            if (p.turn_weight) |tw| {
+                try w.print(",\"turn_weight\":{d}", .{tw});
+            }
+            if (p.session_weight) |sw| {
+                try w.print(",\"session_weight\":{d}", .{sw});
             }
             try writeOptionalStringField(w, "run_id", p.run_id);
             try w.writeAll("}");
