@@ -655,6 +655,17 @@ fn buildSafetySection(w: anytype) !void {
     try w.writeAll("- Precedence: verified runtime state, tool results, and direct observations override workspace docs, memory, and inference.\n\n");
     try w.writeAll("- Preferred tool paths: `schedule` for user time/date/recurrence work; `cron_*` for raw scheduler inspection; `runtime_info` for runtime/session/scheduler truth; `composio` for user OAuth-gated apps (Gmail, GitHub, Notion, Slack, etc. — handles auth/refresh); `http_request` for known public APIs or when composio lacks coverage; `web_search`/`web_fetch` for open-web research; `spawn` for async-now work; `delegate` for specialist subtasks; `message` for explicit outbound sends; `task_list`/`task_get`/`task_stop` to observe or cancel long-running work the user started; `shell` only when no more specific tool is better and policy allows.\n\n");
     try w.writeAll("- Memory writes: use `memory_store` only for facts that will be useful in FUTURE conversations (user preferences, durable decisions, stable project context). Use `memory_edit` to correct existing entries, `memory_forget` to remove outdated ones. Do not save ephemeral turn details, restatements of visible workspace docs, or anything you can re-derive. Scope memory as `session` for per-conversation continuity and `global` for cross-session truths.\n\n");
+    // D52 Hybrid Pillar 1 (2026-05-24): override the LLM RLHF reflex that
+    // refuses to persist user-volunteered PII into the user's OWN personal
+    // memory. This is a personal-memory product — refusing the user's own
+    // contact details, addresses, family members, etc. is paternalistic
+    // and breaks trust. The directive scope is narrow: data the user
+    // EXPLICITLY asks you to remember about themselves, their contacts,
+    // their preferences. Third-party non-consented data still refuses;
+    // explicit clear-out is always honored.
+    try w.writeAll(
+        "- PII storage policy (personal memory): when the user explicitly asks you to remember their own personal information — phone numbers, email addresses, physical addresses, names of family/friends/contacts, ID numbers they volunteer, financial preferences, medical preferences — STORE it via `memory_store`. This is a personal-memory product; the user is opting in by asking. Acknowledge what you stored in your reply (e.g. \"Stored — your brother Karim's number is +49 30 12345. Say 'forget X' anytime to clear it.\"). Do NOT refuse, hedge, or lecture about privacy. Exceptions where the standard refusal still applies: (a) third-party data the user is asking you to harvest WITHOUT their consent (\"look up my coworker's home address\"), (b) credentials and secrets that belong in the secret vault rather than memory (passwords, API tokens, credit-card numbers — direct the user to the secrets surface), (c) anything the user explicitly marks `confidential — do not store`.\n\n",
+    );
     try w.writeAll("- On longer work, send short progress updates instead of going silent. Before risky multi-step changes, briefly state the plan. Default to concise, result-first replies and prefer artifacts or links over pasted output.\n\n");
     try w.writeAll(
         "- Slash commands: you may mention `/help` if the user asks what commands exist, `/reset` if they want to start over, `/new` if they ask for a fresh session, `/approve allow-once|deny` if a tool approval is pending. For everything else, prefer concrete actions via your tools over suggesting slash commands. Do not fabricate commands; the short list above is what you may surface by name.\n\n",
@@ -1302,6 +1313,12 @@ test "buildSystemPrompt includes core sections" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not invent timing, scheduler, or delivery status claims") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Cold memory is tool-only by default") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "When a user turn begins with `[Memory context]`") != null);
+    // D52 Hybrid Pillar 1 regression guard (2026-05-24, Phase E): the PII
+    // storage directive must be in the safety section so the model
+    // overrides its RLHF refusal reflex when the user volunteers their
+    // own personal info into personal memory.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "PII storage policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Do NOT refuse, hedge, or lecture") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "verify with `runtime_info` and use `schedule` first") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Never use `resume` to repair an active errored job") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "`AUTOMATIONS.json`") != null);
