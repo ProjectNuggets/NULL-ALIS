@@ -10837,8 +10837,15 @@ fn handleArtifactList(
     }
 
     const state_mgr = state.zaki_state orelse {
-        // No postgres → empty list (mirrors trace endpoint shape).
-        return .{ .body = "{\"artifacts\":[]}" };
+        // Wave 2 review HIGH#3 — was: 200 `{"artifacts":[]}` (dishonest;
+        // looked like "you have zero" when the backend was offline). All
+        // auth'd artifact endpoints now return 503 with a uniform body
+        // naming the backend dependency so operators / FE can distinguish
+        // "no data" from "no storage."
+        return .{
+            .status = "503 Service Unavailable",
+            .body = "{\"error\":\"state_unavailable\",\"detail\":\"persistent state backend not configured; artifacts require postgres\"}",
+        };
     };
 
     const rows = state_mgr.listArtifactsForUser(allocator, numeric_user_id, kind_param, limit) catch {
@@ -10876,7 +10883,14 @@ fn handleArtifactGet(
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
     };
     const state_mgr = state.zaki_state orelse {
-        return .{ .status = "404 Not Found", .body = "{\"error\":\"artifact_not_found\"}" };
+        // Wave 2 review HIGH#3 — was: 404 `artifact_not_found`. Wrong
+        // signal: the artifact lookup hasn't even happened; the backend
+        // simply isn't configured. Standardized 503 across all auth'd
+        // artifact endpoints.
+        return .{
+            .status = "503 Service Unavailable",
+            .body = "{\"error\":\"state_unavailable\",\"detail\":\"persistent state backend not configured; artifacts require postgres\"}",
+        };
     };
 
     const artifact_opt = state_mgr.getArtifactById(allocator, numeric_user_id, artifact_id) catch {
@@ -10933,7 +10947,13 @@ fn handleArtifactHistory(
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
     };
     const state_mgr = state.zaki_state orelse {
-        return .{ .body = "{\"history\":[]}" };
+        // Wave 2 review HIGH#3 — was: 200 `{"history":[]}` (same dishonest
+        // empty-list pattern as the list endpoint). Standardized 503 so
+        // the FE / agent see "backend down" not "no history exists."
+        return .{
+            .status = "503 Service Unavailable",
+            .body = "{\"error\":\"state_unavailable\",\"detail\":\"persistent state backend not configured; artifacts require postgres\"}",
+        };
     };
 
     // Existence check first so we return 404 (not empty) on a foreign
@@ -10996,7 +11016,13 @@ fn handleArtifactDiff(
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
     };
     const state_mgr = state.zaki_state orelse {
-        return .{ .status = "404 Not Found", .body = "{\"error\":\"artifact_not_found\"}" };
+        // Wave 2 review HIGH#3 — same standardization as the other artifact
+        // endpoints: 503 with the uniform body so the backend-down condition
+        // is unambiguous.
+        return .{
+            .status = "503 Service Unavailable",
+            .body = "{\"error\":\"state_unavailable\",\"detail\":\"persistent state backend not configured; artifacts require postgres\"}",
+        };
     };
 
     var before_opt = state_mgr.getArtifactVersion(allocator, numeric_user_id, artifact_id, from_version) catch {
@@ -11064,7 +11090,11 @@ fn handleArtifactPut(
     const change_summary = jsonStringField(body, "change_summary");
 
     const state_mgr = state.zaki_state orelse {
-        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+        // Wave 2 review HIGH#3 — unified body across all artifact handlers.
+        return .{
+            .status = "503 Service Unavailable",
+            .body = "{\"error\":\"state_unavailable\",\"detail\":\"persistent state backend not configured; artifacts require postgres\"}",
+        };
     };
 
     // Ownership + existence check.
@@ -11128,8 +11158,19 @@ fn handleArtifactShareCreate(
     var hours: i64 = artifacts_store.DEFAULT_SHARE_EXPIRY_HOURS;
     if (extractBody(raw_request)) |body| {
         if (jsonIntField(body, "expires_in_hours")) |h| {
-            if (h <= 0 or h > 24 * 365) {
+            if (h <= 0) {
                 return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_expires_in_hours\"}" };
+            }
+            if (h > artifacts_store.SHARE_MAX_EXPIRY_HOURS) {
+                // Wave 2 review HIGH#2 — name the cap in the error body so
+                // callers can self-correct. The literal 720 is intentional
+                // and matches `SHARE_MAX_EXPIRY_HOURS`; if the constant
+                // ever changes both this string and the trace-share copy
+                // in handleTraceShareCreate must move together.
+                return .{
+                    .status = "400 Bad Request",
+                    .body = "{\"error\":\"expires_in_hours_too_large\",\"max\":720}",
+                };
             }
             hours = h;
         }
@@ -11138,7 +11179,11 @@ fn handleArtifactShareCreate(
     const expires_at_unix = now_unix + hours * 3600;
 
     const state_mgr = state.zaki_state orelse {
-        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+        // Wave 2 review HIGH#3 — unified body across all artifact handlers.
+        return .{
+            .status = "503 Service Unavailable",
+            .body = "{\"error\":\"state_unavailable\",\"detail\":\"persistent state backend not configured; artifacts require postgres\"}",
+        };
     };
 
     // Ownership check before minting a code.
@@ -11188,7 +11233,11 @@ fn handleArtifactShareRevoke(
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
     };
     const state_mgr = state.zaki_state orelse {
-        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+        // Wave 2 review HIGH#3 — unified body across all artifact handlers.
+        return .{
+            .status = "503 Service Unavailable",
+            .body = "{\"error\":\"state_unavailable\",\"detail\":\"persistent state backend not configured; artifacts require postgres\"}",
+        };
     };
     state_mgr.clearArtifactShare(numeric_user_id, artifact_id) catch {
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"revoke_failed\"}" };
@@ -11236,6 +11285,14 @@ fn handleArtifactShareGet(
         return .{ .status = "404 Not Found", .body = "{\"error\":\"share_not_found\"}" };
     }
     const state_mgr = state.zaki_state orelse {
+        // Wave 2 review HIGH#3 — public share endpoint deliberately keeps
+        // 404 (NOT 503) here. Rationale: the authenticated artifact
+        // handlers return 503 so operators / FE can distinguish "no data"
+        // from "no storage," but a public unauthenticated GET must NOT
+        // reveal backend topology. Returning a different status when the
+        // backend is offline vs. when the code is unknown lets an attacker
+        // probe deployment state. Mirrors the trace-share public GET which
+        // uses the same opaque-404 pattern (see handleTraceShareGet).
         return .{ .status = "404 Not Found", .body = "{\"error\":\"share_not_found\"}" };
     };
     const now_unix = std.time.timestamp();
@@ -11412,13 +11469,23 @@ const TraceShareStore = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var key_buf = try ownerKey(self.allocator, user_id, run_id);
+        // Wave 2 review CRITICAL#1 fix: allocate `key_buf` ONCE up front
+        // and let a single `errdefer` own its lifetime. The original code
+        // freed `key_buf` inside an `if`-block `defer`, then re-assigned
+        // it, leaking the first allocation and double-freeing the second
+        // on any post-block error. By holding ONE allocation, we reuse it
+        // for both the existing-record cleanup (via `fetchRemove` returning
+        // the previous KV pair so we free the OLD key explicitly without
+        // conflating it with this one) and the final `by_owner.put` below.
+        const key_buf = try ownerKey(self.allocator, user_id, run_id);
+        errdefer self.allocator.free(key_buf);
+
         // Check for an existing LIVE share first.
         if (self.by_owner.get(key_buf)) |existing_code| {
-            // owner key was a probe — release it.
-            defer self.allocator.free(key_buf);
             if (self.by_code.get(existing_code)) |existing_rec| {
                 if (existing_rec.isLive(now_unix)) {
+                    // Idempotent re-share — discard our fresh key_buf.
+                    self.allocator.free(key_buf);
                     return .{
                         .already_existed = true,
                         .share_code = existing_rec.share_code,
@@ -11431,14 +11498,17 @@ const TraceShareStore = struct {
                 existing_rec.deinit(self.allocator);
                 self.allocator.destroy(existing_rec);
             }
-            // Owner index was orphaned somehow — clean it.
+            // Either by_code had the entry (handled above) or owner was
+            // orphaned. In both cases, remove the by_owner entry and free
+            // ITS owned key + value. `fetchRemove` hands us the kv pair so
+            // we free the PREVIOUS key, never confusing it with `key_buf`.
             if (self.by_owner.fetchRemove(key_buf)) |kv| {
                 self.allocator.free(kv.key);
                 self.allocator.free(kv.value);
             }
-            key_buf = try ownerKey(self.allocator, user_id, run_id);
+            // key_buf is intentionally NOT reassigned — it's still valid
+            // and will be installed as the new by_owner key below.
         }
-        errdefer self.allocator.free(key_buf);
 
         // Mint a fresh code; retry on the astronomically unlikely
         // collision rather than allowing duplicate codes.
@@ -29304,4 +29374,170 @@ test "Wave 2C live: artifacts CRUD + version graph + isolation + share roundtrip
     try std.testing.expect(deleted);
     const after_delete = try mgr.getArtifactById(allocator, 101, artifact.id);
     try std.testing.expect(after_delete == null);
+}
+
+// ─── Wave 2 review regression tests (2026-05-24) ───────────────────────
+
+test "Wave2-CRITICAL: TraceShareStore.createOrGet re-mints over an EXPIRED share without UAF / leak / double-free" {
+    // Reproduces the bug fixed in CRITICAL#1: when (user_id, run_id) had a
+    // PRIOR share that is now expired, the second createOrGet call would
+    // (a) leak the original ownerKey allocation, (b) free the new
+    // ownerKey via an in-block `defer`, then (c) install the freed
+    // pointer as the by_owner HashMap key — a textbook UAF. The
+    // leak-detecting testing allocator catches the leak; any
+    // subsequent operation that hashes/compares against the by_owner
+    // entry would read freed memory and surface as a crash or wrong
+    // lookup. Asserts: no leak, no crash, fresh share_code emerges.
+    const alloc = std.testing.allocator;
+    var share_store = TraceShareStore.init(alloc);
+    defer share_store.deinit();
+
+    const t0: i64 = 1_700_000_000;
+    const ttl_h: i64 = 24; // 1-day window
+    const first = try share_store.createOrGet("user-cw2", "run-cw2", ttl_h, t0);
+    const first_code = try alloc.dupe(u8, first.share_code);
+    defer alloc.free(first_code);
+
+    // Jump past the TTL — first share is now expired (not revoked, but
+    // expired). Re-mint must walk the stale-cleanup branch.
+    const t_expired = t0 + (ttl_h + 1) * 3600;
+    const second = try share_store.createOrGet("user-cw2", "run-cw2", ttl_h, t_expired);
+
+    try std.testing.expect(!second.already_existed);
+    try std.testing.expectEqual(@as(usize, SHARE_CODE_LEN), second.share_code.len);
+    // Fresh code (probabilistically ~certain to differ from the first).
+    try std.testing.expect(!std.mem.eql(u8, first_code, second.share_code));
+
+    // by_owner index must point to the NEW code, and a subsequent lookup
+    // must succeed — proves the by_owner key memory wasn't freed under us.
+    const snap = share_store.getLive(second.share_code, t_expired);
+    try std.testing.expect(snap != null);
+
+    // Idempotent re-share with the SAME (user_id, run_id) at the SAME
+    // moment must return the LIVE record (also exercises the
+    // "already_existed → discard fresh key_buf" branch in the fix).
+    const third = try share_store.createOrGet("user-cw2", "run-cw2", ttl_h, t_expired);
+    try std.testing.expect(third.already_existed);
+    try std.testing.expectEqualStrings(second.share_code, third.share_code);
+}
+
+test "Wave2-CRITICAL: TraceShareStore.createOrGet re-mints over a REVOKED share without UAF / leak" {
+    // Same root cause as the expired path — exercising the revoke flow
+    // because revocation is the other way a record becomes `isLive=false`.
+    const alloc = std.testing.allocator;
+    var share_store = TraceShareStore.init(alloc);
+    defer share_store.deinit();
+
+    const t0: i64 = 1_700_000_000;
+    const first = try share_store.createOrGet("user-rv", "run-rv", 24, t0);
+    const first_code = try alloc.dupe(u8, first.share_code);
+    defer alloc.free(first_code);
+
+    _ = try share_store.revoke("user-rv", "run-rv");
+    // Revoked → isLive=false → stale branch fires on next createOrGet.
+    const second = try share_store.createOrGet("user-rv", "run-rv", 24, t0);
+    try std.testing.expect(!second.already_existed);
+    try std.testing.expect(!std.mem.eql(u8, first_code, second.share_code));
+}
+
+test "Wave2-HIGH2: artifact share-create rejects expires_in_hours above 720 with named cap" {
+    // The body must NAME the 720-hour cap so callers self-correct.
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    const raw = "POST /api/v1/users/1/artifacts/00000000-0000-0000-0000-000000000000/share HTTP/1.1\r\nContent-Length: 26\r\n\r\n{\"expires_in_hours\":721}";
+    const resp = handleArtifactShareCreate(
+        std.testing.allocator,
+        "POST",
+        "1",
+        "00000000-0000-0000-0000-000000000000",
+        raw,
+        &state,
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "expires_in_hours_too_large") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "720") != null);
+}
+
+test "Wave2-HIGH2: artifact share-create accepts the 720-hour cap exactly" {
+    // Boundary test — exactly 720 must NOT trip the cap. We expect a 503
+    // because state_mgr is null in this unit test (the body-validation
+    // 400 surface gets bypassed when the value is in range, and the
+    // handler falls through to the state_mgr check next).
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    const raw = "POST /api/v1/users/1/artifacts/00000000-0000-0000-0000-000000000000/share HTTP/1.1\r\nContent-Length: 26\r\n\r\n{\"expires_in_hours\":720}";
+    const resp = handleArtifactShareCreate(
+        std.testing.allocator,
+        "POST",
+        "1",
+        "00000000-0000-0000-0000-000000000000",
+        raw,
+        &state,
+    );
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp.status);
+}
+
+test "Wave2-HIGH3: artifact handlers return 503 (not 200/404) when state_mgr is null" {
+    // Standardization: every auth'd artifact handler must surface
+    // `state_unavailable` so the FE / operator sees "backend down" instead
+    // of "you have no artifacts" (the prior dishonest default for list +
+    // history).
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    const aid = "00000000-0000-0000-0000-000000000000";
+
+    // List — was 200 `{"artifacts":[]}`.
+    {
+        const r = handleArtifactList(std.testing.allocator, "GET", "1", &state, "/api/v1/users/1/artifacts");
+        try std.testing.expectEqualStrings("503 Service Unavailable", r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "state_unavailable") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "postgres") != null);
+    }
+    // Get — was 404.
+    {
+        const r = handleArtifactGet(std.testing.allocator, "GET", "1", aid, null, &state);
+        try std.testing.expectEqualStrings("503 Service Unavailable", r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "state_unavailable") != null);
+    }
+    // History — was 200 `{"history":[]}`.
+    {
+        const r = handleArtifactHistory(std.testing.allocator, "GET", "1", aid, &state);
+        try std.testing.expectEqualStrings("503 Service Unavailable", r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "state_unavailable") != null);
+    }
+    // Diff — was 404.
+    {
+        const r = handleArtifactDiff(std.testing.allocator, "GET", "1", aid, 1, 2, &state);
+        try std.testing.expectEqualStrings("503 Service Unavailable", r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "state_unavailable") != null);
+    }
+    // Put — already 503; assert the unified body shape lands.
+    {
+        const raw = "PUT /api/v1/users/1/artifacts/abc HTTP/1.1\r\nContent-Length: 19\r\n\r\n{\"content\":\"hello\"}";
+        const r = handleArtifactPut(std.testing.allocator, "PUT", "1", aid, raw, &state);
+        try std.testing.expectEqualStrings("503 Service Unavailable", r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "state_unavailable") != null);
+    }
+    // ShareRevoke — already 503; assert unified body shape.
+    {
+        const r = handleArtifactShareRevoke(std.testing.allocator, "DELETE", "1", aid, &state);
+        try std.testing.expectEqualStrings("503 Service Unavailable", r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "state_unavailable") != null);
+    }
+}
+
+test "Wave2-HIGH3: public artifact share endpoint keeps 404 for enumeration defense" {
+    // The PUBLIC unauthenticated GET deliberately returns 404 (NOT 503)
+    // when state_mgr is null, because a public endpoint must not reveal
+    // backend topology via differential status codes. Mirrors the
+    // trace-share public GET pattern.
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    const valid_code = "abcdefghijklmnopqrstuv"; // 22 chars, isValidShareCode-compliant
+    const r = handleArtifactShareGet(std.testing.allocator, "GET", valid_code, &state);
+    try std.testing.expectEqualStrings("404 Not Found", r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "share_not_found") != null);
+    // Crucially must NOT leak the backend-down signal in the body.
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "state_unavailable") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "postgres") == null);
 }

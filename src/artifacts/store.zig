@@ -17,6 +17,15 @@ const std = @import("std");
 /// `expires_in_hours` body field.
 pub const DEFAULT_SHARE_EXPIRY_HOURS: i64 = 168;
 
+/// Hard ceiling on share lifetime, in hours. Matches the trace share cap
+/// (`SHARE_MAX_HOURS = 720` in gateway.zig) so the commercial v1 contract
+/// is identical on both surfaces: callers cannot mint a share that
+/// outlives 30 days. Wave 2 review HIGH#2 — prior to this constant the
+/// artifact share-create endpoint accepted `24 * 365 = 8760h` (365 days),
+/// contradicting the trace share's published 720h ceiling and the
+/// commit-message claim that the two limits match.
+pub const SHARE_MAX_EXPIRY_HOURS: i64 = 720;
+
 /// URL-safe alphabet for share codes. No look-alikes (no I/l/1, no
 /// O/0) to keep typed/spoken sharing forgiving. 22 chars from this
 /// 58-symbol alphabet ≈ 128 bits of entropy — comfortably resistant
