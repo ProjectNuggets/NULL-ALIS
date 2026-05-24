@@ -52,6 +52,7 @@ pub const ALL_TOOLS = [_][]const u8{
     "memory_timeline",
     "message",
     "openapi",
+    "produce_document",
     "pushover",
     "runtime_info",
     "schedule",

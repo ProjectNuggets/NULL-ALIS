@@ -99,6 +99,7 @@ pub const delegate = @import("delegate.zig");
 pub const browser = @import("browser.zig");
 pub const image = @import("image.zig");
 pub const image_generate = @import("image_generate.zig");
+pub const produce_document = @import("produce_document.zig");
 pub const composio = @import("composio.zig");
 /// Sprint 3 — Universal API Connector. ONE tool exposing operator-
 /// registered OpenAPI 3.x specs via list/describe/invoke modes.
@@ -379,6 +380,16 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .flags = .{ .concurrency_safe = true },
         .risk_level = .low,
         .cost_class = .c,
+    },
+    // produce_document: writes ONLY to <workspace>/attachments/produced/ via
+    // local pandoc/marp/python — no shell-string interpolation (argv-only).
+    // background_safe + concurrency_safe (each invocation gets a unique
+    // timestamped filename). Medium cost — invokes an external binary.
+    .{
+        .name = produce_document.ProduceDocumentTool.tool_name,
+        .flags = .{ .mutating = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+        .cost_class = .b,
     },
     .{
         .name = cron_list.CronListTool.tool_name,
@@ -1120,6 +1131,13 @@ pub fn allTools(
     const igt = try allocator.create(image_generate.ImageGenerateTool);
     igt.* = .{ .workspace_dir = workspace_dir };
     try list.append(allocator, igt.tool());
+
+    // produce_document: first-class PDF/DOCX/XLSX/PPTX/HTML generation.
+    // workspace_dir bound so produced files land under attachments/produced/
+    // inside the agent's workspace.
+    const pdt = try allocator.create(produce_document.ProduceDocumentTool);
+    pdt.* = .{ .workspace_dir = workspace_dir };
+    try list.append(allocator, pdt.tool());
 
     // Memory tools (work gracefully without a backend)
     const mst = try allocator.create(memory_store.MemoryStoreTool);
@@ -2513,7 +2531,8 @@ test "all tools includes extras when enabled" {
     // + memory_maintain (V1.9-5 truth-maintenance toolkit)
     // + time_now (V1.9-DX1 wall-clock tool)
     // + wiki_link (V1.12 entity-mention extractor) = 46.
-    try std.testing.expectEqual(@as(usize, 46), tools.len);
+    // + produce_document (Wave 2A: first-class PDF/DOCX/XLSX/PPTX/HTML) = 47.
+    try std.testing.expectEqual(@as(usize, 47), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -2542,7 +2561,8 @@ test "all tools excludes extras when disabled" {
     // + time_now (V1.9-DX1 wall-clock tool)
     // + wiki_link (V1.12 entity-mention extractor) = 40 base
     // + delegate + spawn (v1 default-on, B1 fix 2026-05-23) = 42
-    try std.testing.expectEqual(@as(usize, 42), tools.len);
+    // + produce_document (Wave 2A) = 43
+    try std.testing.expectEqual(@as(usize, 43), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -2678,7 +2698,8 @@ test "all tools includes message when event bus is available" {
     // V1.9-DX1 added time_now (wall-clock awareness) → 39.
     // V1.12 added wiki_link (entity-mention extractor) → 40.
     // 2026-05-23 B1: delegate + spawn flipped on by default → 42.
-    try std.testing.expectEqual(@as(usize, 42), tools.len);
+    // Wave 2A: produce_document added (first-class PDF/DOCX/XLSX/PPTX/HTML) → 43.
+    try std.testing.expectEqual(@as(usize, 43), tools.len);
 
     var found_message = false;
     for (tools) |t| {
@@ -2915,10 +2936,14 @@ test "multiagent-gated tools (delegate, spawn) still classify as mutating + non-
 test "defaultMetadataRegistry only whitelists expected background_safe tools" {
     const registry = defaultMetadataRegistry();
     const background_safe_names = [_][]const u8{
-        "runtime_info", "file_read",          "memory_recall",
-        "memory_list",  "memory_timeline",    "transcript_read",
-        "web_fetch",    "web_search",         "task_list",
-        "task_get",     "set_execution_mode", "context_snapshot",
+        "runtime_info",     "file_read",          "memory_recall",
+        "memory_list",      "memory_timeline",    "transcript_read",
+        "web_fetch",        "web_search",         "task_list",
+        "task_get",         "set_execution_mode", "context_snapshot",
+        // produce_document: writes ONLY to <workspace>/attachments/produced/
+        // with timestamped filenames (no overwrite, no cross-invocation
+        // state). Safe to run from a scheduled job / cron lane. Wave 2A.
+        "produce_document",
     };
 
     // Everything in the whitelist must be background_safe.
