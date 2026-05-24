@@ -422,7 +422,14 @@ fn runServeCommand(allocator: Allocator, sub_args: []const []const u8) !void {
         },
     );
     if (!auth_config.required()) {
-        log.warn("MCP server running WITHOUT an auth token (open stdio mode) — set NULLALIS_MCP_AUTH_TOKEN to require one", .{});
+        // F-A7.2 (2026-05-24): in stdio mode the terminal IS the trust
+        // boundary — the parent process (the user's IDE / shell) is the
+        // only thing that can speak on the pipe, so the open-mode default
+        // is intentional and not a "WARN-worthy" misconfiguration. We
+        // surface it at info level instead, with the rationale + the
+        // override knob for anyone wanting belt + suspenders or a future
+        // TCP/SSE transport.
+        log.info("MCP server: stdio open-mode (no authToken — terminal is the trust boundary). Set NULLALIS_MCP_AUTH_TOKEN if you want belt+suspenders or are wrapping with a network transport.", .{});
     }
     if (expose_all) {
         log.warn("MCP server exposing the FULL tool registry (includes shell/file-write/etc.) — escape hatch is active", .{});

@@ -164,6 +164,17 @@ pub fn handleToolsCall(
         break :blk a.object;
     };
 
+    // F-A7.1 (2026-05-24): mark the thread-local turn context with origin=.mcp
+    // for the duration of this dispatch. Memory tools (and any future
+    // origin-aware tool) inspect this to fall back to safe defaults (e.g.
+    // memory_recall → scope=global) when an IDE / external MCP client has
+    // no notion of nullalis session lanes. We restore the previous context
+    // on the way out so we never poison neighbouring threads or the same
+    // thread's later non-MCP work.
+    const previous_turn_ctx = tools_mod.getTurnContext();
+    tools_mod.setTurnContext(.{ .origin = .mcp });
+    defer tools_mod.setTurnContext(previous_turn_ctx);
+
     // Dispatch. A tool returning `error` (as opposed to a failed ToolResult)
     // is an internal fault, not a protocol error in the caller's request.
     const tr = tool.execute(arena, args) catch |e| {

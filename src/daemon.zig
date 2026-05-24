@@ -1387,7 +1387,7 @@ fn runCronAgentTurnWithBus(
         const limits = entitlement_mod.Entitlement.limitsFor(effective_tier);
         const is_proactive = switch (turn_origin) {
             .heartbeat, .scheduler, .proactive, .wake => true,
-            .user => false,
+            .user, .mcp => false, // mcp = external foreground caller, never proactive
         };
         if (is_proactive and !limits.proactive_enabled) {
             log.info("cron.skipped reason=entitlement_proactive_disabled user={s} tier={s} job_id={s}", .{

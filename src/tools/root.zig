@@ -1416,6 +1416,13 @@ pub const TurnOrigin = enum {
     scheduler,
     wake,
     proactive,
+    /// 2026-05-24 F-A7.1 — calls dispatched through the MCP server
+    /// (`nullalis mcp serve` stdio) carry this origin. Memory tools use it
+    /// to fall back to global scope when no explicit session_id is given,
+    /// because an IDE / external MCP client has no concept of nullalis
+    /// session lanes and would otherwise hit InvalidSessionId on every
+    /// memory_recall.
+    mcp,
 
     pub fn toSlice(self: TurnOrigin) []const u8 {
         return switch (self) {
@@ -1424,6 +1431,7 @@ pub const TurnOrigin = enum {
             .scheduler => "scheduler",
             .wake => "wake",
             .proactive => "proactive",
+            .mcp => "mcp",
         };
     }
 };
@@ -1567,7 +1575,7 @@ pub fn getTurnContext() RuntimeTurnContext {
 
 pub fn isBackgroundTurnOrigin(origin: TurnOrigin) bool {
     return switch (origin) {
-        .user => false,
+        .user, .mcp => false, // mcp = user-equivalent foreground call from an external client
         .heartbeat, .scheduler, .wake, .proactive => true,
     };
 }
@@ -1660,7 +1668,9 @@ fn backgroundPolicyForOrigin(origin: TurnOrigin) BackgroundOriginPolicy {
             .allow_composio_read_execute = false,
             .allow_message = false,
         },
-        .user => .{
+        .user, .mcp => .{
+            // mcp = external-client foreground call; same trust + capability
+            // surface as a normal user turn (terminal/IDE is the parent).
             .allow_schedule_ensure = true,
             .allow_composio_read_execute = true,
             .allow_message = true,

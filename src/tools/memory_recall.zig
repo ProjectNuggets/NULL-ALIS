@@ -323,13 +323,28 @@ pub const MemoryRecallTool = struct {
             return sid;
         }
 
+        // F-A7.1 (2026-05-24): if scope was not explicitly supplied AND the
+        // caller is the MCP server (no agent-side session_key in the turn
+        // context), fall back to global recall instead of erroring.
+        // IDE / external MCP clients have no concept of nullalis session
+        // lanes, so requiring one would break every memory_recall they make.
+        // Agent-turn callers ALWAYS get an explicit session_key plumbed in;
+        // the .mcp origin is the only path that lands here with a null key.
+        const scope_explicit = root.getString(args, "scope") != null;
         const scope_raw = root.getString(args, "scope") orelse "session";
         const scope = std.mem.trim(u8, scope_raw, " \t\r\n");
         if (scope.len == 0) return error.InvalidScope;
         if (std.ascii.eqlIgnoreCase(scope, "global")) return null;
         if (std.ascii.eqlIgnoreCase(scope, "session")) {
-            const session_key = root.getTurnContext().session_key orelse return error.InvalidSessionId;
-            if (session_key.len == 0) return error.InvalidSessionId;
+            const ctx = root.getTurnContext();
+            const session_key = ctx.session_key orelse {
+                if (!scope_explicit and ctx.origin == .mcp) return null; // graceful MCP default
+                return error.InvalidSessionId;
+            };
+            if (session_key.len == 0) {
+                if (!scope_explicit and ctx.origin == .mcp) return null;
+                return error.InvalidSessionId;
+            }
             return session_key;
         }
         return error.InvalidScope;
@@ -657,4 +672,58 @@ test "memory_recall rejects invalid scope value" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Invalid 'scope'") != null);
+}
+
+// F-A7.1 regression guard (2026-05-24). MCP-context calls (origin=.mcp,
+// no session_key, no explicit scope/session_id) used to error out with
+// "Invalid 'session_id'" because the default scope=session demanded a
+// turn-context session_key and the MCP server provided none. The fix
+// teaches resolveSessionId to gracefully fall through to global recall
+// in that exact shape. This test pins the contract so a future refactor
+// can't silently regress IDE / external-MCP-client UX.
+test "memory_recall MCP-origin falls back to global when no session_key" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("global_fact", "kiwi global", .core, null);
+    try mem.store("session_fact", "kiwi session", .core, "agent:zaki-bot:user:1:main");
+
+    // MCP-origin context: origin=.mcp, session_key=null. Same shape as
+    // src/mcp/server_handlers.zig:handleToolsCall sets up around the
+    // tool.execute call.
+    root.setTurnContext(.{ .origin = .mcp });
+    defer root.clearTurnContext();
+
+    var mt = MemoryRecallTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"query\":\"kiwi\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    // Global recall surfaces BOTH facts (no session scoping applied).
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "global_fact") != null);
+}
+
+// F-A7.1 negative guard: an agent-origin call without a session_key is
+// still an error (that shape indicates a real wiring bug, not an MCP
+// caller). Only the .mcp origin earns the graceful fallback.
+test "memory_recall non-MCP origin still errors without session_key" {
+    const NoneMemory = mem_root.NoneMemory;
+    var backend = NoneMemory.init();
+    defer backend.deinit();
+
+    root.setTurnContext(.{ .origin = .user, .session_key = null });
+    defer root.clearTurnContext();
+
+    var mt = MemoryRecallTool{ .memory = backend.memory() };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"query\":\"x\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Invalid 'session_id'") != null);
 }
