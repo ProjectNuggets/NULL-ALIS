@@ -67,6 +67,22 @@ pub const ProductSettings = struct {
     /// the field as InvalidPayload, but the FE error was swallowed by
     /// retry logic. Now wired.
     autonomy: AutonomyLevel = .full,
+    /// 2026-05-24 (v1.14.21 final-sprint) — user toggle for the nightly
+    /// 3 AM dream-reflection cron job declared in `AUTOMATIONS.json`.
+    /// Default true: every new tenant gets a nightly reflection out of
+    /// the box. When false, the daemon's wake-turn reconciler honors the
+    /// flag and uninstalls (or skips installing) the canonical dream_3am
+    /// job. Pairs with `_user_facing.user_toggle_setting = "dream_enabled"`
+    /// on the matching AUTOMATIONS.json entry.
+    dream_enabled: bool = true,
+    /// 2026-05-24 (v1.14.21 final-sprint) — user toggle for LLM-based
+    /// query expansion at memory-retrieval time. Adds one cheap LLM call
+    /// per query to widen the search ("zed" → "zed editor preferences
+    /// development tools"). Default false because it has a real per-query
+    /// cost; UI should label it "Expand my queries with AI (costs more,
+    /// improves recall on short / vague questions)." Maps to
+    /// `memory.retrieval_stages.query_expansion_enabled` at runtime.
+    query_expansion_enabled: bool = false,
 };
 
 pub const Error = error{
@@ -195,6 +211,8 @@ const tenant_preference_product_settings_keys = [_][]const u8{
     "voice_replies",
     "session_timeout_minutes",
     "autonomy",
+    "dream_enabled",
+    "query_expansion_enabled",
 };
 
 pub const NormalizedTenantConfig = struct {
@@ -335,6 +353,16 @@ pub fn applyPatchToSettingsJson(
             next.autonomy = AutonomyLevel.fromString(value.string) orelse return error.InvalidAutonomy;
             continue;
         }
+        if (std.mem.eql(u8, key, "dream_enabled")) {
+            if (value != .bool) return error.InvalidPayload;
+            next.dream_enabled = value.bool;
+            continue;
+        }
+        if (std.mem.eql(u8, key, "query_expansion_enabled")) {
+            if (value != .bool) return error.InvalidPayload;
+            next.query_expansion_enabled = value.bool;
+            continue;
+        }
         return error.InvalidPayload;
     }
     return next;
@@ -359,6 +387,8 @@ pub fn mergeSettingsIntoConfigJson(
     try putBool(product_obj, a, "voice_replies", settings.voice_replies);
     try putInt(product_obj, a, "session_timeout_minutes", settings.session_timeout_minutes);
     try putString(product_obj, a, "autonomy", settings.autonomy.toString());
+    try putBool(product_obj, a, "dream_enabled", settings.dream_enabled);
+    try putBool(product_obj, a, "query_expansion_enabled", settings.query_expansion_enabled);
 
     var rendered = try std.json.Stringify.valueAlloc(allocator, root, .{});
     if (rendered.len == 0 or rendered[rendered.len - 1] != '\n') {
@@ -419,6 +449,8 @@ pub fn normalizeTenantConfigJson(
     try putBool(product_obj, a, "voice_replies", settings.voice_replies);
     try putInt(product_obj, a, "session_timeout_minutes", settings.session_timeout_minutes);
     try putString(product_obj, a, "autonomy", settings.autonomy.toString());
+    try putBool(product_obj, a, "dream_enabled", settings.dream_enabled);
+    try putBool(product_obj, a, "query_expansion_enabled", settings.query_expansion_enabled);
 
     var rendered = try std.json.Stringify.valueAlloc(allocator, root, .{});
     if (rendered.len == 0 or rendered[rendered.len - 1] != '\n') {
@@ -482,13 +514,26 @@ pub fn applySettingsToConfig(cfg: *Config, settings: ProductSettings) void {
     // via config.json — those are deployment policy, not user
     // preference. The user choice is solely the level.
     cfg.autonomy.level = settings.autonomy;
+
+    // 2026-05-24 (v1.14.21) — query_expansion_enabled propagates from per-
+    // user product_settings into the live memory retrieval pipeline. UI
+    // labels this "Expand my queries with AI (costs more, improves recall
+    // on short / vague questions)." Default false; user opts in.
+    cfg.memory.retrieval_stages.query_expansion_enabled = settings.query_expansion_enabled;
+
+    // dream_enabled propagation: handled by the daemon wake-turn reconciler
+    // reading `user_settings.dream_enabled` and matching against
+    // AUTOMATIONS.json's dream_3am.enabled field — not a config flip here.
+    // See AUTOMATIONS.json `_user_facing.user_toggle_setting` mapping
+    // and src/daemon.zig wake-turn reconciliation.
+
     cfg.syncFlatFields();
 }
 
 pub fn renderSettingsJson(allocator: std.mem.Allocator, settings: ProductSettings) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "{{\"assistant_mode\":\"{s}\",\"group_activation\":\"{s}\",\"proactive_updates\":{s},\"voice_replies\":{s},\"session_timeout_minutes\":{d},\"autonomy\":\"{s}\"}}",
+        "{{\"assistant_mode\":\"{s}\",\"group_activation\":\"{s}\",\"proactive_updates\":{s},\"voice_replies\":{s},\"session_timeout_minutes\":{d},\"autonomy\":\"{s}\",\"dream_enabled\":{s},\"query_expansion_enabled\":{s}}}",
         .{
             settings.assistant_mode.toSlice(),
             settings.group_activation.toSlice(),
@@ -496,6 +541,8 @@ pub fn renderSettingsJson(allocator: std.mem.Allocator, settings: ProductSetting
             if (settings.voice_replies) "true" else "false",
             settings.session_timeout_minutes,
             settings.autonomy.toString(),
+            if (settings.dream_enabled) "true" else "false",
+            if (settings.query_expansion_enabled) "true" else "false",
         },
     );
 }
@@ -539,6 +586,20 @@ fn parseProductSettings(value: std.json.Value) Error!ProductSettings {
         break :blk AutonomyLevel.fromString(raw.string) orelse return error.InvalidAutonomy;
     };
 
+    // 2026-05-24 (v1.14.21) — dream_enabled + query_expansion_enabled are
+    // OPTIONAL on read for the same reason as autonomy above: pre-v1.14.21
+    // stored configs predate these keys; absent → struct default.
+    const dream_enabled: bool = blk: {
+        const raw = obj.get("dream_enabled") orelse break :blk true;
+        if (raw != .bool) return error.InvalidPayload;
+        break :blk raw.bool;
+    };
+    const query_expansion_enabled: bool = blk: {
+        const raw = obj.get("query_expansion_enabled") orelse break :blk false;
+        if (raw != .bool) return error.InvalidPayload;
+        break :blk raw.bool;
+    };
+
     return .{
         .assistant_mode = assistant_mode,
         .group_activation = group_activation,
@@ -546,6 +607,8 @@ fn parseProductSettings(value: std.json.Value) Error!ProductSettings {
         .voice_replies = voice_raw.bool,
         .session_timeout_minutes = clampSessionTimeoutMinutesI64(timeout_raw.integer),
         .autonomy = autonomy_resolved,
+        .dream_enabled = dream_enabled,
+        .query_expansion_enabled = query_expansion_enabled,
     };
 }
 

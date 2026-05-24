@@ -2794,11 +2794,16 @@ test "heartbeatTemplate is non-empty" {
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "HEARTBEAT.md") != null);
 }
 
-test "automationTemplate is non-empty" {
+test "automationTemplate is non-empty + ships dream_3am canonical job (v1.14.21)" {
     const tmpl = try automationTemplate(std.testing.allocator, &ProjectContext{});
     defer std.testing.allocator.free(tmpl);
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "\"version\": 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tmpl, "\"jobs\": []") != null);
+    // 2026-05-24: template ships with one canonical job (dream_3am) so
+    // every new tenant gets a working nightly reflection without
+    // operator intervention. User toggle: product_settings.dream_enabled.
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "\"dream_3am\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "\"schedule\": \"0 3 * * *\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "user_toggle_setting") != null);
 }
 
 test "bootstrapTemplate is non-empty" {
@@ -2828,7 +2833,9 @@ test "zaki templates contain onboarding and proactive guidance" {
 
     const automations = try automationTemplate(std.testing.allocator, &ctx);
     defer std.testing.allocator.free(automations);
-    try std.testing.expect(std.mem.indexOf(u8, automations, "\"jobs\": []") != null);
+    // 2026-05-24 (v1.14.21): zaki bot ships dream_3am canonical job in the
+    // AUTOMATIONS.json template — every new tenant gets nightly reflection.
+    try std.testing.expect(std.mem.indexOf(u8, automations, "\"dream_3am\"") != null);
 
     const bootstrap = try bootstrapTemplate(std.testing.allocator, &ctx);
     defer std.testing.allocator.free(bootstrap);

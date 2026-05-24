@@ -358,6 +358,55 @@ pub const Config = struct {
             if (!self.memory.retrieval_stages.adaptive_retrieval_enabled) {
                 self.memory.retrieval_stages.adaptive_retrieval_enabled = true;
             }
+
+            // 2026-05-24 (v1.14.21 final-sprint activation) — flip 7 dormant
+            // feature flags to default-on for the zaki_bot commercial profile.
+            // Each flag is end-to-end wired today but was opt-in for historical
+            // operator-decides reasons. For SaaS commercial v1 the default
+            // posture is "everything on, central meter throttles." Operators
+            // on standalone deploys can still set explicit `false` in
+            // config.json to opt out per flag.
+            //
+            // Rationale per flag:
+            //   - audio_media: Whisper STT (groq whisper-large-v3) + Telegram
+            //     TTS. Fails soft if no API key. Voice notes "just work."
+            //   - heartbeat: starts the proactive engine. Per-user
+            //     `proactive_updates` flag (user_settings, default true) still
+            //     gates per-tenant. WITHOUT this flip the user-level toggle
+            //     has nothing to gate — silent-off.
+            //   - cron: starts cron-job loading. WITHOUT this flip jobs
+            //     created via the `schedule` tool silently never fire. This
+            //     was a real blocker.
+            //   - response_cache + semantic_cache: end-to-end wired at
+            //     agent/root.zig:3488 + :4557 via mem_rt.semanticCache().get.
+            //     Storage cost only; near-zero hit rate on personal-brain
+            //     workload but covers recurring dream/heartbeat patterns.
+            //   - composio: surfaces Gmail/Calendar/Drive/Slack/Notion tools
+            //     when API key wired. Fails soft if no key.
+            //   - cost: per-tenant cost tracking infrastructure. Pairs with
+            //     the central usage meter at zaki-prod (spend SSE event in
+            //     done frame, v1.14.20).
+            //
+            // What we leave OFF (the audit conclusions):
+            //   - summarizer.enabled — legacy V1.5 sliding-window path;
+            //     Pass A (boundary extraction) + Pass C (session-end) +
+            //     extraction_persist + TTL are the modern replacement and
+            //     enabling the legacy summarizer risks duplicate writes
+            //     fighting the canonical pipeline.
+            //   - browser.enabled — current tool only does `open` (system
+            //     browser launch, useless for SaaS) + `read` (curl-equivalent
+            //     of web_fetch). CDP actions stripped at v1.14.13 per
+            //     §14.5 honesty. Flip when Playwright integration ships
+            //     (server-side MCP OR browser extension).
+            //   - snapshot_enabled, peripherals, query_expansion,
+            //     llm_reranker, qmd — deliberately off; see deferred-register.
+            if (!self.audio_media.enabled) self.audio_media.enabled = true;
+            if (!self.heartbeat.enabled) self.heartbeat.enabled = true;
+            if (!self.cron.enabled) self.cron.enabled = true;
+            if (!self.memory.response_cache.enabled) self.memory.response_cache.enabled = true;
+            if (!self.memory.semantic_cache.enabled) self.memory.semantic_cache.enabled = true;
+            if (!self.composio.enabled) self.composio.enabled = true;
+            if (!self.cost.enabled) self.cost.enabled = true;
         }
     }
 

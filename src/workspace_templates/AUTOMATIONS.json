@@ -1,4 +1,19 @@
 {
   "version": 1,
-  "jobs": []
+  "jobs": [
+    {
+      "id": "dream_3am",
+      "schedule": "0 3 * * *",
+      "kind": "agent",
+      "command": "It is 3 AM. Reflect overnight on the user's last 7 days of conversation.\n\nUse your tools:\n- memory_timeline to scan the recent activity window\n- brain_graph (action=\"communities\") to see emergent topic clusters\n- memory_recall to fetch deeper context on themes that recur\n\nCompose a short reflection (3-5 sentences, plain prose, no headers):\n1. What 2-3 themes does the user keep returning to?\n2. What 1-2 patterns did you notice that the user might not have?\n3. What 1-2 questions worth asking next time would deepen your understanding?\n4. Close with a one-line warm observation — you observed the user, you are not the user.\n\nPersist via memory_store with:\n  key=dream_log/<today's date in YYYY-MM-DD form>\n  category=daily\n  scope=global\n  content=<your reflection prose>",
+      "session_target": "isolated",
+      "enabled": true,
+      "_user_facing": {
+        "title": "Nightly reflection",
+        "description": "Your agent reviews the last 7 days of conversation at 3 AM and writes a short reflection — themes, patterns, questions worth asking next time. Stored as a dream_log/<date> memory you can read in your brain timeline.",
+        "user_toggle_setting": "dream_enabled"
+      }
+    }
+  ],
+  "_doc": "Durable automation spec — see daemon.zig:238. Wake turns reconcile canonical jobs here via `schedule ensure`. User can edit `enabled` per job or use the matching toggle in user_settings (e.g. dream_enabled). Adding/removing jobs from this file means the next wake turn will install/remove them in the live cron."
 }
