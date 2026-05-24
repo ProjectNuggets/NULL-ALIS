@@ -611,3 +611,46 @@ fully preventable.
 emergency-archive of uncommitted work to "get out of the subagent's way," the
 dispatch was missing `isolation: "worktree"`. Recovery is `git worktree add` for
 your own work, not destructive ops on the shared tree.
+
+### 14.13 Per-tenant config precedence (added 2026-05-24 from F-A2.1)
+
+**Per-tenant settings stored in PG win over base `config.json`. Flipping the
+base does not retroactively change existing tenants.**
+
+Surfaced by substrate probe #2 (2026-05-23): an operator flipped
+`autonomy.level=supervised` in the gateway's base config and saw zero effect
+on user 2009. Root cause: PG `zaki_bot.user_config` row stored
+`product_settings.autonomy = "full"` from a prior provision, and
+`user_settings.applySettingsToConfig` writes that resolved value back over
+`cfg.autonomy.level` after the base config has been merged in. This is
+documented design — per-tenant lanes are source-of-truth for user-controlled
+toggles — but it is silent unless surfaced.
+
+**Detection (auto, since 2026-05-24):** when `TenantRuntime.init` resolves
+an autonomy level that differs from `base_config.autonomy.level`, the
+gateway emits
+
+```
+info(gateway): tenant.autonomy.diverged user={id} base={X} resolved={Y} source={pg_user_config|postgres_seeded_from_file|file_config_fallback}
+```
+
+once per tenant init. Grep for `tenant.autonomy.diverged` after a base-config
+flip to see which existing users will NOT pick up the new default.
+
+**Recovery options:**
+1. **Per-user PG patch** (one-shot, lowest blast radius):
+   ```sql
+   UPDATE zaki_bot.user_config
+   SET config = jsonb_set(config, '{product_settings,autonomy}', '"supervised"'::jsonb)
+   WHERE user_id = <id>;
+   ```
+   Then evict the tenant runtime so the next request re-init's from PG.
+2. **Per-user UX** (preferred long-term): have the user themselves change
+   autonomy via the in-app settings — the FE write hits
+   `mergeSettingsIntoConfigJson` and writes the canonical value back to PG.
+3. **Bulk reconcile** (planned: `nullalis reconcile-autonomy`): walks PG
+   users, prints a diff vs base, optionally patches with `--apply`.
+
+**Rule:** when documenting an autonomy / behavior flip in a release, note
+which existing-tenant rows still hold the old value so operators don't ship
+under the assumption that "the base config governs."

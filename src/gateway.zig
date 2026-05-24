@@ -1318,6 +1318,24 @@ const TenantRuntime = struct {
             } else {
                 runtime.effective_config_source = "file_config_fallback";
             }
+            // F-A2.1 transparency (2026-05-24): per-tenant settings stored in
+            // PG (product_settings.autonomy) win over base config.autonomy.level.
+            // This is documented design — per-tenant lanes are source of truth
+            // for user-facing toggles — but it creates a foot-gun for operators
+            // who flip autonomy in the base config and see no effect on existing
+            // users. Surface the divergence as a one-shot info log per tenant
+            // init so operators can SEE which users diverged from the base.
+            if (base_config.autonomy.level != runtime.config.autonomy.level) {
+                log.info(
+                    "tenant.autonomy.diverged user={s} base={s} resolved={s} source={s}",
+                    .{
+                        user_ctx.user_id,
+                        base_config.autonomy.level.toString(),
+                        runtime.config.autonomy.level.toString(),
+                        runtime.effective_config_source,
+                    },
+                );
+            }
             if (std.mem.eql(u8, runtime.config.state.backend, "postgres")) {
                 // Use a ZAKI BOT-specific canonical memory backend instead of the generic
                 // Postgres engine, which targets a different table shape.

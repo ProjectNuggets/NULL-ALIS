@@ -223,6 +223,22 @@ Surfaced by the Sprint 2 four-agent build, its independent post-merge audits, th
 
 ---
 
+## From substrate audit (2026-05-24)
+
+8-substrate end-to-end probe pass on the live gateway: delegate, approvals,
+web (search/fetch/http), brain_graph, schedule/cron, OpenAPI, MCP server,
+MCP client. All eight verified. Six findings surfaced; entries below
+capture closure / deferral with verification artifacts.
+
+| ID | Shape | Why deferred | Target | Status |
+|----|-------|--------------|--------|--------|
+| D57 | **F-A7.3 sweep — `"first scenario"` placeholders in 31 tool descriptions** — substrate probe #7 found 31 tools shipped with literal template-fill placeholders in `tool_description_struct.use_when` / `do_not_use_for`, plus 2 (`file_read_hashed`, `file_edit_hashed`) whose `.what` was just `"<name> tool."` boilerplate. Lint at `src/tools/lint.zig:111` enforced length and sibling-ref correctness but never checked customization, so every model context leaked meaningless guidance. Rewrote all 33; added lint Rule 6 that rejects the placeholders + boilerplate at compile time | n/a | n/a (closed) | **shipped at `6672ef8d`** — 33 files rewritten + Rule 6; CI gate 6410/6482 tests passed |
+| D58 | **F-A7.1 / F-A7.2 — MCP-context UX hardening** — `memory_recall` via MCP returned `InvalidSessionId` because the server entry path set no turn-context session_key; the open-mode "WARN" log misled users into thinking stdio auth-less was a misconfiguration. Added `TurnOrigin.mcp` + MCP-server context handoff + memory_recall global-fallback when origin=.mcp; downgraded auth-less warning to info with rationale | n/a | n/a (closed) | **shipped at `d2183986`** — +2 regression guards; CI gate 6412/6484 |
+| D59 | **F-A2.1 — tenant autonomy divergence transparency** — PG `user_config.product_settings.autonomy` wins over base `config.autonomy.level`; flipping the base has no effect on existing tenants. Documented design but silent. Added one-shot info log per tenant init when base ≠ resolved (`tenant.autonomy.diverged user={} base={} resolved={} source={}`), §14.13 captured the precedence rule + recovery options (per-user PG patch / FE flip / planned bulk reconcile CLI) | The diagnostic + doc landed. A `nullalis reconcile-autonomy` bulk CLI is the natural next step (walk PG users, diff vs base, `--apply` to patch) but is a separate operator surface not gating S-tier | next operator-CLI touch, or when a customer reports the foot-gun | **partial — diagnostic + AGENTS.md §14.13 shipped; bulk reconcile CLI deferred** |
+| D60 | **D52 PII storage policy — Hybrid Pillar 1** — system-prompt directive overriding the LLM PII reflex for the user's own personal-memory channel. Nova green-lit this on 2026-05-24 (S-tier production push, Phase E). Will land alongside Phase E in the same v1.14.19 cycle | n/a (in flight as Phase E) | v1.14.19 | **planned — green-lit, implementation pending** |
+
+---
+
 ## Retroactive reviews (process-gap)
 
 | ID | Shape | Why deferred | Target | Status |
