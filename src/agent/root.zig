@@ -131,14 +131,41 @@ pub const Agent = struct {
         emission_mode: StreamEmissionMode = .undecided,
         buffered_text: std.ArrayListUnmanaged(u8) = .empty,
         final_pending: bool = false,
+        /// D53 third defense layer (2026-05-24): in `.pass_through` mode the
+        /// chunk-by-chunk emit can leak `<tool_call>` markup that the model
+        /// emits AFTER legitimate prose (so the streamer already committed to
+        /// pass_through on the firstNonEmptyLine check). Markup can also be
+        /// split across two chunks ("...some text<too" + "l_call>{...}").
+        /// We hold a short trailing buffer of up-to-`pending_tail_max` bytes
+        /// across chunks so a split prefix can be reassembled on the next
+        /// chunk and stripped. Emitted to the user-facing callback in
+        /// `emitScrubbedDelta` only after the next chunk arrives (or on the
+        /// final chunk via `flushPendingTail`).
+        pending_tail: std.ArrayListUnmanaged(u8) = .empty,
+
+        /// Longest markup sentinel we scan for. `</tool_call>` is 12 bytes;
+        /// hold up to that minus one so we never block a fully-formed
+        /// sentinel from being detected.
+        const pending_tail_max: usize = 11;
 
         fn deinit(self: *StreamTimingContext) void {
             self.buffered_text.deinit(self.agent.allocator);
+            self.pending_tail.deinit(self.agent.allocator);
         }
 
         fn flushBuffered(self: *StreamTimingContext) void {
             if (self.buffered_text.items.len > 0) {
-                self.callback(self.callback_ctx, providers.StreamChunk.textDelta(self.buffered_text.items));
+                // D53 second-layer scrub (2026-05-24): the `.undecided` →
+                // `.pass_through` transition fires when firstNonEmptyLine
+                // looks clean, but `buffered_text` may already contain mid-
+                // stream markup ("Got it.\n<tool_call>{...}"). Strip before
+                // emitting; otherwise the entire accumulated buffer leaks
+                // raw on transition.
+                const scrubbed = Agent.stripToolCallMarkup(self.agent.allocator, self.buffered_text.items);
+                defer if (scrubbed.ptr != self.buffered_text.items.ptr) self.agent.allocator.free(scrubbed);
+                if (scrubbed.len > 0) {
+                    self.callback(self.callback_ctx, providers.StreamChunk.textDelta(scrubbed));
+                }
                 self.buffered_text.clearRetainingCapacity();
             }
             if (self.final_pending) {
@@ -152,7 +179,13 @@ pub const Agent = struct {
             if (self.emission_mode == .pass_through) return;
             self.buffered_text.clearRetainingCapacity();
             if (reply_text.len > 0) {
-                self.callback(self.callback_ctx, providers.StreamChunk.textDelta(reply_text));
+                // D53 (2026-05-24): reply_text comes from already-scrubbed
+                // display_text (see agent/root.zig:4129) so it should be
+                // clean; the strip here is defense-in-depth for any future
+                // caller that forgets the upstream scrub.
+                const scrubbed = Agent.stripToolCallMarkup(self.agent.allocator, reply_text);
+                defer if (scrubbed.ptr != reply_text.ptr) self.agent.allocator.free(scrubbed);
+                self.callback(self.callback_ctx, providers.StreamChunk.textDelta(scrubbed));
             }
             self.callback(self.callback_ctx, providers.StreamChunk.finalChunk());
             self.final_pending = false;
@@ -162,6 +195,73 @@ pub const Agent = struct {
         fn recordBufferedDelta(self: *StreamTimingContext, delta: []const u8) bool {
             self.buffered_text.appendSlice(self.agent.allocator, delta) catch return false;
             return true;
+        }
+
+        /// D53 third defense layer (2026-05-24): emit a chunk that came in
+        /// during `.pass_through` mode, with streaming-aware markup scrub.
+        ///
+        /// Two concerns:
+        ///   1. Complete markup wholly within the chunk → strip via
+        ///      `stripToolCallMarkup`.
+        ///   2. Markup split across two chunks (e.g. chunk N ends with
+        ///      "...<too", chunk N+1 starts with "l_call>{") → hold the
+        ///      trailing bytes that could be a markup-prefix and reassemble
+        ///      on the next chunk.
+        ///
+        /// `is_final == true` on the chunk means we should also flush the
+        /// held tail (whatever it is, the stream is ending, so any held
+        /// bytes are real content, not a future-markup prefix).
+        fn emitScrubbedDelta(self: *StreamTimingContext, chunk: providers.StreamChunk) void {
+            // Combine any held tail with the new delta so split markup
+            // reassembles correctly.
+            const allocator = self.agent.allocator;
+            var combined: std.ArrayListUnmanaged(u8) = .empty;
+            defer combined.deinit(allocator);
+            combined.appendSlice(allocator, self.pending_tail.items) catch {
+                // OOM — fall back to direct forward of the new delta (drop
+                // the held tail, accept the rare leak rather than fail the
+                // turn). Reset state so we don't double-emit later.
+                self.pending_tail.clearRetainingCapacity();
+                self.callback(self.callback_ctx, chunk);
+                return;
+            };
+            combined.appendSlice(allocator, chunk.delta) catch {
+                self.pending_tail.clearRetainingCapacity();
+                self.callback(self.callback_ctx, chunk);
+                return;
+            };
+            self.pending_tail.clearRetainingCapacity();
+
+            // Strip complete markup blocks.
+            const scrubbed = Agent.stripToolCallMarkup(allocator, combined.items);
+            defer if (scrubbed.ptr != combined.items.ptr) allocator.free(scrubbed);
+
+            // Figure out how many trailing bytes look like a markup prefix
+            // we should hold (only when more chunks may follow).
+            const hold_len: usize = if (chunk.is_final) 0 else Agent.trailingMarkupPrefixLen(scrubbed);
+            const emit_len = scrubbed.len - hold_len;
+            if (emit_len > 0) {
+                self.callback(self.callback_ctx, providers.StreamChunk.textDelta(scrubbed[0..emit_len]));
+            }
+            if (hold_len > 0) {
+                self.pending_tail.appendSlice(allocator, scrubbed[emit_len..]) catch {
+                    // Same OOM fallback: emit the rest directly.
+                    self.callback(self.callback_ctx, providers.StreamChunk.textDelta(scrubbed[emit_len..]));
+                };
+            }
+            if (chunk.is_final) {
+                self.callback(self.callback_ctx, providers.StreamChunk.finalChunk());
+            }
+        }
+
+        /// Called when the stream ends without a chunk.is_final having
+        /// been routed through `emitScrubbedDelta` (defensive — both paths
+        /// would otherwise lose the held tail).
+        fn flushPendingTail(self: *StreamTimingContext) void {
+            if (self.pending_tail.items.len > 0) {
+                self.callback(self.callback_ctx, providers.StreamChunk.textDelta(self.pending_tail.items));
+                self.pending_tail.clearRetainingCapacity();
+            }
         }
     };
 
@@ -184,7 +284,14 @@ pub const Agent = struct {
             ctx.agent.observer.recordEvent(&first_token_event);
         }
         if (ctx.emission_mode == .pass_through) {
-            ctx.callback(ctx.callback_ctx, chunk);
+            // D53 third defense layer (2026-05-24): route every pass_through
+            // chunk through `emitScrubbedDelta` so mid-stream `<tool_call>`
+            // markup the streamer already committed to flowing through gets
+            // stripped before reaching the user's SSE stream. Handles two
+            // leak shapes: complete markup inside one chunk (stripped
+            // inline), and markup split across two chunks (held + joined
+            // on next call). Final chunk flushes any held tail.
+            ctx.emitScrubbedDelta(chunk);
             return;
         }
         if (chunk.is_final) {
@@ -1613,6 +1720,45 @@ pub const Agent = struct {
         if (std.mem.startsWith(u8, line, "tool_call>")) return true;
         if (std.mem.startsWith(u8, line, "ool_call>")) return true;
         return false;
+    }
+
+    /// D53 third defense layer (2026-05-24): when streaming a chunk through
+    /// the `.pass_through` path, return the number of TRAILING bytes that
+    /// could be the start of a (yet-unfinished) markup sentinel. Caller
+    /// holds those bytes until the next chunk so a markup token split
+    /// across two chunks (e.g. chunk N ends "...<too", chunk N+1 starts
+    /// "l_call>{") gets reassembled and stripped on the combined buffer.
+    ///
+    /// Sentinels we care about: `<tool_call>` (11), `</tool_call>` (12),
+    /// `tool_call>` (10), `ool_call>` (9). Hold the LONGEST tail that
+    /// matches a non-empty prefix of any sentinel; cap at the longest
+    /// sentinel length minus one (12 - 1 = 11). Empty input → 0.
+    fn trailingMarkupPrefixLen(buf: []const u8) usize {
+        if (buf.len == 0) return 0;
+        const sentinels = [_][]const u8{
+            "</tool_call>",
+            "<tool_call>",
+            "tool_call>",
+            "ool_call>",
+        };
+        const max_hold: usize = 11;
+        const scan_start: usize = if (buf.len > max_hold) buf.len - max_hold else 0;
+        var best: usize = 0;
+        // Try each tail position from earliest possible to end-of-buf and
+        // see if buf[i..] is a strict prefix of any sentinel (and shorter
+        // than the full sentinel — equal length means we have the COMPLETE
+        // sentinel and stripToolCallMarkup would have eaten it already).
+        var i: usize = scan_start;
+        while (i < buf.len) : (i += 1) {
+            const tail = buf[i..];
+            inline for (sentinels) |s| {
+                if (tail.len < s.len and std.mem.eql(u8, tail, s[0..tail.len])) {
+                    const hold = buf.len - i;
+                    if (hold > best) best = hold;
+                }
+            }
+        }
+        return best;
     }
 
     /// Defensive scrub of tool-call markup from text that's about to be emitted
@@ -10875,6 +11021,43 @@ test "Agent looksLikeToolCallMarkupPrefix lets normal replies stream" {
     // Residue substrings mid-line must NOT hold — only exact-prefix matches.
     try std.testing.expect(!Agent.looksLikeToolCallMarkupPrefix("Use tool_call> markup like this in docs."));
     try std.testing.expect(!Agent.looksLikeToolCallMarkupPrefix("see ool_call> appendix"));
+}
+
+// D53 third defense layer (2026-05-24): the streaming pass_through path
+// must hold trailing bytes that could be the start of a markup sentinel
+// so a split-across-chunks markup reassembles cleanly.
+test "Agent trailingMarkupPrefixLen holds full canonical opener prefix" {
+    // Chunk ends with the full `<tool_call>` opener prefix bytes (10 of 11).
+    try std.testing.expectEqual(@as(usize, 10), Agent.trailingMarkupPrefixLen("Some text <tool_call"));
+    // Ends with just `<` — the smallest possible prefix.
+    try std.testing.expectEqual(@as(usize, 1), Agent.trailingMarkupPrefixLen("Hello <"));
+    // Ends with `<t` — 2-byte prefix of `<tool_call>`.
+    try std.testing.expectEqual(@as(usize, 2), Agent.trailingMarkupPrefixLen("Hello <t"));
+    // Ends with residue-prefix `ool` (start of `ool_call>`).
+    try std.testing.expectEqual(@as(usize, 3), Agent.trailingMarkupPrefixLen("Hi ool"));
+}
+
+test "Agent trailingMarkupPrefixLen returns 0 for clean prose" {
+    try std.testing.expectEqual(@as(usize, 0), Agent.trailingMarkupPrefixLen("This is a complete sentence."));
+    try std.testing.expectEqual(@as(usize, 0), Agent.trailingMarkupPrefixLen(""));
+    try std.testing.expectEqual(@as(usize, 0), Agent.trailingMarkupPrefixLen("ends with a number 42"));
+    // `<` followed by content that's NOT a markup prefix — only the last
+    // bytes matter, and "/>" isn't the start of any sentinel we track.
+    try std.testing.expectEqual(@as(usize, 0), Agent.trailingMarkupPrefixLen("XML-ish <foo>"));
+}
+
+test "Agent trailingMarkupPrefixLen does not hold a complete sentinel" {
+    // A complete sentinel is upstream's responsibility (stripToolCallMarkup
+    // ate it). The helper only holds STRICT prefixes shorter than the
+    // shortest matching sentinel. `<tool_call>` is the full opener (11
+    // bytes); it's not a prefix of `</tool_call>` because index 1 differs
+    // (`<t` vs `</`). So the helper returns 0 — and the emit path moves
+    // those bytes downstream. If for some reason a complete sentinel got
+    // past stripToolCallMarkup, that's a strip bug, not a hold bug.
+    try std.testing.expectEqual(@as(usize, 0), Agent.trailingMarkupPrefixLen("Before <tool_call>"));
+    try std.testing.expectEqual(@as(usize, 0), Agent.trailingMarkupPrefixLen("Before </tool_call>"));
+    try std.testing.expectEqual(@as(usize, 0), Agent.trailingMarkupPrefixLen("Before tool_call>"));
+    try std.testing.expectEqual(@as(usize, 0), Agent.trailingMarkupPrefixLen("Before ool_call>"));
 }
 
 test "Agent stripToolCallMarkup removes complete blocks" {
