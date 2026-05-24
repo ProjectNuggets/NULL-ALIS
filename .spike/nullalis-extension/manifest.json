@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "nullalis",
+  "version": "0.1.0",
+  "description": "Let the nullalis agent drive your browser using your own logged-in sessions — locally, with explicit consent per tab.",
+  "minimum_chrome_version": "116",
+  "action": {
+    "default_title": "nullalis agent",
+    "default_popup": "src/popup/index.html",
+    "default_icon": {
+      "16": "public/icon-16.png",
+      "48": "public/icon-48.png",
+      "128": "public/icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "public/icon-16.png",
+    "48": "public/icon-48.png",
+    "128": "public/icon-128.png"
+  },
+  "background": {
+    "service_worker": "src/background.ts",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content.ts"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "tabs",
+    "storage"
+  ],
+  "host_permissions": [],
+  "web_accessible_resources": [
+    {
+      "resources": ["public/icon-16.png", "public/icon-48.png", "public/icon-128.png"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
