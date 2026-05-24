@@ -1064,6 +1064,19 @@ pub const GatewayConfig = struct {
     idempotency_ttl_secs: u64 = 300,
     paired_tokens: []const []const u8 = &.{},
     internal_service_tokens: []const []const u8 = &.{},
+    /// Wave 2B (2026-05-24) — public trace share sanitizer knobs.
+    ///
+    /// `share_redact_models` (default true) replaces `provider` / `model`
+    /// strings with `"redacted"` in shared trace payloads. Operators who
+    /// don't mind competitors knowing the model stack flip this to false
+    /// to expose the raw value.
+    ///
+    /// `share_redact_costs` (default false) hides `cost_usd` /
+    /// `usage_tokens` / `turn_weight` / `session_weight`. Transparency is
+    /// the default; the toggle exists for operators who'd rather not
+    /// publish per-run economics on shareable URLs.
+    share_redact_models: bool = true,
+    share_redact_costs: bool = false,
 };
 
 pub const TenantConfig = struct {

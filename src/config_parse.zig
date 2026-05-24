@@ -1666,6 +1666,16 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (gw.object.get("internal_service_tokens")) |v| {
                 if (v == .array) self.gateway.internal_service_tokens = try parseStringArray(self.allocator, v.array);
             }
+            // Wave 2B (2026-05-24) — public trace share sanitizer knobs.
+            // See `GatewayConfig` doc-comments for semantics. Both
+            // default to safe values when omitted from config so older
+            // deployments inherit the privacy-preserving behavior.
+            if (gw.object.get("share_redact_models")) |v| {
+                if (v == .bool) self.gateway.share_redact_models = v.bool;
+            }
+            if (gw.object.get("share_redact_costs")) |v| {
+                if (v == .bool) self.gateway.share_redact_costs = v.bool;
+            }
         }
     }
 

@@ -845,6 +845,11 @@ pub const GatewayState = struct {
     /// subsequent PUT/DELETE on the same key. In-memory, 5-min TTL,
     /// single-use. See `src/gateway/secret_vault.zig`.
     secret_tokens: secret_vault.TokenStore,
+    /// Wave 2B (2026-05-24) — public trace-share registry. In-memory;
+    /// share codes do NOT survive a gateway restart (documented; the
+    /// trace store itself is bounded in-memory with the same property,
+    /// so a persistent share index would over-promise lifetime).
+    trace_share_store: TraceShareStore,
     /// V1.7a-9 review WR-03 — concurrency guard for
     /// `/brain/communities/recompute`. Single global mutex serializes
     /// recompute calls process-wide; concurrent POSTs return 409 Conflict
@@ -962,6 +967,7 @@ pub const GatewayState = struct {
             .rate_limiter = GatewayRateLimiter.init(10, 30),
             .idempotency = IdempotencyStore.init(300),
             .secret_tokens = secret_vault.TokenStore.init(allocator, secret_vault.DEFAULT_TTL_SECS),
+            .trace_share_store = TraceShareStore.init(allocator),
             .whatsapp_verify_token = verify_token,
             .whatsapp_app_secret = "",
             .whatsapp_access_token = "",
@@ -981,6 +987,7 @@ pub const GatewayState = struct {
         self.rate_limiter.deinit(self.allocator);
         self.idempotency.deinit(self.allocator);
         self.secret_tokens.deinit();
+        self.trace_share_store.deinit();
         self.user_preparation_gate.deinit();
         self.tenant_runtime_mutex.lock();
         defer self.tenant_runtime_mutex.unlock();
@@ -10707,6 +10714,624 @@ fn handleTraceGet(
     return finalizeJsonBuf(allocator, &out);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Public Trace Share (Wave 2B — 2026-05-24)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Lets a user publish ONE specific (user_id, run_id) trace as an opaque
+// short code anyone can fetch without auth — the "look what the agent did
+// for me" share-link pattern.
+//
+//   POST   /api/v1/users/:user_id/traces/:run_id/share  (auth'd)
+//   DELETE /api/v1/users/:user_id/traces/:run_id/share  (auth'd, revoke)
+//   GET    /api/v1/share/:share_code                    (PUBLIC — no auth)
+//
+// Storage: in-memory `TraceShareStore` on GatewayState. Share links do
+// NOT survive gateway restart in v1 (documented trade-off; the trace
+// itself lives in a bounded in-process store with the same property, so
+// a persistent share index would over-promise).
+//
+// Sanitizer trust boundary: every byte returned from the public GET runs
+// through `sanitizeTraceEventJson`. The rule of thumb is "when in
+// doubt, strip" — false positives are recoverable, false negatives are
+// not. Each redaction rule is documented inline at the emission site.
+
+/// Allowed alphabet for share codes: lowercase a–z and 0–9 minus the
+/// visually-ambiguous quartet (0, 1, i, l, o — Crockford-ish). 30 chars
+/// of entropy per position; 16 positions → ~78 bits, well past the
+/// guessing-resistance bar for an opaque public token.
+const SHARE_CODE_ALPHABET: []const u8 = "abcdefghjkmnpqrstuvwxyz23456789";
+const SHARE_CODE_LEN: usize = 16;
+/// Hard ceiling — operators may not pass > 30 days. Caller validation
+/// happens before storage so we never persist out-of-band TTLs.
+const SHARE_MAX_HOURS: i64 = 720;
+/// Default TTL when the caller omits `expires_in_hours`.
+const SHARE_DEFAULT_HOURS: i64 = 168; // 7 days
+
+/// One published-share record. All strings are owned by the parent
+/// `TraceShareStore` allocator and freed on `deinit`.
+const TraceShare = struct {
+    share_code: []u8, // 16 chars, owned
+    user_id: []u8, // owned
+    run_id: []u8, // owned
+    created_at_unix: i64,
+    expires_at_unix: i64, // hard expiry; 0 means "never" (unused — we always set one)
+    revoked: bool = false,
+
+    fn isLive(self: *const TraceShare, now_unix: i64) bool {
+        if (self.revoked) return false;
+        if (self.expires_at_unix != 0 and now_unix >= self.expires_at_unix) return false;
+        return true;
+    }
+
+    fn deinit(self: *TraceShare, allocator: std.mem.Allocator) void {
+        allocator.free(self.share_code);
+        allocator.free(self.user_id);
+        allocator.free(self.run_id);
+        self.* = undefined;
+    }
+};
+
+/// In-memory share registry. Two indices kept in sync:
+///   - `by_code`     — primary lookup for the public GET
+///   - `by_owner`    — (user_id|run_id) → share_code, for the
+///                     409-already-shared check and DELETE
+const TraceShareStore = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    by_code: std.StringHashMapUnmanaged(*TraceShare) = .empty,
+    by_owner: std.StringHashMapUnmanaged([]u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) TraceShareStore {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *TraceShareStore) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.by_code.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.deinit(self.allocator);
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.by_code.deinit(self.allocator);
+        var oit = self.by_owner.iterator();
+        while (oit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.by_owner.deinit(self.allocator);
+    }
+
+    /// Compose the (user_id, run_id) composite key used by `by_owner`.
+    /// Caller owns the returned slice.
+    fn ownerKey(allocator: std.mem.Allocator, user_id: []const u8, run_id: []const u8) ![]u8 {
+        const len = user_id.len + 1 + run_id.len;
+        const buf = try allocator.alloc(u8, len);
+        @memcpy(buf[0..user_id.len], user_id);
+        buf[user_id.len] = '|';
+        @memcpy(buf[user_id.len + 1 ..], run_id);
+        return buf;
+    }
+
+    /// Look up by share_code. Returns null when missing OR when the
+    /// record is revoked/expired — the public endpoint must not
+    /// distinguish those cases (opacity is the point).
+    fn getLive(self: *TraceShareStore, code: []const u8, now_unix: i64) ?TraceShareSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const rec_ptr = self.by_code.get(code) orelse return null;
+        if (!rec_ptr.isLive(now_unix)) return null;
+        return .{
+            .user_id = rec_ptr.user_id,
+            .run_id = rec_ptr.run_id,
+            .created_at_unix = rec_ptr.created_at_unix,
+            .expires_at_unix = rec_ptr.expires_at_unix,
+        };
+    }
+
+    /// Create a share for (user_id, run_id) with the given TTL. If a
+    /// LIVE share already exists for the same pair, returns the
+    /// existing record (idempotent 409). Expired or revoked records do
+    /// NOT block re-share — they're swept and replaced.
+    fn createOrGet(
+        self: *TraceShareStore,
+        user_id: []const u8,
+        run_id: []const u8,
+        ttl_hours: i64,
+        now_unix: i64,
+    ) !ShareCreateResult {
+        const ttl_secs: i64 = ttl_hours * 3600;
+        const expires_at = now_unix + ttl_secs;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var key_buf = try ownerKey(self.allocator, user_id, run_id);
+        // Check for an existing LIVE share first.
+        if (self.by_owner.get(key_buf)) |existing_code| {
+            // owner key was a probe — release it.
+            defer self.allocator.free(key_buf);
+            if (self.by_code.get(existing_code)) |existing_rec| {
+                if (existing_rec.isLive(now_unix)) {
+                    return .{
+                        .already_existed = true,
+                        .share_code = existing_rec.share_code,
+                        .expires_at_unix = existing_rec.expires_at_unix,
+                    };
+                }
+                // Stale (revoked or expired) — drop and fall through to
+                // mint a fresh code.
+                _ = self.by_code.remove(existing_rec.share_code);
+                existing_rec.deinit(self.allocator);
+                self.allocator.destroy(existing_rec);
+            }
+            // Owner index was orphaned somehow — clean it.
+            if (self.by_owner.fetchRemove(key_buf)) |kv| {
+                self.allocator.free(kv.key);
+                self.allocator.free(kv.value);
+            }
+            key_buf = try ownerKey(self.allocator, user_id, run_id);
+        }
+        errdefer self.allocator.free(key_buf);
+
+        // Mint a fresh code; retry on the astronomically unlikely
+        // collision rather than allowing duplicate codes.
+        var code_buf: [SHARE_CODE_LEN]u8 = undefined;
+        var attempts: u8 = 0;
+        while (attempts < 8) : (attempts += 1) {
+            randomShareCode(&code_buf);
+            if (!self.by_code.contains(&code_buf)) break;
+        }
+        if (attempts == 8) return error.ShareCodeCollision;
+
+        const code_owned = try self.allocator.dupe(u8, &code_buf);
+        errdefer self.allocator.free(code_owned);
+        const user_id_owned = try self.allocator.dupe(u8, user_id);
+        errdefer self.allocator.free(user_id_owned);
+        const run_id_owned = try self.allocator.dupe(u8, run_id);
+        errdefer self.allocator.free(run_id_owned);
+
+        const rec = try self.allocator.create(TraceShare);
+        errdefer self.allocator.destroy(rec);
+        rec.* = .{
+            .share_code = code_owned,
+            .user_id = user_id_owned,
+            .run_id = run_id_owned,
+            .created_at_unix = now_unix,
+            .expires_at_unix = expires_at,
+        };
+
+        try self.by_code.put(self.allocator, code_owned, rec);
+        errdefer _ = self.by_code.remove(code_owned);
+
+        const code_for_owner = try self.allocator.dupe(u8, code_owned);
+        errdefer self.allocator.free(code_for_owner);
+        try self.by_owner.put(self.allocator, key_buf, code_for_owner);
+
+        return .{
+            .already_existed = false,
+            .share_code = code_owned,
+            .expires_at_unix = expires_at,
+        };
+    }
+
+    /// Revoke whatever share covers (user_id, run_id). Idempotent —
+    /// returns true if a record was found (even if already revoked),
+    /// false if there was nothing to revoke.
+    fn revoke(self: *TraceShareStore, user_id: []const u8, run_id: []const u8) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const probe_key = try ownerKey(self.allocator, user_id, run_id);
+        defer self.allocator.free(probe_key);
+        const code = self.by_owner.get(probe_key) orelse return false;
+        const rec = self.by_code.get(code) orelse return false;
+        rec.revoked = true;
+        return true;
+    }
+};
+
+const TraceShareSnapshot = struct {
+    user_id: []const u8,
+    run_id: []const u8,
+    created_at_unix: i64,
+    expires_at_unix: i64,
+};
+
+const ShareCreateResult = struct {
+    already_existed: bool,
+    share_code: []const u8,
+    expires_at_unix: i64,
+};
+
+/// Fill `out` with `SHARE_CODE_LEN` characters drawn uniformly from
+/// `SHARE_CODE_ALPHABET` using `std.crypto.random` (CSPRNG-backed).
+fn randomShareCode(out: *[SHARE_CODE_LEN]u8) void {
+    var raw: [SHARE_CODE_LEN]u8 = undefined;
+    std.crypto.random.bytes(&raw);
+    for (raw, 0..) |b, i| {
+        out[i] = SHARE_CODE_ALPHABET[b % SHARE_CODE_ALPHABET.len];
+    }
+}
+
+/// Validation for an inbound share_code path segment. Bounded length,
+/// only characters from our allowed alphabet, no control chars or slashes.
+fn isValidShareCode(code: []const u8) bool {
+    if (code.len != SHARE_CODE_LEN) return false;
+    for (code) |c| {
+        if (std.mem.indexOfScalar(u8, SHARE_CODE_ALPHABET, c) == null) return false;
+    }
+    return true;
+}
+
+// ── Sanitizer ────────────────────────────────────────────────────────
+//
+// Trust boundary for the public GET endpoint. Every value that crosses
+// this function has been considered for at least one redaction rule.
+// Each rule is annotated with what it strips and why.
+
+/// Knobs that govern share-sanitizer behavior. Sourced from
+/// `GatewayConfig.share_redact_models` / `share_redact_costs`. Tests
+/// construct these directly to exercise both modes.
+pub const ShareSanitizeOpts = struct {
+    redact_models: bool = true,
+    redact_costs: bool = false,
+};
+
+/// Detect an email address with a deliberately loose regex-equivalent.
+/// We accept false positives in exchange for not missing the common
+/// `local@host.tld` shape. Returns the index pair of the matched span
+/// or null. Search starts at `from`.
+fn findEmailSpan(s: []const u8, from: usize) ?struct { start: usize, end: usize } {
+    if (from >= s.len) return null;
+    const at_rel = std.mem.indexOfScalar(u8, s[from..], '@') orelse return null;
+    const at_abs = from + at_rel;
+    if (at_abs == 0 or at_abs + 1 >= s.len) return null;
+
+    // Walk backward from '@' over local-part chars.
+    var start = at_abs;
+    while (start > 0) {
+        const c = s[start - 1];
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '.' or c == '_' or c == '-' or c == '+';
+        if (!ok) break;
+        start -= 1;
+    }
+    if (start == at_abs) return null; // empty local-part
+
+    // Walk forward over domain chars; require at least one dot before
+    // the end of the domain to keep the false-positive rate sane.
+    var end = at_abs + 1;
+    var saw_dot = false;
+    while (end < s.len) {
+        const c = s[end];
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '.' or c == '-';
+        if (!ok) break;
+        if (c == '.') saw_dot = true;
+        end += 1;
+    }
+    if (!saw_dot or end == at_abs + 1) return null;
+    return .{ .start = start, .end = end };
+}
+
+/// Phone-number heuristic: scan for the first run of >= 10 digits
+/// (optionally split by `-`, `.`, ` `, `(`, `)`, `+`). Returns the
+/// span. This intentionally over-matches; the cost of a false positive
+/// in a public share payload (one extra `[REDACTED]`) is trivial
+/// compared to leaking a real number.
+fn findPhoneSpan(s: []const u8, from: usize) ?struct { start: usize, end: usize } {
+    var i: usize = from;
+    while (i < s.len) : (i += 1) {
+        const c0 = s[i];
+        const is_digit_or_plus = (c0 >= '0' and c0 <= '9') or c0 == '+';
+        if (!is_digit_or_plus) continue;
+        const start = i;
+        var digits: usize = 0;
+        var end = i;
+        while (end < s.len) : (end += 1) {
+            const c = s[end];
+            if (c >= '0' and c <= '9') {
+                digits += 1;
+            } else if (c == '-' or c == '.' or c == ' ' or c == '(' or c == ')' or c == '+') {
+                // separators allowed, no digit increment
+            } else break;
+        }
+        if (digits >= 10 and digits <= 15) return .{ .start = start, .end = end };
+        i = end;
+    }
+    return null;
+}
+
+/// Emit `input` to `w`, replacing email + phone spans with `[REDACTED]`.
+/// JSON-escaping happens on each emitted segment. When `input` contains
+/// no PII shapes the function is equivalent to `jsonEscapeInto(w, input)`.
+fn writeRedactedString(w: anytype, input: []const u8) !void {
+    var cursor: usize = 0;
+    while (cursor < input.len) {
+        var next_span: ?struct { start: usize, end: usize } = null;
+        if (findEmailSpan(input, cursor)) |sp| next_span = .{ .start = sp.start, .end = sp.end };
+        if (findPhoneSpan(input, cursor)) |sp| {
+            if (next_span == null or sp.start < next_span.?.start) {
+                next_span = .{ .start = sp.start, .end = sp.end };
+            }
+        }
+        if (next_span) |sp| {
+            try jsonEscapeInto(w, input[cursor..sp.start]);
+            try w.writeAll("[REDACTED]");
+            cursor = sp.end;
+        } else {
+            try jsonEscapeInto(w, input[cursor..]);
+            cursor = input.len;
+        }
+    }
+}
+
+/// Public-share serializer. Conservative cousin of
+/// `serializeTraceEventJson` — applies the rules documented in the
+/// Wave 2B share spec.
+///
+/// Per-rule annotations (see also the sanitizer header comment above):
+///   - `tool_use_id` → ALWAYS rewritten to `tc_<index>`. The original
+///     IDs are internal sequence handles whose shape can leak provider
+///     framing (e.g. `call_abc123` is OpenAI's, `toolu_...` is
+///     Anthropic's). Renumbering is cheap and removes any cross-call
+///     correlation hint.
+///   - string fields (`tool`, `phase`, `label`, `risk_level`, `status`,
+///     `task_id`) → run through `writeRedactedString` which strips
+///     email + phone-shaped spans best-effort.
+///   - `usage_tokens` → omitted when `redact_costs=true`. The store
+///     does not currently carry `cost_usd` / weight fields; when those
+///     are added, gate them here.
+///   - There is no `secret`/`password`/`api_key`/`provider`/`model`
+///     field on `TraceEvent` today. The rules from the spec for those
+///     keys are no-ops against the current store but documented here
+///     so future schema additions inherit safe-by-default redaction:
+///     when adding such a field to `TraceEvent`, gate its emission on
+///     `opts.redact_models` (provider/model) or always-omit (secret /
+///     password / api_key) at THIS function, not at the caller.
+fn serializePublicShareEventJson(
+    w: anytype,
+    evt: *const run_trace_store_mod.TraceEvent,
+    index: usize,
+    opts: ShareSanitizeOpts,
+) !void {
+    _ = opts.redact_models; // future-proof guard; see header comment above.
+    try w.writeAll("{\"kind\":\"");
+    try jsonEscapeInto(w, evt.kind.toSlice());
+    try w.print("\",\"ts_ms\":{d}", .{evt.ts_ms});
+    if (evt.phase) |v| {
+        try w.writeAll(",\"phase\":\"");
+        try writeRedactedString(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.tool) |v| {
+        try w.writeAll(",\"tool\":\"");
+        try writeRedactedString(w, v);
+        try w.writeAll("\"");
+    }
+    // tool_use_id is ALWAYS replaced with a positional `tc_<index>` —
+    // never leak the provider-shaped original.
+    if (evt.tool_use_id) |_| {
+        try w.print(",\"tool_use_id\":\"tc_{d}\"", .{index});
+    }
+    if (evt.label) |v| {
+        try w.writeAll(",\"label\":\"");
+        try writeRedactedString(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.risk_level) |v| {
+        try w.writeAll(",\"risk_level\":\"");
+        try writeRedactedString(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.status) |v| {
+        try w.writeAll(",\"status\":\"");
+        try writeRedactedString(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.task_id) |v| {
+        try w.writeAll(",\"task_id\":\"");
+        try writeRedactedString(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.success) |v| try w.print(",\"success\":{s}", .{if (v) "true" else "false"});
+    if (evt.duration_ms) |v| try w.print(",\"duration_ms\":{d}", .{v});
+    if (evt.iteration) |v| try w.print(",\"iteration\":{d}", .{v});
+    if (evt.exit_code) |v| try w.print(",\"exit_code\":{d}", .{v});
+    if (evt.usage_tokens) |v| {
+        if (!opts.redact_costs) try w.print(",\"usage_tokens\":{d}", .{v});
+    }
+    try w.writeAll("}");
+}
+
+/// Render a complete sanitized share payload. `user_id` and any
+/// session/identity fields are NEVER emitted — only the public
+/// run-event timeline.
+fn serializeShareTraceJson(
+    allocator: std.mem.Allocator,
+    snap: *const run_trace_store_mod.TraceSnapshot,
+    opts: ShareSanitizeOpts,
+) RouteResponse {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    // The shared payload deliberately omits `user_id`; we surface
+    // `"user_id":"anonymous"` and `"session_id":"shared_session"` as
+    // breadcrumbs so the frontend can render a placeholder without
+    // reaching for the real identifiers.
+    w.writeAll(
+        "{\"user_id\":\"anonymous\",\"session_id\":\"shared_session\",\"run_id\":\"",
+    ) catch return response_build_err;
+    jsonEscapeInto(w, snap.run_id) catch return response_build_err;
+    w.print(
+        "\",\"first_event_ms\":{d},\"last_event_ms\":{d},\"truncated\":{s},\"events\":[",
+        .{
+            snap.first_event_ms,
+            snap.last_event_ms,
+            if (snap.truncated) "true" else "false",
+        },
+    ) catch return response_build_err;
+    for (snap.events, 0..) |*evt, i| {
+        if (i > 0) w.writeAll(",") catch return response_build_err;
+        serializePublicShareEventJson(w, evt, i, opts) catch return response_build_err;
+    }
+    w.writeAll("]}") catch return response_build_err;
+    var resp = finalizeJsonBuf(allocator, &out);
+    // CORS — the public endpoint is meant to be embedded from third-party
+    // sites. Read-only GET, no credentials, so `*` is safe.
+    resp.content_type = "application/json";
+    return resp;
+}
+
+// ── HTTP handlers ────────────────────────────────────────────────────
+
+/// Parse an optional `expires_in_hours` integer from a JSON body. Empty
+/// body → default. Caller validates the bound separately.
+fn parseShareTtlHours(body_opt: ?[]const u8) i64 {
+    const body = body_opt orelse return SHARE_DEFAULT_HOURS;
+    const raw = jsonIntField(body, "expires_in_hours") orelse return SHARE_DEFAULT_HOURS;
+    return raw;
+}
+
+/// POST handler — auth'd, scoped to a (user_id, run_id).
+fn handleTraceShareCreate(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id: []const u8,
+    run_id: []const u8,
+    body_opt: ?[]const u8,
+    store_opt: ?*run_trace_store_mod.RunTraceStore,
+    share_store: *TraceShareStore,
+    now_unix: i64,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "POST")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+    if (!isValidRunId(run_id)) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid run_id\"}" };
+    }
+    const ttl_raw = parseShareTtlHours(body_opt);
+    if (ttl_raw <= 0) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid expires_in_hours\"}" };
+    }
+    if (ttl_raw > SHARE_MAX_HOURS) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"expires_in_hours exceeds 720 (30 day cap)\"}" };
+    }
+
+    // Confirm the trace exists in THIS user's store. The auth layer
+    // already pinned `user_id` to the caller, so a successful lookup
+    // here doubles as the "trace belongs to user" check.
+    const store = store_opt orelse return .{
+        .status = "404 Not Found",
+        .body = "{\"error\":\"run_not_found\"}",
+    };
+    var snap_opt = store.snapshotRun(allocator, run_id) catch return response_build_err;
+    if (snap_opt) |*s| s.deinit() else return .{
+        .status = "404 Not Found",
+        .body = "{\"error\":\"run_not_found\"}",
+    };
+
+    const result = share_store.createOrGet(user_id, run_id, ttl_raw, now_unix) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"share_create_failed\"}" };
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"share_code\":\"") catch return response_build_err;
+    jsonEscapeInto(w, result.share_code) catch return response_build_err;
+    w.writeAll("\",\"share_url\":\"/api/v1/share/") catch return response_build_err;
+    jsonEscapeInto(w, result.share_code) catch return response_build_err;
+    w.print("\",\"expires_at\":{d}", .{result.expires_at_unix}) catch return response_build_err;
+    w.writeAll("}") catch return response_build_err;
+    var resp = finalizeJsonBuf(allocator, &out);
+    if (result.already_existed) resp.status = "409 Conflict";
+    return resp;
+}
+
+/// DELETE handler — auth'd revoke. Idempotent; always responds 200 with
+/// `{"status":"revoked"}` regardless of whether a record existed.
+fn handleTraceShareDelete(
+    method: []const u8,
+    user_id: []const u8,
+    run_id: []const u8,
+    share_store: *TraceShareStore,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "DELETE")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+    if (!isValidRunId(run_id)) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid run_id\"}" };
+    }
+    _ = share_store.revoke(user_id, run_id) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"share_revoke_failed\"}" };
+    };
+    return .{ .body = "{\"status\":\"revoked\"}" };
+}
+
+/// Public GET handler — no auth, no per-user scoping. Looks up the
+/// share_code, resolves the owning user's trace store via the supplied
+/// resolver callback, then runs the snapshot through the sanitizer.
+///
+/// The resolver is injected (rather than reaching into GatewayState
+/// directly) so tests can drive the handler without spinning the full
+/// tenant-runtime stack.
+fn handleTraceShareGet(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    share_code: []const u8,
+    share_store: *TraceShareStore,
+    now_unix: i64,
+    opts: ShareSanitizeOpts,
+    resolver_ctx: ?*anyopaque,
+    resolveStore: *const fn (ctx: ?*anyopaque, user_id: []const u8) ?*run_trace_store_mod.RunTraceStore,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+    }
+    if (!isValidShareCode(share_code)) {
+        return .{
+            .status = "404 Not Found",
+            .body = "{\"error\":\"share_not_found\"}",
+        };
+    }
+    const meta = share_store.getLive(share_code, now_unix) orelse return .{
+        .status = "404 Not Found",
+        .body = "{\"error\":\"share_not_found\"}",
+    };
+
+    const store = resolveStore(resolver_ctx, meta.user_id) orelse return .{
+        .status = "404 Not Found",
+        .body = "{\"error\":\"share_not_found\"}",
+    };
+    var snap = (store.snapshotRun(allocator, meta.run_id) catch return response_build_err) orelse return .{
+        .status = "404 Not Found",
+        .body = "{\"error\":\"share_not_found\"}",
+    };
+    defer snap.deinit();
+
+    return serializeShareTraceJson(allocator, &snap, opts);
+}
+
+/// Resolver bridge used by `handleTraceShareGet` to look up a
+/// per-tenant trace store via the gateway's existing tenant-runtime
+/// map. Held to a strict signature so the handler stays
+/// state-independent and unit-testable.
+fn resolveStateTraceStoreForUser(
+    ctx: ?*anyopaque,
+    user_id: []const u8,
+) ?*run_trace_store_mod.RunTraceStore {
+    const ptr = ctx orelse return null;
+    const state: *GatewayState = @ptrCast(@alignCast(ptr));
+    state.tenant_runtime_mutex.lock();
+    defer state.tenant_runtime_mutex.unlock();
+    if (state.tenant_runtimes.get(user_id)) |runtime| {
+        return runtime.trace_store;
+    }
+    return null;
+}
+
 fn handleSessionList(
     allocator: std.mem.Allocator,
     method: []const u8,
@@ -14749,6 +15374,29 @@ fn handleApiRoute(
     config_opt: ?*const Config,
     session_mgr_opt: ?*session_mod.SessionManager,
 ) RouteResponse {
+    // ── Public trace-share GET (Wave 2B — 2026-05-24) ─────────────────
+    // This is the ONLY /api/v1/* route that bypasses
+    // `validateInternalServiceToken`. It's the user-facing share link
+    // pattern (Manus-style replay URL); anyone with the opaque code can
+    // GET it, no auth headers required. Every byte returned passes
+    // through the share sanitizer (see `serializeShareTraceJson`).
+    if (std.mem.startsWith(u8, base_path, "/api/v1/share/")) {
+        const code = base_path["/api/v1/share/".len..];
+        const opts: ShareSanitizeOpts = if (config_opt) |cfg| .{
+            .redact_models = cfg.gateway.share_redact_models,
+            .redact_costs = cfg.gateway.share_redact_costs,
+        } else .{};
+        return handleTraceShareGet(
+            req_allocator,
+            method,
+            code,
+            &state.trace_share_store,
+            std.time.timestamp(),
+            opts,
+            @ptrCast(state),
+            resolveStateTraceStoreForUser,
+        );
+    }
     if (!validateInternalServiceToken(raw_request, state)) {
         return .{ .status = "401 Unauthorized", .body = "{\"error\":\"unauthorized\"}" };
     }
@@ -16137,10 +16785,14 @@ fn handleApiRoute(
         return handleUserUsage(req_allocator, method, effective_usage_rt);
     }
 
-    // ── Run trace read-only endpoints (WP4.2) ───────────────────────────
+    // ── Run trace read-only endpoints (WP4.2 + Wave 2B share) ───────────
     // Resolve the per-tenant RunTraceStore without materializing a tenant
     // runtime on demand. Collection returns empty when no runtime exists;
     // a specific run_id returns 404.
+    //
+    // Wave 2B (2026-05-24) adds a `/share` suffix under a run_id:
+    //   POST   /api/v1/users/:id/traces/:run_id/share  → mint share code
+    //   DELETE /api/v1/users/:id/traces/:run_id/share  → revoke (idempotent)
     if (std.mem.eql(u8, parsed.subpath, "traces") or
         std.mem.startsWith(u8, parsed.subpath, "traces/"))
     {
@@ -16155,8 +16807,28 @@ fn handleApiRoute(
         if (std.mem.eql(u8, parsed.subpath, "traces")) {
             return handleTraceList(req_allocator, method, effective_trace_store);
         }
-        const run_id = parsed.subpath["traces/".len..];
-        return handleTraceGet(req_allocator, method, run_id, effective_trace_store);
+        const rest = parsed.subpath["traces/".len..];
+        // /share suffix → share-create / share-delete
+        if (std.mem.endsWith(u8, rest, "/share")) {
+            const run_id = rest[0 .. rest.len - "/share".len];
+            if (std.mem.eql(u8, method, "POST")) {
+                return handleTraceShareCreate(
+                    req_allocator,
+                    method,
+                    scoped_user_id,
+                    run_id,
+                    extractBody(raw_request),
+                    effective_trace_store,
+                    &state.trace_share_store,
+                    std.time.timestamp(),
+                );
+            }
+            if (std.mem.eql(u8, method, "DELETE")) {
+                return handleTraceShareDelete(method, scoped_user_id, run_id, &state.trace_share_store);
+            }
+            return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        }
+        return handleTraceGet(req_allocator, method, rest, effective_trace_store);
     }
 
     return .{ .status = "404 Not Found", .body = "{\"error\":\"not found\"}" };
@@ -25857,6 +26529,280 @@ test "handleTraceGet returns sanitized events for a known run" {
 test "handleTraceGet rejects non-GET methods" {
     const resp = handleTraceGet(std.testing.allocator, "DELETE", "r-1", null);
     try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+// ── Wave 2B: public trace share endpoint tests ─────────────────────────
+
+/// Build a populated RunTraceStore for a single (user, run) pair so the
+/// share-create / share-get path can flow end-to-end in unit tests.
+fn waveTbBuildSharedStore(alloc: std.mem.Allocator, run_id: []const u8) !run_trace_store_mod.RunTraceStore {
+    var store = run_trace_store_mod.RunTraceStore.init(alloc, 4, 8);
+    errdefer store.deinit();
+    const obs = store.observer();
+    const e1 = observability.ObserverEvent{ .tool_call_start = .{
+        .tool = "bash",
+        .tool_use_id = "call_internal_xyz",
+        .run_id = run_id,
+    } };
+    obs.recordEvent(&e1);
+    const e2 = observability.ObserverEvent{ .tool_call = .{
+        .tool = "bash",
+        .tool_use_id = "call_internal_xyz",
+        .success = true,
+        .duration_ms = 11,
+        .run_id = run_id,
+    } };
+    obs.recordEvent(&e2);
+    return store;
+}
+
+/// Test resolver — single store per user_id, supplied by the test
+/// closure via a thread-unsafe singleton (tests run sequentially per
+/// suite, so the pointer-juggling is safe here).
+const TestShareResolverCtx = struct {
+    user_id: []const u8,
+    store: *run_trace_store_mod.RunTraceStore,
+};
+fn testShareResolveStore(ctx: ?*anyopaque, user_id: []const u8) ?*run_trace_store_mod.RunTraceStore {
+    const ptr = ctx orelse return null;
+    const tctx: *TestShareResolverCtx = @ptrCast(@alignCast(ptr));
+    if (std.mem.eql(u8, tctx.user_id, user_id)) return tctx.store;
+    return null;
+}
+
+test "handleTraceShareCreate mints a share code for a valid trace" {
+    const alloc = std.testing.allocator;
+    var store = try waveTbBuildSharedStore(alloc, "r-1");
+    defer store.deinit();
+    var share_store = TraceShareStore.init(alloc);
+    defer share_store.deinit();
+
+    const resp = handleTraceShareCreate(alloc, "POST", "user-1", "r-1", null, &store, &share_store, 1_700_000_000);
+    defer alloc.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"share_code\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"share_url\":\"/api/v1/share/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"expires_at\":") != null);
+}
+
+test "handleTraceShareCreate 404s when run does not exist for this user" {
+    const alloc = std.testing.allocator;
+    var store = try waveTbBuildSharedStore(alloc, "r-mine");
+    defer store.deinit();
+    var share_store = TraceShareStore.init(alloc);
+    defer share_store.deinit();
+
+    // A different run_id than what's in the store simulates either an
+    // unknown run OR a run that belongs to a different user — the
+    // handler conflates both into a single 404, which IS the privacy
+    // story: never confirm cross-user existence.
+    const resp = handleTraceShareCreate(alloc, "POST", "user-1", "r-someone-else", null, &store, &share_store, 1_700_000_000);
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "run_not_found") != null);
+}
+
+test "handleTraceShareCreate 404s when run_id is unknown" {
+    const alloc = std.testing.allocator;
+    var store = try waveTbBuildSharedStore(alloc, "r-1");
+    defer store.deinit();
+    var share_store = TraceShareStore.init(alloc);
+    defer share_store.deinit();
+
+    const resp = handleTraceShareCreate(alloc, "POST", "user-1", "r-absent", null, &store, &share_store, 1_700_000_000);
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+}
+
+test "handleTraceShareCreate rejects expires_in_hours above 720 cap" {
+    const alloc = std.testing.allocator;
+    var store = try waveTbBuildSharedStore(alloc, "r-1");
+    defer store.deinit();
+    var share_store = TraceShareStore.init(alloc);
+    defer share_store.deinit();
+
+    const body = "{\"expires_in_hours\":721}";
+    const resp = handleTraceShareCreate(alloc, "POST", "user-1", "r-1", body, &store, &share_store, 1_700_000_000);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "720") != null);
+}
+
+test "handleTraceShareDelete marks revoked idempotently" {
+    const alloc = std.testing.allocator;
+    var store = try waveTbBuildSharedStore(alloc, "r-1");
+    defer store.deinit();
+    var share_store = TraceShareStore.init(alloc);
+    defer share_store.deinit();
+
+    const create = handleTraceShareCreate(alloc, "POST", "user-1", "r-1", null, &store, &share_store, 1_700_000_000);
+    defer alloc.free(create.body);
+    try std.testing.expectEqualStrings("200 OK", create.status);
+
+    const del1 = handleTraceShareDelete("DELETE", "user-1", "r-1", &share_store);
+    try std.testing.expectEqualStrings("200 OK", del1.status);
+    try std.testing.expect(std.mem.indexOf(u8, del1.body, "revoked") != null);
+
+    // Second delete is idempotent — same response shape.
+    const del2 = handleTraceShareDelete("DELETE", "user-1", "r-1", &share_store);
+    try std.testing.expectEqualStrings("200 OK", del2.status);
+}
+
+test "handleTraceShareGet returns sanitized payload for a valid code" {
+    const alloc = std.testing.allocator;
+    var store = try waveTbBuildSharedStore(alloc, "r-1");
+    defer store.deinit();
+    var share_store = TraceShareStore.init(alloc);
+    defer share_store.deinit();
+
+    const create = handleTraceShareCreate(alloc, "POST", "user-1", "r-1", null, &store, &share_store, 1_700_000_000);
+    defer alloc.free(create.body);
+    const code_field = "\"share_code\":\"";
+    const code_idx = std.mem.indexOf(u8, create.body, code_field).?;
+    const after = create.body[code_idx + code_field.len ..];
+    const end = std.mem.indexOfScalar(u8, after, '"').?;
+    const code = after[0..end];
+
+    var ctx = TestShareResolverCtx{ .user_id = "user-1", .store = &store };
+    const resp = handleTraceShareGet(
+        alloc,
+        "GET",
+        code,
+        &share_store,
+        1_700_000_001,
+        .{},
+        @ptrCast(&ctx),
+        testShareResolveStore,
+    );
+    defer alloc.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    // user_id pseudonymized, session pseudonymized, tool_use_id rewritten
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"user_id\":\"anonymous\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"session_id\":\"shared_session\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"tool_use_id\":\"tc_0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"run_id\":\"r-1\"") != null);
+    // original internal tool_use_id must NOT leak.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "call_internal_xyz") == null);
+}
+
+test "handleTraceShareGet 404s for revoked, expired, or unknown codes" {
+    const alloc = std.testing.allocator;
+    var store = try waveTbBuildSharedStore(alloc, "r-1");
+    defer store.deinit();
+    var share_store = TraceShareStore.init(alloc);
+    defer share_store.deinit();
+    var ctx = TestShareResolverCtx{ .user_id = "user-1", .store = &store };
+
+    // Unknown — opaque 404.
+    const r_unknown = handleTraceShareGet(
+        alloc,
+        "GET",
+        "abcdefghjkmnpqrs", // valid alphabet, valid length, absent
+        &share_store,
+        1_700_000_000,
+        .{},
+        @ptrCast(&ctx),
+        testShareResolveStore,
+    );
+    try std.testing.expectEqualStrings("404 Not Found", r_unknown.status);
+    try std.testing.expect(std.mem.indexOf(u8, r_unknown.body, "share_not_found") != null);
+
+    // Create then revoke → 404.
+    const create = handleTraceShareCreate(alloc, "POST", "user-1", "r-1", null, &store, &share_store, 1_700_000_000);
+    defer alloc.free(create.body);
+    const code_field = "\"share_code\":\"";
+    const code_idx = std.mem.indexOf(u8, create.body, code_field).?;
+    const after = create.body[code_idx + code_field.len ..];
+    const end = std.mem.indexOfScalar(u8, after, '"').?;
+    const code = after[0..end];
+    _ = handleTraceShareDelete("DELETE", "user-1", "r-1", &share_store);
+
+    const r_revoked = handleTraceShareGet(
+        alloc,
+        "GET",
+        code,
+        &share_store,
+        1_700_000_001,
+        .{},
+        @ptrCast(&ctx),
+        testShareResolveStore,
+    );
+    try std.testing.expectEqualStrings("404 Not Found", r_revoked.status);
+
+    // Expired — past the TTL window.
+    const r_expired = handleTraceShareGet(
+        alloc,
+        "GET",
+        code,
+        &share_store,
+        1_700_000_000 + (SHARE_DEFAULT_HOURS + 1) * 3600,
+        .{},
+        @ptrCast(&ctx),
+        testShareResolveStore,
+    );
+    try std.testing.expectEqualStrings("404 Not Found", r_expired.status);
+}
+
+test "share sanitizer strips internal tool_use_id and pseudonymizes identity" {
+    const alloc = std.testing.allocator;
+    var store = try waveTbBuildSharedStore(alloc, "r-1");
+    defer store.deinit();
+    var snap = (try store.snapshotRun(alloc, "r-1")).?;
+    defer snap.deinit();
+
+    const resp = serializeShareTraceJson(alloc, &snap, .{}); // default opts
+    defer alloc.free(resp.body);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"user_id\":\"anonymous\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"session_id\":\"shared_session\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"tool_use_id\":\"tc_0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"tool_use_id\":\"tc_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "call_internal_xyz") == null);
+}
+
+test "share sanitizer keeps usage_tokens when redact_costs is false" {
+    const alloc = std.testing.allocator;
+    var store = run_trace_store_mod.RunTraceStore.init(alloc, 2, 4);
+    defer store.deinit();
+    const obs = store.observer();
+    const evt = observability.ObserverEvent{ .agent_end = .{
+        .run_id = "r-cost",
+        .duration_ms = 100,
+        .tokens_used = 4242,
+    } };
+    obs.recordEvent(&evt);
+    var snap = (try store.snapshotRun(alloc, "r-cost")).?;
+    defer snap.deinit();
+
+    // Default: redact_costs=false → usage_tokens present.
+    const resp_kept = serializeShareTraceJson(alloc, &snap, .{ .redact_costs = false });
+    defer alloc.free(resp_kept.body);
+    try std.testing.expect(std.mem.indexOf(u8, resp_kept.body, "\"usage_tokens\":4242") != null);
+
+    // Flip: redact_costs=true → usage_tokens omitted.
+    const resp_stripped = serializeShareTraceJson(alloc, &snap, .{ .redact_costs = true });
+    defer alloc.free(resp_stripped.body);
+    try std.testing.expect(std.mem.indexOf(u8, resp_stripped.body, "usage_tokens") == null);
+}
+
+test "share sanitizer redacts email and phone patterns in string values" {
+    const alloc = std.testing.allocator;
+    var store = run_trace_store_mod.RunTraceStore.init(alloc, 2, 4);
+    defer store.deinit();
+    const obs = store.observer();
+    const evt = observability.ObserverEvent{ .approval_required = .{
+        .tool = "bash",
+        .reason = "contact alaasuccer@gmail.com or call 415-555-0199 to confirm",
+        .risk_level = "medium",
+        .run_id = "r-pii",
+    } };
+    obs.recordEvent(&evt);
+    var snap = (try store.snapshotRun(alloc, "r-pii")).?;
+    defer snap.deinit();
+
+    const resp = serializeShareTraceJson(alloc, &snap, .{});
+    defer alloc.free(resp.body);
+    // Original PII tokens must not survive.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "alaasuccer@gmail.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "415-555-0199") == null);
+    // Redaction marker present.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "[REDACTED]") != null);
 }
 
 test "validateApproveInput rejects missing body" {
