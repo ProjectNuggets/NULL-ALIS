@@ -291,7 +291,7 @@ fn parseEnginesOption(raw: []const u8) !EngineSelection {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.2.25";
+    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.5.24";
     // V1 convergence flag. When true (default), the build narrows defaults to
     // V1-safe choices: channel default becomes `cli,telegram` only. Pass
     // `-Dv1=false` to restore pre-V1 defaults (all channels enabled) as an

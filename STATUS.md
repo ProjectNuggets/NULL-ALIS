@@ -1,8 +1,27 @@
 # nullALIS — STATUS
 
-**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-23 — v1.14.18 audit MED-tier sweep merged (PR #106, closes 9 ledger rows); P4 tier gate default flipped to 0.005 (`55726e3a`); LoCoMo D44 bench findings #1 (temporal extraction) + #4 (tool_call XML leak) fixed. Prior: Sprint 3 (Universal API Connector) + memory-intelligence sprint (P1–P5); Sprint 2 (Channels V1 + MCP V1); memory-pipeline repair + config hardening.
+**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-24 — **v1.14.19 S-tier production push** shipped (Phases A-E + final QA): 33 tool descriptions rewritten + lint Rule 6 (`6672ef8d`), MCP UX hardening (`d2183986`), tenant-autonomy divergence transparency + AGENTS.md §14.13 (`887cb3cd`), XML-leak third defense layer 7%→2% (`a8c4fc04`), D52 Hybrid Pillar 1 PII override (`74ddd469`), `SUBSTRATE_AUDIT.md` written. Prior: 2026-05-23 v1.14.18 audit MED-tier sweep (PR #106, 9 ledger rows); P4 tier gate default flipped to 0.005; LoCoMo D44 bench findings #1 + #4 fixed; Sprint 3 (Universal API Connector); Sprint 2 (Channels V1 + MCP V1).
 
 This is the single cold-start document. If it disagrees with `.planning/STATE.md`, `PROJECT_LEDGER.md` (archived), or anything in `docs/archive/`, **this wins**.
+
+---
+
+## 2026-05-24 — v1.14.19 S-tier production push
+
+Built on the substrate-audit pass (`SUBSTRATE_AUDIT.md`). 8 substrate probes (delegate, approvals, web, brain_graph, schedule/cron, OpenAPI, MCP server, MCP client) verified end-to-end on the live gateway; six findings surfaced, all addressed or properly deferred. Six commits land cleanly on `main`:
+
+- **`6672ef8d`** Phase A — **F-A7.3:** 33 tool descriptions had `"first scenario"` / `"second scenario"` placeholder leaks degrading model tool-selection. All 33 rewritten with real triggers + sibling refs; lint Rule 6 added (rejects placeholders + `<name> tool.` boilerplate at compile time).
+- **`d2183986`** Phase B — **F-A7.1 + F-A7.2:** `TurnOrigin.mcp` variant + MCP server context handoff + `memory_recall` global-fallback when origin=.mcp (closes IDE / external-MCP-client first-experience cliff). MCP open-mode auth banner downgraded warn → info with rationale.
+- **`887cb3cd`** Phase C — **F-A2.1:** `tenant.autonomy.diverged user={} base={} resolved={} source={}` info log per TenantRuntime.init when base ≠ resolved. AGENTS.md §14.13 captures the precedence rule + recovery options. Operators flipping `autonomy.level` in base config now SEE which existing tenants don't pick up the new value.
+- **`a8c4fc04`** Phase D — **D53:** Third defense layer closes the `<tool_call>` markup leak that survived layers 1+2. `flushBuffered` scrub + `flushValidatedReply` scrub + `emitScrubbedDelta` with cross-chunk `pending_tail` reassembly via `trailingMarkupPrefixLen`. Live verification: 1/50 = 2.0% (down from 7% baseline). Residual ~2% in iteration-3+ multi-tool turns deferred for chunk-flow trace.
+- **`32a34357`** docs — D53 deferred-register row updated with measured 7%→2% delta and residual scope.
+- **`74ddd469`** Phase E — **D52 Hybrid Pillar 1:** System-prompt directive added that overrides LLM RLHF PII reflex when user volunteers their own personal info into personal memory. Three sharp exceptions (third-party harvest, credentials/secrets, explicit confidential mark). Live verification: 3/3 PII prompts (brother phone, home address, work email) that previously refused now store cleanly with acknowledgement.
+
+**CI gate across the push:** 16/16 steps succeeded, **6415/6487 tests passed**, 72 skipped, 0 leaks. +5 new regression guards (Rule 6 leverages the existing comptime path; D53 + F-A7.1 added explicit tests). Zero failures across all six CI gate runs.
+
+**Deferred-register state:** highest row is now **D60** (added D57-D60 from this push). D52 → Pillar 1 shipped at `74ddd469`; D53 → partial (layer 3 shipped at `a8c4fc04`, residual 2% open); F-A7.1, F-A7.2, F-A7.3, F-A2.1 → all closed in this push.
+
+**Audit ledger state:** 47 verified rows + 6 substrate-audit findings; 32 + 4 CLOSED, 1 DEFERRED, 14 future-block + 2 partial (D52 P2-P5, D53 tail) remain. The S-tier push closed every gating substrate concern surfaced in the audit; remaining items are either explicitly deferred follow-ups (next operator-CLI touch, next streaming-layer touch, secret-vault block, post-Sprint-4 SLO) or future-block scaffolding.
 
 ---
 
