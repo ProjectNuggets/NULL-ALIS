@@ -92,7 +92,63 @@ pub const ProduceDocumentTool = struct {
         "<workspace>/attachments/produced/ and the tool returns a markdown link the FE " ++
         "renders inline. Requires pandoc (pdf/docx/html), marp-cli (pptx), and " ++
         "python3 + pandas + openpyxl (xlsx) in the runtime image. If a required binary " ++
-        "is missing the tool returns a clear error with the install hint.";
+        "is missing the tool returns a clear error with the install hint — surface that " ++
+        "to the user verbatim; do NOT try to install binaries via shell (sandbox blocks it).\n\n" ++
+        // ─── Format templates (2026-05-24) — the agent picks the right
+        // shape AND can pattern-match against these without round-trips:
+        "## How to format `content` per `format`\n\n" ++
+        "### pdf / docx / html — markdown source\n" ++
+        "Use standard markdown. Headings (`#`/`##`), bullet lists (`- `), numbered lists\n" ++
+        "(`1. `), tables (pipe syntax), code blocks (triple backticks), blockquotes (`> `),\n" ++
+        "links (`[text](url)`), images (`![alt](path)`). pandoc handles the rest. Keep\n" ++
+        "headings shallow (2-3 levels) for readable PDFs.\n\n" ++
+        "EXAMPLE (PDF / market research):\n" ++
+        "```\n" ++
+        "# Market Research — Personal AI Agents 2026\n\n" ++
+        "## Executive Summary\n" ++
+        "Three vendors dominate: Claude Code, Manus, nullalis.\n\n" ++
+        "## Competitive Landscape\n" ++
+        "| Vendor | Strength | Weakness |\n" ++
+        "|---|---|---|\n" ++
+        "| Claude Code | Native memory | No mobile |\n" ++
+        "| Manus | Browser autonomy | Per-task only |\n\n" ++
+        "## Recommendation\n" ++
+        "> Focus on persistent memory + multi-channel.\n" ++
+        "```\n\n" ++
+        "### xlsx — CSV source\n" ++
+        "Plain CSV with a header row, then data rows. Use commas as separators; quote\n" ++
+        "values containing commas with `\"...\"`. The renderer turns each comma into a cell.\n\n" ++
+        "EXAMPLE (XLSX / expense report):\n" ++
+        "```\n" ++
+        "Date,Category,Description,Amount\n" ++
+        "2026-05-01,Travel,\"Flight, BER → JFK\",542.10\n" ++
+        "2026-05-02,Lodging,Hotel,189.00\n" ++
+        "```\n\n" ++
+        "### pptx — markdown with `---` slide separators (Marp convention)\n" ++
+        "Each `---` on its own line starts a new slide. First H1 on a slide is the title;\n" ++
+        "the rest is body. Use bullets / short lines (each slide is a few seconds of read).\n\n" ++
+        "EXAMPLE (PPTX / kickoff deck):\n" ++
+        "```\n" ++
+        "# Project Kickoff\n" ++
+        "**Q3 2026**\n" ++
+        "---\n" ++
+        "# Why Now\n" ++
+        "- Market signal: customer X asked\n" ++
+        "- Tech ready: substrates verified\n" ++
+        "- Team capacity: 2 engineers freed up\n" ++
+        "---\n" ++
+        "# Plan\n" ++
+        "1. Discovery (week 1-2)\n" ++
+        "2. Build (week 3-6)\n" ++
+        "3. Beta (week 7-8)\n" ++
+        "```\n\n" ++
+        "## When to use produce_document vs alternatives\n" ++
+        "- For a quick 1-3 paragraph reply → answer INLINE, don't produce a doc.\n" ++
+        "- For a substantial deliverable the user will save or share → produce_document.\n" ++
+        "- For an iterative document the user will refine over many turns → artifact_create\n" ++
+        "  (canvas) FIRST, then produce_document only on the user's explicit export request.\n" ++
+        "- For a chart or image → image_generate.\n" ++
+        "- For raw markdown / code the user will copy → file_write.";
 
     pub const tool_params =
         \\{"type":"object","properties":{"format":{"type":"string","enum":["pdf","docx","xlsx","pptx","html"],"description":"Output format. pdf/docx/html accept markdown input; xlsx accepts CSV; pptx accepts markdown with --- slide separators."},"content":{"type":"string","description":"Source content. Markdown for pdf/docx/html/pptx, CSV for xlsx. Required."},"title":{"type":"string","description":"Document title — used for the output filename and (where supported) document metadata. Default 'untitled'. Will be sanitized to filesystem-safe characters."}},"required":["format","content"]}

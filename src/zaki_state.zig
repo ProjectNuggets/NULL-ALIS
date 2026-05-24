@@ -2218,6 +2218,58 @@ const ManagerImpl = struct {
             \\    PRIMARY KEY (user_id, community_id)
             \\)
             ,
+            // ── Wave 2C — canvas/artifacts backend (v1.14.21) ──────────
+            //
+            // Mirrors `src/migrations/0002_artifacts.sql` but rendered
+            // here as idempotent CREATE TABLE IF NOT EXISTS so the
+            // legacy migrate() loop applies it cleanly. The 0002 SQL
+            // file is registered in `src/migrations.zig::MIGRATIONS` for
+            // when we wire `migrations.run()` into this function
+            // post-v1 — at that point this inline block + the legacy
+            // loop go away together, and the framework runs every
+            // migration exactly once. See deferred-register D62.
+            //
+            // Why inline now: the migrations framework has tests but
+            // ZERO production callers — `migrations.run()` is never
+            // invoked from this function. Plumbing the RunnerContext
+            // through is a real refactor; the artifacts schema is
+            // shipping for v1 commercial so the inline path is the
+            // smallest safe change that gets the tables created on
+            // every boot (idempotent, fail-soft, matches the existing
+            // pattern for every other table in this file).
+            \\CREATE TABLE IF NOT EXISTS {schema}.artifacts (
+            \\    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            \\    user_id         BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
+            \\    session_id      TEXT,
+            \\    title           TEXT NOT NULL,
+            \\    kind            TEXT NOT NULL CHECK (kind IN (
+            \\        'markdown','code','html','svg','json','mermaid','plaintext'
+            \\    )),
+            \\    created_at_unix BIGINT NOT NULL,
+            \\    updated_at_unix BIGINT NOT NULL,
+            \\    current_version BIGINT NOT NULL DEFAULT 1,
+            \\    is_shared       BOOLEAN NOT NULL DEFAULT FALSE,
+            \\    share_code      TEXT UNIQUE,
+            \\    share_expires_at_unix BIGINT,
+            \\    metadata_jsonb  JSONB NOT NULL DEFAULT '{}'::jsonb
+            \\)
+            ,
+            "CREATE INDEX IF NOT EXISTS idx_artifacts_user_updated ON {schema}.artifacts(user_id, updated_at_unix DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_artifacts_share_code ON {schema}.artifacts(share_code) WHERE share_code IS NOT NULL",
+            \\CREATE TABLE IF NOT EXISTS {schema}.artifact_versions (
+            \\    id              BIGSERIAL PRIMARY KEY,
+            \\    artifact_id     UUID NOT NULL REFERENCES {schema}.artifacts(id) ON DELETE CASCADE,
+            \\    version         BIGINT NOT NULL,
+            \\    parent_version  BIGINT,
+            \\    content         TEXT NOT NULL,
+            \\    content_hash    TEXT NOT NULL,
+            \\    created_at_unix BIGINT NOT NULL,
+            \\    author          TEXT NOT NULL CHECK (author IN ('agent','user')),
+            \\    change_summary  TEXT,
+            \\    UNIQUE (artifact_id, version)
+            \\)
+            ,
+            "CREATE INDEX IF NOT EXISTS idx_artifact_versions_artifact_ver ON {schema}.artifact_versions(artifact_id, version DESC)",
         };
 
         for (statements) |template| {

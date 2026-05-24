@@ -950,6 +950,26 @@ fn buildResponseProtocolSection(w: anytype) !void {
     // this one says don't trust memory's INSUFFICIENCY without firing
     // the tool that could ground it.
     try w.writeAll("**Knowledge escalation — bridge memory to the world via `web_search`.** When memory contains the user-side signal (preferences, history, context) but the QUESTION requires external facts the agent cannot derive from memory or training (restaurant names, recent events, third-party attributes, prices, schedules, current state), reach for `web_search` BEFORE answering. Pattern: \"<user> likes <category>\" (from memory) + \"What's the best <category> near <place>?\" (external) → `web_search` for \"best <category> near <place>\", then ground the answer in BOTH signals (\"You enjoy Thai food; based on current results, <restaurant> is well-reviewed and matches your usual style — casual, low-key.\"). The hedge \"I don't have current information on that\" is the WRONG answer when `web_search` is available; it's a hedge, not honesty. Skip only when (a) the question is purely about the user themselves with no external bridge, OR (b) `web_search` was already tried this turn and failed.\n\n");
+    // 2026-05-24 (v1.14.21 final-sprint) — Deliverables guidance.
+    // Three tools cover "the agent produces real work for the user":
+    // `produce_document` (one-shot rendered file), `artifact_create` (live
+    // editable canvas), `file_write` (raw file in workspace). The agent
+    // must pick the right one or the user gets a worse experience —
+    // PDF dumped inline when a side-panel artifact would have been
+    // editable, or a canvas where a one-shot PDF was wanted.
+    try w.writeAll("## Deliverables — produce_document vs artifact vs inline\n\n");
+    try w.writeAll("Pick the right output shape for the user's request:\n\n");
+    try w.writeAll("- **Short reply (1-3 paragraphs, conversational, one-off):** answer INLINE in chat. No tool needed. Most turns end here.\n");
+    try w.writeAll("- **Substantial deliverable the user will save / send / share, finished in one shot** (PDF report, slide deck, spreadsheet, Word doc): call **`produce_document`**. Output file lands in `attachments/produced/`, returned as a markdown link. Best for: market research PDFs, expense XLSX, kickoff PPTX, formal docx letters, standalone HTML reports.\n");
+    try w.writeAll("- **Iterative document the user will REFINE over multiple turns** (\"make the intro shorter\", \"add a section on pricing\"): call **`artifact_create`** first → side-panel canvas the user sees + edits + you update via `artifact_update`. Each update versions automatically; user can revert. On the user's explicit export request → bridge to `produce_document` for the final file.\n");
+    try w.writeAll("- **Raw markdown / code / config the user wants in workspace** (a CLAUDE.md template, a config.json, a Python script): use **`file_write`**. No rendering, no versioning, no canvas. The file is the thing.\n");
+    try w.writeAll("- **A chart, logo, diagram, or illustration:** **`image_generate`** — Together-hosted FLUX/SD models, image lands in workspace as markdown the FE renders inline.\n\n");
+    try w.writeAll("**Honesty rule:** if `produce_document` returns an install-hint error (pandoc / marp-cli / pandas missing), surface that to the user VERBATIM and offer an alternative (HTML if PDF fails, CSV if XLSX fails, plain markdown via `file_write` as a last resort). Do NOT try to install binaries via `shell` — the sandbox blocks it.\n\n");
+    try w.writeAll("**Artifact lifecycle pattern (the canvas play):**\n");
+    try w.writeAll("1. User asks for something substantial → `artifact_create(title, kind=markdown, content=<v1 draft>)`. Tell the user the canvas is open.\n");
+    try w.writeAll("2. User requests changes → `artifact_update(id, new_content, change_summary=<one line>)`. The version bumps; the user sees the diff.\n");
+    try w.writeAll("3. User asks to share → tell them the share endpoint is `POST /api/v1/users/:id/artifacts/:id/share` (the UI surfaces a button). The mint returns an opaque public URL with a default 7-day TTL.\n");
+    try w.writeAll("4. User asks to export → call `produce_document(format=pdf|docx|pptx|xlsx, content=<artifact content>, title=<artifact title>)`. The user gets a downloadable file alongside the live canvas.\n\n");
     // v1.14.18-A F3 — Goal Pursuit Protocol (ReAct-style reflection)
     // Teaches the model to emit structured reflection blocks.
     try w.writeAll("## Goal Pursuit Protocol (ReAct-style)\n\n");
