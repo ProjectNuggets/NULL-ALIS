@@ -79,6 +79,9 @@ pub const health = @import("health.zig");
 pub const skills = @import("skills.zig");
 pub const tools = @import("tools/root.zig");
 pub const tasks = @import("tasks/root.zig");
+/// Wave 2C — canvas/artifacts backend. Types + diff + sanitizer +
+/// share-code helper; storage CRUD lives on `zaki_state.Manager`.
+pub const artifacts = @import("artifacts/root.zig");
 pub const identity = @import("identity.zig");
 pub const cost = @import("cost.zig");
 pub const usage_runtime = @import("usage_runtime.zig");

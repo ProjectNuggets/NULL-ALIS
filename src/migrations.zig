@@ -82,6 +82,11 @@ pub const MIGRATIONS = [_]Migration{
         .name = "0001_initial_schema",
         .sql = @embedFile("migrations/0001_initial_schema.sql"),
     },
+    .{
+        .version = 2,
+        .name = "0002_artifacts",
+        .sql = @embedFile("migrations/0002_artifacts.sql"),
+    },
 };
 
 /// Trait the runner's caller must satisfy: a method that takes a

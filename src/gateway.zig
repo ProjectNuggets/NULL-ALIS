@@ -89,6 +89,13 @@ const tasks_mod = @import("tasks/root.zig");
 const usage_runtime_mod = @import("usage_runtime.zig");
 const run_trace_store_mod = @import("run_trace_store.zig");
 const gateway_run_events = @import("gateway_run_events.zig");
+// Wave 2C — canvas/artifacts: types + diff + sanitizer + share-code
+// helper. The Postgres CRUD lives on `zaki_state.Manager`; this is the
+// pure-helper surface the gateway endpoints lean on.
+const artifacts_types = @import("artifacts/types.zig");
+const artifacts_diff = @import("artifacts/diff.zig");
+const artifacts_sanitizer = @import("artifacts/sanitizer.zig");
+const artifacts_store = @import("artifacts/store.zig");
 const channel_health_mod = @import("channel_health.zig");
 const security_review_mod = @import("security_review.zig");
 const entitlement_mod = @import("entitlement.zig");
@@ -10715,6 +10722,554 @@ fn handleTraceGet(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Canvas / Artifacts (Wave 2C — 2026-05-24)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// HTTP surface for the artifacts side panel.
+//
+// Auth'd (X-Internal-Token + ownership-by-user_id):
+//   GET    /api/v1/users/:user_id/artifacts
+//   GET    /api/v1/users/:user_id/artifacts/:id
+//   GET    /api/v1/users/:user_id/artifacts/:id/v/:version
+//   GET    /api/v1/users/:user_id/artifacts/:id/history
+//   GET    /api/v1/users/:user_id/artifacts/:id/diff/:from/:to
+//   PUT    /api/v1/users/:user_id/artifacts/:id
+//   POST   /api/v1/users/:user_id/artifacts/:id/share
+//   DELETE /api/v1/users/:user_id/artifacts/:id/share
+//   POST   /api/v1/users/:user_id/artifacts/:id/export?format=pdf|docx|...
+//
+// Public (no auth, CORS-open):
+//   GET    /api/v1/share/artifact/:share_code
+//
+// Every auth'd handler:
+//   * parses the user_id segment via `parseNumericUserId`
+//   * passes user_id into the Manager call which filters by user_id
+//   * returns 404 (not 403) when the requested artifact_id is not
+//     owned by the user — refuses to confirm/deny existence to a non-owner.
+// The public share path NEVER carries user_id; the sanitizer strips it.
+
+/// Validate an artifact UUID's textual form. Same defensive shape as
+/// `isValidRunId`: bounded length, no control chars or slashes. The
+/// Postgres `id::uuid` cast will reject garbage at the DB layer too,
+/// but rejecting at the HTTP boundary is cheaper and avoids burning
+/// a connection on obvious junk.
+fn isValidArtifactId(id: []const u8) bool {
+    // RFC 4122 UUIDs are exactly 36 chars (32 hex + 4 dashes). Permit
+    // canonical-form only; the DB cast would normalize but FE callers
+    // SHOULD pass canonical form.
+    if (id.len != 36) return false;
+    for (id, 0..) |b, i| {
+        if (i == 8 or i == 13 or i == 18 or i == 23) {
+            if (b != '-') return false;
+        } else {
+            const ok = (b >= '0' and b <= '9') or
+                (b >= 'a' and b <= 'f') or
+                (b >= 'A' and b <= 'F');
+            if (!ok) return false;
+        }
+    }
+    return true;
+}
+
+fn serializeArtifactJson(w: anytype, row: *const zaki_state_mod.ArtifactRow, user_id_str: []const u8) !void {
+    try w.writeAll("{\"id\":\"");
+    try jsonEscapeInto(w, row.id);
+    try w.writeAll("\",\"title\":\"");
+    try jsonEscapeInto(w, row.title);
+    try w.writeAll("\",\"kind\":\"");
+    try jsonEscapeInto(w, row.kind);
+    try w.print("\",\"current_version\":{d},\"created_at_unix\":{d},\"updated_at_unix\":{d}", .{
+        row.current_version,
+        row.created_at_unix,
+        row.updated_at_unix,
+    });
+    if (row.session_id) |sid| {
+        try w.writeAll(",\"session_id\":\"");
+        try jsonEscapeInto(w, sid);
+        try w.writeAll("\"");
+    }
+    try w.print(",\"is_shared\":{s}", .{if (row.is_shared) "true" else "false"});
+    if (row.share_code) |code| {
+        try w.writeAll(",\"share_code\":\"");
+        try jsonEscapeInto(w, code);
+        try w.writeAll("\"");
+    }
+    if (row.share_expires_at_unix) |exp| {
+        try w.print(",\"share_expires_at_unix\":{d}", .{exp});
+    }
+    try w.writeAll(",\"url\":\"/api/v1/users/");
+    try jsonEscapeInto(w, user_id_str);
+    try w.writeAll("/artifacts/");
+    try jsonEscapeInto(w, row.id);
+    try w.writeAll("\"}");
+}
+
+fn handleArtifactList(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id_str: []const u8,
+    state: *GatewayState,
+    target: []const u8,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    const numeric_user_id = parseNumericUserId(user_id_str) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+    const state_mgr = state.zaki_state orelse {
+        // No postgres → empty list (mirrors trace endpoint shape).
+        return .{ .body = "{\"artifacts\":[]}" };
+    };
+
+    const limit_param = parseQueryParam(target, "limit");
+    var limit: u32 = 50;
+    if (limit_param) |s| {
+        const parsed = std.fmt.parseInt(u32, s, 10) catch return .{
+            .status = "400 Bad Request",
+            .body = "{\"error\":\"invalid_limit\"}",
+        };
+        limit = if (parsed == 0 or parsed > 200) 50 else parsed;
+    }
+    const kind_param = parseQueryParam(target, "kind");
+    if (kind_param) |k| {
+        if (artifacts_types.ArtifactKind.fromSlice(k) == null) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_kind\"}" };
+        }
+    }
+
+    const rows = state_mgr.listArtifactsForUser(allocator, numeric_user_id, kind_param, limit) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"list_failed\"}" };
+    };
+    defer zaki_state_mod.freeArtifactRows(allocator, rows);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"artifacts\":[") catch return response_build_err;
+    for (rows, 0..) |*r, i| {
+        if (i > 0) w.writeAll(",") catch return response_build_err;
+        serializeArtifactJson(w, r, user_id_str) catch return response_build_err;
+    }
+    w.writeAll("]}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+fn handleArtifactGet(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id_str: []const u8,
+    artifact_id: []const u8,
+    version_opt: ?u64,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    if (!isValidArtifactId(artifact_id)) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_artifact_id\"}" };
+    }
+    const numeric_user_id = parseNumericUserId(user_id_str) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"artifact_not_found\"}" };
+    };
+
+    const artifact_opt = state_mgr.getArtifactById(allocator, numeric_user_id, artifact_id) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read_failed\"}" };
+    };
+    if (artifact_opt == null) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"artifact_not_found\"}" };
+    }
+    var artifact = artifact_opt.?;
+    defer artifact.deinit(allocator);
+
+    const ver_opt = state_mgr.getArtifactVersion(allocator, numeric_user_id, artifact_id, version_opt) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"version_read_failed\"}" };
+    };
+    if (ver_opt == null) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"version_not_found\"}" };
+    }
+    var ver = ver_opt.?;
+    defer ver.deinit(allocator);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"artifact\":") catch return response_build_err;
+    serializeArtifactJson(w, &artifact, user_id_str) catch return response_build_err;
+    w.print(",\"version\":{d},\"author\":\"", .{ver.version}) catch return response_build_err;
+    jsonEscapeInto(w, ver.author) catch return response_build_err;
+    w.print("\",\"created_at_unix\":{d},\"content\":\"", .{ver.created_at_unix}) catch return response_build_err;
+    jsonEscapeInto(w, ver.content) catch return response_build_err;
+    w.writeAll("\"") catch return response_build_err;
+    if (ver.change_summary) |cs| {
+        w.writeAll(",\"change_summary\":\"") catch return response_build_err;
+        jsonEscapeInto(w, cs) catch return response_build_err;
+        w.writeAll("\"") catch return response_build_err;
+    }
+    w.writeAll("}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+fn handleArtifactHistory(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id_str: []const u8,
+    artifact_id: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    if (!isValidArtifactId(artifact_id)) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_artifact_id\"}" };
+    }
+    const numeric_user_id = parseNumericUserId(user_id_str) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+    const state_mgr = state.zaki_state orelse {
+        return .{ .body = "{\"history\":[]}" };
+    };
+
+    // Existence check first so we return 404 (not empty) on a foreign
+    // artifact_id — preserves the "we don't confirm cross-user existence"
+    // posture.
+    const artifact_opt = state_mgr.getArtifactById(allocator, numeric_user_id, artifact_id) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read_failed\"}" };
+    };
+    if (artifact_opt == null) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"artifact_not_found\"}" };
+    }
+    var artifact = artifact_opt.?;
+    artifact.deinit(allocator);
+
+    const history = state_mgr.listArtifactVersionHistory(allocator, numeric_user_id, artifact_id) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"history_read_failed\"}" };
+    };
+    defer zaki_state_mod.freeArtifactHistoryRows(allocator, history);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"history\":[") catch return response_build_err;
+    for (history, 0..) |*h, i| {
+        if (i > 0) w.writeAll(",") catch return response_build_err;
+        w.print("{{\"version\":{d}", .{h.version}) catch return response_build_err;
+        if (h.parent_version) |pv| w.print(",\"parent_version\":{d}", .{pv}) catch return response_build_err;
+        w.writeAll(",\"author\":\"") catch return response_build_err;
+        jsonEscapeInto(w, h.author) catch return response_build_err;
+        w.print("\",\"created_at_unix\":{d},\"content_hash\":\"", .{h.created_at_unix}) catch return response_build_err;
+        jsonEscapeInto(w, h.content_hash) catch return response_build_err;
+        w.writeAll("\"") catch return response_build_err;
+        if (h.change_summary) |cs| {
+            w.writeAll(",\"change_summary\":\"") catch return response_build_err;
+            jsonEscapeInto(w, cs) catch return response_build_err;
+            w.writeAll("\"") catch return response_build_err;
+        }
+        w.writeAll("}") catch return response_build_err;
+    }
+    w.writeAll("]}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+fn handleArtifactDiff(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id_str: []const u8,
+    artifact_id: []const u8,
+    from_version: u64,
+    to_version: u64,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    if (!isValidArtifactId(artifact_id)) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_artifact_id\"}" };
+    }
+    const numeric_user_id = parseNumericUserId(user_id_str) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"artifact_not_found\"}" };
+    };
+
+    var before_opt = state_mgr.getArtifactVersion(allocator, numeric_user_id, artifact_id, from_version) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"version_read_failed\"}" };
+    };
+    if (before_opt == null) return .{ .status = "404 Not Found", .body = "{\"error\":\"from_version_not_found\"}" };
+    var before = before_opt.?;
+    defer before.deinit(allocator);
+
+    var after_opt = state_mgr.getArtifactVersion(allocator, numeric_user_id, artifact_id, to_version) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"version_read_failed\"}" };
+    };
+    if (after_opt == null) return .{ .status = "404 Not Found", .body = "{\"error\":\"to_version_not_found\"}" };
+    var after = after_opt.?;
+    defer after.deinit(allocator);
+    _ = &before_opt;
+    _ = &after_opt;
+
+    const diff_text = artifacts_diff.unifiedLineDiff(allocator, before.content, after.content) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"diff_failed\"}" };
+    };
+    defer allocator.free(diff_text);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.print("{{\"artifact_id\":\"", .{}) catch return response_build_err;
+    jsonEscapeInto(w, artifact_id) catch return response_build_err;
+    w.print("\",\"from_version\":{d},\"to_version\":{d},\"diff\":\"", .{ from_version, to_version }) catch return response_build_err;
+    jsonEscapeInto(w, diff_text) catch return response_build_err;
+    w.writeAll("\"}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+fn handleArtifactPut(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id_str: []const u8,
+    artifact_id: []const u8,
+    raw_request: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "PUT")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    if (!isValidArtifactId(artifact_id)) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_artifact_id\"}" };
+    }
+    const numeric_user_id = parseNumericUserId(user_id_str) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
+    const body = extractBody(raw_request) orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_body\"}" };
+    };
+    const content = jsonStringField(body, "content") orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_content\"}" };
+    };
+    if (content.len == 0) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"empty_content\"}" };
+    }
+    const change_summary = jsonStringField(body, "change_summary");
+
+    // Ownership + existence check.
+    var existing_opt = state_mgr.getArtifactById(allocator, numeric_user_id, artifact_id) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read_failed\"}" };
+    };
+    if (existing_opt == null) return .{ .status = "404 Not Found", .body = "{\"error\":\"artifact_not_found\"}" };
+    var existing = existing_opt.?;
+    existing.deinit(allocator);
+    _ = &existing_opt;
+
+    const content_hash = artifacts_types.computeContentHash(allocator, content) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"hash_failed\"}" };
+    };
+    defer allocator.free(content_hash);
+    const now_unix = std.time.timestamp();
+
+    // PUT is the user's edit path → author = "user".
+    const new_version = state_mgr.appendArtifactVersion(
+        allocator,
+        numeric_user_id,
+        artifact_id,
+        content,
+        content_hash,
+        "user",
+        change_summary,
+        now_unix,
+    ) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write_failed\"}" };
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.print("{{\"artifact_id\":\"", .{}) catch return response_build_err;
+    jsonEscapeInto(w, artifact_id) catch return response_build_err;
+    w.print("\",\"new_version\":{d},\"author\":\"user\"}}", .{new_version}) catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+fn handleArtifactShareCreate(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id_str: []const u8,
+    artifact_id: []const u8,
+    raw_request: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "POST")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    if (!isValidArtifactId(artifact_id)) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_artifact_id\"}" };
+    }
+    const numeric_user_id = parseNumericUserId(user_id_str) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
+
+    // Optional expires_in_hours, default 168 (7 days).
+    var hours: i64 = artifacts_store.DEFAULT_SHARE_EXPIRY_HOURS;
+    if (extractBody(raw_request)) |body| {
+        if (jsonIntField(body, "expires_in_hours")) |h| {
+            if (h <= 0 or h > 24 * 365) {
+                return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_expires_in_hours\"}" };
+            }
+            hours = h;
+        }
+    }
+    const now_unix = std.time.timestamp();
+    const expires_at_unix = now_unix + hours * 3600;
+
+    // Ownership check before minting a code.
+    var existing_opt = state_mgr.getArtifactById(allocator, numeric_user_id, artifact_id) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read_failed\"}" };
+    };
+    if (existing_opt == null) return .{ .status = "404 Not Found", .body = "{\"error\":\"artifact_not_found\"}" };
+    var existing = existing_opt.?;
+    existing.deinit(allocator);
+    _ = &existing_opt;
+
+    const share_code = artifacts_store.generateShareCode(allocator) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"share_code_failed\"}" };
+    };
+    defer allocator.free(share_code);
+
+    state_mgr.setArtifactShare(numeric_user_id, artifact_id, share_code, expires_at_unix) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"share_persist_failed\"}" };
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"share_code\":\"") catch return response_build_err;
+    jsonEscapeInto(w, share_code) catch return response_build_err;
+    w.writeAll("\",\"share_url\":\"/api/v1/share/artifact/") catch return response_build_err;
+    jsonEscapeInto(w, share_code) catch return response_build_err;
+    w.print("\",\"expires_at_unix\":{d}}}", .{expires_at_unix}) catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+fn handleArtifactShareRevoke(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id_str: []const u8,
+    artifact_id: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    _ = allocator;
+    if (!std.mem.eql(u8, method, "DELETE")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    if (!isValidArtifactId(artifact_id)) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_artifact_id\"}" };
+    }
+    const numeric_user_id = parseNumericUserId(user_id_str) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
+    state_mgr.clearArtifactShare(numeric_user_id, artifact_id) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"revoke_failed\"}" };
+    };
+    return .{ .body = "{\"status\":\"revoked\"}" };
+}
+
+fn handleArtifactExport(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id_str: []const u8,
+    artifact_id: []const u8,
+    target: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    _ = allocator;
+    _ = state;
+    _ = user_id_str;
+    if (!std.mem.eql(u8, method, "POST")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    if (!isValidArtifactId(artifact_id)) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_artifact_id\"}" };
+    }
+    // Wave 2A's `produce_document` tool is the eventual bridge target.
+    // Until it lands the endpoint returns 501 with the documented
+    // dependency so operators can detect "feature parked, not broken."
+    _ = target;
+    return .{
+        .status = "501 Not Implemented",
+        .body = "{\"error\":\"export_not_yet_available\",\"detail\":\"produce_document tool not yet wired; see Wave 2A\"}",
+    };
+}
+
+fn handleArtifactShareGet(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    share_code: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    if (!artifacts_store.isValidShareCode(share_code)) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"share_not_found\"}" };
+    }
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"share_not_found\"}" };
+    };
+    const now_unix = std.time.timestamp();
+    const artifact_opt = state_mgr.getArtifactByShareCode(allocator, share_code, now_unix) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read_failed\"}" };
+    };
+    if (artifact_opt == null) {
+        // Unknown / revoked / expired all return the same 404 so a
+        // guesser can't distinguish "valid but expired" from "never
+        // existed" — minor enumeration-defense win.
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"share_not_found\"}" };
+    }
+    var artifact = artifact_opt.?;
+    defer artifact.deinit(allocator);
+
+    const ver_opt = state_mgr.getArtifactVersion(allocator, artifact.user_id, artifact.id, null) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"version_read_failed\"}" };
+    };
+    if (ver_opt == null) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"share_not_found\"}" };
+    }
+    var ver = ver_opt.?;
+    defer ver.deinit(allocator);
+
+    const kind = artifacts_types.ArtifactKind.fromSlice(artifact.kind) orelse .plaintext;
+    const body = artifacts_sanitizer.renderPublicShareJson(
+        allocator,
+        artifact.title,
+        kind,
+        ver.content,
+        artifact.updated_at_unix,
+    ) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"render_failed\"}" };
+    };
+    // CORS — the response writer normalizes Access-Control headers
+    // on `/api/v1/share/*` paths globally (see the writer in
+    // `respondJsonRouteResponse`). The body itself is sanitized via
+    // `renderPublicShareJson` so adding additional headers here is
+    // unnecessary; relying on the writer keeps CORS policy in one
+    // place.
+    return .{ .body = body };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Public Trace Share (Wave 2B — 2026-05-24)
 // ════════════════════════════════════════════════════════════════════════════
 //
@@ -15374,6 +15929,20 @@ fn handleApiRoute(
     config_opt: ?*const Config,
     session_mgr_opt: ?*session_mod.SessionManager,
 ) RouteResponse {
+    // ── Public artifact-share GET (Wave 2C — 2026-05-24) ──────────────
+    // Public side-panel artifact view. Same auth contract as the trace
+    // share below: no auth headers, every byte goes through the
+    // artifacts/sanitizer.zig allowlist (title + kind + content +
+    // updated_at only — NEVER user_id, session_id, or metadata).
+    //
+    // Path must match BEFORE the generic /api/v1/share/ trace handler
+    // so the more-specific artifact path doesn't get swallowed by the
+    // trace handler treating "artifact/<code>" as a code.
+    if (std.mem.startsWith(u8, base_path, "/api/v1/share/artifact/")) {
+        const code = base_path["/api/v1/share/artifact/".len..];
+        return handleArtifactShareGet(req_allocator, method, code, state);
+    }
+
     // ── Public trace-share GET (Wave 2B — 2026-05-24) ─────────────────
     // This is the ONLY /api/v1/* route that bypasses
     // `validateInternalServiceToken`. It's the user-facing share link
@@ -16829,6 +17398,92 @@ fn handleApiRoute(
             return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
         }
         return handleTraceGet(req_allocator, method, rest, effective_trace_store);
+    }
+
+    // ── Wave 2C — canvas/artifacts auth'd endpoints ────────────────────
+    // The route table (every read path goes through `state.zaki_state`,
+    // every write path checks user-id ownership at the Manager layer):
+    //   GET    /artifacts                              → list
+    //   GET    /artifacts/:id                          → latest version
+    //   GET    /artifacts/:id/v/:version               → specific version
+    //   GET    /artifacts/:id/history                  → version graph
+    //   GET    /artifacts/:id/diff/:from/:to           → textual diff
+    //   PUT    /artifacts/:id                          → user edit
+    //   POST   /artifacts/:id/share                    → mint share code
+    //   DELETE /artifacts/:id/share                    → revoke share
+    //   POST   /artifacts/:id/export?format=...        → produce_document bridge (501)
+    if (std.mem.eql(u8, parsed.subpath, "artifacts")) {
+        const target = extractRequestTarget(raw_request) orelse base_path;
+        return handleArtifactList(req_allocator, method, scoped_user_id, state, target);
+    }
+    if (std.mem.startsWith(u8, parsed.subpath, "artifacts/")) {
+        const rest = parsed.subpath["artifacts/".len..];
+        // Strip any query string before the path-shape match.
+        const path_only = blk: {
+            if (std.mem.indexOfScalar(u8, rest, '?')) |q| break :blk rest[0..q];
+            break :blk rest;
+        };
+
+        // /artifacts/:id (PUT or GET)
+        if (std.mem.indexOfScalar(u8, path_only, '/') == null) {
+            const artifact_id = path_only;
+            if (std.mem.eql(u8, method, "PUT")) {
+                return handleArtifactPut(req_allocator, method, scoped_user_id, artifact_id, raw_request, state);
+            }
+            return handleArtifactGet(req_allocator, method, scoped_user_id, artifact_id, null, state);
+        }
+
+        // Has at least one slash → /:id/<suffix>
+        const slash = std.mem.indexOfScalar(u8, path_only, '/').?;
+        const artifact_id = path_only[0..slash];
+        const suffix = path_only[slash + 1 ..];
+
+        if (std.mem.eql(u8, suffix, "share")) {
+            if (std.mem.eql(u8, method, "POST")) {
+                return handleArtifactShareCreate(req_allocator, method, scoped_user_id, artifact_id, raw_request, state);
+            }
+            if (std.mem.eql(u8, method, "DELETE")) {
+                return handleArtifactShareRevoke(req_allocator, method, scoped_user_id, artifact_id, state);
+            }
+            return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+        }
+
+        if (std.mem.eql(u8, suffix, "history")) {
+            return handleArtifactHistory(req_allocator, method, scoped_user_id, artifact_id, state);
+        }
+
+        if (std.mem.eql(u8, suffix, "export")) {
+            const target = extractRequestTarget(raw_request) orelse base_path;
+            return handleArtifactExport(req_allocator, method, scoped_user_id, artifact_id, target, state);
+        }
+
+        // /v/:version → specific historical version.
+        if (std.mem.startsWith(u8, suffix, "v/")) {
+            const ver_str = suffix["v/".len..];
+            const version = std.fmt.parseInt(u64, ver_str, 10) catch {
+                return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_version\"}" };
+            };
+            return handleArtifactGet(req_allocator, method, scoped_user_id, artifact_id, version, state);
+        }
+
+        // /diff/:from/:to → textual line diff between two versions.
+        if (std.mem.startsWith(u8, suffix, "diff/")) {
+            const versions = suffix["diff/".len..];
+            const sep = std.mem.indexOfScalar(u8, versions, '/') orelse {
+                return .{ .status = "400 Bad Request", .body = "{\"error\":\"diff_requires_from_and_to\"}" };
+            };
+            const from_str = versions[0..sep];
+            const to_str = versions[sep + 1 ..];
+            const from_version = std.fmt.parseInt(u64, from_str, 10) catch {
+                return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_from_version\"}" };
+            };
+            const to_version = std.fmt.parseInt(u64, to_str, 10) catch {
+                return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_to_version\"}" };
+            };
+            return handleArtifactDiff(req_allocator, method, scoped_user_id, artifact_id, from_version, to_version, state);
+        }
+
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"artifact_subpath_not_found\"}" };
     }
 
     return .{ .status = "404 Not Found", .body = "{\"error\":\"not found\"}" };

@@ -263,6 +263,18 @@ pub const RunEventObserver = struct {
                 .state = "error",
                 .label = "Tool iteration limit reached",
             } }),
+            // Wave 2C — bridge artifact_event from the tools into an
+            // artifact_event SSE frame so the FE side panel refreshes.
+            .artifact_event => |e| self.emit(.{ .artifact_event = .{
+                .op = e.op,
+                .artifact_id = e.artifact_id,
+                .title = e.title,
+                .kind = e.kind,
+                .version = e.version,
+                .url = e.url,
+                .change_summary = e.change_summary,
+                .run_id = e.run_id,
+            } }),
             else => {},
         }
     }

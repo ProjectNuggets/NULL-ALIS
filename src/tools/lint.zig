@@ -16,6 +16,10 @@ const metadata = @import("metadata.zig");
 // ── Registry of 57 production tools ──────────────────────────────────
 
 pub const ALL_TOOLS = [_][]const u8{
+    "artifact_create",
+    "artifact_get",
+    "artifact_list",
+    "artifact_update",
     "brain_graph",
     "browser",
     "browser_open",

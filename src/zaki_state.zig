@@ -231,6 +231,81 @@ pub const EntityOverlapRow = struct {
     }
 };
 
+// ── Wave 2C: artifacts row types ─────────────────────────────────────
+//
+// Backing rows for the artifacts + artifact_versions tables (migration
+// 0002). Hoisted to module scope so both ManagerImpl and the stub
+// Manager variant can reference them uniformly — same pattern as
+// SecretMetadata / TaskSnapshot above.
+
+pub const ArtifactRow = struct {
+    id: []u8, // UUID textual form
+    user_id: i64,
+    session_id: ?[]u8,
+    title: []u8,
+    kind: []u8,
+    created_at_unix: i64,
+    updated_at_unix: i64,
+    current_version: u64,
+    is_shared: bool,
+    share_code: ?[]u8,
+    share_expires_at_unix: ?i64,
+    metadata_jsonb: []u8,
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        if (self.session_id) |s| allocator.free(s);
+        allocator.free(self.title);
+        allocator.free(self.kind);
+        if (self.share_code) |s| allocator.free(s);
+        allocator.free(self.metadata_jsonb);
+    }
+};
+
+pub const ArtifactVersionRow = struct {
+    artifact_id: []u8,
+    version: u64,
+    parent_version: ?u64,
+    content: []u8,
+    content_hash: []u8,
+    created_at_unix: i64,
+    author: []u8,
+    change_summary: ?[]u8,
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.artifact_id);
+        allocator.free(self.content);
+        allocator.free(self.content_hash);
+        allocator.free(self.author);
+        if (self.change_summary) |s| allocator.free(s);
+    }
+};
+
+pub const ArtifactHistoryRow = struct {
+    version: u64,
+    parent_version: ?u64,
+    author: []u8,
+    created_at_unix: i64,
+    change_summary: ?[]u8,
+    content_hash: []u8,
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.author);
+        if (self.change_summary) |s| allocator.free(s);
+        allocator.free(self.content_hash);
+    }
+};
+
+pub fn freeArtifactRows(allocator: std.mem.Allocator, list: []ArtifactRow) void {
+    for (list) |*r| r.deinit(allocator);
+    allocator.free(list);
+}
+
+pub fn freeArtifactHistoryRows(allocator: std.mem.Allocator, list: []ArtifactHistoryRow) void {
+    for (list) |*r| r.deinit(allocator);
+    allocator.free(list);
+}
+
 pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn init(_: std.mem.Allocator, _: config_types.StateConfig) !@This() {
         return error.PostgresNotEnabled;
@@ -842,6 +917,94 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
             @panic("postgres not enabled");
         }
     };
+
+    // ── Wave 2C: artifacts stubs ────────────────────────────────────
+    // Non-postgres builds surface a clean PostgresNotEnabled for write
+    // paths and empty/null for read paths so the tools can degrade
+    // gracefully without crashing the stub Manager.
+    pub fn createArtifact(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: i64,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: []const u8,
+        _: []const u8,
+        _: i64,
+    ) !ArtifactRow {
+        return error.PostgresNotEnabled;
+    }
+    pub fn appendArtifactVersion(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: i64,
+        _: []const u8,
+        _: []const u8,
+        _: []const u8,
+        _: []const u8,
+        _: ?[]const u8,
+        _: i64,
+    ) !u64 {
+        return error.PostgresNotEnabled;
+    }
+    pub fn getArtifactById(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: i64,
+        _: []const u8,
+    ) !?ArtifactRow {
+        return null;
+    }
+    pub fn getArtifactVersion(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: i64,
+        _: []const u8,
+        _: ?u64,
+    ) !?ArtifactVersionRow {
+        return null;
+    }
+    pub fn listArtifactsForUser(
+        _: *@This(),
+        allocator: std.mem.Allocator,
+        _: i64,
+        _: ?[]const u8,
+        _: u32,
+    ) ![]ArtifactRow {
+        return allocator.alloc(ArtifactRow, 0);
+    }
+    pub fn listArtifactVersionHistory(
+        _: *@This(),
+        allocator: std.mem.Allocator,
+        _: i64,
+        _: []const u8,
+    ) ![]ArtifactHistoryRow {
+        return allocator.alloc(ArtifactHistoryRow, 0);
+    }
+    pub fn setArtifactShare(
+        _: *@This(),
+        _: i64,
+        _: []const u8,
+        _: []const u8,
+        _: ?i64,
+    ) !void {
+        return error.PostgresNotEnabled;
+    }
+    pub fn clearArtifactShare(_: *@This(), _: i64, _: []const u8) !void {
+        return error.PostgresNotEnabled;
+    }
+    pub fn getArtifactByShareCode(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: i64,
+    ) !?ArtifactRow {
+        return null;
+    }
+    pub fn deleteArtifact(_: *@This(), _: i64, _: []const u8) !bool {
+        return error.PostgresNotEnabled;
+    }
 };
 
 const ManagerImpl = struct {
@@ -9686,6 +9849,620 @@ const ManagerImpl = struct {
         defer self.allocator.free(query);
         const result = try self.execParams(query, params, lengths);
         c.PQclear(result);
+    }
+
+    // ── Wave 2C: artifacts CRUD ─────────────────────────────────────
+    //
+    // Live SQL impl backing the artifacts + artifact_versions tables
+    // (migration 0002). The non-postgres stub Manager mirrors the
+    // signatures up at line ~920 so the gateway + tools compile uniformly.
+    //
+    // Conservative design (per spec — choose the most user-protective
+    // option when uncertain): every read filters by user_id, every write
+    // verifies user_id ownership, every method takes an explicit
+    // `now_unix` from the caller so behavior is deterministic in tests.
+
+    pub fn createArtifact(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        session_id: ?[]const u8,
+        title: []const u8,
+        kind: []const u8,
+        content: []const u8,
+        content_hash: []const u8,
+        now_unix: i64,
+    ) !ArtifactRow {
+        // Two writes wrapped in one connection-pinned transaction so a
+        // mid-insert crash doesn't leave an orphan artifact row without
+        // its v1 (the FE would render a confusing "no content" panel).
+        var txn = try self.beginTransaction();
+        defer txn.deinit();
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const session_z_opt = if (session_id) |s| try self.allocator.dupeZ(u8, s) else null;
+        defer if (session_z_opt) |z| self.allocator.free(z);
+        const title_z = try self.allocator.dupeZ(u8, title);
+        defer self.allocator.free(title_z);
+        const kind_z = try self.allocator.dupeZ(u8, kind);
+        defer self.allocator.free(kind_z);
+        var ts_buf: [32]u8 = undefined;
+        const ts_s = try std.fmt.bufPrintZ(&ts_buf, "{d}", .{now_unix});
+
+        const insert_q = try self.buildQuery(
+            "INSERT INTO {schema}.artifacts (user_id, session_id, title, kind, created_at_unix, updated_at_unix, current_version) " ++
+                "VALUES ($1, $2, $3, $4, $5, $5, 1) " ++
+                "RETURNING id::text, COALESCE(session_id, ''), title, kind, created_at_unix, updated_at_unix, current_version, is_shared, COALESCE(share_code, ''), COALESCE(share_expires_at_unix::text, ''), metadata_jsonb::text",
+        );
+        defer self.allocator.free(insert_q);
+        const params = [_]?[*:0]const u8{
+            user_s.ptr,
+            if (session_z_opt) |z| z.ptr else null,
+            title_z.ptr,
+            kind_z.ptr,
+            ts_s.ptr,
+        };
+        const lengths = [_]c_int{
+            @intCast(user_s.len),
+            if (session_id) |s| @intCast(s.len) else 0,
+            @intCast(title.len),
+            @intCast(kind.len),
+            @intCast(ts_s.len),
+        };
+        const r1 = try txn.execParams(insert_q, &params, &lengths);
+        defer c.PQclear(r1);
+        if (c.PQntuples(r1) == 0) return error.ExecFailed;
+
+        const artifact_id = try dupeResultValue(allocator, r1, 0, 0);
+        errdefer allocator.free(artifact_id);
+        const sid_raw = try dupeResultValue(allocator, r1, 0, 1);
+        defer allocator.free(sid_raw);
+        const sid_owned: ?[]u8 = if (sid_raw.len == 0) null else try allocator.dupe(u8, sid_raw);
+        errdefer if (sid_owned) |s| allocator.free(s);
+        const title_out = try dupeResultValue(allocator, r1, 0, 2);
+        errdefer allocator.free(title_out);
+        const kind_out = try dupeResultValue(allocator, r1, 0, 3);
+        errdefer allocator.free(kind_out);
+        const created_str = try dupeResultValue(allocator, r1, 0, 4);
+        defer allocator.free(created_str);
+        const updated_str = try dupeResultValue(allocator, r1, 0, 5);
+        defer allocator.free(updated_str);
+        const ver_str = try dupeResultValue(allocator, r1, 0, 6);
+        defer allocator.free(ver_str);
+        const is_shared_str = try dupeResultValue(allocator, r1, 0, 7);
+        defer allocator.free(is_shared_str);
+        const share_code_raw = try dupeResultValue(allocator, r1, 0, 8);
+        defer allocator.free(share_code_raw);
+        const share_code_owned: ?[]u8 = if (share_code_raw.len == 0) null else try allocator.dupe(u8, share_code_raw);
+        errdefer if (share_code_owned) |s| allocator.free(s);
+        const expires_raw = try dupeResultValue(allocator, r1, 0, 9);
+        defer allocator.free(expires_raw);
+        const meta_out = try dupeResultValue(allocator, r1, 0, 10);
+        errdefer allocator.free(meta_out);
+
+        // Now write v1 of the content into artifact_versions.
+        const artifact_id_z = try self.allocator.dupeZ(u8, artifact_id);
+        defer self.allocator.free(artifact_id_z);
+        const content_z = try self.allocator.dupeZ(u8, content);
+        defer self.allocator.free(content_z);
+        const hash_z = try self.allocator.dupeZ(u8, content_hash);
+        defer self.allocator.free(hash_z);
+
+        const ver_q = try self.buildQuery(
+            "INSERT INTO {schema}.artifact_versions (artifact_id, version, parent_version, content, content_hash, created_at_unix, author) " ++
+                "VALUES ($1::uuid, 1, NULL, $2, $3, $4, 'agent')",
+        );
+        defer self.allocator.free(ver_q);
+        const vparams = [_]?[*:0]const u8{ artifact_id_z.ptr, content_z.ptr, hash_z.ptr, ts_s.ptr };
+        const vlengths = [_]c_int{ @intCast(artifact_id.len), @intCast(content.len), @intCast(content_hash.len), @intCast(ts_s.len) };
+        const r2 = try txn.execParams(ver_q, &vparams, &vlengths);
+        c.PQclear(r2);
+
+        try txn.commit();
+
+        return .{
+            .id = artifact_id,
+            .user_id = user_id,
+            .session_id = sid_owned,
+            .title = title_out,
+            .kind = kind_out,
+            .created_at_unix = std.fmt.parseInt(i64, created_str, 10) catch 0,
+            .updated_at_unix = std.fmt.parseInt(i64, updated_str, 10) catch 0,
+            .current_version = std.fmt.parseInt(u64, ver_str, 10) catch 1,
+            .is_shared = std.mem.eql(u8, is_shared_str, "t") or std.mem.eql(u8, is_shared_str, "true"),
+            .share_code = share_code_owned,
+            .share_expires_at_unix = if (expires_raw.len == 0) null else (std.fmt.parseInt(i64, expires_raw, 10) catch null),
+            .metadata_jsonb = meta_out,
+        };
+    }
+
+    pub fn appendArtifactVersion(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        artifact_id: []const u8,
+        content: []const u8,
+        content_hash: []const u8,
+        author: []const u8,
+        change_summary: ?[]const u8,
+        now_unix: i64,
+    ) !u64 {
+        _ = allocator;
+        // Ownership-checked transactional append: SELECT the current
+        // version FOR UPDATE so concurrent appends serialize on the
+        // artifact row, then INSERT v=current+1 + UPDATE artifacts.
+        // The FOR UPDATE lock means two concurrent appends get
+        // distinct versions instead of racing on the unique constraint.
+        var txn = try self.beginTransaction();
+        defer txn.deinit();
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const artifact_id_z = try self.allocator.dupeZ(u8, artifact_id);
+        defer self.allocator.free(artifact_id_z);
+
+        const select_q = try self.buildQuery(
+            "SELECT current_version FROM {schema}.artifacts WHERE id = $1::uuid AND user_id = $2 FOR UPDATE",
+        );
+        defer self.allocator.free(select_q);
+        const sparams = [_]?[*:0]const u8{ artifact_id_z.ptr, user_s.ptr };
+        const slengths = [_]c_int{ @intCast(artifact_id.len), @intCast(user_s.len) };
+        const sr = try txn.execParams(select_q, &sparams, &slengths);
+        defer c.PQclear(sr);
+        if (c.PQntuples(sr) == 0) return error.ArtifactNotFound;
+        const cur_str_buf = c.PQgetvalue(sr, 0, 0);
+        const cur_len: usize = @intCast(c.PQgetlength(sr, 0, 0));
+        const cur_src: [*]align(1) const u8 = @ptrCast(cur_str_buf);
+        const cur_str = cur_src[0..cur_len];
+        const current_version = std.fmt.parseInt(u64, cur_str, 10) catch return error.ExecFailed;
+        const next_version = current_version + 1;
+
+        const content_z = try self.allocator.dupeZ(u8, content);
+        defer self.allocator.free(content_z);
+        const hash_z = try self.allocator.dupeZ(u8, content_hash);
+        defer self.allocator.free(hash_z);
+        const author_z = try self.allocator.dupeZ(u8, author);
+        defer self.allocator.free(author_z);
+        const change_z_opt = if (change_summary) |cs| try self.allocator.dupeZ(u8, cs) else null;
+        defer if (change_z_opt) |z| self.allocator.free(z);
+        var next_buf: [32]u8 = undefined;
+        const next_s = try std.fmt.bufPrintZ(&next_buf, "{d}", .{next_version});
+        var parent_buf: [32]u8 = undefined;
+        const parent_s = try std.fmt.bufPrintZ(&parent_buf, "{d}", .{current_version});
+        var ts_buf: [32]u8 = undefined;
+        const ts_s = try std.fmt.bufPrintZ(&ts_buf, "{d}", .{now_unix});
+
+        const insert_q = try self.buildQuery(
+            "INSERT INTO {schema}.artifact_versions (artifact_id, version, parent_version, content, content_hash, created_at_unix, author, change_summary) " ++
+                "VALUES ($1::uuid, $2::bigint, $3::bigint, $4, $5, $6::bigint, $7, $8)",
+        );
+        defer self.allocator.free(insert_q);
+        const iparams = [_]?[*:0]const u8{
+            artifact_id_z.ptr,
+            next_s.ptr,
+            parent_s.ptr,
+            content_z.ptr,
+            hash_z.ptr,
+            ts_s.ptr,
+            author_z.ptr,
+            if (change_z_opt) |z| z.ptr else null,
+        };
+        const ilengths = [_]c_int{
+            @intCast(artifact_id.len),
+            @intCast(next_s.len),
+            @intCast(parent_s.len),
+            @intCast(content.len),
+            @intCast(content_hash.len),
+            @intCast(ts_s.len),
+            @intCast(author.len),
+            if (change_summary) |cs| @intCast(cs.len) else 0,
+        };
+        const ir = try txn.execParams(insert_q, &iparams, &ilengths);
+        c.PQclear(ir);
+
+        const update_q = try self.buildQuery(
+            "UPDATE {schema}.artifacts SET current_version = $1::bigint, updated_at_unix = $2::bigint WHERE id = $3::uuid AND user_id = $4",
+        );
+        defer self.allocator.free(update_q);
+        const uparams = [_]?[*:0]const u8{ next_s.ptr, ts_s.ptr, artifact_id_z.ptr, user_s.ptr };
+        const ulengths = [_]c_int{ @intCast(next_s.len), @intCast(ts_s.len), @intCast(artifact_id.len), @intCast(user_s.len) };
+        const ur = try txn.execParams(update_q, &uparams, &ulengths);
+        c.PQclear(ur);
+
+        try txn.commit();
+        return next_version;
+    }
+
+    pub fn getArtifactById(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        artifact_id: []const u8,
+    ) !?ArtifactRow {
+        const q = try self.buildQuery(
+            "SELECT id::text, COALESCE(session_id, ''), title, kind, created_at_unix, updated_at_unix, current_version, is_shared, COALESCE(share_code, ''), COALESCE(share_expires_at_unix::text, ''), metadata_jsonb::text " ++
+                "FROM {schema}.artifacts WHERE id = $1::uuid AND user_id = $2",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const artifact_id_z = try self.allocator.dupeZ(u8, artifact_id);
+        defer self.allocator.free(artifact_id_z);
+        const params = [_]?[*:0]const u8{ artifact_id_z.ptr, user_s.ptr };
+        const lengths = [_]c_int{ @intCast(artifact_id.len), @intCast(user_s.len) };
+        const result = self.execParams(q, &params, &lengths) catch |err| switch (err) {
+            // Invalid UUID format → null (not found), not an error.
+            error.ExecFailed => return null,
+            else => return err,
+        };
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
+        return try buildArtifactRow(allocator, result, 0, user_id);
+    }
+
+    pub fn getArtifactVersion(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        artifact_id: []const u8,
+        version_opt: ?u64,
+    ) !?ArtifactVersionRow {
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const artifact_id_z = try self.allocator.dupeZ(u8, artifact_id);
+        defer self.allocator.free(artifact_id_z);
+
+        const q = if (version_opt == null) try self.buildQuery(
+            "SELECT v.artifact_id::text, v.version, COALESCE(v.parent_version::text, ''), v.content, v.content_hash, v.created_at_unix, v.author, COALESCE(v.change_summary, '') " ++
+                "FROM {schema}.artifact_versions v JOIN {schema}.artifacts a ON a.id = v.artifact_id " ++
+                "WHERE v.artifact_id = $1::uuid AND a.user_id = $2 ORDER BY v.version DESC LIMIT 1",
+        ) else try self.buildQuery(
+            "SELECT v.artifact_id::text, v.version, COALESCE(v.parent_version::text, ''), v.content, v.content_hash, v.created_at_unix, v.author, COALESCE(v.change_summary, '') " ++
+                "FROM {schema}.artifact_versions v JOIN {schema}.artifacts a ON a.id = v.artifact_id " ++
+                "WHERE v.artifact_id = $1::uuid AND a.user_id = $2 AND v.version = $3::bigint",
+        );
+        defer self.allocator.free(q);
+
+        var ver_buf: [32]u8 = undefined;
+        const result = if (version_opt) |v| blk: {
+            const ver_s = try std.fmt.bufPrintZ(&ver_buf, "{d}", .{v});
+            const params = [_]?[*:0]const u8{ artifact_id_z.ptr, user_s.ptr, ver_s.ptr };
+            const lengths = [_]c_int{ @intCast(artifact_id.len), @intCast(user_s.len), @intCast(ver_s.len) };
+            break :blk self.execParams(q, &params, &lengths) catch |err| switch (err) {
+                error.ExecFailed => return null,
+                else => return err,
+            };
+        } else blk: {
+            const params = [_]?[*:0]const u8{ artifact_id_z.ptr, user_s.ptr };
+            const lengths = [_]c_int{ @intCast(artifact_id.len), @intCast(user_s.len) };
+            break :blk self.execParams(q, &params, &lengths) catch |err| switch (err) {
+                error.ExecFailed => return null,
+                else => return err,
+            };
+        };
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
+
+        const aid = try dupeResultValue(allocator, result, 0, 0);
+        errdefer allocator.free(aid);
+        const ver_str = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(ver_str);
+        const parent_str = try dupeResultValue(allocator, result, 0, 2);
+        defer allocator.free(parent_str);
+        const content_out = try dupeResultValue(allocator, result, 0, 3);
+        errdefer allocator.free(content_out);
+        const hash_out = try dupeResultValue(allocator, result, 0, 4);
+        errdefer allocator.free(hash_out);
+        const created_str = try dupeResultValue(allocator, result, 0, 5);
+        defer allocator.free(created_str);
+        const author_out = try dupeResultValue(allocator, result, 0, 6);
+        errdefer allocator.free(author_out);
+        const change_raw = try dupeResultValue(allocator, result, 0, 7);
+        defer allocator.free(change_raw);
+        const change_owned: ?[]u8 = if (change_raw.len == 0) null else try allocator.dupe(u8, change_raw);
+        errdefer if (change_owned) |s| allocator.free(s);
+
+        return .{
+            .artifact_id = aid,
+            .version = std.fmt.parseInt(u64, ver_str, 10) catch 0,
+            .parent_version = if (parent_str.len == 0) null else (std.fmt.parseInt(u64, parent_str, 10) catch null),
+            .content = content_out,
+            .content_hash = hash_out,
+            .created_at_unix = std.fmt.parseInt(i64, created_str, 10) catch 0,
+            .author = author_out,
+            .change_summary = change_owned,
+        };
+    }
+
+    pub fn listArtifactsForUser(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        kind_filter: ?[]const u8,
+        limit: u32,
+    ) ![]ArtifactRow {
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const capped_limit: u32 = if (limit == 0 or limit > 500) 50 else limit;
+        var limit_buf: [32]u8 = undefined;
+        const limit_s = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{capped_limit});
+
+        const q = if (kind_filter == null) try self.buildQuery(
+            "SELECT id::text, COALESCE(session_id, ''), title, kind, created_at_unix, updated_at_unix, current_version, is_shared, COALESCE(share_code, ''), COALESCE(share_expires_at_unix::text, ''), metadata_jsonb::text " ++
+                "FROM {schema}.artifacts WHERE user_id = $1 ORDER BY updated_at_unix DESC LIMIT $2::int",
+        ) else try self.buildQuery(
+            "SELECT id::text, COALESCE(session_id, ''), title, kind, created_at_unix, updated_at_unix, current_version, is_shared, COALESCE(share_code, ''), COALESCE(share_expires_at_unix::text, ''), metadata_jsonb::text " ++
+                "FROM {schema}.artifacts WHERE user_id = $1 AND kind = $3 ORDER BY updated_at_unix DESC LIMIT $2::int",
+        );
+        defer self.allocator.free(q);
+
+        const result = if (kind_filter) |kind| blk: {
+            const kind_z = try self.allocator.dupeZ(u8, kind);
+            defer self.allocator.free(kind_z);
+            const params = [_]?[*:0]const u8{ user_s.ptr, limit_s.ptr, kind_z };
+            const lengths = [_]c_int{ @intCast(user_s.len), @intCast(limit_s.len), @intCast(kind.len) };
+            break :blk try self.execParams(q, &params, &lengths);
+        } else blk: {
+            const params = [_]?[*:0]const u8{ user_s.ptr, limit_s.ptr };
+            const lengths = [_]c_int{ @intCast(user_s.len), @intCast(limit_s.len) };
+            break :blk try self.execParams(q, &params, &lengths);
+        };
+        defer c.PQclear(result);
+
+        const tuples: usize = @intCast(c.PQntuples(result));
+        const out = try allocator.alloc(ArtifactRow, tuples);
+        var i: usize = 0;
+        errdefer {
+            for (out[0..i]) |*r| r.deinit(allocator);
+            allocator.free(out);
+        }
+        while (i < tuples) : (i += 1) {
+            out[i] = try buildArtifactRow(allocator, result, @intCast(i), user_id);
+        }
+        return out;
+    }
+
+    pub fn listArtifactVersionHistory(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        artifact_id: []const u8,
+    ) ![]ArtifactHistoryRow {
+        const q = try self.buildQuery(
+            "SELECT v.version, COALESCE(v.parent_version::text, ''), v.author, v.created_at_unix, COALESCE(v.change_summary, ''), v.content_hash " ++
+                "FROM {schema}.artifact_versions v JOIN {schema}.artifacts a ON a.id = v.artifact_id " ++
+                "WHERE v.artifact_id = $1::uuid AND a.user_id = $2 ORDER BY v.version DESC",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const artifact_id_z = try self.allocator.dupeZ(u8, artifact_id);
+        defer self.allocator.free(artifact_id_z);
+        const params = [_]?[*:0]const u8{ artifact_id_z.ptr, user_s.ptr };
+        const lengths = [_]c_int{ @intCast(artifact_id.len), @intCast(user_s.len) };
+        const result = self.execParams(q, &params, &lengths) catch |err| switch (err) {
+            error.ExecFailed => return allocator.alloc(ArtifactHistoryRow, 0),
+            else => return err,
+        };
+        defer c.PQclear(result);
+
+        const tuples: usize = @intCast(c.PQntuples(result));
+        const out = try allocator.alloc(ArtifactHistoryRow, tuples);
+        var i: usize = 0;
+        errdefer {
+            for (out[0..i]) |*r| r.deinit(allocator);
+            allocator.free(out);
+        }
+        while (i < tuples) : (i += 1) {
+            const ver_str = try dupeResultValue(allocator, result, @intCast(i), 0);
+            defer allocator.free(ver_str);
+            const parent_str = try dupeResultValue(allocator, result, @intCast(i), 1);
+            defer allocator.free(parent_str);
+            const author = try dupeResultValue(allocator, result, @intCast(i), 2);
+            errdefer allocator.free(author);
+            const created_str = try dupeResultValue(allocator, result, @intCast(i), 3);
+            defer allocator.free(created_str);
+            const change_raw = try dupeResultValue(allocator, result, @intCast(i), 4);
+            defer allocator.free(change_raw);
+            const change_owned: ?[]u8 = if (change_raw.len == 0) null else try allocator.dupe(u8, change_raw);
+            errdefer if (change_owned) |s| allocator.free(s);
+            const hash_out = try dupeResultValue(allocator, result, @intCast(i), 5);
+            errdefer allocator.free(hash_out);
+
+            out[i] = .{
+                .version = std.fmt.parseInt(u64, ver_str, 10) catch 0,
+                .parent_version = if (parent_str.len == 0) null else (std.fmt.parseInt(u64, parent_str, 10) catch null),
+                .author = author,
+                .created_at_unix = std.fmt.parseInt(i64, created_str, 10) catch 0,
+                .change_summary = change_owned,
+                .content_hash = hash_out,
+            };
+        }
+        return out;
+    }
+
+    pub fn setArtifactShare(
+        self: *Self,
+        user_id: i64,
+        artifact_id: []const u8,
+        share_code: []const u8,
+        expires_at_unix: ?i64,
+    ) !void {
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const artifact_id_z = try self.allocator.dupeZ(u8, artifact_id);
+        defer self.allocator.free(artifact_id_z);
+        const code_z = try self.allocator.dupeZ(u8, share_code);
+        defer self.allocator.free(code_z);
+
+        const q = try self.buildQuery(
+            "UPDATE {schema}.artifacts SET is_shared = TRUE, share_code = $1, share_expires_at_unix = NULLIF($2, '')::bigint WHERE id = $3::uuid AND user_id = $4",
+        );
+        defer self.allocator.free(q);
+        var exp_buf: [32]u8 = undefined;
+        const exp_s: [:0]u8 = if (expires_at_unix) |v| try std.fmt.bufPrintZ(&exp_buf, "{d}", .{v}) else (try std.fmt.bufPrintZ(&exp_buf, "", .{}));
+        const params = [_]?[*:0]const u8{ code_z.ptr, exp_s.ptr, artifact_id_z.ptr, user_s.ptr };
+        const lengths = [_]c_int{ @intCast(share_code.len), @intCast(exp_s.len), @intCast(artifact_id.len), @intCast(user_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    pub fn clearArtifactShare(self: *Self, user_id: i64, artifact_id: []const u8) !void {
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const artifact_id_z = try self.allocator.dupeZ(u8, artifact_id);
+        defer self.allocator.free(artifact_id_z);
+        const q = try self.buildQuery(
+            "UPDATE {schema}.artifacts SET is_shared = FALSE, share_code = NULL, share_expires_at_unix = NULL WHERE id = $1::uuid AND user_id = $2",
+        );
+        defer self.allocator.free(q);
+        const params = [_]?[*:0]const u8{ artifact_id_z.ptr, user_s.ptr };
+        const lengths = [_]c_int{ @intCast(artifact_id.len), @intCast(user_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    pub fn getArtifactByShareCode(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        share_code: []const u8,
+        now_unix: i64,
+    ) !?ArtifactRow {
+        // Conservative — silently ignore expired shares (treat as 404).
+        // The handler returns the same 404 for unknown / revoked /
+        // expired so a guesser can't distinguish "valid but expired"
+        // from "never existed."
+        const q = try self.buildQuery(
+            "SELECT id::text, user_id, COALESCE(session_id, ''), title, kind, created_at_unix, updated_at_unix, current_version, is_shared, share_code, COALESCE(share_expires_at_unix::text, ''), metadata_jsonb::text " ++
+                "FROM {schema}.artifacts WHERE share_code = $1 AND is_shared = TRUE AND (share_expires_at_unix IS NULL OR share_expires_at_unix > $2::bigint)",
+        );
+        defer self.allocator.free(q);
+        const code_z = try self.allocator.dupeZ(u8, share_code);
+        defer self.allocator.free(code_z);
+        var now_buf: [32]u8 = undefined;
+        const now_s = try std.fmt.bufPrintZ(&now_buf, "{d}", .{now_unix});
+        const params = [_]?[*:0]const u8{ code_z.ptr, now_s.ptr };
+        const lengths = [_]c_int{ @intCast(share_code.len), @intCast(now_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
+
+        // Column order differs slightly here — user_id is at col 1, rest shifted.
+        const aid = try dupeResultValue(allocator, result, 0, 0);
+        errdefer allocator.free(aid);
+        const uid_str = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(uid_str);
+        const sid_raw = try dupeResultValue(allocator, result, 0, 2);
+        defer allocator.free(sid_raw);
+        const sid_owned: ?[]u8 = if (sid_raw.len == 0) null else try allocator.dupe(u8, sid_raw);
+        errdefer if (sid_owned) |s| allocator.free(s);
+        const title = try dupeResultValue(allocator, result, 0, 3);
+        errdefer allocator.free(title);
+        const kind = try dupeResultValue(allocator, result, 0, 4);
+        errdefer allocator.free(kind);
+        const created_str = try dupeResultValue(allocator, result, 0, 5);
+        defer allocator.free(created_str);
+        const updated_str = try dupeResultValue(allocator, result, 0, 6);
+        defer allocator.free(updated_str);
+        const ver_str = try dupeResultValue(allocator, result, 0, 7);
+        defer allocator.free(ver_str);
+        const is_shared_str = try dupeResultValue(allocator, result, 0, 8);
+        defer allocator.free(is_shared_str);
+        const share_code_out = try dupeResultValue(allocator, result, 0, 9);
+        errdefer allocator.free(share_code_out);
+        const expires_raw = try dupeResultValue(allocator, result, 0, 10);
+        defer allocator.free(expires_raw);
+        const meta_out = try dupeResultValue(allocator, result, 0, 11);
+        errdefer allocator.free(meta_out);
+
+        return .{
+            .id = aid,
+            .user_id = std.fmt.parseInt(i64, uid_str, 10) catch 0,
+            .session_id = sid_owned,
+            .title = title,
+            .kind = kind,
+            .created_at_unix = std.fmt.parseInt(i64, created_str, 10) catch 0,
+            .updated_at_unix = std.fmt.parseInt(i64, updated_str, 10) catch 0,
+            .current_version = std.fmt.parseInt(u64, ver_str, 10) catch 1,
+            .is_shared = std.mem.eql(u8, is_shared_str, "t") or std.mem.eql(u8, is_shared_str, "true"),
+            .share_code = share_code_out,
+            .share_expires_at_unix = if (expires_raw.len == 0) null else (std.fmt.parseInt(i64, expires_raw, 10) catch null),
+            .metadata_jsonb = meta_out,
+        };
+    }
+
+    pub fn deleteArtifact(self: *Self, user_id: i64, artifact_id: []const u8) !bool {
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const artifact_id_z = try self.allocator.dupeZ(u8, artifact_id);
+        defer self.allocator.free(artifact_id_z);
+        const q = try self.buildQuery(
+            "DELETE FROM {schema}.artifacts WHERE id = $1::uuid AND user_id = $2",
+        );
+        defer self.allocator.free(q);
+        const params = [_]?[*:0]const u8{ artifact_id_z.ptr, user_s.ptr };
+        const lengths = [_]c_int{ @intCast(artifact_id.len), @intCast(user_s.len) };
+        const result = self.execParams(q, &params, &lengths) catch |err| switch (err) {
+            error.ExecFailed => return false,
+            else => return err,
+        };
+        defer c.PQclear(result);
+        const tag = c.PQcmdTuples(result);
+        if (tag == null) return false;
+        const tag_slice = std.mem.span(tag);
+        return tag_slice.len > 0 and !std.mem.eql(u8, tag_slice, "0");
+    }
+
+    // Helper used by both single-row and list paths. Reads the 11-column
+    // row layout used by the auth'd SELECTs.
+    fn buildArtifactRow(
+        allocator: std.mem.Allocator,
+        result: *c.PGresult,
+        row: c_int,
+        user_id: i64,
+    ) !ArtifactRow {
+        const aid = try dupeResultValue(allocator, result, row, 0);
+        errdefer allocator.free(aid);
+        const sid_raw = try dupeResultValue(allocator, result, row, 1);
+        defer allocator.free(sid_raw);
+        const sid_owned: ?[]u8 = if (sid_raw.len == 0) null else try allocator.dupe(u8, sid_raw);
+        errdefer if (sid_owned) |s| allocator.free(s);
+        const title = try dupeResultValue(allocator, result, row, 2);
+        errdefer allocator.free(title);
+        const kind = try dupeResultValue(allocator, result, row, 3);
+        errdefer allocator.free(kind);
+        const created_str = try dupeResultValue(allocator, result, row, 4);
+        defer allocator.free(created_str);
+        const updated_str = try dupeResultValue(allocator, result, row, 5);
+        defer allocator.free(updated_str);
+        const ver_str = try dupeResultValue(allocator, result, row, 6);
+        defer allocator.free(ver_str);
+        const is_shared_str = try dupeResultValue(allocator, result, row, 7);
+        defer allocator.free(is_shared_str);
+        const share_code_raw = try dupeResultValue(allocator, result, row, 8);
+        defer allocator.free(share_code_raw);
+        const share_code_owned: ?[]u8 = if (share_code_raw.len == 0) null else try allocator.dupe(u8, share_code_raw);
+        errdefer if (share_code_owned) |s| allocator.free(s);
+        const expires_raw = try dupeResultValue(allocator, result, row, 9);
+        defer allocator.free(expires_raw);
+        const meta_out = try dupeResultValue(allocator, result, row, 10);
+        errdefer allocator.free(meta_out);
+
+        return .{
+            .id = aid,
+            .user_id = user_id,
+            .session_id = sid_owned,
+            .title = title,
+            .kind = kind,
+            .created_at_unix = std.fmt.parseInt(i64, created_str, 10) catch 0,
+            .updated_at_unix = std.fmt.parseInt(i64, updated_str, 10) catch 0,
+            .current_version = std.fmt.parseInt(u64, ver_str, 10) catch 1,
+            .is_shared = std.mem.eql(u8, is_shared_str, "t") or std.mem.eql(u8, is_shared_str, "true"),
+            .share_code = share_code_owned,
+            .share_expires_at_unix = if (expires_raw.len == 0) null else (std.fmt.parseInt(i64, expires_raw, 10) catch null),
+            .metadata_jsonb = meta_out,
+        };
     }
 };
 

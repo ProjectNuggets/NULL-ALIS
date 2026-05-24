@@ -135,6 +135,13 @@ pub const context_snapshot = @import("context_snapshot.zig");
 pub const calculator = @import("calculator.zig");
 pub const file_read_hashed = @import("file_read_hashed.zig");
 pub const file_edit_hashed = @import("file_edit_hashed.zig");
+/// Wave 2C — canvas/artifacts tools. CRUD facade over the artifacts +
+/// artifact_versions tables; emits artifact_event SSE frames so the FE
+/// side panel refreshes in real time.
+pub const artifact_create = @import("artifact_create.zig");
+pub const artifact_update = @import("artifact_update.zig");
+pub const artifact_get = @import("artifact_get.zig");
+pub const artifact_list = @import("artifact_list.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 
@@ -668,6 +675,33 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     },
     .{
         .name = context_snapshot.ContextSnapshotTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    },
+
+    // Wave 2C — canvas/artifacts tools.
+    // create + update mutate; get + list are read-only.
+    .{
+        .name = artifact_create.ArtifactCreateTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    },
+    .{
+        .name = artifact_update.ArtifactUpdateTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    },
+    .{
+        .name = artifact_get.ArtifactGetTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    },
+    .{
+        .name = artifact_list.ArtifactListTool.tool_name,
         .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
         .risk_level = .low,
         .cost_class = .a,
@@ -1411,6 +1445,26 @@ pub fn allTools(
     cst.* = .{};
     try list.append(allocator, cst.tool());
 
+    // Wave 2C — canvas/artifacts tools. state_mgr + user_id wired
+    // separately via bindStateMgrTenant so the tools cleanly degrade
+    // on non-postgres builds (returns "unavailable" rather than
+    // crashing).
+    const act = try allocator.create(artifact_create.ArtifactCreateTool);
+    act.* = .{};
+    try list.append(allocator, act.tool());
+
+    const aut = try allocator.create(artifact_update.ArtifactUpdateTool);
+    aut.* = .{};
+    try list.append(allocator, aut.tool());
+
+    const agt = try allocator.create(artifact_get.ArtifactGetTool);
+    agt.* = .{};
+    try list.append(allocator, agt.tool());
+
+    const alt = try allocator.create(artifact_list.ArtifactListTool);
+    alt.* = .{};
+    try list.append(allocator, alt.tool());
+
     // MCP tools (pre-initialized externally)
     if (opts.mcp_tools) |mt| {
         for (mt) |t| {
@@ -1950,6 +2004,26 @@ pub fn bindStateMgrTenant(tools: []const Tool, state_mgr: ?*zaki_state.Manager, 
             const mt: *memory_list.MemoryListTool = @ptrCast(@alignCast(t.ptr));
             mt.state_mgr = state_mgr;
             mt.user_id = user_id;
+        } else if (t.vtable == &artifact_create.ArtifactCreateTool.vtable) {
+            // Wave 2C — artifact tools all need tenant binding so the
+            // user_id ownership check at the Manager layer has the
+            // right value. Without binding, the tool surfaces a clean
+            // "tenant user not bound" error instead of crashing.
+            const ct: *artifact_create.ArtifactCreateTool = @ptrCast(@alignCast(t.ptr));
+            ct.state_mgr = state_mgr;
+            ct.user_id = user_id;
+        } else if (t.vtable == &artifact_update.ArtifactUpdateTool.vtable) {
+            const ut: *artifact_update.ArtifactUpdateTool = @ptrCast(@alignCast(t.ptr));
+            ut.state_mgr = state_mgr;
+            ut.user_id = user_id;
+        } else if (t.vtable == &artifact_get.ArtifactGetTool.vtable) {
+            const gt: *artifact_get.ArtifactGetTool = @ptrCast(@alignCast(t.ptr));
+            gt.state_mgr = state_mgr;
+            gt.user_id = user_id;
+        } else if (t.vtable == &artifact_list.ArtifactListTool.vtable) {
+            const lt: *artifact_list.ArtifactListTool = @ptrCast(@alignCast(t.ptr));
+            lt.state_mgr = state_mgr;
+            lt.user_id = user_id;
         }
     }
 }
@@ -2532,7 +2606,8 @@ test "all tools includes extras when enabled" {
     // + time_now (V1.9-DX1 wall-clock tool)
     // + wiki_link (V1.12 entity-mention extractor) = 46.
     // + produce_document (Wave 2A: first-class PDF/DOCX/XLSX/PPTX/HTML) = 47.
-    try std.testing.expectEqual(@as(usize, 47), tools.len);
+    // + 4 artifact_* (Wave 2C: canvas/artifacts backend) = 51.
+    try std.testing.expectEqual(@as(usize, 51), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -2562,7 +2637,8 @@ test "all tools excludes extras when disabled" {
     // + wiki_link (V1.12 entity-mention extractor) = 40 base
     // + delegate + spawn (v1 default-on, B1 fix 2026-05-23) = 42
     // + produce_document (Wave 2A) = 43
-    try std.testing.expectEqual(@as(usize, 43), tools.len);
+    // + 4 artifact_* (Wave 2C) = 47
+    try std.testing.expectEqual(@as(usize, 47), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -2699,7 +2775,7 @@ test "all tools includes message when event bus is available" {
     // V1.12 added wiki_link (entity-mention extractor) → 40.
     // 2026-05-23 B1: delegate + spawn flipped on by default → 42.
     // Wave 2A: produce_document added (first-class PDF/DOCX/XLSX/PPTX/HTML) → 43.
-    try std.testing.expectEqual(@as(usize, 43), tools.len);
+    try std.testing.expectEqual(@as(usize, 47), tools.len);
 
     var found_message = false;
     for (tools) |t| {
@@ -2944,6 +3020,12 @@ test "defaultMetadataRegistry only whitelists expected background_safe tools" {
         // with timestamped filenames (no overwrite, no cross-invocation
         // state). Safe to run from a scheduled job / cron lane. Wave 2A.
         "produce_document",
+        // Wave 2C — artifact read tools. Both are read_only against the
+        // artifacts table; safe to run from a scheduled job (cron lane
+        // that needs to summarize "last week's artifacts" etc). The
+        // create + update variants are explicitly NOT background-safe
+        // (mutating; require an authenticated turn context).
+        "artifact_get", "artifact_list",
     };
 
     // Everything in the whitelist must be background_safe.

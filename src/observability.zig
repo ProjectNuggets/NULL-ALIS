@@ -166,6 +166,22 @@ pub const ObserverEvent = union(enum) {
         duration_ms: ?u64 = null,
         run_id: ?[]const u8 = null,
     },
+    /// Wave 2C — canvas/artifacts side-panel notification. Emitted by
+    /// the artifact_create / artifact_update tools. RunEventObserver
+    /// translates this into an `artifact_event` SSE frame so the FE
+    /// can refresh the side panel without polling. Slices borrowed
+    /// for the duration of the call only — observers must copy if
+    /// they want to retain (mirrors task_update payload lifetime).
+    artifact_event: struct {
+        op: []const u8,
+        artifact_id: []const u8,
+        title: []const u8,
+        kind: []const u8,
+        version: u64,
+        url: []const u8,
+        change_summary: ?[]const u8 = null,
+        run_id: ?[]const u8 = null,
+    },
 };
 
 /// Numeric metrics.
@@ -322,6 +338,7 @@ pub const LogObserver = struct {
             .approval_required => |e| std.log.info("approval.required tool={s} reason={s} risk_level={s}", .{ e.tool, e.reason, e.risk_level }),
             .system_notice => |e| std.log.info("system.notice kind={s} severity={s} message={s}", .{ e.kind, e.severity, e.message }),
             .memory_retrieval => |e| std.log.info("memory.retrieval available=true injected={} context_bytes={?d} candidates={?d} duration_ms={?d}", .{ e.success, e.usage_tokens, e.iteration, e.duration_ms }),
+            .artifact_event => |e| std.log.info("artifact.event op={s} id={s} kind={s} version={d}", .{ e.op, e.artifact_id, e.kind, e.version }),
         }
     }
 
@@ -522,6 +539,7 @@ pub const FileObserver = struct {
             .approval_required => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"approval_required\",\"tool\":\"{s}\",\"reason\":\"{s}\",\"risk_level\":\"{s}\"}}", .{ e.tool, e.reason, e.risk_level }) catch return,
             .system_notice => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"system_notice\",\"kind\":\"{s}\",\"severity\":\"{s}\",\"message\":\"{s}\"}}", .{ e.kind, e.severity, e.message }) catch return,
             .memory_retrieval => return,
+            .artifact_event => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"artifact_event\",\"op\":\"{s}\",\"id\":\"{s}\",\"kind\":\"{s}\",\"version\":{d}}}", .{ e.op, e.artifact_id, e.kind, e.version }) catch return,
         };
         self.appendToFile(line);
     }
@@ -868,6 +886,13 @@ pub const OtelObserver = struct {
                 });
             },
             .memory_retrieval => {},
+            .artifact_event => |e| {
+                self.addSpan("artifact.event", now, now, &.{
+                    .{ .key = "op", .value = e.op },
+                    .{ .key = "artifact_id", .value = e.artifact_id },
+                    .{ .key = "kind", .value = e.kind },
+                });
+            },
         }
     }
 

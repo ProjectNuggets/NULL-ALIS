@@ -19,6 +19,10 @@ pub const RunEventType = enum {
     approval_required,
     task_update,
     system_notice,
+    /// Wave 2C — canvas/artifacts side-panel notification. Fired by
+    /// artifact_create / artifact_update tools so the FE can refresh
+    /// the artifacts panel in real time without polling.
+    artifact_event,
     done,
 
     pub fn toSlice(self: RunEventType) []const u8 {
@@ -32,6 +36,7 @@ pub const RunEventType = enum {
             .approval_required => "approval_required",
             .task_update => "task_update",
             .system_notice => "system_notice",
+            .artifact_event => "artifact_event",
             .done => "done",
         };
     }
@@ -130,6 +135,25 @@ pub const DonePayload = struct {
     session_weight: ?u64 = null,
 };
 
+/// Wave 2C — artifact side-panel event. Fired when artifact_create
+/// or artifact_update lands a new revision. The FE side panel listens
+/// for these and pulls the new content via the REST `GET .../artifacts/:id`
+/// endpoint — keeping the SSE payload small.
+///
+/// `op` is "created" | "updated" | "deleted" (string for forward-compat;
+/// new ops can land without an enum rev). `version` is the resulting
+/// `current_version` after the op.
+pub const ArtifactEventPayload = struct {
+    op: []const u8,
+    artifact_id: []const u8,
+    title: []const u8,
+    kind: []const u8,
+    version: u64,
+    url: []const u8,
+    change_summary: ?[]const u8 = null,
+    run_id: ?[]const u8 = null,
+};
+
 /// Binding principle: no silent fallback. When nullalis degrades or has a
 /// notable internal state change the user deserves to know about, emit a
 /// system_notice. The frontend should render these as chrome (badge / toast)
@@ -160,6 +184,7 @@ pub const RunEvent = union(enum) {
     approval_required: ApprovalRequiredPayload,
     task_update: TaskUpdatePayload,
     system_notice: SystemNoticePayload,
+    artifact_event: ArtifactEventPayload,
     done: DonePayload,
 };
 
@@ -174,6 +199,7 @@ pub fn eventType(event: RunEvent) RunEventType {
         .approval_required => .approval_required,
         .task_update => .task_update,
         .system_notice => .system_notice,
+        .artifact_event => .artifact_event,
         .done => .done,
     };
 }
@@ -327,6 +353,23 @@ pub fn toSseFrame(allocator: std.mem.Allocator, event: RunEvent) ![]u8 {
             try writeOptionalStringField(w, "run_id", p.run_id);
             try w.writeAll("}");
         },
+        .artifact_event => |p| {
+            try w.writeAll("{\"type\":\"artifact_event\",\"op\":\"");
+            try jsonEscapeInto(w, p.op);
+            try w.writeAll("\",\"artifact_id\":\"");
+            try jsonEscapeInto(w, p.artifact_id);
+            try w.writeAll("\",\"title\":\"");
+            try jsonEscapeInto(w, p.title);
+            try w.writeAll("\",\"kind\":\"");
+            try jsonEscapeInto(w, p.kind);
+            try w.print("\",\"version\":{d}", .{p.version});
+            try w.writeAll(",\"url\":\"");
+            try jsonEscapeInto(w, p.url);
+            try w.writeAll("\"");
+            try writeOptionalStringField(w, "change_summary", p.change_summary);
+            try writeOptionalStringField(w, "run_id", p.run_id);
+            try w.writeAll("}");
+        },
         .done => |p| {
             try w.writeAll("{\"type\":\"done\"");
             if (p.session_id) |sid| {
@@ -411,9 +454,10 @@ fn writeOptionalStringArrayField(writer: anytype, field_name: []const u8, value:
 
 // ── Tests ────────────────────────────────────────────────────────────
 
-test "RunEventType has exactly 10 variants" {
+test "RunEventType has exactly 11 variants" {
+    // Wave 2C adds artifact_event (+1 over the prior 10).
     const fields = @typeInfo(RunEventType).@"enum".fields;
-    try std.testing.expectEqual(@as(usize, 10), fields.len);
+    try std.testing.expectEqual(@as(usize, 11), fields.len);
 }
 
 test "RunEventType.toSlice returns correct strings" {
@@ -426,6 +470,7 @@ test "RunEventType.toSlice returns correct strings" {
     try std.testing.expectEqualStrings("approval_required", RunEventType.approval_required.toSlice());
     try std.testing.expectEqualStrings("task_update", RunEventType.task_update.toSlice());
     try std.testing.expectEqualStrings("system_notice", RunEventType.system_notice.toSlice());
+    try std.testing.expectEqualStrings("artifact_event", RunEventType.artifact_event.toSlice());
     try std.testing.expectEqualStrings("done", RunEventType.done.toSlice());
 }
 
@@ -765,4 +810,46 @@ test "toSseFrame for task_update with progress_pct" {
     } });
     defer allocator.free(frame);
     try std.testing.expect(std.mem.indexOf(u8, frame, "\"progress_pct\":75") != null);
+}
+
+// Wave 2C — canvas/artifacts SSE event serializer round-trip. Pins
+// the wire shape that the FE side-panel listens for.
+test "toSseFrame for artifact_event serializes all fields" {
+    const allocator = std.testing.allocator;
+    const frame = try toSseFrame(allocator, RunEvent{ .artifact_event = .{
+        .op = "created",
+        .artifact_id = "abc-uuid",
+        .title = "Quarterly plan",
+        .kind = "markdown",
+        .version = 1,
+        .url = "/api/v1/users/42/artifacts/abc-uuid",
+        .change_summary = "first draft",
+        .run_id = "r-9",
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.startsWith(u8, frame, "event: artifact_event\n"));
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"op\":\"created\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"artifact_id\":\"abc-uuid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"title\":\"Quarterly plan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"kind\":\"markdown\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"version\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"url\":\"/api/v1/users/42/artifacts/abc-uuid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"change_summary\":\"first draft\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"run_id\":\"r-9\"") != null);
+}
+
+test "toSseFrame for artifact_event omits optional fields when null" {
+    const allocator = std.testing.allocator;
+    const frame = try toSseFrame(allocator, RunEvent{ .artifact_event = .{
+        .op = "updated",
+        .artifact_id = "id-1",
+        .title = "t",
+        .kind = "code",
+        .version = 5,
+        .url = "/api/v1/users/1/artifacts/id-1",
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"change_summary\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"run_id\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"version\":5") != null);
 }
