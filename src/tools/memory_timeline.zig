@@ -20,14 +20,16 @@ pub const MemoryTimelineTool = struct {
     pub const tool_name = "memory_timeline";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "memory_timeline tool.",
+        .what = "Browse session summaries and timeline objects — cheap structured recall before transcript_read.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "Recalling the gist of a prior session by date / channel / topic",
+            "Checking what was discussed without paying for full transcript fetch",
+            "Auditing summary coverage across sessions before deeper analysis",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "transcript_read — for verbatim message content past a summary",
+            "memory_recall — for atomic facts / preferences rather than session summaries",
+            "memory_store — for persisting new facts",
         },
     };
 

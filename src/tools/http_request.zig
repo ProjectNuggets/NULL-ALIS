@@ -15,14 +15,16 @@ pub const HttpRequestTool = struct {
     pub const tool_name = "http_request";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Perform HTTP requests (GET, POST, etc.) to APIs.",
+        .what = "Call a known external HTTPS API directly (GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS).",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "Hitting a known REST/JSON endpoint where the exact URL and method are determined",
+            "Posting structured JSON to an API that has no first-class openapi/composio integration",
+            "Replacing a 'shell curl' call with a tracked tool that the runtime can sandbox and approve",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "openapi — for endpoints in a registered API spec (better typing + auth)",
+            "web_fetch — for pulling readable text/article content rather than JSON API",
+            "composio — for Gmail/Calendar/Slack/etc. that have first-class integrations",
         },
     };
 

@@ -41,14 +41,16 @@ pub const MemoryPurgeTopicTool = struct {
     pub const tool_name = "memory_purge_topic";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Remove all memories related to a specific topic.",
+        .what = "Bulk-purge agent-generated artifacts (autosave/checkpoints/summaries) mentioning a topic.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "User asks to 'forget' or 'start fresh' on a topic the agent has been repeatedly wrong about",
+            "Hallucinated artifacts about a topic are polluting future turns and need a scrub",
+            "Cleaning a corrupted entity-cluster before re-extracting fresh state from transcripts",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "memory_forget — for hard-delete of a SINGLE user-authored fact by key",
+            "memory_archive — for closing out one specific fact rather than bulk topic scrub",
+            "memory_maintain — for entity renames or contradiction resolution rather than purge",
         },
     };
 

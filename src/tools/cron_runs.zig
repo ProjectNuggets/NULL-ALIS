@@ -36,14 +36,16 @@ pub const CronRunsTool = struct {
     pub const tool_name = "cron_runs";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "List historical runs of a cron job.",
+        .what = "Low-level raw-cron run history: list recent executions of a raw scheduled job.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "Investigating why a recurring job started failing (last_status / last_output reveal the regression)",
+            "Auditing how many times a job fired in the last day/week",
+            "Verifying a one-shot job actually ran after the expected delay",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "cron_list — for the static inventory of jobs rather than execution history",
+            "cron_run — for triggering a new execution rather than reading past ones",
+            "transcript_read — for chat-session history rather than scheduler runs",
         },
     };
 

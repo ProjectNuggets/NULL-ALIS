@@ -20,14 +20,16 @@ pub const MemoryListTool = struct {
     pub const tool_name = "memory_list";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "List all stored memories with optional filtering by key or category.",
+        .what = "Enumerate canonical memory entries by recency, optionally filtered by category or scope.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "Auditing what memories currently exist for the user (scope=global for promoted core)",
+            "Browsing recent session-scoped memories before storing duplicates",
+            "Inspecting internal autosave/hygiene keys with include_internal=true for transcript review",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "memory_recall — for query-driven retrieval of relevant facts rather than recency enumeration",
+            "memory_timeline — for session-summary recall rather than canonical-fact listing",
+            "transcript_read — for raw message history rather than memory rows",
         },
     };
 

@@ -17,14 +17,16 @@ pub const ContextSnapshotTool = struct {
     pub const tool_name = "context_snapshot";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Capture and save the current execution context.",
+        .what = "Read agent self-state JSON: execution mode, pending approvals, verbose flags, active session key.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "Self-inspecting before suggesting edits to confirm execution mode (plan vs execute)",
+            "Checking whether a pending tool approval is blocking progress this turn",
+            "Verifying the active session key before referencing it in tool calls",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "runtime_info — for system-wide runtime state rather than this agent's own context",
+            "set_execution_mode — for changing the mode rather than just reading it",
+            "memory_recall — for stored user facts rather than agent self-state",
         },
     };
 

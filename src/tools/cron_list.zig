@@ -36,14 +36,16 @@ pub const CronListTool = struct {
     pub const tool_name = "cron_list";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "List all active cron jobs and their schedules.",
+        .what = "Low-level raw-cron inventory: list jobs with type, status, and next-run time.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "Operator inspection of the raw scheduler queue",
+            "Pre-flight check before cron_update / cron_remove to confirm job IDs",
+            "Debugging why a scheduled job has not fired (status + next-run reveals stale entries)",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "schedule — for the user-facing list of reminders and proactive jobs",
+            "cron_runs — for execution history of a specific job rather than the inventory",
+            "task_list — for transient task tracking rather than recurring schedules",
         },
     };
 

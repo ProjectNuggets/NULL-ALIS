@@ -37,14 +37,16 @@ pub const CronRemoveTool = struct {
     pub const tool_name = "cron_remove";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Remove an existing cron job by ID or pattern.",
+        .what = "Low-level raw-cron remove: delete a raw scheduled job by exact ID.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "Operator/debug context where a specific raw job must be deleted by ID",
+            "Cleaning up an orphan job left behind by a failed import or recovery",
+            "Removing a programmatic job that the user-facing schedule tool does not own",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "schedule — for cancelling a user-facing reminder via the friendly UX",
+            "cron_update — for disabling a job while keeping it in the inventory",
+            "memory_forget — for deleting memory facts rather than scheduler entries",
         },
     };
 

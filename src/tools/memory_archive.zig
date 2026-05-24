@@ -49,14 +49,16 @@ pub const MemoryArchiveTool = struct {
     pub const tool_name = "memory_archive";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Archive old memory entries to external storage.",
+        .what = "Soft-close a memory: hide from retrieval but keep as audit evidence (bi-temporal close-out).",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "A fact is now stale but the history matters (e.g. an old job title superseded by a new one)",
+            "Closing out an edge so the agent recalls 'used to know X but it changed' rather than scrubbing it",
+            "Marking a superseded preference without losing the audit trail",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "memory_forget — for hard-delete of sensitive or GDPR-requested data",
+            "memory_edit — for modifying a fact in place rather than closing it out",
+            "memory_demote — for downgrading importance/tier rather than closing the fact",
         },
     };
 

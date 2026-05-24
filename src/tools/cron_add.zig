@@ -37,14 +37,16 @@ pub const CronAddTool = struct {
     pub const tool_name = "cron_add";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Add a new cron job with schedule and command.",
+        .what = "Low-level raw-cron add: register a raw command on a cron expression or one-shot delay.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "Operator/debug context where a raw shell-style command must run on a schedule",
+            "Programmatic agent-internal cron entry that bypasses the user-facing reminder UX",
+            "Recreating a job from an export/manifest where the exact expression is the source of truth",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "schedule — for user-facing reminders, briefs, recurring follow-ups",
+            "cron_update — for editing an existing job rather than creating one",
+            "task_list — for tracking transient task lifecycle rather than recurring jobs",
         },
     };
 

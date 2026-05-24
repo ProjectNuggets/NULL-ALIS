@@ -29,14 +29,16 @@ pub const TranscriptReadTool = struct {
     pub const tool_name = "transcript_read";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Read conversation history or transcript data.",
+        .what = "Read raw session transcript verbatim; second line of recall after summaries.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "memory_timeline / memory_recall returned a summary but you need the verbatim wording",
+            "Reconstructing exact tool arguments or content lost to compaction placeholders",
+            "Auditing what was actually said in a prior session beyond the structured fact extraction",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "memory_timeline — for cheap structured summaries (try first)",
+            "memory_recall — for atomic-fact retrieval rather than raw message dump",
+            "memory_list — for canonical memory rows rather than raw transcript messages",
         },
     };
 

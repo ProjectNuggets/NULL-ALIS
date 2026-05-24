@@ -157,6 +157,30 @@ pub fn lintToolDescription(
     // if (renderLen(desc) < 200) {
     //     @compileError(tool_name ++ ": rendered description < 200 chars");
     // }
+
+    // Rule 6 (2026-05-24, substrate probe #7 finding F-A7.3): reject the
+    // boilerplate-template placeholders that previously shipped in 31 tools
+    // (memory_timeline + cron family + memory family + task family + every
+    // io/comms tool). These strings leak directly into the model context and
+    // degrade tool selection because "first scenario / second scenario" tells
+    // the LLM nothing about when to call the tool. The accompanying sweep
+    // replaced all 31; this lint locks the regression closed.
+    inline for (desc.use_when) |entry| {
+        if (std.mem.eql(u8, entry, "first scenario") or std.mem.eql(u8, entry, "second scenario")) {
+            @compileError(tool_name ++ ": .use_when contains placeholder '" ++ entry ++ "' — replace with a real trigger");
+        }
+    }
+    inline for (desc.do_not_use_for) |entry| {
+        if (std.mem.eql(u8, entry, "first scenario") or std.mem.eql(u8, entry, "second scenario")) {
+            @compileError(tool_name ++ ": .do_not_use_for contains placeholder '" ++ entry ++ "' — replace with a real sibling-or-anti-use");
+        }
+    }
+    // "<name> tool." is the same anti-pattern: it tells the model nothing.
+    // Reject .what values shaped like "<tool_name> tool." (case where the
+    // template was never customized at all).
+    if (std.mem.endsWith(u8, desc.what, " tool.") and desc.what.len <= tool_name.len + 8) {
+        @compileError(tool_name ++ ": .what is boilerplate '" ++ desc.what ++ "' — write a real one-sentence description");
+    }
 }
 
 // ── Comptime tests ──────────────────────────────────────────────────

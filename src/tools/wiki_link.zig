@@ -67,14 +67,16 @@ pub const WikiLinkTool = struct {
     pub const tool_name = "wiki_link";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Look up a Wikipedia article by title or search term.",
+        .what = "Entity-mention extractor: identify named entities and write co-occurrence edges to the graph.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "Manually triggering entity-edge ingestion over a specific text block (auto-trigger handles most cases)",
+            "Backfilling entity coverage for a transcript chunk that bypassed the every-3-turns auto path",
+            "Verifying a piece of prose generates the expected entity coreferences before committing it to memory",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "memory_recall — for retrieving stored facts rather than extracting new entity mentions",
+            "memory_maintain — for graph janitorial work rather than first-pass extraction",
+            "web_search — for looking up unfamiliar entities online rather than parsing local prose",
         },
     };
 

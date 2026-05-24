@@ -38,14 +38,16 @@ pub const CronRunTool = struct {
     pub const tool_name = "cron_run";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Trigger a cron job immediately.",
+        .what = "Low-level raw-cron force-run: fire a raw scheduled job immediately, out-of-band.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "Debugging why a scheduled command produces unexpected output",
+            "Operator one-shot run of a raw job without waiting for its expression",
+            "Verifying a cron entry is wired correctly after cron_add or cron_update",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "schedule — for user-facing reminder management (agent-managed jobs do not run here)",
+            "shell — for an arbitrary new command that is not already a registered job",
+            "cron_runs — for inspecting recent execution history rather than triggering a new run",
         },
     };
 

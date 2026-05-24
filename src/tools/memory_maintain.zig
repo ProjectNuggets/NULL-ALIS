@@ -96,14 +96,16 @@ pub const MemoryMaintainTool = struct {
     pub const tool_name = "memory_maintain";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Maintain memory consistency and trigger periodic compaction.",
+        .what = "Memory-graph janitor: rename entities, close stale edges, resolve contradictions, decay confidence.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "An entity was renamed and edges across the graph need cascade_update",
+            "Two facts contradict and need resolve_contradiction (winner/loser by key)",
+            "Stale prose facts mention an old codename and need prose_survey + supersession",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "memory_edit — for changing a single fact's surface text rather than graph-wide cleanup",
+            "memory_archive — for closing one specific fact rather than running a janitorial sweep",
+            "memory_purge_topic — for bulk-removing agent-generated artifacts on a topic",
         },
     };
 

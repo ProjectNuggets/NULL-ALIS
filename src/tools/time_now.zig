@@ -26,14 +26,16 @@ pub const TimeNowTool = struct {
     pub const tool_name = "time_now";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Get the current date and time in the specified timezone.",
+        .what = "Get current wall-clock time: unix_seconds, ISO-8601 UTC, day-of-week, human string.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "Reasoning about ages, deadlines, or 'how long ago' relative timing",
+            "Stamping a memory_store call with the present moment for valid_at",
+            "Verifying current weekday/hour before scheduling something time-sensitive",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "schedule — for setting a future job rather than reading the current time",
+            "memory_maintain — for decaying old memories rather than just timestamping",
+            "runtime_info — for runtime/version info rather than wall-clock time",
         },
     };
 

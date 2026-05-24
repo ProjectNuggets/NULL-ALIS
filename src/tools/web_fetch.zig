@@ -21,14 +21,16 @@ pub const WebFetchTool = struct {
     pub const tool_name = "web_fetch";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Fetch and parse content from a URL.",
+        .what = "Fetch a known HTTPS URL and return its readable text (article/page extraction).",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "You already know the exact URL the user wants summarized or quoted",
+            "Pulling readable article content rather than navigating search results",
+            "Following up after web_search picked a specific URL worth reading in full",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "web_search — for discovering URLs from a natural-language query first",
+            "http_request — for hitting JSON/REST APIs rather than readable web pages",
+            "openapi — for endpoints in a registered API spec rather than ad-hoc web pages",
         },
     };
 

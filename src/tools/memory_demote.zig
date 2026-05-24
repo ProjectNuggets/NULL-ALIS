@@ -41,14 +41,16 @@ pub const MemoryDemoteTool = struct {
     pub const tool_name = "memory_demote";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Reduce the priority level of a memory entry in the knowledge graph.",
+        .what = "Demote a core memory back to daily/conversation/episodic so the V1.7 immortality guard releases it.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "About to memory_edit a fact that was promoted to core (Tier-3) and is now write-locked",
+            "About to memory_archive a core fact that needs to be retired",
+            "Reclassifying a fact that was wrongly promoted to core",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "memory_edit — for in-place edits of NON-core memories",
+            "memory_archive — for the actual close-out after demotion",
+            "memory_forget — for outright hard-delete after demotion",
         },
     };
 

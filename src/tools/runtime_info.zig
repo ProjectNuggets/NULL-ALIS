@@ -58,14 +58,16 @@ pub const RuntimeInfoTool = struct {
     pub const tool_name = "runtime_info";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Retrieve runtime configuration, environment, and execution context.",
+        .what = "Inspect runtime/session/integrations/scheduler/heartbeat state as JSON; verify before claiming.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "User asks about current runtime, session, integration, scheduler, or heartbeat status",
+            "Self-checking which provider/model is wired before answering capability questions",
+            "Debugging why a tool or integration appears unavailable — read the actual ops state",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "time_now — for wall-clock time rather than runtime configuration",
+            "context_snapshot — for the agent's own conversational context rather than runtime state",
+            "memory_recall — for stored user facts rather than runtime/system state",
         },
     };
 

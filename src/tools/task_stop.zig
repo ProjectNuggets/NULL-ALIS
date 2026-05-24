@@ -14,14 +14,16 @@ pub const TaskStopTool = struct {
     pub const tool_name = "task_stop";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Stop or cancel a running task or background job cleanly.",
+        .what = "Cancel a QUEUED task before it starts; running tasks cannot be interrupted (returns error).",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "User changed their mind about a task that was just queued via spawn",
+            "Cleaning up obviously-redundant queued work before it consumes budget",
+            "Cancelling a misrouted task spotted via task_list before it runs",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "spawn — for creating a new background task rather than cancelling one",
+            "task_get — for inspecting status rather than acting on a task",
+            "cron_remove — for deleting scheduled jobs rather than spawned tasks",
         },
     };
 

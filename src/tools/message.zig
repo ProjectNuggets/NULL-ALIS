@@ -23,14 +23,16 @@ pub const MessageTool = struct {
     pub const tool_name = "message";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Send a message to the user or log output to conversation.",
+        .what = "Explicit outbound message to a channel (telegram/slack/discord/etc.) with optional image URL.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "Sending a proactive message into a specific channel that is NOT the current reply lane",
+            "Attaching a public HTTPS image to a chat message (Telegram-native today)",
+            "Cross-posting to a different account/chat than the current turn's default",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "pushover — for phone push notifications rather than chat-channel messages",
+            "schedule — for queuing a future delivery rather than sending now",
+            "composio — for app-level actions (email send, calendar invite) rather than chat-channel message",
         },
     };
 

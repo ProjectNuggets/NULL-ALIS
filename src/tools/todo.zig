@@ -74,14 +74,16 @@ pub const TodoTool = struct {
     pub const tool_name = "todo";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Access the task list via the canonical todo.zig:75 surface.",
+        .what = "Session-scoped structured todo list with status tracking (pending/in_progress/completed/blocked).",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "User asks for 3+ distinct things (numbered, comma-separated, or 'first X then Y then Z')",
+            "Showing the user a plan up front before executing multi-step work",
+            "Tracking dependencies between sub-steps so the model respects ordering",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "task_list — for spawned background subagent tasks rather than in-conversation todos",
+            "schedule — for time-based proactive jobs rather than transient session todos",
+            "memory_store — for durable facts rather than transient task tracking",
         },
     };
 

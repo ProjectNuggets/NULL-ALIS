@@ -14,14 +14,16 @@ pub const SkillRegistryTool = struct {
     pub const tool_name = "skill_registry";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Look up registered skills and capabilities.",
+        .what = "Manage skills: list installed, search Decision Hub, install from Hub, or remove a local skill.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "User asks what skills are installed or available",
+            "Searching the Decision Hub catalog for a skill that solves a specific task",
+            "Installing or removing a named skill on the user's behalf",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "runtime_info — for tool/integration availability rather than skill catalog",
+            "memory_recall — for previously-installed skill notes rather than current registry state",
+            "web_search — for general web queries rather than the skill catalog",
         },
     };
 

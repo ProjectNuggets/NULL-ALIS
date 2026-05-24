@@ -35,16 +35,16 @@ pub const FileReadHashedTool = struct {
     pub const tool_name = "file_read_hashed";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "file_read_hashed tool.",
+        .what = "Read a file with per-line Hashline tags (L<n>:<hash>|) for precise, drift-tolerant editing.",
         .use_when = &.{
-            "Reading files while verifying integrity via hash",
-            "Detecting accidental or malicious file modifications",
-            "Tracking file versions through hash-based snapshots",
+            "About to call file_edit_hashed and need the tagged source for line-precise replacement",
+            "Reading a file you may edit later — Hashline lets the edit survive intervening file shifts",
+            "Auditing whether a previously-tagged line has changed since you last saw it",
         },
         .do_not_use_for = &.{
-            "web_search — for external data queries",
-            "memory_store — for persistent storage",
-            "http_request — for specific API endpoints",
+            "file_read — for a plain content read without per-line hash tagging",
+            "file_edit_hashed — for the actual edit step after this read",
+            "memory_recall — for stored facts rather than file contents",
         },
     };
 

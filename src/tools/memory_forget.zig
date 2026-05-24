@@ -15,14 +15,16 @@ pub const MemoryForgetTool = struct {
     pub const tool_name = "memory_forget";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Delete a memory entry permanently.",
+        .what = "Hard-delete a memory by key (GDPR-grade scrub; no audit trail kept).",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "User explicitly asks to delete or forget specific personal information",
+            "GDPR / data-subject erasure request that requires the row to disappear",
+            "Cleaning sensitive content that must not survive as audit evidence",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "memory_archive — for soft-close that keeps the row as audit evidence",
+            "memory_purge_topic — for bulk-removal of agent-generated artifacts on a topic",
+            "memory_edit — for correcting a fact rather than scrubbing it",
         },
     };
 

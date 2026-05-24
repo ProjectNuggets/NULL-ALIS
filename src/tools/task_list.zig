@@ -16,14 +16,16 @@ pub const TaskListTool = struct {
     pub const tool_name = "task_list";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "List all tasks with filtering and sorting options.",
+        .what = "List spawned/detached tasks with optional status filter; returns id/desc/status/timestamps.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "Reviewing the current backlog of subagent tasks (queued/running/succeeded/failed)",
+            "Filtering tasks by status to find anything stuck in 'running' too long",
+            "Building a status summary before deciding which tasks to inspect or cancel",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "task_get — for the full record of a single task by ID",
+            "task_stop — for cancelling a specific task rather than just listing",
+            "cron_list — for scheduled jobs rather than spawned tasks",
         },
     };
 

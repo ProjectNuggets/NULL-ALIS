@@ -81,16 +81,16 @@ pub const FileEditHashedTool = struct {
     pub const tool_name = "file_edit_hashed";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "file_edit_hashed tool.",
+        .what = "Edit a file using Hashline anchors from file_read_hashed; tolerates ±50-line drift.",
         .use_when = &.{
-            "Editing files with automatic hash tracking",
-            "Detecting concurrent edits or unexpected file changes",
-            "Building audit trails of file modifications",
+            "Replacing a specific line or range identified by L<n>:<hash> from a prior file_read_hashed",
+            "Editing a file that may have shifted since the read (drift-tolerant by design)",
+            "Audit-clean edits where the anchor proves you targeted the right line",
         },
         .do_not_use_for = &.{
-            "web_search — for external data queries",
-            "memory_store — for persistent storage",
-            "http_request — for specific API endpoints",
+            "file_read_hashed — for the prerequisite tagged read that produces the anchors",
+            "file_read — for plain reading rather than editing",
+            "shell — for arbitrary file mutations without the Hashline guard",
         },
     };
 

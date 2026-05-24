@@ -727,14 +727,16 @@ pub const ScheduleTool = struct {
     pub const tool_name = "schedule";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Create, update, or list scheduled tasks to run at specific times.",
+        .what = "User-facing schedule manager for reminders, briefs, recurring follow-ups, and proactive jobs.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "User asks for a reminder, daily brief, or any recurring proactive nudge",
+            "Creating an agent-managed automation that should run on a cron expression or one-shot delay",
+            "Listing, pausing, resuming, or cancelling a previously-created user-facing schedule",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "cron_add — for low-level raw cron entries that bypass the user-facing UX",
+            "task_list — for one-shot spawned tasks rather than recurring schedules",
+            "spawn — for fire-and-forget background work rather than persistent schedules",
         },
     };
 

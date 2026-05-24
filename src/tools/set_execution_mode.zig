@@ -14,14 +14,16 @@ pub const SetExecutionModeTool = struct {
     pub const tool_name = "set_execution_mode";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Configure execution mode (sandbox, live, or dry-run).",
+        .what = "Switch your own execution mode: plan, execute, review, or background.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "Switching to plan before a non-trivial implementation (read-only exploration)",
+            "Switching back to execute once the approach is clear",
+            "Switching to review for read-only verification after a change has landed",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "runtime_info — for inspecting current runtime/mode rather than changing it",
+            "context_snapshot — for the agent's conversational context rather than execution mode",
+            "memory_store — for persisting facts rather than runtime mode changes",
         },
     };
 

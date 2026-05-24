@@ -14,14 +14,16 @@ pub const MemoryEditTool = struct {
     pub const tool_name = "memory_edit";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Edit the content or metadata of an existing memory entry.",
+        .what = "Edit a mutable memory in place by key; preserves original category and scope.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "Correcting a typo or imprecise wording in an existing fact",
+            "Refreshing a memory whose surface text needs to evolve but whose identity stays the same",
+            "Re-anchoring a fact's content after the underlying truth shifted but the entity is unchanged",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "memory_store — for creating a brand-new fact rather than editing an existing one",
+            "memory_demote — for unlocking a core memory that the immortality guard is blocking",
+            "memory_archive — for closing out a fact instead of editing it",
         },
     };
 

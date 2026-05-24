@@ -14,14 +14,16 @@ pub const ScreenshotTool = struct {
     pub const tool_name = "screenshot";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Capture the current screen or a specific window as an image.",
+        .what = "Capture the screen and return an [IMAGE:path] marker the user-visible reply can include verbatim.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "User asks to 'see' or 'show' what's on their screen right now",
+            "Documenting a UI state visually before suggesting changes",
+            "Capturing evidence of an on-screen bug or error message for the user",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "image_info — for reading metadata of an existing image file rather than capturing one",
+            "web_fetch — for screenshots of remote URLs (this is local-display only)",
+            "file_read — for reading text files rather than capturing display contents",
         },
     };
 

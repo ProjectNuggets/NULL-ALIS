@@ -47,14 +47,16 @@ pub const ComposioTool = struct {
     pub const tool_name = "composio";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Execute actions on 1000+ apps via Composio (Gmail, Slack, etc.).",
+        .what = "Composio: list/execute/connect actions on 1000+ apps (Gmail, Notion, GitHub, Slack, ...).",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "User asks to send an email, create a calendar event, open a GitHub issue, post to Slack, etc.",
+            "Listing available actions for a connected app before deciding which to execute",
+            "Generating an OAuth link so the user can connect a new app account",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "http_request — for arbitrary REST endpoints not covered by a Composio integration",
+            "message — for the in-chat reply lane rather than cross-app delivery (email/calendar/etc.)",
+            "openapi — for endpoints registered in a tenant-local API spec",
         },
     };
 

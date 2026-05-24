@@ -15,14 +15,16 @@ pub const TaskGetTool = struct {
     pub const tool_name = "task_get";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Retrieve details of a specific task by ID.",
+        .what = "Fetch one task's full record: description, status, timestamps, result summary, error message.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "Checking whether a previously-spawned subagent task has finished",
+            "Reading the result summary or error message of a completed task by ID",
+            "Drilling into a single task surfaced by task_list before deciding to cancel or wait",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "task_list — for browsing many tasks rather than inspecting one by ID",
+            "task_stop — for cancelling a running task rather than just inspecting it",
+            "cron_runs — for execution history of scheduled jobs rather than tasks",
         },
     };
 

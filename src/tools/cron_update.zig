@@ -37,14 +37,16 @@ pub const CronUpdateTool = struct {
     pub const tool_name = "cron_update";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Update the schedule or command of an existing cron job.",
+        .what = "Low-level raw-cron edit: change a job's expression, command, or enabled flag in place.",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "Pausing/resuming a recurring job without losing its identity",
+            "Retiming an existing job after the expression was wrong on creation",
+            "Patching the command for an operator-owned job whose target script moved",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "schedule — for user-facing reminder edits via the friendly UX",
+            "cron_remove — for outright deletion rather than in-place edit",
+            "cron_add — for creating a new job rather than mutating an existing one",
         },
     };
 

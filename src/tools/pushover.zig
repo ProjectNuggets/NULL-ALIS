@@ -16,14 +16,16 @@ pub const PushoverTool = struct {
     pub const tool_name = "pushover";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Send notifications via the Pushover notification service.",
+        .what = "Push a notification via Pushover (requires PUSHOVER_TOKEN + PUSHOVER_USER_KEY in env).",
         .use_when = &.{
-            "first scenario",
-            "second scenario",
+            "User explicitly asks to push a notification to their phone via Pushover",
+            "An urgent agent-generated alert needs out-of-band delivery beyond the chat surface",
+            "A scheduled job's completion warrants a phone-level ping rather than just a chat reply",
         },
         .do_not_use_for = &.{
-            "web_search — for external queries",
-            "memory_store — for persistence",
+            "message — for sending a message into the current chat/channel rather than a phone push",
+            "schedule — for the recurring trigger rather than the notification delivery itself",
+            "composio — for cross-app notifications (Gmail, Slack, etc.) rather than Pushover specifically",
         },
     };
 
