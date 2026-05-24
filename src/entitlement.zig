@@ -157,39 +157,27 @@ pub const Entitlement = struct {
     }
 
     pub fn limitsFor(tier: Tier) Limits {
-        return switch (tier) {
-            .free => .{
-                // ~100 cheap ops OR ~20 medium OR ~4 expensive per month.
-                // Tuned to feel restrictive but not insulting; real product
-                // balance lives in the BFF plan definition + marketing page.
-                .monthly_weight_budget = 500,
-                .daily_autonomous_weight_budget = 10,
-                .proactive_enabled = false,
-                .integrations_enabled = false,
-                .active_jobs_cap = 4,
-            },
-            .pro => .{
-                .monthly_weight_budget = 50_000,
-                .daily_autonomous_weight_budget = 500,
-                .proactive_enabled = true,
-                .integrations_enabled = true,
-                .active_jobs_cap = 64,
-            },
-            .team => .{
-                .monthly_weight_budget = 250_000,
-                .daily_autonomous_weight_budget = 2_500,
-                .proactive_enabled = true,
-                .integrations_enabled = true,
-                .active_jobs_cap = 256,
-            },
-            .enterprise => .{
-                // Unlimited by default; contract overrides per customer.
-                .monthly_weight_budget = std.math.maxInt(u64),
-                .daily_autonomous_weight_budget = std.math.maxInt(u64),
-                .proactive_enabled = true,
-                .integrations_enabled = true,
-                .active_jobs_cap = std.math.maxInt(u32),
-            },
+        // 2026-05-24 (v1.14.20): nullalis no longer enforces commercial caps.
+        // Metering moved to the zaki-prod central usage meter (5-hour rolling +
+        // weekly windows, aggregated across every product the user touches).
+        // Every tier sees identical "unlimited at the runtime layer" limits;
+        // the central meter throttles upstream by deciding whether to ROUTE a
+        // call to nullalis at all. This decouples runtime caps (operational
+        // safety: host RAM, infinite-loop guards) from commercial caps
+        // (per-plan budgets, per-tool fees) which is the right separation for
+        // a multi-product SaaS where one runtime must serve all plan shapes.
+        //
+        // The Tier enum stays so the BFF can still tag attributable usage
+        // events with the user's plan name, but every tier resolves to the
+        // same Limits shape: maxInt budgets, both feature flags on,
+        // maxInt jobs cap.
+        _ = tier;
+        return .{
+            .monthly_weight_budget = std.math.maxInt(u64),
+            .daily_autonomous_weight_budget = std.math.maxInt(u64),
+            .proactive_enabled = true,
+            .integrations_enabled = true,
+            .active_jobs_cap = std.math.maxInt(u32),
         };
     }
 
@@ -463,18 +451,20 @@ test "effectiveTier collapses canceled-past-end to free" {
     try std.testing.expectEqual(Tier.pro, ent.effectiveTier(500));
 }
 
-test "limitsFor tiers scale as expected" {
-    const free = Entitlement.limitsFor(.free);
-    const pro = Entitlement.limitsFor(.pro);
-    const team = Entitlement.limitsFor(.team);
-    try std.testing.expect(free.monthly_weight_budget < pro.monthly_weight_budget);
-    try std.testing.expect(pro.monthly_weight_budget < team.monthly_weight_budget);
-    try std.testing.expect(!free.proactive_enabled);
-    try std.testing.expect(pro.proactive_enabled);
-    try std.testing.expect(!free.integrations_enabled);
-    try std.testing.expect(pro.integrations_enabled);
-    try std.testing.expectEqual(@as(u32, 4), free.active_jobs_cap);
-    try std.testing.expectEqual(@as(u32, 64), pro.active_jobs_cap);
+// 2026-05-24 (v1.14.20): commercial caps moved to zaki-prod central meter.
+// Every tier resolves to the same uncapped Limits at the runtime layer.
+// This test now pins the new shape so we don't accidentally reintroduce
+// per-tier discrimination in nullalis itself.
+test "limitsFor returns uncapped limits for every tier (central meter shape)" {
+    const tiers = [_]Tier{ .free, .pro, .team, .enterprise };
+    inline for (tiers) |tier| {
+        const limits = Entitlement.limitsFor(tier);
+        try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), limits.monthly_weight_budget);
+        try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), limits.daily_autonomous_weight_budget);
+        try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), limits.active_jobs_cap);
+        try std.testing.expect(limits.proactive_enabled);
+        try std.testing.expect(limits.integrations_enabled);
+    }
 }
 
 test "fromProvision fails closed on invalid tier/status" {
@@ -488,5 +478,8 @@ test "fromProvision happy path for Pro active" {
     try std.testing.expectEqual(Tier.pro, ent.tier);
     try std.testing.expectEqual(Status.active, ent.status);
     try std.testing.expectEqual(@as(i64, 1_735_689_600), ent.period_end_unix.?);
-    try std.testing.expectEqual(@as(u64, 50_000), ent.limits.monthly_weight_budget);
+    // 2026-05-24 (v1.14.20): pro tier no longer has a per-runtime budget;
+    // the central zaki-prod meter throttles upstream. Pin the new uncapped
+    // contract here.
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), ent.limits.monthly_weight_budget);
 }

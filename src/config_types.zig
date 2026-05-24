@@ -66,7 +66,13 @@ pub const AutonomyConfig = struct {
     /// to `.supervised` is tracked for future work.
     level: AutonomyLevel = .full,
     workspace_only: bool = true,
-    max_actions_per_hour: u32 = 100,
+    /// 2026-05-24 (v1.14.20): metering moved to zaki-prod central meter
+    /// (5-hour rolling + weekly windows aggregated across products). Runtime-
+    /// layer hourly action cap defaults to disabled. Operators on a
+    /// standalone deploy can still set this to a finite number to enforce a
+    /// local cap (e.g. shared host with multiple users), but the v1
+    /// commercial SaaS shape is "no runtime cap; throttle at the BFF."
+    max_actions_per_hour: u32 = std.math.maxInt(u32),
     require_approval_for_medium_risk: bool = true,
     block_high_risk_commands: bool = true,
     allowed_commands: []const []const u8 = &.{},
@@ -241,7 +247,17 @@ pub const AgentConfig = struct {
     /// can still disable it explicitly via `compact_context` in config JSON
     /// (config_parse.zig honors an explicit bool).
     compact_context: bool = true,
-    max_tool_iterations: u32 = 500,
+    /// 2026-05-24 (v1.14.20): per-turn iteration cap relaxed. 500 was a
+    /// historical "long enough not to surprise" number; with goal_loop's
+    /// ReAct reflection (agent/goal_loop.zig) the loop EXITS on
+    /// `goal_status=met` and the byte-identical loop detector
+    /// (root.zig:4699) catches pathological repeats, so the iteration cap
+    /// is no longer the right governor. Default lifted to maxInt(u32):
+    /// long-horizon goal-oriented work can run as many iterations as the
+    /// model + tools take. Loop-detected and goal_status=stuck/met are the
+    /// real safeguards. Operators on shared deploys can still set a finite
+    /// cap.
+    max_tool_iterations: u32 = std.math.maxInt(u32),
     // iter26: 0 = uncapped (pure token-based). Adaptive exits (loop_detected, repeated-call) are the real guardrails.
     max_history_messages: u32 = 0,
     /// Execute independent tool calls concurrently. Default true for per-pod

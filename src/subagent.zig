@@ -55,24 +55,27 @@ pub const TaskState = struct {
 pub const SubagentConfig = struct {
     /// Maximum agent loop iterations per subagent (passed to ChannelRuntime).
     ///
-    /// V1.11 (2026-05-07): raised 15 → 50. Subagents handle complex
-    /// delegated tasks (research, multi-step analysis, document synthesis)
-    /// where 15 was cutting off mid-thought. 50 gives the delegate agent
-    /// genuine room to complete hard work; the parent's adaptive-exit
-    /// detectors still catch pathological loops.
-    max_iterations: u32 = 50,
+    /// V1.11 (2026-05-07): raised 15 → 50.
+    /// 2026-05-24 (v1.14.20): commercial-cap removal — subagents are
+    /// long-horizon delegate workers; the per-loop iteration ceiling is no
+    /// longer the right governor. goal_loop.GoalState in the parent +
+    /// loop-detected on byte-identical repeats + the cheap-sidecar
+    /// goal_status=met exit catch pathological cases. Default lifted to
+    /// maxInt(u32). Operators can still set a finite override at
+    /// SubagentManager construction.
+    max_iterations: u32 = std.math.maxInt(u32),
     /// Maximum concurrent subagents per SubagentManager.
     ///
-    /// 2026-05-23 raised 4 → 8 for the v1 commercial baseline. Spawn is the
-    /// agent's parallelism primitive — real research workflows fan out into
-    /// 5-8 parallel branches comfortably, and a cap of 4 was firing in
-    /// power-user scenarios. 8 gives genuine parallelism without inviting
-    /// host-OOM (each subagent ≈ 50-100 MB resident; 8 × ≈ 400-800 MB worst
-    /// case, manageable on any modern host) or saturating provider rate
-    /// limits (most providers handle 5-10 concurrent calls per key fine).
-    /// Operators on fatter hosts can raise the cap via SubagentConfig
-    /// override at SubagentManager construction.
-    max_concurrent: u32 = 8,
+    /// 2026-05-23 raised 4 → 8 for the v1 commercial baseline.
+    /// 2026-05-24 (v1.14.20): raised 8 → 64 alongside the central-meter
+    /// shift. This cap is now ONLY a host-RAM safety ceiling (each subagent
+    /// ≈ 50-100 MB resident; 64 × ≈ 3-6 GB worst case, fits on any modern
+    /// host) — NOT a commercial gate. Provider rate-limits + central usage
+    /// meter govern the actual fan-out. 64 matches the Manus "Wide Research"
+    /// shape (their 100 is per-task VM; ours is per-runtime). Operators on
+    /// thinner hosts (e.g. dev laptop) can lower via SubagentConfig
+    /// override.
+    max_concurrent: u32 = 64,
 };
 
 // ── ThreadContext — passed to each spawned thread ────────────────
@@ -1238,14 +1241,13 @@ test "SubagentManager init and deinit" {
 }
 
 test "SubagentConfig defaults" {
-    // V1.11 (2026-05-07): max_iterations raised 15 → 50 to give delegated
-    // subagent tasks (research, multi-step analysis, document synthesis)
-    // genuine room to complete instead of cutting off mid-thought.
-    // 2026-05-23: max_concurrent raised 4 → 8 for the v1 commercial
-    // baseline — see the SubagentConfig field doc for full rationale.
+    // 2026-05-24 (v1.14.20): commercial caps removed. max_iterations is now
+    // maxInt(u32) — goal_loop + loop-detected handle pathological cases.
+    // max_concurrent is 64 — a pure host-RAM ceiling, not a commercial gate.
+    // See SubagentConfig field docs for full rationale.
     const sc = SubagentConfig{};
-    try std.testing.expectEqual(@as(u32, 50), sc.max_iterations);
-    try std.testing.expectEqual(@as(u32, 8), sc.max_concurrent);
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), sc.max_iterations);
+    try std.testing.expectEqual(@as(u32, 64), sc.max_concurrent);
 }
 
 test "TaskStatus enum values" {
@@ -1852,20 +1854,22 @@ test "SubagentManager spawn e2e completes and publishes bus message" {
 
 // ── Baseline characterization tests (Phase 00-01) ───────────────
 
-test "baseline: SubagentConfig defaults max_iterations to 50 (V1.11 raised from 15)" {
-    // V1.11 (2026-05-07): raised 15 → 50. Subagents handle complex
-    // delegated tasks where 15 iterations regularly cut off useful work.
-    // Adaptive-exit detectors still bound pathological loops.
+test "baseline: SubagentConfig max_iterations is uncapped (v1.14.20 central-meter shift)" {
+    // 2026-05-24 (v1.14.20): commercial-cap removal. goal_loop's ReAct
+    // reflection + loop-detected on byte-identical repeats are the real
+    // governors; per-loop iteration count is no longer.
     const cfg = SubagentConfig{};
-    try std.testing.expectEqual(@as(u32, 50), cfg.max_iterations);
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), cfg.max_iterations);
 }
 
-test "baseline: SubagentConfig defaults max_concurrent to 8 (v1 raised 4→8)" {
-    // 2026-05-23: raised 4 → 8 for the v1 commercial baseline. Spawn is the
-    // agent's parallelism primitive — 4 was firing in power-user research
-    // workflows that fan out to 5-8 parallel branches.
+test "baseline: SubagentConfig max_concurrent defaults to 64 (host-RAM ceiling)" {
+    // 2026-05-24 (v1.14.20): raised 8 → 64. This is a host-RAM safety
+    // ceiling (each subagent ≈ 50-100 MB; 64 × ≈ 3-6 GB), not a commercial
+    // gate. Provider rate-limits + central usage meter govern actual
+    // fan-out. Matches Manus Wide Research shape (their 100 is per-task VM;
+    // ours is per-runtime).
     const cfg = SubagentConfig{};
-    try std.testing.expectEqual(@as(u32, 8), cfg.max_concurrent);
+    try std.testing.expectEqual(@as(u32, 64), cfg.max_concurrent);
 }
 
 test "baseline: TaskStatus has exactly 5 states" {
