@@ -67,79 +67,26 @@ pub const Author = enum {
     }
 };
 
-/// Artifact row metadata (no content). Returned by list/get-metadata
-/// paths. Strings are heap-owned by the caller's allocator; call
-/// `deinit` to release.
-pub const Artifact = struct {
-    id: []u8, // UUID text form
-    user_id: i64,
-    session_id: ?[]u8,
-    title: []u8,
-    kind: ArtifactKind,
-    created_at_unix: i64,
-    updated_at_unix: i64,
-    current_version: u64,
-    is_shared: bool,
-    share_code: ?[]u8,
-    share_expires_at_unix: ?i64,
-    /// Raw JSONB text. Sanitizer in `sanitizer.zig` MUST strip this
-    /// before any public-share rendering — operators may stash internal
-    /// hints here.
-    metadata_jsonb: []u8,
-
-    pub fn deinit(self: *Artifact, allocator: std.mem.Allocator) void {
-        allocator.free(self.id);
-        if (self.session_id) |s| allocator.free(s);
-        allocator.free(self.title);
-        if (self.share_code) |s| allocator.free(s);
-        allocator.free(self.metadata_jsonb);
-    }
-};
-
-/// A single revision of an artifact. `parent_version == null` only on
-/// version=1; the store enforces this invariant at insert time.
-pub const ArtifactVersion = struct {
-    artifact_id: []u8,
-    version: u64,
-    parent_version: ?u64,
-    content: []u8,
-    content_hash: []u8, // sha256 hex
-    created_at_unix: i64,
-    author: Author,
-    change_summary: ?[]u8,
-
-    pub fn deinit(self: *ArtifactVersion, allocator: std.mem.Allocator) void {
-        allocator.free(self.artifact_id);
-        allocator.free(self.content);
-        allocator.free(self.content_hash);
-        if (self.change_summary) |s| allocator.free(s);
-    }
-};
-
-/// A version-history row (no content) for the /history endpoint.
-pub const VersionHistoryEntry = struct {
-    version: u64,
-    parent_version: ?u64,
-    author: Author,
-    created_at_unix: i64,
-    change_summary: ?[]u8,
-    content_hash: []u8,
-
-    pub fn deinit(self: *VersionHistoryEntry, allocator: std.mem.Allocator) void {
-        if (self.change_summary) |s| allocator.free(s);
-        allocator.free(self.content_hash);
-    }
-};
-
-pub fn freeArtifacts(allocator: std.mem.Allocator, list: []Artifact) void {
-    for (list) |*a| a.deinit(allocator);
-    allocator.free(list);
-}
-
-pub fn freeHistory(allocator: std.mem.Allocator, list: []VersionHistoryEntry) void {
-    for (list) |*h| h.deinit(allocator);
-    allocator.free(list);
-}
+// MEDIUM #4 from Wave 2 code review (2026-05-24): the Artifact /
+// ArtifactVersion / VersionHistoryEntry types previously lived here
+// AND in `zaki_state.zig` (ArtifactRow / ArtifactVersionRow /
+// ArtifactHistoryRow). Two parallel struct families for the same
+// concept — silent drift waiting to happen.
+//
+// Resolution per §14.2 (archaeology — wire or delete): DELETED here;
+// the zaki_state row types are the single source of truth because
+// they're the type the Postgres CRUD actually returns. New code that
+// needs an artifact-row shape should import:
+//
+//     const ArtifactRow = @import("../zaki_state.zig").ArtifactRow;
+//     const ArtifactVersionRow = @import("../zaki_state.zig").ArtifactVersionRow;
+//     const ArtifactHistoryRow = @import("../zaki_state.zig").ArtifactHistoryRow;
+//
+// What stays in this file: `ArtifactKind` + `Author` enums (the
+// vocabulary the CHECK constraints + the agent prompt share), and
+// `computeContentHash` (the dedup hash used at write time + by the
+// /diff endpoint). Neither has a zaki_state counterpart; both are
+// canonical here.
 
 /// SHA-256 of `content` as a 64-char lowercase hex string. Caller
 /// owns the returned slice and must free it.

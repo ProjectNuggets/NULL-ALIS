@@ -16,7 +16,7 @@
 //!
 //! Kept fields (the only surface a public reader needs):
 //!   * title
-//:   * kind
+//!   * kind
 //!   * content (rendered from the latest version)
 //!   * updated_at_unix — "last edited" is meaningful for share readers
 //!

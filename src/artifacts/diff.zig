@@ -23,7 +23,7 @@ const std = @import("std");
 /// which we still won't allocate in practice because real artifact diffs
 /// are tens-to-hundreds of lines. The cap exists to refuse the worst case
 /// rather than to be hit in normal operation.
-pub const MAX_DIFF_LINES: usize = 4096;
+pub const MAX_DIFF_LINES: usize = 1024; // MEDIUM #6 from Wave 2 review: 4096 lines → ~64MB LCS table per request, real DOS lever. 1024 = ~4MB cap; covers real diffs (tens to hundreds of lines).
 
 /// Compute a unified-style textual diff between `before` and `after`.
 /// Returns a heap-allocated owned slice the caller must free.

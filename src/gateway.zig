@@ -11317,7 +11317,20 @@ fn handleArtifactShareGet(
     var ver = ver_opt.?;
     defer ver.deinit(allocator);
 
-    const kind = artifacts_types.ArtifactKind.fromSlice(artifact.kind) orelse .plaintext;
+    // MEDIUM #2 from Wave 2 code review (2026-05-24): never silently
+    // coerce unknown kind to .plaintext. The artifacts table's CHECK
+    // constraint blocks unknown values at write time, so an unknown
+    // kind HERE means schema drift between the DB and the ArtifactKind
+    // enum — surface it as 500 + log so operators see the divergence
+    // instead of users getting a degraded plaintext render. Per
+    // AGENTS.md §14.5 (no silent defaults that mask real divergence).
+    const kind = artifacts_types.ArtifactKind.fromSlice(artifact.kind) orelse {
+        std.log.scoped(.gateway).err(
+            "artifact.share.unknown_kind code={s} kind={s} — schema drift between artifacts.kind CHECK and ArtifactKind enum",
+            .{ share_code, artifact.kind },
+        );
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"unknown_kind\"}" };
+    };
     const body = artifacts_sanitizer.renderPublicShareJson(
         allocator,
         artifact.title,

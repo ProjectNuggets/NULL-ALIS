@@ -26,12 +26,20 @@ pub const DEFAULT_SHARE_EXPIRY_HOURS: i64 = 168;
 /// commit-message claim that the two limits match.
 pub const SHARE_MAX_EXPIRY_HOURS: i64 = 720;
 
-/// URL-safe alphabet for share codes. No look-alikes (no I/l/1, no
-/// O/0) to keep typed/spoken sharing forgiving. 22 chars from this
-/// 58-symbol alphabet ≈ 128 bits of entropy — comfortably resistant
-/// to enumeration.
-const SHARE_ALPHABET = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-pub const SHARE_CODE_LEN: usize = 22;
+/// URL-safe alphabet for share codes. Crockford-ish: lowercase + digits
+/// only, no look-alikes (no `i`, `l`, `o`, `0`, `1`). 31 symbols. This
+/// MATCHES the trace-share alphabet at `gateway.zig` (TRACE_SHARE_ALPHABET)
+/// so both surfaces produce visually-consistent codes — Wave 2 review
+/// MEDIUM#5 (the artifact share previously used a 57-char mixed-case
+/// alphabet which violated the commit-message claim that the two surfaces
+/// match + made FE/SMS/voice handling inconsistent).
+///
+/// 16 chars from this 31-symbol alphabet ≈ 78 bits of entropy —
+/// well above the ~32 bits an enumeration attack realistically scans
+/// before TLS rate-limits the attacker. The trace surface uses the same
+/// length for symmetry.
+const SHARE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
+pub const SHARE_CODE_LEN: usize = 16;
 
 /// Generate a fresh URL-safe share code. Caller owns the returned slice.
 /// Cryptographic randomness; collisions across the global namespace are
