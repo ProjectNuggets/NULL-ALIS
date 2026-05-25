@@ -144,14 +144,14 @@ fn buildFactList(allocator: std.mem.Allocator, facts: []const ProseFact) ![]u8 {
 fn appendIsoDate(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
-    unix_seconds: i64,
+    unix_secs: i64,
 ) !void {
-    if (unix_seconds <= 0) {
+    if (unix_secs <= 0) {
         try buf.appendSlice(allocator, "1970-01-01");
         return;
     }
     const day_seconds: i64 = 86400;
-    const days_since_epoch: i64 = @divFloor(unix_seconds, day_seconds);
+    const days_since_epoch: i64 = @divFloor(unix_secs, day_seconds);
     // Civil-from-days conversion (Howard Hinnant's algorithm, simplified).
     const z: i64 = days_since_epoch + 719468;
     const era: i64 = @divFloor(if (z >= 0) z else z - 146096, 146097);
@@ -165,7 +165,7 @@ fn appendIsoDate(
     const year: i64 = if (m <= 2) y + 1 else y;
     // Cast to unsigned for printing — Zig's {d} on signed types emits a
     // leading "+" for positive values. Year is always positive in our
-    // use case (unix_seconds > 0 was guarded above).
+    // use case (unix_secs > 0 was guarded above).
     const year_u: u64 = @intCast(@max(year, 0));
     try buf.writer(allocator).print("{d:0>4}-{d:0>2}-{d:0>2}", .{ year_u, m, d });
 }

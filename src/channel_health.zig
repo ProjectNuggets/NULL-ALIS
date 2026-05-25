@@ -100,10 +100,10 @@ fn stateString(s: dispatch.SupervisedChannel.State) []const u8 {
 }
 
 /// Serialize channel health entries to JSON.
-/// Output shape: {"status":"...","uptime_seconds":N,"channels":[...]}
+/// Output shape: {"status":"...","uptime_secs":N,"channels":[...]}
 /// Caller owns the returned memory.
 /// All string values are JSON-escaped via json_util to prevent injection.
-pub fn formatHealthJson(allocator: std.mem.Allocator, entries: []const ChannelHealthEntry, uptime_seconds: i64) ![]const u8 {
+pub fn formatHealthJson(allocator: std.mem.Allocator, entries: []const ChannelHealthEntry, uptime_secs: i64) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
 
@@ -112,7 +112,7 @@ pub fn formatHealthJson(allocator: std.mem.Allocator, entries: []const ChannelHe
     try json_util.appendJsonString(&buf, allocator, status.toSlice());
     {
         var tmp: [64]u8 = undefined;
-        const n = std.fmt.bufPrint(&tmp, ",\"uptime_seconds\":{d},\"channels\":[", .{uptime_seconds}) catch unreachable;
+        const n = std.fmt.bufPrint(&tmp, ",\"uptime_secs\":{d},\"channels\":[", .{uptime_secs}) catch unreachable;
         try buf.appendSlice(allocator, n);
     }
 
@@ -234,7 +234,7 @@ test "formatHealthJson produces valid JSON with status and channels" {
 
     // Verify JSON structure
     try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"healthy\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"uptime_seconds\":3600") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"uptime_secs\":3600") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"channels\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"telegram\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"state\":\"running\"") != null);
@@ -262,7 +262,7 @@ test "empty channel list produces valid output" {
 
     const json = try formatHealthJson(std.testing.allocator, &entries, 0);
     defer std.testing.allocator.free(json);
-    try std.testing.expectEqualStrings("{\"status\":\"healthy\",\"uptime_seconds\":0,\"channels\":[]}", json);
+    try std.testing.expectEqualStrings("{\"status\":\"healthy\",\"uptime_secs\":0,\"channels\":[]}", json);
 
     const text = try formatHealthText(std.testing.allocator, &entries);
     defer std.testing.allocator.free(text);

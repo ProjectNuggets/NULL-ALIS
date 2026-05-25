@@ -16,7 +16,7 @@ pub const ComponentHealth = struct {
 /// Full health snapshot.
 pub const HealthSnapshot = struct {
     pid: u32,
-    uptime_seconds: u64,
+    uptime_secs: u64,
     components: *std.StringHashMapUnmanaged(ComponentHealth),
 };
 
@@ -119,7 +119,7 @@ pub fn snapshot() HealthSnapshot {
 
     return .{
         .pid = if (builtin.os.tag == .linux) @intCast(std.os.linux.getpid()) else if (builtin.os.tag == .macos) @intCast(std.c.getpid()) else 0,
-        .uptime_seconds = uptime,
+        .uptime_secs = uptime,
         .components = &registry_components,
     };
 }
@@ -133,7 +133,7 @@ pub const ComponentEntry = struct {
 /// Return a heap-allocated copy of all registered components.
 /// Safe to iterate without holding the registry mutex.
 /// Caller owns the returned slice and must free it with the same allocator.
-pub fn snapshotComponents(allocator: std.mem.Allocator) !struct { entries: []ComponentEntry, uptime_seconds: u64 } {
+pub fn snapshotComponents(allocator: std.mem.Allocator) !struct { entries: []ComponentEntry, uptime_secs: u64 } {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     ensureInit();
@@ -152,7 +152,7 @@ pub fn snapshotComponents(allocator: std.mem.Allocator) !struct { entries: []Com
         };
         i += 1;
     }
-    return .{ .entries = entries, .uptime_seconds = uptime };
+    return .{ .entries = entries, .uptime_secs = uptime };
 }
 
 /// Get a specific component's health.

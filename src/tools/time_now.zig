@@ -11,7 +11,7 @@ const JsonObjectMap = root.JsonObjectMap;
 /// "what's NOW" surface instead of inferring from message ordering
 /// or session timestamps. Returns:
 ///
-///   - unix_seconds   (i64) — POSIX epoch
+///   - unix_secs   (i64) — POSIX epoch
 ///   - iso_utc        (str) — RFC 3339 / ISO-8601 in UTC
 ///   - day_of_week    (str) — "Mon" .. "Sun"
 ///   - human          (str) — "Tuesday, May 6, 2026 at 14:32 UTC"
@@ -26,7 +26,7 @@ pub const TimeNowTool = struct {
     pub const tool_name = "time_now";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Get current wall-clock time: unix_seconds, ISO-8601 UTC, day-of-week, human string.",
+        .what = "Get current wall-clock time: unix_secs, ISO-8601 UTC, day-of-week, human string.",
         .use_when = &.{
             "Reasoning about ages, deadlines, or 'how long ago' relative timing",
             "Stamping a memory_store call with the present moment for valid_at",
@@ -43,7 +43,7 @@ pub const TimeNowTool = struct {
         @import("lint.zig").lintToolDescription("time_now", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
     }
     pub const tool_description =
-        "Get the current wall-clock time. Returns unix_seconds, ISO-8601 UTC, " ++
+        "Get the current wall-clock time. Returns unix_secs, ISO-8601 UTC, " ++
         "day of week, and a human-readable string. Use when reasoning about " ++
         "ages, deadlines, or 'how long ago' relative timing — paired naturally " ++
         "with memory_maintain action=temporal_decay (which reports row ages " ++
@@ -132,7 +132,7 @@ pub const TimeNowTool = struct {
 
         const output = try std.fmt.allocPrint(
             allocator,
-            "{{\"unix_seconds\":{d},\"iso_utc\":\"{s}\",\"day_of_week\":\"{s}\",\"human\":\"{s}\"}}",
+            "{{\"unix_secs\":{d},\"iso_utc\":\"{s}\",\"day_of_week\":\"{s}\",\"human\":\"{s}\"}}",
             .{ now_s, iso, dow_short, human },
         );
         return ToolResult{ .success = true, .output = output };

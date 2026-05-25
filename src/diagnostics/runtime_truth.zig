@@ -991,7 +991,9 @@ fn applyHeartbeatConfigObject(enabled: *bool, interval_minutes: *u32, object: st
             interval_minutes.* = @intCast(clamped);
         }
     }
-    inline for ([_][]const u8{ "intervalSec", "interval_seconds", "interval_sec" }) |field| {
+    // v1.14.23 WARN 3.C: canonical key is `interval_secs`; legacy aliases
+    // kept for back-compat. Mirrors tools/runtime_info.zig.
+    inline for ([_][]const u8{ "interval_secs", "intervalSec", "interval_seconds", "interval_sec" }) |field| {
         if (object.get(field)) |value| {
             if (value == .integer) {
                 if (parseHeartbeatSecondsToMinutes(value.integer)) |mins| interval_minutes.* = mins;

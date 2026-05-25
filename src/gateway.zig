@@ -16255,7 +16255,7 @@ fn handleApiRoute(
             const json = channel_health_mod.formatHealthJson(
                 req_allocator,
                 entries,
-                @intCast(snap.uptime_seconds),
+                @intCast(snap.uptime_secs),
             ) catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"health_format_failed\"}" };
             };
@@ -16265,7 +16265,7 @@ fn handleApiRoute(
         const json = channel_health_mod.formatHealthJson(
             req_allocator,
             &.{},
-            @intCast(snap.uptime_seconds),
+            @intCast(snap.uptime_secs),
         ) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"health_format_failed\"}" };
         };

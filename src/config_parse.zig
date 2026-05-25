@@ -1540,8 +1540,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (rd.get("key_prefix")) |v| if (v == .string) {
                         self.memory.redis.key_prefix = try self.allocator.dupe(u8, v.string);
                     };
-                    if (rd.get("ttl_seconds")) |v| if (v == .integer) {
-                        self.memory.redis.ttl_seconds = @intCast(v.integer);
+                    // v1.14.23 WARN 3.C: canonical key is `ttl_secs`;
+                    // `ttl_seconds` kept as back-compat alias for existing
+                    // deployed configs.
+                    if (rd.get("ttl_secs") orelse rd.get("ttl_seconds")) |v| if (v == .integer) {
+                        self.memory.redis.ttl_secs = @intCast(v.integer);
                     };
                 }
             }
@@ -1979,8 +1982,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (res.object.get("max_disk_mb")) |v| {
                         if (v == .integer) self.security.resources.max_disk_mb = @intCast(v.integer);
                     }
-                    if (res.object.get("max_cpu_time_seconds")) |v| {
-                        if (v == .integer) self.security.resources.max_cpu_time_seconds = @intCast(v.integer);
+                    // v1.14.23 WARN 3.C: canonical key is `max_cpu_time_secs`;
+                    // `max_cpu_time_seconds` is kept as a back-compat alias for
+                    // deployed configs already on disk. New configs should use
+                    // `_secs` per the convention in config_types.zig.
+                    if (res.object.get("max_cpu_time_secs") orelse res.object.get("max_cpu_time_seconds")) |v| {
+                        if (v == .integer) self.security.resources.max_cpu_time_secs = @intCast(v.integer);
                     }
                     if (res.object.get("max_subprocesses")) |v| {
                         if (v == .integer) self.security.resources.max_subprocesses = @intCast(v.integer);

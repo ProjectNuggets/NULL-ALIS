@@ -4445,7 +4445,7 @@ fn handleHealthCommand(self: anytype) ![]const u8 {
     errdefer buf.deinit(self.allocator);
     const w = buf.writer(self.allocator);
 
-    try w.print("System Health (uptime: {d}s)\n\n", .{snap.uptime_seconds});
+    try w.print("System Health (uptime: {d}s)\n\n", .{snap.uptime_secs});
 
     if (snap.entries.len == 0) {
         try w.writeAll("  (no components registered)\n");

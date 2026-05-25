@@ -91,7 +91,7 @@ pub const RecomputeConfig = struct {
     /// get fallback names. Cost guard.
     max_llm_calls: u32 = 50,
     /// Recency half-life forwarded to LPA + importance scoring.
-    recency_half_life_seconds: f64 = 60.0 * 86400.0,
+    recency_half_life_secs: f64 = 60.0 * 86400.0,
     /// Reference "now" for recency. Production: std.time.timestamp().
     /// Tests pass fixed value for determinism.
     now_unix: i64 = 0,
@@ -147,7 +147,7 @@ pub fn recomputeCommunitiesForUser(
     // ── 2. Run LPA ────────────────────────────────────────────────
     var labels = try communities.computeCommunityLeaders(allocator, edges, .{
         .max_iterations = config.max_iterations,
-        .recency_half_life_seconds = config.recency_half_life_seconds,
+        .recency_half_life_secs = config.recency_half_life_secs,
         .now_unix = config.now_unix,
     });
     defer labels.deinit(allocator);
@@ -211,7 +211,7 @@ pub fn recomputeCommunitiesForUser(
             edges,
             config.top_k_members,
             config.now_unix,
-            config.recency_half_life_seconds,
+            config.recency_half_life_secs,
         );
         defer allocator.free(top_k);
 

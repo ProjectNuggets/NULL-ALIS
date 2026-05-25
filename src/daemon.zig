@@ -300,6 +300,14 @@ fn applyHeartbeatConfigObject(cfg: *UserHeartbeatConfig, allocator: std.mem.Allo
             cfg.interval_minutes = @intCast(clamped);
         }
     }
+    // v1.14.23 WARN 3.C: canonical key is `interval_secs`;
+    // `intervalSec`, `interval_sec`, and `interval_seconds` are kept as
+    // legacy aliases for back-compat with existing schedule fixtures.
+    if (object.get("interval_secs")) |v| {
+        if (v == .integer) {
+            if (parseHeartbeatSecondsToMinutes(v.integer)) |mins| cfg.interval_minutes = mins;
+        }
+    }
     if (object.get("intervalSec")) |v| {
         if (v == .integer) {
             if (parseHeartbeatSecondsToMinutes(v.integer)) |mins| cfg.interval_minutes = mins;

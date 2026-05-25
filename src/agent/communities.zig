@@ -69,7 +69,7 @@ pub const LpaConfig = struct {
     /// Recency-decay half-life in seconds. 60 days = 5_184_000s.
     /// Anticipates V1.7b-5 edge decay; LPA already applies the soft
     /// version via vote weight.
-    recency_half_life_seconds: f64 = 60.0 * 86400.0,
+    recency_half_life_secs: f64 = 60.0 * 86400.0,
     /// Reference "now" for recency decay. Caller passes std.time.timestamp()
     /// in production; tests pass a fixed value for determinism.
     now_unix: i64 = 0,
@@ -204,7 +204,7 @@ pub fn computeVoteWeight(edge: memory_root.CommunityEdge, config: LpaConfig) f64
     const age_seconds: f64 = @floatFromInt(@max(0, config.now_unix - edge.valid_from_unix));
     // Use base-2 exponential for cleaner half-life semantics: at exactly
     // one half-life elapsed, recency = 0.5.
-    const decay = std.math.pow(f64, 2.0, -(age_seconds / config.recency_half_life_seconds));
+    const decay = std.math.pow(f64, 2.0, -(age_seconds / config.recency_half_life_secs));
     return edge.weight * attr_mult * decay;
 }
 
@@ -341,13 +341,13 @@ test "computeVoteWeight — recency decay" {
     };
     const half_life: f64 = 100.0;
     // At now_unix=0 (or = valid_from), no decay → vote = weight × 1.0
-    const w0 = computeVoteWeight(edge, .{ .now_unix = 0, .recency_half_life_seconds = half_life });
+    const w0 = computeVoteWeight(edge, .{ .now_unix = 0, .recency_half_life_secs = half_life });
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), w0, 0.001);
     // At now_unix == half_life seconds elapsed → vote = 0.5
-    const w_half = computeVoteWeight(edge, .{ .now_unix = 100, .recency_half_life_seconds = half_life });
+    const w_half = computeVoteWeight(edge, .{ .now_unix = 100, .recency_half_life_secs = half_life });
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), w_half, 0.001);
     // At 2× half-life → vote = 0.25
-    const w_2hl = computeVoteWeight(edge, .{ .now_unix = 200, .recency_half_life_seconds = half_life });
+    const w_2hl = computeVoteWeight(edge, .{ .now_unix = 200, .recency_half_life_secs = half_life });
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), w_2hl, 0.001);
 }
 

@@ -140,7 +140,7 @@ pub const RedisConfig = struct {
     password: ?[]const u8 = null,
     db_index: u8 = 0,
     key_prefix: []const u8 = "nullalis",
-    ttl_seconds: ?u32 = null,
+    ttl_secs: ?u32 = null,
 };
 
 // ── RedisMemory ─────────────────────────────────────────────────────
@@ -153,7 +153,7 @@ pub const RedisMemory = struct {
     password: ?[]const u8,
     db_index: u8,
     key_prefix: []const u8,
-    ttl_seconds: ?u32,
+    ttl_secs: ?u32,
     owns_self: bool = false,
 
     const Self = @This();
@@ -166,7 +166,7 @@ pub const RedisMemory = struct {
             .password = config.password,
             .db_index = config.db_index,
             .key_prefix = config.key_prefix,
-            .ttl_seconds = config.ttl_seconds,
+            .ttl_secs = config.ttl_secs,
         };
 
         try self_.connect();
@@ -376,8 +376,8 @@ pub const RedisMemory = struct {
             resp.deinit(self_.allocator);
         }
 
-        // If ttl_seconds: EXPIRE {entry_key} {ttl}
-        if (self_.ttl_seconds) |ttl| {
+        // If ttl_secs: EXPIRE {entry_key} {ttl}
+        if (self_.ttl_secs) |ttl| {
             var ttl_buf: [12]u8 = undefined;
             const ttl_str = std.fmt.bufPrint(&ttl_buf, "{d}", .{ttl}) catch unreachable;
             resp = try self_.sendCommand(&.{ "EXPIRE", entry_key, ttl_str });

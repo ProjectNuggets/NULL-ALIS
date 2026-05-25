@@ -315,7 +315,7 @@ fn createRedis(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstanc
         .password = if (rcfg.password.len > 0) rcfg.password else null,
         .db_index = rcfg.db_index,
         .key_prefix = rcfg.key_prefix,
-        .ttl_seconds = if (rcfg.ttl_seconds > 0) rcfg.ttl_seconds else null,
+        .ttl_secs = if (rcfg.ttl_secs > 0) rcfg.ttl_secs else null,
     });
     impl_.owns_self = true;
     return .{ .memory = impl_.memory(), .session_store = null };
@@ -636,7 +636,7 @@ test "resolvePaths redis config is preserved" {
         .password = "pw",
         .db_index = 2,
         .key_prefix = "agent",
-        .ttl_seconds = 120,
+        .ttl_secs = 120,
     }, null);
 
     try std.testing.expect(cfg.redis_config != null);
@@ -645,7 +645,7 @@ test "resolvePaths redis config is preserved" {
     try std.testing.expectEqualStrings("pw", cfg.redis_config.?.password);
     try std.testing.expectEqual(@as(u8, 2), cfg.redis_config.?.db_index);
     try std.testing.expectEqualStrings("agent", cfg.redis_config.?.key_prefix);
-    try std.testing.expectEqual(@as(u32, 120), cfg.redis_config.?.ttl_seconds);
+    try std.testing.expectEqual(@as(u32, 120), cfg.redis_config.?.ttl_secs);
 }
 
 test "applyPostgresConnectTimeout uri appends query parameter" {

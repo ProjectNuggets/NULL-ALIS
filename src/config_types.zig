@@ -1,5 +1,25 @@
 const std = @import("std");
 
+// ── Time-unit suffix convention (v1.14.23 / WARN 3.C) ───────────
+//
+// All duration-bearing fields/keys/parameters MUST use one of the
+// following suffixes, never `_seconds`:
+//
+//   `_ns`    — nanoseconds, sub-second / programmatic durations
+//              (e.g. AUTH_WINDOW_DEADLINE_NS, READ_RETRY_SLEEP_NS)
+//   `_ms`    — milliseconds, sub-second / programmatic durations
+//              (e.g. DEFAULT_COMMAND_TIMEOUT_MS, timeout_ms)
+//   `_secs`  — seconds, human-scale durations
+//              (e.g. session_ttl_secs, idempotency_ttl_secs,
+//              ttl_secs, max_cpu_time_secs, uptime_secs,
+//              unix_secs, interval_secs)
+//
+// `_seconds` is forbidden — alphabetic + 4 extra chars for zero
+// information vs `_secs`. The historical drift (`_seconds` mixed
+// with `_secs` and `_ms`) was swept by the v1.14.23 Fix 2 commit;
+// any future addition must follow this convention or the reviewer
+// will block the PR.
+
 /// Default context token budget used by agent compaction/context management.
 /// Runtime fallback (`DEFAULT_CONTEXT_TOKENS`).
 pub const DEFAULT_AGENT_TOKEN_LIMIT: u64 = 12_000;
@@ -1011,7 +1031,7 @@ pub const MemoryRedisConfig = struct {
     password: []const u8 = "",
     db_index: u8 = 0,
     key_prefix: []const u8 = "nullalis",
-    ttl_seconds: u32 = 0, // 0 = no expiry
+    ttl_secs: u32 = 0, // 0 = no expiry (renamed v1.14.23 WARN 3.C)
 };
 
 pub const MemoryApiConfig = struct {
@@ -1320,7 +1340,7 @@ pub const ResourceLimitsConfig = struct {
     max_memory_mb: u32 = 512,
     max_cpu_percent: u32 = 80,
     max_disk_mb: u32 = 1024,
-    max_cpu_time_seconds: u64 = 60,
+    max_cpu_time_secs: u64 = 60,
     max_subprocesses: u32 = 10,
     memory_monitoring: bool = true,
 };

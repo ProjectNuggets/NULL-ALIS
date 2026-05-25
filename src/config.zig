@@ -1867,7 +1867,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.security.resources.max_memory_mb = 1024;
     cfg.security.resources.max_cpu_percent = 55;
     cfg.security.resources.max_disk_mb = 2048;
-    cfg.security.resources.max_cpu_time_seconds = 120;
+    cfg.security.resources.max_cpu_time_secs = 120;
     cfg.security.resources.max_subprocesses = 20;
     cfg.security.resources.memory_monitoring = false;
     cfg.security.audit.enabled = false;
@@ -2459,7 +2459,10 @@ test "json parse identity section" {
 // "json parse hardware section" test removed D19 (2026-04-25)
 // alongside HardwareConfig + the parser branch in config_parse.zig.
 
-test "json parse security section" {
+test "json parse security section (legacy max_cpu_time_seconds alias)" {
+    // v1.14.23 WARN 3.C: validates the back-compat alias path for
+    // pre-rename `max_cpu_time_seconds` key. New configs should use
+    // `max_cpu_time_secs` (covered by the test below).
     const allocator = std.testing.allocator;
     const json =
         \\{"security": {"sandbox": {"enabled": true, "backend": "firejail"}, "resources": {"max_memory_mb": 1024, "max_cpu_time_seconds": 120}, "audit": {"enabled": false, "log_path": "custom.log"}}}
@@ -2469,10 +2472,22 @@ test "json parse security section" {
     try std.testing.expect(cfg.security.sandbox.enabled.?);
     try std.testing.expectEqual(SandboxBackend.firejail, cfg.security.sandbox.backend);
     try std.testing.expectEqual(@as(u32, 1024), cfg.security.resources.max_memory_mb);
-    try std.testing.expectEqual(@as(u64, 120), cfg.security.resources.max_cpu_time_seconds);
+    try std.testing.expectEqual(@as(u64, 120), cfg.security.resources.max_cpu_time_secs);
     try std.testing.expect(!cfg.security.audit.enabled);
     try std.testing.expectEqualStrings("custom.log", cfg.security.audit.log_path);
     allocator.free(cfg.security.audit.log_path);
+}
+
+test "json parse security section (canonical max_cpu_time_secs)" {
+    // v1.14.23 WARN 3.C: canonical post-rename key. Both this and the
+    // _seconds legacy alias must populate the same field.
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"security": {"resources": {"max_cpu_time_secs": 240}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(u64, 240), cfg.security.resources.max_cpu_time_secs);
 }
 
 test "json parse browser section" {
