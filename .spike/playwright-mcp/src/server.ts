@@ -82,9 +82,47 @@ import {
 const SERVER_NAME = "nullalis-playwright-mcp";
 const SERVER_VERSION = "0.1.0";
 
+/** Shutdown timeout — past this we hard-exit even if Playwright is wedged. */
+const SHUTDOWN_TIMEOUT_MS = 5_000;
+
 function log(...parts: unknown[]): void {
   // Stderr only — stdout is reserved for the JSON-RPC channel.
   process.stderr.write(`[${SERVER_NAME}] ${parts.map(String).join(" ")}\n`);
+}
+
+/**
+ * Strip filesystem-revealing bits from an error message before it leaves the
+ * server. Playwright errors routinely embed absolute install paths
+ * (`/Users/nova/.../node_modules/playwright-core/lib/...`) which leak the
+ * server's filesystem layout, OS userid, and Node version — all of which help
+ * an attacker shape the next exploit on a multi-tenant deployment.
+ *
+ * We do TWO passes (Wave 3 review HIGH #3):
+ *   1. Collapse any `/.../node_modules/<pkg>/<path>` chain to `<node_modules>`.
+ *   2. Strip the server's install-path prefix when present.
+ * Exported so tests can pin the property.
+ */
+export function sanitizeErrorMessage(raw: string): string {
+  let out = raw;
+  // Pass 1: strip any absolute path that contains a /node_modules/ segment,
+  // including everything before AND after, down to a path-delimiting char.
+  // Replacement is a neutral token that contains neither "node_modules" nor
+  // any filesystem fragment.
+  out = out.replace(/\/[\w/.@~+-]*\/node_modules\/[\w/.@~+-]+/g, "<dep>");
+  // Pass 2: strip the project install-path prefix. We use process.cwd() as
+  // a best-effort prefix for "this server's filesystem root" — anything
+  // starting with cwd gets the prefix elided.
+  const cwd = process.cwd();
+  if (cwd && cwd.length > 1) {
+    out = out.split(cwd).join("<install-path>");
+    // Also strip a parent of cwd if the cwd is a worktree under a larger
+    // repo (the leak target tends to be the *outer* repo path).
+    const parent = cwd.replace(/\/[^/]+$/, "");
+    if (parent && parent.length > 1) {
+      out = out.split(parent).join("<install-path>");
+    }
+  }
+  return out;
 }
 
 interface ToolEntry {
@@ -172,7 +210,11 @@ async function dispatch(
         return textResult({ error: `unknown tool: ${name}` }, true);
     }
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const raw = err instanceof Error ? err.message : String(err);
+    // Wave 3 review HIGH #3: never leak raw filesystem paths to the agent.
+    // The raw message still goes to stderr for operator-side debugging.
+    const message = sanitizeErrorMessage(raw);
+    if (message !== raw) log(`[error sanitized]`, raw);
     return textResult({ error: message }, true);
   }
 }
@@ -244,13 +286,35 @@ async function main(): Promise<void> {
 
   const shutdown = async (signal: string): Promise<void> => {
     log(`received ${signal}, shutting down`);
-    try {
+    // Wave 3 review HIGH #4:
+    //   - Exit code MUST reflect success/failure so the orchestrator (k8s,
+    //     Docker) restarts on a real shutdown failure instead of treating it
+    //     as a clean exit.
+    //   - A wedged Chromium can hang server.close()/pool.shutdown() forever;
+    //     we Promise.race against a 5s cap and force-exit on timeout.
+    let shutdownError: unknown = null;
+    let timedOut = false;
+    const work = (async () => {
       await server.close();
       await pool.shutdown();
+    })();
+    const timeout = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        timedOut = true;
+        resolve();
+      }, SHUTDOWN_TIMEOUT_MS).unref?.();
+    });
+    try {
+      await Promise.race([work, timeout]);
     } catch (err) {
+      shutdownError = err;
       log(`shutdown error: ${err instanceof Error ? err.message : String(err)}`);
     }
-    process.exit(0);
+    if (timedOut) {
+      log(`shutdown exceeded ${SHUTDOWN_TIMEOUT_MS}ms, force-exiting`);
+      process.exit(1);
+    }
+    process.exit(shutdownError ? 1 : 0);
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));

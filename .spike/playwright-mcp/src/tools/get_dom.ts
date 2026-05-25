@@ -32,25 +32,30 @@ export async function getDom(
   args: GetDomArgs,
 ): Promise<GetDomResult> {
   const session_id = args.session_id ?? "default";
-  const { page } = await pool.getOrCreate(session_id);
-  let raw: string;
-  if (args.selector) {
-    raw =
-      (await page.locator(args.selector).evaluate((el) => (el as Element).outerHTML, undefined, {
-        timeout: 10_000,
-      })) ?? "";
-  } else {
-    raw = await page.evaluate(() => document.body?.outerHTML ?? "");
+  pool.beginCall(session_id);
+  try {
+    const { page } = await pool.getOrCreate(session_id);
+    let raw: string;
+    if (args.selector) {
+      raw =
+        (await page.locator(args.selector).evaluate((el) => (el as Element).outerHTML, undefined, {
+          timeout: 10_000,
+        })) ?? "";
+    } else {
+      raw = await page.evaluate(() => document.body?.outerHTML ?? "");
+    }
+    pool.touch(session_id);
+    const truncated = Buffer.byteLength(raw, "utf8") > DOM_CAP_BYTES;
+    let html = raw;
+    if (truncated) {
+      const enc = new TextEncoder();
+      const bytes = enc.encode(raw);
+      html = new TextDecoder("utf-8", { fatal: false }).decode(
+        bytes.slice(0, DOM_CAP_BYTES),
+      );
+    }
+    return { html, truncated };
+  } finally {
+    pool.endCall(session_id);
   }
-  pool.touch(session_id);
-  const truncated = Buffer.byteLength(raw, "utf8") > DOM_CAP_BYTES;
-  let html = raw;
-  if (truncated) {
-    const enc = new TextEncoder();
-    const bytes = enc.encode(raw);
-    html = new TextDecoder("utf-8", { fatal: false }).decode(
-      bytes.slice(0, DOM_CAP_BYTES),
-    );
-  }
-  return { html, truncated };
 }

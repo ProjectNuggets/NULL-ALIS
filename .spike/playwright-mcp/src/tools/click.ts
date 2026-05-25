@@ -33,8 +33,13 @@ export interface ClickResult {
 
 export async function click(pool: BrowserPool, args: ClickArgs): Promise<ClickResult> {
   const session_id = args.session_id ?? "default";
-  const { page } = await pool.getOrCreate(session_id);
-  await page.click(args.selector, { timeout: args.timeout_ms ?? 10_000 });
-  pool.touch(session_id);
-  return { clicked: true };
+  pool.beginCall(session_id);
+  try {
+    const { page } = await pool.getOrCreate(session_id);
+    await page.click(args.selector, { timeout: args.timeout_ms ?? 10_000 });
+    pool.touch(session_id);
+    return { clicked: true };
+  } finally {
+    pool.endCall(session_id);
+  }
 }

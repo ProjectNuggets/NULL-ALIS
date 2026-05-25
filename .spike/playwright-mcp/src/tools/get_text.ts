@@ -32,24 +32,29 @@ export async function getText(
   args: GetTextArgs,
 ): Promise<GetTextResult> {
   const session_id = args.session_id ?? "default";
-  const { page } = await pool.getOrCreate(session_id);
-  let raw: string;
-  if (args.selector) {
-    raw = (await page.locator(args.selector).innerText({ timeout: 10_000 })) ?? "";
-  } else {
-    raw = await page.evaluate(() => document.body?.innerText ?? "");
+  pool.beginCall(session_id);
+  try {
+    const { page } = await pool.getOrCreate(session_id);
+    let raw: string;
+    if (args.selector) {
+      raw = (await page.locator(args.selector).innerText({ timeout: 10_000 })) ?? "";
+    } else {
+      raw = await page.evaluate(() => document.body?.innerText ?? "");
+    }
+    pool.touch(session_id);
+    const truncated = Buffer.byteLength(raw, "utf8") > TEXT_CAP_BYTES;
+    // Truncate by character count first, then byte-trim to stay under cap.
+    let text = raw;
+    if (truncated) {
+      // Quick byte-aware truncation: slice until byte-length fits.
+      const enc = new TextEncoder();
+      const bytes = enc.encode(raw);
+      text = new TextDecoder("utf-8", { fatal: false }).decode(
+        bytes.slice(0, TEXT_CAP_BYTES),
+      );
+    }
+    return { text, truncated };
+  } finally {
+    pool.endCall(session_id);
   }
-  pool.touch(session_id);
-  const truncated = Buffer.byteLength(raw, "utf8") > TEXT_CAP_BYTES;
-  // Truncate by character count first, then byte-trim to stay under cap.
-  let text = raw;
-  if (truncated) {
-    // Quick byte-aware truncation: slice until byte-length fits.
-    const enc = new TextEncoder();
-    const bytes = enc.encode(raw);
-    text = new TextDecoder("utf-8", { fatal: false }).decode(
-      bytes.slice(0, TEXT_CAP_BYTES),
-    );
-  }
-  return { text, truncated };
 }

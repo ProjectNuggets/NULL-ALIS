@@ -37,6 +37,13 @@ interface SessionState {
   created_at: number;
   last_used: number;
   last_url: string | null;
+  /**
+   * In-flight tool calls against this session. The reaper refuses to reap a
+   * session while this is > 0 — otherwise a long-running call (wait_for with
+   * a big timeout, networkidle navigate on a slow site) gets a confusing
+   * "Target closed" error mid-call. Wave 3 review HIGH #8.
+   */
+  in_flight: number;
 }
 
 export interface BrowserPoolOptions {
@@ -56,6 +63,13 @@ export interface BrowserPoolOptions {
 export class BrowserPool {
   private browser: Browser | null = null;
   private readonly sessions = new Map<string, SessionState>();
+  /**
+   * In-flight counter for sessions that don't have a SessionState yet — the
+   * first tool call increments here before getOrCreate runs. We fold the
+   * value into SessionState.in_flight as soon as the slot exists. Wave 3
+   * review HIGH #8.
+   */
+  private readonly pendingCalls = new Map<string, number>();
   private readonly idle_timeout_ms: number;
   private readonly headless: boolean;
   private reaper_handle: NodeJS.Timeout | null = null;
@@ -135,15 +149,56 @@ export class BrowserPool {
     });
     const page = await context.newPage();
     const now = Date.now();
+    // Roll any pending in_flight counter (recorded by beginCall before the
+    // session existed) into the new SessionState.
+    const pending = this.pendingCalls.get(session_id) ?? 0;
+    if (pending > 0) this.pendingCalls.delete(session_id);
     const state: SessionState = {
       context,
       page,
       created_at: now,
       last_used: now,
       last_url: null,
+      in_flight: pending,
     };
     this.sessions.set(session_id, state);
     return { context, page };
+  }
+
+  /**
+   * Tool entry — increment the in-flight counter so the reaper doesn't sweep
+   * a session out from under a running call. Pair with `endCall` in a finally.
+   * Safe to call before `getOrCreate` (we lazy-create the slot if needed) so
+   * tools can wrap their entire body.
+   *
+   * Wave 3 review HIGH #8.
+   */
+  beginCall(session_id: string): void {
+    const s = this.sessions.get(session_id);
+    if (s) {
+      s.in_flight += 1;
+      return;
+    }
+    // Session not yet created — record the pending counter so the inevitable
+    // getOrCreate sees a non-zero in_flight. We don't allocate a SessionState
+    // yet; instead we stash a placeholder in pendingCalls and roll it in.
+    const prev = this.pendingCalls.get(session_id) ?? 0;
+    this.pendingCalls.set(session_id, prev + 1);
+  }
+
+  /** Tool exit — decrement. Safe to call even if the session was reaped. */
+  endCall(session_id: string): void {
+    const s = this.sessions.get(session_id);
+    if (s && s.in_flight > 0) {
+      s.in_flight -= 1;
+      return;
+    }
+    const pending = this.pendingCalls.get(session_id);
+    if (pending && pending > 0) {
+      const next = pending - 1;
+      if (next === 0) this.pendingCalls.delete(session_id);
+      else this.pendingCalls.set(session_id, next);
+    }
   }
 
   /** Update the last-URL tracker after a navigate. */
@@ -197,6 +252,11 @@ export class BrowserPool {
   async reapIdle(now: number = Date.now()): Promise<number> {
     let reaped = 0;
     for (const [session_id, s] of [...this.sessions.entries()]) {
+      // Wave 3 review HIGH #8: do NOT reap a session that's currently
+      // servicing a tool call. The reaper would otherwise destroy the
+      // BrowserContext mid-call (long wait_for, networkidle navigate on a
+      // slow site) and the agent would see a confusing "Target closed".
+      if (s.in_flight > 0) continue;
       if (now - s.last_used >= this.idle_timeout_ms) {
         await this.closeSession(session_id);
         reaped += 1;

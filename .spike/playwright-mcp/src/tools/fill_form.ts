@@ -39,12 +39,17 @@ export async function fillForm(
   args: FillFormArgs,
 ): Promise<FillFormResult> {
   const session_id = args.session_id ?? "default";
-  const { page } = await pool.getOrCreate(session_id);
-  let filled = 0;
-  for (const { selector, value } of args.fields) {
-    await page.locator(selector).fill(value, { timeout: 10_000 });
-    filled += 1;
+  pool.beginCall(session_id);
+  try {
+    const { page } = await pool.getOrCreate(session_id);
+    let filled = 0;
+    for (const { selector, value } of args.fields) {
+      await page.locator(selector).fill(value, { timeout: 10_000 });
+      filled += 1;
+    }
+    pool.touch(session_id);
+    return { filled };
+  } finally {
+    pool.endCall(session_id);
   }
-  pool.touch(session_id);
-  return { filled };
 }

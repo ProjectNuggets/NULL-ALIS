@@ -39,12 +39,17 @@ export async function waitFor(
   args: WaitForArgs,
 ): Promise<WaitForResult> {
   const session_id = args.session_id ?? "default";
-  const { page } = await pool.getOrCreate(session_id);
-  const start = Date.now();
-  await page.locator(args.selector).waitFor({
-    timeout: args.timeout_ms ?? 10_000,
-    state: args.state ?? "visible",
-  });
-  pool.touch(session_id);
-  return { found: true, ms_waited: Date.now() - start };
+  pool.beginCall(session_id);
+  try {
+    const { page } = await pool.getOrCreate(session_id);
+    const start = Date.now();
+    await page.locator(args.selector).waitFor({
+      timeout: args.timeout_ms ?? 10_000,
+      state: args.state ?? "visible",
+    });
+    pool.touch(session_id);
+    return { found: true, ms_waited: Date.now() - start };
+  } finally {
+    pool.endCall(session_id);
+  }
 }

@@ -36,9 +36,19 @@ export type RejectionReason =
   | "unspecified_address_blocked"
   | "reserved_address_blocked";
 
+/**
+ * Soft signals attached to ok-results. Currently the only one is
+ * "punycode_hostname" — the input host was non-ASCII (homograph / IDN) and
+ * was canonicalized to xn-- form by the URL parser. We don't block (the URL
+ * IS a valid public host) but we warn so the agent can flag visually-
+ * deceptive lookalikes to the user. Wave 3 review HIGH #9.
+ */
+export type SanitizeWarning = "punycode_hostname";
+
 export interface SanitizeOk {
   ok: true;
   url: URL;
+  warnings?: SanitizeWarning[];
 }
 
 export interface SanitizeReject {
@@ -223,11 +233,23 @@ export function sanitizeUrl(input: string): SanitizeResult {
 
   const { display, bareHost } = normalizeHost(parsed.hostname);
 
+  // Wave 3 review HIGH #9: detect Unicode-homograph hostnames. Node's URL
+  // parser canonicalizes Cyrillic 'а' → xn--exmple-4nf — visually deceptive
+  // for a user watching a screenshot. We don't block (it IS a valid public
+  // host) but we attach a `punycode_hostname` warning so callers can surface
+  // it. Each DNS label that starts with "xn--" came from a non-ASCII codepoint.
+  const warnings: SanitizeWarning[] = [];
+  if (bareHost.split(".").some((label) => label.startsWith("xn--"))) {
+    warnings.push("punycode_hostname");
+  }
+
   const allowlist = loadAllowlist();
   // Allowlist hits accept both the bracketed and bare forms so operators can
   // write `127.0.0.1` or `localhost` (or `[::1]`/`::1`) in the env var.
   if (allowlist.has(display) || allowlist.has(bareHost)) {
-    return { ok: true, url: parsed };
+    return warnings.length > 0
+      ? { ok: true, url: parsed, warnings }
+      : { ok: true, url: parsed };
   }
 
   // String-level checks first — these short-circuit before IP parsing for
@@ -257,14 +279,18 @@ export function sanitizeUrl(input: string): SanitizeResult {
         ? classifyIPv6(addr as InstanceType<typeof ipaddr.IPv6>)
         : classifyIPv4(addr as ipaddr.IPv4);
     if (verdict) return verdict;
-    return { ok: true, url: parsed };
+    return warnings.length > 0
+      ? { ok: true, url: parsed, warnings }
+      : { ok: true, url: parsed };
   }
 
   // Non-IP hostname that survived the alias checks: treat as public unicast.
   // DNS rebinding (a public hostname that resolves to RFC1918) is OUT OF SCOPE
   // for the string sanitizer — that's defended at the request layer via the
   // route interceptor installed by the BrowserPool (CRITICAL #4 in Wave 3).
-  return { ok: true, url: parsed };
+  return warnings.length > 0
+    ? { ok: true, url: parsed, warnings }
+    : { ok: true, url: parsed };
 }
 
 /** Human-readable error suitable for an MCP tool error response. */

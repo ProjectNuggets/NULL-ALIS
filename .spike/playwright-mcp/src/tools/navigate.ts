@@ -1,5 +1,5 @@
 import type { BrowserPool } from "../browser.js";
-import { rejectionMessage, sanitizeUrl } from "../sanitize.js";
+import { rejectionMessage, sanitizeUrl, type SanitizeWarning } from "../sanitize.js";
 
 export const navigateSchema = {
   type: "object",
@@ -33,6 +33,12 @@ export interface NavigateResult {
   status: number;
   final_url: string;
   title: string;
+  /**
+   * Soft signals from the sanitizer. Present only when non-empty so existing
+   * callers parsing the result aren't surprised. Wave 3 review HIGH #9:
+   * `punycode_hostname` flags visually-deceptive (homograph) hosts.
+   */
+  warnings?: SanitizeWarning[];
 }
 
 export async function navigate(
@@ -44,18 +50,27 @@ export async function navigate(
     throw new Error(rejectionMessage(sanitized));
   }
   const session_id = args.session_id ?? "default";
-  const { page } = await pool.getOrCreate(session_id);
-  const resp = await page.goto(sanitized.url.toString(), {
-    waitUntil: args.wait_until ?? "load",
-    timeout: 30_000,
-  });
-  // page.goto returns null for same-document navigations; surface 0 in that case
-  // so the agent can tell the difference from a real load.
-  const status = resp ? resp.status() : 0;
-  pool.noteUrl(session_id, page.url());
-  return {
-    status,
-    final_url: page.url(),
-    title: await page.title(),
-  };
+  pool.beginCall(session_id);
+  try {
+    const { page } = await pool.getOrCreate(session_id);
+    const resp = await page.goto(sanitized.url.toString(), {
+      waitUntil: args.wait_until ?? "load",
+      timeout: 30_000,
+    });
+    // page.goto returns null for same-document navigations; surface 0 in that case
+    // so the agent can tell the difference from a real load.
+    const status = resp ? resp.status() : 0;
+    pool.noteUrl(session_id, page.url());
+    const result: NavigateResult = {
+      status,
+      final_url: page.url(),
+      title: await page.title(),
+    };
+    if (sanitized.warnings && sanitized.warnings.length > 0) {
+      result.warnings = sanitized.warnings;
+    }
+    return result;
+  } finally {
+    pool.endCall(session_id);
+  }
 }
