@@ -107,10 +107,20 @@ jobs:
           echo "via the production-image-promotion environment."
 
   smoke:
-    # S3.4 — functional smoke on the just-built image.
-    # Pulls sha tag on linux/amd64, runs `nullalis version`, asserts exit 0
-    # and non-empty stdout. Cheap (~15 s) but proves the binary links,
-    # parses args, and exits cleanly on the deploy target arch.
+    # S3.4 — functional smoke on the just-built image (linux/amd64).
+    # Pulls sha tag on linux/amd64, runs `nullalis version` + renderer-chain
+    # probe (pandoc, marp, weasyprint, real PDF render) + brand-fonts
+    # existence check. Cheap (~30-45 s) but proves the binary links,
+    # parses args, exits cleanly, AND that the entire renderer + branding
+    # stack the Dockerfile composed actually works on the deploy target
+    # arch.
+    #
+    # v1.14.23 / Fix 1 (HIGH 5.A from holistic review): widened the smoke
+    # from `version` + `help` to the full renderer-chain probe the
+    # Dockerfile contains. Previously a regression in pip / npm / marp /
+    # weasyprint at run-time (versus build-time) could ship to customers
+    # — the build-time probe in `RUN` is layer-cached, the runtime probe
+    # here re-validates on every push.
     needs: build-and-publish
     runs-on: ubuntu-latest
     permissions:
@@ -161,10 +171,116 @@ jobs:
           fi
           echo "help dispatch OK"
 
+      - name: Smoke — renderer chain (pandoc + marp + weasyprint + PDF render)
+        # v1.14.23 Fix 1: mirror the Dockerfile's RUN-stage renderer probe at
+        # publish-time, on the actual published amd64 image. Catches the
+        # "wheel was cached at build time but missing at run time" class
+        # of regression. Identical structure to the arm64 smoke job below
+        # so a renderer regression on either arch fails publish.
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/amd64 \
+            --entrypoint /bin/sh \
+            "${{ needs.build-and-publish.outputs.sha_tag }}" -c '
+              set -eux
+              pandoc --version > /dev/null
+              marp --version > /dev/null
+              python3 -c "import pandas, openpyxl, weasyprint"
+              echo "# arm64-amd64 smoke probe" | pandoc -o /tmp/probe.pdf --pdf-engine=xelatex
+              test -s /tmp/probe.pdf
+              rm /tmp/probe.pdf
+              ls /usr/local/share/nullalis/branding/fonts/thmanyahsans/woff2/thmanyahsans-Regular.woff2 > /dev/null
+              echo "renderer chain + branding OK (amd64)"
+            '
+
       - name: Smoke summary
         run: |
-          echo "Smoke PASSED on ${{ needs.build-and-publish.outputs.sha_tag }}"
-          echo "Ready for :latest promotion (pending environment approval)."
+          echo "Smoke PASSED on ${{ needs.build-and-publish.outputs.sha_tag }} (linux/amd64)"
+          echo "Ready for :latest promotion (pending environment approval + arm64 smoke green)."
+
+  smoke-arm64:
+    # v1.14.23 Fix 1 (HIGH 5.A): peer-of-`smoke`, exercises the arm64
+    # variant of the multi-arch manifest. The build step publishes
+    # `linux/amd64,linux/arm64` but prior to this job only amd64 was
+    # smoke-tested — the arm64 image's pip / npm / marp-cli / chromium /
+    # texlive-xetex stack was NEVER exercised pre-publish, so a chromium-
+    # arm64 missing dependency, an arm64-incompatible wheel for
+    # weasyprint, or an arm64-only marp regression would slip through.
+    #
+    # Runner: `ubuntu-24.04-arm` — GitHub's native arm64 runners (no QEMU
+    # emulation, ~5-10 min cheaper than amd64+qemu). If GitHub deprecates
+    # or evicts this runner label, fallback path is to swap to
+    # `ubuntu-latest` and rely on `docker run --platform linux/arm64`
+    # under QEMU (slower, ~3-5x, but functionally equivalent).
+    #
+    # promote-latest now depends on BOTH smoke jobs — either one failing
+    # blocks the publish gate.
+    needs: build-and-publish
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      packages: read
+    steps:
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull sha image (linux/arm64)
+        run: docker pull --platform linux/arm64 "${{ needs.build-and-publish.outputs.sha_tag }}"
+
+      - name: Smoke — `nullalis version` on arm64
+        run: |
+          set -euo pipefail
+          out="$(docker run --rm --platform linux/arm64 \
+            --entrypoint nullalis \
+            "${{ needs.build-and-publish.outputs.sha_tag }}" version)"
+          echo "nullalis version (arm64) → ${out}"
+          if [ -z "${out}" ]; then
+            echo "::error::arm64 smoke failed — empty output from 'nullalis version'"
+            exit 1
+          fi
+
+      - name: Smoke — `nullalis help` on arm64
+        run: |
+          set -euo pipefail
+          out="$(docker run --rm --platform linux/arm64 \
+            --entrypoint nullalis \
+            "${{ needs.build-and-publish.outputs.sha_tag }}" help)"
+          echo "${out}" | head -5
+          if ! echo "${out}" | grep -q "gateway"; then
+            echo "::error::arm64 smoke failed — 'help' did not list 'gateway' subcommand"
+            exit 1
+          fi
+          echo "help dispatch OK (arm64)"
+
+      - name: Smoke — renderer chain on arm64 (pandoc + marp + weasyprint + PDF render)
+        # The canonical arm64 surface check: same probe the Dockerfile
+        # runs at build time, but against the published manifest's arm64
+        # variant on a native arm64 runner. Catches arch-conditional pip
+        # wheel failures, chromium-arm64 dynamic-library gaps, marp-cli
+        # arm64-incompatibility, and texlive-xetex arm64 packaging drift.
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/arm64 \
+            --entrypoint /bin/sh \
+            "${{ needs.build-and-publish.outputs.sha_tag }}" -c '
+              set -eux
+              pandoc --version > /dev/null
+              marp --version > /dev/null
+              python3 -c "import pandas, openpyxl, weasyprint"
+              echo "# arm64 smoke probe" | pandoc -o /tmp/probe.pdf --pdf-engine=xelatex
+              test -s /tmp/probe.pdf
+              rm /tmp/probe.pdf
+              ls /usr/local/share/nullalis/branding/fonts/thmanyahsans/woff2/thmanyahsans-Regular.woff2 > /dev/null
+              echo "renderer chain + branding OK (arm64)"
+            '
+
+      - name: arm64 smoke summary
+        run: |
+          echo "arm64 smoke PASSED on ${{ needs.build-and-publish.outputs.sha_tag }}"
+          echo "Both arch variants of the multi-arch manifest are renderer-verified."
 
   promote-latest:
     # S3.4 — manual-approval gate + explicit rollback path.
@@ -181,11 +297,11 @@ jobs:
     # → "Source: ghcr.io/.../null-alis:sha-" (empty suffix) → image
     # not found. To access another job's outputs, that job must be in
     # the `needs:` list explicitly.
-    needs: [build-and-publish, smoke]
+    needs: [build-and-publish, smoke, smoke-arm64]
     if: |
       always() &&
       (
-        (github.event_name == 'push' && github.ref_name == 'main' && needs.smoke.result == 'success')
+        (github.event_name == 'push' && github.ref_name == 'main' && needs.smoke.result == 'success' && needs.smoke-arm64.result == 'success')
         ||
         (github.event_name == 'workflow_dispatch' && github.event.inputs.rollback_to_sha != '')
       )
