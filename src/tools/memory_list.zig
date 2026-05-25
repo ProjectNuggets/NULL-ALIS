@@ -9,6 +9,8 @@ const MemoryCategory = mem_root.MemoryCategory;
 const zaki_state = @import("../zaki_state.zig");
 const supersede_filter = @import("supersede_filter.zig");
 
+const log = std.log.scoped(.memory_list);
+
 pub const MemoryListTool = struct {
     memory: ?Memory = null,
     /// V1.10-D — supersede filter binding. Without it, listing returns
@@ -53,7 +55,7 @@ pub const MemoryListTool = struct {
     pub fn execute(self: *MemoryListTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const m = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot list entries.", .{});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         const limit_raw = root.getInt(args, "limit") orelse 5;
@@ -80,8 +82,9 @@ pub const MemoryListTool = struct {
         defer supersede_filter.freeKeys(allocator, superseded_keys);
 
         const entries = m.list(allocator, category_opt, session_id_opt) catch |err| {
+            log.warn("memory_list list failed err={s}", .{@errorName(err)});
             const msg = try std.fmt.allocPrint(allocator, "Failed to list memory entries: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         defer mem_root.freeEntries(allocator, entries);
 
@@ -174,8 +177,9 @@ test "memory_list executes without backend" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "not configured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not configured") != null);
 }
 
 test "memory_list filters internal keys by default" {

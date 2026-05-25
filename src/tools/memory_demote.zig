@@ -34,6 +34,8 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const zaki_state = @import("../zaki_state.zig");
 
+const log = std.log.scoped(.memory_demote);
+
 pub const MemoryDemoteTool = struct {
     state_mgr: ?*zaki_state.Manager = null,
     user_id: ?i64 = null,
@@ -89,16 +91,17 @@ pub const MemoryDemoteTool = struct {
 
         const smgr = self.state_mgr orelse {
             const msg = try std.fmt.allocPrint(allocator, "Demote unavailable (no postgres state manager): {s}", .{key});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         const uid = self.user_id orelse {
             const msg = try std.fmt.allocPrint(allocator, "Demote unavailable (no tenant user_id): {s}", .{key});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         const demoted = smgr.demoteMemoryFromCore(uid, key, target) catch |err| {
+            log.warn("memory_demote failed user_id={d} key='{s}' target='{s}' err={s}", .{ uid, key, target, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "Failed to demote memory '{s}': {s}", .{ key, @errorName(err) });
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         if (demoted) {
@@ -143,8 +146,9 @@ test "memory_demote without state_mgr surfaces clear error" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "no postgres state manager") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "no postgres state manager") != null);
 }
 
 test "memory_demote missing key" {

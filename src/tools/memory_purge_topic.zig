@@ -6,6 +6,8 @@ const JsonObjectMap = root.JsonObjectMap;
 const mem_root = @import("../memory/root.zig");
 const Memory = mem_root.Memory;
 
+const log = std.log.scoped(.memory_purge_topic);
+
 /// Memory purge-topic tool — cleanup lever for already-accumulated pollution.
 ///
 /// When the agent has repeatedly hallucinated about a topic across prior turns,
@@ -103,14 +105,15 @@ pub const MemoryPurgeTopicTool = struct {
 
         const m = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot purge topic: {s}", .{topic});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         // Enumerate all entries (both scoped and global). List with no
         // category filter returns everything the backend has.
         const scoped = m.list(allocator, null, null) catch |err| {
+            log.warn("memory_purge_topic list failed topic='{s}' err={s}", .{ topic, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "Failed to enumerate memory: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         defer mem_root.freeEntries(allocator, scoped);
 

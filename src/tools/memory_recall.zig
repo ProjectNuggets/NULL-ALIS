@@ -11,6 +11,8 @@ const zaki_state = @import("../zaki_state.zig");
 const supersede_filter = @import("supersede_filter.zig");
 const text_norm = @import("../memory/text_norm.zig");
 
+const log = std.log.scoped(.memory_recall);
+
 // F-T1 (V1.14.6 SOTA context): per-result content cap. Each individual
 // memory_recall hit's content is capped at this many bytes (UTF-8-safe
 // truncation at codepoint boundary). Stops the firehose at the source.
@@ -106,7 +108,7 @@ pub const MemoryRecallTool = struct {
 
         const m = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot search for: {s}", .{query});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         // V1.10-D — fetch supersede skip-set once at the tool boundary.
@@ -121,8 +123,9 @@ pub const MemoryRecallTool = struct {
         // fall back to raw mem.recall() otherwise.
         if (self.mem_rt) |rt| {
             const candidates = rt.search(allocator, query, limit, session_id) catch |err| {
+                log.warn("memory_recall hybrid search failed query='{s}' err={s}", .{ query, @errorName(err) });
                 const msg = try std.fmt.allocPrint(allocator, "Failed to search memories for '{s}': {s}", .{ query, @errorName(err) });
-                return ToolResult{ .success = false, .output = msg };
+                return ToolResult{ .success = false, .error_msg = msg, .output = "" };
             };
             defer mem_root.retrieval.freeCandidates(allocator, candidates);
 
@@ -144,8 +147,9 @@ pub const MemoryRecallTool = struct {
         }
 
         const entries = m.recall(allocator, query, limit, session_id) catch |err| {
+            log.warn("memory_recall fallback recall failed query='{s}' err={s}", .{ query, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "Failed to recall memories for '{s}': {s}", .{ query, @errorName(err) });
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         defer mem_root.freeEntries(allocator, entries);
 
@@ -430,8 +434,9 @@ test "memory_recall executes without backend" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "not configured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not configured") != null);
 }
 
 test "memory_recall missing query" {

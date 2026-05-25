@@ -7,6 +7,8 @@ const mem_root = @import("../memory/root.zig");
 const SessionStore = mem_root.SessionStore;
 const MessageEntry = mem_root.MessageEntry;
 
+const log = std.log.scoped(.transcript_read);
+
 /// Transcript read — cold-memory deep-dive over persisted raw session messages.
 ///
 /// This is the "second line" recall path. First line is `memory_timeline`
@@ -140,12 +142,13 @@ pub const TranscriptReadTool = struct {
             return ToolResult.fail("No session_id provided and no current session context — cannot determine transcript to read.");
 
         const messages = store.loadMessages(allocator, resolved_session_id) catch |err| {
+            log.warn("transcript_read loadMessages failed session='{s}' err={s}", .{ resolved_session_id, @errorName(err) });
             const msg = try std.fmt.allocPrint(
                 allocator,
                 "Failed to load transcript for session '{s}': {s}",
                 .{ resolved_session_id, @errorName(err) },
             );
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         defer mem_root.freeMessages(allocator, messages);
 

@@ -10,6 +10,8 @@ const providers = @import("../providers/root.zig");
 const Provider = providers.Provider;
 const prose_judge = @import("prose_judge.zig");
 
+const log = std.log.scoped(.memory_maintain);
+
 /// V1.9-Rev finding #25 — escape a string for safe embedding inside
 /// a JSON string value. Caller frees the returned slice. All
 /// `next_consideration` strings in this tool are routed through
@@ -163,7 +165,7 @@ pub const MemoryMaintainTool = struct {
             return executeProseSurvey(allocator, smgr, uid, self.judge_provider, self.judge_model, args);
         } else {
             const msg = try std.fmt.allocPrint(allocator, "Unknown action '{s}'. Valid: cascade_update, invalidate_when, resolve_contradiction, propagate_correction, temporal_decay, survey, prose_survey.", .{action});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         }
     }
 
@@ -185,7 +187,7 @@ pub const MemoryMaintainTool = struct {
 
         var result = smgr.cascadeRenameEntity(allocator, uid, old_name, new_name) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "cascade_update failed: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         defer result.deinit(allocator);
 
@@ -225,7 +227,7 @@ pub const MemoryMaintainTool = struct {
 
         const closed = smgr.invalidateEdgesByPattern(uid, predicate, object_name, subject_name) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "invalidate_when failed: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         const next_consideration = if (closed > 0)
@@ -256,7 +258,7 @@ pub const MemoryMaintainTool = struct {
 
         const result = smgr.resolveContradiction(uid, loser_key, winner_key) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "resolve_contradiction failed: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         const next_consideration = if (result.loser_closed)
@@ -294,7 +296,7 @@ pub const MemoryMaintainTool = struct {
 
         var result = smgr.propagateCorrection(allocator, uid, correction_key, entity_pattern) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "propagate_correction failed: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         defer result.deinit(allocator);
 
@@ -348,7 +350,7 @@ pub const MemoryMaintainTool = struct {
 
         const result = smgr.temporalDecay(uid, threshold_days, half_life_days) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "temporal_decay failed: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         const next_consideration = if (result.rows_decayed > 0)
@@ -380,7 +382,7 @@ pub const MemoryMaintainTool = struct {
     ) !ToolResult {
         var result = smgr.surveyContradictions(allocator, uid) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "survey failed: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         defer result.deinit(allocator);
 
@@ -485,7 +487,7 @@ pub const MemoryMaintainTool = struct {
         // 1. Fetch matching prose facts.
         const facts = smgr.fetchProseFactsByPattern(allocator, uid, entity_pattern, max_facts) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "prose_survey fetch failed: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         defer mem_root.freeProseFacts(allocator, facts);
 
@@ -528,7 +530,7 @@ pub const MemoryMaintainTool = struct {
             facts,
         ) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "prose_survey judge failed: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         defer verdicts.deinit(allocator);
 

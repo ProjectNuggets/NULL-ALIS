@@ -5,6 +5,8 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const JsonValue = root.JsonValue;
 
+const log = std.log.scoped(.calculator);
+
 pub const CalculatorTool = struct {
     const MAX_EXACT_INTEGER: i64 = 9_007_199_254_740_991;
     const MAX_FIXED_NOTATION_ABS: f64 = 1_000_000_000_000.0;
@@ -44,27 +46,28 @@ pub const CalculatorTool = struct {
 
     pub fn execute(_: *CalculatorTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const operation = root.getString(args, "operation") orelse {
-            return ToolResult{ .success = false, .output = try std.fmt.allocPrint(allocator, "missing required parameter: operation", .{}) };
+            return ToolResult{ .success = false, .error_msg = try std.fmt.allocPrint(allocator, "missing required parameter: operation", .{}), .output = "" };
         };
 
         const values_arr = root.getArray(args, "values") orelse {
-            return ToolResult{ .success = false, .output = try std.fmt.allocPrint(allocator, "missing required parameter: values", .{}) };
+            return ToolResult{ .success = false, .error_msg = try std.fmt.allocPrint(allocator, "missing required parameter: values", .{}), .output = "" };
         };
 
         if (values_arr.len == 0) {
-            return ToolResult{ .success = false, .output = try std.fmt.allocPrint(allocator, "values array must not be empty", .{}) };
+            return ToolResult{ .success = false, .error_msg = try std.fmt.allocPrint(allocator, "values array must not be empty", .{}), .output = "" };
         }
 
         const values = extractValues(allocator, values_arr) catch |err| switch (err) {
             error.InvalidNumber, error.IntegerPrecisionLoss => {
-                return ToolResult{ .success = false, .output = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)}) };
+                return ToolResult{ .success = false, .error_msg = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)}), .output = "" };
             },
             else => return err,
         };
         defer allocator.free(values);
 
         const result = compute(allocator, operation, values, args) catch |err| {
-            return ToolResult{ .success = false, .output = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)}) };
+            log.warn("calculator compute failed op={s} err={s}", .{ operation, @errorName(err) });
+            return ToolResult{ .success = false, .error_msg = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)}), .output = "" };
         };
 
         return ToolResult{ .success = true, .output = result };
@@ -429,9 +432,10 @@ test "calculator divide by zero" {
     const parsed = try root.parseTestArgs("{\"operation\":\"divide\",\"values\":[10,0]}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer std.testing.allocator.free(result.output);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "DivisionByZero") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "DivisionByZero") != null);
 }
 
 test "calculator mod" {
@@ -451,9 +455,10 @@ test "calculator mod by zero" {
     const parsed = try root.parseTestArgs("{\"operation\":\"mod\",\"values\":[10,0]}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer std.testing.allocator.free(result.output);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "ModuloByZero") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "ModuloByZero") != null);
 }
 
 test "calculator pow" {
@@ -484,7 +489,8 @@ test "calculator sqrt negative" {
     const parsed = try root.parseTestArgs("{\"operation\":\"sqrt\",\"values\":[-4]}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer std.testing.allocator.free(result.output);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
 }
 
@@ -516,9 +522,10 @@ test "calculator log base rejects invalid base" {
     const parsed = try root.parseTestArgs("{\"operation\":\"log_base\",\"values\":[64,1]}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer std.testing.allocator.free(result.output);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "LogBaseInvalidBase") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "LogBaseInvalidBase") != null);
 }
 
 test "calculator ln" {
@@ -626,7 +633,8 @@ test "calculator stdev sample single value rejected" {
     const parsed = try root.parseTestArgs("{\"operation\":\"stdev_sample\",\"values\":[42]}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer std.testing.allocator.free(result.output);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
 }
 
@@ -691,7 +699,8 @@ test "calculator percentile missing rank" {
     const parsed = try root.parseTestArgs("{\"operation\":\"percentile\",\"values\":[1,2,3]}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer std.testing.allocator.free(result.output);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
 }
 
@@ -757,7 +766,8 @@ test "calculator missing operation" {
     const parsed = try root.parseTestArgs("{\"values\":[1,2]}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer std.testing.allocator.free(result.output);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
 }
 
@@ -767,7 +777,8 @@ test "calculator missing values" {
     const parsed = try root.parseTestArgs("{\"operation\":\"add\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer std.testing.allocator.free(result.output);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
 }
 
@@ -777,7 +788,8 @@ test "calculator unknown operation" {
     const parsed = try root.parseTestArgs("{\"operation\":\"fibonacci\",\"values\":[10]}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer std.testing.allocator.free(result.output);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
 }
 
@@ -787,7 +799,8 @@ test "calculator subtract wrong arg count" {
     const parsed = try root.parseTestArgs("{\"operation\":\"subtract\",\"values\":[10]}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer std.testing.allocator.free(result.output);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
 }
 
@@ -797,7 +810,8 @@ test "calculator empty values array" {
     const parsed = try root.parseTestArgs("{\"operation\":\"add\",\"values\":[]}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer std.testing.allocator.free(result.output);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
 }
 
@@ -807,7 +821,8 @@ test "calculator log zero" {
     const parsed = try root.parseTestArgs("{\"operation\":\"log\",\"values\":[0]}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer std.testing.allocator.free(result.output);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
 }
 
@@ -818,9 +833,10 @@ test "calculator invalid values return failed tool result" {
     const parsed = try root.parseTestArgs("{\"operation\":\"add\",\"values\":[1,\"oops\"]}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer std.testing.allocator.free(result.output);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expectEqualStrings("InvalidNumber", result.output);
+    try std.testing.expectEqualStrings("InvalidNumber", result.error_msg.?);
 }
 
 test "calculator rejects integers beyond exact float precision" {
@@ -830,9 +846,10 @@ test "calculator rejects integers beyond exact float precision" {
     const parsed = try root.parseTestArgs("{\"operation\":\"add\",\"values\":[9007199254740993,1]}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer std.testing.allocator.free(result.output);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expectEqualStrings("IntegerPrecisionLoss", result.output);
+    try std.testing.expectEqualStrings("IntegerPrecisionLoss", result.error_msg.?);
 }
 
 test "calculator median handles values beyond 1024 items" {
@@ -884,7 +901,8 @@ test "calculator rejects non-finite results" {
     const parsed = try root.parseTestArgs("{\"operation\":\"exp\",\"values\":[1000]}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer std.testing.allocator.free(result.output);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expectEqualStrings("ResultNotFinite", result.output);
+    try std.testing.expectEqualStrings("ResultNotFinite", result.error_msg.?);
 }

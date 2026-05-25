@@ -6,6 +6,8 @@ const JsonObjectMap = root.JsonObjectMap;
 const mem_root = @import("../memory/root.zig");
 const Memory = mem_root.Memory;
 
+const log = std.log.scoped(.memory_edit);
+
 /// Memory edit tool — explicitly updates an existing mutable memory by key.
 pub const MemoryEditTool = struct {
     memory: ?Memory = null,
@@ -55,7 +57,7 @@ pub const MemoryEditTool = struct {
 
         const m = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot edit: {s}", .{key});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         var lookup = try mem_root.lookupMemoryLifecycleEntry(allocator, m, key);
@@ -63,11 +65,11 @@ pub const MemoryEditTool = struct {
         switch (lookup.status) {
             .missing => {
                 const msg = try std.fmt.allocPrint(allocator, "No memory found with key: {s}", .{key});
-                return ToolResult{ .success = false, .output = msg };
+                return ToolResult{ .success = false, .error_msg = msg, .output = "" };
             },
             .protected => {
                 const msg = try std.fmt.allocPrint(allocator, "Memory key is not editable: {s}", .{key});
-                return ToolResult{ .success = false, .output = msg };
+                return ToolResult{ .success = false, .error_msg = msg, .output = "" };
             },
             .editable => {},
         }
@@ -79,8 +81,9 @@ pub const MemoryEditTool = struct {
         }
 
         m.store(existing.key, content, existing.category, existing.session_id) catch |err| {
+            log.warn("memory_edit store failed key='{s}' err={s}", .{ key, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "Failed to edit memory '{s}': {s}", .{ key, @errorName(err) });
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         if (self.mem_rt) |rt| {
@@ -132,6 +135,7 @@ test "memory_edit rejects missing key" {
     defer parsed.deinit();
     const result = try t.execute(allocator, parsed.value.object);
     defer if (result.output.len > 0) allocator.free(result.output);
+    defer if (result.error_msg) |em| allocator.free(em);
     try std.testing.expect(!result.success);
 }
 
@@ -149,5 +153,6 @@ test "memory_edit rejects system-managed key" {
     defer parsed.deinit();
     const result = try t.execute(allocator, parsed.value.object);
     defer if (result.output.len > 0) allocator.free(result.output);
+    defer if (result.error_msg) |em| allocator.free(em);
     try std.testing.expect(!result.success);
 }

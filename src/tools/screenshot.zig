@@ -5,6 +5,8 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 
+const log = std.log.scoped(.screenshot);
+
 /// Screenshot tool — capture the screen using platform-native commands.
 /// macOS: `screencapture -x FILE`
 /// Linux: `import FILE` (ImageMagick)
@@ -77,6 +79,7 @@ pub const ScreenshotTool = struct {
             return ToolResult{ .success = true, .output = msg };
         }
         const err_msg = try std.fmt.allocPrint(allocator, "Screenshot command failed: {s}", .{if (result.stderr.len > 0) result.stderr else "unknown error"});
+        log.warn("screenshot capture failed exit_code={?d} stderr_len={d}", .{ result.exit_code, result.stderr.len });
         return ToolResult{ .success = false, .output = "", .error_msg = err_msg };
     }
 };

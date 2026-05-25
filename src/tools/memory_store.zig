@@ -129,12 +129,13 @@ pub const MemoryStoreTool = struct {
 
         const m = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot store: {s} = {s}", .{ key, content });
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         m.store(key, content, category, session_id) catch |err| {
+            std.log.scoped(.memory_store).warn("memory_store inline path failed key='{s}' err={s}", .{ key, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "Failed to store memory '{s}': {s}", .{ key, @errorName(err) });
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         // Vector sync: embed and upsert. Surface the outcome to the agent
@@ -222,8 +223,9 @@ pub const MemoryStoreTool = struct {
             .memory_store_tool, // V1.14.12 (M1) — per-path telemetry tag
             0, // P3: not a boundary caller — no boundary ID
         ) catch |err| {
+            std.log.scoped(.memory_store).warn("memory_store unified pipeline failed subject='{s}' predicate='{s}' err={s}", .{ subject, predicate, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "Failed to store memory via unified pipeline: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         const verb = if (result.skipped_semantic_dup > 0)
@@ -294,9 +296,10 @@ test "memory_store executes without backend" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "not configured") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "lang") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not configured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "lang") != null);
 }
 
 test "memory_store missing key" {

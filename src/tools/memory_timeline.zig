@@ -8,6 +8,8 @@ const Memory = mem_root.Memory;
 const zaki_state = @import("../zaki_state.zig");
 const supersede_filter = @import("supersede_filter.zig");
 
+const log = std.log.scoped(.memory_timeline);
+
 pub const MemoryTimelineTool = struct {
     memory: ?Memory = null,
     mem_rt: ?*mem_root.MemoryRuntime = null,
@@ -72,7 +74,7 @@ pub const MemoryTimelineTool = struct {
         _ = self.mem_rt;
         const mem = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot browse timeline summaries.", .{});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         const filters = parseFilters(args) catch |err| return switch (err) {
@@ -520,8 +522,9 @@ test "memory_timeline executes without backend" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "not configured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not configured") != null);
 }
 
 test "memory_timeline returns recent summaries from index" {

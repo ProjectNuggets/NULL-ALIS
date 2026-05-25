@@ -6,6 +6,8 @@ const JsonObjectMap = root.JsonObjectMap;
 const mem_root = @import("../memory/root.zig");
 const Memory = mem_root.Memory;
 
+const log = std.log.scoped(.memory_forget);
+
 /// Memory forget tool — lets the agent delete a memory entry.
 /// When a MemoryRuntime is available, also cleans up the vector store.
 pub const MemoryForgetTool = struct {
@@ -52,26 +54,30 @@ pub const MemoryForgetTool = struct {
 
         const m = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot forget: {s}", .{key});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         var lookup = try mem_root.lookupMemoryLifecycleEntry(allocator, m, key);
         defer lookup.deinit(allocator);
         switch (lookup.status) {
             .missing => {
+                // Idempotent (matches the existing behavior). Caller-
+                // facing message stays in `output` because the call
+                // succeeded (nothing to do).
                 const msg = try std.fmt.allocPrint(allocator, "No memory found with key: {s}", .{key});
                 return ToolResult{ .success = true, .output = msg };
             },
             .protected => {
                 const msg = try std.fmt.allocPrint(allocator, "Memory key is not deletable: {s}", .{key});
-                return ToolResult{ .success = false, .output = msg };
+                return ToolResult{ .success = false, .error_msg = msg, .output = "" };
             },
             .editable => {},
         }
 
         const forgotten = m.forget(key) catch |err| {
+            log.warn("memory_forget delete failed key='{s}' err={s}", .{ key, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "Failed to forget memory '{s}': {s}", .{ key, @errorName(err) });
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         if (forgotten) {
@@ -110,8 +116,9 @@ test "memory_forget executes without backend" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "not configured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "not configured") != null);
 }
 
 test "memory_forget missing key" {
@@ -168,6 +175,7 @@ test "memory_forget rejects system-managed key" {
     defer parsed.deinit();
     const result = try t.execute(allocator, parsed.value.object);
     defer if (result.output.len > 0) allocator.free(result.output);
+    defer if (result.error_msg) |em| allocator.free(em);
     try std.testing.expect(!result.success);
 }
 

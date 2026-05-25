@@ -33,6 +33,8 @@ const mem_root = @import("../memory/root.zig");
 const Memory = mem_root.Memory;
 const zaki_state = @import("../zaki_state.zig");
 
+const log = std.log.scoped(.memory_archive);
+
 pub const MemoryArchiveTool = struct {
     memory: ?Memory = null,
     state_mgr: ?*zaki_state.Manager = null,
@@ -96,11 +98,11 @@ pub const MemoryArchiveTool = struct {
         // a clear error rather than silent fallback.
         const smgr = self.state_mgr orelse {
             const msg = try std.fmt.allocPrint(allocator, "Soft-delete unavailable (no postgres state manager). Use memory_forget for hard delete: {s}", .{key});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         const uid = self.user_id orelse {
             const msg = try std.fmt.allocPrint(allocator, "Soft-delete unavailable (no tenant user_id). Use memory_forget for hard delete: {s}", .{key});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         // Sanity: the row must exist + be deletable. lookupMemoryLifecycleEntry
@@ -115,7 +117,7 @@ pub const MemoryArchiveTool = struct {
                 },
                 .protected => {
                     const msg = try std.fmt.allocPrint(allocator, "Memory key is protected from archival: {s}", .{key});
-                    return ToolResult{ .success = false, .output = msg };
+                    return ToolResult{ .success = false, .error_msg = msg, .output = "" };
                 },
                 .editable => {},
             }
@@ -123,8 +125,9 @@ pub const MemoryArchiveTool = struct {
 
         const now = std.time.timestamp();
         smgr.setMemoryInvalidation(uid, key, now, now) catch |err| {
+            log.warn("memory_archive setMemoryInvalidation failed user_id={d} key='{s}' err={s}", .{ uid, key, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "Failed to archive memory '{s}': {s}", .{ key, @errorName(err) });
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         // V1.14.12 (Memory audit Finding 8 fix, 2026-05-19) — best-effort
@@ -161,8 +164,9 @@ test "memory_archive without state_mgr surfaces clear error" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "no postgres state manager") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "no postgres state manager") != null);
 }
 
 test "memory_archive missing key" {
