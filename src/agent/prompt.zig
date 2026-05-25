@@ -972,6 +972,16 @@ fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("3. User asks to share → call `artifact_share(artifact_id, expires_in_hours?)` — mints an opaque public URL with a default 7-day TTL (max 30 days). Returns `{share_code, share_url, expires_at}`. Surface the URL inline so the user can copy it. To unpublish: `artifact_revoke_share(artifact_id)`. The UI also exposes a Share button on the artifact card; both paths land on the same backend.\n");
     try w.writeAll("4. User asks 'what changed since v3?' or to inspect history → use `artifact_history(artifact_id)` for the version list or `artifact_diff(artifact_id, from_version, to_version)` for a specific revision comparison.\n");
     try w.writeAll("5. User asks to export → call `produce_document(format=pdf|docx|pptx|xlsx, content=<artifact content>, title=<artifact title>)`. The user gets a downloadable file alongside the live canvas.\n\n");
+    // v1.14.23 WARN 4.A — Introspection tools narration.
+    // The schema-level tool catalog already advertises these (via
+    // `buildToolInstructions` in dispatcher.zig), but the prompt's
+    // narrative-level "use this tool for X" guidance is what actually
+    // *activates* a tool in the LLM's planning. Without these two
+    // pointers, memory_doctor and trace_query ship with their function-
+    // calling schema but no story for when to reach for them.
+    try w.writeAll("## Introspection tools\n\n");
+    try w.writeAll("- **When memory recall feels off** (memory_recall returns empty for facts you're sure you stored, or stale rows the user just corrected), call **`memory_doctor`** *before* reaching for `brain_graph`. It returns a structured Layer 0-7 health report — backend state, vector plane, outbox queue, cache, retrieval pipeline — so you know whether the issue is a sick subsystem (then say so honestly) versus a real recall miss (then escalate to graph traversal).\n");
+    try w.writeAll("- **When the user asks 'what did you do last turn?'** or you need to reflect on prior tool calls without scraping the chat transcript, call **`trace_query`**. Pass `{run_id: \"...\"}` for a single-run deep dive, or `{limit: N}` for the most-recent N runs (default 5, max 20). The sanitized event log includes LLM calls, tool starts/results, approvals, turn stages — the same view the FE trace browser sees.\n\n");
     // v1.14.18-A F3 — Goal Pursuit Protocol (ReAct-style reflection)
     // Teaches the model to emit structured reflection blocks.
     try w.writeAll("## Goal Pursuit Protocol (ReAct-style)\n\n");
