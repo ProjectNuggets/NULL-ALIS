@@ -172,16 +172,23 @@ pub fn uploadMoonshotFile(
 }
 
 /// Parse the `id` field from the Moonshot upload response. Exposed for tests.
-/// Returns `error.ApiError` if the response body contains an `"error"` key
-/// (HTTP-200 with an embedded error object — Moonshot's pattern), else
+/// Returns `error.ApiError` if the response body contains a non-null `"error"`
+/// value (HTTP-200 with an embedded error object — Moonshot's pattern), else
 /// `error.InvalidResponse` if the body isn't a JSON object with a string `id`.
+///
+/// HIGH-1 (v1.14.23 review): we MUST check the error VALUE not just key
+/// presence. Some providers return `{"id":"file-1","error":null}` on success
+/// for symmetry — treating that as an error would silently degrade every
+/// upload to the text-note fallback.
 pub fn parseFileIdFromResponse(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
         return error.InvalidResponse;
     defer parsed.deinit();
 
     if (parsed.value != .object) return error.InvalidResponse;
-    if (parsed.value.object.get("error") != null) return error.ApiError;
+    if (parsed.value.object.get("error")) |err_val| {
+        if (err_val != .null) return error.ApiError;
+    }
 
     const id_val = parsed.value.object.get("id") orelse return error.InvalidResponse;
     if (id_val != .string) return error.InvalidResponse;
@@ -473,6 +480,27 @@ test "parseFileIdFromResponse surfaces API error object" {
     const allocator = std.testing.allocator;
     const body = "{\"error\":{\"message\":\"file too large\",\"type\":\"invalid_request_error\"}}";
     try std.testing.expectError(error.ApiError, parseFileIdFromResponse(allocator, body));
+}
+
+// HIGH-1 (v1.14.23 review): success responses with `"error":null` for shape
+// symmetry must NOT be misclassified as an API error. Pre-fix the parser
+// checked key presence; the fix checks the error VALUE for null.
+test "parseFileIdFromResponse accepts success body with explicit error:null" {
+    const allocator = std.testing.allocator;
+    const body = "{\"id\":\"file-1\",\"error\":null}";
+    const id = try parseFileIdFromResponse(allocator, body);
+    defer allocator.free(id);
+    try std.testing.expectEqualStrings("file-1", id);
+}
+
+test "parseFileIdFromResponse accepts richer success body with explicit error:null" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"id":"file-xyz","object":"file","bytes":42,"created_at":1700000000,"filename":"clip.mp4","purpose":"video","status":"ready","status_details":null,"error":null}
+    ;
+    const id = try parseFileIdFromResponse(allocator, body);
+    defer allocator.free(id);
+    try std.testing.expectEqualStrings("file-xyz", id);
 }
 
 test "parseFileIdFromResponse rejects malformed JSON" {
