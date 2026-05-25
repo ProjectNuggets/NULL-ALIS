@@ -13,12 +13,16 @@
 const std = @import("std");
 const metadata = @import("metadata.zig");
 
-// ── Registry of 57 production tools ──────────────────────────────────
+// ── Registry of 63 production tools ──────────────────────────────────
 
 pub const ALL_TOOLS = [_][]const u8{
     "artifact_create",
+    "artifact_diff",
     "artifact_get",
+    "artifact_history",
     "artifact_list",
+    "artifact_revoke_share",
+    "artifact_share",
     "artifact_update",
     "brain_graph",
     "browser",
@@ -56,6 +60,7 @@ pub const ALL_TOOLS = [_][]const u8{
     "image_generate",
     "memory_archive",
     "memory_demote",
+    "memory_doctor",
     "memory_edit",
     "memory_forget",
     "memory_list",
@@ -80,6 +85,7 @@ pub const ALL_TOOLS = [_][]const u8{
     "task_stop",
     "time_now",
     "todo",
+    "trace_query",
     "transcript_read",
     "web_fetch",
     "web_search",

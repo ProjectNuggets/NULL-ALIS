@@ -142,6 +142,21 @@ pub const artifact_create = @import("artifact_create.zig");
 pub const artifact_update = @import("artifact_update.zig");
 pub const artifact_get = @import("artifact_get.zig");
 pub const artifact_list = @import("artifact_list.zig");
+/// 2026-05-25 surface-audit close — agent-callable wrappers over the
+/// share/diff/history HTTP endpoints. Closes the §14.5-borderline gap
+/// where the prompt previously told the agent to narrate the share
+/// URL because no tool existed.
+pub const artifact_share = @import("artifact_share.zig");
+pub const artifact_revoke_share = @import("artifact_revoke_share.zig");
+pub const artifact_diff = @import("artifact_diff.zig");
+pub const artifact_history = @import("artifact_history.zig");
+/// 2026-05-25 surface-audit close — agent-side self-introspection
+/// over memory health (Layer 0-7 brain) and the bounded run-trace
+/// store. Previously reachable only via slash commands / HTTP / FE
+/// PowerUserSheet; the agent had zero ability to reflect on prior
+/// turn behavior from inside a turn.
+pub const memory_doctor = @import("memory_doctor.zig");
+pub const trace_query = @import("trace_query.zig");
 /// Wave 3B — extension_* tool family. Drives the user's connected
 /// browser via the extension's WebSocket. Registered conditionally on
 /// the runtime having an `ExtensionWsHub` available — standalone CLI
@@ -723,6 +738,48 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .risk_level = .low,
         .cost_class = .a,
     },
+    // 2026-05-25 surface-audit close — share/diff/history tools.
+    // share is mutating + medium risk because it publishes a
+    // publicly-accessible URL; the rest are read-only or pure
+    // revocation.
+    .{
+        .name = artifact_share.ArtifactShareTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+        .cost_class = .a,
+    },
+    .{
+        .name = artifact_revoke_share.ArtifactRevokeShareTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    },
+    .{
+        .name = artifact_diff.ArtifactDiffTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    },
+    .{
+        .name = artifact_history.ArtifactHistoryTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    },
+    // 2026-05-25 surface-audit close — memory_doctor + trace_query.
+    // Both read-only diagnostic tools; safe in every execution lane.
+    .{
+        .name = memory_doctor.MemoryDoctorTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    },
+    .{
+        .name = trace_query.TraceQueryTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    },
 
     // Wave 3B — extension_* family. Each entry drives the user's REAL
     // browser via the extension's WebSocket. Strictly interactive: never
@@ -1118,6 +1175,12 @@ pub fn allTools(
         /// (deny-by-default). Slice's storage must outlive the agent
         /// — the gateway-owned config block satisfies that.
         extension_browser_allowlist: []const []const u8 = &.{},
+        /// 2026-05-25 surface-audit close — when non-null, the
+        /// `trace_query` tool is bound to this in-process run trace
+        /// store. Standalone CLI deploys without a trace store (the
+        /// gateway always creates one) leave this null; the tool
+        /// surfaces a "not configured" error rather than crashing.
+        run_trace_store: ?*@import("../run_trace_store.zig").RunTraceStore = null,
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -1618,6 +1681,43 @@ pub fn allTools(
     alt.* = .{};
     try list.append(allocator, alt.tool());
 
+    // 2026-05-25 surface-audit close — share/diff/history tools. Each
+    // tool's state_mgr + user_id are wired via bindStateMgrTenant
+    // alongside the other artifact tools; un-bound calls surface a
+    // clean "tenant user not bound" error rather than crashing.
+    const ast = try allocator.create(artifact_share.ArtifactShareTool);
+    ast.* = .{};
+    try list.append(allocator, ast.tool());
+
+    const arst = try allocator.create(artifact_revoke_share.ArtifactRevokeShareTool);
+    arst.* = .{};
+    try list.append(allocator, arst.tool());
+
+    const adt = try allocator.create(artifact_diff.ArtifactDiffTool);
+    adt.* = .{};
+    try list.append(allocator, adt.tool());
+
+    const aht = try allocator.create(artifact_history.ArtifactHistoryTool);
+    aht.* = .{};
+    try list.append(allocator, aht.tool());
+
+    // 2026-05-25 surface-audit close — memory_doctor. mem_rt is wired
+    // alongside other memory_* tools via bindMemoryRuntime. Always
+    // registered; the tool degrades gracefully when mem_rt is null
+    // (standalone CLI / pre-tenant paths).
+    const mdoct = try allocator.create(memory_doctor.MemoryDoctorTool);
+    mdoct.* = .{};
+    try list.append(allocator, mdoct.tool());
+
+    // 2026-05-25 surface-audit close — trace_query. Bound to the
+    // in-process RunTraceStore via the new opts.run_trace_store
+    // option. Standalone CLI deploys (no gateway → no store) leave
+    // this null; the tool surfaces a "not configured" error rather
+    // than crashing.
+    const tqt = try allocator.create(trace_query.TraceQueryTool);
+    tqt.* = .{ .store = opts.run_trace_store };
+    try list.append(allocator, tqt.tool());
+
     // MCP tools (pre-initialized externally)
     if (opts.mcp_tools) |mt| {
         for (mt) |t| {
@@ -2077,6 +2177,12 @@ pub fn bindMemoryRuntime(tools: []const Tool, mem_rt: ?*memory_mod.MemoryRuntime
         } else if (t.vtable == &transcript_read.TranscriptReadTool.vtable) {
             const trt: *transcript_read.TranscriptReadTool = @ptrCast(@alignCast(t.ptr));
             trt.session_store = if (mem_rt) |rt| rt.session_store else null;
+        } else if (t.vtable == &memory_doctor.MemoryDoctorTool.vtable) {
+            // 2026-05-25 surface-audit close — memory_doctor inspects
+            // the same MemoryRuntime that the slash command + the
+            // diagnostics HTTP handler operate on.
+            const mt: *memory_doctor.MemoryDoctorTool = @ptrCast(@alignCast(t.ptr));
+            mt.mem_rt = mem_rt;
         }
     }
 }
@@ -2177,6 +2283,25 @@ pub fn bindStateMgrTenant(tools: []const Tool, state_mgr: ?*zaki_state.Manager, 
             const lt: *artifact_list.ArtifactListTool = @ptrCast(@alignCast(t.ptr));
             lt.state_mgr = state_mgr;
             lt.user_id = user_id;
+        } else if (t.vtable == &artifact_share.ArtifactShareTool.vtable) {
+            // 2026-05-25 surface-audit close — same tenant binding as
+            // the rest of the artifact_* family. setArtifactShare
+            // enforces ownership via the SQL WHERE clause.
+            const st: *artifact_share.ArtifactShareTool = @ptrCast(@alignCast(t.ptr));
+            st.state_mgr = state_mgr;
+            st.user_id = user_id;
+        } else if (t.vtable == &artifact_revoke_share.ArtifactRevokeShareTool.vtable) {
+            const rt: *artifact_revoke_share.ArtifactRevokeShareTool = @ptrCast(@alignCast(t.ptr));
+            rt.state_mgr = state_mgr;
+            rt.user_id = user_id;
+        } else if (t.vtable == &artifact_diff.ArtifactDiffTool.vtable) {
+            const dt: *artifact_diff.ArtifactDiffTool = @ptrCast(@alignCast(t.ptr));
+            dt.state_mgr = state_mgr;
+            dt.user_id = user_id;
+        } else if (t.vtable == &artifact_history.ArtifactHistoryTool.vtable) {
+            const ht: *artifact_history.ArtifactHistoryTool = @ptrCast(@alignCast(t.ptr));
+            ht.state_mgr = state_mgr;
+            ht.user_id = user_id;
         }
     }
 }
@@ -2800,7 +2925,9 @@ test "all tools includes extras when enabled" {
     // + wiki_link (V1.12 entity-mention extractor) = 46.
     // + produce_document (Wave 2A: first-class PDF/DOCX/XLSX/PPTX/HTML) = 47.
     // + 4 artifact_* (Wave 2C: canvas/artifacts backend) = 51.
-    try std.testing.expectEqual(@as(usize, 51), tools.len);
+    // + 4 artifact_share/revoke/diff/history + 2 memory_doctor/trace_query
+    //   (2026-05-25 surface-audit close) = 57.
+    try std.testing.expectEqual(@as(usize, 57), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -2831,7 +2958,9 @@ test "all tools excludes extras when disabled" {
     // + delegate + spawn (v1 default-on, B1 fix 2026-05-23) = 42
     // + produce_document (Wave 2A) = 43
     // + 4 artifact_* (Wave 2C) = 47
-    try std.testing.expectEqual(@as(usize, 47), tools.len);
+    // + 4 artifact_share/revoke/diff/history + 2 memory_doctor/trace_query
+    //   (2026-05-25 surface-audit close) = 53.
+    try std.testing.expectEqual(@as(usize, 53), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -2968,7 +3097,10 @@ test "all tools includes message when event bus is available" {
     // V1.12 added wiki_link (entity-mention extractor) → 40.
     // 2026-05-23 B1: delegate + spawn flipped on by default → 42.
     // Wave 2A: produce_document added (first-class PDF/DOCX/XLSX/PPTX/HTML) → 43.
-    try std.testing.expectEqual(@as(usize, 47), tools.len);
+    // Wave 2C: 4 artifact_* tools → 47.
+    // 2026-05-25 surface-audit close: +4 artifact_share/revoke/diff/history
+    // + 2 memory_doctor/trace_query → 53.
+    try std.testing.expectEqual(@as(usize, 53), tools.len);
 
     var found_message = false;
     for (tools) |t| {
@@ -3219,6 +3351,16 @@ test "defaultMetadataRegistry only whitelists expected background_safe tools" {
         // create + update variants are explicitly NOT background-safe
         // (mutating; require an authenticated turn context).
         "artifact_get", "artifact_list",
+        // 2026-05-25 surface-audit close — read-only artifact diff +
+        // history tools. Same posture as get + list: safe to run from
+        // a cron summary job. The mutating share + revoke_share
+        // variants are explicitly NOT here.
+        "artifact_diff", "artifact_history",
+        // 2026-05-25 surface-audit close — memory_doctor + trace_query
+        // are pure in-process diagnostics. Memory doctor inspects RAM
+        // counters + capabilities; trace_query reads a bounded RAM
+        // store. Both are safe to run from a scheduled lane.
+        "memory_doctor", "trace_query",
     };
 
     // Everything in the whitelist must be background_safe.

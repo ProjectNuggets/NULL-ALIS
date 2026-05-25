@@ -1573,6 +1573,10 @@ const TenantRuntime = struct {
             .policy = if (runtime.sec_policy) |*policy| policy else null,
             .subagent_manager = runtime.subagent_manager,
             .task_delivery = runtime.task_delivery,
+            // 2026-05-25 surface-audit close — wire trace_query to the
+            // tenant runtime's in-process RunTraceStore so the agent
+            // can read its own recent runs from inside a turn.
+            .run_trace_store = runtime.trace_store,
         }) catch &.{};
         errdefer if (builtin_tools.len > 0) tools_mod.deinitTools(allocator, builtin_tools);
 
