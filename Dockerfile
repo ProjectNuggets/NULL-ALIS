@@ -83,10 +83,59 @@ RUN apk add --no-cache \
       tzdata \
       postgresql-libs \
       poppler-utils \
-      pandoc
+      pandoc \
+      # ── produce_document renderer chain (D63) ─────────────────
+      # PDF: pandoc handles md→pdf via pdflatex/weasyprint fallback.
+      # Pull in weasyprint for the wkhtmltopdf-free path and texlive
+      # for pandoc's LaTeX engine.
+      py3-pip \
+      py3-cffi \
+      py3-cairo \
+      py3-brotli \
+      py3-pillow \
+      py3-tinycss2 \
+      py3-cssselect2 \
+      py3-pyphen \
+      pango \
+      harfbuzz \
+      fontconfig \
+      ttf-dejavu \
+      # XLSX renderer: pandas + openpyxl via pip
+      python3 \
+      py3-numpy \
+      # PPTX renderer: marp-cli via npm (Node.js)
+      nodejs \
+      npm \
+      # Headless chromium needed by marp-cli for slide rendering
+      chromium \
+      nss \
+      freetype \
+      ttf-freefont
 
 COPY --from=builder /app/zig-out/bin/nullalis /usr/local/bin/nullalis
 COPY --from=config /nullclaw-data /nullclaw-data
+
+# ── Renderer chain — pip + npm install (D63) ─────────────────
+# Install renderer deps in a single layer. `--break-system-packages` is
+# safe here: this is a single-purpose runtime image (PEP 668 protection
+# is meant for shared OS pythons, not container singletons).
+# Chromium path is exposed for marp-cli's --executablePath flag.
+RUN pip3 install --no-cache-dir --break-system-packages \
+        pandas \
+        openpyxl \
+        weasyprint && \
+    npm install -g --omit=dev @marp-team/marp-cli && \
+    # Cleanup npm cache to shrink layer
+    npm cache clean --force && \
+    # Verify the renderer chain is wired
+    pandoc --version > /dev/null && \
+    marp --version > /dev/null && \
+    python3 -c "import pandas, openpyxl, weasyprint" && \
+    echo "renderer chain ready"
+
+ENV CHROME_PATH=/usr/bin/chromium-browser
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
 ENV NULLCLAW_WORKSPACE=/nullclaw-data/workspace
 ENV HOME=/nullclaw-data
