@@ -553,6 +553,13 @@ pub const Agent = struct {
     /// fallback disabled (current-regression behavior: images silently
     /// dropped by text-only models).
     vision_fallback_model: []const u8 = "",
+    /// Opt-in gate for the provider Files-API video upload arc.
+    /// Default `false` until the live Moonshot endpoint contract is
+    /// smoke-probed end-to-end (see WARN-4 in v1.14.23 review). When
+    /// false, over-inline-cap videos fall back to the text-note path
+    /// even when an uploader is wired. Plumbed through to
+    /// `MultimodalConfig.experimental_video_upload`.
+    experimental_video_upload: bool = false,
     temperature: f64,
     /// Sidecar provider for cheap auxiliary LLM calls (narration, compaction).
     /// null = sidecar not configured, features degrade gracefully.
@@ -5341,6 +5348,7 @@ pub const Agent = struct {
         return multimodal.prepareMessagesForProvider(arena, m, .{
             .allowed_dirs = allowed,
             .provider_video_upload = uploader,
+            .experimental_video_upload = self.experimental_video_upload,
         });
     }
 

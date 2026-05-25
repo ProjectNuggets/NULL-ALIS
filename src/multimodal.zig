@@ -74,10 +74,19 @@ pub const MultimodalConfig = struct {
     /// (see `max_video_size_bytes`), so a second would overflow it.
     max_videos: u32 = 1,
     /// Hard cap on a single video's raw (pre-base64) byte size. Moonshot's
-    /// Files API caps individual uploads at 100 MB
-    /// (platform.kimi.ai/docs/api/files-upload, 2026-05-25). Larger videos
-    /// are skipped with a text note regardless of routing.
-    max_video_size_bytes: u64 = 104_857_600, // 100 MiB
+    /// Files API caps individual uploads at 100 MB (decimal).
+    ///
+    /// Source: platform.kimi.ai/docs/api/files-upload (verified 2026-05-25).
+    /// Moonshot's public docs and billing conventions express limits in
+    /// decimal MB (10^6 bytes), not binary MiB (2^20 bytes). Pre-v1.14.23
+    /// this value was `104_857_600` (100 MiB) which let files in the
+    /// 100 MB..104.8 MiB band pass local validation but get rejected
+    /// server-side — the user-facing fallback note then read "provider
+    /// upload failed" with no hint that it was a size issue.
+    ///
+    /// WARN-5 (v1.14.23 review): aligned with the provider's decimal cap.
+    /// Larger videos are skipped with a text note regardless of routing.
+    max_video_size_bytes: u64 = 100_000_000, // 100 MB (decimal, Moonshot docs)
     /// Threshold below which a video stays on the fast inline base64 path
     /// (no upload round-trip, no provider state). Sized so the base64-inflated
     /// payload (~33%) still fits comfortably in the OpenAI-compat
@@ -122,7 +131,20 @@ pub const MultimodalConfig = struct {
     /// note; on any other error it logs + falls back too. The turn never
     /// errors out from this path.
     provider_video_upload: ?VideoUploader = null,
+    /// Opt-in gate for the provider Files-API video upload arc. Default
+    /// `false` until the live Moonshot endpoint contract is smoke-probed
+    /// end-to-end (see WARN-4 in v1.14.23 review). When false,
+    /// `decideVideoRoute` ignores `provider_video_upload` even if wired
+    /// and falls back to the text-note path for over-inline-cap videos.
+    /// When operators flip this to `true` we log a one-shot warning
+    /// reminding them to verify the live API contract before broad
+    /// enablement.
+    experimental_video_upload: bool = false,
 };
+
+/// Flag flipped to true after the first time we observe an opted-in
+/// upload attempt. Used to log a one-shot reminder per process.
+var experimental_upload_warn_emitted = std.atomic.Value(bool).init(false);
 
 /// Callback contract for `MultimodalConfig.provider_video_upload`.
 /// `file_path` is an absolute path already validated by `resolveAllowedPath`.
@@ -484,6 +506,20 @@ fn decideVideoRoute(
     // Over inline cap, under hard cap — only the upload route is viable.
     if (config.provider_video_upload == null) {
         return .text_note_inline_oversize;
+    }
+    // WARN-4 (v1.14.23 review): the provider Files-API upload arc has
+    // not been smoke-probed against a live endpoint yet. Operators must
+    // explicitly opt in via `experimental_video_upload = true` before
+    // we'll route an over-inline-cap video through it. Until then the
+    // text-note fallback is the honest answer.
+    if (!config.experimental_video_upload) {
+        return .text_note_inline_oversize;
+    }
+    if (!experimental_upload_warn_emitted.swap(true, .monotonic)) {
+        log.warn(
+            "experimental_video_upload: routing an over-inline-cap video through the provider Files API — verify your provider's upload contract before broad enablement",
+            .{},
+        );
     }
     const mime = detectVideoMimeType(mime_buf[0..n_read]) orelse {
         return .text_note_unreadable;
@@ -1481,8 +1517,12 @@ test "imageFlowMetricsSnapshot tracks detected and prepared image parts" {
 test "MultimodalConfig video defaults" {
     const cfg = MultimodalConfig{};
     try std.testing.expectEqual(@as(u32, 1), cfg.max_videos);
-    // Hard cap matches Moonshot's per-file Files API limit (100 MB).
-    try std.testing.expectEqual(@as(u64, 104_857_600), cfg.max_video_size_bytes);
+    // Hard cap matches Moonshot's per-file Files API limit: 100 MB
+    // decimal (10^8 bytes), not 100 MiB. See WARN-5 in v1.14.23 review.
+    try std.testing.expectEqual(@as(u64, 100_000_000), cfg.max_video_size_bytes);
+    // Default opt-in flag: experimental Files-API upload arc is OFF until
+    // verified against a live Moonshot endpoint.
+    try std.testing.expectEqual(false, cfg.experimental_video_upload);
     // Inline base64 cap stays at 70 MiB so the encoded payload (+33%) fits
     // comfortably within the chat request body limit.
     try std.testing.expectEqual(@as(u64, 73_400_320), cfg.max_inline_video_size_bytes);
@@ -1863,6 +1903,9 @@ test "prepareMessagesForProvider routes over-inline-cap video through uploader" 
         .max_inline_video_size_bytes = 50,
         .max_video_size_bytes = 1000,
         .provider_video_upload = mock.uploader(),
+        // WARN-4 (v1.14.23 review): provider Files-API upload requires
+        // explicit opt-in until the live contract is smoke-probed.
+        .experimental_video_upload = true,
     });
 
     var saw_file_ref = false;
@@ -1888,6 +1931,61 @@ test "prepareMessagesForProvider routes over-inline-cap video through uploader" 
     // filename and is absolute.
     try std.testing.expect(std.fs.path.isAbsolute(mock.last_path.?));
     try std.testing.expect(std.mem.endsWith(u8, mock.last_path.?, "medium.mp4"));
+}
+
+// WARN-4 (v1.14.23 review): the upload arc is opt-in until the live
+// provider contract is verified. With a wired uploader but the default
+// flag (false), an over-inline-cap video MUST fall through to the
+// text-note path and the uploader MUST NOT be invoked.
+test "prepareMessagesForProvider does not call uploader when experimental_video_upload is false" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var buf: [100]u8 = undefined;
+    @memcpy(buf[0..12], "\x00\x00\x00\x18ftypisom");
+    @memset(buf[12..], 0);
+    try tmp_dir.dir.writeFile(.{ .sub_path = "medium.mp4", .data = &buf });
+    const dir_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "medium.mp4" });
+    defer std.testing.allocator.free(file_path);
+
+    var mock = VideoUploadMock{};
+
+    const arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_mut = arena_impl;
+    defer arena_mut.deinit();
+    const arena = arena_mut.allocator();
+
+    const content = try std.fmt.allocPrint(std.testing.allocator, "Analyze [VIDEO:{s}]", .{file_path});
+    defer std.testing.allocator.free(content);
+    var msgs = [_]ChatMessage{ChatMessage.user(content)};
+
+    const result = try prepareMessagesForProvider(arena, &msgs, .{
+        .allowed_dirs = &.{dir_path},
+        .max_inline_video_size_bytes = 50,
+        .max_video_size_bytes = 1000,
+        .provider_video_upload = mock.uploader(),
+        // experimental_video_upload defaults to false → text-note path.
+    });
+
+    var saw_file_ref = false;
+    var saw_inline_video = false;
+    var saw_note = false;
+    for (result[0].content_parts.?) |p| {
+        switch (p) {
+            .video_file_ref => saw_file_ref = true,
+            .video_base64 => saw_inline_video = true,
+            .text => |t| {
+                if (std.mem.indexOf(u8, t, "Video too large") != null) saw_note = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(!saw_file_ref);
+    try std.testing.expect(!saw_inline_video);
+    try std.testing.expect(saw_note);
+    // CRITICAL: the uploader must NOT have been invoked.
+    try std.testing.expect(!mock.invoked);
 }
 
 test "prepareMessagesForProvider small video still uses inline base64 even with uploader wired" {
@@ -2056,6 +2154,8 @@ test "prepareMessagesForProvider uploader failure falls back to text note" {
         .max_inline_video_size_bytes = 50,
         .max_video_size_bytes = 1000,
         .provider_video_upload = mock.uploader(),
+        // WARN-4 (v1.14.23): opt-in to exercise the upload-then-fail path.
+        .experimental_video_upload = true,
     });
 
     var saw_video = false;
