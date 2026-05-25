@@ -5332,9 +5332,94 @@ pub const Agent = struct {
         }
         const allowed = try allowed_dirs_list.toOwnedSlice(arena);
 
+        // Build the provider-side video uploader for default_provider when it
+        // exposes a wired Files API (Moonshot/Kimi for v1). On any setup miss
+        // (unknown provider, missing API key, etc.) we pass null and the
+        // multimodal loop falls back to the inline / text-note path.
+        const uploader = buildProviderVideoUploader(self, arena);
+
         return multimodal.prepareMessagesForProvider(arena, m, .{
             .allowed_dirs = allowed,
+            .provider_video_upload = uploader,
         });
+    }
+
+    /// Wire `multimodal.VideoUploader` for the agent's default provider when
+    /// possible. Returns null if no provider-files backend is wired or if
+    /// the credentials can't be resolved — multimodal.zig handles null
+    /// gracefully (over-inline videos fall back to the text-note path).
+    ///
+    /// Allocations land on `arena` so the closure context lives exactly as
+    /// long as the prepared-messages slice.
+    fn buildProviderVideoUploader(
+        self: *Agent,
+        arena: std.mem.Allocator,
+    ) ?multimodal.VideoUploader {
+        const file_upload = providers.file_upload;
+        const kind = file_upload.classifyForUpload(self.default_provider) orelse return null;
+
+        const api_key_opt: ?[]u8 = providers.resolveApiKeyFromConfig(
+            arena,
+            self.default_provider,
+            self.configured_providers,
+        ) catch null;
+        const api_key = api_key_opt orelse return null;
+        if (api_key.len == 0) return null;
+
+        // Prefer an operator-overridden base_url from the providers config;
+        // fall back to the factory's default for this provider name.
+        var base_url: ?[]const u8 = null;
+        for (self.configured_providers) |e| {
+            if (std.mem.eql(u8, e.name, self.default_provider)) {
+                base_url = e.base_url;
+                break;
+            }
+        }
+        const resolved_base_url = base_url orelse
+            providers.compatibleProviderUrl(self.default_provider) orelse return null;
+
+        switch (kind) {
+            .moonshot => {
+                const ctx = arena.create(MoonshotUploaderCtx) catch return null;
+                ctx.* = .{
+                    .api_key = api_key,
+                    .base_url = resolved_base_url,
+                };
+                return .{
+                    .ctx = @ptrCast(ctx),
+                    .upload = moonshotUploadAdapter,
+                };
+            },
+        }
+    }
+
+    const MoonshotUploaderCtx = struct {
+        api_key: []const u8,
+        base_url: []const u8,
+    };
+
+    /// VideoUploader.upload adapter for Moonshot. Bridges multimodal's
+    /// generic callback shape to providers/file_upload's typed API.
+    fn moonshotUploadAdapter(
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        file_path: []const u8,
+        media_type: []const u8,
+    ) anyerror![]u8 {
+        const c: *MoonshotUploaderCtx = @ptrCast(@alignCast(ctx));
+        _ = media_type; // unused — Moonshot infers from file bytes
+        const filename = std.fs.path.basename(file_path);
+        const file_id = try providers.file_upload.uploadMoonshotFile(
+            allocator,
+            c.api_key,
+            c.base_url,
+            file_path,
+            filename,
+            .video,
+            null,
+        );
+        defer allocator.free(file_id);
+        return providers.file_upload.formatMoonshotRef(allocator, file_id);
     }
 
     /// Returns true if any message in the slice has image content_parts.
@@ -5358,7 +5443,7 @@ pub const Agent = struct {
         for (messages) |msg| {
             const parts = msg.content_parts orelse continue;
             for (parts) |part| switch (part) {
-                .video_base64 => return true,
+                .video_base64, .video_file_ref => return true,
                 else => {},
             };
         }
@@ -5413,7 +5498,7 @@ pub const Agent = struct {
             const parts = msg.content_parts orelse continue;
             var has_video = false;
             for (parts) |p| {
-                if (p == .video_base64) {
+                if (p == .video_base64 or p == .video_file_ref) {
                     has_video = true;
                     break;
                 }
@@ -5422,7 +5507,7 @@ pub const Agent = struct {
 
             var kept: std.ArrayListUnmanaged(providers.ContentPart) = .empty;
             for (parts) |p| {
-                if (p == .video_base64) {
+                if (p == .video_base64 or p == .video_file_ref) {
                     stripped = true;
                     continue;
                 }

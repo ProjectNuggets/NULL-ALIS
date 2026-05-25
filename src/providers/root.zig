@@ -23,6 +23,7 @@ pub const scrub = @import("scrub.zig");
 pub const api_key = @import("api_key.zig");
 pub const factory = @import("factory.zig");
 pub const helpers = @import("helpers.zig");
+pub const file_upload = @import("file_upload.zig");
 
 // Re-exports from scrub.zig
 pub const scrubSecretPatterns = scrub.scrubSecretPatterns;
@@ -88,6 +89,7 @@ pub const ContentPart = union(enum) {
     image_url: ImageUrl,
     image_base64: ImageBase64,
     video_base64: VideoBase64,
+    video_file_ref: VideoFileRef,
 
     pub const ImageUrl = struct {
         url: []const u8,
@@ -118,6 +120,29 @@ pub const ContentPart = union(enum) {
         data: []const u8,
         media_type: []const u8,
     };
+
+    /// Reference to a video that lives on the provider's file storage rather
+    /// than being inlined as base64. Used for videos that exceed the
+    /// base64-inline cap (the OpenAI-compat chat request body itself caps out
+    /// around 100 MB, and base64 inflates payload ~33%). Multimodal upload
+    /// path (`multimodal.MultimodalConfig.provider_video_upload`) uploads the
+    /// raw bytes via the provider's Files API, then constructs this part.
+    ///
+    /// `url` is the fully-formed scheme-prefixed reference the provider
+    /// expects in `video_url.url`:
+    /// - Moonshot/Kimi: `ms://<file_id>` (`ms://` is Moonshot's storage scheme)
+    /// - (future) Gemini: `gs://<bucket>/<object>` via its File API
+    /// - (future) OpenAI: a `file_id` is referenced via a distinct `file`
+    ///   content-part type, not `video_url`; that wiring is not done here.
+    ///
+    /// Serialized by Moonshot/Kimi & OpenAI-compat providers as:
+    /// `{"type":"video_url","video_url":{"url":"<url>"}}`.
+    /// Other providers (Anthropic, Gemini today) degrade to text placeholders
+    /// — mirrors the `video_base64` policy.
+    pub const VideoFileRef = struct {
+        url: []const u8,
+        media_type: []const u8,
+    };
 };
 
 /// Create a text content part.
@@ -138,6 +163,11 @@ pub fn makeBase64ImagePart(data: []const u8, media_type: []const u8) ContentPart
 /// Create a base64-encoded video content part.
 pub fn makeBase64VideoPart(data: []const u8, media_type: []const u8) ContentPart {
     return .{ .video_base64 = .{ .data = data, .media_type = media_type } };
+}
+
+/// Create a provider-storage video reference part (e.g. Moonshot `ms://<id>`).
+pub fn makeVideoFileRefPart(url: []const u8, media_type: []const u8) ContentPart {
+    return .{ .video_file_ref = .{ .url = url, .media_type = media_type } };
 }
 
 /// Roles a message can have in a conversation.

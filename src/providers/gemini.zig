@@ -774,6 +774,22 @@ fn buildChatRequestBody(
                         try buf.appendSlice(allocator, vid.data);
                         try buf.appendSlice(allocator, "\"}}");
                     },
+                    .video_file_ref => |ref| {
+                        // Gemini has its own File API (`gs://...` / `files/...`
+                        // via `fileData`) that does NOT share Moonshot's
+                        // `ms://` scheme. We only wire Moonshot uploads here
+                        // (multimodal.zig MultimodalConfig.provider_video_upload),
+                        // so any video_file_ref reaching the Gemini branch is
+                        // a routing miss — degrade to a text placeholder.
+                        try buf.appendSlice(allocator, "{\"text\":");
+                        var text_buf: std.ArrayListUnmanaged(u8) = .empty;
+                        defer text_buf.deinit(allocator);
+                        try text_buf.appendSlice(allocator, "[Video: ");
+                        try text_buf.appendSlice(allocator, ref.url);
+                        try text_buf.appendSlice(allocator, "]");
+                        try root.appendJsonString(&buf, allocator, text_buf.items);
+                        try buf.append(allocator, '}');
+                    },
                 }
             }
         } else {

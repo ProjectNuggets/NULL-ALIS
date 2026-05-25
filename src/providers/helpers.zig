@@ -342,6 +342,15 @@ pub fn serializeContentPart(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem
             try buf.appendSlice(allocator, vid.data);
             try buf.appendSlice(allocator, "\"}}");
         },
+        .video_file_ref => |ref| {
+            // Provider-storage reference (e.g. Moonshot `ms://<file_id>`).
+            // Same shape as `video_base64` but the URL is the provider's
+            // storage scheme rather than a base64 data URI. The URL is
+            // JSON-escaped — it travels verbatim into the request.
+            try buf.appendSlice(allocator, "{\"type\":\"video_url\",\"video_url\":{\"url\":");
+            try json_util.appendJsonString(buf, allocator, ref.url);
+            try buf.appendSlice(allocator, "}}");
+        },
     }
 }
 

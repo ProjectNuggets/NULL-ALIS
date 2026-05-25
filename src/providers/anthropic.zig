@@ -466,15 +466,17 @@ fn serializeAnthropicContent(
                     }
                     try buf.append(allocator, '}');
                 },
-                .video_base64 => {
+                .video_base64, .video_file_ref => {
                     // The Anthropic Messages API has no video content block —
-                    // emit a text placeholder, never raw video bytes.
+                    // emit a text placeholder, never raw video bytes or a
+                    // foreign provider's storage URL.
                     //
-                    // multimodal.zig constructs video_base64 parts (P3b) and
-                    // the agent's `routeVideoForModel` (P3c) strips them for
-                    // non-video-capable models. Anthropic has no native video
-                    // even on its vision-capable models, so this arm is the
-                    // final safety net should a video part still reach here.
+                    // multimodal.zig constructs video_base64 / video_file_ref
+                    // parts (P3b + provider-files upload path) and the agent's
+                    // `routeVideoForModel` (P3c) strips them for non-video-
+                    // capable models. Anthropic has no native video even on
+                    // its vision-capable models, so this arm is the final
+                    // safety net should a video part still reach here.
                     try buf.appendSlice(allocator, "{\"type\":\"text\",\"text\":");
                     try root.appendJsonString(buf, allocator, "[video omitted: this model has no native video support]");
                     if (cache_breakpoint and is_last) {

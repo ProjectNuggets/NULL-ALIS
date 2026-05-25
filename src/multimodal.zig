@@ -73,12 +73,19 @@ pub const MultimodalConfig = struct {
     /// Default 1: one max-size video already nears the provider body cap
     /// (see `max_video_size_bytes`), so a second would overflow it.
     max_videos: u32 = 1,
-    /// Cap on a single video's raw (pre-base64) byte size. Moonshot/Kimi's
-    /// request body limit is 100 MB and base64 inflates the payload ~33%,
-    /// so raw video must stay under ~70 MB to fit once encoded. Over-cap
-    /// videos are skipped (a text note replaces them); the provider's
-    /// large-file upload API is not wired here.
-    max_video_size_bytes: u64 = 73_400_320, // 70 MiB
+    /// Hard cap on a single video's raw (pre-base64) byte size. Moonshot's
+    /// Files API caps individual uploads at 100 MB
+    /// (platform.kimi.ai/docs/api/files-upload, 2026-05-25). Larger videos
+    /// are skipped with a text note regardless of routing.
+    max_video_size_bytes: u64 = 104_857_600, // 100 MiB
+    /// Threshold below which a video stays on the fast inline base64 path
+    /// (no upload round-trip, no provider state). Sized so the base64-inflated
+    /// payload (~33%) still fits comfortably in the OpenAI-compat
+    /// chat-completions request body cap. Over this threshold but under
+    /// `max_video_size_bytes`, the multimodal loop tries the provider's file
+    /// upload API (see `provider_video_upload`); if that's not wired or fails,
+    /// the over-cap text-note fallback kicks in.
+    max_inline_video_size_bytes: u64 = 73_400_320, // 70 MiB
     /// Allow passing remote image URLs (`https://...`) through to providers
     /// as an `image_url` content part. Disabled by default for
     /// secure-by-default behavior.
@@ -96,6 +103,40 @@ pub const MultimodalConfig = struct {
     /// Directories from which local image reads are allowed.
     /// If empty, all local file reads are rejected (only URLs pass through).
     allowed_dirs: []const []const u8 = &.{},
+    /// Optional provider-side video upload callback. When set, videos that
+    /// exceed `max_inline_video_size_bytes` (but stay within
+    /// `max_video_size_bytes`) are uploaded via the provider's Files API
+    /// and the returned reference URL (e.g. `ms://<file_id>` for Moonshot)
+    /// becomes a `video_file_ref` content part instead of an inline
+    /// `video_base64` part. Null = no upload backend wired; over-inline
+    /// videos fall back to the text-note path (existing behavior).
+    ///
+    /// The callback owns its own allocator state and must return an owned
+    /// slice — multimodal.zig dupes it onto the arena and the callback's
+    /// slice can be freed immediately after return. `ctx` is the opaque
+    /// pointer the agent stashed at config-build time (typically a pointer
+    /// to a tiny struct holding api_key + base_url + provider_name).
+    ///
+    /// The callback may fail (network error, API rejection, etc.). On
+    /// `error.NotImplemented` the multimodal loop falls back to the text
+    /// note; on any other error it logs + falls back too. The turn never
+    /// errors out from this path.
+    provider_video_upload: ?VideoUploader = null,
+};
+
+/// Callback contract for `MultimodalConfig.provider_video_upload`.
+/// `file_path` is an absolute path already validated by `resolveAllowedPath`.
+/// `media_type` is the sniffed container MIME (e.g. `video/mp4`).
+/// Returns an owned slice with the full reference URL to drop into a
+/// `video_file_ref` content part (e.g. `"ms://file-abc123"` for Moonshot).
+pub const VideoUploader = struct {
+    ctx: *anyopaque,
+    upload: *const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        file_path: []const u8,
+        media_type: []const u8,
+    ) anyerror![]u8,
 };
 
 pub const default_config = MultimodalConfig{};
@@ -390,6 +431,68 @@ fn readVideoFromFile(allocator: std.mem.Allocator, file: std.fs.File, max_size: 
     const mime = detectVideoMimeType(data) orelse return error.UnknownVideoFormat;
 
     return .{ .data = data, .mime_type = mime };
+}
+
+/// Routing decision for a local video reference. Computed by reading only
+/// the file's stat + first 32 bytes (for mime sniffing) so the slurp-and-
+/// base64 work is deferred to the path that actually uses it.
+pub const VideoRoute = union(enum) {
+    /// File fits the inline base64 path — caller should read + encode.
+    inline_base64: struct { size: u64 },
+    /// File exceeds inline cap but fits the hard cap and an uploader is
+    /// wired — caller should invoke `provider_video_upload`.
+    upload: struct { resolved_path: []const u8, mime: []const u8, size: u64 },
+    /// File exceeds inline cap, no uploader wired.
+    text_note_inline_oversize,
+    /// File exceeds the hard cap (Moonshot's 100 MB ceiling).
+    text_note_hard_oversize,
+    /// File can't be opened / stat'd / mime-sniffed (path security,
+    /// missing file, unknown container).
+    text_note_unreadable,
+};
+
+/// Decide how to route a local video reference without slurping its bytes.
+/// `arena` is used only for path-resolution allocations (the resolved_path
+/// slice returned in the upload route is arena-owned).
+fn decideVideoRoute(
+    arena: std.mem.Allocator,
+    ref: []const u8,
+    config: MultimodalConfig,
+) !VideoRoute {
+    const resolved = resolveAllowedPath(arena, ref, config) catch {
+        return .text_note_unreadable;
+    };
+
+    const file = std.fs.openFileAbsolute(resolved, .{}) catch {
+        return .text_note_unreadable;
+    };
+    // We only need stat + magic-byte sniff; close immediately after.
+    var mime_buf: [32]u8 = undefined;
+    const stat = file.stat() catch {
+        file.close();
+        return .text_note_unreadable;
+    };
+    const n_read = file.read(&mime_buf) catch 0;
+    file.close();
+
+    if (stat.size > config.max_video_size_bytes) {
+        return .text_note_hard_oversize;
+    }
+    if (stat.size <= config.max_inline_video_size_bytes) {
+        return .{ .inline_base64 = .{ .size = stat.size } };
+    }
+    // Over inline cap, under hard cap — only the upload route is viable.
+    if (config.provider_video_upload == null) {
+        return .text_note_inline_oversize;
+    }
+    const mime = detectVideoMimeType(mime_buf[0..n_read]) orelse {
+        return .text_note_unreadable;
+    };
+    return .{ .upload = .{
+        .resolved_path = resolved,
+        .mime = mime,
+        .size = stat.size,
+    } };
 }
 
 fn readFromFile(allocator: std.mem.Allocator, file: std.fs.File, max_size: u64) !ImageData {
@@ -696,34 +799,86 @@ pub fn prepareMessagesForProvider(
                     .media_type = data_uri.mime_type,
                 } });
             } else if (isHttpUrl(ref) or isHttpsUrl(ref)) {
-                // Moonshot/Kimi accepts video only as a base64 data URI, never
-                // as a plain URL — so a remote video URL cannot be forwarded.
+                // Moonshot/Kimi accepts video only as a base64 data URI or a
+                // provider-storage reference (`ms://<file_id>` after upload);
+                // plain external URLs are never forwarded verbatim.
                 const note = try std.fmt.allocPrint(
                     arena,
-                    "[Remote video URLs are not supported (provider requires base64 video): {s}]",
+                    "[Remote video URLs are not supported (provider requires base64 video or uploaded file_id): {s}]",
                     .{display_ref},
                 );
                 try parts.append(arena, .{ .text = note });
             } else {
-                // Local file — read, size-check, base64 encode.
-                const vid = readLocalVideo(arena, ref, config) catch |err| {
-                    log.warn("failed to read video '{s}': {}", .{ ref, err });
-                    const note = if (err == error.VideoTooLarge)
-                        try std.fmt.allocPrint(arena, "[Video too large: {s} — exceeds {d} MB cap, skipped]", .{ display_ref, video_cap_mb })
-                    else
-                        try std.fmt.allocPrint(arena, "[Failed to load video: {s}]", .{display_ref});
+                // Local file — three-stage routing:
+                //   1. Under the inline cap → fast base64 path (default).
+                //   2. Over inline but under hard cap, uploader wired →
+                //      stream raw bytes to provider Files API, attach as
+                //      `video_file_ref` (e.g. `ms://<file_id>`).
+                //   3. Otherwise → text-note fallback.
+                const route = decideVideoRoute(arena, ref, config) catch |err| {
+                    log.warn("video route resolution failed for '{s}': {}", .{ ref, err });
+                    const note = try std.fmt.allocPrint(arena, "[Failed to load video: {s}]", .{display_ref});
                     try parts.append(arena, .{ .text = note });
                     continue;
                 };
-                const b64 = encodeBase64(arena, vid.data) catch {
-                    const note = try std.fmt.allocPrint(arena, "[Failed to encode video: {s}]", .{display_ref});
-                    try parts.append(arena, .{ .text = note });
-                    continue;
-                };
-                try parts.append(arena, .{ .video_base64 = .{
-                    .data = b64,
-                    .media_type = vid.mime_type,
-                } });
+                switch (route) {
+                    .inline_base64 => |info| {
+                        const vid = readLocalVideo(arena, ref, config) catch |err| {
+                            log.warn("failed to read video '{s}': {}", .{ ref, err });
+                            const note = try std.fmt.allocPrint(arena, "[Failed to load video: {s}]", .{display_ref});
+                            try parts.append(arena, .{ .text = note });
+                            continue;
+                        };
+                        _ = info;
+                        const b64 = encodeBase64(arena, vid.data) catch {
+                            const note = try std.fmt.allocPrint(arena, "[Failed to encode video: {s}]", .{display_ref});
+                            try parts.append(arena, .{ .text = note });
+                            continue;
+                        };
+                        try parts.append(arena, .{ .video_base64 = .{
+                            .data = b64,
+                            .media_type = vid.mime_type,
+                        } });
+                    },
+                    .upload => |info| {
+                        const uploader = config.provider_video_upload.?;
+                        const file_ref_url = uploader.upload(uploader.ctx, arena, info.resolved_path, info.mime) catch |err| {
+                            log.warn("provider video upload failed for '{s}': {}", .{ ref, err });
+                            const note = try std.fmt.allocPrint(
+                                arena,
+                                "[Video too large for inline send and provider upload failed: {s} — exceeds {d} MB inline cap, upload error: {s}]",
+                                .{ display_ref, config.max_inline_video_size_bytes / (1024 * 1024), @errorName(err) },
+                            );
+                            try parts.append(arena, .{ .text = note });
+                            continue;
+                        };
+                        try parts.append(arena, .{ .video_file_ref = .{
+                            .url = file_ref_url,
+                            .media_type = info.mime,
+                        } });
+                    },
+                    .text_note_inline_oversize => {
+                        const inline_cap_mb = config.max_inline_video_size_bytes / (1024 * 1024);
+                        const note = try std.fmt.allocPrint(
+                            arena,
+                            "[Video too large: {s} — exceeds {d} MB inline cap and no provider upload backend is wired]",
+                            .{ display_ref, inline_cap_mb },
+                        );
+                        try parts.append(arena, .{ .text = note });
+                    },
+                    .text_note_hard_oversize => {
+                        const note = try std.fmt.allocPrint(
+                            arena,
+                            "[Video too large: {s} — exceeds {d} MB hard cap, skipped]",
+                            .{ display_ref, video_cap_mb },
+                        );
+                        try parts.append(arena, .{ .text = note });
+                    },
+                    .text_note_unreadable => {
+                        const note = try std.fmt.allocPrint(arena, "[Failed to load video: {s}]", .{display_ref});
+                        try parts.append(arena, .{ .text = note });
+                    },
+                }
             }
         }
 
@@ -1326,7 +1481,12 @@ test "imageFlowMetricsSnapshot tracks detected and prepared image parts" {
 test "MultimodalConfig video defaults" {
     const cfg = MultimodalConfig{};
     try std.testing.expectEqual(@as(u32, 1), cfg.max_videos);
-    try std.testing.expectEqual(@as(u64, 73_400_320), cfg.max_video_size_bytes);
+    // Hard cap matches Moonshot's per-file Files API limit (100 MB).
+    try std.testing.expectEqual(@as(u64, 104_857_600), cfg.max_video_size_bytes);
+    // Inline base64 cap stays at 70 MiB so the encoded payload (+33%) fits
+    // comfortably within the chat request body limit.
+    try std.testing.expectEqual(@as(u64, 73_400_320), cfg.max_inline_video_size_bytes);
+    try std.testing.expect(cfg.provider_video_upload == null);
 }
 
 test "detectVideoMimeType mp4 (ftyp/isom)" {
@@ -1628,4 +1788,307 @@ test "prepareMessagesForProvider exceeds max_videos emits note" {
     }
     try std.testing.expectEqual(@as(usize, 1), video_count);
     try std.testing.expect(saw_limit_note);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Provider video upload routing tests
+//
+// These tests exercise the three-stage local-file route in
+// `prepareMessagesForProvider`:
+//   1. Small video (under inline cap) → base64 `video_base64` part (fast
+//      path, no callback fired even if one is wired).
+//   2. Medium video (over inline cap, under hard cap, uploader wired) →
+//      `video_file_ref` part with the uploader-returned URL.
+//   3. Medium video without uploader → text-note fallback (preserved).
+//   4. Over-hard-cap video → text-note (upload path also rejected).
+//
+// The "uploader" is a captures-everything-in-a-struct mock so we don't
+// touch the network.
+// ────────────────────────────────────────────────────────────────────────────
+
+const VideoUploadMock = struct {
+    invoked: bool = false,
+    last_path: ?[]const u8 = null,
+    last_mime: ?[]const u8 = null,
+    return_url: []const u8 = "ms://mock-file-id",
+    return_error: ?anyerror = null,
+
+    fn upload(
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        file_path: []const u8,
+        media_type: []const u8,
+    ) anyerror![]u8 {
+        const self: *VideoUploadMock = @ptrCast(@alignCast(ctx));
+        self.invoked = true;
+        // Copy onto the arena so the test can read them after the call.
+        self.last_path = try allocator.dupe(u8, file_path);
+        self.last_mime = try allocator.dupe(u8, media_type);
+        if (self.return_error) |e| return e;
+        return try allocator.dupe(u8, self.return_url);
+    }
+
+    fn uploader(self: *VideoUploadMock) VideoUploader {
+        return .{ .ctx = @ptrCast(self), .upload = upload };
+    }
+};
+
+test "prepareMessagesForProvider routes over-inline-cap video through uploader" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    // 100-byte mp4 — over the 50-byte inline cap configured below, under
+    // the 1000-byte hard cap, so the upload route applies.
+    var buf: [100]u8 = undefined;
+    @memcpy(buf[0..12], "\x00\x00\x00\x18ftypisom");
+    @memset(buf[12..], 0);
+    try tmp_dir.dir.writeFile(.{ .sub_path = "medium.mp4", .data = &buf });
+    const dir_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "medium.mp4" });
+    defer std.testing.allocator.free(file_path);
+
+    var mock = VideoUploadMock{};
+
+    const arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_mut = arena_impl;
+    defer arena_mut.deinit();
+    const arena = arena_mut.allocator();
+
+    const content = try std.fmt.allocPrint(std.testing.allocator, "Analyze [VIDEO:{s}]", .{file_path});
+    defer std.testing.allocator.free(content);
+    var msgs = [_]ChatMessage{ChatMessage.user(content)};
+
+    const result = try prepareMessagesForProvider(arena, &msgs, .{
+        .allowed_dirs = &.{dir_path},
+        .max_inline_video_size_bytes = 50,
+        .max_video_size_bytes = 1000,
+        .provider_video_upload = mock.uploader(),
+    });
+
+    var saw_file_ref = false;
+    var saw_inline_video = false;
+    for (result[0].content_parts.?) |p| {
+        switch (p) {
+            .video_file_ref => |ref| {
+                saw_file_ref = true;
+                try std.testing.expectEqualStrings("ms://mock-file-id", ref.url);
+                try std.testing.expectEqualStrings("video/mp4", ref.media_type);
+            },
+            .video_base64 => saw_inline_video = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_file_ref);
+    try std.testing.expect(!saw_inline_video);
+    try std.testing.expect(mock.invoked);
+    try std.testing.expectEqualStrings("video/mp4", mock.last_mime.?);
+    // The path passed to the uploader is the realpath-resolved absolute path,
+    // not the raw marker text. We can't predict the platform's canonical
+    // form (macOS prepends /private/), so just verify it ends with the
+    // filename and is absolute.
+    try std.testing.expect(std.fs.path.isAbsolute(mock.last_path.?));
+    try std.testing.expect(std.mem.endsWith(u8, mock.last_path.?, "medium.mp4"));
+}
+
+test "prepareMessagesForProvider small video still uses inline base64 even with uploader wired" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    // 12-byte mp4 — fits the default inline cap, fast path applies.
+    try tmp_dir.dir.writeFile(.{ .sub_path = "tiny.mp4", .data = "\x00\x00\x00\x18ftypisom" });
+    const dir_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "tiny.mp4" });
+    defer std.testing.allocator.free(file_path);
+
+    var mock = VideoUploadMock{};
+
+    const arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_mut = arena_impl;
+    defer arena_mut.deinit();
+    const arena = arena_mut.allocator();
+
+    const content = try std.fmt.allocPrint(std.testing.allocator, "Watch [VIDEO:{s}]", .{file_path});
+    defer std.testing.allocator.free(content);
+    var msgs = [_]ChatMessage{ChatMessage.user(content)};
+
+    const result = try prepareMessagesForProvider(arena, &msgs, .{
+        .allowed_dirs = &.{dir_path},
+        .provider_video_upload = mock.uploader(),
+        // Default inline cap (70 MiB) > 12 bytes, so inline path is chosen.
+    });
+
+    var saw_inline_video = false;
+    var saw_file_ref = false;
+    for (result[0].content_parts.?) |p| {
+        switch (p) {
+            .video_base64 => saw_inline_video = true,
+            .video_file_ref => saw_file_ref = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_inline_video);
+    try std.testing.expect(!saw_file_ref);
+    // CRITICAL: the uploader must NOT have been invoked — the fast path
+    // explicitly bypasses it.
+    try std.testing.expect(!mock.invoked);
+}
+
+test "prepareMessagesForProvider over-inline-cap video without uploader falls back to text note" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var buf: [100]u8 = undefined;
+    @memcpy(buf[0..12], "\x00\x00\x00\x18ftypisom");
+    @memset(buf[12..], 0);
+    try tmp_dir.dir.writeFile(.{ .sub_path = "medium.mp4", .data = &buf });
+    const dir_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "medium.mp4" });
+    defer std.testing.allocator.free(file_path);
+
+    const arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_mut = arena_impl;
+    defer arena_mut.deinit();
+    const arena = arena_mut.allocator();
+
+    const content = try std.fmt.allocPrint(std.testing.allocator, "Inspect [VIDEO:{s}]", .{file_path});
+    defer std.testing.allocator.free(content);
+    var msgs = [_]ChatMessage{ChatMessage.user(content)};
+
+    const result = try prepareMessagesForProvider(arena, &msgs, .{
+        .allowed_dirs = &.{dir_path},
+        .max_inline_video_size_bytes = 50,
+        .max_video_size_bytes = 1000,
+        // No provider_video_upload set — must fall back to text note.
+    });
+
+    var saw_video = false;
+    var saw_note = false;
+    for (result[0].content_parts.?) |p| {
+        switch (p) {
+            .video_base64, .video_file_ref => saw_video = true,
+            .text => |t| {
+                if (std.mem.indexOf(u8, t, "Video too large") != null and
+                    std.mem.indexOf(u8, t, "no provider upload backend") != null)
+                {
+                    saw_note = true;
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(!saw_video);
+    try std.testing.expect(saw_note);
+}
+
+test "prepareMessagesForProvider over-hard-cap video skipped even with uploader" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var buf: [200]u8 = undefined;
+    @memcpy(buf[0..12], "\x00\x00\x00\x18ftypisom");
+    @memset(buf[12..], 0);
+    try tmp_dir.dir.writeFile(.{ .sub_path = "huge.mp4", .data = &buf });
+    const dir_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "huge.mp4" });
+    defer std.testing.allocator.free(file_path);
+
+    var mock = VideoUploadMock{};
+
+    const arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_mut = arena_impl;
+    defer arena_mut.deinit();
+    const arena = arena_mut.allocator();
+
+    const content = try std.fmt.allocPrint(std.testing.allocator, "Process [VIDEO:{s}]", .{file_path});
+    defer std.testing.allocator.free(content);
+    var msgs = [_]ChatMessage{ChatMessage.user(content)};
+
+    const result = try prepareMessagesForProvider(arena, &msgs, .{
+        .allowed_dirs = &.{dir_path},
+        .max_inline_video_size_bytes = 50,
+        .max_video_size_bytes = 100, // 200-byte file exceeds this.
+        .provider_video_upload = mock.uploader(),
+    });
+
+    var saw_video = false;
+    var saw_hard_cap_note = false;
+    for (result[0].content_parts.?) |p| {
+        switch (p) {
+            .video_base64, .video_file_ref => saw_video = true,
+            .text => |t| {
+                if (std.mem.indexOf(u8, t, "exceeds 0 MB hard cap") != null) saw_hard_cap_note = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(!saw_video);
+    try std.testing.expect(saw_hard_cap_note);
+    // The uploader should NOT have been invoked — the hard cap is checked
+    // before the upload route is even considered.
+    try std.testing.expect(!mock.invoked);
+}
+
+test "prepareMessagesForProvider uploader failure falls back to text note" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var buf: [100]u8 = undefined;
+    @memcpy(buf[0..12], "\x00\x00\x00\x18ftypisom");
+    @memset(buf[12..], 0);
+    try tmp_dir.dir.writeFile(.{ .sub_path = "medium.mp4", .data = &buf });
+    const dir_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "medium.mp4" });
+    defer std.testing.allocator.free(file_path);
+
+    var mock = VideoUploadMock{ .return_error = error.UploadFailed };
+
+    const arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_mut = arena_impl;
+    defer arena_mut.deinit();
+    const arena = arena_mut.allocator();
+
+    const content = try std.fmt.allocPrint(std.testing.allocator, "Try [VIDEO:{s}]", .{file_path});
+    defer std.testing.allocator.free(content);
+    var msgs = [_]ChatMessage{ChatMessage.user(content)};
+
+    const result = try prepareMessagesForProvider(arena, &msgs, .{
+        .allowed_dirs = &.{dir_path},
+        .max_inline_video_size_bytes = 50,
+        .max_video_size_bytes = 1000,
+        .provider_video_upload = mock.uploader(),
+    });
+
+    var saw_video = false;
+    var saw_upload_failed_note = false;
+    for (result[0].content_parts.?) |p| {
+        switch (p) {
+            .video_base64, .video_file_ref => saw_video = true,
+            .text => |t| {
+                if (std.mem.indexOf(u8, t, "provider upload failed") != null and
+                    std.mem.indexOf(u8, t, "UploadFailed") != null)
+                {
+                    saw_upload_failed_note = true;
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(!saw_video);
+    try std.testing.expect(saw_upload_failed_note);
+    try std.testing.expect(mock.invoked);
+}
+
+test "serializeContentPart emits a video_url with ms:// url for video_file_ref" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    const part = providers.ContentPart{ .video_file_ref = .{
+        .url = "ms://file-abc123",
+        .media_type = "video/mp4",
+    } };
+    try @import("providers/helpers.zig").serializeContentPart(&buf, allocator, part);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"video_url\",\"video_url\":{\"url\":\"ms://file-abc123\"}}",
+        buf.items,
+    );
 }
