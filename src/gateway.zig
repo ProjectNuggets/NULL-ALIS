@@ -11406,6 +11406,17 @@ const SHARE_MAX_HOURS: i64 = 720;
 /// Default TTL when the caller omits `expires_in_hours`.
 const SHARE_DEFAULT_HOURS: i64 = 168; // 7 days
 
+/// D64 (Wave 2 code-review MEDIUM #1) — per-user share-spam cap.
+/// A live share holds a TraceShare record + two HashMap entries plus
+/// duped key/value buffers. A user spinning up thousands of runs and
+/// sharing each could blow the in-memory store. 100 live shares per
+/// user matches realistic power-user behavior (one share per project
+/// per week ≈ 50/year) with 2× headroom. Hitting the cap returns
+/// 429 to the caller, who must revoke an existing share to free a
+/// slot. Counted live (not lifetime) — expired/revoked records don't
+/// count toward the cap and are evicted opportunistically below.
+const MAX_LIVE_SHARES_PER_USER: usize = 100;
+
 /// One published-share record. All strings are owned by the parent
 /// `TraceShareStore` allocator and freed on `deinit`.
 const TraceShare = struct {
@@ -11492,6 +11503,11 @@ const TraceShareStore = struct {
     /// LIVE share already exists for the same pair, returns the
     /// existing record (idempotent 409). Expired or revoked records do
     /// NOT block re-share — they're swept and replaced.
+    ///
+    /// Returns `error.ShareLimitReached` if the caller already has
+    /// `MAX_LIVE_SHARES_PER_USER` live (non-revoked, non-expired)
+    /// shares. Idempotent re-share of an existing live record is
+    /// NEVER blocked by the cap (the share already counts toward it).
     fn createOrGet(
         self: *TraceShareStore,
         user_id: []const u8,
@@ -11544,6 +11560,25 @@ const TraceShareStore = struct {
             }
             // key_buf is intentionally NOT reassigned — it's still valid
             // and will be installed as the new by_owner key below.
+        }
+
+        // D64 — per-user share-spam cap. Count live (non-revoked,
+        // non-expired) shares for this user. The check is done HERE,
+        // after the idempotent-re-share short-circuit above, so a
+        // user re-sharing their 100th run isn't penalized. Iteration
+        // is O(N) over the store; at our scale this is fine — the
+        // total share count is bounded by users × cap and we hold the
+        // mutex anyway.
+        var live_count: usize = 0;
+        var live_it = self.by_code.iterator();
+        while (live_it.next()) |entry| {
+            const rec = entry.value_ptr.*;
+            if (std.mem.eql(u8, rec.user_id, user_id) and rec.isLive(now_unix)) {
+                live_count += 1;
+                if (live_count >= MAX_LIVE_SHARES_PER_USER) {
+                    return error.ShareLimitReached;
+                }
+            }
         }
 
         // Mint a fresh code; retry on the astronomically unlikely
@@ -11903,8 +11938,15 @@ fn handleTraceShareCreate(
         .body = "{\"error\":\"run_not_found\"}",
     };
 
-    const result = share_store.createOrGet(user_id, run_id, ttl_raw, now_unix) catch {
-        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"share_create_failed\"}" };
+    const result = share_store.createOrGet(user_id, run_id, ttl_raw, now_unix) catch |err| switch (err) {
+        // D64 — per-user share-spam cap. Surface the limit explicitly
+        // so the FE can prompt the user to revoke an existing share
+        // rather than silently failing or returning a generic 500.
+        error.ShareLimitReached => return .{
+            .status = "429 Too Many Requests",
+            .body = "{\"error\":\"share_limit_reached\",\"limit\":100,\"hint\":\"revoke an existing share before creating a new one\"}",
+        },
+        else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"share_create_failed\"}" },
     };
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -29503,6 +29545,78 @@ test "Wave2-CRITICAL: TraceShareStore.createOrGet re-mints over an EXPIRED share
     const third = try share_store.createOrGet("user-cw2", "run-cw2", ttl_h, t_expired);
     try std.testing.expect(third.already_existed);
     try std.testing.expectEqualStrings(second.share_code, third.share_code);
+}
+
+test "D64: TraceShareStore.createOrGet enforces per-user MAX_LIVE_SHARES cap" {
+    // Per-user share-spam cap: after MAX_LIVE_SHARES_PER_USER live
+    // shares, the next NEW share returns error.ShareLimitReached.
+    // Idempotent re-share of an existing live share is NOT blocked
+    // (the share already counts toward the cap).
+    const alloc = std.testing.allocator;
+    var share_store = TraceShareStore.init(alloc);
+    defer share_store.deinit();
+
+    const t0: i64 = 1_700_000_000;
+    const ttl_h: i64 = 24;
+
+    // Fill the cap with MAX_LIVE_SHARES_PER_USER unique run_ids.
+    var i: usize = 0;
+    while (i < MAX_LIVE_SHARES_PER_USER) : (i += 1) {
+        var run_id_buf: [32]u8 = undefined;
+        const run_id = try std.fmt.bufPrint(&run_id_buf, "cap-run-{d}", .{i});
+        _ = try share_store.createOrGet("user-cap", run_id, ttl_h, t0);
+    }
+
+    // The (cap + 1)-th NEW share must be rejected.
+    const result = share_store.createOrGet("user-cap", "cap-run-overflow", ttl_h, t0);
+    try std.testing.expectError(error.ShareLimitReached, result);
+
+    // A DIFFERENT user is unaffected by user-cap's cap.
+    _ = try share_store.createOrGet("user-other", "other-run-1", ttl_h, t0);
+
+    // Idempotent re-share of an EXISTING live share is NOT blocked
+    // (the share already counts toward the cap; refusing it would
+    // be a needless friction in the FE retry path).
+    const reshare = try share_store.createOrGet("user-cap", "cap-run-0", ttl_h, t0);
+    try std.testing.expect(reshare.already_existed);
+
+    // After revoking one share, a NEW share for user-cap succeeds.
+    _ = try share_store.revoke("user-cap", "cap-run-0");
+    const after_revoke = try share_store.createOrGet("user-cap", "cap-run-fresh", ttl_h, t0);
+    try std.testing.expect(!after_revoke.already_existed);
+}
+
+test "D64: handleTraceShareCreate returns 429 when per-user cap is reached" {
+    // Confirm the handler surfaces the cap as 429 (not 500) with a
+    // structured body the FE can render as "revoke one to share another".
+    // We use the existing waveTbBuildSharedStore helper for a valid
+    // trace store, then fill the share_store cap before the handler
+    // call so the snapshot check passes and the cap check trips.
+    const alloc = std.testing.allocator;
+    var store = try waveTbBuildSharedStore(alloc, "r-cap-test");
+    defer store.deinit();
+    var share_store = TraceShareStore.init(alloc);
+    defer share_store.deinit();
+
+    const t0: i64 = 1_700_000_000;
+
+    // Fill the cap for user-1 with placeholder shares (different
+    // run_ids than the one waveTb seeded). These don't need to exist
+    // in the trace store — createOrGet only cares about the per-user
+    // live count.
+    var i: usize = 0;
+    while (i < MAX_LIVE_SHARES_PER_USER) : (i += 1) {
+        var run_id_buf: [40]u8 = undefined;
+        const run_id = try std.fmt.bufPrint(&run_id_buf, "filler-{d}", .{i});
+        _ = try share_store.createOrGet("user-1", run_id, 24, t0);
+    }
+
+    // Now invoke the HTTP handler for the seeded run; the snapshot
+    // succeeds (trace exists), but the cap is already full.
+    const resp = handleTraceShareCreate(alloc, "POST", "user-1", "r-cap-test", null, &store, &share_store, t0);
+    try std.testing.expectEqualStrings("429 Too Many Requests", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "share_limit_reached") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "100") != null);
 }
 
 test "Wave2-CRITICAL: TraceShareStore.createOrGet re-mints over a REVOKED share without UAF / leak" {
