@@ -558,7 +558,15 @@ pub const ResolvedBranding = struct {
 /// gate brand application — we don't want to emit @font-face URLs that
 /// 404 when the operator's deploy script forgot to mount the font dir.
 fn directoryExists(path: []const u8) bool {
-    var dir = std.fs.openDirAbsolute(path, .{}) catch return false;
+    // 2026-05-25 fix: openDirAbsolute asserts the path is absolute and
+    // SIGABRTs on relative input — caught by a test panic when the
+    // bundled-fonts resolver fell through to its "assets/branding/fonts"
+    // cwd-relative candidate. Use cwd().openDir for the relative case,
+    // openDirAbsolute for the absolute case.
+    var dir = if (std.fs.path.isAbsolute(path))
+        std.fs.openDirAbsolute(path, .{}) catch return false
+    else
+        std.fs.cwd().openDir(path, .{}) catch return false;
     dir.close();
     return true;
 }
@@ -575,15 +583,74 @@ pub fn resolveBranding(
     allocator: std.mem.Allocator,
     branding: BrandingConfig,
 ) !?ResolvedBranding {
-    if (branding.font_dir.len == 0) return null;
-
-    if (!directoryExists(branding.font_dir)) {
-        std.log.scoped(.branding).warn(
-            "branding.font_dir '{s}' does not exist or is not a directory — falling back to system fonts. Verify the operator deploy mounted the font directory.",
-            .{branding.font_dir},
-        );
-        return null;
+    // 2026-05-25 (Nova directive): bundled-fonts fallback. When the
+    // operator config omits `font_dir`, look for the in-repo bundled
+    // fonts at well-known locations relative to the executable. This
+    // makes the SaaS deploy work without any operator config — the
+    // Docker image / binary ships with `assets/branding/fonts/` and
+    // every tenant gets branded output by default.
+    //
+    // License compliance: bundled at `assets/branding/fonts/` is
+    // explicitly NOT redistribution per the thmanyah license (we
+    // embed in our product; users render documents through it; they
+    // can't extract the font files standalone). See
+    // `assets/branding/fonts/README.md` for the migration path if/
+    // when this repo opens to the public.
+    //
+    // Resolution order:
+    //   1. Operator-configured `branding.font_dir` (highest priority)
+    //   2. Bundled `<exe_dir>/assets/branding/fonts` (SaaS default)
+    //   3. Bundled `<exe_dir>/../assets/branding/fonts` (zig-out/bin)
+    //   4. Bundled `<cwd>/assets/branding/fonts` (dev run from repo)
+    //   5. null (no branding; system fonts)
+    if (branding.font_dir.len > 0) {
+        return try resolveBrandingFromDir(allocator, branding);
     }
+    const bundled = resolveBundledFontsPath(allocator) orelse return null;
+    defer allocator.free(bundled);
+    var b = branding;
+    b.font_dir = bundled;
+    return try resolveBrandingFromDir(allocator, b);
+}
+
+/// Try to find the bundled `assets/branding/fonts` directory. Walks the
+/// candidate locations in priority order; returns the FIRST path that
+/// `directoryExists` confirms. Caller owns the returned slice. Returns
+/// null when no bundled directory is found (e.g. binary deployed
+/// without the assets tree).
+fn resolveBundledFontsPath(allocator: std.mem.Allocator) ?[]const u8 {
+    // Candidate A: exe-dir + assets/branding/fonts (typical container layout)
+    if (std.fs.selfExeDirPathAlloc(allocator)) |exe_dir| {
+        defer allocator.free(exe_dir);
+        const a = std.fs.path.join(allocator, &.{ exe_dir, "assets", "branding", "fonts" }) catch null;
+        if (a) |p| {
+            if (directoryExists(p)) return p;
+            allocator.free(p);
+        }
+        // Candidate B: exe-dir/../assets/... (zig-out/bin/nullalis layout)
+        const b = std.fs.path.join(allocator, &.{ exe_dir, "..", "assets", "branding", "fonts" }) catch null;
+        if (b) |p| {
+            if (directoryExists(p)) return p;
+            allocator.free(p);
+        }
+        // Candidate C: exe-dir/../../assets/... (zig-out/bin → repo-root)
+        const c = std.fs.path.join(allocator, &.{ exe_dir, "..", "..", "assets", "branding", "fonts" }) catch null;
+        if (c) |p| {
+            if (directoryExists(p)) return p;
+            allocator.free(p);
+        }
+    } else |_| {}
+    // Candidate D: cwd + assets/branding/fonts (dev run from repo root)
+    const d = allocator.dupe(u8, "assets/branding/fonts") catch return null;
+    if (directoryExists(d)) return d;
+    allocator.free(d);
+    return null;
+}
+
+fn resolveBrandingFromDir(
+    allocator: std.mem.Allocator,
+    branding: BrandingConfig,
+) !?ResolvedBranding {
 
     const body_otf = try std.fs.path.join(allocator, &.{ branding.font_dir, branding.body_font, "otf" });
     errdefer allocator.free(body_otf);
@@ -1873,11 +1940,25 @@ fn buildTestFontDir(allocator: std.mem.Allocator, name_suffix: []const u8) !stru
     return .{ .root = root_dir, .font_dir = font_dir };
 }
 
-test "resolveBranding returns null when font_dir is empty" {
+test "resolveBranding with empty font_dir falls back to bundled or returns null" {
+    // 2026-05-25 (Nova directive): the empty-config path now tries the
+    // bundled `assets/branding/fonts/` fallback. Whether bundled fonts
+    // are actually present at test time depends on the cwd (CI from
+    // repo root → bundled present; CI from arbitrary tmp → bundled
+    // absent). Assert the LIVE contract: either we get null (no
+    // bundled available), OR we get a ResolvedBranding pointing at
+    // the bundled dir. Both are correct outcomes — the test pins the
+    // SHAPE, not a specific environment.
     const alloc = std.testing.allocator;
     const br = BrandingConfig{}; // defaults — empty font_dir
     const got = try resolveBranding(alloc, br);
-    try std.testing.expect(got == null);
+    if (got) |rb| {
+        defer rb.deinit(alloc);
+        // Must point at the bundled dir (relative or absolute path
+        // containing assets/branding/fonts).
+        try std.testing.expect(std.mem.indexOf(u8, rb.body_otf_dir, "branding/fonts") != null);
+    }
+    // else: bundled fonts not present in this test's cwd — also OK
 }
 
 test "resolveBranding returns null when font_dir does not exist" {
@@ -1975,8 +2056,18 @@ test "PPTX with theme=thmanyah but no branding returns clear error" {
     };
     defer std.fs.deleteTreeAbsolute(ws) catch {};
 
-    // Branding intentionally NOT set (empty font_dir = disabled).
-    var pd = ProduceDocumentTool{ .workspace_dir = ws };
+    // Branding intentionally pointed at a missing dir so resolveBranding
+    // returns null (NOT empty — empty triggers the bundled-fonts fallback
+    // when the repo's `assets/branding/fonts/` is present, which would
+    // resolve a real ResolvedBranding and defeat this test's premise).
+    var pd = ProduceDocumentTool{
+        .workspace_dir = ws,
+        .branding = .{
+            .font_dir = "/tmp/pd_definitely_no_fonts_here_xyz_42",
+            .body_font = "x",
+            .display_font = "y",
+        },
+    };
     const t = pd.tool();
     var args = std.json.ObjectMap.init(alloc);
     defer args.deinit();
