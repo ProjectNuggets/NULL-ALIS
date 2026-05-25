@@ -18,6 +18,8 @@ const JsonObjectMap = root.JsonObjectMap;
 const zaki_state = @import("../zaki_state.zig");
 const artifacts_diff = @import("../artifacts/diff.zig");
 
+const log = std.log.scoped(.artifact_diff);
+
 pub const ArtifactDiffTool = struct {
     state_mgr: ?*zaki_state.Manager = null,
     user_id: ?i64 = null,
@@ -96,6 +98,7 @@ pub const ArtifactDiffTool = struct {
         };
 
         var before_opt = smgr.getArtifactVersion(allocator, uid, artifact_id, from_v) catch |err| {
+            log.warn("artifact_diff from_version read failed user_id={d} artifact_id={s} from_v={d} err={s}", .{ uid, artifact_id, from_v, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "artifact_diff: from_version read failed: {s}", .{@errorName(err)});
             return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
@@ -111,6 +114,7 @@ pub const ArtifactDiffTool = struct {
         _ = &before_opt;
 
         var after_opt = smgr.getArtifactVersion(allocator, uid, artifact_id, to_v) catch |err| {
+            log.warn("artifact_diff to_version read failed user_id={d} artifact_id={s} to_v={d} err={s}", .{ uid, artifact_id, to_v, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "artifact_diff: to_version read failed: {s}", .{@errorName(err)});
             return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
@@ -126,6 +130,7 @@ pub const ArtifactDiffTool = struct {
         _ = &after_opt;
 
         const diff_text = artifacts_diff.unifiedLineDiff(allocator, before.content, after.content) catch |err| {
+            log.warn("artifact_diff compute failed user_id={d} artifact_id={s} from_v={d} to_v={d} err={s}", .{ uid, artifact_id, from_v, to_v, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "artifact_diff: diff compute failed: {s}", .{@errorName(err)});
             return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };

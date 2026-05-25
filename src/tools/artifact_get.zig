@@ -10,6 +10,8 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const zaki_state = @import("../zaki_state.zig");
 
+const log = std.log.scoped(.artifact_get);
+
 /// Per-result cap on the content slice we surface to the agent. Same
 /// rationale as memory_recall: the underlying artifact still HAS the
 /// full content; this cap is on the in-context PROJECTION. The agent
@@ -75,24 +77,28 @@ pub const ArtifactGetTool = struct {
         const smgr = self.state_mgr orelse {
             return ToolResult{
                 .success = false,
-                .output = try allocator.dupe(u8, "artifact_get unavailable: state manager not bound (postgres not configured)"),
+                .error_msg = try allocator.dupe(u8, "artifact_get unavailable: state manager not bound (postgres not configured)"),
+                .output = "",
             };
         };
         const uid = self.user_id orelse {
             return ToolResult{
                 .success = false,
-                .output = try allocator.dupe(u8, "artifact_get unavailable: tenant user not bound"),
+                .error_msg = try allocator.dupe(u8, "artifact_get unavailable: tenant user not bound"),
+                .output = "",
             };
         };
 
         const ver_opt = smgr.getArtifactVersion(allocator, uid, artifact_id, version_opt) catch |err| {
+            log.warn("artifact_get read failed user_id={d} artifact_id={s} err={s}", .{ uid, artifact_id, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "Failed to read artifact: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         if (ver_opt == null) {
             return ToolResult{
                 .success = false,
-                .output = try std.fmt.allocPrint(allocator, "No artifact version found (id={s})", .{artifact_id}),
+                .error_msg = try std.fmt.allocPrint(allocator, "No artifact version found (id={s})", .{artifact_id}),
+                .output = "",
             };
         }
         var ver = ver_opt.?;
@@ -143,6 +149,7 @@ test "artifact_get reports unavailable without state_mgr" {
     defer parsed.deinit();
     const result = try t.tool().execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "state manager not bound") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "state manager not bound") != null);
 }

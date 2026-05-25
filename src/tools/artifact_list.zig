@@ -11,6 +11,8 @@ const JsonObjectMap = root.JsonObjectMap;
 const zaki_state = @import("../zaki_state.zig");
 const artifact_types = @import("../artifacts/types.zig");
 
+const log = std.log.scoped(.artifact_list);
+
 pub const ArtifactListTool = struct {
     state_mgr: ?*zaki_state.Manager = null,
     user_id: ?i64 = null,
@@ -76,19 +78,22 @@ pub const ArtifactListTool = struct {
         const smgr = self.state_mgr orelse {
             return ToolResult{
                 .success = false,
-                .output = try allocator.dupe(u8, "artifact_list unavailable: state manager not bound (postgres not configured)"),
+                .error_msg = try allocator.dupe(u8, "artifact_list unavailable: state manager not bound (postgres not configured)"),
+                .output = "",
             };
         };
         const uid = self.user_id orelse {
             return ToolResult{
                 .success = false,
-                .output = try allocator.dupe(u8, "artifact_list unavailable: tenant user not bound"),
+                .error_msg = try allocator.dupe(u8, "artifact_list unavailable: tenant user not bound"),
+                .output = "",
             };
         };
 
         const rows = smgr.listArtifactsForUser(allocator, uid, kind_filter_raw, limit) catch |err| {
+            log.warn("artifact_list query failed user_id={d} err={s}", .{ uid, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "Failed to list artifacts: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         defer zaki_state.freeArtifactRows(allocator, rows);
 
@@ -145,6 +150,7 @@ test "artifact_list reports unavailable without state_mgr" {
     defer parsed.deinit();
     const result = try t.tool().execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "state manager not bound") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "state manager not bound") != null);
 }

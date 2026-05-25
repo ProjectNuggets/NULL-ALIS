@@ -17,6 +17,8 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const zaki_state = @import("../zaki_state.zig");
 
+const log = std.log.scoped(.artifact_history);
+
 /// Hard cap on the version list — keeps response size predictable
 /// even if a runaway agent created hundreds of versions.
 const ARTIFACT_HISTORY_MAX_LIMIT: usize = 100;
@@ -104,6 +106,7 @@ pub const ArtifactHistoryTool = struct {
         // posture (404 on missing or foreign artifact, no existence
         // leak via empty list).
         var artifact_opt = smgr.getArtifactById(allocator, uid, artifact_id) catch |err| {
+            log.warn("artifact_history ownership lookup failed user_id={d} artifact_id={s} err={s}", .{ uid, artifact_id, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "artifact_history: ownership lookup failed: {s}", .{@errorName(err)});
             return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
@@ -119,6 +122,7 @@ pub const ArtifactHistoryTool = struct {
         _ = &artifact_opt;
 
         const history = smgr.listArtifactVersionHistory(allocator, uid, artifact_id) catch |err| {
+            log.warn("artifact_history read failed user_id={d} artifact_id={s} err={s}", .{ uid, artifact_id, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "artifact_history: read failed: {s}", .{@errorName(err)});
             return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };

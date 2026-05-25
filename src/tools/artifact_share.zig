@@ -25,6 +25,9 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const zaki_state = @import("../zaki_state.zig");
 const artifacts_store = @import("../artifacts/store.zig");
+const observability = @import("../observability.zig");
+
+const log = std.log.scoped(.artifact_share);
 
 pub const ArtifactShareTool = struct {
     state_mgr: ?*zaki_state.Manager = null,
@@ -142,9 +145,16 @@ pub const ArtifactShareTool = struct {
         defer allocator.free(share_code);
 
         smgr.setArtifactShare(uid, artifact_id, share_code, expires_at_unix) catch |err| {
+            log.warn("artifact_share persistence failed user_id={d} artifact_id={s} err={s}", .{ uid, artifact_id, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "artifact_share: persistence failed: {s}", .{@errorName(err)});
             return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
+
+        // Operability + metric: success path. Share-code intentionally
+        // elided from the log line — it's an unauthenticated capability
+        // URL, no need to broadcast it through the structured log stream.
+        log.info("artifact_share minted user_id={d} artifact_id={s} expires_in_hours={d}", .{ uid, artifact_id, hours });
+        observability.recordMetricGlobal(.{ .artifact_share_total = 1 });
 
         const msg = try std.fmt.allocPrint(
             allocator,

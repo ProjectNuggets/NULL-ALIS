@@ -18,6 +18,9 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const zaki_state = @import("../zaki_state.zig");
+const observability = @import("../observability.zig");
+
+const log = std.log.scoped(.artifact_revoke_share);
 
 pub const ArtifactRevokeShareTool = struct {
     state_mgr: ?*zaki_state.Manager = null,
@@ -95,9 +98,17 @@ pub const ArtifactRevokeShareTool = struct {
         // matching the HTTP handler's contract — we do NOT leak
         // existence by surfacing a "not found" error here.
         smgr.clearArtifactShare(uid, artifact_id) catch |err| {
+            log.warn("artifact_revoke_share persistence failed user_id={d} artifact_id={s} err={s}", .{ uid, artifact_id, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "artifact_revoke_share: persistence failed: {s}", .{@errorName(err)});
             return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
+
+        // Counter on every successful revoke (which includes idempotent
+        // no-op revokes since the SQL UPDATE itself succeeded). Counted
+        // as a "revoke attempted" rather than a "share-existed-and-was-
+        // revoked" — the latter would require a row-count read-back
+        // which the current store API doesn't expose.
+        observability.recordMetricGlobal(.{ .artifact_share_revoke_total = 1 });
 
         return ToolResult{
             .success = true,

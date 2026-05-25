@@ -14,6 +14,8 @@ const zaki_state = @import("../zaki_state.zig");
 const artifact_types = @import("../artifacts/types.zig");
 const observability = @import("../observability.zig");
 
+const log = std.log.scoped(.artifact_update);
+
 pub const ArtifactUpdateTool = struct {
     state_mgr: ?*zaki_state.Manager = null,
     user_id: ?i64 = null,
@@ -76,13 +78,15 @@ pub const ArtifactUpdateTool = struct {
         const smgr = self.state_mgr orelse {
             return ToolResult{
                 .success = false,
-                .output = try allocator.dupe(u8, "artifact_update unavailable: state manager not bound (postgres not configured)"),
+                .error_msg = try allocator.dupe(u8, "artifact_update unavailable: state manager not bound (postgres not configured)"),
+                .output = "",
             };
         };
         const uid = self.user_id orelse {
             return ToolResult{
                 .success = false,
-                .output = try allocator.dupe(u8, "artifact_update unavailable: tenant user not bound"),
+                .error_msg = try allocator.dupe(u8, "artifact_update unavailable: tenant user not bound"),
+                .output = "",
             };
         };
 
@@ -90,13 +94,15 @@ pub const ArtifactUpdateTool = struct {
         // event AND assert ownership before we attempt the version
         // append. Two round trips on the happy path; cheap.
         const existing_opt = smgr.getArtifactById(allocator, uid, artifact_id) catch |err| {
+            log.warn("artifact_update lookup failed user_id={d} artifact_id={s} err={s}", .{ uid, artifact_id, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "Failed to look up artifact: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         if (existing_opt == null) {
             return ToolResult{
                 .success = false,
-                .output = try std.fmt.allocPrint(allocator, "No artifact found with id={s} for this user", .{artifact_id}),
+                .error_msg = try std.fmt.allocPrint(allocator, "No artifact found with id={s} for this user", .{artifact_id}),
+                .output = "",
             };
         }
         var existing = existing_opt.?;
@@ -116,8 +122,9 @@ pub const ArtifactUpdateTool = struct {
             change_summary,
             now_unix,
         ) catch |err| {
+            log.warn("artifact_update append failed user_id={d} artifact_id={s} err={s}", .{ uid, artifact_id, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "Failed to update artifact: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
         const url = try std.fmt.allocPrint(allocator, "/api/v1/users/{d}/artifacts/{s}", .{ uid, artifact_id });
@@ -137,6 +144,8 @@ pub const ArtifactUpdateTool = struct {
             };
             obs.recordEvent(&evt);
         }
+        // HIGH 2.A — counter on every successful version append.
+        observability.recordMetricGlobal(.{ .artifact_update_total = 1 });
 
         const msg = try std.fmt.allocPrint(
             allocator,
@@ -185,6 +194,7 @@ test "artifact_update reports unavailable without state_mgr" {
     defer parsed.deinit();
     const result = try t.tool().execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "state manager not bound") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "state manager not bound") != null);
 }

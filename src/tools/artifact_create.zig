@@ -15,6 +15,8 @@ const zaki_state = @import("../zaki_state.zig");
 const artifact_types = @import("../artifacts/types.zig");
 const observability = @import("../observability.zig");
 
+const log = std.log.scoped(.artifact_create);
+
 pub const ArtifactCreateTool = struct {
     state_mgr: ?*zaki_state.Manager = null,
     user_id: ?i64 = null,
@@ -79,13 +81,15 @@ pub const ArtifactCreateTool = struct {
         const smgr = self.state_mgr orelse {
             return ToolResult{
                 .success = false,
-                .output = try allocator.dupe(u8, "artifact_create unavailable: state manager not bound (postgres not configured)"),
+                .error_msg = try allocator.dupe(u8, "artifact_create unavailable: state manager not bound (postgres not configured)"),
+                .output = "",
             };
         };
         const uid = self.user_id orelse {
             return ToolResult{
                 .success = false,
-                .output = try allocator.dupe(u8, "artifact_create unavailable: tenant user not bound"),
+                .error_msg = try allocator.dupe(u8, "artifact_create unavailable: tenant user not bound"),
+                .output = "",
             };
         };
 
@@ -104,8 +108,9 @@ pub const ArtifactCreateTool = struct {
             content_hash,
             now_unix,
         ) catch |err| {
+            log.warn("artifact_create persistence failed user_id={d} kind={s} err={s}", .{ uid, kind.toSlice(), @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "Failed to create artifact: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         defer artifact.deinit(allocator);
 
@@ -131,6 +136,9 @@ pub const ArtifactCreateTool = struct {
             };
             obs.recordEvent(&evt);
         }
+        // HIGH 2.A: counter on every successful create. Global emit; if
+        // no observer is wired, falls through to a scoped log line.
+        observability.recordMetricGlobal(.{ .artifact_create_total = 1 });
 
         const msg = try std.fmt.allocPrint(
             allocator,
@@ -187,6 +195,7 @@ test "artifact_create reports unavailable without state_mgr" {
     defer parsed.deinit();
     const result = try t.tool().execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "state manager not bound") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "state manager not bound") != null);
 }
