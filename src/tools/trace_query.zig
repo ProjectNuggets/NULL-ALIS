@@ -25,9 +25,12 @@
 const std = @import("std");
 const root = @import("root.zig");
 const run_trace_store_mod = @import("../run_trace_store.zig");
+const observability_mod = @import("../observability.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
+
+const log = std.log.scoped(.trace_query);
 
 /// Hard cap on the recent-runs list — keeps response size predictable
 /// even if the operator bumps `DEFAULT_MAX_RUNS` above 20. Mirrors the
@@ -92,6 +95,12 @@ pub const TraceQueryTool = struct {
     }
 
     pub fn execute(self: *TraceQueryTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+        // HIGH 2.A: usage counter — operators can see "what did I do
+        // last turn?" reflections vs total turns; a runaway loop where
+        // the agent keeps trace_query'ing its own history without
+        // making forward progress shows up as a spike.
+        observability_mod.recordMetricGlobal(.{ .trace_query_total = 1 });
+
         const store = self.store orelse {
             return ToolResult{
                 .success = false,
@@ -121,6 +130,7 @@ pub const TraceQueryTool = struct {
         run_id: []const u8,
     ) !ToolResult {
         const snap_opt = store.snapshotRun(allocator, run_id) catch |err| {
+            log.warn("trace_query snapshot failed run_id='{s}' err={s}", .{ run_id, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "trace_query: snapshot failed: {s}", .{@errorName(err)});
             return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
@@ -157,6 +167,7 @@ pub const TraceQueryTool = struct {
         limit: usize,
     ) !ToolResult {
         var index = store.listRuns(allocator) catch |err| {
+            log.warn("trace_query listRuns failed err={s}", .{@errorName(err)});
             const msg = try std.fmt.allocPrint(allocator, "trace_query: list failed: {s}", .{@errorName(err)});
             return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };

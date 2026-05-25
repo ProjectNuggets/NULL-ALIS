@@ -11957,11 +11957,21 @@ fn handleTraceShareCreate(
         // D64 — per-user share-spam cap. Surface the limit explicitly
         // so the FE can prompt the user to revoke an existing share
         // rather than silently failing or returning a generic 500.
-        error.ShareLimitReached => return .{
-            .status = "429 Too Many Requests",
-            .body = "{\"error\":\"share_limit_reached\",\"limit\":100,\"hint\":\"revoke an existing share before creating a new one\"}",
+        error.ShareLimitReached => {
+            // WARN 2.C: share-spam cap was previously zero-signal —
+            // the operator had no idea a tenant was hitting the cap
+            // until the user complained. Now logged + metricked.
+            log.info("share_create denied user_id='{s}' reason=share_limit_reached", .{user_id});
+            observability.recordMetricGlobal(.{ .share_create_429_total = 1 });
+            return .{
+                .status = "429 Too Many Requests",
+                .body = "{\"error\":\"share_limit_reached\",\"limit\":100,\"hint\":\"revoke an existing share before creating a new one\"}",
+            };
         },
-        else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"share_create_failed\"}" },
+        else => {
+            log.warn("share_create failed user_id='{s}' err={s}", .{ user_id, @errorName(err) });
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"share_create_failed\"}" };
+        },
     };
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -11974,7 +11984,14 @@ fn handleTraceShareCreate(
     w.print("\",\"expires_at\":{d}", .{result.expires_at_unix}) catch return response_build_err;
     w.writeAll("}") catch return response_build_err;
     var resp = finalizeJsonBuf(allocator, &out);
-    if (result.already_existed) resp.status = "409 Conflict";
+    if (result.already_existed) {
+        resp.status = "409 Conflict";
+    } else {
+        // HIGH 2.A: counter for fresh mints only (idempotent re-mints
+        // fold into the existing record and are not counted as a new
+        // share for the purposes of this counter).
+        observability.recordMetricGlobal(.{ .share_create_success_total = 1 });
+    }
     return resp;
 }
 

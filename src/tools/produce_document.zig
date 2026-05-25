@@ -197,10 +197,38 @@ pub const ProduceDocumentTool = struct {
     }
 
     pub fn execute(self: *ProduceDocumentTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+        // HIGH 2.A: time the whole call + tag the format + result so
+        // operators can chart renderer latency per format and spot
+        // when a missing binary (pandoc / marp-cli) starts a 100%
+        // failure run.
+        //
+        // Strategy: a single tracking variable `metric_result` defaults
+        // to "render_failed" (the most common failure mode for this
+        // tool — missing renderer binary / pandoc failure / etc.) and
+        // a `defer` block records the metric on EVERY exit path. The
+        // success arm overrides `metric_result = "ok"` just before
+        // returning; the invalid-input early-returns override to
+        // "invalid_input". Latency is always sampled.
+        const t_start_ns = std.time.nanoTimestamp();
+        var metric_result: []const u8 = "render_failed";
+        var metric_format: []const u8 = "unknown";
+        defer {
+            const elapsed_ms: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - t_start_ns, std.time.ns_per_ms));
+            @import("../observability.zig").recordMetricGlobal(.{
+                .produce_document_latency_ms = .{ .format = metric_format, .value = elapsed_ms },
+            });
+            @import("../observability.zig").recordMetricGlobal(.{
+                .produce_document_total = .{ .format = metric_format, .result = metric_result },
+            });
+        }
+
         // ── Validate args ────────────────────────────────────────────
-        const format_raw = root.getString(args, "format") orelse
+        const format_raw = root.getString(args, "format") orelse {
+            metric_result = "invalid_input";
             return ToolResult.fail("Missing 'format' parameter (one of: pdf, docx, xlsx, pptx, html)");
+        };
         const format = parseFormat(format_raw) orelse {
+            metric_result = "invalid_input";
             const msg = try std.fmt.allocPrint(
                 allocator,
                 "Invalid 'format' value: '{s}'. Must be one of: pdf, docx, xlsx, pptx, html",
@@ -208,6 +236,8 @@ pub const ProduceDocumentTool = struct {
             );
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
+        const format_label = formatLabel(format);
+        metric_format = format_label;
 
         const content = root.getString(args, "content") orelse
             return ToolResult.fail("Missing 'content' parameter");
@@ -443,6 +473,9 @@ pub const ProduceDocumentTool = struct {
 
         // ── Format agent-facing response ─────────────────────────────
         const label = formatLabel(format);
+        // HIGH 2.A: success path — the `defer` block emits latency +
+        // result counter. Override the default "render_failed" tag.
+        metric_result = "ok";
         const result_md = try std.fmt.allocPrint(
             allocator,
             "[Generated {s}: {s}](attachments/produced/{s})",

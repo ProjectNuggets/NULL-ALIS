@@ -22,9 +22,12 @@ const std = @import("std");
 const root = @import("root.zig");
 const memory_mod = @import("../memory/root.zig");
 const mem_lifecycle_diag = @import("../memory/lifecycle/diagnostics.zig");
+const observability = @import("../observability.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
+
+const log = std.log.scoped(.memory_doctor);
 
 pub const MemoryDoctorTool = struct {
     /// Bound at tool-construction time via `bindMemoryRuntime` (mirrors
@@ -84,6 +87,12 @@ pub const MemoryDoctorTool = struct {
     }
 
     pub fn execute(self: *MemoryDoctorTool, allocator: std.mem.Allocator, _: JsonObjectMap) !ToolResult {
+        // HIGH 2.A: usage counter so operators can see how often the
+        // agent self-checks Layer 0-7 health. A sudden spike often
+        // pairs with a recall-failure user complaint — the metric is
+        // the early-warning signal for that pattern.
+        observability.recordMetricGlobal(.{ .memory_doctor_total = 1 });
+
         const rt = self.mem_rt orelse {
             return ToolResult{
                 .success = false,
@@ -99,6 +108,7 @@ pub const MemoryDoctorTool = struct {
         // We do the same so the agent always sees a uniformly-parseable
         // JSON object regardless of which path produced it.
         const text = mem_lifecycle_diag.formatReport(report, allocator) catch |err| {
+            log.warn("memory_doctor report rendering failed err={s}", .{@errorName(err)});
             const msg = try std.fmt.allocPrint(allocator, "memory_doctor: report rendering failed: {s}", .{@errorName(err)});
             return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };

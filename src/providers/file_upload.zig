@@ -33,6 +33,7 @@
 const std = @import("std");
 const json_util = @import("../json_util.zig");
 const platform = @import("../platform.zig");
+const observability = @import("../observability.zig");
 
 const log = std.log.scoped(.provider_file_upload);
 
@@ -119,7 +120,20 @@ pub fn uploadMoonshotFile(
     purpose: MoonshotPurpose,
     proxy: ?[]const u8,
 ) Error![]u8 {
-    const boundary = generateBoundary() catch return error.BoundaryGenerationFailed;
+    // HIGH 2.A: emit `moonshot_video_upload_total{result}` on every
+    // exit path. The defer reads `metric_result` set by the failure
+    // sites (or `"ok"` on success). Bytes are emitted separately after
+    // we resolve the source file's size (skipped on early-validation
+    // failures where we never reached the file).
+    var metric_result: []const u8 = "network_error";
+    defer observability.recordMetricGlobal(.{
+        .moonshot_video_upload_total = .{ .result = metric_result },
+    });
+
+    const boundary = generateBoundary() catch {
+        metric_result = "boundary_failed";
+        return error.BoundaryGenerationFailed;
+    };
 
     // Tempfile for the multipart body (so we never hold both raw file +
     // body in RAM simultaneously for a 100 MB video).
@@ -131,12 +145,17 @@ pub fn uploadMoonshotFile(
     // cryptographic randomness AND create the file with O_EXCL so a
     // pre-existing path (collision OR attacker symlink) errors instead of
     // overwriting.
-    const tmp_dir = platform.getTempDir(allocator) catch return error.TempFileFailed;
+    const tmp_dir = platform.getTempDir(allocator) catch {
+        metric_result = "tempfile_failed";
+        return error.TempFileFailed;
+    };
     defer allocator.free(tmp_dir);
 
     var tmp_path_buf: [512]u8 = undefined;
-    const tmp_path = buildUploadTempPath(&tmp_path_buf, tmp_dir, getPid()) catch
+    const tmp_path = buildUploadTempPath(&tmp_path_buf, tmp_dir, getPid()) catch {
+        metric_result = "tempfile_failed";
         return error.TempFileFailed;
+    };
 
     // WARN-1 (v1.14.23 review): register the cleanup defer BEFORE the
     // write call so a partial-write fault (disk full mid-stream, source
@@ -147,29 +166,47 @@ pub fn uploadMoonshotFile(
     // We create the file exclusively up front so the defer's unlink
     // targets a tempfile we own (mitigates symlink-overwrite races).
     {
-        const tmp_file = std.fs.createFileAbsolute(tmp_path, .{ .exclusive = true }) catch
+        const tmp_file = std.fs.createFileAbsolute(tmp_path, .{ .exclusive = true }) catch {
+            metric_result = "tempfile_failed";
             return error.TempFileFailed;
+        };
         tmp_file.close();
     }
     defer std.fs.deleteFileAbsolute(tmp_path) catch {};
 
-    writeMultipartToTempFile(tmp_path, file_path, filename_hint, &boundary, purpose) catch
+    writeMultipartToTempFile(tmp_path, file_path, filename_hint, &boundary, purpose) catch {
+        metric_result = "file_read_failed";
         return error.FileReadFailed;
+    };
+
+    // HIGH 2.A: emit the bytes histogram now that the multipart body
+    // is on disk. This is the wire-bytes count (multipart envelope +
+    // payload) — slightly larger than the raw source file but operators
+    // care about the actual upload size for bandwidth attribution.
+    if (std.fs.cwd().statFile(tmp_path)) |st| {
+        observability.recordMetricGlobal(.{ .moonshot_video_upload_bytes = @intCast(st.size) });
+    } else |_| {}
 
     // Build endpoint URL: <base_url>/files
-    const endpoint = std.fmt.allocPrint(allocator, "{s}/files", .{base_url}) catch
+    const endpoint = std.fmt.allocPrint(allocator, "{s}/files", .{base_url}) catch {
+        metric_result = "oom";
         return error.OutOfMemory;
+    };
     defer allocator.free(endpoint);
 
     // Build headers.
     var content_type_buf: [128]u8 = undefined;
     var ct_fbs = std.io.fixedBufferStream(&content_type_buf);
-    ct_fbs.writer().print("Content-Type: multipart/form-data; boundary={s}", .{&boundary}) catch
+    ct_fbs.writer().print("Content-Type: multipart/form-data; boundary={s}", .{&boundary}) catch {
+        metric_result = "boundary_failed";
         return error.BoundaryGenerationFailed;
+    };
     const content_type_hdr = ct_fbs.getWritten();
 
-    const auth_hdr = std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key}) catch
+    const auth_hdr = std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key}) catch {
+        metric_result = "oom";
         return error.OutOfMemory;
+    };
     defer allocator.free(auth_hdr);
 
     const resp = curlPostFromFile(
@@ -180,14 +217,18 @@ pub fn uploadMoonshotFile(
         proxy,
     ) catch |err| {
         log.warn("file upload failed: {s} (endpoint={s}, file={s})", .{ @errorName(err), endpoint, file_path });
+        metric_result = "upload_failed";
         return error.UploadFailed;
     };
     defer allocator.free(resp);
 
-    return parseFileIdFromResponse(allocator, resp) catch |err| {
+    const file_id = parseFileIdFromResponse(allocator, resp) catch |err| {
         log.warn("could not parse file_id from upload response: {s} (body_len={d})", .{ @errorName(err), resp.len });
+        metric_result = "invalid_response";
         return error.InvalidResponse;
     };
+    metric_result = "ok";
+    return file_id;
 }
 
 /// Parse the `id` field from the Moonshot upload response. Exposed for tests.
