@@ -1077,6 +1077,13 @@ pub const GatewayConfig = struct {
     /// publish per-run economics on shareable URLs.
     share_redact_models: bool = true,
     share_redact_costs: bool = false,
+    /// Wave 3B (2026-05-25) — enable the `/api/v1/extension/ws`
+    /// endpoint + per-user `ExtensionWsHub`. When false (default),
+    /// `extension_*` tools are NOT registered (§14.7 — don't advertise
+    /// what we can't deliver) and the endpoint returns 503. Flip to
+    /// true on gateways that run alongside the production BFF so users
+    /// can pair the browser extension.
+    extension_ws_enabled: bool = false,
 };
 
 pub const TenantConfig = struct {

@@ -34,6 +34,7 @@ pub const ALL_TOOLS = [_][]const u8{
     "cron_runs",
     "cron_update",
     "delegate",
+    "extension_navigate",
     "file_append",
     "file_edit",
     "file_edit_hashed",

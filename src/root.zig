@@ -15,6 +15,15 @@ pub const http_util = @import("http_util.zig");
 pub const http_native = @import("http_native/root.zig");
 pub const net_security = @import("net_security.zig");
 pub const websocket = @import("websocket.zig");
+/// Wave 3B — gateway-side WebSocket server for the browser
+/// extension. Three sub-modules (server / hub / auth) split along
+/// testability boundaries; the gateway dispatch routes
+/// `/api/v1/extension/ws` into `extension_ws.server.handleUpgrade`.
+pub const extension_ws = struct {
+    pub const server = @import("extension_ws/server.zig");
+    pub const hub = @import("extension_ws/hub.zig");
+    pub const auth = @import("extension_ws/auth.zig");
+};
 
 // Phase 1: Core
 pub const bus = @import("bus.zig");

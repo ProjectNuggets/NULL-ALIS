@@ -76,6 +76,9 @@ const telegram_token = @import("telegram_token.zig");
 const user_settings = @import("user_settings.zig");
 const tool_sandbox_v1 = @import("tools/tool_sandbox_v1.zig");
 const lane_metrics = @import("lane_metrics.zig");
+const extension_ws_server = @import("extension_ws/server.zig");
+const extension_ws_hub = @import("extension_ws/hub.zig");
+const extension_ws_auth = @import("extension_ws/auth.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 // S7.13 — constant-time byte comparison for webhook secret verification.
 // The pairing module already exports a well-tested helper; reuse it rather
@@ -963,6 +966,16 @@ pub const GatewayState = struct {
     event_bus: ?*bus_mod.Bus = null,
     zaki_state: ?*zaki_state_mod.Manager = null,
     lifecycle_metrics: LifecycleMetrics = .{},
+    /// Wave 3B — per-user browser-extension WebSocket registry. Non-null
+    /// when the operator deploys the extension endpoint (`/api/v1/
+    /// extension/ws` is reachable). Null in standalone CLI builds — the
+    /// tools/root.zig conditional registration leaves the
+    /// `extension_*` tool family unregistered in that case so the agent
+    /// doesn't see tools it can't drive.
+    extension_ws_hub: ?*extension_ws_hub.ExtensionWsHub = null,
+    extension_ws_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    extension_ws_active: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    extension_ws_auth_failed_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn init(allocator: std.mem.Allocator) GatewayState {
         return initWithVerifyToken(allocator, "");
@@ -1018,6 +1031,16 @@ pub const GatewayState = struct {
         if (self.zaki_state) |mgr| {
             mgr.deinit();
             self.allocator.destroy(mgr);
+        }
+        // Wave 3B — drain the extension WS hub. Active conns have
+        // already been signaled to close by their pump-loop owners
+        // (each `handleUpgrade` thread's defer chain unregisters +
+        // destroys its conn). Any conn still in the map at this point
+        // is a leak; hub.deinit logs it as a warning and frees the
+        // map keys.
+        if (self.extension_ws_hub) |hub| {
+            hub.deinit();
+            self.allocator.destroy(hub);
         }
     }
 
@@ -19554,6 +19577,42 @@ fn handleAcceptedConnection(
         return;
     }
 
+    // Wave 3B — browser-extension WebSocket endpoint. Take-over of the
+    // socket: handshake → auth_ack → frame pump in a single blocking
+    // call; this thread is dedicated to one connection until it closes.
+    // The hub (when configured) lets the agent's `extension_*` tools
+    // reach the user's connected extension. We require the request to
+    // be `GET` + carry `Upgrade: websocket` to avoid the same path
+    // accepting a stray POST.
+    if (std.mem.eql(u8, base_path, "/api/v1/extension/ws")) {
+        if (state.extension_ws_hub == null) {
+            sendHttpResponse(conn.stream, "503 Service Unavailable", "application/json", "{\"error\":\"extension_ws_disabled\",\"hint\":\"this gateway is not configured to accept extension connections\"}") catch {};
+            return;
+        }
+        if (!std.mem.eql(u8, method_str, "GET")) {
+            sendHttpResponse(conn.stream, "405 Method Not Allowed", "application/json", "{\"error\":\"method_not_allowed\",\"hint\":\"use GET with Upgrade: websocket\"}") catch {};
+            return;
+        }
+        if (extractHeader(raw, "Upgrade") == null) {
+            sendHttpResponse(conn.stream, "426 Upgrade Required", "application/json", "{\"error\":\"upgrade_required\",\"hint\":\"send Upgrade: websocket and Sec-WebSocket-Key/Version: 13\"}") catch {};
+            return;
+        }
+        _ = state.extension_ws_total.fetchAdd(1, .monotonic);
+        _ = state.extension_ws_active.fetchAdd(1, .acq_rel);
+        defer _ = state.extension_ws_active.fetchSub(1, .acq_rel);
+
+        const outcome = extension_ws_server.handleUpgrade(conn.stream, .{
+            .long_allocator = allocator,
+            .raw_request = raw,
+            .hub = state.extension_ws_hub.?,
+            .auth = .{ .tokens = state.internal_service_tokens },
+        });
+        if (outcome == .auth_failed) {
+            _ = state.extension_ws_auth_failed_total.fetchAdd(1, .monotonic);
+        }
+        return;
+    }
+
     if (is_chat_stream_path) {
         _ = handleApiChatStreamSseConnection(
             allocator,
@@ -20277,6 +20336,18 @@ pub fn runWithRole(
         }
         state.internal_service_tokens = cfg.gateway.internal_service_tokens;
         state.require_explicit_chat_stream_session_key = cfg.gateway.require_explicit_chat_stream_session_key;
+        // Wave 3B — instantiate the extension WS hub when enabled.
+        // Hub state is global to the process (one connection per user
+        // across the whole gateway); destroyed in the deferred-cleanup
+        // path further down so its connection map drains before any
+        // pending request observer threads exit.
+        if (cfg.gateway.extension_ws_enabled) {
+            const hub = allocator.create(extension_ws_hub.ExtensionWsHub) catch null;
+            if (hub) |h| {
+                h.* = extension_ws_hub.ExtensionWsHub.init(allocator);
+                state.extension_ws_hub = h;
+            }
+        }
         state.tenant_enabled = cfg.tenant.enabled;
         state.tenant_data_root = cfg.tenant.data_root;
         state.workspace_dir = cfg.workspace_dir;

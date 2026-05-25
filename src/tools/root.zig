@@ -142,6 +142,12 @@ pub const artifact_create = @import("artifact_create.zig");
 pub const artifact_update = @import("artifact_update.zig");
 pub const artifact_get = @import("artifact_get.zig");
 pub const artifact_list = @import("artifact_list.zig");
+/// Wave 3B — extension_* tool family. The first wired tool
+/// (`extension_navigate`) drives the user's connected browser via the
+/// extension's WebSocket. Registered conditionally on the runtime
+/// having an `ExtensionWsHub` available — standalone CLI deploys
+/// without the gateway-side hub never see the tool.
+pub const extension_navigate = @import("extension_navigate.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 
@@ -706,6 +712,20 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .risk_level = .low,
         .cost_class = .a,
     },
+
+    // Wave 3B — extension_* family. Each entry drives the user's REAL
+    // browser via the extension's WebSocket. Strictly interactive: never
+    // `background_safe` (background turns can't prompt the user; sending
+    // a click to a tab the user isn't watching is surprising at best).
+    // `.high` risk because the actions are visible + affect logged-in
+    // state; `.b` cost because the per-call payload is small but the
+    // round-trip is non-trivial.
+    .{
+        .name = extension_navigate.ExtensionNavigateTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .high,
+        .cost_class = .b,
+    },
 };
 
 /// Return the static default metadata registry for built-in tools.
@@ -1016,6 +1036,11 @@ pub fn allTools(
         tools_config: @import("../config.zig").ToolsConfig = .{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
         task_delivery: ?*@import("../tasks/root.zig").TaskDelivery = null,
+        /// Wave 3B — when non-null, the `extension_*` tool family is
+        /// registered and bound to this hub. Standalone CLI deploys
+        /// pass null so the agent doesn't advertise tools that have
+        /// nothing to dispatch to.
+        extension_ws_hub: ?*@import("../extension_ws/hub.zig").ExtensionWsHub = null,
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -1413,6 +1438,16 @@ pub fn allTools(
         const bot = try allocator.create(browser_open.BrowserOpenTool);
         bot.* = .{ .allowed_domains = domains };
         try list.append(allocator, bot.tool());
+    }
+
+    // Wave 3B — extension_* tool family. Only register when the
+    // gateway has wired a hub; otherwise the model would see tools
+    // that fail every dispatch with "no extension connected", which
+    // erodes tool-selection quality on the surrounding tools (§14.7).
+    if (opts.extension_ws_hub) |hub| {
+        const ent = try allocator.create(extension_navigate.ExtensionNavigateTool);
+        ent.* = .{ .hub = hub };
+        try list.append(allocator, ent.tool());
     }
 
     // Hardware/IoT tools fully removed D19 (2026-04-25). Was kept as
@@ -2149,6 +2184,19 @@ pub fn lookupProviderApiKey(
         }
     }
     return "";
+}
+
+/// Wave 3B — bind the per-tenant user_id into `extension_*` tools so
+/// the hub can route commands to the right connection. Called from the
+/// gateway's chat-stream tenant setup right after `allTools`. No-op for
+/// tool lists that don't include the extension family.
+pub fn bindExtensionTools(tools: []const Tool, user_id: ?[]const u8) void {
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), extension_navigate.ExtensionNavigateTool.tool_name)) {
+            const ent: *extension_navigate.ExtensionNavigateTool = @ptrCast(@alignCast(t.ptr));
+            ent.user_id = user_id;
+        }
+    }
 }
 
 /// Wire audit memory into tools that support command logging (currently: shell).
