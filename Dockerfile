@@ -85,9 +85,15 @@ RUN apk add --no-cache \
       poppler-utils \
       pandoc \
       # ── produce_document renderer chain (D63) ─────────────────
-      # PDF: pandoc handles md→pdf via pdflatex/weasyprint fallback.
-      # Pull in weasyprint for the wkhtmltopdf-free path and texlive
-      # for pandoc's LaTeX engine.
+      # PDF: pandoc handles md→pdf via xelatex (branded) /
+      # weasyprint (unbranded HTML fallback). Pull in texlive-xetex
+      # explicitly — D63's original apk list omitted any LaTeX engine,
+      # so produce_document's pandoc PDF path failed with
+      # "pdflatex: not found" before this v1.14.22 hotfix.
+      # texlive-xetex is ~150 MB; the full `texlive` meta-package is
+      # ~3 GB which is not worth the size hit for a single rendering
+      # engine.
+      texlive-xetex \
       py3-pip \
       py3-cffi \
       py3-cairo \
@@ -115,6 +121,19 @@ RUN apk add --no-cache \
 COPY --from=builder /app/zig-out/bin/nullalis /usr/local/bin/nullalis
 COPY --from=config /nullclaw-data /nullclaw-data
 
+# CR-04 (v1.14.22) — bundle Thmanyah brand assets into the runtime
+# image. Without this COPY, resolveBundledFontsPath
+# (src/tools/produce_document.zig) walks all exe-dir-relative
+# candidates, finds none (the binary lives at /usr/local/bin/ — no
+# assets/ sibling), and returns null. Every tenant rendered with system
+# fonts (DejaVu), silently breaking the "SaaS deploy ships with
+# Thmanyah branding ENABLED out of the box" v1.14.21 promise.
+#
+# Path: /usr/local/share/nullalis/branding/fonts/ is the canonical
+# system-wide assets path on Alpine; resolveBundledFontsPath
+# candidate "E" matches this exact location.
+COPY assets/branding /usr/local/share/nullalis/branding
+
 # ── Renderer chain — pip + npm install (D63) ─────────────────
 # Install renderer deps in a single layer. `--break-system-packages` is
 # safe here: this is a single-purpose runtime image (PEP 668 protection
@@ -127,11 +146,20 @@ RUN pip3 install --no-cache-dir --break-system-packages \
     npm install -g --omit=dev @marp-team/marp-cli && \
     # Cleanup npm cache to shrink layer
     npm cache clean --force && \
-    # Verify the renderer chain is wired
+    # ── CR-03 / CR-04 verification (v1.14.22) ───────────────────
+    # Verify each renderer binary EXISTS *and* PRODUCES OUTPUT. Old
+    # check (D63) only ran `--version`, which passes even when the
+    # underlying LaTeX engine is missing. Now actually render a tiny
+    # PDF — if texlive-xetex is missing, this fails the build.
     pandoc --version > /dev/null && \
     marp --version > /dev/null && \
     python3 -c "import pandas, openpyxl, weasyprint" && \
-    echo "renderer chain ready"
+    echo '# hotfix probe' | pandoc -o /tmp/probe.pdf --pdf-engine=xelatex && \
+    rm /tmp/probe.pdf && \
+    # CR-04: confirm the brand-font bundle landed at the path
+    # resolveBundledFontsPath expects.
+    ls /usr/local/share/nullalis/branding/fonts/thmanyahsans/woff2/thmanyahsans-Regular.woff2 > /dev/null && \
+    echo "renderer chain + branding ready"
 
 ENV CHROME_PATH=/usr/bin/chromium-browser
 ENV PUPPETEER_SKIP_DOWNLOAD=true

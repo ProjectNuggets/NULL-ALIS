@@ -640,10 +640,19 @@ fn resolveBundledFontsPath(allocator: std.mem.Allocator) ?[]const u8 {
             allocator.free(p);
         }
     } else |_| {}
-    // Candidate D: cwd + assets/branding/fonts (dev run from repo root)
-    const d = allocator.dupe(u8, "assets/branding/fonts") catch return null;
-    if (directoryExists(d)) return d;
-    allocator.free(d);
+    // CR-04 (v1.14.22) — Dockerfile bundles fonts under
+    // /usr/local/share/nullalis/branding/fonts via an explicit COPY.
+    // Exe-dir-relative candidates miss this because nullalis binary
+    // lives at /usr/local/bin/ (exe_dir/../share is NOT exe_dir/../).
+    const e = allocator.dupe(u8, "/usr/local/share/nullalis/branding/fonts") catch null;
+    if (e) |p| {
+        if (directoryExists(p)) return p;
+        allocator.free(p);
+    }
+    // Candidate F: cwd + assets/branding/fonts (dev run from repo root)
+    const f = allocator.dupe(u8, "assets/branding/fonts") catch return null;
+    if (directoryExists(f)) return f;
+    allocator.free(f);
     return null;
 }
 
@@ -946,7 +955,36 @@ fn renderPdf(
     const pandoc_attempt = runRenderer(allocator, &pandoc_args, "pandoc");
     switch (pandoc_attempt) {
         .success => |s| return s,
-        .ran_but_failed => |r| return r,
+        .ran_but_failed => |r| {
+            // HI-04 / CR-03 (v1.14.22): pandoc returned non-zero, but it
+            // may have run successfully INTO a missing LaTeX engine —
+            // exactly the shape the D63 Dockerfile produced before the
+            // texlive-xetex install. Mirror the xelatex-missing
+            // detection above; when pandoc's stderr indicates a missing
+            // pdf engine, fall through to weasyprint instead of
+            // surfacing pandoc's cryptic "pdflatex: not found".
+            const stderr = if (r.error_msg) |em| em else "";
+            const latex_engine_missing =
+                (std.mem.indexOf(u8, stderr, "pdflatex") != null and
+                    (std.mem.indexOf(u8, stderr, "not found") != null or
+                        std.mem.indexOf(u8, stderr, "No such file") != null or
+                        std.mem.indexOf(u8, stderr, "command not found") != null)) or
+                (std.mem.indexOf(u8, stderr, "xelatex") != null and
+                    (std.mem.indexOf(u8, stderr, "not found") != null or
+                        std.mem.indexOf(u8, stderr, "No such file") != null or
+                        std.mem.indexOf(u8, stderr, "command not found") != null)) or
+                std.mem.indexOf(u8, stderr, "latex engine") != null;
+
+            if (!latex_engine_missing) return r;
+
+            std.log.scoped(.produce_document).warn(
+                "pandoc PDF render failed (LaTeX engine missing) — falling through to weasyprint. Install texlive-xetex for native LaTeX rendering. stderr: {s}",
+                .{stderr},
+            );
+            if (r.output.len > 0) allocator.free(r.output);
+            if (r.error_msg) |em| allocator.free(em);
+            // Fall through to wkhtmltopdf / weasyprint below.
+        },
         .binary_missing => |bm| allocator.free(bm),
         // Wave 2 review HIGH#1 — static message; do NOT free.
         .binary_missing_static => {},
@@ -957,7 +995,15 @@ fn renderPdf(
     const wk_attempt = runRenderer(allocator, &wkhtml_args, "wkhtmltopdf");
     switch (wk_attempt) {
         .success => |s| return s,
-        .ran_but_failed => |r| return r,
+        // HI-04: wkhtmltopdf is often missing too on minimal images.
+        // Surface the failure detail only if weasyprint also missing;
+        // otherwise prefer weasyprint's verdict.
+        .ran_but_failed => |r| {
+            // Best-effort: free wkhtmltopdf's stderr buf and fall
+            // through; weasyprint is the genuine workhorse on Alpine.
+            if (r.output.len > 0) allocator.free(r.output);
+            if (r.error_msg) |em| allocator.free(em);
+        },
         .binary_missing => |bm| allocator.free(bm),
         .binary_missing_static => {},
     }
