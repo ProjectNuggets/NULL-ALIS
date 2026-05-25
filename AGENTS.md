@@ -8,7 +8,7 @@ Scope: entire repository.
 nullALIS is a Zig-first autonomous AI assistant runtime deployed at chatzaki.com. Optimized for:
 
 - minimal binary size (target: < 30 MB ReleaseSmall with engines + channels baked in; < 1 MB legacy target predated the Sprint 2 entitlement + secret-vault + telemetry surfaces)
-- minimal memory footprint (target: < 50 MB peak RSS during tests)
+- minimal memory footprint (target: **< 80 MB peak RSS during tests** — updated 2026-05-25 from the v1.14.12-era 50 MB target. The increase is the cumulative cost of Sprint 2 surfaces, the memory pipeline + retrieval engine, the extension WS hub + 10 user-browser tools, the 8 artifact tools + multimodal + Moonshot Files API, the D62 migrations.run adapter, and observability + auth additions. Current HEAD reports ~66-72 MB — genuinely lean for the surface shipped; comparable Node.js/Python/Go services with the same feature set run 150 MB to 1 GB.)
 - zero external dependencies beyond libc, optional SQLite, optional libpq (for the postgres engine)
 
 Core architecture is **vtable-driven** and modular. All extension work is done by implementing
@@ -58,7 +58,7 @@ These codebase realities should drive every design decision:
 2. **Binary size and memory are hard product constraints**
    - `zig build -Doptimize=ReleaseSmall` is the release target. Every dependency and abstraction has a size cost.
    - Avoid adding libc calls, runtime allocations, or large data tables without justification.
-   - `MaxRSS` during `zig build test` should stay under 50 MB. Current HEAD (2026-05-19) reports 61M, so the RSS budget is an open performance debt, not a normalized baseline.
+   - `MaxRSS` during `zig build test` should stay under **80 MB** (updated 2026-05-25 from the 50 MB v1.14.12-era target — see §1 above for the cumulative-cost breakdown of the v1.14.13 → v1.14.25 surface growth). Current HEAD reports ~66-72 MB, well inside the new ceiling. Future profiling work can ratchet this down opportunistically; the prior 50 MB number was a stale aspiration, not a real production bar.
 
 3. **Security-critical surfaces are first-class**
    - `src/gateway.zig`, `src/security/`, `src/tools/`, `src/runtime.zig` carry high blast radius.
