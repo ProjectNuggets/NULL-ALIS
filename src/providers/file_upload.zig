@@ -26,9 +26,23 @@
 //! - Reference shape in chat completions:
 //!   `{"type":"video_url","video_url":{"url":"ms://<file_id>"}}`.
 //!
-//! TODO: verify against live Moonshot API once a key is provisioned for the
-//! upload-purpose path. The shape above is the documented contract; the live
-//! call has not been smoke-probed from this codebase yet.
+//! Live-verified against api.moonshot.ai on 2026-05-25 (Gate #1 of the
+//! v1.14.24 verification pass) — see `docs/archive/2026-05-25/MOONSHOT_LIVE_PROBE.md`.
+//! Confirmed:
+//!   - POST /v1/files with `purpose=image` returns 200 + `{"id":"...","status":"ready"}`
+//!   - Canonical purpose enum (per Moonshot's 400-response disclosure):
+//!     `file-extract`, `batch`, `batch_output`, `lambda`, `image`, `video`
+//!   - Response `id` field name matches `parseFileIdFromResponse`
+//!   - `ms://<file_id>` URL form accepted in chat completion content parts
+//!     against `kimi-k2.6` (default model; billed for the request)
+//!   - `image_url` and `data:image/...;base64,...` inline path also works
+//!
+//! Not yet smoke-probed end-to-end:
+//!   - A real video file upload + chat completion round-trip with
+//!     `purpose=video`. The image path validates the SAME multipart
+//!     contract + response shape + URL form, so video is high-confidence
+//!     by symmetry, but `experimental_video_upload: false` stays default
+//!     until a >1MB MP4 has been uploaded + referenced in a chat turn.
 
 const std = @import("std");
 const json_util = @import("../json_util.zig");

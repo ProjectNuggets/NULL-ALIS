@@ -87,6 +87,18 @@ const MODEL_TABLE = [_]ModelEntry{
     // K2.5; Moonshot kept it at 256K rather than expanding.
     .{ .key = "kimi-k2.6", .caps = .{ .context_window = 262_144, .max_output = 32_768, .vision = true, .video = true } },
     .{ .key = "k2p6", .caps = .{ .context_window = 262_144, .max_output = 32_768, .vision = true, .video = true } },
+    // Gate #1 live probe (2026-05-25) — full account model list from
+    // GET https://api.moonshot.ai/v1/models. The `moonshot-v1-*` family
+    // is the older lineage (pre-K2); useful for cost-tiered text + the
+    // vision-preview branch. Add entries so operators routing to these
+    // ids get correct context windows + vision/video flags.
+    .{ .key = "moonshot-v1-8k", .caps = .{ .context_window = 8_192, .max_output = 8_192 } },
+    .{ .key = "moonshot-v1-32k", .caps = .{ .context_window = 32_768, .max_output = 8_192 } },
+    .{ .key = "moonshot-v1-128k", .caps = .{ .context_window = 131_072, .max_output = 8_192 } },
+    .{ .key = "moonshot-v1-auto", .caps = .{ .context_window = 131_072, .max_output = 8_192 } },
+    .{ .key = "moonshot-v1-8k-vision-preview", .caps = .{ .context_window = 8_192, .max_output = 8_192, .vision = true } },
+    .{ .key = "moonshot-v1-32k-vision-preview", .caps = .{ .context_window = 32_768, .max_output = 8_192, .vision = true } },
+    .{ .key = "moonshot-v1-128k-vision-preview", .caps = .{ .context_window = 131_072, .max_output = 8_192, .vision = true } },
     // DeepSeek
     .{ .key = "deepseek-v3.2", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
     .{ .key = "deepseek-chat", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
