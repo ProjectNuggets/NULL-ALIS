@@ -31,14 +31,15 @@ test "resolveContextTokens honors explicit override first" {
 
 test "lookupContextTokens resolves known model ids" {
     try std.testing.expectEqual(@as(?u64, 128_000), lookupContextTokens("openai/gpt-4.1-mini"));
-    try std.testing.expectEqual(@as(?u64, 200_000), lookupContextTokens("claude-sonnet-4.6"));
+    // v1.14.22: Claude 4.x ships 1M context natively at standard pricing.
+    try std.testing.expectEqual(@as(?u64, 1_000_000), lookupContextTokens("claude-sonnet-4.6"));
     try std.testing.expectEqual(@as(?u64, 32_768), lookupContextTokens("mixtral-8x7b-32768"));
     try std.testing.expectEqual(@as(?u64, 262_144), lookupContextTokens("moonshotai/Kimi-K2.5"));
 }
 
 test "lookupContextTokens handles nested provider refs" {
     try std.testing.expectEqual(
-        @as(?u64, 200_000),
+        @as(?u64, 1_000_000),
         lookupContextTokens("openrouter/anthropic/claude-sonnet-4.6"),
     );
     try std.testing.expectEqual(
@@ -52,8 +53,9 @@ test "lookupContextTokens handles nested provider refs" {
 }
 
 test "lookupContextTokens strips date suffixes" {
+    // v1.14.22: Claude 4.x ships 1M context natively.
     try std.testing.expectEqual(
-        @as(?u64, 200_000),
+        @as(?u64, 1_000_000),
         lookupContextTokens("anthropic/claude-sonnet-4.6-20260219"),
     );
 }

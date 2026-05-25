@@ -44,21 +44,23 @@ const ModelEntry = struct {
 
 const MODEL_TABLE = [_]ModelEntry{
     // Anthropic — Claude 4.x is vision-capable (images), no native video/audio.
-    .{ .key = "claude-opus-4-6", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true } },
-    .{ .key = "claude-opus-4.6", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true } },
-    .{ .key = "claude-sonnet-4-6", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true } },
-    .{ .key = "claude-sonnet-4.6", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true } },
+    //
+    // V1.14.22 honesty correction (was v1.14.21): the prior synthetic `-1m`
+    // suffix entries (`claude-opus-4.6-1m`, `claude-sonnet-4.6-1m`,
+    // `gemini-2.5-pro-1m`) were based on Anthropic's retired
+    // `context-1m-2025-08-07` beta-header gate. As of April 30 2026 the
+    // beta gate is gone — Claude Opus 4.7 and Sonnet 4.6 ship 1M context
+    // at standard API pricing on the BASE model ids with no header and
+    // no suffix. The `-1m` suffix entries were unreachable (Anthropic
+    // 404s on unknown model ids) and have been DELETED. Base entries
+    // promoted to 1_000_000 to reflect reality.
+    .{ .key = "claude-opus-4-7", .caps = .{ .context_window = 1_000_000, .max_output = 8_192, .vision = true } },
+    .{ .key = "claude-opus-4.7", .caps = .{ .context_window = 1_000_000, .max_output = 8_192, .vision = true } },
+    .{ .key = "claude-opus-4-6", .caps = .{ .context_window = 1_000_000, .max_output = 8_192, .vision = true } },
+    .{ .key = "claude-opus-4.6", .caps = .{ .context_window = 1_000_000, .max_output = 8_192, .vision = true } },
+    .{ .key = "claude-sonnet-4-6", .caps = .{ .context_window = 1_000_000, .max_output = 8_192, .vision = true } },
+    .{ .key = "claude-sonnet-4.6", .caps = .{ .context_window = 1_000_000, .max_output = 8_192, .vision = true } },
     .{ .key = "claude-haiku-4-5", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true } },
-    // Wave 4 (Wave 4 — 1M context routing, v1.14.21) — opt-in 1M tier
-    // variants. Operators set the `-1m` suffixed model id to route through
-    // Anthropic's 1M-context beta (header `context-1m-2026-04-15` or
-    // equivalent active beta on the provider's side). Costs more per
-    // token but lifts the 200K compaction wall for paying long-horizon
-    // sessions (research agents, long codebases). Output cap unchanged.
-    .{ .key = "claude-opus-4-6-1m", .caps = .{ .context_window = 1_000_000, .max_output = 8_192, .vision = true } },
-    .{ .key = "claude-opus-4.6-1m", .caps = .{ .context_window = 1_000_000, .max_output = 8_192, .vision = true } },
-    .{ .key = "claude-sonnet-4-6-1m", .caps = .{ .context_window = 1_000_000, .max_output = 8_192, .vision = true } },
-    .{ .key = "claude-sonnet-4.6-1m", .caps = .{ .context_window = 1_000_000, .max_output = 8_192, .vision = true } },
     // OpenAI — GPT-4o/4.1/4.5/5.x accept image input. This table marks vision
     // only; audio-capable variants (e.g. gpt-4o-audio) are not wired here.
     // o3-mini is text-only (left at defaults).
@@ -71,15 +73,12 @@ const MODEL_TABLE = [_]ModelEntry{
     .{ .key = "gpt-4o-mini", .caps = .{ .context_window = 128_000, .max_output = 8_192, .vision = true } },
     .{ .key = "o3-mini", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
     // Google — Gemini 2.x natively understands images AND video.
-    .{ .key = "gemini-2.5-pro", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true, .video = true } },
+    // Gemini 2.5 Pro ships with 1M context natively (Google's published
+    // spec). Flash variants stay at 200K. The synthetic `-1m` suffix is
+    // gone — use the base id.
+    .{ .key = "gemini-2.5-pro", .caps = .{ .context_window = 1_000_000, .max_output = 8_192, .vision = true, .video = true } },
     .{ .key = "gemini-2.5-flash", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true, .video = true } },
     .{ .key = "gemini-2.0-flash", .caps = .{ .context_window = 200_000, .max_output = 8_192, .vision = true, .video = true } },
-    // Wave 4 — Gemini 2.5 Pro natively supports 1M context. We expose
-    // this through a `-1m` variant for consistency with the Anthropic
-    // opt-in path (operator routes the model_id explicitly when they
-    // want the bigger window). The base `gemini-2.5-pro` entry stays
-    // at 200K for conservative cost defaults.
-    .{ .key = "gemini-2.5-pro-1m", .caps = .{ .context_window = 1_000_000, .max_output = 8_192, .vision = true, .video = true } },
     // Moonshot / Kimi — K2.5 is text-only; K2.6 is multimodal (vision + video).
     .{ .key = "kimi-k2.5", .caps = .{ .context_window = 262_144, .max_output = 32_768 } },
     .{ .key = "k2p5", .caps = .{ .context_window = 262_144, .max_output = 32_768 } },
@@ -125,10 +124,14 @@ const ProviderEntry = struct {
 };
 
 const PROVIDER_TABLE = [_]ProviderEntry{
-    .{ .key = "anthropic", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
+    // Anthropic and Google's 1M context is now native at standard pricing on
+    // current Claude 4.x and Gemini 2.5 Pro SKUs; raise the provider-level
+    // fallback so an unknown-but-prefixed model id at least gets the right
+    // ceiling. Specific model overrides still win via MODEL_TABLE.
+    .{ .key = "anthropic", .caps = .{ .context_window = 1_000_000, .max_output = 8_192 } },
     .{ .key = "openai", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
-    .{ .key = "google", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
-    .{ .key = "gemini", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
+    .{ .key = "google", .caps = .{ .context_window = 1_000_000, .max_output = 8_192 } },
+    .{ .key = "gemini", .caps = .{ .context_window = 1_000_000, .max_output = 8_192 } },
     .{ .key = "openrouter", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
     .{ .key = "minimax", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
     .{ .key = "xiaomi", .caps = .{ .context_window = 262_144, .max_output = 8_192 } },
@@ -211,24 +214,17 @@ fn inferFromPattern(model_id: []const u8) ?ModelCapabilities {
     if (startsWithIgnoreCase(model_id, "kimi-coding"))
         return .{ .context_window = 262_144, .max_output = 32_768 };
 
-    // Wave 4 — `-1m` suffix on a Claude or Gemini model id is the
-    // explicit opt-in to the 1M-context tier. The exact MODEL_TABLE
-    // entries above cover the known SKUs; this pattern catches
-    // future dated variants like claude-sonnet-4.6-1m-20260601.
-    if (endsWithIgnoreCase(model_id, "-1m") and
-        (startsWithIgnoreCase(model_id, "claude-") or startsWithIgnoreCase(model_id, "gemini-")))
-    {
-        const vision = startsWithIgnoreCase(model_id, "claude-") or
-            startsWithIgnoreCase(model_id, "gemini-");
-        const video = startsWithIgnoreCase(model_id, "gemini-");
-        return .{ .context_window = 1_000_000, .max_output = 8_192, .vision = vision, .video = video };
-    }
-
+    // Claude 4.x and Gemini 2.5 Pro both ship 1M context natively at
+    // standard pricing as of April 30 2026. The retired
+    // `context-1m-2025-08-07` beta header and the synthetic `-1m`
+    // suffix are gone. Unknown-but-prefixed `claude-` and `gemini-`
+    // ids get the modern ceiling; haiku / flash variants are still
+    // pinned at 200K via explicit MODEL_TABLE entries that win first.
     if (startsWithIgnoreCase(model_id, "claude-"))
-        return .{ .context_window = 200_000, .max_output = 8_192 };
+        return .{ .context_window = 1_000_000, .max_output = 8_192 };
 
     if (startsWithIgnoreCase(model_id, "gemini-"))
-        return .{ .context_window = 200_000, .max_output = 8_192 };
+        return .{ .context_window = 1_000_000, .max_output = 8_192 };
 
     if (startsWithIgnoreCase(model_id, "gpt-") or
         startsWithIgnoreCase(model_id, "o1") or
@@ -420,8 +416,10 @@ test "resolveContextTokens honors explicit override" {
 }
 
 test "lookupCapabilities known models" {
+    // v1.14.22: Claude 4.x now reports 1M context (Anthropic's beta-gated
+    // 1M-context tier is GA at standard pricing as of April 30 2026).
     const claude = lookupCapabilities("claude-sonnet-4.6").?;
-    try std.testing.expectEqual(@as(u64, 200_000), claude.context_window);
+    try std.testing.expectEqual(@as(u64, 1_000_000), claude.context_window);
     try std.testing.expectEqual(@as(u32, 8_192), claude.max_output);
 
     const kimi = lookupCapabilities("kimi-k2.5").?;
@@ -435,7 +433,7 @@ test "lookupCapabilities known models" {
 
 test "lookupCapabilities nested openrouter refs" {
     const caps = lookupCapabilities("openrouter/anthropic/claude-sonnet-4.6").?;
-    try std.testing.expectEqual(@as(u64, 200_000), caps.context_window);
+    try std.testing.expectEqual(@as(u64, 1_000_000), caps.context_window);
     try std.testing.expectEqual(@as(u32, 8_192), caps.max_output);
 
     const kimi = lookupCapabilities("openrouter/moonshotai/kimi-k2.5").?;
@@ -444,7 +442,7 @@ test "lookupCapabilities nested openrouter refs" {
 
 test "lookupCapabilities strips date and latest suffixes" {
     const claude_dated = lookupCapabilities("anthropic/claude-sonnet-4.6-20260219").?;
-    try std.testing.expectEqual(@as(u64, 200_000), claude_dated.context_window);
+    try std.testing.expectEqual(@as(u64, 1_000_000), claude_dated.context_window);
 
     const gpt_latest = lookupCapabilities("openai/gpt-4.1-latest").?;
     try std.testing.expectEqual(@as(u32, 8_192), gpt_latest.max_output);
@@ -498,57 +496,69 @@ test "kimi-coding provider has large output ceiling" {
     try std.testing.expectEqual(@as(u64, 262_144), caps.context_window);
 }
 
-test "Wave 4 — 1M context routing: explicit Claude 1M variants resolve to 1M window" {
-    const opus_dash = lookupCapabilities("claude-opus-4-6-1m").?;
+test "v1.14.22 — 1M context: Claude Opus 4.7 (base id, no suffix) resolves to 1M" {
+    // Anthropic released Opus 4.7 in April 2026 with 1M context native at
+    // standard API pricing. No beta header, no -1m suffix needed; the
+    // BASE model id is the 1M id.
+    const opus_dash = lookupCapabilities("claude-opus-4-7").?;
     try std.testing.expectEqual(@as(u64, 1_000_000), opus_dash.context_window);
     try std.testing.expectEqual(@as(u32, 8_192), opus_dash.max_output);
     try std.testing.expect(opus_dash.vision);
 
-    const opus_dot = lookupCapabilities("claude-opus-4.6-1m").?;
+    const opus_dot = lookupCapabilities("claude-opus-4.7").?;
     try std.testing.expectEqual(@as(u64, 1_000_000), opus_dot.context_window);
-
-    const sonnet_dash = lookupCapabilities("claude-sonnet-4-6-1m").?;
-    try std.testing.expectEqual(@as(u64, 1_000_000), sonnet_dash.context_window);
-
-    const sonnet_dot = lookupCapabilities("claude-sonnet-4.6-1m").?;
-    try std.testing.expectEqual(@as(u64, 1_000_000), sonnet_dot.context_window);
+    try std.testing.expect(opus_dot.vision);
 
     // Provider-prefixed routing also resolves.
-    const via_anthropic = lookupCapabilities("anthropic/claude-sonnet-4.6-1m").?;
+    const via_anthropic = lookupCapabilities("anthropic/claude-opus-4.7").?;
     try std.testing.expectEqual(@as(u64, 1_000_000), via_anthropic.context_window);
 }
 
-test "Wave 4 — 1M context routing: Gemini 1M variant resolves and keeps video flag" {
-    const gemini_1m = lookupCapabilities("gemini-2.5-pro-1m").?;
-    try std.testing.expectEqual(@as(u64, 1_000_000), gemini_1m.context_window);
-    try std.testing.expect(gemini_1m.vision);
-    try std.testing.expect(gemini_1m.video);
+test "v1.14.22 — 1M context: Gemini 2.5 Pro base id is 1M (native, no suffix)" {
+    // Google's published spec: gemini-2.5-pro has 1M context window native.
+    const gemini = lookupCapabilities("gemini-2.5-pro").?;
+    try std.testing.expectEqual(@as(u64, 1_000_000), gemini.context_window);
+    try std.testing.expect(gemini.vision);
+    try std.testing.expect(gemini.video);
+
+    // Flash is still 200K — only Pro got the 1M tier.
+    const flash = lookupCapabilities("gemini-2.5-flash").?;
+    try std.testing.expectEqual(@as(u64, 200_000), flash.context_window);
 }
 
-test "Wave 4 — 1M context routing: base (non-1m) variants stay at 200K (conservative cost default)" {
-    // The base model id without the `-1m` suffix MUST stay at 200K so
-    // operators who don't explicitly opt in are billed at the cheaper
-    // tier. This pins the "1M is opt-in, not silent default" rule.
-    const opus_base = lookupCapabilities("claude-opus-4.6").?;
-    try std.testing.expectEqual(@as(u64, 200_000), opus_base.context_window);
+test "v1.14.22 — 1M context: Claude Sonnet 4.6 base id is 1M (beta gate retired)" {
+    // Sonnet 4.6's 1M tier was previously gated by the
+    // `context-1m-2025-08-07` beta header; that header was retired on
+    // April 30 2026 and 1M is now native at standard pricing on the
+    // base id.
+    const sonnet = lookupCapabilities("claude-sonnet-4.6").?;
+    try std.testing.expectEqual(@as(u64, 1_000_000), sonnet.context_window);
+    try std.testing.expect(sonnet.vision);
 
-    const sonnet_base = lookupCapabilities("claude-sonnet-4.6").?;
-    try std.testing.expectEqual(@as(u64, 200_000), sonnet_base.context_window);
-
-    const gemini_base = lookupCapabilities("gemini-2.5-pro").?;
-    try std.testing.expectEqual(@as(u64, 200_000), gemini_base.context_window);
+    const sonnet_dash = lookupCapabilities("claude-sonnet-4-6").?;
+    try std.testing.expectEqual(@as(u64, 1_000_000), sonnet_dash.context_window);
 }
 
-test "Wave 4 — 1M context routing: pattern match catches future dated variants" {
-    // Anthropic publishes dated 1M variants over time
-    // (e.g. claude-sonnet-4.6-1m would later become
-    // claude-sonnet-4.6-1m-20260601 with a date stamp). Pattern matching
-    // on the `-1m` suffix must catch the leaf model id after date strip.
-    // The stripDateSuffix walker drops the trailing 8-digit segment, so
-    // the post-strip id ends in `-1m` and the pattern fires.
-    const dated_opus = lookupCapabilities("anthropic/claude-opus-4.6-1m-20260601").?;
-    try std.testing.expectEqual(@as(u64, 1_000_000), dated_opus.context_window);
+test "v1.14.22 — Kimi K2.6 honestly stays at 262_144 (256K), did NOT extend to 1M" {
+    // Moonshot's published spec for K2.6 is 256K (262_144 tokens). There
+    // is no Kimi 1M variant. This test pins the §14.5 honesty boundary:
+    // we will not silently advertise a context window the provider does
+    // not actually support, even if a UI option made the request.
+    const k26 = lookupCapabilities("kimi-k2.6").?;
+    try std.testing.expectEqual(@as(u64, 262_144), k26.context_window);
 
-    const dated_gemini = lookupCapabilities("gemini-2.5-pro-1m-20260601").?;
-    try std.testing.expectEqual(@as(u64, 1_000_000), dated_gemini.context_window);
+    const k26_alias = lookupCapabilities("k2p6").?;
+    try std.testing.expectEqual(@as(u64, 262_144), k26_alias.context_window);
+
+    const k25 = lookupCapabilities("kimi-k2.5").?;
+    try std.testing.expectEqual(@as(u64, 262_144), k25.context_window);
+}
+
+test "v1.14.22 — synthetic -1m suffix entries are GONE from the table" {
+    // Comptime audit: walk MODEL_TABLE and assert no entry ends in `-1m`.
+    // These entries were based on the retired Anthropic beta header and
+    // would route to model ids the provider 404s on. Deleted in v1.14.22.
+    inline for (MODEL_TABLE) |entry| {
+        try std.testing.expect(!std.mem.endsWith(u8, entry.key, "-1m"));
+    }
 }

@@ -11366,8 +11366,9 @@ test "baseline: Agent struct has required execution control fields" {
 
 test "baseline: context_tokens resolves known model windows" {
     // Snapshot key model context windows so any model table change is visible.
+    // v1.14.22: Claude 4.x ships 1M context natively at standard pricing.
     const ct = @import("context_tokens.zig");
-    try std.testing.expectEqual(@as(?u64, 200_000), ct.lookupContextTokens("claude-sonnet-4.6"));
+    try std.testing.expectEqual(@as(?u64, 1_000_000), ct.lookupContextTokens("claude-sonnet-4.6"));
     try std.testing.expectEqual(@as(?u64, 128_000), ct.lookupContextTokens("openai/gpt-4.1-mini"));
 }
 
