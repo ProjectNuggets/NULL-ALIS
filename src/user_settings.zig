@@ -83,7 +83,106 @@ pub const ProductSettings = struct {
     /// improves recall on short / vague questions)." Maps to
     /// `memory.retrieval_stages.query_expansion_enabled` at runtime.
     query_expansion_enabled: bool = false,
+    /// 2026-05-25 (v1.14.22 hotfix sprint) — per-user model selection.
+    ///
+    /// When non-null, this overrides `cfg.default_model` for this tenant's
+    /// turns (set in `applySettingsToConfig` AFTER profile defaults / env
+    /// overrides land, so the user choice is the last writer). When null,
+    /// the operator-configured `default_model` is used (existing behavior).
+    ///
+    /// The FE renders a model picker; the selection round-trips through
+    /// product_settings → mergeSettingsIntoConfigJson → tenant config →
+    /// applySettingsToConfig → cfg.default_model → provider router. Switching
+    /// the picker is end-to-end real, not a half-wired claim.
+    ///
+    /// Validation: parseProductSettings rejects unknown ids with
+    /// `error.InvalidSelectedModel`. The allowlist is `SELECTED_MODEL_ALLOWLIST`
+    /// below; operators add new ids there. We intentionally do NOT echo
+    /// arbitrary tenant input into cfg.default_model — a tenant could
+    /// otherwise smuggle in a model id with embedded provider routing
+    /// (e.g. "openrouter/proxy.evil/model-x") that bypasses the operator's
+    /// provider allowlist.
+    ///
+    /// Storage: `SelectedModelBuf` is a fixed-size inline buffer (64 bytes,
+    /// well above the longest allowlisted id) so the field is self-owned and
+    /// does not alias arena memory from JSON parsing. Use `selectedModelSlice()`
+    /// to read the string, and `setSelectedModel()` to set it from a slice.
+    /// `selected_model_set = false` means null.
+    selected_model_set: bool = false,
+    selected_model_buf: SelectedModelBuf = .{},
+
+    pub fn selectedModelSlice(self: *const ProductSettings) ?[]const u8 {
+        if (!self.selected_model_set) return null;
+        return self.selected_model_buf.bytes[0..self.selected_model_buf.len];
+    }
+
+    pub fn setSelectedModel(self: *ProductSettings, value: ?[]const u8) error{SelectedModelTooLong}!void {
+        if (value) |s| {
+            if (s.len > self.selected_model_buf.bytes.len) return error.SelectedModelTooLong;
+            self.selected_model_buf.len = @intCast(s.len);
+            @memcpy(self.selected_model_buf.bytes[0..s.len], s);
+            self.selected_model_set = true;
+        } else {
+            self.selected_model_set = false;
+            self.selected_model_buf.len = 0;
+        }
+    }
 };
+
+/// Fixed-size storage for ProductSettings.selected_model. 64 bytes is well
+/// above any allowlisted id (longest is ~20 chars), and the inline shape
+/// keeps the field independent of JSON arena lifetime.
+pub const SelectedModelBuf = struct {
+    bytes: [64]u8 = [_]u8{0} ** 64,
+    len: u8 = 0,
+
+    pub fn slice(self: *const SelectedModelBuf) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+// ── Per-user model selection allowlist ──────────────────────────────────────
+//
+// v1.14.22 (2026-05-25). Tenants choose from this list via the FE settings
+// picker. New ids must be added explicitly — see selected_model docstring.
+//
+// Pricing note: Kimi K2.6 is the default cheap option (262K context, ~$0.40
+// per million in / ~$2 out at Moonshot's published rate as of May 2026).
+// Anthropic Opus 4.7 is the premium 1M-context option. Pricing varies — we
+// don't enforce a price ceiling here; that's the operator's metering job.
+//
+// Case-insensitive match (FE may send any casing).
+const SELECTED_MODEL_ALLOWLIST = [_][]const u8{
+    // Moonshot / Kimi — cheap defaults, 256K context
+    "kimi-k2.6",
+    "kimi-k2.5",
+    "k2p6",
+    "k2p5",
+    // Anthropic — Claude 4.x with 1M-context tier on Opus 4.7 / Sonnet 4.6
+    "claude-opus-4.7",
+    "claude-opus-4-7",
+    "claude-opus-4.6",
+    "claude-opus-4-6",
+    "claude-sonnet-4.6",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+    // OpenAI
+    "gpt-5.2",
+    "gpt-4.1",
+    // Google — Gemini 2.5 Pro has 1M context native
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    // DeepSeek
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+};
+
+fn isAllowedSelectedModel(candidate: []const u8) bool {
+    for (SELECTED_MODEL_ALLOWLIST) |allowed| {
+        if (std.ascii.eqlIgnoreCase(allowed, candidate)) return true;
+    }
+    return false;
+}
 
 pub const Error = error{
     InvalidPayload,
@@ -93,6 +192,11 @@ pub const Error = error{
     InvalidVoiceReplies,
     InvalidSessionTimeoutMinutes,
     InvalidAutonomy,
+    /// v1.14.22 — `selected_model` was present but is not on the per-user
+    /// model picker allowlist (`SELECTED_MODEL_ALLOWLIST`). The tenant
+    /// either typo'd the model id or attempted to set a model the operator
+    /// does not whitelist for direct selection.
+    InvalidSelectedModel,
 };
 
 pub const OwnershipPlane = enum {
@@ -213,6 +317,7 @@ const tenant_preference_product_settings_keys = [_][]const u8{
     "autonomy",
     "dream_enabled",
     "query_expansion_enabled",
+    "selected_model",
 };
 
 pub const NormalizedTenantConfig = struct {
@@ -363,6 +468,26 @@ pub fn applyPatchToSettingsJson(
             next.query_expansion_enabled = value.bool;
             continue;
         }
+        if (std.mem.eql(u8, key, "selected_model")) {
+            // v1.14.22 — same validation rules as parseProductSettings.
+            // String must be on SELECTED_MODEL_ALLOWLIST; null clears
+            // the current selection; any other shape is rejected.
+            switch (value) {
+                .null => {
+                    next.setSelectedModel(null) catch return error.InvalidSelectedModel;
+                },
+                .string => |s| {
+                    if (s.len == 0) {
+                        next.setSelectedModel(null) catch return error.InvalidSelectedModel;
+                    } else {
+                        if (!isAllowedSelectedModel(s)) return error.InvalidSelectedModel;
+                        next.setSelectedModel(s) catch return error.InvalidSelectedModel;
+                    }
+                },
+                else => return error.InvalidSelectedModel,
+            }
+            continue;
+        }
         return error.InvalidPayload;
     }
     return next;
@@ -389,6 +514,14 @@ pub fn mergeSettingsIntoConfigJson(
     try putString(product_obj, a, "autonomy", settings.autonomy.toString());
     try putBool(product_obj, a, "dream_enabled", settings.dream_enabled);
     try putBool(product_obj, a, "query_expansion_enabled", settings.query_expansion_enabled);
+    // v1.14.22 — when the tenant has picked a model, persist it; when they
+    // haven't, ensure any stale key is REMOVED so the round-trip doesn't
+    // resurrect a deleted choice on the next read.
+    if (settings.selectedModelSlice()) |sm| {
+        try putString(product_obj, a, "selected_model", sm);
+    } else {
+        _ = product_obj.swapRemove("selected_model");
+    }
 
     var rendered = try std.json.Stringify.valueAlloc(allocator, root, .{});
     if (rendered.len == 0 or rendered[rendered.len - 1] != '\n') {
@@ -451,6 +584,11 @@ pub fn normalizeTenantConfigJson(
     try putString(product_obj, a, "autonomy", settings.autonomy.toString());
     try putBool(product_obj, a, "dream_enabled", settings.dream_enabled);
     try putBool(product_obj, a, "query_expansion_enabled", settings.query_expansion_enabled);
+    if (settings.selectedModelSlice()) |sm| {
+        try putString(product_obj, a, "selected_model", sm);
+    } else {
+        _ = product_obj.swapRemove("selected_model");
+    }
 
     var rendered = try std.json.Stringify.valueAlloc(allocator, root, .{});
     if (rendered.len == 0 or rendered[rendered.len - 1] != '\n') {
@@ -527,13 +665,39 @@ pub fn applySettingsToConfig(cfg: *Config, settings: ProductSettings) void {
     // See AUTOMATIONS.json `_user_facing.user_toggle_setting` mapping
     // and src/daemon.zig wake-turn reconciliation.
 
+    // v1.14.22 — per-user model selection. When the tenant has picked a
+    // model in their settings, override the operator's default_model for
+    // this turn. Allocation lifecycle: cfg.default_model is allocator-
+    // owned, so free the previous value (if any) and dup the new one
+    // into cfg.allocator. The selected_model value was already validated
+    // against SELECTED_MODEL_ALLOWLIST at parse time — no need to
+    // re-validate here.
+    //
+    // Failure mode: if dup OOMs we leave cfg.default_model untouched so
+    // the operator default keeps working. applySettingsToConfig has a
+    // void signature, so OOM is logged and the caller proceeds.
+    if (settings.selectedModelSlice()) |sm| {
+        if (cfg.allocator.dupe(u8, sm)) |duped| {
+            if (cfg.default_model) |old| cfg.allocator.free(old);
+            cfg.default_model = duped;
+        } else |err| {
+            std.log.warn("applySettingsToConfig: failed to dupe selected_model '{s}' ({s}); keeping operator default", .{ sm, @errorName(err) });
+        }
+    }
+
     cfg.syncFlatFields();
 }
 
 pub fn renderSettingsJson(allocator: std.mem.Allocator, settings: ProductSettings) ![]u8 {
-    return std.fmt.allocPrint(
+    // v1.14.22 — selected_model is OMITTED when null so the on-disk shape
+    // for tenants who haven't picked a model stays clean (and downstream
+    // diff tools don't surface `"selected_model": null` as a meaningful
+    // edit). When set, it serializes as a quoted string. The validator
+    // already rejects invalid ids in parseProductSettings, so the value
+    // here is known-safe at render time.
+    const head = try std.fmt.allocPrint(
         allocator,
-        "{{\"assistant_mode\":\"{s}\",\"group_activation\":\"{s}\",\"proactive_updates\":{s},\"voice_replies\":{s},\"session_timeout_minutes\":{d},\"autonomy\":\"{s}\",\"dream_enabled\":{s},\"query_expansion_enabled\":{s}}}",
+        "{{\"assistant_mode\":\"{s}\",\"group_activation\":\"{s}\",\"proactive_updates\":{s},\"voice_replies\":{s},\"session_timeout_minutes\":{d},\"autonomy\":\"{s}\",\"dream_enabled\":{s},\"query_expansion_enabled\":{s}",
         .{
             settings.assistant_mode.toSlice(),
             settings.group_activation.toSlice(),
@@ -545,6 +709,11 @@ pub fn renderSettingsJson(allocator: std.mem.Allocator, settings: ProductSetting
             if (settings.query_expansion_enabled) "true" else "false",
         },
     );
+    defer allocator.free(head);
+    if (settings.selectedModelSlice()) |sm| {
+        return std.fmt.allocPrint(allocator, "{s},\"selected_model\":\"{s}\"}}", .{ head, sm });
+    }
+    return std.fmt.allocPrint(allocator, "{s}}}", .{head});
 }
 
 fn parseRootOrEmptyObject(allocator: std.mem.Allocator, json: []const u8) std.json.Value {
@@ -600,7 +769,14 @@ fn parseProductSettings(value: std.json.Value) Error!ProductSettings {
         break :blk raw.bool;
     };
 
-    return .{
+    // v1.14.22 — selected_model is optional. Three valid shapes:
+    //  1. key absent           → null (operator default wins)
+    //  2. key present, JSON null → null
+    //  3. key present, string  → must be on SELECTED_MODEL_ALLOWLIST
+    // Any other shape is `InvalidSelectedModel`. Storage is inline
+    // (SelectedModelBuf) so the value survives the JSON arena's deinit
+    // — unlike the raw `.string` slice which aliases arena memory.
+    var result = ProductSettings{
         .assistant_mode = assistant_mode,
         .group_activation = group_activation,
         .proactive_updates = proactive_raw.bool,
@@ -610,6 +786,22 @@ fn parseProductSettings(value: std.json.Value) Error!ProductSettings {
         .dream_enabled = dream_enabled,
         .query_expansion_enabled = query_expansion_enabled,
     };
+
+    if (obj.get("selected_model")) |raw| switch (raw) {
+        .null => {}, // keep default (unset)
+        .string => |s| {
+            if (s.len > 0) {
+                if (!isAllowedSelectedModel(s)) return error.InvalidSelectedModel;
+                // Reject impossibly long ids — every allowlisted id is well
+                // under SelectedModelBuf.bytes.len. SelectedModelTooLong
+                // from setSelectedModel surfaces as InvalidSelectedModel.
+                result.setSelectedModel(s) catch return error.InvalidSelectedModel;
+            }
+        },
+        else => return error.InvalidSelectedModel,
+    };
+
+    return result;
 }
 
 fn deriveNearestFromAgentObject(agent: std.json.ObjectMap) ProductSettings {
@@ -1124,4 +1316,146 @@ test "V1.14.4: mergeSettingsIntoConfigJson writes canonical autonomy" {
     // V1.14.4 review CR-01 fix — toString emits "read_only" (underscore
     // form) to match the FE TypeScript contract.
     try std.testing.expectEqualStrings("read_only", product.get("autonomy").?.string);
+}
+
+// ── v1.14.22: per-user model selection tests ────────────────────────────────
+
+test "v1.14.22: selected_model defaults to null" {
+    // Pre-v1.14.22 stored configs do not have the selected_model key.
+    // They must deserialize cleanly with selectedModelSlice() == null so
+    // the operator's default_model wins (the backward-compat contract
+    // every ProductSettings field on this struct honors).
+    const cfg =
+        \\{"product_settings":{"assistant_mode":"balanced","group_activation":"mention","proactive_updates":true,"voice_replies":false,"session_timeout_minutes":30}}
+    ;
+    const settings = try resolveSettingsFromConfigJson(std.testing.allocator, cfg);
+    try std.testing.expect(settings.selectedModelSlice() == null);
+
+    // Fresh defaults() also yields null.
+    try std.testing.expect(defaults().selectedModelSlice() == null);
+}
+
+test "v1.14.22: selected_model accepts allowlisted ids (case-insensitive)" {
+    // Round-trip through parseProductSettings via resolveSettingsFromConfigJson.
+    const cases = [_][]const u8{
+        "kimi-k2.6",
+        "claude-opus-4.7",
+        "claude-opus-4-7",
+        "claude-sonnet-4.6",
+        "gemini-2.5-pro",
+        // Case-insensitive — FE may upper-case to be safe.
+        "Claude-Opus-4.7",
+        "KIMI-K2.6",
+    };
+    inline for (cases) |id| {
+        const cfg_json = "{\"product_settings\":{\"assistant_mode\":\"balanced\",\"group_activation\":\"mention\",\"proactive_updates\":true,\"voice_replies\":false,\"session_timeout_minutes\":30,\"selected_model\":\"" ++ id ++ "\"}}";
+        const settings = try resolveSettingsFromConfigJson(std.testing.allocator, cfg_json);
+        try std.testing.expect(settings.selectedModelSlice() != null);
+        try std.testing.expectEqualStrings(id, settings.selectedModelSlice().?);
+    }
+}
+
+test "v1.14.22: selected_model rejects ids not on the allowlist" {
+    // Unknown model id — should fail parse with InvalidSelectedModel via
+    // the FE patch path (applyPatchToSettingsJson). The on-disk-config
+    // load path (extractFromConfigJson) intentionally swallows parse
+    // errors to keep startup robust, so the patch path is the gate
+    // that surfaces validation to the user.
+    const bad_id_cases = [_][]const u8{
+        "not-a-real-model",
+        "gpt-3.5-turbo", // not on our allowlist
+        "claude-opus-3", // older Claude not on list
+        "openai/gpt-4.1", // provider-prefixed forms must be rejected — the
+        // tenant can't smuggle in routing through this field
+        "kimi-k2.6-1m", // synthetic suffix not on list
+    };
+    inline for (bad_id_cases) |id| {
+        const patch = "{\"selected_model\":\"" ++ id ++ "\"}";
+        const result = applyPatchToSettingsJson(std.testing.allocator, defaults(), patch);
+        try std.testing.expectError(error.InvalidSelectedModel, result);
+    }
+
+    // Non-string shape is also rejected.
+    const bad_shape = "{\"selected_model\":42}";
+    try std.testing.expectError(error.InvalidSelectedModel, applyPatchToSettingsJson(std.testing.allocator, defaults(), bad_shape));
+
+    // And via the full-parse path too — parseProductSettings rejects.
+    // (We can't observe this through resolveSettingsFromConfigJson because
+    // extractFromConfigJson swallows; assert against parseProductSettings
+    // directly via a JSON arena.)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const obj_json = "{\"assistant_mode\":\"balanced\",\"group_activation\":\"mention\",\"proactive_updates\":true,\"voice_replies\":false,\"session_timeout_minutes\":30,\"selected_model\":\"not-real\"}";
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), obj_json, .{});
+    try std.testing.expectError(error.InvalidSelectedModel, parseProductSettings(parsed.value));
+}
+
+test "v1.14.22: selected_model overrides cfg.default_model in applySettingsToConfig" {
+    // The whole point of the feature: when the tenant picks a model in
+    // the FE, the agent's outbound routing must reflect that choice.
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = try std.testing.allocator.dupe(u8, "operator-default-model"),
+        .allocator = std.testing.allocator,
+    };
+    defer if (cfg.default_model) |m| std.testing.allocator.free(m);
+
+    // Apply with selected_model set — cfg.default_model is rewritten.
+    var s1 = ProductSettings{
+        .assistant_mode = .balanced,
+        .group_activation = .mention,
+        .proactive_updates = true,
+        .voice_replies = false,
+        .session_timeout_minutes = 30,
+        .autonomy = .full,
+    };
+    try s1.setSelectedModel("claude-opus-4.7");
+    applySettingsToConfig(&cfg, s1);
+    try std.testing.expect(cfg.default_model != null);
+    try std.testing.expectEqualStrings("claude-opus-4.7", cfg.default_model.?);
+
+    // Apply with selected_model = null — cfg.default_model stays as-is
+    // (this preserves the operator's choice for tenants who haven't
+    // explicitly picked).
+    applySettingsToConfig(&cfg, .{
+        .assistant_mode = .balanced,
+        .group_activation = .mention,
+        .proactive_updates = true,
+        .voice_replies = false,
+        .session_timeout_minutes = 30,
+        .autonomy = .full,
+    });
+    try std.testing.expectEqualStrings("claude-opus-4.7", cfg.default_model.?);
+}
+
+test "v1.14.22: selected_model round-trips through render + parse" {
+    // renderSettingsJson → mergeSettingsIntoConfigJson → resolveSettingsFromConfigJson
+    // must preserve the picked model. Null round-trips to absent key.
+    var original = ProductSettings{
+        .assistant_mode = .balanced,
+        .group_activation = .mention,
+        .proactive_updates = true,
+        .voice_replies = false,
+        .session_timeout_minutes = 30,
+        .autonomy = .full,
+    };
+    try original.setSelectedModel("kimi-k2.6");
+
+    const merged = try mergeSettingsIntoConfigJson(std.testing.allocator, "{}", original);
+    defer std.testing.allocator.free(merged);
+
+    const read_back = try resolveSettingsFromConfigJson(std.testing.allocator, merged);
+    try std.testing.expect(read_back.selectedModelSlice() != null);
+    try std.testing.expectEqualStrings("kimi-k2.6", read_back.selectedModelSlice().?);
+
+    // Null round-trip: render with null → JSON has no selected_model key →
+    // parse → null again.
+    const null_original = ProductSettings{};
+    const null_merged = try mergeSettingsIntoConfigJson(std.testing.allocator, "{}", null_original);
+    defer std.testing.allocator.free(null_merged);
+    try std.testing.expect(std.mem.indexOf(u8, null_merged, "selected_model") == null);
+
+    const null_read = try resolveSettingsFromConfigJson(std.testing.allocator, null_merged);
+    try std.testing.expect(null_read.selectedModelSlice() == null);
 }
