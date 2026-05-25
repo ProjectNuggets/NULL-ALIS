@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const observability = @import("../observability.zig");
 
 const log = std.log.scoped(.extension_ws);
 
@@ -544,6 +545,16 @@ pub const ExtensionWsHub = struct {
         // dropped by unregister/eviction/hub-deinit; the caller's
         // ref is dropped by destroyConn (= pump exit).
         conn.retain();
+
+        // WARN 2.C: operability signal — operator sees one info line
+        // per new extension binding. user_id is logged here (not in
+        // the cross-cutting metric) so a single operator grep can
+        // attribute a hub event to a specific tenant.
+        log.info("extension_ws: connection registered user_id='{s}' active={d}", .{ user_id, self.users.count() });
+        // HIGH 2.A: gauge of live extension WS sessions. Take the
+        // count under the lock so the sample is consistent with the
+        // map state visible to other readers.
+        observability.recordMetricGlobal(.{ .extension_ws_connections_active = self.users.count() });
         return conn;
     }
 
@@ -584,6 +595,8 @@ pub const ExtensionWsHub = struct {
             // semantics handle the timing.
             _ = kv.value.release();
             self.allocator.free(kv.key);
+            // HIGH 2.A: refresh gauge after the slot is gone.
+            observability.recordMetricGlobal(.{ .extension_ws_connections_active = self.users.count() });
             return true;
         }
         return false;
@@ -619,9 +632,18 @@ pub const ExtensionWsHub = struct {
         args_json: []const u8,
         timeout_ms: u64,
     ) ![]u8 {
+        // HIGH 2.A: track command-call latency + result-class. The
+        // emit is at the central hub entry-point (rather than per-
+        // tool) so all 10 extension_* tools surface a metric without
+        // each having to duplicate the timing dance.
+        const t_start_ns = std.time.nanoTimestamp();
+
         // META CRIT #3 — getForUser bumped the refcount; we MUST
         // release before returning, regardless of error path.
-        const conn = self.getForUser(user_id) orelse return error.NoExtensionConnected;
+        const conn = self.getForUser(user_id) orelse {
+            observability.recordMetricGlobal(.{ .extension_ws_command_total = .{ .result = "no_conn", .tool = tool } });
+            return error.NoExtensionConnected;
+        };
         defer _ = conn.release();
 
         const id = try conn.mintCommandId(result_allocator);
@@ -634,8 +656,32 @@ pub const ExtensionWsHub = struct {
         );
         defer result_allocator.free(command_json);
 
-        const result_borrowed = try conn.sendCommand(result_allocator, id, command_json, timeout_ms);
+        const result_borrowed = conn.sendCommand(result_allocator, id, command_json, timeout_ms) catch |err| {
+            const elapsed_ms: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - t_start_ns, std.time.ns_per_ms));
+            observability.recordMetricGlobal(.{ .extension_ws_command_latency_ms = elapsed_ms });
+            const result_label: []const u8 = switch (err) {
+                error.Timeout => "timeout",
+                error.ConnectionClosed => "conn_closed",
+                error.ResultDeliveryOom => "oom",
+                else => "error_other",
+            };
+            observability.recordMetricGlobal(.{ .extension_ws_command_total = .{ .result = result_label, .tool = tool } });
+            // WARN 2.C: operator-visible signal for timeouts. Other
+            // failure classes are not log-spammed here because they
+            // bubble to the tool layer where the user-facing error is
+            // surfaced; a timeout is the one most useful to chart in
+            // logs because the user often can't tell why their click
+            // "did nothing".
+            if (err == error.Timeout) {
+                log.info("extension_ws: command timed out user_id='{s}' tool='{s}' timeout_ms={d}", .{ user_id, tool, timeout_ms });
+            }
+            return err;
+        };
         defer conn.allocator.free(result_borrowed);
+
+        const elapsed_ms: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - t_start_ns, std.time.ns_per_ms));
+        observability.recordMetricGlobal(.{ .extension_ws_command_latency_ms = elapsed_ms });
+        observability.recordMetricGlobal(.{ .extension_ws_command_total = .{ .result = "ok", .tool = tool } });
 
         // Re-dupe into the caller's allocator so the caller's free
         // path matches what `sendCommand`'s docstring promises.

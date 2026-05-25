@@ -15,6 +15,11 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 
+// WARN 2.B (v1.14.23): scoped logger for cross-boundary handoff
+// failures. Timeouts / OOM / disconnects are metricked + logged at the
+// hub layer; this catches the dispatch catch-all and malformed frames.
+const log = std.log.scoped(.extension_list_tabs);
+
 pub const ExtensionListTabsTool = struct {
     hub: *hub_mod.ExtensionWsHub,
     user_id: ?[]const u8 = null,
@@ -82,6 +87,7 @@ pub const ExtensionListTabsTool = struct {
             // HI-01 (v1.14.22): distinguish gateway OOM from connection-closed.
             error.ResultDeliveryOom => return ToolResult.fail("gateway ran out of memory delivering the extension result — please retry; if persistent, check the gateway available RAM."),
             else => |e| {
+                log.warn("extension_list_tabs dispatch failed user_id='{s}' err={s}", .{ user_id, @errorName(e) });
                 const msg = try std.fmt.allocPrint(allocator, "extension_list_tabs dispatch failed: {s}", .{@errorName(e)});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             },
@@ -95,12 +101,16 @@ fn interpretResultJson(allocator: std.mem.Allocator, json: []u8) !ToolResult {
     defer allocator.free(json);
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch {
+        log.warn("extension_list_tabs malformed result frame len={d}", .{json.len});
         return ToolResult.fail("extension returned malformed CommandResult JSON");
     };
     defer parsed.deinit();
     const obj = switch (parsed.value) {
         .object => |o| o,
-        else => return ToolResult.fail("extension returned non-object CommandResult"),
+        else => {
+            log.warn("extension_list_tabs non-object result frame", .{});
+            return ToolResult.fail("extension returned non-object CommandResult");
+        },
     };
 
     const ok = if (obj.get("ok")) |v| switch (v) {

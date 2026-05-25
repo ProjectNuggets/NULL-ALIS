@@ -13,6 +13,12 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 
+// WARN 2.B (v1.14.23): scoped logger for cross-boundary handoff
+// failures. The hub-layer already metrics + logs timeouts / OOM /
+// disconnects centrally; this logger adds signal for the local
+// dispatch-error catch-all and malformed result frames.
+const log = std.log.scoped(.extension_fill_form);
+
 /// Cap the number of fields per call. 50 is enough for any realistic
 /// form (long surveys average 20–30 fields); anything bigger is almost
 /// certainly an agent loop or a misuse.
@@ -133,6 +139,7 @@ pub const ExtensionFillFormTool = struct {
             // HI-01 (v1.14.22): distinguish gateway OOM from connection-closed.
             error.ResultDeliveryOom => return ToolResult.fail("gateway ran out of memory delivering the extension result — please retry; if persistent, check the gateway available RAM."),
             else => |e| {
+                log.warn("extension_fill_form dispatch failed user_id='{s}' err={s}", .{ user_id, @errorName(e) });
                 const msg = try std.fmt.allocPrint(allocator, "extension_fill_form dispatch failed: {s}", .{@errorName(e)});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             },
@@ -146,12 +153,16 @@ fn interpretResultJson(allocator: std.mem.Allocator, json: []u8) !ToolResult {
     defer allocator.free(json);
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch {
+        log.warn("extension_fill_form malformed result frame len={d}", .{json.len});
         return ToolResult.fail("extension returned malformed CommandResult JSON");
     };
     defer parsed.deinit();
     const obj = switch (parsed.value) {
         .object => |o| o,
-        else => return ToolResult.fail("extension returned non-object CommandResult"),
+        else => {
+            log.warn("extension_fill_form non-object result frame", .{});
+            return ToolResult.fail("extension returned non-object CommandResult");
+        },
     };
 
     const ok = if (obj.get("ok")) |v| switch (v) {

@@ -26,6 +26,12 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 
+// WARN 2.B (v1.14.23): scoped logger for cross-boundary handoff
+// failures. The hub-layer already metrics + logs timeouts / OOM /
+// disconnects centrally; this logger adds signal for the local
+// dispatch-error catch-all and malformed result frames.
+const log = std.log.scoped(.extension_navigate);
+
 /// Per-instance state: the hub handle is bound at `allTools` time
 /// (conditional registration — see tools/root.zig), and the user_id is
 /// bound per-call via `bindExtensionTools` from the chat-stream
@@ -103,6 +109,15 @@ pub const ExtensionNavigateTool = struct {
         switch (url_sanitize.sanitize(url, self.url_allowlist)) {
             .ok => {},
             .reject => |rj| {
+                // WARN 2.C + HIGH 2.A: operability signal — operators
+                // need to see SSRF blocks on a chart and in logs to
+                // tune `extension_browser_allowlist` for LAN-trusted
+                // deployments. user_id is included so operators can
+                // attribute blocks to a tenant when triaging "why is
+                // my agent refusing to open localhost:3000?"
+                const uid_label: []const u8 = self.user_id orelse "<unbound>";
+                log.info("extension_ws.ssrf_block user_id='{s}' reason={s} detail={s}", .{ uid_label, rj.reason.toString(), rj.detail });
+                @import("../observability.zig").recordMetricGlobal(.{ .extension_ws_ssrf_block_total = 1 });
                 const msg = try std.fmt.allocPrint(
                     allocator,
                     "url blocked by SSRF defense [{s}]: {s}",
@@ -143,6 +158,7 @@ pub const ExtensionNavigateTool = struct {
             // operators see the real cause in the surfaced error.
             error.ResultDeliveryOom => return ToolResult.fail("gateway ran out of memory delivering the extension result — please retry; if persistent, check the gateway's available RAM."),
             else => |e| {
+                log.warn("extension_navigate dispatch failed user_id='{s}' err={s}", .{ user_id, @errorName(e) });
                 const msg = try std.fmt.allocPrint(allocator, "extension_navigate dispatch failed: {s}", .{@errorName(e)});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             },
@@ -161,12 +177,16 @@ fn interpretResultJson(allocator: std.mem.Allocator, json: []u8) !ToolResult {
     defer allocator.free(json);
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch {
+        log.warn("extension_navigate malformed result frame len={d}", .{json.len});
         return ToolResult.fail("extension returned malformed CommandResult JSON");
     };
     defer parsed.deinit();
     const obj = switch (parsed.value) {
         .object => |o| o,
-        else => return ToolResult.fail("extension returned non-object CommandResult"),
+        else => {
+            log.warn("extension_navigate non-object result frame", .{});
+            return ToolResult.fail("extension returned non-object CommandResult");
+        },
     };
 
     const ok = if (obj.get("ok")) |v| switch (v) {
