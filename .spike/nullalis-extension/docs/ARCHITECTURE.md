@@ -39,8 +39,10 @@
 
 ### Content script (`src/content.ts`)
 
-- Installed via `manifest.json` content_scripts for `<all_urls>`, runs at
-  `document_idle`.
+- Installed via `manifest.json` content_scripts for `http://*/*` and
+  `https://*/*` only (NOT `<all_urls>` — we exclude `file://`, `data:`,
+  `blob:`, `ftp:`, `view-source:` etc. since the agent only automates
+  the user's web-based logged-in sessions). Runs at `document_idle`.
 - Listens for `ExecuteInTab` and `ShowToast` messages from the background.
 - Dispatches `ExecuteInTab.command` against the page's real `document` via
   the same pure functions used in unit tests (`src/commands.ts`).

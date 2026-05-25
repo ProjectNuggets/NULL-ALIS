@@ -28,10 +28,15 @@ describe("manifest.json", () => {
     expect(manifest.action?.default_popup).toBe("src/popup/index.html");
   });
 
-  it("declares the content script for <all_urls>", () => {
+  it("declares the content script narrowly for http/https only", () => {
+    // We deliberately do NOT use <all_urls>: the agent automates the user's
+    // logged-in browser sessions, which are always http(s). Excluding file://,
+    // data:, blob:, ftp:, view-source: keeps the in-page injection surface to
+    // the actually-targeted protocol set. See docs/SECURITY.md.
     const scripts = manifest.content_scripts ?? [];
     expect(scripts.length).toBe(1);
-    expect(scripts[0].matches).toContain("<all_urls>");
+    expect(scripts[0].matches).toEqual(["http://*/*", "https://*/*"]);
+    expect(scripts[0].matches).not.toContain("<all_urls>");
     expect(scripts[0].js).toContain("src/content.ts");
     expect(scripts[0].run_at).toBe("document_idle");
   });

@@ -39,6 +39,12 @@ When you install this extension, you are trusting that:
 - The extension does NOT request `<all_urls>` host permission. The content
   script attaches declaratively, and the background uses `activeTab` only,
   so the agent's reach is gated by user focus.
+- The declarative content-script injection itself is also narrowed: it only
+  matches `http://*/*` and `https://*/*`, not `<all_urls>`. `file://`,
+  `data:`, `blob:`, `ftp:`, and `view-source:` documents do NOT get the
+  content script injected — they're outside the use case (the agent
+  automates web-based logged-in sessions) and were prior in-page surface
+  with no purpose.
 
 ## Mitigations in v1
 
