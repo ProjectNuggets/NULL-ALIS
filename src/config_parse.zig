@@ -1830,6 +1830,25 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    // Branding (operator-deployed brand typography). Missing block →
+    // BrandingConfig defaults (empty font_dir = disabled). Existing-but-
+    // partial block → only the supplied fields override; the rest keep
+    // defaults. Mirrors the composio shape so an operator who already
+    // wired one nested block needs no new shape vocabulary.
+    if (root.get("branding")) |br| {
+        if (br == .object) {
+            if (br.object.get("font_dir")) |v| {
+                if (v == .string) self.branding.font_dir = try self.allocator.dupe(u8, v.string);
+            }
+            if (br.object.get("body_font")) |v| {
+                if (v == .string) self.branding.body_font = try self.allocator.dupe(u8, v.string);
+            }
+            if (br.object.get("display_font")) |v| {
+                if (v == .string) self.branding.display_font = try self.allocator.dupe(u8, v.string);
+            }
+        }
+    }
+
     // Secrets
     if (root.get("secrets")) |sec| {
         if (sec == .object) {

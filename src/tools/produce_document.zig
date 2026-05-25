@@ -31,9 +31,13 @@
 const std = @import("std");
 const root = @import("root.zig");
 const process_util = @import("process_util.zig");
+const config_types = @import("../config_types.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
+
+/// Re-exported so callers needn't reach into config_types.
+pub const BrandingConfig = config_types.BrandingConfig;
 
 /// Maximum bytes for any produced output file. 50 MB matches the AGENTS.md
 /// guidance for agent-facing artifacts — large enough for a long PDF or a
@@ -62,6 +66,14 @@ pub const ProduceDocumentTool = struct {
     /// Workspace root where attachments/sources/ and attachments/produced/
     /// are created. Bound at tool registration time.
     workspace_dir: []const u8 = "",
+
+    /// Operator-deployed brand typography. Empty/missing `font_dir` ⇒
+    /// branding disabled and produce_document falls back to system fonts
+    /// (existing behaviour). When the dir exists with the expected
+    /// `<font_dir>/<body_font>/otf` + `<font_dir>/<display_font>/otf`
+    /// subfolders, every produced document is styled with the brand
+    /// typography. NOT user-settable — operator decision only.
+    branding: BrandingConfig = .{},
 
     pub const tool_name = "produce_document";
 
@@ -132,8 +144,22 @@ pub const ProduceDocumentTool = struct {
         "  - `default` (clean white, sans, projector-friendly) — best general use\n" ++
         "  - `gaia` (warm cream, serif accents, book-feel) — best for talks\n" ++
         "  - `uncover` (bold black/white, big type) — best for keynote / lecture\n" ++
+        "  - `thmanyah` (brand typography) — AVAILABLE ONLY WHEN the operator has\n" ++
+        "    deployed a font dir + set `branding.font_dir` in config. If you pick\n" ++
+        "    `thmanyah` without branding enabled the tool returns a clear error so\n" ++
+        "    you can fall back to `default`. See your operator if you want branded\n" ++
+        "    output and it is not currently available.\n" ++
         "If you DO want custom frontmatter, start `content` with `---` and yours wins\n" ++
         "(operator escape hatch).\n\n" ++
+        "### branding (operator-owned)\n" ++
+        "When the operator has deployed a brand font (e.g. Thmanyah) and set\n" ++
+        "`branding.font_dir` in config, every PDF / DOCX / PPTX / HTML produced by\n" ++
+        "this tool uses the brand typography automatically — you write the same\n" ++
+        "content, the deliverable carries the brand. For DOCX specifically, the\n" ++
+        "operator may also place a styled `<workspace>/branding/reference.docx` for\n" ++
+        "richer style application; if absent the tool logs a hint and produces a\n" ++
+        "plain DOCX. Branding is NOT a per-user preference — do not expose a\n" ++
+        "branding choice to users; it is an operator-level brand decision.\n\n" ++
         "EXAMPLE (PPTX / kickoff deck):\n" ++
         "```\n" ++
         "# Project Kickoff\n" ++
@@ -158,7 +184,7 @@ pub const ProduceDocumentTool = struct {
         "- For raw markdown / code the user will copy → file_write.";
 
     pub const tool_params =
-        \\{"type":"object","properties":{"format":{"type":"string","enum":["pdf","docx","xlsx","pptx","html"],"description":"Output format. pdf/docx/html accept markdown input; xlsx accepts CSV; pptx accepts markdown with --- slide separators."},"content":{"type":"string","description":"Source content. Markdown for pdf/docx/html/pptx, CSV for xlsx. Required."},"title":{"type":"string","description":"Document title — used for the output filename and (where supported) document metadata. Default 'untitled'. Will be sanitized to filesystem-safe characters."},"theme":{"type":"string","enum":["default","gaia","uncover"],"description":"Marp theme for PPTX slides. Ignored for non-pptx formats. 'default' = clean white background, dark text. 'gaia' = warm cream background with serif accents, good for talks. 'uncover' = bold black-on-white, lecture/keynote style. Default 'default'."}},"required":["format","content"]}
+        \\{"type":"object","properties":{"format":{"type":"string","enum":["pdf","docx","xlsx","pptx","html"],"description":"Output format. pdf/docx/html accept markdown input; xlsx accepts CSV; pptx accepts markdown with --- slide separators."},"content":{"type":"string","description":"Source content. Markdown for pdf/docx/html/pptx, CSV for xlsx. Required."},"title":{"type":"string","description":"Document title — used for the output filename and (where supported) document metadata. Default 'untitled'. Will be sanitized to filesystem-safe characters."},"theme":{"type":"string","enum":["default","gaia","uncover","thmanyah"],"description":"Marp theme for PPTX slides. Ignored for non-pptx formats. 'default' = clean white background, dark text. 'gaia' = warm cream background with serif accents, good for talks. 'uncover' = bold black-on-white, lecture/keynote style. 'thmanyah' = brand typography (AVAILABLE ONLY when operator has deployed branding fonts; otherwise returns a clear error). Default 'default'."}},"required":["format","content"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -215,7 +241,7 @@ pub const ProduceDocumentTool = struct {
         const theme = parseTheme(theme_raw) orelse {
             const msg = try std.fmt.allocPrint(
                 allocator,
-                "Invalid 'theme' value: '{s}'. Must be one of: default, gaia, uncover",
+                "Invalid 'theme' value: '{s}'. Must be one of: default, gaia, uncover, thmanyah",
                 .{theme_raw},
             );
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
@@ -223,6 +249,33 @@ pub const ProduceDocumentTool = struct {
 
         if (self.workspace_dir.len == 0) {
             return ToolResult.fail("Workspace not configured — tool has no place to write the produced document");
+        }
+
+        // Resolve branding ONCE per call. Null = disabled or misconfigured
+        // (silent fallback for empty font_dir; warned fallback for missing
+        // subdirs). The renderers branch on `resolved == null` to decide
+        // whether to apply brand typography.
+        const resolved_branding_opt: ?ResolvedBranding = resolveBranding(allocator, self.branding) catch |err| blk: {
+            std.log.scoped(.branding).warn(
+                "resolveBranding errored ({s}) — falling back to system fonts",
+                .{@errorName(err)},
+            );
+            break :blk null;
+        };
+        defer if (resolved_branding_opt) |rb| rb.deinit(allocator);
+
+        // §14.5 honesty gate: if the agent picked `thmanyah` theme but
+        // branding is NOT enabled, refuse with a clear error rather than
+        // silently substituting `default`. The agent must surface this so
+        // the user knows their explicit branded request can't be honored.
+        if (theme == .thmanyah and resolved_branding_opt == null) {
+            const msg = try allocator.dupe(
+                u8,
+                "theme='thmanyah' requires operator branding to be enabled. " ++
+                    "Branding is not configured (operator hasn't set `branding.font_dir` in config). " ++
+                    "Fall back to theme='default'/'gaia'/'uncover' or ask your operator to deploy the brand font.",
+            );
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
         }
 
         // ── Prepare directories ──────────────────────────────────────
@@ -331,11 +384,11 @@ pub const ProduceDocumentTool = struct {
 
         // ── Dispatch to renderer ─────────────────────────────────────
         const render_result = switch (format) {
-            .pdf => try renderPdf(allocator, src_path, out_path, safe_title),
-            .docx => try renderDocx(allocator, src_path, out_path, safe_title),
+            .pdf => try renderPdf(allocator, src_path, out_path, safe_title, resolved_branding_opt),
+            .docx => try renderDocx(allocator, src_path, out_path, safe_title, self.workspace_dir, resolved_branding_opt),
             .xlsx => try renderXlsx(allocator, src_path, out_path),
-            .pptx => try renderPptx(allocator, src_path, out_path),
-            .html => try renderHtml(allocator, src_path, out_path, safe_title),
+            .pptx => try renderPptx(allocator, src_path, out_path, theme, self.workspace_dir, resolved_branding_opt),
+            .html => try renderHtml(allocator, src_path, out_path, safe_title, resolved_branding_opt),
         };
 
         // If renderer failed, return the error (and clean up the output if it
@@ -428,12 +481,19 @@ const Theme = enum {
     default_theme,
     gaia,
     uncover,
+    /// Operator-brand theme (e.g. Thmanyah). Selecting this when the
+    /// operator has NOT enabled branding (empty/missing font_dir) yields
+    /// a clear "branding not configured" error — the tool does NOT
+    /// silently fall back to default (§14.5 honesty: explicit theme
+    /// requests must succeed or surface why they can't).
+    thmanyah,
 
     pub fn toSlice(self: Theme) []const u8 {
         return switch (self) {
             .default_theme => "default",
             .gaia => "gaia",
             .uncover => "uncover",
+            .thmanyah => "thmanyah",
         };
     }
 };
@@ -443,7 +503,222 @@ fn parseTheme(s: []const u8) ?Theme {
     if (std.ascii.eqlIgnoreCase(t, "default")) return .default_theme;
     if (std.ascii.eqlIgnoreCase(t, "gaia")) return .gaia;
     if (std.ascii.eqlIgnoreCase(t, "uncover")) return .uncover;
+    if (std.ascii.eqlIgnoreCase(t, "thmanyah")) return .thmanyah;
     return null;
+}
+
+// ── Branding resolution ──────────────────────────────────────────────
+//
+// Branding lives at operator config (BrandingConfig). For each format
+// renderer we want a single fast question: "do we have a font dir we can
+// trust for this render?" — answered by `resolveBranding`. If yes, we
+// thread a small `ResolvedBranding` struct (paths + family names) into
+// the renderer; if no, the renderer skips its font-application path and
+// falls back to system defaults silently.
+//
+// We do NOT copy fonts anywhere — the resolver only confirms the
+// expected `<font_dir>/<family>/otf` subfolders exist. Marp / pandoc /
+// HTML @font-face declarations reference the operator's directory via
+// absolute `file://` URLs (Marp + HTML self-rendered) or `--variable
+// mainfont=<family>` (pandoc → xelatex/lualatex which discovers fonts
+// from a system path; see renderPdf for the install-hint fallback).
+//
+// License: the font files NEVER enter the nullalis repo. The license
+// text at /Users/nova/Downloads/Thmanyah-Font-Family/LICENSE.pdf permits
+// embedding in produced documents but prohibits redistribution of the
+// font files themselves; following that rule means the operator owns
+// the font directory and we only read it.
+
+/// Resolved branding info, returned by `resolveBranding` when the
+/// operator has deployed a brand font. All paths are heap-allocated
+/// from the same allocator the caller passes; free with `deinit`.
+pub const ResolvedBranding = struct {
+    body_font_family: []const u8,
+    /// Absolute path to `<font_dir>/<body_font>/otf`.
+    body_otf_dir: []const u8,
+    /// Absolute path to `<font_dir>/<body_font>/woff2` (may be empty if
+    /// the woff2 subdir is absent — HTML/Marp emit only otf @font-face
+    /// in that case).
+    body_woff2_dir: []const u8,
+    display_font_family: []const u8,
+    display_otf_dir: []const u8,
+    display_woff2_dir: []const u8,
+
+    pub fn deinit(self: ResolvedBranding, allocator: std.mem.Allocator) void {
+        allocator.free(self.body_font_family);
+        allocator.free(self.body_otf_dir);
+        allocator.free(self.body_woff2_dir);
+        allocator.free(self.display_font_family);
+        allocator.free(self.display_otf_dir);
+        allocator.free(self.display_woff2_dir);
+    }
+};
+
+/// Verify `<dir>` exists and is a directory. Used by resolveBranding to
+/// gate brand application — we don't want to emit @font-face URLs that
+/// 404 when the operator's deploy script forgot to mount the font dir.
+fn directoryExists(path: []const u8) bool {
+    var dir = std.fs.openDirAbsolute(path, .{}) catch return false;
+    dir.close();
+    return true;
+}
+
+/// Resolve a BrandingConfig to a ResolvedBranding suitable for the
+/// renderers. Returns null when branding is disabled OR when the
+/// directory shape is wrong — both fall through to system fonts. On the
+/// disabled-via-empty-font_dir path we are silent; on the misconfigured-
+/// directory path we log a warn so the operator notices the gap (still
+/// fall through; broken branding must not break document production).
+///
+/// Caller owns the returned struct; call `.deinit(allocator)`.
+pub fn resolveBranding(
+    allocator: std.mem.Allocator,
+    branding: BrandingConfig,
+) !?ResolvedBranding {
+    if (branding.font_dir.len == 0) return null;
+
+    if (!directoryExists(branding.font_dir)) {
+        std.log.scoped(.branding).warn(
+            "branding.font_dir '{s}' does not exist or is not a directory — falling back to system fonts. Verify the operator deploy mounted the font directory.",
+            .{branding.font_dir},
+        );
+        return null;
+    }
+
+    const body_otf = try std.fs.path.join(allocator, &.{ branding.font_dir, branding.body_font, "otf" });
+    errdefer allocator.free(body_otf);
+    if (!directoryExists(body_otf)) {
+        std.log.scoped(.branding).warn(
+            "branding body font '{s}' missing otf subdir at '{s}' — falling back to system fonts.",
+            .{ branding.body_font, body_otf },
+        );
+        allocator.free(body_otf);
+        return null;
+    }
+
+    const display_otf = try std.fs.path.join(allocator, &.{ branding.font_dir, branding.display_font, "otf" });
+    errdefer allocator.free(display_otf);
+    if (!directoryExists(display_otf)) {
+        std.log.scoped(.branding).warn(
+            "branding display font '{s}' missing otf subdir at '{s}' — falling back to system fonts.",
+            .{ branding.display_font, display_otf },
+        );
+        allocator.free(body_otf);
+        allocator.free(display_otf);
+        return null;
+    }
+
+    // woff2 dirs are optional — only used for HTML / Marp @font-face.
+    // Pass empty string when absent so renderers can skip those rules.
+    const body_woff2 = try std.fs.path.join(allocator, &.{ branding.font_dir, branding.body_font, "woff2" });
+    errdefer allocator.free(body_woff2);
+    const display_woff2 = try std.fs.path.join(allocator, &.{ branding.font_dir, branding.display_font, "woff2" });
+    errdefer allocator.free(display_woff2);
+
+    const body_woff2_final: []const u8 = if (directoryExists(body_woff2)) body_woff2 else blk: {
+        allocator.free(body_woff2);
+        break :blk try allocator.dupe(u8, "");
+    };
+    const display_woff2_final: []const u8 = if (directoryExists(display_woff2)) display_woff2 else blk: {
+        allocator.free(display_woff2);
+        break :blk try allocator.dupe(u8, "");
+    };
+
+    return ResolvedBranding{
+        .body_font_family = try allocator.dupe(u8, branding.body_font),
+        .body_otf_dir = body_otf,
+        .body_woff2_dir = body_woff2_final,
+        .display_font_family = try allocator.dupe(u8, branding.display_font),
+        .display_otf_dir = display_otf,
+        .display_woff2_dir = display_woff2_final,
+    };
+}
+
+/// Emit a CSS `@font-face` block + body/display rules for the resolved
+/// branding. Used by the HTML renderer (inline `<style>`) AND by the
+/// Marp `thmanyah` theme generator. URLs are absolute `file://` so the
+/// renderer can find the fonts at compile time; for HTML served as a
+/// landing page the operator can rewrite these via post-processing if
+/// the static-serving root differs from the workspace.
+///
+/// `kind` selects the URL prefix:
+///   .file  → `file://<abs-path>/...` (HTML self-rendered, Marp)
+///   .relative → `../../branding/fonts/...` (rarely used; reserved for
+///               future workspace-bundled font use, requires the
+///               operator to opt into copying the fonts to workspace —
+///               not currently supported but the enum is here for
+///               clarity)
+///
+/// Caller frees.
+pub const FontUrlKind = enum { file, relative };
+
+pub fn cssFontFaceBlock(
+    allocator: std.mem.Allocator,
+    rb: ResolvedBranding,
+    kind: FontUrlKind,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    // Helper: pick woff2 dir if present, else otf dir. woff2 is much
+    // smaller (~30% of otf), so we prefer it for browsers; absent woff2
+    // falls back to otf which every modern browser also accepts.
+    const body_dir = if (rb.body_woff2_dir.len > 0) rb.body_woff2_dir else rb.body_otf_dir;
+    const body_ext: []const u8 = if (rb.body_woff2_dir.len > 0) "woff2" else "otf";
+    const body_format: []const u8 = if (rb.body_woff2_dir.len > 0) "woff2" else "opentype";
+
+    const display_dir = if (rb.display_woff2_dir.len > 0) rb.display_woff2_dir else rb.display_otf_dir;
+    const display_ext: []const u8 = if (rb.display_woff2_dir.len > 0) "woff2" else "otf";
+    const display_format: []const u8 = if (rb.display_woff2_dir.len > 0) "woff2" else "opentype";
+
+    const url_prefix: []const u8 = switch (kind) {
+        .file => "file://",
+        .relative => "",
+    };
+
+    // We assume the Thmanyah-style naming convention `<family>-<Weight>.<ext>`
+    // because that matches the licensed distribution we tested against
+    // (Regular / Bold / Black / Medium / Light per family). Operators
+    // with differently-named files can either rename to match the
+    // convention or place a workspace-local CSS override (future work).
+    //
+    // Emit one @font-face per weight so the renderer doesn't have to
+    // synthesize bolds; declare 5 weights = full coverage of the
+    // Thmanyah distribution.
+    const weights = [_]struct { name: []const u8, num: u16 }{
+        .{ .name = "Light", .num = 300 },
+        .{ .name = "Regular", .num = 400 },
+        .{ .name = "Medium", .num = 500 },
+        .{ .name = "Bold", .num = 700 },
+        .{ .name = "Black", .num = 900 },
+    };
+
+    for (weights) |wt| {
+        try w.print(
+            "@font-face {{ font-family: '{s}'; font-weight: {d}; font-style: normal; src: url('{s}{s}/{s}-{s}.{s}') format('{s}'); font-display: swap; }}\n",
+            .{ rb.body_font_family, wt.num, url_prefix, body_dir, rb.body_font_family, wt.name, body_ext, body_format },
+        );
+    }
+    for (weights) |wt| {
+        try w.print(
+            "@font-face {{ font-family: '{s}'; font-weight: {d}; font-style: normal; src: url('{s}{s}/{s}-{s}.{s}') format('{s}'); font-display: swap; }}\n",
+            .{ rb.display_font_family, wt.num, url_prefix, display_dir, rb.display_font_family, wt.name, display_ext, display_format },
+        );
+    }
+
+    // Body / heading rules. The body rule applies the body font + a
+    // generic fallback stack so a missing weight degrades gracefully.
+    try w.print(
+        "body, p, li, td, th, blockquote {{ font-family: '{s}', system-ui, -apple-system, 'Helvetica Neue', sans-serif; }}\n",
+        .{rb.body_font_family},
+    );
+    try w.print(
+        "h1, h2, h3, h4, h5, h6 {{ font-family: '{s}', Georgia, 'Times New Roman', serif; }}\n",
+        .{rb.display_font_family},
+    );
+
+    return buf.toOwnedSlice(allocator);
 }
 
 fn sourceExtension(f: Format) []const u8 {
@@ -536,22 +811,70 @@ fn sanitizeTitle(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 /// only if the binary genuinely could not be invoked (FileNotFound), not if
 /// the renderer ran but errored on the input. That keeps the error surfaced
 /// to the agent specific and actionable.
+///
+/// Branding: when `resolved_branding` is non-null we ask pandoc to use
+/// xelatex (the only pdflatex variant that handles OTF/TTF natively) and
+/// set `mainfont`/`sansfont` to the operator's body family. If xelatex
+/// isn't installed we re-attempt WITHOUT the branding args + log a warn
+/// so the PDF still renders unstyled. Pandoc looks up the family by name
+/// on the host font path (fc-cache / OSX FontBook) — so the operator
+/// must ensure the brand font is registered system-wide on the runtime
+/// host for the branded path to take effect.
 fn renderPdf(
     allocator: std.mem.Allocator,
     src_path: []const u8,
     out_path: []const u8,
     title: []const u8,
+    resolved_branding: ?ResolvedBranding,
 ) !ToolResult {
-    // Try pandoc first.
+    const meta = try metadataArg(allocator, "title", title);
+    defer allocator.free(meta);
+
+    if (resolved_branding) |rb| {
+        const mainfont_arg = try std.fmt.allocPrint(allocator, "mainfont={s}", .{rb.body_font_family});
+        defer allocator.free(mainfont_arg);
+        const sansfont_arg = try std.fmt.allocPrint(allocator, "sansfont={s}", .{rb.body_font_family});
+        defer allocator.free(sansfont_arg);
+
+        const branded_args = [_][]const u8{
+            "pandoc",          src_path,        "-o",        out_path,
+            "--pdf-engine",    "xelatex",       "-V",        mainfont_arg,
+            "-V",              sansfont_arg,    "--metadata", meta,
+        };
+        const branded_attempt = runRenderer(allocator, &branded_args, "pandoc");
+        switch (branded_attempt) {
+            .success => |s| return s,
+            .ran_but_failed => |r| {
+                // Most common failure: xelatex not installed. Detect via
+                // stderr contents and fall back to the plain pandoc path
+                // (which uses pdflatex internally) — branding loss is
+                // strictly better than no PDF.
+                const stderr = if (r.error_msg) |em| em else "";
+                const xelatex_missing = std.mem.indexOf(u8, stderr, "xelatex") != null and
+                    (std.mem.indexOf(u8, stderr, "not found") != null or
+                        std.mem.indexOf(u8, stderr, "No such file") != null or
+                        std.mem.indexOf(u8, stderr, "command not found") != null);
+                if (!xelatex_missing) {
+                    return r;
+                }
+                std.log.scoped(.branding).warn(
+                    "PDF branded render failed (likely xelatex missing) — retrying without branding. Install xelatex (texlive-xetex) for branded PDFs. stderr: {s}",
+                    .{stderr},
+                );
+                if (r.output.len > 0) allocator.free(r.output);
+                if (r.error_msg) |em| allocator.free(em);
+                // Fall through to plain pandoc path below.
+            },
+            .binary_missing => |bm| allocator.free(bm),
+            .binary_missing_static => {},
+        }
+    }
+
+    // Plain pandoc (no branding, or branded retry fell through).
     const pandoc_args = [_][]const u8{
-        "pandoc",
-        src_path,
-        "-o",
-        out_path,
-        "--metadata",
-        try metadataArg(allocator, "title", title),
+        "pandoc",     src_path, "-o", out_path,
+        "--metadata", meta,
     };
-    defer allocator.free(pandoc_args[5]);
 
     const pandoc_attempt = runRenderer(allocator, &pandoc_args, "pandoc");
     switch (pandoc_attempt) {
@@ -591,23 +914,67 @@ fn renderPdf(
     return ToolResult{ .success = false, .output = "", .error_msg = msg };
 }
 
+/// DOCX: pandoc's font handling is via a `--reference-doc=<path>`
+/// template containing the desired styles (font-face overrides at the
+/// XML style level). For v1 we look for an operator-placed template at
+/// `<workspace>/branding/reference.docx`. When branding is enabled but
+/// the template is absent we log a hint so the operator knows what to
+/// drop in next; the DOCX still produces (unstyled), preserving §14.5
+/// "broken branding must not break document production."
+///
+/// v1.1 (TODO): programmatically generate a reference.docx from
+/// BrandingConfig at first-use via python-docx — skipped here to keep
+/// the surface dependency-light. When implemented, drop the hint and
+/// auto-create the template under `<workspace>/branding/`.
 fn renderDocx(
     allocator: std.mem.Allocator,
     src_path: []const u8,
     out_path: []const u8,
     title: []const u8,
+    workspace_dir: []const u8,
+    resolved_branding: ?ResolvedBranding,
 ) !ToolResult {
     const meta = try metadataArg(allocator, "title", title);
     defer allocator.free(meta);
-    const argv = [_][]const u8{
-        "pandoc",
-        src_path,
-        "-o",
-        out_path,
-        "--metadata",
-        meta,
-    };
-    const attempt = runRenderer(allocator, &argv, "pandoc");
+
+    // Look for an operator-placed reference.docx when branding is on.
+    var ref_arg_opt: ?[]u8 = null;
+    defer if (ref_arg_opt) |ra| allocator.free(ra);
+    if (resolved_branding) |_| {
+        const ref_path = try std.fs.path.join(allocator, &.{ workspace_dir, "branding", "reference.docx" });
+        defer allocator.free(ref_path);
+        if (std.fs.openFileAbsolute(ref_path, .{})) |f| {
+            f.close();
+            ref_arg_opt = try std.fmt.allocPrint(allocator, "--reference-doc={s}", .{ref_path});
+        } else |_| {
+            std.log.scoped(.branding).info(
+                "branding enabled but no reference.docx at '{s}' — DOCX will render unstyled. " ++
+                    "Place a styled reference.docx at that path to apply brand body/heading fonts to DOCX output.",
+                .{ref_path},
+            );
+        }
+    }
+
+    var argv_buf: [8][]const u8 = undefined;
+    var argv_len: usize = 0;
+    argv_buf[argv_len] = "pandoc";
+    argv_len += 1;
+    argv_buf[argv_len] = src_path;
+    argv_len += 1;
+    argv_buf[argv_len] = "-o";
+    argv_len += 1;
+    argv_buf[argv_len] = out_path;
+    argv_len += 1;
+    argv_buf[argv_len] = "--metadata";
+    argv_len += 1;
+    argv_buf[argv_len] = meta;
+    argv_len += 1;
+    if (ref_arg_opt) |ra| {
+        argv_buf[argv_len] = ra;
+        argv_len += 1;
+    }
+    const argv = argv_buf[0..argv_len];
+    const attempt = runRenderer(allocator, argv, "pandoc");
     return switch (attempt) {
         .success => |s| s,
         .ran_but_failed => |r| r,
@@ -714,14 +1081,116 @@ fn renderXlsx(
     };
 }
 
+/// PPTX (Marp): when theme=thmanyah AND branding is resolved, generate a
+/// `<workspace>/branding/marp/thmanyah.css` theme on the fly (containing
+/// @font-face declarations with file:// URLs to the operator's font dir)
+/// and pass `--theme-set` so marp picks it up. The dynamic generation is
+/// idempotent (overwritten every call) — operators who want a frozen
+/// theme can drop their own thmanyah.css at the same path before the
+/// first call and it'll be overwritten only when this code path runs.
 fn renderPptx(
     allocator: std.mem.Allocator,
     src_path: []const u8,
     out_path: []const u8,
+    theme: Theme,
+    workspace_dir: []const u8,
+    resolved_branding: ?ResolvedBranding,
 ) !ToolResult {
-    // marp-cli: markdown → pptx with --- as slide separator.
-    const argv = [_][]const u8{ "marp", src_path, "-o", out_path };
-    const attempt = runRenderer(allocator, &argv, "marp");
+    // Branding-gated thmanyah theme writes a CSS file under
+    // <workspace>/branding/marp/ then tells marp to look there for
+    // additional themes. Other themes (default/gaia/uncover) skip this
+    // path entirely — marp ships them built-in.
+    var theme_dir_opt: ?[]u8 = null;
+    defer if (theme_dir_opt) |td| allocator.free(td);
+
+    if (theme == .thmanyah) {
+        // execute() already validated that branding is resolved (theme
+        // requires branding); this is just an extra debug guard.
+        const rb = resolved_branding orelse {
+            return ToolResult{
+                .success = false,
+                .output = "",
+                .error_msg = try allocator.dupe(u8, "internal: theme=thmanyah reached renderPptx with null branding"),
+            };
+        };
+
+        const theme_dir = try std.fs.path.join(allocator, &.{ workspace_dir, "branding", "marp" });
+        errdefer allocator.free(theme_dir);
+        std.fs.cwd().makePath(theme_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => {
+                allocator.free(theme_dir);
+                const msg = try std.fmt.allocPrint(
+                    allocator,
+                    "Failed to create marp theme dir '{s}': {s}",
+                    .{ theme_dir, @errorName(err) },
+                );
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            },
+        };
+
+        const face_block = try cssFontFaceBlock(allocator, rb, .file);
+        defer allocator.free(face_block);
+
+        // The /* @theme thmanyah */ comment is REQUIRED by marp-cli to
+        // recognize the file as a registered theme keyed by the name
+        // we used in the frontmatter (`theme: thmanyah`).
+        const css = try std.fmt.allocPrint(
+            allocator,
+            "/* @theme thmanyah */\n\n" ++
+                "@import 'default';\n\n" ++
+                "{s}\n" ++
+                "section {{ font-family: '{s}', system-ui, sans-serif; }}\n" ++
+                "section h1, section h2, section h3 {{ font-family: '{s}', Georgia, serif; }}\n",
+            .{ face_block, rb.body_font_family, rb.display_font_family },
+        );
+        defer allocator.free(css);
+
+        const css_path = try std.fs.path.join(allocator, &.{ theme_dir, "thmanyah.css" });
+        defer allocator.free(css_path);
+        const f = std.fs.createFileAbsolute(css_path, .{}) catch |err| {
+            allocator.free(theme_dir);
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "Failed to create marp theme CSS '{s}': {s}",
+                .{ css_path, @errorName(err) },
+            );
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        };
+        defer f.close();
+        f.writeAll(css) catch |err| {
+            allocator.free(theme_dir);
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "Failed to write marp theme CSS: {s}",
+                .{@errorName(err)},
+            );
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        };
+        theme_dir_opt = theme_dir;
+    }
+
+    // marp-cli: markdown → pptx with --- as slide separator. When theme
+    // is thmanyah we add --theme-set <dir> so the dynamically-written
+    // CSS theme is registered.
+    var argv_buf: [8][]const u8 = undefined;
+    var argv_len: usize = 0;
+    argv_buf[argv_len] = "marp";
+    argv_len += 1;
+    argv_buf[argv_len] = src_path;
+    argv_len += 1;
+    argv_buf[argv_len] = "-o";
+    argv_len += 1;
+    argv_buf[argv_len] = out_path;
+    argv_len += 1;
+    if (theme_dir_opt) |td| {
+        argv_buf[argv_len] = "--theme-set";
+        argv_len += 1;
+        argv_buf[argv_len] = td;
+        argv_len += 1;
+    }
+    const argv = argv_buf[0..argv_len];
+    const attempt = runRenderer(allocator, argv, "marp");
     return switch (attempt) {
         .success => |s| s,
         .ran_but_failed => |r| r,
@@ -746,24 +1215,92 @@ fn renderPptx(
     };
 }
 
+/// HTML: pandoc --standalone produces a full HTML document. When
+/// branding is resolved we write a `<style>` block containing
+/// @font-face declarations + body/heading rules to a temp file under
+/// `<src_dir>/.branding_header.html` and pass it via `-H`. URLs are
+/// absolute `file://` so the produced HTML renders correctly when
+/// opened locally; for landing-page deployments served from a static
+/// origin, the operator's post-processing layer can rewrite the
+/// `file://...` URLs to served paths.
 fn renderHtml(
     allocator: std.mem.Allocator,
     src_path: []const u8,
     out_path: []const u8,
     title: []const u8,
+    resolved_branding: ?ResolvedBranding,
 ) !ToolResult {
     const meta = try metadataArg(allocator, "title", title);
     defer allocator.free(meta);
-    const argv = [_][]const u8{
-        "pandoc",
-        src_path,
-        "-o",
-        out_path,
-        "--standalone",
-        "--metadata",
-        meta,
+
+    var header_path_opt: ?[]u8 = null;
+    defer if (header_path_opt) |hp| {
+        // Best-effort cleanup; ignore failure.
+        std.fs.deleteFileAbsolute(hp) catch {};
+        allocator.free(hp);
     };
-    const attempt = runRenderer(allocator, &argv, "pandoc");
+
+    if (resolved_branding) |rb| {
+        const src_dir = std.fs.path.dirname(src_path) orelse "/tmp";
+        const header_path = try std.fs.path.join(allocator, &.{ src_dir, ".branding_header.html" });
+        errdefer allocator.free(header_path);
+
+        const face_block = try cssFontFaceBlock(allocator, rb, .file);
+        defer allocator.free(face_block);
+
+        const header_content = try std.fmt.allocPrint(
+            allocator,
+            "<style>\n{s}</style>\n",
+            .{face_block},
+        );
+        defer allocator.free(header_content);
+
+        const f = std.fs.createFileAbsolute(header_path, .{}) catch |err| {
+            allocator.free(header_path);
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "Failed to create HTML branding header '{s}': {s}",
+                .{ header_path, @errorName(err) },
+            );
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        };
+        defer f.close();
+        f.writeAll(header_content) catch |err| {
+            allocator.free(header_path);
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "Failed to write HTML branding header: {s}",
+                .{@errorName(err)},
+            );
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        };
+        header_path_opt = header_path;
+    }
+
+    var argv_buf: [10][]const u8 = undefined;
+    var argv_len: usize = 0;
+    argv_buf[argv_len] = "pandoc";
+    argv_len += 1;
+    argv_buf[argv_len] = src_path;
+    argv_len += 1;
+    argv_buf[argv_len] = "-o";
+    argv_len += 1;
+    argv_buf[argv_len] = out_path;
+    argv_len += 1;
+    argv_buf[argv_len] = "--standalone";
+    argv_len += 1;
+    argv_buf[argv_len] = "--metadata";
+    argv_len += 1;
+    argv_buf[argv_len] = meta;
+    argv_len += 1;
+    if (header_path_opt) |hp| {
+        argv_buf[argv_len] = "-H";
+        argv_len += 1;
+        argv_buf[argv_len] = hp;
+        argv_len += 1;
+    }
+    const argv = argv_buf[0..argv_len];
+    const attempt = runRenderer(allocator, argv, "pandoc");
     return switch (attempt) {
         .success => |s| s,
         .ran_but_failed => |r| r,
@@ -1291,4 +1828,325 @@ test "Wave2-HIGH5: produced filename includes CSPRNG nonce — 100 same-title in
         }
     }
     try std.testing.expectEqual(@as(u32, 100), seen.count());
+}
+
+// ─── Branding (Thmanyah) integration tests (2026-05-25) ─────────────────
+
+/// Helper for branding tests: builds a tmp dir with the Thmanyah-shape
+/// font directory structure so resolveBranding can succeed. Caller frees
+/// `font_dir`. The dir tree is also queued for cleanup via the returned
+/// `root_for_cleanup` (use `defer deleteTreeAbsolute`).
+fn buildTestFontDir(allocator: std.mem.Allocator, name_suffix: []const u8) !struct {
+    root: []u8,
+    font_dir: []u8,
+} {
+    const ts = std.time.milliTimestamp();
+    const root_dir = try std.fmt.allocPrint(allocator, "/tmp/pd_brand_test_{d}_{s}", .{ ts, name_suffix });
+    errdefer allocator.free(root_dir);
+    try std.fs.makeDirAbsolute(root_dir);
+
+    // <root>/fonts/thmanyahsans/{otf,woff2}
+    // <root>/fonts/thmanyahserifdisplay/{otf,woff2}
+    const font_dir = try std.fs.path.join(allocator, &.{ root_dir, "fonts" });
+    errdefer allocator.free(font_dir);
+    try std.fs.makeDirAbsolute(font_dir);
+
+    const families = [_][]const u8{ "thmanyahsans", "thmanyahserifdisplay" };
+    for (families) |fam| {
+        const fam_dir = try std.fs.path.join(allocator, &.{ font_dir, fam });
+        defer allocator.free(fam_dir);
+        try std.fs.makeDirAbsolute(fam_dir);
+        const otf_dir = try std.fs.path.join(allocator, &.{ fam_dir, "otf" });
+        defer allocator.free(otf_dir);
+        try std.fs.makeDirAbsolute(otf_dir);
+        const woff2_dir = try std.fs.path.join(allocator, &.{ fam_dir, "woff2" });
+        defer allocator.free(woff2_dir);
+        try std.fs.makeDirAbsolute(woff2_dir);
+        // Drop one file so the dir is non-empty (matches operator deploy
+        // shape; resolveBranding doesn't currently inspect contents but
+        // future hardening might want at least one face).
+        const probe_otf = try std.fs.path.join(allocator, &.{ otf_dir, "probe.otf" });
+        defer allocator.free(probe_otf);
+        const fo = try std.fs.createFileAbsolute(probe_otf, .{});
+        fo.close();
+    }
+    return .{ .root = root_dir, .font_dir = font_dir };
+}
+
+test "resolveBranding returns null when font_dir is empty" {
+    const alloc = std.testing.allocator;
+    const br = BrandingConfig{}; // defaults — empty font_dir
+    const got = try resolveBranding(alloc, br);
+    try std.testing.expect(got == null);
+}
+
+test "resolveBranding returns null when font_dir does not exist" {
+    const alloc = std.testing.allocator;
+    const br = BrandingConfig{
+        .font_dir = "/tmp/pd_brand_definitely_missing_dir_xyz_42",
+        .body_font = "thmanyahsans",
+        .display_font = "thmanyahserifdisplay",
+    };
+    // We expect a warn log but no error and a null result. We can't
+    // easily intercept logs in a test; the observable contract is
+    // null-on-missing.
+    const got = try resolveBranding(alloc, br);
+    try std.testing.expect(got == null);
+}
+
+test "resolveBranding resolves cleanly when dir matches Thmanyah shape" {
+    const alloc = std.testing.allocator;
+    const built = try buildTestFontDir(alloc, "ok");
+    defer {
+        std.fs.deleteTreeAbsolute(built.root) catch {};
+        alloc.free(built.font_dir);
+        alloc.free(built.root);
+    }
+    const br = BrandingConfig{
+        .font_dir = built.font_dir,
+        .body_font = "thmanyahsans",
+        .display_font = "thmanyahserifdisplay",
+    };
+    const got = try resolveBranding(alloc, br);
+    try std.testing.expect(got != null);
+    defer got.?.deinit(alloc);
+
+    try std.testing.expectEqualStrings("thmanyahsans", got.?.body_font_family);
+    try std.testing.expectEqualStrings("thmanyahserifdisplay", got.?.display_font_family);
+    // Resolved paths must reference the operator's font dir.
+    try std.testing.expect(std.mem.indexOf(u8, got.?.body_otf_dir, "thmanyahsans/otf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got.?.display_otf_dir, "thmanyahserifdisplay/otf") != null);
+    try std.testing.expect(got.?.body_woff2_dir.len > 0);
+    try std.testing.expect(got.?.display_woff2_dir.len > 0);
+}
+
+test "cssFontFaceBlock emits valid @font-face declarations" {
+    const alloc = std.testing.allocator;
+    const built = try buildTestFontDir(alloc, "css");
+    defer {
+        std.fs.deleteTreeAbsolute(built.root) catch {};
+        alloc.free(built.font_dir);
+        alloc.free(built.root);
+    }
+    const br = BrandingConfig{
+        .font_dir = built.font_dir,
+        .body_font = "thmanyahsans",
+        .display_font = "thmanyahserifdisplay",
+    };
+    const rb = (try resolveBranding(alloc, br)).?;
+    defer rb.deinit(alloc);
+
+    const css = try cssFontFaceBlock(alloc, rb, .file);
+    defer alloc.free(css);
+
+    // Basic shape: @font-face for both families, weights, body rule.
+    try std.testing.expect(std.mem.indexOf(u8, css, "@font-face") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css, "thmanyahsans") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css, "thmanyahserifdisplay") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css, "font-family") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css, "src: url(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css, "file://") != null);
+    // Weight coverage — at minimum we want regular + bold.
+    try std.testing.expect(std.mem.indexOf(u8, css, "font-weight: 400") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css, "font-weight: 700") != null);
+    // Body / heading rules — the headline contract.
+    try std.testing.expect(std.mem.indexOf(u8, css, "body") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css, "h1, h2, h3") != null);
+}
+
+test "parseTheme accepts thmanyah" {
+    try std.testing.expectEqual(@as(?Theme, .thmanyah), parseTheme("thmanyah"));
+    try std.testing.expectEqual(@as(?Theme, .thmanyah), parseTheme("THMANYAH"));
+    try std.testing.expectEqual(@as(?Theme, .thmanyah), parseTheme(" Thmanyah "));
+    try std.testing.expectEqual(@as(?Theme, .default_theme), parseTheme("default"));
+    try std.testing.expectEqual(@as(?Theme, .gaia), parseTheme("gaia"));
+    try std.testing.expectEqual(@as(?Theme, .uncover), parseTheme("uncover"));
+    try std.testing.expectEqual(@as(?Theme, null), parseTheme("nope"));
+}
+
+test "PPTX with theme=thmanyah but no branding returns clear error" {
+    const alloc = std.testing.allocator;
+    const ts = std.time.milliTimestamp();
+    const ws = try std.fmt.allocPrint(alloc, "/tmp/pd_thmanyah_unbranded_{d}", .{ts});
+    defer alloc.free(ws);
+    std.fs.makeDirAbsolute(ws) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    defer std.fs.deleteTreeAbsolute(ws) catch {};
+
+    // Branding intentionally NOT set (empty font_dir = disabled).
+    var pd = ProduceDocumentTool{ .workspace_dir = ws };
+    const t = pd.tool();
+    var args = std.json.ObjectMap.init(alloc);
+    defer args.deinit();
+    try args.put("format", std.json.Value{ .string = "pptx" });
+    try args.put("content", std.json.Value{ .string = "# Slide 1\n---\n# Slide 2" });
+    try args.put("theme", std.json.Value{ .string = "thmanyah" });
+
+    const result = try t.execute(alloc, args);
+    defer {
+        if (result.output.len > 0) alloc.free(result.output);
+        if (result.error_msg) |m| alloc.free(m);
+    }
+    try std.testing.expect(!result.success);
+    const msg = if (result.error_msg) |m| m else result.output;
+    // Honesty: the error must name the missing operator config so the
+    // agent can surface it verbatim to the user.
+    try std.testing.expect(std.mem.indexOf(u8, msg, "thmanyah") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "branding") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "font_dir") != null);
+}
+
+test "PPTX with theme=thmanyah + branding writes the marp theme CSS" {
+    const alloc = std.testing.allocator;
+    const built = try buildTestFontDir(alloc, "pptx");
+    defer {
+        std.fs.deleteTreeAbsolute(built.root) catch {};
+        alloc.free(built.font_dir);
+        alloc.free(built.root);
+    }
+
+    // Use the same root as the workspace so cleanup is one tree.
+    const ws = try std.fs.path.join(alloc, &.{ built.root, "workspace" });
+    defer alloc.free(ws);
+    try std.fs.makeDirAbsolute(ws);
+
+    var pd = ProduceDocumentTool{
+        .workspace_dir = ws,
+        .branding = .{
+            .font_dir = built.font_dir,
+            .body_font = "thmanyahsans",
+            .display_font = "thmanyahserifdisplay",
+        },
+    };
+    const t = pd.tool();
+    var args = std.json.ObjectMap.init(alloc);
+    defer args.deinit();
+    try args.put("format", std.json.Value{ .string = "pptx" });
+    try args.put("content", std.json.Value{ .string = "# Slide 1\n---\n# Slide 2" });
+    try args.put("theme", std.json.Value{ .string = "thmanyah" });
+
+    const result = try t.execute(alloc, args);
+    defer {
+        if (result.output.len > 0) alloc.free(result.output);
+        if (result.error_msg) |m| alloc.free(m);
+    }
+    // marp-cli is not guaranteed to be on the CI sandbox PATH. Two
+    // valid outcomes: success (marp + render worked) OR a marp-missing
+    // error. Either way the theme CSS should have been written BEFORE
+    // marp was invoked — that's the contract we're testing.
+    const css_path = try std.fs.path.join(alloc, &.{ ws, "branding", "marp", "thmanyah.css" });
+    defer alloc.free(css_path);
+    const css_file = std.fs.openFileAbsolute(css_path, .{}) catch |err| {
+        std.debug.print("expected thmanyah.css at '{s}', got {s}\n", .{ css_path, @errorName(err) });
+        return err;
+    };
+    defer css_file.close();
+    var buf: [4096]u8 = undefined;
+    const n = try css_file.readAll(&buf);
+    try std.testing.expect(n > 0);
+    const content = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, content, "@theme thmanyah") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "@font-face") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "thmanyahsans") != null);
+}
+
+test "config.branding parses correctly" {
+    const Config = @import("../config.zig").Config;
+    const alloc = std.testing.allocator;
+    const json =
+        \\{
+        \\  "models": {"providers": {"anthropic": {"api_key": "sk-test"}}},
+        \\  "agents": {"defaults": {"model": {"primary": "anthropic/claude"}}},
+        \\  "branding": {
+        \\    "font_dir": "/opt/fonts/thmanyah",
+        \\    "body_font": "thmanyahsans",
+        \\    "display_font": "thmanyahserifdisplay"
+        \\  }
+        \\}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/ws_brand",
+        .config_path = "/tmp/ws_brand/config.json",
+        .allocator = alloc,
+    };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqualStrings("/opt/fonts/thmanyah", cfg.branding.font_dir);
+    try std.testing.expectEqualStrings("thmanyahsans", cfg.branding.body_font);
+    try std.testing.expectEqualStrings("thmanyahserifdisplay", cfg.branding.display_font);
+
+    // Cleanup
+    alloc.free(cfg.default_provider);
+    alloc.free(cfg.default_model.?);
+    for (cfg.providers) |e| {
+        alloc.free(e.name);
+        if (e.api_key) |k| alloc.free(k);
+        if (e.base_url) |b| alloc.free(b);
+    }
+    alloc.free(cfg.providers);
+    alloc.free(cfg.branding.font_dir);
+    alloc.free(cfg.branding.body_font);
+    alloc.free(cfg.branding.display_font);
+}
+
+test "smoke: real Thmanyah dir resolves and CSS references woff2 src URLs" {
+    // Operator-local smoke. Skipped automatically when the real
+    // Thmanyah dist isn't present (CI sandboxes, other-dev machines).
+    // When present (Nova's box) it asserts the spec's manual smoke:
+    // HTML contains `src=...thmanyahsans/woff2/...`.
+    const real_dir = "/Users/nova/Downloads/Thmanyah-Font-Family/thmanyah typeface";
+    var probe = std.fs.openDirAbsolute(real_dir, .{}) catch return error.SkipZigTest;
+    probe.close();
+
+    const alloc = std.testing.allocator;
+    const br = BrandingConfig{
+        .font_dir = real_dir,
+        .body_font = "thmanyahsans",
+        .display_font = "thmanyahserifdisplay",
+    };
+    const rb = (try resolveBranding(alloc, br)) orelse return error.UnexpectedNullResolve;
+    defer rb.deinit(alloc);
+
+    const css = try cssFontFaceBlock(alloc, rb, .file);
+    defer alloc.free(css);
+
+    // Spec asks: output contains @font-face src="...thmanyahsans/woff2/..."
+    try std.testing.expect(std.mem.indexOf(u8, css, "thmanyahsans/woff2/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css, "thmanyahserifdisplay/woff2/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css, "file://") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css, "thmanyahsans-Regular.woff2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, css, "thmanyahsans-Bold.woff2") != null);
+}
+
+test "config.branding empty / missing block falls back to defaults" {
+    const Config = @import("../config.zig").Config;
+    const alloc = std.testing.allocator;
+    const json =
+        \\{
+        \\  "models": {"providers": {"anthropic": {"api_key": "sk-test"}}},
+        \\  "agents": {"defaults": {"model": {"primary": "anthropic/claude"}}}
+        \\}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/ws_brand_def",
+        .config_path = "/tmp/ws_brand_def/config.json",
+        .allocator = alloc,
+    };
+    try cfg.parseJson(json);
+
+    // Defaults: empty font_dir (disabled) + Thmanyah-shaped slugs.
+    try std.testing.expectEqualStrings("", cfg.branding.font_dir);
+    try std.testing.expectEqualStrings("thmanyahsans", cfg.branding.body_font);
+    try std.testing.expectEqualStrings("thmanyahserifdisplay", cfg.branding.display_font);
+
+    alloc.free(cfg.default_provider);
+    alloc.free(cfg.default_model.?);
+    for (cfg.providers) |e| {
+        alloc.free(e.name);
+        if (e.api_key) |k| alloc.free(k);
+        if (e.base_url) |b| alloc.free(b);
+    }
+    alloc.free(cfg.providers);
 }

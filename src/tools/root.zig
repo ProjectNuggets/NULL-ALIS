@@ -1193,9 +1193,14 @@ pub fn allTools(
 
     // produce_document: first-class PDF/DOCX/XLSX/PPTX/HTML generation.
     // workspace_dir bound so produced files land under attachments/produced/
-    // inside the agent's workspace.
+    // inside the agent's workspace. `branding` is pulled from operator
+    // config — empty/missing dir = disabled, system fonts. When set,
+    // produced documents pick up the brand typography (Thmanyah default).
     const pdt = try allocator.create(produce_document.ProduceDocumentTool);
-    pdt.* = .{ .workspace_dir = workspace_dir };
+    pdt.* = .{
+        .workspace_dir = workspace_dir,
+        .branding = if (opts.config) |cfg| cfg.branding else .{},
+    };
     try list.append(allocator, pdt.tool());
 
     // Memory tools (work gracefully without a backend)

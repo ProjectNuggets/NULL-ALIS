@@ -54,6 +54,7 @@ pub const GatewayConfig = config_types.GatewayConfig;
 pub const TenantConfig = config_types.TenantConfig;
 pub const StateConfig = config_types.StateConfig;
 pub const ComposioConfig = config_types.ComposioConfig;
+pub const BrandingConfig = config_types.BrandingConfig;
 pub const SecretsConfig = config_types.SecretsConfig;
 pub const BrowserComputerUseConfig = config_types.BrowserComputerUseConfig;
 pub const BrowserConfig = config_types.BrowserConfig;
@@ -131,6 +132,11 @@ pub const Config = struct {
     tenant: TenantConfig = .{},
     state: StateConfig = .{},
     composio: ComposioConfig = .{},
+    /// Operator-deployed brand typography (Thmanyah by default). Empty
+    /// font_dir disables; otherwise produce_document applies @font-face /
+    /// pandoc --variable mainfont so PDF/DOCX/PPTX/HTML output matches the
+    /// operator's house font. See `BrandingConfig` for details.
+    branding: BrandingConfig = .{},
     secrets: SecretsConfig = .{},
     browser: BrowserConfig = .{},
     http_request: HttpRequestConfig = .{},
@@ -1243,6 +1249,7 @@ const config_field_accounting = [_]ConfigFieldAccount{
     .{ .name = "tenant", .disposition = .json_parsed },
     .{ .name = "state", .disposition = .json_parsed },
     .{ .name = "composio", .disposition = .json_parsed },
+    .{ .name = "branding", .disposition = .json_parsed },
     .{ .name = "secrets", .disposition = .json_parsed },
     .{ .name = "browser", .disposition = .json_parsed },
     .{ .name = "http_request", .disposition = .json_parsed },

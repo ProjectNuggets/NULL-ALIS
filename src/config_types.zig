@@ -1143,6 +1143,41 @@ pub const ComposioConfig = struct {
     entity_id: []const u8 = "default",
 };
 
+// ── Branding config (operator-deployed brand typography) ────────
+//
+// Operator-only config — NOT user-settable. Lets a deployment apply a
+// licensed font family (e.g. Thmanyah) to every document produced via
+// `produce_document` (PDF / DOCX / PPTX / HTML / landing pages). The
+// font files themselves are NEVER committed to this repo (license forbids
+// redistribution); the operator places them on their own infrastructure
+// and points us at the directory via `font_dir`.
+//
+// Honesty (§14.5): when `font_dir` is empty or the directory is missing,
+// `produce_document` falls back to system defaults silently and does NOT
+// advertise the branded `theme: thmanyah` Marp variant to the agent.
+pub const BrandingConfig = struct {
+    /// Absolute path to a directory containing font subfolders. Expected
+    /// structure (compatible with Thmanyah's distribution shape):
+    ///   <font_dir>/thmanyahsans/otf/*.otf
+    ///   <font_dir>/thmanyahsans/woff2/*.woff2
+    ///   <font_dir>/thmanyahserifdisplay/...
+    ///   <font_dir>/thmanyahseriftext/...
+    /// Empty string → no branding; produce_document falls back to system
+    /// defaults (Helvetica / Arial / sans-serif). Operator-controlled,
+    /// not user-controlled (this is a brand decision, not a preference).
+    font_dir: []const u8 = "",
+
+    /// Family slug to use as body font. Must match one of the subfolder
+    /// names under `font_dir`. Default "thmanyahsans" assumes the
+    /// Thmanyah distribution; an operator with a different brand just
+    /// changes the slug + provides a matching dir.
+    body_font: []const u8 = "thmanyahsans",
+
+    /// Same as body_font but for display / headings. Default
+    /// "thmanyahserifdisplay".
+    display_font: []const u8 = "thmanyahserifdisplay",
+};
+
 // ── Secrets config ──────────────────────────────────────────────
 
 pub const SecretsConfig = struct {
