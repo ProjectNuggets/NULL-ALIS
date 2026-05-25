@@ -1678,6 +1678,42 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (gw.object.get("extension_ws_enabled")) |v| {
                 if (v == .bool) self.gateway.extension_ws_enabled = v.bool;
             }
+            // 2026-05-25 (Wave 3 E2E gate) — same gap as `extension_ws_enabled`
+            // above: `extension_tokens` was declared on GatewayConfig and read
+            // by the gateway boot path, but the JSON parser had no clause for
+            // it. Result: every operator who configured per-user tokens got
+            // an empty list at boot, the META CRIT #2 warning fired, and EVERY
+            // auth attempt rejected with `invalid_token` regardless of what the
+            // extension sent. Live socket probe caught it. Format:
+            //   "extension_tokens": [
+            //     {"token":"<secret>", "user_id":"<id>"},
+            //     ...
+            //   ]
+            // Entries missing either field are silently skipped (mirrors the
+            // fail-soft pattern in parseStringArray for paired_tokens et al.).
+            if (gw.object.get("extension_tokens")) |v| {
+                if (v == .array) {
+                    var list: std.ArrayListUnmanaged(types.ExtensionTokenEntry) = .empty;
+                    try list.ensureTotalCapacity(self.allocator, @intCast(v.array.items.len));
+                    for (v.array.items) |item| {
+                        if (item != .object) continue;
+                        const tok = item.object.get("token") orelse continue;
+                        const uid = item.object.get("user_id") orelse continue;
+                        if (tok != .string or uid != .string) continue;
+                        try list.append(self.allocator, .{
+                            .token = try self.allocator.dupe(u8, tok.string),
+                            .user_id = try self.allocator.dupe(u8, uid.string),
+                        });
+                    }
+                    self.gateway.extension_tokens = try list.toOwnedSlice(self.allocator);
+                }
+            }
+            // Companion knob: extension_browser_allowlist (LAN/internal hosts
+            // that bypass the SSRF deny in extension_navigate). Same shape as
+            // paired_tokens / internal_service_tokens.
+            if (gw.object.get("extension_browser_allowlist")) |v| {
+                if (v == .array) self.gateway.extension_browser_allowlist = try parseStringArray(self.allocator, v.array);
+            }
             // Wave 2B (2026-05-24) — public trace share sanitizer knobs.
             // See `GatewayConfig` doc-comments for semantics. Both
             // default to safe values when omitted from config so older

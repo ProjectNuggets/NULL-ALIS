@@ -1370,3 +1370,639 @@ test "IN-01: deliver-after-timeout — sender returns Timeout, deliver still saf
     gate.set();
     deliver_thread.join();
 }
+
+// ── 50-session concurrent soak (2026-05-25) ──────────────────────────
+//
+// Stress-test gate for the refcount + mutex code under burst load. The
+// earlier "META CRIT #3: stress — 50 sessions" test was *sequential* —
+// one user, register→evict→destroy in a tight loop. That exercised
+// the refcount, but did NOT exercise lock contention on `pending_mu`,
+// `write_mu`, or `users_mu` under burst from many threads at once.
+//
+// This soak spawns 50 worker threads, each acting as the agent side
+// of a distinct extension WS session, plus a single "broker" thread
+// that plays the role of the extension's read loop — scanning each
+// per-conn TestStream for newly written commands and feeding back
+// CommandResult frames via `deliverResult`. Every command thus
+// completes the full hub roundtrip: write under write_mu, register
+// pending under pending_mu, broker fetchRemoves under pending_mu,
+// broker writes result + sets ready, sender wakes, re-dups, releases.
+//
+// What this gate proves under testing allocator:
+//   1. No UAF — testing allocator pages would page-fault on freed access.
+//   2. No leak — testing allocator asserts at teardown all blocks freed.
+//   3. No deadlock — test must finish well under its budget.
+//   4. No torn writes on the pending HashMap — sequential
+//      consistency is required by the broker's fetchRemove never
+//      seeing a half-inserted entry (a torn write would surface as a
+//      "command_id unknown" warning + timeouts on the sender side;
+//      we assert zero timeouts in the all-respond path).
+//   5. Eviction lane works under traffic — a subset of users gets
+//      re-registered mid-soak, which exercises the registerConn
+//      eviction branch concurrent with senders/brokers.
+
+const SoakStream = struct {
+    written: std.ArrayListUnmanaged(u8) = .empty,
+    closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    mu: std.Thread.Mutex = .{},
+    allocator: std.mem.Allocator,
+
+    pub fn writeText(ctx: *anyopaque, text: []const u8) anyerror!void {
+        const self: *SoakStream = @ptrCast(@alignCast(ctx));
+        self.mu.lock();
+        defer self.mu.unlock();
+        try self.written.appendSlice(self.allocator, text);
+        try self.written.append(self.allocator, '\n');
+    }
+
+    pub fn closeStream(ctx: *anyopaque) void {
+        const self: *SoakStream = @ptrCast(@alignCast(ctx));
+        self.closed.store(true, .release);
+    }
+
+    pub fn deinit(self: *SoakStream) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.written.deinit(self.allocator);
+    }
+
+    /// Drain ALL pending command frames from the write buffer and copy
+    /// their command_ids out. The buffer is cleared on every drain so
+    /// the broker only sees fresh commands on the next pass.
+    fn drainCommandIds(self: *SoakStream, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged([]u8)) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.written.items.len == 0) return;
+        // Each frame is terminated by '\n' in our writeText.
+        var cursor: usize = 0;
+        const buf = self.written.items;
+        while (cursor < buf.len) {
+            const nl_off = std.mem.indexOfScalarPos(u8, buf, cursor, '\n') orelse break;
+            const frame = buf[cursor..nl_off];
+            const marker = "\"command_id\":\"";
+            if (std.mem.indexOf(u8, frame, marker)) |s| {
+                const after = frame[s + marker.len ..];
+                if (std.mem.indexOfScalar(u8, after, '"')) |e| {
+                    const id_copy = try allocator.dupe(u8, after[0..e]);
+                    try out.append(allocator, id_copy);
+                }
+            }
+            cursor = nl_off + 1;
+        }
+        // Clear the buffer so next drain starts fresh.
+        self.written.clearRetainingCapacity();
+    }
+};
+
+test "soak: 50 concurrent extension WS sessions — no deadlock, no UAF, no leak" {
+    // Set up: 50 workers, each its own user_id, each sending CMDS_PER_WORKER
+    // commands through the hub. A single broker thread drains each
+    // worker's outbound buffer and writes a matching result back through
+    // the conn's `deliverResult`. The broker is the ONLY thread doing
+    // deliveries; the 50 workers contend on (a) per-conn write_mu (b)
+    // their own pending_mu (broker also touches that one) (c) the hub's
+    // users_mu (only on register/unregister, but the eviction lane
+    // does fire it under load).
+    //
+    // Workload sizing chosen so the test completes in ~1-2 s on a
+    // modern dev box (M-series Mac). Set N_WORKERS=50 to match the
+    // user's stated load goal; CMDS_PER_WORKER=20 → 1000 total
+    // commands through the hub.
+
+    const N_WORKERS: usize = 50;
+    const CMDS_PER_WORKER: usize = 20;
+    const TOTAL_CMDS: usize = N_WORKERS * CMDS_PER_WORKER;
+    const PER_CMD_TIMEOUT_MS: u64 = 5_000; // generous; broker should answer in µs
+    const TEST_BUDGET_MS: u64 = 60_000; // hard timeout — if we hit this, deadlock
+
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+
+    // Per-worker state lives on the heap so we can hand stable pointers
+    // to threads.
+    const WorkerState = struct {
+        user_id: [16]u8 = [_]u8{0} ** 16,
+        user_id_len: usize = 0,
+        stream: SoakStream,
+        conn: *ExtensionWsConn = undefined,
+        // Stats: ok_count/timeout_count/err_count are written only by
+        // the owning worker. Latencies are appended in microseconds.
+        ok_count: usize = 0,
+        timeout_count: usize = 0,
+        err_count: usize = 0,
+        latencies_us: std.ArrayListUnmanaged(u64) = .empty,
+    };
+
+    const workers = try std.testing.allocator.alloc(WorkerState, N_WORKERS);
+    defer std.testing.allocator.free(workers);
+
+    // Initialize + register all 50 sessions up front.
+    for (workers, 0..) |*w, i| {
+        w.* = .{ .stream = .{ .allocator = std.testing.allocator } };
+        const n = std.fmt.bufPrint(&w.user_id, "soak-u-{d}", .{i}) catch unreachable;
+        w.user_id_len = n.len;
+        w.conn = try hub.registerConn(
+            w.user_id[0..w.user_id_len],
+            &w.stream,
+            SoakStream.writeText,
+            &w.stream,
+            SoakStream.closeStream,
+        );
+    }
+    defer {
+        for (workers) |*w| {
+            _ = hub.unregister(w.user_id[0..w.user_id_len]);
+            hub.destroyConn(w.conn);
+            w.latencies_us.deinit(std.testing.allocator);
+            w.stream.deinit();
+        }
+    }
+
+    // Done counter — broker exits when all workers have signaled done.
+    var workers_done = std.atomic.Value(usize).init(0);
+    var broker_stop = std.atomic.Value(bool).init(false);
+
+    // Broker thread: polls each worker's stream, drains command_ids,
+    // delivers a synthetic CommandResult for each. Spins at ~10kHz; the
+    // workers do real work between sends so the broker rarely loops idle.
+    const BrokerCtx = struct {
+        workers: []WorkerState,
+        workers_done: *std.atomic.Value(usize),
+        broker_stop: *std.atomic.Value(bool),
+        allocator: std.mem.Allocator,
+    };
+    const Broker = struct {
+        fn run(ctx: BrokerCtx) void {
+            var local_buf: std.ArrayListUnmanaged([]u8) = .empty;
+            defer local_buf.deinit(ctx.allocator);
+            while (!ctx.broker_stop.load(.acquire)) {
+                var did_work = false;
+                for (ctx.workers) |*w| {
+                    local_buf.clearRetainingCapacity();
+                    w.stream.drainCommandIds(ctx.allocator, &local_buf) catch continue;
+                    for (local_buf.items) |id| {
+                        defer ctx.allocator.free(id);
+                        const result_json = std.fmt.allocPrint(
+                            ctx.allocator,
+                            "{{\"command_id\":\"{s}\",\"ok\":true,\"result\":{{\"x\":1}}}}",
+                            .{id},
+                        ) catch continue;
+                        defer ctx.allocator.free(result_json);
+                        w.conn.deliverResult(result_json) catch {};
+                        did_work = true;
+                    }
+                }
+                if (!did_work) {
+                    // No commands seen this pass — short sleep to avoid
+                    // pinning a core. 50 µs is short enough that
+                    // worker p99 latency stays in low single-digit ms.
+                    std.Thread.sleep(50 * std.time.ns_per_us);
+                }
+                // Stop condition: all workers signaled done AND no
+                // commands were drained this pass (i.e., we're caught up).
+                if (!did_work and ctx.workers_done.load(.acquire) >= ctx.workers.len) break;
+            }
+        }
+    };
+
+    const broker_thread = try std.Thread.spawn(.{}, Broker.run, .{BrokerCtx{
+        .workers = workers,
+        .workers_done = &workers_done,
+        .broker_stop = &broker_stop,
+        .allocator = std.testing.allocator,
+    }});
+
+    // Worker thread: loop CMDS_PER_WORKER times, send command, time it.
+    const WorkerCtx = struct {
+        hub: *ExtensionWsHub,
+        state: *WorkerState,
+        cmds: usize,
+        timeout_ms: u64,
+        allocator: std.mem.Allocator,
+    };
+    const Worker = struct {
+        fn run(ctx: WorkerCtx) void {
+            var i: usize = 0;
+            while (i < ctx.cmds) : (i += 1) {
+                const t0 = std.time.nanoTimestamp();
+                const r = ctx.hub.sendCommand(
+                    ctx.allocator,
+                    ctx.state.user_id[0..ctx.state.user_id_len],
+                    "navigate",
+                    "{\"url\":\"https://soak.test\"}",
+                    ctx.timeout_ms,
+                );
+                const elapsed_us: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - t0, std.time.ns_per_us));
+                if (r) |buf| {
+                    ctx.allocator.free(buf);
+                    ctx.state.ok_count += 1;
+                    ctx.state.latencies_us.append(ctx.allocator, elapsed_us) catch {};
+                } else |err| switch (err) {
+                    error.Timeout => ctx.state.timeout_count += 1,
+                    else => ctx.state.err_count += 1,
+                }
+            }
+        }
+    };
+
+    const threads = try std.testing.allocator.alloc(std.Thread, N_WORKERS);
+    defer std.testing.allocator.free(threads);
+
+    const t_start = std.time.nanoTimestamp();
+
+    for (workers, threads) |*w, *t| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{WorkerCtx{
+            .hub = &hub,
+            .state = w,
+            .cmds = CMDS_PER_WORKER,
+            .timeout_ms = PER_CMD_TIMEOUT_MS,
+            .allocator = std.testing.allocator,
+        }});
+    }
+
+    // Join workers. If the test budget is blown, the test will be
+    // killed by Zig's outer test runner; we approximate a deadlock
+    // check by asserting elapsed < TEST_BUDGET_MS after the joins.
+    for (threads) |t| t.join();
+    _ = workers_done.fetchAdd(N_WORKERS, .acq_rel);
+
+    // Wait for broker to finish draining anything still in flight.
+    broker_thread.join();
+
+    const elapsed_ms: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - t_start, std.time.ns_per_ms));
+
+    // Aggregate stats across workers.
+    var total_ok: usize = 0;
+    var total_timeout: usize = 0;
+    var total_err: usize = 0;
+    var all_latencies: std.ArrayListUnmanaged(u64) = .empty;
+    defer all_latencies.deinit(std.testing.allocator);
+    for (workers) |w| {
+        total_ok += w.ok_count;
+        total_timeout += w.timeout_count;
+        total_err += w.err_count;
+        try all_latencies.appendSlice(std.testing.allocator, w.latencies_us.items);
+    }
+
+    // Sort latencies for percentile extraction.
+    std.mem.sort(u64, all_latencies.items, {}, std.sort.asc(u64));
+    const p50 = if (all_latencies.items.len > 0) all_latencies.items[all_latencies.items.len * 50 / 100] else 0;
+    const p95 = if (all_latencies.items.len > 0) all_latencies.items[all_latencies.items.len * 95 / 100] else 0;
+    const p99 = if (all_latencies.items.len > 0) all_latencies.items[@min(all_latencies.items.len - 1, all_latencies.items.len * 99 / 100)] else 0;
+    const p_max = if (all_latencies.items.len > 0) all_latencies.items[all_latencies.items.len - 1] else 0;
+
+    std.debug.print(
+        "\n[soak/50] elapsed={d}ms total={d} ok={d} timeout={d} err={d} p50={d}us p95={d}us p99={d}us pmax={d}us\n",
+        .{ elapsed_ms, TOTAL_CMDS, total_ok, total_timeout, total_err, p50, p95, p99, p_max },
+    );
+
+    // Gate assertions:
+    //   - Deadlock: elapsed must be well under the 60 s budget.
+    //   - Correctness: every command got a response (broker fed all
+    //     responses; nothing should time out under normal scheduling).
+    //   - Liveness: no `error_other` errors (write/dup OOMs etc).
+    try std.testing.expect(elapsed_ms < TEST_BUDGET_MS);
+    try std.testing.expectEqual(@as(usize, TOTAL_CMDS), total_ok);
+    try std.testing.expectEqual(@as(usize, 0), total_timeout);
+    try std.testing.expectEqual(@as(usize, 0), total_err);
+}
+
+test "soak: 50 sessions with mid-flight eviction churn on a hot user" {
+    // Companion soak: model the same-user-multi-conn case. 49 workers
+    // own distinct user_ids; ONE user_id ("hot") is repeatedly
+    // re-registered by an "evictor" thread while a worker is mid-call
+    // on that slot. The eviction-vs-sendCommand race is exactly the
+    // META CRIT #3 path — refcounted conn lifetime keeps the slot
+    // pointer live across the eviction handoff. Senders on the hot
+    // user are EXPECTED to see ConnectionClosed (hub drain wakes
+    // pending) or NoExtensionConnected (race window where the new
+    // conn hasn't landed yet) — but never UAF, never deadlock, never
+    // an unexpected error class.
+
+    const N_WORKERS: usize = 49;
+    const CMDS_PER_WORKER: usize = 10;
+    const EVICTIONS: usize = 20;
+    // Per-cmd timeout for the hot lane: short, because a command that
+    // got written to a now-evicted conn has no broker watching it
+    // (broker only polls the LATEST hot stream). That sender SHOULD
+    // get a Timeout — a valid outcome of "command sent right before
+    // eviction landed." We bound the wait so the test exits fast.
+    const PER_CMD_TIMEOUT_MS: u64 = 200;
+
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+
+    const WorkerState = struct {
+        user_id: [16]u8 = [_]u8{0} ** 16,
+        user_id_len: usize = 0,
+        stream: SoakStream,
+        conn: *ExtensionWsConn = undefined,
+        ok_count: usize = 0,
+        timeout_count: usize = 0,
+        err_count: usize = 0,
+    };
+
+    const workers = try std.testing.allocator.alloc(WorkerState, N_WORKERS);
+    defer std.testing.allocator.free(workers);
+
+    for (workers, 0..) |*w, i| {
+        w.* = .{ .stream = .{ .allocator = std.testing.allocator } };
+        const n = std.fmt.bufPrint(&w.user_id, "evic-u-{d}", .{i}) catch unreachable;
+        w.user_id_len = n.len;
+        w.conn = try hub.registerConn(
+            w.user_id[0..w.user_id_len],
+            &w.stream,
+            SoakStream.writeText,
+            &w.stream,
+            SoakStream.closeStream,
+        );
+    }
+    defer {
+        for (workers) |*w| {
+            _ = hub.unregister(w.user_id[0..w.user_id_len]);
+            hub.destroyConn(w.conn);
+            w.stream.deinit();
+        }
+    }
+
+    // "Hot" user_id slot — owned by the evictor lane, not part of `workers`.
+    // We hold conn pointers in a small bag so destroyConn can run after
+    // the test body without UAF concerns.
+    var hot_conns: std.ArrayListUnmanaged(*ExtensionWsConn) = .empty;
+    defer {
+        for (hot_conns.items) |c| hub.destroyConn(c);
+        hot_conns.deinit(std.testing.allocator);
+    }
+    var hot_streams: std.ArrayListUnmanaged(*SoakStream) = .empty;
+    defer {
+        for (hot_streams.items) |s| {
+            s.deinit();
+            std.testing.allocator.destroy(s);
+        }
+        hot_streams.deinit(std.testing.allocator);
+    }
+    var hot_mu: std.Thread.Mutex = .{};
+
+    var stop = std.atomic.Value(bool).init(false);
+    var workers_done = std.atomic.Value(usize).init(0);
+
+    // Broker for the stable workers + the current hot conn.
+    const BrokerCtx = struct {
+        workers: []WorkerState,
+        hot_streams: *std.ArrayListUnmanaged(*SoakStream),
+        hot_conns: *std.ArrayListUnmanaged(*ExtensionWsConn),
+        hot_mu: *std.Thread.Mutex,
+        workers_done: *std.atomic.Value(usize),
+        stop: *std.atomic.Value(bool),
+        allocator: std.mem.Allocator,
+    };
+    const Broker = struct {
+        fn run(ctx: BrokerCtx) void {
+            var local_buf: std.ArrayListUnmanaged([]u8) = .empty;
+            defer local_buf.deinit(ctx.allocator);
+            while (!ctx.stop.load(.acquire)) {
+                var did_work = false;
+                for (ctx.workers) |*w| {
+                    local_buf.clearRetainingCapacity();
+                    w.stream.drainCommandIds(ctx.allocator, &local_buf) catch continue;
+                    for (local_buf.items) |id| {
+                        defer ctx.allocator.free(id);
+                        const result_json = std.fmt.allocPrint(
+                            ctx.allocator,
+                            "{{\"command_id\":\"{s}\",\"ok\":true,\"result\":{{\"x\":1}}}}",
+                            .{id},
+                        ) catch continue;
+                        defer ctx.allocator.free(result_json);
+                        w.conn.deliverResult(result_json) catch {};
+                        did_work = true;
+                    }
+                }
+                // Drain hot conn's CURRENT stream (last one pushed).
+                ctx.hot_mu.lock();
+                if (ctx.hot_streams.items.len > 0) {
+                    const last_stream = ctx.hot_streams.items[ctx.hot_streams.items.len - 1];
+                    const last_conn = ctx.hot_conns.items[ctx.hot_conns.items.len - 1];
+                    ctx.hot_mu.unlock();
+                    local_buf.clearRetainingCapacity();
+                    last_stream.drainCommandIds(ctx.allocator, &local_buf) catch {};
+                    for (local_buf.items) |id| {
+                        defer ctx.allocator.free(id);
+                        const result_json = std.fmt.allocPrint(
+                            ctx.allocator,
+                            "{{\"command_id\":\"{s}\",\"ok\":true,\"result\":{{\"x\":1}}}}",
+                            .{id},
+                        ) catch continue;
+                        defer ctx.allocator.free(result_json);
+                        last_conn.deliverResult(result_json) catch {};
+                        did_work = true;
+                    }
+                } else {
+                    ctx.hot_mu.unlock();
+                }
+                if (!did_work) std.Thread.sleep(50 * std.time.ns_per_us);
+                if (!did_work and ctx.workers_done.load(.acquire) >= ctx.workers.len) break;
+            }
+        }
+    };
+
+    const broker_thread = try std.Thread.spawn(.{}, Broker.run, .{BrokerCtx{
+        .workers = workers,
+        .hot_streams = &hot_streams,
+        .hot_conns = &hot_conns,
+        .hot_mu = &hot_mu,
+        .workers_done = &workers_done,
+        .stop = &stop,
+        .allocator = std.testing.allocator,
+    }});
+
+    // Evictor: repeatedly registerConn on the same "hot" user_id,
+    // each registration evicts the previous one. The new conn's
+    // pointer is appended to the hot_conns bag; the previous conn's
+    // refs were dropped by registerConn's eviction branch.
+    const EvictorCtx = struct {
+        hub: *ExtensionWsHub,
+        hot_streams: *std.ArrayListUnmanaged(*SoakStream),
+        hot_conns: *std.ArrayListUnmanaged(*ExtensionWsConn),
+        hot_mu: *std.Thread.Mutex,
+        n_evictions: usize,
+        allocator: std.mem.Allocator,
+    };
+    const Evictor = struct {
+        fn run(ctx: EvictorCtx) void {
+            var i: usize = 0;
+            while (i < ctx.n_evictions) : (i += 1) {
+                const s = ctx.allocator.create(SoakStream) catch return;
+                s.* = .{ .allocator = ctx.allocator };
+                const conn = ctx.hub.registerConn(
+                    "hot",
+                    s,
+                    SoakStream.writeText,
+                    s,
+                    SoakStream.closeStream,
+                ) catch {
+                    s.deinit();
+                    ctx.allocator.destroy(s);
+                    return;
+                };
+                ctx.hot_mu.lock();
+                ctx.hot_streams.append(ctx.allocator, s) catch {};
+                ctx.hot_conns.append(ctx.allocator, conn) catch {};
+                ctx.hot_mu.unlock();
+                // Short stagger between evictions — long enough that
+                // a sender can get a command through but short enough
+                // that we churn the slot meaningfully.
+                std.Thread.sleep(500 * std.time.ns_per_us);
+            }
+        }
+    };
+    const evictor_thread = try std.Thread.spawn(.{}, Evictor.run, .{EvictorCtx{
+        .hub = &hub,
+        .hot_streams = &hot_streams,
+        .hot_conns = &hot_conns,
+        .hot_mu = &hot_mu,
+        .n_evictions = EVICTIONS,
+        .allocator = std.testing.allocator,
+    }});
+
+    // Hot-user sender (just one, but it races against the evictor).
+    const HotSenderCtx = struct {
+        hub: *ExtensionWsHub,
+        timeout_ms: u64,
+        n_cmds: usize,
+        allocator: std.mem.Allocator,
+        ok: *usize,
+        closed: *usize,
+        no_conn: *usize,
+        timeout: *usize,
+        other_err: *usize,
+    };
+    const HotSender = struct {
+        fn run(ctx: HotSenderCtx) void {
+            var i: usize = 0;
+            while (i < ctx.n_cmds) : (i += 1) {
+                const r = ctx.hub.sendCommand(
+                    ctx.allocator,
+                    "hot",
+                    "navigate",
+                    "{\"url\":\"https://hot.test\"}",
+                    ctx.timeout_ms,
+                );
+                if (r) |buf| {
+                    ctx.allocator.free(buf);
+                    ctx.ok.* += 1;
+                } else |err| switch (err) {
+                    error.ConnectionClosed => ctx.closed.* += 1,
+                    error.NoExtensionConnected => ctx.no_conn.* += 1,
+                    // A command written to a conn that gets evicted
+                    // immediately afterward has its pending stranded
+                    // (broker only watches the LATEST hot stream). The
+                    // sender legitimately sees Timeout. This is NOT a
+                    // hub bug; it's the test broker's limitation.
+                    error.Timeout => ctx.timeout.* += 1,
+                    else => ctx.other_err.* += 1,
+                }
+                std.Thread.sleep(200 * std.time.ns_per_us);
+            }
+        }
+    };
+    var hot_ok: usize = 0;
+    var hot_closed: usize = 0;
+    var hot_no_conn: usize = 0;
+    var hot_timeout: usize = 0;
+    var hot_other: usize = 0;
+    const hot_sender_thread = try std.Thread.spawn(.{}, HotSender.run, .{HotSenderCtx{
+        .hub = &hub,
+        .timeout_ms = PER_CMD_TIMEOUT_MS,
+        .n_cmds = EVICTIONS * 3, // more sends than evictions
+        .allocator = std.testing.allocator,
+        .ok = &hot_ok,
+        .closed = &hot_closed,
+        .no_conn = &hot_no_conn,
+        .timeout = &hot_timeout,
+        .other_err = &hot_other,
+    }});
+
+    // Stable workers.
+    const WorkerCtx2 = struct {
+        hub: *ExtensionWsHub,
+        state: *WorkerState,
+        cmds: usize,
+        timeout_ms: u64,
+        allocator: std.mem.Allocator,
+    };
+    const Worker2 = struct {
+        fn run(ctx: WorkerCtx2) void {
+            var i: usize = 0;
+            while (i < ctx.cmds) : (i += 1) {
+                const r = ctx.hub.sendCommand(
+                    ctx.allocator,
+                    ctx.state.user_id[0..ctx.state.user_id_len],
+                    "navigate",
+                    "{\"url\":\"https://soak.test\"}",
+                    ctx.timeout_ms,
+                );
+                if (r) |buf| {
+                    ctx.allocator.free(buf);
+                    ctx.state.ok_count += 1;
+                } else |err| switch (err) {
+                    error.Timeout => ctx.state.timeout_count += 1,
+                    else => ctx.state.err_count += 1,
+                }
+            }
+        }
+    };
+
+    const threads = try std.testing.allocator.alloc(std.Thread, N_WORKERS);
+    defer std.testing.allocator.free(threads);
+    const t_start = std.time.nanoTimestamp();
+    for (workers, threads) |*w, *t| {
+        t.* = try std.Thread.spawn(.{}, Worker2.run, .{WorkerCtx2{
+            .hub = &hub,
+            .state = w,
+            .cmds = CMDS_PER_WORKER,
+            .timeout_ms = PER_CMD_TIMEOUT_MS,
+            .allocator = std.testing.allocator,
+        }});
+    }
+
+    for (threads) |t| t.join();
+    _ = workers_done.fetchAdd(N_WORKERS, .acq_rel);
+    hot_sender_thread.join();
+    evictor_thread.join();
+    // Stop the broker; tear down hot conns + streams via defer above.
+    stop.store(true, .release);
+    broker_thread.join();
+    // Drain the still-current hot slot from the hub map (the last
+    // evictor registration left it registered).
+    _ = hub.unregister("hot");
+
+    const elapsed_ms: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - t_start, std.time.ns_per_ms));
+
+    var total_ok: usize = 0;
+    var total_timeout: usize = 0;
+    var total_err: usize = 0;
+    for (workers) |w| {
+        total_ok += w.ok_count;
+        total_timeout += w.timeout_count;
+        total_err += w.err_count;
+    }
+    const STABLE_TOTAL: usize = N_WORKERS * CMDS_PER_WORKER;
+
+    std.debug.print(
+        "\n[soak/evict] elapsed={d}ms stable_total={d} stable_ok={d} stable_timeout={d} stable_err={d} hot_ok={d} hot_closed={d} hot_no_conn={d} hot_timeout={d} hot_other={d}\n",
+        .{ elapsed_ms, STABLE_TOTAL, total_ok, total_timeout, total_err, hot_ok, hot_closed, hot_no_conn, hot_timeout, hot_other },
+    );
+
+    // Stable workers must all succeed — they don't share state with
+    // the evictor lane and the broker feeds them all.
+    try std.testing.expectEqual(STABLE_TOTAL, total_ok);
+    try std.testing.expectEqual(@as(usize, 0), total_timeout);
+    try std.testing.expectEqual(@as(usize, 0), total_err);
+    // The hot lane is allowed any mix of ok/closed/no_conn/timeout —
+    // those are all valid outcomes for a sender racing eviction.
+    // What's forbidden is "other" (an unexpected error class) — that
+    // would signal a bug. Also gate: total hot outcomes account for
+    // every sent command (no swallowed errors / lost frames).
+    try std.testing.expectEqual(@as(usize, 0), hot_other);
+    try std.testing.expectEqual(EVICTIONS * 3, hot_ok + hot_closed + hot_no_conn + hot_timeout);
+}

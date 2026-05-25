@@ -10049,8 +10049,38 @@ const ManagerImpl = struct {
             return null;
         }
 
-        // Finding C fix (2026-05-21): gate on !builtin.is_test — see TxnLease.exec.
-        if (!builtin.is_test) log.err("postgres exec failed: {s}", .{c.PQerrorMessage(conn)});
+        // Gate #3 live-PG probe (2026-05-25) surfaced that vanilla
+        // `postgres:16-alpine` makes EVERY tenant migration die silently
+        // because `CREATE EXTENSION IF NOT EXISTS vector` fails with
+        // `extension "vector" is not available`. Surface this specific
+        // failure with operator-actionable diagnostic — a generic
+        // ExecFailed leaves operators chasing the wrong layer.
+        const err_msg = c.PQerrorMessage(conn);
+        if (std.mem.startsWith(u8, template, "CREATE EXTENSION IF NOT EXISTS")) {
+            const err_text = std.mem.span(err_msg);
+            if (std.mem.indexOf(u8, err_text, "is not available") != null or
+                std.mem.indexOf(u8, err_text, "could not open extension control file") != null)
+            {
+                log.err(
+                    "postgres extension unavailable — required for nullalis memory: {s}. " ++
+                        "Use the pgvector/pgvector:pg16 image (or install pgvector via `apk add postgresql-pgvector` / your distro's equivalent) — vanilla postgres:16-alpine does NOT include pgvector.",
+                    .{err_text},
+                );
+                c.PQclear(result);
+                return error.PostgresExtensionUnavailable;
+            }
+        }
+
+        // Finding C fix (2026-05-21): gate err-level on !builtin.is_test
+        // because err-level logs FAIL the test runner. Gate #3 follow-up
+        // (2026-05-25): always emit at warn level so test-mode failures
+        // surface a diagnostic without breaking the runner. Operators
+        // running outside tests still get the err-level severity.
+        if (!builtin.is_test) {
+            log.err("postgres exec failed: {s}", .{err_msg});
+        } else {
+            log.warn("postgres exec failed (test mode): {s}", .{err_msg});
+        }
         c.PQclear(result);
         return error.ExecFailed;
     }

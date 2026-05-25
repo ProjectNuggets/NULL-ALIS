@@ -29543,10 +29543,17 @@ test "Wave 2C live: artifacts CRUD + version graph + isolation + share roundtrip
     const history = try mgr.listArtifactVersionHistory(allocator, 101, artifact.id);
     defer zaki_state_mod.freeArtifactHistoryRows(allocator, history);
     try std.testing.expectEqual(@as(usize, 3), history.len);
-    // ORDER BY version DESC → [v3, v2, v1]
+    // ORDER BY version DESC → history[0]=v3, history[1]=v2, history[2]=v1.
+    // Gate #3 live PG probe (2026-05-25) surfaced the wrong indexing on
+    // the next line — history[2] is v1, whose parent_version IS NULL,
+    // so `.?` panicked. The find-by-value loop below was the correct
+    // assertion; the bare index unwrap was leftover scaffolding. Asserting
+    // history[1] (v2) has parent_version=1 here keeps the positional check
+    // honest; the find loop continues to cover v1 + v2 by value match.
     try std.testing.expectEqual(@as(u64, 3), history[0].version);
-    try std.testing.expectEqual(@as(u64, 2), history[2].parent_version.?);
-    // Wait — history[2] is v1; check actual indexing.
+    try std.testing.expectEqual(@as(u64, 1), history[2].version);
+    try std.testing.expect(history[2].parent_version == null);
+    try std.testing.expectEqual(@as(u64, 1), history[1].parent_version.?);
     var found_v1: bool = false;
     var found_v2: bool = false;
     for (history) |h| {
