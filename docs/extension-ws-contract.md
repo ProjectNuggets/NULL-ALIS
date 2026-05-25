@@ -1,5 +1,15 @@
 # Gateway-side extension WebSocket — contract + tool recipe
 
+**v1 surface complete (10/10 tools).** Wave 3B shipped `extension_navigate`
+as proof-of-pattern; the follow-up fan-out landed the remaining nine
+(`extension_click`, `extension_type`, `extension_fill_form`,
+`extension_screenshot`, `extension_get_text`, `extension_get_dom`,
+`extension_wait_for`, `extension_scroll`, `extension_list_tabs`) by
+mechanically applying the recipe below. Each ships with the same six-
+test scaffold + (for capped tools) an over-cap rejection test. Keep
+the recipe in place — future v1.1 additions (cross-tab, file_upload,
+etc.) drop in the same way.
+
 Wave 3B landed the gateway half of the browser-extension story:
 
 - **Endpoint:** `GET /api/v1/extension/ws` (registered in

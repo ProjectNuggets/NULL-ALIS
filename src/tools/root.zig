@@ -142,12 +142,23 @@ pub const artifact_create = @import("artifact_create.zig");
 pub const artifact_update = @import("artifact_update.zig");
 pub const artifact_get = @import("artifact_get.zig");
 pub const artifact_list = @import("artifact_list.zig");
-/// Wave 3B — extension_* tool family. The first wired tool
-/// (`extension_navigate`) drives the user's connected browser via the
-/// extension's WebSocket. Registered conditionally on the runtime
-/// having an `ExtensionWsHub` available — standalone CLI deploys
-/// without the gateway-side hub never see the tool.
+/// Wave 3B — extension_* tool family. Drives the user's connected
+/// browser via the extension's WebSocket. Registered conditionally on
+/// the runtime having an `ExtensionWsHub` available — standalone CLI
+/// deploys without the gateway-side hub never see these tools.
+/// `extension_navigate` was the first wired tool; the rest (click,
+/// type, fill_form, screenshot, get_text, get_dom, wait_for, scroll,
+/// list_tabs) mirror the contract recipe one-to-one.
 pub const extension_navigate = @import("extension_navigate.zig");
+pub const extension_click = @import("extension_click.zig");
+pub const extension_type = @import("extension_type.zig");
+pub const extension_fill_form = @import("extension_fill_form.zig");
+pub const extension_screenshot = @import("extension_screenshot.zig");
+pub const extension_get_text = @import("extension_get_text.zig");
+pub const extension_get_dom = @import("extension_get_dom.zig");
+pub const extension_wait_for = @import("extension_wait_for.zig");
+pub const extension_scroll = @import("extension_scroll.zig");
+pub const extension_list_tabs = @import("extension_list_tabs.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 
@@ -720,9 +731,69 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     // `.high` risk because the actions are visible + affect logged-in
     // state; `.b` cost because the per-call payload is small but the
     // round-trip is non-trivial.
+    //
+    // Split into mutating vs read_only: click/type/fill_form/scroll
+    // change page state (mutating, approval-gated in .supervised);
+    // screenshot/get_text/get_dom/wait_for/list_tabs are read-only
+    // (no page mutation, but still .high risk because they expose the
+    // user's logged-in view to the agent).
     .{
         .name = extension_navigate.ExtensionNavigateTool.tool_name,
         .flags = .{ .mutating = true },
+        .risk_level = .high,
+        .cost_class = .b,
+    },
+    .{
+        .name = extension_click.ExtensionClickTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .high,
+        .cost_class = .b,
+    },
+    .{
+        .name = extension_type.ExtensionTypeTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .high,
+        .cost_class = .b,
+    },
+    .{
+        .name = extension_fill_form.ExtensionFillFormTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .high,
+        .cost_class = .b,
+    },
+    .{
+        .name = extension_scroll.ExtensionScrollTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .high,
+        .cost_class = .b,
+    },
+    .{
+        .name = extension_screenshot.ExtensionScreenshotTool.tool_name,
+        .flags = .{ .read_only = true },
+        .risk_level = .high,
+        .cost_class = .b,
+    },
+    .{
+        .name = extension_get_text.ExtensionGetTextTool.tool_name,
+        .flags = .{ .read_only = true },
+        .risk_level = .high,
+        .cost_class = .b,
+    },
+    .{
+        .name = extension_get_dom.ExtensionGetDomTool.tool_name,
+        .flags = .{ .read_only = true },
+        .risk_level = .high,
+        .cost_class = .b,
+    },
+    .{
+        .name = extension_wait_for.ExtensionWaitForTool.tool_name,
+        .flags = .{ .read_only = true },
+        .risk_level = .high,
+        .cost_class = .b,
+    },
+    .{
+        .name = extension_list_tabs.ExtensionListTabsTool.tool_name,
+        .flags = .{ .read_only = true },
         .risk_level = .high,
         .cost_class = .b,
     },
@@ -1459,6 +1530,42 @@ pub fn allTools(
         const ent = try allocator.create(extension_navigate.ExtensionNavigateTool);
         ent.* = .{ .hub = hub, .url_allowlist = opts.extension_browser_allowlist };
         try list.append(allocator, ent.tool());
+
+        const click_t = try allocator.create(extension_click.ExtensionClickTool);
+        click_t.* = .{ .hub = hub };
+        try list.append(allocator, click_t.tool());
+
+        const type_t = try allocator.create(extension_type.ExtensionTypeTool);
+        type_t.* = .{ .hub = hub };
+        try list.append(allocator, type_t.tool());
+
+        const fill_t = try allocator.create(extension_fill_form.ExtensionFillFormTool);
+        fill_t.* = .{ .hub = hub };
+        try list.append(allocator, fill_t.tool());
+
+        const shot_t = try allocator.create(extension_screenshot.ExtensionScreenshotTool);
+        shot_t.* = .{ .hub = hub };
+        try list.append(allocator, shot_t.tool());
+
+        const gettext_t = try allocator.create(extension_get_text.ExtensionGetTextTool);
+        gettext_t.* = .{ .hub = hub };
+        try list.append(allocator, gettext_t.tool());
+
+        const getdom_t = try allocator.create(extension_get_dom.ExtensionGetDomTool);
+        getdom_t.* = .{ .hub = hub };
+        try list.append(allocator, getdom_t.tool());
+
+        const wait_t = try allocator.create(extension_wait_for.ExtensionWaitForTool);
+        wait_t.* = .{ .hub = hub };
+        try list.append(allocator, wait_t.tool());
+
+        const scroll_t = try allocator.create(extension_scroll.ExtensionScrollTool);
+        scroll_t.* = .{ .hub = hub };
+        try list.append(allocator, scroll_t.tool());
+
+        const tabs_t = try allocator.create(extension_list_tabs.ExtensionListTabsTool);
+        tabs_t.* = .{ .hub = hub };
+        try list.append(allocator, tabs_t.tool());
     }
 
     // Hardware/IoT tools fully removed D19 (2026-04-25). Was kept as
@@ -2205,6 +2312,33 @@ pub fn bindExtensionTools(tools: []const Tool, user_id: ?[]const u8) void {
     for (tools) |t| {
         if (std.mem.eql(u8, t.name(), extension_navigate.ExtensionNavigateTool.tool_name)) {
             const ent: *extension_navigate.ExtensionNavigateTool = @ptrCast(@alignCast(t.ptr));
+            ent.user_id = user_id;
+        } else if (std.mem.eql(u8, t.name(), extension_click.ExtensionClickTool.tool_name)) {
+            const ent: *extension_click.ExtensionClickTool = @ptrCast(@alignCast(t.ptr));
+            ent.user_id = user_id;
+        } else if (std.mem.eql(u8, t.name(), extension_type.ExtensionTypeTool.tool_name)) {
+            const ent: *extension_type.ExtensionTypeTool = @ptrCast(@alignCast(t.ptr));
+            ent.user_id = user_id;
+        } else if (std.mem.eql(u8, t.name(), extension_fill_form.ExtensionFillFormTool.tool_name)) {
+            const ent: *extension_fill_form.ExtensionFillFormTool = @ptrCast(@alignCast(t.ptr));
+            ent.user_id = user_id;
+        } else if (std.mem.eql(u8, t.name(), extension_screenshot.ExtensionScreenshotTool.tool_name)) {
+            const ent: *extension_screenshot.ExtensionScreenshotTool = @ptrCast(@alignCast(t.ptr));
+            ent.user_id = user_id;
+        } else if (std.mem.eql(u8, t.name(), extension_get_text.ExtensionGetTextTool.tool_name)) {
+            const ent: *extension_get_text.ExtensionGetTextTool = @ptrCast(@alignCast(t.ptr));
+            ent.user_id = user_id;
+        } else if (std.mem.eql(u8, t.name(), extension_get_dom.ExtensionGetDomTool.tool_name)) {
+            const ent: *extension_get_dom.ExtensionGetDomTool = @ptrCast(@alignCast(t.ptr));
+            ent.user_id = user_id;
+        } else if (std.mem.eql(u8, t.name(), extension_wait_for.ExtensionWaitForTool.tool_name)) {
+            const ent: *extension_wait_for.ExtensionWaitForTool = @ptrCast(@alignCast(t.ptr));
+            ent.user_id = user_id;
+        } else if (std.mem.eql(u8, t.name(), extension_scroll.ExtensionScrollTool.tool_name)) {
+            const ent: *extension_scroll.ExtensionScrollTool = @ptrCast(@alignCast(t.ptr));
+            ent.user_id = user_id;
+        } else if (std.mem.eql(u8, t.name(), extension_list_tabs.ExtensionListTabsTool.tool_name)) {
+            const ent: *extension_list_tabs.ExtensionListTabsTool = @ptrCast(@alignCast(t.ptr));
             ent.user_id = user_id;
         }
     }
