@@ -123,19 +123,38 @@ pub fn uploadMoonshotFile(
 
     // Tempfile for the multipart body (so we never hold both raw file +
     // body in RAM simultaneously for a 100 MB video).
+    //
+    // HIGH-2 (v1.14.23 review): the prior path `{tmp_dir}/nullalis_upload_{pid}.bin`
+    // collided on concurrent in-process uploads (two threads/coroutines
+    // truncating each other's body mid-stream) and was a predictable
+    // symlink-race target in shared /tmp. We now mix in 96 bits of
+    // cryptographic randomness AND create the file with O_EXCL so a
+    // pre-existing path (collision OR attacker symlink) errors instead of
+    // overwriting.
     const tmp_dir = platform.getTempDir(allocator) catch return error.TempFileFailed;
     defer allocator.free(tmp_dir);
-    var tmp_path_buf: [256]u8 = undefined;
-    var tmp_fbs = std.io.fixedBufferStream(&tmp_path_buf);
-    tmp_fbs.writer().print("{s}/nullalis_upload_{d}.bin", .{ tmp_dir, getPid() }) catch
+
+    var tmp_path_buf: [512]u8 = undefined;
+    const tmp_path = buildUploadTempPath(&tmp_path_buf, tmp_dir, getPid()) catch
         return error.TempFileFailed;
-    const tmp_path_len = tmp_fbs.pos;
-    tmp_path_buf[tmp_path_len] = 0;
-    const tmp_path: [:0]const u8 = tmp_path_buf[0..tmp_path_len :0];
+
+    // WARN-1 (v1.14.23 review): register the cleanup defer BEFORE the
+    // write call so a partial-write fault (disk full mid-stream, source
+    // file disappears, perm error after createFile succeeded) still
+    // unlinks the tempfile. Previously the defer was registered after
+    // the `catch return`, leaking the partial body on every failure.
+    //
+    // We create the file exclusively up front so the defer's unlink
+    // targets a tempfile we own (mitigates symlink-overwrite races).
+    {
+        const tmp_file = std.fs.createFileAbsolute(tmp_path, .{ .exclusive = true }) catch
+            return error.TempFileFailed;
+        tmp_file.close();
+    }
+    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
 
     writeMultipartToTempFile(tmp_path, file_path, filename_hint, &boundary, purpose) catch
         return error.FileReadFailed;
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
 
     // Build endpoint URL: <base_url>/files
     const endpoint = std.fmt.allocPrint(allocator, "{s}/files", .{base_url}) catch
@@ -218,6 +237,40 @@ fn getPid() u64 {
     return 0;
 }
 
+/// Build a per-call unique tempfile path in `tmp_dir`. The path embeds the
+/// caller's PID for forensic correlation AND 96 bits of cryptographic
+/// randomness so two concurrent in-process uploads (or any symlink-race
+/// attempt against the predictable PID-only path) cannot collide.
+///
+/// `buf` must be large enough to hold `tmp_dir + "/nullalis_upload_<pid>_<24hex>.bin"
+/// + NUL`. Returns `error.TempPathTooLong` if the buffer can't fit the
+/// formatted path with its trailing NUL.
+///
+/// Exposed (pub) so tests can assert the uniqueness contract without
+/// needing filesystem mocks.
+pub fn buildUploadTempPath(
+    buf: []u8,
+    tmp_dir: []const u8,
+    pid: u64,
+) ![:0]const u8 {
+    var rand_bytes: [12]u8 = undefined;
+    std.crypto.random.bytes(&rand_bytes);
+    var rand_hex: [24]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (rand_bytes, 0..) |b, i| {
+        rand_hex[i * 2] = hex_chars[b >> 4];
+        rand_hex[i * 2 + 1] = hex_chars[b & 0x0f];
+    }
+
+    var fbs = std.io.fixedBufferStream(buf);
+    fbs.writer().print("{s}/nullalis_upload_{d}_{s}.bin", .{ tmp_dir, pid, &rand_hex }) catch
+        return error.TempPathTooLong;
+    const len = fbs.pos;
+    if (len + 1 > buf.len) return error.TempPathTooLong;
+    buf[len] = 0;
+    return buf[0..len :0];
+}
+
 /// Build the multipart/form-data body in-memory. Exposed (and used) by tests
 /// so they don't have to spin up a temp file. The runtime path uses
 /// `writeMultipartToTempFile` to stream straight to disk for memory reasons.
@@ -264,6 +317,12 @@ pub fn buildMultipartBody(
 /// Stream the multipart body straight to a tempfile so we never hold both
 /// the raw file bytes + the assembled body in memory. Same pattern as
 /// `voice.zig writeMultipartToTempFile`.
+///
+/// PRE-CONDITION: `tmp_path` already exists (created exclusively by the
+/// caller, see `uploadMoonshotFile`). We open the existing inode rather
+/// than re-create it so we don't race against the caller's defer-unlink
+/// or against a concurrent symlink-overwrite attempt between the create
+/// and the open.
 fn writeMultipartToTempFile(
     tmp_path: [:0]const u8,
     file_path: []const u8,
@@ -271,7 +330,7 @@ fn writeMultipartToTempFile(
     boundary: []const u8,
     purpose: MoonshotPurpose,
 ) !void {
-    const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+    const tmp_file = try std.fs.openFileAbsolute(tmp_path, .{ .mode = .write_only });
     defer tmp_file.close();
 
     // file part header
@@ -369,7 +428,17 @@ fn curlPostFromFile(
     try child.spawn();
 
     // Upload responses are small JSON objects — 1 MB cap is plenty.
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
+    //
+    // WARN-2 (v1.14.23 review): if the read fails (StreamTooLong, OOM,
+    // IO error) we MUST still reap the spawned child or its process
+    // descriptor stays a zombie until the gateway exits. Pre-fix the
+    // bare `catch return` leaked the PID; under a flapping upload loop
+    // this exhausts the process table.
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+        _ = child.wait() catch {};
+        log.warn("curl read failed; reaped child: {s}", .{@errorName(err)});
+        return error.CurlReadError;
+    };
     errdefer allocator.free(stdout);
 
     const term = child.wait() catch return error.CurlWaitError;
@@ -509,6 +578,47 @@ test "parseFileIdFromResponse rejects malformed JSON" {
     try std.testing.expectError(error.InvalidResponse, parseFileIdFromResponse(allocator, "[1,2,3]"));
     try std.testing.expectError(error.InvalidResponse, parseFileIdFromResponse(allocator, "{}"));
     try std.testing.expectError(error.InvalidResponse, parseFileIdFromResponse(allocator, "{\"id\":123}"));
+}
+
+// HIGH-2 (v1.14.23 review): tempfile path must embed 96 bits of
+// cryptographic randomness so two concurrent uploads in the same
+// process cannot collide on the predictable PID-only path.
+test "buildUploadTempPath embeds tmp_dir, pid, and 24-hex-char random suffix" {
+    var buf: [512]u8 = undefined;
+    const p = try buildUploadTempPath(&buf, "/tmp", 12345);
+    try std.testing.expect(std.mem.startsWith(u8, p, "/tmp/nullalis_upload_12345_"));
+    try std.testing.expect(std.mem.endsWith(u8, p, ".bin"));
+    // path = "/tmp/nullalis_upload_12345_" + 24 hex + ".bin"
+    const prefix = "/tmp/nullalis_upload_12345_";
+    try std.testing.expectEqual(@as(usize, prefix.len + 24 + ".bin".len), p.len);
+    // Sentinel is in place.
+    try std.testing.expectEqual(@as(u8, 0), buf[p.len]);
+    // Suffix between prefix and ".bin" is 24 lowercase hex chars.
+    const hex_slice = p[prefix.len .. p.len - ".bin".len];
+    try std.testing.expectEqual(@as(usize, 24), hex_slice.len);
+    for (hex_slice) |c| {
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+        try std.testing.expect(ok);
+    }
+}
+
+test "buildUploadTempPath returns distinct random suffixes across calls" {
+    var buf_a: [512]u8 = undefined;
+    var buf_b: [512]u8 = undefined;
+    const a = try buildUploadTempPath(&buf_a, "/tmp", 99);
+    const b = try buildUploadTempPath(&buf_b, "/tmp", 99);
+    // Same PID + same tmp_dir but distinct random suffix → distinct paths.
+    // 96 bits of entropy means a collision probability is negligible
+    // (~1 in 2^96), so a test failure here is a real regression.
+    try std.testing.expect(!std.mem.eql(u8, a, b));
+}
+
+test "buildUploadTempPath errors on undersized buffer" {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectError(
+        error.TempPathTooLong,
+        buildUploadTempPath(&buf, "/tmp", 12345),
+    );
 }
 
 // Suppress unused-import warning in release builds when json_util is only
