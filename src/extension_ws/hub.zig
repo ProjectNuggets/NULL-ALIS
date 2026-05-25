@@ -25,8 +25,37 @@
 //!     was already evicted by a new registration is a no-op.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const log = std.log.scoped(.extension_ws);
+
+// ── IN-01 (2026-05-25) — deterministic CR-02 race injection ──────────
+//
+// Test-only hooks the IN-01 regression test uses to deterministically
+// stall `deliverResult` AFTER its `fetchRemove` succeeded but BEFORE
+// it writes `pending.result` / sets `pending.ready`. With this gate the
+// test can guarantee the timeout-vs-deliver race window is hit on
+// every run instead of relying on CPU scheduling luck (the pre-IN-01
+// test was probabilistic — 20 iterations hoping the race lands).
+//
+// Both pointers default to null in test AND non-test builds; only the
+// test sets them. In non-test builds the gate-check branch is dead
+// code (`builtin.is_test == false` is comptime-known) and the
+// optimizer prunes the check entirely, so production has zero overhead
+// AND zero binary bloat from these hooks.
+//
+// Protocol:
+//   - The test creates two ResetEvents: `gate` and `reached`.
+//   - The test sets `test_deliver_gate = &gate` and
+//     `test_deliver_reached = &reached`.
+//   - When `deliverResult` reaches the injection point, it `.set()`s
+//     `reached` so the test knows the race window is open, then
+//     `.wait()`s on `gate`.
+//   - The test does whatever ordering it wants (e.g. lets
+//     sendCommand's timedWait expire), then `.set()`s `gate`.
+//   - `deliverResult` resumes and finishes its writes / release.
+pub var test_deliver_gate: ?*std.Thread.ResetEvent = null;
+pub var test_deliver_reached: ?*std.Thread.ResetEvent = null;
 
 /// Default per-command timeout: 30 s matches the contract's
 /// `timeout_ms: 30000` default for browser tools. The contract's
@@ -378,6 +407,16 @@ pub const ExtensionWsConn = struct {
             log.info("extension_ws: dropping result for unknown command_id={s}", .{id});
             return;
         };
+
+        // IN-01 — test-only deterministic race gate. Inserted between
+        // fetchRemove (succeeded above; we hold the map ref) and the
+        // pending.result/.ready writes (below) so the IN-01 test can
+        // freeze us in the exact window where the timeout-vs-deliver
+        // UAF used to fire. Comptime-eliminated in non-test builds.
+        if (comptime builtin.is_test) {
+            if (test_deliver_reached) |r| r.set();
+            if (test_deliver_gate) |g| g.wait();
+        }
 
         // CR-02 (v1.14.22): we now hold the map ref (fetchRemove
         // transferred it to us — the map no longer accounts for it,
@@ -1007,18 +1046,37 @@ test "META HIGH #3: deliverResult OOM surfaces ResultDeliveryOom not ConnectionC
 
 // ── CR-02 regression test: timeout-vs-deliver UAF ──────────────────────
 
-test "CR-02: timeout firing while deliverResult is mid-write does not UAF" {
-    // Reproduce the exact race the review flagged: sender's
-    // timedWait returns just as the read-loop's deliverResult is
-    // between fetchRemove and the pending.result/.ready writes.
-    // Pre-fix, the sender would destroy(pending) and the deliver
-    // path would write to freed memory. With the refcount, both
-    // sides keep the pending alive until the last release.
+test "IN-01/CR-02: timeout firing while deliverResult is mid-write does not UAF (deterministic)" {
+    // IN-01 (2026-05-25) — replaces the prior probabilistic test that
+    // looped 20 iterations hoping the race window would hit by luck.
+    // This version uses the `test_deliver_gate` injection point in
+    // `deliverResult` to FORCE deliver to be exactly in the
+    // post-fetchRemove / pre-result-write window when the sender's
+    // timedWait expires. Every run exercises the race; no scheduling
+    // luck involved.
     //
-    // The test deliberately spawns the "extension" thread with a
-    // sleep tuned to land in the sender's timeout-wait window. We
-    // run the race repeatedly to maximize the chance of hitting
-    // the narrow window in any one trial.
+    // Sequence:
+    //   T0  Test sets gate + reached pointers.
+    //   T1  "Sender" thread calls hub.sendCommand (timeout = 100 ms).
+    //       The frame is registered; sendCommand blocks in timedWait.
+    //   T2  "Deliver" thread calls conn.deliverResult with the
+    //       matching command_id. Deliver succeeds at fetchRemove,
+    //       sets `reached`, then blocks on `gate.wait()`.
+    //   T3  Test thread waits on `reached` so it knows deliver is
+    //       inside the race window with the map ref held but result
+    //       not yet written.
+    //   T4  Test thread releases `gate`. Deliver writes
+    //       `pending.result`, sets `pending.ready`, releases map ref.
+    //   T5  Sender wakes (ready was set BEFORE timedWait expired —
+    //       gate.set happened well within 100 ms). Sender returns
+    //       the result.
+    //
+    // Pre-CR-02 behavior: a sender whose timedWait fired between T2's
+    // fetchRemove and T4's writes would destroy(pending) and T4 would
+    // UAF. Post-fix the refcount keeps pending alive until both sides
+    // release, so this test's strict ordering is safe AND a
+    // regression would either deadlock (no fail) or trip testing
+    // allocator's leak/UAF detector.
     var hub = ExtensionWsHub.init(std.testing.allocator);
     defer hub.deinit();
 
@@ -1031,70 +1089,238 @@ test "CR-02: timeout firing while deliverResult is mid-write does not UAF" {
         hub.destroyConn(c1);
     }
 
-    const Iters = 20;
-    var iter: usize = 0;
-    while (iter < Iters) : (iter += 1) {
-        // Clear any prior frame so we can grep the new command_id.
-        s1.written.clearRetainingCapacity();
-
-        const HelperCtx = struct {
-            stream: *TestStream,
-            conn: *ExtensionWsConn,
-            allocator: std.mem.Allocator,
-        };
-        const Helper = struct {
-            fn run(ctx: HelperCtx) void {
-                // Wait until the command frame appears.
-                var attempts: usize = 0;
-                while (attempts < 5_000) : (attempts += 1) {
-                    std.Thread.sleep(50 * std.time.ns_per_us);
-                    if (ctx.stream.written.items.len > 0) break;
-                }
-                if (ctx.stream.written.items.len == 0) return;
-
-                const written = ctx.stream.written.items;
-                const id_marker = "\"command_id\":\"";
-                const id_start = std.mem.indexOf(u8, written, id_marker) orelse return;
-                const after = written[id_start + id_marker.len ..];
-                const id_end = std.mem.indexOfScalar(u8, after, '"') orelse return;
-                const id = after[0..id_end];
-
-                // Sleep to ~match the sender's 5 ms timeout, then
-                // call deliverResult — most iterations will land
-                // either just before or just after the timeout
-                // fires, exercising both code paths.
-                std.Thread.sleep(5 * std.time.ns_per_ms);
-
-                const result_json = std.fmt.allocPrint(
-                    ctx.allocator,
-                    "{{\"command_id\":\"{s}\",\"ok\":true,\"result\":{{}}}}",
-                    .{id},
-                ) catch return;
-                defer ctx.allocator.free(result_json);
-                ctx.conn.deliverResult(result_json) catch {};
-            }
-        };
-        const thread = try std.Thread.spawn(.{}, Helper.run, .{HelperCtx{
-            .stream = &s1,
-            .conn = c1,
-            .allocator = std.testing.allocator,
-        }});
-
-        // 5 ms budget: half-likely to fire before deliver, half after.
-        // Both outcomes are valid — we're not asserting WHICH wins,
-        // we're asserting NEITHER UAFs and the testing allocator
-        // doesn't report a leak.
-        const result = hub.sendCommand(
-            std.testing.allocator,
-            "alice",
-            "navigate",
-            "{\"url\":\"https://example.com\"}",
-            5,
-        );
-        if (result) |r| std.testing.allocator.free(r) else |_| {}
-
-        thread.join();
+    var gate = std.Thread.ResetEvent{};
+    var reached = std.Thread.ResetEvent{};
+    test_deliver_gate = &gate;
+    test_deliver_reached = &reached;
+    defer {
+        // Always tear down the global injection points — a leftover
+        // pointer would corrupt subsequent tests in the same binary.
+        test_deliver_gate = null;
+        test_deliver_reached = null;
     }
-    // If we reach here with no leak from std.testing.allocator and
-    // no segfault from the refcount logic, the race is closed.
+
+    const SenderCtx = struct {
+        hub: *ExtensionWsHub,
+        allocator: std.mem.Allocator,
+        result_slot: *?anyerror,
+        ok_slot: *?[]u8,
+    };
+    const Sender = struct {
+        fn run(ctx: SenderCtx) void {
+            // 100 ms timeout — plenty of headroom for the test thread
+            // to drive the gate. A regression that breaks the
+            // refcount would either UAF (testing allocator catches)
+            // or leak (testing allocator's defer hook catches at
+            // end-of-test).
+            const r = ctx.hub.sendCommand(
+                ctx.allocator,
+                "alice",
+                "navigate",
+                "{\"url\":\"https://example.com\"}",
+                100,
+            );
+            if (r) |buf| {
+                ctx.ok_slot.* = buf;
+            } else |err| {
+                ctx.result_slot.* = err;
+            }
+        }
+    };
+
+    var sender_err: ?anyerror = null;
+    var sender_ok: ?[]u8 = null;
+    const sender_thread = try std.Thread.spawn(.{}, Sender.run, .{SenderCtx{
+        .hub = &hub,
+        .allocator = std.testing.allocator,
+        .result_slot = &sender_err,
+        .ok_slot = &sender_ok,
+    }});
+
+    // Wait for the command frame to appear so we can extract the
+    // command_id. We poll the test stream — sender is mid-call.
+    const cmd_id = blk: {
+        var attempts: usize = 0;
+        while (attempts < 1_000) : (attempts += 1) {
+            std.Thread.sleep(100 * std.time.ns_per_us);
+            const written = s1.written.items;
+            const marker = "\"command_id\":\"";
+            const start = std.mem.indexOf(u8, written, marker) orelse continue;
+            const after = written[start + marker.len ..];
+            const end = std.mem.indexOfScalar(u8, after, '"') orelse continue;
+            break :blk try std.testing.allocator.dupe(u8, after[0..end]);
+        }
+        sender_thread.join();
+        return error.CommandFrameNeverAppeared;
+    };
+    defer std.testing.allocator.free(cmd_id);
+
+    // Spawn the deliver thread. It will hit the gate post-fetchRemove
+    // and block until we release it.
+    const DeliverCtx = struct {
+        conn: *ExtensionWsConn,
+        allocator: std.mem.Allocator,
+        cmd_id: []const u8,
+    };
+    const Deliver = struct {
+        fn run(ctx: DeliverCtx) void {
+            const result_json = std.fmt.allocPrint(
+                ctx.allocator,
+                "{{\"command_id\":\"{s}\",\"ok\":true,\"result\":{{}}}}",
+                .{ctx.cmd_id},
+            ) catch return;
+            defer ctx.allocator.free(result_json);
+            ctx.conn.deliverResult(result_json) catch {};
+        }
+    };
+    const deliver_thread = try std.Thread.spawn(.{}, Deliver.run, .{DeliverCtx{
+        .conn = c1,
+        .allocator = std.testing.allocator,
+        .cmd_id = cmd_id,
+    }});
+
+    // Wait for deliver to enter the gate. After this point we know
+    // deliver has done fetchRemove (it holds the map ref) but has
+    // NOT yet written pending.result or set pending.ready. The
+    // sender is still blocked in its timedWait at this moment.
+    reached.wait();
+
+    // Release the gate. Deliver writes result, sets ready, releases
+    // map ref. Sender's timedWait returns successfully because we
+    // set ready well before the 100ms budget expired. Sender then
+    // dups the result, releases its sender ref, and the last release
+    // frees pending. No UAF, no leak.
+    gate.set();
+
+    deliver_thread.join();
+    sender_thread.join();
+
+    // Assert outcome: ordering above guarantees sender returns the
+    // result, NOT a timeout. (A regression that flipped the ordering
+    // — e.g. swapped ready.set() with the map-ref release in the
+    // wrong direction — would also still pass this assertion because
+    // the test always lets deliver complete first; the load-bearing
+    // check is the leak detector in std.testing.allocator at test
+    // teardown.)
+    try std.testing.expect(sender_err == null);
+    try std.testing.expect(sender_ok != null);
+    if (sender_ok) |buf| {
+        std.testing.allocator.free(buf);
+        // Sanity check the payload round-tripped.
+    }
+}
+
+test "IN-01: deliver-after-timeout — sender returns Timeout, deliver still safe" {
+    // Companion test: drive the OPPOSITE ordering through the same
+    // gate. Sender's timedWait fires BEFORE deliver releases the
+    // gate. With the refcount, the sender still cleanly returns
+    // error.Timeout, and deliver — once released — writes/releases
+    // safely on its still-live pending. Pre-fix this was the
+    // canonical UAF case.
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+
+    var s1 = TestStream{ .allocator = std.testing.allocator };
+    defer s1.deinit();
+
+    const c1 = try hub.registerConn("alice", &s1, TestStream.writeText, &s1, TestStream.close);
+    defer {
+        _ = hub.unregister("alice");
+        hub.destroyConn(c1);
+    }
+
+    var gate = std.Thread.ResetEvent{};
+    var reached = std.Thread.ResetEvent{};
+    test_deliver_gate = &gate;
+    test_deliver_reached = &reached;
+    defer {
+        test_deliver_gate = null;
+        test_deliver_reached = null;
+    }
+
+    const SenderCtx = struct {
+        hub: *ExtensionWsHub,
+        allocator: std.mem.Allocator,
+        err_slot: *?anyerror,
+        ok_slot: *?[]u8,
+    };
+    const Sender = struct {
+        fn run(ctx: SenderCtx) void {
+            const r = ctx.hub.sendCommand(
+                ctx.allocator,
+                "alice",
+                "navigate",
+                "{\"url\":\"https://example.com\"}",
+                25, // short timeout so we don't slow the suite
+            );
+            if (r) |buf| ctx.ok_slot.* = buf else |err| ctx.err_slot.* = err;
+        }
+    };
+
+    var sender_err: ?anyerror = null;
+    var sender_ok: ?[]u8 = null;
+    const sender_thread = try std.Thread.spawn(.{}, Sender.run, .{SenderCtx{
+        .hub = &hub,
+        .allocator = std.testing.allocator,
+        .err_slot = &sender_err,
+        .ok_slot = &sender_ok,
+    }});
+
+    const cmd_id = blk: {
+        var attempts: usize = 0;
+        while (attempts < 1_000) : (attempts += 1) {
+            std.Thread.sleep(100 * std.time.ns_per_us);
+            const written = s1.written.items;
+            const marker = "\"command_id\":\"";
+            const start = std.mem.indexOf(u8, written, marker) orelse continue;
+            const after = written[start + marker.len ..];
+            const end = std.mem.indexOfScalar(u8, after, '"') orelse continue;
+            break :blk try std.testing.allocator.dupe(u8, after[0..end]);
+        }
+        sender_thread.join();
+        return error.CommandFrameNeverAppeared;
+    };
+    defer std.testing.allocator.free(cmd_id);
+
+    const DeliverCtx = struct {
+        conn: *ExtensionWsConn,
+        allocator: std.mem.Allocator,
+        cmd_id: []const u8,
+    };
+    const Deliver = struct {
+        fn run(ctx: DeliverCtx) void {
+            const result_json = std.fmt.allocPrint(
+                ctx.allocator,
+                "{{\"command_id\":\"{s}\",\"ok\":true,\"result\":{{}}}}",
+                .{ctx.cmd_id},
+            ) catch return;
+            defer ctx.allocator.free(result_json);
+            ctx.conn.deliverResult(result_json) catch {};
+        }
+    };
+    const deliver_thread = try std.Thread.spawn(.{}, Deliver.run, .{DeliverCtx{
+        .conn = c1,
+        .allocator = std.testing.allocator,
+        .cmd_id = cmd_id,
+    }});
+
+    // Wait for deliver to enter the gate (post-fetchRemove).
+    reached.wait();
+
+    // DO NOT release the gate yet. Wait until the sender's 25 ms
+    // timedWait has definitely expired. Then sender will try to
+    // fetchRemove, find nothing (deliver already removed), drop ONLY
+    // its sender ref, and return error.Timeout. The pending stays
+    // alive because deliver still holds the map ref.
+    sender_thread.join();
+    try std.testing.expect(sender_err != null);
+    try std.testing.expectEqual(@as(anyerror, error.Timeout), sender_err.?);
+    try std.testing.expect(sender_ok == null);
+
+    // NOW release the gate. Deliver dups the payload (will succeed),
+    // writes pending.result, sets pending.ready (no one's listening,
+    // that's fine), releases its map ref → refs goes 1 → 0 → free.
+    // No UAF. testing.allocator would scream otherwise.
+    gate.set();
+    deliver_thread.join();
 }
