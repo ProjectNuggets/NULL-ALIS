@@ -50,20 +50,57 @@ pub const CloseFn = *const fn (ctx: *anyopaque) void;
 pub const PendingCommand = struct {
     /// Heap-allocated copy of the result payload (null until the read
     /// loop delivers, or until `sendCommand` gives up on timeout).
-    /// On timeout, `sendCommand` removes this entry from the pending
-    /// map BEFORE the result lands, so a late result is dropped on the
-    /// floor (no use-after-free).
+    /// Allocated via the conn's allocator (the same one that allocated
+    /// the PendingCommand itself), so either side can free it without
+    /// cross-allocator confusion.
     result: ?[]u8 = null,
-    /// Set when `result` is populated. `sendCommand` waits on this with
-    /// a timeout. The event-vs-mutex split exists because Zig 0.15.2's
-    /// `ResetEvent.timedWait` returns a clean timeout signal we can map
-    /// to `error.Timeout` without ambiguous state.
+    /// Set when `result` is populated OR when the conn is shutting down.
+    /// `sendCommand` waits on this with a timeout.
     ready: std.Thread.ResetEvent = .{},
     /// META HIGH #3 (2026-05-25) — distinguish "OOM while delivering"
     /// from "connection closed before delivery." When set, `sendCommand`
     /// returns `error.ResultDeliveryOom` instead of
     /// `error.ConnectionClosed` so operators see the real cause.
     oom_dropped: bool = false,
+    /// v1.14.22 (CR-02 fix, 2026-05-25) — atomic reference count.
+    /// Closes the timeout-vs-deliver UAF race that the META subagent's
+    /// conn-level refcount fix did NOT cover.
+    ///
+    /// Initial value: 2 when the pending entry is inserted into the
+    /// conn's pending map: one ref for the map itself (held while the
+    /// entry is in `self.pending`) and one ref for the sender
+    /// (`sendCommand`'s frame). Every removal-from-map call site
+    /// (timeout path in sendCommand, success path in deliverResult,
+    /// rollback paths, hub deinit drain) drops the map ref via
+    /// `release(allocator)`. `sendCommand` always drops the sender
+    /// ref via `release(allocator)` at function exit.
+    ///
+    /// The last release frees the struct via `allocator.destroy(self)`.
+    /// The allocator MUST match the one used to create the struct
+    /// (the conn's allocator); enforce this at every release call site.
+    ///
+    /// Race trace (timeout vs deliver):
+    ///   refs=2; A=timeout-path, B=deliver-path.
+    ///   B.fetchRemove succeeds, holds pointer, hasn't written yet.
+    ///   A.timedWait fires, A.fetchRemove returns null (B removed).
+    ///   A calls release(alloc) for sender ref       → refs=1
+    ///   B writes pending.result, pending.ready.set()
+    ///     (safe — refs=1 means PendingCommand still alive)
+    ///   B calls release(alloc) for map ref          → refs=0 → free
+    refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    /// CR-02 — decrement the refcount; if this was the last reference,
+    /// free `self.result` (if populated) and destroy the struct.
+    /// `allocator` MUST be the conn's allocator (the one used at
+    /// allocation time AND for `result`).
+    pub fn release(self: *PendingCommand, allocator: std.mem.Allocator) void {
+        const prev = self.refs.fetchSub(1, .acq_rel);
+        std.debug.assert(prev >= 1); // double-release == bug
+        if (prev == 1) {
+            if (self.result) |r| allocator.free(r);
+            allocator.destroy(self);
+        }
+    }
 };
 
 pub const ExtensionWsConn = struct {
@@ -111,31 +148,44 @@ pub const ExtensionWsConn = struct {
     refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
 
     pub fn deinit(self: *ExtensionWsConn) void {
-        // Drain any waiters with a synthetic error: anyone still
-        // blocked in `sendCommand` should wake up and observe their
-        // PendingCommand was removed, then return error.ConnectionClosed.
-        // We can't set their `ready` here because the result slot is
-        // null — they'll see ready+result==null and treat it as a
-        // dropped connection.
+        // Drain any waiters with a synthetic "connection closed":
+        // anyone blocked in `sendCommand` wakes via `ready.set()`,
+        // observes result==null + oom_dropped==false, and returns
+        // `error.ConnectionClosed`. The drain also drops the map ref
+        // for every entry; if a sender is still waiting, its release
+        // is the final one and the PendingCommand frees there.
+        //
+        // HI-06 (v1.14.22): pre-allocate the keys arraylist to the
+        // known map size so subsequent appends can't OOM and skip
+        // entries. The previous `catch {}` swallow caused a partial
+        // drain on OOM — orphan PendingCommand structs leaked because
+        // their senders saw no ready.set.
         self.pending_mu.lock();
-        var it = self.pending.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.*.ready.set();
-        }
-        // Free key strings + remove entries. PendingCommand structs
-        // themselves are owned by the `sendCommand` stack frame, so
-        // we don't `destroy` them here — they'll be freed once their
-        // owner returns.
+        const pending_count = self.pending.count();
         var keys: std.ArrayListUnmanaged([]const u8) = .empty;
         defer keys.deinit(self.allocator);
-        var key_it = self.pending.keyIterator();
-        while (key_it.next()) |k| keys.append(self.allocator, k.*) catch {
-            // by-design: shutdown path; failing to enumerate a key
-            // just leaks the entry. The whole hub is going down.
-        };
+        // Pre-allocate. If THIS fails, we have nothing to enumerate
+        // safely — the shutdown path can't gracefully recover from
+        // not even having space for the key list. Log + bail. The
+        // map's contents will leak but the process is exiting anyway
+        // (deinit is shutdown-only).
+        if (keys.ensureTotalCapacity(self.allocator, pending_count)) {
+            var key_it = self.pending.keyIterator();
+            while (key_it.next()) |k| {
+                // Now safe: ensureTotalCapacity above guarantees
+                // these appends do not allocate.
+                keys.appendAssumeCapacity(k.*);
+            }
+        } else |err| {
+            log.warn("extension_ws: hub.deinit OOM pre-allocating drain key buffer ({s}); leaking {d} pending entries", .{ @errorName(err), pending_count });
+        }
         for (keys.items) |k| {
-            _ = self.pending.remove(k);
-            self.allocator.free(k);
+            if (self.pending.fetchRemove(k)) |kv| {
+                // Wake the sender first, then drop the map ref.
+                kv.value.ready.set();
+                kv.value.release(self.allocator); // map ref
+                self.allocator.free(kv.key);
+            }
         }
         self.pending.deinit(self.allocator);
         self.pending_mu.unlock();
@@ -185,20 +235,20 @@ pub const ExtensionWsConn = struct {
         command_json: []const u8,
         timeout_ms: u64,
     ) ![]u8 {
-        // Allocate the PendingCommand on the heap so the read loop can
-        // safely populate `result` after we return from a timed-out
-        // wait. We remove it from the map on timeout BEFORE freeing,
-        // so the read loop can't find it after the timeout fires.
-        //
-        // The destroy(pending) lands in every exit path explicitly
-        // rather than via `errdefer` — error paths and the success
-        // path all need to free, and errdefer + explicit free in the
-        // same path is the double-free trap we hit on first pass.
-        const pending = try result_allocator.create(PendingCommand);
-        pending.* = .{};
+        // CR-02 (v1.14.22) — PendingCommand now uses an atomic refcount
+        // to close the timeout-vs-deliver UAF. The struct is allocated
+        // via `self.allocator` (NOT the caller's `result_allocator`) so
+        // both sides can release without cross-allocator confusion.
+        // The result payload is also self.allocator-owned (dup'd by
+        // `deliverResult`); we re-dup into `result_allocator` before
+        // returning to the caller so the docstring contract is honored.
+        const pending = try self.allocator.create(PendingCommand);
+        pending.* = .{ .refs = std.atomic.Value(u32).init(2) }; // map ref + sender ref
 
         const id_copy = self.allocator.dupe(u8, id) catch |err| {
-            result_allocator.destroy(pending);
+            // Pre-insertion failure path: nothing else holds a ref yet.
+            // Skip the refcount dance and just destroy.
+            self.allocator.destroy(pending);
             return err;
         };
 
@@ -210,23 +260,32 @@ pub const ExtensionWsConn = struct {
             defer self.pending_mu.unlock();
             self.pending.put(self.allocator, id_copy, pending) catch |err| {
                 self.allocator.free(id_copy);
-                result_allocator.destroy(pending);
+                // Still pre-insertion (the put failed); same direct
+                // destroy is safe — no other holder exists.
+                self.allocator.destroy(pending);
                 return err;
             };
         }
+        // Once inserted, the map holds 1 ref and the sender (this
+        // frame) holds 1 ref. Every exit path below MUST release
+        // exactly one ref for the sender, and any code path that
+        // removes from the map MUST release the map ref.
 
         // Write the command frame under the write mutex.
         {
             self.write_mu.lock();
             defer self.write_mu.unlock();
             self.write_text(self.write_ctx, command_json) catch |err| {
-                // Roll back the pending entry on write failure.
+                // Roll back the pending entry on write failure. Both
+                // refs need to be dropped here (map ref + sender ref).
                 self.pending_mu.lock();
-                if (self.pending.fetchRemove(id_copy)) |kv| {
-                    self.allocator.free(kv.key);
-                }
+                const removed = self.pending.fetchRemove(id_copy);
                 self.pending_mu.unlock();
-                result_allocator.destroy(pending);
+                if (removed) |kv| {
+                    self.allocator.free(kv.key);
+                    pending.release(self.allocator); // map ref
+                }
+                pending.release(self.allocator); // sender ref
                 return err;
             };
         }
@@ -234,28 +293,47 @@ pub const ExtensionWsConn = struct {
         // Wait for the result with a timeout.
         const timeout_ns: u64 = timeout_ms *| std.time.ns_per_ms;
         pending.ready.timedWait(timeout_ns) catch |err| {
-            // Timeout — remove from pending so a late result is dropped
-            // on the floor (the read loop will find no entry and log).
+            // Timeout — try to remove from pending. The deliverResult
+            // path may have already removed (race window: B removed
+            // but hasn't written yet); in that case `removed == null`
+            // and we ONLY drop the sender ref. The map ref was already
+            // taken over by B and B will drop it after writing.
+            //
+            // If we win the race (`removed != null`), we drop the map
+            // ref ourselves + the sender ref. Either way pending is
+            // safe to leave in B's hands (refs>=1 until B's release).
             self.pending_mu.lock();
-            if (self.pending.fetchRemove(id_copy)) |kv| {
-                self.allocator.free(kv.key);
-            }
+            const removed = self.pending.fetchRemove(id_copy);
             self.pending_mu.unlock();
-            result_allocator.destroy(pending);
+            if (removed) |kv| {
+                self.allocator.free(kv.key);
+                pending.release(self.allocator); // map ref
+            }
+            pending.release(self.allocator); // sender ref — last one if A won
             return err;
         };
 
-        // Ready was set. Distinguish three states:
-        //   1. result populated → return it
+        // Ready was set by deliverResult (or by a hub shutdown drain).
+        // Distinguish three states:
+        //   1. result populated → re-dup into caller's allocator
         //   2. result==null AND oom_dropped → ResultDeliveryOom
-        //   3. result==null AND !oom_dropped → ConnectionClosed
-        // The read loop removed our entry from the pending map (in
-        // deliverResult) BEFORE setting ready, so id_copy was already
-        // freed there.
-        const result = pending.result;
+        //   3. result==null AND !oom_dropped → ConnectionClosed (drain)
+        //
+        // The map ref was already released by deliverResult (or by
+        // hub.deinit's drain). We only drop the sender ref here.
+        const result_slice = pending.result;
         const was_oom = pending.oom_dropped;
-        result_allocator.destroy(pending);
-        if (result) |r| return r;
+
+        // Re-dup BEFORE releasing — release may free `pending.result`
+        // if this is the last ref.
+        const caller_owned: ?[]u8 = if (result_slice) |r|
+            try result_allocator.dupe(u8, r)
+        else
+            null;
+
+        pending.release(self.allocator); // sender ref
+
+        if (caller_owned) |r| return r;
         if (was_oom) return error.ResultDeliveryOom;
         return error.ConnectionClosed;
     }
@@ -292,40 +370,27 @@ pub const ExtensionWsConn = struct {
             return;
         };
 
-        // Dupe into the conn's long-lived allocator; the caller's
-        // arena will be reclaimed when its frame is dropped. The
-        // `sendCommand` waker frees `pending.result` via the
-        // result_allocator it owns — but we're not using that here;
-        // instead `sendCommand` returns the slice to the caller as
-        // owned-by-result_allocator. So we MUST dupe via that same
-        // allocator. We don't know it here — so dupe via the conn's
-        // allocator and let `sendCommand` re-dupe + free.
+        // CR-02 (v1.14.22): we now hold the map ref (fetchRemove
+        // transferred it to us — the map no longer accounts for it,
+        // but the refcount still does). We must release the map ref
+        // when we're done writing pending — but NOT before, because
+        // pending.result/oom_dropped writes need pending to be alive.
         //
-        // For v1 simplicity: dupe via the conn's allocator. The
-        // `sendCommand` contract above says "caller frees returned
-        // slice via `allocator.free` (the allocator the caller passed
-        // as `result_allocator`)". We satisfy that by having
-        // `sendCommand` re-dupe into `result_allocator` before
-        // returning, and free this intermediate buffer.
+        // The sender's ref is independent: sender might already have
+        // returned (CR-02 race), in which case our release here drops
+        // refs from 1 → 0 and we free. Or sender is still waiting and
+        // its release after seeing ready.set() drops to 0.
         const dup = self.allocator.dupe(u8, payload) catch |err| {
-            // META HIGH #3 (2026-05-25) — distinguish OOM from
-            // connection-closed. Set `oom_dropped` so the waker can
-            // return `error.ResultDeliveryOom` (caller surfaces that
-            // distinct error type so operators can see the real
-            // cause). Log at warn level — err would be more accurate
-            // but Zig's test runner fails any test that emits
-            // err-level logs, and the recoverable nature (distinct
-            // error → operator can retry / scale up RAM) makes warn
-            // an honest fit. Operators monitoring warn-level still
-            // see it.
             log.warn("extension_ws: deliverResult OOM (result lost) err={s}", .{@errorName(err)});
             pending.result = null;
             pending.oom_dropped = true;
             pending.ready.set();
+            pending.release(self.allocator); // map ref
             return err;
         };
         pending.result = dup;
         pending.ready.set();
+        pending.release(self.allocator); // map ref
     }
 
     /// Force-close (called by `unregister` and by eviction of a stale
@@ -869,23 +934,10 @@ test "META CRIT #3: stress — 50 sessions evicted with in-flight reads, no UAF"
 // ── META HIGH #3 regression test: deliverResult OOM distinct error ───
 
 test "META HIGH #3: deliverResult OOM surfaces ResultDeliveryOom not ConnectionClosed" {
-    // Direct unit-level test on `deliverResult`'s error path. We
-    // construct a conn, set up a PendingCommand, then point the
-    // conn's allocator at a SelectiveAllocator that succeeds for
-    // the JSON-parse step (via the GPA) but fails on the dupe
-    // (which is the one we want to test).
-    //
-    // Approach: register the pending entry under a known id; swap
-    // the conn's allocator to one that only rejects allocations
-    // larger than 8 bytes; deliverResult's extractCommandId only
-    // allocates the small id string + JSON tree nodes, but the
-    // result-payload dupe is `>8 bytes` and trips the rejection.
-    //
-    // We can't easily build that exact selective allocator, so we
-    // instead patch the conn's allocator AFTER the entries are
-    // pre-populated, then deliver a payload via a simpler route:
-    // call extractCommandId out-of-band to remove the id-allocation
-    // path from the deliverResult traces.
+    // CR-02 (v1.14.22) — PendingCommand now uses an atomic refcount.
+    // Initialize refs=2 (map + simulated sender) so the test's
+    // own deliverResult-path release brings it to 1 (map ref dropped)
+    // and the test's manual release brings it to 0 (sender ref dropped).
     var hub = ExtensionWsHub.init(std.testing.allocator);
     defer hub.deinit();
 
@@ -898,10 +950,11 @@ test "META HIGH #3: deliverResult OOM surfaces ResultDeliveryOom not ConnectionC
         hub.destroyConn(c1);
     }
 
-    // Pre-register a pending command in the conn's pending map.
-    const pending = try std.testing.allocator.create(PendingCommand);
-    defer std.testing.allocator.destroy(pending);
-    pending.* = .{};
+    // Pre-register a pending command in the conn's pending map. The
+    // PendingCommand MUST be allocated via c1.allocator (the conn's
+    // allocator) because release() destroys via that allocator.
+    const pending = try c1.allocator.create(PendingCommand);
+    pending.* = .{ .refs = std.atomic.Value(u32).init(2) }; // map + sender (we are the sender)
     {
         c1.pending_mu.lock();
         defer c1.pending_mu.unlock();
@@ -909,45 +962,130 @@ test "META HIGH #3: deliverResult OOM surfaces ResultDeliveryOom not ConnectionC
         try c1.pending.put(c1.allocator, id_copy, pending);
     }
 
-    // Construct a single-source-of-failure pattern: a
-    // FailingAllocator wrapping std.testing.allocator that fails
-    // after N successful allocations. We measure N by running the
-    // JSON parse path once with a dry-run identical-shape payload,
-    // then set fail_index = N for the second pass.
     const payload =
         \\{"command_id":"cmd-test","ok":true,"result":{"x":1}}
     ;
-    // Count allocations needed up to (but excluding) the final dupe.
-    // Empirically: JSON parse uses ~3-5 small allocs for this payload
-    // shape (plus the extractCommandId dupe = 1). We'll set the fail
-    // index high enough to clear extractCommandId, then it fails on
-    // the result-dupe path. Use FailingAllocator's `fail_index` after
-    // a probe.
+    // Probe the alloc count needed to walk extractCommandId so we
+    // can fail the very next allocation (the result-payload dup).
     var probe_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1_000_000 });
     c1.allocator = probe_failing.allocator();
-    // Use the SAME extractCommandId path our pending lookup uses.
     const probe_id = try extractCommandId(c1.allocator, payload);
     c1.allocator.free(probe_id);
     const allocs_for_extract = probe_failing.alloc_index;
 
-    // Now set fail_index so that extractCommandId succeeds (and
-    // pending lookup runs) but the result-dupe fails. The dupe is
-    // the very next allocation after extractCommandId returns. We
-    // add 2 for any JSON parse internal book-keeping leftover.
     var oom_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = allocs_for_extract });
     c1.allocator = oom_failing.allocator();
 
     const err = c1.deliverResult(payload);
-    // Restore allocator BEFORE any cleanup so destroyConn's deinit
-    // can free the user_id + pending entries normally.
+    // Restore allocator BEFORE any cleanup. deliverResult's release
+    // already used the failing allocator BUT only for the failing
+    // pathway — the map ref drop after the error path uses
+    // self.allocator which by then was still oom_failing. Setting
+    // it back to testing_allocator is required for the LATER sender
+    // release to free the struct cleanly.
     c1.allocator = std.testing.allocator;
 
     try std.testing.expectError(error.OutOfMemory, err);
 
-    // The pending was woken up + marked oom_dropped — that's the
-    // key META HIGH #3 property: sendCommand sees the OOM bit and
-    // returns ResultDeliveryOom, not ConnectionClosed.
     try std.testing.expect(pending.ready.isSet());
     try std.testing.expect(pending.oom_dropped);
     try std.testing.expect(pending.result == null);
+    // Drop the simulated sender ref. The map ref was dropped inside
+    // deliverResult's error path → refs went 2→1; this release
+    // brings it to 0 and frees.
+    pending.release(c1.allocator);
+}
+
+// ── CR-02 regression test: timeout-vs-deliver UAF ──────────────────────
+
+test "CR-02: timeout firing while deliverResult is mid-write does not UAF" {
+    // Reproduce the exact race the review flagged: sender's
+    // timedWait returns just as the read-loop's deliverResult is
+    // between fetchRemove and the pending.result/.ready writes.
+    // Pre-fix, the sender would destroy(pending) and the deliver
+    // path would write to freed memory. With the refcount, both
+    // sides keep the pending alive until the last release.
+    //
+    // The test deliberately spawns the "extension" thread with a
+    // sleep tuned to land in the sender's timeout-wait window. We
+    // run the race repeatedly to maximize the chance of hitting
+    // the narrow window in any one trial.
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+
+    var s1 = TestStream{ .allocator = std.testing.allocator };
+    defer s1.deinit();
+
+    const c1 = try hub.registerConn("alice", &s1, TestStream.writeText, &s1, TestStream.close);
+    defer {
+        _ = hub.unregister("alice");
+        hub.destroyConn(c1);
+    }
+
+    const Iters = 20;
+    var iter: usize = 0;
+    while (iter < Iters) : (iter += 1) {
+        // Clear any prior frame so we can grep the new command_id.
+        s1.written.clearRetainingCapacity();
+
+        const HelperCtx = struct {
+            stream: *TestStream,
+            conn: *ExtensionWsConn,
+            allocator: std.mem.Allocator,
+        };
+        const Helper = struct {
+            fn run(ctx: HelperCtx) void {
+                // Wait until the command frame appears.
+                var attempts: usize = 0;
+                while (attempts < 5_000) : (attempts += 1) {
+                    std.Thread.sleep(50 * std.time.ns_per_us);
+                    if (ctx.stream.written.items.len > 0) break;
+                }
+                if (ctx.stream.written.items.len == 0) return;
+
+                const written = ctx.stream.written.items;
+                const id_marker = "\"command_id\":\"";
+                const id_start = std.mem.indexOf(u8, written, id_marker) orelse return;
+                const after = written[id_start + id_marker.len ..];
+                const id_end = std.mem.indexOfScalar(u8, after, '"') orelse return;
+                const id = after[0..id_end];
+
+                // Sleep to ~match the sender's 5 ms timeout, then
+                // call deliverResult — most iterations will land
+                // either just before or just after the timeout
+                // fires, exercising both code paths.
+                std.Thread.sleep(5 * std.time.ns_per_ms);
+
+                const result_json = std.fmt.allocPrint(
+                    ctx.allocator,
+                    "{{\"command_id\":\"{s}\",\"ok\":true,\"result\":{{}}}}",
+                    .{id},
+                ) catch return;
+                defer ctx.allocator.free(result_json);
+                ctx.conn.deliverResult(result_json) catch {};
+            }
+        };
+        const thread = try std.Thread.spawn(.{}, Helper.run, .{HelperCtx{
+            .stream = &s1,
+            .conn = c1,
+            .allocator = std.testing.allocator,
+        }});
+
+        // 5 ms budget: half-likely to fire before deliver, half after.
+        // Both outcomes are valid — we're not asserting WHICH wins,
+        // we're asserting NEITHER UAFs and the testing allocator
+        // doesn't report a leak.
+        const result = hub.sendCommand(
+            std.testing.allocator,
+            "alice",
+            "navigate",
+            "{\"url\":\"https://example.com\"}",
+            5,
+        );
+        if (result) |r| std.testing.allocator.free(r) else |_| {}
+
+        thread.join();
+    }
+    // If we reach here with no leak from std.testing.allocator and
+    // no segfault from the refcount logic, the race is closed.
 }
