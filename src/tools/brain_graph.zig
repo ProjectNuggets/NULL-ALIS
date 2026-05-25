@@ -370,18 +370,13 @@ fn parseIsoDateUtc(s: []const u8) ?i64 {
     return days * 86400;
 }
 
-fn jsonEscape(writer: anytype, s: []const u8) !void {
-    for (s) |ch| {
-        switch (ch) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => try writer.writeByte(ch),
-        }
-    }
-}
+/// CRITICAL 3.A (v1.14.23 holistic review, 2026-05-25): brain_graph
+/// shipped HI-05 still using the broken `\n \r \t \" \\`-only escaper
+/// for almost a month after `src/tools/json_escape.zig` was introduced
+/// as "the SINGLE escaper for all tools." A brain entity name
+/// containing a control byte (0x00-0x07, 0x0B, 0x0C, 0x0E-0x1F) produced
+/// invalid JSON. Now delegated to the shared writer-variant.
+const jsonEscape = @import("json_escape.zig").writeJsonStringContent;
 
 // ── Tests ───────────────────────────────────────────────────────────
 

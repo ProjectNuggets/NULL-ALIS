@@ -82,24 +82,9 @@ pub const TaskGetTool = struct {
     }
 };
 
-fn jsonEscapeInto(writer: anytype, input: []const u8) !void {
-    for (input) |c| {
-        switch (c) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => {
-                if (c < 0x20) {
-                    try writer.print("\\u{x:0>4}", .{c});
-                } else {
-                    try writer.writeByte(c);
-                }
-            },
-        }
-    }
-}
+/// HIGH 3.B (v1.14.23 holistic review): consolidated onto the shared
+/// escaper. See `task_list.zig` for the rationale.
+const jsonEscapeInto = @import("json_escape.zig").writeJsonStringContent;
 
 // ── Tests ────────────────────────────────────────────────────────────
 

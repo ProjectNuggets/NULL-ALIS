@@ -463,22 +463,12 @@ fn parseUpdatedAt(json_str: []const u8) ?i64 {
 }
 
 /// Write a JSON-escaped string to a writer. Wraps in double-quotes.
-/// Handles control chars + backslash + double-quote per RFC 8259.
+/// Delegates the escape body to the shared `json_escape.writeJsonStringContent`
+/// (HIGH 3.B, v1.14.23 holistic review — single source of truth for the
+/// JSON escape rules).
 fn writeJsonString(w: anytype, s: []const u8) !void {
     try w.writeAll("\"");
-    for (s) |c| {
-        switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            0x08 => try w.writeAll("\\b"),
-            0x0C => try w.writeAll("\\f"),
-            0...0x07, 0x0B, 0x0E...0x1F => try w.print("\\u{x:0>4}", .{c}),
-            else => try w.writeByte(c),
-        }
-    }
+    try @import("json_escape.zig").writeJsonStringContent(w, s);
     try w.writeAll("\"");
 }
 

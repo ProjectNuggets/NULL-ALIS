@@ -52,6 +52,39 @@ pub fn writeJsonString(
     try buf.append(allocator, '"');
 }
 
+/// Writer-variant: emit the escaped CONTENT (no surrounding quotes) to a
+/// `std.io.Writer`-shaped target. Some callers (`brain_graph`, `task_list`,
+/// `task_get`, `todo`) build JSON via a streaming writer rather than an
+/// `ArrayListUnmanaged` and wrap their own quotes around the call site.
+/// This variant matches that pattern so they can drop their broken inline
+/// `\n \r \t \" \\`-only escapers without changing the call shape.
+///
+/// HI-05 follow-up (2026-05-25): brain_graph still shipped the broken
+/// inline escaper after HI-05 was filed. Consolidating the writer-flavored
+/// callers behind THIS function closes that drift.
+pub fn writeJsonStringContent(writer: anytype, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0x08 => try writer.writeAll("\\b"),
+            0x0C => try writer.writeAll("\\f"),
+            else => {
+                if (c < 0x20) {
+                    var hex_buf: [6]u8 = undefined;
+                    const hex = std.fmt.bufPrint(&hex_buf, "\\u{x:0>4}", .{c}) catch unreachable;
+                    try writer.writeAll(hex);
+                } else {
+                    try writer.writeByte(c);
+                }
+            },
+        }
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 test "escapes named C0 controls (\\n \\r \\t \\b \\f)" {
@@ -109,4 +142,23 @@ test "empty string yields just the quotes" {
     defer buf.deinit(std.testing.allocator);
     try writeJsonString(std.testing.allocator, &buf, "");
     try std.testing.expectEqualStrings("\"\"", buf.items);
+}
+
+test "writer variant: escapes every C0 control + canonical quotes" {
+    // HI-05 follow-up regression — matches the writer-anytype shape
+    // brain_graph + task_list + task_get + todo use.
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try writeJsonStringContent(buf.writer(std.testing.allocator), "a\x01b\nc\"d\\e\x00f");
+    try std.testing.expectEqualStrings("a\\u0001b\\nc\\\"d\\\\e\\u0000f", buf.items);
+}
+
+test "writer variant: NUL byte does not silently truncate" {
+    // The original broken brain_graph escaper passed NUL through, which
+    // produced JSON that downstream parsers either rejected or treated
+    // as a string terminator.
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try writeJsonStringContent(buf.writer(std.testing.allocator), "before\x00after");
+    try std.testing.expectEqualStrings("before\\u0000after", buf.items);
 }

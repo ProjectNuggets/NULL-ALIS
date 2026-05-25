@@ -92,24 +92,12 @@ fn writeEntryJson(w: anytype, entry: *const TaskEntry) !void {
     try w.writeByte('}');
 }
 
-fn jsonEscapeInto(writer: anytype, input: []const u8) !void {
-    for (input) |c| {
-        switch (c) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => {
-                if (c < 0x20) {
-                    try writer.print("\\u{x:0>4}", .{c});
-                } else {
-                    try writer.writeByte(c);
-                }
-            },
-        }
-    }
-}
+/// HIGH 3.B (v1.14.23 holistic review, 2026-05-25): consolidated onto
+/// the shared `json_escape.writeJsonStringContent`. The previous inline
+/// version was correct but a duplicate; future RFC changes (e.g. `<`/`>`
+/// escaping for JSON-embedded-in-HTML safety) now land in ONE file
+/// rather than three.
+const jsonEscapeInto = @import("json_escape.zig").writeJsonStringContent;
 
 // ── Tests ────────────────────────────────────────────────────────────
 
