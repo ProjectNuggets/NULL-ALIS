@@ -83,24 +83,27 @@ pub const ArtifactDiffTool = struct {
         const smgr = self.state_mgr orelse {
             return ToolResult{
                 .success = false,
-                .output = try allocator.dupe(u8, "artifact_diff unavailable: state manager not bound (postgres not configured)"),
+                .error_msg = try allocator.dupe(u8, "artifact_diff unavailable: state manager not bound (postgres not configured)"),
+                .output = "",
             };
         };
         const uid = self.user_id orelse {
             return ToolResult{
                 .success = false,
-                .output = try allocator.dupe(u8, "artifact_diff unavailable: tenant user not bound"),
+                .error_msg = try allocator.dupe(u8, "artifact_diff unavailable: tenant user not bound"),
+                .output = "",
             };
         };
 
         var before_opt = smgr.getArtifactVersion(allocator, uid, artifact_id, from_v) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "artifact_diff: from_version read failed: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         if (before_opt == null) {
             return ToolResult{
                 .success = false,
-                .output = try std.fmt.allocPrint(allocator, "from_version {d} not found for artifact {s}", .{ from_v, artifact_id }),
+                .error_msg = try std.fmt.allocPrint(allocator, "from_version {d} not found for artifact {s}", .{ from_v, artifact_id }),
+                .output = "",
             };
         }
         var before = before_opt.?;
@@ -109,12 +112,13 @@ pub const ArtifactDiffTool = struct {
 
         var after_opt = smgr.getArtifactVersion(allocator, uid, artifact_id, to_v) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "artifact_diff: to_version read failed: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         if (after_opt == null) {
             return ToolResult{
                 .success = false,
-                .output = try std.fmt.allocPrint(allocator, "to_version {d} not found for artifact {s}", .{ to_v, artifact_id }),
+                .error_msg = try std.fmt.allocPrint(allocator, "to_version {d} not found for artifact {s}", .{ to_v, artifact_id }),
+                .output = "",
             };
         }
         var after = after_opt.?;
@@ -123,7 +127,7 @@ pub const ArtifactDiffTool = struct {
 
         const diff_text = artifacts_diff.unifiedLineDiff(allocator, before.content, after.content) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "artifact_diff: diff compute failed: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         defer allocator.free(diff_text);
 
@@ -207,8 +211,10 @@ test "artifact_diff reports unavailable without state_mgr" {
     defer parsed.deinit();
     const result = try t.tool().execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "state manager not bound") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "state manager not bound") != null);
 }
 
 test "artifact_diff metadata is read_only" {

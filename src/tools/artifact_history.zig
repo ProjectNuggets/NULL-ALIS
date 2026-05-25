@@ -88,13 +88,15 @@ pub const ArtifactHistoryTool = struct {
         const smgr = self.state_mgr orelse {
             return ToolResult{
                 .success = false,
-                .output = try allocator.dupe(u8, "artifact_history unavailable: state manager not bound (postgres not configured)"),
+                .error_msg = try allocator.dupe(u8, "artifact_history unavailable: state manager not bound (postgres not configured)"),
+                .output = "",
             };
         };
         const uid = self.user_id orelse {
             return ToolResult{
                 .success = false,
-                .output = try allocator.dupe(u8, "artifact_history unavailable: tenant user not bound"),
+                .error_msg = try allocator.dupe(u8, "artifact_history unavailable: tenant user not bound"),
+                .output = "",
             };
         };
 
@@ -103,12 +105,13 @@ pub const ArtifactHistoryTool = struct {
         // leak via empty list).
         var artifact_opt = smgr.getArtifactById(allocator, uid, artifact_id) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "artifact_history: ownership lookup failed: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         if (artifact_opt == null) {
             return ToolResult{
                 .success = false,
-                .output = try std.fmt.allocPrint(allocator, "artifact not found (id={s})", .{artifact_id}),
+                .error_msg = try std.fmt.allocPrint(allocator, "artifact not found (id={s})", .{artifact_id}),
+                .output = "",
             };
         }
         var artifact = artifact_opt.?;
@@ -117,7 +120,7 @@ pub const ArtifactHistoryTool = struct {
 
         const history = smgr.listArtifactVersionHistory(allocator, uid, artifact_id) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "artifact_history: read failed: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         defer zaki_state.freeArtifactHistoryRows(allocator, history);
 
@@ -216,8 +219,10 @@ test "artifact_history reports unavailable without state_mgr" {
     defer parsed.deinit();
     const result = try t.tool().execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "state manager not bound") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "state manager not bound") != null);
 }
 
 test "artifact_history metadata is read_only background_safe" {

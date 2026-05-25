@@ -87,7 +87,8 @@ pub const MemoryDoctorTool = struct {
         const rt = self.mem_rt orelse {
             return ToolResult{
                 .success = false,
-                .output = try allocator.dupe(u8, "memory_doctor unavailable: memory runtime not configured for this session"),
+                .error_msg = try allocator.dupe(u8, "memory_doctor unavailable: memory runtime not configured for this session"),
+                .output = "",
             };
         };
 
@@ -99,7 +100,7 @@ pub const MemoryDoctorTool = struct {
         // JSON object regardless of which path produced it.
         const text = mem_lifecycle_diag.formatReport(report, allocator) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "memory_doctor: report rendering failed: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         defer allocator.free(text);
 
@@ -165,8 +166,10 @@ test "memory_doctor without mem_rt returns clean error" {
     defer parsed.deinit();
     const result = try t.tool().execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "memory runtime not configured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "memory runtime not configured") != null);
 }
 
 test "memory_doctor declares read_only + background_safe metadata" {

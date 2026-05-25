@@ -19668,16 +19668,32 @@ fn handleAcceptedConnection(
         // the auth module's `TokenEntry` slice. Both shapes are
         // identical bytes — the type-system separation exists so the
         // auth module is testable without dragging config_types in.
-        var entries_buf: [256]extension_ws_auth.TokenEntry = undefined;
-        const ent_count = @min(state.extension_tokens.len, entries_buf.len);
-        for (state.extension_tokens[0..ent_count], 0..) |e, i| {
+        //
+        // HI-03 (v1.14.22, 2026-05-25) — the prior fixed-256 stack
+        // buffer silently dropped operators 257-and-onward. Heap-allocate
+        // sized to the real count so every configured (token, user_id)
+        // entry is honored. allocator is the per-request short-lived
+        // arena; the entries_buf only needs to live until handleUpgrade
+        // returns synchronously.
+        const entries_buf = allocator.alloc(
+            extension_ws_auth.TokenEntry,
+            state.extension_tokens.len,
+        ) catch |alloc_err| {
+            std.log.scoped(.extension_ws).err(
+                "extension_ws: OOM allocating {d} auth entries: {s}",
+                .{ state.extension_tokens.len, @errorName(alloc_err) },
+            );
+            return;
+        };
+        defer allocator.free(entries_buf);
+        for (state.extension_tokens, 0..) |e, i| {
             entries_buf[i] = .{ .token = e.token, .user_id = e.user_id };
         }
         const outcome = extension_ws_server.handleUpgrade(conn.stream, .{
             .long_allocator = allocator,
             .raw_request = raw,
             .hub = state.extension_ws_hub.?,
-            .auth = .{ .entries = entries_buf[0..ent_count] },
+            .auth = .{ .entries = entries_buf },
         });
         if (outcome == .auth_failed) {
             _ = state.extension_ws_auth_failed_total.fetchAdd(1, .monotonic);

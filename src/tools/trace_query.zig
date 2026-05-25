@@ -95,7 +95,8 @@ pub const TraceQueryTool = struct {
         const store = self.store orelse {
             return ToolResult{
                 .success = false,
-                .output = try allocator.dupe(u8, "trace_query unavailable: run trace store not configured"),
+                .error_msg = try allocator.dupe(u8, "trace_query unavailable: run trace store not configured"),
+                .output = "",
             };
         };
 
@@ -121,12 +122,13 @@ pub const TraceQueryTool = struct {
     ) !ToolResult {
         const snap_opt = store.snapshotRun(allocator, run_id) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "trace_query: snapshot failed: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         var snap = snap_opt orelse {
             return ToolResult{
                 .success = false,
-                .output = try std.fmt.allocPrint(allocator, "no run found with id '{s}'", .{run_id}),
+                .error_msg = try std.fmt.allocPrint(allocator, "no run found with id '{s}'", .{run_id}),
+                .output = "",
             };
         };
         defer snap.deinit();
@@ -156,7 +158,7 @@ pub const TraceQueryTool = struct {
     ) !ToolResult {
         var index = store.listRuns(allocator) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "trace_query: list failed: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .output = msg };
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
         defer index.deinit();
 
@@ -286,8 +288,10 @@ test "trace_query without store returns clean error" {
     defer parsed.deinit();
     const result = try t.tool().execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "trace store not configured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "trace store not configured") != null);
 }
 
 test "trace_query rejects empty run_id" {
@@ -333,9 +337,10 @@ test "trace_query returns 404-shape when run_id is not found" {
     const parsed = try root.parseTestArgs("{\"run_id\":\"missing-run-xyz\"}");
     defer parsed.deinit();
     const result = try t.tool().execute(std.testing.allocator, parsed.value.object);
-    defer std.testing.allocator.free(result.output);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "no run found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "no run found") != null);
 }
 
 test "trace_query lists most-recent runs newest-first when populated" {
