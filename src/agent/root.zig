@@ -5366,13 +5366,37 @@ pub const Agent = struct {
         const file_upload = providers.file_upload;
         const kind = file_upload.classifyForUpload(self.default_provider) orelse return null;
 
+        // INFO-3 (v1.14.23 review): when classifyForUpload matched but the
+        // API key resolves to null/empty, the prior silent return left
+        // operators with a "video too large for inline send" fallback and
+        // no breadcrumb. An operator who set `MOONSHOT_API_KEY` but
+        // mis-named the env var deserves a single info-level line so they
+        // can correlate the fallback to the missing credential.
         const api_key_opt: ?[]u8 = providers.resolveApiKeyFromConfig(
             arena,
             self.default_provider,
             self.configured_providers,
-        ) catch null;
-        const api_key = api_key_opt orelse return null;
-        if (api_key.len == 0) return null;
+        ) catch |err| blk: {
+            log.info(
+                "video upload disabled — api-key resolution failed for provider '{s}': {s}",
+                .{ self.default_provider, @errorName(err) },
+            );
+            break :blk null;
+        };
+        const api_key = api_key_opt orelse {
+            log.info(
+                "video upload disabled — no API key resolved for provider '{s}'",
+                .{self.default_provider},
+            );
+            return null;
+        };
+        if (api_key.len == 0) {
+            log.info(
+                "video upload disabled — empty API key for provider '{s}'",
+                .{self.default_provider},
+            );
+            return null;
+        }
 
         // Prefer an operator-overridden base_url from the providers config;
         // fall back to the factory's default for this provider name.
@@ -5408,6 +5432,17 @@ pub const Agent = struct {
 
     /// VideoUploader.upload adapter for Moonshot. Bridges multimodal's
     /// generic callback shape to providers/file_upload's typed API.
+    ///
+    /// INFO-4 (v1.14.23 review): we synthesize the filename from the
+    /// validated `media_type` (e.g. `upload-1700000000.mp4`) rather than
+    /// passing the source `basename(file_path)`. Some Moonshot client
+    /// libraries use the filename extension as a content-type hint; if
+    /// the source file landed on disk with a `.bin` extension (a long
+    /// tempfile chain, a download cache, the upload-tempfile staging
+    /// path itself), the hint mis-aligns with the actual container and
+    /// the server can reject with `purpose mismatch`. The synthetic
+    /// filename keeps the hint media-aligned for defense in depth. The
+    /// raw source file_path is still streamed verbatim.
     fn moonshotUploadAdapter(
         ctx: *anyopaque,
         allocator: std.mem.Allocator,
@@ -5415,8 +5450,8 @@ pub const Agent = struct {
         media_type: []const u8,
     ) anyerror![]u8 {
         const c: *MoonshotUploaderCtx = @ptrCast(@alignCast(ctx));
-        _ = media_type; // unused — Moonshot infers from file bytes
-        const filename = std.fs.path.basename(file_path);
+        const filename = try synthMoonshotFilename(allocator, media_type);
+        defer allocator.free(filename);
         const file_id = try providers.file_upload.uploadMoonshotFile(
             allocator,
             c.api_key,
@@ -5428,6 +5463,44 @@ pub const Agent = struct {
         );
         defer allocator.free(file_id);
         return providers.file_upload.formatMoonshotRef(allocator, file_id);
+    }
+
+    /// Build a synthetic filename for the Moonshot upload's multipart
+    /// header from the validated `media_type`. `media_type` is the
+    /// sniffed container MIME (e.g. `video/mp4`); we strip the leading
+    /// `video/` and use the remainder as the file extension. Falls back
+    /// to `.mp4` when the MIME is malformed or empty (multimodal's
+    /// decideVideoRoute should have rejected unknown formats earlier,
+    /// but defense in depth).
+    ///
+    /// Exposed pub for unit testability — see tests at end of file.
+    pub fn synthMoonshotFilename(
+        allocator: std.mem.Allocator,
+        media_type: []const u8,
+    ) ![]u8 {
+        const ext = blk: {
+            if (std.mem.startsWith(u8, media_type, "video/")) {
+                const suffix = media_type["video/".len..];
+                // Sanitize: only accept ASCII alnum / dash / underscore.
+                var ok = suffix.len > 0 and suffix.len <= 16;
+                if (ok) {
+                    for (suffix) |c| {
+                        const valid = (c >= 'a' and c <= 'z') or
+                            (c >= 'A' and c <= 'Z') or
+                            (c >= '0' and c <= '9') or
+                            c == '-' or c == '_';
+                        if (!valid) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if (ok) break :blk suffix;
+            }
+            break :blk "mp4";
+        };
+        const ts_ms = std.time.milliTimestamp();
+        return std.fmt.allocPrint(allocator, "upload-{d}.{s}", .{ ts_ms, ext });
     }
 
     /// Returns true if any message in the slice has image content_parts.
@@ -13010,4 +13083,46 @@ test "skills_nudge gate predicate evaluates correctly across enabled states" {
     const legacy_would_fire = turn_tool_calls_total >= 5 and workspace_set and
         last_turn_tool_count < 5 and cfg_legacy.skills_nudge_enabled;
     try std.testing.expect(legacy_would_fire);
+}
+
+// INFO-4 (v1.14.23 review): synthMoonshotFilename derives a filename
+// from the validated media_type so Moonshot's filename-based
+// content-type hint stays media-aligned even when the source file_path
+// is a tempfile with a `.bin` extension.
+
+test "synthMoonshotFilename uses media_type subtype as extension" {
+    const allocator = std.testing.allocator;
+    const name = try Agent.synthMoonshotFilename(allocator, "video/mp4");
+    defer allocator.free(name);
+    try std.testing.expect(std.mem.startsWith(u8, name, "upload-"));
+    try std.testing.expect(std.mem.endsWith(u8, name, ".mp4"));
+}
+
+test "synthMoonshotFilename handles webm and quicktime subtypes" {
+    const allocator = std.testing.allocator;
+    const webm = try Agent.synthMoonshotFilename(allocator, "video/webm");
+    defer allocator.free(webm);
+    try std.testing.expect(std.mem.endsWith(u8, webm, ".webm"));
+
+    const qt = try Agent.synthMoonshotFilename(allocator, "video/quicktime");
+    defer allocator.free(qt);
+    try std.testing.expect(std.mem.endsWith(u8, qt, ".quicktime"));
+}
+
+test "synthMoonshotFilename falls back to mp4 on malformed media_type" {
+    const allocator = std.testing.allocator;
+    const malformed_cases = [_][]const u8{
+        "",
+        "not-a-mime",
+        "image/png", // not video/* prefix
+        "video/",
+        "video/mp4; codecs=avc1", // illegal characters in subtype
+        "video/../../etc/passwd", // path traversal attempt
+        "video/" ++ ("x" ** 32), // overlong subtype
+    };
+    for (malformed_cases) |mt| {
+        const name = try Agent.synthMoonshotFilename(allocator, mt);
+        defer allocator.free(name);
+        try std.testing.expect(std.mem.endsWith(u8, name, ".mp4"));
+    }
 }
