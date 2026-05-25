@@ -1,13 +1,16 @@
 ---
 tags: [prose, prose/docs, prose/handoff]
 authored: 2026-05-25
-status: DRAFT — Wave 5 handoff to UI agent
+refreshed: 2026-05-25 (v1.14.22 hotfix)
+status: READY — Wave 5 handoff to UI agent, refreshed against v1.14.22 ground truth
 audience: UI/UX agent building the chatzaki.com commercial v1 surface
+backend_version: v1.14.22 (hotfix tag — closes 4 CRIT + 8 HIGH from v1.14.21 review)
 pairs_with:
   - docs/online-agent-contract.md (event grammar — the wire transport)
   - docs/openapi-v1.yaml (HTTP surface — full API reference)
   - docs/extension-ws-contract.md (browser-extension WebSocket protocol)
-  - .planning/SURFACE_AUDIT.md (Swiss-watch capability map — backend ↔ agent surface)
+  - /tmp/AGENT_SURFACE_AUDIT.md (Swiss-watch capability map — backend ↔ agent surface)
+  - /tmp/V1_14_21_REVIEW.md + /tmp/V1_14_22_REVIEW.md (code-review trail)
 binds_to: AGENTS.md §14.1 (UI/UX activation is mandatory per shipped feature)
 ---
 
@@ -77,8 +80,9 @@ transport doc the UI binds to.
 | `memory_store` | Save a fact (auto-fired by extraction; user can also pin) | Pin button on any assistant message |
 | `memory_recall` | Look up past facts | Subtle "remembered:" chip when used |
 | `memory_search` | Semantic search across all sessions | "Search my memory" command |
-| `memory_summary` | Time-bounded session summary | Sidebar "Recent context" panel |
-| `brain_graph_query` | Knowledge-graph traversal | Optional power-user view |
+| `memory_timeline` | Time-bounded history (replaces "memory_summary") | Sidebar "Recent context" panel |
+| `memory_doctor` *(v1.14.21)* | Health report — extraction status, hydration cache, brain graph integrity, sidecar pipeline freshness | "Memory health" link in Settings → Memory |
+| `brain_graph` | Knowledge-graph traversal | Optional power-user view |
 | `memory_forget` | User-driven deletion | Privacy settings → "Forget about…" |
 | `query_expansion` | (off by default) | Setting toggle, not a tool |
 
@@ -146,23 +150,33 @@ Two completely different lanes that the user picks per use case.
 | `artifact_update` | Patch existing artifact | Side panel diffs in place |
 | `artifact_get` | Re-fetch latest version | Used by the panel on focus |
 | `artifact_list` | All artifacts in this session | "Artifacts" tab in side panel |
+| `artifact_share` *(v1.14.21)* | Mint public share URL (default 7d TTL, max 30d) | "Share" button on artifact card |
+| `artifact_revoke_share` *(v1.14.21)* | Unpublish a shared artifact | "Stop sharing" on share modal |
+| `artifact_diff` *(v1.14.21)* | Compute diff between two versions | "What changed since v3?" inline answer |
+| `artifact_history` *(v1.14.21)* | List all versions with timestamps + change summaries | "Version history" panel |
 | `artifact_event` SSE | Real-time refresh notification | Panel updates without polling |
 
 **UX rule**: artifacts are the "you're co-authoring with the agent"
 surface. They must feel responsive — the `artifact_event` SSE frame
-exists specifically so the panel refreshes without polling.
+exists specifically so the panel refreshes without polling. The agent
+will call `artifact_share` directly when a user asks to share; the FE
+"Share" button is the same backend path — both work in parallel.
 
 ### 2.7 Trace sharing — shareable runs
 
-| Endpoint | Purpose | UX |
+| Endpoint / Tool | Purpose | UX |
 |---|---|---|
-| `POST /api/v1/traces/share` | Create a share URL for a run | "Share this run" button on done turn |
-| `GET /api/v1/traces/share/:id` | Public viewer for a shared trace | Linkable, no login required |
-| `DELETE /api/v1/traces/share/:id` | Revoke a share | Trash icon on share modal |
+| `POST /api/v1/users/:id/traces/:run_id/share` | Create a share URL for a run | "Share this run" button on done turn |
+| `GET /api/v1/share/:code` | Public viewer for a shared trace | Linkable, no login required |
+| `DELETE /api/v1/users/:id/traces/:run_id/share` | Revoke a share | Trash icon on share modal |
+| `trace_query` tool *(v1.14.21)* | Agent introspection of recent runs ("what tools did you fire last turn?") | Power-user "tools fired" pane; not a hero surface |
 
 **UX rule**: sharing is sanitized — secrets are stripped server-side
 (see `trace_share_store.zig` sanitizer). Show the user the sanitized
-preview before they confirm publish.
+preview before they confirm publish. Per-user share-spam cap of 100
+live shares (D64, v1.14.21); when hit, surface as "Revoke an existing
+share to mint another." (Returns HTTP 429 with `share_limit_reached`
+hint.)
 
 ### 2.8 Spend & metering — central meter, no per-tier caps
 
@@ -191,7 +205,44 @@ don't enforce.
 
 See `src/workspace_templates/AUTOMATIONS.json` for the seed jobs.
 
-### 2.10 Integrations — channels & MCP
+### 2.10 Model selection — the user picks, the agent routes (v1.14.22)
+
+**The flagship per-user knob.** The FE exposes a model picker; the
+agent uses whatever the user picked on the next turn. Context window
+auto-resolves from the chosen model's capability.
+
+| Model id (allowlist) | Context | Output | Multimodal | Cost class | Notes |
+|---|---:|---:|---|---|---|
+| `kimi-k2.6` *(default)* | 256K | 32K | vision + video | A (cheap) | Moonshot's flagship; great default — fast + cheap + multimodal |
+| `claude-opus-4.7` | **1M** | 8K | vision | C (premium) | Anthropic's current flagship; 1M context at standard pricing (native — no beta header) |
+| `claude-sonnet-4.6` | **1M** | 8K | vision | B | Anthropic balanced tier, 1M native |
+| `claude-opus-4.6` | **1M** | 8K | vision | C | Anthropic prior flagship; 1M native |
+| `gemini-2.5-pro` | **1M** | 8K | vision + video | B | Google flagship; native 1M + video understanding |
+| `gemini-2.5-flash` | 200K | 8K | vision + video | A | Cheap multimodal — good for vision-heavy short tasks |
+| `gpt-5.2` | 128K | 8K | vision | C | OpenAI flagship — for OpenAI-loyal users |
+| `gpt-4.1` | 128K | 8K | vision | B | Cost-conscious OpenAI tier |
+| `deepseek-v4-pro` | 512K | 32K | text-only | A | Long-context coding (Together-hosted, 512K) |
+| `deepseek-v4-flash` | 512K | 32K | text-only | A | Same context, lighter latency |
+| `kimi-k2.5` | 256K | 32K | text-only | A | K2.5 if user doesn't need multimodal |
+
+**Wire**:
+- `PATCH /api/v1/users/:id/settings` with body `{"selected_model":"claude-opus-4.7"}`
+- Setting persists per-user; takes effect on the next turn
+- Validated server-side against the allowlist above; invalid ids return `400 Bad Request` with `Error.InvalidSelectedModel`
+- When unset (default `null`), the operator's `default_model` (Kimi K2.6) is used
+
+**UX surface**:
+- **Settings → AI Model** — primary picker (full table with cost class + context badge)
+- **Quick-pick chip in chat composer** — top 3 by recency; one-tap swap mid-conversation
+- **Context-window badge** — show "256K / 1M" so users understand how much they can paste
+- **Cost-class indicator** — small letter (A/B/C) with hover tooltip ("Cheap default" / "Balanced" / "Premium — best quality")
+
+**Important**: there are NO caps. Central zaki-prod meter handles
+billing; the FE just shows usage. Users on `claude-opus-4.7` pay
+more per turn but hit zero tier walls — this is intentional per the
+cap-lift design.
+
+### 2.11 Integrations — channels & MCP
 
 | Channel | Direction | State |
 |---|---|---|
@@ -204,6 +255,27 @@ See `src/workspace_templates/AUTOMATIONS.json` for the seed jobs.
 
 **UX surface**: Settings → Integrations is the hub. Each integration
 shows connection state, last activity, and a per-integration log link.
+
+### 2.12 SSE wire — the FULL event surface (v1.14.21 schema honesty fix)
+
+Earlier docs claimed "11 SSE event types." The wire actually carries
+**16 unique `event:` kinds**: 11 are structured `RunEvent` variants
+(documented in `src/agent/run_event_types.zig`), and 5 are
+transport-only frames the gateway emits raw:
+
+| Wire kind | Schema'd? | What it carries |
+|---|---|---|
+| `ready` / `reply_start` / `progress` / `reasoning_summary` / `tool_start` / `tool_result` / `approval_required` / `task_update` / `system_notice` / `artifact_event` / `done` | YES (RunEvent) | See `run_event_types.zig` for payload shapes |
+| `token` | NO (transport-only) | Streaming reply text chunk. No `type` field — payload is the raw token slice. |
+| `error` | NO | Terminal error frame; JSON envelope with `error.message` + `error.code`. Always followed by `done`. |
+| `audio_reply` | NO | Voice/TTS reply bytes (base64). Emitted when `cfg.agent.tts_mode != off`. |
+| `subagent_completion` | NO | Async spawn/delegate result delivery (on reconnect or async arrival). |
+| `tool_only_summary` | NO | Synthetic frame when a turn ran tools but produced no user-visible reply. |
+
+**`done.tool_only_turn: bool` field** (v1.14.21 schema fix) — true
+when the turn ran tools but produced no reply. FE should render this
+as "no reply, but X tools fired" indicator instead of an empty
+bubble.
 
 ## 3. User-controllable settings inventory
 
@@ -223,6 +295,12 @@ config control plane.
 | Export-all-memories | n/a action | Returns a JSON dump of stored facts |
 | Delete-account | n/a action | Hard wipe of tenant cell (server-side confirmation step) |
 
+### 3.X Model selection *(v1.14.22 — the flagship picker)*
+
+| Setting | Default | Description |
+|---|---|---|
+| `selected_model` | `null` (operator default = Kimi K2.6) | Per-user model picker. When set, overrides the operator's `default_model` for this tenant's turns. See §2.10 for the allowlist + context windows. Wire: `PATCH /api/v1/users/:id/settings` with `{"selected_model":"<id>"}`. |
+
 ### 3.2 Autonomy
 
 | Setting | Default | Description |
@@ -234,7 +312,7 @@ config control plane.
 
 | Setting | Default | Description |
 |---|---|---|
-| `branding.font_dir` | unset → bundled Thmanyah | Operator can override with custom dir |
+| `branding.font_dir` | unset → bundled Thmanyah at `/usr/local/share/nullalis/branding/fonts/` | v1.14.22 CR-04 — bundled fonts now ship IN the container. Operators don't need to deploy anything; tenants get branded output out of the box. Override with a custom dir only for non-Thmanyah brand. |
 | `branding.primary_color` | brand teal | Used in PDF/HTML/PPTX themes |
 | Default PPTX theme | `thmanyah` | User-overridable per call |
 
@@ -280,6 +358,29 @@ These are the "wow" surfaces — design them to feel premium.
 | First document deliverable | Side-panel slide-in with preview thumbnail | Proof of real output |
 | First successful long-horizon delegate | Background-task completion toast | Proof of autonomy |
 | First user-browser automation | Permission card with screenshot of target page | Proof of trust + capability |
+| First model swap to 1M-context | Chip "Now using Claude Opus 4.7 — 1M token window" | Proof the picker actually changes the agent |
+| First Thmanyah-branded PDF/PPTX delivery | Brand-styled preview thumbnail | Proof of premium typography differentiator |
+
+### 4.6 Model picker UX *(v1.14.22)*
+
+The picker is the visible promise that the user is in control of cost
+and capability. Design it to feel premium, not buried:
+
+- **Primary surface**: Settings → AI Model — show the full table from
+  §2.10 with cost-class badge (A/B/C), context-window badge (256K /
+  1M / 128K / 512K), multimodal capability icons (image/video).
+- **Quick-pick chip in chat composer** — show the active model name +
+  context window ("Kimi K2.6 · 256K"). Click → dropdown with the top
+  3 by recency + "All models…" → Settings.
+- **Per-turn cost preview** — when the picker is on a class-C model
+  (Opus 4.7, GPT-5.2), show a subtle "≈ $0.04/turn" estimate in the
+  composer footer so users self-pace.
+- **Context-window indicator** — when the conversation approaches the
+  window cap, surface "180K / 256K used — pasting a large doc?
+  Switch to Opus 4.7 (1M) for headroom." Auto-suggestion, not forced.
+- **NEVER hide the picker behind a paywall** — caps were lifted; the
+  central meter handles billing. Premium model availability is a
+  feature, not a gate.
 
 ### 4.3 Progress disclosure — the trust ladder
 
@@ -326,13 +427,15 @@ control what it remembers." Make this true in the UI:
 | Contract | Purpose |
 |---|---|
 | `docs/openapi-v1.yaml` | Every HTTP endpoint with request/response schemas |
-| `docs/online-agent-contract.md` | The 11 SSE event types + payload schemas |
+| `docs/online-agent-contract.md` | The 11 STRUCTURED SSE event types + payload schemas. See §2.12 above for the 5 transport-only kinds the gateway also emits. |
 | `docs/extension-ws-contract.md` | Browser-extension WS protocol (auth + commands + acks) |
 | `docs/scheduler-automation-contract.md` | Cron job schema |
 | `docs/mcp-client.md` | How nullalis consumes external MCP servers |
 | `docs/state-secrets-wiring.md` | Where secrets live + how the vault gates them |
 | `src/agent/prompt.zig` | The system prompt the agent runs under — read it to understand agent behavior |
-| `src/agent/run_event_types.zig` | The Zig source of truth for the SSE schema |
+| `src/agent/run_event_types.zig` | The Zig source of truth for the SSE schema (11 structured variants; 5 transport-only kinds documented in module-level doc block) |
+| `src/agent/model_capabilities.zig` | The model_id → (context_window, max_output, vision, video) lookup table. Source of truth for context-window badge values in the model picker. |
+| `src/user_settings.zig` | Source of truth for `ProductSettings` — `selected_model`, `dream_enabled`, `query_expansion_enabled`, `autonomy`, etc. |
 
 ## 6. Open questions & deferred work
 
@@ -341,26 +444,62 @@ these surfaces.
 
 | ID | Item | Owner | ETA |
 |---|---|---|---|
-| D62 | Wire `migrations.run()` into `zaki_state.migrate` | backend | v1.15 |
-| D63 | Sandbox runtime image needs pandoc/marp/pandas/openpyxl/weasyprint | ops | v1.15 |
-| D64 | Per-user share-spam cap (Wave 2 MEDIUM #1) | backend | v1.15 |
+| D62 | Wire `migrations.run()` into `zaki_state.migrate` | backend | v1.15 — inline-DDL loop works for v1 |
 | WP-future | Per-cell isolated pods (multi-tenant → single-tenant per cell) | platform | v1.18 |
+| WP-future | Vite 5 → 7+ migration in `.spike/nullalis-extension` | spike | follow-up sprint — 7 devDep-only CVEs (no runtime ship to users) |
+| ME-02 | Auth-validator constant-time loop length-based timing leak | backend | v1.15 (JWT path matters more) |
+| ME-04 | "Registry of 63 production tools" comment stale (actually 74) | backend | trivial cleanup |
+| ME-07 | Boot warning gap when `extension_browser_allowlist` empty | backend | trivial |
+
+**Closed in v1.14.21 / v1.14.22** (no longer deferred):
+- D63 — Renderer chain bundled in Dockerfile (texlive-xetex + pandoc + marp-cli + pandas + openpyxl + weasyprint + chromium); build-time probe runs a real PDF render
+- D64 — Per-user share-spam cap shipped (100 live shares; 429 surface)
+- Thmanyah brand fonts shipped IN the container at `/usr/local/share/nullalis/branding/fonts/`
+- 1M context routing — Claude Opus 4.7 + Sonnet 4.6 + Gemini 2.5 Pro all native 1M (no beta header needed)
+- Per-user model selection — `selected_model` in ProductSettings
 
 ## 7. Handoff checklist — UI agent's first day
 
 Before shipping any UI surface, confirm:
 
-- [ ] You've read `docs/online-agent-contract.md` end-to-end.
-- [ ] You can render every event type in §1.1 (test fixtures in
-      `src/agent/run_event_types.zig` tests).
-- [ ] You've subscribed to `artifact_event` for live canvas refresh.
-- [ ] You've wired the `approval_required` card with a 60s timeout +
-      three actions.
-- [ ] You expose the autonomy 3-state toggle prominently.
-- [ ] Settings hub covers every field in §3 of this doc.
-- [ ] You've reviewed `.planning/SURFACE_AUDIT.md` for last-mile gaps.
-- [ ] You've signed off the privacy panel with a real "forget about X"
-      smoke test against a live tenant.
+**Core SSE surface**
+- [ ] You've read `docs/online-agent-contract.md` end-to-end + §2.12 above for the 5 transport-only kinds.
+- [ ] You can render all 11 STRUCTURED event types (`ready`, `reply_start`, `progress`, `reasoning_summary`, `tool_start`, `tool_result`, `approval_required`, `task_update`, `system_notice`, `artifact_event`, `done`) per the `src/agent/run_event_types.zig` test fixtures.
+- [ ] You can render the 5 TRANSPORT-only kinds (`token`, `error`, `audio_reply`, `subagent_completion`, `tool_only_summary`).
+- [ ] You handle `done.tool_only_turn:true` as "no reply, but X tools fired" indicator (not an empty bubble).
+- [ ] You render `done.turn_weight` + `done.session_weight` as cost pills (zaki-prod central meter).
+
+**Canvas + artifacts**
+- [ ] You've subscribed to `artifact_event` SSE for live canvas refresh (no polling).
+- [ ] You've wired the artifact card's `Share` / `Stop sharing` / `Version history` / `Diff` actions — backend tools are `artifact_share` / `artifact_revoke_share` / `artifact_history` / `artifact_diff`.
+
+**Approval + autonomy**
+- [ ] You've wired the `approval_required` card with a 60s timeout + three actions (Approve / Modify-args / Deny).
+- [ ] You expose the autonomy 3-state toggle prominently (read_only / supervised / full).
+
+**Model selection (v1.14.22 flagship)**
+- [ ] Settings → AI Model picker shows the full §2.10 table.
+- [ ] Quick-pick chip in chat composer shows active model + context window.
+- [ ] PATCH `/api/v1/users/:id/settings` with `{"selected_model":"…"}` swaps the model on the next turn.
+- [ ] Client-side allowlist mirrors the server-side one (defense in depth).
+- [ ] Context-window indicator shows "180K / 256K used" near the cap; auto-suggests a 1M model.
+
+**Settings hub**
+- [ ] Every field in §3 of this doc has a settings surface (`selected_model`, `dream_enabled`, `query_expansion_enabled`, `pii_storage_consent`, `autonomy_level`).
+- [ ] You've reviewed `/tmp/AGENT_SURFACE_AUDIT.md` for any last-mile gaps.
+- [ ] You've signed off the privacy panel with a real "forget about X" smoke test against a live tenant.
+
+**Trust + privacy**
+- [ ] Memory pane shows every stored fact with provenance + delete button.
+- [ ] PII consent gate is OFF by default; one-time opt-in dialog when a PII-class fact is about to be persisted.
+
+**Browser extension**
+- [ ] Connect-extension banner shown when an `extension_*` tool is about to fire and no extension is paired.
+- [ ] Per-tool permission card for the first `extension_*` invocation per session.
+- [ ] Tab picker when `extension_list_tabs` returns >1 candidate.
+
+**Cost-class indicators**
+- [ ] Premium-model picker shows estimated cost per turn (rough ¢ estimate, hover for the meter window state).
 
 ## 8. Brand & visual identity
 
@@ -372,13 +511,47 @@ Before shipping any UI surface, confirm:
 | Theme tokens | (TODO — UI agent defines + writes back to `assets/branding/tokens.json`) |
 | PPTX brand theme | `thmanyah` in `produce_document` |
 
-The Thmanyah font family is bundled in-repo (commit `49ad4618`) and
-auto-resolved by `produce_document.resolveBranding`. The UI agent owns
-the design-tokens layer.
+The Thmanyah font family is bundled in-repo (commit `49ad4618`),
+shipped IN the runtime container at `/usr/local/share/nullalis/branding/fonts/`
+(commit `b7f1da9f`, v1.14.22 CR-04), and auto-resolved by
+`produce_document.resolveBranding`. The UI agent owns the
+design-tokens layer.
+
+### Suggested `assets/branding/tokens.json` shape
+
+The backend doesn't read this yet; the UI agent writes it as the
+source of truth for FE styling. Suggested shape:
+
+```json
+{
+  "colors": {
+    "brand_primary": "#0D5A52",
+    "brand_secondary": "#E8B453",
+    "surface_default": "#FAFAF8",
+    "surface_elevated": "#FFFFFF",
+    "text_primary": "#1A1A1A",
+    "text_muted": "#6B6B6B"
+  },
+  "typography": {
+    "body_family": "Thmanyah Sans, system-ui, -apple-system, sans-serif",
+    "display_family": "Thmanyah Serif Display, Georgia, serif",
+    "mono_family": "JetBrains Mono, Menlo, Consolas, monospace"
+  },
+  "radius": { "sm": 4, "md": 8, "lg": 12 },
+  "spacing": { "xs": 4, "sm": 8, "md": 16, "lg": 24, "xl": 32 }
+}
+```
+
+The backend's CSS generator (`cssFontFaceBlock` in
+`produce_document.zig`) honors the typography family names — keep
+the body/display family strings in sync with what the brand fonts
+ship as.
 
 ---
 
 **Owner**: UI agent (Wave 5 of commercial v1 sprint).
-**Status**: DRAFT — refresh capability tables when `.planning/SURFACE_AUDIT.md`
-lands from the Swiss-watch audit subagent.
-**Last updated**: 2026-05-25.
+**Status**: READY — refreshed 2026-05-25 against v1.14.22 ground
+truth. Capability tables, settings, and contracts all reflect
+shipped code; deferred-work list reflects what's still open vs
+closed in the hotfix.
+**Last updated**: 2026-05-25 (v1.14.22 hotfix refresh).
