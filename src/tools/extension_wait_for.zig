@@ -103,6 +103,8 @@ pub const ExtensionWaitForTool = struct {
             error.NoExtensionConnected => return ToolResult.fail("no extension connected for this user. Ask the user to open the nullalis extension popup and connect."),
             error.Timeout => return ToolResult.fail("extension did not respond within the timeout window. The user's browser may be unresponsive or the extension may have disconnected."),
             error.ConnectionClosed => return ToolResult.fail("extension connection closed before wait_for completed. Ask the user to reconnect the extension."),
+            // HI-01 (v1.14.22): distinguish gateway OOM from connection-closed.
+            error.ResultDeliveryOom => return ToolResult.fail("gateway ran out of memory delivering the extension result — please retry; if persistent, check the gateway available RAM."),
             else => |e| {
                 const msg = try std.fmt.allocPrint(allocator, "extension_wait_for dispatch failed: {s}", .{@errorName(e)});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
@@ -156,20 +158,12 @@ fn interpretResultJson(allocator: std.mem.Allocator, json: []u8) !ToolResult {
     return ToolResult{ .success = true, .output = out };
 }
 
-fn writeJsonString(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| {
-        switch (c) {
-            '"' => try buf.appendSlice(allocator, "\\\""),
-            '\\' => try buf.appendSlice(allocator, "\\\\"),
-            '\n' => try buf.appendSlice(allocator, "\\n"),
-            '\r' => try buf.appendSlice(allocator, "\\r"),
-            '\t' => try buf.appendSlice(allocator, "\\t"),
-            else => try buf.append(allocator, c),
-        }
-    }
-    try buf.append(allocator, '"');
-}
+/// HI-05 (v1.14.22) — shared escaper. See src/tools/json_escape.zig
+/// for the RFC 8259 §7-correct implementation that escapes all C0
+/// control characters (the prior per-file inline version escaped only
+/// the named escapes and let `\b` `\f` `\x01-\x07` etc. through, producing
+/// invalid JSON for user-controlled selectors / text).
+const writeJsonString = @import("json_escape.zig").writeJsonString;
 
 // ── Tests ────────────────────────────────────────────────────────────
 

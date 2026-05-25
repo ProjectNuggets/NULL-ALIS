@@ -172,8 +172,10 @@ pub fn sanitize(url: []const u8, allowlist: []const []const u8) SanitizeResult {
     for (allowlist) |allowed| {
         if (asciiEqlIgnoreCase(allowed, normalized_host)) return .{ .ok = {} };
         // Also tolerate operator entries that include the trailing dot
-        // or brackets; normalize the comparison from the operator side.
-        const trimmed = trimTrailingDot(allowed);
+        // or IPv6 brackets; normalize the comparison from the operator
+        // side. HI-08: stripIPv6Brackets makes `["[::1]"]` actually
+        // match the bracket-stripped `::1` host produced by parseHost.
+        const trimmed = stripIPv6Brackets(trimTrailingDot(allowed));
         if (asciiEqlIgnoreCase(trimmed, normalized_host)) return .{ .ok = {} };
     }
 
@@ -469,6 +471,20 @@ fn trimTrailingDot(s: []const u8) []const u8 {
     return s;
 }
 
+/// HI-08 (v1.14.22, 2026-05-25) — strip enclosing brackets from an
+/// IPv6 literal in operator allowlist entries. The URL host parser
+/// already canonicalises `[::1]` → `::1` (bracket-free), so an
+/// operator who writes the natural bracketed form in their
+/// `extension_browser_allowlist` list (e.g. `["[::1]"]`) gets a
+/// mismatch and the allowlist silently fails. Mirror the
+/// `trimTrailingDot` pattern.
+fn stripIPv6Brackets(s: []const u8) []const u8 {
+    if (s.len >= 2 and s[0] == '[' and s[s.len - 1] == ']') {
+        return s[1 .. s.len - 1];
+    }
+    return s;
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 const t = std.testing;
@@ -655,6 +671,20 @@ test "allowlist: case-insensitive match" {
 
 test "allowlist: operator trailing dot tolerated" {
     try expectOk(sanitize("http://internal.lan/", &.{"internal.lan."}));
+}
+
+test "allowlist: operator bracketed IPv6 literal tolerated (HI-08)" {
+    // The URL host parser canonicalises `[::1]` → `::1` (bracket-free).
+    // An operator who writes the natural bracketed form must still match.
+    // (Use https — the sanitizer's scheme allowlist is http/https only,
+    // so we exercise the allowlist comparison path through a permitted
+    // scheme. wss is rejected by scheme_blocked before reaching the host
+    // comparison, which would mask the HI-08 fix we're testing.)
+    try expectOk(sanitize("https://[::1]:8080/x", &.{"[::1]"}));
+    // The bare form also works (back-compat).
+    try expectOk(sanitize("https://[::1]:8080/x", &.{"::1"}));
+    // Bracket-form on a public IPv6 literal also works.
+    try expectOk(sanitize("https://[2001:db8::1]/x", &.{"[2001:db8::1]"}));
 }
 
 test "allowlist does NOT bypass scheme check (file:// still rejected)" {

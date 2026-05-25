@@ -79,6 +79,8 @@ pub const ExtensionListTabsTool = struct {
             error.NoExtensionConnected => return ToolResult.fail("no extension connected for this user. Ask the user to open the nullalis extension popup and connect."),
             error.Timeout => return ToolResult.fail("extension did not respond within the timeout window. The user's browser may be unresponsive or the extension may have disconnected."),
             error.ConnectionClosed => return ToolResult.fail("extension connection closed before list_tabs completed. Ask the user to reconnect the extension."),
+            // HI-01 (v1.14.22): distinguish gateway OOM from connection-closed.
+            error.ResultDeliveryOom => return ToolResult.fail("gateway ran out of memory delivering the extension result — please retry; if persistent, check the gateway available RAM."),
             else => |e| {
                 const msg = try std.fmt.allocPrint(allocator, "extension_list_tabs dispatch failed: {s}", .{@errorName(e)});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };

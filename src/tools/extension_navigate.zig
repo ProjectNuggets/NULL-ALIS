@@ -208,20 +208,12 @@ fn interpretResultJson(allocator: std.mem.Allocator, json: []u8) !ToolResult {
 /// already been validated to start with http:// or https://, which
 /// rules out the control chars JSON cares about; we only escape
 /// quotes + backslashes defensively.
-fn writeJsonString(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| {
-        switch (c) {
-            '"' => try buf.appendSlice(allocator, "\\\""),
-            '\\' => try buf.appendSlice(allocator, "\\\\"),
-            '\n' => try buf.appendSlice(allocator, "\\n"),
-            '\r' => try buf.appendSlice(allocator, "\\r"),
-            '\t' => try buf.appendSlice(allocator, "\\t"),
-            else => try buf.append(allocator, c),
-        }
-    }
-    try buf.append(allocator, '"');
-}
+/// HI-05 (v1.14.22) — shared escaper. See src/tools/json_escape.zig
+/// for the RFC 8259 §7-correct implementation that escapes all C0
+/// control characters (the prior per-file inline version escaped only
+/// the named escapes and let `\b` `\f` `\x01-\x07` etc. through, producing
+/// invalid JSON for user-controlled selectors / text).
+const writeJsonString = @import("json_escape.zig").writeJsonString;
 
 // ── Tests ────────────────────────────────────────────────────────────
 

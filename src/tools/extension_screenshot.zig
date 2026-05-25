@@ -32,7 +32,7 @@ pub const ExtensionScreenshotTool = struct {
             "extension_get_dom — for inspecting the HTML structure rather than a visual capture",
             "screenshot — for capturing the operator's local terminal rather than the user's browser",
         },
-        .cost_note = "Returns up to ~5 MB base64-encoded PNG; the per-turn weight budget should account for that.",
+        .cost_note = "Returns up to ~3 MB base64-encoded PNG; the per-turn weight budget should account for that. The 3 MB advertised cap reserves headroom under the hub's 4 MB WebSocket frame ceiling for JSON envelope overhead.",
         .completion_hint = "Returns a base64 data URL of the captured PNG plus the full_page flag.",
     };
 
@@ -46,8 +46,10 @@ pub const ExtensionScreenshotTool = struct {
 
     pub const tool_description =
         "Capture a PNG screenshot of the user's active browser tab via the nullalis " ++
-        "extension. Returns a base64 data URL (cap ~5 MB) on success, or a clear " ++
-        "error if no extension is connected.";
+        "extension. Returns a base64 data URL (cap ~3 MB base64-encoded PNG; the " ++
+        "transport ceiling is 4 MB and the JSON envelope eats the difference) on " ++
+        "success, or a clear error if no extension is connected. Larger screenshots " ++
+        "are rejected by the transport — crop or split the capture.";
 
     pub const tool_params =
         \\{"type":"object","properties":{"full_page":{"type":"boolean","description":"If true, capture the full scrollable page (extension v1 may fall back to viewport)."}}}
@@ -83,6 +85,13 @@ pub const ExtensionScreenshotTool = struct {
             error.NoExtensionConnected => return ToolResult.fail("no extension connected for this user. Ask the user to open the nullalis extension popup and connect."),
             error.Timeout => return ToolResult.fail("extension did not respond within the timeout window. The user's browser may be unresponsive or the extension may have disconnected."),
             error.ConnectionClosed => return ToolResult.fail("extension connection closed before screenshot completed. Ask the user to reconnect the extension."),
+            // HI-01 (v1.14.22): distinguish gateway OOM from connection-closed.
+            error.ResultDeliveryOom => return ToolResult.fail("gateway ran out of memory delivering the extension result — please retry; if persistent, check the gateway available RAM."),
+            // HI-07 (v1.14.22): the WebSocket transport caps a single
+            // frame at 4 MB; a full-page 4K screenshot easily exceeds
+            // that. Surface a precise, actionable error instead of the
+            // confusing generic "dispatch failed: FrameTooLarge".
+            error.FrameTooLarge => return ToolResult.fail("tab screenshot exceeded the 4 MB transport cap; pass full_page:false, crop the viewport, or split the capture into multiple regions."),
             else => |e| {
                 const msg = try std.fmt.allocPrint(allocator, "extension_screenshot dispatch failed: {s}", .{@errorName(e)});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
