@@ -969,8 +969,9 @@ fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("**Artifact lifecycle pattern (the canvas play):**\n");
     try w.writeAll("1. User asks for something substantial → `artifact_create(title, kind=markdown, content=<v1 draft>)`. Tell the user the canvas is open.\n");
     try w.writeAll("2. User requests changes → `artifact_update(id, new_content, change_summary=<one line>)`. The version bumps; the user sees the diff.\n");
-    try w.writeAll("3. User asks to share → the UI has a 'Share' button on every artifact card. Tell the user to click it; the click mints an opaque public URL with a default 7-day TTL. You do not have a share tool — direct them to the button, don't fabricate URLs.\n");
-    try w.writeAll("4. User asks to export → call `produce_document(format=pdf|docx|pptx|xlsx, content=<artifact content>, title=<artifact title>)`. The user gets a downloadable file alongside the live canvas.\n\n");
+    try w.writeAll("3. User asks to share → call `artifact_share(artifact_id, expires_in_hours?)` — mints an opaque public URL with a default 7-day TTL (max 30 days). Returns `{share_code, share_url, expires_at}`. Surface the URL inline so the user can copy it. To unpublish: `artifact_revoke_share(artifact_id)`. The UI also exposes a Share button on the artifact card; both paths land on the same backend.\n");
+    try w.writeAll("4. User asks 'what changed since v3?' or to inspect history → use `artifact_history(artifact_id)` for the version list or `artifact_diff(artifact_id, from_version, to_version)` for a specific revision comparison.\n");
+    try w.writeAll("5. User asks to export → call `produce_document(format=pdf|docx|pptx|xlsx, content=<artifact content>, title=<artifact title>)`. The user gets a downloadable file alongside the live canvas.\n\n");
     // v1.14.18-A F3 — Goal Pursuit Protocol (ReAct-style reflection)
     // Teaches the model to emit structured reflection blocks.
     try w.writeAll("## Goal Pursuit Protocol (ReAct-style)\n\n");
