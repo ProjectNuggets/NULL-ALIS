@@ -20458,6 +20458,18 @@ pub fn runWithRole(
                     .{},
                 );
             }
+            // ME-07 (2026-05-25) — same shape, opposite failure mode:
+            // LAN-only kiosks that forgot `extension_browser_allowlist`
+            // will silently reject every navigation with
+            // `private_ip_blocked` and the operator has no breadcrumb
+            // at boot. Info-level (not warn) because public-internet
+            // deployments WANT the allowlist empty.
+            if (cfg.gateway.extension_browser_allowlist.len == 0) {
+                log.info(
+                    "extension_ws: extension_browser_allowlist is empty — SSRF defense will block all RFC1918/loopback navigation targets. Add entries here for trusted LAN/internal hosts.",
+                    .{},
+                );
+            }
         }
         state.tenant_enabled = cfg.tenant.enabled;
         state.tenant_data_root = cfg.tenant.data_root;
