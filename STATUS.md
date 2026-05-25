@@ -1,8 +1,62 @@
 # nullALIS — STATUS
 
-**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-24 — **v1.14.19 S-tier production push** shipped (Phases A-E + final QA): 33 tool descriptions rewritten + lint Rule 6 (`6672ef8d`), MCP UX hardening (`d2183986`), tenant-autonomy divergence transparency + AGENTS.md §14.13 (`887cb3cd`), XML-leak third defense layer 7%→2% (`a8c4fc04`), D52 Hybrid Pillar 1 PII override (`74ddd469`), `SUBSTRATE_AUDIT.md` written. Prior: 2026-05-23 v1.14.18 audit MED-tier sweep (PR #106, 9 ledger rows); P4 tier gate default flipped to 0.005; LoCoMo D44 bench findings #1 + #4 fixed; Sprint 3 (Universal API Connector); Sprint 2 (Channels V1 + MCP V1).
+**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-25 — **commercial v1 sprint Waves 1–4 shipped + Wave 5 in flight.** This refresh covers the multi-wave commercial-launch arc: cap-lift + 7 default-on flags + dream cron (Wave 1), produce_document + trace-share + canvas/artifacts (Wave 2), dual-lane browser automation (server-side Playwright MCP + 10 user-browser `extension_*` tools, Wave 3), 1M-context model routing + renderer-chain hardening (Wave 4), Swiss-watch surface audit + UI agent handoff doc (Wave 5). Prior refresh covered v1.14.19 S-tier push.
 
 This is the single cold-start document. If it disagrees with `.planning/STATE.md`, `PROJECT_LEDGER.md` (archived), or anything in `docs/archive/`, **this wins**.
+
+---
+
+## 2026-05-25 — Commercial v1 sprint Waves 1–4 shipped + Wave 5 in flight
+
+Twelve commits on `main` since v1.14.20 close the commercial-launch gap-to-Manus + Claude-Code identified in the recon pass. Bench gate green at **6672 passed / 146 skipped / 0 failed**. Tag pending v1.14.21 once Wave 5's 6-tools follow-up subagent lands.
+
+### Wave 1 — Activation (prior session, all flipped default-on)
+
+- 7 dormant flags activated in `applyProfileDefaults(zaki_bot)`: audio_media, heartbeat, cron, memory.response_cache, memory.semantic_cache, composio, cost
+- Canonical `dream_3am` cron job seeded in `AUTOMATIONS.json` (toggle `dream_enabled` per user)
+- 2 new user toggles: `dream_enabled` (default true), `query_expansion_enabled` (default false, costs more)
+
+### Wave 2 — Deliverables + canvas (`9a85c60a` Thmanyah + prior)
+
+- `produce_document` tool for PDF/DOCX/XLSX/PPTX/HTML; argv-only subprocess, sanitizers, timeouts, 50MB cap
+- Marp themes: `default`/`gaia`/`uncover`/`thmanyah` (brand) with auto-frontmatter prepend
+- Trace share URLs with server-side sanitizer (`POST /api/v1/users/:id/traces/:id/share`)
+- Canvas artifacts (`artifact_create/update/get/list` + `artifact_event` SSE for live panel refresh)
+- **Bundled Thmanyah fonts in repo** (`49ad4618`) — `assets/branding/fonts/{thmanyahsans,thmanyahserifdisplay,thmanyahseriftext}/{otf,woff2}/` with auto-resolve from `produce_document.resolveBranding`; SaaS deploy gets brand typography without operator config
+
+### Wave 3 — Dual-lane browser automation
+
+**Lane A: server-side Playwright MCP** (`.spike/playwright-mcp/`) — TypeScript MCP server with SSRF defense via ipaddr.js (blocks IPv4-mapped IPv6, ULA, link-local, decimal IP, trailing-dot bypasses, post-redirect via context.route interceptor).
+
+**Lane B: user-browser extension** (Chrome MV3 + WebSocket back to gateway):
+- `c8393a40` — gateway WS endpoint at `/api/v1/extension/ws` + per-user hub + first `extension_navigate` tool
+- `cab65f26` — two live-probe wiring fixes (config-parser miss + WouldBlock retry)
+- `cac40f28` — **3 META CRITICAL fixes**: SSRF defense in `extension_navigate` (new `src/extension_ws/url_sanitize.zig`, 48 tests), per-user token auth in `AuthValidator` (frame's user_id IGNORED, mapped user_id returned from matching entry — closes cross-tenant impersonation), hub UAF via atomic refcount on `ExtensionWsConn`. +4 HIGH (pre-auth read timeout, auth_frame_too_large distinct error, OOM disambiguation, MV3 race fix). +63 tests.
+- `39681aa2` — MV3 storage counter race-safety (mutex-via-promise serializer, +3 tests)
+- `9307f60e` — **9 remaining `extension_*` tools** (click/type/fill_form/screenshot/get_text/get_dom/wait_for/scroll/list_tabs). +61 tests. Browser product surface now complete: 10/10 tools.
+- `d722851d` + `d8c6cad9` — Wave 3B cleanup: bumped `happy-dom 14→20` killing 3 CVEs (2 CRITICAL RCE + XSS + 1 HIGH credential-leak in vitest test-env devDep). Narrowed `content_scripts.matches` from `<all_urls>` to `http(s)` only — excludes `file://`, `data:`, `blob:`, `ftp:`, `view-source:`. 51/51 vitest pass.
+
+### Wave 4 — 1M context routing + renderer chain (`db5dad47` + `9eaf0d40`)
+
+- `db5dad47` — Anthropic `claude-{opus,sonnet}-4-6-1m` + `4.6-1m` aliases + Google `gemini-2.5-pro-1m` in `model_capabilities.zig`. Base (non-`-1m`) variants stay at 200K for conservative cost default — 1M is opt-in by explicit model id. Pattern match on `-1m` suffix catches future dated variants. +4 tests.
+- `9eaf0d40` — D63 Dockerfile renderer chain: pandoc + marp-cli (npm) + pandas + openpyxl + weasyprint + chromium baked into release-base, verified in-build (`pandoc --version && marp --version && python3 -c "import pandas, openpyxl, weasyprint"` gates the layer).
+- Per-user dynamic context-aware routing (auto-swap base → -1m when context > 200K) deferred to v1.15.
+
+### Wave 5 — Swiss-watch surface audit + UI handoff
+
+- `66de1cff` — Wave 5 surface-audit schema honesty (the §14.5 closure):
+  - Documented 5 transport-only SSE kinds (`token`, `error`, `audio_reply`, `subagent_completion`, `tool_only_summary`) at top of `run_event_types.zig` — schema no longer undersells the 16-kind wire surface as "11 events"
+  - Added `tool_only_turn: ?bool` to `DonePayload` struct + structured serializer (matches what gateway already writes inline at `gateway.zig:8705`)
+  - Tightened prompt to direct users to UI share button rather than narrate a URL the agent can't hit (will revert when `artifact_share` tool ships from in-flight subagent)
+- `351a74eb` — `docs/ui-handoff.md` (384 lines): comprehensive UI agent briefing covering 8 sections — capability inventory, settings, UX strategy, contracts, deferred work, handoff checklist, brand identity
+- **Surface audit deliverable** at `/tmp/AGENT_SURFACE_AUDIT.md` (read-only audit): 9 ship recommendations, 4 defer, 1 document; identified 4 endpoints lacking agent-tool equivalents (memory_doctor, trace_query, artifact_share, artifact_diff/history); the 6-tools follow-up subagent (in flight) closes these.
+- `528385f7` — D64 per-user share-spam cap (`MAX_LIVE_SHARES_PER_USER=100`, 429 response with `share_limit_reached` hint, +2 tests). Closes Wave 2 code-review MEDIUM #1.
+
+**CI gate across the wave-5 push:** 6672/6818 (146 skipped, 0 failed). 12 commits since `v1.14.20` (`cab65f26`..`d8c6cad9`). One subagent still in flight: 6 surface-audit follow-up tools (memory_doctor, trace_query, artifact_share, artifact_revoke_share, artifact_diff, artifact_history) — these close the last documented agent-surface gaps from the audit. Once they land, `v1.14.21` tag captures the entire commercial-v1 commercial-launch arc.
+
+**Deferred-register state:** D62 (wire `migrations.run()` into `zaki_state.migrate`) intentionally deferred to v1.15 — the legacy inline-DDL loop ships v1 commercial correctly; the framework refactor is real work without v1 customer impact. D63 closed (Dockerfile renderer chain shipped). D64 closed (share-spam cap shipped).
+
+---
 
 ---
 
