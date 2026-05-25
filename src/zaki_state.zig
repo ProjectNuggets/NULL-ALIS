@@ -2270,7 +2270,19 @@ const ManagerImpl = struct {
             \\    UNIQUE (artifact_id, version)
             \\)
             ,
-            "CREATE INDEX IF NOT EXISTS idx_artifact_versions_artifact_ver ON {schema}.artifact_versions(artifact_id, version DESC)",
+            // v1.14.23 WARN-3: canonical name is `idx_artifact_versions_artifact_version`
+            // — matches the migration file at src/migrations/0002_artifacts.sql:84.
+            // Pre-fix, the inline path used `_artifact_ver` while migrations.run()
+            // used `_artifact_version`; both `IF NOT EXISTS` succeeded, persisting
+            // two indexes on the same (artifact_id, version DESC) columns →
+            // storage bloat + double-write cost on every artifact_versions write.
+            // Post-fix: the inline-loop path is now a no-op on post-D62 DBs
+            // (idempotent, same name as migrations.run); fresh DBs get exactly
+            // one canonical-named index. Drop of the legacy `_artifact_ver`
+            // index on already-migrated DBs is intentionally NOT done here —
+            // operators should run `DROP INDEX IF EXISTS idx_artifact_versions_artifact_ver`
+            // manually as a one-shot during their next maintenance window.
+            "CREATE INDEX IF NOT EXISTS idx_artifact_versions_artifact_version ON {schema}.artifact_versions(artifact_id, version DESC)",
         };
 
         for (statements) |template| {
@@ -11253,6 +11265,105 @@ test "D62 — migrate() populates schema_migrations with every registered versio
             return error.MigrationNotRecorded;
         }
     }
+}
+
+test "v1.14.23 WARN-3 — artifact_versions has exactly ONE index after fresh migrate (no _artifact_ver duplicate)" {
+    // Pre-fix, the inline-loop path in zaki_state.migrate() created
+    // `idx_artifact_versions_artifact_ver` while migrations.run() created
+    // `idx_artifact_versions_artifact_version` from the 0002_artifacts.sql
+    // file. Both `IF NOT EXISTS` succeeded → two indexes on the same
+    // (artifact_id, version DESC) columns → storage bloat + double-write
+    // cost on every artifact_versions write.
+    //
+    // Post-fix: the inline path uses the canonical `_artifact_version`
+    // name, matching the migration file. A fresh DB ends up with exactly
+    // ONE index whose name starts with `idx_artifact_versions`. This test
+    // asserts that.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_warn3", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+
+    // Drop schema if it exists so the migrate path runs end-to-end.
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+
+    try mgr.migrate();
+
+    // pg_indexes.schemaname is matched as a string literal, not an identifier;
+    // we want only indexes in the just-created test schema so a parallel
+    // test's `_artifact_ver` (if any survives a prior bad run) doesn't bleed in.
+    const count_q = try std.fmt.allocPrint(
+        allocator,
+        "SELECT count(*)::int FROM pg_indexes WHERE schemaname = '{s}' AND indexname LIKE 'idx_artifact_versions%'",
+        .{schema},
+    );
+    defer allocator.free(count_q);
+    const result = try mgr.exec(count_q);
+    defer c.PQclear(result);
+
+    try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+    const count_text = try dupeResultValue(allocator, result, 0, 0);
+    defer allocator.free(count_text);
+    const count = try std.fmt.parseInt(u32, count_text, 10);
+    if (count != 1) {
+        std.debug.print(
+            "WARN-3 fix regressed: expected exactly 1 index matching 'idx_artifact_versions%', got {d}\n",
+            .{count},
+        );
+
+        // Surface which indexes are present so a future debugger can see
+        // the divergence directly.
+        const names_q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT indexname FROM pg_indexes WHERE schemaname = '{s}' AND indexname LIKE 'idx_artifact_versions%' ORDER BY indexname",
+            .{schema},
+        );
+        defer allocator.free(names_q);
+        const names_res = try mgr.exec(names_q);
+        defer c.PQclear(names_res);
+        const n_names: usize = @intCast(c.PQntuples(names_res));
+        for (0..n_names) |i| {
+            const nm = try dupeResultValue(allocator, names_res, @intCast(i), 0);
+            defer allocator.free(nm);
+            std.debug.print("  - {s}\n", .{nm});
+        }
+        return error.DuplicateArtifactIndex;
+    }
+
+    // Belt-and-suspenders: the surviving index must be the canonical
+    // `_artifact_version` name. The legacy `_artifact_ver` name must NOT
+    // be present.
+    const canonical_q = try std.fmt.allocPrint(
+        allocator,
+        "SELECT count(*)::int FROM pg_indexes WHERE schemaname = '{s}' AND indexname = 'idx_artifact_versions_artifact_version'",
+        .{schema},
+    );
+    defer allocator.free(canonical_q);
+    const canonical_res = try mgr.exec(canonical_q);
+    defer c.PQclear(canonical_res);
+    const canonical_text = try dupeResultValue(allocator, canonical_res, 0, 0);
+    defer allocator.free(canonical_text);
+    try std.testing.expectEqualStrings("1", canonical_text);
 }
 
 test "V1.5.1 brain hygiene PG roundtrip — listMemoriesBrainVisible + listMemoriesTimeline filter agent bookkeeping" {
