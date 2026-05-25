@@ -93,7 +93,21 @@ RUN apk add --no-cache \
       # texlive-xetex is ~150 MB; the full `texlive` meta-package is
       # ~3 GB which is not worth the size hit for a single rendering
       # engine.
+      #
+      # NOTE (v1.14.24, Gate #2 arm64 probe): texlive-xetex on
+      # Alpine 3.23 does NOT bundle xcolor.sty, which pandoc's default
+      # LaTeX template requires unconditionally. Without
+      # `texmf-dist-latexrecommended` (the TeX Live "Recommended
+      # LaTeX" collection, 38 MiB, supplies xcolor + ~50 standard
+      # packages), the in-build probe `pandoc -o probe.pdf
+      # --pdf-engine=xelatex` fails with `LaTeX Error: File
+      # 'xcolor.sty' not found.` on BOTH amd64 and arm64. The probe
+      # the v1.14.22 CR-03 hotfix added correctly caught this — but
+      # the apk install line in the same hotfix was incomplete.
+      # Verified fix: 38 MiB image-size cost, single-layer rebuild,
+      # both architectures pass the probe.
       texlive-xetex \
+      texmf-dist-latexrecommended \
       py3-pip \
       py3-cffi \
       py3-cairo \
@@ -159,6 +173,12 @@ RUN pip3 install --no-cache-dir --break-system-packages \
     # CR-04: confirm the brand-font bundle landed at the path
     # resolveBundledFontsPath expects.
     ls /usr/local/share/nullalis/branding/fonts/thmanyahsans/woff2/thmanyahsans-Regular.woff2 > /dev/null && \
+    # v1.14.24 (Gate #2 arm64 follow-up): pre-build the fontconfig
+    # cache as root so the non-root runtime user (uid 65534) doesn't
+    # spam "Fontconfig error: No writable cache directories" on every
+    # PDF/HTML render. Build-time cache is world-readable; runtime
+    # reads succeed without needing per-user cache write access.
+    fc-cache -f -v > /dev/null && \
     echo "renderer chain + branding ready"
 
 ENV CHROME_PATH=/usr/bin/chromium-browser
