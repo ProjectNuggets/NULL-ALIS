@@ -124,14 +124,19 @@ const ProviderEntry = struct {
 };
 
 const PROVIDER_TABLE = [_]ProviderEntry{
-    // Anthropic and Google's 1M context is now native at standard pricing on
-    // current Claude 4.x and Gemini 2.5 Pro SKUs; raise the provider-level
-    // fallback so an unknown-but-prefixed model id at least gets the right
-    // ceiling. Specific model overrides still win via MODEL_TABLE.
-    .{ .key = "anthropic", .caps = .{ .context_window = 1_000_000, .max_output = 8_192 } },
+    // IN-02 (v1.14.22 follow-up): provider-level fallback for UNKNOWN
+    // model ids stays at a conservative 200K floor. The reviewer's
+    // defensive concern: if Anthropic ships a future Haiku-tier SKU
+    // with 200K context and operators route to it without adding the
+    // MODEL_TABLE entry, the fallback would assume 1M and the agent
+    // would try to fit > 200K → provider 400s. Known 1M models
+    // (claude-opus-4.7, claude-sonnet-4.6, gemini-2.5-pro) ALL have
+    // explicit MODEL_TABLE entries above; the fallback is only hit
+    // for genuinely unknown ids where being conservative is correct.
+    .{ .key = "anthropic", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
     .{ .key = "openai", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
-    .{ .key = "google", .caps = .{ .context_window = 1_000_000, .max_output = 8_192 } },
-    .{ .key = "gemini", .caps = .{ .context_window = 1_000_000, .max_output = 8_192 } },
+    .{ .key = "google", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
+    .{ .key = "gemini", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
     .{ .key = "openrouter", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
     .{ .key = "minimax", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
     .{ .key = "xiaomi", .caps = .{ .context_window = 262_144, .max_output = 8_192 } },
@@ -214,17 +219,21 @@ fn inferFromPattern(model_id: []const u8) ?ModelCapabilities {
     if (startsWithIgnoreCase(model_id, "kimi-coding"))
         return .{ .context_window = 262_144, .max_output = 32_768 };
 
-    // Claude 4.x and Gemini 2.5 Pro both ship 1M context natively at
-    // standard pricing as of April 30 2026. The retired
-    // `context-1m-2025-08-07` beta header and the synthetic `-1m`
-    // suffix are gone. Unknown-but-prefixed `claude-` and `gemini-`
-    // ids get the modern ceiling; haiku / flash variants are still
-    // pinned at 200K via explicit MODEL_TABLE entries that win first.
+    // IN-02 (v1.14.22 follow-up): keep the pattern-match fallback at
+    // a CONSERVATIVE 200K floor for UNKNOWN Claude / Gemini ids. The
+    // 1M-tier models (claude-opus-4.6/4.7, claude-sonnet-4.6,
+    // gemini-2.5-pro) all have explicit MODEL_TABLE entries that win
+    // first; this fallback only fires for genuinely unrecognized
+    // ids. The defensive rationale: if Anthropic ships a future
+    // Haiku-tier SKU at 200K and operators route there before adding
+    // a MODEL_TABLE entry, optimistically assuming 1M would let the
+    // agent try to fit > 200K context and get 400'd by the provider.
+    // 200K is the safer pessimistic floor.
     if (startsWithIgnoreCase(model_id, "claude-"))
-        return .{ .context_window = 1_000_000, .max_output = 8_192 };
+        return .{ .context_window = 200_000, .max_output = 8_192 };
 
     if (startsWithIgnoreCase(model_id, "gemini-"))
-        return .{ .context_window = 1_000_000, .max_output = 8_192 };
+        return .{ .context_window = 200_000, .max_output = 8_192 };
 
     if (startsWithIgnoreCase(model_id, "gpt-") or
         startsWithIgnoreCase(model_id, "o1") or

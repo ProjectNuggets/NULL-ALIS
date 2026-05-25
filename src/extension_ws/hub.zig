@@ -326,10 +326,19 @@ pub const ExtensionWsConn = struct {
 
         // Re-dup BEFORE releasing — release may free `pending.result`
         // if this is the last ref.
-        const caller_owned: ?[]u8 = if (result_slice) |r|
-            try result_allocator.dupe(u8, r)
-        else
-            null;
+        //
+        // WR-01 (v1.14.22 hotfix follow-up): the dup itself is a
+        // fault point. If `result_allocator.dupe` OOMs, we must
+        // still release the sender ref before propagating the error
+        // — otherwise the pending leaks at refs=1 with the map ref
+        // already at 0 (released by deliverResult).
+        const caller_owned: ?[]u8 = if (result_slice) |r| blk: {
+            const owned = result_allocator.dupe(u8, r) catch |err| {
+                pending.release(self.allocator); // sender ref
+                return err;
+            };
+            break :blk owned;
+        } else null;
 
         pending.release(self.allocator); // sender ref
 

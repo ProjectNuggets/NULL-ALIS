@@ -19683,6 +19683,17 @@ fn handleAcceptedConnection(
                 "extension_ws: OOM allocating {d} auth entries: {s}",
                 .{ state.extension_tokens.len, @errorName(alloc_err) },
             );
+            // WR-03 (v1.14.22 follow-up): surface the OOM to the
+            // connecting extension with an explicit 503 so the peer
+            // doesn't hang until TCP timeout. The catch-and-ignore is
+            // intentional — if the response itself fails (broken
+            // pipe), we still want the function to return cleanly.
+            sendHttpResponse(
+                conn.stream,
+                "503 Service Unavailable",
+                "application/json",
+                "{\"error\":\"oom\",\"hint\":\"gateway temporarily out of memory; retry shortly\"}",
+            ) catch {};
             return;
         };
         defer allocator.free(entries_buf);

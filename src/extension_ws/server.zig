@@ -235,10 +235,18 @@ pub const Frame = struct {
 
 /// Hard cap on inbound frame payload size. Larger frames are rejected
 /// before the payload buffer is allocated — protects against a
-/// pathological client trying to allocate gigabytes server-side. 4 MB
-/// matches `websocket.zig`'s outbound client cap so the two sides agree
-/// on what a "reasonable" frame is.
-pub const MAX_FRAME_PAYLOAD: u64 = 4 * 1024 * 1024;
+/// pathological client trying to allocate gigabytes server-side.
+///
+/// WR-02 (v1.14.22 follow-up): raised 4 MB → 8 MB. The 4 MB cap was
+/// chosen to match `websocket.zig`'s outbound client cap, but it
+/// prevented full-page screenshots from `extension_screenshot` (which
+/// produces base64-encoded PNGs that can run 3-5 MB after JSON envelope
+/// overhead). The screenshot tool's description advertises a ~3 MB
+/// cap; 8 MB gives ~2.5× headroom for JSON overhead + future feature
+/// payload growth. The DoS surface widens proportionally but a
+/// per-connection 8 MB allocation is still a reasonable server-side
+/// budget against authenticated extension peers.
+pub const MAX_FRAME_PAYLOAD: u64 = 8 * 1024 * 1024;
 
 // ── Header extraction (mirrors gateway.extractHeader semantics) ────────
 
