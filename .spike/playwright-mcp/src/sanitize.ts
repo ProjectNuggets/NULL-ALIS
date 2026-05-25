@@ -11,6 +11,16 @@
 // Default-deny matches AGENTS.md §3.5 (secure-by-default, least privilege).
 // Operators who *do* need access (e.g. a staging app on localhost) opt in via
 // the PLAYWRIGHT_MCP_ALLOWLIST env var.
+//
+// IPv6 parsing delegates to `ipaddr.js` because the prior hand-rolled string
+// checks missed every canonical IPv6 form (IPv4-mapped, ULA, unspecified, etc.).
+// See Wave 3 review CRITICAL #1, #2, #3 for the bypass classes this defends.
+
+// ipaddr.js is published as CommonJS. Under Node's ESM loader the named
+// exports get wrapped inside `default`, so the default import is the only
+// portable form (works for both `tsc → dist/` ES2022 emit and the test
+// runner's native ESM loader).
+import ipaddr from "ipaddr.js";
 
 /**
  * Reasons a URL might be rejected. Surfaced to the agent (and the user
@@ -22,7 +32,9 @@ export type RejectionReason =
   | "loopback_blocked"
   | "link_local_blocked"
   | "private_ip_blocked"
-  | "metadata_endpoint_blocked";
+  | "metadata_endpoint_blocked"
+  | "unspecified_address_blocked"
+  | "reserved_address_blocked";
 
 export interface SanitizeOk {
   ok: true;
@@ -50,55 +62,137 @@ function loadAllowlist(): Set<string> {
 
 const ALLOWED_SCHEMES = new Set(["http:", "https:"]);
 
-/** IPv4 dotted quad as four numbers, or null if not parseable. */
-function parseIPv4(host: string): [number, number, number, number] | null {
-  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (!m) return null;
-  const parts = m.slice(1, 5).map((n) => Number(n)) as [
-    number,
-    number,
-    number,
-    number,
-  ];
-  if (parts.some((p) => p < 0 || p > 255)) return null;
-  return parts;
+/**
+ * Normalize a hostname for comparison:
+ *   - lowercase
+ *   - strip trailing dot (DNS strips it at resolution → bypass class)
+ *   - strip surrounding `[...]` brackets from IPv6 literals
+ */
+function normalizeHost(rawHost: string): { display: string; bareHost: string } {
+  const lowered = rawHost.toLowerCase().replace(/\.$/, "");
+  const bareHost =
+    lowered.startsWith("[") && lowered.endsWith("]")
+      ? lowered.slice(1, -1)
+      : lowered;
+  return { display: lowered, bareHost };
 }
 
-/** True for RFC1918 private ranges + carrier-grade NAT. */
-function isPrivateIPv4(host: string): boolean {
-  const ip = parseIPv4(host);
-  if (!ip) return false;
-  const [a, b] = ip;
-  if (a === 10) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
-  return false;
+/**
+ * Classify an IPv4 address against the deny categories. ipaddr.js range
+ * categories: "unicast" (the open internet), "private" (RFC1918),
+ * "loopback" (127/8), "linkLocal" (169.254/16), "unspecified" (0.0.0.0),
+ * "carrierGradeNat" (100.64/10), "broadcast", "multicast", "reserved".
+ * We allow only "unicast"; everything else is blocked with a specific reason.
+ */
+function classifyIPv4(v4: ipaddr.IPv4): SanitizeReject | null {
+  const range = v4.range();
+  const octets = v4.octets;
+
+  // Distinguish 169.254.169.254 specifically (metadata) from the broader
+  // 169.254/16 link-local block, so the agent gets a more actionable reason.
+  if (range === "linkLocal") {
+    if (octets[0] === 169 && octets[1] === 254 && octets[2] === 169 && octets[3] === 254) {
+      return {
+        ok: false,
+        reason: "link_local_blocked",
+        detail: `cloud metadata endpoint 169.254.169.254 is blocked`,
+      };
+    }
+    return {
+      ok: false,
+      reason: "link_local_blocked",
+      detail: `link-local IPv4 ${v4.toString()} is blocked`,
+    };
+  }
+  if (range === "loopback") {
+    return {
+      ok: false,
+      reason: "loopback_blocked",
+      detail: `loopback IPv4 ${v4.toString()} is blocked — add to PLAYWRIGHT_MCP_ALLOWLIST to permit`,
+    };
+  }
+  if (range === "private" || range === "carrierGradeNat") {
+    return {
+      ok: false,
+      reason: "private_ip_blocked",
+      detail: `private IPv4 ${v4.toString()} is blocked — add to PLAYWRIGHT_MCP_ALLOWLIST to permit`,
+    };
+  }
+  if (range === "unspecified") {
+    return {
+      ok: false,
+      reason: "unspecified_address_blocked",
+      detail: `unspecified IPv4 ${v4.toString()} routes to local interfaces — blocked`,
+    };
+  }
+  if (range === "unicast") return null;
+  // multicast / broadcast / reserved / anything new — default-deny.
+  return {
+    ok: false,
+    reason: "reserved_address_blocked",
+    detail: `reserved IPv4 ${v4.toString()} (range=${range}) is blocked`,
+  };
 }
 
-function isLoopback(host: string): boolean {
-  const h = host.toLowerCase();
-  if (h === "localhost" || h.endsWith(".localhost")) return true;
-  const ip = parseIPv4(h);
-  if (ip && ip[0] === 127) return true;
-  if (h === "::1" || h === "[::1]") return true;
-  return false;
+/**
+ * Classify an IPv6 address. IPv4-mapped addresses (::ffff:a.b.c.d) recurse
+ * through the IPv4 classifier so we don't have to duplicate the deny logic.
+ *
+ * ipaddr.js range categories for v6: "unicast", "unspecified" (::),
+ * "loopback" (::1), "linkLocal" (fe80::/10), "uniqueLocal" (fc00::/7,
+ * includes fd00::), "ipv4Mapped" (::ffff:0:0/96), "multicast", "rfc6145",
+ * "rfc6052", "6to4", "teredo", "reserved". Allow only "unicast".
+ */
+function classifyIPv6(v6: InstanceType<typeof ipaddr.IPv6>): SanitizeReject | null {
+  if (v6.isIPv4MappedAddress()) {
+    return classifyIPv4(v6.toIPv4Address());
+  }
+  const range = v6.range();
+  if (range === "unicast") return null;
+
+  // Map ipaddr.js range names onto our public RejectionReason vocabulary.
+  switch (range) {
+    case "loopback":
+      return {
+        ok: false,
+        reason: "loopback_blocked",
+        detail: `IPv6 loopback ${v6.toNormalizedString()} is blocked`,
+      };
+    case "linkLocal":
+      return {
+        ok: false,
+        reason: "link_local_blocked",
+        detail: `IPv6 link-local ${v6.toNormalizedString()} is blocked`,
+      };
+    case "uniqueLocal":
+      return {
+        ok: false,
+        reason: "private_ip_blocked",
+        detail: `IPv6 unique-local ${v6.toNormalizedString()} is blocked (includes AWS IPv6 metadata fd00::ec2:254)`,
+      };
+    case "unspecified":
+      return {
+        ok: false,
+        reason: "unspecified_address_blocked",
+        detail: `IPv6 unspecified :: routes to local interfaces — blocked`,
+      };
+    default:
+      return {
+        ok: false,
+        reason: "reserved_address_blocked",
+        detail: `IPv6 ${v6.toNormalizedString()} (range=${range}) is blocked`,
+      };
+  }
 }
 
-function isLinkLocal(host: string): boolean {
-  const ip = parseIPv4(host);
-  if (ip && ip[0] === 169 && ip[1] === 254) return true;
-  // IPv6 link-local: fe80::/10
-  const lower = host.toLowerCase().replace(/^\[|\]$/g, "");
-  if (lower.startsWith("fe80:") || lower.startsWith("fe80::")) return true;
-  return false;
+/** Hostnames that are well-known cloud-metadata aliases at the DNS layer. */
+function isMetadataAlias(displayHost: string): boolean {
+  return displayHost === "metadata.google.internal" || displayHost === "metadata";
 }
 
-function isMetadataEndpoint(host: string): boolean {
-  // AWS / GCP / Azure all live on 169.254.169.254 — caught by link-local — but
-  // the metadata.google.internal alias is DNS-resolved at the OS layer, so we
-  // catch the well-known name here too.
-  return host === "metadata.google.internal" || host === "metadata";
+/** Hostnames that resolve to loopback at the DNS layer. */
+function isLoopbackAlias(displayHost: string): boolean {
+  return displayHost === "localhost" || displayHost.endsWith(".localhost");
 }
 
 /**
@@ -107,7 +201,7 @@ function isMetadataEndpoint(host: string): boolean {
  *
  * Behavior:
  *   - non-http(s) schemes are rejected (file://, chrome://, javascript:, etc.)
- *   - loopback + link-local + RFC1918 IPs are rejected
+ *   - loopback + link-local + RFC1918 + ULA + unspecified addresses are rejected
  *   - well-known metadata hostnames are rejected
  *   - hostnames in PLAYWRIGHT_MCP_ALLOWLIST bypass loopback + private checks
  */
@@ -127,41 +221,49 @@ export function sanitizeUrl(input: string): SanitizeResult {
     };
   }
 
-  const host = parsed.hostname.toLowerCase();
+  const { display, bareHost } = normalizeHost(parsed.hostname);
+
   const allowlist = loadAllowlist();
-  if (allowlist.has(host)) {
+  // Allowlist hits accept both the bracketed and bare forms so operators can
+  // write `127.0.0.1` or `localhost` (or `[::1]`/`::1`) in the env var.
+  if (allowlist.has(display) || allowlist.has(bareHost)) {
     return { ok: true, url: parsed };
   }
 
-  if (isMetadataEndpoint(host)) {
+  // String-level checks first — these short-circuit before IP parsing for
+  // hostnames that look nothing like an IP literal (localhost, metadata.*).
+  if (isMetadataAlias(display)) {
     return {
       ok: false,
       reason: "metadata_endpoint_blocked",
-      detail: `cloud metadata endpoint '${host}' is blocked`,
+      detail: `cloud metadata endpoint '${display}' is blocked`,
     };
   }
-  if (isLinkLocal(host)) {
-    return {
-      ok: false,
-      reason: "link_local_blocked",
-      detail: `link-local address '${host}' is blocked (includes cloud metadata 169.254.169.254)`,
-    };
-  }
-  if (isLoopback(host)) {
+  if (isLoopbackAlias(display)) {
     return {
       ok: false,
       reason: "loopback_blocked",
-      detail: `loopback host '${host}' is blocked — add to PLAYWRIGHT_MCP_ALLOWLIST to permit`,
-    };
-  }
-  if (isPrivateIPv4(host)) {
-    return {
-      ok: false,
-      reason: "private_ip_blocked",
-      detail: `private IP '${host}' is blocked — add to PLAYWRIGHT_MCP_ALLOWLIST to permit`,
+      detail: `loopback host '${display}' is blocked — add to PLAYWRIGHT_MCP_ALLOWLIST to permit`,
     };
   }
 
+  // IP-literal path: ipaddr.js handles every canonical form (IPv4 dotted,
+  // IPv4-mapped IPv6, IPv6 ULA, IPv6 link-local, IPv6 unspecified, etc.)
+  // including the canonicalized forms Node's URL parser emits.
+  if (ipaddr.isValid(bareHost)) {
+    const addr = ipaddr.parse(bareHost);
+    const verdict =
+      addr.kind() === "ipv6"
+        ? classifyIPv6(addr as InstanceType<typeof ipaddr.IPv6>)
+        : classifyIPv4(addr as ipaddr.IPv4);
+    if (verdict) return verdict;
+    return { ok: true, url: parsed };
+  }
+
+  // Non-IP hostname that survived the alias checks: treat as public unicast.
+  // DNS rebinding (a public hostname that resolves to RFC1918) is OUT OF SCOPE
+  // for the string sanitizer — that's defended at the request layer via the
+  // route interceptor installed by the BrowserPool (CRITICAL #4 in Wave 3).
   return { ok: true, url: parsed };
 }
 

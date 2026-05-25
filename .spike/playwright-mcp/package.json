@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
+    "ipaddr.js": "^2.4.0",
     "playwright": "^1.49.0"
   },
   "devDependencies": {

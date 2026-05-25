@@ -108,3 +108,81 @@ test("navigate tool surfaces sanitizer rejection as a thrown error", async () =>
     await pool.shutdown();
   }
 });
+
+// ---------------------------------------------------------------------------
+// CRITICAL Wave-3-review regression tests. Each url below was VERIFIED to
+// bypass the pre-fix sanitizer (allowed when it should have been blocked).
+// Keep these as `expect(r.ok).toBe(false)` so any future regression fails loud.
+// ---------------------------------------------------------------------------
+
+test("CRITICAL: IPv4-mapped IPv6 → cloud metadata (::ffff:169.254.169.254) is rejected", () => {
+  delete process.env.PLAYWRIGHT_MCP_ALLOWLIST;
+  const r = sanitizeUrl("http://[::ffff:169.254.169.254]/latest/meta-data/");
+  expect(r.ok).toBe(false);
+});
+
+test("CRITICAL: IPv4-mapped IPv6 → loopback (::ffff:7f00:1) is rejected", () => {
+  delete process.env.PLAYWRIGHT_MCP_ALLOWLIST;
+  const r = sanitizeUrl("http://[::ffff:7f00:1]/");
+  expect(r.ok).toBe(false);
+});
+
+test("CRITICAL: IPv4-mapped IPv6 → RFC1918 (::ffff:a00:1) is rejected", () => {
+  delete process.env.PLAYWRIGHT_MCP_ALLOWLIST;
+  const r = sanitizeUrl("http://[::ffff:a00:1]/");
+  expect(r.ok).toBe(false);
+});
+
+test("CRITICAL: IPv6 ULA fd00::ec2:254 (AWS IPv6 metadata alias) is rejected", () => {
+  delete process.env.PLAYWRIGHT_MCP_ALLOWLIST;
+  const r = sanitizeUrl("http://[fd00::ec2:254]/");
+  expect(r.ok).toBe(false);
+});
+
+test("CRITICAL: IPv6 ULA fd00:ec2::254 is rejected", () => {
+  delete process.env.PLAYWRIGHT_MCP_ALLOWLIST;
+  const r = sanitizeUrl("http://[fd00:ec2::254]/");
+  expect(r.ok).toBe(false);
+});
+
+test("CRITICAL: IPv6 loopback ::1 is rejected", () => {
+  delete process.env.PLAYWRIGHT_MCP_ALLOWLIST;
+  const r = sanitizeUrl("http://[::1]/");
+  expect(r.ok).toBe(false);
+});
+
+test("CRITICAL: IPv6 link-local fe80::1 is rejected", () => {
+  delete process.env.PLAYWRIGHT_MCP_ALLOWLIST;
+  const r = sanitizeUrl("http://[fe80::1]/");
+  expect(r.ok).toBe(false);
+});
+
+test("CRITICAL: localhost. (trailing dot) is rejected", () => {
+  delete process.env.PLAYWRIGHT_MCP_ALLOWLIST;
+  const r = sanitizeUrl("http://localhost./admin");
+  expect(r.ok).toBe(false);
+});
+
+test("CRITICAL: metadata.google.internal. (trailing dot) is rejected", () => {
+  delete process.env.PLAYWRIGHT_MCP_ALLOWLIST;
+  const r = sanitizeUrl("http://metadata.google.internal./computeMetadata/v1/");
+  expect(r.ok).toBe(false);
+});
+
+test("CRITICAL: bare 0 (canonicalizes to 0.0.0.0) is rejected", () => {
+  delete process.env.PLAYWRIGHT_MCP_ALLOWLIST;
+  const r = sanitizeUrl("http://0/");
+  expect(r.ok).toBe(false);
+});
+
+test("CRITICAL: 0.0.0.0 (unspecified IPv4) is rejected", () => {
+  delete process.env.PLAYWRIGHT_MCP_ALLOWLIST;
+  const r = sanitizeUrl("http://0.0.0.0/");
+  expect(r.ok).toBe(false);
+});
+
+test("CRITICAL: [::] (unspecified IPv6) is rejected", () => {
+  delete process.env.PLAYWRIGHT_MCP_ALLOWLIST;
+  const r = sanitizeUrl("http://[::]/");
+  expect(r.ok).toBe(false);
+});

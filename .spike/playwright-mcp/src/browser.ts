@@ -16,6 +16,7 @@ import {
   type Page,
   chromium,
 } from "playwright";
+import { sanitizeUrl } from "./sanitize.js";
 
 /** Default idle timeout. Operators can override via env. */
 const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
@@ -105,6 +106,32 @@ export class BrowserPool {
       viewport: { width: 1280, height: 800 },
       userAgent:
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 nullalis-playwright-mcp",
+    });
+    // SSRF defense layer 2: sanitize every outgoing request URL, not just the
+    // user-input one. Catches:
+    //   - redirects (302 → http://169.254.169.254/...)
+    //   - sub-resources (<img src=metadata-host>, <iframe src=loopback>, etc.)
+    //   - JS-initiated fetches (fetch(), XHR, WebSocket upgrades)
+    //   - DNS rebinding (public hostname resolving to RFC1918 at request time —
+    //     the URL string we see post-resolution still hits the sanitizer)
+    // Performance cost: one URL parse + one IP classification per request.
+    // Wave 3 review CRITICAL #4.
+    await context.route("**", async (route) => {
+      const url = route.request().url();
+      const verdict = sanitizeUrl(url);
+      if (!verdict.ok) {
+        try {
+          await route.abort("blockedbyclient");
+        } catch {
+          // Route already handled by another listener / page closed mid-flight.
+        }
+        return;
+      }
+      try {
+        await route.continue();
+      } catch {
+        // Same: tolerate races against page/context teardown.
+      }
     });
     const page = await context.newPage();
     const now = Date.now();
