@@ -21,9 +21,18 @@ export async function getConfig(): Promise<StoredConfig | null> {
   return v;
 }
 
+/** Loopback hostnames where plaintext ws:// is acceptable. */
+const LOOPBACK_HOSTS = new Set<string>(["localhost", "127.0.0.1", "[::1]", "::1"]);
+
 /**
  * Persist a new token + gateway URL. Validates the URL is ws:// or wss:// so
  * we never accidentally try to negotiate a plain-HTTP socket.
+ *
+ * Wave 3 review HIGH #7: ws:// (plaintext) is REJECTED for any non-loopback
+ * hostname. The README's "always use wss:// in any non-loopback scenario"
+ * rule is now enforced in code. A user pasting `ws://prod.gateway.example.com/ws`
+ * (typo / phishing / misunderstanding) would otherwise send the bearer token
+ * in cleartext on every reconnect handshake.
  */
 export async function setConfig(token: string, gatewayUrl: string): Promise<void> {
   const trimmedToken = token.trim();
@@ -34,6 +43,24 @@ export async function setConfig(token: string, gatewayUrl: string): Promise<void
   }
   if (!/^wss?:\/\//.test(trimmedUrl)) {
     throw new Error("gateway_url must start with ws:// or wss://");
+  }
+
+  // Loopback ws:// is allowed (dev / self-hosted localhost); everything
+  // else MUST be wss:// so the token is encrypted in transit.
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmedUrl);
+  } catch {
+    throw new Error("gateway_url is not a valid URL");
+  }
+  if (parsed.protocol === "ws:") {
+    const host = parsed.hostname.toLowerCase();
+    const bracketed = `[${host}]`;
+    if (!LOOPBACK_HOSTS.has(host) && !LOOPBACK_HOSTS.has(bracketed)) {
+      throw new Error(
+        `gateway_url must use wss:// for non-loopback hosts — refusing ws://${host} to keep the token off the wire in cleartext`,
+      );
+    }
   }
 
   const config: StoredConfig = { token: trimmedToken, gateway_url: trimmedUrl };

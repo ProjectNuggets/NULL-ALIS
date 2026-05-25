@@ -16,6 +16,13 @@
 import { getConfig, setConfig, clearConfig } from "./auth";
 import { WsClient } from "./ws_client";
 import { BACKGROUND_TOOLS, CommandError, validateCommand } from "./commands";
+import {
+  addTouchedTab,
+  clearTouchedTabs,
+  getCommandsTotal,
+  getTouchedTabs,
+  incrementCommandsTotal,
+} from "./session_state";
 import type {
   BgToContentMessage,
   Command,
@@ -44,8 +51,10 @@ const status: ConnectionStatus = {
   commands_total: 0,
 };
 
-/** Tabs the agent has touched in this worker lifetime — used by STOP to reload them. */
-const touchedTabs = new Set<number>();
+// Touched-tabs + commands_total are now persisted via chrome.storage.session
+// (see ./session_state). MV3 evicts idle workers after ~30s; in-memory state
+// would otherwise reset and the STOP button would reload zero tabs while the
+// popup poll would show wrong counts. Wave 3 review HIGH #5, #6.
 
 // ---------- Connection lifecycle ----------
 
@@ -127,7 +136,10 @@ function handleServerMessage(msg: ServerMessage): void {
 async function executeCommand(c: Command): Promise<void> {
   const startedAt = Date.now();
   status.last_command = { tool: c.tool, command_id: c.command_id, at_ms: startedAt };
-  status.commands_total++;
+  // Persist the counter via storage.session so it survives worker eviction.
+  // Wave 3 review HIGH #6. We also update the in-memory mirror in `status`
+  // so synchronous popup reads aren't stale until the next get_status call.
+  status.commands_total = await incrementCommandsTotal();
 
   try {
     validateCommand(c);
@@ -196,12 +208,12 @@ async function cmdNavigate(args: Record<string, unknown>): Promise<{ tab_id: num
   const newTab = args.new_tab === true;
   if (newTab) {
     const tab = await chrome.tabs.create({ url });
-    if (tab.id !== undefined) touchedTabs.add(tab.id);
+    if (tab.id !== undefined) await addTouchedTab(tab.id);
     return { tab_id: tab.id ?? -1, url };
   }
   const active = await getActiveTab();
   await chrome.tabs.update(active.id!, { url });
-  touchedTabs.add(active.id!);
+  await addTouchedTab(active.id!);
   return { tab_id: active.id!, url };
 }
 
@@ -238,7 +250,7 @@ async function getActiveTab(): Promise<chrome.tabs.Tab> {
 
 async function forwardToContentScript(c: Command): Promise<unknown> {
   const tab = await getActiveTab();
-  touchedTabs.add(tab.id!);
+  await addTouchedTab(tab.id!);
 
   // Announce in-page so the user sees what's happening.
   void notifyToast(tab.id!, `nullalis agent → ${c.tool}`);
@@ -298,6 +310,10 @@ async function handlePopupRequest(req: PopupRequest): Promise<PopupResponse> {
       const cfg = await getConfig();
       status.has_token = cfg !== null;
       status.gateway_url = cfg?.gateway_url ?? null;
+      // Hydrate commands_total from storage.session — this worker may be a
+      // fresh revive after eviction, so the in-memory mirror could be 0
+      // even if the previous worker ran many commands. Wave 3 review HIGH #6.
+      status.commands_total = await getCommandsTotal();
       return { ok: true, status };
     }
     case "set_token": {
@@ -322,16 +338,19 @@ async function handlePopupRequest(req: PopupRequest): Promise<PopupResponse> {
     }
     case "stop_all": {
       teardownConnection();
-      // Reload every tab the agent touched in this lifetime, so any partial
-      // state (typing a query, a half-filled form) is discarded.
-      for (const tabId of touchedTabs) {
+      // Reload every tab the agent touched THIS BROWSER SESSION (not just
+      // this worker lifetime — Wave 3 review HIGH #5). Hydrating from
+      // storage.session catches tabs touched by a previous worker that's
+      // since been evicted.
+      const tabIds = await getTouchedTabs();
+      for (const tabId of tabIds) {
         try {
           await chrome.tabs.reload(tabId);
         } catch {
           // Tab may be closed already — fine.
         }
       }
-      touchedTabs.clear();
+      await clearTouchedTabs();
       return { ok: true };
     }
   }
