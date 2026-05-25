@@ -36,6 +36,7 @@ const EXTENSION_VERSION = chrome.runtime.getManifest().version;
 let wsClient: WsClient | null = null;
 const status: ConnectionStatus = {
   connected: false,
+  authenticated: false,
   last_error: null,
   gateway_url: null,
   has_token: false,
@@ -68,6 +69,24 @@ async function ensureConnection(): Promise<void> {
     onStateChange: (connected, err) => {
       status.connected = connected;
       status.last_error = err ?? null;
+      if (!connected) {
+        // Auth state can only be true while the socket is up; drop it when
+        // we lose the connection so the popup doesn't show stale "authenticated".
+        status.authenticated = false;
+      }
+    },
+    onAuthStateChange: (state, reason) => {
+      // Surface auth handshake outcome in the popup so the user sees what
+      // happened (red badge "auth_failed: invalid_token" vs green "authenticated").
+      // Wave 3 review CRITICAL #5.
+      if (state === "authenticated") {
+        status.authenticated = true;
+        status.last_error = null;
+      } else {
+        // "auth_failed" / "auth_timeout" — surface the reason
+        status.authenticated = false;
+        status.last_error = reason ? `${state}: ${reason}` : state;
+      }
     },
   });
   wsClient.start();
@@ -79,6 +98,7 @@ function teardownConnection(): void {
     wsClient = null;
   }
   status.connected = false;
+  status.authenticated = false;
 }
 
 // ---------- Server frame handling ----------
@@ -87,6 +107,18 @@ function handleServerMessage(msg: ServerMessage): void {
   // Auth-ack / pong / ping pass through; only Commands need dispatch.
   if ("type" in msg) {
     // Control frame — nothing to do at this layer (pings handled in WsClient).
+    return;
+  }
+  // Double-defense (Wave 3 review CRITICAL #5): even though WsClient drops
+  // pre-auth_ack frames internally, we re-check here so any code path that
+  // bypasses WsClient (future refactors, direct injection in tests, etc.)
+  // still hits the gate. If this fires the WsClient gate failed too — log
+  // it loudly so we notice.
+  if (!wsClient || !wsClient.isAuthenticated()) {
+    console.warn(
+      "[nullalis-bg] DROPPING command — wsClient not authenticated",
+      { command_id: msg.command_id, tool: msg.tool },
+    );
     return;
   }
   void executeCommand(msg);

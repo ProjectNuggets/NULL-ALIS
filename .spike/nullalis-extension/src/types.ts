@@ -72,6 +72,14 @@ export type PopupRequest =
 export interface ConnectionStatus {
   /** Whether the extension currently has an open WS to the gateway. */
   connected: boolean;
+  /**
+   * Whether the gateway has successfully `auth_ack`-ed the open socket.
+   * Distinct from `connected`: a connected-but-unauthenticated socket exists
+   * during the brief window between WS open and auth_ack, AND while a
+   * misbehaving gateway is silently dropping the auth frame. Commands are
+   * NEVER dispatched while this is false. (Wave 3 review CRITICAL #5.)
+   */
+  authenticated: boolean;
   /** Last error message if the most recent connection attempt failed. */
   last_error: string | null;
   /** Gateway URL the extension is configured to talk to. */

@@ -2,13 +2,26 @@
 // plain class so we can unit-test it with a mock WebSocket implementation.
 //
 // Lifecycle:
-//   new WsClient({...})  →  .start()  →  open  →  send auth frame  →  ready
+//   new WsClient({...})  →  .start()  →  open  →  send auth frame  →
+//                                                  await auth_ack  →  ready
 //                                         │
 //                                         └─ on close: backoff → reconnect
 //                                         └─ on error: log, let close handle reconnect
 //
-// The client is push-only from the gateway side: every inbound frame other
-// than ping/pong/auth_ack is forwarded to onCommand().
+// AUTH GATE (Wave 3 review CRITICAL #5):
+// The client buffers / drops every inbound non-control frame until the gateway
+// has responded with `auth_ack` (ok: true). This prevents the
+// "extension dispatches commands BEFORE the gateway has validated the token"
+// trust-on-first-paste attack class:
+//   1. User pastes attacker's wss://attacker/ws + fake token.
+//   2. Extension opens socket, sends auth frame.
+//   3. Pre-fix: attacker server immediately replied with a navigate Command
+//      to a credential-harvest page; extension EXECUTED it.
+//   4. Post-fix: any non-`auth_ack` / non-`ping` frame received before
+//      auth_ack{ok:true} is dropped on the floor, the socket is closed after
+//      `authTimeoutMs` with reason "auth_timeout", and on auth_ack{ok:false}
+//      it closes with "auth_failed".
+// Ping/pong is exempt — the proxy / gateway heartbeat must work pre-ack.
 
 import type { ClientMessage, ServerMessage } from "./types";
 
@@ -16,10 +29,21 @@ export interface WsClientOptions {
   url: string;
   token: string;
   extensionVersion: string;
-  /** Called for every inbound non-control frame. */
+  /** Called for every inbound non-control frame, only after auth_ack{ok:true}. */
   onMessage: (msg: ServerMessage) => void;
   /** Called whenever the connected state transitions. */
   onStateChange?: (connected: boolean, error?: string) => void;
+  /**
+   * Called when the auth handshake transitions:
+   *   - "authenticated":  auth_ack{ok:true} received; Commands now flow
+   *   - "auth_failed":    auth_ack{ok:false} received; socket closing
+   *   - "auth_timeout":   no auth_ack within authTimeoutMs; socket closing
+   * Subscribed by background.ts to surface in the popup.
+   */
+  onAuthStateChange?: (
+    state: "authenticated" | "auth_failed" | "auth_timeout",
+    reason?: string,
+  ) => void;
   /** Injected for tests. Defaults to globalThis.WebSocket. */
   WebSocketImpl?: typeof WebSocket;
   /** Initial reconnect delay in ms. */
@@ -28,11 +52,18 @@ export interface WsClientOptions {
   maxBackoffMs?: number;
   /** Heartbeat interval. Set 0 to disable. */
   heartbeatMs?: number;
+  /**
+   * How long to wait for `auth_ack` after the socket opens. Default 5s.
+   * If the gateway doesn't respond within this window, the socket is closed
+   * (the extension will then attempt to reconnect with normal backoff).
+   */
+  authTimeoutMs?: number;
 }
 
 const DEFAULT_INITIAL_BACKOFF = 1_000;
 const DEFAULT_MAX_BACKOFF = 30_000;
 const DEFAULT_HEARTBEAT = 25_000;
+const DEFAULT_AUTH_TIMEOUT = 5_000;
 
 // WebSocket readyState constants by literal value. We don't reference
 // `WebSocket.OPEN` because in some test/runtime environments the WebSocket
@@ -42,14 +73,29 @@ const WS_OPEN = 1;
 const WS_CONNECTING = 0;
 
 export class WsClient {
-  private readonly opts: Required<Omit<WsClientOptions, "onStateChange">> & {
+  private readonly opts: Required<
+    Omit<WsClientOptions, "onStateChange" | "onAuthStateChange">
+  > & {
     onStateChange: ((connected: boolean, error?: string) => void) | undefined;
+    onAuthStateChange:
+      | ((
+          state: "authenticated" | "auth_failed" | "auth_timeout",
+          reason?: string,
+        ) => void)
+      | undefined;
   };
   private ws: WebSocket | null = null;
   private backoffMs: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private authTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
+  /**
+   * True only after the gateway acknowledged auth (auth_ack{ok:true}).
+   * Reset to false on every socket open. Public via `isAuthenticated()` so
+   * background.ts can double-defend command dispatch.
+   */
+  private authAcked = false;
 
   constructor(opts: WsClientOptions) {
     this.opts = {
@@ -58,10 +104,12 @@ export class WsClient {
       extensionVersion: opts.extensionVersion,
       onMessage: opts.onMessage,
       onStateChange: opts.onStateChange,
+      onAuthStateChange: opts.onAuthStateChange,
       WebSocketImpl: opts.WebSocketImpl ?? (globalThis.WebSocket as typeof WebSocket),
       initialBackoffMs: opts.initialBackoffMs ?? DEFAULT_INITIAL_BACKOFF,
       maxBackoffMs: opts.maxBackoffMs ?? DEFAULT_MAX_BACKOFF,
       heartbeatMs: opts.heartbeatMs ?? DEFAULT_HEARTBEAT,
+      authTimeoutMs: opts.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT,
     };
     this.backoffMs = this.opts.initialBackoffMs;
   }
@@ -83,6 +131,8 @@ export class WsClient {
       this.reconnectTimer = null;
     }
     this.clearHeartbeat();
+    this.clearAuthTimer();
+    this.authAcked = false;
     if (this.ws) {
       try {
         this.ws.close(1000, "client_stop");
@@ -94,9 +144,17 @@ export class WsClient {
     this.emitState(false);
   }
 
-  /** True if the socket is OPEN. */
+  /** True if the socket is OPEN. Does NOT imply auth_ack — see isAuthenticated(). */
   isConnected(): boolean {
     return this.ws !== null && this.ws.readyState === WS_OPEN;
+  }
+
+  /**
+   * True only after the gateway sent `auth_ack{ok:true}`. Background dispatch
+   * should always gate on this in addition to whatever WsClient does internally.
+   */
+  isAuthenticated(): boolean {
+    return this.authAcked && this.isConnected();
   }
 
   /** Send a frame to the gateway. Returns false if the socket isn't open. */
@@ -121,6 +179,10 @@ export class WsClient {
       return;
     }
     this.ws = ws;
+    // Reset auth state for the new socket. Critical for reconnect: a
+    // previously-authenticated session does not carry over its auth_ack to
+    // the next socket — the gateway must ack the new socket too.
+    this.authAcked = false;
 
     ws.onopen = () => {
       // Reset backoff once we have a real connection.
@@ -132,6 +194,7 @@ export class WsClient {
         extension_version: this.opts.extensionVersion,
       });
       this.startHeartbeat();
+      this.startAuthTimer();
       this.emitState(true);
     };
 
@@ -140,14 +203,47 @@ export class WsClient {
       try {
         parsed = JSON.parse(typeof ev.data === "string" ? ev.data : "") as ServerMessage;
       } catch {
-        // Malformed frame from server — drop silently. Could log.
+        // Malformed frame from server — drop silently. By design: a misbehaving
+        // gateway shouldn't crash the extension. See docs/silent-catches-policy.md.
         return;
       }
-      // Inline ping handling: respond pong without bothering the consumer.
-      if ((parsed as { type?: string }).type === "ping") {
+      const type = (parsed as { type?: string }).type;
+
+      // Heartbeat is always allowed, before AND after auth_ack — the proxy /
+      // load balancer needs the keepalive regardless of app-layer auth state.
+      if (type === "ping") {
         this.send({ type: "pong" });
         return;
       }
+      if (type === "pong") {
+        // No-op; we sent a ping and got the expected reply.
+        return;
+      }
+
+      // Auth handshake.
+      if (type === "auth_ack") {
+        const ack = parsed as { type: "auth_ack"; ok: boolean; error?: string };
+        this.clearAuthTimer();
+        if (ack.ok) {
+          this.authAcked = true;
+          this.emitAuthState("authenticated");
+        } else {
+          // Server rejected the token. Close the socket; popup will surface.
+          this.authAcked = false;
+          this.emitAuthState("auth_failed", ack.error);
+          this.closeSocket(1008, ack.error ?? "auth_failed");
+        }
+        return;
+      }
+
+      // Anything else (Command frames, unknown control frames) is GATED on
+      // auth_ack. Pre-fix this was the bypass: a malicious gateway could
+      // send a Command before auth and the extension would execute it.
+      if (!this.authAcked) {
+        // Drop silently. Logging here would be noise on every reconnect race.
+        return;
+      }
+
       this.opts.onMessage(parsed);
     };
 
@@ -158,6 +254,8 @@ export class WsClient {
 
     ws.onclose = (ev: CloseEvent) => {
       this.clearHeartbeat();
+      this.clearAuthTimer();
+      this.authAcked = false;
       this.ws = null;
       this.emitState(false, ev.reason || `closed (code ${ev.code})`);
       if (!this.stopped) this.scheduleReconnect();
@@ -194,9 +292,46 @@ export class WsClient {
     }
   }
 
+  private startAuthTimer(): void {
+    this.clearAuthTimer();
+    this.authTimer = setTimeout(() => {
+      this.authTimer = null;
+      if (!this.authAcked) {
+        this.emitAuthState("auth_timeout");
+        this.closeSocket(1008, "auth_timeout");
+      }
+    }, this.opts.authTimeoutMs);
+  }
+
+  private clearAuthTimer(): void {
+    if (this.authTimer) {
+      clearTimeout(this.authTimer);
+      this.authTimer = null;
+    }
+  }
+
+  /** Close the socket with a code/reason. Silent on already-closed sockets. */
+  private closeSocket(code: number, reason: string): void {
+    if (!this.ws) return;
+    try {
+      this.ws.close(code, reason);
+    } catch {
+      // Already-closed socket; nothing to do.
+    }
+  }
+
   private emitState(connected: boolean, error?: string): void {
     if (this.opts.onStateChange) {
       this.opts.onStateChange(connected, error);
+    }
+  }
+
+  private emitAuthState(
+    state: "authenticated" | "auth_failed" | "auth_timeout",
+    reason?: string,
+  ): void {
+    if (this.opts.onAuthStateChange) {
+      this.opts.onAuthStateChange(state, reason);
     }
   }
 

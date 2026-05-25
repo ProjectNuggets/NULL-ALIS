@@ -87,8 +87,21 @@ chooses to host the extension socket — the path is configurable in the popup).
 
    and then close the socket with code 1008 (policy violation).
 
-4. The extension does not currently block on `auth_ack`. The gateway is
-   expected to drop any non-auth frames received before successful auth.
+4. The extension DOES block on `auth_ack` (since 2026-05-25, Wave 3
+   review CRITICAL #5). Inbound `Command` frames received before
+   `auth_ack{ok:true}` are dropped on the floor and not dispatched. If
+   `auth_ack` doesn't arrive within `authTimeoutMs` (default 5s), the
+   extension closes the socket with code 1008 and surfaces
+   `last_error: "auth_timeout"` in the popup. `auth_ack{ok:false}`
+   closes with `last_error: "auth_failed: <reason>"`. Ping/pong is
+   exempt — heartbeat must work pre-ack so proxies don't drop the
+   connection during the handshake window.
+
+   Gateways MUST send `auth_ack` immediately after validating the token.
+   The pre-fix "we just close the socket on bad auth" behavior also
+   works (the extension reconnects with backoff) but is less informative
+   for the user — a fast `auth_ack{ok:false}` produces a clean popup
+   message; a silent close produces a generic "closed (code 1006)".
 
 ### Commands
 

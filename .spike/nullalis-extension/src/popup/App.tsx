@@ -185,15 +185,26 @@ export function App(): JSX.Element {
   };
 
   const connected = status?.connected ?? false;
+  const authenticated = status?.authenticated ?? false;
   const hasToken = status?.has_token ?? false;
+
+  // Badge: green only when fully authenticated. A "connected" socket that
+  // hasn't been auth_ack'd is a UX signal the user should see — pre-Wave-3-fix
+  // the extension would have started executing commands here, now it
+  // explicitly waits. (Wave 3 review CRITICAL #5.)
+  const badgeLabel = authenticated
+    ? "authenticated"
+    : connected
+      ? "connecting…"
+      : hasToken
+        ? "disconnected"
+        : "no token";
 
   return (
     <div>
       <header style={styles.header}>
         <span style={styles.brand}>nullalis</span>
-        <span style={badgeStyle(connected)}>
-          {connected ? "connected" : hasToken ? "disconnected" : "no token"}
-        </span>
+        <span style={badgeStyle(authenticated)}>{badgeLabel}</span>
       </header>
 
       <section style={styles.section}>
