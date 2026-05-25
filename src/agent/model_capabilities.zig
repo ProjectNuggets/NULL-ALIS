@@ -84,21 +84,17 @@ const MODEL_TABLE = [_]ModelEntry{
     .{ .key = "k2p5", .caps = .{ .context_window = 262_144, .max_output = 32_768 } },
     // V1.11 hardening (2026-05-07) — K2.6 full switch. Multimodal (vision +
     // video), 256K context, SWE-Bench Verified 80.2. Same context window as
-    // K2.5; Moonshot kept it at 256K rather than expanding.
+    // K2.5; Moonshot kept it at 256K rather than expanding. This is the
+    // nullalis default model.
+    //
+    // Per Nova's directive (2026-05-25): only K2.5 + K2.6 are kept in the
+    // model-specific table. Every other Moonshot/Kimi SKU on the account
+    // (`moonshot-v1-*` family, `kimi-coding`, etc.) is LEGACY — we do not
+    // route to them. Adding them to this table would be premature breadth
+    // per §14.2 ("every line of code creates compounding value"). If a
+    // future need surfaces, add the entry then — not now.
     .{ .key = "kimi-k2.6", .caps = .{ .context_window = 262_144, .max_output = 32_768, .vision = true, .video = true } },
     .{ .key = "k2p6", .caps = .{ .context_window = 262_144, .max_output = 32_768, .vision = true, .video = true } },
-    // Gate #1 live probe (2026-05-25) — full account model list from
-    // GET https://api.moonshot.ai/v1/models. The `moonshot-v1-*` family
-    // is the older lineage (pre-K2); useful for cost-tiered text + the
-    // vision-preview branch. Add entries so operators routing to these
-    // ids get correct context windows + vision/video flags.
-    .{ .key = "moonshot-v1-8k", .caps = .{ .context_window = 8_192, .max_output = 8_192 } },
-    .{ .key = "moonshot-v1-32k", .caps = .{ .context_window = 32_768, .max_output = 8_192 } },
-    .{ .key = "moonshot-v1-128k", .caps = .{ .context_window = 131_072, .max_output = 8_192 } },
-    .{ .key = "moonshot-v1-auto", .caps = .{ .context_window = 131_072, .max_output = 8_192 } },
-    .{ .key = "moonshot-v1-8k-vision-preview", .caps = .{ .context_window = 8_192, .max_output = 8_192, .vision = true } },
-    .{ .key = "moonshot-v1-32k-vision-preview", .caps = .{ .context_window = 32_768, .max_output = 8_192, .vision = true } },
-    .{ .key = "moonshot-v1-128k-vision-preview", .caps = .{ .context_window = 131_072, .max_output = 8_192, .vision = true } },
     // DeepSeek
     .{ .key = "deepseek-v3.2", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
     .{ .key = "deepseek-chat", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
@@ -156,7 +152,6 @@ const PROVIDER_TABLE = [_]ProviderEntry{
     .{ .key = "moonshot", .caps = .{ .context_window = 256_000, .max_output = 8_192 } },
     .{ .key = "moonshotai", .caps = .{ .context_window = 256_000, .max_output = 8_192 } },
     .{ .key = "kimi", .caps = .{ .context_window = 262_144, .max_output = 8_192 } },
-    .{ .key = "kimi-coding", .caps = .{ .context_window = 262_144, .max_output = 32_768 } },
     .{ .key = "together-ai", .caps = .{ .context_window = 200_000, .max_output = 8_192 } },
     .{ .key = "ollama", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
     .{ .key = "qwen", .caps = .{ .context_window = 128_000, .max_output = 8_192 } },
@@ -222,13 +217,12 @@ fn inferFromPattern(model_id: []const u8) ?ModelCapabilities {
     // truth for modality; a model recognized only by a broad name prefix
     // routes through the sidecar rather than guessing it is multimodal.
 
-    // Kimi large-context variants
-    if (std.mem.indexOf(u8, model_id, "k2p5") != null or
-        startsWithIgnoreCase(model_id, "kimi-k2"))
-        return .{ .context_window = 262_144, .max_output = 32_768 };
-
-    // Kimi coding endpoint
-    if (startsWithIgnoreCase(model_id, "kimi-coding"))
+    // Kimi K2 large-context family — K2.5 + K2.6 are explicit in
+    // MODEL_TABLE (with .vision/.video flags on K2.6); this pattern
+    // catches future dated variants like `kimi-k2.6-20260901`. The
+    // older `kimi-coding-*` endpoint is intentionally NOT pattern-
+    // matched anymore (legacy per Nova directive 2026-05-25).
+    if (startsWithIgnoreCase(model_id, "kimi-k2"))
         return .{ .context_window = 262_144, .max_output = 32_768 };
 
     // IN-02 (v1.14.22 follow-up): keep the pattern-match fallback at
@@ -511,10 +505,19 @@ test "Mode-swap 2026-04-29 — DeepSeek V4 family resolves to 512K context, not 
     try std.testing.expectEqual(@as(u64, 128_000), v3.context_window);
 }
 
-test "kimi-coding provider has large output ceiling" {
-    const caps = lookupCapabilities("kimi-coding/some-model").?;
-    try std.testing.expectEqual(@as(u32, 32_768), caps.max_output);
-    try std.testing.expectEqual(@as(u64, 262_144), caps.context_window);
+test "Nova-directive (2026-05-25): legacy kimi-coding provider entry removed cleanly" {
+    // The `kimi-coding` provider-table entry + the corresponding
+    // `startsWithIgnoreCase(model_id, "kimi-coding")` pattern in
+    // inferFromPattern were both removed per the K2.5+K2.6-only
+    // directive. The provider name `kimi-coding` is now genuinely
+    // unrecognized: lookupCapabilities returns null instead of the
+    // old bespoke 32K-output entry. Callers fall back to the global
+    // DEFAULT_CONTEXT_WINDOW / DEFAULT_MAX_OUTPUT via resolveContextTokens.
+    try std.testing.expectEqual(@as(?ModelCapabilities, null), lookupCapabilities("kimi-coding/some-model"));
+    // The known K2 ids still resolve correctly (no collateral damage).
+    const k26 = lookupCapabilities("kimi-k2.6").?;
+    try std.testing.expectEqual(@as(u64, 262_144), k26.context_window);
+    try std.testing.expectEqual(@as(u32, 32_768), k26.max_output);
 }
 
 test "v1.14.22 — 1M context: Claude Opus 4.7 (base id, no suffix) resolves to 1M" {
