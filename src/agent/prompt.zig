@@ -968,7 +968,7 @@ fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("**Artifact lifecycle pattern (the canvas play):**\n");
     try w.writeAll("1. User asks for something substantial → `artifact_create(title, kind=markdown, content=<v1 draft>)`. Tell the user the canvas is open.\n");
     try w.writeAll("2. User requests changes → `artifact_update(id, new_content, change_summary=<one line>)`. The version bumps; the user sees the diff.\n");
-    try w.writeAll("3. User asks to share → tell them the share endpoint is `POST /api/v1/users/:id/artifacts/:id/share` (the UI surfaces a button). The mint returns an opaque public URL with a default 7-day TTL.\n");
+    try w.writeAll("3. User asks to share → the UI has a 'Share' button on every artifact card. Tell the user to click it; the click mints an opaque public URL with a default 7-day TTL. You do not have a share tool — direct them to the button, don't fabricate URLs.\n");
     try w.writeAll("4. User asks to export → call `produce_document(format=pdf|docx|pptx|xlsx, content=<artifact content>, title=<artifact title>)`. The user gets a downloadable file alongside the live canvas.\n\n");
     // v1.14.18-A F3 — Goal Pursuit Protocol (ReAct-style reflection)
     // Teaches the model to emit structured reflection blocks.

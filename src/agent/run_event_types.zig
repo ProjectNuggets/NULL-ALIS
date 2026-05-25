@@ -1,9 +1,40 @@
 //! Structured run-event type system for online client consumption.
 //!
-//! Defines the 9 event kinds from REQ-004 (ready, reply_start, progress,
+//! Defines the 11 *structured* event kinds (ready, reply_start, progress,
 //! reasoning_summary, tool_start, tool_result, approval_required,
-//! task_update, done) as a tagged union with per-event payloads and an
-//! SSE frame serializer.
+//! task_update, system_notice, artifact_event, done) as a tagged union
+//! with per-event payloads and an SSE frame serializer.
+//!
+//! ── Transport-only event kinds (NOT modeled here) ────────────────────
+//!
+//! The gateway also emits 5 additional `event:` kinds on the SSE wire
+//! that are intentionally NOT part of this tagged union. They are kept
+//! out of `RunEvent` either because they have no structured payload
+//! (just an opaque slice) or because they're synthetic frames produced
+//! by the SSE transport layer itself, not the agent runtime. FE and
+//! out-of-process consumers must handle these directly off the wire.
+//!
+//! - `token`               — streaming reply text chunk. No `type` field,
+//!                           no JSON envelope; the payload is the raw
+//!                           token slice. Emitted from gateway.zig at
+//!                           the final-reply pump.
+//! - `error`               — terminal error frame, always followed by
+//!                           `done`. Payload is a JSON error envelope
+//!                           with `error.message` + `error.code`.
+//! - `audio_reply`         — voice/TTS reply bytes (base64). Emitted
+//!                           when `cfg.agent.tts_mode != off`.
+//! - `subagent_completion` — async spawn/delegate result delivery (on
+//!                           reconnect or async arrival). Carries a
+//!                           snapshot of the child task's terminal state.
+//! - `tool_only_summary`   — synthetic frame when a turn ran tools but
+//!                           produced no user-visible reply. Lets the FE
+//!                           render a "no reply, but X tools fired" pill.
+//!
+//! Gateway emit sites for all 5 are listed in `gateway_run_events.zig`
+//! (the bridge module) and `gateway.zig` (the raw emit fallback path).
+//! When adding a new structured event with rich JSON payload, promote
+//! it to `RunEvent` here. When adding a thin transport-only frame,
+//! add it to the list above so the schema stays honest (§14.5).
 
 const std = @import("std");
 
@@ -133,6 +164,14 @@ pub const DonePayload = struct {
     /// as a per-turn "cost" pill + lifetime session total.
     turn_weight: ?u64 = null,
     session_weight: ?u64 = null,
+    /// 2026-05-25 (Wave 5 surface-audit fix) — true when the turn ran
+    /// tools but produced no user-visible reply (the agent finished
+    /// in a tool-only state). The FE renders this as a "no reply, but
+    /// X tools fired" indicator instead of an empty bubble. Mirrors
+    /// the literal field the gateway already writes inline at the
+    /// done frame; promoting it to the schema closes the §14.5
+    /// schema-vs-wire honesty gap surfaced in the surface audit.
+    tool_only_turn: ?bool = null,
 };
 
 /// Wave 2C — artifact side-panel event. Fired when artifact_create
@@ -395,6 +434,9 @@ pub fn toSseFrame(allocator: std.mem.Allocator, event: RunEvent) ![]u8 {
             if (p.session_weight) |sw| {
                 try w.print(",\"session_weight\":{d}", .{sw});
             }
+            if (p.tool_only_turn) |tot| {
+                try w.print(",\"tool_only_turn\":{s}", .{if (tot) "true" else "false"});
+            }
             try writeOptionalStringField(w, "run_id", p.run_id);
             try w.writeAll("}");
         },
@@ -454,8 +496,14 @@ fn writeOptionalStringArrayField(writer: anytype, field_name: []const u8, value:
 
 // ── Tests ────────────────────────────────────────────────────────────
 
-test "RunEventType has exactly 11 variants" {
+test "RunEventType has exactly 11 structured variants" {
     // Wave 2C adds artifact_event (+1 over the prior 10).
+    //
+    // The wire SSE surface is LARGER than this enum — the gateway also
+    // emits 5 transport-only kinds (`token`, `error`, `audio_reply`,
+    // `subagent_completion`, `tool_only_summary`) that intentionally
+    // sit outside this tagged union. See the module-level doc block.
+    // Total wire-visible kinds = 11 structured + 5 transport-only = 16.
     const fields = @typeInfo(RunEventType).@"enum".fields;
     try std.testing.expectEqual(@as(usize, 11), fields.len);
 }
@@ -639,6 +687,38 @@ test "toSseFrame for done event" {
     try std.testing.expect(std.mem.startsWith(u8, frame, "event: done\n"));
     try std.testing.expect(std.mem.indexOf(u8, frame, "\"session_id\":\"s1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "\"usage_tokens\":1500") != null);
+}
+
+test "toSseFrame for done emits tool_only_turn when set" {
+    // Wave 5 surface-audit fix — DonePayload now declares
+    // tool_only_turn explicitly. Lock the wire shape so the
+    // schema and gateway stay in sync.
+    const allocator = std.testing.allocator;
+    const frame = try toSseFrame(allocator, RunEvent{ .done = .{
+        .session_id = "s1",
+        .tool_only_turn = true,
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"tool_only_turn\":true") != null);
+}
+
+test "toSseFrame for done omits tool_only_turn when null" {
+    const allocator = std.testing.allocator;
+    const frame = try toSseFrame(allocator, RunEvent{ .done = .{
+        .session_id = "s1",
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "tool_only_turn") == null);
+}
+
+test "toSseFrame for done emits tool_only_turn false explicitly" {
+    const allocator = std.testing.allocator;
+    const frame = try toSseFrame(allocator, RunEvent{ .done = .{
+        .session_id = "s1",
+        .tool_only_turn = false,
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"tool_only_turn\":false") != null);
 }
 
 test "toSseFrame truncates output_preview to 256 chars" {
