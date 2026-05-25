@@ -288,6 +288,16 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
 const AUTH_READ_DEADLINE_NS: i128 = 30 * std.time.ns_per_s;
 const READ_RETRY_SLEEP_NS: u64 = 10 * std.time.ns_per_ms;
 
+/// META HIGH #1 (2026-05-25) — overall connection-age deadline for the
+/// pre-auth window. A peer that completes the WS upgrade then sends
+/// one tiny ping every 25s while never sending the auth frame would
+/// otherwise hold a gateway slot forever. Track elapsed time from
+/// the 101 ACK to auth_ack; if `> AUTH_WINDOW_DEADLINE_NS`, close-
+/// 1008 with `auth_window_exceeded`. 60s is wide enough for slow
+/// proxies + manual paste of a token, but bounded enough to defeat
+/// slow-loris.
+pub const AUTH_WINDOW_DEADLINE_NS: i128 = 60 * std.time.ns_per_s;
+
 fn readExact(stream: anytype, buf: []u8) !void {
     var total: usize = 0;
     const start = std.time.nanoTimestamp();
@@ -423,9 +433,26 @@ pub fn handleUpgrade(stream: anytype, ctx: UpgradeContext) UpgradeOutcome {
     defer arena.deinit();
     const ra = arena.allocator();
 
-    const auth_frame = waitForAuthFrame(ra, stream) catch |err| {
-        log.warn("extension_ws: auth-window read failed: {}", .{err});
-        return .io_error;
+    // META HIGH #1: stamp the start of the auth window so
+    // waitForAuthFrame can enforce the overall deadline.
+    const auth_window_start = std.time.nanoTimestamp();
+    const auth_frame = waitForAuthFrame(ra, stream, auth_window_start) catch |err| switch (err) {
+        // META HIGH #1: distinguish the "we ran out the window"
+        // close from the generic I/O failure. Send a close-1008
+        // with a clear reason so an operator (or the extension's
+        // popup) sees the diagnosis.
+        error.AuthWindowExceeded => {
+            log.warn("extension_ws: auth window exceeded ({d}s) — closing 1008", .{
+                @divTrunc(AUTH_WINDOW_DEADLINE_NS, std.time.ns_per_s),
+            });
+            writeText(ra, stream, "{\"type\":\"auth_ack\",\"ok\":false,\"error\":\"auth_window_exceeded\"}") catch {};
+            writeClose(ra, stream, 1008) catch {};
+            return .auth_failed;
+        },
+        else => {
+            log.warn("extension_ws: auth-window read failed: {}", .{err});
+            return .io_error;
+        },
     } orelse {
         // Peer closed without sending auth.
         return .closed_normally;
@@ -514,8 +541,17 @@ pub fn handleUpgrade(stream: anytype, ctx: UpgradeContext) UpgradeOutcome {
 /// pong frames. Returns the first text-frame payload (heap-allocated;
 /// caller frees) or null on graceful close. Errors propagate so the
 /// handler can decide whether to send `auth_ack{ok:false}` vs. just close.
-fn waitForAuthFrame(allocator: std.mem.Allocator, stream: anytype) !?[]u8 {
+///
+/// META HIGH #1: enforces the overall AUTH_WINDOW_DEADLINE_NS from
+/// `window_start`. Returns `error.AuthWindowExceeded` when the
+/// deadline elapses regardless of partial-frame progress — defeats the
+/// slow-loris pattern (1-byte-per-25s, ping-every-minute, etc.) that
+/// would otherwise hold a gateway thread forever.
+fn waitForAuthFrame(allocator: std.mem.Allocator, stream: anytype, window_start: i128) !?[]u8 {
     while (true) {
+        if (std.time.nanoTimestamp() - window_start > AUTH_WINDOW_DEADLINE_NS) {
+            return error.AuthWindowExceeded;
+        }
         const frame_opt = try readFrame(allocator, stream);
         const frame = frame_opt orelse return null;
         switch (frame.opcode) {
@@ -712,6 +748,66 @@ test "writeFrame extended length 126 uses 2-byte size field" {
     try std.testing.expectEqual(@as(u8, 126), sink.buf.items[1]); // 126 sentinel
     try std.testing.expectEqual(@as(u8, 0), sink.buf.items[2]); // high byte
     try std.testing.expectEqual(@as(u8, 200), sink.buf.items[3]); // low byte
+}
+
+// ── META HIGH #1 regression test ─────────────────────────────────────
+
+test "META HIGH #1: waitForAuthFrame returns AuthWindowExceeded after deadline" {
+    // A peer that never sends a text frame (just keeps the stream
+    // open) used to hold the read loop forever. Now: the overall
+    // window-age check fires `error.AuthWindowExceeded` and
+    // handleUpgrade closes-1008 with that reason.
+    //
+    // Test pattern: a stream whose `read` returns WouldBlock every
+    // call (the same shape as a silent peer). We claim the window
+    // started "infinity ago" so the very first deadline check
+    // trips, regardless of what readFrame does next.
+    const SilentStream = struct {
+        pub fn read(_: *@This(), _: []u8) !usize {
+            return error.WouldBlock;
+        }
+        pub fn write(_: *@This(), bytes: []const u8) !usize {
+            return bytes.len; // never called in this test, but the
+            // comptime duck-typed `writeFrame` requires the method
+            // to exist for type-check.
+        }
+    };
+    var s = SilentStream{};
+    // window_start = 0 (epoch); nanoTimestamp - 0 always > deadline.
+    const r = waitForAuthFrame(std.testing.allocator, &s, 0);
+    try std.testing.expectError(error.AuthWindowExceeded, r);
+}
+
+test "META HIGH #1: waitForAuthFrame admits frames within deadline" {
+    // Sanity check: the deadline doesn't fire for frames that arrive
+    // promptly. A stream that returns a complete text frame on the
+    // first read should produce the payload without tripping the
+    // deadline. window_start = now (the deadline is 60s out).
+    const TextStream = struct {
+        buf: []const u8,
+        pos: usize = 0,
+        pub fn read(self: *@This(), out: []u8) !usize {
+            const remaining = self.buf[self.pos..];
+            const n = @min(remaining.len, out.len);
+            @memcpy(out[0..n], remaining[0..n]);
+            self.pos += n;
+            return n;
+        }
+        pub fn write(_: *@This(), bytes: []const u8) !usize {
+            return bytes.len;
+        }
+    };
+    // A minimal RFC-6455-shaped text frame: FIN+text(0x81), masked
+    // len=4 (0x84), mask 4 bytes, payload "hi" (xored with mask).
+    var s = TextStream{ .buf = &.{
+        0x81, 0x84, // FIN+text, MASK+len=4
+        0x01, 0x02, 0x03, 0x04, // mask
+        // payload "test" XOR mask:
+        't' ^ 0x01, 'e' ^ 0x02, 's' ^ 0x03, 't' ^ 0x04,
+    } };
+    const r = try waitForAuthFrame(std.testing.allocator, &s, std.time.nanoTimestamp());
+    defer std.testing.allocator.free(r.?);
+    try std.testing.expectEqualStrings("test", r.?);
 }
 
 test "writeClose includes close code in payload" {

@@ -889,6 +889,17 @@ pub const GatewayState = struct {
     lark_account_id: []const u8 = "default",
     lark_allow_from: []const []const u8 = &.{},
     internal_service_tokens: []const []const u8 = &.{},
+    /// META CRIT #2 (2026-05-25) — per-user (token, user_id) entries
+    /// for the extension WS endpoint. Borrowed from
+    /// `cfg.gateway.extension_tokens`. The auth-validator iterates
+    /// these on every connect and IGNORES the inbound auth frame's
+    /// `user_id` field. Default empty (closed-by-default — operator
+    /// must configure at least one entry to admit any extension).
+    extension_tokens: []const @import("config_types.zig").ExtensionTokenEntry = &.{},
+    /// META CRIT #1 (2026-05-25) — hostnames that bypass the SSRF
+    /// deny check inside `extension_*` URL-accepting tools. Borrowed
+    /// from `cfg.gateway.extension_browser_allowlist`. Default empty.
+    extension_browser_allowlist: []const []const u8 = &.{},
     internal_auth_required: bool = false,
     internal_token_configured: bool = false,
     internal_token_policy_ok: bool = true,
@@ -19643,11 +19654,26 @@ fn handleAcceptedConnection(
         _ = state.extension_ws_active.fetchAdd(1, .acq_rel);
         defer _ = state.extension_ws_active.fetchSub(1, .acq_rel);
 
+        // META CRIT #2 (2026-05-25) — auth now uses per-user
+        // (token, user_id) entries. The frame's `user_id` field is
+        // ignored entirely; the gateway maps token → user_id from
+        // `state.extension_tokens`. An empty `extension_tokens` list
+        // means every auth attempt rejects (see boot warning above).
+        //
+        // We translate the config's `ExtensionTokenEntry` slice into
+        // the auth module's `TokenEntry` slice. Both shapes are
+        // identical bytes — the type-system separation exists so the
+        // auth module is testable without dragging config_types in.
+        var entries_buf: [256]extension_ws_auth.TokenEntry = undefined;
+        const ent_count = @min(state.extension_tokens.len, entries_buf.len);
+        for (state.extension_tokens[0..ent_count], 0..) |e, i| {
+            entries_buf[i] = .{ .token = e.token, .user_id = e.user_id };
+        }
         const outcome = extension_ws_server.handleUpgrade(conn.stream, .{
             .long_allocator = allocator,
             .raw_request = raw,
             .hub = state.extension_ws_hub.?,
-            .auth = .{ .tokens = state.internal_service_tokens },
+            .auth = .{ .entries = entries_buf[0..ent_count] },
         });
         if (outcome == .auth_failed) {
             _ = state.extension_ws_auth_failed_total.fetchAdd(1, .monotonic);
@@ -20377,6 +20403,8 @@ pub fn runWithRole(
             return error.SecurityConfigInvalid;
         }
         state.internal_service_tokens = cfg.gateway.internal_service_tokens;
+        state.extension_tokens = cfg.gateway.extension_tokens;
+        state.extension_browser_allowlist = cfg.gateway.extension_browser_allowlist;
         state.require_explicit_chat_stream_session_key = cfg.gateway.require_explicit_chat_stream_session_key;
         // Wave 3B — instantiate the extension WS hub when enabled.
         // Hub state is global to the process (one connection per user
@@ -20388,6 +20416,16 @@ pub fn runWithRole(
             if (hub) |h| {
                 h.* = extension_ws_hub.ExtensionWsHub.init(allocator);
                 state.extension_ws_hub = h;
+            }
+            // META CRIT #2 (2026-05-25) — without per-user tokens, the
+            // gateway is enabled but no user can authenticate. Surface
+            // the gap loudly so the operator sees it at boot rather
+            // than discovering it via "extension never connects."
+            if (cfg.gateway.extension_tokens.len == 0) {
+                log.warn(
+                    "extension_ws: enabled but `gateway.extension_tokens` is EMPTY — no extension can authenticate. Configure at least one (token, user_id) entry to admit users.",
+                    .{},
+                );
             }
         }
         state.tenant_enabled = cfg.tenant.enabled;

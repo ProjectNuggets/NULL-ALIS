@@ -23,6 +23,7 @@ pub const extension_ws = struct {
     pub const server = @import("extension_ws/server.zig");
     pub const hub = @import("extension_ws/hub.zig");
     pub const auth = @import("extension_ws/auth.zig");
+    pub const url_sanitize = @import("extension_ws/url_sanitize.zig");
 };
 
 // Phase 1: Core

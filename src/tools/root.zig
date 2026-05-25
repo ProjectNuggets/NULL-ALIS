@@ -1041,6 +1041,12 @@ pub fn allTools(
         /// pass null so the agent doesn't advertise tools that have
         /// nothing to dispatch to.
         extension_ws_hub: ?*@import("../extension_ws/hub.zig").ExtensionWsHub = null,
+        /// Wave 3B META CRITICAL — operator-controlled allowlist of
+        /// hostnames that bypass the SSRF deny check inside the
+        /// `extension_*` URL-accepting tools. Default empty
+        /// (deny-by-default). Slice's storage must outlive the agent
+        /// — the gateway-owned config block satisfies that.
+        extension_browser_allowlist: []const []const u8 = &.{},
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -1451,7 +1457,7 @@ pub fn allTools(
     // erodes tool-selection quality on the surrounding tools (§14.7).
     if (opts.extension_ws_hub) |hub| {
         const ent = try allocator.create(extension_navigate.ExtensionNavigateTool);
-        ent.* = .{ .hub = hub };
+        ent.* = .{ .hub = hub, .url_allowlist = opts.extension_browser_allowlist };
         try list.append(allocator, ent.tool());
     }
 

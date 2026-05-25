@@ -1,44 +1,93 @@
 //! Token validation for the extension WebSocket endpoint.
 //!
-//! For v1, we reuse the same `internal_service_tokens` surface the
-//! gateway's `/api/v1/chat/stream` endpoint uses (see
-//! `gateway.validateInternalServiceToken`). The auth frame's `token`
-//! field is compared against the configured list; on a match the
-//! frame's `user_id` field (or, fallback, the validator's
-//! `default_user_id`) becomes the connection's identity.
+//! META CRITICAL #2 (2026-05-25) — per-user tokens.
 //!
-//! This keeps the v1 deployment story simple: the same secret that
-//! authenticates the BFF→gateway chat stream also authenticates the
-//! extension's outbound socket. A future iteration can split the
-//! surfaces (per-extension API keys, OIDC bearer, etc.) by swapping
-//! the `AuthValidator` instance without touching the server pipeline.
+//! Prior model: a shared `internal_service_tokens` list authenticated
+//! every extension, and the frame's `user_id` field was trusted. Any
+//! holder of any token could authenticate as any user_id by setting
+//! the frame field — cross-tenant impersonation. A user who
+//! exfiltrated THEIR OWN token from their own `chrome.storage.local`
+//! could connect as Alice and receive every `extension_*` command the
+//! agent dispatched on Alice's behalf.
+//!
+//! New model: operators provision a UNIQUE token per user. Each token
+//! maps to exactly one user_id. The auth frame's `user_id` field is
+//! IGNORED — the gateway returns the mapped `user_id` from the entry
+//! that matched the inbound token.
+//!
+//! For single-tenant deployments (one user, one extension) the
+//! operator still configures one entry with that user's id; the API
+//! is the same. There is no path that falls back to the legacy
+//! shared-token model; if `entries` is empty, every auth attempt
+//! rejects with `invalid_token` and the operator sees an explicit
+//! warning at gateway boot.
+//!
+//! Side-channel: the validator iterates ALL entries and performs a
+//! constant-time compare on each. This avoids leaking via timing
+//! which token (or even WHETHER any token) matched. An attacker
+//! probing the token-space sees one indistinguishable rejection per
+//! attempt regardless of how close they got.
 
 const std = @import("std");
 
+/// One operator-provisioned token + the user_id it authenticates as.
+/// Mirrors `config_types.ExtensionTokenEntry` — kept here as a
+/// distinct type so the auth module is testable without dragging the
+/// gateway config tree into the test binary.
+pub const TokenEntry = struct {
+    token: []const u8,
+    user_id: []const u8,
+};
+
 pub const AuthDecision = struct {
     ok: bool,
-    /// On success, the user_id the connection registers under in the
-    /// hub. On failure, null.
+    /// On success, the SERVER-derived user_id (from the matching
+    /// `TokenEntry`). On failure, null. NEVER reflects the inbound
+    /// auth frame's `user_id` field.
     user_id: ?[]const u8 = null,
-    /// On failure, a short machine-readable reason (`"invalid_token"`,
-    /// `"missing_user_id"`, `"malformed_auth_frame"`). Lands in the
+    /// On failure, a short machine-readable reason
+    /// (`"invalid_token"`, `"auth_frame_too_large"`,
+    /// `"malformed_auth_frame"`). Lands in the
     /// `auth_ack{ok:false, error}` envelope verbatim — keep it
     /// alphanumeric-and-underscores so popup-rendering stays simple.
     reason: ?[]const u8 = null,
 };
 
+/// META HIGH #2 (2026-05-25) — explicit size cap on auth-frame JSON,
+/// surfaced as a distinct rejection reason so operators can
+/// distinguish "someone hammering us with junk" from "someone has a
+/// malformed extension build."
+///
+/// 4 KB is plenty for the contract's three-field auth frame (token +
+/// extension_version + optional user_id). A real JWT can push past
+/// this; v2 will lift it when JWTs become the token shape. For now,
+/// over-4KB → distinct reason instead of being conflated with
+/// "malformed JSON" inside the parser's OutOfMemory return.
+pub const MAX_AUTH_FRAME_BYTES: usize = 4 * 1024;
+
 /// Stateless validator: given an auth frame JSON payload, decides
-/// whether to admit the connection.
+/// whether to admit the connection AND which user_id to register
+/// under.
 pub const AuthValidator = struct {
-    /// Configured tokens; matches gateway `internal_service_tokens`.
-    /// Empty list ⇒ reject everything (closed-by-default).
-    tokens: []const []const u8,
+    /// Configured (token, user_id) entries. Empty list ⇒ reject
+    /// everything (closed-by-default — operator must configure at
+    /// least one entry to admit any extension).
+    entries: []const TokenEntry,
 
     pub fn validate(self: AuthValidator, auth_frame_json: []const u8) AuthDecision {
+        // META HIGH #2: distinguish "frame is huge garbage" from "frame
+        // is small but malformed." Operators chasing a DoS see the
+        // size-blocked reason; operators chasing a stale extension
+        // build see the parser reason.
+        if (auth_frame_json.len > MAX_AUTH_FRAME_BYTES) {
+            return .{ .ok = false, .reason = "auth_frame_too_large" };
+        }
+
         // Parse with a stack-bounded arena so the validator can be
         // called from any thread without involving a long-lived
-        // allocator. 8 KB is plenty for the contract's three-field
-        // auth frame (token + extension_version + optional user_id).
+        // allocator. 8 KB FBA — strictly larger than the
+        // MAX_AUTH_FRAME_BYTES cap above, with headroom for the
+        // parser's own internal book-keeping.
         var buf: [8 * 1024]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&buf);
         var parsed = std.json.parseFromSlice(
@@ -69,51 +118,42 @@ pub const AuthValidator = struct {
             else => return .{ .ok = false, .reason = "invalid_token" },
         };
 
-        if (!matchesAnyToken(token_str, self.tokens)) {
-            return .{ .ok = false, .reason = "invalid_token" };
+        // Iterate ALL entries with a constant-time compare per entry.
+        // Do NOT short-circuit on first match: short-circuiting would
+        // let an attacker measure which token slot matched (the loop
+        // body's branch latency leaks). Iterate all, accumulate the
+        // matching index, ignore the inbound user_id.
+        var matched_idx: ?usize = null;
+        for (self.entries, 0..) |entry, i| {
+            // constantTimeEql also short-circuits on length mismatch.
+            // Length is not secret in v1 (the operator chose the token
+            // length); see MEDIUM #6 in the meta-review for the v2
+            // flag.
+            if (constantTimeEql(entry.token, token_str)) {
+                // Don't break — keep iterating so an attacker can't
+                // time-attack "which slot did I hit." We still
+                // capture the matched index.
+                if (matched_idx == null) matched_idx = i;
+            }
         }
 
-        // The extension contract DOES NOT mandate a `user_id` in the
-        // auth frame — the gateway resolves identity from the
-        // `X-Zaki-User-Id` header on standard HTTP. For WS we don't
-        // have headers post-upgrade, so we let the auth frame include
-        // a `user_id` field. Without one, fall through to
-        // `missing_user_id` so operators see the gap explicitly.
-        const user_id_val = obj.get("user_id") orelse return .{ .ok = false, .reason = "missing_user_id" };
-        const user_id_str = switch (user_id_val) {
-            .string => |s| s,
-            else => return .{ .ok = false, .reason = "missing_user_id" },
-        };
-        if (user_id_str.len == 0) return .{ .ok = false, .reason = "missing_user_id" };
+        if (matched_idx) |idx| {
+            // SERVER-derived user_id. The inbound frame's user_id
+            // field is ignored entirely — that's the whole point of
+            // CRIT #2's fix.
+            return .{ .ok = true, .user_id = self.entries[idx].user_id };
+        }
 
-        // The user_id slice points into the parsed arena — but the
-        // arena is going to be reclaimed when we return. We can't
-        // return a borrowed slice. The caller (server.handleUpgrade)
-        // must dupe before storing. To make that work cleanly without
-        // a callback, we return a *parsed* sub-slice that lives only
-        // for the immediate `if (decision.ok)` block, and require the
-        // caller to copy out before the next call.
-        //
-        // In practice the caller takes `decision.user_id` and
-        // immediately passes it to `hub.registerConn`, which dupes
-        // before storing. The slice is valid for that single sync
-        // call, which is the existing contract for `extractHeader`
-        // and friends.
-        return .{ .ok = true, .user_id = user_id_str };
+        // Don't reveal whether the token was unknown vs malformed-
+        // shape; the user sees one indistinguishable rejection.
+        return .{ .ok = false, .reason = "invalid_token" };
     }
 };
 
-fn matchesAnyToken(candidate: []const u8, tokens: []const []const u8) bool {
-    for (tokens) |t| {
-        if (constantTimeEql(t, candidate)) return true;
-    }
-    return false;
-}
-
-/// Constant-time token comparison. Avoids leaking secret length match
-/// progress via early-exit timing. Standard library `crypto.timing_safe`
-/// requires fixed-length slices; we early-exit on length mismatch
-/// (which is fine — the LENGTH isn't secret, only the bytes are).
+/// Constant-time token comparison. Avoids leaking secret-byte match
+/// progress via early-exit timing. We early-exit on length mismatch
+/// (MEDIUM #6: length isn't secret for the v1 operator-chosen-string
+/// token model; flag for review when v2 JWT tokens land).
 fn constantTimeEql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     var diff: u8 = 0;
@@ -125,51 +165,78 @@ fn constantTimeEql(a: []const u8, b: []const u8) bool {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
-test "AuthValidator accepts valid token + user_id" {
-    const v = AuthValidator{ .tokens = &.{"sekrit-1"} };
+test "AuthValidator accepts valid token; returns MAPPED user_id (ignores frame's)" {
+    const entries = [_]TokenEntry{
+        .{ .token = "tok-alice", .user_id = "alice" },
+        .{ .token = "tok-bob", .user_id = "bob" },
+    };
+    const v = AuthValidator{ .entries = &entries };
     const auth =
-        \\{"type":"auth","token":"sekrit-1","user_id":"alice","extension_version":"0.1.0"}
+        \\{"type":"auth","token":"tok-alice","user_id":"i-claim-to-be-bob","extension_version":"0.1.0"}
     ;
     const d = v.validate(auth);
     try std.testing.expect(d.ok);
+    // The MAPPED user_id is alice — the frame's "i-claim-to-be-bob"
+    // is ignored.
     try std.testing.expectEqualStrings("alice", d.user_id.?);
     try std.testing.expect(d.reason == null);
 }
 
+test "META CRIT #2: frame's user_id is IGNORED even when missing" {
+    const entries = [_]TokenEntry{
+        .{ .token = "tok-alice", .user_id = "alice" },
+    };
+    const v = AuthValidator{ .entries = &entries };
+    // No user_id field at all — under the new model, that's fine
+    // because the gateway derives it from the token entry.
+    const auth =
+        \\{"type":"auth","token":"tok-alice","extension_version":"0.1.0"}
+    ;
+    const d = v.validate(auth);
+    try std.testing.expect(d.ok);
+    try std.testing.expectEqualStrings("alice", d.user_id.?);
+}
+
+test "META CRIT #2: cross-tenant impersonation is impossible" {
+    // The exfiltrated-token attack: a holder of tok-alice tries to
+    // pose as bob by setting the frame's user_id="bob". Pre-fix this
+    // returned ok=true with user_id="bob". Post-fix: ok=true with
+    // user_id="alice" (the MAPPED value).
+    const entries = [_]TokenEntry{
+        .{ .token = "tok-alice", .user_id = "alice" },
+        .{ .token = "tok-bob", .user_id = "bob" },
+    };
+    const v = AuthValidator{ .entries = &entries };
+    const auth =
+        \\{"type":"auth","token":"tok-alice","user_id":"bob"}
+    ;
+    const d = v.validate(auth);
+    try std.testing.expect(d.ok);
+    try std.testing.expectEqualStrings("alice", d.user_id.?);
+    try std.testing.expect(!std.mem.eql(u8, d.user_id.?, "bob"));
+}
+
 test "AuthValidator rejects wrong token" {
-    const v = AuthValidator{ .tokens = &.{"sekrit-1"} };
+    const entries = [_]TokenEntry{
+        .{ .token = "tok-alice", .user_id = "alice" },
+    };
+    const v = AuthValidator{ .entries = &entries };
     const auth =
         \\{"type":"auth","token":"bogus","user_id":"alice","extension_version":"0.1.0"}
     ;
     const d = v.validate(auth);
     try std.testing.expect(!d.ok);
     try std.testing.expectEqualStrings("invalid_token", d.reason.?);
-}
-
-test "AuthValidator rejects missing user_id" {
-    const v = AuthValidator{ .tokens = &.{"sekrit-1"} };
-    const auth =
-        \\{"type":"auth","token":"sekrit-1","extension_version":"0.1.0"}
-    ;
-    const d = v.validate(auth);
-    try std.testing.expect(!d.ok);
-    try std.testing.expectEqualStrings("missing_user_id", d.reason.?);
-}
-
-test "AuthValidator rejects empty user_id" {
-    const v = AuthValidator{ .tokens = &.{"sekrit-1"} };
-    const auth =
-        \\{"type":"auth","token":"sekrit-1","user_id":"","extension_version":"0.1.0"}
-    ;
-    const d = v.validate(auth);
-    try std.testing.expect(!d.ok);
-    try std.testing.expectEqualStrings("missing_user_id", d.reason.?);
+    try std.testing.expect(d.user_id == null);
 }
 
 test "AuthValidator rejects wrong frame type" {
-    const v = AuthValidator{ .tokens = &.{"sekrit-1"} };
+    const entries = [_]TokenEntry{
+        .{ .token = "tok-alice", .user_id = "alice" },
+    };
+    const v = AuthValidator{ .entries = &entries };
     const auth =
-        \\{"type":"ping","token":"sekrit-1","user_id":"alice"}
+        \\{"type":"ping","token":"tok-alice","user_id":"alice"}
     ;
     const d = v.validate(auth);
     try std.testing.expect(!d.ok);
@@ -177,30 +244,71 @@ test "AuthValidator rejects wrong frame type" {
 }
 
 test "AuthValidator rejects malformed JSON" {
-    const v = AuthValidator{ .tokens = &.{"sekrit-1"} };
+    const entries = [_]TokenEntry{
+        .{ .token = "tok-alice", .user_id = "alice" },
+    };
+    const v = AuthValidator{ .entries = &entries };
     const d = v.validate("not json at all");
     try std.testing.expect(!d.ok);
     try std.testing.expectEqualStrings("malformed_auth_frame", d.reason.?);
 }
 
-test "AuthValidator rejects empty token list" {
-    const v = AuthValidator{ .tokens = &.{} };
+test "META CRIT #2: empty entries list → every token is invalid" {
+    const v = AuthValidator{ .entries = &.{} };
     const auth =
         \\{"type":"auth","token":"anything","user_id":"alice"}
     ;
     const d = v.validate(auth);
     try std.testing.expect(!d.ok);
     try std.testing.expectEqualStrings("invalid_token", d.reason.?);
+    try std.testing.expect(d.user_id == null);
 }
 
-test "AuthValidator matches one of several configured tokens" {
-    const v = AuthValidator{ .tokens = &.{ "alpha", "beta", "gamma" } };
+test "AuthValidator matches the right user_id among several entries" {
+    const entries = [_]TokenEntry{
+        .{ .token = "alpha", .user_id = "u1" },
+        .{ .token = "beta", .user_id = "u2" },
+        .{ .token = "gamma", .user_id = "u3" },
+    };
+    const v = AuthValidator{ .entries = &entries };
     const auth =
-        \\{"type":"auth","token":"beta","user_id":"alice"}
+        \\{"type":"auth","token":"beta","user_id":"i-claim-to-be-anyone"}
     ;
     const d = v.validate(auth);
     try std.testing.expect(d.ok);
-    try std.testing.expectEqualStrings("alice", d.user_id.?);
+    try std.testing.expectEqualStrings("u2", d.user_id.?);
+}
+
+test "META HIGH #2: oversized auth frame returns auth_frame_too_large" {
+    const entries = [_]TokenEntry{
+        .{ .token = "tok", .user_id = "alice" },
+    };
+    const v = AuthValidator{ .entries = &entries };
+
+    // Build a frame larger than MAX_AUTH_FRAME_BYTES.
+    var buf: [MAX_AUTH_FRAME_BYTES + 100]u8 = undefined;
+    @memset(&buf, 'x');
+    const d = v.validate(&buf);
+    try std.testing.expect(!d.ok);
+    try std.testing.expectEqualStrings("auth_frame_too_large", d.reason.?);
+}
+
+test "META HIGH #2: a 1MB junk blob returns auth_frame_too_large, NOT malformed" {
+    // Operator-visible distinction: huge payload should NOT be
+    // logged as "malformed extension build" — it's likely DoS.
+    const entries = [_]TokenEntry{
+        .{ .token = "tok", .user_id = "alice" },
+    };
+    const v = AuthValidator{ .entries = &entries };
+
+    // 1 MB of garbage. We allocate on the heap for this one because
+    // a 1 MB stack array is iffy in a test runner.
+    const big = std.testing.allocator.alloc(u8, 1024 * 1024) catch unreachable;
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    const d = v.validate(big);
+    try std.testing.expect(!d.ok);
+    try std.testing.expectEqualStrings("auth_frame_too_large", d.reason.?);
 }
 
 test "constantTimeEql length mismatch returns false" {

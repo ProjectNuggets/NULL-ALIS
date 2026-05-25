@@ -21,6 +21,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const hub_mod = @import("../extension_ws/hub.zig");
+const url_sanitize = @import("../extension_ws/url_sanitize.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
@@ -36,6 +37,12 @@ pub const ExtensionNavigateTool = struct {
     hub: *hub_mod.ExtensionWsHub,
     user_id: ?[]const u8 = null,
     timeout_ms: u64 = hub_mod.DEFAULT_COMMAND_TIMEOUT_MS,
+    /// Operator-controlled SSRF allowlist. Default empty (deny all
+    /// non-public hosts). Borrowed from `GatewayConfig.extension_browser_allowlist`
+    /// at tool registration time. The slice's underlying storage must
+    /// outlive every tool invocation — guaranteed by the gateway's
+    /// long-lived config block.
+    url_allowlist: []const []const u8 = &.{},
 
     pub const tool_name = "extension_navigate";
 
@@ -85,8 +92,24 @@ pub const ExtensionNavigateTool = struct {
     pub fn execute(self: *ExtensionNavigateTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const url = root.getString(args, "url") orelse return ToolResult.fail("missing 'url' parameter");
         if (url.len == 0) return ToolResult.fail("'url' must be a non-empty string");
-        if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
-            return ToolResult.fail("'url' must be an absolute http:// or https:// URL");
+
+        // SSRF defense FIRST — before any hub dispatch. Mirrors the
+        // playwright-mcp sanitizer for the server-side browser; this
+        // path closes the same bypass classes for the USER-side
+        // browser (cloud metadata, RFC1918, loopback, IPv6 link-local,
+        // IPv4-mapped IPv6, decimal/hex-encoded IPs, localhost.
+        // trailing-dot aliases, etc.). Operator escape: a hostname in
+        // `extension_browser_allowlist` skips the deny check.
+        switch (url_sanitize.sanitize(url, self.url_allowlist)) {
+            .ok => {},
+            .reject => |rj| {
+                const msg = try std.fmt.allocPrint(
+                    allocator,
+                    "url blocked by SSRF defense [{s}]: {s}",
+                    .{ rj.reason.toString(), rj.detail },
+                );
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            },
         }
 
         const user_id = self.user_id orelse return ToolResult.fail("extension_navigate not bound to a user (gateway-side wiring bug)");
@@ -116,6 +139,9 @@ pub const ExtensionNavigateTool = struct {
             error.NoExtensionConnected => return ToolResult.fail("no extension connected for this user. Ask the user to open the nullalis extension popup and connect."),
             error.Timeout => return ToolResult.fail("extension did not respond within the timeout window. The user's browser may be unresponsive or the extension may have disconnected."),
             error.ConnectionClosed => return ToolResult.fail("extension connection closed before the navigation completed. Ask the user to reconnect the extension."),
+            // META HIGH #3: distinguish OOM from connection-closed so
+            // operators see the real cause in the surfaced error.
+            error.ResultDeliveryOom => return ToolResult.fail("gateway ran out of memory delivering the extension result — please retry; if persistent, check the gateway's available RAM."),
             else => |e| {
                 const msg = try std.fmt.allocPrint(allocator, "extension_navigate dispatch failed: {s}", .{@errorName(e)});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
@@ -228,8 +254,107 @@ test "extension_navigate rejects non-http scheme" {
     const parsed = try root.parseTestArgs("{\"url\":\"file:///etc/passwd\"}");
     defer parsed.deinit();
     const result = try nav.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |m| std.testing.allocator.free(m);
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "http") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "scheme_blocked") != null);
+}
+
+// ── META CRITICAL #1 regression tests: SSRF defense at tool boundary ──
+//
+// Each of these used to be ACCEPTED by the prior `startsWith("http://")`
+// check — the tool happily handed them to `hub.sendCommand` which
+// would dispatch the navigation to the user's REAL browser. Now they
+// hit the sanitizer first and surface a scheme-typed rejection.
+
+test "META CRIT #1: extension_navigate blocks cloud metadata 169.254.169.254" {
+    var hub = hub_mod.ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    var nav = ExtensionNavigateTool{ .hub = &hub, .user_id = "alice", .timeout_ms = 50 };
+    const parsed = try root.parseTestArgs("{\"url\":\"http://169.254.169.254/latest/meta-data/\"}");
+    defer parsed.deinit();
+    const result = try nav.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |m| std.testing.allocator.free(m);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "metadata_endpoint_blocked") != null);
+}
+
+test "META CRIT #1: extension_navigate blocks IPv4-mapped IPv6 metadata" {
+    var hub = hub_mod.ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    var nav = ExtensionNavigateTool{ .hub = &hub, .user_id = "alice", .timeout_ms = 50 };
+    const parsed = try root.parseTestArgs("{\"url\":\"http://[::ffff:169.254.169.254]/\"}");
+    defer parsed.deinit();
+    const result = try nav.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |m| std.testing.allocator.free(m);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "metadata_endpoint_blocked") != null);
+}
+
+test "META CRIT #1: extension_navigate blocks 192.168.1.1 RFC1918" {
+    var hub = hub_mod.ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    var nav = ExtensionNavigateTool{ .hub = &hub, .user_id = "alice", .timeout_ms = 50 };
+    const parsed = try root.parseTestArgs("{\"url\":\"http://192.168.1.1/admin\"}");
+    defer parsed.deinit();
+    const result = try nav.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |m| std.testing.allocator.free(m);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "private_ip_blocked") != null);
+}
+
+test "META CRIT #1: extension_navigate blocks localhost. trailing dot" {
+    var hub = hub_mod.ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    var nav = ExtensionNavigateTool{ .hub = &hub, .user_id = "alice", .timeout_ms = 50 };
+    const parsed = try root.parseTestArgs("{\"url\":\"http://localhost./admin\"}");
+    defer parsed.deinit();
+    const result = try nav.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |m| std.testing.allocator.free(m);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "loopback_blocked") != null);
+}
+
+test "META CRIT #1: extension_navigate blocks decimal-encoded private IP" {
+    var hub = hub_mod.ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    var nav = ExtensionNavigateTool{ .hub = &hub, .user_id = "alice", .timeout_ms = 50 };
+    const parsed = try root.parseTestArgs("{\"url\":\"http://3232235521/\"}");
+    defer parsed.deinit();
+    const result = try nav.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |m| std.testing.allocator.free(m);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "private_ip_blocked") != null);
+}
+
+test "META CRIT #1: extension_navigate blocks hex-encoded loopback" {
+    var hub = hub_mod.ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    var nav = ExtensionNavigateTool{ .hub = &hub, .user_id = "alice", .timeout_ms = 50 };
+    const parsed = try root.parseTestArgs("{\"url\":\"http://0x7F000001/\"}");
+    defer parsed.deinit();
+    const result = try nav.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |m| std.testing.allocator.free(m);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "loopback_blocked") != null);
+}
+
+test "META CRIT #1: extension_navigate allowlist permits LAN service" {
+    var hub = hub_mod.ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    var nav = ExtensionNavigateTool{
+        .hub = &hub,
+        .user_id = "alice",
+        .timeout_ms = 50,
+        .url_allowlist = &.{"192.168.1.1"},
+    };
+    const parsed = try root.parseTestArgs("{\"url\":\"http://192.168.1.1/dashboard\"}");
+    defer parsed.deinit();
+    // No extension is connected so we expect "no extension connected" —
+    // the URL itself made it past the sanitizer. That error is a
+    // static literal from ToolResult.fail, so we MUST NOT free it.
+    const result = try nav.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "no extension connected") != null);
 }
 
 test "extension_navigate without bound user returns wiring-bug error" {

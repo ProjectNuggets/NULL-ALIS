@@ -1084,6 +1084,38 @@ pub const GatewayConfig = struct {
     /// true on gateways that run alongside the production BFF so users
     /// can pair the browser extension.
     extension_ws_enabled: bool = false,
+    /// Wave 3B META CRITICAL (2026-05-25) — per-user tokens for the
+    /// extension WS endpoint. Each entry maps `token → user_id`. The
+    /// gateway IGNORES any `user_id` field in the inbound auth frame;
+    /// it returns the mapped `user_id` from the matching entry instead.
+    /// This closes the cross-tenant impersonation hole the symmetric
+    /// shared-token model left open (an attacker who exfiltrated their
+    /// own token could connect as any user_id).
+    ///
+    /// Default: empty. With `extension_ws_enabled=true` AND this list
+    /// empty, NO users can authenticate (closed-by-default). A clear
+    /// warning is logged at boot so the operator sees the gap.
+    extension_tokens: []const ExtensionTokenEntry = &.{},
+    /// Wave 3B META CRITICAL (2026-05-25) — hostnames that bypass the
+    /// SSRF deny check in `extension_navigate` (and future
+    /// `extension_*` tools that accept URLs). Use for trusted
+    /// deployments (LAN automation, internal staging) where the
+    /// operator explicitly wants the extension to drive the user's
+    /// browser at otherwise-blocked targets. Comparison is
+    /// case-insensitive; trailing dots tolerated on both sides.
+    ///
+    /// Default: empty (deny-all-non-public). Mirrors the
+    /// `PLAYWRIGHT_MCP_ALLOWLIST` env var on the server-side browser.
+    extension_browser_allowlist: []const []const u8 = &.{},
+};
+
+/// One operator-provisioned token + the user_id it authenticates as.
+/// The `token` is a static secret pasted into the user's extension;
+/// the gateway maps it back to `user_id` at auth time, ignoring
+/// whatever user_id the frame claims.
+pub const ExtensionTokenEntry = struct {
+    token: []const u8,
+    user_id: []const u8,
 };
 
 pub const TenantConfig = struct {
