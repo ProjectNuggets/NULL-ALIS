@@ -8,7 +8,14 @@
 -- share via opaque share_code.
 --
 -- Migration contract (per migrations.zig §S10.1):
---   * versioned (not idempotent — pure diff)
+--   * versioned + idempotent during the dual-path window (D62, 2026-05-25):
+--     the legacy `zaki_state.zig::migrate` inline loop ALSO creates the
+--     artifacts tables via CREATE IF NOT EXISTS so existing v1 deployments
+--     get the schema even when the migrations framework is being wired up.
+--     migrations.run() runs immediately after that inline loop, so the
+--     0002 body MUST tolerate the tables already existing. Once the
+--     inline block is deleted (follow-up after D62), this migration can
+--     drop the IF NOT EXISTS guards and become a true pure-diff entry.
 --   * applies in a single transaction (no CONCURRENTLY)
 --   * references {schema}.users(user_id) with ON DELETE CASCADE so
 --     GDPR purgeUser drops a user's artifacts automatically
@@ -29,7 +36,7 @@
 --     The DB does not enforce dedup; the application chooses whether
 --     to insert a no-change version (default: skip).
 
-CREATE TABLE {schema}.artifacts (
+CREATE TABLE IF NOT EXISTS {schema}.artifacts (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id         BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
     session_id      TEXT,
@@ -52,16 +59,16 @@ CREATE TABLE {schema}.artifacts (
     metadata_jsonb  JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
-CREATE INDEX idx_artifacts_user_updated
+CREATE INDEX IF NOT EXISTS idx_artifacts_user_updated
     ON {schema}.artifacts (user_id, updated_at_unix DESC);
 
 -- Partial index — only actively-shared rows. Saves space when most
 -- artifacts are private (the expected steady-state shape).
-CREATE INDEX idx_artifacts_share_code
+CREATE INDEX IF NOT EXISTS idx_artifacts_share_code
     ON {schema}.artifacts (share_code)
     WHERE share_code IS NOT NULL;
 
-CREATE TABLE {schema}.artifact_versions (
+CREATE TABLE IF NOT EXISTS {schema}.artifact_versions (
     id                  BIGSERIAL PRIMARY KEY,
     artifact_id         UUID NOT NULL REFERENCES {schema}.artifacts(id) ON DELETE CASCADE,
     version             BIGINT NOT NULL,
@@ -74,5 +81,5 @@ CREATE TABLE {schema}.artifact_versions (
     UNIQUE (artifact_id, version)
 );
 
-CREATE INDEX idx_artifact_versions_artifact_version
+CREATE INDEX IF NOT EXISTS idx_artifact_versions_artifact_version
     ON {schema}.artifact_versions (artifact_id, version DESC);

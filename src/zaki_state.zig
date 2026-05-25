@@ -36,6 +36,7 @@ pub const SessionInfo = struct {
 const pg_helpers = @import("memory/engines/postgres.zig");
 const zaki_session = @import("session/root.zig");
 const lane_metrics = @import("lane_metrics.zig");
+const migrations = @import("migrations.zig");
 const log = std.log.scoped(.zaki_state);
 
 const c = if (build_options.enable_postgres) @cImport({
@@ -2278,7 +2279,195 @@ const ManagerImpl = struct {
             const result = try self.execMigrateStatement(template, query);
             if (result) |pg_result| c.PQclear(pg_result);
         }
+
+        // ── D62 (2026-05-25) — wire src/migrations.zig framework ──────
+        //
+        // After the legacy idempotent loop above has bootstrapped the
+        // schema_migrations tracker (v1 row inserted via ON CONFLICT
+        // DO NOTHING), invoke the versioned-migration framework so any
+        // 0002+ entries land through it with full version-tracking
+        // semantics (transactional apply + once-per-DB enforcement).
+        //
+        // Why this runs AFTER the legacy loop, not instead of it:
+        //   - 0001's full DDL is already covered by the legacy loop
+        //     (idempotent CREATE IF NOT EXISTS guards).
+        //   - migrations.run() sees v=1 already applied → skips 0001
+        //     body, applies 0002+ once.
+        //   - Failures here surface (no canIgnoreMigrateError swallow);
+        //     0002_artifacts.sql is idempotent for the dual-path window
+        //     so the framework can safely re-create tables the inline
+        //     loop already made.
+        //
+        // Once the inline artifacts block (lines ~2240+) is deleted in a
+        // follow-up commit, the framework becomes the sole creator for
+        // 0002+ tables and 0002_artifacts.sql can drop its IF NOT EXISTS
+        // guards to become a true pure-diff migration.
+        try migrationsRunForManager(self);
     }
+
+    /// D62 adapter glue: build a `migrations.RunnerContext` that wraps
+    /// this Manager's connection-pool primitives + `{schema}`-substituting
+    /// `buildQuery`, then invoke `migrations.run()`. Extracted so tests can
+    /// exercise the wiring independently of the legacy loop and so the
+    /// adapter struct (which holds transient transaction state) lives in
+    /// its own stack frame.
+    fn migrationsRunForManager(self: *Self) !void {
+        var adapter = MigrationsAdapter{ .mgr = self };
+        defer adapter.deinit();
+        try migrations.run(adapter.context());
+    }
+
+    /// D62 adapter: maps `migrations.RunnerContext`'s 7-callback vtable
+    /// onto this Manager's `exec` / `beginTransaction` / `buildQuery`
+    /// primitives. A single instance is created per `migrate()` call
+    /// and owns at most one in-flight `TxnLease` between `begin` and
+    /// `commit`/`rollback`. Connection pinning is mandatory: BEGIN on
+    /// conn-X is meaningless on conn-Y, so the same TxnLease handles
+    /// every `exec` and `recordApplied` issued inside the transaction.
+    const MigrationsAdapter = struct {
+        mgr: *Self,
+        /// Pinned-connection lease populated by `begin`, consumed by
+        /// `commit` / `rollback`. Null outside of a transaction (the
+        /// runner execs the schema_migrations DDL + the `isApplied`
+        /// SELECTs auto-committed on a one-shot pool connection).
+        txn: ?TxnLease = null,
+
+        fn deinit(self: *MigrationsAdapter) void {
+            // Defensive: if a transaction is still open when the
+            // adapter is torn down (e.g. runner panicked between begin
+            // and commit), roll it back so the pool conn isn't poisoned.
+            if (self.txn) |*t| t.deinit();
+        }
+
+        fn context(self: *MigrationsAdapter) migrations.RunnerContext {
+            return .{
+                .exec = execImpl,
+                .begin = beginImpl,
+                .commit = commitImpl,
+                .rollback = rollbackImpl,
+                .isApplied = isAppliedImpl,
+                .recordApplied = recordAppliedImpl,
+                .buildQuery = buildQueryImpl,
+                .freeQuery = freeQueryImpl,
+                .ctx = @ptrCast(self),
+            };
+        }
+
+        fn execImpl(ctx: *anyopaque, query: []const u8) anyerror!void {
+            const self: *MigrationsAdapter = @ptrCast(@alignCast(ctx));
+            if (self.txn) |*t| {
+                const result = try t.exec(query);
+                c.PQclear(result);
+            } else {
+                const result = try self.mgr.exec(query);
+                c.PQclear(result);
+            }
+        }
+
+        fn beginImpl(ctx: *anyopaque) anyerror!void {
+            const self: *MigrationsAdapter = @ptrCast(@alignCast(ctx));
+            if (self.txn != null) return error.NestedTransactionNotSupported;
+            self.txn = try self.mgr.beginTransaction();
+        }
+
+        fn commitImpl(ctx: *anyopaque) anyerror!void {
+            const self: *MigrationsAdapter = @ptrCast(@alignCast(ctx));
+            if (self.txn) |*t| {
+                try t.commit();
+                self.txn = null;
+            }
+        }
+
+        fn rollbackImpl(ctx: *anyopaque) anyerror!void {
+            const self: *MigrationsAdapter = @ptrCast(@alignCast(ctx));
+            if (self.txn) |*t| {
+                t.rollback();
+                self.txn = null;
+            }
+        }
+
+        fn isAppliedImpl(ctx: *anyopaque, version: u32) anyerror!bool {
+            const self: *MigrationsAdapter = @ptrCast(@alignCast(ctx));
+            const q = try self.mgr.buildQuery(
+                "SELECT 1 FROM {schema}.schema_migrations WHERE version = $1 LIMIT 1",
+            );
+            defer self.mgr.allocator.free(q);
+
+            var ver_buf: [16]u8 = undefined;
+            const ver_s = try std.fmt.bufPrintZ(&ver_buf, "{d}", .{version});
+
+            // Use the pinned txn conn if we're already inside one (rare
+            // for isApplied, but the runner makes no guarantee about
+            // ordering). The non-txn path acquires a one-shot pool conn.
+            const result = if (self.txn) |*t|
+                try t.execParams(q, &.{ver_s.ptr}, &.{@as(c_int, @intCast(ver_s.len))})
+            else
+                try self.mgr.execParams(q, &.{ver_s.ptr}, &.{@as(c_int, @intCast(ver_s.len))});
+            defer c.PQclear(result);
+            return c.PQntuples(result) > 0;
+        }
+
+        fn recordAppliedImpl(ctx: *anyopaque, version: u32, name: []const u8) anyerror!void {
+            const self: *MigrationsAdapter = @ptrCast(@alignCast(ctx));
+            const q = try self.mgr.buildQuery(
+                "INSERT INTO {schema}.schema_migrations (version, name) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
+            );
+            defer self.mgr.allocator.free(q);
+
+            var ver_buf: [16]u8 = undefined;
+            const ver_s = try std.fmt.bufPrintZ(&ver_buf, "{d}", .{version});
+            const name_z = try self.mgr.allocator.dupeZ(u8, name);
+            defer self.mgr.allocator.free(name_z);
+
+            // Must run on the pinned txn conn when one is open so the
+            // version-row insert rolls back atomically with the DDL.
+            // The runner ALWAYS calls recordApplied while a transaction
+            // is open for transactional migrations; for concurrent_only
+            // migrations the runner wraps recordApplied in its own
+            // begin/commit pair, so the txn lease is set then too.
+            if (self.txn) |*t| {
+                const result = try t.execParams(
+                    q,
+                    &.{ ver_s.ptr, name_z.ptr },
+                    &.{ @as(c_int, @intCast(ver_s.len)), @as(c_int, @intCast(name.len)) },
+                );
+                c.PQclear(result);
+            } else {
+                // Defensive fallback — the runner contract has it always
+                // call recordApplied inside a transaction, but tolerate
+                // a stray call so we don't lose the version marker.
+                const result = try self.mgr.execParams(
+                    q,
+                    &.{ ver_s.ptr, name_z.ptr },
+                    &.{ @as(c_int, @intCast(ver_s.len)), @as(c_int, @intCast(name.len)) },
+                );
+                c.PQclear(result);
+            }
+        }
+
+        fn buildQueryImpl(ctx: *anyopaque, template: []const u8) anyerror![]const u8 {
+            const self: *MigrationsAdapter = @ptrCast(@alignCast(ctx));
+            // Self.buildQuery returns [:0]u8 (sentinel-terminated, since
+            // it backs libpq's null-terminated query interface). The
+            // RunnerContext API is []const u8 — we coerce the slice but
+            // freeQueryImpl below reconstructs the [:0]u8 view so
+            // Allocator.free reads the right allocation size (sentinel
+            // slices use len+1 bytes; non-sentinel use len).
+            const z = try self.mgr.buildQuery(template);
+            return z;
+        }
+
+        fn freeQueryImpl(ctx: *anyopaque, query: []const u8) void {
+            const self: *MigrationsAdapter = @ptrCast(@alignCast(ctx));
+            // Reconstruct the [:0]u8 view of the same allocation so
+            // Allocator.free deallocates len+1 bytes — the original
+            // size emitted by buildQuery / toOwnedSliceSentinel. A
+            // plain `free(query)` (over []const u8) would leak the
+            // sentinel byte per call.
+            const z: [:0]const u8 = query.ptr[0..query.len :0];
+            self.mgr.allocator.free(z);
+        }
+    };
 
     pub fn provisionUser(self: *Self, user_id: i64, workspace_path: []const u8) !void {
         if (try self.hasExternalIdentity(user_id)) |exists| {
@@ -10962,6 +11151,106 @@ test "V1.6 schema migration applies cleanly + memory_entities round-trips" {
         if (!found_indexes.contains(idx_name)) {
             std.debug.print("V1.6 index missing: {s}\n", .{idx_name});
             return error.MissingIndex;
+        }
+    }
+}
+
+// D62 (2026-05-25) — wire migrations.run() from zaki_state.migrate.
+//
+// Static contract test: verifies `migrations.MIGRATIONS` is non-empty,
+// contains the artifacts entry, and that the SQL embedded for 0002 is
+// idempotent (CREATE TABLE IF NOT EXISTS) so it's safe to apply during
+// the dual-path window where the legacy inline loop also creates the
+// same tables. No postgres required — pure compile-time / SQL-string
+// assertions, so it runs in every build (including non-postgres).
+test "D62 — migrations framework is wired with idempotent 0002 entry" {
+    // The MIGRATIONS array must have the artifacts entry registered.
+    var saw_artifacts = false;
+    for (migrations.MIGRATIONS) |m| {
+        if (m.version == 2 and std.mem.eql(u8, m.name, "0002_artifacts")) {
+            saw_artifacts = true;
+            // Dual-path idempotency: 0002's CREATE TABLE statements must
+            // use IF NOT EXISTS so the migration is safe to re-apply
+            // against a DB where the legacy inline loop in
+            // `zaki_state.zig::migrate` already created the same tables.
+            // After the inline block is deleted (D62 follow-up), this
+            // guard can be dropped and the migration becomes a true diff.
+            try std.testing.expect(std.mem.indexOf(u8, m.sql, "CREATE TABLE IF NOT EXISTS {schema}.artifacts") != null);
+            try std.testing.expect(std.mem.indexOf(u8, m.sql, "CREATE TABLE IF NOT EXISTS {schema}.artifact_versions") != null);
+            // Indexes also guarded with IF NOT EXISTS.
+            try std.testing.expect(std.mem.indexOf(u8, m.sql, "CREATE INDEX IF NOT EXISTS idx_artifacts_user_updated") != null);
+            try std.testing.expect(std.mem.indexOf(u8, m.sql, "CREATE INDEX IF NOT EXISTS idx_artifacts_share_code") != null);
+            try std.testing.expect(std.mem.indexOf(u8, m.sql, "CREATE INDEX IF NOT EXISTS idx_artifact_versions_artifact_version") != null);
+        }
+    }
+    try std.testing.expect(saw_artifacts);
+}
+
+test "D62 — migrate() populates schema_migrations with every registered version" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_d62", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+
+    // Fresh schema — drop anything left over from a previous test run.
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+
+    // First migrate — runs both the legacy inline loop AND migrations.run().
+    try mgr.migrate();
+    // Second migrate — must be idempotent. migrations.run() sees every
+    // registered version already applied and short-circuits.
+    try mgr.migrate();
+
+    // Assert schema_migrations contains a row for every registered version.
+    const list_q = try std.fmt.allocPrint(
+        allocator,
+        "SELECT version, name FROM {s}.schema_migrations ORDER BY version ASC",
+        .{schema},
+    );
+    defer allocator.free(list_q);
+    const result = try mgr.exec(list_q);
+    defer c.PQclear(result);
+
+    const got_rows: usize = @intCast(c.PQntuples(result));
+    try std.testing.expect(got_rows >= migrations.MIGRATIONS.len);
+
+    // Every registered version must appear (set inclusion — the legacy
+    // bootstrap may also insert duplicates that ON CONFLICT DO NOTHING).
+    for (migrations.MIGRATIONS) |m| {
+        var found = false;
+        for (0..got_rows) |i| {
+            const row_idx: c_int = @intCast(i);
+            const ver_text = try dupeResultValue(allocator, result, row_idx, 0);
+            defer allocator.free(ver_text);
+            const ver = try std.fmt.parseInt(u32, ver_text, 10);
+            if (ver == m.version) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std.debug.print("D62: registered migration version {d} ({s}) missing from schema_migrations\n", .{ m.version, m.name });
+            return error.MigrationNotRecorded;
         }
     }
 }
