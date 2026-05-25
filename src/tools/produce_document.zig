@@ -126,7 +126,14 @@ pub const ProduceDocumentTool = struct {
         "```\n\n" ++
         "### pptx — markdown with `---` slide separators (Marp convention)\n" ++
         "Each `---` on its own line starts a new slide. First H1 on a slide is the title;\n" ++
-        "the rest is body. Use bullets / short lines (each slide is a few seconds of read).\n\n" ++
+        "the rest is body. Use bullets / short lines (each slide is a few seconds of read).\n" ++
+        "The Marp `marp: true` frontmatter is AUTO-PREPENDED so you don't include it —\n" ++
+        "just write slide content. Pick a theme via the optional `theme` param:\n" ++
+        "  - `default` (clean white, sans, projector-friendly) — best general use\n" ++
+        "  - `gaia` (warm cream, serif accents, book-feel) — best for talks\n" ++
+        "  - `uncover` (bold black/white, big type) — best for keynote / lecture\n" ++
+        "If you DO want custom frontmatter, start `content` with `---` and yours wins\n" ++
+        "(operator escape hatch).\n\n" ++
         "EXAMPLE (PPTX / kickoff deck):\n" ++
         "```\n" ++
         "# Project Kickoff\n" ++
@@ -151,7 +158,7 @@ pub const ProduceDocumentTool = struct {
         "- For raw markdown / code the user will copy → file_write.";
 
     pub const tool_params =
-        \\{"type":"object","properties":{"format":{"type":"string","enum":["pdf","docx","xlsx","pptx","html"],"description":"Output format. pdf/docx/html accept markdown input; xlsx accepts CSV; pptx accepts markdown with --- slide separators."},"content":{"type":"string","description":"Source content. Markdown for pdf/docx/html/pptx, CSV for xlsx. Required."},"title":{"type":"string","description":"Document title — used for the output filename and (where supported) document metadata. Default 'untitled'. Will be sanitized to filesystem-safe characters."}},"required":["format","content"]}
+        \\{"type":"object","properties":{"format":{"type":"string","enum":["pdf","docx","xlsx","pptx","html"],"description":"Output format. pdf/docx/html accept markdown input; xlsx accepts CSV; pptx accepts markdown with --- slide separators."},"content":{"type":"string","description":"Source content. Markdown for pdf/docx/html/pptx, CSV for xlsx. Required."},"title":{"type":"string","description":"Document title — used for the output filename and (where supported) document metadata. Default 'untitled'. Will be sanitized to filesystem-safe characters."},"theme":{"type":"string","enum":["default","gaia","uncover"],"description":"Marp theme for PPTX slides. Ignored for non-pptx formats. 'default' = clean white background, dark text. 'gaia' = warm cream background with serif accents, good for talks. 'uncover' = bold black-on-white, lecture/keynote style. Default 'default'."}},"required":["format","content"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -192,6 +199,27 @@ pub const ProduceDocumentTool = struct {
         const raw_title = root.getString(args, "title") orelse DEFAULT_TITLE;
         const safe_title = try sanitizeTitle(allocator, raw_title);
         defer allocator.free(safe_title);
+
+        // 2026-05-25 (Wave 3 hardening) — Marp slide theme support.
+        // For PPTX, the renderer needs `marp: true` in the source's YAML
+        // frontmatter to actually treat the markdown as slides. We auto-
+        // prepend that frontmatter so the agent's `content` can be pure
+        // slide markdown (---separated H1 + body) without per-call ritual.
+        // Three built-in Marp themes are exposed:
+        //   - default — clean white background, dark text (general use)
+        //   - gaia    — warm cream + serif accents (talks / decks)
+        //   - uncover — bold black-on-white (lecture / keynote)
+        // For non-pptx formats this param is ignored (with a hint in the
+        // tool schema).
+        const theme_raw = root.getString(args, "theme") orelse "default";
+        const theme = parseTheme(theme_raw) orelse {
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "Invalid 'theme' value: '{s}'. Must be one of: default, gaia, uncover",
+                .{theme_raw},
+            );
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        };
 
         if (self.workspace_dir.len == 0) {
             return ToolResult.fail("Workspace not configured — tool has no place to write the produced document");
@@ -257,6 +285,14 @@ pub const ProduceDocumentTool = struct {
         defer allocator.free(out_path);
 
         // ── Write source file ────────────────────────────────────────
+        //
+        // For PPTX, prepend the Marp frontmatter so the agent's content can
+        // be pure slide markdown without per-call frontmatter ritual. The
+        // frontmatter selects the theme + sets sensible slide defaults
+        // (16:9 widescreen, paginate every slide). If the agent's content
+        // ALREADY starts with `---` (custom frontmatter), we skip our
+        // prepend so the agent's intent wins — operator escape hatch.
+        const should_prepend_marp = (format == .pptx) and !std.mem.startsWith(u8, content, "---");
         {
             const src_file = std.fs.createFileAbsolute(src_path, .{}) catch |err| {
                 const msg = try std.fmt.allocPrint(
@@ -267,6 +303,22 @@ pub const ProduceDocumentTool = struct {
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
             defer src_file.close();
+            if (should_prepend_marp) {
+                const fm = try std.fmt.allocPrint(
+                    allocator,
+                    "---\nmarp: true\ntheme: {s}\npaginate: true\nsize: 16:9\n---\n\n",
+                    .{theme.toSlice()},
+                );
+                defer allocator.free(fm);
+                src_file.writeAll(fm) catch |err| {
+                    const msg = try std.fmt.allocPrint(
+                        allocator,
+                        "Failed to write Marp frontmatter: {s}",
+                        .{@errorName(err)},
+                    );
+                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                };
+            }
             src_file.writeAll(content) catch |err| {
                 const msg = try std.fmt.allocPrint(
                     allocator,
@@ -358,6 +410,39 @@ fn parseFormat(s: []const u8) ?Format {
     if (std.ascii.eqlIgnoreCase(t, "xlsx")) return .xlsx;
     if (std.ascii.eqlIgnoreCase(t, "pptx")) return .pptx;
     if (std.ascii.eqlIgnoreCase(t, "html")) return .html;
+    return null;
+}
+
+/// 2026-05-25 (Wave 3 hardening) — Marp built-in theme for PPTX. Three
+/// supported variants; each is a recognized Marp theme key that ships
+/// with marp-cli so no per-tenant theme file deploy is needed.
+///
+/// Visual character (per Marp docs + verified visually):
+///   - default — clean white background, Helvetica-style sans, dark text.
+///               Best general-purpose; reads well in projector light.
+///   - gaia    — warm cream background, serif body, slight color accents.
+///               Better for human talks where a printed-book feel helps.
+///   - uncover — bold black-on-white, large type, bullet-emphasis style.
+///               Best for keynote / lecture / "ideas at a glance" decks.
+const Theme = enum {
+    default_theme,
+    gaia,
+    uncover,
+
+    pub fn toSlice(self: Theme) []const u8 {
+        return switch (self) {
+            .default_theme => "default",
+            .gaia => "gaia",
+            .uncover => "uncover",
+        };
+    }
+};
+
+fn parseTheme(s: []const u8) ?Theme {
+    const t = std.mem.trim(u8, s, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(t, "default")) return .default_theme;
+    if (std.ascii.eqlIgnoreCase(t, "gaia")) return .gaia;
+    if (std.ascii.eqlIgnoreCase(t, "uncover")) return .uncover;
     return null;
 }
 
