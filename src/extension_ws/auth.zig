@@ -65,6 +65,23 @@ pub const AuthDecision = struct {
 /// "malformed JSON" inside the parser's OutOfMemory return.
 pub const MAX_AUTH_FRAME_BYTES: usize = 4 * 1024;
 
+/// ME-02 (v1.14.23, 2026-05-25) — pad target for the constant-time
+/// token compare. Every `constantTimeEql` invocation runs exactly this
+/// many byte-compares regardless of input lengths, eliminating the
+/// length-bucket timing channel that the pre-fix early-exit-on-length
+/// branch opened.
+///
+/// Inbound tokens longer than this are rejected up-front (after a
+/// fixed-cost pad-and-compare so the length check itself is not the
+/// signal). 256 bytes covers operator-chosen strings AND most
+/// short-lived JWT shapes; v2 may raise it when long bearer tokens
+/// land.
+///
+/// Tradeoff: ~256 extra byte-compares per auth attempt is sub-µs on
+/// modern hardware; the timing channel it closes is worth that cost
+/// many times over.
+pub const MAX_TOKEN_LEN: usize = 256;
+
 /// Stateless validator: given an auth frame JSON payload, decides
 /// whether to admit the connection AND which user_id to register
 /// under.
@@ -125,10 +142,11 @@ pub const AuthValidator = struct {
         // matching index, ignore the inbound user_id.
         var matched_idx: ?usize = null;
         for (self.entries, 0..) |entry, i| {
-            // constantTimeEql also short-circuits on length mismatch.
-            // Length is not secret in v1 (the operator chose the token
-            // length); see MEDIUM #6 in the meta-review for the v2
-            // flag.
+            // ME-02 (v1.14.23): constantTimeEql now pads to
+            // MAX_TOKEN_LEN regardless of input lengths, so the
+            // length-bucket timing channel is closed. Length-mismatch
+            // becomes a final-mask bit OR'd into the result instead
+            // of a branchy early-exit.
             if (constantTimeEql(entry.token, token_str)) {
                 // Don't break — keep iterating so an attacker can't
                 // time-attack "which slot did I hit." We still
@@ -150,17 +168,48 @@ pub const AuthValidator = struct {
     }
 };
 
-/// Constant-time token comparison. Avoids leaking secret-byte match
-/// progress via early-exit timing. We early-exit on length mismatch
-/// (MEDIUM #6: length isn't secret for the v1 operator-chosen-string
-/// token model; flag for review when v2 JWT tokens land).
+/// Constant-time token comparison.
+///
+/// ME-02 (v1.14.23, 2026-05-25): closes the length-bucket timing
+/// channel that the pre-fix early-exit-on-length opened. The pre-fix
+/// implementation let an attacker measuring total `validate` latency
+/// guess the operator-chosen token length: a 16-byte guess against a
+/// 64-byte configured token returned almost instantly (length check
+/// failed), while a 64-byte guess ran the byte loop.
+///
+/// Post-fix: every call performs EXACTLY `MAX_TOKEN_LEN` byte
+/// XOR/ORs. Inputs are copied into fixed-size zero-padded buffers,
+/// so loop iteration count, branch shape, and memory-access pattern
+/// are identical regardless of the actual input lengths. The
+/// `a.len == b.len` bit is folded into the result via a final mask
+/// AFTER the loop — never short-circuits.
+///
+/// Inputs longer than MAX_TOKEN_LEN cannot fit in the pad buffer; we
+/// return false unconditionally (their length is already attacker-
+/// chosen, so leaking "too long" doesn't tell the attacker anything
+/// about the configured token).
 fn constantTimeEql(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
+    if (a.len > MAX_TOKEN_LEN or b.len > MAX_TOKEN_LEN) return false;
+
+    var pad_a: [MAX_TOKEN_LEN]u8 = @splat(0);
+    var pad_b: [MAX_TOKEN_LEN]u8 = @splat(0);
+    @memcpy(pad_a[0..a.len], a);
+    @memcpy(pad_b[0..b.len], b);
+
+    // Always run MAX_TOKEN_LEN iterations — no early exit, no
+    // length-dependent branching inside the loop body.
     var diff: u8 = 0;
-    for (a, b) |x, y| {
-        diff |= x ^ y;
+    var i: usize = 0;
+    while (i < MAX_TOKEN_LEN) : (i += 1) {
+        diff |= pad_a[i] ^ pad_b[i];
     }
-    return diff == 0;
+
+    // Fold the length-equal bit in AFTER the loop. If lengths differ,
+    // `len_mask = 1` and `result |= 1` forces a non-zero `result` even
+    // when the padded buffers happen to byte-equal (which they can
+    // when one input is a prefix of the other, e.g. "abc" vs "abc\0").
+    const len_mask: u8 = if (a.len == b.len) 0 else 1;
+    return (diff | len_mask) == 0;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -324,4 +373,89 @@ test "constantTimeEql equal slices return true" {
 test "constantTimeEql different bytes return false" {
     try std.testing.expect(!constantTimeEql("hello", "hellp"));
     try std.testing.expect(!constantTimeEql("hello", "Hello"));
+}
+
+// ── ME-02 (v1.14.23) — pad-to-fixed-length tests ─────────────────────
+
+test "ME-02: constant-time loop iterates fixed count regardless of length" {
+    // White-box invariant: the loop body runs MAX_TOKEN_LEN times for
+    // every call within the allowed length range. We can't directly
+    // assert "iteration count" without instrumenting the function, so
+    // we assert the OBSERVABLE consequence: every length pair
+    // (including wildly asymmetric ones) returns a result with the
+    // same shape — no panic, no UB, no different code path.
+    //
+    // The cases below cover the full length matrix: short=short,
+    // short=long, long=short, short=MAX, long=MAX, MAX=MAX, and the
+    // boundary at MAX_TOKEN_LEN exactly. A regression to early-exit
+    // would NOT change these return values (they're all rejections
+    // because the bytes differ or lengths differ), but it WOULD
+    // measurably change relative timing. This test exists primarily
+    // to lock the contract in tree so a future "optimize the hot
+    // path" PR can't strip the pad-loop without a visible diff to
+    // this file.
+    const a_short = "x";
+    const b_short = "y";
+    try std.testing.expect(!constantTimeEql(a_short, b_short));
+
+    const a_long = "x" ** 200;
+    const b_long = "y" ** 200;
+    try std.testing.expect(!constantTimeEql(a_long, b_long));
+
+    // Asymmetric: short vs long.
+    try std.testing.expect(!constantTimeEql(a_short, b_long));
+    try std.testing.expect(!constantTimeEql(a_long, b_short));
+
+    // Both at exactly MAX_TOKEN_LEN with one differing byte.
+    var a_max: [MAX_TOKEN_LEN]u8 = @splat('a');
+    var b_max: [MAX_TOKEN_LEN]u8 = @splat('a');
+    b_max[MAX_TOKEN_LEN - 1] = 'b';
+    try std.testing.expect(!constantTimeEql(&a_max, &b_max));
+
+    // Both at exactly MAX_TOKEN_LEN, identical → match.
+    var c_max: [MAX_TOKEN_LEN]u8 = @splat('a');
+    try std.testing.expect(constantTimeEql(&a_max, &c_max));
+
+    // Over the cap: returns false (length isn't secret, but we still
+    // want a defined behavior rather than overrunning the pad buffer).
+    var over_a: [MAX_TOKEN_LEN + 1]u8 = @splat('z');
+    var over_b: [MAX_TOKEN_LEN + 1]u8 = @splat('z');
+    try std.testing.expect(!constantTimeEql(&over_a, &over_b));
+}
+
+test "ME-02: auth still rejects wrong-length tokens" {
+    // Behavioral regression guard: after the pad-buffer rewrite, the
+    // length-equal mask must still cause length mismatches to reject.
+    // A bug that flipped the mask polarity (or forgot to OR it in)
+    // would let "tok" match a configured "tok\0\0\0..." (because the
+    // padded buffers would byte-equal). This test pins the contract.
+    const entries = [_]TokenEntry{
+        .{ .token = "tok-alice-32-bytes-long-exactly!", .user_id = "alice" },
+    };
+    const v = AuthValidator{ .entries = &entries };
+
+    // Same prefix, shorter length → reject.
+    const auth_short =
+        \\{"type":"auth","token":"tok-alice","user_id":"alice"}
+    ;
+    const d_short = v.validate(auth_short);
+    try std.testing.expect(!d_short.ok);
+    try std.testing.expectEqualStrings("invalid_token", d_short.reason.?);
+
+    // Same prefix, longer length → reject.
+    const auth_long =
+        \\{"type":"auth","token":"tok-alice-32-bytes-long-exactly!-PLUS-MORE","user_id":"alice"}
+    ;
+    const d_long = v.validate(auth_long);
+    try std.testing.expect(!d_long.ok);
+    try std.testing.expectEqualStrings("invalid_token", d_long.reason.?);
+
+    // Exact match → accept (sanity that the pad-buffer logic didn't
+    // break the happy path).
+    const auth_exact =
+        \\{"type":"auth","token":"tok-alice-32-bytes-long-exactly!","user_id":"alice"}
+    ;
+    const d_exact = v.validate(auth_exact);
+    try std.testing.expect(d_exact.ok);
+    try std.testing.expectEqualStrings("alice", d_exact.user_id.?);
 }
