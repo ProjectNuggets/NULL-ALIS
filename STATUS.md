@@ -62,7 +62,7 @@ Twelve commits on `main` since v1.14.20 close the commercial-launch gap-to-Manus
 
 ## 2026-05-24 — v1.14.19 S-tier production push
 
-Built on the substrate-audit pass (`SUBSTRATE_AUDIT.md`). 8 substrate probes (delegate, approvals, web, brain_graph, schedule/cron, OpenAPI, MCP server, MCP client) verified end-to-end on the live gateway; six findings surfaced, all addressed or properly deferred. Six commits land cleanly on `main`:
+Built on the substrate-audit pass (`docs/archive/2026-05-25/SUBSTRATE_AUDIT.md`). 8 substrate probes (delegate, approvals, web, brain_graph, schedule/cron, OpenAPI, MCP server, MCP client) verified end-to-end on the live gateway; six findings surfaced, all addressed or properly deferred. Six commits land cleanly on `main`:
 
 - **`6672ef8d`** Phase A — **F-A7.3:** 33 tool descriptions had `"first scenario"` / `"second scenario"` placeholder leaks degrading model tool-selection. All 33 rewritten with real triggers + sibling refs; lint Rule 6 added (rejects placeholders + `<name> tool.` boilerplate at compile time).
 - **`d2183986`** Phase B — **F-A7.1 + F-A7.2:** `TurnOrigin.mcp` variant + MCP server context handoff + `memory_recall` global-fallback when origin=.mcp (closes IDE / external-MCP-client first-experience cliff). MCP open-mode auth banner downgraded warn → info with rationale.
@@ -166,7 +166,7 @@ Code truth as of `7874226c` on `main`. This session found the agent memory pipel
 
 All four fixed, merged, **verified live**: Pass A and Pass C fire and extract real entities/edges, hydration produces continuity summaries, compaction summaries persist and are agent-recallable. The memory engine, graph, and vectors are functional end-to-end.
 
-**Config/control-plane hardened.** A repo-wide audit (`docs/CONFIG_CONTROL_PLANE_AUDIT.md`) found all four regressions share one class — *config surfaces that exist but are not enforced*. Hardening landed:
+**Config/control-plane hardened.** A repo-wide audit (`docs/archive/2026-05-25/CONFIG_CONTROL_PLANE_AUDIT.md`) found all four regressions share one class — *config surfaces that exist but are not enforced*. Hardening landed:
 - Tenant config inverted to a **strict allowlist** (only `product_settings` survives) — a tenant can no longer choose the model or toggle compaction; deny-by-default closes the finding-#3 leak class.
 - A **comptime exhaustiveness guard** — every `Config` field must be registered (`json_parsed` / `runtime_or_derived` / `decorative_pending`); adding a field with no parser is now a compile error. The finding-#3/#4 "struct field, no parser" class cannot merge silently again.
 - `reliability.vision_fallback` parser added (another dead-config bug fixed); enforcement tests for the `compact_context` default and `sidecar` round-trip; `zaki_bot` profile now defaults a capable extraction sidecar (Together/Llama-3.3-70B).
@@ -175,7 +175,7 @@ All four fixed, merged, **verified live**: Pass A and Pass C fire and extract re
 
 **The K2.6 LoCoMo result is not a clean memory number.** The conv-0 run scored ~94%, but on a dead memory pipeline — that was long-context recall (the conversation fit K2.6's 262K window), not the memory engine. A clean re-bench is warranted now the pipeline is repaired.
 
-**Deferred follow-ups** (all tracked in `docs/CONFIG_CONTROL_PLANE_AUDIT.md`, none a live fire): `network` config parser + HTTP-layer wiring; `agent.extraction` parse-or-delete; eliminate the sentinel-collision profile-default pattern; the streaming-path blunt error mapping.
+**Deferred follow-ups** (all tracked in `docs/archive/2026-05-25/CONFIG_CONTROL_PLANE_AUDIT.md`, none a live fire): `network` config parser + HTTP-layer wiring; `agent.extraction` parse-or-delete; eliminate the sentinel-collision profile-default pattern; the streaming-path blunt error mapping.
 
 ---
 

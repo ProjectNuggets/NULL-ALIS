@@ -331,7 +331,7 @@ treated as defects, not preferences.
 
 **Bound documents (read these before working):**
 - `docs/ROADMAP.md` — the versioned plan (which V block lands at which tag).
-- `docs/MULTI_AGENT_PLAN.md` — the agent dispatch matrix (which agent does what, file ownership,
+- `docs/archive/2026-05-25/MULTI_AGENT_PLAN.md` — the agent dispatch matrix (which agent does what, file ownership,
   branch conventions, bench gate convergence). When you are spawned as Agent A/B/C/..., your
   scope, owned files, and closing standard come from this document.
 - `STATUS.md` — current snapshot (repo root; `docs/STATUS.md` archived 2026-05-22).

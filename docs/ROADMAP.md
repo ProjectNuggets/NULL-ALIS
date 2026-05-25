@@ -45,7 +45,7 @@ Tags: `v1.14.12` · `v1.14.13` · `v1.14.14` · `v1.14.18` (v1.14.18-A/B block) 
 | Channels / MCP | **Sprint 2 shipped (v1.14.20)** | Discord+Slack finished, Email+Teams activated; MCP client hardened + MCP server built (A2A core). Memory-over-MCP + Nostr deferred |
 | LoCoMo / τ-bench | **No clean K2.6 number** | the ~94% LoCoMo conv-0 was long-context recall on a then-dead pipeline; re-bench deferred (must be a multi-session / over-window test) |
 
-**What 2026-05-19 → 2026-05-22 actually did:** v1.14.13 + v1.14.14 tagged; the channel blocks (v1.14.15/.16/.17 Email/Teams/Nostr) were **deferred**, re-cut as "Sprint 2"; v1.14.18-A/B (learning loop) merged. Then an **unplanned fire**: the memory pipeline was found silently dead (4 config/wiring regressions) and repaired, the config control plane was audited + hardened — closed as **v1.14.19** (`docs/CONFIG_CONTROL_PLANE_AUDIT.md`). Then **Sprint 2 shipped** as 4 parallel agents — Discord/Slack finished, Email/Teams activated, MCP client hardened, MCP server built — merged, independently audited, fix-forward'd, closed as **v1.14.20**.
+**What 2026-05-19 → 2026-05-22 actually did:** v1.14.13 + v1.14.14 tagged; the channel blocks (v1.14.15/.16/.17 Email/Teams/Nostr) were **deferred**, re-cut as "Sprint 2"; v1.14.18-A/B (learning loop) merged. Then an **unplanned fire**: the memory pipeline was found silently dead (4 config/wiring regressions) and repaired, the config control plane was audited + hardened — closed as **v1.14.19** (`docs/archive/2026-05-25/CONFIG_CONTROL_PLANE_AUDIT.md`). Then **Sprint 2 shipped** as 4 parallel agents — Discord/Slack finished, Email/Teams activated, MCP client hardened, MCP server built — merged, independently audited, fix-forward'd, closed as **v1.14.20**.
 
 **Audit ledger:** `docs/audits/2026-05-19-file-by-file-audit-ledger.md` remains the active control ledger (67 findings: 9 HIGH / 31 MED / 27 LOW — half-finished orphans, config zombies, false-confidence handlers). No block tags until its rows close. **These are unfinished work, not delete candidates (§14.2/§14.4) — the blocks below finish them.**
 
@@ -64,7 +64,7 @@ The active near-term sequence. "Sprints 0–4" was a tactical re-cut; reconciled
 | **Sprint 3** | **Universal API Connector** (OpenAPI → agent tools) | new — slots before v1.17 connectors; see block below | **✅ done 2026-05-22 (PR #105)** |
 | **Sprint 4** | **UI/UX activation + feature-freeze** | overlaps v1.16 frontend wave | **P1** |
 
-After the Sprints, the version blocks below carry the road to v2.0. **Deferred follow-ups** (tracked in `docs/CONFIG_CONTROL_PLANE_AUDIT.md`, not lost): `network` config parser+wiring · `agent.extraction` parse-or-delete · sentinel-collision profile pattern · streaming-path error mapping. **LoCoMo Cat-3 lift** (the R6/R3/R4/R2 lever set — temporal/inference 56–77% → 80%+) is folded into the v1.15.0 bench-iteration block.
+After the Sprints, the version blocks below carry the road to v2.0. **Deferred follow-ups** (tracked in `docs/archive/2026-05-25/CONFIG_CONTROL_PLANE_AUDIT.md`, not lost): `network` config parser+wiring · `agent.extraction` parse-or-delete · sentinel-collision profile pattern · streaming-path error mapping. **LoCoMo Cat-3 lift** (the R6/R3/R4/R2 lever set — temporal/inference 56–77% → 80%+) is folded into the v1.15.0 bench-iteration block.
 
 **Folded from retired plan docs (2026-05-22 reconcile)** — captured here so nothing is lost when the source docs archive: the **F-A2.1 / F-T1 / F-PA1** fixes are **verified shipped 2026-05-22** — F-A2.1 via prompt-level `brain_graph` routing for entity questions (`prompt.zig`), F-T1 via `elideUnverifiedHistory` (`root.zig:5204`), F-PA1 via `archiveDroppedMessages` (Pass A archives to `compaction_dropped/` before deletion). The **cognitive-layers track** (Working / Procedural / Dream-consolidation memory — partly landed, the v1.14.21 sleep cycle is its home) and the **SOTA append-only context end-state** (ContextEngine migration at v1.14.14 covered the bulk) remain the open carry-forward items.
 
@@ -888,7 +888,7 @@ Candidate pillar order (Nova-revisable):
 - **v1.14.12 / .13 / .14** — TAGGED.
 - **v1.14.15 / .16** (Email/Teams channels) — DELIVERED via **Sprint 2**, folded into the `v1.14.20` tag. **.17** (Nostr) — still DEFERRED (no user demand).
 - **v1.14.18-A / -B** (learning loop) — MERGED via PR #87 / #98; **TAGGED `v1.14.18`** (2026-05-22, at block-completion commit `79094848`).
-- **v1.14.19** — Memory-pipeline repair + config-control-plane hardening; **TAGGED `v1.14.19`** (2026-05-22, `docs/CONFIG_CONTROL_PLANE_AUDIT.md`).
+- **v1.14.19** — Memory-pipeline repair + config-control-plane hardening; **TAGGED `v1.14.19`** (2026-05-22, `docs/archive/2026-05-25/CONFIG_CONTROL_PLANE_AUDIT.md`).
 - **v1.14.20** — **Sprint 2: Channels V1 + MCP V1 (the A2A core).** 4 PRs (#99–#102) merged, independently audited, 5 fix-forward commits; **TAGGED `v1.14.20`** (2026-05-22 at `99db4ea8`). MCP follow-ups: enable the MCP client (config key rename), wire a memory backend into `mcp serve`.
 - **NEXT:** Sprint 3 (universal-environment access) → Sprint 4 (UI/UX + freeze), then the v1.15+ blocks to v2.0. The "Sleep cycle" block is renumbered v1.14.19 → **v1.14.21**.
 - **v1.14.18 MED-tier sweep** — partially addressed by the §14.10 activation audit; the full 31-MED sweep is still open against the audit ledger.
