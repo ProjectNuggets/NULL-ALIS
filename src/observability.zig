@@ -185,12 +185,180 @@ pub const ObserverEvent = union(enum) {
 };
 
 /// Numeric metrics.
+///
+/// **v1.14.23 extension (review HIGH 2.A):** the original four kinds
+/// (latency / tokens / sessions / queue) covered the agent core but
+/// gave the v1.14.20→22 surface (artifacts, extension WS hub, share
+/// store, produce_document, trace_query, memory_doctor, Moonshot
+/// uploads) zero chartable signal. The added kinds below let
+/// dashboards count + histogram every operationally interesting
+/// surface without re-keying through scoped logs.
+///
+/// **Convention:**
+///   - `*_total` — monotonic counters (the value is the increment,
+///     usually 1; backends are expected to sum them).
+///   - `*_latency_ms` / `*_bytes` — point-in-time samples that
+///     histogram-backends should bucket.
+///   - `*_active` — gauges (current value, observers should track
+///     the most recent sample).
+///
+/// `result` and `format` are short ASCII identifiers (e.g. "ok",
+/// "timeout", "conn_closed", "oom", "pdf", "docx", "share_limit") —
+/// observers may label-shard metric series by them. Slices are
+/// borrowed for the duration of the recordMetric call only; an
+/// observer that retains must dupe.
 pub const ObserverMetric = union(enum) {
     request_latency_ms: u64,
     tokens_used: u64,
     active_sessions: u64,
     queue_depth: u64,
+
+    // ── v1.14.23 added (closing v1.14.20→22 observability gap) ──
+
+    /// Artifact lifecycle counters — every successful create/update/
+    /// share/revoke increments by 1. Tenant attribution is via the
+    /// active `getTenantContext()` at emit time; the metric payload
+    /// itself stays single-scalar to keep the union small.
+    artifact_create_total: u64,
+    artifact_update_total: u64,
+    artifact_share_total: u64,
+    artifact_share_revoke_total: u64,
+
+    /// Share-spam cap (D64). `share_create_429_total` fires when the
+    /// per-user `MAX_LIVE_SHARES_PER_USER` cap denies a new share;
+    /// `share_create_success_total` fires on every successful mint
+    /// (idempotent re-mints DO NOT increment — they fold into the
+    /// existing record).
+    share_create_success_total: u64,
+    share_create_429_total: u64,
+
+    /// Extension WS hub.
+    ///   - `extension_ws_connections_active` is a gauge — observers
+    ///     should overwrite the prior sample with the new value.
+    ///   - `extension_ws_command_latency_ms` is a per-command sample
+    ///     (the histogram backend buckets it).
+    extension_ws_connections_active: u64,
+    extension_ws_command_latency_ms: u64,
+
+    /// Extension WS command result counter. `result` is one of:
+    /// "ok", "timeout", "conn_closed", "oom", "queue_drained",
+    /// "command_alloc_failed", "no_conn", "registration_failed".
+    /// The tool name is the optional `tool` label.
+    extension_ws_command_total: struct {
+        result: []const u8,
+        tool: ?[]const u8 = null,
+    },
+
+    /// SSRF-defense denial in extension navigate. Operators want to
+    /// see this on a chart so an extension-only deployment with a
+    /// misconfigured allowlist surfaces fast.
+    extension_ws_ssrf_block_total: u64,
+
+    /// produce_document tool. `format` is "pdf|docx|pptx|xlsx|html|
+    /// md". `result` is "ok|tool_missing|render_failed|invalid_input".
+    produce_document_total: struct {
+        format: []const u8,
+        result: []const u8,
+    },
+    produce_document_latency_ms: struct {
+        format: []const u8,
+        value: u64,
+    },
+
+    /// Read-only introspection tools — usage counters.
+    trace_query_total: u64,
+    memory_doctor_total: u64,
+
+    /// Moonshot Files API video upload (large-payload path).
+    /// `result` is "ok|http_4xx|http_5xx|network_error|size_cap".
+    moonshot_video_upload_total: struct { result: []const u8 },
+    /// Bytes-on-the-wire histogram for the same upload.
+    moonshot_video_upload_bytes: u64,
 };
+
+// ── Global module-level observer (v1.14.23 HIGH 2.A) ────────────────
+//
+// The tool-scoped observer (`current_tool_observer` in `tools/root.zig`)
+// is set per-turn and only visible inside the agent's tool dispatch
+// path. The newly-shipped surface emits metrics from cross-cutting
+// sites (gateway HTTP handlers, extension WS hub callbacks, provider
+// upload paths) that run OUTSIDE a tool execute() and have no
+// turn-scoped observer to read.
+//
+// `global_observer` is a process-wide pointer the gateway sets at boot
+// (after constructing its MultiObserver) so those cross-cutting sites
+// have a single emit address. NULL is the well-defined fallback — in
+// that case `recordMetricGlobal` falls through to a scoped-log line so
+// operators still have *something* to grep for, per the user directive
+// at v1.14.23 review-fix HIGH 2.A: "graceful degradation: if no
+// observer is registered, log the event so operators have SOMETHING."
+//
+// Tests + standalone CLI never set it; their emits become structured
+// log lines, which is the right shape for those paths anyway.
+//
+// Thread-safety: the pointer is set once at boot, read many. Reads use
+// `@atomicLoad` to satisfy a tools-thread reading mid-init.
+
+var global_observer: ?*Observer = null;
+
+/// Install the process-wide observer. Called once by the gateway after
+/// composing its MultiObserver. Pass null at shutdown to detach.
+pub fn setGlobalObserver(obs: ?*Observer) void {
+    @atomicStore(?*Observer, &global_observer, obs, .release);
+}
+
+/// Borrow the current global observer (null if none installed).
+pub fn getGlobalObserver() ?*Observer {
+    return @atomicLoad(?*Observer, &global_observer, .acquire);
+}
+
+const metric_log = std.log.scoped(.metric);
+
+/// Emit a metric to the global observer if one is registered; otherwise
+/// fall back to a `log.info` line so operators see the event even on
+/// observer-less deployments. Safe to call from any thread.
+///
+/// **Cost:** when `global_observer == null`, this still produces an
+/// info-level log line (one stderr write). Don't sprinkle this in a
+/// hot loop; it's intended for per-tool-call / per-request emit sites.
+pub fn recordMetricGlobal(metric: ObserverMetric) void {
+    if (getGlobalObserver()) |obs| {
+        obs.recordMetric(&metric);
+        return;
+    }
+    // Graceful degradation: log the metric so the operator has a
+    // grep target even when no observer is wired. Each variant gets
+    // a stable key prefix that matches the metric name; downstream
+    // log aggregators can rebuild a counter by grep+count.
+    switch (metric) {
+        .request_latency_ms => |v| metric_log.info("metric request_latency_ms value={d}", .{v}),
+        .tokens_used => |v| metric_log.info("metric tokens_used value={d}", .{v}),
+        .active_sessions => |v| metric_log.info("metric active_sessions value={d}", .{v}),
+        .queue_depth => |v| metric_log.info("metric queue_depth value={d}", .{v}),
+        .artifact_create_total => |v| metric_log.info("metric artifact_create_total value={d}", .{v}),
+        .artifact_update_total => |v| metric_log.info("metric artifact_update_total value={d}", .{v}),
+        .artifact_share_total => |v| metric_log.info("metric artifact_share_total value={d}", .{v}),
+        .artifact_share_revoke_total => |v| metric_log.info("metric artifact_share_revoke_total value={d}", .{v}),
+        .share_create_success_total => |v| metric_log.info("metric share_create_success_total value={d}", .{v}),
+        .share_create_429_total => |v| metric_log.info("metric share_create_429_total value={d}", .{v}),
+        .extension_ws_connections_active => |v| metric_log.info("metric extension_ws_connections_active value={d}", .{v}),
+        .extension_ws_command_latency_ms => |v| metric_log.info("metric extension_ws_command_latency_ms value={d}", .{v}),
+        .extension_ws_command_total => |e| {
+            if (e.tool) |t| {
+                metric_log.info("metric extension_ws_command_total result={s} tool={s}", .{ e.result, t });
+            } else {
+                metric_log.info("metric extension_ws_command_total result={s}", .{e.result});
+            }
+        },
+        .extension_ws_ssrf_block_total => |v| metric_log.info("metric extension_ws_ssrf_block_total value={d}", .{v}),
+        .produce_document_total => |e| metric_log.info("metric produce_document_total format={s} result={s}", .{ e.format, e.result }),
+        .produce_document_latency_ms => |e| metric_log.info("metric produce_document_latency_ms format={s} value={d}", .{ e.format, e.value }),
+        .trace_query_total => |v| metric_log.info("metric trace_query_total value={d}", .{v}),
+        .memory_doctor_total => |v| metric_log.info("metric memory_doctor_total value={d}", .{v}),
+        .moonshot_video_upload_total => |e| metric_log.info("metric moonshot_video_upload_total result={s}", .{e.result}),
+        .moonshot_video_upload_bytes => |v| metric_log.info("metric moonshot_video_upload_bytes value={d}", .{v}),
+    }
+}
 
 /// Core observability interface — Zig vtable pattern.
 ///
@@ -348,6 +516,28 @@ pub const LogObserver = struct {
             .tokens_used => |v| std.log.info("metric.tokens_used tokens={d}", .{v}),
             .active_sessions => |v| std.log.info("metric.active_sessions sessions={d}", .{v}),
             .queue_depth => |v| std.log.info("metric.queue_depth depth={d}", .{v}),
+            .artifact_create_total => |v| std.log.info("metric.artifact_create_total value={d}", .{v}),
+            .artifact_update_total => |v| std.log.info("metric.artifact_update_total value={d}", .{v}),
+            .artifact_share_total => |v| std.log.info("metric.artifact_share_total value={d}", .{v}),
+            .artifact_share_revoke_total => |v| std.log.info("metric.artifact_share_revoke_total value={d}", .{v}),
+            .share_create_success_total => |v| std.log.info("metric.share_create_success_total value={d}", .{v}),
+            .share_create_429_total => |v| std.log.info("metric.share_create_429_total value={d}", .{v}),
+            .extension_ws_connections_active => |v| std.log.info("metric.extension_ws_connections_active value={d}", .{v}),
+            .extension_ws_command_latency_ms => |v| std.log.info("metric.extension_ws_command_latency_ms value={d}", .{v}),
+            .extension_ws_command_total => |e| {
+                if (e.tool) |t| {
+                    std.log.info("metric.extension_ws_command_total result={s} tool={s}", .{ e.result, t });
+                } else {
+                    std.log.info("metric.extension_ws_command_total result={s}", .{e.result});
+                }
+            },
+            .extension_ws_ssrf_block_total => |v| std.log.info("metric.extension_ws_ssrf_block_total value={d}", .{v}),
+            .produce_document_total => |e| std.log.info("metric.produce_document_total format={s} result={s}", .{ e.format, e.result }),
+            .produce_document_latency_ms => |e| std.log.info("metric.produce_document_latency_ms format={s} value={d}", .{ e.format, e.value }),
+            .trace_query_total => |v| std.log.info("metric.trace_query_total value={d}", .{v}),
+            .memory_doctor_total => |v| std.log.info("metric.memory_doctor_total value={d}", .{v}),
+            .moonshot_video_upload_total => |e| std.log.info("metric.moonshot_video_upload_total result={s}", .{e.result}),
+            .moonshot_video_upload_bytes => |v| std.log.info("metric.moonshot_video_upload_bytes value={d}", .{v}),
         }
     }
 
@@ -552,6 +742,28 @@ pub const FileObserver = struct {
             .tokens_used => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"tokens_used\",\"value\":{d}}}", .{v}) catch return,
             .active_sessions => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"active_sessions\",\"value\":{d}}}", .{v}) catch return,
             .queue_depth => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"queue_depth\",\"value\":{d}}}", .{v}) catch return,
+            .artifact_create_total => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"artifact_create_total\",\"value\":{d}}}", .{v}) catch return,
+            .artifact_update_total => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"artifact_update_total\",\"value\":{d}}}", .{v}) catch return,
+            .artifact_share_total => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"artifact_share_total\",\"value\":{d}}}", .{v}) catch return,
+            .artifact_share_revoke_total => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"artifact_share_revoke_total\",\"value\":{d}}}", .{v}) catch return,
+            .share_create_success_total => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"share_create_success_total\",\"value\":{d}}}", .{v}) catch return,
+            .share_create_429_total => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"share_create_429_total\",\"value\":{d}}}", .{v}) catch return,
+            .extension_ws_connections_active => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"extension_ws_connections_active\",\"value\":{d}}}", .{v}) catch return,
+            .extension_ws_command_latency_ms => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"extension_ws_command_latency_ms\",\"value\":{d}}}", .{v}) catch return,
+            .extension_ws_command_total => |e| blk: {
+                if (e.tool) |t| {
+                    break :blk std.fmt.bufPrint(&buf, "{{\"metric\":\"extension_ws_command_total\",\"result\":\"{s}\",\"tool\":\"{s}\"}}", .{ e.result, t }) catch return;
+                } else {
+                    break :blk std.fmt.bufPrint(&buf, "{{\"metric\":\"extension_ws_command_total\",\"result\":\"{s}\"}}", .{e.result}) catch return;
+                }
+            },
+            .extension_ws_ssrf_block_total => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"extension_ws_ssrf_block_total\",\"value\":{d}}}", .{v}) catch return,
+            .produce_document_total => |e| std.fmt.bufPrint(&buf, "{{\"metric\":\"produce_document_total\",\"format\":\"{s}\",\"result\":\"{s}\"}}", .{ e.format, e.result }) catch return,
+            .produce_document_latency_ms => |e| std.fmt.bufPrint(&buf, "{{\"metric\":\"produce_document_latency_ms\",\"format\":\"{s}\",\"value\":{d}}}", .{ e.format, e.value }) catch return,
+            .trace_query_total => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"trace_query_total\",\"value\":{d}}}", .{v}) catch return,
+            .memory_doctor_total => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"memory_doctor_total\",\"value\":{d}}}", .{v}) catch return,
+            .moonshot_video_upload_total => |e| std.fmt.bufPrint(&buf, "{{\"metric\":\"moonshot_video_upload_total\",\"result\":\"{s}\"}}", .{e.result}) catch return,
+            .moonshot_video_upload_bytes => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"moonshot_video_upload_bytes\",\"value\":{d}}}", .{v}) catch return,
         };
         self.appendToFile(line);
     }
@@ -930,6 +1142,68 @@ pub const OtelObserver = struct {
                 const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch return;
                 self.addSpan("metric.queue_depth", now, now, &.{
                     .{ .key = "value", .value = s },
+                });
+            },
+            // ── v1.14.23 added — scalar counters/gauges/histograms ──
+            // For each new metric we emit a discrete span. The Otel
+            // exporter doesn't (yet) implement OTLP metrics natively;
+            // span-as-metric is the existing convention in this file
+            // (the four legacy metrics use the same shape). A future
+            // pass can migrate to OTLP metrics without changing the
+            // emit-site API.
+            //
+            // `@tagName(metric.*)` is a slice into the comptime-emitted
+            // type-info table, which lives in .rodata — safe to store
+            // as the span's borrowed `name` (same lifetime as the
+            // string literals used by the legacy variants above).
+            .artifact_create_total,
+            .artifact_update_total,
+            .artifact_share_total,
+            .artifact_share_revoke_total,
+            .share_create_success_total,
+            .share_create_429_total,
+            .extension_ws_connections_active,
+            .extension_ws_command_latency_ms,
+            .extension_ws_ssrf_block_total,
+            .trace_query_total,
+            .memory_doctor_total,
+            .moonshot_video_upload_bytes,
+            => |v| {
+                var buf: [20]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch return;
+                self.addSpan(@tagName(metric.*), now, now, &.{
+                    .{ .key = "value", .value = s },
+                });
+            },
+            .extension_ws_command_total => |e| {
+                if (e.tool) |t| {
+                    self.addSpan("metric.extension_ws_command_total", now, now, &.{
+                        .{ .key = "result", .value = e.result },
+                        .{ .key = "tool", .value = t },
+                    });
+                } else {
+                    self.addSpan("metric.extension_ws_command_total", now, now, &.{
+                        .{ .key = "result", .value = e.result },
+                    });
+                }
+            },
+            .produce_document_total => |e| {
+                self.addSpan("metric.produce_document_total", now, now, &.{
+                    .{ .key = "format", .value = e.format },
+                    .{ .key = "result", .value = e.result },
+                });
+            },
+            .produce_document_latency_ms => |e| {
+                var buf: [20]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "{d}", .{e.value}) catch return;
+                self.addSpan("metric.produce_document_latency_ms", now, now, &.{
+                    .{ .key = "format", .value = e.format },
+                    .{ .key = "value", .value = s },
+                });
+            },
+            .moonshot_video_upload_total => |e| {
+                self.addSpan("metric.moonshot_video_upload_total", now, now, &.{
+                    .{ .key = "result", .value = e.result },
                 });
             },
         }
