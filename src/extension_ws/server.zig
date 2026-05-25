@@ -281,10 +281,33 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+/// Per-call deadline for auth-window + initial frame reads. The gateway's
+/// listener socket is non-blocking; on `error.WouldBlock` we sleep
+/// briefly and retry rather than fail immediately. Total wait is bounded
+/// by AUTH_READ_DEADLINE_NS so a silent peer can't hold a slot forever.
+const AUTH_READ_DEADLINE_NS: i128 = 30 * std.time.ns_per_s;
+const READ_RETRY_SLEEP_NS: u64 = 10 * std.time.ns_per_ms;
+
 fn readExact(stream: anytype, buf: []u8) !void {
     var total: usize = 0;
+    const start = std.time.nanoTimestamp();
     while (total < buf.len) {
-        const n = try stream.read(buf[total..]);
+        const n = stream.read(buf[total..]) catch |err| switch (err) {
+            // 2026-05-25 (Wave 3B live-probe fix): gateway listener is
+            // non-blocking; first WS frame after the 101 takes a moment
+            // to arrive. Retry-with-sleep until data shows up or the
+            // deadline passes, rather than fail-fast with WouldBlock.
+            // Live probe caught this on every connection — auth_ack was
+            // never sent because readExact returned WouldBlock on byte 0
+            // of the auth frame.
+            error.WouldBlock => {
+                const elapsed = std.time.nanoTimestamp() - start;
+                if (elapsed > AUTH_READ_DEADLINE_NS) return error.ReadDeadlineExceeded;
+                std.Thread.sleep(READ_RETRY_SLEEP_NS);
+                continue;
+            },
+            else => return err,
+        };
         if (n == 0) return error.ConnectionClosed;
         total += n;
     }

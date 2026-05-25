@@ -1666,6 +1666,15 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (gw.object.get("internal_service_tokens")) |v| {
                 if (v == .array) self.gateway.internal_service_tokens = try parseStringArray(self.allocator, v.array);
             }
+            // 2026-05-25 (Wave 3B verify) — extension_ws_enabled flag was
+            // declared on GatewayConfig + checked at runtime but never
+            // wired into the JSON parser. Result: operator could set true
+            // in config.json and gateway would silently behave as if false
+            // (struct default), returning 503 to every extension connection.
+            // Live probe caught it. Wire here so flag actually takes effect.
+            if (gw.object.get("extension_ws_enabled")) |v| {
+                if (v == .bool) self.gateway.extension_ws_enabled = v.bool;
+            }
             // Wave 2B (2026-05-24) — public trace share sanitizer knobs.
             // See `GatewayConfig` doc-comments for semantics. Both
             // default to safe values when omitted from config so older
