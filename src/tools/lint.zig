@@ -13,7 +13,18 @@
 const std = @import("std");
 const metadata = @import("metadata.zig");
 
-// ── Registry of 63 production tools ──────────────────────────────────
+// ── Registry of production tools ─────────────────────────────────────
+//
+// Count is derived at comptime from `ALL_TOOLS.len` — see the
+// `production_tool_count` constant at the end of this file. Adding or
+// removing a tool here automatically updates the count, so this comment
+// can never go stale again (regression ME-04 from v1.14.22 review:
+// hardcoded "63" had drifted from the actual length of 74).
+//
+// IMPORTANT: keep the list strictly alphabetically sorted. The
+// `tools_sorted_alphabetically` comptime test below asserts ordering.
+// `image_generate` MUST come before `image_info` (regression ME-03 from
+// the same review: the two were swapped).
 
 pub const ALL_TOOLS = [_][]const u8{
     "artifact_create",
@@ -56,8 +67,8 @@ pub const ALL_TOOLS = [_][]const u8{
     "file_write",
     "git_operations",
     "http_request",
-    "image_info",
     "image_generate",
+    "image_info",
     "memory_archive",
     "memory_demote",
     "memory_doctor",
@@ -238,4 +249,45 @@ test "renderLen produces non-zero for valid desc" {
     };
     const len = renderLen(desc);
     try std.testing.expect(len > 0);
+}
+
+// ── Comptime registry invariants (ME-04, 2026-05-25) ─────────────────
+//
+// The count is derived from `ALL_TOOLS.len` so it can never drift from
+// the actual list. Surfaced publicly so other modules (and the operator
+// `runtime_info` tool) can render the current count without
+// re-counting.
+pub const production_tool_count: usize = ALL_TOOLS.len;
+
+// Alpha-order invariant: a single misplaced entry trips compilation.
+// This catches the kind of swap that produced ME-03 (`image_info`
+// before `image_generate`) before any test runs.
+comptime {
+    var i: usize = 1;
+    while (i < ALL_TOOLS.len) : (i += 1) {
+        if (std.mem.order(u8, ALL_TOOLS[i - 1], ALL_TOOLS[i]) != .lt) {
+            @compileError(
+                "ALL_TOOLS not sorted alphabetically: '" ++
+                    ALL_TOOLS[i - 1] ++
+                    "' must come after '" ++
+                    ALL_TOOLS[i] ++
+                    "' (or they are duplicates).",
+            );
+        }
+    }
+}
+
+test "ALL_TOOLS is sorted alphabetically (runtime check)" {
+    // The comptime block above is the load-bearing assertion; this
+    // runtime test is a belt-and-suspenders backstop and gives the
+    // test report a green checkmark for the invariant.
+    var i: usize = 1;
+    while (i < ALL_TOOLS.len) : (i += 1) {
+        const cmp = std.mem.order(u8, ALL_TOOLS[i - 1], ALL_TOOLS[i]);
+        try std.testing.expect(cmp == .lt);
+    }
+}
+
+test "production_tool_count matches ALL_TOOLS.len" {
+    try std.testing.expectEqual(ALL_TOOLS.len, production_tool_count);
 }
