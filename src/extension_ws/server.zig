@@ -241,11 +241,16 @@ pub const Frame = struct {
 /// chosen to match `websocket.zig`'s outbound client cap, but it
 /// prevented full-page screenshots from `extension_screenshot` (which
 /// produces base64-encoded PNGs that can run 3-5 MB after JSON envelope
-/// overhead). The screenshot tool's description advertises a ~3 MB
-/// cap; 8 MB gives ~2.5× headroom for JSON overhead + future feature
-/// payload growth. The DoS surface widens proportionally but a
-/// per-connection 8 MB allocation is still a reasonable server-side
-/// budget against authenticated extension peers.
+/// overhead). The screenshot tool's description advertises a ~6 MB
+/// cap (raised from 3 MB in v1.14.23 to match real-world page captures);
+/// 8 MB on the transport gives ~1.3× headroom over the advertised tool
+/// cap, enough for JSON envelope overhead. The DoS surface widens
+/// proportionally but a per-connection 8 MB allocation is still a
+/// reasonable server-side budget against authenticated extension peers.
+///
+/// MED-2 (v1.14.23 review): the prior comment still referenced the pre-
+/// v1.14.23 "~3 MB" advertised cap. Updated to track the current tool
+/// description.
 pub const MAX_FRAME_PAYLOAD: u64 = 8 * 1024 * 1024;
 
 // ── Header extraction (mirrors gateway.extractHeader semantics) ────────

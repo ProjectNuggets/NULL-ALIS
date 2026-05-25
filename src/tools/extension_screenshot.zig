@@ -13,6 +13,24 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 
+/// Error message returned to the agent when the WebSocket connection
+/// closes mid-screenshot (typically because the response frame exceeded
+/// the hub's 8 MB cap).
+///
+/// MED-1 (v1.14.23 review): the prior text told the agent to retry with
+/// `full_page:false`, but the extension's `cmdScreenshot` always calls
+/// `chrome.tabs.captureVisibleTab` regardless of the `full_page` arg
+/// (see `.spike/nullalis-extension/src/background.ts`). The agent would
+/// retry, get the identical capture, and fail the same way — a §14.5
+/// honesty violation (the remediation advertised an action the code
+/// can't perform). Replaced with operator-actionable guidance until the
+/// v1.1 stitched-capture path lands. Extracted to a `pub const` so the
+/// regression test can lock the honest contract in place.
+pub const CONNECTION_CLOSED_MSG: []const u8 =
+    "extension connection closed before screenshot completed — this may indicate the screenshot exceeded the 8 MB WebSocket frame cap. " ++
+    "Ask the user to reduce viewport zoom or navigate to a smaller portion of the page; the full_page flag does not change capture behavior in the current extension build. " ++
+    "If the issue persists, ask the user to reconnect the extension.";
+
 pub const ExtensionScreenshotTool = struct {
     hub: *hub_mod.ExtensionWsHub,
     user_id: ?[]const u8 = null,
@@ -84,7 +102,10 @@ pub const ExtensionScreenshotTool = struct {
         ) catch |err| switch (err) {
             error.NoExtensionConnected => return ToolResult.fail("no extension connected for this user. Ask the user to open the nullalis extension popup and connect."),
             error.Timeout => return ToolResult.fail("extension did not respond within the timeout window. The user's browser may be unresponsive or the extension may have disconnected."),
-            error.ConnectionClosed => return ToolResult.fail("extension connection closed before screenshot completed — this may indicate the screenshot exceeded the 8 MB WebSocket frame cap. Try full_page:false, crop the viewport, or split the capture into multiple regions; otherwise ask the user to reconnect the extension."),
+            // MED-1 (v1.14.23 review): see CONNECTION_CLOSED_MSG above
+            // for rationale (§14.5 honesty fix — full_page flag doesn't
+            // change capture behavior in the current extension build).
+            error.ConnectionClosed => return ToolResult.fail(CONNECTION_CLOSED_MSG),
             // HI-01 (v1.14.22): distinguish gateway OOM from connection-closed.
             error.ResultDeliveryOom => return ToolResult.fail("gateway ran out of memory delivering the extension result — please retry; if persistent, check the gateway available RAM."),
             else => |e| {
@@ -163,6 +184,20 @@ test "extension_screenshot tool name + spec" {
     try std.testing.expectEqualStrings("extension_screenshot", t.name());
     const s = t.spec();
     try std.testing.expect(std.mem.indexOf(u8, s.parameters_json, "full_page") != null);
+}
+
+// MED-1 (v1.14.23 review) regression: the ConnectionClosed remediation
+// message must NOT tell the agent to retry with `full_page:false`,
+// because the extension's `cmdScreenshot` ignores the flag entirely.
+// It SHOULD instead point at viewport zoom / page navigation as the
+// real lever the user can actually pull.
+test "CONNECTION_CLOSED_MSG does not advertise the unsupported full_page:false retry" {
+    // §14.5 contract: no remediation that the code can't perform.
+    try std.testing.expect(std.mem.indexOf(u8, CONNECTION_CLOSED_MSG, "full_page:false") == null);
+    try std.testing.expect(std.mem.indexOf(u8, CONNECTION_CLOSED_MSG, "Try full_page") == null);
+    // Honest remediation is in place.
+    try std.testing.expect(std.mem.indexOf(u8, CONNECTION_CLOSED_MSG, "reduce viewport zoom") != null);
+    try std.testing.expect(std.mem.indexOf(u8, CONNECTION_CLOSED_MSG, "does not change capture behavior") != null);
 }
 
 test "extension_screenshot without bound user returns wiring-bug error" {
