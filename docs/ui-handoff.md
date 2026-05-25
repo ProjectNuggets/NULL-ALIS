@@ -9,8 +9,8 @@ pairs_with:
   - docs/online-agent-contract.md (event grammar — the wire transport)
   - docs/openapi-v1.yaml (HTTP surface — full API reference)
   - docs/extension-ws-contract.md (browser-extension WebSocket protocol)
-  - /tmp/AGENT_SURFACE_AUDIT.md (Swiss-watch capability map — backend ↔ agent surface)
-  - /tmp/V1_14_21_REVIEW.md + /tmp/V1_14_22_REVIEW.md (code-review trail)
+  - docs/archive/2026-05-25/AGENT_SURFACE_AUDIT.md (Swiss-watch capability map — backend ↔ agent surface)
+  - docs/archive/2026-05-25/V1_14_21_REVIEW.md + V1_14_22_REVIEW.md + V1_14_23_HOLISTIC_REVIEW.md (code-review trail)
 binds_to: AGENTS.md §14.1 (UI/UX activation is mandatory per shipped feature)
 ---
 
@@ -33,7 +33,8 @@ here with a pointer to the canonical contract.
 3. **docs/openapi-v1.yaml** — every HTTP endpoint with request/response schema.
 4. **docs/extension-ws-contract.md** — browser-extension WS protocol for
    user-browser automation.
-5. **.planning/SURFACE_AUDIT.md** — gap report; what's wired vs what's
+5. **docs/archive/2026-05-25/AGENT_SURFACE_AUDIT.md** — Swiss-watch
+   capability map (backend ↔ agent surface); what's wired vs what's
    intentionally not surfaced.
 6. **AGENTS.md §14.1** — the "UI/UX activation is mandatory per shipped
    feature" standard. A backend capability without UI surface is not

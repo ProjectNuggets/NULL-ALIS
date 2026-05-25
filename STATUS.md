@@ -1,14 +1,16 @@
 # nullALIS — STATUS
 
-**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-25 — **commercial v1 sprint Waves 1–4 shipped + Wave 5 in flight.** This refresh covers the multi-wave commercial-launch arc: cap-lift + 7 default-on flags + dream cron (Wave 1), produce_document + trace-share + canvas/artifacts (Wave 2), dual-lane browser automation (server-side Playwright MCP + 10 user-browser `extension_*` tools, Wave 3), 1M-context model routing + renderer-chain hardening (Wave 4), Swiss-watch surface audit + UI agent handoff doc (Wave 5). Prior refresh covered v1.14.19 S-tier push.
+**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-25 — **commercial v1 sprint Waves 1–5 SHIPPED + v1.14.22 hotfix + v1.14.23 hardening pass.** This refresh covers the multi-wave commercial-launch arc + the two follow-up review-closure passes. Prior refresh covered v1.14.19 S-tier push.
 
 This is the single cold-start document. If it disagrees with `.planning/STATE.md`, `PROJECT_LEDGER.md` (archived), or anything in `docs/archive/`, **this wins**.
 
 ---
 
-## 2026-05-25 — Commercial v1 sprint Waves 1–4 shipped + Wave 5 in flight
+## 2026-05-25 — Commercial v1 sprint Waves 1–5 shipped + 2 review-closure passes
 
-Twelve commits on `main` since v1.14.20 close the commercial-launch gap-to-Manus + Claude-Code identified in the recon pass. Bench gate green at **6672 passed / 146 skipped / 0 failed**. Tag pending v1.14.21 once Wave 5's 6-tools follow-up subagent lands.
+**~62 commits on `main` since v1.14.20** close the commercial-launch gap-to-Manus + Claude-Code identified in the recon pass. Three tags landed: `v1.14.21` (the commercial v1 sprint), `v1.14.22` (hotfix closing 4 CRIT + 8 HIGH from the v1.14.21 review), v1.14.23 in flight (closing combined per-file + holistic findings from the second review). Bench gate green at **6751 passed / 148 skipped / 0 failed** post-CRITICAL-3.A closure.
+
+**v1.14.21 is a KNOWN-BAD reference tag** — it shipped 4 CRITICAL bugs (1M context half-wired, PendingCommand UAF, Dockerfile PDF broken, fonts not bundled). v1.14.22 is the first commercially-shippable tag; v1.14.23 hardens further per Nova's S-tier directive.
 
 ### Wave 1 — Activation (prior session, all flipped default-on)
 
@@ -36,11 +38,24 @@ Twelve commits on `main` since v1.14.20 close the commercial-launch gap-to-Manus
 - `9307f60e` — **9 remaining `extension_*` tools** (click/type/fill_form/screenshot/get_text/get_dom/wait_for/scroll/list_tabs). +61 tests. Browser product surface now complete: 10/10 tools.
 - `d722851d` + `d8c6cad9` — Wave 3B cleanup: bumped `happy-dom 14→20` killing 3 CVEs (2 CRITICAL RCE + XSS + 1 HIGH credential-leak in vitest test-env devDep). Narrowed `content_scripts.matches` from `<all_urls>` to `http(s)` only — excludes `file://`, `data:`, `blob:`, `ftp:`, `view-source:`. 51/51 vitest pass.
 
-### Wave 4 — 1M context routing + renderer chain (`db5dad47` + `9eaf0d40`)
+### Wave 4 — 1M context + renderer chain (initial, superseded by v1.14.22 CR-01)
 
-- `db5dad47` — Anthropic `claude-{opus,sonnet}-4-6-1m` + `4.6-1m` aliases + Google `gemini-2.5-pro-1m` in `model_capabilities.zig`. Base (non-`-1m`) variants stay at 200K for conservative cost default — 1M is opt-in by explicit model id. Pattern match on `-1m` suffix catches future dated variants. +4 tests.
-- `9eaf0d40` — D63 Dockerfile renderer chain: pandoc + marp-cli (npm) + pandas + openpyxl + weasyprint + chromium baked into release-base, verified in-build (`pandoc --version && marp --version && python3 -c "import pandas, openpyxl, weasyprint"` gates the layer).
-- Per-user dynamic context-aware routing (auto-swap base → -1m when context > 200K) deferred to v1.15.
+The initial v1.14.21 wave shipped synthetic `-1m` model id aliases that
+were dishonest (Anthropic ships native 1M on base ids; no beta header
+needed). The v1.14.22 CR-01 hotfix replaced this with honest wiring:
+
+- `claude-opus-4.6/4-6`, `claude-sonnet-4.6/4-6`, `gemini-2.5-pro` bumped
+  to native 1M (Anthropic deprecated the `context-1m-2025-08-07` beta
+  header April 30 2026 — 1M is native at standard pricing now).
+- `claude-opus-4.7` added (current flagship, 1M native).
+- Kimi K2.6 stays at 256K (honest — Moonshot did not extend).
+- Synthetic `-1m` suffix entries DELETED.
+- `9eaf0d40` D63 Dockerfile renderer chain (pandoc + marp-cli + pandas
+  + openpyxl + weasyprint + chromium); v1.14.22 added missing
+  `texlive-xetex` + real PDF build-time probe + COPY of brand fonts.
+- Per-user dynamic context-aware routing: per-user `selected_model`
+  setting wired in v1.14.22 (`6e3b48b0`) — FE picker swaps the model,
+  context window resolves from the chosen model's capability entry.
 
 ### Wave 5 — Swiss-watch surface audit + UI handoff
 
@@ -52,9 +67,43 @@ Twelve commits on `main` since v1.14.20 close the commercial-launch gap-to-Manus
 - **Surface audit deliverable** at `/tmp/AGENT_SURFACE_AUDIT.md` (read-only audit): 9 ship recommendations, 4 defer, 1 document; identified 4 endpoints lacking agent-tool equivalents (memory_doctor, trace_query, artifact_share, artifact_diff/history); the 6-tools follow-up subagent (in flight) closes these.
 - `528385f7` — D64 per-user share-spam cap (`MAX_LIVE_SHARES_PER_USER=100`, 429 response with `share_limit_reached` hint, +2 tests). Closes Wave 2 code-review MEDIUM #1.
 
-**CI gate across the wave-5 push:** 6672/6818 (146 skipped, 0 failed). 12 commits since `v1.14.20` (`cab65f26`..`d8c6cad9`). One subagent still in flight: 6 surface-audit follow-up tools (memory_doctor, trace_query, artifact_share, artifact_revoke_share, artifact_diff, artifact_history) — these close the last documented agent-surface gaps from the audit. Once they land, `v1.14.21` tag captures the entire commercial-v1 commercial-launch arc.
+**CI gate across the full arc:** 6751/6899 (148 skipped, 0 failed) post-v1.14.23 CRITICAL-3.A closure.
 
-**Deferred-register state:** D62 (wire `migrations.run()` into `zaki_state.migrate`) intentionally deferred to v1.15 — the legacy inline-DDL loop ships v1 commercial correctly; the framework refactor is real work without v1 customer impact. D63 closed (Dockerfile renderer chain shipped). D64 closed (share-spam cap shipped).
+### v1.14.22 hotfix — closing the v1.14.21 review (4 CRIT + 8 HIGH)
+
+Independent review of v1.14.21 surfaced 4 CRITICAL findings landed in
+the commercial v1 sprint. v1.14.22 closes them all + 8 HIGH:
+
+- **CR-01** Honest 1M context (above) — drop synthetic `-1m` entries; bump
+  real Anthropic + Gemini SKUs to native 1M.
+- **CR-02** `PendingCommand` UAF in hub.sendCommand timeout-vs-deliver
+  race (atomic refcount, same pattern as conn-level refcount). IN-01
+  deterministic gate-injection test replaces the prior probabilistic
+  race test.
+- **CR-03** Dockerfile renderer broken (no LaTeX engine; PDF fallback
+  bug returns on `ran_but_failed`). texlive-xetex + real PDF probe.
+- **CR-04** Thmanyah fonts not COPYed into runtime image. Added the
+  COPY + build-time path verification.
+- 8 HIGH closed in `c12ebc39`, `6fe78b61`, `8d9f59dd`. See
+  `docs/archive/2026-05-25/V1_14_21_REVIEW.md`.
+
+### v1.14.23 hardening pass — closing combined per-file + holistic review
+
+- **CRITICAL 3.A** brain_graph.zig still had OLD broken JSON escaper
+  HI-05 was supposed to eradicate. `c94ac5d0` consolidates the 4
+  escapers (brain_graph + task_list + task_get + todo) onto the shared
+  `json_escape.zig::writeJsonStringContent`.
+- 9 commits since v1.14.22: Vite 8 upgrade (`3c201e45`), D62
+  migrations.run wiring (`fcb32a07`), debt sweep ME-02/04/07 + IN-01
+  (`120965c4`..`45bf5183`), Moonshot Files API for >70MB videos
+  (`93a10b72`), docs cleanup (`c15faf82`).
+- Additional in-flight: 3 parallel subagents closing the remaining
+  HIGH+WARN tier of the v1.14.23 review (file_upload hardening,
+  observability+metrics sweep, arm64 CI + time-unit + index-name
+  unify).
+
+**Deferred-register state:** D62 SHIPPED at `fcb32a07`. D63 SHIPPED.
+D64 SHIPPED. See `docs/deferred-register.md` for the full ledger.
 
 ---
 
