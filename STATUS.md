@@ -25,6 +25,7 @@ This is the single cold-start document. If it disagrees with `.planning/STATE.md
 - Trace share URLs with server-side sanitizer (`POST /api/v1/users/:id/traces/:id/share`)
 - Canvas artifacts (`artifact_create/update/get/list` + `artifact_event` SSE for live panel refresh)
 - **Bundled Thmanyah fonts in repo** (`49ad4618`) — `assets/branding/fonts/{thmanyahsans,thmanyahserifdisplay,thmanyahseriftext}/{otf,woff2}/` with auto-resolve from `produce_document.resolveBranding`; SaaS deploy gets brand typography without operator config
+- **Artifact export bridge (Wave 2A)** — `POST /api/v1/users/:id/artifacts/:id/export?format=pdf|docx|pptx|xlsx|html` resolves ownership via `getArtifactById`, calls `ProduceDocumentTool.execute()` with the safe `default` theme, returns JSON `{status, artifact_id, format, filename, path, url, download_url}`. Companion `GET /api/v1/users/:id/exports/:filename` streams produced files with correct Content-Type, filename-traversal guarded. Renderer-missing → `502 renderer_unavailable` with install hint. Covered by 6 handler-level tests + live-PG cross-user isolation test.
 
 ### Wave 3 — Dual-lane browser automation
 
