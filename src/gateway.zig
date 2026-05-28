@@ -29267,7 +29267,13 @@ test "Sprint 2 TOCTOU — handleSessionApprove rejects swap during the session.m
         .req = req,
     };
 
-    const gateway_thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, struct {
+    // 2 MB stack matches the production scheduler thread (commit
+    // f7f81370 bumped it from 256 KB → 2 MB to close a deterministic
+    // SIGILL on the agent's tool-execution path). handleSessionApprove
+    // routes through processMessage → agent.turn → handleSlashCommand,
+    // the same chain that motivated the production bump; under
+    // release-safe with SIMD-spilled locals 1 MB is too thin.
+    const gateway_thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, struct {
         fn run(c: *ThreadCtx) void {
             c.resp = handleSessionApprove(c.alloc, c.mgr, c.key, c.req);
         }
