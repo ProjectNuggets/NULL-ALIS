@@ -258,6 +258,21 @@ pub const RunEventObserver = struct {
                 .state = "done",
                 .label = "Response ready",
             } }),
+            // Production-readiness gate (2026-05-28): the agent emits
+            // `turn_cancelled` from `agent/root.zig` when the cooperative
+            // CancellationToken trips between iterations. Surface it as a
+            // structured `system_notice` so the FE can render a
+            // user-visible "Stopped" chip without misclassifying the
+            // turn as an error. The accompanying `turn_complete` event
+            // (emitted by the same code path) still flows as the
+            // canonical `progress.finalize.done` frame, so clients always
+            // see a clean terminal `done` after a cancel.
+            .turn_cancelled => |e| self.emit(.{ .system_notice = .{
+                .kind = "turn_cancelled",
+                .severity = "info",
+                .message = "Turn cancelled by user request.",
+                .detail = e.reason,
+            } }),
             .tool_iterations_exhausted => self.emit(.{ .progress = .{
                 .phase = "finalize",
                 .state = "error",

@@ -19,12 +19,26 @@ info:
       `approval_required`, `task_update`, `done`, etc.) is documented in
       docs/online-agent-contract.md. That document is the authoritative
       schema for frames emitted over `/api/v1/chat/stream`.
-    - Direct operator controls (execution mode, permissions posture,
-      usage/cost inspection) are exposed as chat slash commands in the
+    - Direct operator controls are exposed as chat slash commands in the
       agent runtime (`/permissions`, `/mode`, `/plan`, `/review`,
-      `/execute`, `/approve`, `/usage`, `/cost`). REST parity is planned
-      but deferred — see the "Planned endpoint additions" block below
-      and docs/online-agent-contract.md §2a.
+      `/execute`, `/approve`, `/usage`, `/cost`). Session-scoped REST
+      parity exists for approval, execution mode, AND backend-owned
+      active-turn cancellation:
+      `/api/v1/users/{user_id}/sessions/{session_key}/approve`,
+      `/api/v1/users/{user_id}/sessions/{session_key}/mode`,
+      `/api/v1/users/{user_id}/sessions/{session_key}/cancel`.
+      Clients must NOT assume `/api/v1/chat/cancel`, `/api/v1/chat/resume`,
+      or `/api/v1/chat/approve` exists — those endpoints have never been
+      shipped. Cancel is idempotent; resume is not implemented and the
+      reconnect contract relies on reconnecting to `POST /api/v1/chat/stream`
+      plus reading the bounded in-process trace store via
+      `GET /api/v1/users/{user_id}/traces/{run_id}` (see §7 of
+      docs/online-agent-contract.md).
+    - Canvas/artifact CRUD, share, export, attachment upload (with
+      `Idempotency-Key` dedupe), trace sharing, and the authenticated
+      export download route are documented below. The artifact export
+      bridge resolves through `produce_document` and supports pdf, docx,
+      pptx, xlsx, and html; unknown formats return 400.
     - TODO: Task lifecycle extensions are documented in docs/agent-lifecycle-spec.md.
 servers:
   - url: http://127.0.0.1:3000
@@ -1287,8 +1301,10 @@ paths:
   # commands** in the agent runtime, not as REST endpoints. See
   # docs/online-agent-contract.md §2a for the implemented slash-command
   # surface (`/permissions`, `/mode`, `/plan`, `/review`, `/execute`,
-  # `/approve`, `/usage`, `/cost`). REST parity for these controls is
-  # planned but deferred beyond v0.1.
+  # `/approve`, `/usage`, `/cost`). Session-scoped REST parity exists
+  # for approve and mode. Backend-owned active-turn cancel/resume is a
+  # production-readiness gate and is not represented by phantom
+  # /api/v1/chat/cancel or /api/v1/chat/resume paths.
   #
   # SSE event vocabulary for POST /api/v1/chat/stream (tool_start,
   # tool_result, approval_required, task_update, ...) IS implemented.
@@ -1336,7 +1352,13 @@ paths:
   #   - Persistent generic allowlist for `/approve allow-always`.
   #   - Live subagent interruption (only queued tasks are cancellable).
   #   - Planner artifacts (persisted plans / plan ids).
-  #   - Full REST parity for operator slash commands beyond /approve.
+  #   - Backend-owned active-turn RESUME (cancel SHIPPED 2026-05-28 as
+  #     `POST /api/v1/users/{user_id}/sessions/{session_key}/cancel`;
+  #     resume is intentionally not implemented — clients reconnect to
+  #     `POST /api/v1/chat/stream` and read trace history via
+  #     `GET /api/v1/users/{user_id}/traces/{run_id}` instead).
+  #   - Full REST parity for operator slash commands beyond /approve,
+  #     /mode, and /cancel.
   #   - MCP runtime metadata registry.
   #
 
@@ -1741,6 +1763,506 @@ paths:
         '404':
           description: Session not found
 
+  /api/v1/users/{user_id}/sessions/{session_key}/mode:
+    post:
+      summary: Set the active session execution mode
+      description: |
+        Routes through the canonical `/mode` slash-command handler so chat
+        commands and UI controls share one behavior path. Applies to the
+        live session only; persisted/evicted sessions do not have a live
+        agent process and return 404.
+      operationId: setSessionMode
+      tags: [Sessions]
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/SessionKeyPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode]
+              properties:
+                mode:
+                  type: string
+                  enum: [plan, review, execute, background]
+      responses:
+        '200':
+          description: Mode changed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [mode, message]
+                properties:
+                  mode:
+                    type: string
+                    enum: [plan, review, execute, background]
+                  message:
+                    type: string
+        '400':
+          description: Missing body, invalid JSON, or invalid mode
+        '403':
+          description: Session not owned by user
+        '404':
+          description: Session not found or no live session manager
+
+  /api/v1/users/{user_id}/sessions/{session_key}/cancel:
+    post:
+      summary: Cancel the session's active agent turn (P0 — 2026-05-28)
+      description: |
+        Backend-owned active-turn cancellation. Signals the session
+        agent's atomic `CancellationToken`; the agent loop polls
+        between iterations and exits early with a `[Cancelled]`-prefixed
+        reply, an SSE `system_notice { kind: "turn_cancelled" }`, and
+        the canonical `progress { phase: "finalize", state: "done" }`
+        frame followed by `done`.
+
+        Idempotent:
+          - Repeated cancels produce the same `cancellation_signalled`
+            response. The atomic store is a no-op on an already-set
+            flag.
+          - A cancel against an idle session is safe; the agent resets
+            the token at the start of every turn, so a stale cancel
+            cannot silently cancel a future user message. The response
+            sets `was_active: false` so the FE can tell the user that
+            no real work was interrupted.
+
+        Production gate: the FE Stop button MUST bind to this route.
+        Client-side `fetch().abort()` alone is insufficient — without
+        this route the server-side run keeps consuming tokens, tool
+        side-effects, and meter receipts after the client disconnects.
+      operationId: cancelSession
+      tags: [Sessions]
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/SessionKeyPath'
+      responses:
+        '200':
+          description: Cancellation signalled
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, session_key, was_active]
+                properties:
+                  status:
+                    type: string
+                    enum: [cancellation_signalled]
+                  session_key:
+                    type: string
+                  was_active:
+                    type: boolean
+                    description: True when the session had an in-flight active reference at cancel time; false when the session was idle.
+        '403':
+          description: Session not owned by user
+        '404':
+          description: Session not found
+        '405':
+          description: Method not allowed (only POST is supported)
+
+  /api/v1/users/{user_id}/attachments:
+    post:
+      summary: Upload a base64-encoded attachment to the user workspace
+      description: |
+        Writes the decoded bytes to `{workspace}/attachments/{filename}`.
+        The agent then reads the attachment via the `file_read` tool
+        with path `attachments/{filename}` (per-user scoping is
+        guaranteed by the workspace boundary; no cross-user paths can
+        be reached).
+
+        Filename safety:
+          - `..` segments, `/`, hidden files, and control characters
+            are rejected with 400.
+        Size caps:
+          - base64 input <= 27 MB.
+          - decoded bytes <= 20 MB (matches multimodal cap).
+
+        Idempotency (D7 closure, 2026-05-28):
+          - `Idempotency-Key` header is honored in soft mode: when
+            absent, the upload proceeds normally (existing-client
+            compatibility).
+          - When present, a retry with the same key returns the same
+            response body verbatim from the in-memory cache and does
+            NOT re-write the file. A different filename or content
+            attached to the same key still returns the FIRST upload's
+            response — at-most-once semantics protect against unsafe
+            overwrite.
+          - Empty / oversized (`> 256`) keys return 400.
+          - Error responses are NOT cached, so a transient 5xx does
+            not lock the client out of retrying.
+      operationId: uploadUserAttachment
+      tags: [Attachments]
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+          description: Optional dedupe key. Retries with the same key return the same response body.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [filename, content_b64]
+              properties:
+                filename:
+                  type: string
+                  description: Must pass isSafeAttachmentFilename (no `..`, `/`, hidden, control chars).
+                content_b64:
+                  type: string
+                  description: Standard base64 encoding of the file bytes (decoded size <= 20 MB).
+      responses:
+        '200':
+          description: Attachment written or idempotency hit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttachmentUploadResponse'
+        '400':
+          description: Missing body, missing field, unsafe filename, invalid base64, or invalid Idempotency-Key
+        '413':
+          description: Attachment too large
+        '500':
+          description: Filesystem or allocation failure
+
+  /api/v1/users/{user_id}/artifacts:
+    get:
+      summary: List artifacts owned by user
+      operationId: listUserArtifacts
+      tags: [Artifacts]
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+      responses:
+        '200':
+          description: Artifact list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactListResponse'
+        '503':
+          description: Persistent state backend not configured
+
+  /api/v1/users/{user_id}/artifacts/{artifact_id}:
+    get:
+      summary: Get the latest version of an artifact
+      operationId: getUserArtifact
+      tags: [Artifacts]
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/ArtifactIdPath'
+      responses:
+        '200':
+          description: Artifact metadata + latest version content
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactResponse'
+        '400':
+          description: Malformed artifact_id
+        '404':
+          description: Artifact not found
+        '503':
+          description: Persistent state backend not configured
+    put:
+      summary: Append a new version of an artifact (user edit)
+      operationId: putUserArtifact
+      tags: [Artifacts]
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/ArtifactIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+                change_summary:
+                  type: string
+      responses:
+        '200':
+          description: New version appended
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactResponse'
+        '400':
+          description: Missing body or invalid payload
+        '404':
+          description: Artifact not found
+        '503':
+          description: Persistent state backend not configured
+
+  /api/v1/users/{user_id}/artifacts/{artifact_id}/share:
+    post:
+      summary: Mint a public share URL for an artifact
+      description: |
+        Returns `share_url` rooted at `/api/v1/share/artifact/{code}`.
+        Default TTL 7 days; max 30 days. Per-user share-spam cap of
+        100 live shares (D64); when hit, returns 429 with
+        `share_limit_reached`.
+      operationId: shareUserArtifact
+      tags: [Artifacts]
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/ArtifactIdPath'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ttl_secs:
+                  type: integer
+                  minimum: 60
+                  maximum: 2592000
+                  description: Time-to-live in seconds. Defaults to 604800 (7 days); max 2592000 (30 days).
+      responses:
+        '200':
+          description: Share minted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactShareResponse'
+        '404':
+          description: Artifact not found
+        '429':
+          description: Per-user share-spam cap reached
+          content:
+            application/json:
+              examples:
+                share_limit_reached:
+                  value: { error: share_limit_reached, detail: "Revoke an existing share before minting another." }
+        '503':
+          description: Persistent state backend not configured
+    delete:
+      summary: Revoke an artifact's share URL
+      operationId: revokeUserArtifactShare
+      tags: [Artifacts]
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/ArtifactIdPath'
+      responses:
+        '200':
+          description: Share revoked (idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '404':
+          description: Artifact not found
+        '503':
+          description: Persistent state backend not configured
+
+  /api/v1/users/{user_id}/artifacts/{artifact_id}/export:
+    post:
+      summary: Export an artifact through produce_document (Wave 2A — 2026-05-28)
+      description: |
+        Calls `ProduceDocumentTool.execute()` with the safe `default`
+        theme and the artifact's latest content. Branding is operator-
+        owned and applies automatically when configured; the user
+        cannot pick `thmanyah` via this endpoint.
+
+        Renderer-missing failures surface as `502 renderer_unavailable`
+        with the install hint embedded in `detail`. Format must be one
+        of `pdf|docx|pptx|xlsx|html`; anything else returns 400.
+
+        Response shape includes both `url` and `download_url`, both
+        pointing at `GET /api/v1/users/{user_id}/exports/{filename}`
+        for a user-scoped binary download with the right Content-Type.
+      operationId: exportUserArtifact
+      tags: [Artifacts]
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/ArtifactIdPath'
+        - in: query
+          name: format
+          required: false
+          schema:
+            type: string
+            enum: [pdf, docx, pptx, xlsx, html]
+            default: pdf
+      responses:
+        '200':
+          description: Export produced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactExportResponse'
+        '400':
+          description: Invalid artifact id or unsupported format
+        '404':
+          description: Artifact or version not found
+        '500':
+          description: Render or write failure (when not renderer-missing)
+        '502':
+          description: Renderer binary missing in image (renderer_unavailable)
+        '503':
+          description: Persistent state backend not configured
+
+  /api/v1/users/{user_id}/exports/{filename}:
+    get:
+      summary: Stream a single produced export file (Wave 2A — 2026-05-28)
+      description: |
+        Serves `{workspace}/attachments/produced/{filename}` with a
+        Content-Type derived from the filename extension. The route is
+        user-scoped via UserContext upstream of dispatch and
+        filename-traversal guarded by isSafeAttachmentFilename.
+      operationId: getUserExport
+      tags: [Artifacts]
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - in: path
+          name: filename
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: File bytes with appropriate Content-Type
+          content:
+            application/pdf: { schema: { type: string, format: binary } }
+            application/vnd.openxmlformats-officedocument.wordprocessingml.document: { schema: { type: string, format: binary } }
+            application/vnd.openxmlformats-officedocument.presentationml.presentation: { schema: { type: string, format: binary } }
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet: { schema: { type: string, format: binary } }
+            text/html: { schema: { type: string } }
+        '400':
+          description: Unsafe filename (e.g. ..-traversal)
+        '404':
+          description: Export not found
+        '500':
+          description: I/O or alloc failure
+
+  /api/v1/users/{user_id}/traces/{run_id}/share:
+    post:
+      summary: Mint a public share URL for a run trace
+      description: |
+        Public trace viewer at `/api/v1/share/{share_code}`. Server-
+        side sanitizer strips secrets before exposing events; the
+        endpoint never reveals raw provider payloads or tool outputs
+        beyond the same allowlisted public field subset used by
+        `GET /api/v1/users/{user_id}/traces/{run_id}` (see §7 of
+        docs/online-agent-contract.md).
+      operationId: shareUserTrace
+      tags: [Traces]
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Share minted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TraceShareResponse'
+        '404':
+          description: Run not present in in-process trace store
+        '429':
+          description: Per-user share-spam cap reached
+    delete:
+      summary: Revoke a previously minted run-trace share
+      operationId: revokeUserTraceShare
+      tags: [Traces]
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Share revoked (idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '404':
+          description: Share not found
+
+  /api/v1/share/{share_code}:
+    get:
+      summary: Public viewer for a shared run trace (no auth)
+      operationId: getSharedTrace
+      tags: [Traces]
+      parameters:
+        - in: path
+          name: share_code
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Sanitized trace view
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '404':
+          description: Share not found or expired
+
+  /api/v1/share/artifact/{share_code}:
+    get:
+      summary: Public viewer for a shared artifact (no auth)
+      operationId: getSharedArtifact
+      tags: [Artifacts]
+      parameters:
+        - in: path
+          name: share_code
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Sanitized artifact view (title + kind + content + updated_at)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '404':
+          description: Share not found or expired
+
 components:
   parameters:
     UserIdPath:
@@ -1785,6 +2307,16 @@ components:
         Canonical task id (format `task_<11 hex digits>`, 16 chars).
         The gateway rejects task_ids containing control characters,
         `/`, or longer than 64 chars with 400 Bad Request.
+    ArtifactIdPath:
+      in: path
+      name: artifact_id
+      required: true
+      schema:
+        type: string
+      description: >
+        Canonical artifact id (uuid-shaped, validated by
+        isValidArtifactId). Malformed ids return 400 before any DB
+        touch.
 
   securitySchemes:
     InternalToken:
@@ -2265,3 +2797,122 @@ components:
           type: integer
           nullable: true
       additionalProperties: false
+
+    # ── Attachments (Idempotency-Key dedupe — D7 SHIPPED 2026-05-28) ─
+    AttachmentUploadResponse:
+      type: object
+      required: [path, bytes]
+      properties:
+        path:
+          type: string
+          description: Path relative to the user workspace; agent reads via the `file_read` tool.
+        bytes:
+          type: integer
+          format: int64
+          description: Decoded byte size of the written file.
+
+    # ── Artifacts (Wave 2C) ─────────────────────────────────────────
+    ArtifactSummary:
+      type: object
+      required: [id, title, kind, latest_version, updated_at_ms]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        kind:
+          type: string
+          description: Free-form kind (markdown, code, html, etc.).
+        latest_version:
+          type: integer
+          format: int32
+        updated_at_ms:
+          type: integer
+          format: int64
+        share_code:
+          type: string
+          nullable: true
+    ArtifactListResponse:
+      type: object
+      required: [artifacts]
+      properties:
+        artifacts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ArtifactSummary'
+    ArtifactResponse:
+      type: object
+      required: [id, title, kind, version, content, updated_at_ms]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        kind:
+          type: string
+        version:
+          type: integer
+          format: int32
+        content:
+          type: string
+        change_summary:
+          type: string
+          nullable: true
+        updated_at_ms:
+          type: integer
+          format: int64
+        share_code:
+          type: string
+          nullable: true
+    ArtifactShareResponse:
+      type: object
+      required: [share_code, share_url, expires_at_ms]
+      properties:
+        share_code:
+          type: string
+        share_url:
+          type: string
+          description: Public URL rooted at /api/v1/share/artifact/{code}.
+        expires_at_ms:
+          type: integer
+          format: int64
+
+    # ── Artifact export bridge (Wave 2A — SHIPPED 2026-05-28) ───────
+    ArtifactExportResponse:
+      type: object
+      required: [status, artifact_id, format, filename, path, url, download_url]
+      properties:
+        status:
+          type: string
+          enum: [exported]
+        artifact_id:
+          type: string
+        format:
+          type: string
+          enum: [pdf, docx, pptx, xlsx, html]
+        filename:
+          type: string
+          description: Generated filename inside attachments/produced/.
+        path:
+          type: string
+          description: Path relative to the workspace, e.g. attachments/produced/report_<ts>_<rand>.pdf.
+        url:
+          type: string
+          description: User-scoped binary URL (alias of download_url) — /api/v1/users/{user_id}/exports/{filename}.
+        download_url:
+          type: string
+          description: Same as `url` — both fields exist for FE convenience.
+
+    # ── Trace sharing ───────────────────────────────────────────────
+    TraceShareResponse:
+      type: object
+      required: [share_code, share_url, expires_at_ms]
+      properties:
+        share_code:
+          type: string
+        share_url:
+          type: string
+          description: Public URL rooted at /api/v1/share/{code}.
+        expires_at_ms:
+          type: integer
+          format: int64

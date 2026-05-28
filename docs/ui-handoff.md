@@ -1,14 +1,15 @@
 ---
 tags: [prose, prose/docs, prose/handoff]
 authored: 2026-05-25
-refreshed: 2026-05-25 (v1.14.22 hotfix)
-status: READY — Wave 5 handoff to UI agent, refreshed against v1.14.22 ground truth
+refreshed: 2026-05-28 (production-readiness refresh)
+status: PRODUCTION-READINESS HANDOFF — UI may build from this, but launch requires the P0/P1 gates in §6 to close
 audience: UI/UX agent building the chatzaki.com commercial v1 surface
-backend_version: v1.14.22 (hotfix tag — closes 4 CRIT + 8 HIGH from v1.14.21 review)
+backend_version: v1.14.25+ readiness branch (verify exact commit before release)
 pairs_with:
   - docs/online-agent-contract.md (event grammar — the wire transport)
   - docs/openapi-v1.yaml (HTTP surface — full API reference)
   - docs/extension-ws-contract.md (browser-extension WebSocket protocol)
+  - docs/production-readiness-prompt.md (backend burn-down prompt + acceptance gates)
   - docs/archive/2026-05-25/AGENT_SURFACE_AUDIT.md (Swiss-watch capability map — backend ↔ agent surface)
   - docs/archive/2026-05-25/V1_14_21_REVIEW.md + V1_14_22_REVIEW.md + V1_14_23_HOLISTIC_REVIEW.md (code-review trail)
 binds_to: AGENTS.md §14.1 (UI/UX activation is mandatory per shipped feature)
@@ -26,6 +27,12 @@ should not need to spelunk the Zig code to know what features exist or
 how to expose them. Everything reachable by an end user is enumerated
 here with a pointer to the canonical contract.
 
+Production rule: the deferred register is a visibility ledger, not a
+permission slip. Anything that affects user trust, data durability,
+memory correctness, browser control, artifacts, session lifecycle,
+approvals, metering, or privacy is a launch gate until closed or
+explicitly scoped out of V1 by product.
+
 ## 0. Reading order for the UI agent
 
 1. **This doc** — capability inventory + UX strategy.
@@ -33,10 +40,12 @@ here with a pointer to the canonical contract.
 3. **docs/openapi-v1.yaml** — every HTTP endpoint with request/response schema.
 4. **docs/extension-ws-contract.md** — browser-extension WS protocol for
    user-browser automation.
-5. **docs/archive/2026-05-25/AGENT_SURFACE_AUDIT.md** — Swiss-watch
+5. **docs/production-readiness-prompt.md** — backend burn-down prompt
+   and launch acceptance gates.
+6. **docs/archive/2026-05-25/AGENT_SURFACE_AUDIT.md** — Swiss-watch
    capability map (backend ↔ agent surface); what's wired vs what's
    intentionally not surfaced.
-6. **AGENTS.md §14.1** — the "UI/UX activation is mandatory per shipped
+7. **AGENTS.md §14.1** — the "UI/UX activation is mandatory per shipped
    feature" standard. A backend capability without UI surface is not
    "done" by nullalis grading.
 
@@ -69,10 +78,20 @@ transport doc the UI binds to.
 | Capability | Tool / endpoint | Contract | UX surface |
 |---|---|---|---|
 | Stream a turn | `POST /api/v1/chat/stream` (SSE) | `online-agent-contract.md` §1 | Main chat input + transcript |
-| Resume a turn | `POST /api/v1/chat/resume` | §1.2 reconnect path | Reconnect indicator |
-| Approve a paused tool | `POST /api/v1/chat/approve` | §1.1 `approval_required` event | Inline approval card |
-| Cancel a turn | `POST /api/v1/chat/cancel` | — | Stop button |
+| Reconnect / replay | reconnect to `POST /api/v1/chat/stream`; trace reads via `GET /api/v1/users/:id/traces/:run_id` | §1.2 + §7 | Reconnect indicator; no fake "resume" claim — there is no `chat/resume` route |
+| Approve a paused tool | `POST /api/v1/users/:id/sessions/:session_key/approve` | §1.1 + OpenAPI Sessions | Inline approval card |
+| Change run mode | `POST /api/v1/users/:id/sessions/:session_key/mode` | `online-agent-contract.md` §2a | Plan / Review / Execute / Background segmented control |
+| Cancel a turn | `POST /api/v1/users/:id/sessions/:session_key/cancel` *(SHIPPED 2026-05-28)* | §2a + OpenAPI Sessions | Stop button — idempotent; SSE bridge emits `system_notice { kind: "turn_cancelled" }` followed by canonical `done`. Response includes `was_active` so the UI can tell the user whether real work was interrupted. |
 | Slash commands | `commands.zig` registry | §3.4 | `/` palette in input |
+
+**Production-grade lifecycle rule**: the UI must not invent lifecycle
+semantics that the backend does not own. Stop and approval are
+backend-owned and idempotent today; mode changes apply to the live
+session only. There is intentionally no `resume` route — reconnect via
+`POST /api/v1/chat/stream` and read the trace history endpoint instead.
+Client-side `fetch().abort()` alone does NOT count as a cancel — bind
+the Stop button to the cancel route so server-side work, meter
+receipts, and tool side-effects honor the user's intent.
 
 ### 2.2 Persistent memory — the differentiator
 
@@ -155,6 +174,7 @@ Two completely different lanes that the user picks per use case.
 | `artifact_revoke_share` *(v1.14.21)* | Unpublish a shared artifact | "Stop sharing" on share modal |
 | `artifact_diff` *(v1.14.21)* | Compute diff between two versions | "What changed since v3?" inline answer |
 | `artifact_history` *(v1.14.21)* | List all versions with timestamps + change summaries | "Version history" panel |
+| `POST /api/v1/users/:id/artifacts/:artifact_id/export?format=pdf|docx|pptx|xlsx|html` | Export an artifact through `produce_document` | Download / Open file action on artifact card |
 | `artifact_event` SSE | Real-time refresh notification | Panel updates without polling |
 
 **UX rule**: artifacts are the "you're co-authoring with the agent"
@@ -162,6 +182,15 @@ surface. They must feel responsive — the `artifact_event` SSE frame
 exists specifically so the panel refreshes without polling. The agent
 will call `artifact_share` directly when a user asks to share; the FE
 "Share" button is the same backend path — both work in parallel.
+Artifact export is wired to `produce_document` (Wave 2A bridge, shipped
+in this commit chain): a successful export returns JSON
+`{status, artifact_id, format, filename, path, url, download_url}` where
+both `url` and `download_url` point at
+`GET /api/v1/users/:id/exports/:filename` — a user-scoped binary route
+that streams the produced file with the correct Content-Type. Renderer-
+missing failures surface as `502 renderer_unavailable` with the install
+hint embedded in `detail`, so the FE can show an actionable error
+instead of a generic crash.
 
 ### 2.7 Trace sharing — shareable runs
 
@@ -438,23 +467,32 @@ control what it remembers." Make this true in the UI:
 | `src/agent/model_capabilities.zig` | The model_id → (context_window, max_output, vision, video) lookup table. Source of truth for context-window badge values in the model picker. |
 | `src/user_settings.zig` | Source of truth for `ProductSettings` — `selected_model`, `dream_enabled`, `query_expansion_enabled`, `autonomy`, etc. |
 
-## 6. Open questions & deferred work
+## 6. Production Readiness Burn-Down
 
-These are intentional gaps. The UI agent should plan for, not ship,
-these surfaces.
+These are not "nice to have" if the commercial V1 exposes the related
+surface. P0 blocks launch. P1 blocks the S-tier claim and must close
+before public scale unless product explicitly hides the surface.
 
-| ID | Item | Owner | ETA |
+| Gate | Item | Owner | Acceptance |
 |---|---|---|---|
-| D62 | Wire `migrations.run()` into `zaki_state.migrate` | backend | v1.15 — inline-DDL loop works for v1 |
-| WP-future | Per-cell isolated pods (multi-tenant → single-tenant per cell) | platform | v1.18 |
-| WP-future | Vite 5 → 7+ migration in `.spike/nullalis-extension` | spike | follow-up sprint — 7 devDep-only CVEs (no runtime ship to users) |
-| ME-02 | Auth-validator constant-time loop length-based timing leak | backend | v1.15 (JWT path matters more) |
-| ME-04 | "Registry of 63 production tools" comment stale (actually 74) | backend | trivial cleanup |
-| ME-07 | Boot warning gap when `extension_browser_allowlist` empty | backend | trivial |
+| P1 | Approval consolidation | backend | One canonical pending-approval model; no legacy `pending_exec_*` ambiguity; stable enough identifiers for UI cards |
+| P1 | Durable traces/shares | backend | User-visible traces and share records survive restart, or the UI contract explicitly labels them ephemeral and hides durable-history UX |
+| P1 | Extension browser readiness | backend + extension | Per-user token auth, pairing, disconnect state, approval behavior, and browser command failures are observable and test-covered |
+| P1 | Observability/SLOs | backend + platform | Run id, session id, product id, tool latency, artifact export, approvals, extension commands, memory writes, and meter receipt IDs are chartable |
+| P1 | Memory PII purge/export UX | backend | `memory_forget` is callable from the UI; PII-tagged memories can be enumerated and bulk-cleared; consent gate stays opt-in |
+
+**Closed in this readiness pass** (2026-05-28 — P0 burn-down):
+- **P0 — Backend-owned turn cancel**: `POST /api/v1/users/:id/sessions/:key/cancel` ships. Atomic `CancellationToken`; the agent loop polls between iterations; SSE bridge surfaces `system_notice { kind: "turn_cancelled" }` then the canonical `done`. Idempotent; cancels against idle sessions report `was_active: false`. There is NO `chat/resume` and the docs no longer claim one. Covered by `cancelActiveTurn` tests in `session.zig` and `handleSessionCancel` tests in `gateway.zig`.
+- **P0 — Attachment idempotency (D7)**: `POST /api/v1/users/:id/attachments` honors `Idempotency-Key` in soft mode. Retries with the same key short-circuit to the cached response BEFORE any filesystem touch — so a different filename or content paired with the same key cannot unsafely overwrite the first upload. Empty/oversized keys return 400. Error responses are NOT cached. Covered by 4 dedicated tests against a tmpdir workspace.
+- **P0 — Contract sync**: `docs/openapi-v1.yaml` now documents cancel, mode, approve, attachment Idempotency-Key, artifact CRUD, artifact share/export, artifact export download, trace share, and the public share viewers. No phantom `chat/cancel`, `chat/resume`, or `chat/approve` paths remain.
+- **P0 — Memory user scope + privacy (D60 / Hybrid Pillar 1)**: per-user memory write/read/delete/export verified end-to-end via the GDPR purge cascade tests, PII consent gate is opt-in by default, and the in-prompt "STORE if user shares own personal info" directive landed at `74ddd469` (live-verified 3/3 personal-fact prompts now store cleanly). Memory_doctor returns actionable readiness. `memory_store(valid_at)` shipped at `3d5ef37b`.
 
 **Closed in v1.14.21 / v1.14.22** (no longer deferred):
+- Artifact export bridge — `POST /api/v1/users/:id/artifacts/:id/export?format=pdf|docx|pptx|xlsx|html` resolves ownership via `getArtifactById`, calls `ProduceDocumentTool.execute()` with the safe `default` theme, and returns JSON `{status, artifact_id, format, filename, path, url, download_url}`. Companion route `GET /api/v1/users/:id/exports/:filename` streams the produced file with the right binary Content-Type and is filename-traversal guarded. Renderer-missing failures surface as `502 renderer_unavailable`. Covered by handler-level unit tests + live-PG cross-user isolation test.
 - D63 — Renderer chain bundled in Dockerfile (texlive-xetex + pandoc + marp-cli + pandas + openpyxl + weasyprint + chromium); build-time probe runs a real PDF render
 - D64 — Per-user share-spam cap shipped (100 live shares; 429 surface)
+- D62 — `migrations.run()` wired into `zaki_state.migrate`
+- ME-02 — extension auth constant-time length leak closed; auth now maps token → server-side user id
 - Thmanyah brand fonts shipped IN the container at `/usr/local/share/nullalis/branding/fonts/`
 - 1M context routing — Claude Opus 4.7 + Sonnet 4.6 + Gemini 2.5 Pro all native 1M (no beta header needed)
 - Per-user model selection — `selected_model` in ProductSettings
@@ -473,10 +511,12 @@ Before shipping any UI surface, confirm:
 **Canvas + artifacts**
 - [ ] You've subscribed to `artifact_event` SSE for live canvas refresh (no polling).
 - [ ] You've wired the artifact card's `Share` / `Stop sharing` / `Version history` / `Diff` actions — backend tools are `artifact_share` / `artifact_revoke_share` / `artifact_history` / `artifact_diff`.
+- [ ] You've smoke-tested artifact export for PDF and one office format against a live tenant; disabled UI if the backend gate is not closed.
 
 **Approval + autonomy**
 - [ ] You've wired the `approval_required` card with a 60s timeout + three actions (Approve / Modify-args / Deny).
 - [ ] You expose the autonomy 3-state toggle prominently (read_only / supervised / full).
+- [ ] Stop/cancel is backend-owned, idempotent, and verified; client-side fetch abort alone does not count.
 
 **Model selection (v1.14.22 flagship)**
 - [ ] Settings → AI Model picker shows the full §2.10 table.

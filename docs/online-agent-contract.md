@@ -6,7 +6,8 @@ tags: [prose, prose/docs]
 
 > Transport-agnostic event grammar for the nullalis agent runtime.
 > Applies to: SSE (gateway), daemon loops, desktop app, embedded runtimes.
-> Contract baseline: 2026-04-09 (Phase 00-02). Revised 2026-04-17 (WP1.x).
+> Contract baseline: 2026-04-09 (Phase 00-02). Revised 2026-05-28
+> for production-readiness gates.
 
 ## Scope
 
@@ -17,6 +18,13 @@ extensions, CLI, and embedded deployments bind these same events to their
 own transport.
 
 Transport-specific details (HTTP status codes, SSE framing) are in Section 6.
+
+Production-readiness rule: this document must describe both the current
+wire truth and the launch gates. A capability listed as deferred is not
+automatically acceptable for commercial V1; anything that affects
+session lifecycle, approvals, memory, browser control, artifacts,
+privacy, or user-visible history must either be implemented and tested
+or hidden from the product surface.
 
 Canonical runtime sources:
 - Structured run events: [src/agent/run_event_types.zig](../src/agent/run_event_types.zig)
@@ -211,10 +219,56 @@ Client guidance:
 ## 2a. Operator Slash-Command Surface
 
 Direct operator controls are exposed as **chat slash commands** in the
-current runtime. There is no REST parity for these controls in v0.1
-beyond the per-session `/api/v1/users/{user_id}/sessions/{session_key}/approve`
-endpoint already documented in `docs/openapi-v1.yaml`. All commands below
-are handled by [src/agent/commands.zig](../src/agent/commands.zig).
+current runtime. Production UI controls should use the REST parity that
+exists today:
+
+- `POST /api/v1/users/{user_id}/sessions/{session_key}/approve`
+- `POST /api/v1/users/{user_id}/sessions/{session_key}/mode`
+- `POST /api/v1/users/{user_id}/sessions/{session_key}/cancel` *(2026-05-28)*
+
+`approve` and `mode` go through the slash-command implementation, so
+[src/agent/commands.zig](../src/agent/commands.zig) remains the single
+behavioral truth. `cancel` writes directly to the session agent's
+atomic `CancellationToken` (see
+[src/agent/abort.zig](../src/agent/abort.zig) and the cooperative
+cancellation check in [src/agent/root.zig](../src/agent/root.zig)) so
+it does not block on the in-flight turn's session mutex.
+
+Active-turn cancel — semantics:
+
+- The agent loop polls `cancellation_token.isCancelled()` between
+  iterations. On cancel it emits an internal `turn_cancelled`
+  ObserverEvent that the SSE bridge translates to
+  `event: system_notice` with `kind: "turn_cancelled"`, severity
+  `info`, and `detail: "user_request"`. The canonical `turn_complete`
+  event still fires, so the stream still reaches the terminal `done`
+  frame and clients see a clean SSE termination.
+- **Cancel takes effect at iteration boundaries, not mid-tool.** If a
+  cancel arrives while the agent is mid-tool (a 30s shell command, an
+  LLM stream waiting on the provider, or a tool that itself blocks),
+  the flag is set immediately but the in-flight tool runs to its
+  natural completion before the loop re-checks. The user-facing
+  Stop chip may feel laggy when a long-running tool is in flight;
+  surface "Stopping…" while the cancel is pending rather than claiming
+  the turn already terminated.
+- The agent's return text is `[Cancelled]` (or
+  `[Cancelled: last tool was <name>]` when a tool was mid-flight),
+  delivered through the normal `token` chunks before `done`.
+- Idempotent: repeated cancels land the same atomic store. Cancel
+  against an idle session is safe — the agent resets the token at the
+  start of every turn, so a stale cancel cannot silently cancel a
+  future user message. The response payload includes
+  `was_active: true|false` so the FE can communicate the difference.
+
+Active-turn resume / replay:
+
+- Backend-owned resume is **not implemented** and is intentionally not
+  planned for V1. There is no `POST /api/v1/chat/resume`.
+- Reconnect/replay is handled by reconnecting to
+  `POST /api/v1/chat/stream` for new turns and reading the bounded
+  in-process trace store via
+  `GET /api/v1/users/{user_id}/traces/{run_id}` for historical events
+  (see §7 for the storage and field-subset contract).
 
 Execution posture:
 
@@ -246,8 +300,13 @@ Usage and cost:
   pricing is wired, otherwise explicitly reports
   `Cost estimate unavailable`. Does not mutate usage mode or counters.
 
-Non-goals in v0.1 (deferred, explicitly **not** implemented):
+Current limitations to close or explicitly hide before production:
 
+- **Active-turn resume.** The runtime exposes idempotent cancel (above)
+  but NOT resume. Clients reconnect to `POST /api/v1/chat/stream` for
+  new turns and to `GET /api/v1/users/{user_id}/traces/{run_id}` for
+  in-process trace history. Permanent-history UX must wait for
+  durable trace storage (Section 7 caveats).
 - **Durable trace storage.** The WP4.1 trace store is in-process only;
   events are not persisted across restarts (Section 7).
 - **Persistent generic allowlist.** `/approve allow-always` does not
@@ -264,8 +323,9 @@ Non-goals in v0.1 (deferred, explicitly **not** implemented):
   priced (WP5.1), but no hard/soft budget gate exists.
 - **`cost_update` SSE event.** Per-turn cost is exposed via `/usage`
   and `/cost`; there is no streaming `cost_update` frame (Section 8).
-- **Full REST parity for slash commands.** Besides `/approve`, direct
-  operator controls remain chat-only.
+- **Full REST parity for slash commands.** `/approve` and `/mode` have
+  session-scoped REST routes. Other operator commands remain
+  slash-command-only unless the product surface requires them.
 - **MCP runtime metadata registry.** MCP-provided tools are not yet
   surfaced through the runtime's tool-metadata registry.
 

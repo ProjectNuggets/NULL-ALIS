@@ -34,6 +34,7 @@ const gdpr_mod = @import("gdpr.zig");
 const env_rebrand = @import("env_rebrand.zig");
 const providers = @import("providers/root.zig");
 const tools_mod = @import("tools/root.zig");
+const produce_document_mod = @import("tools/produce_document.zig");
 const mcp_mod = @import("mcp.zig");
 const memory_mod = @import("memory/root.zig");
 const importance_mod = @import("memory/importance.zig");
@@ -42,6 +43,7 @@ const zaki_postgres_memory = @import("memory/engines/zaki_postgres.zig");
 const subagent_mod = @import("subagent.zig");
 const observability = @import("observability.zig");
 const sentry_runtime = @import("sentry_runtime.zig");
+const execution_mode_mod = @import("agent/execution_mode.zig");
 
 // EMPTY_TURN_PLACEHOLDER const removed v1.14.13 Step 5 (Agent E). The V1.14.4
 // TurnOutcome refactor and V1.11 (Move 6) `tool_only_summary` + `done.tool_only_turn`
@@ -78,6 +80,12 @@ const tool_sandbox_v1 = @import("tools/tool_sandbox_v1.zig");
 const lane_metrics = @import("lane_metrics.zig");
 const extension_ws_server = @import("extension_ws/server.zig");
 const extension_ws_hub = @import("extension_ws/hub.zig");
+
+const ChatStreamTurnOptions = struct {
+    execution_mode: ?execution_mode_mod.ExecutionMode = null,
+    autonomy: ?security.AutonomyLevel = null,
+    reasoning_effort: ?[]const u8 = null,
+};
 const extension_ws_auth = @import("extension_ws/auth.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 // S7.13 — constant-time byte comparison for webhook secret verification.
@@ -329,61 +337,202 @@ pub const GatewayRateLimiter = struct {
 // ── Idempotency Store ────────────────────────────────────────────
 
 pub const IdempotencyStore = struct {
+    /// Owned by the store. MUST be a long-lived allocator — never an
+    /// arena / request-scoped allocator. Production code-review 2026-05-28
+    /// surfaced that piping `req_allocator` into the store leaves dangling
+    /// pointers behind after the request arena tears down: the keys map,
+    /// the responses map, every duped key/status/body, and the internal
+    /// hashmap buckets ALL live as long as the store does. The store now
+    /// owns its allocator at init time so call sites cannot mismatch.
+    allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
     ttl_ns: i128,
     /// Map of key -> timestamp when recorded.
-    keys: std.StringHashMapUnmanaged(i128),
+    keys: std.StringHashMapUnmanaged(i128) = .empty,
+    /// Optional cached response body for at-most-once mutating routes
+    /// (e.g. attachment upload — S2.10 follow-up D7). When a route
+    /// records its response under a key, subsequent calls within the
+    /// TTL window can fetch the same body verbatim instead of
+    /// re-executing the handler. Routes that don't need cached
+    /// responses (provisioning) simply skip `cacheResponse` and rely
+    /// on `recordIfNew` alone.
+    responses: std.StringHashMapUnmanaged(CachedResponse) = .empty,
 
-    pub fn init(ttl_secs: u64) IdempotencyStore {
+    /// Per-instance ceilings. Both maps share the same cap so a single
+    /// attacker pushing unique keys cannot blow either side individually.
+    /// The cap is large enough that legitimate burst traffic (a 10K-user
+    /// pod with one in-flight retry each) never trips it but small enough
+    /// that even at MAX_CACHED_BODY_BYTES per entry the memory ceiling
+    /// stays under ~1 GB.
+    pub const MAX_ENTRIES: usize = 10_000;
+    /// Max cached response body, in bytes. Bodies bigger than this are
+    /// not stored — the next retry re-runs the handler instead of
+    /// replaying a huge cached payload. Picked at 64 KB which is
+    /// comfortably above attachment-upload JSON ack sizes but well
+    /// below any plausible attacker-controlled limit.
+    pub const MAX_CACHED_BODY_BYTES: usize = 64 * 1024;
+
+    pub const CachedResponse = struct {
+        status: []const u8,
+        body: []const u8,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, ttl_secs: u64) IdempotencyStore {
         return .{
+            .allocator = allocator,
             .ttl_ns = @as(i128, @intCast(@max(ttl_secs, 1))) * 1_000_000_000,
-            .keys = .empty,
         };
     }
 
-    pub fn deinit(self: *IdempotencyStore, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *IdempotencyStore) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         var it = self.keys.iterator();
         while (it.next()) |entry| {
-            allocator.free(@constCast(entry.key_ptr.*));
+            self.allocator.free(@constCast(entry.key_ptr.*));
         }
-        self.keys.deinit(allocator);
+        self.keys.deinit(self.allocator);
+        var rit = self.responses.iterator();
+        while (rit.next()) |entry| {
+            self.allocator.free(@constCast(entry.key_ptr.*));
+            self.allocator.free(@constCast(entry.value_ptr.*.status));
+            self.allocator.free(@constCast(entry.value_ptr.*.body));
+        }
+        self.responses.deinit(self.allocator);
+    }
+
+    fn sweepExpired(self: *IdempotencyStore, cutoff: i128) void {
+        var iter = self.keys.iterator();
+        var to_remove: std.ArrayList([]const u8) = .empty;
+        defer to_remove.deinit(self.allocator);
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* < cutoff) {
+                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
+            }
+        }
+        // ORDERING IS LOAD-BEARING: `to_remove` holds borrowed pointers
+        // into the keys map's storage. `keys.fetchRemove(k)` returns the
+        // same pointer (the slice that was stored in the map) and we
+        // then free it. If we processed `keys` first, the next
+        // `responses.fetchRemove(k)` would read freed bytes. Process
+        // `responses` first so each `k` lookup happens before its
+        // canonical bytes are freed.
+        for (to_remove.items) |k| {
+            if (self.responses.fetchRemove(k)) |removed| {
+                self.allocator.free(@constCast(removed.key));
+                self.allocator.free(@constCast(removed.value.status));
+                self.allocator.free(@constCast(removed.value.body));
+            }
+            if (self.keys.fetchRemove(k)) |removed| {
+                self.allocator.free(@constCast(removed.key));
+            }
+        }
     }
 
     /// Returns true if this key is new and is now recorded.
-    /// Returns false if this is a duplicate.
-    pub fn recordIfNew(self: *IdempotencyStore, allocator: std.mem.Allocator, key: []const u8) bool {
+    /// Returns false if this is a duplicate. At-cap inserts are
+    /// rejected as duplicates rather than allowed silently — preserves
+    /// the at-most-once invariant.
+    pub fn recordIfNew(self: *IdempotencyStore, key: []const u8) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         const now = std.time.nanoTimestamp();
         const cutoff = now - self.ttl_ns;
+        self.sweepExpired(cutoff);
 
-        // Clean expired keys (simple sweep)
-        var iter = self.keys.iterator();
-        var to_remove: std.ArrayList([]const u8) = .empty;
-        defer to_remove.deinit(allocator);
-        while (iter.next()) |entry| {
-            if (entry.value_ptr.* < cutoff) {
-                to_remove.append(allocator, entry.key_ptr.*) catch continue;
-            }
-        }
-        for (to_remove.items) |k| {
-            if (self.keys.fetchRemove(k)) |removed| {
-                allocator.free(@constCast(removed.key));
-            }
-        }
-
-        // Check if already present
         if (self.keys.get(key)) |_| return false;
 
-        // Record new key
-        const key_copy = allocator.dupe(u8, key) catch return true;
-        self.keys.put(allocator, key_copy, now) catch {
-            allocator.free(key_copy);
+        // Hard cap — if we're already at MAX_ENTRIES after a sweep,
+        // refuse the insert. Returning false (treat as duplicate)
+        // keeps callers' code paths short-circuiting instead of
+        // running the mutating handler again, which is the safer
+        // failure mode under load.
+        if (self.keys.count() >= MAX_ENTRIES) return false;
+
+        const key_copy = self.allocator.dupe(u8, key) catch return true;
+        self.keys.put(self.allocator, key_copy, now) catch {
+            self.allocator.free(key_copy);
             return true;
         };
         return true;
+    }
+
+    /// Look up a cached response for this key. Returned `CachedResponse`
+    /// contains BORROWED slices owned by the store; the caller MUST
+    /// dupe them into route-scoped memory before handing them off to
+    /// a RouteResponse — otherwise a concurrent TTL sweep can free the
+    /// underlying bytes while the response is still being serialized
+    /// to the wire. Callers that need ownership can use the convenience
+    /// helper `fetchCachedOwned` below.
+    pub fn fetchCached(self: *IdempotencyStore, key: []const u8) ?CachedResponse {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.responses.get(key)) |cached| return cached;
+        return null;
+    }
+
+    /// Like `fetchCached` but returns slices owned by `dest_allocator`
+    /// so the caller can hand them to a RouteResponse without worrying
+    /// about the store's TTL sweep. Caller frees both `status` and
+    /// `body`.
+    pub fn fetchCachedOwned(
+        self: *IdempotencyStore,
+        dest_allocator: std.mem.Allocator,
+        key: []const u8,
+    ) ?CachedResponse {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const cached = self.responses.get(key) orelse return null;
+        const owned_status = dest_allocator.dupe(u8, cached.status) catch return null;
+        const owned_body = dest_allocator.dupe(u8, cached.body) catch {
+            dest_allocator.free(owned_status);
+            return null;
+        };
+        return .{ .status = owned_status, .body = owned_body };
+    }
+
+    /// Cache a (status, body) pair under this key so a retry can fetch
+    /// the same response verbatim. Best-effort: alloc failures silently
+    /// skip the cache (the route still returned the response to the
+    /// original caller; a future retry will re-run the handler).
+    /// Bodies larger than MAX_CACHED_BODY_BYTES are also silently
+    /// skipped — the next retry just re-runs the handler.
+    pub fn cacheResponse(
+        self: *IdempotencyStore,
+        key: []const u8,
+        status: []const u8,
+        body: []const u8,
+    ) void {
+        if (body.len > MAX_CACHED_BODY_BYTES) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.responses.get(key)) |_| return; // already cached — preserve first-write
+        if (self.responses.count() >= MAX_ENTRIES) {
+            // At cap. Try a sweep before giving up; if still over,
+            // skip the cache. This converges under sustained load
+            // without dropping the original response on the floor.
+            const cutoff = std.time.nanoTimestamp() - self.ttl_ns;
+            self.sweepExpired(cutoff);
+            if (self.responses.count() >= MAX_ENTRIES) return;
+        }
+        const owned_key = self.allocator.dupe(u8, key) catch return;
+        const owned_status = self.allocator.dupe(u8, status) catch {
+            self.allocator.free(owned_key);
+            return;
+        };
+        const owned_body = self.allocator.dupe(u8, body) catch {
+            self.allocator.free(owned_key);
+            self.allocator.free(owned_status);
+            return;
+        };
+        self.responses.put(self.allocator, owned_key, .{
+            .status = owned_status,
+            .body = owned_body,
+        }) catch {
+            self.allocator.free(owned_key);
+            self.allocator.free(owned_status);
+            self.allocator.free(owned_body);
+        };
     }
 };
 
@@ -996,7 +1145,7 @@ pub const GatewayState = struct {
         return .{
             .allocator = allocator,
             .rate_limiter = GatewayRateLimiter.init(10, 30),
-            .idempotency = IdempotencyStore.init(300),
+            .idempotency = IdempotencyStore.init(allocator, 300),
             .secret_tokens = secret_vault.TokenStore.init(allocator, secret_vault.DEFAULT_TTL_SECS),
             .trace_share_store = TraceShareStore.init(allocator),
             .whatsapp_verify_token = verify_token,
@@ -1016,7 +1165,7 @@ pub const GatewayState = struct {
             worker.join();
         }
         self.rate_limiter.deinit(self.allocator);
-        self.idempotency.deinit(self.allocator);
+        self.idempotency.deinit();
         self.secret_tokens.deinit();
         self.trace_share_store.deinit();
         self.user_preparation_gate.deinit();
@@ -1961,6 +2110,29 @@ const TenantRuntime = struct {
         stream_callback: ?providers.StreamCallback,
         stream_ctx: ?*anyopaque,
     ) ![]const u8 {
+        return self.processMessageWithTurnOptions(
+            session_key,
+            message,
+            conversation_context,
+            message_turn_context,
+            progress_observer,
+            stream_callback,
+            stream_ctx,
+            .{},
+        );
+    }
+
+    fn processMessageWithTurnOptions(
+        self: *TenantRuntime,
+        session_key: []const u8,
+        message: []const u8,
+        conversation_context: ?agent_prompt.ConversationContext,
+        message_turn_context: ?tools_mod.MessageTurnContext,
+        progress_observer: ?Observer,
+        stream_callback: ?providers.StreamCallback,
+        stream_ctx: ?*anyopaque,
+        turn_options: ChatStreamTurnOptions,
+    ) ![]const u8 {
         self.last_used_s.store(std.time.timestamp(), .release);
         const numeric_user_id = std.fmt.parseInt(i64, self.user_id, 10) catch null;
         tools_mod.setTenantContext(.{
@@ -1976,6 +2148,9 @@ const TenantRuntime = struct {
             .progress_observer = progress_observer,
             .stream_callback = stream_callback,
             .stream_ctx = stream_ctx,
+            .turn_execution_mode = turn_options.execution_mode,
+            .turn_autonomy = turn_options.autonomy,
+            .turn_reasoning_effort = turn_options.reasoning_effort,
         });
         return response;
     }
@@ -3086,12 +3261,11 @@ pub const IdempotencyCheck = enum {
 /// memory. See `IdempotencyStore` for the TTL sweep logic.
 pub fn checkIdempotency(
     state: *GatewayState,
-    allocator: std.mem.Allocator,
     raw_request: []const u8,
 ) IdempotencyCheck {
     const key = extractIdempotencyKey(raw_request) orelse return .none;
     if (key.len == 0 or key.len > 256) return .invalid;
-    return if (state.idempotency.recordIfNew(allocator, key)) .new else .duplicate;
+    return if (state.idempotency.recordIfNew(key)) .new else .duplicate;
 }
 
 /// Extract the bearer token from an Authorization header value.
@@ -5225,6 +5399,63 @@ pub fn jsonStringField(json: []const u8, key: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+fn cleanJsonStringField(json: []const u8, key: []const u8) ?[]const u8 {
+    const value = jsonStringField(json, key) orelse return null;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    return if (trimmed.len > 0) trimmed else null;
+}
+
+fn parseChatStreamExecutionMode(body: []const u8) ?execution_mode_mod.ExecutionMode {
+    const raw = cleanJsonStringField(body, "mode") orelse return null;
+    return execution_mode_mod.ExecutionMode.fromString(raw);
+}
+
+fn parseChatStreamAutonomy(body: []const u8) ?security.AutonomyLevel {
+    const raw = cleanJsonStringField(body, "autonomy") orelse return null;
+    return security.AutonomyLevel.fromString(raw);
+}
+
+fn parseChatStreamReasoningEffort(body: []const u8) ?[]const u8 {
+    if (cleanJsonStringField(body, "reasoning_effort")) |raw| {
+        if (std.ascii.eqlIgnoreCase(raw, "low")) return "low";
+        if (std.ascii.eqlIgnoreCase(raw, "medium")) return "medium";
+        if (std.ascii.eqlIgnoreCase(raw, "high")) return "high";
+        if (std.ascii.eqlIgnoreCase(raw, "none")) return "none";
+    }
+    if (cleanJsonStringField(body, "assistant_mode")) |raw| {
+        if (std.ascii.eqlIgnoreCase(raw, "fast")) return "low";
+        if (std.ascii.eqlIgnoreCase(raw, "balanced")) return "medium";
+        if (std.ascii.eqlIgnoreCase(raw, "deep")) return "high";
+    }
+    return null;
+}
+
+fn parseChatStreamTurnOptions(body: []const u8) ChatStreamTurnOptions {
+    return .{
+        .execution_mode = parseChatStreamExecutionMode(body),
+        .autonomy = parseChatStreamAutonomy(body),
+        .reasoning_effort = parseChatStreamReasoningEffort(body),
+    };
+}
+
+test "chat stream turn options map zaki composer controls" {
+    const body =
+        \\{"message":"run it","mode":"review","autonomy":"read_only","reasoning_effort":"high"}
+    ;
+    const options = parseChatStreamTurnOptions(body);
+    try std.testing.expectEqual(execution_mode_mod.ExecutionMode.review, options.execution_mode.?);
+    try std.testing.expectEqual(security.AutonomyLevel.read_only, options.autonomy.?);
+    try std.testing.expectEqualStrings("high", options.reasoning_effort.?);
+}
+
+test "chat stream turn options map assistant mode fallback to reasoning effort" {
+    const body = "{\"message\":\"think\",\"assistant_mode\":\"deep\"}";
+    const options = parseChatStreamTurnOptions(body);
+    try std.testing.expect(options.execution_mode == null);
+    try std.testing.expect(options.autonomy == null);
+    try std.testing.expectEqualStrings("high", options.reasoning_effort.?);
 }
 
 /// Extract an integer field from a JSON blob.
@@ -9740,6 +9971,7 @@ fn handleApiChatStreamSseConnection(
         sendSseErrorResponse(stream, req_allocator, "400 Bad Request", code, msg);
         return true;
     };
+    const turn_options = parseChatStreamTurnOptions(body);
     _ = state.chat_stream_total.fetchAdd(1, .monotonic);
     recordChatStreamLane(state, session_key, user_id, state.tenant_enabled);
     var sse_stream = LockedSseStream(@TypeOf(stream)).init(stream);
@@ -9852,7 +10084,7 @@ fn handleApiChatStreamSseConnection(
             spend_usage_rt = tenant_runtime.usage_rt;
             session_weight_before = tenant_runtime.usage_rt.sessionWeight();
             // Tenant runtime path: stream tokens directly to SSE for live delivery.
-            break :blk .{ .ok = tenant_runtime.processMessage(
+            break :blk .{ .ok = tenant_runtime.processMessageWithTurnOptions(
                 session_key,
                 message,
                 .{
@@ -9868,6 +10100,7 @@ fn handleApiChatStreamSseConnection(
                 progress_observer,
                 if (is_live) liveStreamCallback else null,
                 if (is_live) @ptrCast(&live_ctx) else null,
+                turn_options,
             ) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                 break :blk .{ .err = .{ .code = "chat_failed", .msg = "chat failed" } };
@@ -9884,6 +10117,9 @@ fn handleApiChatStreamSseConnection(
                 .progress_observer = progress_observer,
                 .stream_callback = if (is_live) liveStreamCallback else null,
                 .stream_ctx = if (is_live) @ptrCast(&live_ctx) else null,
+                .turn_execution_mode = turn_options.execution_mode,
+                .turn_autonomy = turn_options.autonomy,
+                .turn_reasoning_effort = turn_options.reasoning_effort,
             }) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                 break :blk .{ .err = .{ .code = "chat_failed", .msg = "chat failed" } };
@@ -11283,31 +11519,220 @@ fn handleArtifactShareRevoke(
     return .{ .body = "{\"status\":\"revoked\"}" };
 }
 
+/// Parse the markdown link `ProduceDocumentTool.execute()` returns and
+/// extract the produced filename. Format:
+///   `[Generated FORMAT: <filename>](attachments/produced/<filename>)`
+/// Returns null on any deviation — the gateway treats that as a render
+/// failure rather than guessing.
+fn parseProducedFilename(md: []const u8) ?[]const u8 {
+    const open_paren = std.mem.indexOfScalar(u8, md, '(') orelse return null;
+    if (!std.mem.endsWith(u8, md, ")")) return null;
+    const path = md[open_paren + 1 .. md.len - 1];
+    const prefix = "attachments/produced/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const name = path[prefix.len..];
+    if (name.len == 0) return null;
+    return name;
+}
+
+/// Map a `produce_document` format string to a serving Content-Type.
+/// Unknown formats fall back to `application/octet-stream`.
+fn producedContentType(format: []const u8) []const u8 {
+    if (std.mem.eql(u8, format, "pdf")) return "application/pdf";
+    if (std.mem.eql(u8, format, "docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    if (std.mem.eql(u8, format, "pptx")) return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+    if (std.mem.eql(u8, format, "xlsx")) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    if (std.mem.eql(u8, format, "html")) return "text/html; charset=utf-8";
+    return "application/octet-stream";
+}
+
 fn handleArtifactExport(
     allocator: std.mem.Allocator,
     method: []const u8,
     user_id_str: []const u8,
     artifact_id: []const u8,
     target: []const u8,
+    user_ctx: *const UserContext,
+    config_opt: ?*const Config,
     state: *GatewayState,
 ) RouteResponse {
-    _ = allocator;
-    _ = state;
-    _ = user_id_str;
     if (!std.mem.eql(u8, method, "POST")) {
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
     }
     if (!isValidArtifactId(artifact_id)) {
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_artifact_id\"}" };
     }
-    // Wave 2A's `produce_document` tool is the eventual bridge target.
-    // Until it lands the endpoint returns 501 with the documented
-    // dependency so operators can detect "feature parked, not broken."
-    _ = target;
-    return .{
-        .status = "501 Not Implemented",
-        .body = "{\"error\":\"export_not_yet_available\",\"detail\":\"produce_document tool not yet wired; see Wave 2A\"}",
+    const numeric_user_id = parseNumericUserId(user_id_str) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
     };
+
+    // Allowlist matches `produce_document`'s `Format` enum and applies the
+    // SAME case-insensitivity (produce_document.zig:492-500 trims + lowers
+    // via std.ascii.eqlIgnoreCase). We canonicalize to lowercase HERE so a
+    // caller passing `?format=PDF` still succeeds AND the response's
+    // `format` field echoes the canonical lowercase form — easier for FE
+    // contract validation.
+    const format_raw = parseQueryParam(target, "format") orelse "pdf";
+    const format: []const u8 = blk: {
+        if (std.ascii.eqlIgnoreCase(format_raw, "pdf")) break :blk "pdf";
+        if (std.ascii.eqlIgnoreCase(format_raw, "docx")) break :blk "docx";
+        if (std.ascii.eqlIgnoreCase(format_raw, "pptx")) break :blk "pptx";
+        if (std.ascii.eqlIgnoreCase(format_raw, "xlsx")) break :blk "xlsx";
+        if (std.ascii.eqlIgnoreCase(format_raw, "html")) break :blk "html";
+        return .{
+            .status = "400 Bad Request",
+            .body = "{\"error\":\"invalid_format\",\"detail\":\"format must be one of: pdf, docx, pptx, xlsx, html\"}",
+        };
+    };
+
+    // Workspace_path safety: produce_document writes via std.fs.path.join +
+    // std.fs.cwd().makePath. If workspace_path is somehow not absolute
+    // (operator config drift), surface a controlled 500 instead of letting
+    // the tool fail later in a less-actionable way.
+    if (!std.fs.path.isAbsolute(user_ctx.workspace_path)) {
+        return .{
+            .status = "500 Internal Server Error",
+            .body = "{\"error\":\"workspace_not_absolute\",\"detail\":\"user workspace_path is not absolute; refusing to export\"}",
+        };
+    }
+
+    const state_mgr = state.zaki_state orelse {
+        return .{
+            .status = "503 Service Unavailable",
+            .body = "{\"error\":\"state_unavailable\",\"detail\":\"persistent state backend not configured; artifacts require postgres\"}",
+        };
+    };
+
+    // Ownership + existence check (mirrors handleArtifactGet at :11029).
+    const artifact_opt = state_mgr.getArtifactById(allocator, numeric_user_id, artifact_id) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read_failed\"}" };
+    };
+    if (artifact_opt == null) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"artifact_not_found\"}" };
+    }
+    var artifact = artifact_opt.?;
+    defer artifact.deinit(allocator);
+
+    const ver_opt = state_mgr.getArtifactVersion(allocator, numeric_user_id, artifact_id, null) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"version_read_failed\"}" };
+    };
+    if (ver_opt == null) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"version_not_found\"}" };
+    }
+    var ver = ver_opt.?;
+    defer ver.deinit(allocator);
+
+    // Build the tool args. We always use the safe `default` theme — branding
+    // is operator-owned and applies automatically when configured; the user's
+    // export request must NOT pick `thmanyah` (per §14.5 honesty gate).
+    var args = std.json.ObjectMap.init(allocator);
+    defer args.deinit();
+    args.put("format", std.json.Value{ .string = format }) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
+    };
+    args.put("content", std.json.Value{ .string = ver.content }) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
+    };
+    args.put("title", std.json.Value{ .string = artifact.title }) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
+    };
+    args.put("theme", std.json.Value{ .string = "default" }) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
+    };
+
+    var pdt = produce_document_mod.ProduceDocumentTool{
+        .workspace_dir = user_ctx.workspace_path,
+        .branding = if (config_opt) |cfg| cfg.branding else .{},
+    };
+    const tool_result = pdt.execute(allocator, args) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"export_failed\",\"detail\":\"tool dispatch raised an error\"}" };
+    };
+    // Ownership: produce_document allocates `output` and `error_msg` with our
+    // allocator except for the four `.fail(<literal>)` paths in
+    // produce_document.zig — those return string literals that must NOT be
+    // freed. `isProduceDocumentLiteralError` recognizes that set.
+    defer {
+        if (tool_result.output.len > 0) allocator.free(tool_result.output);
+        if (tool_result.error_msg) |em| {
+            if (!isProduceDocumentLiteralError(em)) allocator.free(em);
+        }
+    }
+
+    if (!tool_result.success) {
+        const err = tool_result.error_msg orelse "render failed";
+        // Renderer-missing failures: surface 502 with `renderer_unavailable`
+        // so callers can distinguish "binary not installed in image" from
+        // "user-provided content was rejected". `produce_document` includes
+        // install-hint phrases like "install:" / "not found" / "Install" in
+        // those error strings.
+        const is_renderer_gap = std.mem.indexOf(u8, err, "install:") != null or
+            std.mem.indexOf(u8, err, "Install:") != null or
+            std.mem.indexOf(u8, err, "install ") != null or
+            std.mem.indexOf(u8, err, "not found") != null or
+            std.mem.indexOf(u8, err, "FileNotFound") != null or
+            std.mem.indexOf(u8, err, "marp-cli") != null or
+            std.mem.indexOf(u8, err, "pandoc") != null;
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        // `toOwnedSlice` zeroes the buf on success → the defer becomes a
+        // no-op when we return the body; on any catch the defer cleans up.
+        defer out.deinit(allocator);
+        const w = out.writer(allocator);
+        if (is_renderer_gap) {
+            w.writeAll("{\"error\":\"renderer_unavailable\",\"detail\":\"") catch return response_build_err;
+        } else {
+            w.writeAll("{\"error\":\"export_failed\",\"detail\":\"") catch return response_build_err;
+        }
+        jsonEscapeInto(w, err) catch return response_build_err;
+        w.writeAll("\"}") catch return response_build_err;
+        const body = out.toOwnedSlice(allocator) catch return response_build_err;
+        return .{
+            .status = if (is_renderer_gap) "502 Bad Gateway" else "500 Internal Server Error",
+            .body = body,
+        };
+    }
+
+    // Success — parse the produced filename out of the markdown link.
+    const filename = parseProducedFilename(tool_result.output) orelse {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"export_failed\",\"detail\":\"renderer succeeded but filename could not be parsed\"}" };
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"status\":\"exported\",\"artifact_id\":\"") catch return response_build_err;
+    jsonEscapeInto(w, artifact_id) catch return response_build_err;
+    w.writeAll("\",\"format\":\"") catch return response_build_err;
+    jsonEscapeInto(w, format) catch return response_build_err;
+    w.writeAll("\",\"filename\":\"") catch return response_build_err;
+    jsonEscapeInto(w, filename) catch return response_build_err;
+    w.writeAll("\",\"path\":\"attachments/produced/") catch return response_build_err;
+    jsonEscapeInto(w, filename) catch return response_build_err;
+    // `url` and `download_url` MIRROR each other today — both point at the
+    // gateway's authenticated GET. The two keys exist so a future deploy
+    // can flip `download_url` to a pre-signed object-storage URL (CDN,
+    // S3) without breaking the FE contract: `url` is the canonical
+    // gateway path, `download_url` is the preferred fetch target.
+    // Until that lands, FEs may treat them as interchangeable.
+    w.writeAll("\",\"url\":\"/api/v1/users/") catch return response_build_err;
+    jsonEscapeInto(w, user_id_str) catch return response_build_err;
+    w.writeAll("/exports/") catch return response_build_err;
+    jsonEscapeInto(w, filename) catch return response_build_err;
+    w.writeAll("\",\"download_url\":\"/api/v1/users/") catch return response_build_err;
+    jsonEscapeInto(w, user_id_str) catch return response_build_err;
+    w.writeAll("/exports/") catch return response_build_err;
+    jsonEscapeInto(w, filename) catch return response_build_err;
+    w.writeAll("\"}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+/// Recognize the static-literal error strings `produce_document.ToolResult.fail()`
+/// uses, so the caller does NOT free them. Heap-allocated error strings (via
+/// allocPrint) are everything else and MUST be freed.
+fn isProduceDocumentLiteralError(em: []const u8) bool {
+    return std.mem.eql(u8, em, "Missing 'format' parameter (one of: pdf, docx, xlsx, pptx, html)") or
+        std.mem.eql(u8, em, "Missing 'content' parameter") or
+        std.mem.eql(u8, em, "'content' must not be empty") or
+        std.mem.eql(u8, em, "Workspace not configured — tool has no place to write the produced document");
 }
 
 fn handleArtifactShareGet(
@@ -12282,16 +12707,76 @@ fn handleSessionAction(
         if (!std.mem.eql(u8, method, "POST")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
         return handleSessionMode(allocator, mgr, session_key, raw_request);
     }
+    if (std.mem.eql(u8, act, "cancel")) {
+        if (!std.mem.eql(u8, method, "POST")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        return handleSessionCancel(allocator, mgr, session_key);
+    }
 
     return .{ .status = "404 Not Found", .body = "{\"error\":\"unknown_session_action\"}" };
 }
 
 fn isSessionAction(s: []const u8) bool {
-    const actions = [_][]const u8{ "compact", "context", "export", "history", "approve", "mode" };
+    const actions = [_][]const u8{ "compact", "context", "export", "history", "approve", "mode", "cancel" };
     for (actions) |a| {
         if (std.mem.eql(u8, s, a)) return true;
     }
     return false;
+}
+
+/// POST /api/v1/users/:id/sessions/:key/cancel
+///
+/// Backend-owned active-turn cancellation. Signals the session's
+/// agent CancellationToken; the agent loop polls between iterations
+/// (see `src/agent/root.zig` near the cooperative-cancellation check)
+/// and exits with a `[Cancelled]`-prefixed reply + a `turn_cancelled`
+/// ObserverEvent that the SSE bridge surfaces as a `system_notice`.
+/// The same code path still emits the canonical `turn_complete` event,
+/// so the SSE stream always reaches the terminal `done` frame.
+///
+/// Idempotent:
+///   - Repeated cancels land the same atomic store (no-op after first).
+///   - Cancel against an idle session is safe; the agent resets the
+///     token at the start of every turn, so it cannot silently cancel
+///     a future user message.
+///
+/// Response shapes:
+///   200 {"status":"cancellation_signalled","session_key":"...","was_active":true|false}
+///   404 {"error":"session_not_found"} when the session is unknown.
+///
+/// Production gate: this is the route the FE Stop button binds to.
+/// Client-side `fetch().abort()` alone is insufficient — without this
+/// route the server-side run keeps consuming tokens after the client
+/// disconnects, violating the meter receipt + tool-side-effect honesty.
+fn handleSessionCancel(
+    allocator: std.mem.Allocator,
+    mgr: *session_mod.SessionManager,
+    session_key: []const u8,
+) RouteResponse {
+    const outcome = mgr.cancelActiveTurn(session_key);
+    switch (outcome) {
+        .session_not_found => return .{
+            .status = "404 Not Found",
+            .body = "{\"error\":\"session_not_found\"}",
+        },
+        .cancellation_signalled_active, .cancellation_signalled_idle => {},
+    }
+
+    const was_active = outcome == .cancellation_signalled_active;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"status\":\"cancellation_signalled\",\"session_key\":\"") catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    jsonEscapeInto(w, session_key) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    w.writeAll("\",\"was_active\":") catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    w.writeAll(if (was_active) "true" else "false") catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    w.writeAll("}") catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    return .{ .body = out.toOwnedSlice(allocator) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
 }
 
 /// POST /api/v1/users/:id/sessions/:key/mode
@@ -16169,7 +16654,7 @@ fn handleApiRoute(
         // re-run the provisioning pipeline (user_cell ensure, state
         // allocation, scaffold) end-to-end. With a key attached, the
         // second call short-circuits to an at-most-once ack.
-        switch (checkIdempotency(state, req_allocator, raw_request)) {
+        switch (checkIdempotency(state, raw_request)) {
             .duplicate => return .{ .status = "200 OK", .body = "{\"status\":\"duplicate\",\"detail\":\"already provisioned within idempotency window\"}" },
             .invalid => return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_idempotency_key\",\"detail\":\"Idempotency-Key must be 1..=256 bytes\"}" },
             .none, .new => {},
@@ -17261,7 +17746,19 @@ fn handleApiRoute(
     // Writes to {workspace_path}/attachments/<safe_name>. Agent reads via
     // the file_read tool with path "attachments/<safe_name>".
     if (std.mem.eql(u8, parsed.subpath, "attachments")) {
-        return handleAttachmentUpload(req_allocator, method, raw_request, &user_ctx);
+        return handleAttachmentUpload(req_allocator, method, raw_request, &user_ctx, state);
+    }
+
+    // ── Exports (Wave 2A artifact-export bridge) ───────────────────────
+    // GET /api/v1/users/{id}/exports/{filename}
+    // Streams a single produced file out of
+    // {workspace_path}/attachments/produced/. User-scoped (UserContext
+    // selection above this call enforces ownership) + filename traversal
+    // guarded. Mirrors handleAttachmentUpload but read-only and limited
+    // to the produced/ subdirectory.
+    if (std.mem.startsWith(u8, parsed.subpath, "exports/")) {
+        const filename = parsed.subpath["exports/".len..];
+        return handleArtifactExportDownload(req_allocator, method, filename, &user_ctx);
     }
 
     // ── /brain/graph — V1.5 day-2 task 2B ────────────────────────────────
@@ -17601,7 +18098,7 @@ fn handleApiRoute(
     //   PUT    /artifacts/:id                          → user edit
     //   POST   /artifacts/:id/share                    → mint share code
     //   DELETE /artifacts/:id/share                    → revoke share
-    //   POST   /artifacts/:id/export?format=...        → produce_document bridge (501)
+    //   POST   /artifacts/:id/export?format=pdf|docx|pptx|xlsx|html → produce_document bridge
     if (std.mem.eql(u8, parsed.subpath, "artifacts")) {
         const target = extractRequestTarget(raw_request) orelse base_path;
         return handleArtifactList(req_allocator, method, scoped_user_id, state, target);
@@ -17643,8 +18140,8 @@ fn handleApiRoute(
         }
 
         if (std.mem.eql(u8, suffix, "export")) {
-            const target = extractRequestTarget(raw_request) orelse base_path;
-            return handleArtifactExport(req_allocator, method, scoped_user_id, artifact_id, target, state);
+            const target_full = extractRequestTarget(raw_request) orelse base_path;
+            return handleArtifactExport(req_allocator, method, scoped_user_id, artifact_id, target_full, &user_ctx, config_opt, state);
         }
 
         // /v/:version → specific historical version.
@@ -17833,6 +18330,21 @@ fn isSafeAttachmentFilename(name: []const u8) bool {
 /// Writes decoded bytes to {workspace_path}/attachments/{filename}.
 /// Returns: {"path":"attachments/<filename>","bytes":<n>}
 ///
+/// Idempotency (D7 closure, 2026-05-28):
+///   - `Idempotency-Key` header is honored in soft mode: missing header
+///     proceeds with normal upload semantics (existing-client compatibility).
+///   - Key present + duplicate → the first response (status + body) is
+///     served verbatim out of `state.idempotency.responses`. The file is
+///     NOT re-written, so a retry with the same key cannot unsafely
+///     overwrite the first upload's content even if the body carries a
+///     different `content_b64`.
+///   - Key present + new → upload proceeds, the response is cached on
+///     success (200 OK only), and a subsequent retry within the TTL
+///     window short-circuits to the cached response.
+///   - Key present + invalid (empty or >256 bytes) → 400.
+///   - Error responses (400/413/500) are NOT cached so a transient
+///     failure does not lock the client out of retrying.
+///
 /// Security:
 /// - Filename must match isSafeAttachmentFilename (no /, no .., no hidden).
 /// - Max decoded size: 20 MB (matches multimodal cap).
@@ -17843,10 +18355,70 @@ fn handleAttachmentUpload(
     method: []const u8,
     raw_request: []const u8,
     user_ctx: *const UserContext,
+    state: *GatewayState,
 ) RouteResponse {
     if (!std.mem.eql(u8, method, "POST")) {
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
     }
+
+    // Idempotency-Key dedupe: if a key is present we honor it. Cached
+    // hit short-circuits BEFORE any body parsing so a retry never even
+    // touches the filesystem.
+    //
+    // Cross-user-leak guard (review finding 2026-05-28): the
+    // IdempotencyStore is gateway-wide, so two different users sending
+    // the same `Idempotency-Key` header would otherwise collide. We
+    // namespace the key with the user_id from the resolved UserContext
+    // BEFORE looking up the cache, so each user has a private dedupe
+    // window. Filenames are user-supplied + often PII; sharing the
+    // cached response body across users would leak a filename even
+    // though the actual file content stays on the original uploader's
+    // workspace.
+    const idem_key_opt = extractIdempotencyKey(raw_request);
+    var namespaced_key_buf: [320]u8 = undefined;
+    const namespaced_key_opt: ?[]const u8 = if (idem_key_opt) |idem_key| blk: {
+        if (idem_key.len == 0 or idem_key.len > 256) {
+            break :blk null;
+        }
+        // 320 bytes = "attachments:" (12) + user_id (≤ 64) + ":" + key (≤ 256). The
+        // user_id sanitation upstream of dispatch keeps it within numeric / opaque
+        // bounds; clamp defensively here.
+        const uid_clamped = if (user_ctx.user_id.len <= 64)
+            user_ctx.user_id
+        else
+            user_ctx.user_id[0..64];
+        break :blk std.fmt.bufPrint(
+            &namespaced_key_buf,
+            "attachments:{s}:{s}",
+            .{ uid_clamped, idem_key },
+        ) catch null;
+    } else null;
+    if (idem_key_opt) |idem_key| {
+        if (idem_key.len == 0 or idem_key.len > 256) {
+            return .{
+                .status = "400 Bad Request",
+                .body = "{\"error\":\"invalid_idempotency_key\",\"detail\":\"Idempotency-Key must be 1..=256 bytes\"}",
+            };
+        }
+        if (namespaced_key_opt) |ns_key| {
+            // Dupe the body into the route-scoped allocator BEFORE the
+            // store lock drops — protects against a concurrent TTL
+            // sweep freeing the bytes while we serialize them onto the
+            // wire. We don't bother with the cached status: this route
+            // only caches 200 OK responses, so we emit the literal at
+            // the return site. Keeping the response status as a string
+            // literal also sidesteps the question of who frees a
+            // heap-allocated `RouteResponse.status` downstream (callers
+            // assume `.status` is a literal across the codebase).
+            if (state.idempotency.fetchCached(ns_key)) |cached| {
+                const body_copy = allocator.dupe(u8, cached.body) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"alloc_failed\"}" };
+                };
+                return .{ .status = "200 OK", .body = body_copy };
+            }
+        }
+    }
+
     const body = extractBody(raw_request) orelse {
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing body\"}" };
     };
@@ -17912,7 +18484,103 @@ fn handleAttachmentUpload(
         "{{\"path\":\"attachments/{s}\",\"bytes\":{d}}}",
         .{ filename, decoded_len },
     ) catch "{\"error\":\"response build failed\"}";
+
+    // Cache the successful response under the namespaced idempotency
+    // key so the next retry within the TTL window short-circuits to
+    // the same body without re-touching the filesystem. We cache the
+    // original allocPrint failure literal too — it is a static string,
+    // harmlessly cached. The store owns its allocator, so calling code
+    // does NOT need to pass `allocator` (which is the request arena
+    // and would dangle the moment the arena drops).
+    if (namespaced_key_opt) |ns_key| {
+        state.idempotency.cacheResponse(ns_key, "200 OK", resp);
+    }
     return .{ .body = resp };
+}
+
+/// GET /api/v1/users/{id}/exports/{filename}
+/// Streams a single file from {workspace_path}/attachments/produced/{filename}.
+/// User-scoped (the caller has already authenticated against this user_ctx);
+/// confined to the `produced/` subtree; filename safety enforced by
+/// isSafeAttachmentFilename (blocks .., /, hidden, control chars).
+///
+/// Response:
+///   200 OK + binary body, Content-Type derived from filename extension.
+///   400 if filename fails the safety check.
+///   404 if the file is not present in attachments/produced/.
+///   500 on I/O / alloc failure.
+fn handleArtifactExportDownload(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    filename: []const u8,
+    user_ctx: *const UserContext,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    if (!isSafeAttachmentFilename(filename)) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"unsafe_filename\"}" };
+    }
+    // `openFileAbsolute` requires an absolute path or it panics on debug
+    // assertion. In production user_ctx.workspace_path is always absolute,
+    // but guard explicitly so an operator-config drift surfaces as a
+    // controlled 500 — never a panic.
+    if (!std.fs.path.isAbsolute(user_ctx.workspace_path)) {
+        return .{
+            .status = "500 Internal Server Error",
+            .body = "{\"error\":\"workspace_not_absolute\",\"detail\":\"user workspace_path is not absolute; refusing to serve\"}",
+        };
+    }
+
+    const path = std.fmt.allocPrint(
+        allocator,
+        "{s}/attachments/produced/{s}",
+        .{ user_ctx.workspace_path, filename },
+    ) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"path_build_failed\"}" };
+    };
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.IsDir, error.AccessDenied => return .{
+            .status = "404 Not Found",
+            .body = "{\"error\":\"export_not_found\"}",
+        },
+        else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"open_failed\"}" },
+    };
+    defer file.close();
+
+    const stat = file.stat() catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"stat_failed\"}" };
+    };
+    // 50 MB cap matches ProduceDocumentTool.MAX_OUTPUT_BYTES — files that
+    // could not have been produced by the bridge must not be served.
+    if (stat.size > 50 * 1024 * 1024) {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"file_too_large\"}" };
+    }
+
+    const body = allocator.alloc(u8, @intCast(stat.size)) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"alloc_failed\"}" };
+    };
+    const read = file.readAll(body) catch {
+        allocator.free(body);
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read_failed\"}" };
+    };
+    if (read != stat.size) {
+        allocator.free(body);
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"short_read\"}" };
+    }
+
+    // Derive Content-Type from the filename extension — produced files are
+    // named `<title>_<ts>_<rand>.<ext>` so extension matching is reliable.
+    const ext = blk: {
+        const dot = std.mem.lastIndexOfScalar(u8, filename, '.') orelse break :blk "";
+        break :blk filename[dot + 1 ..];
+    };
+    return .{
+        .body = body,
+        .content_type = producedContentType(ext),
+    };
 }
 
 /// POST /api/v1/users/{id}/voice/synthesize
@@ -18273,7 +18941,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 var key_buf: [192]u8 = undefined;
                 const dedupe_scope = if (scoped_user_id) |uid| uid else tg_account_id;
                 const key = std.fmt.bufPrint(&key_buf, "telegram:update:{s}:{d}", .{ dedupe_scope, update_id }) catch "telegram:update:invalid";
-                if (!ctx.state.idempotency.recordIfNew(ctx.state.allocator, key)) {
+                if (!ctx.state.idempotency.recordIfNew(key)) {
                     ctx.response_body = "{\"status\":\"duplicate\"}";
                     return;
                 }
@@ -20394,7 +21062,7 @@ pub fn runWithRole(
             cfg.gateway.pair_rate_limit_per_minute,
             cfg.gateway.webhook_rate_limit_per_minute,
         );
-        state.idempotency = IdempotencyStore.init(cfg.gateway.idempotency_ttl_secs);
+        state.idempotency = IdempotencyStore.init(state.allocator, cfg.gateway.idempotency_ttl_secs);
         state.pairing_guard = try PairingGuard.init(
             allocator,
             cfg.gateway.require_pairing,
@@ -20813,22 +21481,22 @@ test "gateway rate limiter blocks after limit" {
 }
 
 test "idempotency store rejects duplicate key" {
-    var store = IdempotencyStore.init(30);
-    defer store.deinit(std.testing.allocator);
+    var store = IdempotencyStore.init(std.testing.allocator, 30);
+    defer store.deinit();
 
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "req-1"));
-    try std.testing.expect(!store.recordIfNew(std.testing.allocator, "req-1"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "req-2"));
+    try std.testing.expect(store.recordIfNew("req-1"));
+    try std.testing.expect(!store.recordIfNew("req-1"));
+    try std.testing.expect(store.recordIfNew("req-2"));
 }
 
 test "idempotency store allows different keys" {
-    var store = IdempotencyStore.init(300);
-    defer store.deinit(std.testing.allocator);
+    var store = IdempotencyStore.init(std.testing.allocator, 300);
+    defer store.deinit();
 
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "a"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "b"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "c"));
-    try std.testing.expect(!store.recordIfNew(std.testing.allocator, "a"));
+    try std.testing.expect(store.recordIfNew("a"));
+    try std.testing.expect(store.recordIfNew("b"));
+    try std.testing.expect(store.recordIfNew("c"));
+    try std.testing.expect(!store.recordIfNew("a"));
 }
 
 test "extractIdempotencyKey reads the header case-insensitively (S2.10)" {
@@ -20899,55 +21567,55 @@ test "gateway rate limiter zero limits always allow" {
 }
 
 test "idempotency store init with various TTLs" {
-    var store1 = IdempotencyStore.init(1);
-    defer store1.deinit(std.testing.allocator);
+    var store1 = IdempotencyStore.init(std.testing.allocator, 1);
+    defer store1.deinit();
     try std.testing.expect(store1.ttl_ns > 0);
 
-    var store2 = IdempotencyStore.init(3600);
-    defer store2.deinit(std.testing.allocator);
+    var store2 = IdempotencyStore.init(std.testing.allocator, 3600);
+    defer store2.deinit();
     try std.testing.expect(store2.ttl_ns > store1.ttl_ns);
 }
 
 test "idempotency store zero TTL treated as 1 second" {
-    var store = IdempotencyStore.init(0);
-    defer store.deinit(std.testing.allocator);
+    var store = IdempotencyStore.init(std.testing.allocator, 0);
+    defer store.deinit();
     // Should use @max(0, 1) = 1 second
     try std.testing.expectEqual(@as(i128, 1_000_000_000), store.ttl_ns);
 }
 
 test "idempotency store many unique keys" {
-    var store = IdempotencyStore.init(300);
-    defer store.deinit(std.testing.allocator);
+    var store = IdempotencyStore.init(std.testing.allocator, 300);
+    defer store.deinit();
 
     // Use distinct string literals to avoid buffer aliasing
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "key-alpha"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "key-beta"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "key-gamma"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "key-delta"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "key-epsilon"));
+    try std.testing.expect(store.recordIfNew("key-alpha"));
+    try std.testing.expect(store.recordIfNew("key-beta"));
+    try std.testing.expect(store.recordIfNew("key-gamma"));
+    try std.testing.expect(store.recordIfNew("key-delta"));
+    try std.testing.expect(store.recordIfNew("key-epsilon"));
 }
 
 test "idempotency store duplicate after many inserts" {
-    var store = IdempotencyStore.init(300);
-    defer store.deinit(std.testing.allocator);
+    var store = IdempotencyStore.init(std.testing.allocator, 300);
+    defer store.deinit();
 
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "first"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "second"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "third"));
+    try std.testing.expect(store.recordIfNew("first"));
+    try std.testing.expect(store.recordIfNew("second"));
+    try std.testing.expect(store.recordIfNew("third"));
     // First key should still be duplicate
-    try std.testing.expect(!store.recordIfNew(std.testing.allocator, "first"));
+    try std.testing.expect(!store.recordIfNew("first"));
 }
 
 test "idempotency store copies transient key memory" {
-    var store = IdempotencyStore.init(300);
-    defer store.deinit(std.testing.allocator);
+    var store = IdempotencyStore.init(std.testing.allocator, 300);
+    defer store.deinit();
 
     var key_buf: [32]u8 = undefined;
     const transient_key = try std.fmt.bufPrint(&key_buf, "req-{d}", .{123});
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, transient_key));
+    try std.testing.expect(store.recordIfNew(transient_key));
 
     @memset(&key_buf, 'x');
-    try std.testing.expect(!store.recordIfNew(std.testing.allocator, "req-123"));
+    try std.testing.expect(!store.recordIfNew("req-123"));
 }
 
 test "rate limiter copies transient key memory" {
@@ -27027,14 +27695,246 @@ test "baseline: SlidingWindowRateLimiter tracks requests within window" {
 }
 
 test "baseline: IdempotencyStore deduplicates keys" {
-    var store = IdempotencyStore.init(300);
-    defer store.deinit(std.testing.allocator);
+    var store = IdempotencyStore.init(std.testing.allocator, 300);
+    defer store.deinit();
     // First insert returns true (new)
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "req-1"));
+    try std.testing.expect(store.recordIfNew("req-1"));
     // Duplicate returns false
-    try std.testing.expect(!store.recordIfNew(std.testing.allocator, "req-1"));
+    try std.testing.expect(!store.recordIfNew("req-1"));
     // Different key returns true
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "req-2"));
+    try std.testing.expect(store.recordIfNew("req-2"));
+}
+
+test "IdempotencyStore caches response body and returns it on duplicate" {
+    var store = IdempotencyStore.init(std.testing.allocator, 300);
+    defer store.deinit();
+
+    // Miss before any write
+    try std.testing.expect(store.fetchCached("key-a") == null);
+
+    // Write a response
+    store.cacheResponse("key-a", "200 OK", "{\"path\":\"attachments/x.pdf\",\"bytes\":42}");
+
+    const hit_a = store.fetchCached("key-a");
+    try std.testing.expect(hit_a != null);
+    try std.testing.expectEqualStrings("200 OK", hit_a.?.status);
+    try std.testing.expectEqualStrings("{\"path\":\"attachments/x.pdf\",\"bytes\":42}", hit_a.?.body);
+
+    // Second cacheResponse on the same key is a no-op — preserves first-write.
+    store.cacheResponse("key-a", "500 Internal Server Error", "{\"error\":\"different\"}");
+    const hit_again = store.fetchCached("key-a");
+    try std.testing.expect(hit_again != null);
+    try std.testing.expectEqualStrings("200 OK", hit_again.?.status);
+    try std.testing.expectEqualStrings("{\"path\":\"attachments/x.pdf\",\"bytes\":42}", hit_again.?.body);
+
+    // Different key still misses.
+    try std.testing.expect(store.fetchCached("key-b") == null);
+}
+
+test "handleAttachmentUpload dedupes on Idempotency-Key retry" {
+    // Set up workspace tmpdir.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws);
+
+    // Minimal GatewayState — we only need the idempotency store.
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    // Minimal UserContext.
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, ws);
+    defer ctx.deinit(std.testing.allocator);
+
+    // First upload: small base64 of "hello\n" = aGVsbG8K
+    const body_first =
+        "POST /api/v1/users/1/attachments HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Idempotency-Key: upload-X1\r\n" ++
+        "Content-Length: 56\r\n" ++
+        "\r\n" ++
+        "{\"filename\":\"first.txt\",\"content_b64\":\"aGVsbG8K\"}";
+
+    const resp1 = handleAttachmentUpload(std.testing.allocator, "POST", body_first, &ctx, &state);
+    defer if (resp1.body.len > 0) std.testing.allocator.free(resp1.body);
+    try std.testing.expectEqualStrings("200 OK", resp1.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp1.body, "\"path\":\"attachments/first.txt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp1.body, "\"bytes\":6") != null);
+
+    // Retry with the SAME key but a DIFFERENT filename + content. The
+    // cached response wins — the new content is NOT written and the
+    // response matches the first call's body exactly.
+    const body_retry =
+        "POST /api/v1/users/1/attachments HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Idempotency-Key: upload-X1\r\n" ++
+        "Content-Length: 60\r\n" ++
+        "\r\n" ++
+        "{\"filename\":\"second.txt\",\"content_b64\":\"YnllYnll\"}";
+    const resp2 = handleAttachmentUpload(std.testing.allocator, "POST", body_retry, &ctx, &state);
+    defer if (resp2.body.len > 0) std.testing.allocator.free(resp2.body);
+    try std.testing.expectEqualStrings("200 OK", resp2.status);
+    try std.testing.expectEqualStrings(resp1.body, resp2.body);
+
+    // Crucially: the second filename was NOT created on disk — the
+    // dedupe short-circuited before any filesystem touch.
+    const second_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/attachments/second.txt", .{ws});
+    defer std.testing.allocator.free(second_path);
+    if (std.fs.openFileAbsolute(second_path, .{})) |f| {
+        defer f.close();
+        // The whole point of the dedupe is that this file MUST NOT
+        // exist. If it does, the dedupe was bypassed — fail loud.
+        try std.testing.expect(false);
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    // A new key starts a fresh upload.
+    const body_new_key =
+        "POST /api/v1/users/1/attachments HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Idempotency-Key: upload-X2\r\n" ++
+        "Content-Length: 60\r\n" ++
+        "\r\n" ++
+        "{\"filename\":\"third.txt\",\"content_b64\":\"d29ybGQK\"}";
+    const resp3 = handleAttachmentUpload(std.testing.allocator, "POST", body_new_key, &ctx, &state);
+    defer if (resp3.body.len > 0) std.testing.allocator.free(resp3.body);
+    try std.testing.expectEqualStrings("200 OK", resp3.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp3.body, "\"path\":\"attachments/third.txt\"") != null);
+}
+
+test "handleAttachmentUpload rejects empty Idempotency-Key with 400" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, ws);
+    defer ctx.deinit(std.testing.allocator);
+
+    const req =
+        "POST /api/v1/users/1/attachments HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Idempotency-Key: \r\n" ++
+        "Content-Length: 56\r\n" ++
+        "\r\n" ++
+        "{\"filename\":\"first.txt\",\"content_b64\":\"aGVsbG8K\"}";
+    const resp = handleAttachmentUpload(std.testing.allocator, "POST", req, &ctx, &state);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid_idempotency_key") != null);
+}
+
+test "handleAttachmentUpload without Idempotency-Key still works (soft mode)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, ws);
+    defer ctx.deinit(std.testing.allocator);
+
+    const req =
+        "POST /api/v1/users/1/attachments HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Length: 56\r\n" ++
+        "\r\n" ++
+        "{\"filename\":\"plain.txt\",\"content_b64\":\"aGVsbG8K\"}";
+    const resp = handleAttachmentUpload(std.testing.allocator, "POST", req, &ctx, &state);
+    defer if (resp.body.len > 0) std.testing.allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"path\":\"attachments/plain.txt\"") != null);
+}
+
+test "handleAttachmentUpload idempotency cache is namespaced by user_id" {
+    // Same Idempotency-Key from two different users must NOT collide.
+    // The first user uploads a file; the second user retrying with the
+    // SAME key must NOT receive the first user's filename in the
+    // response (cross-user filename leak).
+    var tmp_a = std.testing.tmpDir(.{});
+    defer tmp_a.cleanup();
+    const ws_a = try tmp_a.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_a);
+    var tmp_b = std.testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+    const ws_b = try tmp_b.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_b);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var ctx_a = try makeExportTestUserCtx(std.testing.allocator, ws_a);
+    defer ctx_a.deinit(std.testing.allocator);
+    ctx_a.user_id = "111";
+    var ctx_b = try makeExportTestUserCtx(std.testing.allocator, ws_b);
+    defer ctx_b.deinit(std.testing.allocator);
+    ctx_b.user_id = "222";
+
+    const a_req =
+        "POST /api/v1/users/111/attachments HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Idempotency-Key: shared-key\r\n" ++
+        "Content-Length: 58\r\n" ++
+        "\r\n" ++
+        "{\"filename\":\"a_secret.pdf\",\"content_b64\":\"aGVsbG8K\"}";
+    const resp_a = handleAttachmentUpload(std.testing.allocator, "POST", a_req, &ctx_a, &state);
+    defer if (resp_a.body.len > 0) std.testing.allocator.free(resp_a.body);
+    try std.testing.expectEqualStrings("200 OK", resp_a.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp_a.body, "\"path\":\"attachments/a_secret.pdf\"") != null);
+
+    const b_req =
+        "POST /api/v1/users/222/attachments HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Idempotency-Key: shared-key\r\n" ++
+        "Content-Length: 60\r\n" ++
+        "\r\n" ++
+        "{\"filename\":\"b_innocent.txt\",\"content_b64\":\"d29ybGQK\"}";
+    const resp_b = handleAttachmentUpload(std.testing.allocator, "POST", b_req, &ctx_b, &state);
+    defer if (resp_b.body.len > 0) std.testing.allocator.free(resp_b.body);
+    try std.testing.expectEqualStrings("200 OK", resp_b.status);
+    // Critical: user B must NOT see user A's filename.
+    try std.testing.expect(std.mem.indexOf(u8, resp_b.body, "a_secret.pdf") == null);
+    // User B's own upload runs normally.
+    try std.testing.expect(std.mem.indexOf(u8, resp_b.body, "\"path\":\"attachments/b_innocent.txt\"") != null);
+
+    // Same user retrying their OWN key still dedupes correctly.
+    const a_retry =
+        "POST /api/v1/users/111/attachments HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Idempotency-Key: shared-key\r\n" ++
+        "Content-Length: 64\r\n" ++
+        "\r\n" ++
+        "{\"filename\":\"different.txt\",\"content_b64\":\"YmJiYg==\"}";
+    const resp_a2 = handleAttachmentUpload(std.testing.allocator, "POST", a_retry, &ctx_a, &state);
+    defer if (resp_a2.body.len > 0) std.testing.allocator.free(resp_a2.body);
+    try std.testing.expectEqualStrings("200 OK", resp_a2.status);
+    try std.testing.expectEqualStrings(resp_a.body, resp_a2.body);
+}
+
+test "IdempotencyStore rejects bodies larger than MAX_CACHED_BODY_BYTES" {
+    var store = IdempotencyStore.init(std.testing.allocator, 300);
+    defer store.deinit();
+
+    // Build a body just over the cap.
+    const big = try std.testing.allocator.alloc(u8, IdempotencyStore.MAX_CACHED_BODY_BYTES + 1);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    store.cacheResponse("oversize-key", "200 OK", big);
+    // The oversize body must not have been stored.
+    try std.testing.expect(store.fetchCached("oversize-key") == null);
+
+    // A body exactly at the cap is still acceptable.
+    const at_cap = try std.testing.allocator.alloc(u8, IdempotencyStore.MAX_CACHED_BODY_BYTES);
+    defer std.testing.allocator.free(at_cap);
+    @memset(at_cap, 'y');
+    store.cacheResponse("cap-key", "200 OK", at_cap);
+    const hit = store.fetchCached("cap-key");
+    try std.testing.expect(hit != null);
+    try std.testing.expectEqual(@as(usize, IdempotencyStore.MAX_CACHED_BODY_BYTES), hit.?.body.len);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -27047,6 +27947,8 @@ test "isSessionAction recognises known actions" {
     try std.testing.expect(isSessionAction("export"));
     try std.testing.expect(isSessionAction("history"));
     try std.testing.expect(isSessionAction("approve"));
+    try std.testing.expect(isSessionAction("mode"));
+    try std.testing.expect(isSessionAction("cancel"));
     try std.testing.expect(!isSessionAction("unknown"));
     try std.testing.expect(!isSessionAction(""));
     try std.testing.expect(!isSessionAction("sessions"));
@@ -27940,6 +28842,57 @@ test "handleSessionDelete returns 404 for unknown session" {
 
     const resp = handleSessionDelete(std.testing.allocator, &mgr, "agent:zaki-bot:user:1:thread:ghost", null, "1");
     try std.testing.expectEqualStrings("404 Not Found", resp.status);
+}
+
+test "handleSessionCancel returns 404 for unknown session" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const resp = handleSessionCancel(std.testing.allocator, &mgr, "agent:zaki-bot:user:1:thread:ghost");
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "session_not_found") != null);
+}
+
+test "handleSessionCancel signals idle when session present without active refs" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const session = try mgr.getOrCreate("agent:zaki-bot:user:11:thread:cancel-idle");
+    try std.testing.expect(!session.agent.cancellation_token.isCancelled());
+
+    const resp = handleSessionCancel(std.testing.allocator, &mgr, "agent:zaki-bot:user:11:thread:cancel-idle");
+    defer std.testing.allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"cancellation_signalled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"was_active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "agent:zaki-bot:user:11:thread:cancel-idle") != null);
+    try std.testing.expect(session.agent.cancellation_token.isCancelled());
+}
+
+test "handleSessionCancel reports was_active true while a turn pin is held" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const session = try mgr.getOrCreate("agent:zaki-bot:user:12:thread:cancel-active");
+    session.active_refs = 1; // simulate an in-flight turn
+    defer session.active_refs = 0;
+
+    const resp = handleSessionCancel(std.testing.allocator, &mgr, "agent:zaki-bot:user:12:thread:cancel-active");
+    defer std.testing.allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"was_active\":true") != null);
+    try std.testing.expect(session.agent.cancellation_token.isCancelled());
+
+    // Idempotent — second cancel produces the same shape and keeps the
+    // token set (atomic store on an already-set flag is a no-op).
+    const resp2 = handleSessionCancel(std.testing.allocator, &mgr, "agent:zaki-bot:user:12:thread:cancel-active");
+    defer std.testing.allocator.free(resp2.body);
+    try std.testing.expectEqualStrings("200 OK", resp2.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp2.body, "\"was_active\":true") != null);
+    try std.testing.expect(session.agent.cancellation_token.isCancelled());
 }
 
 test "handleSessionCompact returns status on empty session" {
@@ -29410,20 +30363,10 @@ test "Wave 2C: get endpoint rejects malformed artifact id" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid_artifact_id") != null);
 }
 
-test "Wave 2C: export endpoint stubs as 501 with documented dependency" {
-    var state = GatewayState.init(std.testing.allocator);
-    defer state.deinit();
-    const resp = handleArtifactExport(
-        std.testing.allocator,
-        "POST",
-        "1",
-        "00000000-0000-0000-0000-000000000000",
-        "POST /api/v1/users/1/artifacts/.../export?format=pdf HTTP/1.1",
-        &state,
-    );
-    try std.testing.expectEqualStrings("501 Not Implemented", resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "produce_document") != null);
-}
+// "Wave 2C: export endpoint stubs as 501" — removed in Wave 2A (this commit).
+// The export endpoint is now wired to ProduceDocumentTool; the new coverage
+// lives in the "Wave 2A — export bridge handler" block at the end of this
+// file.
 
 test "Wave 2C: PUT rejects empty content" {
     var state = GatewayState.init(std.testing.allocator);
@@ -29843,4 +30786,334 @@ test "Wave2-HIGH3: public artifact share endpoint keeps 404 for enumeration defe
     // Crucially must NOT leak the backend-down signal in the body.
     try std.testing.expect(std.mem.indexOf(u8, r.body, "state_unavailable") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.body, "postgres") == null);
+}
+
+// ─── Wave 2A — artifact export bridge helpers ──────────────────────────
+
+test "parseProducedFilename extracts the produced filename from tool markdown" {
+    const md = "[Generated PDF: report_1716_a1b2c3d4.pdf](attachments/produced/report_1716_a1b2c3d4.pdf)";
+    const fn_opt = parseProducedFilename(md);
+    try std.testing.expect(fn_opt != null);
+    try std.testing.expectEqualStrings("report_1716_a1b2c3d4.pdf", fn_opt.?);
+}
+
+test "parseProducedFilename returns null on malformed input" {
+    try std.testing.expect(parseProducedFilename("not a link") == null);
+    try std.testing.expect(parseProducedFilename("[just text]") == null);
+    try std.testing.expect(parseProducedFilename("[Generated PDF: x.pdf](no-prefix/x.pdf)") == null);
+}
+
+test "producedContentType returns the right MIME for each format" {
+    try std.testing.expectEqualStrings("application/pdf", producedContentType("pdf"));
+    try std.testing.expectEqualStrings(
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        producedContentType("docx"),
+    );
+    try std.testing.expectEqualStrings(
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        producedContentType("pptx"),
+    );
+    try std.testing.expectEqualStrings(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        producedContentType("xlsx"),
+    );
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", producedContentType("html"));
+    try std.testing.expectEqualStrings("application/octet-stream", producedContentType("???"));
+}
+
+// ─── Wave 2A — export bridge handler ───────────────────────────────────
+
+/// Test fixture: synthesize a minimal UserContext pointing at a tmpdir
+/// workspace. The real dispatch site supplies a fully-resolved context;
+/// at handler level we only need workspace_path to be valid and the rest
+/// of the freed-by-deinit slices to be heap-allocated so deinit's frees
+/// stay balanced.
+fn makeExportTestUserCtx(allocator: std.mem.Allocator, workspace_path: []const u8) !UserContext {
+    return UserContext{
+        .user_id = "1",
+        .user_root = try allocator.dupe(u8, workspace_path),
+        .workspace_path = try allocator.dupe(u8, workspace_path),
+        .memory_db_path = try allocator.dupe(u8, ""),
+        .cron_path = try allocator.dupe(u8, ""),
+        .config_path = try allocator.dupe(u8, ""),
+        .heartbeat_path = try allocator.dupe(u8, ""),
+        .channel_state_path = try allocator.dupe(u8, ""),
+        .telegram_path = try allocator.dupe(u8, ""),
+        .secrets_dir = try allocator.dupe(u8, ""),
+    };
+}
+
+// Note: target slices here match what `extractRequestTarget` returns at the
+// dispatch site — just the request-target part (path+query), NOT the full
+// HTTP request line. parseQueryParam splits on space-less input.
+
+test "Wave 2A: export endpoint rejects unknown format with 400" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, "/tmp/nullalis-export-test-fake");
+    defer ctx.deinit(std.testing.allocator);
+    const resp = handleArtifactExport(
+        std.testing.allocator,
+        "POST",
+        "1",
+        "00000000-0000-0000-0000-000000000000",
+        "/api/v1/users/1/artifacts/00000000-0000-0000-0000-000000000000/export?format=rtf",
+        &ctx,
+        null,
+        &state,
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid_format") != null);
+}
+
+test "Wave 2A: export endpoint rejects malformed artifact id with 400" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, "/tmp/nullalis-export-test-fake");
+    defer ctx.deinit(std.testing.allocator);
+    const resp = handleArtifactExport(
+        std.testing.allocator,
+        "POST",
+        "1",
+        "not-a-uuid",
+        "/api/v1/users/1/artifacts/not-a-uuid/export?format=pdf",
+        &ctx,
+        null,
+        &state,
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid_artifact_id") != null);
+}
+
+test "Wave 2A: export endpoint returns 503 when state backend is absent" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit(); // zaki_state stays null
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, "/tmp/nullalis-export-test-fake");
+    defer ctx.deinit(std.testing.allocator);
+    const resp = handleArtifactExport(
+        std.testing.allocator,
+        "POST",
+        "1",
+        "00000000-0000-0000-0000-000000000000",
+        "/api/v1/users/1/artifacts/00000000-0000-0000-0000-000000000000/export?format=pdf",
+        &ctx,
+        null,
+        &state,
+    );
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "state_unavailable") != null);
+}
+
+test "Wave 2A: export endpoint rejects non-POST with 405" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, "/tmp/nullalis-export-test-fake");
+    defer ctx.deinit(std.testing.allocator);
+    const resp = handleArtifactExport(
+        std.testing.allocator,
+        "GET",
+        "1",
+        "00000000-0000-0000-0000-000000000000",
+        "/api/v1/users/1/artifacts/00000000-0000-0000-0000-000000000000/export?format=pdf",
+        &ctx,
+        null,
+        &state,
+    );
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "Wave 2A: download endpoint rejects unsafe filename" {
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, "/tmp/nullalis-export-test-fake");
+    defer ctx.deinit(std.testing.allocator);
+    const resp = handleArtifactExportDownload(
+        std.testing.allocator,
+        "GET",
+        "../etc/passwd",
+        &ctx,
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "unsafe_filename") != null);
+}
+
+test "Wave 2A: download endpoint returns 404 when file is absent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws);
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, ws);
+    defer ctx.deinit(std.testing.allocator);
+    const resp = handleArtifactExportDownload(
+        std.testing.allocator,
+        "GET",
+        "does_not_exist.pdf",
+        &ctx,
+    );
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "export_not_found") != null);
+}
+
+test "Wave 2A: download endpoint serves file with correct Content-Type" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(ws);
+
+    // Materialize a real file under attachments/produced/ with known bytes
+    // so the test exercises the open / stat / readAll / Content-Type path
+    // end-to-end (the live-PG roundtrip test does NOT actually GET the
+    // produced file, so this is the only place that pins the success
+    // contract offline).
+    const produced_dir = try std.fmt.allocPrint(allocator, "{s}/attachments/produced", .{ws});
+    defer allocator.free(produced_dir);
+    try std.fs.cwd().makePath(produced_dir);
+    const fixture_bytes = "%PDF-1.4\n% test fixture for export download contract\n";
+    const fixture_path = try std.fmt.allocPrint(allocator, "{s}/fixture_export.pdf", .{produced_dir});
+    defer allocator.free(fixture_path);
+    {
+        const f = try std.fs.createFileAbsolute(fixture_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(fixture_bytes);
+    }
+
+    var ctx = try makeExportTestUserCtx(allocator, ws);
+    defer ctx.deinit(allocator);
+
+    const resp = handleArtifactExportDownload(allocator, "GET", "fixture_export.pdf", &ctx);
+    defer if (resp.body.len > 0) allocator.free(resp.body);
+
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expectEqualStrings("application/pdf", resp.content_type);
+    try std.testing.expectEqualStrings(fixture_bytes, resp.body);
+}
+
+test "Wave 2A: export endpoint accepts case-insensitive format (PDF → pdf)" {
+    // PG-not-configured means the call short-circuits at the state-mgr
+    // check AFTER format validation. A 503 response proves the
+    // case-insensitive allowlist accepted `PDF`; a 400 would prove the
+    // opposite. Mirrors the in-tool case insensitivity at
+    // produce_document.zig:492-500 (eqlIgnoreCase).
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, "/tmp/nullalis-export-test-fake");
+    defer ctx.deinit(std.testing.allocator);
+    const resp = handleArtifactExport(
+        std.testing.allocator,
+        "POST",
+        "1",
+        "00000000-0000-0000-0000-000000000000",
+        "/api/v1/users/1/artifacts/00000000-0000-0000-0000-000000000000/export?format=PDF",
+        &ctx,
+        null,
+        &state,
+    );
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp.status);
+}
+
+test "Wave 2A: export endpoint refuses relative workspace_path with controlled 500" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    // Deliberately relative — production resolveUserContext always emits
+    // absolute paths; this fixture covers the operator-config-drift gate.
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, "relative/workspace/path");
+    defer ctx.deinit(std.testing.allocator);
+    const resp = handleArtifactExport(
+        std.testing.allocator,
+        "POST",
+        "1",
+        "00000000-0000-0000-0000-000000000000",
+        "/api/v1/users/1/artifacts/00000000-0000-0000-0000-000000000000/export?format=pdf",
+        &ctx,
+        null,
+        &state,
+    );
+    try std.testing.expectEqualStrings("500 Internal Server Error", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "workspace_not_absolute") != null);
+}
+
+test "Wave 2A live: export bridge writes produced file + returns download URL" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_w2a_export_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    defer mgr.dropSchemaForTests() catch {};
+
+    // Build a unique workspace under /tmp that the bridge can write into.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(ws);
+
+    try mgr.provisionUser(601, ws);
+    try mgr.provisionUser(602, ws);
+
+    // Create an artifact + version owned by user 601.
+    const now = std.time.timestamp();
+    const hash_v1 = try artifacts_types.computeContentHash(allocator, "# Hello\n\nExport bridge smoke.");
+    defer allocator.free(hash_v1);
+    var artifact = try mgr.createArtifact(allocator, 601, null, "ExportBridgeSmoke", "markdown", "# Hello\n\nExport bridge smoke.", hash_v1, now);
+    defer artifact.deinit(allocator);
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    defer state.zaki_state = null;
+    state.zaki_state = &mgr;
+
+    var ctx = try makeExportTestUserCtx(allocator, ws);
+    defer ctx.deinit(allocator);
+
+    // Pick HTML — pandoc-only path; if pandoc isn't installed we still
+    // exercise the renderer_unavailable code path (asserted below).
+    const target = try std.fmt.allocPrint(allocator, "/api/v1/users/601/artifacts/{s}/export?format=html", .{artifact.id});
+    defer allocator.free(target);
+
+    const resp = handleArtifactExport(
+        allocator,
+        "POST",
+        "601",
+        artifact.id,
+        target,
+        &ctx,
+        null,
+        &state,
+    );
+
+    if (std.mem.indexOf(u8, resp.body, "renderer_unavailable") != null) {
+        // pandoc not installed in the sandbox — the controlled-failure
+        // shape is the assertion of interest. Done.
+        try std.testing.expectEqualStrings("502 Bad Gateway", resp.status);
+        if (resp.body.len > 0) allocator.free(resp.body);
+        return;
+    }
+
+    // pandoc IS installed — full success path.
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"exported\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"format\":\"html\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "attachments/produced/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "/api/v1/users/601/exports/") != null);
+    if (resp.body.len > 0) allocator.free(resp.body);
+
+    // Cross-user isolation: user 602 cannot export user 601's artifact.
+    const resp2 = handleArtifactExport(
+        allocator,
+        "POST",
+        "602",
+        artifact.id,
+        target,
+        &ctx,
+        null,
+        &state,
+    );
+    try std.testing.expectEqualStrings("404 Not Found", resp2.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp2.body, "artifact_not_found") != null);
 }

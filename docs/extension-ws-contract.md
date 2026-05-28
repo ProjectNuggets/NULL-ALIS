@@ -1,14 +1,11 @@
 # Gateway-side extension WebSocket — contract + tool recipe
 
-**v1 surface complete (10/10 tools).** Wave 3B shipped `extension_navigate`
-as proof-of-pattern; the follow-up fan-out landed the remaining nine
-(`extension_click`, `extension_type`, `extension_fill_form`,
-`extension_screenshot`, `extension_get_text`, `extension_get_dom`,
-`extension_wait_for`, `extension_scroll`, `extension_list_tabs`) by
-mechanically applying the recipe below. Each ships with the same six-
-test scaffold + (for capped tools) an over-cap rejection test. Keep
-the recipe in place — future v1.1 additions (cross-tab, file_upload,
-etc.) drop in the same way.
+**v1 surface complete (10/10 tools).** The shipped tool set is
+`extension_navigate`, `extension_click`, `extension_type`,
+`extension_fill_form`, `extension_screenshot`, `extension_get_text`,
+`extension_get_dom`, `extension_wait_for`, `extension_scroll`, and
+`extension_list_tabs`. Keep the recipe below in place for future v1.1
+additions such as cross-tab actions or file upload.
 
 Wave 3B landed the gateway half of the browser-extension story:
 
@@ -20,11 +17,12 @@ Wave 3B landed the gateway half of the browser-extension story:
 - **Per-user registry:** `src/extension_ws/hub.zig` — one connection
   per `user_id`, eviction-on-reconnect, `sendCommand(user_id, tool,
   args_json, timeout_ms)` for the agent side.
-- **Auth:** `src/extension_ws/auth.zig` — validates against the
-  gateway's existing `internal_service_tokens`; the auth frame must
-  carry `{type:"auth", token, user_id, extension_version}`.
-- **First wired tool:** `extension_navigate` in
-  `src/tools/extension_navigate.zig`.
+- **Auth:** `src/extension_ws/auth.zig` — validates per-user extension
+  tokens. The token maps to one server-side `user_id`; any `user_id`
+  in the auth frame is ignored and kept only for legacy client
+  compatibility.
+- **Wired tools:** the ten `extension_*` tools are registered through
+  `src/tools/root.zig` and dispatch through the hub.
 
 The contract itself is locked in
 `.spike/nullalis-extension/docs/ARCHITECTURE.md` — the client
@@ -32,10 +30,8 @@ implementation lives there; this doc covers only the gateway side.
 
 ## Add another extension_* tool — recipe
 
-Wave 3B shipped ONE wired tool (`extension_navigate`) as proof-of-
-pattern. The remaining 9 tools from the contract (`click`, `type`,
-`fill_form`, `screenshot`, `get_text`, `get_dom`, `wait_for`, `scroll`,
-`list_tabs`) drop in mechanically. The whole recipe is five steps:
+The ten v1 tools are already shipped. Future extension tools should
+follow the same recipe. The whole recipe is five steps:
 
 1. **Copy the file.** `cp src/tools/extension_navigate.zig
    src/tools/extension_<NAME>.zig`. The wiring + error handling + JSON
@@ -82,41 +78,32 @@ pattern. The remaining 9 tools from the contract (`click`, `type`,
    frame). Adjust the args/payload literals to match the new tool's
    contract.
 
-The recipe lands a new tool in roughly 15 minutes per tool plus
-review. A coordinator running the 9-tool fill-in sprint can dispatch
-this as a fan-out with `isolation: "worktree"` per §14.12 — each tool
-is independent.
+The recipe lands a future tool in roughly 15 minutes plus review. If a
+future browser-control expansion adds multiple tools, dispatch one
+worktree per tool and keep each change independently tested.
 
-## Why ship one tool now instead of all ten
+## Production Completion Rule
 
-§14.5 (no loose ends — completion contract) says "a feature is
-complete only when ALL of [code lands, tests cover happy + failure
-paths, ...]". Shipping ten copy-pasted tool files without each one
-having its happy-path test against the live hub + a real CommandResult
-mock is the cruft pattern this rule outlaws. Shipping one tool fully
-proves the wiring; the recipe + the tests scaffold reduce each
-follow-up to mechanical work that lands behind its own bench gate.
-
-A follow-up sprint should land the remaining nine in a single
-fan-out, one per worktree, each with the six-test scaffold.
-Behavioral activation per §14.10 is the agent calling the new tool
-end-to-end through the connected extension — not the tool's
-existence in the catalog.
+§14.5 (no loose ends — completion contract) says a feature is complete
+only when code, tests, runtime wiring, behavioral activation, docs, and
+user surface all land. For extension browser control, that means each
+tool must be callable through a paired extension, approval behavior must
+match the active autonomy level, disconnects/timeouts must surface as
+clear tool failures, and the ZAKI UI must show whether the user-browser
+lane is connected before offering logged-in browser work.
 
 ## Token + user_id semantics
 
-For v1, the gateway accepts any token in its configured
-`internal_service_tokens` list (same as the chat-stream endpoint).
-The extension's popup asks the user to paste this token; the
-extension's auth frame includes a `user_id` field the user also
-provides (the same `X-Zaki-User-Id` they'd send on chat requests).
+For v1, operators provision unique extension tokens as
+`(token, user_id)` pairs. The auth frame carries
+`{type:"auth", token, user_id?, extension_version}`; the server validates
+the token using a constant-time comparison across all configured entries
+and registers the connection under the mapped server-side `user_id`.
+The inbound `user_id` value is ignored. Empty token config rejects every
+extension connection closed-by-default.
 
-A v1.1 iteration should swap this for a per-extension API key minted
-by the BFF on user pair, with the user_id baked into the token's
-claims so the auth frame doesn't need a separate `user_id` field. The
-contract change would be in `extension_ws/auth.zig::AuthValidator`
-(swap the membership check for a JWT-style verify); the rest of the
-pipeline stays the same.
+A later BFF pairing flow can mint short-lived or rotating per-extension
+tokens, but it must preserve the server-derived user identity rule.
 
 ## Approval-gate behavior
 
