@@ -10899,10 +10899,15 @@ const ManagerImpl = struct {
         var expires_buf: [32]u8 = undefined;
         const expires_s = try std.fmt.bufPrintZ(&expires_buf, "{d}", .{expires_at_unix});
 
+        // `$4::json` (NOT `::jsonb`) — see migrations/0003_trace_shares.sql
+        // for the rationale. `JSON` preserves byte-exact input; `JSONB`
+        // would normalize (reorder keys, strip whitespace) and break the
+        // public-share contract that bytes returned by the public GET
+        // match the bytes the gateway emitted at share-create time.
         const q = try self.buildQuery(
             "INSERT INTO {schema}.trace_shares " ++
                 "(share_code, user_id, run_id, events_json, created_at_unix, expires_at_unix, revoked) " ++
-                "VALUES ($1, $2, $3, $4::jsonb, $5::bigint, $6::bigint, FALSE)",
+                "VALUES ($1, $2, $3, $4::json, $5::bigint, $6::bigint, FALSE)",
         );
         defer self.allocator.free(q);
         const params = [_]?[*:0]const u8{

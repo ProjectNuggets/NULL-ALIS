@@ -31,12 +31,25 @@ CREATE TABLE IF NOT EXISTS {schema}.trace_shares (
     -- run_id is opaque to the DB — matches the in-process run_id used
     -- by RunTraceStore. NOT a foreign key (run_ids are ephemeral).
     run_id          TEXT NOT NULL,
-    -- Sanitized snapshot. JSON array matching the response shape of
-    -- `GET /api/v1/share/:share_code` — `[{event_kind, ts_ms, ...}, ...]`.
+    -- Sanitized snapshot. JSON document matching the response shape of
+    -- `GET /api/v1/share/:share_code` — `{user_id, session_id, run_id,
+    -- first_event_ms, last_event_ms, truncated, events:[...]}`.
     -- Sanitization rules baked in at share-create time; future rule
     -- changes do NOT retroactively apply to existing shares (deliberate
     -- — old shares stay readable).
-    events_json     JSONB NOT NULL,
+    --
+    -- **Column type chosen for byte preservation.** `JSON` (not
+    -- `JSONB`) is used here on purpose: PostgreSQL `JSON` validates
+    -- structure on insert but stores the original text verbatim,
+    -- whereas `JSONB` normalizes (sorts keys, strips insignificant
+    -- whitespace). The public-share contract promises the snapshot
+    -- bytes returned by the public GET match the bytes the gateway
+    -- emitted at share-create time — a byte-exact assertion that
+    -- `JSONB` would silently break (key reordering would surface as
+    -- a test failure on the CI Canonical Profile run). `JSON` also
+    -- keeps the validation safety net: malformed payloads are
+    -- rejected at INSERT time rather than corrupting the share index.
+    events_json     JSON NOT NULL,
     created_at_unix BIGINT NOT NULL,
     expires_at_unix BIGINT NOT NULL,
     -- Revoke is soft-delete to preserve audit. `getTraceByShareCode`

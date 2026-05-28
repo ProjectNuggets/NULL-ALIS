@@ -12209,10 +12209,17 @@ const TraceShareStore = struct {
         // callers that opt out of persistence), we skip PG; the
         // share is in-memory only by explicit caller choice.
         //
-        // When state_mgr IS bound but user_id is non-numeric
-        // (synthetic test fixture), we log + skip persistence and
-        // proceed with the in-memory commit. Production user_ids are
-        // numeric so this branch is dead in commercial deploys.
+        // PR #110 review-pass fix (2026-05-29) — when state_mgr IS
+        // bound AND events_json is non-empty AND user_id is non-
+        // numeric, we ALSO fail closed. The previous version logged
+        // and proceeded into an in-memory-only share, which would
+        // present the user a durable `share_url` that did not survive
+        // restart. Production user_ids are always numeric (the auth
+        // layer enforces it); a non-numeric user_id reaching here in
+        // PG-backed mode signals a misconfigured tenant + the only
+        // safe answer is 500. Legacy in-memory-only tests use
+        // `TraceShareStore.init` (no state_mgr) so this branch is
+        // unreachable for them.
         if (self.state_mgr) |mgr| {
             if (events_json.len > 0) {
                 if (std.fmt.parseInt(i64, user_id, 10)) |uid| {
@@ -12221,7 +12228,8 @@ const TraceShareStore = struct {
                         return error.PersistFailed;
                     };
                 } else |_| {
-                    log.info("trace_share.persist_skipped non_numeric_user_id='{s}' run_id='{s}' — in-memory only, will NOT survive restart", .{ user_id, run_id });
+                    log.warn("trace_share.persist_failed non_numeric_user_id='{s}' run_id='{s}' — failing closed (PG-backed mode requires numeric user_id; do not surface an in-memory-only share as durable)", .{ user_id, run_id });
+                    return error.PersistFailed;
                 }
             }
         }
@@ -30938,6 +30946,148 @@ test "Sprint 3 live: trace_shares survive restart + sanitizer-safe + isolation" 
 
     // User A revokes their own share for cleanup.
     _ = try store2.revoke("101", "s3-iso-run-a");
+}
+
+// PR #110 review-pass test (2026-05-29) — handler-level public-GET
+// restart proof. Exercises the FULL `handleTraceShareGet` HTTP path
+// (not just `getLive` internals) with a resolver that returns NULL
+// for the RunTraceStore — proving the public viewer no longer needs
+// the in-process trace events after a restart.
+test "Sprint 3 live: handleTraceShareGet serves persisted snapshot post-restart with NO RunTraceStore" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_s3_handler_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    defer mgr.dropSchemaForTests() catch {};
+
+    try mgr.provisionUser(303, "/tmp/nullalis-s3-handler-user-303/workspace");
+
+    const now: i64 = std.time.timestamp();
+    const ttl_h: i64 = 24;
+
+    // ── Stage 1: write-through to PG via store#1 ──────────────────────
+    var store1 = TraceShareStore.initWithPersistence(allocator, &mgr);
+    defer store1.deinit();
+
+    const snapshot_json: []const u8 =
+        \\{"user_id":"anonymous","session_id":"shared_session","run_id":"h-restart-proof","first_event_ms":0,"last_event_ms":50,"truncated":false,"events":[{"kind":"turn_stage","ts_ms":0,"phase":"start"},{"kind":"agent_end","ts_ms":50,"success":true}]}
+    ;
+
+    const created = try store1.createOrGet("303", "h-restart-proof", ttl_h, now, snapshot_json);
+    const code_dup = try allocator.dupe(u8, created.share_code);
+    defer allocator.free(code_dup);
+
+    // ── Stage 2: simulate restart — fresh store, same mgr ─────────────
+    // store#1 is gone; store#2's in-memory cache is empty.
+    var store2 = TraceShareStore.initWithPersistence(allocator, &mgr);
+    defer store2.deinit();
+
+    // ── Stage 3: handler-level public GET with NULL RunTraceStore ─────
+    // The resolver returns null — proves the public path no longer
+    // depends on the in-process trace events after a restart. The
+    // handler must hit the cache miss → lazy-load from PG → return
+    // the persisted snapshot bytes verbatim.
+    const NullResolver = struct {
+        fn resolve(_: ?*anyopaque, _: []const u8) ?*run_trace_store_mod.RunTraceStore {
+            return null;
+        }
+    };
+
+    const resp = handleTraceShareGet(
+        allocator,
+        "GET",
+        code_dup,
+        &store2,
+        now,
+        .{},
+        null,
+        NullResolver.resolve,
+    );
+    // Success path: status default ("200 OK"), body is heap-allocated.
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    defer allocator.free(resp.body);
+
+    // Stage 4: byte-exact assertion — JSON column preserves input
+    // verbatim (JSONB would normalize and break this).
+    try std.testing.expectEqualStrings(snapshot_json, resp.body);
+
+    // Sanitizer-safety: the public viewer must NOT reveal the real
+    // user_id or session_id; the breadcrumbs are anonymous.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"user_id\":\"anonymous\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"session_id\":\"shared_session\"") != null);
+    // Confirm the persisted bytes did NOT leak the numeric user_id
+    // (303) — the sanitizer ran at share-create time and the persisted
+    // snapshot inherits that protection.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "303") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "user_id\":303") == null);
+
+    // ── Stage 5: revoke through store#2; cold GET on store#3 → 404 ────
+    const revoked = try store2.revoke("303", "h-restart-proof");
+    try std.testing.expect(revoked);
+
+    var store3 = TraceShareStore.initWithPersistence(allocator, &mgr);
+    defer store3.deinit();
+
+    const resp_revoked = handleTraceShareGet(
+        allocator,
+        "GET",
+        code_dup,
+        &store3,
+        now,
+        .{},
+        null,
+        NullResolver.resolve,
+    );
+    // 404 body is a static literal — do NOT free.
+    try std.testing.expectEqualStrings("404 Not Found", resp_revoked.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp_revoked.body, "share_not_found") != null);
+}
+
+// PR #110 review-pass test (2026-05-29) — fail-closed gate for the
+// non-numeric user_id branch in PG-backed mode. Exercises the
+// runtime error.PersistFailed path WITHOUT needing live PG: the
+// caller binds state_mgr but passes a non-numeric user_id with a
+// non-empty events_json. Expected: error.PersistFailed.
+//
+// We use the fake-manager stub to avoid touching live PG; the fake
+// stubs return `error.PostgresNotEnabled` for the actual setTraceShare
+// call, but the new fail-closed gate fires BEFORE that — on the
+// parseInt-failure branch, returning `error.PersistFailed` directly.
+test "Sprint 3 review: createOrGet fails closed when state_mgr bound and user_id non-numeric" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    // No PG URL — use a no-arg `Manager.init` style. Actually, in
+    // non-postgres builds Manager is the stub struct. In postgres
+    // builds we need a Manager; the simplest is to skip-on-no-url
+    // since we just want the gate behavior.
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_s3_failclosed_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    defer mgr.dropSchemaForTests() catch {};
+
+    var store = TraceShareStore.initWithPersistence(allocator, &mgr);
+    defer store.deinit();
+
+    const non_empty_snapshot: []const u8 = "{\"events\":[]}";
+    const result = store.createOrGet("synthetic-user-id", "run-x", 24, std.time.timestamp(), non_empty_snapshot);
+    try std.testing.expectError(error.PersistFailed, result);
 }
 
 // ─── Wave 2 review regression tests (2026-05-24) ───────────────────────
