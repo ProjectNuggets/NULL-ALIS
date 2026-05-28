@@ -13440,13 +13440,24 @@ fn handleSessionApprove(
         mgr.mutex.unlock();
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"approval_failed\"}" };
     };
+    defer allocator.free(result);
 
     // Unpin after successful processing
     mgr.mutex.lock();
     if (session.active_refs > 0) session.active_refs -= 1;
     mgr.mutex.unlock();
 
-    defer allocator.free(result);
+    // S2 follow-up fix. The id-qualified slash command correctly
+    // rejects a swapped pending, but processMessage returns that as a
+    // normal command reply. Do not let the HTTP layer report
+    // {"status":"approved"} / {"status":"denied"} for a stale card;
+    // surface the same 409 contract as the pre-dispatch guard.
+    if (input.approval_id != null and std.mem.indexOf(u8, result, "Approval id mismatch") != null) {
+        return .{
+            .status = "409 Conflict",
+            .body = "{\"error\":\"approval_id_mismatch\",\"hint\":\"the pending approval changed or was already resolved; refresh the session before retrying\"}",
+        };
+    }
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
@@ -29206,16 +29217,16 @@ test "Sprint 2 TOCTOU — handleSessionApprove dispatches id-qualified command a
     try seedPendingApprovalForTest(session, 999);
 
     // Release session.mutex so processMessage proceeds. With the fix
-    // it dispatches "/approve 42 allow-once" → mismatch → 200 OK with
-    // "Approval id mismatch" embedded in the reply, pending #999 stays.
+    // it dispatches "/approve 42 allow-once" → mismatch → HTTP 409,
+    // pending #999 stays, and the FE refreshes instead of assuming the
+    // card was approved.
     // Pre-fix it would dispatch plain "/approve allow-once" → resolves
     // #999 → pending becomes null → assertion below would fail.
     session.mutex.unlock();
     gateway_thread.join();
-    defer std.testing.allocator.free(ctx.resp.body);
 
-    try std.testing.expectEqualStrings("200 OK", ctx.resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, ctx.resp.body, "Approval id mismatch") != null);
+    try std.testing.expectEqualStrings("409 Conflict", ctx.resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.resp.body, "approval_id_mismatch") != null);
     try std.testing.expect(session.agent.pending_tool_approval != null);
     if (session.agent.pending_tool_approval) |p| {
         try std.testing.expectEqual(@as(u64, 999), p.id);
