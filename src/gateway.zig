@@ -13344,6 +13344,25 @@ fn validateApproveInput(raw_request: []const u8) union(enum) { approved: Approve
     } };
 }
 
+/// Build the slash command dispatched to processMessage when resolving
+/// an approval. When `qualified_id` is non-null the command embeds that
+/// numeric id (`/approve <id> allow-once|deny`) so the canonical handler
+/// rejects with "Approval id mismatch" if the pending slot has been
+/// swapped between the gateway's stale-card check and the slash-command
+/// handler's lock. When null (no approval_id from FE) the command stays
+/// plain so pre-Sprint-2 clients keep their V1.14.x behavior.
+fn buildApproveCommand(
+    allocator: std.mem.Allocator,
+    approved: bool,
+    qualified_id: ?u64,
+) ![]u8 {
+    const decision: []const u8 = if (approved) "allow-once" else "deny";
+    if (qualified_id) |id| {
+        return std.fmt.allocPrint(allocator, "/approve {d} {s}", .{ id, decision });
+    }
+    return std.fmt.allocPrint(allocator, "/approve {s}", .{decision});
+}
+
 fn handleSessionApprove(
     allocator: std.mem.Allocator,
     mgr: *session_mod.SessionManager,
@@ -13374,6 +13393,16 @@ fn handleSessionApprove(
     // after the card was rendered. When `approval_id` is absent the
     // route addresses the current pending without verification (V1.14.x
     // backwards-compat for pre-Sprint-2 clients).
+    //
+    // S2 review fix (TOCTOU). When approval_id matches, we ALSO capture
+    // `pending.id` while still under mgr.mutex and bake it into the
+    // dispatched slash command (see buildApproveCommand below). Without
+    // this, the gateway unlocks → another caller resolves the matched
+    // pending → a new pending mints in the same slot → plain
+    // `/approve allow-once` silently resolves the NEW pending, defeating
+    // the stale-card guard. With the captured id, the canonical handler
+    // rejects with "Approval id mismatch" when the slot has changed.
+    var captured_pending_id: ?u64 = null;
     if (input.approval_id) |claimed_id| {
         const pending = session.agent.pending_tool_approval;
         const matches = if (pending) |p|
@@ -13388,12 +13417,22 @@ fn handleSessionApprove(
                 .body = "{\"error\":\"approval_id_mismatch\",\"hint\":\"the pending approval changed or was already resolved; refresh the session before retrying\"}",
             };
         }
+        // Safe: `matches` is true ⇒ pending is non-null.
+        captured_pending_id = pending.?.id;
     }
     mgr.mutex.unlock();
 
     // Route the decision through the existing slash command handler.
     // This keeps approval logic in one place (commands.zig).
-    const command = if (approved) "/approve allow-once" else "/approve deny";
+    const command = buildApproveCommand(allocator, approved, captured_pending_id) catch {
+        // Unpin on OOM
+        mgr.mutex.lock();
+        if (session.active_refs > 0) session.active_refs -= 1;
+        mgr.mutex.unlock();
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"approval_failed\"}" };
+    };
+    defer allocator.free(command);
+
     const result = mgr.processMessage(session_key, command, null) catch {
         // Unpin on error path
         mgr.mutex.lock();
@@ -29009,6 +29048,179 @@ test "Sprint 2 — cross-session isolation: approve in A doesn't touch B's pendi
 // `approval_already_pending`. The S2 gateway tests above lock the
 // HTTP/JSON contract; collision semantics live at the agent layer
 // where they belong.
+
+// ── Sprint 2 — TOCTOU regression (S2 review blocker) ───────────────
+//
+// Background. handleSessionApprove verifies the FE-supplied
+// `approval_id` against the agent's current pending while holding
+// mgr.mutex, then UNLOCKS and dispatches a slash command via
+// processMessage. Pre-fix the dispatched command was the plain
+// literal `/approve allow-once` / `/approve deny` — no numeric id.
+// Between the unlock and the next session lock taken inside
+// processMessage, another caller can resolve the matched pending
+// AND another tool call can mint a new pending in the same slot.
+// The plain slash command then resolves that NEW pending — the
+// exact race the stale-card guard exists to prevent.
+//
+// Fix. When approval_id is supplied AND matches, the gateway
+// captures `pending.id` while still under mgr.mutex and builds the
+// id-qualified command `/approve <pending.id> allow-once|deny`.
+// The canonical handler at src/agent/commands.zig:2889 already
+// rejects with "Approval id mismatch" when the qualified id does
+// not match the live pending — so a swapped slot is caught at the
+// dispatch layer instead of being silently resolved.
+//
+// The tests below lock both halves of the contract:
+//   1. buildApproveCommand emits the id-qualified form when an id
+//      is captured, and the plain form otherwise (legacy clients).
+//   2. The id-qualified command from (1), dispatched against a
+//      slot that has since been swapped, is rejected by the
+//      canonical handler — proving the gateway's race window can
+//      no longer silently resolve a different pending.
+
+test "Sprint 2 TOCTOU — buildApproveCommand qualifies command with captured pending.id" {
+    const allocator = std.testing.allocator;
+
+    // Contract: when the gateway captured `pending.id` while still
+    // under mgr.mutex (because approval_id was supplied AND matched),
+    // the dispatched slash command MUST embed that numeric id. The
+    // canonical handler's id-match check then rejects rather than
+    // silently resolving a pending that took the slot between the
+    // gateway's unlock and processMessage.
+    const allow_qualified = try buildApproveCommand(allocator, true, 7);
+    defer allocator.free(allow_qualified);
+    try std.testing.expectEqualStrings("/approve 7 allow-once", allow_qualified);
+
+    const deny_qualified = try buildApproveCommand(allocator, false, 7);
+    defer allocator.free(deny_qualified);
+    try std.testing.expectEqualStrings("/approve 7 deny", deny_qualified);
+
+    // Backwards-compat: pre-Sprint-2 clients omit approval_id, so the
+    // gateway passes null here and the command stays plain — preserving
+    // V1.14.x behavior bit-for-bit.
+    const allow_plain = try buildApproveCommand(allocator, true, null);
+    defer allocator.free(allow_plain);
+    try std.testing.expectEqualStrings("/approve allow-once", allow_plain);
+
+    const deny_plain = try buildApproveCommand(allocator, false, null);
+    defer allocator.free(deny_plain);
+    try std.testing.expectEqualStrings("/approve deny", deny_plain);
+}
+
+test "Sprint 2 TOCTOU — id-qualified command cannot resolve a swapped pending" {
+    // Stand-alone proof for the dispatch half of the contract: an
+    // id-qualified command built from a captured pending.id, dispatched
+    // against a slot that has since been swapped, is rejected by the
+    // canonical handler. This locks the assumption that the canonical
+    // handler still enforces id matching.
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const session = try mgr.getOrCreate("agent:zaki-bot:user:82:thread:s2-toctou-swap");
+    try seedPendingApprovalForTest(session, 5);
+
+    // Drop pending (#5) and install (#99). In production this happens
+    // between the gateway's unlock and the slash-command handler's
+    // lock; here we do it inline because we are exercising the
+    // canonical handler directly.
+    session.agent.clearPendingToolApproval();
+    try seedPendingApprovalForTest(session, 99);
+
+    // Build the SAME command the fixed gateway would have built using
+    // the captured pending.id=5.
+    const cmd = try buildApproveCommand(std.testing.allocator, true, 5);
+    defer std.testing.allocator.free(cmd);
+
+    const reply = try mgr.processMessage("agent:zaki-bot:user:82:thread:s2-toctou-swap", cmd, null);
+    defer std.testing.allocator.free(reply);
+
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Approval id mismatch") != null);
+    try std.testing.expect(session.agent.pending_tool_approval != null);
+    if (session.agent.pending_tool_approval) |p| {
+        try std.testing.expectEqual(@as(u64, 99), p.id);
+    }
+}
+
+test "Sprint 2 TOCTOU — handleSessionApprove dispatches id-qualified command across the unlock window" {
+    // True end-to-end regression test for the S2 review blocker. The
+    // gateway thread is forced to block at session.mutex.lock() inside
+    // processMessage — this is the same window the production race
+    // exploits. While it's blocked we swap the pending. With the fix,
+    // the gateway dispatches "/approve 42 allow-once" which the
+    // canonical handler rejects because the swapped pending.id is
+    // 999. With the pre-fix code, it would dispatch plain
+    // "/approve allow-once" and silently resolve #999.
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const key = "agent:zaki-bot:user:83:thread:s2-toctou-race";
+    const session = try mgr.getOrCreate(key);
+    // Queue-off so processMessage takes session.mutex directly (no
+    // waiter registration path). Matches the gateway's V1.14.x default.
+    session.agent.queue_mode = .off;
+    try seedPendingApprovalForTest(session, 42);
+
+    // Pre-lock session.mutex so the gateway thread blocks AFTER the
+    // stale-card guard releases mgr.mutex but BEFORE processMessage
+    // can acquire session.mutex and run the slash command. This is
+    // the exact race window the fix closes.
+    session.mutex.lock();
+
+    const body = "{\"approved\":true,\"approval_id\":\"apr-42\"}";
+    const req = std.fmt.comptimePrint(
+        "POST /approve HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    const ThreadCtx = struct {
+        alloc: std.mem.Allocator,
+        mgr: *session_mod.SessionManager,
+        key: []const u8,
+        req: []const u8,
+        resp: RouteResponse = undefined,
+    };
+    var ctx: ThreadCtx = .{
+        .alloc = std.testing.allocator,
+        .mgr = &mgr,
+        .key = key,
+        .req = req,
+    };
+
+    const gateway_thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, struct {
+        fn run(c: *ThreadCtx) void {
+            c.resp = handleSessionApprove(c.alloc, c.mgr, c.key, c.req);
+        }
+    }.run, .{&ctx});
+
+    // Give the gateway thread time to: pass the stale-card guard,
+    // unlock mgr.mutex, build the command, enter processMessage, and
+    // block on session.mutex.lock(). Matches the 25ms cadence used
+    // by sibling queue/race tests in src/session.zig.
+    std.Thread.sleep(25 * std.time.ns_per_ms);
+
+    // Swap the pending slot while the gateway thread is blocked.
+    // pending.id moves from 42 → 999.
+    session.agent.clearPendingToolApproval();
+    try seedPendingApprovalForTest(session, 999);
+
+    // Release session.mutex so processMessage proceeds. With the fix
+    // it dispatches "/approve 42 allow-once" → mismatch → 200 OK with
+    // "Approval id mismatch" embedded in the reply, pending #999 stays.
+    // Pre-fix it would dispatch plain "/approve allow-once" → resolves
+    // #999 → pending becomes null → assertion below would fail.
+    session.mutex.unlock();
+    gateway_thread.join();
+    defer std.testing.allocator.free(ctx.resp.body);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.resp.body, "Approval id mismatch") != null);
+    try std.testing.expect(session.agent.pending_tool_approval != null);
+    if (session.agent.pending_tool_approval) |p| {
+        try std.testing.expectEqual(@as(u64, 999), p.id);
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Session CRUD Integration Tests (IN-01)
