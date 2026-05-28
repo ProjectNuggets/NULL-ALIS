@@ -12105,20 +12105,43 @@ const TraceShareStore = struct {
         // D64 — per-user share-spam cap. Count live (non-revoked,
         // non-expired) shares for this user. The check is done HERE,
         // after the idempotent-re-share short-circuit above, so a
-        // user re-sharing their 100th run isn't penalized. Iteration
-        // is O(N) over the store; at our scale this is fine — the
-        // total share count is bounded by users × cap and we hold the
-        // mutex anyway.
+        // user re-sharing their 100th run isn't penalized.
+        //
+        // Code-review fix F2 — when `state_mgr` is bound, the
+        // authoritative live count comes from PG via
+        // `countLiveTraceSharesForUser`. Post-restart, the in-memory
+        // by_code is empty until lazy-loads populate it; counting
+        // by_code alone would under-count and let a user blow past
+        // the cap before any of their shares had been lazy-loaded.
+        // PG-counted enforcement closes that window.
+        //
+        // When state_mgr is NOT bound (legacy in-memory mode used by
+        // unit tests), we fall back to the in-memory iteration —
+        // O(N) over the store, bounded by `users × cap`.
         var live_count: usize = 0;
-        var live_it = self.by_code.iterator();
-        while (live_it.next()) |entry| {
-            const rec = entry.value_ptr.*;
-            if (std.mem.eql(u8, rec.user_id, user_id) and rec.isLive(now_unix)) {
-                live_count += 1;
-                if (live_count >= MAX_LIVE_SHARES_PER_USER) {
-                    return error.ShareLimitReached;
+        if (self.state_mgr) |mgr| {
+            if (std.fmt.parseInt(i64, user_id, 10)) |uid| {
+                live_count = mgr.countLiveTraceSharesForUser(uid, now_unix) catch |err| blk: {
+                    log.warn("trace_share.count_pg_failed user='{s}' err={s} — falling back to in-memory count", .{ user_id, @errorName(err) });
+                    break :blk 0;
+                };
+            } else |_| {
+                // Non-numeric user_id (synthetic test value) — PG
+                // path doesn't apply; fall back to in-memory iteration
+                // by leaving live_count at 0 and counting below.
+            }
+        }
+        if (live_count == 0) {
+            var live_it = self.by_code.iterator();
+            while (live_it.next()) |entry| {
+                const rec = entry.value_ptr.*;
+                if (std.mem.eql(u8, rec.user_id, user_id) and rec.isLive(now_unix)) {
+                    live_count += 1;
                 }
             }
+        }
+        if (live_count >= MAX_LIVE_SHARES_PER_USER) {
+            return error.ShareLimitReached;
         }
 
         // Mint a fresh code; retry on the astronomically unlikely
@@ -12165,24 +12188,34 @@ const TraceShareStore = struct {
         // AND the caller supplied a snapshot, persist to PG. The
         // in-memory state remains the source of truth for cache-hit
         // reads; PG is the source of truth on restart recovery.
+        //
+        // Persist-failure policy: log warn and continue. The share is
+        // live for THIS gateway instance; restart-recovery is broken
+        // for shares with PG-write failures. Acceptable for V1: the
+        // failure is logged for operator visibility, and a successful
+        // user re-share will resync (idempotent for same user/run/ttl,
+        // or new share_code for new run). Strict-consistency mode
+        // (fail the user request on PG write failure) is a V1.x
+        // operator knob.
         if (self.state_mgr) |mgr| {
             if (events_json.len > 0) {
                 // user_id arrives as a path-segment string; parse to i64
                 // for the PG column. Reject non-numeric user_ids by
                 // skipping persistence — this matches the production
-                // path where authenticated user_ids are always numeric
-                // and the legacy fixture/tests use synthetic strings
-                // that don't need to survive restart.
+                // path where authenticated user_ids are always numeric.
+                // Legacy fixture/tests use synthetic non-numeric
+                // strings that don't need to survive restart.
                 if (std.fmt.parseInt(i64, user_id, 10)) |uid| {
                     mgr.setTraceShare(uid, run_id, code_owned, events_json, now_unix, expires_at) catch |err| {
                         log.warn("trace_share.persist_failed user='{s}' run_id='{s}' err={s}", .{ user_id, run_id, @errorName(err) });
-                        // Fall through to return the in-memory record —
-                        // the share is live for THIS gateway instance.
-                        // The deferred-register has a row tracking the
-                        // "persist failed but in-mem succeeded" reconciliation
-                        // path for V1.x.
                     };
-                } else |_| {}
+                } else |_| {
+                    // Code-review fix F1 — surface the parseInt skip
+                    // so operators see when non-numeric user_ids are
+                    // bypassing persistence in production (a misconfig
+                    // signal that previously was silent).
+                    log.info("trace_share.persist_skipped non_numeric_user_id='{s}' run_id='{s}' — in-memory only, will NOT survive restart", .{ user_id, run_id });
+                }
             }
         }
 
@@ -12223,7 +12256,12 @@ const TraceShareStore = struct {
                     log.warn("trace_share.revoke_pg_failed user='{s}' run_id='{s}' err={s}", .{ user_id, run_id, @errorName(err) });
                     break :blk false;
                 };
-            } else |_| {}
+            } else |_| {
+                // Code-review fix F1 — non-numeric user_id signals
+                // either a synthetic test fixture (acceptable, silent
+                // info) or production misconfig (operator-visible).
+                log.info("trace_share.revoke_pg_skipped non_numeric_user_id='{s}' run_id='{s}'", .{ user_id, run_id });
+            }
         }
 
         return found_in_cache or found_in_pg;
@@ -12548,8 +12586,23 @@ fn handleTraceShareCreate(
     // `ShareSanitizeOpts{}` matches the conservative-redact baseline;
     // when the upstream dispatch eventually threads operator opts
     // through to this handler, this can switch to live opts.
+    //
+    // Code-review fix F6 — `serializeShareTraceJson` can fail and
+    // return `response_build_err`, whose body is a STATIC LITERAL
+    // (`"{\"error\":\"response_build_failed\"}"`). Blindly treating
+    // that body as heap-allocated and `allocator.free`-ing it would
+    // corrupt the heap. Detect the error response by its
+    // 500-Internal-Server-Error status and propagate it up before we
+    // get anywhere near the cache/PG path. Successful responses use
+    // the default `""` status which `finalizeJsonBuf` leaves alone
+    // and whose body IS heap-allocated.
     const snapshot_resp = serializeShareTraceJson(allocator, &snap, .{});
+    if (std.mem.eql(u8, snapshot_resp.status, "500 Internal Server Error")) {
+        return snapshot_resp;
+    }
     const events_json: []const u8 = snapshot_resp.body;
+    // Now safe to free — finalizeJsonBuf returns a heap-allocated body
+    // for the success path (success path leaves `.status` default).
     defer if (events_json.len > 0) allocator.free(events_json);
 
     const result = share_store.createOrGet(user_id, run_id, ttl_raw, now_unix, events_json) catch |err| switch (err) {
@@ -30867,6 +30920,65 @@ test "D64: handleTraceShareCreate returns 429 when per-user cap is reached" {
     try std.testing.expectEqualStrings("429 Too Many Requests", resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "share_limit_reached") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "100") != null);
+}
+
+test "Sprint 3 code-review fix F6: events_json roundtrips through cache without UAF" {
+    // Locks the events_json plumbing end-to-end at the cache layer:
+    //   1. createOrGet accepts a non-empty events_json
+    //   2. The TraceShare stores its OWN copy (no aliasing the caller's
+    //      input buffer — caller is free to free / reuse it after)
+    //   3. getLive returns the cached events_json bytes verbatim
+    //   4. clearing the cache (deinit) frees the events_json without
+    //      double-free or UAF
+    //
+    // Pairs with the F6 fix at `handleTraceShareCreate`: the body bytes
+    // returned by `serializeShareTraceJson` are heap-allocated by
+    // `finalizeJsonBuf` and freed by the handler's defer. The cache
+    // dupes them, so the handler's defer is safe.
+    const alloc = std.testing.allocator;
+    var share_store = TraceShareStore.init(alloc);
+    defer share_store.deinit();
+
+    const t0: i64 = 1_700_000_000;
+    // A real-shaped sanitized snapshot — does not have to be valid
+    // JSON for the cache layer to test; the cache is opaque about
+    // payload format. The handler-layer schema is locked by the
+    // existing trace_share tests.
+    const fake_events: []const u8 = "{\"user_id\":\"anonymous\",\"events\":[]}";
+    const result = try share_store.createOrGet("42", "run-events-roundtrip", 24, t0, fake_events);
+    const code_dup = try alloc.dupe(u8, result.share_code);
+    defer alloc.free(code_dup);
+
+    // Caller is free to throw away the original `fake_events` bytes —
+    // the cache must have its own copy.
+    const snap_opt = share_store.getLive(code_dup, t0);
+    try std.testing.expect(snap_opt != null);
+    const snap = snap_opt.?;
+    // events_json plumbing: bytes match what we passed in.
+    try std.testing.expectEqualStrings(fake_events, snap.events_json);
+    // by_code's keyed copy must own a separate allocation — verify by
+    // comparing pointers, NOT just contents. (Aliasing the caller's
+    // buffer would be a hidden lifetime bug.)
+    try std.testing.expect(@intFromPtr(snap.events_json.ptr) != @intFromPtr(fake_events.ptr));
+}
+
+test "Sprint 3 code-review fix F6: empty events_json signals legacy-resolver mode" {
+    // The flip-side of the F6 plumbing test: when the caller supplies
+    // an empty events_json (legacy in-memory-only mode used by unit
+    // tests), the cache stores an empty `events_json` and getLive
+    // returns the same. This is the signal handleTraceShareGet uses
+    // to fall back to the RunTraceStore resolver path.
+    const alloc = std.testing.allocator;
+    var share_store = TraceShareStore.init(alloc);
+    defer share_store.deinit();
+
+    const t0: i64 = 1_700_000_000;
+    const result = try share_store.createOrGet("99", "run-legacy", 24, t0, "");
+    const code_dup = try alloc.dupe(u8, result.share_code);
+    defer alloc.free(code_dup);
+
+    const snap = share_store.getLive(code_dup, t0).?;
+    try std.testing.expectEqual(@as(usize, 0), snap.events_json.len);
 }
 
 test "Wave2-CRITICAL: TraceShareStore.createOrGet re-mints over a REVOKED share without UAF / leak" {
