@@ -11426,18 +11426,33 @@ fn handleArtifactExport(
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
     };
 
-    // Allowlist matches `produce_document`'s `Format` enum; we validate
-    // up-front so a bad value returns 400 before we touch the DB.
+    // Allowlist matches `produce_document`'s `Format` enum and applies the
+    // SAME case-insensitivity (produce_document.zig:492-500 trims + lowers
+    // via std.ascii.eqlIgnoreCase). We canonicalize to lowercase HERE so a
+    // caller passing `?format=PDF` still succeeds AND the response's
+    // `format` field echoes the canonical lowercase form — easier for FE
+    // contract validation.
     const format_raw = parseQueryParam(target, "format") orelse "pdf";
-    if (!(std.mem.eql(u8, format_raw, "pdf") or
-        std.mem.eql(u8, format_raw, "docx") or
-        std.mem.eql(u8, format_raw, "pptx") or
-        std.mem.eql(u8, format_raw, "xlsx") or
-        std.mem.eql(u8, format_raw, "html")))
-    {
+    const format: []const u8 = blk: {
+        if (std.ascii.eqlIgnoreCase(format_raw, "pdf")) break :blk "pdf";
+        if (std.ascii.eqlIgnoreCase(format_raw, "docx")) break :blk "docx";
+        if (std.ascii.eqlIgnoreCase(format_raw, "pptx")) break :blk "pptx";
+        if (std.ascii.eqlIgnoreCase(format_raw, "xlsx")) break :blk "xlsx";
+        if (std.ascii.eqlIgnoreCase(format_raw, "html")) break :blk "html";
         return .{
             .status = "400 Bad Request",
             .body = "{\"error\":\"invalid_format\",\"detail\":\"format must be one of: pdf, docx, pptx, xlsx, html\"}",
+        };
+    };
+
+    // Workspace_path safety: produce_document writes via std.fs.path.join +
+    // std.fs.cwd().makePath. If workspace_path is somehow not absolute
+    // (operator config drift), surface a controlled 500 instead of letting
+    // the tool fail later in a less-actionable way.
+    if (!std.fs.path.isAbsolute(user_ctx.workspace_path)) {
+        return .{
+            .status = "500 Internal Server Error",
+            .body = "{\"error\":\"workspace_not_absolute\",\"detail\":\"user workspace_path is not absolute; refusing to export\"}",
         };
     }
 
@@ -11472,7 +11487,7 @@ fn handleArtifactExport(
     // export request must NOT pick `thmanyah` (per §14.5 honesty gate).
     var args = std.json.ObjectMap.init(allocator);
     defer args.deinit();
-    args.put("format", std.json.Value{ .string = format_raw }) catch {
+    args.put("format", std.json.Value{ .string = format }) catch {
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
     };
     args.put("content", std.json.Value{ .string = ver.content }) catch {
@@ -11518,30 +11533,18 @@ fn handleArtifactExport(
             std.mem.indexOf(u8, err, "marp-cli") != null or
             std.mem.indexOf(u8, err, "pandoc") != null;
         var out: std.ArrayListUnmanaged(u8) = .empty;
+        // `toOwnedSlice` zeroes the buf on success → the defer becomes a
+        // no-op when we return the body; on any catch the defer cleans up.
+        defer out.deinit(allocator);
         const w = out.writer(allocator);
         if (is_renderer_gap) {
-            w.writeAll("{\"error\":\"renderer_unavailable\",\"detail\":\"") catch {
-                out.deinit(allocator);
-                return response_build_err;
-            };
+            w.writeAll("{\"error\":\"renderer_unavailable\",\"detail\":\"") catch return response_build_err;
         } else {
-            w.writeAll("{\"error\":\"export_failed\",\"detail\":\"") catch {
-                out.deinit(allocator);
-                return response_build_err;
-            };
+            w.writeAll("{\"error\":\"export_failed\",\"detail\":\"") catch return response_build_err;
         }
-        jsonEscapeInto(w, err) catch {
-            out.deinit(allocator);
-            return response_build_err;
-        };
-        w.writeAll("\"}") catch {
-            out.deinit(allocator);
-            return response_build_err;
-        };
-        const body = out.toOwnedSlice(allocator) catch {
-            out.deinit(allocator);
-            return response_build_err;
-        };
+        jsonEscapeInto(w, err) catch return response_build_err;
+        w.writeAll("\"}") catch return response_build_err;
+        const body = out.toOwnedSlice(allocator) catch return response_build_err;
         return .{
             .status = if (is_renderer_gap) "502 Bad Gateway" else "500 Internal Server Error",
             .body = body,
@@ -11559,11 +11562,17 @@ fn handleArtifactExport(
     w.writeAll("{\"status\":\"exported\",\"artifact_id\":\"") catch return response_build_err;
     jsonEscapeInto(w, artifact_id) catch return response_build_err;
     w.writeAll("\",\"format\":\"") catch return response_build_err;
-    jsonEscapeInto(w, format_raw) catch return response_build_err;
+    jsonEscapeInto(w, format) catch return response_build_err;
     w.writeAll("\",\"filename\":\"") catch return response_build_err;
     jsonEscapeInto(w, filename) catch return response_build_err;
     w.writeAll("\",\"path\":\"attachments/produced/") catch return response_build_err;
     jsonEscapeInto(w, filename) catch return response_build_err;
+    // `url` and `download_url` MIRROR each other today — both point at the
+    // gateway's authenticated GET. The two keys exist so a future deploy
+    // can flip `download_url` to a pre-signed object-storage URL (CDN,
+    // S3) without breaking the FE contract: `url` is the canonical
+    // gateway path, `download_url` is the preferred fetch target.
+    // Until that lands, FEs may treat them as interchangeable.
     w.writeAll("\",\"url\":\"/api/v1/users/") catch return response_build_err;
     jsonEscapeInto(w, user_id_str) catch return response_build_err;
     w.writeAll("/exports/") catch return response_build_err;
@@ -12558,16 +12567,76 @@ fn handleSessionAction(
         if (!std.mem.eql(u8, method, "POST")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
         return handleSessionMode(allocator, mgr, session_key, raw_request);
     }
+    if (std.mem.eql(u8, act, "cancel")) {
+        if (!std.mem.eql(u8, method, "POST")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        return handleSessionCancel(allocator, mgr, session_key);
+    }
 
     return .{ .status = "404 Not Found", .body = "{\"error\":\"unknown_session_action\"}" };
 }
 
 fn isSessionAction(s: []const u8) bool {
-    const actions = [_][]const u8{ "compact", "context", "export", "history", "approve", "mode" };
+    const actions = [_][]const u8{ "compact", "context", "export", "history", "approve", "mode", "cancel" };
     for (actions) |a| {
         if (std.mem.eql(u8, s, a)) return true;
     }
     return false;
+}
+
+/// POST /api/v1/users/:id/sessions/:key/cancel
+///
+/// Backend-owned active-turn cancellation. Signals the session's
+/// agent CancellationToken; the agent loop polls between iterations
+/// (see `src/agent/root.zig` near the cooperative-cancellation check)
+/// and exits with a `[Cancelled]`-prefixed reply + a `turn_cancelled`
+/// ObserverEvent that the SSE bridge surfaces as a `system_notice`.
+/// The same code path still emits the canonical `turn_complete` event,
+/// so the SSE stream always reaches the terminal `done` frame.
+///
+/// Idempotent:
+///   - Repeated cancels land the same atomic store (no-op after first).
+///   - Cancel against an idle session is safe; the agent resets the
+///     token at the start of every turn, so it cannot silently cancel
+///     a future user message.
+///
+/// Response shapes:
+///   200 {"status":"cancellation_signalled","session_key":"...","was_active":true|false}
+///   404 {"error":"session_not_found"} when the session is unknown.
+///
+/// Production gate: this is the route the FE Stop button binds to.
+/// Client-side `fetch().abort()` alone is insufficient — without this
+/// route the server-side run keeps consuming tokens after the client
+/// disconnects, violating the meter receipt + tool-side-effect honesty.
+fn handleSessionCancel(
+    allocator: std.mem.Allocator,
+    mgr: *session_mod.SessionManager,
+    session_key: []const u8,
+) RouteResponse {
+    const outcome = mgr.cancelActiveTurn(session_key);
+    switch (outcome) {
+        .session_not_found => return .{
+            .status = "404 Not Found",
+            .body = "{\"error\":\"session_not_found\"}",
+        },
+        .cancellation_signalled_active, .cancellation_signalled_idle => {},
+    }
+
+    const was_active = outcome == .cancellation_signalled_active;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"status\":\"cancellation_signalled\",\"session_key\":\"") catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    jsonEscapeInto(w, session_key) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    w.writeAll("\",\"was_active\":") catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    w.writeAll(if (was_active) "true" else "false") catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    w.writeAll("}") catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    return .{ .body = out.toOwnedSlice(allocator) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
 }
 
 /// POST /api/v1/users/:id/sessions/:key/mode
@@ -18225,6 +18294,16 @@ fn handleArtifactExportDownload(
     }
     if (!isSafeAttachmentFilename(filename)) {
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"unsafe_filename\"}" };
+    }
+    // `openFileAbsolute` requires an absolute path or it panics on debug
+    // assertion. In production user_ctx.workspace_path is always absolute,
+    // but guard explicitly so an operator-config drift surfaces as a
+    // controlled 500 — never a panic.
+    if (!std.fs.path.isAbsolute(user_ctx.workspace_path)) {
+        return .{
+            .status = "500 Internal Server Error",
+            .body = "{\"error\":\"workspace_not_absolute\",\"detail\":\"user workspace_path is not absolute; refusing to serve\"}",
+        };
     }
 
     const path = std.fmt.allocPrint(
@@ -27410,6 +27489,8 @@ test "isSessionAction recognises known actions" {
     try std.testing.expect(isSessionAction("export"));
     try std.testing.expect(isSessionAction("history"));
     try std.testing.expect(isSessionAction("approve"));
+    try std.testing.expect(isSessionAction("mode"));
+    try std.testing.expect(isSessionAction("cancel"));
     try std.testing.expect(!isSessionAction("unknown"));
     try std.testing.expect(!isSessionAction(""));
     try std.testing.expect(!isSessionAction("sessions"));
@@ -28303,6 +28384,57 @@ test "handleSessionDelete returns 404 for unknown session" {
 
     const resp = handleSessionDelete(std.testing.allocator, &mgr, "agent:zaki-bot:user:1:thread:ghost", null, "1");
     try std.testing.expectEqualStrings("404 Not Found", resp.status);
+}
+
+test "handleSessionCancel returns 404 for unknown session" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const resp = handleSessionCancel(std.testing.allocator, &mgr, "agent:zaki-bot:user:1:thread:ghost");
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "session_not_found") != null);
+}
+
+test "handleSessionCancel signals idle when session present without active refs" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const session = try mgr.getOrCreate("agent:zaki-bot:user:11:thread:cancel-idle");
+    try std.testing.expect(!session.agent.cancellation_token.isCancelled());
+
+    const resp = handleSessionCancel(std.testing.allocator, &mgr, "agent:zaki-bot:user:11:thread:cancel-idle");
+    defer std.testing.allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"cancellation_signalled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"was_active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "agent:zaki-bot:user:11:thread:cancel-idle") != null);
+    try std.testing.expect(session.agent.cancellation_token.isCancelled());
+}
+
+test "handleSessionCancel reports was_active true while a turn pin is held" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const session = try mgr.getOrCreate("agent:zaki-bot:user:12:thread:cancel-active");
+    session.active_refs = 1; // simulate an in-flight turn
+    defer session.active_refs = 0;
+
+    const resp = handleSessionCancel(std.testing.allocator, &mgr, "agent:zaki-bot:user:12:thread:cancel-active");
+    defer std.testing.allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"was_active\":true") != null);
+    try std.testing.expect(session.agent.cancellation_token.isCancelled());
+
+    // Idempotent — second cancel produces the same shape and keeps the
+    // token set (atomic store on an already-set flag is a no-op).
+    const resp2 = handleSessionCancel(std.testing.allocator, &mgr, "agent:zaki-bot:user:12:thread:cancel-active");
+    defer std.testing.allocator.free(resp2.body);
+    try std.testing.expectEqualStrings("200 OK", resp2.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp2.body, "\"was_active\":true") != null);
+    try std.testing.expect(session.agent.cancellation_token.isCancelled());
 }
 
 test "handleSessionCompact returns status on empty session" {
@@ -30360,6 +30492,85 @@ test "Wave 2A: download endpoint returns 404 when file is absent" {
     );
     try std.testing.expectEqualStrings("404 Not Found", resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "export_not_found") != null);
+}
+
+test "Wave 2A: download endpoint serves file with correct Content-Type" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(ws);
+
+    // Materialize a real file under attachments/produced/ with known bytes
+    // so the test exercises the open / stat / readAll / Content-Type path
+    // end-to-end (the live-PG roundtrip test does NOT actually GET the
+    // produced file, so this is the only place that pins the success
+    // contract offline).
+    const produced_dir = try std.fmt.allocPrint(allocator, "{s}/attachments/produced", .{ws});
+    defer allocator.free(produced_dir);
+    try std.fs.cwd().makePath(produced_dir);
+    const fixture_bytes = "%PDF-1.4\n% test fixture for export download contract\n";
+    const fixture_path = try std.fmt.allocPrint(allocator, "{s}/fixture_export.pdf", .{produced_dir});
+    defer allocator.free(fixture_path);
+    {
+        const f = try std.fs.createFileAbsolute(fixture_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(fixture_bytes);
+    }
+
+    var ctx = try makeExportTestUserCtx(allocator, ws);
+    defer ctx.deinit(allocator);
+
+    const resp = handleArtifactExportDownload(allocator, "GET", "fixture_export.pdf", &ctx);
+    defer if (resp.body.len > 0) allocator.free(resp.body);
+
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expectEqualStrings("application/pdf", resp.content_type);
+    try std.testing.expectEqualStrings(fixture_bytes, resp.body);
+}
+
+test "Wave 2A: export endpoint accepts case-insensitive format (PDF → pdf)" {
+    // PG-not-configured means the call short-circuits at the state-mgr
+    // check AFTER format validation. A 503 response proves the
+    // case-insensitive allowlist accepted `PDF`; a 400 would prove the
+    // opposite. Mirrors the in-tool case insensitivity at
+    // produce_document.zig:492-500 (eqlIgnoreCase).
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, "/tmp/nullalis-export-test-fake");
+    defer ctx.deinit(std.testing.allocator);
+    const resp = handleArtifactExport(
+        std.testing.allocator,
+        "POST",
+        "1",
+        "00000000-0000-0000-0000-000000000000",
+        "/api/v1/users/1/artifacts/00000000-0000-0000-0000-000000000000/export?format=PDF",
+        &ctx,
+        null,
+        &state,
+    );
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp.status);
+}
+
+test "Wave 2A: export endpoint refuses relative workspace_path with controlled 500" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    // Deliberately relative — production resolveUserContext always emits
+    // absolute paths; this fixture covers the operator-config-drift gate.
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, "relative/workspace/path");
+    defer ctx.deinit(std.testing.allocator);
+    const resp = handleArtifactExport(
+        std.testing.allocator,
+        "POST",
+        "1",
+        "00000000-0000-0000-0000-000000000000",
+        "/api/v1/users/1/artifacts/00000000-0000-0000-0000-000000000000/export?format=pdf",
+        &ctx,
+        null,
+        &state,
+    );
+    try std.testing.expectEqualStrings("500 Internal Server Error", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "workspace_not_absolute") != null);
 }
 
 test "Wave 2A live: export bridge writes produced file + returns download URL" {
