@@ -2003,13 +2003,35 @@ pub const Agent = struct {
     /// Owned snapshot of a tool call awaiting generic user approval.
     /// Strings are duped from the call so they survive across turns and
     /// are independent of model-response arenas.
+    ///
+    /// Sprint 2 (prod-readiness 2026-05-28) — added `approval_id`,
+    /// `created_at_unix` for the canonical UI binding contract:
+    ///
+    ///   * `approval_id` is a stable string the UI pins to a single
+    ///     approval card. Format: `apr-<u64>` (deterministic transform
+    ///     of `id`). FE sends it back in `POST /sessions/:key/approve`
+    ///     so a stale card cannot accidentally resolve a NEW pending
+    ///     approval that took the slot after a collision-reject.
+    ///   * `created_at_unix` powers the UI's "waiting Ns" countdown and
+    ///     is the anchor for future TTL enforcement (currently unused
+    ///     by the runtime; the field is the schema commitment).
+    ///   * `expires_at_unix` is null in V1 (no TTL sweep yet); the
+    ///     schema slot exists so the UI can render countdown when
+    ///     populated by V1.x.
     pub const PendingToolApproval = struct {
         id: u64,
+        /// Stable wire ID for the FE — `apr-<id>`. Heap-owned.
+        approval_id: []const u8,
         tool_name: []const u8,
         tool_call_id: ?[]const u8,
         arguments_json: []const u8,
         reason: []const u8,
         risk_level: tool_metadata.RiskLevel,
+        /// Unix epoch seconds — when the approval was created.
+        created_at_unix: i64,
+        /// Optional Unix epoch seconds — when the approval auto-expires.
+        /// V1 always-null (no TTL sweep). UI renders countdown when set.
+        expires_at_unix: ?i64 = null,
     };
 
     const ToolPreflightAllowed = struct {
@@ -2251,6 +2273,7 @@ pub const Agent = struct {
 
     pub fn clearPendingToolApproval(self: *Agent) void {
         const pending = self.pending_tool_approval orelse return;
+        self.allocator.free(pending.approval_id);
         self.allocator.free(pending.tool_name);
         if (pending.tool_call_id) |id| self.allocator.free(id);
         self.allocator.free(pending.arguments_json);
@@ -2285,13 +2308,25 @@ pub const Agent = struct {
         if (self.pending_tool_approval_id_counter == 0) self.pending_tool_approval_id_counter = 1;
         const new_id = self.pending_tool_approval_id_counter;
 
+        // Sprint 2 (2026-05-28) — derive a stable wire ID the FE can
+        // pin. Format `apr-<u64>`. The u64 is per-session (lives in
+        // `pending_tool_approval_id_counter`) so collisions can only
+        // happen within a single agent instance — and the
+        // `error.PendingToolApprovalAlreadyExists` reject above prevents
+        // overwrite while one is live.
+        const approval_id = try std.fmt.allocPrint(self.allocator, "apr-{d}", .{new_id});
+        errdefer self.allocator.free(approval_id);
+
         self.pending_tool_approval = .{
             .id = new_id,
+            .approval_id = approval_id,
             .tool_name = tool_name,
             .tool_call_id = tool_call_id_copy,
             .arguments_json = args_copy,
             .reason = reason_copy,
             .risk_level = meta.risk_level,
+            .created_at_unix = std.time.timestamp(),
+            .expires_at_unix = null,
         };
         return new_id;
     }

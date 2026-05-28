@@ -179,42 +179,98 @@ absence of correlation, not as an error.
 ## 2. Approval Behavior
 
 Supervised mutating tools gate their execution through a generic,
-single-slot approval queue that is resolved by the `/approve` slash command.
+single-slot approval queue. The runtime exposes ONE canonical model;
+the REST surface (`POST /api/v1/users/{user_id}/sessions/{session_key}/approve`)
+and the operator slash command (`/approve allow-once | deny`) both
+resolve the same slot.
 
-Runtime semantics (as implemented):
+### Runtime semantics (as implemented)
 
 - **Emission.** When a tool preflight produces the verdict
   `approval_required`, the runtime emits an `approval_required` event with
-  `reason = "supervised_mutating_requires_approval"` and the tool’s
+  `reason = "supervised_mutating_requires_approval"` and the tool's
   `risk_level`. The underlying tool call does not execute and is held as a
   pending approval owned by the session.
-- **Resolution.** The operator resolves the pending approval by sending a
-  user message containing `/approve allow-once` or `/approve deny`. The
-  gateway’s REST approval endpoint also accepts a boolean `approved` flag
-  and translates it into the same two slash-command decisions.
+- **Resolution via REST.** The FE calls
+  `POST /api/v1/users/{user_id}/sessions/{session_key}/approve` with body
+  `{"approved": bool, "approval_id": "apr-<u64>"}`. `approved: true`
+  routes to `/approve allow-once`; `approved: false` to `/approve deny`.
+- **Resolution via slash command.** Same code path with operator-typed
+  `/approve allow-once` or `/approve deny`.
 - **`allow-always` is not persistent in v1.** `/approve allow-always` is
   accepted as a synonym for `allow-once`: the pending tool runs exactly
   once, and a follow-up note indicates that a persistent generic allowlist
   is not implemented. There is no durable per-tool auto-approve store.
+  See `docs/deferred-register.md` D2 for the planned run-scoped allowlist.
 - **One pending approval at a time.** If another tool call reaches the
   approval gate while one approval is already pending, preflight blocks the
   new call with reason `approval_already_pending` and does **not** emit a
   second `approval_required` event. The operator must resolve the existing
-  one first.
+  one first. The collision is rejected at the agent layer
+  (`error.PendingToolApprovalAlreadyExists`) — the slot is never silently
+  overwritten.
 - **Denial.** `/approve deny` clears the pending approval without running
   the tool. The agent loop sees a blocked preflight and composes a refusal
   reply.
 - **Scope.** The queue is per agent/session — there is no cross-session
   approval broadcast and no durable persisted approval history in v1.
 
-Client guidance:
+### Sprint 2 (2026-05-28) — stable approval id + stale-card guard
 
-- Track pending approvals locally keyed by `run_id` (when present) plus the
-  emitted `tool`. Do not assume stable approval ids on the wire — the gate
-  exposes ids only through the `/approve` textual surface.
-- Treat `reason = approval_already_pending` surfaced in tool error output
-  as a collision signal; prompt the operator to resolve the earlier
-  pending approval before retrying.
+Each pending approval carries an **`approval_id`** of the form
+`apr-<u64>` (the u64 is the legacy per-agent counter, kept embedded for
+slash-command compatibility — new clients pin to the string form).
+
+The pending-approval card on the session detail surfaces:
+
+```json
+{
+  "approval_id": "apr-7",
+  "id": 7,
+  "tool": "shell",
+  "reason": "supervised_mutating_requires_approval",
+  "risk_level": "medium",
+  "created_at": 1779988800,
+  "expires_at": null
+}
+```
+
+`created_at` is Unix epoch seconds — UI uses it for the "waiting Ns"
+countdown. `expires_at` is null in V1; the schema slot is committed
+ahead of the V1.x TTL sweep so the UI can render a countdown without
+another schema bump.
+
+**Stale-card guard.** When the FE supplies `approval_id` in the
+request body, the gateway verifies it against the agent's CURRENT
+pending. If the card the user is approving has been replaced by a new
+one (or already cleared), the request yields **`409 Conflict`** with
+`{"error": "approval_id_mismatch", "hint": ...}` — refresh the session
+detail before retrying. When `approval_id` is omitted (pre-Sprint-2
+clients), the gateway addresses whatever is currently pending without
+verification.
+
+### Client guidance
+
+- Pin to `approval_id` when rendering the card; echo it back on resolve
+  to defend against the collision case.
+- Treat `409 approval_id_mismatch` as "refresh + re-render"; do NOT
+  silently retry without a UI prompt.
+- Treat `reason = approval_already_pending` (surfaced in tool error
+  output) as a collision signal; the operator must resolve the earlier
+  pending before the new tool call can proceed.
+- Do NOT assume the legacy numeric `id` is stable beyond an Agent
+  lifetime — pin to `approval_id`, which is durable for the lifetime of
+  the pending approval.
+
+### Legacy `/exec` flow (Gate 3) — operator-only, NOT surfaced here
+
+A separate pre-registry approval gate exists for the operator-typed
+`/exec <cmd>` slash command (commands.zig: `pending_exec_command` +
+`pending_exec_id`). This gate is documented at `/policy` Gate 3 and is
+explicitly NOT routed through `ApprovalPolicy.forTool`. The HTTP
+`POST .../approve` route does NOT address Gate 3 — it's only reachable
+from chat slash commands typed by operators. End-user UIs should not
+expose this path; it stays as a chat-only operator surface.
 
 ## 2a. Operator Slash-Command Surface
 

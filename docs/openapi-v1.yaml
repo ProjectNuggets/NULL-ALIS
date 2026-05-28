@@ -1726,8 +1726,26 @@ paths:
         Resolves the single pending approval held by the session's agent
         (see docs/online-agent-contract.md §2). `approved: true` is
         translated to `/approve allow-once` and `approved: false` to
-        `/approve deny`. Generic persistent allow-always is not supported
-        in v1.
+        `/approve deny`. Generic persistent allow-always is not
+        supported in v1; the legacy slash-command `/exec` flow uses a
+        separate operator-only path (Gate 3, not surfaced here).
+
+        Sprint 2 (prod-readiness 2026-05-28) — stable approval id +
+        stale-card guard:
+
+          * Each pending approval carries a stable `approval_id` of
+            the form `apr-<u64>`. The FE pins to it when rendering the
+            approval card, then echoes it back in the request body.
+          * When `approval_id` is supplied, the gateway verifies it
+            against the agent's current pending. Mismatch (a NEW
+            approval slot took over after the card was rendered, or the
+            slot is empty) yields **409 Conflict** with
+            `{"error":"approval_id_mismatch", ...}`. The FE should
+            refresh session detail and retry.
+          * When `approval_id` is omitted (or sent empty), the gateway
+            addresses the current pending without verification — the
+            pre-Sprint-2 behavior. This is the back-compat path for
+            older clients; new clients should always send the id.
       operationId: approveSession
       tags: [Sessions]
       parameters:
@@ -1743,6 +1761,15 @@ paths:
               properties:
                 approved:
                   type: boolean
+                approval_id:
+                  type: string
+                  pattern: '^apr-[0-9]+$'
+                  description: |
+                    Stable wire id of the approval card being resolved.
+                    Format `apr-<u64>`. When present, must match the
+                    current pending or the request is rejected with 409.
+                    Omit or send empty for backwards-compatible
+                    addressed-current-pending behavior.
       responses:
         '200':
           description: Approval result
@@ -1762,6 +1789,23 @@ paths:
           description: Session not owned by user
         '404':
           description: Session not found
+        '409':
+          description: |
+            `approval_id` was supplied but does not match the agent's
+            current pending approval (the slot is empty or holds a
+            different id). The pending — if any — is left untouched;
+            the FE should refresh `GET /sessions/{session_key}` and
+            present whichever card is current.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: [approval_id_mismatch]
+                  hint:
+                    type: string
 
   /api/v1/users/{user_id}/sessions/{session_key}/mode:
     post:
@@ -2369,6 +2413,68 @@ components:
         history_len:
           type: integer
           format: int64
+        pending_approval_count:
+          type: integer
+          format: int32
+          description: |
+            Count of items in `pending_approvals` (0 or 1 in V1 — the
+            agent runs a single-slot model). Provided as a quick
+            existence signal for FE list views that don't expand the
+            full array.
+        pending_approvals:
+          type: array
+          description: |
+            Sprint 2 (2026-05-28) — at most one pending approval card
+            per session. Empty when nothing is pending.
+          items:
+            $ref: '#/components/schemas/PendingApprovalCard'
+    PendingApprovalCard:
+      type: object
+      description: |
+        Sprint 2 (2026-05-28) — canonical approval-card shape the FE
+        binds to. The `approval_id` is the stable wire id (`apr-<u64>`)
+        the FE pins to and echoes back in
+        `POST /api/v1/users/{user_id}/sessions/{session_key}/approve`.
+        `id` is the underlying agent counter (numeric) kept for the
+        slash-command compatibility surface; new clients should not
+        depend on it. `created_at` powers the UI "waiting Ns" countdown;
+        `expires_at` is null in V1 (no TTL sweep) — the schema slot is
+        committed here so a V1.x TTL implementation surfaces without
+        another schema bump.
+      required: [approval_id, id, tool, reason, risk_level, created_at, expires_at]
+      properties:
+        approval_id:
+          type: string
+          pattern: '^apr-[0-9]+$'
+          description: Stable wire id of the approval card.
+        id:
+          type: integer
+          format: int64
+          description: |
+            Legacy per-agent counter id (also embedded in
+            `approval_id`). Kept for slash-command compatibility; FE
+            clients should pin to `approval_id`.
+        tool:
+          type: string
+          description: Tool name awaiting approval.
+        reason:
+          type: string
+          description: Human-readable reason the approval was requested.
+        risk_level:
+          type: string
+          enum: [low, medium, high]
+        created_at:
+          type: integer
+          format: int64
+          description: Unix epoch seconds when the approval was set.
+        expires_at:
+          type: integer
+          format: int64
+          nullable: true
+          description: |
+            Unix epoch seconds when the approval auto-expires. Always
+            null in V1 — no runtime TTL sweep yet. Surfaces here so
+            countdown UX can render once V1.x lands.
     # ── Task query schemas (WP2.2) ──────────────────────────────────
     TaskRecord:
       type: object
