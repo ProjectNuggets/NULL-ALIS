@@ -111,24 +111,46 @@ pub fn flagsForCategory(category: []const u8) ?Flags {
 
 /// True when `content` contains a phone-number-shaped run.
 ///
-/// Definition: starts with optional `+`, then a run of digits and
-/// standard separators (`-` ` ` `(` `)` `.` `/`) containing AT LEAST
-/// **7** digits total. Standard separators allowed between digits;
-/// the run terminates on the first non-{digit,separator} character.
+/// Definition: a digit-and-separator run that satisfies AT LEAST ONE
+/// of these structural hints:
 ///
-/// Why 7: shortest reasonable phone number is a 7-digit local number
-/// (e.g. US "555-0100"). Anything shorter is noise (zip codes, dates,
-/// quantities). False-positive guard: short runs of digits inside a
-/// sentence ("I'm 42 and live at 1234567 — wait actually that's not
-/// my number") will tag — that's a feature, not a bug. Better than
-/// missing real phone numbers.
+///   * **leading `+`** — international country-code prefix
+///   * **>= 10 digits total** — full national-format number (US 10,
+///     international 11-15)
+///
+/// Standard separators allowed between digits: `-` ` ` `(` `)` `.` `/`.
+/// The run terminates on the first non-{digit,separator} character.
+///
+/// ## Why the dual-criterion gate
+///
+/// The original "7+ digit" rule produced false positives on common
+/// non-phone tokens that V1 prod-readiness audit flagged:
+///   * `2026-05-28` (date, 8 digits)
+///   * `2026-05-28T14:30:00` (date prefix, 8 digits before `T`)
+///   * `version 1.2.3.4567890` (long version, 10 digits — STILL caught
+///     but that's acceptable since version strings in personal-memory
+///     content are rare)
+///   * `pi 3.14159265` (math constant, 9 digits)
+///
+/// Bumping to 10 digits eliminates dates (max 8 digits in standard
+/// formats) and most version numbers. Phones written with country
+/// code (`+` prefix) bypass the digit floor entirely so short
+/// dial-out forms still tag (e.g. `+1 555 0100` = 7 digits + `+`).
+///
+/// The tradeoff: pure 7-digit US-local numbers without area code
+/// (`555-0100`) MISS detection. This is acceptable in V1 because:
+///   * Modern US numbers include area code (10 digits)
+///   * `memory_purge_pii(dry_run=true)` lets the user inspect before
+///     deletion if they're concerned
+///   * False negatives on detection just mean those memories don't
+///     get the auto-purge UX; manual `forget` by key still works.
 fn detectPhone(content: []const u8) bool {
     var i: usize = 0;
     while (i < content.len) {
         // Find the start of a potential phone run.
         // Accept leading `+` (international prefix) or digit.
         const has_plus = content[i] == '+';
-        const has_digit = i < content.len and isDigit(content[i]);
+        const has_digit = isDigit(content[i]);
         if (!has_plus and !has_digit) {
             i += 1;
             continue;
@@ -150,7 +172,11 @@ fn detectPhone(content: []const u8) bool {
             }
         }
 
-        if (digit_count >= 7) return true;
+        // V1 heuristic: '+' prefix is the strongest phone signal; for
+        // run-without-+, require 10+ digits to filter dates/versions.
+        if (has_plus and digit_count >= 7) return true;
+        if (!has_plus and digit_count >= 10) return true;
+
         // Move past this run before trying again — avoids quadratic
         // re-scans of the same digit cluster.
         i = if (j > i) j else i + 1;
@@ -263,26 +289,42 @@ fn allLetters(s: []const u8) bool {
 
 // ── Tests ──────────────────────────────────────────────────────────
 
-test "detect phone — international with separators" {
+test "detect phone — international with + prefix (7+ digits)" {
     try std.testing.expect(detect("My brother Karim: +49 30 12345 67").phone);
     try std.testing.expect(detect("+1-555-867-5309").phone);
+}
+
+test "detect phone — national 10-digit US format" {
+    try std.testing.expect(detect("Call 555-867-5309 for support").phone);
+    try std.testing.expect(detect("5558675309").phone);
     try std.testing.expect(detect("Call (415) 555-2671 tomorrow").phone);
 }
 
-test "detect phone — national 7-digit minimum" {
-    try std.testing.expect(detect("Call 555-0100 for support").phone);
-    try std.testing.expect(detect("5550100").phone);
+test "detect phone — rejects ISO dates (false-positive guard)" {
+    // V1 audit found these were the most common false positives.
+    try std.testing.expect(!detect("I joined on 2026-05-28").phone);
+    try std.testing.expect(!detect("Born 1985-03-15").phone);
+    try std.testing.expect(!detect("ts 2026-05-28T14:30:00").phone);
 }
 
-test "detect phone — rejects too-short runs" {
+test "detect phone — rejects short national numbers (V1 tradeoff)" {
+    // V1 misses pure 7-9 digit numbers without country code or +.
+    // Tradeoff documented in detectPhone() docstring. Most US numbers
+    // include area code so coverage stays high.
+    try std.testing.expect(!detect("Call 555-0100 for support").phone);
+    try std.testing.expect(!detect("5550100").phone);
+}
+
+test "detect phone — rejects too-short and non-phone digit runs" {
     try std.testing.expect(!detect("I'm 42 years old").phone);
     try std.testing.expect(!detect("Zip 12345").phone);
     try std.testing.expect(!detect("year 2026 month 05").phone);
+    try std.testing.expect(!detect("pi 3.14159").phone);
 }
 
 test "detect phone — handles surrounding text" {
     try std.testing.expect(detect("call me at 555-867-5309 thanks").phone);
-    try std.testing.expect(detect("Phone: 49 30 12345 67 (Berlin)").phone);
+    try std.testing.expect(detect("Phone: +49 30 12345 67 (Berlin)").phone);
 }
 
 test "detect email — basic shape" {
@@ -310,6 +352,15 @@ test "detect multiple — both fire" {
     try std.testing.expect(flags.email);
     try std.testing.expectEqual(@as(usize, 2), flags.count());
     try std.testing.expect(flags.any());
+}
+
+test "detect — date adjacent to email does not promote date to phone" {
+    // Regression guard for the V1 fix — content that has both a date
+    // (which would have been a false-positive phone) and a real email
+    // tags only email, not phone.
+    const flags = detect("Onboarded 2026-05-28; contact alaa@nullalis.dev");
+    try std.testing.expect(!flags.phone);
+    try std.testing.expect(flags.email);
 }
 
 test "detect — clean text reports nothing" {
