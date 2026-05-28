@@ -1004,10 +1004,16 @@ pub const GatewayState = struct {
     /// subsequent PUT/DELETE on the same key. In-memory, 5-min TTL,
     /// single-use. See `src/gateway/secret_vault.zig`.
     secret_tokens: secret_vault.TokenStore,
-    /// Wave 2B (2026-05-24) — public trace-share registry. In-memory;
-    /// share codes do NOT survive a gateway restart (documented; the
-    /// trace store itself is bounded in-memory with the same property,
-    /// so a persistent share index would over-promise lifetime).
+    /// Wave 2B (2026-05-24) → Sprint 3 prod-readiness (2026-05-29):
+    /// public trace-share registry. In-memory **cache** backed by
+    /// Postgres via `state_mgr` (wired right after `state.zaki_state`
+    /// in the boot path). Share codes + sanitized snapshot now SURVIVE
+    /// a gateway restart — `getLive` lazy-loads from PG on cache miss
+    /// and `createOrGet` fails closed if `setTraceShare` does not
+    /// persist. See `migrations/0003_trace_shares.sql` for the schema
+    /// + `TraceShareStore.initWithPersistence` for the runtime wiring.
+    /// Trace EVENTS themselves remain in the bounded in-process
+    /// `RunTraceStore` (V1.x decision — separate from share durability).
     trace_share_store: TraceShareStore,
     /// V1.7a-9 review WR-03 — concurrency guard for
     /// `/brain/communities/recompute`. Single global mutex serializes
@@ -11824,10 +11830,18 @@ fn handleArtifactShareGet(
 //   DELETE /api/v1/users/:user_id/traces/:run_id/share  (auth'd, revoke)
 //   GET    /api/v1/share/:share_code                    (PUBLIC — no auth)
 //
-// Storage: in-memory `TraceShareStore` on GatewayState. Share links do
-// NOT survive gateway restart in v1 (documented trade-off; the trace
-// itself lives in a bounded in-process store with the same property, so
-// a persistent share index would over-promise).
+// Storage: in-memory `TraceShareStore` on GatewayState, backed by
+// Postgres via `state_mgr.setTraceShare`/`getTraceByShareCode`/
+// `clearTraceShare` (migration 0003). Sprint 3 (2026-05-29) closed
+// the restart-fragility gap: share codes + sanitized snapshots
+// SURVIVE gateway restart for the share's TTL. `createOrGet` is
+// fail-closed — if `setTraceShare` does not persist, the API returns
+// `share_persist_failed` and the in-memory mint is rolled back.
+// The lazy-load path in `getLive` rehydrates the cache from PG on
+// miss. The trace EVENTS themselves still live in the in-process
+// `RunTraceStore` (bounded 64 runs × 256 events); the share record
+// owns its own snapshot taken at click time, so the public viewer
+// doesn't depend on the events still being in memory.
 //
 // Sanitizer trust boundary: every byte returned from the public GET runs
 // through `sanitizeTraceEventJson`. The rule of thumb is "when in
@@ -12177,47 +12191,48 @@ const TraceShareStore = struct {
             .events_json = events_owned,
         };
 
+        // Sprint 3 prod-blocker fix (2026-05-29) — **fail-closed**
+        // persistence. PG write MUST happen BEFORE we commit anything
+        // to the in-memory cache. If `setTraceShare` fails, every
+        // allocation above is reclaimed via the existing errdefer
+        // chain (rec destroy, code_owned/user_id_owned/run_id_owned/
+        // events_owned/key_buf frees), the caller receives
+        // `error.PersistFailed`, and the handler returns 500 with a
+        // structured `share_persist_failed` body. The API must NOT
+        // return a normal `share_url` unless the snapshot is durable.
+        //
+        // When state_mgr is NOT bound (legacy unit-test mode), the
+        // pre-Sprint-3 in-memory-only semantics apply — no PG round-
+        // trip, no fail-closed gate.
+        //
+        // When state_mgr IS bound but events_json is empty (internal
+        // callers that opt out of persistence), we skip PG; the
+        // share is in-memory only by explicit caller choice.
+        //
+        // When state_mgr IS bound but user_id is non-numeric
+        // (synthetic test fixture), we log + skip persistence and
+        // proceed with the in-memory commit. Production user_ids are
+        // numeric so this branch is dead in commercial deploys.
+        if (self.state_mgr) |mgr| {
+            if (events_json.len > 0) {
+                if (std.fmt.parseInt(i64, user_id, 10)) |uid| {
+                    mgr.setTraceShare(uid, run_id, code_owned, events_json, now_unix, expires_at) catch |err| {
+                        log.warn("trace_share.persist_failed user='{s}' run_id='{s}' err={s} — failing closed", .{ user_id, run_id, @errorName(err) });
+                        return error.PersistFailed;
+                    };
+                } else |_| {
+                    log.info("trace_share.persist_skipped non_numeric_user_id='{s}' run_id='{s}' — in-memory only, will NOT survive restart", .{ user_id, run_id });
+                }
+            }
+        }
+
+        // In-memory commit AFTER PG success (or skip).
         try self.by_code.put(self.allocator, code_owned, rec);
         errdefer _ = self.by_code.remove(code_owned);
 
         const code_for_owner = try self.allocator.dupe(u8, code_owned);
         errdefer self.allocator.free(code_for_owner);
         try self.by_owner.put(self.allocator, key_buf, code_for_owner);
-
-        // Sprint 3 — durability write-through. When state_mgr is bound
-        // AND the caller supplied a snapshot, persist to PG. The
-        // in-memory state remains the source of truth for cache-hit
-        // reads; PG is the source of truth on restart recovery.
-        //
-        // Persist-failure policy: log warn and continue. The share is
-        // live for THIS gateway instance; restart-recovery is broken
-        // for shares with PG-write failures. Acceptable for V1: the
-        // failure is logged for operator visibility, and a successful
-        // user re-share will resync (idempotent for same user/run/ttl,
-        // or new share_code for new run). Strict-consistency mode
-        // (fail the user request on PG write failure) is a V1.x
-        // operator knob.
-        if (self.state_mgr) |mgr| {
-            if (events_json.len > 0) {
-                // user_id arrives as a path-segment string; parse to i64
-                // for the PG column. Reject non-numeric user_ids by
-                // skipping persistence — this matches the production
-                // path where authenticated user_ids are always numeric.
-                // Legacy fixture/tests use synthetic non-numeric
-                // strings that don't need to survive restart.
-                if (std.fmt.parseInt(i64, user_id, 10)) |uid| {
-                    mgr.setTraceShare(uid, run_id, code_owned, events_json, now_unix, expires_at) catch |err| {
-                        log.warn("trace_share.persist_failed user='{s}' run_id='{s}' err={s}", .{ user_id, run_id, @errorName(err) });
-                    };
-                } else |_| {
-                    // Code-review fix F1 — surface the parseInt skip
-                    // so operators see when non-numeric user_ids are
-                    // bypassing persistence in production (a misconfig
-                    // signal that previously was silent).
-                    log.info("trace_share.persist_skipped non_numeric_user_id='{s}' run_id='{s}' — in-memory only, will NOT survive restart", .{ user_id, run_id });
-                }
-            }
-        }
 
         return .{
             .already_existed = false,
@@ -12618,6 +12633,17 @@ fn handleTraceShareCreate(
             return .{
                 .status = "429 Too Many Requests",
                 .body = "{\"error\":\"share_limit_reached\",\"limit\":100,\"hint\":\"revoke an existing share before creating a new one\"}",
+            };
+        },
+        // Sprint 3 prod-blocker fix (2026-05-29) — fail-closed
+        // persistence. Distinct from `share_create_failed` so the FE
+        // can prompt a retry ("the database is briefly unreachable —
+        // try again in a moment") rather than a generic 500.
+        error.PersistFailed => {
+            log.warn("share_create persistence failed user_id='{s}' run_id='{s}'", .{ user_id, run_id });
+            return .{
+                .status = "500 Internal Server Error",
+                .body = "{\"error\":\"share_persist_failed\",\"hint\":\"the share snapshot could not be saved durably; retry shortly\"}",
             };
         },
         else => {
@@ -30803,6 +30829,115 @@ test "Wave 2C live: artifacts CRUD + version graph + isolation + share roundtrip
     try std.testing.expect(deleted);
     const after_delete = try mgr.getArtifactById(allocator, 101, artifact.id);
     try std.testing.expect(after_delete == null);
+}
+
+// ─── Sprint 3 (prod-readiness) — live PG trace-share durability proof ──
+// End-to-end test against a real Postgres that exercises the canonical
+// restart-survival path:
+//   1. createOrGet on store#1 (bound to live mgr) — share persists
+//   2. drop store#1's in-memory cache; create store#2 bound to SAME mgr
+//   3. handleTraceShareGet on store#2 → cache miss → lazy load from PG
+//      → sanitized snapshot returned WITHOUT consulting RunTraceStore
+//   4. revoke; cold lookup returns 404
+//   5. cross-user isolation: user B can't reach user A's share via clear
+//
+// Skips unless NULLALIS_POSTGRES_TEST_URL is set (same pattern as the
+// Wave 2C artifact roundtrip above).
+test "Sprint 3 live: trace_shares survive restart + sanitizer-safe + isolation" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_s3_traces_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    // `Manager.init` runs the migration framework as part of bootstrap
+    // (see `migrations.run` wired in v1.14.24 D62). No explicit migrate
+    // call needed — the artifact roundtrip above is the same pattern.
+    defer mgr.dropSchemaForTests() catch {};
+
+    try mgr.provisionUser(101, "/tmp/nullalis-s3-traces-user-101/workspace");
+    try mgr.provisionUser(202, "/tmp/nullalis-s3-traces-user-202/workspace");
+
+    const now: i64 = std.time.timestamp();
+    const ttl_h: i64 = 24;
+    const expires_at = now + ttl_h * 3600;
+
+    // ── Stage 1: store#1 — write-through to PG ─────────────────────────
+    var store1 = TraceShareStore.initWithPersistence(allocator, &mgr);
+    defer store1.deinit();
+
+    // A real-shaped sanitized snapshot (matches `serializeShareTraceJson`
+    // output shape — anonymous user_id, shared_session, run_id, events).
+    const snapshot_json: []const u8 =
+        \\{"user_id":"anonymous","session_id":"shared_session","run_id":"s3-restart-proof","first_event_ms":0,"last_event_ms":100,"truncated":false,"events":[{"kind":"turn_stage","ts_ms":0,"phase":"start"},{"kind":"agent_end","ts_ms":100,"success":true}]}
+    ;
+
+    const created = try store1.createOrGet("101", "s3-restart-proof", ttl_h, now, snapshot_json);
+    try std.testing.expect(!created.already_existed);
+    try std.testing.expectEqual(@as(usize, SHARE_CODE_LEN), created.share_code.len);
+    try std.testing.expectEqual(expires_at, created.expires_at_unix);
+    const code_dup = try allocator.dupe(u8, created.share_code);
+    defer allocator.free(code_dup);
+
+    // ── Stage 2: simulate restart — fresh store, same mgr ──────────────
+    // store1 is "gone" from the caller's perspective; store2's in-memory
+    // cache is empty. The share_code MUST resolve via PG lazy load.
+    var store2 = TraceShareStore.initWithPersistence(allocator, &mgr);
+    defer store2.deinit();
+
+    // Cold lookup → must hit PG, populate cache, return the snapshot
+    // bytes verbatim. This bypasses RunTraceStore entirely (which would
+    // 404 for a run the in-process bounded ring buffer has evicted).
+    const snap_opt = store2.getLive(code_dup, now);
+    try std.testing.expect(snap_opt != null);
+    const snap = snap_opt.?;
+    try std.testing.expectEqualStrings(snapshot_json, snap.events_json);
+    try std.testing.expectEqualStrings("101", snap.user_id);
+    try std.testing.expectEqualStrings("s3-restart-proof", snap.run_id);
+
+    // Sanitizer-safe: the persisted snapshot must NOT leak raw user_id /
+    // session_id outside the `anonymous`/`shared_session` breadcrumbs —
+    // those substrings are produced by `serializeShareTraceJson` at
+    // share-create time. The persistence layer must not mutate them.
+    try std.testing.expect(std.mem.indexOf(u8, snap.events_json, "\"user_id\":\"anonymous\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snap.events_json, "\"session_id\":\"shared_session\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snap.events_json, "\"run_id\":\"s3-restart-proof\"") != null);
+
+    // ── Stage 3: revoke through store2; cold lookup on store3 → 404 ────
+    const revoked = try store2.revoke("101", "s3-restart-proof");
+    try std.testing.expect(revoked);
+
+    var store3 = TraceShareStore.initWithPersistence(allocator, &mgr);
+    defer store3.deinit();
+
+    const after_revoke = store3.getLive(code_dup, now);
+    try std.testing.expect(after_revoke == null);
+
+    // ── Stage 4: cross-user isolation ──────────────────────────────────
+    // Mint a fresh share for user A; user B's revoke must NOT touch it.
+    const a_share = try store2.createOrGet("101", "s3-iso-run-a", ttl_h, now, snapshot_json);
+    const a_code = try allocator.dupe(u8, a_share.share_code);
+    defer allocator.free(a_code);
+
+    // User B revokes a run_id they don't own — must return false (no-op).
+    const b_revoke = try store2.revoke("202", "s3-iso-run-a");
+    try std.testing.expect(!b_revoke);
+
+    // User A's share must still be reachable in a cold lookup.
+    var store4 = TraceShareStore.initWithPersistence(allocator, &mgr);
+    defer store4.deinit();
+    const a_after = store4.getLive(a_code, now);
+    try std.testing.expect(a_after != null);
+
+    // User A revokes their own share for cleanup.
+    _ = try store2.revoke("101", "s3-iso-run-a");
 }
 
 // ─── Wave 2 review regression tests (2026-05-24) ───────────────────────
