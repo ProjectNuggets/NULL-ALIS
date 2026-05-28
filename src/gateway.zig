@@ -11378,6 +11378,33 @@ fn handleArtifactShareRevoke(
     return .{ .body = "{\"status\":\"revoked\"}" };
 }
 
+/// Parse the markdown link `ProduceDocumentTool.execute()` returns and
+/// extract the produced filename. Format:
+///   `[Generated FORMAT: <filename>](attachments/produced/<filename>)`
+/// Returns null on any deviation — the gateway treats that as a render
+/// failure rather than guessing.
+fn parseProducedFilename(md: []const u8) ?[]const u8 {
+    const open_paren = std.mem.indexOfScalar(u8, md, '(') orelse return null;
+    if (!std.mem.endsWith(u8, md, ")")) return null;
+    const path = md[open_paren + 1 .. md.len - 1];
+    const prefix = "attachments/produced/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const name = path[prefix.len..];
+    if (name.len == 0) return null;
+    return name;
+}
+
+/// Map a `produce_document` format string to a serving Content-Type.
+/// Unknown formats fall back to `application/octet-stream`.
+fn producedContentType(format: []const u8) []const u8 {
+    if (std.mem.eql(u8, format, "pdf")) return "application/pdf";
+    if (std.mem.eql(u8, format, "docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    if (std.mem.eql(u8, format, "pptx")) return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+    if (std.mem.eql(u8, format, "xlsx")) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    if (std.mem.eql(u8, format, "html")) return "text/html; charset=utf-8";
+    return "application/octet-stream";
+}
+
 fn handleArtifactExport(
     allocator: std.mem.Allocator,
     method: []const u8,
@@ -29938,4 +29965,37 @@ test "Wave2-HIGH3: public artifact share endpoint keeps 404 for enumeration defe
     // Crucially must NOT leak the backend-down signal in the body.
     try std.testing.expect(std.mem.indexOf(u8, r.body, "state_unavailable") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.body, "postgres") == null);
+}
+
+// ─── Wave 2A — artifact export bridge helpers ──────────────────────────
+
+test "parseProducedFilename extracts the produced filename from tool markdown" {
+    const md = "[Generated PDF: report_1716_a1b2c3d4.pdf](attachments/produced/report_1716_a1b2c3d4.pdf)";
+    const fn_opt = parseProducedFilename(md);
+    try std.testing.expect(fn_opt != null);
+    try std.testing.expectEqualStrings("report_1716_a1b2c3d4.pdf", fn_opt.?);
+}
+
+test "parseProducedFilename returns null on malformed input" {
+    try std.testing.expect(parseProducedFilename("not a link") == null);
+    try std.testing.expect(parseProducedFilename("[just text]") == null);
+    try std.testing.expect(parseProducedFilename("[Generated PDF: x.pdf](no-prefix/x.pdf)") == null);
+}
+
+test "producedContentType returns the right MIME for each format" {
+    try std.testing.expectEqualStrings("application/pdf", producedContentType("pdf"));
+    try std.testing.expectEqualStrings(
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        producedContentType("docx"),
+    );
+    try std.testing.expectEqualStrings(
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        producedContentType("pptx"),
+    );
+    try std.testing.expectEqualStrings(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        producedContentType("xlsx"),
+    );
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", producedContentType("html"));
+    try std.testing.expectEqualStrings("application/octet-stream", producedContentType("???"));
 }
