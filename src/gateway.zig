@@ -30230,3 +30230,221 @@ test "producedContentType returns the right MIME for each format" {
     try std.testing.expectEqualStrings("text/html; charset=utf-8", producedContentType("html"));
     try std.testing.expectEqualStrings("application/octet-stream", producedContentType("???"));
 }
+
+// ─── Wave 2A — export bridge handler ───────────────────────────────────
+
+/// Test fixture: synthesize a minimal UserContext pointing at a tmpdir
+/// workspace. The real dispatch site supplies a fully-resolved context;
+/// at handler level we only need workspace_path to be valid and the rest
+/// of the freed-by-deinit slices to be heap-allocated so deinit's frees
+/// stay balanced.
+fn makeExportTestUserCtx(allocator: std.mem.Allocator, workspace_path: []const u8) !UserContext {
+    return UserContext{
+        .user_id = "1",
+        .user_root = try allocator.dupe(u8, workspace_path),
+        .workspace_path = try allocator.dupe(u8, workspace_path),
+        .memory_db_path = try allocator.dupe(u8, ""),
+        .cron_path = try allocator.dupe(u8, ""),
+        .config_path = try allocator.dupe(u8, ""),
+        .heartbeat_path = try allocator.dupe(u8, ""),
+        .channel_state_path = try allocator.dupe(u8, ""),
+        .telegram_path = try allocator.dupe(u8, ""),
+        .secrets_dir = try allocator.dupe(u8, ""),
+    };
+}
+
+// Note: target slices here match what `extractRequestTarget` returns at the
+// dispatch site — just the request-target part (path+query), NOT the full
+// HTTP request line. parseQueryParam splits on space-less input.
+
+test "Wave 2A: export endpoint rejects unknown format with 400" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, "/tmp/nullalis-export-test-fake");
+    defer ctx.deinit(std.testing.allocator);
+    const resp = handleArtifactExport(
+        std.testing.allocator,
+        "POST",
+        "1",
+        "00000000-0000-0000-0000-000000000000",
+        "/api/v1/users/1/artifacts/00000000-0000-0000-0000-000000000000/export?format=rtf",
+        &ctx,
+        null,
+        &state,
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid_format") != null);
+}
+
+test "Wave 2A: export endpoint rejects malformed artifact id with 400" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, "/tmp/nullalis-export-test-fake");
+    defer ctx.deinit(std.testing.allocator);
+    const resp = handleArtifactExport(
+        std.testing.allocator,
+        "POST",
+        "1",
+        "not-a-uuid",
+        "/api/v1/users/1/artifacts/not-a-uuid/export?format=pdf",
+        &ctx,
+        null,
+        &state,
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid_artifact_id") != null);
+}
+
+test "Wave 2A: export endpoint returns 503 when state backend is absent" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit(); // zaki_state stays null
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, "/tmp/nullalis-export-test-fake");
+    defer ctx.deinit(std.testing.allocator);
+    const resp = handleArtifactExport(
+        std.testing.allocator,
+        "POST",
+        "1",
+        "00000000-0000-0000-0000-000000000000",
+        "/api/v1/users/1/artifacts/00000000-0000-0000-0000-000000000000/export?format=pdf",
+        &ctx,
+        null,
+        &state,
+    );
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "state_unavailable") != null);
+}
+
+test "Wave 2A: export endpoint rejects non-POST with 405" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, "/tmp/nullalis-export-test-fake");
+    defer ctx.deinit(std.testing.allocator);
+    const resp = handleArtifactExport(
+        std.testing.allocator,
+        "GET",
+        "1",
+        "00000000-0000-0000-0000-000000000000",
+        "/api/v1/users/1/artifacts/00000000-0000-0000-0000-000000000000/export?format=pdf",
+        &ctx,
+        null,
+        &state,
+    );
+    try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
+}
+
+test "Wave 2A: download endpoint rejects unsafe filename" {
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, "/tmp/nullalis-export-test-fake");
+    defer ctx.deinit(std.testing.allocator);
+    const resp = handleArtifactExportDownload(
+        std.testing.allocator,
+        "GET",
+        "../etc/passwd",
+        &ctx,
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "unsafe_filename") != null);
+}
+
+test "Wave 2A: download endpoint returns 404 when file is absent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws);
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, ws);
+    defer ctx.deinit(std.testing.allocator);
+    const resp = handleArtifactExportDownload(
+        std.testing.allocator,
+        "GET",
+        "does_not_exist.pdf",
+        &ctx,
+    );
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "export_not_found") != null);
+}
+
+test "Wave 2A live: export bridge writes produced file + returns download URL" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_w2a_export_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    defer mgr.dropSchemaForTests() catch {};
+
+    // Build a unique workspace under /tmp that the bridge can write into.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(ws);
+
+    try mgr.provisionUser(601, ws);
+    try mgr.provisionUser(602, ws);
+
+    // Create an artifact + version owned by user 601.
+    const now = std.time.timestamp();
+    const hash_v1 = try artifacts_types.computeContentHash(allocator, "# Hello\n\nExport bridge smoke.");
+    defer allocator.free(hash_v1);
+    var artifact = try mgr.createArtifact(allocator, 601, null, "ExportBridgeSmoke", "markdown", "# Hello\n\nExport bridge smoke.", hash_v1, now);
+    defer artifact.deinit(allocator);
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    defer state.zaki_state = null;
+    state.zaki_state = &mgr;
+
+    var ctx = try makeExportTestUserCtx(allocator, ws);
+    defer ctx.deinit(allocator);
+
+    // Pick HTML — pandoc-only path; if pandoc isn't installed we still
+    // exercise the renderer_unavailable code path (asserted below).
+    const target = try std.fmt.allocPrint(allocator, "/api/v1/users/601/artifacts/{s}/export?format=html", .{artifact.id});
+    defer allocator.free(target);
+
+    const resp = handleArtifactExport(
+        allocator,
+        "POST",
+        "601",
+        artifact.id,
+        target,
+        &ctx,
+        null,
+        &state,
+    );
+
+    if (std.mem.indexOf(u8, resp.body, "renderer_unavailable") != null) {
+        // pandoc not installed in the sandbox — the controlled-failure
+        // shape is the assertion of interest. Done.
+        try std.testing.expectEqualStrings("502 Bad Gateway", resp.status);
+        if (resp.body.len > 0) allocator.free(resp.body);
+        return;
+    }
+
+    // pandoc IS installed — full success path.
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"exported\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"format\":\"html\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "attachments/produced/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "/api/v1/users/601/exports/") != null);
+    if (resp.body.len > 0) allocator.free(resp.body);
+
+    // Cross-user isolation: user 602 cannot export user 601's artifact.
+    const resp2 = handleArtifactExport(
+        allocator,
+        "POST",
+        "602",
+        artifact.id,
+        target,
+        &ctx,
+        null,
+        &state,
+    );
+    try std.testing.expectEqualStrings("404 Not Found", resp2.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp2.body, "artifact_not_found") != null);
+}
