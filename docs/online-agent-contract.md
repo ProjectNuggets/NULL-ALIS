@@ -369,7 +369,14 @@ Current limitations to close or explicitly hide before production:
   new turns and to `GET /api/v1/users/{user_id}/traces/{run_id}` for
   in-process trace history. Permanent-history UX must wait for
   durable trace storage (Section 7 caveats).
-- **Durable trace storage.** The WP4.1 trace store is in-process only;
+- **Durable trace SHARES.** Sprint 3 (2026-05-28, prod-readiness)
+  landed PG-backed persistence for share RECORDS: the share URL +
+  sanitized snapshot of the events at share-create time survive
+  gateway restart. The snapshot is moment-in-time (frozen at the
+  click — future sanitizer rule changes do not retroactively apply).
+  Schema lives at `migrations/0003_trace_shares.sql`; the runtime
+  wiring is in `TraceShareStore.initWithPersistence`.
+- **Durable trace EVENTS storage.** The WP4.1 trace store is in-process only;
   events are not persisted across restarts (Section 7).
 - **Persistent generic allowlist.** `/approve allow-always` does not
   create durable state; there is no per-tool auto-approve ledger.

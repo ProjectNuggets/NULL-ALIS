@@ -87,6 +87,16 @@ pub const MIGRATIONS = [_]Migration{
         .name = "0002_artifacts",
         .sql = @embedFile("migrations/0002_artifacts.sql"),
     },
+    .{
+        // Sprint 3 (2026-05-28, prod-readiness) — durable trace shares.
+        // See `src/migrations/0003_trace_shares.sql` for the rationale +
+        // schema. Closes `ui-handoff.md` §7 P1 for the shares half;
+        // trace EVENTS stay in the in-process RunTraceStore (V1.x
+        // decision documented in the migration file).
+        .version = 3,
+        .name = "0003_trace_shares",
+        .sql = @embedFile("migrations/0003_trace_shares.sql"),
+    },
 };
 
 /// Trait the runner's caller must satisfy: a method that takes a
