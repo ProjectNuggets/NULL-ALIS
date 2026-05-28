@@ -10,6 +10,14 @@ sprint's close-out carries an item into a named follow-up with
 rationale, it lands here. If a review pass classifies a finding as
 MEDIUM/LOW and we don't fix it inline, it lands here.
 
+Production-readiness policy (2026-05-28): this file is a visibility
+ledger, not a launch waiver. Any open item that affects user trust,
+data durability, memory correctness, privacy, browser control,
+artifacts, approvals, metering, or session lifecycle must be promoted
+to a P0/P1 production-readiness gate before commercial release unless
+the corresponding product surface is explicitly hidden. The burn-down
+prompt and acceptance gates live in `docs/production-readiness-prompt.md`.
+
 Each row lists:
 - **ID** — `Dn` identifier as cited in the originating sprint/review doc.
 - **From** — which sprint/review surfaced it.
@@ -17,6 +25,13 @@ Each row lists:
 - **Why deferred** — the honest reason it wasn't done in-sprint.
 - **Target** — where the follow-up is expected to live.
 - **Status** — `open` / `shipped` / `obsolete`.
+
+Recommended launch classification:
+- **P0 launch blocker** — exposed production surface would be broken,
+  misleading, unsafe, or non-durable without it.
+- **P1 production hardening** — required for the S-tier claim before
+  public scale, but the surface may be temporarily hidden or constrained.
+- **P2 post-launch** — valuable, but outside exposed V1 behavior.
 
 When an item ships, mark `shipped at <sha>` in the Status column and
 leave the row — the historical audit trail is part of the value. When
@@ -42,7 +57,7 @@ one-line reason.
 |----|-------|--------------|--------|--------|
 | D5 | `CostTracker` (420 LoC, USD-cost JSONL) full wire-up: per-user workspace resolution, lifecycle alongside cell-pod tenancy, JSONL persistence path | S2.8 shipped session-scoped weight cap (still bounds single-session abuse); true calendar-monthly persistence requires threading CostTracker through per-tenant runtime | Sprint 2 follow-up PR | **shipped at PR #51** (2026-04-26) — V1-must per `docs/v1-triage.md`. Implementation took the minimal-viable path: extended `UsageRuntime` (already per-tenant via gateway.zig:1405) with a JSONL ledger field instead of standing up the parallel CostTracker module. Ledger lives at `{workspace_dir}/state/cost.jsonl`, append-on-recordTurn, calendar-month rollup via `monthlyTotalUsd(now_secs)` with std.time.epoch year/month ordinal (correct across leap years + month boundaries, unlike the day/30 approximation in cost.zig). 6 new tests cover: path construction, append correctness, monthly aggregation, cross-month exclusion, no-path fallback, year-boundary correctness. CostTracker module remains for future budget-check integration; this PR closes the persistence gap V1 needs. |
 | D6 | `Idempotency-Key` strict-enforcement mode (missing header → 400, not current soft mode) | Flipping strict before zaki-prod BFF confirms every mutating call attaches a key would break provisioning | After zaki-prod confirms | **open** |
-| D7 | Extend Idempotency-Key dedupe to `POST /api/v1/users/:id/attachments` | Needs `state` threaded through `handleAttachmentUpload` signature; kept atomic scope for the S2.10 commit | Sprint 2 follow-up PR | **open** |
+| D7 | Extend Idempotency-Key dedupe to `POST /api/v1/users/:id/attachments` | Needs `state` threaded through `handleAttachmentUpload` signature; kept atomic scope for the S2.10 commit | Sprint 2 follow-up PR | **shipped at production-readiness pass 2026-05-28** — `IdempotencyStore` gained an in-memory response cache (`fetchCached` + `cacheResponse`) bounded by the existing TTL sweep. `handleAttachmentUpload` now extracts `Idempotency-Key`, short-circuits to the cached response on duplicate (no filesystem touch — protects against unsafe overwrite even when retry body differs), and caches the 200 OK response on first success. Empty / >256-byte keys → 400. Error responses (400/413/500) are NOT cached so transient failures stay retryable. 4 new tests: store cache hit/miss/first-write-wins, dedupe roundtrip vs different filename, empty-key rejection, no-key soft mode. |
 | D8 | Full secret vault API (5 routes + `zaki_bot.secret_mutations` table + two-phase mutation crypto) | Substantial new surface out of scope for Sprint 2 body | Dedicated atomic PR | **shipped at `f303153`** (PR #11) |
 | D9 | Sprint-2 self-review MEDIUM finding | Tracked in `docs/sprints/sprint-2-review.md` | Sprint 2 review follow-up | **shipped at PR #53** (2026-04-26) — V1-nice per docs/v1-triage.md. Extracted `.entitlements_revoke` switch arm body into `pub fn handleEntitlementsRevokeRequest(raw, tokens, auth_required, method) EntitlementsRevokeResponse` near the existing `validateInternalServiceToken` helpers. Switch arm now just composes the response. 4 new unit tests cover: 405 method-not-allowed, 401 unauthorized (missing token), 400 missing user_id, 200 OK happy path with installEntitlement roundtrip. Happy-path test pairs `useDefaultResolver` with `resetDefaultStore` cleanup to prevent global-state pollution across the test suite. |
 | D10 | Sprint-2 self-review LOW finding | Tracked in `docs/sprints/sprint-2-review.md` | Sprint 2 review follow-up | **open** |
@@ -263,6 +278,18 @@ capture closure / deferral with verification artifacts.
 | ID | Shape | Why deferred | Target | Status |
 |----|-------|--------------|--------|--------|
 | D24 | Retroactive self-review for Sprint 1 + Sprint 3 (review protocol was only adopted mid-session, starting with Sprint 2) | Sprints 1 and 3 already merged through main; any findings go into this register or direct follow-up PRs. Not blocking any current work | Opportunistic — do during any future Sprint 1/3 surface touch | **open** — low priority; doc completeness only |
+
+---
+
+---
+
+## From production-readiness pass 2026-05-28 (ZAKI commercial V1)
+
+| ID | Shape | Why deferred | Target | Status |
+|----|-------|--------------|--------|--------|
+| D71 | Backend-owned active-turn cancel — stable, idempotent HTTP route that signals the in-flight agent loop and produces a clean SSE terminal state | Until this lands the FE Stop button can only abort the local fetch — server-side tools, meter receipts, and tokens keep accruing after the user "stopped" | Production-readiness pass | **shipped at production-readiness pass 2026-05-28** — `POST /api/v1/users/:id/sessions/:key/cancel` writes directly to the existing atomic `CancellationToken` (`src/agent/abort.zig`) the agent loop already polls between iterations. SessionManager.cancelActiveTurn returns `cancellation_signalled_active` / `_idle` / `session_not_found`; idempotent (atomic store is a no-op on already-set flag); cancel against an idle session is safe because the token resets at the start of each turn. The SSE bridge in `gateway_run_events.zig` translates the agent's `turn_cancelled` ObserverEvent into a `system_notice { kind: "turn_cancelled" }` frame; the canonical `turn_complete` → `progress.finalize.done` → `done` sequence still fires. 5 new tests: SessionManager 404, idle vs active outcomes, gateway 404, idle 200, active 200 + idempotency. Documented in OpenAPI, ui-handoff.md, online-agent-contract.md §2a. |
+| D72 | Active-turn resume / replay | Resume requires server-side turn checkpointing + token-stream restart from a known good seq; significant new surface. Reconnect via fresh `POST /api/v1/chat/stream` + `GET /traces/:run_id` is the supported pattern for V1 | V1.x (post-launch) | **closed-as-out-of-scope-for-V1** — the contract docs no longer claim a `chat/resume` route. Clients reconnect via `POST /api/v1/chat/stream` for new turns and read the bounded in-process trace store via `GET /api/v1/users/:id/traces/:run_id` for replay. Durable trace storage (D-trace-durability) remains the gate for permanent-history UX. |
+| D73 | Contract sync — docs/openapi-v1.yaml, ui-handoff.md, online-agent-contract.md aligned with actual gateway routes | Three separate docs drifted as Waves 2A/2C/2D shipped without round-tripping the OpenAPI surface | Production-readiness pass | **shipped at production-readiness pass 2026-05-28** — OpenAPI now covers: cancel (D71), mode, approve, attachments (with `Idempotency-Key` header), artifacts list/get/put, artifact share/revoke, artifact export, exports/:filename download, trace share/revoke, and the public share viewers (`/api/v1/share/:code`, `/api/v1/share/artifact/:code`). Top-of-file notes flipped to reflect cancel-shipped + resume-not-implemented. Phantom `/api/v1/chat/cancel`, `/api/v1/chat/resume`, and `/api/v1/chat/approve` claims removed everywhere. |
 
 ---
 
