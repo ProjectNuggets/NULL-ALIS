@@ -51,6 +51,7 @@ const providers = @import("../providers/root.zig");
 const edge_resolution = @import("edge_resolution.zig");
 const memory_embeddings = @import("../memory/vector/embeddings.zig");
 const text_norm = @import("../memory/text_norm.zig");
+const pii_detect = @import("../memory/pii_detect.zig");
 const working_memory = @import("working_memory.zig");
 
 /// One atomic fact extracted from a conversation. Mirrors the JSON
@@ -556,6 +557,18 @@ fn buildExtractionMetadata(
     try w.writeAll("\"");
     try w.print(",\"confidence\":{d:.3}", .{mem.confidence});
     try w.print(",\"extracted_at\":{d}", .{std.time.timestamp()});
+
+    // D52 Pillar 2 (2026-05-28, prod-readiness Sprint 1) — tag detected
+    // PII categories so the `memory_purge_pii` tool can offer
+    // category-scoped delete. Detection is allocation-free + runs once
+    // per write. Conservative set: phone + email only (see
+    // `memory/pii_detect.zig` rationale on address/name omission).
+    const pii_flags = pii_detect.detect(mem.text);
+    if (pii_flags.any()) {
+        try w.writeAll(",");
+        try pii_detect.writeTagsJson(w, pii_flags);
+    }
+
     try w.writeAll("}");
     return buf.toOwnedSlice(allocator);
 }

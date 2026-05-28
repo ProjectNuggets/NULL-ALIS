@@ -538,6 +538,14 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn forgetMemory(_: *@This(), _: i64, _: []const u8) !bool {
         return error.PostgresNotEnabled;
     }
+    /// D52 Pillar 4 (2026-05-28) — stub for non-postgres builds.
+    pub fn listPiiMemoryKeys(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const u8) ![]const []const u8 {
+        return allocator.alloc([]const u8, 0);
+    }
+    /// D52 Pillar 4 (2026-05-28) — stub for non-postgres builds.
+    pub fn deletePiiMemoriesByCategory(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8) !usize {
+        return error.PostgresNotEnabled;
+    }
     /// V1.9-1 — stub for non-postgres builds; cascade rename no-ops.
     /// Returns found_old=false so callers degrade to "treat as fresh
     /// write" rather than crashing.
@@ -5475,6 +5483,109 @@ const ManagerImpl = struct {
         }
 
         return memory_deleted;
+    }
+
+    /// D52 Pillar 4 (2026-05-28, prod-readiness Sprint 1) — list memory
+    /// keys tagged with the requested PII category.
+    ///
+    /// `category` must be one of:
+    ///   - "all"   → any row where `metadata ? 'pii_tags'`
+    ///   - "phone" → `metadata->'pii_tags' ? 'phone'`
+    ///   - "email" → `metadata->'pii_tags' ? 'email'`
+    ///
+    /// User-scoped (`user_id = $1`); validity-filtered (already
+    /// superseded rows skipped). Caller frees each returned key + the
+    /// outer slice.
+    pub fn listPiiMemoryKeys(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        category: []const u8,
+    ) ![]const []const u8 {
+        const is_all = std.mem.eql(u8, category, "all");
+        const is_phone = std.mem.eql(u8, category, "phone");
+        const is_email = std.mem.eql(u8, category, "email");
+        if (!is_all and !is_phone and !is_email) return error.InvalidPiiCategory;
+
+        const q = try self.buildQuery(if (is_all)
+            "SELECT key FROM {schema}.memories " ++
+                "WHERE user_id = $1 " ++
+                "AND metadata ? 'pii_tags' " ++
+                "AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
+                "ORDER BY created_at DESC"
+        else
+            "SELECT key FROM {schema}.memories " ++
+                "WHERE user_id = $1 " ++
+                "AND metadata->'pii_tags' ? $2 " ++
+                "AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
+                "ORDER BY created_at DESC");
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+
+        const result = if (is_all) blk: {
+            const params = [_]?[*:0]const u8{user_s.ptr};
+            const lengths = [_]c_int{@intCast(user_s.len)};
+            break :blk try self.execParams(q, &params, &lengths);
+        } else blk: {
+            const cat_z = try allocator.dupeZ(u8, category);
+            defer allocator.free(cat_z);
+            const params = [_]?[*:0]const u8{ user_s.ptr, cat_z.ptr };
+            const lengths = [_]c_int{ @intCast(user_s.len), @intCast(category.len) };
+            break :blk try self.execParams(q, &params, &lengths);
+        };
+        defer c.PQclear(result);
+
+        const tuples = c.PQntuples(result);
+        var out = std.ArrayListUnmanaged([]const u8){};
+        errdefer {
+            for (out.items) |k| allocator.free(k);
+            out.deinit(allocator);
+        }
+        var i: c_int = 0;
+        while (i < tuples) : (i += 1) {
+            const k = try dupeResultValue(allocator, result, i, 0);
+            errdefer allocator.free(k);
+            try out.append(allocator, k);
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    /// D52 Pillar 4 (2026-05-28, prod-readiness Sprint 1) — delete every
+    /// PII-tagged memory in the given category for `user_id`. Returns
+    /// the count of memories successfully forgotten.
+    ///
+    /// Implementation: list → forgetMemory loop. Reuses `forgetMemory`'s
+    /// cascade-edge close-out + edge-event emission for each row. Less
+    /// efficient than a single bulk DELETE (N+1 transactions) but
+    /// strictly correct re: graph state. PII purges are rare and small
+    /// (typical user has <100 tagged rows) so the loop cost is fine.
+    ///
+    /// Errors during individual deletes are logged + skipped so a single
+    /// edge cascade failure doesn't leave the remaining rows dangling.
+    pub fn deletePiiMemoriesByCategory(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        category: []const u8,
+    ) !usize {
+        const keys = try self.listPiiMemoryKeys(allocator, user_id, category);
+        defer {
+            for (keys) |k| allocator.free(k);
+            allocator.free(keys);
+        }
+
+        var deleted: usize = 0;
+        for (keys) |k| {
+            const ok = self.forgetMemory(user_id, k) catch |err| {
+                log.warn("memory_purge_pii.forget_failed user={d} key={s} category={s} err={s}", .{ user_id, k, category, @errorName(err) });
+                continue;
+            };
+            if (ok) deleted += 1;
+        }
+        log.info("memory_purge_pii user={d} category={s} candidates={d} deleted={d}", .{ user_id, category, keys.len, deleted });
+        return deleted;
     }
 
     /// V1.6 commit 6 — fetch same-subject extraction-classifier memories

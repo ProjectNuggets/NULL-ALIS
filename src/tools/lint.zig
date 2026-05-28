@@ -76,6 +76,7 @@ pub const ALL_TOOLS = [_][]const u8{
     "memory_forget",
     "memory_list",
     "memory_maintain",
+    "memory_purge_pii",
     "memory_purge_topic",
     "memory_recall",
     "memory_store",
