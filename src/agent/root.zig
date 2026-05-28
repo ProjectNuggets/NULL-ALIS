@@ -12563,6 +12563,65 @@ test "approval gate: second pending request does not overwrite the first" {
     try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
 }
 
+test "/approve <id> does not cross namespace from generic to legacy shell when generic is null" {
+    // S2 audit regression. `pending_exec_id` and
+    // `pending_tool_approval_id_counter` are independent u64 counters,
+    // so a numeric id captured by the gateway for a generic-namespace
+    // approval can coincidentally match a legacy shell pending. Pre-fix
+    // the canonical handler would fall through to the legacy branch
+    // and execute the shell command — the user clicked "Approve Tool X"
+    // and a shell command they never saw approved would run. The fix
+    // refuses to fall through when an id was supplied; the legacy plain
+    // form `/approve allow-once` still resolves shell approvals.
+    const allocator = std.testing.allocator;
+    const shell_impl = try allocator.create(tools_mod.shell.ShellTool);
+    shell_impl.* = .{ .workspace_dir = "." };
+    const shell_tool = shell_impl.tool();
+    defer shell_tool.deinit(allocator);
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{shell_tool},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    // Force the cross-namespace collision setup: generic is null, but
+    // a legacy shell pending exists with pending_exec_id=42 — the same
+    // id the gateway would have captured from a generic apr-42.
+    const exec_resp = (try agent.handleSlashCommand("/exec ask=always")).?;
+    defer allocator.free(exec_resp);
+    const pending_resp = (try agent.handleSlashCommand("/bash echo cross-namespace-canary")).?;
+    defer allocator.free(pending_resp);
+    try std.testing.expect(agent.pending_exec_command != null);
+    agent.pending_exec_id = 42;
+    try std.testing.expect(agent.pending_tool_approval == null);
+
+    // Gateway-style id-qualified slash (the fixed gateway always builds
+    // this form when the FE supplied approval_id) must NOT resolve the
+    // legacy pending, even though the numeric ids match by coincidence.
+    const approve_resp = (try agent.handleSlashCommand("/approve 42 allow-once")).?;
+    defer allocator.free(approve_resp);
+    try std.testing.expect(std.mem.startsWith(u8, approve_resp, "Approval id mismatch"));
+    // Legacy pending stays intact — the canonical handler did not run
+    // the shell command. The next plain `/approve allow-once` (no id)
+    // is the user's escape hatch to resolve the legacy slot.
+    try std.testing.expect(agent.pending_exec_command != null);
+    try std.testing.expectEqualStrings("echo cross-namespace-canary", agent.pending_exec_command.?);
+    try std.testing.expectEqual(@as(u64, 42), agent.pending_exec_id);
+}
+
 test "legacy shell /approve flow preserved when no generic pending approval" {
     const allocator = std.testing.allocator;
     const shell_impl = try allocator.create(tools_mod.shell.ShellTool);

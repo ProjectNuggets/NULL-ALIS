@@ -13363,6 +13363,18 @@ fn buildApproveCommand(
     return std.fmt.allocPrint(allocator, "/approve {s}", .{decision});
 }
 
+/// True when the canonical slash-command reply is the id-mismatch
+/// rejection from handleGenericToolApprove (commands.zig:2891) or the
+/// legacy shell-approve branch (commands.zig:3066). Both replies are
+/// returned DIRECTLY from the handler (no turn invocation), so the
+/// prefix is the first non-whitespace content. Substring search would
+/// false-positive on any successful approval whose continuation-turn
+/// reply happens to embed the phrase.
+fn isApprovalIdMismatchReply(reply: []const u8) bool {
+    const trimmed = std.mem.trimLeft(u8, reply, " \t\r\n");
+    return std.mem.startsWith(u8, trimmed, "Approval id mismatch");
+}
+
 fn handleSessionApprove(
     allocator: std.mem.Allocator,
     mgr: *session_mod.SessionManager,
@@ -13385,6 +13397,7 @@ fn handleSessionApprove(
         return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
     };
     session.active_refs += 1; // Pin — eviction skips active_refs > 0
+    mgr.mutex.unlock();
 
     // Sprint 2 (2026-05-28) — stale-card guard. When the FE sends an
     // `approval_id` it's pinning to a SPECIFIC approval card; if the
@@ -13395,13 +13408,23 @@ fn handleSessionApprove(
     // backwards-compat for pre-Sprint-2 clients).
     //
     // S2 review fix (TOCTOU). When approval_id matches, we ALSO capture
-    // `pending.id` while still under mgr.mutex and bake it into the
-    // dispatched slash command (see buildApproveCommand below). Without
-    // this, the gateway unlocks → another caller resolves the matched
-    // pending → a new pending mints in the same slot → plain
-    // `/approve allow-once` silently resolves the NEW pending, defeating
-    // the stale-card guard. With the captured id, the canonical handler
+    // `pending.id` and bake it into the dispatched slash command (see
+    // buildApproveCommand below). Without this, the gateway unlocks →
+    // another caller resolves the matched pending → a new pending mints
+    // in the same slot → plain `/approve allow-once` silently resolves
+    // the NEW pending. With the captured id, the canonical handler
     // rejects with "Approval id mismatch" when the slot has changed.
+    //
+    // S2 audit fix (wrong-lock). `pending_tool_approval` is mutated by
+    // setPendingToolApproval / clearPendingToolApproval which run inside
+    // `agent.turn()` under `session.mutex` (acquired by processMessage).
+    // Reading it under mgr.mutex would race a concurrent turn — torn
+    // read on the optional discriminant or UAF on `approval_id` whose
+    // backing buffer was just freed. Lock-escalate to session.mutex for
+    // the read, then release it before processMessage so the slash
+    // dispatch can re-acquire. The id-qualified command closes the gap
+    // between release and re-acquire.
+    session.mutex.lock();
     var captured_pending_id: ?u64 = null;
     if (input.approval_id) |claimed_id| {
         const pending = session.agent.pending_tool_approval;
@@ -13410,6 +13433,8 @@ fn handleSessionApprove(
         else
             false;
         if (!matches) {
+            session.mutex.unlock();
+            mgr.mutex.lock();
             if (session.active_refs > 0) session.active_refs -= 1;
             mgr.mutex.unlock();
             return .{
@@ -13417,10 +13442,11 @@ fn handleSessionApprove(
                 .body = "{\"error\":\"approval_id_mismatch\",\"hint\":\"the pending approval changed or was already resolved; refresh the session before retrying\"}",
             };
         }
-        // Safe: `matches` is true ⇒ pending is non-null.
+        // Safe: `matches` is true ⇒ pending is non-null. `pending.?.id`
+        // is a u64 copy — stable across the unlock below.
         captured_pending_id = pending.?.id;
     }
-    mgr.mutex.unlock();
+    session.mutex.unlock();
 
     // Route the decision through the existing slash command handler.
     // This keeps approval logic in one place (commands.zig).
@@ -13452,7 +13478,16 @@ fn handleSessionApprove(
     // normal command reply. Do not let the HTTP layer report
     // {"status":"approved"} / {"status":"denied"} for a stale card;
     // surface the same 409 contract as the pre-dispatch guard.
-    if (input.approval_id != null and std.mem.indexOf(u8, result, "Approval id mismatch") != null) {
+    //
+    // S2 audit fix (substring brittleness). `indexOf` would false-
+    // positive on any successful approval whose continuation-turn text
+    // happened to mention the phrase. The canonical handler returns the
+    // mismatch literal directly (no turn invocation — see
+    // handleGenericToolApprove + the legacy branch in
+    // handleApproveCommand) so the reply STARTS with the prefix; check
+    // that, after trimming leading whitespace, instead of scanning the
+    // whole reply.
+    if (input.approval_id != null and isApprovalIdMismatchReply(result)) {
         return .{
             .status = "409 Conflict",
             .body = "{\"error\":\"approval_id_mismatch\",\"hint\":\"the pending approval changed or was already resolved; refresh the session before retrying\"}",
@@ -29089,6 +29124,23 @@ test "Sprint 2 — cross-session isolation: approve in A doesn't touch B's pendi
 //      canonical handler — proving the gateway's race window can
 //      no longer silently resolve a different pending.
 
+test "Sprint 2 TOCTOU — isApprovalIdMismatchReply matches canonical mismatch prefix, not substring" {
+    // Locks the contract: the gateway translates the canonical
+    // handler's mismatch reply into HTTP 409 only when the reply STARTS
+    // with the mismatch prefix (after trimming leading whitespace). A
+    // pure substring search would false-positive on any successful
+    // approval whose continuation-turn text happens to mention the
+    // phrase.
+    try std.testing.expect(isApprovalIdMismatchReply("Approval id mismatch. Pending tool approval id is 42."));
+    try std.testing.expect(isApprovalIdMismatchReply("Approval id mismatch. Pending id is 7."));
+    try std.testing.expect(isApprovalIdMismatchReply("  \n\tApproval id mismatch. Pending tool approval id is 42."));
+    // Embedded mention in a successful approval's continuation-turn
+    // reply must NOT trigger the 409 path.
+    try std.testing.expect(!isApprovalIdMismatchReply("Approved tool execution: id=42 tool=shell status=succeeded.\nThe user mentioned 'Approval id mismatch' earlier."));
+    try std.testing.expect(!isApprovalIdMismatchReply("Approved exec (id=42).\nls output ..."));
+    try std.testing.expect(!isApprovalIdMismatchReply(""));
+}
+
 test "Sprint 2 TOCTOU — buildApproveCommand qualifies command with captured pending.id" {
     const allocator = std.testing.allocator;
 
@@ -29153,15 +29205,25 @@ test "Sprint 2 TOCTOU — id-qualified command cannot resolve a swapped pending"
     }
 }
 
-test "Sprint 2 TOCTOU — handleSessionApprove dispatches id-qualified command across the unlock window" {
-    // True end-to-end regression test for the S2 review blocker. The
-    // gateway thread is forced to block at session.mutex.lock() inside
-    // processMessage — this is the same window the production race
-    // exploits. While it's blocked we swap the pending. With the fix,
-    // the gateway dispatches "/approve 42 allow-once" which the
-    // canonical handler rejects because the swapped pending.id is
-    // 999. With the pre-fix code, it would dispatch plain
-    // "/approve allow-once" and silently resolve #999.
+test "Sprint 2 TOCTOU — handleSessionApprove rejects swap during the session.mutex window" {
+    // End-to-end regression for the S2 review blocker. After the audit
+    // pass, the gateway lock-escalates to session.mutex for the pending
+    // read and then releases it before processMessage re-acquires —
+    // there are now two ways a swap during the gateway's life-cycle can
+    // surface:
+    //   1. Pre-dispatch: pending changes BEFORE the gateway's
+    //      stale-card guard runs → gateway sees the new approval_id,
+    //      returns 409.
+    //   2. Post-dispatch: pending changes BETWEEN the gateway's
+    //      session.mutex.unlock() and processMessage's reacquire →
+    //      gateway dispatched the captured pending.id, the canonical
+    //      handler emits "Approval id mismatch", and gateway translates
+    //      that to 409 (via isApprovalIdMismatchReply).
+    // This test exercises the pre-dispatch case by pre-locking
+    // session.mutex; the post-dispatch case is covered by tests 1/2
+    // above (helper contract + canonical handler rejection). Either
+    // way, the user-visible contract is "swap during the window =>
+    // HTTP 409, pending stays".
     var mock = TestMockProvider{};
     var mgr = testCrudSessionManager(std.testing.allocator, &mock);
     defer mgr.deinit();
@@ -29173,10 +29235,10 @@ test "Sprint 2 TOCTOU — handleSessionApprove dispatches id-qualified command a
     session.agent.queue_mode = .off;
     try seedPendingApprovalForTest(session, 42);
 
-    // Pre-lock session.mutex so the gateway thread blocks AFTER the
-    // stale-card guard releases mgr.mutex but BEFORE processMessage
-    // can acquire session.mutex and run the slash command. This is
-    // the exact race window the fix closes.
+    // Pre-lock session.mutex so the gateway thread blocks waiting for
+    // it during the stale-card guard's lock-escalation read. While the
+    // gateway is blocked we swap the pending; when we release, the
+    // gateway sees the new approval_id and rejects with 409.
     session.mutex.lock();
 
     const body = "{\"approved\":true,\"approval_id\":\"apr-42\"}";
@@ -29185,12 +29247,18 @@ test "Sprint 2 TOCTOU — handleSessionApprove dispatches id-qualified command a
         .{ body.len, body },
     );
 
+    // S2 audit fix: initialize `resp` to a sentinel so that if the
+    // spawned thread panics before assigning the real response,
+    // post-join assertions read recognisable bytes instead of
+    // `undefined` (which is UB to read and may format garbage). Both
+    // status and body are static literals — no allocator-owned bytes
+    // here so the post-join code never frees a static pointer.
     const ThreadCtx = struct {
         alloc: std.mem.Allocator,
         mgr: *session_mod.SessionManager,
         key: []const u8,
         req: []const u8,
-        resp: RouteResponse = undefined,
+        resp: RouteResponse = .{ .status = "499 Thread Not Assigned", .body = "{\"error\":\"thread_did_not_assign\"}" },
     };
     var ctx: ThreadCtx = .{
         .alloc = std.testing.allocator,

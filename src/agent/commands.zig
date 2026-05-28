@@ -3036,6 +3036,25 @@ fn handleApproveCommand(self: anytype, arg: []const u8) ![]const u8 {
         }
     }
 
+    // S2 audit fix (cross-namespace collision). `pending_exec_id` and
+    // `pending_tool_approval_id_counter` are independent u64 counters,
+    // so a numeric id captured for the generic namespace can
+    // coincidentally match a legacy shell pending. If the caller
+    // supplied an id (the Sprint-2 gateway always does when the FE
+    // pinned to `approval_id`), we MUST NOT let the legacy shell path
+    // satisfy a generic-namespace approval — reject as id mismatch and
+    // leave the shell pending intact for the next plain /approve.
+    const trimmed_arg = std.mem.trim(u8, arg, " \t");
+    if (trimmed_arg.len > 0) {
+        const head = splitFirstToken(trimmed_arg).head;
+        if (parseTaskId(head) != null) {
+            return try self.allocator.dupe(
+                u8,
+                "Approval id mismatch. Pending tool approval was already resolved or cleared.",
+            );
+        }
+    }
+
     const pending_command = self.pending_exec_command orelse
         return try self.allocator.dupe(u8, "No pending approval requests.");
 
