@@ -337,61 +337,202 @@ pub const GatewayRateLimiter = struct {
 // ── Idempotency Store ────────────────────────────────────────────
 
 pub const IdempotencyStore = struct {
+    /// Owned by the store. MUST be a long-lived allocator — never an
+    /// arena / request-scoped allocator. Production code-review 2026-05-28
+    /// surfaced that piping `req_allocator` into the store leaves dangling
+    /// pointers behind after the request arena tears down: the keys map,
+    /// the responses map, every duped key/status/body, and the internal
+    /// hashmap buckets ALL live as long as the store does. The store now
+    /// owns its allocator at init time so call sites cannot mismatch.
+    allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
     ttl_ns: i128,
     /// Map of key -> timestamp when recorded.
-    keys: std.StringHashMapUnmanaged(i128),
+    keys: std.StringHashMapUnmanaged(i128) = .empty,
+    /// Optional cached response body for at-most-once mutating routes
+    /// (e.g. attachment upload — S2.10 follow-up D7). When a route
+    /// records its response under a key, subsequent calls within the
+    /// TTL window can fetch the same body verbatim instead of
+    /// re-executing the handler. Routes that don't need cached
+    /// responses (provisioning) simply skip `cacheResponse` and rely
+    /// on `recordIfNew` alone.
+    responses: std.StringHashMapUnmanaged(CachedResponse) = .empty,
 
-    pub fn init(ttl_secs: u64) IdempotencyStore {
+    /// Per-instance ceilings. Both maps share the same cap so a single
+    /// attacker pushing unique keys cannot blow either side individually.
+    /// The cap is large enough that legitimate burst traffic (a 10K-user
+    /// pod with one in-flight retry each) never trips it but small enough
+    /// that even at MAX_CACHED_BODY_BYTES per entry the memory ceiling
+    /// stays under ~1 GB.
+    pub const MAX_ENTRIES: usize = 10_000;
+    /// Max cached response body, in bytes. Bodies bigger than this are
+    /// not stored — the next retry re-runs the handler instead of
+    /// replaying a huge cached payload. Picked at 64 KB which is
+    /// comfortably above attachment-upload JSON ack sizes but well
+    /// below any plausible attacker-controlled limit.
+    pub const MAX_CACHED_BODY_BYTES: usize = 64 * 1024;
+
+    pub const CachedResponse = struct {
+        status: []const u8,
+        body: []const u8,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, ttl_secs: u64) IdempotencyStore {
         return .{
+            .allocator = allocator,
             .ttl_ns = @as(i128, @intCast(@max(ttl_secs, 1))) * 1_000_000_000,
-            .keys = .empty,
         };
     }
 
-    pub fn deinit(self: *IdempotencyStore, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *IdempotencyStore) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         var it = self.keys.iterator();
         while (it.next()) |entry| {
-            allocator.free(@constCast(entry.key_ptr.*));
+            self.allocator.free(@constCast(entry.key_ptr.*));
         }
-        self.keys.deinit(allocator);
+        self.keys.deinit(self.allocator);
+        var rit = self.responses.iterator();
+        while (rit.next()) |entry| {
+            self.allocator.free(@constCast(entry.key_ptr.*));
+            self.allocator.free(@constCast(entry.value_ptr.*.status));
+            self.allocator.free(@constCast(entry.value_ptr.*.body));
+        }
+        self.responses.deinit(self.allocator);
+    }
+
+    fn sweepExpired(self: *IdempotencyStore, cutoff: i128) void {
+        var iter = self.keys.iterator();
+        var to_remove: std.ArrayList([]const u8) = .empty;
+        defer to_remove.deinit(self.allocator);
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* < cutoff) {
+                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
+            }
+        }
+        // ORDERING IS LOAD-BEARING: `to_remove` holds borrowed pointers
+        // into the keys map's storage. `keys.fetchRemove(k)` returns the
+        // same pointer (the slice that was stored in the map) and we
+        // then free it. If we processed `keys` first, the next
+        // `responses.fetchRemove(k)` would read freed bytes. Process
+        // `responses` first so each `k` lookup happens before its
+        // canonical bytes are freed.
+        for (to_remove.items) |k| {
+            if (self.responses.fetchRemove(k)) |removed| {
+                self.allocator.free(@constCast(removed.key));
+                self.allocator.free(@constCast(removed.value.status));
+                self.allocator.free(@constCast(removed.value.body));
+            }
+            if (self.keys.fetchRemove(k)) |removed| {
+                self.allocator.free(@constCast(removed.key));
+            }
+        }
     }
 
     /// Returns true if this key is new and is now recorded.
-    /// Returns false if this is a duplicate.
-    pub fn recordIfNew(self: *IdempotencyStore, allocator: std.mem.Allocator, key: []const u8) bool {
+    /// Returns false if this is a duplicate. At-cap inserts are
+    /// rejected as duplicates rather than allowed silently — preserves
+    /// the at-most-once invariant.
+    pub fn recordIfNew(self: *IdempotencyStore, key: []const u8) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         const now = std.time.nanoTimestamp();
         const cutoff = now - self.ttl_ns;
+        self.sweepExpired(cutoff);
 
-        // Clean expired keys (simple sweep)
-        var iter = self.keys.iterator();
-        var to_remove: std.ArrayList([]const u8) = .empty;
-        defer to_remove.deinit(allocator);
-        while (iter.next()) |entry| {
-            if (entry.value_ptr.* < cutoff) {
-                to_remove.append(allocator, entry.key_ptr.*) catch continue;
-            }
-        }
-        for (to_remove.items) |k| {
-            if (self.keys.fetchRemove(k)) |removed| {
-                allocator.free(@constCast(removed.key));
-            }
-        }
-
-        // Check if already present
         if (self.keys.get(key)) |_| return false;
 
-        // Record new key
-        const key_copy = allocator.dupe(u8, key) catch return true;
-        self.keys.put(allocator, key_copy, now) catch {
-            allocator.free(key_copy);
+        // Hard cap — if we're already at MAX_ENTRIES after a sweep,
+        // refuse the insert. Returning false (treat as duplicate)
+        // keeps callers' code paths short-circuiting instead of
+        // running the mutating handler again, which is the safer
+        // failure mode under load.
+        if (self.keys.count() >= MAX_ENTRIES) return false;
+
+        const key_copy = self.allocator.dupe(u8, key) catch return true;
+        self.keys.put(self.allocator, key_copy, now) catch {
+            self.allocator.free(key_copy);
             return true;
         };
         return true;
+    }
+
+    /// Look up a cached response for this key. Returned `CachedResponse`
+    /// contains BORROWED slices owned by the store; the caller MUST
+    /// dupe them into route-scoped memory before handing them off to
+    /// a RouteResponse — otherwise a concurrent TTL sweep can free the
+    /// underlying bytes while the response is still being serialized
+    /// to the wire. Callers that need ownership can use the convenience
+    /// helper `fetchCachedOwned` below.
+    pub fn fetchCached(self: *IdempotencyStore, key: []const u8) ?CachedResponse {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.responses.get(key)) |cached| return cached;
+        return null;
+    }
+
+    /// Like `fetchCached` but returns slices owned by `dest_allocator`
+    /// so the caller can hand them to a RouteResponse without worrying
+    /// about the store's TTL sweep. Caller frees both `status` and
+    /// `body`.
+    pub fn fetchCachedOwned(
+        self: *IdempotencyStore,
+        dest_allocator: std.mem.Allocator,
+        key: []const u8,
+    ) ?CachedResponse {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const cached = self.responses.get(key) orelse return null;
+        const owned_status = dest_allocator.dupe(u8, cached.status) catch return null;
+        const owned_body = dest_allocator.dupe(u8, cached.body) catch {
+            dest_allocator.free(owned_status);
+            return null;
+        };
+        return .{ .status = owned_status, .body = owned_body };
+    }
+
+    /// Cache a (status, body) pair under this key so a retry can fetch
+    /// the same response verbatim. Best-effort: alloc failures silently
+    /// skip the cache (the route still returned the response to the
+    /// original caller; a future retry will re-run the handler).
+    /// Bodies larger than MAX_CACHED_BODY_BYTES are also silently
+    /// skipped — the next retry just re-runs the handler.
+    pub fn cacheResponse(
+        self: *IdempotencyStore,
+        key: []const u8,
+        status: []const u8,
+        body: []const u8,
+    ) void {
+        if (body.len > MAX_CACHED_BODY_BYTES) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.responses.get(key)) |_| return; // already cached — preserve first-write
+        if (self.responses.count() >= MAX_ENTRIES) {
+            // At cap. Try a sweep before giving up; if still over,
+            // skip the cache. This converges under sustained load
+            // without dropping the original response on the floor.
+            const cutoff = std.time.nanoTimestamp() - self.ttl_ns;
+            self.sweepExpired(cutoff);
+            if (self.responses.count() >= MAX_ENTRIES) return;
+        }
+        const owned_key = self.allocator.dupe(u8, key) catch return;
+        const owned_status = self.allocator.dupe(u8, status) catch {
+            self.allocator.free(owned_key);
+            return;
+        };
+        const owned_body = self.allocator.dupe(u8, body) catch {
+            self.allocator.free(owned_key);
+            self.allocator.free(owned_status);
+            return;
+        };
+        self.responses.put(self.allocator, owned_key, .{
+            .status = owned_status,
+            .body = owned_body,
+        }) catch {
+            self.allocator.free(owned_key);
+            self.allocator.free(owned_status);
+            self.allocator.free(owned_body);
+        };
     }
 };
 
@@ -1004,7 +1145,7 @@ pub const GatewayState = struct {
         return .{
             .allocator = allocator,
             .rate_limiter = GatewayRateLimiter.init(10, 30),
-            .idempotency = IdempotencyStore.init(300),
+            .idempotency = IdempotencyStore.init(allocator, 300),
             .secret_tokens = secret_vault.TokenStore.init(allocator, secret_vault.DEFAULT_TTL_SECS),
             .trace_share_store = TraceShareStore.init(allocator),
             .whatsapp_verify_token = verify_token,
@@ -1024,7 +1165,7 @@ pub const GatewayState = struct {
             worker.join();
         }
         self.rate_limiter.deinit(self.allocator);
-        self.idempotency.deinit(self.allocator);
+        self.idempotency.deinit();
         self.secret_tokens.deinit();
         self.trace_share_store.deinit();
         self.user_preparation_gate.deinit();
@@ -3120,12 +3261,11 @@ pub const IdempotencyCheck = enum {
 /// memory. See `IdempotencyStore` for the TTL sweep logic.
 pub fn checkIdempotency(
     state: *GatewayState,
-    allocator: std.mem.Allocator,
     raw_request: []const u8,
 ) IdempotencyCheck {
     const key = extractIdempotencyKey(raw_request) orelse return .none;
     if (key.len == 0 or key.len > 256) return .invalid;
-    return if (state.idempotency.recordIfNew(allocator, key)) .new else .duplicate;
+    return if (state.idempotency.recordIfNew(key)) .new else .duplicate;
 }
 
 /// Extract the bearer token from an Authorization header value.
@@ -16514,7 +16654,7 @@ fn handleApiRoute(
         // re-run the provisioning pipeline (user_cell ensure, state
         // allocation, scaffold) end-to-end. With a key attached, the
         // second call short-circuits to an at-most-once ack.
-        switch (checkIdempotency(state, req_allocator, raw_request)) {
+        switch (checkIdempotency(state, raw_request)) {
             .duplicate => return .{ .status = "200 OK", .body = "{\"status\":\"duplicate\",\"detail\":\"already provisioned within idempotency window\"}" },
             .invalid => return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_idempotency_key\",\"detail\":\"Idempotency-Key must be 1..=256 bytes\"}" },
             .none, .new => {},
@@ -17606,7 +17746,7 @@ fn handleApiRoute(
     // Writes to {workspace_path}/attachments/<safe_name>. Agent reads via
     // the file_read tool with path "attachments/<safe_name>".
     if (std.mem.eql(u8, parsed.subpath, "attachments")) {
-        return handleAttachmentUpload(req_allocator, method, raw_request, &user_ctx);
+        return handleAttachmentUpload(req_allocator, method, raw_request, &user_ctx, state);
     }
 
     // ── Exports (Wave 2A artifact-export bridge) ───────────────────────
@@ -18190,6 +18330,21 @@ fn isSafeAttachmentFilename(name: []const u8) bool {
 /// Writes decoded bytes to {workspace_path}/attachments/{filename}.
 /// Returns: {"path":"attachments/<filename>","bytes":<n>}
 ///
+/// Idempotency (D7 closure, 2026-05-28):
+///   - `Idempotency-Key` header is honored in soft mode: missing header
+///     proceeds with normal upload semantics (existing-client compatibility).
+///   - Key present + duplicate → the first response (status + body) is
+///     served verbatim out of `state.idempotency.responses`. The file is
+///     NOT re-written, so a retry with the same key cannot unsafely
+///     overwrite the first upload's content even if the body carries a
+///     different `content_b64`.
+///   - Key present + new → upload proceeds, the response is cached on
+///     success (200 OK only), and a subsequent retry within the TTL
+///     window short-circuits to the cached response.
+///   - Key present + invalid (empty or >256 bytes) → 400.
+///   - Error responses (400/413/500) are NOT cached so a transient
+///     failure does not lock the client out of retrying.
+///
 /// Security:
 /// - Filename must match isSafeAttachmentFilename (no /, no .., no hidden).
 /// - Max decoded size: 20 MB (matches multimodal cap).
@@ -18200,10 +18355,70 @@ fn handleAttachmentUpload(
     method: []const u8,
     raw_request: []const u8,
     user_ctx: *const UserContext,
+    state: *GatewayState,
 ) RouteResponse {
     if (!std.mem.eql(u8, method, "POST")) {
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
     }
+
+    // Idempotency-Key dedupe: if a key is present we honor it. Cached
+    // hit short-circuits BEFORE any body parsing so a retry never even
+    // touches the filesystem.
+    //
+    // Cross-user-leak guard (review finding 2026-05-28): the
+    // IdempotencyStore is gateway-wide, so two different users sending
+    // the same `Idempotency-Key` header would otherwise collide. We
+    // namespace the key with the user_id from the resolved UserContext
+    // BEFORE looking up the cache, so each user has a private dedupe
+    // window. Filenames are user-supplied + often PII; sharing the
+    // cached response body across users would leak a filename even
+    // though the actual file content stays on the original uploader's
+    // workspace.
+    const idem_key_opt = extractIdempotencyKey(raw_request);
+    var namespaced_key_buf: [320]u8 = undefined;
+    const namespaced_key_opt: ?[]const u8 = if (idem_key_opt) |idem_key| blk: {
+        if (idem_key.len == 0 or idem_key.len > 256) {
+            break :blk null;
+        }
+        // 320 bytes = "attachments:" (12) + user_id (≤ 64) + ":" + key (≤ 256). The
+        // user_id sanitation upstream of dispatch keeps it within numeric / opaque
+        // bounds; clamp defensively here.
+        const uid_clamped = if (user_ctx.user_id.len <= 64)
+            user_ctx.user_id
+        else
+            user_ctx.user_id[0..64];
+        break :blk std.fmt.bufPrint(
+            &namespaced_key_buf,
+            "attachments:{s}:{s}",
+            .{ uid_clamped, idem_key },
+        ) catch null;
+    } else null;
+    if (idem_key_opt) |idem_key| {
+        if (idem_key.len == 0 or idem_key.len > 256) {
+            return .{
+                .status = "400 Bad Request",
+                .body = "{\"error\":\"invalid_idempotency_key\",\"detail\":\"Idempotency-Key must be 1..=256 bytes\"}",
+            };
+        }
+        if (namespaced_key_opt) |ns_key| {
+            // Dupe the body into the route-scoped allocator BEFORE the
+            // store lock drops — protects against a concurrent TTL
+            // sweep freeing the bytes while we serialize them onto the
+            // wire. We don't bother with the cached status: this route
+            // only caches 200 OK responses, so we emit the literal at
+            // the return site. Keeping the response status as a string
+            // literal also sidesteps the question of who frees a
+            // heap-allocated `RouteResponse.status` downstream (callers
+            // assume `.status` is a literal across the codebase).
+            if (state.idempotency.fetchCached(ns_key)) |cached| {
+                const body_copy = allocator.dupe(u8, cached.body) catch {
+                    return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"alloc_failed\"}" };
+                };
+                return .{ .status = "200 OK", .body = body_copy };
+            }
+        }
+    }
+
     const body = extractBody(raw_request) orelse {
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing body\"}" };
     };
@@ -18269,6 +18484,17 @@ fn handleAttachmentUpload(
         "{{\"path\":\"attachments/{s}\",\"bytes\":{d}}}",
         .{ filename, decoded_len },
     ) catch "{\"error\":\"response build failed\"}";
+
+    // Cache the successful response under the namespaced idempotency
+    // key so the next retry within the TTL window short-circuits to
+    // the same body without re-touching the filesystem. We cache the
+    // original allocPrint failure literal too — it is a static string,
+    // harmlessly cached. The store owns its allocator, so calling code
+    // does NOT need to pass `allocator` (which is the request arena
+    // and would dangle the moment the arena drops).
+    if (namespaced_key_opt) |ns_key| {
+        state.idempotency.cacheResponse(ns_key, "200 OK", resp);
+    }
     return .{ .body = resp };
 }
 
@@ -18715,7 +18941,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 var key_buf: [192]u8 = undefined;
                 const dedupe_scope = if (scoped_user_id) |uid| uid else tg_account_id;
                 const key = std.fmt.bufPrint(&key_buf, "telegram:update:{s}:{d}", .{ dedupe_scope, update_id }) catch "telegram:update:invalid";
-                if (!ctx.state.idempotency.recordIfNew(ctx.state.allocator, key)) {
+                if (!ctx.state.idempotency.recordIfNew(key)) {
                     ctx.response_body = "{\"status\":\"duplicate\"}";
                     return;
                 }
@@ -20836,7 +21062,7 @@ pub fn runWithRole(
             cfg.gateway.pair_rate_limit_per_minute,
             cfg.gateway.webhook_rate_limit_per_minute,
         );
-        state.idempotency = IdempotencyStore.init(cfg.gateway.idempotency_ttl_secs);
+        state.idempotency = IdempotencyStore.init(state.allocator, cfg.gateway.idempotency_ttl_secs);
         state.pairing_guard = try PairingGuard.init(
             allocator,
             cfg.gateway.require_pairing,
@@ -21255,22 +21481,22 @@ test "gateway rate limiter blocks after limit" {
 }
 
 test "idempotency store rejects duplicate key" {
-    var store = IdempotencyStore.init(30);
-    defer store.deinit(std.testing.allocator);
+    var store = IdempotencyStore.init(std.testing.allocator, 30);
+    defer store.deinit();
 
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "req-1"));
-    try std.testing.expect(!store.recordIfNew(std.testing.allocator, "req-1"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "req-2"));
+    try std.testing.expect(store.recordIfNew("req-1"));
+    try std.testing.expect(!store.recordIfNew("req-1"));
+    try std.testing.expect(store.recordIfNew("req-2"));
 }
 
 test "idempotency store allows different keys" {
-    var store = IdempotencyStore.init(300);
-    defer store.deinit(std.testing.allocator);
+    var store = IdempotencyStore.init(std.testing.allocator, 300);
+    defer store.deinit();
 
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "a"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "b"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "c"));
-    try std.testing.expect(!store.recordIfNew(std.testing.allocator, "a"));
+    try std.testing.expect(store.recordIfNew("a"));
+    try std.testing.expect(store.recordIfNew("b"));
+    try std.testing.expect(store.recordIfNew("c"));
+    try std.testing.expect(!store.recordIfNew("a"));
 }
 
 test "extractIdempotencyKey reads the header case-insensitively (S2.10)" {
@@ -21341,55 +21567,55 @@ test "gateway rate limiter zero limits always allow" {
 }
 
 test "idempotency store init with various TTLs" {
-    var store1 = IdempotencyStore.init(1);
-    defer store1.deinit(std.testing.allocator);
+    var store1 = IdempotencyStore.init(std.testing.allocator, 1);
+    defer store1.deinit();
     try std.testing.expect(store1.ttl_ns > 0);
 
-    var store2 = IdempotencyStore.init(3600);
-    defer store2.deinit(std.testing.allocator);
+    var store2 = IdempotencyStore.init(std.testing.allocator, 3600);
+    defer store2.deinit();
     try std.testing.expect(store2.ttl_ns > store1.ttl_ns);
 }
 
 test "idempotency store zero TTL treated as 1 second" {
-    var store = IdempotencyStore.init(0);
-    defer store.deinit(std.testing.allocator);
+    var store = IdempotencyStore.init(std.testing.allocator, 0);
+    defer store.deinit();
     // Should use @max(0, 1) = 1 second
     try std.testing.expectEqual(@as(i128, 1_000_000_000), store.ttl_ns);
 }
 
 test "idempotency store many unique keys" {
-    var store = IdempotencyStore.init(300);
-    defer store.deinit(std.testing.allocator);
+    var store = IdempotencyStore.init(std.testing.allocator, 300);
+    defer store.deinit();
 
     // Use distinct string literals to avoid buffer aliasing
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "key-alpha"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "key-beta"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "key-gamma"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "key-delta"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "key-epsilon"));
+    try std.testing.expect(store.recordIfNew("key-alpha"));
+    try std.testing.expect(store.recordIfNew("key-beta"));
+    try std.testing.expect(store.recordIfNew("key-gamma"));
+    try std.testing.expect(store.recordIfNew("key-delta"));
+    try std.testing.expect(store.recordIfNew("key-epsilon"));
 }
 
 test "idempotency store duplicate after many inserts" {
-    var store = IdempotencyStore.init(300);
-    defer store.deinit(std.testing.allocator);
+    var store = IdempotencyStore.init(std.testing.allocator, 300);
+    defer store.deinit();
 
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "first"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "second"));
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "third"));
+    try std.testing.expect(store.recordIfNew("first"));
+    try std.testing.expect(store.recordIfNew("second"));
+    try std.testing.expect(store.recordIfNew("third"));
     // First key should still be duplicate
-    try std.testing.expect(!store.recordIfNew(std.testing.allocator, "first"));
+    try std.testing.expect(!store.recordIfNew("first"));
 }
 
 test "idempotency store copies transient key memory" {
-    var store = IdempotencyStore.init(300);
-    defer store.deinit(std.testing.allocator);
+    var store = IdempotencyStore.init(std.testing.allocator, 300);
+    defer store.deinit();
 
     var key_buf: [32]u8 = undefined;
     const transient_key = try std.fmt.bufPrint(&key_buf, "req-{d}", .{123});
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, transient_key));
+    try std.testing.expect(store.recordIfNew(transient_key));
 
     @memset(&key_buf, 'x');
-    try std.testing.expect(!store.recordIfNew(std.testing.allocator, "req-123"));
+    try std.testing.expect(!store.recordIfNew("req-123"));
 }
 
 test "rate limiter copies transient key memory" {
@@ -27469,14 +27695,246 @@ test "baseline: SlidingWindowRateLimiter tracks requests within window" {
 }
 
 test "baseline: IdempotencyStore deduplicates keys" {
-    var store = IdempotencyStore.init(300);
-    defer store.deinit(std.testing.allocator);
+    var store = IdempotencyStore.init(std.testing.allocator, 300);
+    defer store.deinit();
     // First insert returns true (new)
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "req-1"));
+    try std.testing.expect(store.recordIfNew("req-1"));
     // Duplicate returns false
-    try std.testing.expect(!store.recordIfNew(std.testing.allocator, "req-1"));
+    try std.testing.expect(!store.recordIfNew("req-1"));
     // Different key returns true
-    try std.testing.expect(store.recordIfNew(std.testing.allocator, "req-2"));
+    try std.testing.expect(store.recordIfNew("req-2"));
+}
+
+test "IdempotencyStore caches response body and returns it on duplicate" {
+    var store = IdempotencyStore.init(std.testing.allocator, 300);
+    defer store.deinit();
+
+    // Miss before any write
+    try std.testing.expect(store.fetchCached("key-a") == null);
+
+    // Write a response
+    store.cacheResponse("key-a", "200 OK", "{\"path\":\"attachments/x.pdf\",\"bytes\":42}");
+
+    const hit_a = store.fetchCached("key-a");
+    try std.testing.expect(hit_a != null);
+    try std.testing.expectEqualStrings("200 OK", hit_a.?.status);
+    try std.testing.expectEqualStrings("{\"path\":\"attachments/x.pdf\",\"bytes\":42}", hit_a.?.body);
+
+    // Second cacheResponse on the same key is a no-op — preserves first-write.
+    store.cacheResponse("key-a", "500 Internal Server Error", "{\"error\":\"different\"}");
+    const hit_again = store.fetchCached("key-a");
+    try std.testing.expect(hit_again != null);
+    try std.testing.expectEqualStrings("200 OK", hit_again.?.status);
+    try std.testing.expectEqualStrings("{\"path\":\"attachments/x.pdf\",\"bytes\":42}", hit_again.?.body);
+
+    // Different key still misses.
+    try std.testing.expect(store.fetchCached("key-b") == null);
+}
+
+test "handleAttachmentUpload dedupes on Idempotency-Key retry" {
+    // Set up workspace tmpdir.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws);
+
+    // Minimal GatewayState — we only need the idempotency store.
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    // Minimal UserContext.
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, ws);
+    defer ctx.deinit(std.testing.allocator);
+
+    // First upload: small base64 of "hello\n" = aGVsbG8K
+    const body_first =
+        "POST /api/v1/users/1/attachments HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Idempotency-Key: upload-X1\r\n" ++
+        "Content-Length: 56\r\n" ++
+        "\r\n" ++
+        "{\"filename\":\"first.txt\",\"content_b64\":\"aGVsbG8K\"}";
+
+    const resp1 = handleAttachmentUpload(std.testing.allocator, "POST", body_first, &ctx, &state);
+    defer if (resp1.body.len > 0) std.testing.allocator.free(resp1.body);
+    try std.testing.expectEqualStrings("200 OK", resp1.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp1.body, "\"path\":\"attachments/first.txt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp1.body, "\"bytes\":6") != null);
+
+    // Retry with the SAME key but a DIFFERENT filename + content. The
+    // cached response wins — the new content is NOT written and the
+    // response matches the first call's body exactly.
+    const body_retry =
+        "POST /api/v1/users/1/attachments HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Idempotency-Key: upload-X1\r\n" ++
+        "Content-Length: 60\r\n" ++
+        "\r\n" ++
+        "{\"filename\":\"second.txt\",\"content_b64\":\"YnllYnll\"}";
+    const resp2 = handleAttachmentUpload(std.testing.allocator, "POST", body_retry, &ctx, &state);
+    defer if (resp2.body.len > 0) std.testing.allocator.free(resp2.body);
+    try std.testing.expectEqualStrings("200 OK", resp2.status);
+    try std.testing.expectEqualStrings(resp1.body, resp2.body);
+
+    // Crucially: the second filename was NOT created on disk — the
+    // dedupe short-circuited before any filesystem touch.
+    const second_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/attachments/second.txt", .{ws});
+    defer std.testing.allocator.free(second_path);
+    if (std.fs.openFileAbsolute(second_path, .{})) |f| {
+        defer f.close();
+        // The whole point of the dedupe is that this file MUST NOT
+        // exist. If it does, the dedupe was bypassed — fail loud.
+        try std.testing.expect(false);
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    // A new key starts a fresh upload.
+    const body_new_key =
+        "POST /api/v1/users/1/attachments HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Idempotency-Key: upload-X2\r\n" ++
+        "Content-Length: 60\r\n" ++
+        "\r\n" ++
+        "{\"filename\":\"third.txt\",\"content_b64\":\"d29ybGQK\"}";
+    const resp3 = handleAttachmentUpload(std.testing.allocator, "POST", body_new_key, &ctx, &state);
+    defer if (resp3.body.len > 0) std.testing.allocator.free(resp3.body);
+    try std.testing.expectEqualStrings("200 OK", resp3.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp3.body, "\"path\":\"attachments/third.txt\"") != null);
+}
+
+test "handleAttachmentUpload rejects empty Idempotency-Key with 400" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, ws);
+    defer ctx.deinit(std.testing.allocator);
+
+    const req =
+        "POST /api/v1/users/1/attachments HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Idempotency-Key: \r\n" ++
+        "Content-Length: 56\r\n" ++
+        "\r\n" ++
+        "{\"filename\":\"first.txt\",\"content_b64\":\"aGVsbG8K\"}";
+    const resp = handleAttachmentUpload(std.testing.allocator, "POST", req, &ctx, &state);
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid_idempotency_key") != null);
+}
+
+test "handleAttachmentUpload without Idempotency-Key still works (soft mode)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, ws);
+    defer ctx.deinit(std.testing.allocator);
+
+    const req =
+        "POST /api/v1/users/1/attachments HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Length: 56\r\n" ++
+        "\r\n" ++
+        "{\"filename\":\"plain.txt\",\"content_b64\":\"aGVsbG8K\"}";
+    const resp = handleAttachmentUpload(std.testing.allocator, "POST", req, &ctx, &state);
+    defer if (resp.body.len > 0) std.testing.allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"path\":\"attachments/plain.txt\"") != null);
+}
+
+test "handleAttachmentUpload idempotency cache is namespaced by user_id" {
+    // Same Idempotency-Key from two different users must NOT collide.
+    // The first user uploads a file; the second user retrying with the
+    // SAME key must NOT receive the first user's filename in the
+    // response (cross-user filename leak).
+    var tmp_a = std.testing.tmpDir(.{});
+    defer tmp_a.cleanup();
+    const ws_a = try tmp_a.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_a);
+    var tmp_b = std.testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+    const ws_b = try tmp_b.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_b);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var ctx_a = try makeExportTestUserCtx(std.testing.allocator, ws_a);
+    defer ctx_a.deinit(std.testing.allocator);
+    ctx_a.user_id = "111";
+    var ctx_b = try makeExportTestUserCtx(std.testing.allocator, ws_b);
+    defer ctx_b.deinit(std.testing.allocator);
+    ctx_b.user_id = "222";
+
+    const a_req =
+        "POST /api/v1/users/111/attachments HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Idempotency-Key: shared-key\r\n" ++
+        "Content-Length: 58\r\n" ++
+        "\r\n" ++
+        "{\"filename\":\"a_secret.pdf\",\"content_b64\":\"aGVsbG8K\"}";
+    const resp_a = handleAttachmentUpload(std.testing.allocator, "POST", a_req, &ctx_a, &state);
+    defer if (resp_a.body.len > 0) std.testing.allocator.free(resp_a.body);
+    try std.testing.expectEqualStrings("200 OK", resp_a.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp_a.body, "\"path\":\"attachments/a_secret.pdf\"") != null);
+
+    const b_req =
+        "POST /api/v1/users/222/attachments HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Idempotency-Key: shared-key\r\n" ++
+        "Content-Length: 60\r\n" ++
+        "\r\n" ++
+        "{\"filename\":\"b_innocent.txt\",\"content_b64\":\"d29ybGQK\"}";
+    const resp_b = handleAttachmentUpload(std.testing.allocator, "POST", b_req, &ctx_b, &state);
+    defer if (resp_b.body.len > 0) std.testing.allocator.free(resp_b.body);
+    try std.testing.expectEqualStrings("200 OK", resp_b.status);
+    // Critical: user B must NOT see user A's filename.
+    try std.testing.expect(std.mem.indexOf(u8, resp_b.body, "a_secret.pdf") == null);
+    // User B's own upload runs normally.
+    try std.testing.expect(std.mem.indexOf(u8, resp_b.body, "\"path\":\"attachments/b_innocent.txt\"") != null);
+
+    // Same user retrying their OWN key still dedupes correctly.
+    const a_retry =
+        "POST /api/v1/users/111/attachments HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Idempotency-Key: shared-key\r\n" ++
+        "Content-Length: 64\r\n" ++
+        "\r\n" ++
+        "{\"filename\":\"different.txt\",\"content_b64\":\"YmJiYg==\"}";
+    const resp_a2 = handleAttachmentUpload(std.testing.allocator, "POST", a_retry, &ctx_a, &state);
+    defer if (resp_a2.body.len > 0) std.testing.allocator.free(resp_a2.body);
+    try std.testing.expectEqualStrings("200 OK", resp_a2.status);
+    try std.testing.expectEqualStrings(resp_a.body, resp_a2.body);
+}
+
+test "IdempotencyStore rejects bodies larger than MAX_CACHED_BODY_BYTES" {
+    var store = IdempotencyStore.init(std.testing.allocator, 300);
+    defer store.deinit();
+
+    // Build a body just over the cap.
+    const big = try std.testing.allocator.alloc(u8, IdempotencyStore.MAX_CACHED_BODY_BYTES + 1);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    store.cacheResponse("oversize-key", "200 OK", big);
+    // The oversize body must not have been stored.
+    try std.testing.expect(store.fetchCached("oversize-key") == null);
+
+    // A body exactly at the cap is still acceptable.
+    const at_cap = try std.testing.allocator.alloc(u8, IdempotencyStore.MAX_CACHED_BODY_BYTES);
+    defer std.testing.allocator.free(at_cap);
+    @memset(at_cap, 'y');
+    store.cacheResponse("cap-key", "200 OK", at_cap);
+    const hit = store.fetchCached("cap-key");
+    try std.testing.expect(hit != null);
+    try std.testing.expectEqual(@as(usize, IdempotencyStore.MAX_CACHED_BODY_BYTES), hit.?.body.len);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -420,6 +420,57 @@ pub const SessionManager = struct {
         return self.sessions.get(session_key);
     }
 
+    /// Outcome of a backend-owned cancel request against an existing
+    /// session. The agent's CancellationToken is an atomic boolean
+    /// reset at the start of every turn, so cancel is safe to call
+    /// against an idle session — it just lands as a no-op on the next
+    /// reset. We surface whether the session was actively pinned so
+    /// the gateway can tell the FE whether real work was interrupted.
+    pub const CancelOutcome = enum {
+        cancellation_signalled_active,
+        cancellation_signalled_idle,
+        session_not_found,
+    };
+
+    /// Signal cooperative cancellation against the session's running
+    /// agent. Thread-safe: the SessionManager mutex is held only for
+    /// the lookup and the active_refs adjustment; the atomic store on
+    /// the CancellationToken does not require the lock and never
+    /// blocks on the in-flight turn (which holds `session.mutex`).
+    ///
+    /// Idempotent: repeated calls land the same atomic write. After
+    /// the turn finishes, the next turn's `reset()` clears the flag,
+    /// so a stale cancel never silently cancels a future user message.
+    ///
+    /// Shutdown ordering: callers must drain in-flight cancel requests
+    /// before SessionManager.deinit. The deinit path tears down every
+    /// session unconditionally without consulting active_refs, so a
+    /// cancel that arrives after deinit begins will dereference a freed
+    /// `session.agent`. In the gateway this is handled by the
+    /// pre-shutdown drain in `hasActiveTurns()` (see `src/gateway.zig`
+    /// around the maintenance loop).
+    pub fn cancelActiveTurn(self: *SessionManager, session_key: []const u8) CancelOutcome {
+        self.mutex.lock();
+        const session = self.sessions.get(session_key) orelse {
+            self.mutex.unlock();
+            return .session_not_found;
+        };
+        const was_active = session.active_refs > 0;
+        // Pin so the session pointer remains valid while we touch the
+        // cancellation_token. Without the pin a concurrent eviction
+        // could free the agent state under us.
+        session.active_refs += 1;
+        self.mutex.unlock();
+
+        session.agent.cancellation_token.cancel();
+
+        self.mutex.lock();
+        if (session.active_refs > 0) session.active_refs -= 1;
+        self.mutex.unlock();
+
+        return if (was_active) .cancellation_signalled_active else .cancellation_signalled_idle;
+    }
+
     pub fn getOrCreate(self: *SessionManager, session_key: []const u8) !*Session {
         return self.getOrCreateInternal(session_key, false);
     }
@@ -3066,6 +3117,48 @@ test "evictUserSessions counts active_refs as skipped" {
     try testing.expectEqual(@as(usize, 1), result.active_skipped);
     // Session remains in the map (still reachable for the in-flight turn).
     try testing.expectEqual(@as(usize, 1), sm.countUserSessions("55"));
+}
+
+test "cancelActiveTurn returns session_not_found for unknown session" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const outcome = sm.cancelActiveTurn("agent:zaki-bot:user:404:main");
+    try testing.expectEqual(SessionManager.CancelOutcome.session_not_found, outcome);
+}
+
+test "cancelActiveTurn signals cancel + reports active vs idle" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("agent:zaki-bot:user:99:main");
+
+    // Idle session — the token is reset on each turn so a cancel here is
+    // safe but reports `idle` so the gateway can communicate "no active
+    // turn was interrupted" to the FE.
+    try testing.expect(!session.agent.cancellation_token.isCancelled());
+    const idle_outcome = sm.cancelActiveTurn("agent:zaki-bot:user:99:main");
+    try testing.expectEqual(SessionManager.CancelOutcome.cancellation_signalled_idle, idle_outcome);
+    try testing.expect(session.agent.cancellation_token.isCancelled());
+
+    // Reset and simulate an in-flight turn pinning the session.
+    session.agent.cancellation_token.reset();
+    session.active_refs = 1;
+    defer session.active_refs = 0;
+
+    const active_outcome = sm.cancelActiveTurn("agent:zaki-bot:user:99:main");
+    try testing.expectEqual(SessionManager.CancelOutcome.cancellation_signalled_active, active_outcome);
+    try testing.expect(session.agent.cancellation_token.isCancelled());
+
+    // Idempotent — a second cancel produces the same outcome and the
+    // token stays set.
+    const second_outcome = sm.cancelActiveTurn("agent:zaki-bot:user:99:main");
+    try testing.expectEqual(SessionManager.CancelOutcome.cancellation_signalled_active, second_outcome);
+    try testing.expect(session.agent.cancellation_token.isCancelled());
 }
 
 test "getOrCreate enforces MAX_SESSIONS_PER_USER per user" {
