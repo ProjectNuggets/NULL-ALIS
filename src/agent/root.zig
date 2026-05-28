@@ -2003,13 +2003,35 @@ pub const Agent = struct {
     /// Owned snapshot of a tool call awaiting generic user approval.
     /// Strings are duped from the call so they survive across turns and
     /// are independent of model-response arenas.
+    ///
+    /// Sprint 2 (prod-readiness 2026-05-28) — added `approval_id`,
+    /// `created_at_unix` for the canonical UI binding contract:
+    ///
+    ///   * `approval_id` is a stable string the UI pins to a single
+    ///     approval card. Format: `apr-<u64>` (deterministic transform
+    ///     of `id`). FE sends it back in `POST /sessions/:key/approve`
+    ///     so a stale card cannot accidentally resolve a NEW pending
+    ///     approval that took the slot after a collision-reject.
+    ///   * `created_at_unix` powers the UI's "waiting Ns" countdown and
+    ///     is the anchor for future TTL enforcement (currently unused
+    ///     by the runtime; the field is the schema commitment).
+    ///   * `expires_at_unix` is null in V1 (no TTL sweep yet); the
+    ///     schema slot exists so the UI can render countdown when
+    ///     populated by V1.x.
     pub const PendingToolApproval = struct {
         id: u64,
+        /// Stable wire ID for the FE — `apr-<id>`. Heap-owned.
+        approval_id: []const u8,
         tool_name: []const u8,
         tool_call_id: ?[]const u8,
         arguments_json: []const u8,
         reason: []const u8,
         risk_level: tool_metadata.RiskLevel,
+        /// Unix epoch seconds — when the approval was created.
+        created_at_unix: i64,
+        /// Optional Unix epoch seconds — when the approval auto-expires.
+        /// V1 always-null (no TTL sweep). UI renders countdown when set.
+        expires_at_unix: ?i64 = null,
     };
 
     const ToolPreflightAllowed = struct {
@@ -2251,6 +2273,7 @@ pub const Agent = struct {
 
     pub fn clearPendingToolApproval(self: *Agent) void {
         const pending = self.pending_tool_approval orelse return;
+        self.allocator.free(pending.approval_id);
         self.allocator.free(pending.tool_name);
         if (pending.tool_call_id) |id| self.allocator.free(id);
         self.allocator.free(pending.arguments_json);
@@ -2285,13 +2308,25 @@ pub const Agent = struct {
         if (self.pending_tool_approval_id_counter == 0) self.pending_tool_approval_id_counter = 1;
         const new_id = self.pending_tool_approval_id_counter;
 
+        // Sprint 2 (2026-05-28) — derive a stable wire ID the FE can
+        // pin. Format `apr-<u64>`. The u64 is per-session (lives in
+        // `pending_tool_approval_id_counter`) so collisions can only
+        // happen within a single agent instance — and the
+        // `error.PendingToolApprovalAlreadyExists` reject above prevents
+        // overwrite while one is live.
+        const approval_id = try std.fmt.allocPrint(self.allocator, "apr-{d}", .{new_id});
+        errdefer self.allocator.free(approval_id);
+
         self.pending_tool_approval = .{
             .id = new_id,
+            .approval_id = approval_id,
             .tool_name = tool_name,
             .tool_call_id = tool_call_id_copy,
             .arguments_json = args_copy,
             .reason = reason_copy,
             .risk_level = meta.risk_level,
+            .created_at_unix = std.time.timestamp(),
+            .expires_at_unix = null,
         };
         return new_id;
     }
@@ -12526,6 +12561,65 @@ test "approval gate: second pending request does not overwrite the first" {
 
     // No second approval_required event was emitted.
     try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+}
+
+test "/approve <id> does not cross namespace from generic to legacy shell when generic is null" {
+    // S2 audit regression. `pending_exec_id` and
+    // `pending_tool_approval_id_counter` are independent u64 counters,
+    // so a numeric id captured by the gateway for a generic-namespace
+    // approval can coincidentally match a legacy shell pending. Pre-fix
+    // the canonical handler would fall through to the legacy branch
+    // and execute the shell command — the user clicked "Approve Tool X"
+    // and a shell command they never saw approved would run. The fix
+    // refuses to fall through when an id was supplied; the legacy plain
+    // form `/approve allow-once` still resolves shell approvals.
+    const allocator = std.testing.allocator;
+    const shell_impl = try allocator.create(tools_mod.shell.ShellTool);
+    shell_impl.* = .{ .workspace_dir = "." };
+    const shell_tool = shell_impl.tool();
+    defer shell_tool.deinit(allocator);
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{shell_tool},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    // Force the cross-namespace collision setup: generic is null, but
+    // a legacy shell pending exists with pending_exec_id=42 — the same
+    // id the gateway would have captured from a generic apr-42.
+    const exec_resp = (try agent.handleSlashCommand("/exec ask=always")).?;
+    defer allocator.free(exec_resp);
+    const pending_resp = (try agent.handleSlashCommand("/bash echo cross-namespace-canary")).?;
+    defer allocator.free(pending_resp);
+    try std.testing.expect(agent.pending_exec_command != null);
+    agent.pending_exec_id = 42;
+    try std.testing.expect(agent.pending_tool_approval == null);
+
+    // Gateway-style id-qualified slash (the fixed gateway always builds
+    // this form when the FE supplied approval_id) must NOT resolve the
+    // legacy pending, even though the numeric ids match by coincidence.
+    const approve_resp = (try agent.handleSlashCommand("/approve 42 allow-once")).?;
+    defer allocator.free(approve_resp);
+    try std.testing.expect(std.mem.startsWith(u8, approve_resp, "Approval id mismatch"));
+    // Legacy pending stays intact — the canonical handler did not run
+    // the shell command. The next plain `/approve allow-once` (no id)
+    // is the user's escape hatch to resolve the legacy slot.
+    try std.testing.expect(agent.pending_exec_command != null);
+    try std.testing.expectEqualStrings("echo cross-namespace-canary", agent.pending_exec_command.?);
+    try std.testing.expectEqual(@as(u64, 42), agent.pending_exec_id);
 }
 
 test "legacy shell /approve flow preserved when no generic pending approval" {
