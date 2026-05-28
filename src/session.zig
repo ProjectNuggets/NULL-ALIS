@@ -31,6 +31,8 @@ const MultiObserver = observability.MultiObserver;
 const tools_mod = @import("tools/root.zig");
 const Tool = tools_mod.Tool;
 const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
+const AutonomyLevel = @import("security/policy.zig").AutonomyLevel;
+const ExecutionMode = @import("agent/execution_mode.zig").ExecutionMode;
 const log = std.log.scoped(.session);
 const SESSION_LOCK_WAIT_STAGE = "session_lock_wait";
 const SESSION_LOCK_WAIT_WARN_MS: u64 = 50;
@@ -227,6 +229,9 @@ pub const SessionManager = struct {
         progress_observer: ?Observer = null,
         stream_callback: ?providers.StreamCallback = null,
         stream_ctx: ?*anyopaque = null,
+        turn_execution_mode: ?ExecutionMode = null,
+        turn_autonomy: ?AutonomyLevel = null,
+        turn_reasoning_effort: ?[]const u8 = null,
     };
 
     pub const OriginSnapshot = struct {
@@ -848,6 +853,34 @@ pub const SessionManager = struct {
             session.agent.observer.recordEvent(&lock_wait_event);
             if (lock_wait_ms >= SESSION_LOCK_WAIT_WARN_MS) {
                 log.warn("session.lock_wait session={s} wait_ms={d}", .{ session_key, lock_wait_ms });
+            }
+        }
+
+        const previous_execution_mode = session.agent.execution_mode;
+        const previous_reasoning_effort = session.agent.reasoning_effort;
+        const previous_policy = session.agent.policy;
+        var turn_policy = if (session.agent.policy) |policy| policy.* else SecurityPolicy{};
+        var turn_policy_applied = false;
+        if (options.turn_execution_mode) |mode| {
+            session.agent.execution_mode = mode;
+        }
+        if (options.turn_reasoning_effort) |effort| {
+            session.agent.reasoning_effort = effort;
+        }
+        if (options.turn_autonomy) |autonomy| {
+            turn_policy.autonomy = autonomy;
+            session.agent.policy = &turn_policy;
+            turn_policy_applied = true;
+        }
+        defer {
+            if (options.turn_execution_mode != null) {
+                session.agent.execution_mode = previous_execution_mode;
+            }
+            if (options.turn_reasoning_effort != null) {
+                session.agent.reasoning_effort = previous_reasoning_effort;
+            }
+            if (turn_policy_applied) {
+                session.agent.policy = previous_policy;
             }
         }
 

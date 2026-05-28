@@ -42,6 +42,7 @@ const zaki_postgres_memory = @import("memory/engines/zaki_postgres.zig");
 const subagent_mod = @import("subagent.zig");
 const observability = @import("observability.zig");
 const sentry_runtime = @import("sentry_runtime.zig");
+const execution_mode_mod = @import("agent/execution_mode.zig");
 
 // EMPTY_TURN_PLACEHOLDER const removed v1.14.13 Step 5 (Agent E). The V1.14.4
 // TurnOutcome refactor and V1.11 (Move 6) `tool_only_summary` + `done.tool_only_turn`
@@ -78,6 +79,12 @@ const tool_sandbox_v1 = @import("tools/tool_sandbox_v1.zig");
 const lane_metrics = @import("lane_metrics.zig");
 const extension_ws_server = @import("extension_ws/server.zig");
 const extension_ws_hub = @import("extension_ws/hub.zig");
+
+const ChatStreamTurnOptions = struct {
+    execution_mode: ?execution_mode_mod.ExecutionMode = null,
+    autonomy: ?security.AutonomyLevel = null,
+    reasoning_effort: ?[]const u8 = null,
+};
 const extension_ws_auth = @import("extension_ws/auth.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 // S7.13 — constant-time byte comparison for webhook secret verification.
@@ -1961,6 +1968,29 @@ const TenantRuntime = struct {
         stream_callback: ?providers.StreamCallback,
         stream_ctx: ?*anyopaque,
     ) ![]const u8 {
+        return self.processMessageWithTurnOptions(
+            session_key,
+            message,
+            conversation_context,
+            message_turn_context,
+            progress_observer,
+            stream_callback,
+            stream_ctx,
+            .{},
+        );
+    }
+
+    fn processMessageWithTurnOptions(
+        self: *TenantRuntime,
+        session_key: []const u8,
+        message: []const u8,
+        conversation_context: ?agent_prompt.ConversationContext,
+        message_turn_context: ?tools_mod.MessageTurnContext,
+        progress_observer: ?Observer,
+        stream_callback: ?providers.StreamCallback,
+        stream_ctx: ?*anyopaque,
+        turn_options: ChatStreamTurnOptions,
+    ) ![]const u8 {
         self.last_used_s.store(std.time.timestamp(), .release);
         const numeric_user_id = std.fmt.parseInt(i64, self.user_id, 10) catch null;
         tools_mod.setTenantContext(.{
@@ -1976,6 +2006,9 @@ const TenantRuntime = struct {
             .progress_observer = progress_observer,
             .stream_callback = stream_callback,
             .stream_ctx = stream_ctx,
+            .turn_execution_mode = turn_options.execution_mode,
+            .turn_autonomy = turn_options.autonomy,
+            .turn_reasoning_effort = turn_options.reasoning_effort,
         });
         return response;
     }
@@ -5225,6 +5258,63 @@ pub fn jsonStringField(json: []const u8, key: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+fn cleanJsonStringField(json: []const u8, key: []const u8) ?[]const u8 {
+    const value = jsonStringField(json, key) orelse return null;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    return if (trimmed.len > 0) trimmed else null;
+}
+
+fn parseChatStreamExecutionMode(body: []const u8) ?execution_mode_mod.ExecutionMode {
+    const raw = cleanJsonStringField(body, "mode") orelse return null;
+    return execution_mode_mod.ExecutionMode.fromString(raw);
+}
+
+fn parseChatStreamAutonomy(body: []const u8) ?security.AutonomyLevel {
+    const raw = cleanJsonStringField(body, "autonomy") orelse return null;
+    return security.AutonomyLevel.fromString(raw);
+}
+
+fn parseChatStreamReasoningEffort(body: []const u8) ?[]const u8 {
+    if (cleanJsonStringField(body, "reasoning_effort")) |raw| {
+        if (std.ascii.eqlIgnoreCase(raw, "low")) return "low";
+        if (std.ascii.eqlIgnoreCase(raw, "medium")) return "medium";
+        if (std.ascii.eqlIgnoreCase(raw, "high")) return "high";
+        if (std.ascii.eqlIgnoreCase(raw, "none")) return "none";
+    }
+    if (cleanJsonStringField(body, "assistant_mode")) |raw| {
+        if (std.ascii.eqlIgnoreCase(raw, "fast")) return "low";
+        if (std.ascii.eqlIgnoreCase(raw, "balanced")) return "medium";
+        if (std.ascii.eqlIgnoreCase(raw, "deep")) return "high";
+    }
+    return null;
+}
+
+fn parseChatStreamTurnOptions(body: []const u8) ChatStreamTurnOptions {
+    return .{
+        .execution_mode = parseChatStreamExecutionMode(body),
+        .autonomy = parseChatStreamAutonomy(body),
+        .reasoning_effort = parseChatStreamReasoningEffort(body),
+    };
+}
+
+test "chat stream turn options map zaki composer controls" {
+    const body =
+        \\{"message":"run it","mode":"review","autonomy":"read_only","reasoning_effort":"high"}
+    ;
+    const options = parseChatStreamTurnOptions(body);
+    try std.testing.expectEqual(execution_mode_mod.ExecutionMode.review, options.execution_mode.?);
+    try std.testing.expectEqual(security.AutonomyLevel.read_only, options.autonomy.?);
+    try std.testing.expectEqualStrings("high", options.reasoning_effort.?);
+}
+
+test "chat stream turn options map assistant mode fallback to reasoning effort" {
+    const body = "{\"message\":\"think\",\"assistant_mode\":\"deep\"}";
+    const options = parseChatStreamTurnOptions(body);
+    try std.testing.expect(options.execution_mode == null);
+    try std.testing.expect(options.autonomy == null);
+    try std.testing.expectEqualStrings("high", options.reasoning_effort.?);
 }
 
 /// Extract an integer field from a JSON blob.
@@ -9740,6 +9830,7 @@ fn handleApiChatStreamSseConnection(
         sendSseErrorResponse(stream, req_allocator, "400 Bad Request", code, msg);
         return true;
     };
+    const turn_options = parseChatStreamTurnOptions(body);
     _ = state.chat_stream_total.fetchAdd(1, .monotonic);
     recordChatStreamLane(state, session_key, user_id, state.tenant_enabled);
     var sse_stream = LockedSseStream(@TypeOf(stream)).init(stream);
@@ -9852,7 +9943,7 @@ fn handleApiChatStreamSseConnection(
             spend_usage_rt = tenant_runtime.usage_rt;
             session_weight_before = tenant_runtime.usage_rt.sessionWeight();
             // Tenant runtime path: stream tokens directly to SSE for live delivery.
-            break :blk .{ .ok = tenant_runtime.processMessage(
+            break :blk .{ .ok = tenant_runtime.processMessageWithTurnOptions(
                 session_key,
                 message,
                 .{
@@ -9868,6 +9959,7 @@ fn handleApiChatStreamSseConnection(
                 progress_observer,
                 if (is_live) liveStreamCallback else null,
                 if (is_live) @ptrCast(&live_ctx) else null,
+                turn_options,
             ) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                 break :blk .{ .err = .{ .code = "chat_failed", .msg = "chat failed" } };
@@ -9884,6 +9976,9 @@ fn handleApiChatStreamSseConnection(
                 .progress_observer = progress_observer,
                 .stream_callback = if (is_live) liveStreamCallback else null,
                 .stream_ctx = if (is_live) @ptrCast(&live_ctx) else null,
+                .turn_execution_mode = turn_options.execution_mode,
+                .turn_autonomy = turn_options.autonomy,
+                .turn_reasoning_effort = turn_options.reasoning_effort,
             }) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                 break :blk .{ .err = .{ .code = "chat_failed", .msg = "chat failed" } };
