@@ -2463,10 +2463,31 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     }
 
     // Spawn scheduler thread
+    //
+    // STACK SIZE: 2 MB. This thread runs the FULL agent turn synchronously via
+    // `runCronAgentTurnWithBus → SessionManager.processMessageWithContext →
+    // Agent.turnOutcome`, which then descends into provider calls, memory
+    // writes, and (critically) SQLite expression-code generation when the
+    // semantic_cache evicts. SQLite's recursive parser + codegen for the
+    // evictLru `LIMIT MAX(0, (SELECT COUNT(*) ...) - ?1)` form alone adds
+    // ~15 nested frames on top of an already-deep Zig call chain.
+    //
+    // History: this thread was originally 256 KB (sized for dispatch-only
+    // work). After we wired in-thread agent turn execution in v1.13, the
+    // 256 KB budget became unsafe. The symptom: SIGILL on byte-write
+    // translation fault (macOS reports stack-guard hits as SIGILL on arm64)
+    // deterministically inside `sqlite3ExprCodeTarget → memset`, observed
+    // ~2 min after gateway boot once cron first fires a cached agent turn.
+    // Four IPS crash dumps on 2026-05-28 all matched this exact site.
+    //
+    // Sizing: 2 MB matches the realistic peak (Agent.turnOutcome locals +
+    // provider call buffers + memory writes + SQLite codegen) with ~8× the
+    // historic budget and ~4× the comparable 512 KB threads. Cost is
+    // 1.75 MB extra RAM, single-process.
     var sched_thread: ?std.Thread = null;
     if (config.scheduler.enabled) {
         state.markRunning("scheduler");
-        if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, schedulerThread, .{ allocator, config, &state, &event_bus })) |thread| {
+        if (std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, schedulerThread, .{ allocator, config, &state, &event_bus })) |thread| {
             sched_thread = thread;
         } else |err| {
             state.markError("scheduler", @errorName(err));
