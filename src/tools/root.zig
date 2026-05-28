@@ -84,6 +84,7 @@ pub const memory_forget = @import("memory_forget.zig");
 pub const memory_archive = @import("memory_archive.zig");
 pub const memory_demote = @import("memory_demote.zig");
 pub const memory_purge_topic = @import("memory_purge_topic.zig");
+pub const memory_purge_pii = @import("memory_purge_pii.zig");
 pub const memory_maintain = @import("memory_maintain.zig");
 pub const time_now = @import("time_now.zig");
 pub const schedule = @import("schedule.zig");
@@ -510,6 +511,18 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // intended (heuristic protects against overly-short topics).
         // Local DB scan + delete — medium cost depending on scope.
         .name = memory_purge_topic.MemoryPurgeTopicTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+        .cost_class = .b,
+    },
+    .{
+        // D52 Pillar 4 (2026-05-28, prod-readiness Sprint 1) — bulk-delete
+        // memories tagged with detected PII categories. Mutating; medium
+        // risk because the user explicitly asked to forget personal data
+        // (cascading edges via the audited forgetMemory path keeps the
+        // graph consistent). Cost class b: per-key SQL DELETEs bounded
+        // by the matched rowset (typically <100).
+        .name = memory_purge_pii.MemoryPurgePiiTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
         .cost_class = .b,
@@ -1388,6 +1401,13 @@ pub fn allTools(
     mpt.* = .{};
     try list.append(allocator, mpt.tool());
 
+    // D52 Pillar 4 (2026-05-28) — bulk PII purge. state_mgr + user_id
+    // wired via bindStateMgrTenant; without them the tool returns a
+    // clean failure rather than crashing.
+    const mppt = try allocator.create(memory_purge_pii.MemoryPurgePiiTool);
+    mppt.* = .{};
+    try list.append(allocator, mppt.tool());
+
     // V1.9-5 — unified truth-maintenance toolkit. state_mgr +
     // user_id wired separately via bindStateMgrTenant.
     const mmt = try allocator.create(memory_maintain.MemoryMaintainTool);
@@ -2245,6 +2265,13 @@ pub fn bindStateMgrTenant(tools: []const Tool, state_mgr: ?*zaki_state.Manager, 
             const mt: *memory_maintain.MemoryMaintainTool = @ptrCast(@alignCast(t.ptr));
             mt.state_mgr = state_mgr;
             mt.user_id = user_id;
+        } else if (t.vtable == &memory_purge_pii.MemoryPurgePiiTool.vtable) {
+            // D52 Pillar 4 (2026-05-28) — PII-tagged bulk-delete needs
+            // tenant context to scope the SQL JSONB filter. Without it
+            // the tool returns a clean failure rather than crashing.
+            const mt: *memory_purge_pii.MemoryPurgePiiTool = @ptrCast(@alignCast(t.ptr));
+            mt.state_mgr = state_mgr;
+            mt.user_id = user_id;
         } else if (t.vtable == &memory_recall.MemoryRecallTool.vtable) {
             // V1.10-D — memory_recall needs tenant context to fetch the
             // supersede skip-set per call. Without it (non-postgres
@@ -2927,7 +2954,9 @@ test "all tools includes extras when enabled" {
     // + 4 artifact_* (Wave 2C: canvas/artifacts backend) = 51.
     // + 4 artifact_share/revoke/diff/history + 2 memory_doctor/trace_query
     //   (2026-05-25 surface-audit close) = 57.
-    try std.testing.expectEqual(@as(usize, 57), tools.len);
+    // + memory_purge_pii (D52 Pillar 4, prod-readiness Sprint 1,
+    //   2026-05-28) = 58.
+    try std.testing.expectEqual(@as(usize, 58), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -2960,7 +2989,9 @@ test "all tools excludes extras when disabled" {
     // + 4 artifact_* (Wave 2C) = 47
     // + 4 artifact_share/revoke/diff/history + 2 memory_doctor/trace_query
     //   (2026-05-25 surface-audit close) = 53.
-    try std.testing.expectEqual(@as(usize, 53), tools.len);
+    // + memory_purge_pii (D52 Pillar 4, prod-readiness Sprint 1,
+    //   2026-05-28) = 54.
+    try std.testing.expectEqual(@as(usize, 54), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -3100,7 +3131,8 @@ test "all tools includes message when event bus is available" {
     // Wave 2C: 4 artifact_* tools → 47.
     // 2026-05-25 surface-audit close: +4 artifact_share/revoke/diff/history
     // + 2 memory_doctor/trace_query → 53.
-    try std.testing.expectEqual(@as(usize, 53), tools.len);
+    // D52 Pillar 4 (prod-readiness Sprint 1, 2026-05-28): +memory_purge_pii → 54.
+    try std.testing.expectEqual(@as(usize, 54), tools.len);
 
     var found_message = false;
     for (tools) |t| {

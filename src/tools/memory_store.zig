@@ -8,6 +8,7 @@ const Memory = mem_root.Memory;
 const MemoryCategory = mem_root.MemoryCategory;
 const zaki_state = @import("../zaki_state.zig");
 const extraction_persist = @import("../agent/extraction_persist.zig");
+const pii_detect = @import("../memory/pii_detect.zig");
 
 /// Memory store tool — lets the agent persist facts to long-term memory.
 /// When a MemoryRuntime is available, also triggers vector sync after store.
@@ -132,11 +133,40 @@ pub const MemoryStoreTool = struct {
             return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         };
 
-        m.store(key, content, category, session_id) catch |err| {
-            std.log.scoped(.memory_store).warn("memory_store inline path failed key='{s}' err={s}", .{ key, @errorName(err) });
-            const msg = try std.fmt.allocPrint(allocator, "Failed to store memory '{s}': {s}", .{ key, @errorName(err) });
-            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
-        };
+        // D52 Pillar 2 (2026-05-28, prod-readiness Sprint 1) — when
+        // detection fires on the inline path (no triple supplied),
+        // route through `storeWithMetadata` so `metadata->'pii_tags'`
+        // is queryable by the `memory_purge_pii` tool. Backends without
+        // metadata support gracefully degrade — `storeWithMetadata`
+        // falls back to plain `store` (see memory/root.zig:1730). The
+        // triple path is already PII-tagged inside
+        // `extraction_persist.buildExtractionMetadata`.
+        const pii_flags = pii_detect.detect(content);
+        if (pii_flags.any()) {
+            var meta_buf: std.ArrayListUnmanaged(u8) = .{};
+            defer meta_buf.deinit(allocator);
+            const w = meta_buf.writer(allocator);
+            w.writeAll("{\"write_origin\":\"memory_store_tool\",") catch {
+                return ToolResult.fail("Failed to build PII metadata");
+            };
+            pii_detect.writeTagsJson(w, pii_flags) catch {
+                return ToolResult.fail("Failed to write PII tags");
+            };
+            w.writeAll("}") catch {
+                return ToolResult.fail("Failed to close PII metadata");
+            };
+            m.storeWithMetadata(key, content, category, session_id, meta_buf.items) catch |err| {
+                std.log.scoped(.memory_store).warn("memory_store inline+metadata path failed key='{s}' err={s}", .{ key, @errorName(err) });
+                const msg = try std.fmt.allocPrint(allocator, "Failed to store memory '{s}': {s}", .{ key, @errorName(err) });
+                return ToolResult{ .success = false, .error_msg = msg, .output = "" };
+            };
+        } else {
+            m.store(key, content, category, session_id) catch |err| {
+                std.log.scoped(.memory_store).warn("memory_store inline path failed key='{s}' err={s}", .{ key, @errorName(err) });
+                const msg = try std.fmt.allocPrint(allocator, "Failed to store memory '{s}': {s}", .{ key, @errorName(err) });
+                return ToolResult{ .success = false, .error_msg = msg, .output = "" };
+            };
+        }
 
         // Vector sync: embed and upsert. Surface the outcome to the agent
         // so it knows whether the memory is semantically retrievable yet
