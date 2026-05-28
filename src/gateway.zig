@@ -17540,6 +17540,18 @@ fn handleApiRoute(
         return handleAttachmentUpload(req_allocator, method, raw_request, &user_ctx);
     }
 
+    // ── Exports (Wave 2A artifact-export bridge) ───────────────────────
+    // GET /api/v1/users/{id}/exports/{filename}
+    // Streams a single produced file out of
+    // {workspace_path}/attachments/produced/. User-scoped (UserContext
+    // selection above this call enforces ownership) + filename traversal
+    // guarded. Mirrors handleAttachmentUpload but read-only and limited
+    // to the produced/ subdirectory.
+    if (std.mem.startsWith(u8, parsed.subpath, "exports/")) {
+        const filename = parsed.subpath["exports/".len..];
+        return handleArtifactExportDownload(req_allocator, method, filename, &user_ctx);
+    }
+
     // ── /brain/graph — V1.5 day-2 task 2B ────────────────────────────────
     // GET /api/v1/users/{id}/brain/graph[?since=<unix>&max_nodes=N&node_kinds=csv]
     // Returns nodes + edges (session, semantic, reference) for the user's
@@ -18189,6 +18201,81 @@ fn handleAttachmentUpload(
         .{ filename, decoded_len },
     ) catch "{\"error\":\"response build failed\"}";
     return .{ .body = resp };
+}
+
+/// GET /api/v1/users/{id}/exports/{filename}
+/// Streams a single file from {workspace_path}/attachments/produced/{filename}.
+/// User-scoped (the caller has already authenticated against this user_ctx);
+/// confined to the `produced/` subtree; filename safety enforced by
+/// isSafeAttachmentFilename (blocks .., /, hidden, control chars).
+///
+/// Response:
+///   200 OK + binary body, Content-Type derived from filename extension.
+///   400 if filename fails the safety check.
+///   404 if the file is not present in attachments/produced/.
+///   500 on I/O / alloc failure.
+fn handleArtifactExportDownload(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    filename: []const u8,
+    user_ctx: *const UserContext,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    if (!isSafeAttachmentFilename(filename)) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"unsafe_filename\"}" };
+    }
+
+    const path = std.fmt.allocPrint(
+        allocator,
+        "{s}/attachments/produced/{s}",
+        .{ user_ctx.workspace_path, filename },
+    ) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"path_build_failed\"}" };
+    };
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.IsDir, error.AccessDenied => return .{
+            .status = "404 Not Found",
+            .body = "{\"error\":\"export_not_found\"}",
+        },
+        else => return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"open_failed\"}" },
+    };
+    defer file.close();
+
+    const stat = file.stat() catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"stat_failed\"}" };
+    };
+    // 50 MB cap matches ProduceDocumentTool.MAX_OUTPUT_BYTES — files that
+    // could not have been produced by the bridge must not be served.
+    if (stat.size > 50 * 1024 * 1024) {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"file_too_large\"}" };
+    }
+
+    const body = allocator.alloc(u8, @intCast(stat.size)) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"alloc_failed\"}" };
+    };
+    const read = file.readAll(body) catch {
+        allocator.free(body);
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read_failed\"}" };
+    };
+    if (read != stat.size) {
+        allocator.free(body);
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"short_read\"}" };
+    }
+
+    // Derive Content-Type from the filename extension — produced files are
+    // named `<title>_<ts>_<rand>.<ext>` so extension matching is reliable.
+    const ext = blk: {
+        const dot = std.mem.lastIndexOfScalar(u8, filename, '.') orelse break :blk "";
+        break :blk filename[dot + 1 ..];
+    };
+    return .{
+        .body = body,
+        .content_type = producedContentType(ext),
+    };
 }
 
 /// POST /api/v1/users/{id}/voice/synthesize
