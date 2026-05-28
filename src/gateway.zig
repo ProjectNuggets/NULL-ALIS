@@ -34,6 +34,7 @@ const gdpr_mod = @import("gdpr.zig");
 const env_rebrand = @import("env_rebrand.zig");
 const providers = @import("providers/root.zig");
 const tools_mod = @import("tools/root.zig");
+const produce_document_mod = @import("tools/produce_document.zig");
 const mcp_mod = @import("mcp.zig");
 const memory_mod = @import("memory/root.zig");
 const importance_mod = @import("memory/importance.zig");
@@ -11411,25 +11412,178 @@ fn handleArtifactExport(
     user_id_str: []const u8,
     artifact_id: []const u8,
     target: []const u8,
+    user_ctx: *const UserContext,
+    config_opt: ?*const Config,
     state: *GatewayState,
 ) RouteResponse {
-    _ = allocator;
-    _ = state;
-    _ = user_id_str;
     if (!std.mem.eql(u8, method, "POST")) {
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
     }
     if (!isValidArtifactId(artifact_id)) {
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_artifact_id\"}" };
     }
-    // Wave 2A's `produce_document` tool is the eventual bridge target.
-    // Until it lands the endpoint returns 501 with the documented
-    // dependency so operators can detect "feature parked, not broken."
-    _ = target;
-    return .{
-        .status = "501 Not Implemented",
-        .body = "{\"error\":\"export_not_yet_available\",\"detail\":\"produce_document tool not yet wired; see Wave 2A\"}",
+    const numeric_user_id = parseNumericUserId(user_id_str) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
     };
+
+    // Allowlist matches `produce_document`'s `Format` enum; we validate
+    // up-front so a bad value returns 400 before we touch the DB.
+    const format_raw = parseQueryParam(target, "format") orelse "pdf";
+    if (!(std.mem.eql(u8, format_raw, "pdf") or
+        std.mem.eql(u8, format_raw, "docx") or
+        std.mem.eql(u8, format_raw, "pptx") or
+        std.mem.eql(u8, format_raw, "xlsx") or
+        std.mem.eql(u8, format_raw, "html")))
+    {
+        return .{
+            .status = "400 Bad Request",
+            .body = "{\"error\":\"invalid_format\",\"detail\":\"format must be one of: pdf, docx, pptx, xlsx, html\"}",
+        };
+    }
+
+    const state_mgr = state.zaki_state orelse {
+        return .{
+            .status = "503 Service Unavailable",
+            .body = "{\"error\":\"state_unavailable\",\"detail\":\"persistent state backend not configured; artifacts require postgres\"}",
+        };
+    };
+
+    // Ownership + existence check (mirrors handleArtifactGet at :11029).
+    const artifact_opt = state_mgr.getArtifactById(allocator, numeric_user_id, artifact_id) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read_failed\"}" };
+    };
+    if (artifact_opt == null) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"artifact_not_found\"}" };
+    }
+    var artifact = artifact_opt.?;
+    defer artifact.deinit(allocator);
+
+    const ver_opt = state_mgr.getArtifactVersion(allocator, numeric_user_id, artifact_id, null) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"version_read_failed\"}" };
+    };
+    if (ver_opt == null) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"version_not_found\"}" };
+    }
+    var ver = ver_opt.?;
+    defer ver.deinit(allocator);
+
+    // Build the tool args. We always use the safe `default` theme — branding
+    // is operator-owned and applies automatically when configured; the user's
+    // export request must NOT pick `thmanyah` (per §14.5 honesty gate).
+    var args = std.json.ObjectMap.init(allocator);
+    defer args.deinit();
+    args.put("format", std.json.Value{ .string = format_raw }) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
+    };
+    args.put("content", std.json.Value{ .string = ver.content }) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
+    };
+    args.put("title", std.json.Value{ .string = artifact.title }) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
+    };
+    args.put("theme", std.json.Value{ .string = "default" }) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
+    };
+
+    var pdt = produce_document_mod.ProduceDocumentTool{
+        .workspace_dir = user_ctx.workspace_path,
+        .branding = if (config_opt) |cfg| cfg.branding else .{},
+    };
+    const tool_result = pdt.execute(allocator, args) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"export_failed\",\"detail\":\"tool dispatch raised an error\"}" };
+    };
+    // Ownership: produce_document allocates `output` and `error_msg` with our
+    // allocator except for the four `.fail(<literal>)` paths in
+    // produce_document.zig — those return string literals that must NOT be
+    // freed. `isProduceDocumentLiteralError` recognizes that set.
+    defer {
+        if (tool_result.output.len > 0) allocator.free(tool_result.output);
+        if (tool_result.error_msg) |em| {
+            if (!isProduceDocumentLiteralError(em)) allocator.free(em);
+        }
+    }
+
+    if (!tool_result.success) {
+        const err = tool_result.error_msg orelse "render failed";
+        // Renderer-missing failures: surface 502 with `renderer_unavailable`
+        // so callers can distinguish "binary not installed in image" from
+        // "user-provided content was rejected". `produce_document` includes
+        // install-hint phrases like "install:" / "not found" / "Install" in
+        // those error strings.
+        const is_renderer_gap = std.mem.indexOf(u8, err, "install:") != null or
+            std.mem.indexOf(u8, err, "Install:") != null or
+            std.mem.indexOf(u8, err, "install ") != null or
+            std.mem.indexOf(u8, err, "not found") != null or
+            std.mem.indexOf(u8, err, "FileNotFound") != null or
+            std.mem.indexOf(u8, err, "marp-cli") != null or
+            std.mem.indexOf(u8, err, "pandoc") != null;
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        const w = out.writer(allocator);
+        if (is_renderer_gap) {
+            w.writeAll("{\"error\":\"renderer_unavailable\",\"detail\":\"") catch {
+                out.deinit(allocator);
+                return response_build_err;
+            };
+        } else {
+            w.writeAll("{\"error\":\"export_failed\",\"detail\":\"") catch {
+                out.deinit(allocator);
+                return response_build_err;
+            };
+        }
+        jsonEscapeInto(w, err) catch {
+            out.deinit(allocator);
+            return response_build_err;
+        };
+        w.writeAll("\"}") catch {
+            out.deinit(allocator);
+            return response_build_err;
+        };
+        const body = out.toOwnedSlice(allocator) catch {
+            out.deinit(allocator);
+            return response_build_err;
+        };
+        return .{
+            .status = if (is_renderer_gap) "502 Bad Gateway" else "500 Internal Server Error",
+            .body = body,
+        };
+    }
+
+    // Success — parse the produced filename out of the markdown link.
+    const filename = parseProducedFilename(tool_result.output) orelse {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"export_failed\",\"detail\":\"renderer succeeded but filename could not be parsed\"}" };
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"status\":\"exported\",\"artifact_id\":\"") catch return response_build_err;
+    jsonEscapeInto(w, artifact_id) catch return response_build_err;
+    w.writeAll("\",\"format\":\"") catch return response_build_err;
+    jsonEscapeInto(w, format_raw) catch return response_build_err;
+    w.writeAll("\",\"filename\":\"") catch return response_build_err;
+    jsonEscapeInto(w, filename) catch return response_build_err;
+    w.writeAll("\",\"path\":\"attachments/produced/") catch return response_build_err;
+    jsonEscapeInto(w, filename) catch return response_build_err;
+    w.writeAll("\",\"url\":\"/api/v1/users/") catch return response_build_err;
+    jsonEscapeInto(w, user_id_str) catch return response_build_err;
+    w.writeAll("/exports/") catch return response_build_err;
+    jsonEscapeInto(w, filename) catch return response_build_err;
+    w.writeAll("\",\"download_url\":\"/api/v1/users/") catch return response_build_err;
+    jsonEscapeInto(w, user_id_str) catch return response_build_err;
+    w.writeAll("/exports/") catch return response_build_err;
+    jsonEscapeInto(w, filename) catch return response_build_err;
+    w.writeAll("\"}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+/// Recognize the static-literal error strings `produce_document.ToolResult.fail()`
+/// uses, so the caller does NOT free them. Heap-allocated error strings (via
+/// allocPrint) are everything else and MUST be freed.
+fn isProduceDocumentLiteralError(em: []const u8) bool {
+    return std.mem.eql(u8, em, "Missing 'format' parameter (one of: pdf, docx, xlsx, pptx, html)") or
+        std.mem.eql(u8, em, "Missing 'content' parameter") or
+        std.mem.eql(u8, em, "'content' must not be empty") or
+        std.mem.eql(u8, em, "Workspace not configured — tool has no place to write the produced document");
 }
 
 fn handleArtifactShareGet(
@@ -17723,7 +17877,7 @@ fn handleApiRoute(
     //   PUT    /artifacts/:id                          → user edit
     //   POST   /artifacts/:id/share                    → mint share code
     //   DELETE /artifacts/:id/share                    → revoke share
-    //   POST   /artifacts/:id/export?format=...        → produce_document bridge (501)
+    //   POST   /artifacts/:id/export?format=pdf|docx|pptx|xlsx|html → produce_document bridge
     if (std.mem.eql(u8, parsed.subpath, "artifacts")) {
         const target = extractRequestTarget(raw_request) orelse base_path;
         return handleArtifactList(req_allocator, method, scoped_user_id, state, target);
@@ -17765,8 +17919,8 @@ fn handleApiRoute(
         }
 
         if (std.mem.eql(u8, suffix, "export")) {
-            const target = extractRequestTarget(raw_request) orelse base_path;
-            return handleArtifactExport(req_allocator, method, scoped_user_id, artifact_id, target, state);
+            const target_full = extractRequestTarget(raw_request) orelse base_path;
+            return handleArtifactExport(req_allocator, method, scoped_user_id, artifact_id, target_full, &user_ctx, config_opt, state);
         }
 
         // /v/:version → specific historical version.
@@ -29532,20 +29686,10 @@ test "Wave 2C: get endpoint rejects malformed artifact id" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid_artifact_id") != null);
 }
 
-test "Wave 2C: export endpoint stubs as 501 with documented dependency" {
-    var state = GatewayState.init(std.testing.allocator);
-    defer state.deinit();
-    const resp = handleArtifactExport(
-        std.testing.allocator,
-        "POST",
-        "1",
-        "00000000-0000-0000-0000-000000000000",
-        "POST /api/v1/users/1/artifacts/.../export?format=pdf HTTP/1.1",
-        &state,
-    );
-    try std.testing.expectEqualStrings("501 Not Implemented", resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "produce_document") != null);
-}
+// "Wave 2C: export endpoint stubs as 501" — removed in Wave 2A (this commit).
+// The export endpoint is now wired to ProduceDocumentTool; the new coverage
+// lives in the "Wave 2A — export bridge handler" block at the end of this
+// file.
 
 test "Wave 2C: PUT rejects empty content" {
     var state = GatewayState.init(std.testing.allocator);
