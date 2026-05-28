@@ -11866,6 +11866,14 @@ const TraceShare = struct {
     created_at_unix: i64,
     expires_at_unix: i64, // hard expiry; 0 means "never" (unused — we always set one)
     revoked: bool = false,
+    /// Sprint 3 (2026-05-28, prod-readiness) — sanitized JSON snapshot
+    /// of the trace events at share-create time. Owned. Empty when this
+    /// store is operating in legacy in-memory-only mode (no state_mgr
+    /// bound) — handleTraceShareGet then falls back to the RunTraceStore
+    /// resolver. When non-empty (PG-backed mode), the public GET returns
+    /// this verbatim, removing the restart-fragility of the resolver
+    /// path.
+    events_json: []u8 = "",
 
     fn isLive(self: *const TraceShare, now_unix: i64) bool {
         if (self.revoked) return false;
@@ -11877,22 +11885,49 @@ const TraceShare = struct {
         allocator.free(self.share_code);
         allocator.free(self.user_id);
         allocator.free(self.run_id);
+        if (self.events_json.len > 0) allocator.free(self.events_json);
         self.* = undefined;
     }
 };
 
-/// In-memory share registry. Two indices kept in sync:
+/// Share registry — in-memory cache with optional Postgres write-through.
+///
+/// Two indices kept in sync:
 ///   - `by_code`     — primary lookup for the public GET
 ///   - `by_owner`    — (user_id|run_id) → share_code, for the
 ///                     409-already-shared check and DELETE
+///
+/// Sprint 3 (2026-05-28, prod-readiness) — durability layer. When
+/// `state_mgr` is non-null (production path), every mutation writes
+/// through to the `trace_shares` table (migration 0003). On a public
+/// GET cache miss (e.g. after gateway restart), `getLive` falls back
+/// to `state_mgr.getTraceByShareCode` and rehydrates the in-memory
+/// cache. The result: share URLs survive restart even though the
+/// in-memory `RunTraceStore` does not (the snapshot is baked into the
+/// PG record at share-create time).
+///
+/// `state_mgr` is null in the legacy in-memory-only mode used by older
+/// unit tests — they exercise the cache semantics without exercising
+/// persistence. The new PG-gated tests in `src/zaki_state.zig` lock
+/// the persistence contract independently.
 const TraceShareStore = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
     by_code: std.StringHashMapUnmanaged(*TraceShare) = .empty,
     by_owner: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// Optional persistence binding. When set, createOrGet, revoke, and
+    /// getLive cache misses all route through state_mgr.
+    state_mgr: ?*zaki_state_mod.Manager = null,
 
     fn init(allocator: std.mem.Allocator) TraceShareStore {
         return .{ .allocator = allocator };
+    }
+
+    /// Sprint 3 (2026-05-28) — production constructor with PG-backed
+    /// persistence. Legacy `init` stays around for tests that exercise
+    /// pure in-memory behavior.
+    fn initWithPersistence(allocator: std.mem.Allocator, mgr: *zaki_state_mod.Manager) TraceShareStore {
+        return .{ .allocator = allocator, .state_mgr = mgr };
     }
 
     fn deinit(self: *TraceShareStore) void {
@@ -11926,16 +11961,75 @@ const TraceShareStore = struct {
     /// Look up by share_code. Returns null when missing OR when the
     /// record is revoked/expired — the public endpoint must not
     /// distinguish those cases (opacity is the point).
+    ///
+    /// Sprint 3 (2026-05-28) — on cache miss, when `state_mgr` is
+    /// bound, this also attempts a lazy fetch from PG via
+    /// `getTraceByShareCode`. If PG has a live record the in-memory
+    /// cache is repopulated (including the events_json snapshot) so
+    /// subsequent reads are O(1). This is the restart-recovery path
+    /// that closes the `ui-handoff.md` §7 P1 gap.
     fn getLive(self: *TraceShareStore, code: []const u8, now_unix: i64) ?TraceShareSnapshot {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const rec_ptr = self.by_code.get(code) orelse return null;
-        if (!rec_ptr.isLive(now_unix)) return null;
+
+        if (self.by_code.get(code)) |rec_ptr| {
+            if (!rec_ptr.isLive(now_unix)) return null;
+            return .{
+                .user_id = rec_ptr.user_id,
+                .run_id = rec_ptr.run_id,
+                .created_at_unix = rec_ptr.created_at_unix,
+                .expires_at_unix = rec_ptr.expires_at_unix,
+                .events_json = rec_ptr.events_json,
+            };
+        }
+
+        // Cache miss — try PG.
+        const mgr = self.state_mgr orelse return null;
+        var pg_row = (mgr.getTraceByShareCode(self.allocator, code, now_unix) catch |err| blk: {
+            log.warn("trace_share.lazy_load_failed code='{s}' err={s}", .{ code, @errorName(err) });
+            break :blk null;
+        }) orelse return null;
+
+        // Take ownership of the PG row's allocations by passing them
+        // straight into the TraceShare struct (no extra dupe).
+        // pg_row.share_code is parallel to `code` so prefer the PG copy
+        // for consistency with by_code's key requirement.
+        const user_id_str = std.fmt.allocPrint(self.allocator, "{d}", .{pg_row.user_id}) catch {
+            pg_row.deinit(self.allocator);
+            return null;
+        };
+
+        const rec = self.allocator.create(TraceShare) catch {
+            self.allocator.free(user_id_str);
+            pg_row.deinit(self.allocator);
+            return null;
+        };
+        rec.* = .{
+            .share_code = pg_row.share_code,
+            .user_id = user_id_str,
+            .run_id = pg_row.run_id,
+            .created_at_unix = pg_row.created_at_unix,
+            .expires_at_unix = pg_row.expires_at_unix,
+            .events_json = pg_row.events_json,
+        };
+
+        self.by_code.put(self.allocator, rec.share_code, rec) catch {
+            rec.deinit(self.allocator);
+            self.allocator.destroy(rec);
+            return null;
+        };
+        // Note: by_owner is NOT repopulated on lazy load. The composite
+        // (user_id, run_id) → code lookup is only needed for the auth'd
+        // POST/DELETE paths, which run under the live user's session and
+        // would re-mint the by_owner entry on first use. The public GET
+        // only consults by_code, which is now populated.
+
         return .{
-            .user_id = rec_ptr.user_id,
-            .run_id = rec_ptr.run_id,
-            .created_at_unix = rec_ptr.created_at_unix,
-            .expires_at_unix = rec_ptr.expires_at_unix,
+            .user_id = rec.user_id,
+            .run_id = rec.run_id,
+            .created_at_unix = rec.created_at_unix,
+            .expires_at_unix = rec.expires_at_unix,
+            .events_json = rec.events_json,
         };
     }
 
@@ -11948,12 +12042,18 @@ const TraceShareStore = struct {
     /// `MAX_LIVE_SHARES_PER_USER` live (non-revoked, non-expired)
     /// shares. Idempotent re-share of an existing live record is
     /// NEVER blocked by the cap (the share already counts toward it).
+    /// Sprint 3 (2026-05-28) — `events_json` is the sanitized JSON
+    /// snapshot at share-create time. Empty when the caller doesn't
+    /// supply one (legacy in-memory mode); non-empty in production so
+    /// the share record can be served from PG on cache miss after
+    /// restart. The store dupes its own copy.
     fn createOrGet(
         self: *TraceShareStore,
         user_id: []const u8,
         run_id: []const u8,
         ttl_hours: i64,
         now_unix: i64,
+        events_json: []const u8,
     ) !ShareCreateResult {
         const ttl_secs: i64 = ttl_hours * 3600;
         const expires_at = now_unix + ttl_secs;
@@ -12040,12 +12140,18 @@ const TraceShareStore = struct {
 
         const rec = try self.allocator.create(TraceShare);
         errdefer self.allocator.destroy(rec);
+        const events_owned: []u8 = if (events_json.len > 0)
+            try self.allocator.dupe(u8, events_json)
+        else
+            "";
+        errdefer if (events_owned.len > 0) self.allocator.free(events_owned);
         rec.* = .{
             .share_code = code_owned,
             .user_id = user_id_owned,
             .run_id = run_id_owned,
             .created_at_unix = now_unix,
             .expires_at_unix = expires_at,
+            .events_json = events_owned,
         };
 
         try self.by_code.put(self.allocator, code_owned, rec);
@@ -12054,6 +12160,31 @@ const TraceShareStore = struct {
         const code_for_owner = try self.allocator.dupe(u8, code_owned);
         errdefer self.allocator.free(code_for_owner);
         try self.by_owner.put(self.allocator, key_buf, code_for_owner);
+
+        // Sprint 3 — durability write-through. When state_mgr is bound
+        // AND the caller supplied a snapshot, persist to PG. The
+        // in-memory state remains the source of truth for cache-hit
+        // reads; PG is the source of truth on restart recovery.
+        if (self.state_mgr) |mgr| {
+            if (events_json.len > 0) {
+                // user_id arrives as a path-segment string; parse to i64
+                // for the PG column. Reject non-numeric user_ids by
+                // skipping persistence — this matches the production
+                // path where authenticated user_ids are always numeric
+                // and the legacy fixture/tests use synthetic strings
+                // that don't need to survive restart.
+                if (std.fmt.parseInt(i64, user_id, 10)) |uid| {
+                    mgr.setTraceShare(uid, run_id, code_owned, events_json, now_unix, expires_at) catch |err| {
+                        log.warn("trace_share.persist_failed user='{s}' run_id='{s}' err={s}", .{ user_id, run_id, @errorName(err) });
+                        // Fall through to return the in-memory record —
+                        // the share is live for THIS gateway instance.
+                        // The deferred-register has a row tracking the
+                        // "persist failed but in-mem succeeded" reconciliation
+                        // path for V1.x.
+                    };
+                } else |_| {}
+            }
+        }
 
         return .{
             .already_existed = false,
@@ -12065,21 +12196,51 @@ const TraceShareStore = struct {
     /// Revoke whatever share covers (user_id, run_id). Idempotent —
     /// returns true if a record was found (even if already revoked),
     /// false if there was nothing to revoke.
+    ///
+    /// Sprint 3 (2026-05-28) — when `state_mgr` is bound, ALSO writes
+    /// the revocation to PG via `clearTraceShare`. If only PG has the
+    /// share (cache cold after a recent restart), the PG path still
+    /// flips revoked=true so the public GET 404s on restart-recovery
+    /// lookup. Returns true if either layer found something to revoke.
     fn revoke(self: *TraceShareStore, user_id: []const u8, run_id: []const u8) !bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         const probe_key = try ownerKey(self.allocator, user_id, run_id);
         defer self.allocator.free(probe_key);
-        const code = self.by_owner.get(probe_key) orelse return false;
-        const rec = self.by_code.get(code) orelse return false;
-        rec.revoked = true;
-        return true;
+
+        var found_in_cache = false;
+        if (self.by_owner.get(probe_key)) |code| {
+            if (self.by_code.get(code)) |rec| {
+                rec.revoked = true;
+                found_in_cache = true;
+            }
+        }
+
+        var found_in_pg = false;
+        if (self.state_mgr) |mgr| {
+            if (std.fmt.parseInt(i64, user_id, 10)) |uid| {
+                found_in_pg = mgr.clearTraceShare(uid, run_id) catch |err| blk: {
+                    log.warn("trace_share.revoke_pg_failed user='{s}' run_id='{s}' err={s}", .{ user_id, run_id, @errorName(err) });
+                    break :blk false;
+                };
+            } else |_| {}
+        }
+
+        return found_in_cache or found_in_pg;
     }
 };
 
 const TraceShareSnapshot = struct {
     user_id: []const u8,
     run_id: []const u8,
+    /// Sprint 3 (2026-05-28) — sanitized JSON snapshot of trace events
+    /// at share-create time. Empty when the store is operating in
+    /// legacy in-memory-only mode (no state_mgr bound). When non-empty,
+    /// the public GET handler returns this verbatim instead of going
+    /// through the RunTraceStore resolver — which closes the restart-
+    /// fragility gap (the resolver can't find traces evicted from
+    /// memory after a process restart).
+    events_json: []const u8 = "",
     created_at_unix: i64,
     expires_at_unix: i64,
 };
@@ -12372,13 +12533,26 @@ fn handleTraceShareCreate(
         .status = "404 Not Found",
         .body = "{\"error\":\"run_not_found\"}",
     };
-    var snap_opt = store.snapshotRun(allocator, run_id) catch return response_build_err;
-    if (snap_opt) |*s| s.deinit() else return .{
+    var snap = (store.snapshotRun(allocator, run_id) catch return response_build_err) orelse return .{
         .status = "404 Not Found",
         .body = "{\"error\":\"run_not_found\"}",
     };
+    defer snap.deinit();
 
-    const result = share_store.createOrGet(user_id, run_id, ttl_raw, now_unix) catch |err| switch (err) {
+    // Sprint 3 (2026-05-28) — serialize the sanitized snapshot ONCE,
+    // up-front, and persist it into the share record. Future public
+    // GETs return the persisted bytes verbatim (no re-snapshot). The
+    // moment-in-time semantic is documented in
+    // `src/migrations/0003_trace_shares.sql` — future sanitizer rule
+    // changes do NOT retroactively apply to existing shares. Default
+    // `ShareSanitizeOpts{}` matches the conservative-redact baseline;
+    // when the upstream dispatch eventually threads operator opts
+    // through to this handler, this can switch to live opts.
+    const snapshot_resp = serializeShareTraceJson(allocator, &snap, .{});
+    const events_json: []const u8 = snapshot_resp.body;
+    defer if (events_json.len > 0) allocator.free(events_json);
+
+    const result = share_store.createOrGet(user_id, run_id, ttl_raw, now_unix, events_json) catch |err| switch (err) {
         // D64 — per-user share-spam cap. Surface the limit explicitly
         // so the FE can prompt the user to revoke an existing share
         // rather than silently failing or returning a generic 500.
@@ -12471,6 +12645,26 @@ fn handleTraceShareGet(
         .body = "{\"error\":\"share_not_found\"}",
     };
 
+    // Sprint 3 (2026-05-28) — PG-backed mode caches the sanitized
+    // JSON at share-create time and again on lazy load from PG. When
+    // the cache carries the bytes (`events_json.len > 0`), serve them
+    // verbatim — no need to walk back through the RunTraceStore
+    // resolver, which can't find traces evicted from the in-process
+    // bounded ring buffer after a process restart. This is the
+    // restart-recovery path that closes `ui-handoff.md` §7 P1 for
+    // shares.
+    if (meta.events_json.len > 0) {
+        const body = allocator.dupe(u8, meta.events_json) catch return response_build_err;
+        return .{
+            .body = body,
+            .content_type = "application/json",
+        };
+    }
+
+    // Legacy fallback — in-memory-only mode (no state_mgr bound, e.g.
+    // unit tests). Walk the RunTraceStore resolver as before. The
+    // public payload IS re-sanitized at GET time with the live opts,
+    // which is the pre-Sprint-3 behavior unit tests depend on.
     const store = resolveStore(resolver_ctx, meta.user_id) orelse return .{
         .status = "404 Not Found",
         .body = "{\"error\":\"share_not_found\"}",
@@ -21170,6 +21364,14 @@ pub fn runWithRole(
                 break :init_state;
             };
             state.zaki_state = mgr;
+            // Sprint 3 (2026-05-28, prod-readiness) — wire the
+            // persistence binding so trace share creates/revokes/gets
+            // route through Postgres alongside the in-memory cache.
+            // See `TraceShareStore` doc-comment for the cache+PG
+            // protocol and `migrations/0003_trace_shares.sql` for the
+            // backing schema. This closes the `ui-handoff.md` §7 P1
+            // gap for share-record durability across gateway restart.
+            state.trace_share_store.state_mgr = mgr;
         }
         if (cfg.tenant.enabled) {
             const owner_id = tenant_lock.resolveOwnerId(allocator) catch null;
@@ -30568,14 +30770,14 @@ test "Wave2-CRITICAL: TraceShareStore.createOrGet re-mints over an EXPIRED share
 
     const t0: i64 = 1_700_000_000;
     const ttl_h: i64 = 24; // 1-day window
-    const first = try share_store.createOrGet("user-cw2", "run-cw2", ttl_h, t0);
+    const first = try share_store.createOrGet("user-cw2", "run-cw2", ttl_h, t0, "");
     const first_code = try alloc.dupe(u8, first.share_code);
     defer alloc.free(first_code);
 
     // Jump past the TTL — first share is now expired (not revoked, but
     // expired). Re-mint must walk the stale-cleanup branch.
     const t_expired = t0 + (ttl_h + 1) * 3600;
-    const second = try share_store.createOrGet("user-cw2", "run-cw2", ttl_h, t_expired);
+    const second = try share_store.createOrGet("user-cw2", "run-cw2", ttl_h, t_expired, "");
 
     try std.testing.expect(!second.already_existed);
     try std.testing.expectEqual(@as(usize, SHARE_CODE_LEN), second.share_code.len);
@@ -30590,7 +30792,7 @@ test "Wave2-CRITICAL: TraceShareStore.createOrGet re-mints over an EXPIRED share
     // Idempotent re-share with the SAME (user_id, run_id) at the SAME
     // moment must return the LIVE record (also exercises the
     // "already_existed → discard fresh key_buf" branch in the fix).
-    const third = try share_store.createOrGet("user-cw2", "run-cw2", ttl_h, t_expired);
+    const third = try share_store.createOrGet("user-cw2", "run-cw2", ttl_h, t_expired, "");
     try std.testing.expect(third.already_existed);
     try std.testing.expectEqualStrings(second.share_code, third.share_code);
 }
@@ -30612,25 +30814,25 @@ test "D64: TraceShareStore.createOrGet enforces per-user MAX_LIVE_SHARES cap" {
     while (i < MAX_LIVE_SHARES_PER_USER) : (i += 1) {
         var run_id_buf: [32]u8 = undefined;
         const run_id = try std.fmt.bufPrint(&run_id_buf, "cap-run-{d}", .{i});
-        _ = try share_store.createOrGet("user-cap", run_id, ttl_h, t0);
+        _ = try share_store.createOrGet("user-cap", run_id, ttl_h, t0, "");
     }
 
     // The (cap + 1)-th NEW share must be rejected.
-    const result = share_store.createOrGet("user-cap", "cap-run-overflow", ttl_h, t0);
+    const result = share_store.createOrGet("user-cap", "cap-run-overflow", ttl_h, t0, "");
     try std.testing.expectError(error.ShareLimitReached, result);
 
     // A DIFFERENT user is unaffected by user-cap's cap.
-    _ = try share_store.createOrGet("user-other", "other-run-1", ttl_h, t0);
+    _ = try share_store.createOrGet("user-other", "other-run-1", ttl_h, t0, "");
 
     // Idempotent re-share of an EXISTING live share is NOT blocked
     // (the share already counts toward the cap; refusing it would
     // be a needless friction in the FE retry path).
-    const reshare = try share_store.createOrGet("user-cap", "cap-run-0", ttl_h, t0);
+    const reshare = try share_store.createOrGet("user-cap", "cap-run-0", ttl_h, t0, "");
     try std.testing.expect(reshare.already_existed);
 
     // After revoking one share, a NEW share for user-cap succeeds.
     _ = try share_store.revoke("user-cap", "cap-run-0");
-    const after_revoke = try share_store.createOrGet("user-cap", "cap-run-fresh", ttl_h, t0);
+    const after_revoke = try share_store.createOrGet("user-cap", "cap-run-fresh", ttl_h, t0, "");
     try std.testing.expect(!after_revoke.already_existed);
 }
 
@@ -30656,7 +30858,7 @@ test "D64: handleTraceShareCreate returns 429 when per-user cap is reached" {
     while (i < MAX_LIVE_SHARES_PER_USER) : (i += 1) {
         var run_id_buf: [40]u8 = undefined;
         const run_id = try std.fmt.bufPrint(&run_id_buf, "filler-{d}", .{i});
-        _ = try share_store.createOrGet("user-1", run_id, 24, t0);
+        _ = try share_store.createOrGet("user-1", run_id, 24, t0, "");
     }
 
     // Now invoke the HTTP handler for the seeded run; the snapshot
@@ -30675,13 +30877,13 @@ test "Wave2-CRITICAL: TraceShareStore.createOrGet re-mints over a REVOKED share 
     defer share_store.deinit();
 
     const t0: i64 = 1_700_000_000;
-    const first = try share_store.createOrGet("user-rv", "run-rv", 24, t0);
+    const first = try share_store.createOrGet("user-rv", "run-rv", 24, t0, "");
     const first_code = try alloc.dupe(u8, first.share_code);
     defer alloc.free(first_code);
 
     _ = try share_store.revoke("user-rv", "run-rv");
     // Revoked → isLive=false → stale branch fires on next createOrGet.
-    const second = try share_store.createOrGet("user-rv", "run-rv", 24, t0);
+    const second = try share_store.createOrGet("user-rv", "run-rv", 24, t0, "");
     try std.testing.expect(!second.already_existed);
     try std.testing.expect(!std.mem.eql(u8, first_code, second.share_code));
 }

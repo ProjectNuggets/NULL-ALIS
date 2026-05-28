@@ -476,7 +476,7 @@ before public scale unless product explicitly hides the surface.
 | Gate | Item | Owner | Acceptance |
 |---|---|---|---|
 | P1 | Approval consolidation | backend | One canonical pending-approval model; no legacy `pending_exec_*` ambiguity; stable enough identifiers for UI cards |
-| P1 | Durable traces/shares | backend | User-visible traces and share records survive restart, or the UI contract explicitly labels them ephemeral and hides durable-history UX |
+| P1 | Durable traces/shares — **SHARES SHIPPED**, events deferred | backend | **Sprint 3 (2026-05-28) landed PG-backed trace SHARES** via `migrations/0003_trace_shares.sql`. Share URL + sanitized snapshot survive gateway restart for the share's TTL. Trace EVENTS stay in the bounded in-process `RunTraceStore` (64 runs × 256 events). UI surfaces `/api/v1/share/:share_code` as durable; the listing `/api/v1/users/:id/traces` remains best-effort ephemeral. |
 | P1 | Extension browser readiness | backend + extension | Per-user token auth, pairing, disconnect state, approval behavior, and browser command failures are observable and test-covered |
 | P1 | Observability/SLOs | backend + platform | Run id, session id, product id, tool latency, artifact export, approvals, extension commands, memory writes, and meter receipt IDs are chartable |
 | P1 | Memory PII purge/export UX | backend | `memory_forget` is callable from the UI; PII-tagged memories can be enumerated and bulk-cleared; consent gate stays opt-in |

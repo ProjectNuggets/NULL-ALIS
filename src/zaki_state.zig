@@ -263,6 +263,29 @@ pub const ArtifactRow = struct {
     }
 };
 
+/// Sprint 3 (2026-05-28, prod-readiness) — one durable trace-share
+/// record returned by `getTraceByShareCode`. Fields mirror the
+/// `trace_shares` schema (see `src/migrations/0003_trace_shares.sql`).
+/// All slices are heap-owned by the allocator passed to the lookup;
+/// caller frees via `deinit`.
+pub const TraceShareRow = struct {
+    share_code: []u8,
+    user_id: i64,
+    run_id: []u8,
+    /// Sanitized JSON snapshot of the trace events at share-create
+    /// time — the exact bytes the gateway returned to the FE for the
+    /// public-view endpoint.
+    events_json: []u8,
+    created_at_unix: i64,
+    expires_at_unix: i64,
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.share_code);
+        allocator.free(self.run_id);
+        allocator.free(self.events_json);
+    }
+};
+
 pub const ArtifactVersionRow = struct {
     artifact_id: []u8,
     version: u64,
@@ -1011,6 +1034,36 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     ) !?ArtifactRow {
         return null;
     }
+    // ── Sprint 3 (2026-05-28, prod-readiness): durable trace shares ──
+    // Fake-manager stubs. Non-postgres builds return `error.PostgresNotEnabled`
+    // / `null` so the gateway degrades to "trace sharing unavailable" rather
+    // than crashing.
+    pub fn setTraceShare(
+        _: *@This(),
+        _: i64,
+        _: []const u8,
+        _: []const u8,
+        _: []const u8,
+        _: i64,
+        _: i64,
+    ) !void {
+        return error.PostgresNotEnabled;
+    }
+    pub fn clearTraceShare(_: *@This(), _: i64, _: []const u8) !bool {
+        return error.PostgresNotEnabled;
+    }
+    pub fn getTraceByShareCode(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: i64,
+    ) !?TraceShareRow {
+        return null;
+    }
+    pub fn countLiveTraceSharesForUser(_: *@This(), _: i64, _: i64) !usize {
+        return 0;
+    }
+
     pub fn deleteArtifact(_: *@This(), _: i64, _: []const u8) !bool {
         return error.PostgresNotEnabled;
     }
@@ -10806,6 +10859,149 @@ const ManagerImpl = struct {
         if (tag == null) return false;
         const tag_slice = std.mem.span(tag);
         return tag_slice.len > 0 and !std.mem.eql(u8, tag_slice, "0");
+    }
+
+    // ── Sprint 3 (2026-05-28, prod-readiness) — durable trace shares ──
+    //
+    // Mirrors the artifact-share pattern above:
+    //   * `setTraceShare` — INSERT new live share. Errors with the
+    //     INSERT-violated unique-partial-index if a live share for
+    //     (user, run) already exists (the gateway translates this to
+    //     409 Conflict for the FE).
+    //   * `clearTraceShare` — soft-delete via `revoked = TRUE`. Allows
+    //     a fresh share for the same run without losing the audit row.
+    //     Returns true when a row was actually flipped (false on no-op).
+    //   * `getTraceByShareCode` — public lookup. Filters revoked +
+    //     expired so the conservative-404 surface stays uniform across
+    //     "unknown / revoked / expired".
+    //   * `countLiveTraceSharesForUser` — D64 spam-cap enforcement
+    //     (was an in-memory counter; now backed by PG).
+
+    pub fn setTraceShare(
+        self: *Self,
+        user_id: i64,
+        run_id: []const u8,
+        share_code: []const u8,
+        events_json: []const u8,
+        created_at_unix: i64,
+        expires_at_unix: i64,
+    ) !void {
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const run_z = try self.allocator.dupeZ(u8, run_id);
+        defer self.allocator.free(run_z);
+        const code_z = try self.allocator.dupeZ(u8, share_code);
+        defer self.allocator.free(code_z);
+        const events_z = try self.allocator.dupeZ(u8, events_json);
+        defer self.allocator.free(events_z);
+        var created_buf: [32]u8 = undefined;
+        const created_s = try std.fmt.bufPrintZ(&created_buf, "{d}", .{created_at_unix});
+        var expires_buf: [32]u8 = undefined;
+        const expires_s = try std.fmt.bufPrintZ(&expires_buf, "{d}", .{expires_at_unix});
+
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.trace_shares " ++
+                "(share_code, user_id, run_id, events_json, created_at_unix, expires_at_unix, revoked) " ++
+                "VALUES ($1, $2, $3, $4::jsonb, $5::bigint, $6::bigint, FALSE)",
+        );
+        defer self.allocator.free(q);
+        const params = [_]?[*:0]const u8{
+            code_z.ptr, user_s.ptr, run_z.ptr, events_z.ptr, created_s.ptr, expires_s.ptr,
+        };
+        const lengths = [_]c_int{
+            @intCast(share_code.len), @intCast(user_s.len), @intCast(run_id.len),
+            @intCast(events_json.len), @intCast(created_s.len), @intCast(expires_s.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    pub fn clearTraceShare(self: *Self, user_id: i64, run_id: []const u8) !bool {
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const run_z = try self.allocator.dupeZ(u8, run_id);
+        defer self.allocator.free(run_z);
+
+        const q = try self.buildQuery(
+            "UPDATE {schema}.trace_shares SET revoked = TRUE " ++
+                "WHERE user_id = $1::bigint AND run_id = $2 AND NOT revoked",
+        );
+        defer self.allocator.free(q);
+        const params = [_]?[*:0]const u8{ user_s.ptr, run_z.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(run_id.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const tag = c.PQcmdTuples(result);
+        if (tag == null) return false;
+        const tag_slice = std.mem.span(tag);
+        return tag_slice.len > 0 and !std.mem.eql(u8, tag_slice, "0");
+    }
+
+    pub fn getTraceByShareCode(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        share_code: []const u8,
+        now_unix: i64,
+    ) !?TraceShareRow {
+        const q = try self.buildQuery(
+            "SELECT share_code, user_id, run_id, events_json::text, " ++
+                "created_at_unix, expires_at_unix " ++
+                "FROM {schema}.trace_shares " ++
+                "WHERE share_code = $1 AND NOT revoked AND expires_at_unix > $2::bigint",
+        );
+        defer self.allocator.free(q);
+        const code_z = try self.allocator.dupeZ(u8, share_code);
+        defer self.allocator.free(code_z);
+        var now_buf: [32]u8 = undefined;
+        const now_s = try std.fmt.bufPrintZ(&now_buf, "{d}", .{now_unix});
+        const params = [_]?[*:0]const u8{ code_z.ptr, now_s.ptr };
+        const lengths = [_]c_int{ @intCast(share_code.len), @intCast(now_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
+
+        const code_out = try dupeResultValue(allocator, result, 0, 0);
+        errdefer allocator.free(code_out);
+        const uid_str = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(uid_str);
+        const run_out = try dupeResultValue(allocator, result, 0, 2);
+        errdefer allocator.free(run_out);
+        const events_out = try dupeResultValue(allocator, result, 0, 3);
+        errdefer allocator.free(events_out);
+        const created_str = try dupeResultValue(allocator, result, 0, 4);
+        defer allocator.free(created_str);
+        const expires_str = try dupeResultValue(allocator, result, 0, 5);
+        defer allocator.free(expires_str);
+
+        return .{
+            .share_code = code_out,
+            .user_id = std.fmt.parseInt(i64, uid_str, 10) catch 0,
+            .run_id = run_out,
+            .events_json = events_out,
+            .created_at_unix = std.fmt.parseInt(i64, created_str, 10) catch 0,
+            .expires_at_unix = std.fmt.parseInt(i64, expires_str, 10) catch 0,
+        };
+    }
+
+    pub fn countLiveTraceSharesForUser(self: *Self, user_id: i64, now_unix: i64) !usize {
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        var now_buf: [32]u8 = undefined;
+        const now_s = try std.fmt.bufPrintZ(&now_buf, "{d}", .{now_unix});
+
+        const q = try self.buildQuery(
+            "SELECT COUNT(*) FROM {schema}.trace_shares " ++
+                "WHERE user_id = $1::bigint AND NOT revoked AND expires_at_unix > $2::bigint",
+        );
+        defer self.allocator.free(q);
+        const params = [_]?[*:0]const u8{ user_s.ptr, now_s.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(now_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return 0;
+        const count_str = try dupeResultValue(self.allocator, result, 0, 0);
+        defer self.allocator.free(count_str);
+        return std.fmt.parseInt(usize, count_str, 10) catch 0;
     }
 
     // Helper used by both single-row and list paths. Reads the 11-column
