@@ -2441,7 +2441,14 @@ components:
         `expires_at` is null in V1 (no TTL sweep) — the schema slot is
         committed here so a V1.x TTL implementation surfaces without
         another schema bump.
-      required: [approval_id, id, tool, reason, risk_level, created_at, expires_at]
+
+        `tool_call_id` (Sprint 2 code-review fix #2) is the provider
+        tool-use id that triggered the approval, when present. Lets the
+        FE correlate the approval card with the `tool_use` SSE event the
+        chat stream emitted before the gate fired. Null when the
+        provider did not supply one (e.g. for slash-command-induced
+        approvals).
+      required: [approval_id, id, tool, tool_call_id, reason, risk_level, created_at, expires_at]
       properties:
         approval_id:
           type: string
@@ -2457,6 +2464,14 @@ components:
         tool:
           type: string
           description: Tool name awaiting approval.
+        tool_call_id:
+          type: string
+          nullable: true
+          description: |
+            Provider-emitted tool-use correlation id. Null when the
+            provider did not supply one (slash-command-induced
+            approvals, providers that omit the field). Use to bind the
+            approval card to the matching `tool_use` SSE event.
         reason:
           type: string
           description: Human-readable reason the approval was requested.

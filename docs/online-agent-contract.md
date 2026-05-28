@@ -228,12 +228,18 @@ The pending-approval card on the session detail surfaces:
   "approval_id": "apr-7",
   "id": 7,
   "tool": "shell",
+  "tool_call_id": "call_abc-123",
   "reason": "supervised_mutating_requires_approval",
   "risk_level": "medium",
   "created_at": 1779988800,
   "expires_at": null
 }
 ```
+
+`tool_call_id` is the provider's correlation id for the tool call that
+triggered the approval. The FE binds it to the matching `tool_use` SSE
+event so the approval card visually attaches to the tool invocation
+that's waiting. Null when the provider did not supply one.
 
 `created_at` is Unix epoch seconds — UI uses it for the "waiting Ns"
 countdown. `expires_at` is null in V1; the schema slot is committed

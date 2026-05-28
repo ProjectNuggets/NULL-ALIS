@@ -12948,21 +12948,40 @@ fn renderLiveSessionDetail(
 
     // pending_approvals: array of 0 or 1 item. Single-slot model in the
     // agent — matches PendingToolApproval struct at agent/root.zig:2006.
-    // arguments_json deliberately omitted (can be large; tool_call_id +
-    // reason + risk_level are sufficient for the approval UI).
+    // arguments_json deliberately omitted from the SUMMARY array (can be
+    // large; the FE drills into a dedicated detail surface for the
+    // raw args when needed).
     //
     // Sprint 2 (2026-05-28) — `approval_id` is the stable wire ID the
     // FE pins to. `created_at` powers the UI "waiting Ns" countdown.
     // `expires_at` is null in V1 (no TTL sweep) — the schema slot is
     // here so the UI can render countdown when populated by V1.x.
+    //
+    // S2 code-review fix #1 — approval_id is jsonEscape'd defensively
+    // even though its construction format `apr-<u64>` contains no
+    // characters that need escaping today. Locks against future code
+    // paths that might widen the format without re-auditing the
+    // emission sites.
+    //
+    // S2 code-review fix #2 — `tool_call_id` is surfaced when the
+    // provider attached one to the original tool call. Lets the FE
+    // correlate the approval card with the `tool_use` SSE event the
+    // chat stream emitted before the gate fired.
     w.writeAll(",\"pending_approvals\":[") catch return response_build_err;
     if (session.agent.pending_tool_approval) |pending| {
-        w.print(
-            "{{\"approval_id\":\"{s}\",\"id\":{d},\"tool\":\"",
-            .{ pending.approval_id, pending.id },
-        ) catch return response_build_err;
+        w.writeAll("{\"approval_id\":\"") catch return response_build_err;
+        jsonEscapeInto(w, pending.approval_id) catch return response_build_err;
+        w.print("\",\"id\":{d},\"tool\":\"", .{pending.id}) catch return response_build_err;
         jsonEscapeInto(w, pending.tool_name) catch return response_build_err;
-        w.writeAll("\",\"reason\":\"") catch return response_build_err;
+        w.writeAll("\",\"tool_call_id\":") catch return response_build_err;
+        if (pending.tool_call_id) |tcid| {
+            w.writeAll("\"") catch return response_build_err;
+            jsonEscapeInto(w, tcid) catch return response_build_err;
+            w.writeAll("\"") catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+        w.writeAll(",\"reason\":\"") catch return response_build_err;
         jsonEscapeInto(w, pending.reason) catch return response_build_err;
         w.writeAll("\",\"risk_level\":\"") catch return response_build_err;
         jsonEscapeInto(w, pending.risk_level.toSlice()) catch return response_build_err;
@@ -28835,6 +28854,67 @@ test "Sprint 2 — handleSessionGet renders approval_id + created_at when pendin
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"risk_level\":\"medium\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"created_at\":1779988800") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"expires_at\":null") != null);
+    // Code-review fix #2 — tool_call_id null surfaces explicitly (the
+    // seed leaves it null; the FE consumes null without ambiguity).
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"tool_call_id\":null") != null);
+}
+
+test "Sprint 2 — handleSessionGet surfaces tool_call_id when set (code-review fix #2)" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const session = try mgr.getOrCreate("agent:zaki-bot:user:55:thread:s2-tcid");
+    // Seed with a non-null tool_call_id to verify the JSON path includes it.
+    const a = session.agent.allocator;
+    const approval_id = try a.dupe(u8, "apr-13");
+    errdefer a.free(approval_id);
+    const tool_name = try a.dupe(u8, "shell");
+    errdefer a.free(tool_name);
+    const tcid = try a.dupe(u8, "call_abc-123");
+    errdefer a.free(tcid);
+    const args = try a.dupe(u8, "{}");
+    errdefer a.free(args);
+    const reason = try a.dupe(u8, "test seeded with tool_call_id");
+    errdefer a.free(reason);
+    session.agent.pending_tool_approval_id_counter = 13;
+    session.agent.pending_tool_approval = .{
+        .id = 13,
+        .approval_id = approval_id,
+        .tool_name = tool_name,
+        .tool_call_id = tcid,
+        .arguments_json = args,
+        .reason = reason,
+        .risk_level = .high,
+        .created_at_unix = 1779988900,
+        .expires_at_unix = null,
+    };
+
+    const resp = handleSessionGet(std.testing.allocator, &mgr, "agent:zaki-bot:user:55:thread:s2-tcid", null, "55");
+    defer std.testing.allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"tool_call_id\":\"call_abc-123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"risk_level\":\"high\"") != null);
+}
+
+test "Sprint 2 — approval_id is jsonEscape-safe (code-review fix #1)" {
+    // Lock the format invariant: approval_id is constructed exactly as
+    // `apr-<u64>`. Any future widening (UUIDs, etc.) MUST go through
+    // jsonEscapeInto on the emission path — which today already does.
+    // This test enforces the structural assumption.
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const session = try mgr.getOrCreate("agent:zaki-bot:user:56:thread:s2-shape");
+    try seedPendingApprovalForTest(session, 1_000_000);
+    const pending = session.agent.pending_tool_approval.?;
+    // Format: starts with "apr-", followed by 1+ ASCII digits.
+    try std.testing.expect(std.mem.startsWith(u8, pending.approval_id, "apr-"));
+    try std.testing.expect(pending.approval_id.len > 4);
+    for (pending.approval_id[4..]) |c| {
+        try std.testing.expect(c >= '0' and c <= '9');
+    }
 }
 
 test "Sprint 2 — handleSessionApprove 409s on approval_id mismatch" {
@@ -28922,35 +29002,13 @@ test "Sprint 2 — cross-session isolation: approve in A doesn't touch B's pendi
     }
 }
 
-test "Sprint 2 — setPendingToolApproval rejects collision (single-slot model)" {
-    // Locks the documented "reject the second" semantics. A future
-    // refactor that switches to "replace the previous" would need to
-    // explicitly delete this test + amend the contract docs.
-    const agent_mod = @import("agent/root.zig");
-    _ = agent_mod;
-
-    var mock = TestMockProvider{};
-    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
-    defer mgr.deinit();
-
-    const session = try mgr.getOrCreate("agent:zaki-bot:user:61:thread:s2-collision");
-    try seedPendingApprovalForTest(session, 5);
-
-    // Try seeding a SECOND approval directly — the seed bypasses the
-    // single-slot guard (it just overwrites the field), so we exercise
-    // the runtime guard via the actual setter. That setter requires a
-    // ParsedToolCall + ToolMetadata which are heavyweight to construct
-    // in this test. Instead we assert at the structural level that the
-    // field is non-null AND verify the existing slot's approval_id
-    // survives — proving the slot was indeed occupied. The real
-    // collision-rejection path (`error.PendingToolApprovalAlreadyExists`)
-    // is locked at agent/root.zig:2270 with an explicit `if (... != null)
-    // return error` guard.
-    try std.testing.expect(session.agent.pending_tool_approval != null);
-    if (session.agent.pending_tool_approval) |p| {
-        try std.testing.expectEqualStrings("apr-5", p.approval_id);
-    }
-}
+// Note: collision rejection at the agent layer is already locked by
+// `approval gate: second pending request does not overwrite the first`
+// at src/agent/root.zig:12518 — it exercises preflightToolPolicy with
+// two mutating tools and asserts the second blocks with
+// `approval_already_pending`. The S2 gateway tests above lock the
+// HTTP/JSON contract; collision semantics live at the agent layer
+// where they belong.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Session CRUD Integration Tests (IN-01)
