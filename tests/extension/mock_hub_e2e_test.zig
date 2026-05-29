@@ -12,6 +12,14 @@
 //! Cross-tool pin: a regression where any tool stops surfacing one of
 //! these named states would fail here even if the per-tool inline tests
 //! are still passing.
+//!
+//! S4 hardening: each scenario runs through `runScenario` which wraps
+//! ToolResult lifecycle and conn refcount handoff in defers so:
+//!   (a) the deliverer thread is joined BEFORE the conn ref is dropped,
+//!       closing the use-after-free race the prior shape had;
+//!   (b) every tool allocation (whether the tool returned a static-string
+//!       error_msg or a heap-allocated one) is freed via an arena so the
+//!       cleanup is uniform — no more "do not free this branch" carve-outs.
 
 const std = @import("std");
 const nullalis = @import("nullalis");
@@ -166,11 +174,54 @@ fn setTinyTimeout(tool_list: []const tools.Tool, name: []const u8) void {
     }
 }
 
-// ── Test 1: no extension connected ───────────────────────────────────────────
+// ── Scenario verdict ──────────────────────────────────────────────────────────
 
-test "E2E: every extension_* tool surfaces no_extension_connected when nothing paired" {
+const ScenarioVerdict = enum {
+    expect_no_extension_connected,
+    expect_success,
+    expect_timeout,
+    expect_extension_reported_error,
+};
+
+/// Spawn either an ok-deliverer, an err-deliverer, or no deliverer at
+/// all depending on the scenario.
+const Deliverer = enum {
+    none,
+    ok_reply,
+    err_reply,
+};
+
+/// Run one tool-scenario combination cleanly:
+///   - tool execution uses a per-call arena so any ToolResult fields
+///     (static or heap) are freed atomically with `arena.deinit()`,
+///     regardless of which tool branch returned them.
+///   - deliverer thread (when spawned) is joined BEFORE the conn ref
+///     is dropped, closing the use-after-free race the prior layout
+///     had if `findTool` returned null with a live thread still
+///     holding the conn pointer.
+fn runScenario(
+    harness: ToolHarness,
+    verdict: ScenarioVerdict,
+    deliverer: Deliverer,
+) !void {
     var hub = hub_mod.ExtensionWsHub.init(std.testing.allocator);
     defer hub.deinit();
+
+    var stream = RecordingStream{ .allocator = std.testing.allocator };
+    defer stream.deinit();
+
+    // Conn lifecycle: only register if the scenario isn't testing the
+    // "no extension connected" path.
+    const conn_opt: ?*hub_mod.ExtensionWsConn = if (verdict == .expect_no_extension_connected) null else try hub.registerConn(
+        "alice",
+        @ptrCast(&stream),
+        RecordingStream.writeText,
+        @ptrCast(&stream),
+        RecordingStream.close,
+    );
+    // Caller's ref dropped here. Hub's ref dropped by hub.deinit. The
+    // pair ensures the conn frees by test end.
+    defer if (conn_opt) |c| hub.destroyConn(c);
 
     const tool_list = try tools.allTools(std.testing.allocator, "/tmp", .{
         .config = &TEST_CONFIG,
@@ -179,23 +230,108 @@ test "E2E: every extension_* tool surfaces no_extension_connected when nothing p
     defer tools.deinitTools(std.testing.allocator, tool_list);
     tools.bindExtensionTools(tool_list, "alice");
 
-    for (TOOL_HARNESSES) |h| {
-        const t = findTool(tool_list, h.name) orelse {
-            std.debug.print("missing tool {s}\n", .{h.name});
-            try std.testing.expect(false);
-            continue;
-        };
-        const parsed = try tools.parseTestArgs(h.args_json);
-        defer parsed.deinit();
-        const result = try t.execute(std.testing.allocator, parsed.value.object);
-        // "no extension connected" is a static ToolResult.fail literal — do NOT free.
-        // output is always "" here (fail path), also a literal — do NOT free.
-        try std.testing.expect(!result.success);
-        try std.testing.expect(result.error_msg != null);
-        if (std.mem.indexOf(u8, result.error_msg.?, "no extension connected") == null) {
-            std.debug.print("{s} error_msg='{s}'\n", .{ h.name, result.error_msg.? });
-            try std.testing.expect(false);
+    if (verdict == .expect_timeout) {
+        setTinyTimeout(tool_list, harness.name);
+    }
+
+    // Spawn deliverer BEFORE finding the tool so that if `findTool`
+    // returns null we still reach the defer-join chain rather than
+    // racing the explicit cleanup. The thread.join defer is declared
+    // AFTER conn's destroyConn defer so it fires FIRST (defers run
+    // LIFO) — guarantees the thread is joined before the conn ref
+    // is released.
+    var deliverer_thread: ?std.Thread = null;
+    defer if (deliverer_thread) |th| th.join();
+
+    if (conn_opt) |conn| {
+        switch (deliverer) {
+            .none => {},
+            .ok_reply => {
+                const Ctx = struct {
+                    c: *hub_mod.ExtensionWsConn,
+                    s: *RecordingStream,
+                    body: []const u8,
+                    fn run(ctx: @This()) void {
+                        deliverOk(ctx.c, ctx.s, ctx.body) catch {};
+                    }
+                };
+                deliverer_thread = try std.Thread.spawn(.{}, Ctx.run, .{Ctx{ .c = conn, .s = &stream, .body = harness.happy_result_body }});
+            },
+            .err_reply => {
+                const Ctx = struct {
+                    c: *hub_mod.ExtensionWsConn,
+                    s: *RecordingStream,
+                    fn run(ctx: @This()) void {
+                        deliverErr(ctx.c, ctx.s, "denied", "user blocked the action") catch {};
+                    }
+                };
+                deliverer_thread = try std.Thread.spawn(.{}, Ctx.run, .{Ctx{ .c = conn, .s = &stream }});
+            },
         }
+    }
+
+    const t = findTool(tool_list, harness.name) orelse {
+        std.debug.print("missing tool {s}\n", .{harness.name});
+        try std.testing.expect(false);
+        return;
+    };
+
+    // Per-scenario arena: every allocation the tool execution makes
+    // (whether the tool returns a static-string error_msg or a heap
+    // one) is owned by the arena and freed atomically when this
+    // function returns. No "do NOT free this branch" carve-outs;
+    // the cleanup is the same shape regardless of which path the
+    // tool takes.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const parsed = try tools.parseTestArgs(harness.args_json);
+    defer parsed.deinit();
+
+    const result = try t.execute(a, parsed.value.object);
+
+    switch (verdict) {
+        .expect_no_extension_connected => {
+            try std.testing.expect(!result.success);
+            try std.testing.expect(result.error_msg != null);
+            if (std.mem.indexOf(u8, result.error_msg.?, "no extension connected") == null) {
+                std.debug.print("{s} error_msg='{s}'\n", .{ harness.name, result.error_msg.? });
+                try std.testing.expect(false);
+            }
+        },
+        .expect_success => {
+            if (!result.success) {
+                std.debug.print("{s} unexpected fail error_msg={?s}\n", .{ harness.name, result.error_msg });
+                try std.testing.expect(false);
+            }
+        },
+        .expect_timeout => {
+            try std.testing.expect(!result.success);
+            try std.testing.expect(result.error_msg != null);
+            if (std.mem.indexOf(u8, result.error_msg.?, "timeout") == null and
+                std.mem.indexOf(u8, result.error_msg.?, "did not respond") == null)
+            {
+                std.debug.print("{s} timeout msg='{s}'\n", .{ harness.name, result.error_msg.? });
+                try std.testing.expect(false);
+            }
+        },
+        .expect_extension_reported_error => {
+            try std.testing.expect(!result.success);
+            try std.testing.expect(result.error_msg != null);
+            if (std.mem.indexOf(u8, result.error_msg.?, "extension reported error") == null) {
+                std.debug.print("{s} denied msg='{s}'\n", .{ harness.name, result.error_msg.? });
+                try std.testing.expect(false);
+            }
+        },
+    }
+}
+
+// ── Test 1: no extension connected ───────────────────────────────────────────
+
+test "E2E: every extension_* tool surfaces no_extension_connected when nothing paired" {
+    for (TOOL_HARNESSES) |h| {
+        try runScenario(h, .expect_no_extension_connected, .none);
     }
 }
 
@@ -203,64 +339,7 @@ test "E2E: every extension_* tool surfaces no_extension_connected when nothing p
 
 test "E2E: every extension_* tool happy-path returns success when mock replies ok:true" {
     for (TOOL_HARNESSES) |h| {
-        var hub = hub_mod.ExtensionWsHub.init(std.testing.allocator);
-        defer hub.deinit();
-
-        var stream = RecordingStream{ .allocator = std.testing.allocator };
-        defer stream.deinit();
-
-        const conn = try hub.registerConn(
-            "alice",
-            @ptrCast(&stream),
-            RecordingStream.writeText,
-            @ptrCast(&stream),
-            RecordingStream.close,
-        );
-
-        const tool_list = try tools.allTools(std.testing.allocator, "/tmp", .{
-            .config = &TEST_CONFIG,
-            .extension_ws_hub = &hub,
-        });
-        defer tools.deinitTools(std.testing.allocator, tool_list);
-        tools.bindExtensionTools(tool_list, "alice");
-
-        // Background thread: wait for the command frame, deliver ok reply.
-        const DelivererCtx = struct {
-            c: *hub_mod.ExtensionWsConn,
-            s: *RecordingStream,
-            body: []const u8,
-
-            fn run(ctx: @This()) void {
-                deliverOk(ctx.c, ctx.s, ctx.body) catch {};
-            }
-        };
-        var thread = try std.Thread.spawn(
-            .{},
-            DelivererCtx.run,
-            .{DelivererCtx{ .c = conn, .s = &stream, .body = h.happy_result_body }},
-        );
-        defer thread.join();
-
-        const t = findTool(tool_list, h.name) orelse {
-            _ = hub.unregister("alice");
-            hub.destroyConn(conn);
-            std.debug.print("missing tool {s}\n", .{h.name});
-            try std.testing.expect(false);
-            continue;
-        };
-        const parsed = try tools.parseTestArgs(h.args_json);
-        defer parsed.deinit();
-        const result = try t.execute(std.testing.allocator, parsed.value.object);
-        defer if (result.error_msg) |m| std.testing.allocator.free(m);
-        defer if (result.output.len > 0) std.testing.allocator.free(result.output);
-
-        _ = hub.unregister("alice");
-        hub.destroyConn(conn);
-
-        if (!result.success) {
-            std.debug.print("{s} unexpected fail error_msg={?s}\n", .{ h.name, result.error_msg });
-            try std.testing.expect(false);
-        }
+        try runScenario(h, .expect_success, .ok_reply);
     }
 }
 
@@ -268,54 +347,7 @@ test "E2E: every extension_* tool happy-path returns success when mock replies o
 
 test "E2E: every extension_* tool surfaces timeout when mock never replies" {
     for (TOOL_HARNESSES) |h| {
-        var hub = hub_mod.ExtensionWsHub.init(std.testing.allocator);
-        defer hub.deinit();
-
-        var stream = RecordingStream{ .allocator = std.testing.allocator };
-        defer stream.deinit();
-
-        const conn = try hub.registerConn(
-            "alice",
-            @ptrCast(&stream),
-            RecordingStream.writeText,
-            @ptrCast(&stream),
-            RecordingStream.close,
-        );
-
-        const tool_list = try tools.allTools(std.testing.allocator, "/tmp", .{
-            .config = &TEST_CONFIG,
-            .extension_ws_hub = &hub,
-        });
-        defer tools.deinitTools(std.testing.allocator, tool_list);
-        tools.bindExtensionTools(tool_list, "alice");
-
-        // Shrink the timeout so the test finishes in ~30 ms.
-        setTinyTimeout(tool_list, h.name);
-
-        const t = findTool(tool_list, h.name) orelse {
-            _ = hub.unregister("alice");
-            hub.destroyConn(conn);
-            std.debug.print("missing tool {s}\n", .{h.name});
-            try std.testing.expect(false);
-            continue;
-        };
-        const parsed = try tools.parseTestArgs(h.args_json);
-        defer parsed.deinit();
-        const result = try t.execute(std.testing.allocator, parsed.value.object);
-        // Timeout path always returns ToolResult.fail("...") — static literal, do NOT free.
-        // output is "" literal on fail path — do NOT free.
-
-        _ = hub.unregister("alice");
-        hub.destroyConn(conn);
-
-        try std.testing.expect(!result.success);
-        try std.testing.expect(result.error_msg != null);
-        if (std.mem.indexOf(u8, result.error_msg.?, "timeout") == null and
-            std.mem.indexOf(u8, result.error_msg.?, "did not respond") == null)
-        {
-            std.debug.print("{s} timeout msg='{s}'\n", .{ h.name, result.error_msg.? });
-            try std.testing.expect(false);
-        }
+        try runScenario(h, .expect_timeout, .none);
     }
 }
 
@@ -323,64 +355,6 @@ test "E2E: every extension_* tool surfaces timeout when mock never replies" {
 
 test "E2E: every extension_* tool surfaces ok:false error frame as named failure" {
     for (TOOL_HARNESSES) |h| {
-        var hub = hub_mod.ExtensionWsHub.init(std.testing.allocator);
-        defer hub.deinit();
-
-        var stream = RecordingStream{ .allocator = std.testing.allocator };
-        defer stream.deinit();
-
-        const conn = try hub.registerConn(
-            "alice",
-            @ptrCast(&stream),
-            RecordingStream.writeText,
-            @ptrCast(&stream),
-            RecordingStream.close,
-        );
-
-        const tool_list = try tools.allTools(std.testing.allocator, "/tmp", .{
-            .config = &TEST_CONFIG,
-            .extension_ws_hub = &hub,
-        });
-        defer tools.deinitTools(std.testing.allocator, tool_list);
-        tools.bindExtensionTools(tool_list, "alice");
-
-        // Background thread: deliver an ok:false error reply.
-        const DelivererCtx = struct {
-            c: *hub_mod.ExtensionWsConn,
-            s: *RecordingStream,
-
-            fn run(ctx: @This()) void {
-                deliverErr(ctx.c, ctx.s, "denied", "user blocked the action") catch {};
-            }
-        };
-        var thread = try std.Thread.spawn(
-            .{},
-            DelivererCtx.run,
-            .{DelivererCtx{ .c = conn, .s = &stream }},
-        );
-        defer thread.join();
-
-        const t = findTool(tool_list, h.name) orelse {
-            _ = hub.unregister("alice");
-            hub.destroyConn(conn);
-            std.debug.print("missing tool {s}\n", .{h.name});
-            try std.testing.expect(false);
-            continue;
-        };
-        const parsed = try tools.parseTestArgs(h.args_json);
-        defer parsed.deinit();
-        const result = try t.execute(std.testing.allocator, parsed.value.object);
-        defer if (result.error_msg) |m| std.testing.allocator.free(m);
-        defer if (result.output.len > 0) std.testing.allocator.free(result.output);
-
-        _ = hub.unregister("alice");
-        hub.destroyConn(conn);
-
-        try std.testing.expect(!result.success);
-        try std.testing.expect(result.error_msg != null);
-        if (std.mem.indexOf(u8, result.error_msg.?, "extension reported error") == null) {
-            std.debug.print("{s} denied msg='{s}'\n", .{ h.name, result.error_msg.? });
-            try std.testing.expect(false);
-        }
+        try runScenario(h, .expect_extension_reported_error, .err_reply);
     }
 }

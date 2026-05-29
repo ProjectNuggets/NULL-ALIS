@@ -6660,6 +6660,21 @@ pub const ExtensionDiagnosticInput = struct {
     auth_failed_total: u64,
 };
 
+/// `user_id` charset accepted by the extension diagnostic routes
+/// + the `extensionUserStatusPayload` defense-in-depth guard. Limited
+/// to alphanumeric + `_-.` so the unescaped JSON write in the per-user
+/// payload stays safe and there is no ambiguity about which characters
+/// the operator can put in `extension_tokens`.
+pub fn isSafeExtensionUserId(user_id: []const u8) bool {
+    if (user_id.len == 0) return false;
+    for (user_id) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-' and c != '.') {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// Render the system-wide extension WS diagnostic JSON. Keys:
 ///   - enabled: bool — true iff `input.hub` is non-null.
 ///   - total_active: number of currently-paired users (live count from the hub).
@@ -6694,15 +6709,29 @@ pub fn extensionStatusPayload(allocator: std.mem.Allocator, input: ExtensionDiag
 ///   - last_command_at_unix: i64 (seconds), 0 when no command yet.
 ///   - last_command_tool: string ("" when no command yet).
 ///   - last_command_result: string ("" when no command yet).
+///
+/// S4 review fix: defense-in-depth — validates `user_id` matches the
+/// safe-charset `[A-Za-z0-9_\-.]` before the unescaped JSON write
+/// below. The route handler already gates on this charset before
+/// calling, but this fn is `pub` and could be reached by tests or
+/// future call sites; returning `error.InvalidUserId` here is fail-
+/// closed against JSON injection if the route gate is ever bypassed.
 pub fn extensionUserStatusPayload(allocator: std.mem.Allocator, input: ExtensionDiagnosticInput, user_id: []const u8) ![]u8 {
+    if (!isSafeExtensionUserId(user_id)) return error.InvalidUserId;
     var paired = false;
     var connected_at_unix: i64 = 0;
     var last_at_unix: i64 = 0;
-    var last_tool: []const u8 = "";
-    var last_result: []const u8 = "";
 
-    var tool_buf: [32]u8 = undefined;
-    var result_buf: [32]u8 = undefined;
+    // Snapshot is declared at function scope so its inline tool_buf /
+    // result_buf survive past the inner `if (getForUser)` block (the
+    // `last_tool` / `last_result` slices below borrow from it).
+    var last_snap: extension_ws_hub.LastCommandSnapshot = .{
+        .tool_buf = [_]u8{0} ** extension_ws_hub.LAST_COMMAND_BUF_LEN,
+        .tool_len = 0,
+        .result_buf = [_]u8{0} ** extension_ws_hub.LAST_COMMAND_BUF_LEN,
+        .result_len = 0,
+        .at_ns = 0,
+    };
 
     if (input.hub) |hub| {
         if (hub.getForUser(user_id)) |conn| {
@@ -6710,14 +6739,14 @@ pub fn extensionUserStatusPayload(allocator: std.mem.Allocator, input: Extension
             paired = true;
             const ns = conn.connected_at_ns.load(.acquire);
             connected_at_unix = @intCast(@divTrunc(ns, std.time.ns_per_s));
-            const last = conn.snapshotLastCommand(&tool_buf, &result_buf);
-            if (last.at_ns > 0) {
-                last_at_unix = @intCast(@divTrunc(last.at_ns, std.time.ns_per_s));
+            last_snap = conn.snapshotLastCommand();
+            if (last_snap.at_ns > 0) {
+                last_at_unix = @intCast(@divTrunc(last_snap.at_ns, std.time.ns_per_s));
             }
-            last_tool = tool_buf[0..last.tool_len];
-            last_result = result_buf[0..last.result_len];
         }
     }
+    const last_tool = last_snap.tool();
+    const last_result = last_snap.result();
 
     return std.fmt.allocPrint(
         allocator,
@@ -17196,11 +17225,10 @@ fn handleApiRoute(
         // config can only set alphanumeric + underscore + hyphen + dot
         // user_ids by operator convention; reject anything else up-front
         // so the unescaped JSON write in extensionUserStatusPayload stays
-        // safe.
-        for (path_user_id) |c| {
-            if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-' and c != '.') {
-                return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
-            }
+        // safe. The helper is also called from `extensionUserStatusPayload`
+        // itself as a fail-closed guard.
+        if (!isSafeExtensionUserId(path_user_id)) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
         }
         // S4 review fix: drop the X-Zaki-User-Id "self-only" path. The
         // header is set by the BFF after its own auth, but at the
@@ -32512,6 +32540,44 @@ test "extensionUserStatusPayload renders not_paired when user has no conn" {
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"user_id\":\"alice\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"paired\":false") != null);
+}
+
+test "extensionUserStatusPayload defense-in-depth: rejects unsafe user_ids" {
+    var hub = extension_ws_hub.ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    const input: ExtensionDiagnosticInput = .{
+        .hub = &hub,
+        .connections_total = 0,
+        .auth_failed_total = 0,
+    };
+
+    // Quote-bearing user_id — would inject extra JSON keys if the
+    // function trusted the route gate. The internal guard rejects it.
+    try std.testing.expectError(error.InvalidUserId, extensionUserStatusPayload(std.testing.allocator, input, "alice\",\"paired\":true,\"x\":\""));
+    // Backslash — same JSON-escape vector.
+    try std.testing.expectError(error.InvalidUserId, extensionUserStatusPayload(std.testing.allocator, input, "a\\b"));
+    // Newline — would break the single-line JSON shape.
+    try std.testing.expectError(error.InvalidUserId, extensionUserStatusPayload(std.testing.allocator, input, "a\nb"));
+    // Empty string — definitely not a valid user_id.
+    try std.testing.expectError(error.InvalidUserId, extensionUserStatusPayload(std.testing.allocator, input, ""));
+    // Safe charset — accepted.
+    const ok = try extensionUserStatusPayload(std.testing.allocator, input, "alice.1-2_3");
+    defer std.testing.allocator.free(ok);
+}
+
+test "isSafeExtensionUserId accepts the documented charset, rejects everything else" {
+    try std.testing.expect(isSafeExtensionUserId("alice"));
+    try std.testing.expect(isSafeExtensionUserId("alice.123"));
+    try std.testing.expect(isSafeExtensionUserId("a-b_c.d"));
+    try std.testing.expect(isSafeExtensionUserId("0"));
+    // Reject.
+    try std.testing.expect(!isSafeExtensionUserId(""));
+    try std.testing.expect(!isSafeExtensionUserId(" "));
+    try std.testing.expect(!isSafeExtensionUserId("a b"));
+    try std.testing.expect(!isSafeExtensionUserId("a/b"));
+    try std.testing.expect(!isSafeExtensionUserId("a\""));
+    try std.testing.expect(!isSafeExtensionUserId("a\\b"));
+    try std.testing.expect(!isSafeExtensionUserId("a\nb"));
 }
 
 test "extension diagnostics status route requires internal token" {
