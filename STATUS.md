@@ -1,8 +1,35 @@
 # nullALIS — STATUS
 
-**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-29 — **prod-readiness Sprint S4 (extension browser readiness) shipped** (PR #111 / branch `prod-readiness/s4-extension-browser-readiness`). Prior refresh: 2026-05-25 covered the commercial v1 sprint Waves 1–5 + v1.14.22 hotfix + v1.14.23 hardening pass.
+**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-29 — **prod-readiness Sprint S6 (V1 production verification matrix) in progress** (branch `prod-readiness/s6-verification-matrix`). Prior refreshes (same day): S5 follow-up #113 merged (observability hardening), S5 #112 merged (observability + SLOs), S4 #111 merged (extension browser readiness). Prior session: 2026-05-25 covered the commercial v1 sprint Waves 1–5 + v1.14.22 hotfix + v1.14.23 hardening pass.
 
 This is the single cold-start document. If it disagrees with `.planning/STATE.md`, `PROJECT_LEDGER.md` (archived), or anything in `docs/archive/`, **this wins**.
+
+---
+
+## 2026-05-29 — Sprint S6: V1 production verification matrix (ready for review)
+
+**Branch:** `prod-readiness/s6-verification-matrix`. **PR:** [#115](https://github.com/ProjectNuggets/NULL-ALIS/pull/115). Builds on the hardened S1–S5 stack (S1 #108, S2 #109, S3 #110, S4 #111, S5 #112 + follow-up #113, #114 OOM fix — all on `main`). S6 is the production-readiness gate: a fresh checkout verifies the pinned V1 backend surfaces (see [docs/operations/verification-matrix.md](docs/operations/verification-matrix.md) "Surface coverage" table — health/metrics, sanitizer/parser/detector contracts, and the live-PG integrations D25 cascade / memory_purge_pii / trace-share durability / artifact CRUD) with two commands. Surfaces NOT in the table are explicitly deferred with compensating controls.
+
+**What S6 ships (acceptance bar from the spec):**
+
+- **`zig build test-postgres` named step** — runs the `tests/verification/` aggregate. Default `zig build test` is intentionally unchanged; the matrix is additive.
+- **`tests/verification/harness.zig`** — canonical postgres URL resolver via `env_rebrand.getEnvOwnedWithRebrand` (`NULLALIS_POSTGRES_TEST_URL` primary + `NULLCLAW_POSTGRES_TEST_URL` legacy fallback with banner + per-key warning; OOM / WTF-8 / other genuine errors PROPAGATE — only env-var-absent collapses to SkipZigTest); `schemaName` (wraps the shared `zaki_state.buildTestSchemaName` for one source of truth); `provisionTestUser` (per-test stamp-based unique uid + identity-gate bypass via the test-only `Manager.skipExternalIdentityForTests`, which is `comptime`-guarded against production callers); `dropAndDeinit` (drop-failure-logging cleanup); `openApiPathBlock` (path-scoped YAML response checks); `loadProjectFile` / `migrationSql` helpers for source-of-truth-document scans.
+- **18 verified V1 surfaces** (see `docs/operations/verification-matrix.md` "Surface coverage" table): health/metrics catalog + cardinality cap + histogram buckets, PG URL resolver, chat stream contract, mode switch, session cancel, approvals (stable `apr-{u64}` + 409 + Idempotency-Key), attachments (Idempotency-Key dedupe), artifacts (sanitizer whitelist + JSON escape + ArtifactKind round-trip), trace sharing (durable migration + sanitizer keep-list), extension browser (10 shipped extension_* tools + url_sanitize SSRF defense), memory tools (PII detect phone+email scope + V1 negative-space on address/name + `memory_purge_pii` documented in ui-handoff), GDPR D25 cascade (≥17 user_id CASCADE FKs in 0001 + line-precise SET NULL / NO ACTION absence on user_id FKs), static schema invariants (every V1-critical table + monotonic migrations + critical indexes), observability cardinality cap + warm/cold path semantics, startup fail-loud (`isFatalStartupError` exhaustive over `StartupSelfCheckError`), Composio gated lane (env-skip + production-name guard).
+- **CI wiring** — `.github/workflows/ci.yml`'s `canonical-production-profile` job runs the matrix against the existing pgvector service container. Step renamed "V1 production verification matrix" (the parenthetical "live Postgres" was misdirecting triage on non-PG failure modes per code review).
+- **Operator runbook** — `docs/operations/verification-matrix.md` with TL;DR two commands, env vars, per-PR vs per-release cadence, local Docker runbook, complete 18-row Surface coverage table, failure triage, restart/pod-loss expectations, V1 hidden-surfaces list verbatim, and explicit "what S6 does NOT cover" boundary with compensating controls.
+- **V1 readiness report template** — `docs/operations/v1-readiness-report.md`, marked PENDING FINAL CONSOLIDATION until S6 lands on main.
+- **Contract doc sync** — `docs/ui-handoff.md` row for `memory_purge_pii` (closes the S1 #108 doc gap the matrix caught); `src/memory/root.zig` re-exports `pii_detect` so the V1 PII detector is a public surface.
+
+**Verification (latest commit on branch, local + ephemeral Docker pgvector):**
+
+- `zig build -Dengines=base,sqlite,postgres` → exit 0
+- `zig build test -Dengines=base,sqlite,postgres --summary all` → 22/22 steps, **6892/6971 passed, 79 skipped** (default suite unchanged from main; +1 test surfaced by the `pii_detect` re-export)
+- `NULLALIS_POSTGRES_TEST_URL=postgresql://zaki:zaki@localhost:5432/zaki zig build test-postgres -Dengines=base,sqlite,postgres --summary all` → 6/6 steps, **93/94 passed, 1 skipped** (the skip is the Composio configured-lane test, env-gated; live D25 cascade asserts the public seed/readback path and the static scan pins all `user_id` FKs; matches the documented contract)
+- Negative proofs (must FAIL per S6 spec):
+  * `NULLALIS_POSTGRES_TEST_URL=postgresql://zaki:zaki@127.0.0.1:1/zaki zig build test-postgres -Dengines=base,sqlite,postgres` → 7 live-PG tests RED, exit 1 (bogus URL hard-fails)
+  * `zig build test-postgres -Dengines=base,sqlite` → `@compileError` at `tests/verification/root.zig`, exit 1 (engine-off hard-fails)
+
+**V1 hidden / not-claimed (verbatim, matches the matrix doc):** `/api/v1/chat/{cancel,resume,approve}` as top-level routes; live subagent interruption; bi-temporal `valid_to` classifier; per-cell isolated pods; D52 Pillar 5 at-rest encryption of `pii_tagged` rows; address/name PII detection; 7–9 digit US-local phones without `+`; end-user Composio claims; public `/metrics` (operator-only).
 
 ---
 

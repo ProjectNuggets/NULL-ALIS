@@ -14,6 +14,11 @@ const provider_api_key = @import("../providers/api_key.zig");
 const util = @import("../util.zig");
 const log = std.log.scoped(.memory);
 
+// PII detection (Layer 0 — surface for the persist path + the
+// memory_purge_pii tool + the S6 verification matrix). V1 detector
+// scope is phone + email only (see pii_detect.zig:9-22).
+pub const pii_detect = @import("pii_detect.zig");
+
 // engines/ (Layer A: Primary Store)
 pub const sqlite = if (build_options.enable_sqlite) @import("engines/sqlite.zig") else @import("engines/sqlite_disabled.zig");
 pub const markdown = @import("engines/markdown.zig");

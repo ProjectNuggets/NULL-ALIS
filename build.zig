@@ -642,6 +642,35 @@ pub fn build(b: *std.Build) void {
         extension_diagnostics_tests.root_module.linkSystemLibrary("pq", .{});
     }
 
+    // ---- S6 verification matrix ----
+    // Aggregate root for the V1 production verification suite. Per-surface
+    // test files live under tests/verification/ and are pulled in by
+    // tests/verification/root.zig. The suite is intentionally additive —
+    // the default `test` step is NOT modified, and `test-postgres` runs
+    // ONLY this aggregate. Live-PG tests skip cleanly when
+    // NULLALIS_POSTGRES_TEST_URL is unset (matches the existing
+    // promotion_reflection_pg_test idiom), so `zig build test-postgres`
+    // is safe to invoke locally without a fixture.
+    const verification_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/verification/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nullalis", .module = lib_mod },
+                .{ .name = "build_options", .module = build_options_module },
+            },
+        }),
+    });
+    if (sqlite3) |lib| {
+        verification_tests.linkLibrary(lib);
+    }
+    if (enable_postgres) {
+        addHomebrewLibpqPaths(verification_tests);
+        addHomebrewLibpqPaths(verification_tests.root_module);
+        verification_tests.root_module.linkSystemLibrary("pq", .{});
+    }
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
@@ -666,4 +695,23 @@ pub fn build(b: *std.Build) void {
     // NULLALIS_MCP_LIVE_TEST=1 zig build test-mcp-live
     const mcp_live_step = b.step("test-mcp-live", "Run only the MCP client live integration test (needs npx)");
     mcp_live_step.dependOn(&b.addRunArtifact(mcp_live_tests).step);
+
+    // Sprint S6 — V1 production verification matrix. Runs only the
+    // tests/verification/ aggregate. Default `test` step is unchanged.
+    //
+    // REQUIRES `-Dengines=...,postgres` AT COMPILE TIME — the matrix is
+    // the V1 live-PG lane. Running with `-Dengines=base,sqlite` (or any
+    // engine set that excludes postgres) fails at compile time via a
+    // `@compileError` at tests/verification/root.zig:14. Engine absence
+    // is NOT a runtime skip.
+    //
+    // At runtime, the live-PG tests need `NULLALIS_POSTGRES_TEST_URL` to
+    // point at a reachable Postgres. URL absence → SkipZigTest on the
+    // live-PG tests (static contract scans still run). A URL that is
+    // SET but unreachable → connection error PROPAGATES (test RED).
+    const test_postgres_step = b.step(
+        "test-postgres",
+        "Run the V1 production verification matrix (requires -Dengines=...,postgres; set NULLALIS_POSTGRES_TEST_URL for the live-PG lane)",
+    );
+    test_postgres_step.dependOn(&b.addRunArtifact(verification_tests).step);
 }

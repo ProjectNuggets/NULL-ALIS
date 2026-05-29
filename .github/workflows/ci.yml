@@ -125,5 +125,20 @@ jobs:
           NULLALIS_POSTGRES_TEST_URL: postgresql://zaki:zaki@localhost:5432/zaki
         run: zig build test --summary all -Dengines=base,sqlite,postgres -Dchannels=cli,telegram
 
+      - name: V1 production verification matrix
+        # Sprint S6 — runs the tests/verification/ aggregate against the
+        # same pgvector service container as the canonical test step above.
+        # The matrix is additive: the previous step still exercises the
+        # default suite; this step pins V1 user-facing backend surfaces
+        # (health/metrics, approvals, attachments, artifacts, trace shares,
+        # extension browser, memory tools incl. memory_purge_pii, GDPR
+        # cascade, schema invariants, startup fail-loud, Composio gated lane).
+        # The pgvector service container above is a precondition, NOT the
+        # subject — a non-PG failure mode (e.g. metric catalog drift) is
+        # equally in scope, so the step name stays surface-agnostic.
+        env:
+          NULLALIS_POSTGRES_TEST_URL: postgresql://zaki:zaki@localhost:5432/zaki
+        run: zig build test-postgres --summary all -Dengines=base,sqlite,postgres -Dchannels=cli,telegram
+
       - name: Build ReleaseSmall (canonical production engines)
         run: zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres -Dchannels=cli,telegram
