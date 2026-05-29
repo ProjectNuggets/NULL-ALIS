@@ -50,6 +50,7 @@ tags:
   - name: app
   - name: user
   - name: webhook
+  - name: observability
 
 paths:
   # ── Stable endpoints (do not break) ───────────────────────────────
@@ -92,15 +93,25 @@ paths:
 
   /metrics:
     get:
-      tags: [ops]
-      summary: Prometheus metrics
+      tags: [observability]
+      summary: Prometheus metrics scrape.
+      description: |
+        Prometheus text exposition v0.0.4. See docs/operations/SLOs.md for
+        the full metric catalog, alert PromQL, and V1 launch gates.
+
+        No authentication is performed. The deployment must firewall this
+        endpoint from the public internet.
       responses:
-        "200":
-          description: Metrics payload
+        '200':
+          description: Prometheus text exposition.
           content:
             text/plain:
               schema:
                 type: string
+                example: |
+                  # HELP nullalis_gateway_requests_total Total HTTP requests handled.
+                  # TYPE nullalis_gateway_requests_total counter
+                  nullalis_gateway_requests_total 42
 
   /pair:
     post:

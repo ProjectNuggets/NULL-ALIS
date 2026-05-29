@@ -478,7 +478,7 @@ before public scale unless product explicitly hides the surface.
 | P1 | Approval consolidation | backend | One canonical pending-approval model; no legacy `pending_exec_*` ambiguity; stable enough identifiers for UI cards |
 | P1 | Durable traces/shares — **SHARES SHIPPED**, events deferred | backend | **Sprint 3 (2026-05-28) landed PG-backed trace SHARES** via `migrations/0003_trace_shares.sql`. Share URL + sanitized snapshot survive gateway restart for the share's TTL. Trace EVENTS stay in the bounded in-process `RunTraceStore` (64 runs × 256 events). UI surfaces `/api/v1/share/:share_code` as durable; the listing `/api/v1/users/:id/traces` remains best-effort ephemeral. |
 | P1 | Extension browser readiness | backend + extension | Per-user token auth (only model), pair/disconnect/timeout/command_failed observable via `/api/v1/diagnostics/extension/*` + canonical `extension_ws.event=*` logs, cross-user isolation tested, mock-hub E2E across all ten extension_* tools |
-| P1 | Observability/SLOs | backend + platform | Run id, session id, product id, tool latency, artifact export, approvals, extension commands, memory writes, and meter receipt IDs are chartable |
+| P1 | Observability/SLOs | backend + platform | `/metrics` exposes bounded Prometheus series for approvals, artifact export, extension commands, memory ops, trace shares, per-tool latency, meter receipts, and degraded state; run/session correlation stays in structured logs; production Postgres degradation fails loud |
 | P1 | Memory PII purge/export UX | backend | `memory_forget` is callable from the UI; PII-tagged memories can be enumerated and bulk-cleared; consent gate stays opt-in |
 
 **Closed in this readiness pass** (2026-05-28 — P0 burn-down):
@@ -496,6 +496,30 @@ before public scale unless product explicitly hides the surface.
 - Thmanyah brand fonts shipped IN the container at `/usr/local/share/nullalis/branding/fonts/`
 - 1M context routing — Claude Opus 4.7 + Sonnet 4.6 + Gemini 2.5 Pro all native 1M (no beta header needed)
 - Per-user model selection — `selected_model` in ProductSettings
+
+**Closed in prod-readiness Sprint 5** (2026-05-29 — observability + readiness):
+- **P1 — Observability/SLOs**: `/metrics` exposes the full chartable
+  catalog (approvals, artifact export, extension WS commands, memory
+  ops, trace shares, per-tool latency, meter receipts, plus the
+  pre-S5 gateway/HTTP/lifecycle families). Production startup is
+  fail-loud (`error.ProductionPostgresRequired`, non-zero exit,
+  `startup.production_postgres_required` line at `log.err`) when
+  Postgres is configured but unavailable on a non-loopback host.
+  Dev/test still warn-and-continue. See `docs/operations/SLOs.md`.
+
+### Gateway degraded state and metrics
+
+The gateway exposes `nullalis_gateway_degraded{configured,effective,reason}`
+on `/metrics`. A non-zero value indicates the gateway started in degraded
+mode (configured backend != effective backend). In production deployments
+this gauge is always 0 — startup is fail-loud when Postgres is configured
+but unavailable; the process exits non-zero with a
+`startup.production_postgres_required` log line at `log.err` level.
+Dev/test deployments may show a non-zero value when iterating without
+Postgres.
+
+See [docs/operations/SLOs.md](operations/SLOs.md) for the full metric
+catalog and V1 launch gates.
 
 ## 7. Handoff checklist — UI agent's first day
 
