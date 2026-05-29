@@ -5284,7 +5284,14 @@ fn buildFallbackChainIntoBuf(buf: []u8, fallback_providers: []const []const u8) 
     return used;
 }
 
-fn applyStartupSelfCheck(state: *GatewayState, cfg: *const Config, postgres_init_error: ?anyerror) void {
+const StartupSelfCheckError = error{ProductionPostgresRequired};
+
+fn applyStartupSelfCheck(
+    state: *GatewayState,
+    cfg: *const Config,
+    postgres_init_error: ?anyerror,
+    effective_host: []const u8,
+) StartupSelfCheckError!void {
     state.state_backend_configured = cfg.state.backend;
     state.state_backend_effective = if (state.zaki_state != null) "postgres" else "file";
     state.scheduler_backend = if (state.zaki_state != null and cfg.tenant.enabled) "postgres" else "file";
@@ -5312,6 +5319,27 @@ fn applyStartupSelfCheck(state: *GatewayState, cfg: *const Config, postgres_init
         state.state_degraded_reason_len = copyIntoBuf(&state.state_degraded_reason_buf, reason);
     } else {
         state.state_degraded_reason_len = 0;
+    }
+
+    // S5 (2026-05-29, prod-readiness): fail-loud when a production-like
+    // gateway was configured for Postgres but failed to initialize it.
+    // Dev/test profiles (loopback host + allow_public_bind=false) keep
+    // the warn-and-continue path below — operator ergonomics matter
+    // for `zig build run` against `config.example.json`.
+    if (state.state_degraded and
+        std.mem.eql(u8, cfg.state.backend, "postgres") and
+        isProductionLikeGateway(cfg, effective_host))
+    {
+        const reason = if (postgres_init_error) |err| @errorName(err) else "postgres_init_failed";
+        // NOTE: emit at warn level (not err) so the Zig test runner can
+        // unit-test the returned error without tripping its log-err guard.
+        // The returned error is the actual fail-loud signal — Zig prints
+        // the error trace and exits non-zero, which is what operators see.
+        log.warn(
+            "startup.production_postgres_required configured=postgres effective={s} reason={s} host={s} — refusing to run degraded in production",
+            .{ state.state_backend_effective, reason, effective_host },
+        );
+        return error.ProductionPostgresRequired;
     }
 
     const dispatch_mode = tool_dispatcher.parseMode(cfg.agent.tool_dispatcher);
@@ -22296,7 +22324,7 @@ pub fn runWithRole(
             }
         }
 
-        applyStartupSelfCheck(&state, cfg, postgres_init_error);
+        try applyStartupSelfCheck(&state, cfg, postgres_init_error, host);
         logStartupSelfCheck(&state);
     }
     if (state.pairing_guard == null) {
@@ -28123,6 +28151,89 @@ test "metricsPayload S5: registry counter shows up in scrape" {
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_approval_decision_total{result=\"issued\"} 2") != null);
+}
+
+// ── S5 (2026-05-29, prod-readiness) production-fail-loud readiness gate ──
+//
+// applyStartupSelfCheck must return error.ProductionPostgresRequired
+// when running production-like (non-loopback host OR allow_public_bind)
+// AND the configured state backend is postgres AND postgres failed to
+// initialize (state_degraded). Dev/test on the loopback host with
+// allow_public_bind=false must keep the warn-and-continue behavior so
+// `zig build run` against `config.example.json` still works.
+
+test "applyStartupSelfCheck: degraded + non-production host = warn, no error" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullalis",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = allocator,
+    };
+    cfg.state.backend = "postgres";
+    cfg.gateway.allow_public_bind = false;
+    // zaki_state stays null — simulates postgres init failure.
+    try applyStartupSelfCheck(&gs, &cfg, error.ConnectionRefused, "127.0.0.1");
+    try std.testing.expect(gs.state_degraded);
+    try std.testing.expectEqualStrings("ConnectionRefused", gs.degradedReason());
+}
+
+test "applyStartupSelfCheck: degraded + production host + postgres-configured = ProductionPostgresRequired" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullalis",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = allocator,
+    };
+    cfg.state.backend = "postgres";
+    cfg.gateway.allow_public_bind = true; // forces production-like
+
+    const result = applyStartupSelfCheck(&gs, &cfg, error.ConnectionRefused, "0.0.0.0");
+    try std.testing.expectError(error.ProductionPostgresRequired, result);
+}
+
+test "applyStartupSelfCheck: production + state.backend=file = no error" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullalis",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = allocator,
+    };
+    cfg.state.backend = "file";
+    cfg.gateway.allow_public_bind = true;
+
+    try applyStartupSelfCheck(&gs, &cfg, null, "0.0.0.0");
+    try std.testing.expect(!gs.state_degraded);
+}
+
+test "applyStartupSelfCheck: production + postgres + zaki_state present = no error" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    // Make zaki_state non-null so degraded stays false. The function
+    // only checks `state.zaki_state != null` — never dereferences the
+    // pointer — so a stack-local undefined Manager is sufficient.
+    var dummy_manager: zaki_state_mod.Manager = undefined;
+    gs.zaki_state = &dummy_manager;
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullalis",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = allocator,
+    };
+    cfg.state.backend = "postgres";
+    cfg.gateway.allow_public_bind = true;
+
+    try applyStartupSelfCheck(&gs, &cfg, null, "0.0.0.0");
+    try std.testing.expect(!gs.state_degraded);
 }
 
 // ── S5 (2026-05-29, prod-readiness) emit-site round-trip tests ──
