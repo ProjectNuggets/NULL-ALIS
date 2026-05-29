@@ -3514,6 +3514,18 @@ fn validateInternalServiceToken(raw: []const u8, state: *const GatewayState) boo
     );
 }
 
+/// Predicate used by `/api/v1/diagnostics/extension/users/{user_id}` to
+/// allow a request through when the inbound `X-Zaki-User-Id` matches
+/// the path parameter — the user inspecting their own extension state.
+///
+/// `hdr_user_id` is whatever the gateway extracted from the
+/// `X-Zaki-User-Id` header (may be null when not present).
+fn extensionUserDiagnosticsSelfAllowed(hdr_user_id: ?[]const u8, path_user_id: []const u8) bool {
+    const hu = hdr_user_id orelse return false;
+    if (hu.len == 0) return false;
+    return std.mem.eql(u8, hu, path_user_id);
+}
+
 /// **D9 (2026-04-26)** — extracted from `.entitlements_revoke` switch
 /// arm so the route logic is unit-testable without spinning up a real
 /// HTTP listener. The switch arm calls this function and assigns the
@@ -17167,6 +17179,56 @@ fn handleApiRoute(
             resolveStateTraceStoreForUser,
         );
     }
+    // S4 (Sprint 4) — extension control-plane diagnostics.
+    if (std.mem.eql(u8, base_path, "/api/v1/diagnostics/extension/status")) {
+        if (!std.mem.eql(u8, method, "GET")) {
+            return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+        }
+        if (!validateInternalServiceToken(raw_request, state)) {
+            return .{ .status = "401 Unauthorized", .body = "{\"error\":\"unauthorized\"}" };
+        }
+        const input: ExtensionDiagnosticInput = .{
+            .hub = state.extension_ws_hub,
+            .connections_total = state.extension_ws_total.load(.monotonic),
+            .auth_failed_total = state.extension_ws_auth_failed_total.load(.monotonic),
+        };
+        const body = extensionStatusPayload(req_allocator, input) catch "{\"error\":\"render_failed\"}";
+        return .{ .status = "200 OK", .body = body };
+    }
+    if (std.mem.startsWith(u8, base_path, "/api/v1/diagnostics/extension/users/")) {
+        if (!std.mem.eql(u8, method, "GET")) {
+            return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+        }
+        const path_user_id = base_path["/api/v1/diagnostics/extension/users/".len..];
+        if (path_user_id.len == 0 or std.mem.indexOfScalar(u8, path_user_id, '/') != null) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+        }
+        // Defense-in-depth: reject user_ids containing characters that
+        // would require JSON escaping in the response body. The token
+        // config can only set alphanumeric + underscore + hyphen + dot
+        // user_ids by operator convention; reject anything else up-front
+        // so the unescaped JSON write in extensionUserStatusPayload stays
+        // safe.
+        for (path_user_id) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-' and c != '.') {
+                return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+            }
+        }
+        const hdr_uid = extractHeader(raw_request, "X-Zaki-User-Id");
+        const internal_ok = validateInternalServiceToken(raw_request, state);
+        const self_ok = extensionUserDiagnosticsSelfAllowed(hdr_uid, path_user_id);
+        if (!internal_ok and !self_ok) {
+            return .{ .status = "401 Unauthorized", .body = "{\"error\":\"unauthorized\"}" };
+        }
+        const input: ExtensionDiagnosticInput = .{
+            .hub = state.extension_ws_hub,
+            .connections_total = state.extension_ws_total.load(.monotonic),
+            .auth_failed_total = state.extension_ws_auth_failed_total.load(.monotonic),
+        };
+        const body = extensionUserStatusPayload(req_allocator, input, path_user_id) catch "{\"error\":\"render_failed\"}";
+        return .{ .status = "200 OK", .body = body };
+    }
+
     if (!validateInternalServiceToken(raw_request, state)) {
         return .{ .status = "401 Unauthorized", .body = "{\"error\":\"unauthorized\"}" };
     }
@@ -32444,4 +32506,29 @@ test "extensionUserStatusPayload renders not_paired when user has no conn" {
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"user_id\":\"alice\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"paired\":false") != null);
+}
+
+test "extension diagnostics status route requires internal token" {
+    // No token configured, auth_required = true → reject.
+    const no_auth_raw = "GET /api/v1/diagnostics/extension/status HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const allowed = validateInternalServiceTokenWithPolicy(no_auth_raw, &.{}, true);
+    try std.testing.expect(!allowed);
+}
+
+test "extension diagnostics status route accepts valid internal token" {
+    const tokens = [_][]const u8{"prod-internal-1234"};
+    const auth_raw = "GET /api/v1/diagnostics/extension/status HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: prod-internal-1234\r\n\r\n";
+    const allowed = validateInternalServiceTokenWithPolicy(auth_raw, &tokens, true);
+    try std.testing.expect(allowed);
+}
+
+test "extension diagnostics per-user route allows self when X-Zaki-User-Id matches" {
+    const matches = extensionUserDiagnosticsSelfAllowed("alice", "alice");
+    try std.testing.expect(matches);
+    const mismatch = extensionUserDiagnosticsSelfAllowed("alice", "bob");
+    try std.testing.expect(!mismatch);
+    const missing = extensionUserDiagnosticsSelfAllowed(null, "alice");
+    try std.testing.expect(!missing);
+    const empty = extensionUserDiagnosticsSelfAllowed("", "alice");
+    try std.testing.expect(!empty);
 }
