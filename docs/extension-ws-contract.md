@@ -153,10 +153,18 @@ accept count; `auth_failed_total` is the cumulative count of `auth_ack
 
 ### `GET /api/v1/diagnostics/extension/users/{user_id}`
 
-Per-user view. Auth: internal-token OR `X-Zaki-User-Id == {user_id}`
-(self-only). UI components SHOULD use the self-only mode so the
-extension status pill in the chat header binds without operator
-plumbing.
+Per-user view. Auth: `X-Internal-Token` (operator-only). An earlier
+S4 draft admitted an `X-Zaki-User-Id == {user_id}` "self-only" path —
+that path was **dropped during S4 review** because `X-Zaki-User-Id`
+is caller-controlled at the gateway HTTP boundary (it carries no
+credential), and admitting it as the sole auth would let any
+unauthenticated caller read another user's pairing state. UIs reach
+this route through the BFF, which already carries the internal token.
+
+In `user_cell` deployment mode (one gateway pinned to one user), the
+route additionally enforces `state.pinned_user_id == path_user_id`
+and returns `403 wrong_user_cell` otherwise — mirrors the gate the
+canonical `/api/v1/users/{uid}/*` routes apply.
 
 The `{user_id}` path parameter must be alphanumeric + `_` + `-` + `.`
 only; anything else returns `400 Bad Request` with `invalid_user_id`.

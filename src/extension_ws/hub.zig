@@ -675,6 +675,17 @@ pub const ExtensionWsHub = struct {
         return conn;
     }
 
+    /// Live count of paired users. Takes `users_mu` for the duration
+    /// of the read so the sample is consistent. Diagnostic helpers in
+    /// `gateway.zig` use this instead of touching `users_mu` /
+    /// `users` directly — the hub keeps its threading model
+    /// encapsulated.
+    pub fn activeCount(self: *ExtensionWsHub) usize {
+        self.users_mu.lock();
+        defer self.users_mu.unlock();
+        return self.users.count();
+    }
+
     /// Caller-owned snapshot of every currently-paired user. The slice
     /// AND each element's fields are heap-allocated; free via
     /// `ExtensionState.freeSlice(allocator, slice)`.
@@ -876,10 +887,21 @@ pub fn formatLifecycleEvent(writer: anytype, ev: LifecycleEvent, args: Lifecycle
 }
 
 /// Production-side emitter: routes the canonical line through std.log.
+///
+/// S4 review fix: if the 512-byte fixed buffer overflows
+/// (pathological user_id or extra_val), surface a warn line with the
+/// event class so the loss is operator-visible. Silent drop would
+/// hide a real shipping-relevant event class from log shipping.
 fn emitLifecycleEvent(ev: LifecycleEvent, args: LifecycleEventArgs) void {
     var buf: [512]u8 = undefined;
     var sink = std.io.fixedBufferStream(&buf);
-    formatLifecycleEvent(sink.writer(), ev, args) catch return;
+    formatLifecycleEvent(sink.writer(), ev, args) catch {
+        log.warn(
+            "extension_ws.event={s} log_drop_reason=format_buf_overflow",
+            .{ev.toString()},
+        );
+        return;
+    };
     log.info("{s}", .{sink.getWritten()});
 }
 

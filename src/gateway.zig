@@ -3514,18 +3514,6 @@ fn validateInternalServiceToken(raw: []const u8, state: *const GatewayState) boo
     );
 }
 
-/// Predicate used by `/api/v1/diagnostics/extension/users/{user_id}` to
-/// allow a request through when the inbound `X-Zaki-User-Id` matches
-/// the path parameter — the user inspecting their own extension state.
-///
-/// `hdr_user_id` is whatever the gateway extracted from the
-/// `X-Zaki-User-Id` header (may be null when not present).
-fn extensionUserDiagnosticsSelfAllowed(hdr_user_id: ?[]const u8, path_user_id: []const u8) bool {
-    const hu = hdr_user_id orelse return false;
-    if (hu.len == 0) return false;
-    return std.mem.eql(u8, hu, path_user_id);
-}
-
 /// **D9 (2026-04-26)** — extracted from `.entitlements_revoke` switch
 /// arm so the route logic is unit-testable without spinning up a real
 /// HTTP listener. The switch arm calls this function and assigns the
@@ -6681,11 +6669,11 @@ pub const ExtensionDiagnosticInput = struct {
 /// Returned slice is heap-allocated; caller frees via `allocator.free`.
 pub fn extensionStatusPayload(allocator: std.mem.Allocator, input: ExtensionDiagnosticInput) ![]u8 {
     const enabled = input.hub != null;
-    const total_active: usize = if (input.hub) |hub| blk: {
-        hub.users_mu.lock();
-        defer hub.users_mu.unlock();
-        break :blk hub.users.count();
-    } else 0;
+    // S4 review fix: go through the hub's public activeCount() instead
+    // of touching users_mu / users directly. Keeps the hub's threading
+    // model encapsulated; future locking changes on the hub side
+    // don't silently break gateway.zig.
+    const total_active: usize = if (input.hub) |hub| hub.activeCount() else 0;
 
     return std.fmt.allocPrint(
         allocator,
@@ -17214,11 +17202,29 @@ fn handleApiRoute(
                 return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
             }
         }
-        const hdr_uid = extractHeader(raw_request, "X-Zaki-User-Id");
-        const internal_ok = validateInternalServiceToken(raw_request, state);
-        const self_ok = extensionUserDiagnosticsSelfAllowed(hdr_uid, path_user_id);
-        if (!internal_ok and !self_ok) {
+        // S4 review fix: drop the X-Zaki-User-Id "self-only" path. The
+        // header is set by the BFF after its own auth, but at the
+        // gateway HTTP boundary it is caller-controlled and was not
+        // validated against any credential — anyone could set
+        // `X-Zaki-User-Id: alice` and read alice's pairing state.
+        // Require X-Internal-Token always, matching every other
+        // `/api/v1/users/{uid}/*` route. user_cell-mode also enforces
+        // `pinned_user_id` via `resolveGatewayPathUserId`; this route
+        // adds a defensive check below.
+        if (!validateInternalServiceToken(raw_request, state)) {
             return .{ .status = "401 Unauthorized", .body = "{\"error\":\"unauthorized\"}" };
+        }
+        // S4 review fix: user_cell mode pins one user per gateway
+        // instance. Reject requests for any other user before doing
+        // the lookup — mirrors `resolveGatewayPathUserId`'s
+        // UserCellUserMismatch return for the canonical user routes.
+        if (state.role == .user_cell) {
+            const pinned = state.pinned_user_id orelse {
+                return .{ .status = "403 Forbidden", .body = "{\"error\":\"wrong_user_cell\"}" };
+            };
+            if (!std.mem.eql(u8, pinned, path_user_id)) {
+                return .{ .status = "403 Forbidden", .body = "{\"error\":\"wrong_user_cell\"}" };
+            }
         }
         const input: ExtensionDiagnosticInput = .{
             .hub = state.extension_ws_hub,
@@ -32522,13 +32528,20 @@ test "extension diagnostics status route accepts valid internal token" {
     try std.testing.expect(allowed);
 }
 
-test "extension diagnostics per-user route allows self when X-Zaki-User-Id matches" {
-    const matches = extensionUserDiagnosticsSelfAllowed("alice", "alice");
-    try std.testing.expect(matches);
-    const mismatch = extensionUserDiagnosticsSelfAllowed("alice", "bob");
-    try std.testing.expect(!mismatch);
-    const missing = extensionUserDiagnosticsSelfAllowed(null, "alice");
-    try std.testing.expect(!missing);
-    const empty = extensionUserDiagnosticsSelfAllowed("", "alice");
-    try std.testing.expect(!empty);
+test "extension diagnostics per-user route requires internal token (no self-only path)" {
+    // S4 review fix — the per-user route no longer admits an
+    // unauthenticated X-Zaki-User-Id. Same gate as /status; the
+    // header alone cannot read another user's pairing state.
+    const tokens = [_][]const u8{"prod-internal-1234"};
+
+    const no_auth_raw = "GET /api/v1/diagnostics/extension/users/alice HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    try std.testing.expect(!validateInternalServiceTokenWithPolicy(no_auth_raw, &tokens, true));
+
+    // X-Zaki-User-Id alone is not a credential.
+    const self_only_raw = "GET /api/v1/diagnostics/extension/users/alice HTTP/1.1\r\nHost: localhost\r\nX-Zaki-User-Id: alice\r\n\r\n";
+    try std.testing.expect(!validateInternalServiceTokenWithPolicy(self_only_raw, &tokens, true));
+
+    // X-Internal-Token gets through.
+    const auth_raw = "GET /api/v1/diagnostics/extension/users/alice HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: prod-internal-1234\r\n\r\n";
+    try std.testing.expect(validateInternalServiceTokenWithPolicy(auth_raw, &tokens, true));
 }

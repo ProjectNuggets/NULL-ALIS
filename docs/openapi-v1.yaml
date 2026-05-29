@@ -1330,11 +1330,15 @@ paths:
       summary: Per-user extension pairing + last-command state
       description: |
         Returns whether the requested user has a live extension paired,
-        when they paired, and what their last command did. Auth model:
-        either a valid `X-Internal-Token` (operator view) OR an
-        `X-Zaki-User-Id` header that matches the path parameter (self
-        view). The `user_id` path parameter must be alphanumeric +
-        `_-.` only; anything else returns 400.
+        when they paired, and what their last command did. Auth:
+        `X-Internal-Token` (operator-only). An earlier S4 draft
+        admitted an `X-Zaki-User-Id == {user_id}` self-only path —
+        dropped during review because the header carries no
+        credential at this boundary. In `user_cell` deployment mode
+        the route additionally rejects with `403 wrong_user_cell` if
+        the path's `user_id` does not match the cell's pinned user.
+        The `user_id` path parameter must be alphanumeric + `_-.`
+        only; anything else returns 400.
       security:
         - InternalToken: []
       parameters:
