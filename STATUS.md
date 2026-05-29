@@ -24,7 +24,7 @@ This is the single cold-start document. If it disagrees with `.planning/STATE.md
 
 - `zig build -Dengines=base,sqlite,postgres` → exit 0
 - `zig build test -Dengines=base,sqlite,postgres --summary all` → 22/22 steps, **6892/6971 passed, 79 skipped** (default suite unchanged from main; +1 test surfaced by the `pii_detect` re-export)
-- `NULLALIS_POSTGRES_TEST_URL=postgresql://zaki:zaki@localhost:5432/zaki zig build test-postgres -Dengines=base,sqlite,postgres --summary all` → 6/6 steps, **93/94 passed, 1 skipped** (the skip is the Composio configured-lane test, env-gated; live D25 cascade now covers 11 of 19 tables runtime-verified + 19/19 statically; matches the documented contract)
+- `NULLALIS_POSTGRES_TEST_URL=postgresql://zaki:zaki@localhost:5432/zaki zig build test-postgres -Dengines=base,sqlite,postgres --summary all` → 6/6 steps, **93/94 passed, 1 skipped** (the skip is the Composio configured-lane test, env-gated; live D25 cascade asserts the public seed/readback path and the static scan pins all `user_id` FKs; matches the documented contract)
 - Negative proofs (must FAIL per S6 spec):
   * `NULLALIS_POSTGRES_TEST_URL=postgresql://zaki:zaki@127.0.0.1:1/zaki zig build test-postgres -Dengines=base,sqlite,postgres` → 7 live-PG tests RED, exit 1 (bogus URL hard-fails)
   * `zig build test-postgres -Dengines=base,sqlite` → `@compileError` at `tests/verification/root.zig`, exit 1 (engine-off hard-fails)

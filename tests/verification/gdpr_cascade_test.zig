@@ -71,10 +71,10 @@ test "S6.11 D25 static: every user_id FK line declares ON DELETE CASCADE" {
 
 // ── Live PG D25 cascade — expanded coverage ──────────────────────────
 //
-// `provisionUser` seeds 6 of the 19 cascade tables on its own:
-//   users, user_config, heartbeat, channel_state, onboarding, sessions.
-// We then seed the remaining tables reachable via the Manager's public
-// CRUD:
+// `provisionUser` seeds the user plus default rows in:
+//   user_config, heartbeat, channel_state, onboarding, sessions.
+// We then seed the user-scoped tables that the Manager exposes through
+// public CRUD/readback helpers:
 //   memories         (upsertMemory)
 //   working_memory   (upsertWorkingMemorySlot)
 //   user_secrets     (putSecret)
@@ -83,11 +83,11 @@ test "S6.11 D25 static: every user_id FK line declares ON DELETE CASCADE" {
 //   artifacts        (createArtifact)
 //   trace_shares     (setTraceShare)
 //
-// = 13 of the 19 cascade tables seeded and verified at runtime. The
-// remaining 6 (messages, completion_events, memory_events, tasks,
-// telegram_updates, channel_identity_bindings, tenant_user_leases,
-// job_runs) don't have public seed APIs on Manager and are covered by
-// the static line-scan above.
+// The post-delete assertions verify every table that has a public
+// readback path in this harness: sessions, memories, working_memory,
+// user_secrets, secret_mutations, jobs, artifacts (plus
+// artifact_versions transitively), and trace_shares. Tables without a
+// public seed/readback helper stay pinned by the static line-scan above.
 
 test "S6.11 D25 live: DELETE FROM users cascades EVERY publicly-seedable table" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
