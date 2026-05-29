@@ -737,6 +737,7 @@ pub const ExtensionWsHub = struct {
                 else => "error_other",
             };
             observability.recordMetricGlobal(.{ .extension_ws_command_total = .{ .result = result_label, .tool = tool } });
+            conn.recordCommandOutcome(tool, result_label); // S4 — diagnostic stamp
             // WARN 2.C: operator-visible signal for timeouts. Other
             // failure classes are not log-spammed here because they
             // bubble to the tool layer where the user-facing error is
@@ -753,6 +754,7 @@ pub const ExtensionWsHub = struct {
         const elapsed_ms: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - t_start_ns, std.time.ns_per_ms));
         observability.recordMetricGlobal(.{ .extension_ws_command_latency_ms = elapsed_ms });
         observability.recordMetricGlobal(.{ .extension_ws_command_total = .{ .result = "ok", .tool = tool } });
+        conn.recordCommandOutcome(tool, "ok"); // S4 — diagnostic stamp
 
         // Re-dupe into the caller's allocator so the caller's free
         // path matches what `sendCommand`'s docstring promises.
@@ -1585,6 +1587,79 @@ test "ExtensionWsConn recordCommandOutcome + snapshotLastCommand round-trip" {
     try std.testing.expectEqualStrings("extension_screenshot", tool_buf[0..overwritten.tool_len]);
     try std.testing.expectEqualStrings("timeout", result_buf[0..overwritten.result_len]);
     try std.testing.expect(overwritten.at_ns >= after.at_ns);
+}
+
+test "sendCommand records last command outcome on success" {
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    var ts = TestStream{ .allocator = std.testing.allocator };
+    defer ts.deinit();
+    const conn = try hub.registerConn(
+        "alice",
+        @ptrCast(&ts),
+        TestStream.writeText,
+        @ptrCast(&ts),
+        TestStream.close,
+    );
+    defer hub.destroyConn(conn);
+
+    const Helper = struct {
+        c: *ExtensionWsConn,
+        fn deliver(ctx: @This()) void {
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+            ctx.c.deliverResult(
+                \\{"command_id":"cmd-1","ok":true,"result":{"loaded":true}}
+            ) catch {};
+        }
+    };
+    var thread = try std.Thread.spawn(.{}, Helper.deliver, .{Helper{ .c = conn }});
+    defer thread.join();
+
+    const r = try hub.sendCommand(std.testing.allocator, "alice", "navigate", "{}", 200);
+    defer std.testing.allocator.free(r);
+
+    var tool_buf: [32]u8 = undefined;
+    var result_buf: [32]u8 = undefined;
+    const snap = conn.snapshotLastCommand(&tool_buf, &result_buf);
+    try std.testing.expectEqualStrings("navigate", tool_buf[0..snap.tool_len]);
+    try std.testing.expectEqualStrings("ok", result_buf[0..snap.result_len]);
+    try std.testing.expect(snap.at_ns > 0);
+}
+
+test "sendCommand records timeout as last command result" {
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    var ts = TestStream{ .allocator = std.testing.allocator };
+    defer ts.deinit();
+    const conn = try hub.registerConn(
+        "alice",
+        @ptrCast(&ts),
+        TestStream.writeText,
+        @ptrCast(&ts),
+        TestStream.close,
+    );
+    defer hub.destroyConn(conn);
+
+    // No deliverer thread — let it timeout.
+    const r = hub.sendCommand(std.testing.allocator, "alice", "click", "{}", 20);
+    try std.testing.expectError(error.Timeout, r);
+
+    var tool_buf: [32]u8 = undefined;
+    var result_buf: [32]u8 = undefined;
+    const snap = conn.snapshotLastCommand(&tool_buf, &result_buf);
+    try std.testing.expectEqualStrings("click", tool_buf[0..snap.tool_len]);
+    try std.testing.expectEqualStrings("timeout", result_buf[0..snap.result_len]);
+}
+
+test "sendCommand records no_conn when no extension paired" {
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    // No registerConn — no_conn path.
+    const r = hub.sendCommand(std.testing.allocator, "ghost", "screenshot", "{}", 20);
+    try std.testing.expectError(error.NoExtensionConnected, r);
+    // Ghost user has no conn so there's nothing to assert on the
+    // snapshot side — the metric is the visible signal. This test
+    // mostly pins the error class.
 }
 
 test "soak: 50 concurrent extension WS sessions — no deadlock, no UAF, no leak" {
