@@ -193,9 +193,30 @@ pub fn isShutdownRequested() bool {
 }
 
 /// Gateway thread entry point.
+///
+/// S5 (2026-05-29) — Production fail-loud. The gateway thread cannot
+/// propagate an error back to main (Zig threads return void), so we exit the
+/// process directly on fatal-class startup errors. The gateway already emitted
+/// `log.err` with the named reason before returning the error; we emit a
+/// daemon-level breadcrumb so operators see both perspectives in the log.
+///
+/// To verify manually: set `state.backend=postgres` with an unreachable host
+/// + `gateway.allow_public_bind=true`; start the gateway; expect non-zero
+/// exit within a few seconds with a `daemon.gateway_thread: production
+/// fail-loud` log line on stderr.
 fn gatewayThread(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     const gateway = @import("gateway.zig");
     gateway.run(allocator, host, port, config, event_bus) catch |err| {
+        // Fail-loud on the production readiness gate: thread `return` cannot
+        // surface this to main, and other supervisor threads would happily
+        // keep running with file-backed state — exactly the silent-degraded
+        // behavior S5 was meant to eliminate. String-match `@errorName` so we
+        // do not need to plumb the (file-private) `StartupSelfCheckError`
+        // error set out of gateway.zig.
+        if (std.mem.eql(u8, @errorName(err), "ProductionPostgresRequired")) {
+            log.err("daemon.gateway_thread: production fail-loud — exiting non-zero (reason: {s})", .{@errorName(err)});
+            std.process.exit(1);
+        }
         state.markError("gateway", @errorName(err));
         health.markComponentError("gateway", @errorName(err));
         return;
