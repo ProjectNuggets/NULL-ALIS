@@ -28,13 +28,22 @@ test "S6.5 approvals: stable approval_id format apr-{u64} roundtrips" {
     try std.testing.expect(n2 > n1);
 }
 
-test "S6.5 approvals: 409 stale-card response shape is documented in OpenAPI" {
+test "S6.5 approvals: 409 stale-card response shape is declared INSIDE the /approve path block" {
+    // Path-scoped: the 409 must live in the /approve route's block, not
+    // just anywhere in the OpenAPI doc (which would pass vacuously on
+    // any 409 declared elsewhere).
     const yaml = try harness.loadProjectFile("docs/openapi-v1.yaml");
-    const has_approve = std.mem.indexOf(u8, yaml, "/approve:") != null;
-    const has_409 = std.mem.indexOf(u8, yaml, "'409'") != null or
-        std.mem.indexOf(u8, yaml, "\"409\"") != null or
-        std.mem.indexOf(u8, yaml, " 409:") != null;
-    try std.testing.expect(has_approve and has_409);
+    const block = harness.openApiPathBlock(yaml, "/approve:") orelse {
+        std.debug.print("S6.5: /approve path block not found in OpenAPI\n", .{});
+        return error.ApproveBlockMissing;
+    };
+    const has_409 = std.mem.indexOf(u8, block, "'409'") != null or
+        std.mem.indexOf(u8, block, "\"409\"") != null or
+        std.mem.indexOf(u8, block, " 409:") != null;
+    if (!has_409) {
+        std.debug.print("S6.5: /approve block does NOT declare a 409 response — UI cannot bind stale-card surface\n", .{});
+        return error.ApproveNo409;
+    }
 }
 
 test "S6.5 approvals: extractIdempotencyKey honors approve-route idempotency" {
@@ -44,11 +53,6 @@ test "S6.5 approvals: extractIdempotencyKey honors approve-route idempotency" {
 }
 
 test "S6.5 approvals: full decision vocabulary (issued|auto_approved|user_approved|user_denied|blocked|expired) is documented in source" {
-    // S2 (#109) consolidated the canonical decision-outcome label set on
-    // `nullalis_approval_decision_total` (gateway.zig:1408). The
-    // documented vocabulary lives in the HELP block at gateway.zig:7290.
-    // A rename here that drops a member breaks the SLO dashboard. Pin
-    // every member by scanning the gateway source directly.
     const gateway_src = try harness.loadProjectFile("src/gateway.zig");
     const decision_vocabulary = [_][]const u8{
         "issued",
@@ -67,19 +71,11 @@ test "S6.5 approvals: full decision vocabulary (issued|auto_approved|user_approv
 }
 
 test "S6.5 approvals: irreversible-action surface is documented as requiring approval" {
-    // V1 contract: an irreversible action (shell exec, destructive tool
-    // call, file overwrite) cannot auto-approve; it requires an explicit
-    // user decision via the canonical error code surfaced in the
-    // online-agent contract.
     const contract = try harness.loadProjectFile("docs/online-agent-contract.md");
     try std.testing.expect(std.mem.indexOf(u8, contract, "supervised_mutating_requires_approval") != null);
 }
 
-test "S6.5 approvals: cross-session collision surface — approval_id_mismatch error code is documented" {
-    // The 409 stale-card guard at gateway.zig:14359 rejects an
-    // approval_id from a different session even if its numeric suffix
-    // overlaps. The canonical error code `approval_id_mismatch` is the
-    // UI's bind point; a rename here breaks the UI's mismatch detection.
+test "S6.5 approvals: approval_id_mismatch error code is documented in OpenAPI" {
     const yaml = try harness.loadProjectFile("docs/openapi-v1.yaml");
     if (std.mem.indexOf(u8, yaml, "approval_id_mismatch") == null) {
         std.debug.print("S6.5: 'approval_id_mismatch' missing from docs/openapi-v1.yaml — UI cannot bind the 409 response\n", .{});

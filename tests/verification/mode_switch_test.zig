@@ -13,12 +13,22 @@ test "S6.4 mode: ui-handoff doc mentions the mode surface" {
     try std.testing.expect(std.mem.indexOf(u8, ui_handoff, "mode") != null);
 }
 
-test "S6.4 mode: invalid-transition failure surface is documented" {
+test "S6.4 mode: invalid-transition 4xx is declared INSIDE the /mode path block" {
+    // Path-scoped: the 400/422 declaration must live in the /mode route's
+    // own response section. A global substring would pass even if no 4xx
+    // response was declared under /mode itself.
     const yaml = try harness.loadProjectFile("docs/openapi-v1.yaml");
-    const has_mode = std.mem.indexOf(u8, yaml, "/mode:") != null;
-    const has_4xx = std.mem.indexOf(u8, yaml, "'400'") != null or
-        std.mem.indexOf(u8, yaml, "\"400\"") != null or
-        std.mem.indexOf(u8, yaml, " 400:") != null or
-        std.mem.indexOf(u8, yaml, " 422:") != null;
-    try std.testing.expect(has_mode and has_4xx);
+    const block = harness.openApiPathBlock(yaml, "/mode:") orelse {
+        std.debug.print("S6.4: /mode path block not found in OpenAPI\n", .{});
+        return error.ModeBlockMissing;
+    };
+    const has_4xx = std.mem.indexOf(u8, block, "'400'") != null or
+        std.mem.indexOf(u8, block, "\"400\"") != null or
+        std.mem.indexOf(u8, block, " 400:") != null or
+        std.mem.indexOf(u8, block, " 422:") != null or
+        std.mem.indexOf(u8, block, "'422'") != null;
+    if (!has_4xx) {
+        std.debug.print("S6.4: /mode block does NOT declare a 4xx response — invalid-transition contract not documented\n", .{});
+        return error.ModeNo4xxDeclared;
+    }
 }

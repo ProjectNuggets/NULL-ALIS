@@ -8,7 +8,7 @@ This is the single cold-start document. If it disagrees with `.planning/STATE.md
 
 ## 2026-05-29 — Sprint S6: V1 production verification matrix (ready for review)
 
-**Branch:** `prod-readiness/s6-verification-matrix`. **PR:** [#115](https://github.com/ProjectNuggets/NULL-ALIS/pull/115). Builds on the hardened S1–S5 stack (S1 #108, S2 #109, S3 #110, S4 #111, S5 #112 + follow-up #113, #114 OOM fix — all on `main`). S6 is the production-readiness closer: a fresh checkout verifies every V1 user-facing backend flow with two commands.
+**Branch:** `prod-readiness/s6-verification-matrix`. **PR:** [#115](https://github.com/ProjectNuggets/NULL-ALIS/pull/115). Builds on the hardened S1–S5 stack (S1 #108, S2 #109, S3 #110, S4 #111, S5 #112 + follow-up #113, #114 OOM fix — all on `main`). S6 is the production-readiness gate: a fresh checkout verifies the pinned V1 backend surfaces (see [docs/operations/verification-matrix.md](docs/operations/verification-matrix.md) "Surface coverage" table — health/metrics, sanitizer/parser/detector contracts, and the live-PG integrations D25 cascade / memory_purge_pii / trace-share durability / artifact CRUD) with two commands. Surfaces NOT in the table are explicitly deferred with compensating controls.
 
 **What S6 ships (acceptance bar from the spec):**
 

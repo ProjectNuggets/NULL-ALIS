@@ -84,22 +84,94 @@ test "S6.7 artifacts: every shipped ArtifactKind serializes via toSlice" {
     }
 }
 
-test "S6.7 artifacts: export route uses the unsafe-filename guard (path-traversal pin)" {
-    // Wave 2A (#107) shipped artifact export. The download path at
-    // `gateway.zig:19623` rejects filenames that contain `..`, leading
-    // dots, or path separators via `isSafeAttachmentFilename`. The guard
-    // is file-private (lowercase fn) so we cannot call it directly from
-    // tests/verification — instead, pin its INVOCATION at the route
-    // handler. A rename that loses the guard call surfaces here.
+test "S6.7 artifacts: handleArtifactExportDownload calls isSafeAttachmentFilename + returns unsafe_filename" {
+    // Tighter than a global substring scan: locate the actual handler
+    // function body and assert the guard call lives INSIDE it. A
+    // regression that moves the call elsewhere (or wires the route to
+    // a handler that bypasses the guard) would fail this assertion.
     const gateway_src = try harness.loadProjectFile("src/gateway.zig");
-    if (std.mem.indexOf(u8, gateway_src, "isSafeAttachmentFilename") == null) {
-        std.debug.print("S6.7: `isSafeAttachmentFilename` guard absent from src/gateway.zig — path traversal regression\n", .{});
-        return error.UnsafeFilenameGuardMissing;
+
+    const fn_anchor = "fn handleArtifactExportDownload(";
+    const fn_start = std.mem.indexOf(u8, gateway_src, fn_anchor) orelse {
+        std.debug.print("S6.7: handleArtifactExportDownload symbol absent — route may be unwired\n", .{});
+        return error.ExportDownloadHandlerMissing;
+    };
+
+    // Bound the handler body. The function is bounded by the next
+    // top-level `fn ` declaration (a Zig top-level function starts at
+    // column 0). Conservative ceiling at 8 KB — the handler is ~80
+    // lines today; 8 KB is comfortable headroom.
+    const ceiling = @min(fn_start + 8 * 1024, gateway_src.len);
+    const fn_region = gateway_src[fn_start..ceiling];
+    const next_top_fn = std.mem.indexOf(u8, fn_region[1..], "\nfn ") orelse fn_region.len - 1;
+    const fn_body = fn_region[0..@min(next_top_fn + 1, fn_region.len)];
+
+    if (std.mem.indexOf(u8, fn_body, "isSafeAttachmentFilename") == null) {
+        std.debug.print("S6.7: handleArtifactExportDownload does NOT call isSafeAttachmentFilename — path-traversal guard bypassed\n", .{});
+        return error.UnsafeFilenameGuardBypassed;
     }
-    // The guard must be CALLED, not just defined. Look for the canonical
-    // rejection body the route returns when the guard fails.
-    if (std.mem.indexOf(u8, gateway_src, "unsafe_filename") == null) {
-        std.debug.print("S6.7: `unsafe_filename` error response absent from src/gateway.zig — guard may be unwired\n", .{});
+    if (std.mem.indexOf(u8, fn_body, "unsafe_filename") == null) {
+        std.debug.print("S6.7: handleArtifactExportDownload does NOT return the unsafe_filename error code\n", .{});
         return error.UnsafeFilenameResponseMissing;
     }
+}
+
+// ── LIVE PG: artifact CRUD roundtrip ─────────────────────────────────
+
+test "S6.7 artifacts live: create + get round-trip pins the V1 artifact storage path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const test_url = try harness.requirePostgresUrl(allocator);
+    var schema_buf: [96]u8 = undefined;
+    const schema = try harness.schemaName(&schema_buf, "artifact_crud");
+    var mgr = try harness.newManager(allocator, test_url, schema);
+    defer {
+        mgr.dropSchemaForTests() catch {};
+        mgr.deinit();
+    }
+
+    const uid: i64 = 1;
+    try mgr.provisionUser(uid, "/tmp/nullalis-s6-artifact");
+
+    const session_id = "artifact-test-session";
+    const created = try mgr.createArtifact(
+        allocator,
+        uid,
+        session_id,
+        "Verification Smoke Doc",
+        "markdown",
+        "# Hello from S6\n\nbody",
+        "sha256:test", // content_hash
+        1_716_000_000,
+    );
+    defer {
+        allocator.free(created.id);
+        allocator.free(created.title);
+        allocator.free(created.kind);
+        if (created.session_id) |s| allocator.free(s);
+        if (created.share_code) |s| allocator.free(s);
+        allocator.free(created.metadata_jsonb);
+    }
+
+    try std.testing.expectEqualStrings("Verification Smoke Doc", created.title);
+    try std.testing.expectEqualStrings("markdown", created.kind);
+    try std.testing.expectEqual(@as(i32, 1), created.current_version);
+
+    // Read back by id — must match the create response.
+    const fetched = try mgr.getArtifactById(allocator, uid, created.id) orelse {
+        std.debug.print("S6.7 artifact live: createArtifact returned id '{s}' but getArtifactById found nothing\n", .{created.id});
+        return error.ArtifactNotPersisted;
+    };
+    defer {
+        allocator.free(fetched.id);
+        allocator.free(fetched.title);
+        allocator.free(fetched.kind);
+        if (fetched.session_id) |s| allocator.free(s);
+        if (fetched.share_code) |s| allocator.free(s);
+        allocator.free(fetched.metadata_jsonb);
+    }
+    try std.testing.expectEqualStrings(created.id, fetched.id);
+    try std.testing.expectEqualStrings(created.title, fetched.title);
 }

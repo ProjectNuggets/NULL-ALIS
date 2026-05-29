@@ -1,17 +1,27 @@
 //! S6 verification matrix — single aggregation root.
 //!
-//! Every per-surface file is a test container; this file pulls them in so
-//! `build.zig` only needs one `addTest` artifact for the entire matrix.
-//!
-//! Default `zig build test` does NOT run this — the matrix is wired into
-//! the dedicated `zig build test-postgres` step. Postgres-gated tests skip
-//! cleanly when NULLALIS_POSTGRES_TEST_URL is unset, so the step is safe to
-//! run locally without a fixture.
+//! HARD GATE: when built without `-Dengines=...,postgres`, this file
+//! fails to compile via `@compileError`. The `test-postgres` step
+//! therefore FAILS (not skips) under `zig build test-postgres
+//! -Dengines=base,sqlite` — the matrix is intentionally PG-only, and
+//! a missing engine is a build misconfiguration, not a runtime skip.
 
 const std = @import("std");
+const build_options = @import("build_options");
+
+comptime {
+    if (!build_options.enable_postgres) {
+        @compileError(
+            "test-postgres requires -Dengines=...,postgres — " ++
+                "the S6 verification matrix is the live-PG lane. " ++
+                "Remove `-Dengines=base,sqlite` (or similar) and rebuild.",
+        );
+    }
+}
 
 test {
     _ = @import("harness.zig");
+    _ = @import("live_pg_test.zig");
     _ = @import("health_metrics_test.zig");
     _ = @import("chat_stream_test.zig");
     _ = @import("mode_switch_test.zig");

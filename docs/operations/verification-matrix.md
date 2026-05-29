@@ -1,9 +1,13 @@
 # V1 Production Verification Matrix
 
-> **Purpose.** A fresh checkout must be able to verify every V1 user-facing
-> backend flow with two commands. This document is the operator-facing
-> runbook for that verification + the source-of-truth for which surfaces
-> are pinned, which are smoke-only, and which are explicitly deferred.
+> **Purpose.** Operator runbook for the V1 production verification gate.
+> The matrix pins the V1 backend surfaces enumerated in the
+> "Surface coverage" table below — health/metrics, durable storage,
+> sanitizer / parser / detector contracts, and a small set of live-PG
+> integrations (D25 cascade, memory_purge_pii, trace-share durability,
+> artifact CRUD). Surfaces NOT in the table are explicitly deferred
+> with their compensating controls. Do not read this doc as "every V1
+> user-facing flow is covered" — read the table.
 
 ## TL;DR — two commands
 
