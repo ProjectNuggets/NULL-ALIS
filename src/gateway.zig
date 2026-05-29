@@ -28228,9 +28228,14 @@ test "applyStartupSelfCheck: production + postgres + zaki_state present = no err
     defer gs.deinit();
     // Make zaki_state non-null so degraded stays false. The function
     // only checks `state.zaki_state != null` — never dereferences the
-    // pointer — so a stack-local undefined Manager is sufficient.
+    // pointer — so a stack-local undefined Manager is sufficient FOR
+    // applyStartupSelfCheck itself. But GatewayState.deinit() may
+    // touch the field under the postgres engine, so we reset it to
+    // null before deinit fires (LIFO defer order guarantees the reset
+    // runs first).
     var dummy_manager: zaki_state_mod.Manager = undefined;
     gs.zaki_state = &dummy_manager;
+    defer gs.zaki_state = null;
 
     var cfg = Config{
         .workspace_dir = "/tmp/nullalis",
