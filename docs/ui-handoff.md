@@ -131,7 +131,7 @@ Two completely different lanes that the user picks per use case.
 | Lane | When to use | Tools | Auth |
 |---|---|---|---|
 | **Server-side Playwright** | Public web, scraping, no login needed | `web_fetch`, `web_search`, plus MCP `playwright_*` | None (anonymous) |
-| **User-browser extension** | User's logged-in sessions (Gmail, X, internal tools) | `extension_navigate`, `extension_click`, `extension_type`, `extension_fill_form`, `extension_screenshot`, `extension_get_text`, `extension_get_dom`, `extension_wait_for`, `extension_scroll`, `extension_list_tabs` | Chrome extension MV3 over `wss://` |
+| **User-browser extension** | User's logged-in sessions (Gmail, X, internal tools) | `extension_navigate`, `extension_click`, `extension_type`, `extension_fill_form`, `extension_screenshot`, `extension_get_text`, `extension_get_dom`, `extension_wait_for`, `extension_scroll`, `extension_list_tabs` | Chrome extension MV3 over `wss://`. UI binds pair state via `GET /api/v1/diagnostics/extension/users/{user_id}` (self-only via `X-Zaki-User-Id`). |
 
 **UX surface**:
 - **Connect-extension banner** in the chat header when the user requests
@@ -477,7 +477,7 @@ before public scale unless product explicitly hides the surface.
 |---|---|---|---|
 | P1 | Approval consolidation | backend | One canonical pending-approval model; no legacy `pending_exec_*` ambiguity; stable enough identifiers for UI cards |
 | P1 | Durable traces/shares — **SHARES SHIPPED**, events deferred | backend | **Sprint 3 (2026-05-28) landed PG-backed trace SHARES** via `migrations/0003_trace_shares.sql`. Share URL + sanitized snapshot survive gateway restart for the share's TTL. Trace EVENTS stay in the bounded in-process `RunTraceStore` (64 runs × 256 events). UI surfaces `/api/v1/share/:share_code` as durable; the listing `/api/v1/users/:id/traces` remains best-effort ephemeral. |
-| P1 | Extension browser readiness | backend + extension | Per-user token auth, pairing, disconnect state, approval behavior, and browser command failures are observable and test-covered |
+| P1 | Extension browser readiness | backend + extension | Per-user token auth (only model), pair/disconnect/timeout/command_failed observable via `/api/v1/diagnostics/extension/*` + canonical `extension_ws.event=*` logs, cross-user isolation tested, mock-hub E2E across all ten extension_* tools |
 | P1 | Observability/SLOs | backend + platform | Run id, session id, product id, tool latency, artifact export, approvals, extension commands, memory writes, and meter receipt IDs are chartable |
 | P1 | Memory PII purge/export UX | backend | `memory_forget` is callable from the UI; PII-tagged memories can be enumerated and bulk-cleared; consent gate stays opt-in |
 

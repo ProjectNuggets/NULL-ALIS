@@ -581,12 +581,76 @@ pub fn build(b: *std.Build) void {
         task_lifecycle_tests.root_module.linkSystemLibrary("pq", .{});
     }
 
+    // Sprint S4 — extension browser readiness tests. Live outside src/
+    // because they pin cross-module contracts (hub × tools × gateway diagnostic
+    // route shapes). Each runs under every engine profile; no postgres or
+    // sqlite dependency.
+    const extension_isolation_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/extension/cross_user_isolation_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nullalis", .module = lib_mod },
+            },
+        }),
+    });
+    if (sqlite3) |lib| {
+        extension_isolation_tests.linkLibrary(lib);
+    }
+    if (enable_postgres) {
+        addHomebrewLibpqPaths(extension_isolation_tests);
+        addHomebrewLibpqPaths(extension_isolation_tests.root_module);
+        extension_isolation_tests.root_module.linkSystemLibrary("pq", .{});
+    }
+
+    const extension_mock_e2e_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/extension/mock_hub_e2e_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nullalis", .module = lib_mod },
+            },
+        }),
+    });
+    if (sqlite3) |lib| {
+        extension_mock_e2e_tests.linkLibrary(lib);
+    }
+    if (enable_postgres) {
+        addHomebrewLibpqPaths(extension_mock_e2e_tests);
+        addHomebrewLibpqPaths(extension_mock_e2e_tests.root_module);
+        extension_mock_e2e_tests.root_module.linkSystemLibrary("pq", .{});
+    }
+
+    const extension_diagnostics_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/extension/diagnostics_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nullalis", .module = lib_mod },
+            },
+        }),
+    });
+    if (sqlite3) |lib| {
+        extension_diagnostics_tests.linkLibrary(lib);
+    }
+    if (enable_postgres) {
+        addHomebrewLibpqPaths(extension_diagnostics_tests);
+        addHomebrewLibpqPaths(extension_diagnostics_tests.root_module);
+        extension_diagnostics_tests.root_module.linkSystemLibrary("pq", .{});
+    }
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     test_step.dependOn(&b.addRunArtifact(security_sandbox_tests).step);
     test_step.dependOn(&b.addRunArtifact(agent_pg_tests).step);
     test_step.dependOn(&b.addRunArtifact(task_lifecycle_tests).step);
+    test_step.dependOn(&b.addRunArtifact(extension_isolation_tests).step);
+    test_step.dependOn(&b.addRunArtifact(extension_mock_e2e_tests).step);
+    test_step.dependOn(&b.addRunArtifact(extension_diagnostics_tests).step);
     // mcp_live_tests is compiled (so it can never bit-rot) but only its
     // skip-path runs here; the real exercise is the test-mcp-live step.
     test_step.dependOn(&b.addRunArtifact(mcp_live_tests).step);

@@ -6650,6 +6650,118 @@ fn normalizedLocalAgentMemoryConfig(cfg: *const Config) config_types.MemoryConfi
     return memory_cfg;
 }
 
+/// Minimal input for the extension-WS diagnostic payload renderers.
+/// Carved off `GatewayState` so the renderers are unit-testable without
+/// constructing the full gateway state struct (which has many non-default
+/// fields wired during boot).
+pub const ExtensionDiagnosticInput = struct {
+    hub: ?*extension_ws_hub.ExtensionWsHub,
+    connections_total: u64,
+    auth_failed_total: u64,
+};
+
+/// `user_id` charset accepted by the extension diagnostic routes
+/// + the `extensionUserStatusPayload` defense-in-depth guard. Limited
+/// to alphanumeric + `_-.` so the unescaped JSON write in the per-user
+/// payload stays safe and there is no ambiguity about which characters
+/// the operator can put in `extension_tokens`.
+pub fn isSafeExtensionUserId(user_id: []const u8) bool {
+    if (user_id.len == 0) return false;
+    for (user_id) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-' and c != '.') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Render the system-wide extension WS diagnostic JSON. Keys:
+///   - enabled: bool — true iff `input.hub` is non-null.
+///   - total_active: number of currently-paired users (live count from the hub).
+///   - connections_total: lifetime connections accepted.
+///   - auth_failed_total: lifetime auth_failed outcomes.
+///
+/// Returned slice is heap-allocated; caller frees via `allocator.free`.
+pub fn extensionStatusPayload(allocator: std.mem.Allocator, input: ExtensionDiagnosticInput) ![]u8 {
+    const enabled = input.hub != null;
+    // S4 review fix: go through the hub's public activeCount() instead
+    // of touching users_mu / users directly. Keeps the hub's threading
+    // model encapsulated; future locking changes on the hub side
+    // don't silently break gateway.zig.
+    const total_active: usize = if (input.hub) |hub| hub.activeCount() else 0;
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"enabled\":{s},\"total_active\":{d},\"connections_total\":{d},\"auth_failed_total\":{d}}}",
+        .{
+            if (enabled) "true" else "false",
+            total_active,
+            input.connections_total,
+            input.auth_failed_total,
+        },
+    );
+}
+
+/// Render the per-user extension WS diagnostic JSON. Keys:
+///   - user_id: echo of the requested user_id.
+///   - paired: bool — true iff this user has a live extension conn.
+///   - connected_at_unix: i64 (seconds since epoch), 0 when not paired.
+///   - last_command_at_unix: i64 (seconds), 0 when no command yet.
+///   - last_command_tool: string ("" when no command yet).
+///   - last_command_result: string ("" when no command yet).
+///
+/// S4 review fix: defense-in-depth — validates `user_id` matches the
+/// safe-charset `[A-Za-z0-9_\-.]` before the unescaped JSON write
+/// below. The route handler already gates on this charset before
+/// calling, but this fn is `pub` and could be reached by tests or
+/// future call sites; returning `error.InvalidUserId` here is fail-
+/// closed against JSON injection if the route gate is ever bypassed.
+pub fn extensionUserStatusPayload(allocator: std.mem.Allocator, input: ExtensionDiagnosticInput, user_id: []const u8) ![]u8 {
+    if (!isSafeExtensionUserId(user_id)) return error.InvalidUserId;
+    var paired = false;
+    var connected_at_unix: i64 = 0;
+    var last_at_unix: i64 = 0;
+
+    // Snapshot is declared at function scope so its inline tool_buf /
+    // result_buf survive past the inner `if (getForUser)` block (the
+    // `last_tool` / `last_result` slices below borrow from it).
+    var last_snap: extension_ws_hub.LastCommandSnapshot = .{
+        .tool_buf = [_]u8{0} ** extension_ws_hub.LAST_COMMAND_BUF_LEN,
+        .tool_len = 0,
+        .result_buf = [_]u8{0} ** extension_ws_hub.LAST_COMMAND_BUF_LEN,
+        .result_len = 0,
+        .at_ns = 0,
+    };
+
+    if (input.hub) |hub| {
+        if (hub.getForUser(user_id)) |conn| {
+            defer _ = conn.release();
+            paired = true;
+            const ns = conn.connected_at_ns.load(.acquire);
+            connected_at_unix = @intCast(@divTrunc(ns, std.time.ns_per_s));
+            last_snap = conn.snapshotLastCommand();
+            if (last_snap.at_ns > 0) {
+                last_at_unix = @intCast(@divTrunc(last_snap.at_ns, std.time.ns_per_s));
+            }
+        }
+    }
+    const last_tool = last_snap.tool();
+    const last_result = last_snap.result();
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"user_id\":\"{s}\",\"paired\":{s},\"connected_at_unix\":{d},\"last_command_at_unix\":{d},\"last_command_tool\":\"{s}\",\"last_command_result\":\"{s}\"}}",
+        .{
+            user_id,
+            if (paired) "true" else "false",
+            connected_at_unix,
+            last_at_unix,
+            last_tool,
+            last_result,
+        },
+    );
+}
+
 fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u8 {
     const transport_stats = http_util.transport_stats_snapshot();
     const requests_total = state.requests_total.load(.monotonic);
@@ -17084,6 +17196,77 @@ fn handleApiRoute(
             resolveStateTraceStoreForUser,
         );
     }
+    // S4 (Sprint 4) — extension control-plane diagnostics.
+    if (std.mem.eql(u8, base_path, "/api/v1/diagnostics/extension/status")) {
+        if (!std.mem.eql(u8, method, "GET")) {
+            return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+        }
+        if (!validateInternalServiceToken(raw_request, state)) {
+            return .{ .status = "401 Unauthorized", .body = "{\"error\":\"unauthorized\"}" };
+        }
+        const input: ExtensionDiagnosticInput = .{
+            .hub = state.extension_ws_hub,
+            .connections_total = state.extension_ws_total.load(.monotonic),
+            .auth_failed_total = state.extension_ws_auth_failed_total.load(.monotonic),
+        };
+        const body = extensionStatusPayload(req_allocator, input) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"render_failed\"}" };
+        };
+        return .{ .status = "200 OK", .body = body };
+    }
+    if (std.mem.startsWith(u8, base_path, "/api/v1/diagnostics/extension/users/")) {
+        if (!std.mem.eql(u8, method, "GET")) {
+            return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+        }
+        const path_user_id = base_path["/api/v1/diagnostics/extension/users/".len..];
+        if (path_user_id.len == 0 or std.mem.indexOfScalar(u8, path_user_id, '/') != null) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+        }
+        // Defense-in-depth: reject user_ids containing characters that
+        // would require JSON escaping in the response body. The token
+        // config can only set alphanumeric + underscore + hyphen + dot
+        // user_ids by operator convention; reject anything else up-front
+        // so the unescaped JSON write in extensionUserStatusPayload stays
+        // safe. The helper is also called from `extensionUserStatusPayload`
+        // itself as a fail-closed guard.
+        if (!isSafeExtensionUserId(path_user_id)) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+        }
+        // S4 review fix: drop the X-Zaki-User-Id "self-only" path. The
+        // header is set by the BFF after its own auth, but at the
+        // gateway HTTP boundary it is caller-controlled and was not
+        // validated against any credential — anyone could set
+        // `X-Zaki-User-Id: alice` and read alice's pairing state.
+        // Require X-Internal-Token always, matching every other
+        // `/api/v1/users/{uid}/*` route. user_cell-mode also enforces
+        // `pinned_user_id` via `resolveGatewayPathUserId`; this route
+        // adds a defensive check below.
+        if (!validateInternalServiceToken(raw_request, state)) {
+            return .{ .status = "401 Unauthorized", .body = "{\"error\":\"unauthorized\"}" };
+        }
+        // S4 review fix: user_cell mode pins one user per gateway
+        // instance. Reject requests for any other user before doing
+        // the lookup — mirrors `resolveGatewayPathUserId`'s
+        // UserCellUserMismatch return for the canonical user routes.
+        if (state.role == .user_cell) {
+            const pinned = state.pinned_user_id orelse {
+                return .{ .status = "403 Forbidden", .body = "{\"error\":\"wrong_user_cell\"}" };
+            };
+            if (!std.mem.eql(u8, pinned, path_user_id)) {
+                return .{ .status = "403 Forbidden", .body = "{\"error\":\"wrong_user_cell\"}" };
+            }
+        }
+        const input: ExtensionDiagnosticInput = .{
+            .hub = state.extension_ws_hub,
+            .connections_total = state.extension_ws_total.load(.monotonic),
+            .auth_failed_total = state.extension_ws_auth_failed_total.load(.monotonic),
+        };
+        const body = extensionUserStatusPayload(req_allocator, input, path_user_id) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"render_failed\"}" };
+        };
+        return .{ .status = "200 OK", .body = body };
+    }
+
     if (!validateInternalServiceToken(raw_request, state)) {
         return .{ .status = "401 Unauthorized", .body = "{\"error\":\"unauthorized\"}" };
     }
@@ -32319,4 +32502,116 @@ test "Wave 2A live: export bridge writes produced file + returns download URL" {
     );
     try std.testing.expectEqualStrings("404 Not Found", resp2.status);
     try std.testing.expect(std.mem.indexOf(u8, resp2.body, "artifact_not_found") != null);
+}
+
+test "extensionStatusPayload renders disabled when hub is null" {
+    const input: ExtensionDiagnosticInput = .{
+        .hub = null,
+        .connections_total = 0,
+        .auth_failed_total = 0,
+    };
+    const json = try extensionStatusPayload(std.testing.allocator, input);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"enabled\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"total_active\":0") != null);
+}
+
+test "extensionStatusPayload renders enabled + counters when hub is present" {
+    var hub = extension_ws_hub.ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    const input: ExtensionDiagnosticInput = .{
+        .hub = &hub,
+        .connections_total = 3,
+        .auth_failed_total = 1,
+    };
+    const json = try extensionStatusPayload(std.testing.allocator, input);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"total_active\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"connections_total\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"auth_failed_total\":1") != null);
+}
+
+test "extensionUserStatusPayload renders not_paired when user has no conn" {
+    var hub = extension_ws_hub.ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    const input: ExtensionDiagnosticInput = .{
+        .hub = &hub,
+        .connections_total = 0,
+        .auth_failed_total = 0,
+    };
+    const json = try extensionUserStatusPayload(std.testing.allocator, input, "alice");
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"user_id\":\"alice\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"paired\":false") != null);
+}
+
+test "extensionUserStatusPayload defense-in-depth: rejects unsafe user_ids" {
+    var hub = extension_ws_hub.ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    const input: ExtensionDiagnosticInput = .{
+        .hub = &hub,
+        .connections_total = 0,
+        .auth_failed_total = 0,
+    };
+
+    // Quote-bearing user_id — would inject extra JSON keys if the
+    // function trusted the route gate. The internal guard rejects it.
+    try std.testing.expectError(error.InvalidUserId, extensionUserStatusPayload(std.testing.allocator, input, "alice\",\"paired\":true,\"x\":\""));
+    // Backslash — same JSON-escape vector.
+    try std.testing.expectError(error.InvalidUserId, extensionUserStatusPayload(std.testing.allocator, input, "a\\b"));
+    // Newline — would break the single-line JSON shape.
+    try std.testing.expectError(error.InvalidUserId, extensionUserStatusPayload(std.testing.allocator, input, "a\nb"));
+    // Empty string — definitely not a valid user_id.
+    try std.testing.expectError(error.InvalidUserId, extensionUserStatusPayload(std.testing.allocator, input, ""));
+    // Safe charset — accepted.
+    const ok = try extensionUserStatusPayload(std.testing.allocator, input, "alice.1-2_3");
+    defer std.testing.allocator.free(ok);
+}
+
+test "isSafeExtensionUserId accepts the documented charset, rejects everything else" {
+    try std.testing.expect(isSafeExtensionUserId("alice"));
+    try std.testing.expect(isSafeExtensionUserId("alice.123"));
+    try std.testing.expect(isSafeExtensionUserId("a-b_c.d"));
+    try std.testing.expect(isSafeExtensionUserId("0"));
+    // Reject.
+    try std.testing.expect(!isSafeExtensionUserId(""));
+    try std.testing.expect(!isSafeExtensionUserId(" "));
+    try std.testing.expect(!isSafeExtensionUserId("a b"));
+    try std.testing.expect(!isSafeExtensionUserId("a/b"));
+    try std.testing.expect(!isSafeExtensionUserId("a\""));
+    try std.testing.expect(!isSafeExtensionUserId("a\\b"));
+    try std.testing.expect(!isSafeExtensionUserId("a\nb"));
+}
+
+test "extension diagnostics status route requires internal token" {
+    // No token configured, auth_required = true → reject.
+    const no_auth_raw = "GET /api/v1/diagnostics/extension/status HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const allowed = validateInternalServiceTokenWithPolicy(no_auth_raw, &.{}, true);
+    try std.testing.expect(!allowed);
+}
+
+test "extension diagnostics status route accepts valid internal token" {
+    const tokens = [_][]const u8{"prod-internal-1234"};
+    const auth_raw = "GET /api/v1/diagnostics/extension/status HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: prod-internal-1234\r\n\r\n";
+    const allowed = validateInternalServiceTokenWithPolicy(auth_raw, &tokens, true);
+    try std.testing.expect(allowed);
+}
+
+test "extension diagnostics per-user route requires internal token (no self-only path)" {
+    // S4 review fix — the per-user route no longer admits an
+    // unauthenticated X-Zaki-User-Id. Same gate as /status; the
+    // header alone cannot read another user's pairing state.
+    const tokens = [_][]const u8{"prod-internal-1234"};
+
+    const no_auth_raw = "GET /api/v1/diagnostics/extension/users/alice HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    try std.testing.expect(!validateInternalServiceTokenWithPolicy(no_auth_raw, &tokens, true));
+
+    // X-Zaki-User-Id alone is not a credential.
+    const self_only_raw = "GET /api/v1/diagnostics/extension/users/alice HTTP/1.1\r\nHost: localhost\r\nX-Zaki-User-Id: alice\r\n\r\n";
+    try std.testing.expect(!validateInternalServiceTokenWithPolicy(self_only_raw, &tokens, true));
+
+    // X-Internal-Token gets through.
+    const auth_raw = "GET /api/v1/diagnostics/extension/users/alice HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: prod-internal-1234\r\n\r\n";
+    try std.testing.expect(validateInternalServiceTokenWithPolicy(auth_raw, &tokens, true));
 }

@@ -1,8 +1,22 @@
 # nullALIS — STATUS
 
-**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-25 — **commercial v1 sprint Waves 1–5 SHIPPED + v1.14.22 hotfix + v1.14.23 hardening pass.** This refresh covers the multi-wave commercial-launch arc + the two follow-up review-closure passes. Prior refresh covered v1.14.19 S-tier push.
+**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-29 — **prod-readiness Sprint S4 (extension browser readiness) shipped** (PR #111 / branch `prod-readiness/s4-extension-browser-readiness`). Prior refresh: 2026-05-25 covered the commercial v1 sprint Waves 1–5 + v1.14.22 hotfix + v1.14.23 hardening pass.
 
 This is the single cold-start document. If it disagrees with `.planning/STATE.md`, `PROJECT_LEDGER.md` (archived), or anything in `docs/archive/`, **this wins**.
+
+---
+
+## 2026-05-29 — Sprint S4: extension browser readiness shipped (PR #111)
+
+**16 commits** on `prod-readiness/s4-extension-browser-readiness` close the chat-side browser-extension surface to production-grade. `src/extension_ws/auth.zig` and `src/extension_ws/server.zig` are unchanged — the per-user token contract (META CRIT #2) was already locked. S4 closes the observability + diagnostics + isolation gaps:
+
+- **Per-user lifecycle snapshot on the hub.** `ExtensionWsConn` gains `connected_at_ns`, `last_command_at_ns`, fixed-32-byte buffers for `last_command_tool` / `last_command_result`, mutex-guarded for consistent reads. `ExtensionWsHub.listSnapshot(allocator)` + `activeCount()` expose them through the hub's public API so `gateway.zig` never touches `users_mu` directly.
+- **Canonical lifecycle logs.** `extension_ws.event=<pair|disconnect|timeout|command_failed>` via `emitLifecycleEvent`. Wired at five sites: registerConn pair, registerConn eviction disconnect, unregister disconnect, sendCommand timeout, sendCommand non-timeout failure. Format-buffer overflow surfaces a warn so operators see drops.
+- **Control-plane diagnostic routes.** `GET /api/v1/diagnostics/extension/status` + `/users/{user_id}` — both gated by `X-Internal-Token` (operator-only). user_cell mode additionally enforces `pinned_user_id == path_user_id`. user_id path param validated to alphanumeric + `_-.` only.
+- **Tests under `tests/extension/`.** Cross-user isolation pin (4 invariants), mock-hub E2E across all ten `extension_*` tools (10 × 4 = 40 cross-tool pins), diagnostic-route shape pins (4). Wired into the test step.
+- **Docs synced.** `extension-ws-contract.md`, `openapi-v1.yaml`, `ui-handoff.md`, `deferred-register.md` (D67 extension lane closed; v1.15 SLO sweep covers the remaining surfaces).
+
+CI gate green on the canonical profile: `zig build test -Dengines=base,sqlite,postgres -Dchannels=cli,telegram`.
 
 ---
 

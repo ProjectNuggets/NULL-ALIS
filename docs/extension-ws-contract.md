@@ -105,6 +105,88 @@ extension connection closed-by-default.
 A later BFF pairing flow can mint short-lived or rotating per-extension
 tokens, but it must preserve the server-derived user identity rule.
 
+## Connection state machine
+
+Each per-user `ExtensionWsConn` moves through a small set of named states.
+Operators observe state transitions in three places: the canonical
+`extension_ws.event=<class>` log line, the `extension_ws_command_total`
+metric (tagged by result class), and the
+`GET /api/v1/diagnostics/extension/users/{user_id}` endpoint.
+
+| Event             | Trigger                                                      | Observable surface                                                                                  |
+|-------------------|--------------------------------------------------------------|-----------------------------------------------------------------------------------------------------|
+| `pair`            | Auth succeeds + `registerConn` returns                       | log `extension_ws.event=pair user_id='...'`; gauge `extension_ws_connections_active` bumps          |
+| `disconnect`      | `unregister` (graceful close, eviction, or hub deinit)       | log `extension_ws.event=disconnect user_id='...'`; gauge decrements                                  |
+| `timeout`         | `sendCommand` exceeds `timeout_ms`                            | log `extension_ws.event=timeout user_id='...' tool='...'`; metric `extension_ws_command_total{result=timeout,tool}` |
+| `command_failed`  | `sendCommand` returns a named error class other than timeout | log `extension_ws.event=command_failed user_id='...' tool='...'`; metric tagged with the class       |
+
+Eviction-on-reconnect is the only path where `pair` and `disconnect` fire
+in the same tick: the prior connection emits `disconnect`, then the new
+connection emits `pair`. Operators chasing "why did Alice's extension
+drop" can disambiguate by checking whether an immediate `pair` follows
+the `disconnect` (= reconnect / eviction) or not (= clean close).
+
+## Control-plane diagnostics
+
+Two routes return the live state of the extension surface.
+
+### `GET /api/v1/diagnostics/extension/status`
+
+System-wide view. Internal-token auth (same model as `/internal/diagnostics`).
+
+Response shape:
+
+```json
+{
+  "enabled": true,
+  "total_active": 7,
+  "connections_total": 142,
+  "auth_failed_total": 3
+}
+```
+
+`enabled` is true iff the gateway was started with `extension_ws_enabled`
++ at least one configured `(token, user_id)` entry. `total_active` is the
+live count of paired users; `connections_total` is the cumulative lifetime
+accept count; `auth_failed_total` is the cumulative count of `auth_ack
+{ok:false}` outcomes.
+
+### `GET /api/v1/diagnostics/extension/users/{user_id}`
+
+Per-user view. Auth: `X-Internal-Token` (operator-only). An earlier
+S4 draft admitted an `X-Zaki-User-Id == {user_id}` "self-only" path —
+that path was **dropped during S4 review** because `X-Zaki-User-Id`
+is caller-controlled at the gateway HTTP boundary (it carries no
+credential), and admitting it as the sole auth would let any
+unauthenticated caller read another user's pairing state. UIs reach
+this route through the BFF, which already carries the internal token.
+
+In `user_cell` deployment mode (one gateway pinned to one user), the
+route additionally enforces `state.pinned_user_id == path_user_id`
+and returns `403 wrong_user_cell` otherwise — mirrors the gate the
+canonical `/api/v1/users/{uid}/*` routes apply.
+
+The `{user_id}` path parameter must be alphanumeric + `_` + `-` + `.`
+only; anything else returns `400 Bad Request` with `invalid_user_id`.
+
+Response shape:
+
+```json
+{
+  "user_id": "alice",
+  "paired": true,
+  "connected_at_unix": 1748534400,
+  "last_command_at_unix": 1748534512,
+  "last_command_tool": "navigate",
+  "last_command_result": "ok"
+}
+```
+
+Fields are zero / empty when the user has never paired or has not yet
+dispatched a command since pairing. `last_command_result` is one of:
+`ok`, `timeout`, `conn_closed`, `oom`, `error_other`. The UI maps
+these to the user-safe states in the next section.
+
 ## Approval-gate behavior
 
 Every `extension_*` tool is `.mutating + .risk_level=.high`. The
@@ -115,6 +197,25 @@ existing agent preflight (`canonicalMetadataForCall` →
 still observable in the run-trace store via the standard tool-call
 event emission — operators see what the agent did to the user's
 browser session after the fact.
+
+## UI-safe failure states
+
+The UI MUST branch on the diagnostic route's `last_command_result` (or
+on the tool-call SSE error field) using these named states. Do NOT
+parse free-form error strings — they are user-facing copy that can
+change without notice.
+
+| State                  | When                                                       | Suggested UI surface                                                |
+|------------------------|------------------------------------------------------------|---------------------------------------------------------------------|
+| `disconnected`         | `paired == false`                                           | "Browser extension not connected" pill + connect-extension banner   |
+| `timed_out`            | `last_command_result == "timeout"`                          | "The browser took too long to respond" warning toast               |
+| `denied`               | tool's `error_msg` matches `[denied]` or extension-side `code` is `denied` | "You blocked this action in the extension" copy                     |
+| `command_failed`       | `last_command_result == "conn_closed"` or `"oom"` or `"error_other"`, or tool emitted an `[*]` error code other than `denied` | "Something went wrong driving your browser; retry?" with the code as small text |
+| `success`              | `last_command_result == "ok"`                               | Standard success styling (no special surface needed)               |
+
+The `denied` state is the only one that surfaces user intent (the user
+declined the action in the extension's permission card). Every other
+failure state is a system condition the user did not cause directly.
 
 Cost class `.b` (medium): the per-call network payload is small but
 each call is a full WS round-trip + a real browser-side action, so

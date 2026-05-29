@@ -66,6 +66,16 @@ pub var test_deliver_reached: ?*std.Thread.ResetEvent = null;
 /// needed. 30 s is plenty for navigate/click/screenshot.
 pub const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 30_000;
 
+/// Cap on the per-conn "last command" tool-name + result-class
+/// buffers. 32 bytes comfortably holds every v1 `extension_*` tool
+/// name (longest is `extension_screenshot` at 20) plus every result
+/// classifier (`ok`, `timeout`, `conn_closed`, `oom`, `no_conn`,
+/// `error_other` — all ≤11). Both `ExtensionWsConn`'s storage and
+/// `LastCommandSnapshot`'s value-typed buffers reference this
+/// constant so future tool-name growth widens both sites in lockstep
+/// without callers having to size scratch buffers.
+pub const LAST_COMMAND_BUF_LEN: usize = 32;
+
 /// Callback type for writing a text frame to the underlying socket.
 /// Server-side framing (no mask) is built by the implementation; the
 /// hub only knows about text payloads. `ctx` is whatever opaque pointer
@@ -176,6 +186,43 @@ pub const ExtensionWsConn = struct {
     /// (no free yet); step 3 still has a live pointer; on completion
     /// the agent releases → drops to 0 → free. Safe.
     refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+
+    /// Wall-clock nanoseconds (std.time.nanoTimestamp, truncated to i64)
+    /// when this conn was registered with the hub. Set once in
+    /// `registerConn`; never updated thereafter. Zero means "not yet
+    /// registered" (only observable on a half-constructed conn struct).
+    ///
+    /// S4 CI fix: stored as `i64` rather than `i128` because Linux
+    /// x86_64 codegen + atomic operations on `i128` hit a Zig 0.15.2
+    /// backend bug (`genSetReg called with a value larger than dst_reg`
+    /// at compile time, plus a 16-byte-alignment-induced SIGSEGV at
+    /// runtime). `i64` nanoseconds-since-epoch covers ~292 years —
+    /// safe through 2262.
+    connected_at_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+
+    /// Wall-clock nanoseconds of the last command dispatch result
+    /// (success OR named failure). Zero means "no command yet." See
+    /// `connected_at_ns` for the i64 rationale.
+    last_command_at_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+
+    /// Fixed-size scratch buffer for the last command's tool name. The
+    /// `LAST_COMMAND_BUF_LEN` cap is generous for the v1 tool family
+    /// (longest is `extension_screenshot` at 20 bytes); future longer
+    /// names get truncated rather than allocated-per-update. Reading
+    /// requires loading `last_command_tool_len` first.
+    last_command_tool_buf: [LAST_COMMAND_BUF_LEN]u8 = [_]u8{0} ** LAST_COMMAND_BUF_LEN,
+    last_command_tool_len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    /// Same buffer pattern for the last command's result classifier
+    /// ("ok", "timeout", "conn_closed", "oom", "no_conn", "error_other").
+    last_command_result_buf: [LAST_COMMAND_BUF_LEN]u8 = [_]u8{0} ** LAST_COMMAND_BUF_LEN,
+    last_command_result_len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    /// Mutex protecting the two fixed-size buffers above. We use a mutex
+    /// rather than treating the buffers as atomic-byte-stores because the
+    /// snapshot fn needs to read tool + result + length consistently
+    /// (otherwise it could observe a torn pair: new length, old bytes).
+    last_command_mu: std.Thread.Mutex = .{},
 
     pub fn deinit(self: *ExtensionWsConn) void {
         // Drain any waiters with a synthetic "connection closed":
@@ -447,6 +494,104 @@ pub const ExtensionWsConn = struct {
     pub fn close(self: *ExtensionWsConn) void {
         self.close_fn(self.close_ctx);
     }
+
+    /// Stamp the last_command_* fields with the named result class and
+    /// the dispatched tool. Called by the hub's `sendCommand` at every
+    /// terminal point (success + each error branch).
+    ///
+    /// `tool` and `result` are borrowed only for the copy; the buffers
+    /// are owned by the conn struct (fixed-size, no heap).
+    pub fn recordCommandOutcome(self: *ExtensionWsConn, tool: []const u8, result: []const u8) void {
+        self.last_command_mu.lock();
+        defer self.last_command_mu.unlock();
+
+        const tool_len = @min(tool.len, self.last_command_tool_buf.len);
+        @memcpy(self.last_command_tool_buf[0..tool_len], tool[0..tool_len]);
+        self.last_command_tool_len.store(tool_len, .release);
+
+        const result_len = @min(result.len, self.last_command_result_buf.len);
+        @memcpy(self.last_command_result_buf[0..result_len], result[0..result_len]);
+        self.last_command_result_len.store(result_len, .release);
+
+        // S4 CI fix: store as i64 (see connected_at_ns rationale).
+        // nanoTimestamp returns i128; truncate via @intCast — safe
+        // until year ~2262.
+        self.last_command_at_ns.store(@intCast(std.time.nanoTimestamp()), .release);
+    }
+
+    /// Snapshot helper — copy the last command's tool + result into a
+    /// caller-owned `LastCommandSnapshot` value under a single mutex
+    /// hold. The snapshot's buffers are sized to `LAST_COMMAND_BUF_LEN`
+    /// in lockstep with the conn's storage, so there is no caller-side
+    /// buffer-sizing contract to get wrong.
+    pub fn snapshotLastCommand(self: *ExtensionWsConn) LastCommandSnapshot {
+        self.last_command_mu.lock();
+        defer self.last_command_mu.unlock();
+
+        var snap: LastCommandSnapshot = .{
+            .tool_buf = [_]u8{0} ** LAST_COMMAND_BUF_LEN,
+            .tool_len = self.last_command_tool_len.load(.monotonic),
+            .result_buf = [_]u8{0} ** LAST_COMMAND_BUF_LEN,
+            .result_len = self.last_command_result_len.load(.monotonic),
+            .at_ns = self.last_command_at_ns.load(.monotonic),
+        };
+        @memcpy(snap.tool_buf[0..snap.tool_len], self.last_command_tool_buf[0..snap.tool_len]);
+        @memcpy(snap.result_buf[0..snap.result_len], self.last_command_result_buf[0..snap.result_len]);
+        return snap;
+    }
+};
+
+/// Return shape of `ExtensionWsConn.snapshotLastCommand`. Carries the
+/// tool name + result classifier inline (no heap, no caller-provided
+/// buffer) so the snapshot is self-contained and unambiguously sized.
+///
+/// Named (not anonymous) so the Zig x86_64 backend codegens it cleanly
+/// — the previous anonymous return tripped a `genSetReg called with a
+/// value larger than dst_reg` bug in Zig 0.15.2 on Linux x86_64.
+pub const LastCommandSnapshot = struct {
+    tool_buf: [LAST_COMMAND_BUF_LEN]u8,
+    tool_len: usize,
+    result_buf: [LAST_COMMAND_BUF_LEN]u8,
+    result_len: usize,
+    /// Nanoseconds since epoch (truncated to i64; see
+    /// `ExtensionWsConn.last_command_at_ns`). Zero when no command
+    /// has been recorded yet.
+    at_ns: i64,
+
+    /// Borrow a view of the tool-name bytes. Lifetime is tied to the
+    /// snapshot's stack frame — copy out before the snapshot goes
+    /// out of scope if you need to keep the bytes longer.
+    pub fn tool(self: *const LastCommandSnapshot) []const u8 {
+        return self.tool_buf[0..self.tool_len];
+    }
+
+    pub fn result(self: *const LastCommandSnapshot) []const u8 {
+        return self.result_buf[0..self.result_len];
+    }
+};
+
+/// Caller-owned snapshot of one paired extension. Returned by
+/// `ExtensionWsHub.listSnapshot` for the diagnostic routes.
+///
+/// All slice fields are heap-allocated copies; free via
+/// `ExtensionState.freeSlice` so the caller doesn't have to track
+/// individual allocations.
+pub const ExtensionState = struct {
+    user_id: []u8,
+    /// Nanoseconds since epoch (truncated to i64; see `ExtensionWsConn.connected_at_ns`).
+    connected_at_ns: i64,
+    last_command_at_ns: i64,
+    last_command_tool: []u8,
+    last_command_result: []u8,
+
+    pub fn freeSlice(allocator: std.mem.Allocator, slice: []ExtensionState) void {
+        for (slice) |s| {
+            allocator.free(s.user_id);
+            allocator.free(s.last_command_tool);
+            allocator.free(s.last_command_result);
+        }
+        allocator.free(slice);
+    }
 };
 
 pub const ExtensionWsHub = struct {
@@ -469,11 +614,16 @@ pub const ExtensionWsHub = struct {
             // ref via release(). If the pump is gone the conn frees
             // here; if it's still running, the pump's exit-path
             // release will free.
+            //
+            // S4 hardening: log user_id BEFORE the free so leak-diagnosis
+            // is actually useful. The prior log message ended with "for
+            // user_id" but never formatted the value — operators had no
+            // way to attribute the leak to a tenant.
             entry.value_ptr.*.evicted.store(true, .release);
             entry.value_ptr.*.close();
             _ = entry.value_ptr.*.release();
+            log.warn("extension_ws: hub deinit with un-drained conn user_id='{s}'", .{entry.key_ptr.*});
             self.allocator.free(entry.key_ptr.*);
-            log.warn("extension_ws: hub deinit with un-drained conn for user_id", .{});
         }
         self.users.deinit(self.allocator);
     }
@@ -515,46 +665,71 @@ pub const ExtensionWsHub = struct {
             // ALSO accounted for. See deinit/release semantics.
             .refs = std.atomic.Value(u32).init(1),
         };
+        // S4 CI fix: truncate nanoTimestamp's i128 to i64 (safe through year ~2262).
+        conn.connected_at_ns.store(@intCast(std.time.nanoTimestamp()), .release);
 
-        self.users_mu.lock();
-        defer self.users_mu.unlock();
+        // S4 hardening: keep the lifecycle log emit OUT of the
+        // users_mu critical section. We track the eviction + new-pair
+        // events inside the lock with stack-local flags, then emit
+        // after the lock releases. log.info / emitLifecycleEvent
+        // ultimately write to stderr (or whatever std.log sink the
+        // operator wires up), which may take its own internal lock —
+        // doing that under users_mu would let a slow log sink stall
+        // every concurrent getForUser/registerConn/unregister caller.
+        var did_evict = false;
+        var post_lock_active_count: usize = 0;
+        {
+            self.users_mu.lock();
+            defer self.users_mu.unlock();
 
-        if (self.users.fetchRemove(user_id)) |evicted| {
-            // Mark the prior conn as evicted, close its socket (so
-            // the prior read loop wakes and unwinds), and drop the
-            // hub's owning ref. The prior pump may still be running;
-            // its own `release()` on pump-exit will finally free.
-            // META CRIT #3: the refcount semantics make this safe —
-            // any agent thread that grabbed the conn via
-            // `getForUser` between hub-release and pump-release has
-            // its own ref and will free it last.
-            evicted.value.evicted.store(true, .release);
-            evicted.value.close();
-            _ = evicted.value.release();
-            self.allocator.free(evicted.key);
-            log.info("extension_ws: evicted prior connection for user_id='{s}'", .{user_id});
+            if (self.users.fetchRemove(user_id)) |evicted| {
+                // Mark the prior conn as evicted, close its socket (so
+                // the prior read loop wakes and unwinds), and drop the
+                // hub's owning ref. The prior pump may still be running;
+                // its own `release()` on pump-exit will finally free.
+                // META CRIT #3: the refcount semantics make this safe —
+                // any agent thread that grabbed the conn via
+                // `getForUser` between hub-release and pump-release has
+                // its own ref and will free it last.
+                evicted.value.evicted.store(true, .release);
+                evicted.value.close();
+                _ = evicted.value.release();
+                self.allocator.free(evicted.key);
+                did_evict = true;
+            }
+
+            // Dupe the user_id one more time for the map key so the conn's
+            // own copy can be freed independently in `unregister`.
+            const map_key = try self.allocator.dupe(u8, user_id);
+            errdefer self.allocator.free(map_key);
+            try self.users.put(self.allocator, map_key, conn);
+            // META CRIT #3: the map now holds a reference; bump refs to
+            // 2 (one for the caller, one for the hub). The hub's ref is
+            // dropped by unregister/eviction/hub-deinit; the caller's
+            // ref is dropped by destroyConn (= pump exit).
+            conn.retain();
+            post_lock_active_count = self.users.count();
+            // HIGH 2.A: gauge of live extension WS sessions. Take the
+            // count under the lock so the sample is consistent with the
+            // map state visible to other readers.
+            observability.recordMetricGlobal(.{ .extension_ws_connections_active = post_lock_active_count });
         }
 
-        // Dupe the user_id one more time for the map key so the conn's
-        // own copy can be freed independently in `unregister`.
-        const map_key = try self.allocator.dupe(u8, user_id);
-        errdefer self.allocator.free(map_key);
-        try self.users.put(self.allocator, map_key, conn);
-        // META CRIT #3: the map now holds a reference; bump refs to
-        // 2 (one for the caller, one for the hub). The hub's ref is
-        // dropped by unregister/eviction/hub-deinit; the caller's
-        // ref is dropped by destroyConn (= pump exit).
-        conn.retain();
-
+        // Post-lock: emit the lifecycle events + operator-facing log
+        // lines. Order is disconnect-before-pair so eviction-on-reconnect
+        // shows the prior connection going away first, then the new one
+        // arriving — operators can grep for the pair-after-disconnect
+        // motif to identify clean reconnects vs cold pairs.
+        if (did_evict) {
+            log.info("extension_ws: evicted prior connection for user_id='{s}'", .{user_id});
+            emitLifecycleEvent(.disconnect, .{ .user_id = user_id });
+        }
         // WARN 2.C: operability signal — operator sees one info line
         // per new extension binding. user_id is logged here (not in
         // the cross-cutting metric) so a single operator grep can
         // attribute a hub event to a specific tenant.
-        log.info("extension_ws: connection registered user_id='{s}' active={d}", .{ user_id, self.users.count() });
-        // HIGH 2.A: gauge of live extension WS sessions. Take the
-        // count under the lock so the sample is consistent with the
-        // map state visible to other readers.
-        observability.recordMetricGlobal(.{ .extension_ws_connections_active = self.users.count() });
+        log.info("extension_ws: connection registered user_id='{s}' active={d}", .{ user_id, post_lock_active_count });
+        emitLifecycleEvent(.pair, .{ .user_id = user_id });
         return conn;
     }
 
@@ -579,6 +754,78 @@ pub const ExtensionWsHub = struct {
         return conn;
     }
 
+    /// Live count of paired users. Takes `users_mu` for the duration
+    /// of the read so the sample is consistent. Diagnostic helpers in
+    /// `gateway.zig` use this instead of touching `users_mu` /
+    /// `users` directly — the hub keeps its threading model
+    /// encapsulated.
+    pub fn activeCount(self: *ExtensionWsHub) usize {
+        self.users_mu.lock();
+        defer self.users_mu.unlock();
+        return self.users.count();
+    }
+
+    /// Caller-owned snapshot of every currently-paired user. The slice
+    /// AND each element's fields are heap-allocated; free via
+    /// `ExtensionState.freeSlice(allocator, slice)`.
+    ///
+    /// Takes `users_mu` for the duration of the iteration. The per-conn
+    /// `last_command_*` fields are read under the conn's
+    /// `last_command_mu` (via `snapshotLastCommand`) so the snapshot is
+    /// internally consistent even under concurrent sendCommand calls.
+    pub fn listSnapshot(self: *ExtensionWsHub, allocator: std.mem.Allocator) ![]ExtensionState {
+        self.users_mu.lock();
+        defer self.users_mu.unlock();
+
+        var out = try allocator.alloc(ExtensionState, self.users.count());
+        var written: usize = 0;
+        // S4 hardening — leak audit, by exit point:
+        //   (1) OOM at the `out` alloc above: nothing yet allocated, caller sees
+        //       the error and out goes unused.
+        //   (2) OOM at the per-entry `uid` dupe: this iteration's local
+        //       errdefer frees nothing yet for the current entry; the outer
+        //       errdefer frees out[0..written-1] (previous iterations'
+        //       fully-populated triples) plus `out` itself.
+        //   (3) OOM at the per-entry `tool` dupe: this iteration's
+        //       errdefer-uid frees uid; outer frees out[0..written-1] + out.
+        //   (4) OOM at the per-entry `result` dupe: this iteration's
+        //       errdefer-tool frees tool, errdefer-uid frees uid; outer frees
+        //       out[0..written-1] + out.
+        //   (5) Success: `out[written] = ...; written += 1;` runs;
+        //       on the NEXT iteration's OOM, the just-written entry is
+        //       covered by the outer errdefer because `written` was incremented.
+        // No leak in any exit path.
+        errdefer {
+            var i: usize = 0;
+            while (i < written) : (i += 1) {
+                allocator.free(out[i].user_id);
+                allocator.free(out[i].last_command_tool);
+                allocator.free(out[i].last_command_result);
+            }
+            allocator.free(out);
+        }
+
+        var it = self.users.iterator();
+        while (it.next()) |entry| {
+            const conn = entry.value_ptr.*;
+            const last = conn.snapshotLastCommand();
+            const uid = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(uid);
+            const tool = try allocator.dupe(u8, last.tool());
+            errdefer allocator.free(tool);
+            const result = try allocator.dupe(u8, last.result());
+            out[written] = .{
+                .user_id = uid,
+                .connected_at_ns = conn.connected_at_ns.load(.acquire),
+                .last_command_at_ns = last.at_ns,
+                .last_command_tool = tool,
+                .last_command_result = result,
+            };
+            written += 1;
+        }
+        return out;
+    }
+
     /// Mark the connection for `user_id` as evicted and remove it from
     /// the registry. Drops the hub's owning ref via `release()`. If
     /// the pump (or any agent thread holding a `getForUser` reference)
@@ -586,20 +833,31 @@ pub const ExtensionWsHub = struct {
     /// if any other party still holds a ref, the LAST release frees.
     /// Returns true iff the slot was present.
     pub fn unregister(self: *ExtensionWsHub, user_id: []const u8) bool {
-        self.users_mu.lock();
-        defer self.users_mu.unlock();
-        if (self.users.fetchRemove(user_id)) |kv| {
-            kv.value.evicted.store(true, .release);
-            // The hub no longer owns a ref to this conn. Releasing
-            // here may or may not be the final ref; refcount
-            // semantics handle the timing.
-            _ = kv.value.release();
-            self.allocator.free(kv.key);
-            // HIGH 2.A: refresh gauge after the slot is gone.
-            observability.recordMetricGlobal(.{ .extension_ws_connections_active = self.users.count() });
-            return true;
+        // S4 hardening: emit lifecycle event AFTER releasing
+        // users_mu. See registerConn for the rationale (avoid a slow
+        // log sink stalling concurrent hub-map callers).
+        var did_remove = false;
+        {
+            self.users_mu.lock();
+            defer self.users_mu.unlock();
+            if (self.users.fetchRemove(user_id)) |kv| {
+                kv.value.evicted.store(true, .release);
+                // The hub no longer owns a ref to this conn. Releasing
+                // here may or may not be the final ref; refcount
+                // semantics handle the timing.
+                _ = kv.value.release();
+                self.allocator.free(kv.key);
+                // HIGH 2.A: refresh gauge after the slot is gone.
+                observability.recordMetricGlobal(.{ .extension_ws_connections_active = self.users.count() });
+                did_remove = true;
+            }
         }
-        return false;
+        if (did_remove) {
+            // `user_id` is the caller-borrowed slice; it outlives the
+            // function call, so it's safe to log after the lock drop.
+            emitLifecycleEvent(.disconnect, .{ .user_id = user_id });
+        }
+        return did_remove;
     }
 
     /// META CRIT #3 — `destroyConn` is now a thin alias for
@@ -666,6 +924,7 @@ pub const ExtensionWsHub = struct {
                 else => "error_other",
             };
             observability.recordMetricGlobal(.{ .extension_ws_command_total = .{ .result = result_label, .tool = tool } });
+            conn.recordCommandOutcome(tool, result_label); // S4 — diagnostic stamp
             // WARN 2.C: operator-visible signal for timeouts. Other
             // failure classes are not log-spammed here because they
             // bubble to the tool layer where the user-facing error is
@@ -674,20 +933,88 @@ pub const ExtensionWsHub = struct {
             // "did nothing".
             if (err == error.Timeout) {
                 log.info("extension_ws: command timed out user_id='{s}' tool='{s}' timeout_ms={d}", .{ user_id, tool, timeout_ms });
+                emitLifecycleEvent(.timeout, .{ .user_id = user_id, .extra_key = "tool", .extra_val = tool });
+            } else {
+                emitLifecycleEvent(.command_failed, .{ .user_id = user_id, .extra_key = "tool", .extra_val = tool });
             }
             return err;
         };
-        defer conn.allocator.free(result_borrowed);
+        // S4 review fix: `result_borrowed` was allocated by
+        // `conn.sendCommand` from the CALLER's `result_allocator`
+        // (see conn.sendCommand's `result_allocator.dupe(u8, r)`).
+        // The previous `conn.allocator.free` worked only when the
+        // caller happened to pass the same allocator the conn was
+        // built with — under any other allocator (e.g., an arena per
+        // call) it triggers an invalid-free panic. Free through the
+        // owning allocator.
+        defer result_allocator.free(result_borrowed);
 
         const elapsed_ms: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - t_start_ns, std.time.ns_per_ms));
         observability.recordMetricGlobal(.{ .extension_ws_command_latency_ms = elapsed_ms });
         observability.recordMetricGlobal(.{ .extension_ws_command_total = .{ .result = "ok", .tool = tool } });
+        conn.recordCommandOutcome(tool, "ok"); // S4 — diagnostic stamp
 
         // Re-dupe into the caller's allocator so the caller's free
         // path matches what `sendCommand`'s docstring promises.
         return result_allocator.dupe(u8, result_borrowed);
     }
 };
+
+/// Canonical lifecycle event class. Used by `emitLifecycleEvent` and
+/// in tests via `formatLifecycleEvent` to pin the exact log shape
+/// operators grep for.
+pub const LifecycleEvent = enum {
+    pair, // new extension authenticated + registered.
+    disconnect, // pump exited (graceful close, eviction, or error).
+    timeout, // sendCommand hit its timedWait deadline.
+    command_failed, // hub.sendCommand returned a named error class other than no_conn.
+
+    pub fn toString(self: LifecycleEvent) []const u8 {
+        return switch (self) {
+            .pair => "pair",
+            .disconnect => "disconnect",
+            .timeout => "timeout",
+            .command_failed => "command_failed",
+        };
+    }
+};
+
+const LifecycleEventArgs = struct {
+    user_id: []const u8,
+    extra_key: ?[]const u8 = null,
+    extra_val: ?[]const u8 = null,
+};
+
+/// Format one lifecycle log line into `writer`. Exposed for tests; the
+/// production helper `emitLifecycleEvent` calls this with the std.log
+/// writer.
+pub fn formatLifecycleEvent(writer: anytype, ev: LifecycleEvent, args: LifecycleEventArgs) !void {
+    try writer.print("extension_ws.event={s} user_id='{s}'", .{ ev.toString(), args.user_id });
+    if (args.extra_key) |k| {
+        if (args.extra_val) |v| {
+            try writer.print(" {s}='{s}'", .{ k, v });
+        }
+    }
+}
+
+/// Production-side emitter: routes the canonical line through std.log.
+///
+/// S4 review fix: if the 512-byte fixed buffer overflows
+/// (pathological user_id or extra_val), surface a warn line with the
+/// event class so the loss is operator-visible. Silent drop would
+/// hide a real shipping-relevant event class from log shipping.
+fn emitLifecycleEvent(ev: LifecycleEvent, args: LifecycleEventArgs) void {
+    var buf: [512]u8 = undefined;
+    var sink = std.io.fixedBufferStream(&buf);
+    formatLifecycleEvent(sink.writer(), ev, args) catch {
+        log.warn(
+            "extension_ws.event={s} log_drop_reason=format_buf_overflow",
+            .{ev.toString()},
+        );
+        return;
+    };
+    log.info("{s}", .{sink.getWritten()});
+}
 
 /// Extract the `command_id` field from a CommandResult JSON payload.
 /// Returns an allocator-owned copy. Errors:
@@ -730,6 +1057,21 @@ const TestStream = struct {
 
     pub fn deinit(self: *TestStream) void {
         self.written.deinit(self.allocator);
+    }
+
+    /// Borrow the most recent written frame (newline-delimited).
+    /// Returns null if no frame has been written yet. The slice
+    /// borrows from `self.written.items` — valid until the next
+    /// write or deinit.
+    pub fn lastWrite(self: *TestStream) ?[]const u8 {
+        if (self.written.items.len == 0) return null;
+        const trimmed = std.mem.trimEnd(u8, self.written.items, "\n");
+        if (trimmed.len == 0) return null;
+        // Find the last '\n' delimiter before `trimmed.len`.
+        if (std.mem.lastIndexOfScalar(u8, trimmed, '\n')) |last_nl| {
+            return trimmed[last_nl + 1 ..];
+        }
+        return trimmed;
     }
 };
 
@@ -1453,6 +1795,221 @@ const SoakStream = struct {
         self.written.clearRetainingCapacity();
     }
 };
+
+test "ExtensionWsConn lifecycle fields default to zero on construction" {
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    var ts = TestStream{ .allocator = std.testing.allocator };
+    defer ts.deinit();
+    const conn = try hub.registerConn(
+        "alice",
+        @ptrCast(&ts),
+        TestStream.writeText,
+        @ptrCast(&ts),
+        TestStream.close,
+    );
+    defer hub.destroyConn(conn);
+    // Connected timestamp is set on registerConn — not zero.
+    try std.testing.expect(conn.connected_at_ns.load(.monotonic) > 0);
+    // last_command_at starts at zero (no commands yet).
+    try std.testing.expectEqual(@as(i64, 0), conn.last_command_at_ns.load(.monotonic));
+    // last_command_tool / last_command_result start empty.
+    try std.testing.expectEqual(@as(usize, 0), conn.last_command_tool_len.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), conn.last_command_result_len.load(.monotonic));
+}
+
+test "ExtensionWsConn recordCommandOutcome + snapshotLastCommand round-trip" {
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    var ts = TestStream{ .allocator = std.testing.allocator };
+    defer ts.deinit();
+    const conn = try hub.registerConn(
+        "alice",
+        @ptrCast(&ts),
+        TestStream.writeText,
+        @ptrCast(&ts),
+        TestStream.close,
+    );
+    defer hub.destroyConn(conn);
+
+    // Before any recordCommandOutcome call: snapshot returns empty + at_ns=0.
+    const before = conn.snapshotLastCommand();
+    try std.testing.expectEqual(@as(usize, 0), before.tool_len);
+    try std.testing.expectEqual(@as(usize, 0), before.result_len);
+    try std.testing.expectEqual(@as(i64, 0), before.at_ns);
+
+    // After a recordCommandOutcome call: snapshot returns the recorded
+    // tool + result + a non-zero timestamp.
+    conn.recordCommandOutcome("extension_click", "ok");
+    const after = conn.snapshotLastCommand();
+    try std.testing.expectEqualStrings("extension_click", after.tool());
+    try std.testing.expectEqualStrings("ok", after.result());
+    try std.testing.expect(after.at_ns > 0);
+
+    // A second recordCommandOutcome overwrites the prior values.
+    conn.recordCommandOutcome("extension_screenshot", "timeout");
+    const overwritten = conn.snapshotLastCommand();
+    try std.testing.expectEqualStrings("extension_screenshot", overwritten.tool());
+    try std.testing.expectEqualStrings("timeout", overwritten.result());
+    try std.testing.expect(overwritten.at_ns >= after.at_ns);
+}
+
+test "sendCommand records last command outcome on success" {
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    var ts = TestStream{ .allocator = std.testing.allocator };
+    defer ts.deinit();
+    const conn = try hub.registerConn(
+        "alice",
+        @ptrCast(&ts),
+        TestStream.writeText,
+        @ptrCast(&ts),
+        TestStream.close,
+    );
+    defer hub.destroyConn(conn);
+
+    // S4 hardening: parse the actual command_id the hub wrote
+    // (instead of hardcoding "cmd-1") so the test stays correct under
+    // any future change to `mintCommandId`'s counter seed.
+    const Helper = struct {
+        c: *ExtensionWsConn,
+        s: *TestStream,
+        fn deliver(ctx: @This()) void {
+            var attempts: usize = 0;
+            while (attempts < 1000 and ctx.s.lastWrite() == null) : (attempts += 1) {
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+            const frame = ctx.s.lastWrite() orelse return;
+            const needle = "\"command_id\":\"";
+            const start_idx = std.mem.indexOf(u8, frame, needle) orelse return;
+            const after = start_idx + needle.len;
+            const end_idx = std.mem.indexOfScalarPos(u8, frame, after, '"') orelse return;
+            const cmd_id = frame[after..end_idx];
+            var reply_buf: [256]u8 = undefined;
+            const reply = std.fmt.bufPrint(
+                &reply_buf,
+                "{{\"command_id\":\"{s}\",\"ok\":true,\"result\":{{\"loaded\":true}}}}",
+                .{cmd_id},
+            ) catch return;
+            ctx.c.deliverResult(reply) catch {};
+        }
+    };
+    var thread = try std.Thread.spawn(.{}, Helper.deliver, .{Helper{ .c = conn, .s = &ts }});
+    defer thread.join();
+
+    const r = try hub.sendCommand(std.testing.allocator, "alice", "navigate", "{}", 500);
+    defer std.testing.allocator.free(r);
+
+    const snap = conn.snapshotLastCommand();
+    try std.testing.expectEqualStrings("navigate", snap.tool());
+    try std.testing.expectEqualStrings("ok", snap.result());
+    try std.testing.expect(snap.at_ns > 0);
+}
+
+test "sendCommand records timeout as last command result" {
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    var ts = TestStream{ .allocator = std.testing.allocator };
+    defer ts.deinit();
+    const conn = try hub.registerConn(
+        "alice",
+        @ptrCast(&ts),
+        TestStream.writeText,
+        @ptrCast(&ts),
+        TestStream.close,
+    );
+    defer hub.destroyConn(conn);
+
+    // No deliverer thread — let it timeout.
+    const r = hub.sendCommand(std.testing.allocator, "alice", "click", "{}", 20);
+    try std.testing.expectError(error.Timeout, r);
+
+    const snap = conn.snapshotLastCommand();
+    try std.testing.expectEqualStrings("click", snap.tool());
+    try std.testing.expectEqualStrings("timeout", snap.result());
+}
+
+test "sendCommand records no_conn when no extension paired" {
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    // No registerConn — no_conn path.
+    const r = hub.sendCommand(std.testing.allocator, "ghost", "screenshot", "{}", 20);
+    try std.testing.expectError(error.NoExtensionConnected, r);
+    // Ghost user has no conn so there's nothing to assert on the
+    // snapshot side — the metric is the visible signal. This test
+    // mostly pins the error class.
+}
+
+test "ExtensionWsHub.listSnapshot returns empty slice when no conns" {
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    const snap = try hub.listSnapshot(std.testing.allocator);
+    defer ExtensionState.freeSlice(std.testing.allocator, snap);
+    try std.testing.expectEqual(@as(usize, 0), snap.len);
+}
+
+test "ExtensionWsHub.listSnapshot reflects registered conns with default last_command empty" {
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    var ts_a = TestStream{ .allocator = std.testing.allocator };
+    defer ts_a.deinit();
+    var ts_b = TestStream{ .allocator = std.testing.allocator };
+    defer ts_b.deinit();
+    const conn_a = try hub.registerConn("alice", @ptrCast(&ts_a), TestStream.writeText, @ptrCast(&ts_a), TestStream.close);
+    defer hub.destroyConn(conn_a);
+    const conn_b = try hub.registerConn("bob", @ptrCast(&ts_b), TestStream.writeText, @ptrCast(&ts_b), TestStream.close);
+    defer hub.destroyConn(conn_b);
+
+    const snap = try hub.listSnapshot(std.testing.allocator);
+    defer ExtensionState.freeSlice(std.testing.allocator, snap);
+    try std.testing.expectEqual(@as(usize, 2), snap.len);
+    // Snapshot fields populated correctly. We don't pin ordering
+    // (hashmap iteration is undefined-ordered) so check by uid.
+    var saw_alice = false;
+    var saw_bob = false;
+    for (snap) |s| {
+        if (std.mem.eql(u8, s.user_id, "alice")) {
+            saw_alice = true;
+            try std.testing.expect(s.connected_at_ns > 0);
+            try std.testing.expectEqual(@as(i64, 0), s.last_command_at_ns);
+            try std.testing.expectEqualStrings("", s.last_command_tool);
+            try std.testing.expectEqualStrings("", s.last_command_result);
+        } else if (std.mem.eql(u8, s.user_id, "bob")) {
+            saw_bob = true;
+        }
+    }
+    try std.testing.expect(saw_alice);
+    try std.testing.expect(saw_bob);
+}
+
+test "emitLifecycleEvent writes canonical line shape for pair" {
+    // formatLifecycleEvent is the test-exposed formatter. Verifies the
+    // exact line shape operators grep for.
+    var buf: [256]u8 = undefined;
+    var sink = std.io.fixedBufferStream(&buf);
+    try formatLifecycleEvent(sink.writer(), .pair, .{
+        .user_id = "alice",
+        .extra_key = "extension_version",
+        .extra_val = "0.1.0",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, sink.getWritten(), "extension_ws.event=pair") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.getWritten(), "user_id='alice'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.getWritten(), "extension_version='0.1.0'") != null);
+}
+
+test "formatLifecycleEvent disconnect omits extra_key when null" {
+    var buf: [256]u8 = undefined;
+    var sink = std.io.fixedBufferStream(&buf);
+    try formatLifecycleEvent(sink.writer(), .disconnect, .{
+        .user_id = "alice",
+        .extra_key = null,
+        .extra_val = null,
+    });
+    const out = sink.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, out, "extension_ws.event=disconnect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "user_id='alice'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "extension_version=") == null);
+}
 
 test "soak: 50 concurrent extension WS sessions — no deadlock, no UAF, no leak" {
     // Set up: 50 workers, each its own user_id, each sending CMDS_PER_WORKER
