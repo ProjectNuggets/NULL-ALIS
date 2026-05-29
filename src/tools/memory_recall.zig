@@ -10,6 +10,7 @@ const MemoryEntry = mem_root.MemoryEntry;
 const zaki_state = @import("../zaki_state.zig");
 const supersede_filter = @import("supersede_filter.zig");
 const text_norm = @import("../memory/text_norm.zig");
+const observability = @import("../observability.zig");
 
 const log = std.log.scoped(.memory_recall);
 
@@ -84,7 +85,25 @@ pub const MemoryRecallTool = struct {
         };
     }
 
+    /// S5 (2026-05-29, prod-readiness) — public entry point wraps the
+    /// underlying executor with latency + result emit. See the parallel
+    /// pattern in `memory_store.zig` for rationale.
     pub fn execute(self: *MemoryRecallTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+        const start_ms = std.time.milliTimestamp();
+        const result = self.executeInner(allocator, args) catch |err| {
+            const elapsed_ms: u64 = @intCast(@max(@as(i64, 0), std.time.milliTimestamp() - start_ms));
+            observability.recordMetricGlobal(.{ .memory_op_total = .{ .op = "recall", .result = "err" } });
+            observability.recordMetricGlobal(.{ .memory_op_latency_ms = .{ .op = "recall", .value = elapsed_ms } });
+            return err;
+        };
+        const elapsed_ms: u64 = @intCast(@max(@as(i64, 0), std.time.milliTimestamp() - start_ms));
+        const label: []const u8 = if (result.success) "ok" else "err";
+        observability.recordMetricGlobal(.{ .memory_op_total = .{ .op = "recall", .result = label } });
+        observability.recordMetricGlobal(.{ .memory_op_latency_ms = .{ .op = "recall", .value = elapsed_ms } });
+        return result;
+    }
+
+    fn executeInner(self: *MemoryRecallTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const query = root.getString(args, "query") orelse
             return ToolResult.fail("Missing 'query' parameter");
         if (query.len == 0) return ToolResult.fail("'query' must not be empty");

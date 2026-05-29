@@ -96,6 +96,11 @@ pub const identity = @import("identity.zig");
 pub const cost = @import("cost.zig");
 pub const usage_runtime = @import("usage_runtime.zig");
 pub const observability = @import("observability.zig");
+/// **S5** — process-wide Prometheus counter/histogram registry for
+/// the chartable signals (approvals, artifact_export, extension_command,
+/// memory_op, trace_share, tool_call, meter_receipt). Substrate only;
+/// callers land in subsequent S5 commits.
+pub const observability_metrics = @import("observability_metrics.zig");
 pub const run_trace_store = @import("run_trace_store.zig");
 pub const heartbeat = @import("heartbeat.zig");
 pub const runtime = @import("runtime.zig");

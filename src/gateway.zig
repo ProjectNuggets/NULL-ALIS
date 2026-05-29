@@ -42,6 +42,7 @@ const zaki_dual_memory = @import("memory/engines/zaki_dual.zig");
 const zaki_postgres_memory = @import("memory/engines/zaki_postgres.zig");
 const subagent_mod = @import("subagent.zig");
 const observability = @import("observability.zig");
+const observability_metrics = @import("observability_metrics.zig");
 const sentry_runtime = @import("sentry_runtime.zig");
 const execution_mode_mod = @import("agent/execution_mode.zig");
 
@@ -1132,6 +1133,20 @@ pub const GatewayState = struct {
     event_bus: ?*bus_mod.Bus = null,
     zaki_state: ?*zaki_state_mod.Manager = null,
     lifecycle_metrics: LifecycleMetrics = .{},
+    /// S5 (2026-05-29, prod-readiness) — bridge to the process-wide
+    /// `observability_metrics.Registry`. Backing storage lives on
+    /// `GatewayState` so the observer pointer stays valid for the
+    /// lifetime of the gateway. Field defaults to `undefined` and is
+    /// initialized at boot once the registry is allocated.
+    metrics_registry_observer: MetricsRegistryObserver = undefined,
+    /// S5 (2026-05-29) — the heap-allocated registry that `runGateway`
+    /// owns. `deinit` consults THIS field (not `globalRegistry()`) to
+    /// decide whether to free, so a unit test that installs its own
+    /// stack-local registry via `setGlobalRegistry` does not get its
+    /// stack memory destroyed by a `GatewayState.deinit` running in
+    /// the same scope. Null when the gateway boots without the local
+    /// agent path (which is the only site that allocates).
+    metrics_registry_owned: ?*observability_metrics.Registry = null,
     /// Wave 3B — per-user browser-extension WebSocket registry. Non-null
     /// when the operator deploys the extension endpoint (`/api/v1/
     /// extension/ws` is reachable). Null in standalone CLI builds — the
@@ -1165,6 +1180,38 @@ pub const GatewayState = struct {
     }
 
     pub fn deinit(self: *GatewayState) void {
+        // S5 (2026-05-29, prod-readiness) — detach the process-wide
+        // observer BEFORE freeing the registry. The observer's vtable
+        // resolves to a pointer into stack memory (gateway_global_observer
+        // in runGateway); detaching here makes late-emit threads fall
+        // through to log-only output instead of dispatching through a
+        // dangling pointer. Then drop only the registry WE allocated
+        // (gated on `metrics_registry_owned` — a test that installs
+        // its own stack-local registry via `setGlobalRegistry` would
+        // otherwise have its stack memory destroyed here).
+        //
+        // S5 review-fix F3 (2026-05-29) — shutdown protocol with grace
+        // period. A thread that has already loaded `getGlobalObserver()`
+        // via the `.acquire` atomic load holds a `*Observer` pointer
+        // that resolves through the still-loaded module's vtable; the
+        // observer's `self.registry` field, however, points at heap
+        // memory we are about to free. Without a quiesce barrier, a
+        // recordMetric call mid-shutdown would touch a freed Registry.
+        // The shutdown protocol is explicit now:
+        //   1. detachGlobalObserverAndWait() clears the global observer
+        //      pointer and waits until all in-flight recordMetricGlobal
+        //      calls that borrowed the old pointer have returned.
+        //   2. detachGlobalRegistryAndWait(reg) clears the scrape pointer
+        //      and waits until any in-flight metricsPayload render using
+        //      the old registry has returned.
+        //   3. reg.deinit(); destroy(reg).
+        observability.detachGlobalObserverAndWait();
+        if (self.metrics_registry_owned) |reg| {
+            observability_metrics.detachGlobalRegistryAndWait(reg);
+            reg.deinit();
+            self.allocator.destroy(reg);
+            self.metrics_registry_owned = null;
+        }
         self.app_event_subscribers.deinit();
         self.tenant_telegram_queue.close();
         if (self.tenant_telegram_worker) |worker| {
@@ -1317,6 +1364,181 @@ const LifecycleMetricsObserver = struct {
     fn flush(_: *anyopaque) void {}
     fn name(_: *anyopaque) []const u8 {
         return "gateway_lifecycle_metrics";
+    }
+};
+
+/// S5 (2026-05-29, prod-readiness) — bridge ObserverMetric S5 variants
+/// into the process-wide `observability_metrics.Registry`. Installed at
+/// gateway boot alongside `LifecycleMetricsObserver`; emits from
+/// cross-cutting sites (tool dispatch, artifact export, memory ops,
+/// trace shares, approvals, meter receipts) route through
+/// `recordMetricGlobal` → this observer → registry counters/histograms,
+/// which `metricsPayload` renders on the next /metrics scrape.
+const MetricsRegistryObserver = struct {
+    registry: *observability_metrics.Registry,
+
+    const vtable = Observer.VTable{
+        .record_event = noopRecordEvent,
+        .record_metric = recordMetric,
+        .flush = noopFlush,
+        .name = name,
+    };
+
+    fn observer(self: *MetricsRegistryObserver) Observer {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn noopRecordEvent(_: *anyopaque, _: *const observability.ObserverEvent) void {}
+    fn noopFlush(_: *anyopaque) void {}
+    fn name(_: *anyopaque) []const u8 {
+        return "metrics_registry";
+    }
+
+    fn recordMetric(ptr: *anyopaque, metric: *const observability.ObserverMetric) void {
+        const self: *MetricsRegistryObserver = @ptrCast(@alignCast(ptr));
+        switch (metric.*) {
+            .approval_decision_total => |e| {
+                var buf: [128]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "nullalis_approval_decision_total{{result=\"{s}\"}}", .{e.result}) catch return;
+                self.registry.incCounter(key);
+            },
+            .artifact_export_total => |e| {
+                var buf: [192]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "nullalis_artifact_export_total{{format=\"{s}\",result=\"{s}\"}}", .{ e.format, e.result }) catch return;
+                self.registry.incCounter(key);
+            },
+            .artifact_export_latency_ms => |e| {
+                var buf: [128]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "nullalis_artifact_export_latency_ms{{format=\"{s}\"}}", .{e.format}) catch return;
+                self.registry.observeHistogram(key, e.value);
+            },
+            .memory_op_total => |e| {
+                var buf: [128]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "nullalis_memory_op_total{{op=\"{s}\",result=\"{s}\"}}", .{ e.op, e.result }) catch return;
+                self.registry.incCounter(key);
+            },
+            .memory_op_latency_ms => |e| {
+                var buf: [128]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "nullalis_memory_op_latency_ms{{op=\"{s}\"}}", .{e.op}) catch return;
+                self.registry.observeHistogram(key, e.value);
+            },
+            .trace_share_total => |e| {
+                var buf: [128]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "nullalis_trace_share_total{{op=\"{s}\",result=\"{s}\"}}", .{ e.op, e.result }) catch return;
+                self.registry.incCounter(key);
+            },
+            .tool_call_total => |e| {
+                var buf: [192]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "nullalis_tool_call_total{{tool=\"{s}\",result=\"{s}\"}}", .{ e.tool, e.result }) catch return;
+                self.registry.incCounter(key);
+            },
+            .tool_call_latency_ms => |e| {
+                var buf: [128]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "nullalis_tool_call_latency_ms{{tool=\"{s}\"}}", .{e.tool}) catch return;
+                self.registry.observeHistogram(key, e.value);
+            },
+            .meter_receipt_total => |e| {
+                var buf: [96]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "nullalis_meter_receipt_total{{result=\"{s}\"}}", .{e.result}) catch return;
+                self.registry.incCounter(key);
+            },
+            // S5 (2026-05-29, prod-readiness) — route the S4-owned
+            // extension_ws variants (emitted from src/extension_ws/hub.zig)
+            // into the chartable-signals registry so they surface on
+            // /metrics alongside the rest of the S5 catalog. The
+            // emit-site code itself stays untouched — S4 owns that file.
+            .extension_ws_command_total => |e| {
+                var buf: [192]u8 = undefined;
+                const key = if (e.tool) |t|
+                    std.fmt.bufPrint(&buf, "nullalis_extension_ws_command_total{{result=\"{s}\",tool=\"{s}\"}}", .{ e.result, t }) catch return
+                else
+                    std.fmt.bufPrint(&buf, "nullalis_extension_ws_command_total{{result=\"{s}\",tool=\"none\"}}", .{e.result}) catch return;
+                self.registry.incCounter(key);
+            },
+            .extension_ws_command_latency_ms => |v| {
+                const key = "nullalis_extension_ws_command_latency_ms";
+                self.registry.observeHistogram(key, v);
+            },
+            .extension_ws_connections_active => |_| {
+                // Gauge — the substrate's `Registry` only models
+                // counters + histograms. The LogObserver still captures
+                // the value, and a future Registry extension (or a
+                // dedicated point-in-time observation route) can surface
+                // it on /metrics. Left as a no-op rather than coerced
+                // into a counter (which would silently misrepresent
+                // gauge semantics).
+            },
+            .extension_ws_ssrf_block_total => |_| {
+                self.registry.incCounter("nullalis_extension_ws_ssrf_block_total");
+            },
+            // S5 review-fix F2 (2026-05-29) — route the v1.14.23
+            // chartable variants that were dropped to log-only by the
+            // previous `else => {}` branch. Pre-S5 these were a silent
+            // gap: chartable per the variant doc-comments but the only
+            // observer touching them was LifecycleMetricsObserver
+            // (whose recordMetric is a literal no-op). Now they land
+            // in the registry alongside the S5 catalog.
+            .artifact_create_total => |_| {
+                self.registry.incCounter("nullalis_artifact_create_total");
+            },
+            .artifact_update_total => |_| {
+                self.registry.incCounter("nullalis_artifact_update_total");
+            },
+            .artifact_share_total => |_| {
+                self.registry.incCounter("nullalis_artifact_share_total");
+            },
+            .artifact_share_revoke_total => |_| {
+                self.registry.incCounter("nullalis_artifact_share_revoke_total");
+            },
+            .share_create_success_total => |_| {
+                self.registry.incCounter("nullalis_share_create_success_total");
+            },
+            .share_create_429_total => |_| {
+                // D64 spam-cap signal — explicitly chartable per the
+                // ObserverMetric doc-comment. Operators alert on rate
+                // increases to detect a bot/abuser hammering the
+                // share-mint endpoint.
+                self.registry.incCounter("nullalis_share_create_429_total");
+            },
+            .produce_document_total => |e| {
+                var buf: [192]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "nullalis_produce_document_total{{format=\"{s}\",result=\"{s}\"}}", .{ e.format, e.result }) catch return;
+                self.registry.incCounter(key);
+            },
+            .produce_document_latency_ms => |e| {
+                var buf: [128]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "nullalis_produce_document_latency_ms{{format=\"{s}\"}}", .{e.format}) catch return;
+                self.registry.observeHistogram(key, e.value);
+            },
+            .trace_query_total => |_| {
+                self.registry.incCounter("nullalis_trace_query_total");
+            },
+            .memory_doctor_total => |_| {
+                self.registry.incCounter("nullalis_memory_doctor_total");
+            },
+            .moonshot_video_upload_total => |e| {
+                var buf: [128]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "nullalis_moonshot_video_upload_total{{result=\"{s}\"}}", .{e.result}) catch return;
+                self.registry.incCounter(key);
+            },
+            .moonshot_video_upload_bytes => |v| {
+                // Bytes-on-the-wire histogram per the ObserverMetric
+                // doc-comment. The substrate's histogram buckets are
+                // labeled `_ms` and use millisecond bucket boundaries,
+                // but we reuse them here because bucket boundaries
+                // (10, 50, ..., 10000, +Inf) are size-agnostic and
+                // operators recognize them as generic order-of-magnitude
+                // thresholds. Series name stays `_bytes` so dashboards
+                // know the unit.
+                self.registry.observeHistogram("nullalis_moonshot_video_upload_bytes", v);
+            },
+            // Gauges + generic variants are routed by other observers
+            // (LogObserver, OtelObserver). `request_latency_ms` /
+            // `tokens_used` / `active_sessions` / `queue_depth` stay
+            // here; a future Registry extension may add gauge support
+            // and a fan-in pass for generic histograms.
+            else => {},
+        }
     }
 };
 
@@ -5142,7 +5364,14 @@ fn buildFallbackChainIntoBuf(buf: []u8, fallback_providers: []const []const u8) 
     return used;
 }
 
-fn applyStartupSelfCheck(state: *GatewayState, cfg: *const Config, postgres_init_error: ?anyerror) void {
+const StartupSelfCheckError = error{ProductionPostgresRequired};
+
+fn applyStartupSelfCheck(
+    state: *GatewayState,
+    cfg: *const Config,
+    postgres_init_error: ?anyerror,
+    effective_host: []const u8,
+) StartupSelfCheckError!void {
     state.state_backend_configured = cfg.state.backend;
     state.state_backend_effective = if (state.zaki_state != null) "postgres" else "file";
     state.scheduler_backend = if (state.zaki_state != null and cfg.tenant.enabled) "postgres" else "file";
@@ -5170,6 +5399,26 @@ fn applyStartupSelfCheck(state: *GatewayState, cfg: *const Config, postgres_init
         state.state_degraded_reason_len = copyIntoBuf(&state.state_degraded_reason_buf, reason);
     } else {
         state.state_degraded_reason_len = 0;
+    }
+
+    // S5 (2026-05-29, prod-readiness): fail-loud when a production-like
+    // gateway was configured for Postgres but failed to initialize it.
+    // Dev/test profiles (loopback host + allow_public_bind=false) keep
+    // the warn-and-continue path below — operator ergonomics matter
+    // for `zig build run` against `config.example.json`.
+    //
+    // S5 (2026-05-29) — Production fail-loud guard. We return the error
+    // SILENTLY here; the matching log.err is emitted in the runWithRole
+    // caller after this returns. Reason: Zig 0.15's test runner counts
+    // any log.err call as a test failure, so unit tests that exercise
+    // this error-return path would trip the err-counter even though
+    // they're verifying correct behavior. The caller has access to the
+    // same diagnostic data via `state` after the error returns.
+    if (state.state_degraded and
+        std.mem.eql(u8, cfg.state.backend, "postgres") and
+        isProductionLikeGateway(cfg, effective_host))
+    {
+        return error.ProductionPostgresRequired;
     }
 
     const dispatch_mode = tool_dispatcher.parseMode(cfg.agent.tool_dispatcher);
@@ -6762,6 +7011,36 @@ pub fn extensionUserStatusPayload(allocator: std.mem.Allocator, input: Extension
     );
 }
 
+/// Escape a string for use as a Prometheus label value per the
+/// exposition format: `"` → `\"`, `\` → `\\`, `\n` → `\n`. Returns the
+/// borrowed slice if no escaping is needed, otherwise writes into
+/// `buf` and returns that. Truncates to fit `buf` (escaped) — safe
+/// because label values in this file are short (host names, backend
+/// kind, errorName strings).
+fn promEscapeLabel(value: []const u8, buf: []u8) []const u8 {
+    var needs_escape = false;
+    for (value) |c| {
+        if (c == '"' or c == '\\' or c == '\n') {
+            needs_escape = true;
+            break;
+        }
+    }
+    if (!needs_escape) return value;
+    var written: usize = 0;
+    for (value) |c| {
+        const replacement: []const u8 = switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            else => &[_]u8{c},
+        };
+        if (written + replacement.len > buf.len) break;
+        @memcpy(buf[written .. written + replacement.len], replacement);
+        written += replacement.len;
+    }
+    return buf[0..written];
+}
+
 fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u8 {
     const transport_stats = http_util.transport_stats_snapshot();
     const requests_total = state.requests_total.load(.monotonic);
@@ -6974,6 +7253,88 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
             pool_idle,
         },
     );
+
+    // S5 (2026-05-29, prod-readiness) — chartable signals catalog.
+    // HELP/TYPE headers are emitted unconditionally so a Prometheus
+    // scrape sees the family declarations on the very first scrape,
+    // even before any sample lands and even when the gateway boots
+    // without the global registry installed (CLI-only / unit-test
+    // paths). Series values are appended only when a registry is
+    // actually installed.
+    try w.print(
+        \\# HELP nullalis_approval_decision_total Approval lifecycle: issued|auto_approved|user_approved|user_denied|blocked|expired.
+        \\# TYPE nullalis_approval_decision_total counter
+        \\# HELP nullalis_artifact_export_total Artifact-export operations by format and result.
+        \\# TYPE nullalis_artifact_export_total counter
+        \\# HELP nullalis_artifact_export_latency_ms Artifact-export latency milliseconds histogram by format.
+        \\# TYPE nullalis_artifact_export_latency_ms histogram
+        \\# HELP nullalis_memory_op_total Memory-tool operations (store|recall|forget) by result.
+        \\# TYPE nullalis_memory_op_total counter
+        \\# HELP nullalis_memory_op_latency_ms Memory-tool latency milliseconds histogram by op.
+        \\# TYPE nullalis_memory_op_latency_ms histogram
+        \\# HELP nullalis_trace_share_total Trace-share operations (create|revoke|get) by result.
+        \\# TYPE nullalis_trace_share_total counter
+        \\# HELP nullalis_tool_call_total Per-tool dispatch by result.
+        \\# TYPE nullalis_tool_call_total counter
+        \\# HELP nullalis_tool_call_latency_ms Per-tool latency milliseconds histogram.
+        \\# TYPE nullalis_tool_call_latency_ms histogram
+        \\# HELP nullalis_meter_receipt_total Cost-tracker meter-receipt ledger emit by result.
+        \\# TYPE nullalis_meter_receipt_total counter
+        \\# HELP nullalis_extension_ws_command_total Extension WS command dispatch by result and tool.
+        \\# TYPE nullalis_extension_ws_command_total counter
+        \\# HELP nullalis_extension_ws_command_latency_ms Extension WS command roundtrip latency histogram.
+        \\# TYPE nullalis_extension_ws_command_latency_ms histogram
+        \\# HELP nullalis_extension_ws_ssrf_block_total Extension WS SSRF block denials.
+        \\# TYPE nullalis_extension_ws_ssrf_block_total counter
+        \\# HELP nullalis_artifact_create_total Artifact-lifecycle create counter.
+        \\# TYPE nullalis_artifact_create_total counter
+        \\# HELP nullalis_artifact_update_total Artifact-lifecycle update counter.
+        \\# TYPE nullalis_artifact_update_total counter
+        \\# HELP nullalis_artifact_share_total Artifact-lifecycle share counter (mint).
+        \\# TYPE nullalis_artifact_share_total counter
+        \\# HELP nullalis_artifact_share_revoke_total Artifact-lifecycle share-revoke counter.
+        \\# TYPE nullalis_artifact_share_revoke_total counter
+        \\# HELP nullalis_share_create_success_total Share-mint successes (first mint per record; idempotent re-mints do not increment).
+        \\# TYPE nullalis_share_create_success_total counter
+        \\# HELP nullalis_share_create_429_total Share-mint denials due to per-user spam cap (D64).
+        \\# TYPE nullalis_share_create_429_total counter
+        \\# HELP nullalis_produce_document_total produce_document tool dispatch by format and result.
+        \\# TYPE nullalis_produce_document_total counter
+        \\# HELP nullalis_produce_document_latency_ms produce_document tool latency histogram by format.
+        \\# TYPE nullalis_produce_document_latency_ms histogram
+        \\# HELP nullalis_trace_query_total trace_query tool dispatch counter.
+        \\# TYPE nullalis_trace_query_total counter
+        \\# HELP nullalis_memory_doctor_total memory_doctor tool dispatch counter.
+        \\# TYPE nullalis_memory_doctor_total counter
+        \\# HELP nullalis_moonshot_video_upload_total Moonshot Files API video upload result counter.
+        \\# TYPE nullalis_moonshot_video_upload_total counter
+        \\# HELP nullalis_moonshot_video_upload_bytes Moonshot Files API video upload bytes-on-the-wire histogram (bucket boundaries are unitless order-of-magnitude thresholds).
+        \\# TYPE nullalis_moonshot_video_upload_bytes histogram
+        \\
+    , .{});
+    if (observability_metrics.borrowGlobalRegistry()) |reg| {
+        defer observability_metrics.releaseGlobalRegistry();
+        try reg.render(allocator, w);
+    }
+
+    // Gateway degraded-state gauge with labels — emitted whether or not
+    // the registry has any S5 series yet so SLO dashboards always see
+    // the series and operators can alert on a flip from 0 → 1.
+    const degraded_val: u8 = if (state.state_degraded) 1 else 0;
+    const degraded_reason: []const u8 = if (state.state_degraded) state.degradedReason() else "none";
+    var cfg_buf: [256]u8 = undefined;
+    var eff_buf: [256]u8 = undefined;
+    var reason_buf: [256]u8 = undefined;
+    const cfg_label = promEscapeLabel(state.state_backend_configured, &cfg_buf);
+    const eff_label = promEscapeLabel(state.state_backend_effective, &eff_buf);
+    const reason_label = promEscapeLabel(degraded_reason, &reason_buf);
+    try w.print(
+        \\# HELP nullalis_gateway_degraded Gateway degraded-state gauge (1 when configured backend != effective backend).
+        \\# TYPE nullalis_gateway_degraded gauge
+        \\nullalis_gateway_degraded{{configured="{s}",effective="{s}",reason="{s}"}} {d}
+        \\
+    , .{ cfg_label, eff_label, reason_label, degraded_val });
+
     return buf.toOwnedSlice(allocator);
 }
 
@@ -11674,6 +12035,31 @@ fn handleArtifactExport(
     config_opt: ?*const Config,
     state: *GatewayState,
 ) RouteResponse {
+    // S5 (2026-05-29, prod-readiness) — artifact_export_total +
+    // artifact_export_latency_ms emit. `fmt_label` starts as "invalid"
+    // and is upgraded to the canonical lowercase format only once the
+    // query param has been validated. `result_label` is mutated per-
+    // exit-path with the documented vocabulary
+    // (ok|invalid_format|invalid_input|missing_artifact|state_unavailable|
+    // renderer_unavailable).
+    //
+    // S5 code-review pass: `result_label` defaults to "invalid_input" — NOT
+    // "invalid_format" — because the 405 method-not-allowed, the 400
+    // invalid_artifact_id, and the 400 invalid_user_id early-exits all return
+    // BEFORE the format-allowlist runs. Defaulting to "invalid_format"
+    // previously polluted the invalid-format SLO dashboard with results
+    // attributable to method/id input rejection. The label is upgraded to
+    // "invalid_format" only inside the allowlist `else` arm (where we
+    // actually know the format was bad).
+    const start_ms = std.time.milliTimestamp();
+    var fmt_label: []const u8 = "invalid";
+    var result_label: []const u8 = "invalid_input";
+    defer {
+        const elapsed_ms: u64 = @intCast(@max(@as(i64, 0), std.time.milliTimestamp() - start_ms));
+        observability.recordMetricGlobal(.{ .artifact_export_total = .{ .format = fmt_label, .result = result_label } });
+        observability.recordMetricGlobal(.{ .artifact_export_latency_ms = .{ .format = fmt_label, .value = elapsed_ms } });
+    }
+
     if (!std.mem.eql(u8, method, "POST")) {
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
     }
@@ -11697,17 +12083,26 @@ fn handleArtifactExport(
         if (std.ascii.eqlIgnoreCase(format_raw, "pptx")) break :blk "pptx";
         if (std.ascii.eqlIgnoreCase(format_raw, "xlsx")) break :blk "xlsx";
         if (std.ascii.eqlIgnoreCase(format_raw, "html")) break :blk "html";
+        // Format-allowlist failure: upgrade the result_label to
+        // "invalid_format" so the SLO signal correctly attributes THIS
+        // 400 to a bad format param (vs. bad method/artifact_id/user_id,
+        // which keep the default "invalid_input").
+        result_label = "invalid_format";
         return .{
             .status = "400 Bad Request",
             .body = "{\"error\":\"invalid_format\",\"detail\":\"format must be one of: pdf, docx, pptx, xlsx, html\"}",
         };
     };
+    // Format validated — upgrade the metric label so the histogram and
+    // counter shard by the canonical format string from here on.
+    fmt_label = format;
 
     // Workspace_path safety: produce_document writes via std.fs.path.join +
     // std.fs.cwd().makePath. If workspace_path is somehow not absolute
     // (operator config drift), surface a controlled 500 instead of letting
     // the tool fail later in a less-actionable way.
     if (!std.fs.path.isAbsolute(user_ctx.workspace_path)) {
+        result_label = "state_unavailable";
         return .{
             .status = "500 Internal Server Error",
             .body = "{\"error\":\"workspace_not_absolute\",\"detail\":\"user workspace_path is not absolute; refusing to export\"}",
@@ -11715,6 +12110,7 @@ fn handleArtifactExport(
     }
 
     const state_mgr = state.zaki_state orelse {
+        result_label = "state_unavailable";
         return .{
             .status = "503 Service Unavailable",
             .body = "{\"error\":\"state_unavailable\",\"detail\":\"persistent state backend not configured; artifacts require postgres\"}",
@@ -11723,18 +12119,22 @@ fn handleArtifactExport(
 
     // Ownership + existence check (mirrors handleArtifactGet at :11029).
     const artifact_opt = state_mgr.getArtifactById(allocator, numeric_user_id, artifact_id) catch {
+        result_label = "state_unavailable";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read_failed\"}" };
     };
     if (artifact_opt == null) {
+        result_label = "missing_artifact";
         return .{ .status = "404 Not Found", .body = "{\"error\":\"artifact_not_found\"}" };
     }
     var artifact = artifact_opt.?;
     defer artifact.deinit(allocator);
 
     const ver_opt = state_mgr.getArtifactVersion(allocator, numeric_user_id, artifact_id, null) catch {
+        result_label = "state_unavailable";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"version_read_failed\"}" };
     };
     if (ver_opt == null) {
+        result_label = "missing_artifact";
         return .{ .status = "404 Not Found", .body = "{\"error\":\"version_not_found\"}" };
     }
     var ver = ver_opt.?;
@@ -11746,15 +12146,19 @@ fn handleArtifactExport(
     var args = std.json.ObjectMap.init(allocator);
     defer args.deinit();
     args.put("format", std.json.Value{ .string = format }) catch {
+        result_label = "state_unavailable";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
     };
     args.put("content", std.json.Value{ .string = ver.content }) catch {
+        result_label = "state_unavailable";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
     };
     args.put("title", std.json.Value{ .string = artifact.title }) catch {
+        result_label = "state_unavailable";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
     };
     args.put("theme", std.json.Value{ .string = "default" }) catch {
+        result_label = "state_unavailable";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
     };
 
@@ -11763,6 +12167,7 @@ fn handleArtifactExport(
         .branding = if (config_opt) |cfg| cfg.branding else .{},
     };
     const tool_result = pdt.execute(allocator, args) catch {
+        result_label = "renderer_unavailable";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"export_failed\",\"detail\":\"tool dispatch raised an error\"}" };
     };
     // Ownership: produce_document allocates `output` and `error_msg` with our
@@ -11790,6 +12195,11 @@ fn handleArtifactExport(
             std.mem.indexOf(u8, err, "FileNotFound") != null or
             std.mem.indexOf(u8, err, "marp-cli") != null or
             std.mem.indexOf(u8, err, "pandoc") != null;
+        // Both the renderer-missing (502) and the export-failed (500) tails
+        // map to the same metric label — operators care about "the renderer
+        // could not produce a document" as a single signal. The 500-vs-502
+        // distinction stays in the HTTP response so FE can differentiate.
+        result_label = "renderer_unavailable";
         var out: std.ArrayListUnmanaged(u8) = .empty;
         // `toOwnedSlice` zeroes the buf on success → the defer becomes a
         // no-op when we return the body; on any catch the defer cleans up.
@@ -11811,6 +12221,7 @@ fn handleArtifactExport(
 
     // Success — parse the produced filename out of the markdown link.
     const filename = parseProducedFilename(tool_result.output) orelse {
+        result_label = "renderer_unavailable";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"export_failed\",\"detail\":\"renderer succeeded but filename could not be parsed\"}" };
     };
 
@@ -11840,6 +12251,7 @@ fn handleArtifactExport(
     w.writeAll("/exports/") catch return response_build_err;
     jsonEscapeInto(w, filename) catch return response_build_err;
     w.writeAll("\"}") catch return response_build_err;
+    result_label = "ok";
     return finalizeJsonBuf(allocator, &out);
 }
 
@@ -12095,11 +12507,32 @@ const TraceShareStore = struct {
     /// subsequent reads are O(1). This is the restart-recovery path
     /// that closes the `ui-handoff.md` §7 P1 gap.
     fn getLive(self: *TraceShareStore, code: []const u8, now_unix: i64) ?TraceShareSnapshot {
+        // S5 (2026-05-29, prod-readiness) — trace_share_total{op="get"}
+        // emit. Distinguishes the four operational tails the SLO panel
+        // cares about: ok | not_found | expired | revoked. The cache-
+        // hit path can detect expired vs revoked precisely (the record
+        // is still present, just non-live). The PG fallback path can
+        // only tell ok vs not_found — the SQL view filters out expired
+        // / revoked at the source so a cache-miss lazy-load that yields
+        // null is collapsed to "not_found" by design.
+        var result_label: []const u8 = "not_found";
+        defer observability.recordMetricGlobal(.{ .trace_share_total = .{ .op = "get", .result = result_label } });
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
         if (self.by_code.get(code)) |rec_ptr| {
-            if (!rec_ptr.isLive(now_unix)) return null;
+            if (!rec_ptr.isLive(now_unix)) {
+                // isLive() returns false when revoked OR expired —
+                // surface the more specific tail when we can tell.
+                if (rec_ptr.revoked) {
+                    result_label = "revoked";
+                } else {
+                    result_label = "expired";
+                }
+                return null;
+            }
+            result_label = "ok";
             return .{
                 .user_id = rec_ptr.user_id,
                 .run_id = rec_ptr.run_id,
@@ -12150,6 +12583,7 @@ const TraceShareStore = struct {
         // would re-mint the by_owner entry on first use. The public GET
         // only consults by_code, which is now populated.
 
+        result_label = "ok";
         return .{
             .user_id = rec.user_id,
             .run_id = rec.run_id,
@@ -12181,6 +12615,13 @@ const TraceShareStore = struct {
         now_unix: i64,
         events_json: []const u8,
     ) !ShareCreateResult {
+        // S5 (2026-05-29, prod-readiness) — trace_share_total{op="create"}
+        // emit. `result_label` is mutated per-exit-path. "err" is the
+        // catch-all fallback for unanticipated error paths — the spec
+        // vocabulary is ok|cap|err for create.
+        var result_label: []const u8 = "err";
+        defer observability.recordMetricGlobal(.{ .trace_share_total = .{ .op = "create", .result = result_label } });
+
         const ttl_secs: i64 = ttl_hours * 3600;
         const expires_at = now_unix + ttl_secs;
 
@@ -12204,6 +12645,7 @@ const TraceShareStore = struct {
                 if (existing_rec.isLive(now_unix)) {
                     // Idempotent re-share — discard our fresh key_buf.
                     self.allocator.free(key_buf);
+                    result_label = "ok";
                     return .{
                         .already_existed = true,
                         .share_code = existing_rec.share_code,
@@ -12267,6 +12709,7 @@ const TraceShareStore = struct {
             }
         }
         if (live_count >= MAX_LIVE_SHARES_PER_USER) {
+            result_label = "cap";
             return error.ShareLimitReached;
         }
 
@@ -12354,6 +12797,7 @@ const TraceShareStore = struct {
         errdefer self.allocator.free(code_for_owner);
         try self.by_owner.put(self.allocator, key_buf, code_for_owner);
 
+        result_label = "ok";
         return .{
             .already_existed = false,
             .share_code = code_owned,
@@ -12371,6 +12815,13 @@ const TraceShareStore = struct {
     /// flips revoked=true so the public GET 404s on restart-recovery
     /// lookup. Returns true if either layer found something to revoke.
     fn revoke(self: *TraceShareStore, user_id: []const u8, run_id: []const u8) !bool {
+        // S5 (2026-05-29, prod-readiness) — trace_share_total{op="revoke"}
+        // emit. Spec vocabulary for revoke is ok|not_found|err. The
+        // ok-vs-not_found tail is derived from the boolean return at the
+        // end; an error path leaves the default "err" in place.
+        var result_label: []const u8 = "err";
+        defer observability.recordMetricGlobal(.{ .trace_share_total = .{ .op = "revoke", .result = result_label } });
+
         self.mutex.lock();
         defer self.mutex.unlock();
         const probe_key = try ownerKey(self.allocator, user_id, run_id);
@@ -12399,7 +12850,9 @@ const TraceShareStore = struct {
             }
         }
 
-        return found_in_cache or found_in_pg;
+        const found = found_in_cache or found_in_pg;
+        result_label = if (found) "ok" else "not_found";
+        return found;
     }
 };
 
@@ -21674,9 +22127,58 @@ pub fn runWithRole(
     var noop_obs_gateway = observability.NoopObserver{};
     var otel_obs_gateway_opt: ?observability.OtelObserver = observability.OtelObserver.fromEnv(allocator);
     defer if (otel_obs_gateway_opt) |*otel| otel.deinit();
-    var gateway_observer_slots: [4]Observer = undefined;
+    var gateway_observer_slots: [5]Observer = undefined;
     var gateway_observer_multi = observability.MultiObserver{ .observers = &.{} };
+    // S5 (2026-05-29) — process-wide global observer for cross-cutting
+    // recordMetricGlobal sites (HTTP handlers, extension WS hub, provider
+    // upload paths). Anchored as a stack-local with a stable address;
+    // set after MultiObserver composition below; detached on shutdown
+    // via the matching `defer setGlobalObserver(null)` so deinit can
+    // safely tear down the registry without dangling pointers in the
+    // observer slot.
+    var gateway_global_observer: Observer = undefined;
     const needs_local_agent = gatewayRoleNeedsLocalAgent(role, event_bus != null);
+
+    // S5 review-fix F1 (2026-05-29) — install the process-wide
+    // chartable-signals registry and compose the global observer in
+    // EVERY gateway role (.shared, .broker, .user_cell — including the
+    // daemon-mode `event_bus != null` path where `needs_local_agent` is
+    // false). Previously this lived inside the local-agent branch
+    // below; daemon/broker/user_cell gateways had no registry installed,
+    // no global observer wired, and `/metrics` showed only HELP/TYPE
+    // catalog lines with zero series.
+    //
+    // The substrate guarantees:
+    //   - `observability_metrics.globalRegistry()` returns non-null,
+    //     so `metricsPayload` renders the registry-driven section.
+    //   - `observability.getGlobalObserver()` returns non-null, so
+    //     every cross-cutting `recordMetricGlobal` site routes through
+    //     the LogObserver + LifecycleMetrics + Sentry + OTel + Registry
+    //     fan-out.
+    //   - Lifetime: the slots live on the stack here for the whole
+    //     `runWithRole` body; teardown is via `GatewayState.deinit`,
+    //     which detaches the global observer/registry and waits for
+    //     active metric emitters/scrapes before freeing the registry.
+    //
+    // OOM here is treated as configuration-level failure — propagate
+    // so the operator sees the boot error rather than silently losing
+    // the entire S5 catalog.
+    const registry_ptr = try allocator.create(observability_metrics.Registry);
+    registry_ptr.* = observability_metrics.Registry.init(allocator);
+    observability_metrics.setGlobalRegistry(registry_ptr);
+    state.metrics_registry_observer = .{ .registry = registry_ptr };
+    state.metrics_registry_owned = registry_ptr;
+
+    gateway_observer_slots = .{
+        log_obs_gateway.observer(),
+        metrics_obs_gateway.observer(),
+        sentry_runtime.globalOrFallback().observer(),
+        if (otel_obs_gateway_opt) |*otel| otel.observer() else noop_obs_gateway.observer(),
+        state.metrics_registry_observer.observer(),
+    };
+    gateway_observer_multi = .{ .observers = gateway_observer_slots[0..] };
+    gateway_global_observer = gateway_observer_multi.observer();
+    observability.setGlobalObserver(&gateway_global_observer);
 
     if (config_opt) |cfg_ptr| {
         const cfg = cfg_ptr;
@@ -21867,14 +22369,14 @@ pub fn runWithRole(
                 standalone_usage_rt = usage_runtime_mod.UsageRuntime.init(allocator);
 
                 const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
-                gateway_observer_slots = .{
-                    log_obs_gateway.observer(),
-                    metrics_obs_gateway.observer(),
-                    sentry_runtime.globalOrFallback().observer(),
-                    if (otel_obs_gateway_opt) |*otel| otel.observer() else noop_obs_gateway.observer(),
-                };
-                gateway_observer_multi = .{ .observers = gateway_observer_slots[0..] };
 
+                // S5 review-fix F1 (2026-05-29) — registry + global
+                // observer install moved out of this branch up to the
+                // top of runWithRole so daemon/broker/user_cell modes
+                // also get a registry installed. The local-agent path
+                // still composes its own task_delivery + session_mgr
+                // using the same `gateway_observer_multi` that the
+                // function-level setup built; nothing changes below.
                 standalone_task_delivery = .{
                     .ledger = &(standalone_task_ledger.?),
                     .observer = gateway_observer_multi.observer(),
@@ -21937,7 +22439,16 @@ pub fn runWithRole(
             }
         }
 
-        applyStartupSelfCheck(&state, cfg, postgres_init_error);
+        applyStartupSelfCheck(&state, cfg, postgres_init_error, host) catch |err| {
+            if (err == error.ProductionPostgresRequired) {
+                const reason = if (postgres_init_error) |perr| @errorName(perr) else "postgres_init_failed";
+                log.err(
+                    "startup.production_postgres_required configured={s} effective={s} reason={s} host={s} — refusing to run degraded in production",
+                    .{ state.state_backend_configured, state.state_backend_effective, reason, host },
+                );
+            }
+            return err;
+        };
         logStartupSelfCheck(&state);
     }
     if (state.pairing_guard == null) {
@@ -27698,6 +28209,383 @@ test "metricsPayload includes lifecycle timing series" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_lifecycle_stage_duration_ms_total{stage=\"pruning\"} 7") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_tenant_runtime_pruned_total{reason=\"idle\"} 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_tenant_runtime_pruned_total{reason=\"capacity\"} 1") != null);
+}
+
+test "metricsPayload S5: emits new family HELP/TYPE lines and degraded gauge" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    gs.state_backend_configured = "file";
+    gs.state_backend_effective = "file";
+    gs.state_degraded = false;
+
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "# TYPE nullalis_approval_decision_total counter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "# TYPE nullalis_tool_call_latency_ms histogram") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_degraded{configured=\"file\",effective=\"file\",reason=\"none\"} 0") != null);
+}
+
+test "metricsPayload S5: degraded gauge reports labels when state is degraded" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    gs.state_backend_configured = "postgres";
+    gs.state_backend_effective = "file";
+    gs.state_degraded = true;
+    const reason = "ConnectionRefused";
+    gs.state_degraded_reason_len = copyIntoBuf(&gs.state_degraded_reason_buf, reason);
+
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_degraded{configured=\"postgres\",effective=\"file\",reason=\"ConnectionRefused\"} 1") != null);
+}
+
+test "metricsPayload S5: degraded gauge escapes embedded quotes in labels" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    gs.state_backend_configured = "post\"gres";
+    gs.state_backend_effective = "file";
+    gs.state_degraded = true;
+    const reason = "Conn\\Refused";
+    gs.state_degraded_reason_len = copyIntoBuf(&gs.state_degraded_reason_buf, reason);
+
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "configured=\"post\\\"gres\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "reason=\"Conn\\\\Refused\"") != null);
+}
+
+test "metricsPayload S5: registry counter shows up in scrape" {
+    const allocator = std.testing.allocator;
+    var reg = observability_metrics.Registry.init(allocator);
+    defer reg.deinit();
+    observability_metrics.setGlobalRegistry(&reg);
+    defer observability_metrics.setGlobalRegistry(null);
+    reg.incCounter("nullalis_approval_decision_total{result=\"issued\"}");
+    reg.incCounter("nullalis_approval_decision_total{result=\"issued\"}");
+
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_approval_decision_total{result=\"issued\"} 2") != null);
+}
+
+// ── S5 (2026-05-29, prod-readiness) production-fail-loud readiness gate ──
+//
+// applyStartupSelfCheck must return error.ProductionPostgresRequired
+// when running production-like (non-loopback host OR allow_public_bind)
+// AND the configured state backend is postgres AND postgres failed to
+// initialize (state_degraded). Dev/test on the loopback host with
+// allow_public_bind=false must keep the warn-and-continue behavior so
+// `zig build run` against `config.example.json` still works.
+
+test "applyStartupSelfCheck: degraded + non-production host = warn, no error" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullalis",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = allocator,
+    };
+    cfg.state.backend = "postgres";
+    cfg.gateway.allow_public_bind = false;
+    // zaki_state stays null — simulates postgres init failure.
+    try applyStartupSelfCheck(&gs, &cfg, error.ConnectionRefused, "127.0.0.1");
+    try std.testing.expect(gs.state_degraded);
+    try std.testing.expectEqualStrings("ConnectionRefused", gs.degradedReason());
+}
+
+test "applyStartupSelfCheck: degraded + production host + postgres-configured = ProductionPostgresRequired" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullalis",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = allocator,
+    };
+    cfg.state.backend = "postgres";
+    cfg.gateway.allow_public_bind = true; // forces production-like
+
+    const result = applyStartupSelfCheck(&gs, &cfg, error.ConnectionRefused, "0.0.0.0");
+    try std.testing.expectError(error.ProductionPostgresRequired, result);
+}
+
+test "applyStartupSelfCheck: production + state.backend=file = no error" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullalis",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = allocator,
+    };
+    cfg.state.backend = "file";
+    cfg.gateway.allow_public_bind = true;
+
+    try applyStartupSelfCheck(&gs, &cfg, null, "0.0.0.0");
+    try std.testing.expect(!gs.state_degraded);
+}
+
+test "applyStartupSelfCheck: production + postgres + zaki_state present = no error" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    // Make zaki_state non-null so degraded stays false. The function
+    // only checks `state.zaki_state != null` — never dereferences the
+    // pointer — so a stack-local undefined Manager is sufficient FOR
+    // applyStartupSelfCheck itself. But GatewayState.deinit() may
+    // touch the field under the postgres engine, so we reset it to
+    // null before deinit fires (LIFO defer order guarantees the reset
+    // runs first).
+    var dummy_manager: zaki_state_mod.Manager = undefined;
+    gs.zaki_state = &dummy_manager;
+    defer gs.zaki_state = null;
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullalis",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = allocator,
+    };
+    cfg.state.backend = "postgres";
+    cfg.gateway.allow_public_bind = true;
+
+    try applyStartupSelfCheck(&gs, &cfg, null, "0.0.0.0");
+    try std.testing.expect(!gs.state_degraded);
+}
+
+// ── S5 (2026-05-29, prod-readiness) emit-site round-trip tests ──
+//
+// Each test installs both a stack-local Registry as the global
+// chartable-signals registry AND a stack-local MetricsRegistryObserver
+// as the global metric observer, so a `recordMetricGlobal` from any
+// emit site lands a counter or histogram sample observable via the
+// rendered /metrics scrape. The tests assert end-to-end:
+//
+//   recordMetricGlobal(.{ .family = ... })
+//     → MetricsRegistryObserver.recordMetric
+//     → Registry.incCounter / observeHistogram
+//     → metricsPayload() → string match on the rendered scrape
+
+test "S5 emit-site: tool_call_total + tool_call_latency_ms register and render" {
+    const allocator = std.testing.allocator;
+    var reg = observability_metrics.Registry.init(allocator);
+    defer reg.deinit();
+    observability_metrics.setGlobalRegistry(&reg);
+    defer observability_metrics.setGlobalRegistry(null);
+
+    var mro = MetricsRegistryObserver{ .registry = &reg };
+    var mro_obs = mro.observer();
+    observability.setGlobalObserver(&mro_obs);
+    defer observability.setGlobalObserver(null);
+
+    observability.recordMetricGlobal(.{ .tool_call_total = .{ .tool = "memory_store", .result = "ok" } });
+    observability.recordMetricGlobal(.{ .tool_call_latency_ms = .{ .tool = "memory_store", .value = 42 } });
+
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_tool_call_total{tool=\"memory_store\",result=\"ok\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_tool_call_latency_ms_sum{tool=\"memory_store\"} 42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_tool_call_latency_ms_count{tool=\"memory_store\"} 1") != null);
+}
+
+test "S5 emit-site: approval_decision_total{result=\"issued\"} registers and renders" {
+    const allocator = std.testing.allocator;
+    var reg = observability_metrics.Registry.init(allocator);
+    defer reg.deinit();
+    observability_metrics.setGlobalRegistry(&reg);
+    defer observability_metrics.setGlobalRegistry(null);
+
+    var mro = MetricsRegistryObserver{ .registry = &reg };
+    var mro_obs = mro.observer();
+    observability.setGlobalObserver(&mro_obs);
+    defer observability.setGlobalObserver(null);
+
+    observability.recordMetricGlobal(.{ .approval_decision_total = .{ .result = "issued" } });
+
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_approval_decision_total{result=\"issued\"} 1") != null);
+}
+
+test "S5 emit-site: artifact_export_total + artifact_export_latency_ms register and render" {
+    const allocator = std.testing.allocator;
+    var reg = observability_metrics.Registry.init(allocator);
+    defer reg.deinit();
+    observability_metrics.setGlobalRegistry(&reg);
+    defer observability_metrics.setGlobalRegistry(null);
+
+    var mro = MetricsRegistryObserver{ .registry = &reg };
+    var mro_obs = mro.observer();
+    observability.setGlobalObserver(&mro_obs);
+    defer observability.setGlobalObserver(null);
+
+    observability.recordMetricGlobal(.{ .artifact_export_total = .{ .format = "pdf", .result = "ok" } });
+    observability.recordMetricGlobal(.{ .artifact_export_latency_ms = .{ .format = "pdf", .value = 123 } });
+
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_artifact_export_total{format=\"pdf\",result=\"ok\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_artifact_export_latency_ms_sum{format=\"pdf\"} 123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_artifact_export_latency_ms_count{format=\"pdf\"} 1") != null);
+}
+
+test "S5 emit-site: handleArtifactExport early-exit emits invalid_input (not invalid_format)" {
+    // Regression for code-review finding: prior to the fix, handleArtifactExport
+    // initialized `result_label = "invalid_format"`. The 400 invalid_artifact_id
+    // early-exit returns BEFORE the format-allowlist runs, so it incorrectly
+    // emitted result="invalid_format" — polluting the invalid-format SLO with
+    // results actually attributable to bad artifact-id input.
+    //
+    // Pick the malformed artifact_id route (cheapest reproducible early-exit
+    // path: no PG, no actual exporter setup needed) and assert the rendered
+    // scrape carries result="invalid_input", NOT result="invalid_format".
+    const allocator = std.testing.allocator;
+    var reg = observability_metrics.Registry.init(allocator);
+    defer reg.deinit();
+    observability_metrics.setGlobalRegistry(&reg);
+    defer observability_metrics.setGlobalRegistry(null);
+
+    var mro = MetricsRegistryObserver{ .registry = &reg };
+    var mro_obs = mro.observer();
+    observability.setGlobalObserver(&mro_obs);
+    defer observability.setGlobalObserver(null);
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    var ctx = try makeExportTestUserCtx(allocator, "/tmp/nullalis-export-test-fake");
+    defer ctx.deinit(allocator);
+    const resp = handleArtifactExport(
+        allocator,
+        "POST",
+        "1",
+        "not-a-uuid",
+        "/api/v1/users/1/artifacts/not-a-uuid/export?format=pdf",
+        &ctx,
+        null,
+        &state,
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+
+    const payload = try metricsPayload(allocator, &state);
+    defer allocator.free(payload);
+
+    // Must surface as invalid_input — the input-rejection bucket.
+    try std.testing.expect(std.mem.indexOf(u8, payload, "result=\"invalid_input\"") != null);
+    // Must NOT surface as invalid_format — that label is reserved for the
+    // format-allowlist failure (covered by the "rejects unknown format" test).
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_artifact_export_total{format=\"invalid\",result=\"invalid_format\"}") == null);
+}
+
+test "S5 emit-site: memory_op_total + memory_op_latency_ms register and render" {
+    const allocator = std.testing.allocator;
+    var reg = observability_metrics.Registry.init(allocator);
+    defer reg.deinit();
+    observability_metrics.setGlobalRegistry(&reg);
+    defer observability_metrics.setGlobalRegistry(null);
+
+    var mro = MetricsRegistryObserver{ .registry = &reg };
+    var mro_obs = mro.observer();
+    observability.setGlobalObserver(&mro_obs);
+    defer observability.setGlobalObserver(null);
+
+    observability.recordMetricGlobal(.{ .memory_op_total = .{ .op = "store", .result = "ok" } });
+    observability.recordMetricGlobal(.{ .memory_op_latency_ms = .{ .op = "store", .value = 7 } });
+
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_memory_op_total{op=\"store\",result=\"ok\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_memory_op_latency_ms_sum{op=\"store\"} 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_memory_op_latency_ms_count{op=\"store\"} 1") != null);
+}
+
+test "S5 emit-site: trace_share_total{op=\"create\",result=\"ok\"} registers and renders" {
+    const allocator = std.testing.allocator;
+    var reg = observability_metrics.Registry.init(allocator);
+    defer reg.deinit();
+    observability_metrics.setGlobalRegistry(&reg);
+    defer observability_metrics.setGlobalRegistry(null);
+
+    var mro = MetricsRegistryObserver{ .registry = &reg };
+    var mro_obs = mro.observer();
+    observability.setGlobalObserver(&mro_obs);
+    defer observability.setGlobalObserver(null);
+
+    observability.recordMetricGlobal(.{ .trace_share_total = .{ .op = "create", .result = "ok" } });
+
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_trace_share_total{op=\"create\",result=\"ok\"} 1") != null);
+}
+
+test "S5 emit-site: meter_receipt_total{result=\"ok\"} registers and renders" {
+    const allocator = std.testing.allocator;
+    var reg = observability_metrics.Registry.init(allocator);
+    defer reg.deinit();
+    observability_metrics.setGlobalRegistry(&reg);
+    defer observability_metrics.setGlobalRegistry(null);
+
+    var mro = MetricsRegistryObserver{ .registry = &reg };
+    var mro_obs = mro.observer();
+    observability.setGlobalObserver(&mro_obs);
+    defer observability.setGlobalObserver(null);
+
+    observability.recordMetricGlobal(.{ .meter_receipt_total = .{ .result = "ok" } });
+
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_meter_receipt_total{result=\"ok\"} 1") != null);
+}
+
+test "S5 emit-site: extension_ws_command_total routes through registry" {
+    const allocator = std.testing.allocator;
+    var reg = observability_metrics.Registry.init(allocator);
+    defer reg.deinit();
+    observability_metrics.setGlobalRegistry(&reg);
+    defer observability_metrics.setGlobalRegistry(null);
+
+    var mro = MetricsRegistryObserver{ .registry = &reg };
+    var mro_obs = mro.observer();
+    observability.setGlobalObserver(&mro_obs);
+    defer observability.setGlobalObserver(null);
+
+    observability.recordMetricGlobal(.{ .extension_ws_command_total = .{ .result = "ok", .tool = "extension_screenshot" } });
+
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_extension_ws_command_total{result=\"ok\",tool=\"extension_screenshot\"} 1") != null);
 }
 
 // ── jsonEscapeInto tests ────────────────────────────────────────
