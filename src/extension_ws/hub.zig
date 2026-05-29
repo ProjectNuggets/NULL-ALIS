@@ -519,6 +519,29 @@ pub const ExtensionWsConn = struct {
     }
 };
 
+/// Caller-owned snapshot of one paired extension. Returned by
+/// `ExtensionWsHub.listSnapshot` for the diagnostic routes.
+///
+/// All slice fields are heap-allocated copies; free via
+/// `ExtensionState.freeSlice` so the caller doesn't have to track
+/// individual allocations.
+pub const ExtensionState = struct {
+    user_id: []u8,
+    connected_at_ns: i128,
+    last_command_at_ns: i128,
+    last_command_tool: []u8,
+    last_command_result: []u8,
+
+    pub fn freeSlice(allocator: std.mem.Allocator, slice: []ExtensionState) void {
+        for (slice) |s| {
+            allocator.free(s.user_id);
+            allocator.free(s.last_command_tool);
+            allocator.free(s.last_command_result);
+        }
+        allocator.free(slice);
+    }
+};
+
 pub const ExtensionWsHub = struct {
     allocator: std.mem.Allocator,
     users_mu: std.Thread.Mutex = .{},
@@ -648,6 +671,53 @@ pub const ExtensionWsHub = struct {
         const conn = self.users.get(user_id) orelse return null;
         conn.retain();
         return conn;
+    }
+
+    /// Caller-owned snapshot of every currently-paired user. The slice
+    /// AND each element's fields are heap-allocated; free via
+    /// `ExtensionState.freeSlice(allocator, slice)`.
+    ///
+    /// Takes `users_mu` for the duration of the iteration. The per-conn
+    /// `last_command_*` fields are read under the conn's
+    /// `last_command_mu` (via `snapshotLastCommand`) so the snapshot is
+    /// internally consistent even under concurrent sendCommand calls.
+    pub fn listSnapshot(self: *ExtensionWsHub, allocator: std.mem.Allocator) ![]ExtensionState {
+        self.users_mu.lock();
+        defer self.users_mu.unlock();
+
+        var out = try allocator.alloc(ExtensionState, self.users.count());
+        var written: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < written) : (i += 1) {
+                allocator.free(out[i].user_id);
+                allocator.free(out[i].last_command_tool);
+                allocator.free(out[i].last_command_result);
+            }
+            allocator.free(out);
+        }
+
+        var it = self.users.iterator();
+        while (it.next()) |entry| {
+            const conn = entry.value_ptr.*;
+            var tool_buf: [32]u8 = undefined;
+            var result_buf: [32]u8 = undefined;
+            const last = conn.snapshotLastCommand(&tool_buf, &result_buf);
+            const uid = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(uid);
+            const tool = try allocator.dupe(u8, tool_buf[0..last.tool_len]);
+            errdefer allocator.free(tool);
+            const result = try allocator.dupe(u8, result_buf[0..last.result_len]);
+            out[written] = .{
+                .user_id = uid,
+                .connected_at_ns = conn.connected_at_ns.load(.acquire),
+                .last_command_at_ns = last.at_ns,
+                .last_command_tool = tool,
+                .last_command_result = result,
+            };
+            written += 1;
+        }
+        return out;
     }
 
     /// Mark the connection for `user_id` as evicted and remove it from
@@ -1660,6 +1730,48 @@ test "sendCommand records no_conn when no extension paired" {
     // Ghost user has no conn so there's nothing to assert on the
     // snapshot side — the metric is the visible signal. This test
     // mostly pins the error class.
+}
+
+test "ExtensionWsHub.listSnapshot returns empty slice when no conns" {
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    const snap = try hub.listSnapshot(std.testing.allocator);
+    defer ExtensionState.freeSlice(std.testing.allocator, snap);
+    try std.testing.expectEqual(@as(usize, 0), snap.len);
+}
+
+test "ExtensionWsHub.listSnapshot reflects registered conns with default last_command empty" {
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    var ts_a = TestStream{ .allocator = std.testing.allocator };
+    defer ts_a.deinit();
+    var ts_b = TestStream{ .allocator = std.testing.allocator };
+    defer ts_b.deinit();
+    const conn_a = try hub.registerConn("alice", @ptrCast(&ts_a), TestStream.writeText, @ptrCast(&ts_a), TestStream.close);
+    defer hub.destroyConn(conn_a);
+    const conn_b = try hub.registerConn("bob", @ptrCast(&ts_b), TestStream.writeText, @ptrCast(&ts_b), TestStream.close);
+    defer hub.destroyConn(conn_b);
+
+    const snap = try hub.listSnapshot(std.testing.allocator);
+    defer ExtensionState.freeSlice(std.testing.allocator, snap);
+    try std.testing.expectEqual(@as(usize, 2), snap.len);
+    // Snapshot fields populated correctly. We don't pin ordering
+    // (hashmap iteration is undefined-ordered) so check by uid.
+    var saw_alice = false;
+    var saw_bob = false;
+    for (snap) |s| {
+        if (std.mem.eql(u8, s.user_id, "alice")) {
+            saw_alice = true;
+            try std.testing.expect(s.connected_at_ns > 0);
+            try std.testing.expectEqual(@as(i128, 0), s.last_command_at_ns);
+            try std.testing.expectEqualStrings("", s.last_command_tool);
+            try std.testing.expectEqualStrings("", s.last_command_result);
+        } else if (std.mem.eql(u8, s.user_id, "bob")) {
+            saw_bob = true;
+        }
+    }
+    try std.testing.expect(saw_alice);
+    try std.testing.expect(saw_bob);
 }
 
 test "soak: 50 concurrent extension WS sessions — no deadlock, no UAF, no leak" {
