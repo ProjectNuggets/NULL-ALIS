@@ -625,6 +625,7 @@ pub const ExtensionWsHub = struct {
             evicted.value.evicted.store(true, .release);
             evicted.value.close();
             _ = evicted.value.release();
+            emitLifecycleEvent(.disconnect, .{ .user_id = evicted.key });
             self.allocator.free(evicted.key);
             log.info("extension_ws: evicted prior connection for user_id='{s}'", .{user_id});
         }
@@ -645,6 +646,7 @@ pub const ExtensionWsHub = struct {
         // the cross-cutting metric) so a single operator grep can
         // attribute a hub event to a specific tenant.
         log.info("extension_ws: connection registered user_id='{s}' active={d}", .{ user_id, self.users.count() });
+        emitLifecycleEvent(.pair, .{ .user_id = user_id });
         // HIGH 2.A: gauge of live extension WS sessions. Take the
         // count under the lock so the sample is consistent with the
         // map state visible to other readers.
@@ -731,6 +733,7 @@ pub const ExtensionWsHub = struct {
         defer self.users_mu.unlock();
         if (self.users.fetchRemove(user_id)) |kv| {
             kv.value.evicted.store(true, .release);
+            emitLifecycleEvent(.disconnect, .{ .user_id = kv.key });
             // The hub no longer owns a ref to this conn. Releasing
             // here may or may not be the final ref; refcount
             // semantics handle the timing.
@@ -816,6 +819,9 @@ pub const ExtensionWsHub = struct {
             // "did nothing".
             if (err == error.Timeout) {
                 log.info("extension_ws: command timed out user_id='{s}' tool='{s}' timeout_ms={d}", .{ user_id, tool, timeout_ms });
+                emitLifecycleEvent(.timeout, .{ .user_id = user_id, .extra_key = "tool", .extra_val = tool });
+            } else {
+                emitLifecycleEvent(.command_failed, .{ .user_id = user_id, .extra_key = "tool", .extra_val = tool });
             }
             return err;
         };
@@ -831,6 +837,51 @@ pub const ExtensionWsHub = struct {
         return result_allocator.dupe(u8, result_borrowed);
     }
 };
+
+/// Canonical lifecycle event class. Used by `emitLifecycleEvent` and
+/// in tests via `formatLifecycleEvent` to pin the exact log shape
+/// operators grep for.
+pub const LifecycleEvent = enum {
+    pair, // new extension authenticated + registered.
+    disconnect, // pump exited (graceful close, eviction, or error).
+    timeout, // sendCommand hit its timedWait deadline.
+    command_failed, // hub.sendCommand returned a named error class other than no_conn.
+
+    pub fn toString(self: LifecycleEvent) []const u8 {
+        return switch (self) {
+            .pair => "pair",
+            .disconnect => "disconnect",
+            .timeout => "timeout",
+            .command_failed => "command_failed",
+        };
+    }
+};
+
+const LifecycleEventArgs = struct {
+    user_id: []const u8,
+    extra_key: ?[]const u8 = null,
+    extra_val: ?[]const u8 = null,
+};
+
+/// Format one lifecycle log line into `writer`. Exposed for tests; the
+/// production helper `emitLifecycleEvent` calls this with the std.log
+/// writer.
+pub fn formatLifecycleEvent(writer: anytype, ev: LifecycleEvent, args: LifecycleEventArgs) !void {
+    try writer.print("extension_ws.event={s} user_id='{s}'", .{ ev.toString(), args.user_id });
+    if (args.extra_key) |k| {
+        if (args.extra_val) |v| {
+            try writer.print(" {s}='{s}'", .{ k, v });
+        }
+    }
+}
+
+/// Production-side emitter: routes the canonical line through std.log.
+fn emitLifecycleEvent(ev: LifecycleEvent, args: LifecycleEventArgs) void {
+    var buf: [512]u8 = undefined;
+    var sink = std.io.fixedBufferStream(&buf);
+    formatLifecycleEvent(sink.writer(), ev, args) catch return;
+    log.info("{s}", .{sink.getWritten()});
+}
 
 /// Extract the `command_id` field from a CommandResult JSON payload.
 /// Returns an allocator-owned copy. Errors:
@@ -1772,6 +1823,35 @@ test "ExtensionWsHub.listSnapshot reflects registered conns with default last_co
     }
     try std.testing.expect(saw_alice);
     try std.testing.expect(saw_bob);
+}
+
+test "emitLifecycleEvent writes canonical line shape for pair" {
+    // formatLifecycleEvent is the test-exposed formatter. Verifies the
+    // exact line shape operators grep for.
+    var buf: [256]u8 = undefined;
+    var sink = std.io.fixedBufferStream(&buf);
+    try formatLifecycleEvent(sink.writer(), .pair, .{
+        .user_id = "alice",
+        .extra_key = "extension_version",
+        .extra_val = "0.1.0",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, sink.getWritten(), "extension_ws.event=pair") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.getWritten(), "user_id='alice'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.getWritten(), "extension_version='0.1.0'") != null);
+}
+
+test "formatLifecycleEvent disconnect omits extra_key when null" {
+    var buf: [256]u8 = undefined;
+    var sink = std.io.fixedBufferStream(&buf);
+    try formatLifecycleEvent(sink.writer(), .disconnect, .{
+        .user_id = "alice",
+        .extra_key = null,
+        .extra_val = null,
+    });
+    const out = sink.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, out, "extension_ws.event=disconnect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "user_id='alice'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "extension_version=") == null);
 }
 
 test "soak: 50 concurrent extension WS sessions — no deadlock, no UAF, no leak" {
