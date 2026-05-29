@@ -1370,7 +1370,7 @@ const MetricsRegistryObserver = struct {
         .name = name,
     };
 
-    pub fn observer(self: *MetricsRegistryObserver) Observer {
+    fn observer(self: *MetricsRegistryObserver) Observer {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 
@@ -6875,6 +6875,36 @@ pub fn extensionUserStatusPayload(allocator: std.mem.Allocator, input: Extension
     );
 }
 
+/// Escape a string for use as a Prometheus label value per the
+/// exposition format: `"` → `\"`, `\` → `\\`, `\n` → `\n`. Returns the
+/// borrowed slice if no escaping is needed, otherwise writes into
+/// `buf` and returns that. Truncates to fit `buf` (escaped) — safe
+/// because label values in this file are short (host names, backend
+/// kind, errorName strings).
+fn promEscapeLabel(value: []const u8, buf: []u8) []const u8 {
+    var needs_escape = false;
+    for (value) |c| {
+        if (c == '"' or c == '\\' or c == '\n') {
+            needs_escape = true;
+            break;
+        }
+    }
+    if (!needs_escape) return value;
+    var written: usize = 0;
+    for (value) |c| {
+        const replacement: []const u8 = switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            else => &[_]u8{c},
+        };
+        if (written + replacement.len > buf.len) break;
+        @memcpy(buf[written .. written + replacement.len], replacement);
+        written += replacement.len;
+    }
+    return buf[0..written];
+}
+
 fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u8 {
     const transport_stats = http_util.transport_stats_snapshot();
     const requests_total = state.requests_total.load(.monotonic);
@@ -7125,12 +7155,18 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
     // the series and operators can alert on a flip from 0 → 1.
     const degraded_val: u8 = if (state.state_degraded) 1 else 0;
     const degraded_reason: []const u8 = if (state.state_degraded) state.degradedReason() else "none";
+    var cfg_buf: [256]u8 = undefined;
+    var eff_buf: [256]u8 = undefined;
+    var reason_buf: [256]u8 = undefined;
+    const cfg_label = promEscapeLabel(state.state_backend_configured, &cfg_buf);
+    const eff_label = promEscapeLabel(state.state_backend_effective, &eff_buf);
+    const reason_label = promEscapeLabel(degraded_reason, &reason_buf);
     try w.print(
         \\# HELP nullalis_gateway_degraded Gateway degraded-state gauge (1 when configured backend != effective backend).
         \\# TYPE nullalis_gateway_degraded gauge
         \\nullalis_gateway_degraded{{configured="{s}",effective="{s}",reason="{s}"}} {d}
         \\
-    , .{ state.state_backend_configured, state.state_backend_effective, degraded_reason, degraded_val });
+    , .{ cfg_label, eff_label, reason_label, degraded_val });
 
     return buf.toOwnedSlice(allocator);
 }
@@ -27926,6 +27962,23 @@ test "metricsPayload S5: degraded gauge reports labels when state is degraded" {
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_gateway_degraded{configured=\"postgres\",effective=\"file\",reason=\"ConnectionRefused\"} 1") != null);
+}
+
+test "metricsPayload S5: degraded gauge escapes embedded quotes in labels" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    gs.state_backend_configured = "post\"gres";
+    gs.state_backend_effective = "file";
+    gs.state_degraded = true;
+    const reason = "Conn\\Refused";
+    gs.state_degraded_reason_len = copyIntoBuf(&gs.state_degraded_reason_buf, reason);
+
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "configured=\"post\\\"gres\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "reason=\"Conn\\\\Refused\"") != null);
 }
 
 test "metricsPayload S5: registry counter shows up in scrape" {
