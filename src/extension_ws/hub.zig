@@ -505,8 +505,8 @@ pub const ExtensionWsConn = struct {
         self.last_command_mu.lock();
         defer self.last_command_mu.unlock();
 
-        const tool_len = self.last_command_tool_len.load(.acquire);
-        const result_len = self.last_command_result_len.load(.acquire);
+        const tool_len = self.last_command_tool_len.load(.monotonic);
+        const result_len = self.last_command_result_len.load(.monotonic);
         const tl = @min(tool_len, out_tool.len);
         const rl = @min(result_len, out_result.len);
         @memcpy(out_tool[0..tl], self.last_command_tool_buf[0..tl]);
@@ -514,7 +514,7 @@ pub const ExtensionWsConn = struct {
         return .{
             .tool_len = tl,
             .result_len = rl,
-            .at_ns = self.last_command_at_ns.load(.acquire),
+            .at_ns = self.last_command_at_ns.load(.monotonic),
         };
     }
 };
@@ -1545,6 +1545,46 @@ test "ExtensionWsConn lifecycle fields default to zero on construction" {
     // last_command_tool / last_command_result start empty.
     try std.testing.expectEqual(@as(usize, 0), conn.last_command_tool_len.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 0), conn.last_command_result_len.load(.monotonic));
+}
+
+test "ExtensionWsConn recordCommandOutcome + snapshotLastCommand round-trip" {
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    var ts = TestStream{ .allocator = std.testing.allocator };
+    defer ts.deinit();
+    const conn = try hub.registerConn(
+        "alice",
+        @ptrCast(&ts),
+        TestStream.writeText,
+        @ptrCast(&ts),
+        TestStream.close,
+    );
+    defer hub.destroyConn(conn);
+
+    // Before any recordCommandOutcome call: snapshot returns empty + at_ns=0.
+    var tool_buf: [32]u8 = undefined;
+    var result_buf: [32]u8 = undefined;
+    const before = conn.snapshotLastCommand(&tool_buf, &result_buf);
+    try std.testing.expectEqual(@as(usize, 0), before.tool_len);
+    try std.testing.expectEqual(@as(usize, 0), before.result_len);
+    try std.testing.expectEqual(@as(i128, 0), before.at_ns);
+
+    // After a recordCommandOutcome call: snapshot returns the recorded
+    // tool + result + a non-zero timestamp.
+    conn.recordCommandOutcome("extension_click", "ok");
+    const after = conn.snapshotLastCommand(&tool_buf, &result_buf);
+    try std.testing.expectEqual(@as(usize, "extension_click".len), after.tool_len);
+    try std.testing.expectEqualStrings("extension_click", tool_buf[0..after.tool_len]);
+    try std.testing.expectEqual(@as(usize, 2), after.result_len);
+    try std.testing.expectEqualStrings("ok", result_buf[0..after.result_len]);
+    try std.testing.expect(after.at_ns > 0);
+
+    // A second recordCommandOutcome overwrites the prior values.
+    conn.recordCommandOutcome("extension_screenshot", "timeout");
+    const overwritten = conn.snapshotLastCommand(&tool_buf, &result_buf);
+    try std.testing.expectEqualStrings("extension_screenshot", tool_buf[0..overwritten.tool_len]);
+    try std.testing.expectEqualStrings("timeout", result_buf[0..overwritten.result_len]);
+    try std.testing.expect(overwritten.at_ns >= after.at_ns);
 }
 
 test "soak: 50 concurrent extension WS sessions — no deadlock, no UAF, no leak" {
