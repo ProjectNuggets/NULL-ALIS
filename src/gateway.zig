@@ -5326,19 +5326,18 @@ fn applyStartupSelfCheck(
     // Dev/test profiles (loopback host + allow_public_bind=false) keep
     // the warn-and-continue path below — operator ergonomics matter
     // for `zig build run` against `config.example.json`.
+    //
+    // S5 (2026-05-29) — Production fail-loud guard. We return the error
+    // SILENTLY here; the matching log.err is emitted in the runWithRole
+    // caller after this returns. Reason: Zig 0.15's test runner counts
+    // any log.err call as a test failure, so unit tests that exercise
+    // this error-return path would trip the err-counter even though
+    // they're verifying correct behavior. The caller has access to the
+    // same diagnostic data via `state` after the error returns.
     if (state.state_degraded and
         std.mem.eql(u8, cfg.state.backend, "postgres") and
         isProductionLikeGateway(cfg, effective_host))
     {
-        const reason = if (postgres_init_error) |err| @errorName(err) else "postgres_init_failed";
-        // NOTE: emit at warn level (not err) so the Zig test runner can
-        // unit-test the returned error without tripping its log-err guard.
-        // The returned error is the actual fail-loud signal — Zig prints
-        // the error trace and exits non-zero, which is what operators see.
-        log.warn(
-            "startup.production_postgres_required configured=postgres effective={s} reason={s} host={s} — refusing to run degraded in production",
-            .{ state.state_backend_effective, reason, effective_host },
-        );
         return error.ProductionPostgresRequired;
     }
 
@@ -22324,7 +22323,16 @@ pub fn runWithRole(
             }
         }
 
-        try applyStartupSelfCheck(&state, cfg, postgres_init_error, host);
+        applyStartupSelfCheck(&state, cfg, postgres_init_error, host) catch |err| {
+            if (err == error.ProductionPostgresRequired) {
+                const reason = if (postgres_init_error) |perr| @errorName(perr) else "postgres_init_failed";
+                log.err(
+                    "startup.production_postgres_required configured={s} effective={s} reason={s} host={s} — refusing to run degraded in production",
+                    .{ state.state_backend_configured, state.state_backend_effective, reason, host },
+                );
+            }
+            return err;
+        };
         logStartupSelfCheck(&state);
     }
     if (state.pairing_guard == null) {
