@@ -11908,13 +11908,20 @@ fn handleArtifactExport(
     // and is upgraded to the canonical lowercase format only once the
     // query param has been validated. `result_label` is mutated per-
     // exit-path with the documented vocabulary
-    // (ok|invalid_format|missing_artifact|state_unavailable|
-    // renderer_unavailable). The format-stays-"invalid" case correctly
-    // sticks for the input-rejection paths (405/400) where there is no
-    // validated format to label by.
+    // (ok|invalid_format|invalid_input|missing_artifact|state_unavailable|
+    // renderer_unavailable).
+    //
+    // S5 code-review pass: `result_label` defaults to "invalid_input" — NOT
+    // "invalid_format" — because the 405 method-not-allowed, the 400
+    // invalid_artifact_id, and the 400 invalid_user_id early-exits all return
+    // BEFORE the format-allowlist runs. Defaulting to "invalid_format"
+    // previously polluted the invalid-format SLO dashboard with results
+    // attributable to method/id input rejection. The label is upgraded to
+    // "invalid_format" only inside the allowlist `else` arm (where we
+    // actually know the format was bad).
     const start_ms = std.time.milliTimestamp();
     var fmt_label: []const u8 = "invalid";
-    var result_label: []const u8 = "invalid_format";
+    var result_label: []const u8 = "invalid_input";
     defer {
         const elapsed_ms: u64 = @intCast(@max(@as(i64, 0), std.time.milliTimestamp() - start_ms));
         observability.recordMetricGlobal(.{ .artifact_export_total = .{ .format = fmt_label, .result = result_label } });
@@ -11944,6 +11951,11 @@ fn handleArtifactExport(
         if (std.ascii.eqlIgnoreCase(format_raw, "pptx")) break :blk "pptx";
         if (std.ascii.eqlIgnoreCase(format_raw, "xlsx")) break :blk "xlsx";
         if (std.ascii.eqlIgnoreCase(format_raw, "html")) break :blk "html";
+        // Format-allowlist failure: upgrade the result_label to
+        // "invalid_format" so the SLO signal correctly attributes THIS
+        // 400 to a bad format param (vs. bad method/artifact_id/user_id,
+        // which keep the default "invalid_input").
+        result_label = "invalid_format";
         return .{
             .status = "400 Bad Request",
             .body = "{\"error\":\"invalid_format\",\"detail\":\"format must be one of: pdf, docx, pptx, xlsx, html\"}",
@@ -28196,6 +28208,53 @@ test "S5 emit-site: artifact_export_total + artifact_export_latency_ms register 
     try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_artifact_export_total{format=\"pdf\",result=\"ok\"} 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_artifact_export_latency_ms_sum{format=\"pdf\"} 123") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_artifact_export_latency_ms_count{format=\"pdf\"} 1") != null);
+}
+
+test "S5 emit-site: handleArtifactExport early-exit emits invalid_input (not invalid_format)" {
+    // Regression for code-review finding: prior to the fix, handleArtifactExport
+    // initialized `result_label = "invalid_format"`. The 400 invalid_artifact_id
+    // early-exit returns BEFORE the format-allowlist runs, so it incorrectly
+    // emitted result="invalid_format" — polluting the invalid-format SLO with
+    // results actually attributable to bad artifact-id input.
+    //
+    // Pick the malformed artifact_id route (cheapest reproducible early-exit
+    // path: no PG, no actual exporter setup needed) and assert the rendered
+    // scrape carries result="invalid_input", NOT result="invalid_format".
+    const allocator = std.testing.allocator;
+    var reg = observability_metrics.Registry.init(allocator);
+    defer reg.deinit();
+    observability_metrics.setGlobalRegistry(&reg);
+    defer observability_metrics.setGlobalRegistry(null);
+
+    var mro = MetricsRegistryObserver{ .registry = &reg };
+    var mro_obs = mro.observer();
+    observability.setGlobalObserver(&mro_obs);
+    defer observability.setGlobalObserver(null);
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    var ctx = try makeExportTestUserCtx(allocator, "/tmp/nullalis-export-test-fake");
+    defer ctx.deinit(allocator);
+    const resp = handleArtifactExport(
+        allocator,
+        "POST",
+        "1",
+        "not-a-uuid",
+        "/api/v1/users/1/artifacts/not-a-uuid/export?format=pdf",
+        &ctx,
+        null,
+        &state,
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+
+    const payload = try metricsPayload(allocator, &state);
+    defer allocator.free(payload);
+
+    // Must surface as invalid_input — the input-rejection bucket.
+    try std.testing.expect(std.mem.indexOf(u8, payload, "result=\"invalid_input\"") != null);
+    // Must NOT surface as invalid_format — that label is reserved for the
+    // format-allowlist failure (covered by the "rejects unknown format" test).
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_artifact_export_total{format=\"invalid\",result=\"invalid_format\"}") == null);
 }
 
 test "S5 emit-site: memory_op_total + memory_op_latency_ms register and render" {

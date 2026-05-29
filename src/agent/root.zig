@@ -5289,15 +5289,30 @@ pub const Agent = struct {
         //   - "err"         — `t.execute` raised OR `result.success == false`
         //                     (covers exec-block-message refusals too)
         //   - "ok"          — happy path
+        //
+        // S5 code-review pass: `emit_tool` is a SEPARATE label from `call.name`
+        // because `call.name` is LLM-controlled. A model that hallucinates
+        // thousands of fake tool names would create an unbounded set of
+        // counter+histogram series in the in-process Registry — a memory-
+        // exhaustion vector. We default to the constant string "unknown" and
+        // upgrade to `t.name()` (canonical, from the small registered-tool
+        // set) ONLY on the matched-tool path. This bounds tool-name cardinality
+        // at `self.tools.len + 1` regardless of what the model emits.
         const start_ms = std.time.milliTimestamp();
         var observed_result: []const u8 = "unknown_tool";
+        var emit_tool: []const u8 = "unknown";
         defer {
             const elapsed_ms: u64 = @intCast(@max(@as(i64, 0), std.time.milliTimestamp() - start_ms));
-            observability.recordMetricGlobal(.{ .tool_call_total = .{ .tool = call.name, .result = observed_result } });
-            observability.recordMetricGlobal(.{ .tool_call_latency_ms = .{ .tool = call.name, .value = elapsed_ms } });
+            observability.recordMetricGlobal(.{ .tool_call_total = .{ .tool = emit_tool, .result = observed_result } });
+            observability.recordMetricGlobal(.{ .tool_call_latency_ms = .{ .tool = emit_tool, .value = elapsed_ms } });
         }
         for (self.tools) |t| {
             if (std.mem.eql(u8, t.name(), call.name)) {
+                // Canonical tool label — `t.name()` is a const string from the
+                // tool registry, NOT `call.name`. All subsequent `observed_result`
+                // mutations on this matched-tool path will be paired with this
+                // canonical label by the defer block above.
+                emit_tool = t.name();
                 // Record this dispatch against the session weight budget
                 // (S2.8). Fires here rather than in preflightToolPolicy
                 // because preflight is also used for dry-run approval
