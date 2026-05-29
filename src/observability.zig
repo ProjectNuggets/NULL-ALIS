@@ -886,7 +886,15 @@ pub const OtelSpan = struct {
     attributes: std.ArrayListUnmanaged(OtelAttribute),
 
     pub fn deinit(self: *OtelSpan, allocator: std.mem.Allocator) void {
+        // F14 (S5 code-review pass): `name` and every attribute key/value
+        // are observer-owned dupes created in `addSpan` (the sole span
+        // constructor). Free them here — they are never borrowed slices.
+        for (self.attributes.items) |attr| {
+            allocator.free(attr.key);
+            allocator.free(attr.value);
+        }
         self.attributes.deinit(allocator);
+        allocator.free(self.name);
     }
 };
 
@@ -1012,19 +1020,50 @@ pub const OtelObserver = struct {
         var span_id: [16]u8 = undefined;
         randomHex(&span_id);
 
+        // F14 (S5 code-review pass): a span sits in `self.spans` until the
+        // batch flushes — up to `max_batch_size` more record* calls later.
+        // The `name` and every attribute key/value handed in are BORROWED:
+        // ObserverEvent/ObserverMetric slices are valid only for the
+        // duration of the record* call (see the ObserverMetric doc-comment),
+        // and several metric arms format the value into a stack buffer that
+        // dies when the switch arm returns. Retaining the borrowed slices is
+        // a use-after-free at flush/serialize time. Dupe everything the span
+        // keeps into observer-owned memory; `OtelSpan.deinit` frees it.
+        const name_copy = self.allocator.dupe(u8, name) catch return;
+
         var attributes: std.ArrayListUnmanaged(OtelAttribute) = .empty;
         for (attrs) |attr| {
-            attributes.append(self.allocator, attr) catch break;
+            const key_copy = self.allocator.dupe(u8, attr.key) catch break;
+            const val_copy = self.allocator.dupe(u8, attr.value) catch {
+                self.allocator.free(key_copy);
+                break;
+            };
+            attributes.append(self.allocator, .{ .key = key_copy, .value = val_copy }) catch {
+                self.allocator.free(key_copy);
+                self.allocator.free(val_copy);
+                break;
+            };
         }
 
         self.spans.append(self.allocator, .{
             .trace_id = self.current_trace_id,
             .span_id = span_id,
-            .name = name,
+            .name = name_copy,
             .start_ns = start_ns,
             .end_ns = end_ns,
             .attributes = attributes,
-        }) catch return;
+        }) catch {
+            // Span did not make it into the batch — free the dupes so this
+            // error path does not leak observer-owned memory.
+            for (attributes.items) |a| {
+                self.allocator.free(a.key);
+                self.allocator.free(a.value);
+            }
+            var attrs_mut = attributes;
+            attrs_mut.deinit(self.allocator);
+            self.allocator.free(name_copy);
+            return;
+        };
 
         if (self.spans.items.len >= max_batch_size) {
             self.flushLocked();

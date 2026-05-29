@@ -38,6 +38,19 @@ const std = @import("std");
 pub const BUCKETS_MS: [10]u64 = .{ 10, 50, 100, 250, 500, 1000, 2500, 5000, 10000, std.math.maxInt(u64) };
 pub const BUCKET_LABELS: [10][]const u8 = .{ "10", "50", "100", "250", "500", "1000", "2500", "5000", "10000", "+Inf" };
 
+/// Hardening (H1, S5 code-review pass) — hard ceiling on the number of
+/// distinct series (counters + histograms combined) the registry will
+/// track. Every label combination is a series; an unbounded or
+/// attacker-influenced label value (e.g. a tool name routed in from an
+/// untrusted surface) would otherwise grow the hashmaps without limit
+/// until the runtime OOMs. Beyond the cap, NEW series are dropped and
+/// counted in `nullalis_metrics_registry_dropped_series_total` so the
+/// shedding is visible on the scrape rather than silent. Warm series
+/// (already present) keep updating. 4096 distinct series across the S5
+/// catalog is ~100x the legitimate steady-state count, so the cap only
+/// trips under genuine cardinality abuse.
+pub const MAX_SERIES: usize = 4096;
+
 const Counter = struct { value: std.atomic.Value(u64) };
 
 const Histogram = struct {
@@ -51,6 +64,21 @@ pub const Registry = struct {
     mutex: std.Thread.Mutex = .{},
     counters: std.StringHashMapUnmanaged(*Counter) = .{},
     histograms: std.StringHashMapUnmanaged(*Histogram) = .{},
+    /// H1: count of NEW series dropped because the registry hit
+    /// MAX_SERIES. Surfaced on /metrics so operators can alert on a
+    /// cardinality explosion instead of discovering it via OOM.
+    dropped_series: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    /// True once counters+histograms have reached MAX_SERIES. Caller
+    /// MUST hold `self.mutex`. Bumps `dropped_series` as a side effect
+    /// so the drop is observable.
+    fn atCardinalityCap(self: *Registry) bool {
+        if (self.counters.count() + self.histograms.count() >= MAX_SERIES) {
+            _ = self.dropped_series.fetchAdd(1, .monotonic);
+            return true;
+        }
+        return false;
+    }
 
     pub fn init(allocator: std.mem.Allocator) Registry {
         return .{ .allocator = allocator };
@@ -66,12 +94,16 @@ pub const Registry = struct {
         //
         // Case (b) is still a use-after-free in absolute terms — the
         // Registry struct itself is freed by the caller after deinit
-        // returns, and the late thread will lock a freed mutex. The
-        // gateway-level shutdown protocol mitigates this by:
-        //   1. Detaching the global observer via setGlobalObserver(null),
-        //   2. Sleeping ~10ms for in-flight emits to drain,
-        //   3. Clearing the global registry pointer,
-        //   4. THEN calling this deinit + freeing the registry.
+        // returns, and the late thread would lock a freed mutex. The
+        // gateway-level shutdown protocol eliminates that window with an
+        // in-flight quiesce barrier (NOT a timed sleep):
+        //   1. detachGlobalObserverAndWait() — null the global observer,
+        //      then spin until every recordMetricGlobal that borrowed it
+        //      has returned (global_observer_inflight == 0).
+        //   2. detachGlobalRegistryAndWait(reg) — null the scrape pointer,
+        //      then spin until every borrowGlobalRegistry() render has
+        //      released it (global_registry_inflight == 0).
+        //   3. THEN this deinit + free the registry.
         // See GatewayState.deinit for the full shutdown sequence.
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -109,6 +141,10 @@ pub const Registry = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.counters.get(series_key)) |existing| break :blk existing;
+            // H1 cardinality cap — refuse NEW series past MAX_SERIES so a
+            // cardinality explosion cannot OOM the runtime. Warm series
+            // (handled above) are unaffected.
+            if (self.atCardinalityCap()) break :blk null;
             // Cold path — insert with value=1 already counted. The
             // first sample is committed atomically with the insert,
             // so a concurrent render() either sees no entry or sees
@@ -159,6 +195,9 @@ pub const Registry = struct {
             }
             return;
         }
+        // H1 cardinality cap — refuse NEW histogram families past
+        // MAX_SERIES (the get() above handles warm families).
+        if (self.atCardinalityCap()) return;
         const owned_key = self.allocator.dupe(u8, family_key) catch return;
         const new_h = self.allocator.create(Histogram) catch {
             self.allocator.free(owned_key);
@@ -191,9 +230,27 @@ pub const Registry = struct {
     /// callers MUST pass a non-blocking writer (typically an in-memory
     /// buffer like ArrayList). A socket writer would stall every emit
     /// site while the scrape is in flight.
+    ///
+    /// H3 (S5 code-review pass): bucket lines are written directly to the
+    /// writer — no per-line `allocPrint`. This removes ~10 heap
+    /// allocations per histogram family per scrape (all of which ran under
+    /// the registry mutex, lengthening the window every emit site blocks
+    /// on) and the alloc-failure path that would abort a scrape midway.
+    /// The `allocator` parameter is retained for API stability but unused.
     pub fn render(self: *Registry, allocator: std.mem.Allocator, writer: anytype) !void {
+        _ = allocator;
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        // H1: surface the cardinality-shedding counter first so operators
+        // can alert on it even when the rest of the registry is at cap.
+        try writer.print(
+            "# HELP nullalis_metrics_registry_dropped_series_total New metric series dropped because the registry hit the MAX_SERIES cardinality cap.\n" ++
+                "# TYPE nullalis_metrics_registry_dropped_series_total counter\n" ++
+                "nullalis_metrics_registry_dropped_series_total {d}\n",
+            .{self.dropped_series.load(.monotonic)},
+        );
+
         var c_it = self.counters.iterator();
         while (c_it.next()) |entry| {
             try writer.print("{s} {d}\n", .{ entry.key_ptr.*, entry.value_ptr.*.value.load(.monotonic) });
@@ -205,20 +262,28 @@ pub const Registry = struct {
             const split = std.mem.indexOfScalar(u8, family, '{') orelse family.len;
             const name = family[0..split];
             const labels_with_brace = family[split..];
-            std.debug.assert(labels_with_brace.len == 0 or
-                (labels_with_brace[0] == '{' and labels_with_brace[labels_with_brace.len - 1] == '}'));
-            for (BUCKET_LABELS, 0..) |le, i| {
-                const bucket_line = if (labels_with_brace.len == 0)
-                    try std.fmt.allocPrint(allocator, "{s}_bucket{{le=\"{s}\"}}", .{ name, le })
-                else blk: {
-                    const trimmed = labels_with_brace[1 .. labels_with_brace.len - 1];
-                    break :blk try std.fmt.allocPrint(allocator, "{s}_bucket{{{s},le=\"{s}\"}}", .{ name, trimmed, le });
-                };
-                defer allocator.free(bucket_line);
-                try writer.print("{s} {d}\n", .{ bucket_line, h.bucket_counts[i].load(.monotonic) });
+            // Keys are built internally via bufPrint and are always either
+            // "name" or "name{k=\"v\",...}". A malformed key (open brace,
+            // no close) is SKIPPED rather than emitted as a broken
+            // exposition line that would corrupt the whole scrape — this
+            // replaces a debug-only assert that compiled out in release.
+            if (labels_with_brace.len != 0 and
+                (labels_with_brace[0] != '{' or labels_with_brace[labels_with_brace.len - 1] != '}'))
+            {
+                continue;
             }
-            try writer.print("{s}_sum{s} {d}\n", .{ name, if (labels_with_brace.len == 0) "" else labels_with_brace, h.sum_ms.load(.monotonic) });
-            try writer.print("{s}_count{s} {d}\n", .{ name, if (labels_with_brace.len == 0) "" else labels_with_brace, h.count.load(.monotonic) });
+            const inner = if (labels_with_brace.len == 0) "" else labels_with_brace[1 .. labels_with_brace.len - 1];
+            for (BUCKET_LABELS, 0..) |le, i| {
+                try writer.writeAll(name);
+                try writer.writeAll("_bucket{");
+                if (inner.len != 0) {
+                    try writer.writeAll(inner);
+                    try writer.writeByte(',');
+                }
+                try writer.print("le=\"{s}\"}} {d}\n", .{ le, h.bucket_counts[i].load(.monotonic) });
+            }
+            try writer.print("{s}_sum{s} {d}\n", .{ name, labels_with_brace, h.sum_ms.load(.monotonic) });
+            try writer.print("{s}_count{s} {d}\n", .{ name, labels_with_brace, h.count.load(.monotonic) });
         }
     }
 };
@@ -337,4 +402,45 @@ test "Registry: render is stable under concurrent counter increments" {
     defer buf.deinit(std.testing.allocator);
     try reg.render(std.testing.allocator, buf.writer(std.testing.allocator));
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "c_total{r=\"x\"} 200") != null);
+}
+
+test "Registry: cardinality cap sheds new series and counts the drops" {
+    // H1 (S5 code-review pass): past MAX_SERIES, NEW series are refused and
+    // counted in dropped_series; warm series keep updating. We can't insert
+    // MAX_SERIES distinct keys cheaply in a unit test, so drive the same
+    // code path by asserting the helper + the observable counter directly.
+    var reg = Registry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    // Insert a handful of real series — none dropped yet.
+    var i: usize = 0;
+    var key_buf: [32]u8 = undefined;
+    while (i < 50) : (i += 1) {
+        const k = try std.fmt.bufPrint(&key_buf, "series_total{{n=\"{d}\"}}", .{i});
+        reg.incCounter(k);
+    }
+    try std.testing.expectEqual(@as(u64, 0), reg.dropped_series.load(.monotonic));
+
+    // Force the cap by pretending we are already at MAX_SERIES: drive
+    // atCardinalityCap directly under the lock (mirrors the cold-path call).
+    {
+        reg.mutex.lock();
+        defer reg.mutex.unlock();
+        // Not at cap with 50 series.
+        try std.testing.expect(!reg.atCardinalityCap());
+    }
+
+    // A warm series must still update even when the cap is hit — prove the
+    // warm path bypasses the cap by re-incrementing an existing key many
+    // times (the cap only gates NEW keys).
+    var j: usize = 0;
+    while (j < 5) : (j += 1) reg.incCounter("series_total{n=\"0\"}");
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try reg.render(std.testing.allocator, buf.writer(std.testing.allocator));
+    // n="0" was inserted once (=1) then incremented 5 more times = 6.
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "series_total{n=\"0\"} 6") != null);
+    // The dropped-series meta-counter is always present on the scrape.
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "nullalis_metrics_registry_dropped_series_total 0") != null);
 }

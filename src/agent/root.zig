@@ -2747,6 +2747,24 @@ pub const Agent = struct {
                 };
             }
 
+            // S5 review-fix E1 (2026-05-29) — a result-cache HIT short-circuits
+            // `self.executeTool`, which is where `tool_call_total` /
+            // `tool_call_latency_ms` are normally emitted (via the defer in
+            // executeToolUnchecked). Without this, cacheable tools (web_search,
+            // memory_recall, composio) under-report call-rate AND skew error-rate
+            // high (only successes are cached, so the success denominator loses
+            // every cache hit). Emit here so the tool-dispatch view stays
+            // complete. `call.name` is canonical on this path — it matched a
+            // registered cacheable tool, so cardinality stays bounded.
+            // NOTE: `memory_op_total` is deliberately NOT emitted for a cached
+            // memory_recall — a cache hit never touched the memory subsystem, so
+            // the subsystem-health view should not count it. (Documented in
+            // docs/operations/SLOs.md §2.1.)
+            if (cache_hit_used) {
+                observability.recordMetricGlobal(.{ .tool_call_total = .{ .tool = call.name, .result = if (result.success) "ok" else "err" } });
+                observability.recordMetricGlobal(.{ .tool_call_latency_ms = .{ .tool = call.name, .value = tool_duration } });
+            }
+
             const tool_event = ObserverEvent{ .tool_call = .{
                 .tool = call.name,
                 .duration_ms = tool_duration,
