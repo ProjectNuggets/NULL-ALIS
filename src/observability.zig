@@ -274,6 +274,36 @@ pub const ObserverMetric = union(enum) {
     moonshot_video_upload_total: struct { result: []const u8 },
     /// Bytes-on-the-wire histogram for the same upload.
     moonshot_video_upload_bytes: u64,
+
+    // ── S5 (2026-05-29, prod-readiness) — chartable signals ──
+
+    /// Approval lifecycle. `result` is one of:
+    /// "issued" | "auto_approved" | "user_approved" | "user_denied" |
+    /// "blocked" | "expired".
+    approval_decision_total: struct { result: []const u8 },
+
+    /// Artifact-export operation. `format` is "pdf|docx|pptx|xlsx|html",
+    /// `result` is "ok|invalid_format|missing_artifact|state_unavailable|
+    /// renderer_unavailable|cross_user_denied".
+    artifact_export_total: struct { format: []const u8, result: []const u8 },
+    artifact_export_latency_ms: struct { format: []const u8, value: u64 },
+
+    /// Memory-tool operation. `op` is "store|recall|forget",
+    /// `result` is "ok|err".
+    memory_op_total: struct { op: []const u8, result: []const u8 },
+    memory_op_latency_ms: struct { op: []const u8, value: u64 },
+
+    /// Trace-share operation. `op` is "create|revoke|get",
+    /// `result` is "ok|not_found|expired|revoked|cap|err".
+    trace_share_total: struct { op: []const u8, result: []const u8 },
+
+    /// Per-tool execution. `tool` is the canonical tool name,
+    /// `result` is "ok|err|unknown_tool|invalid_args".
+    tool_call_total: struct { tool: []const u8, result: []const u8 },
+    tool_call_latency_ms: struct { tool: []const u8, value: u64 },
+
+    /// Cost-tracker meter-receipt emit. `result` is "ok|err_write".
+    meter_receipt_total: struct { result: []const u8 },
 };
 
 // ── Global module-level observer (v1.14.23 HIGH 2.A) ────────────────
@@ -357,6 +387,15 @@ pub fn recordMetricGlobal(metric: ObserverMetric) void {
         .memory_doctor_total => |v| metric_log.info("metric memory_doctor_total value={d}", .{v}),
         .moonshot_video_upload_total => |e| metric_log.info("metric moonshot_video_upload_total result={s}", .{e.result}),
         .moonshot_video_upload_bytes => |v| metric_log.info("metric moonshot_video_upload_bytes value={d}", .{v}),
+        .approval_decision_total => |e| metric_log.info("metric approval_decision_total result={s}", .{e.result}),
+        .artifact_export_total => |e| metric_log.info("metric artifact_export_total format={s} result={s}", .{ e.format, e.result }),
+        .artifact_export_latency_ms => |e| metric_log.info("metric artifact_export_latency_ms format={s} value={d}", .{ e.format, e.value }),
+        .memory_op_total => |e| metric_log.info("metric memory_op_total op={s} result={s}", .{ e.op, e.result }),
+        .memory_op_latency_ms => |e| metric_log.info("metric memory_op_latency_ms op={s} value={d}", .{ e.op, e.value }),
+        .trace_share_total => |e| metric_log.info("metric trace_share_total op={s} result={s}", .{ e.op, e.result }),
+        .tool_call_total => |e| metric_log.info("metric tool_call_total tool={s} result={s}", .{ e.tool, e.result }),
+        .tool_call_latency_ms => |e| metric_log.info("metric tool_call_latency_ms tool={s} value={d}", .{ e.tool, e.value }),
+        .meter_receipt_total => |e| metric_log.info("metric meter_receipt_total result={s}", .{e.result}),
     }
 }
 
@@ -538,6 +577,15 @@ pub const LogObserver = struct {
             .memory_doctor_total => |v| std.log.info("metric.memory_doctor_total value={d}", .{v}),
             .moonshot_video_upload_total => |e| std.log.info("metric.moonshot_video_upload_total result={s}", .{e.result}),
             .moonshot_video_upload_bytes => |v| std.log.info("metric.moonshot_video_upload_bytes value={d}", .{v}),
+            .approval_decision_total => |e| std.log.info("metric.approval_decision_total result={s}", .{e.result}),
+            .artifact_export_total => |e| std.log.info("metric.artifact_export_total format={s} result={s}", .{ e.format, e.result }),
+            .artifact_export_latency_ms => |e| std.log.info("metric.artifact_export_latency_ms format={s} value={d}", .{ e.format, e.value }),
+            .memory_op_total => |e| std.log.info("metric.memory_op_total op={s} result={s}", .{ e.op, e.result }),
+            .memory_op_latency_ms => |e| std.log.info("metric.memory_op_latency_ms op={s} value={d}", .{ e.op, e.value }),
+            .trace_share_total => |e| std.log.info("metric.trace_share_total op={s} result={s}", .{ e.op, e.result }),
+            .tool_call_total => |e| std.log.info("metric.tool_call_total tool={s} result={s}", .{ e.tool, e.result }),
+            .tool_call_latency_ms => |e| std.log.info("metric.tool_call_latency_ms tool={s} value={d}", .{ e.tool, e.value }),
+            .meter_receipt_total => |e| std.log.info("metric.meter_receipt_total result={s}", .{e.result}),
         }
     }
 
@@ -764,6 +812,15 @@ pub const FileObserver = struct {
             .memory_doctor_total => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"memory_doctor_total\",\"value\":{d}}}", .{v}) catch return,
             .moonshot_video_upload_total => |e| std.fmt.bufPrint(&buf, "{{\"metric\":\"moonshot_video_upload_total\",\"result\":\"{s}\"}}", .{e.result}) catch return,
             .moonshot_video_upload_bytes => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"moonshot_video_upload_bytes\",\"value\":{d}}}", .{v}) catch return,
+            .approval_decision_total => |e| std.fmt.bufPrint(&buf, "{{\"metric\":\"approval_decision_total\",\"result\":\"{s}\"}}", .{e.result}) catch return,
+            .artifact_export_total => |e| std.fmt.bufPrint(&buf, "{{\"metric\":\"artifact_export_total\",\"format\":\"{s}\",\"result\":\"{s}\"}}", .{ e.format, e.result }) catch return,
+            .artifact_export_latency_ms => |e| std.fmt.bufPrint(&buf, "{{\"metric\":\"artifact_export_latency_ms\",\"format\":\"{s}\",\"value\":{d}}}", .{ e.format, e.value }) catch return,
+            .memory_op_total => |e| std.fmt.bufPrint(&buf, "{{\"metric\":\"memory_op_total\",\"op\":\"{s}\",\"result\":\"{s}\"}}", .{ e.op, e.result }) catch return,
+            .memory_op_latency_ms => |e| std.fmt.bufPrint(&buf, "{{\"metric\":\"memory_op_latency_ms\",\"op\":\"{s}\",\"value\":{d}}}", .{ e.op, e.value }) catch return,
+            .trace_share_total => |e| std.fmt.bufPrint(&buf, "{{\"metric\":\"trace_share_total\",\"op\":\"{s}\",\"result\":\"{s}\"}}", .{ e.op, e.result }) catch return,
+            .tool_call_total => |e| std.fmt.bufPrint(&buf, "{{\"metric\":\"tool_call_total\",\"tool\":\"{s}\",\"result\":\"{s}\"}}", .{ e.tool, e.result }) catch return,
+            .tool_call_latency_ms => |e| std.fmt.bufPrint(&buf, "{{\"metric\":\"tool_call_latency_ms\",\"tool\":\"{s}\",\"value\":{d}}}", .{ e.tool, e.value }) catch return,
+            .meter_receipt_total => |e| std.fmt.bufPrint(&buf, "{{\"metric\":\"meter_receipt_total\",\"result\":\"{s}\"}}", .{e.result}) catch return,
         };
         self.appendToFile(line);
     }
@@ -1203,6 +1260,66 @@ pub const OtelObserver = struct {
             },
             .moonshot_video_upload_total => |e| {
                 self.addSpan("metric.moonshot_video_upload_total", now, now, &.{
+                    .{ .key = "result", .value = e.result },
+                });
+            },
+            // ── S5 (2026-05-29) — chartable signals ──
+            // Same span-as-metric convention as the legacy structs above.
+            .approval_decision_total => |e| {
+                self.addSpan("metric.approval_decision_total", now, now, &.{
+                    .{ .key = "result", .value = e.result },
+                });
+            },
+            .artifact_export_total => |e| {
+                self.addSpan("metric.artifact_export_total", now, now, &.{
+                    .{ .key = "format", .value = e.format },
+                    .{ .key = "result", .value = e.result },
+                });
+            },
+            .artifact_export_latency_ms => |e| {
+                var buf: [20]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "{d}", .{e.value}) catch return;
+                self.addSpan("metric.artifact_export_latency_ms", now, now, &.{
+                    .{ .key = "format", .value = e.format },
+                    .{ .key = "value", .value = s },
+                });
+            },
+            .memory_op_total => |e| {
+                self.addSpan("metric.memory_op_total", now, now, &.{
+                    .{ .key = "op", .value = e.op },
+                    .{ .key = "result", .value = e.result },
+                });
+            },
+            .memory_op_latency_ms => |e| {
+                var buf: [20]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "{d}", .{e.value}) catch return;
+                self.addSpan("metric.memory_op_latency_ms", now, now, &.{
+                    .{ .key = "op", .value = e.op },
+                    .{ .key = "value", .value = s },
+                });
+            },
+            .trace_share_total => |e| {
+                self.addSpan("metric.trace_share_total", now, now, &.{
+                    .{ .key = "op", .value = e.op },
+                    .{ .key = "result", .value = e.result },
+                });
+            },
+            .tool_call_total => |e| {
+                self.addSpan("metric.tool_call_total", now, now, &.{
+                    .{ .key = "tool", .value = e.tool },
+                    .{ .key = "result", .value = e.result },
+                });
+            },
+            .tool_call_latency_ms => |e| {
+                var buf: [20]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "{d}", .{e.value}) catch return;
+                self.addSpan("metric.tool_call_latency_ms", now, now, &.{
+                    .{ .key = "tool", .value = e.tool },
+                    .{ .key = "value", .value = s },
+                });
+            },
+            .meter_receipt_total => |e| {
+                self.addSpan("metric.meter_receipt_total", now, now, &.{
                     .{ .key = "result", .value = e.result },
                 });
             },
