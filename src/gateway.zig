@@ -10929,14 +10929,52 @@ const response_build_err: RouteResponse = .{
     .body = "{\"error\":\"response_build_failed\"}",
 };
 
-/// Finalize a JSON buffer into a RouteResponse body. On OOM the buffer is freed
-/// and response_build_err is returned.
+/// Finalize a JSON buffer into a RouteResponse body. On OOM the buffer's
+/// backing memory is freed and response_build_err is returned.
+///
+/// The error path uses `clearAndFree`, NOT `deinit`, on purpose. Most callers
+/// pair this with their own `defer out.deinit(allocator)` (needed for their
+/// early-return paths). `deinit` sets the list to `undefined`, so that second
+/// deferred `deinit` would then free an undefined pointer — a double-free /
+/// UB on the OOM path (reachable only if `toOwnedSlice`'s shrink-alloc fails).
+/// `clearAndFree` frees the backing memory and resets the list to empty
+/// (len=0, capacity=0); a subsequent `deinit` frees a zero-length slice, which
+/// `Allocator.free` early-returns on — a safe no-op. This makes the function
+/// correct whether or not the caller holds a paired `defer deinit` (with →
+/// no double-free; without → no leak).
 fn finalizeJsonBuf(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8)) RouteResponse {
     const body = buf.toOwnedSlice(allocator) catch {
-        buf.deinit(allocator);
+        buf.clearAndFree(allocator);
         return response_build_err;
     };
     return .{ .body = body };
+}
+
+test "finalizeJsonBuf: toOwnedSlice OOM uses clearAndFree so a paired deferred deinit is a safe no-op (no double-free)" {
+    // Regression guard for the latent double-free. Real callers pair
+    //   var out: ...= .empty; defer out.deinit(allocator);
+    //   ...; return finalizeJsonBuf(allocator, &out);
+    // If the error path used `deinit` (which sets the list to `undefined`),
+    // that second, deferred `deinit` would free an undefined pointer — a
+    // double-free/UB. `clearAndFree` leaves an empty list, so the deferred
+    // deinit frees a zero-length slice, which Allocator.free early-returns
+    // on. This test forces toOwnedSlice's error path and then lets the
+    // deferred deinit run: under the leak/double-free-detecting testing
+    // allocator, a regression to `deinit` would crash or fail here.
+    //
+    // Forcing the path: resize_fail_index=0 makes toOwnedSlice's `remap`
+    // return null (so it falls through to the shrink-alloc); fail_index=1
+    // fails that alloc. alloc_index 0 is appendSlice's growth allocation.
+    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1, .resize_fail_index = 0 });
+    const alloc = fa.allocator();
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc); // mirrors the caller pattern — must be a safe no-op after the OOM path
+    try out.appendSlice(alloc, "hello");
+
+    const resp = finalizeJsonBuf(alloc, &out);
+    try std.testing.expectEqualStrings("500 Internal Server Error", resp.status);
+    try std.testing.expectEqual(@as(usize, 0), out.capacity); // clearAndFree reset capacity to 0
 }
 
 // ── Task query endpoints (WP2.2) ──────────────────────────────────────
