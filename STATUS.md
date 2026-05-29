@@ -6,28 +6,27 @@ This is the single cold-start document. If it disagrees with `.planning/STATE.md
 
 ---
 
-## 2026-05-29 — Sprint S6: V1 production verification matrix (in progress)
+## 2026-05-29 — Sprint S6: V1 production verification matrix (ready for review)
 
-**Branch:** `prod-readiness/s6-verification-matrix`. Builds on the hardened S1–S5 stack (S1 #108, S2 #109, S3 #110, S4 #111, S5 #112 + follow-up #113 — all on `main`). S6 is the production-readiness closer: a fresh checkout must verify every V1 user-facing backend flow with two commands.
+**Branch:** `prod-readiness/s6-verification-matrix`. **PR:** [#115](https://github.com/ProjectNuggets/NULL-ALIS/pull/115). Builds on the hardened S1–S5 stack (S1 #108, S2 #109, S3 #110, S4 #111, S5 #112 + follow-up #113, #114 OOM fix — all on `main`). S6 is the production-readiness closer: a fresh checkout verifies every V1 user-facing backend flow with two commands.
 
-What landed in the foundation commit (10e17731):
+**What S6 ships (acceptance bar from the spec):**
 
-- **`zig build test-postgres` named step** — runs the new `tests/verification/` aggregate. Default `zig build test` is **intentionally unchanged**; the matrix is additive.
-- **`tests/verification/harness.zig`** — canonical postgres URL resolver via `env_rebrand.getEnvOwnedWithRebrand` (`NULLALIS_POSTGRES_TEST_URL` primary + `NULLCLAW_POSTGRES_TEST_URL` legacy fallback with banner + per-key warning); per-test schema name builder (microsecond timestamp); skip-graceful semantics matching the established `tests/agent/promotion_reflection_pg_test.zig` idiom.
-- **First real consumer: `health_metrics_test.zig`** — pins the S5 chartable catalog membership (11 counters + 2 histogram families), the H1 cardinality-counter exposure invariant from #113, and counter / histogram movement assertions against `Registry.render()`.
-- **CI wiring** — `.github/workflows/ci.yml`'s `canonical-production-profile` job runs the matrix against the existing pgvector service container.
-- **Operator runbook** — `docs/operations/verification-matrix.md` with TL;DR, env vars, per-PR vs per-release cadence, surface matrix table, failure triage, restart/pod-loss expectations, the hidden-V1-surfaces list, and the explicit "what S6 does NOT cover" boundary.
-- **V1 readiness report template** — `docs/operations/v1-readiness-report.md`, marked PENDING FINAL CONSOLIDATION until S1–S6 are all on main.
+- **`zig build test-postgres` named step** — runs the `tests/verification/` aggregate. Default `zig build test` is intentionally unchanged; the matrix is additive.
+- **`tests/verification/harness.zig`** — canonical postgres URL resolver via `env_rebrand.getEnvOwnedWithRebrand` (`NULLALIS_POSTGRES_TEST_URL` primary + `NULLCLAW_POSTGRES_TEST_URL` legacy fallback with banner + per-key warning); per-test schema name builder; named `PgGateError` set with strict + lenient public wrappers (the strict variant guards canonical-lane gates against vacuously-green skips); `loadProjectFile` + `migrationSql` helpers for source-of-truth-document scans.
+- **18 verified V1 surfaces** (see `docs/operations/verification-matrix.md` "Surface coverage" table): health/metrics catalog + cardinality cap + histogram buckets, PG URL resolver, chat stream contract, mode switch, session cancel, approvals (stable `apr-{u64}` + 409 + Idempotency-Key), attachments (Idempotency-Key dedupe), artifacts (sanitizer whitelist + JSON escape + ArtifactKind round-trip), trace sharing (durable migration + sanitizer keep-list), extension browser (10 shipped extension_* tools + url_sanitize SSRF defense), memory tools (PII detect phone+email scope + V1 negative-space on address/name + `memory_purge_pii` documented in ui-handoff), GDPR D25 cascade (≥17 user_id CASCADE FKs in 0001 + line-precise SET NULL / NO ACTION absence on user_id FKs), static schema invariants (every V1-critical table + monotonic migrations + critical indexes), observability cardinality cap + warm/cold path semantics, startup fail-loud (`isFatalStartupError` exhaustive over `StartupSelfCheckError`), Composio gated lane (env-skip + production-name guard).
+- **CI wiring** — `.github/workflows/ci.yml`'s `canonical-production-profile` job runs the matrix against the existing pgvector service container. Step renamed "V1 production verification matrix" (the parenthetical "live Postgres" was misdirecting triage on non-PG failure modes per code review).
+- **Operator runbook** — `docs/operations/verification-matrix.md` with TL;DR two commands, env vars, per-PR vs per-release cadence, local Docker runbook, complete 18-row Surface coverage table, failure triage, restart/pod-loss expectations, V1 hidden-surfaces list verbatim, and explicit "what S6 does NOT cover" boundary with compensating controls.
+- **V1 readiness report template** — `docs/operations/v1-readiness-report.md`, marked PENDING FINAL CONSOLIDATION until S6 lands on main.
+- **Contract doc sync** — `docs/ui-handoff.md` row for `memory_purge_pii` (closes the S1 #108 doc gap the matrix caught); `src/memory/root.zig` re-exports `pii_detect` so the V1 PII detector is a public surface.
 
-Per-surface tests (chat stream, mode switch, session cancel, approvals, attachments, artifacts, trace sharing, extension browser, memory tools incl. `memory_purge_pii`, GDPR D25 cascade, schema-static, observability full coverage, startup fail-loud, Composio gated lane) are scaffolded as compiling placeholders; each is filled in by a follow-up task per the plan at `docs/superpowers/plans/2026-05-29-s6-verification-matrix.md`.
-
-Verification (foundation commit):
+**Verification (latest commit on branch, local + ephemeral Docker pgvector):**
 
 - `zig build -Dengines=base,sqlite,postgres` → exit 0
-- `zig build test -Dengines=base,sqlite,postgres --summary all` → 22/22 steps, 6891/6970 passed, 79 skipped (unchanged from main)
-- `zig build test-postgres -Dengines=base,sqlite,postgres --summary all` → 6/6 steps, 7/7 passed (live-PG tests skip-graceful without env)
+- `zig build test -Dengines=base,sqlite,postgres --summary all` → 22/22 steps, **6892/6971 passed, 79 skipped** (default suite unchanged from main; +1 test surfaced by the `pii_detect` re-export)
+- `NULLALIS_POSTGRES_TEST_URL=postgresql://zaki:zaki@localhost:5432/zaki zig build test-postgres -Dengines=base,sqlite,postgres --summary all` → 6/6 steps, **79/81 passed, 2 skipped** (Composio gated lane skip-graceful when env absent; matches the documented contract)
 
-**V1 hidden / not-claimed (verbatim):** `/api/v1/chat/{cancel,resume,approve}` as top-level routes; live subagent interruption; bi-temporal `valid_to` classifier; per-cell isolated pods; D52 Pillar 5 at-rest encryption of `pii_tagged` rows; address/name PII detection; 7-9 digit US-local phones without `+`; end-user Composio claims; public `/metrics` (operator-only).
+**V1 hidden / not-claimed (verbatim, matches the matrix doc):** `/api/v1/chat/{cancel,resume,approve}` as top-level routes; live subagent interruption; bi-temporal `valid_to` classifier; per-cell isolated pods; D52 Pillar 5 at-rest encryption of `pii_tagged` rows; address/name PII detection; 7–9 digit US-local phones without `+`; end-user Composio claims; public `/metrics` (operator-only).
 
 ---
 

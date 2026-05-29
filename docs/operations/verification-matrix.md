@@ -66,35 +66,43 @@ A failed `V1 production verification matrix` step is a hard merge block. A faile
 
 ## Surface coverage
 
-This section lists ONLY surfaces that the matrix actually pins. `Smoke` = the business-logic surface is exercised via the established in-process fixture pattern (handler / store / tool calls against fixtures); it does NOT include a bound-port HTTP roundtrip. The table is the operator's authoritative coverage answer — surfaces planned but not yet pinned live in the **Coverage roadmap** subsection below so the table never makes a promise the code does not keep.
+This section lists every surface that the matrix actually pins. `Smoke` = the business-logic surface is exercised via the established in-process fixture pattern (handler / store / tool calls against fixtures, sanitizer functions, parser functions, source-of-truth doc and migration scans); it does NOT include a bound-port HTTP roundtrip — that remains deferred and is covered by the canonical CI lane + the runbook above.
 
-| Surface | Status | Test file | Failure mode pin |
-|---|---|---|---|
-| S5 chartable metrics catalog (the 18 counters + 6 histograms declared at `src/gateway.zig:7290-7337`) | Smoke | `tests/verification/health_metrics_test.zig` | catalog drift between gateway HELP/TYPE block and Registry round-trip — fails with the exact missing series name printed by the test runner |
-| Registry cardinality cap exposure (H1 from S5 follow-up #113) | Smoke | `tests/verification/health_metrics_test.zig` | `nullalis_metrics_registry_dropped_series_total` not emitted on empty registry |
-| Histogram bucket distribution at the canonical BUCKETS_MS boundaries | Smoke | `tests/verification/health_metrics_test.zig` | bucket boundary refactor that breaks Grafana panel queries |
-| Postgres URL resolver contract (canonical + legacy fallback) | Smoke | `tests/verification/harness.zig` | overbroad catch silently swallowing a real env-read failure |
+| # | Surface | Status | Test file | Failure mode pin |
+|---|---|---|---|---|
+| 1 | S5 chartable metrics catalog (18 counters + 6 histograms declared at `src/gateway.zig:7290-7337`) | Smoke | `tests/verification/health_metrics_test.zig` | catalog drift between gateway HELP/TYPE block and Registry round-trip — fails with the exact missing series name |
+| 2 | Registry cardinality cap exposure (H1 from S5 follow-up #113) | Smoke | `tests/verification/health_metrics_test.zig` | `nullalis_metrics_registry_dropped_series_total` not emitted on empty registry |
+| 3 | Histogram bucket distribution at canonical BUCKETS_MS boundaries | Smoke | `tests/verification/health_metrics_test.zig` | bucket boundary refactor that breaks Grafana panel queries |
+| 4 | Postgres URL resolver contract (canonical + legacy fallback + strict variant) | Smoke | `tests/verification/harness.zig` | overbroad catch silently swallowing real env-read failures |
+| 5 | Chat-stream SSE event-name surface (chunk/done/message/turn) + phantom-route absence | Smoke | `tests/verification/chat_stream_test.zig` | rename in source that drops a documented event name → UI binding silently breaks |
+| 6 | Mode switching — canonical mode route + 4xx failure surface documented | Smoke | `tests/verification/mode_switch_test.zig` | OpenAPI section reshape that loses the `/mode:` path or the 400 response |
+| 7 | Session cancel — canonical session-scoped route + idle response shape (`was_active`) + `/api/v1/chat/cancel` absent + Idempotency-Key contract | Smoke | `tests/verification/session_cancel_test.zig` | phantom top-level route appears, or Idempotency-Key parser regresses |
+| 8 | Approvals — canonical approve route + stable `apr-{u64}` format + 409 stale-card response + `/api/v1/chat/approve` absent + Idempotency-Key contract | Smoke | `tests/verification/approvals_test.zig` | approval_id format drift; 409 disappears from the OpenAPI |
+| 9 | Attachments — route documented + Idempotency-Key parser (happy / missing → null / empty) + 4xx failure surface | Smoke | `tests/verification/attachments_test.zig` | parser breaks → dedupe lane silently broken |
+| 10 | Artifacts — route documented + `sanitizer.isPublicField` whitelist + `renderPublicShareJson` no-leak + JSON escape + every ArtifactKind serializes | Smoke | `tests/verification/artifacts_test.zig` | sanitizer accidentally widened to leak `user_id` / `session_id` / `metadata` |
+| 11 | Trace sharing — public-share route documented + migration declares user_id CASCADE + share_code PK + JSON snapshot column + sanitizer keep-list (redundant pin) | Smoke | `tests/verification/trace_share_test.zig` | durable migration loses CASCADE FK; sanitizer widens |
+| 12 | Extension browser — WS endpoint + diagnostics route + per-user token contract + every shipped `extension_*` tool documented + `url_sanitize.sanitize` SSRF defense + benign URL not over-rejected | Smoke | `tests/verification/extension_browser_test.zig` | SSRF gate regresses (lets through loopback / link-local); benign URL rejected (overbroad) |
+| 13 | Memory tools — PII detector fires on phone + email + V1-scope-respecting (no address/name) + `Flags.any()` / `Flags.count()` contract + every shipped memory_* tool documented incl. `memory_purge_pii` | Smoke | `tests/verification/memory_tools_test.zig` | detector starts firing on address/name without scope review; doc gap |
+| 14 | Postgres GDPR D25 cascade — 0001 migration has ≥17 user_id CASCADE FKs; artifacts + trace_shares each declare CASCADE; no user_id FK declares `SET NULL` or `NO ACTION` | Smoke | `tests/verification/gdpr_cascade_test.zig` | a new user-scoped table added without CASCADE on user_id |
+| 15 | Static schema invariants (D33-equivalent) — every V1-critical table present + `migrations.MIGRATIONS` monotonically versioned starting at 1 + every migration carries non-empty SQL + critical indexes present + unique names | Smoke | `tests/verification/schema_static_test.zig` | dropped table, duplicate migration name, non-monotonic version |
+| 16 | Observability — `MAX_SERIES = 4096` invariant + cold-path cardinality shedding + warm-path increments survive past cap + HELP/TYPE block on empty render | Smoke | `tests/verification/observability_test.zig` | cap shedding regresses; warm series accidentally bucketed as cold; HELP block dropped |
+| 17 | Startup fail-loud — `gateway.isFatalStartupError` recognizes `ProductionPostgresRequired` + rejects unrelated transient errors | Smoke | `tests/verification/startup_fail_loud_test.zig` | a new `StartupSelfCheckError` variant added but daemon's fail-loud predicate not updated |
+| 18 | Composio gated lane — `ComposioConfig` struct shape pinned at compile time + capability namespace wired + env-gated skip-graceful + production-name guard rejects unsafe test entity | Smoke (env-gated) | `tests/verification/composio_gated_test.zig` | struct field rename; env-set path mutates production data |
 
-### Coverage roadmap
+A surface migrates onto this table the same commit that lands its real assertions. There is intentionally no "Pending" row — every pending surface is closed before the matrix doc lists it.
 
-The following surfaces are scheduled by the plan at [`docs/superpowers/plans/2026-05-29-s6-verification-matrix.md`](../superpowers/plans/2026-05-29-s6-verification-matrix.md) but are NOT yet pinned in CI. They are tracked here only so the runbook reader can locate which plan task will close each gap; do not treat them as covered.
+## What is NOT covered by the matrix (deferred — see runbook above for shape)
 
-- Chat-stream SSE event-name surface + phantom-route absence — plan Task 2
-- Mode switching valid/invalid + persistence — plan Task 2
-- Session cancel idle/active/idempotent — plan Task 2
-- Approvals — stable `apr-{u64}` id, 409 stale-card, approve/deny/expiry, idempotency, cross-session, irreversible gating — plan Task 3
-- Attachments — upload + Idempotency-Key dedupe + invalid + cross-user — plan Task 3
-- Artifacts — CRUD, share/revoke, export, unsafe-filename, cross-user — plan Task 4
-- Trace sharing — create/get/revoke + sanitizer whitelist + restart-equivalent durability + cross-user list — plan Task 4
-- Extension browser — every shipped `extension_*` command via mock hub (partial coverage today in `tests/extension/mock_hub_e2e_test.zig`) — plan Task 5
-- Memory tools — store/recall/forget/doctor + `memory_purge_pii` dry+wet + user isolation — plan Task 5
-- Postgres GDPR D25 cascade across the 19 FK tables — plan Task 6
-- Static schema invariants (D33-equivalent) — plan Task 6
-- Full observability counter + histogram movement after representative flows — plan Task 7
-- Startup fail-loud — production-mode + missing PG → non-zero exit — plan Task 7
-- Composio gated lane — plan Task 8
-
-A surface migrates from this roadmap to the table above when its `tests/verification/*_test.zig` file lands real content + the matrix-doc row is added in the same commit.
+| Not covered | Reason | Compensating control |
+|---|---|---|
+| Bound-port HTTP roundtrip harness | Codebase has no bound-port test harness; `GatewayState` has heavy init dependencies. Building one is a separate sprint. | Canonical-profile CI job boots the binary; runbook curl steps. |
+| Live SSE-over-TCP roundtrip | Same. The SSE event-name surface is pinned via contract-doc scan. | Operator manual runbook. |
+| Real Chrome extension binary | Mock hub is the contract pin (`tests/extension/mock_hub_e2e_test.zig`). | Operator manual runbook. |
+| Address / name PII detection | V1 scope is phone + email only. | Documented as hidden V1 surface; matrix actively asserts the negative. |
+| US-local 7–9 digit phones (no `+`, no area code) | Same V1 detector scope. | Documented hidden surface. |
+| At-rest encryption of `pii_tagged` rows (D52 Pillar 5) | V1 ships PII *tagging* + *purge* (Pillars 2+4 from #108); encryption-at-rest is V2. | Documented hidden surface. |
+| Subprocess-level startup fail-loud (exit-code check on the booted binary) | The Zig test pins the membership invariant (`isFatalStartupError` covers every variant via comptime iteration). Spawning the binary in a subprocess is operator-driven. | Documented in runbook §"Failure triage". |
+| Live cross-user PG cascade integration (insert rows, delete user, count) | The matrix pins the static migration contract; a live integration test needs per-table `seedRow` helpers on the Manager — added in a follow-up. | Static migration scan + S1's runtime tests already in `tests/agent/promotion_reflection_pg_test.zig`. |
 
 ## Failure triage
 
@@ -132,17 +140,6 @@ The following are deliberately hidden from V1 docs and UI claims. The matrix ass
 - 7-9 digit US-local phone numbers without area code or `+` prefix.
 - End-user Composio / integration claims unless the gated smoke lane is configured *and* passing on the operator's environment.
 - Public `/metrics` — treat as operator-only / firewalled.
-
-## What is NOT covered by S6 (and why)
-
-| Not covered | Why deferred |
-|---|---|
-| Bound-port HTTP roundtrip harness | The codebase has no bound-port test harness today and `GatewayState` has heavy init dependencies (postgres pool, observer registry, extension hub, agent runtime). Building one is a separate sprint. Coverage is provided by (a) the canonical-production-profile CI job which boots the binary, and (b) the operator runbook above. |
-| Live SSE-over-TCP roundtrip | Same. The SSE event-name surface is pinned in `chat_stream_test.zig` against the emitter helpers directly. |
-| Real Chrome extension binary | The extension mock hub (`tests/extension/mock_hub_e2e_test.zig`) is the canonical pin for the WS contract. A real-extension lane is operator-driven. |
-| Address / name PII detection | V1 scope is phone + email only — too noisy without NER. Documented as hidden above. |
-| US-local 7-9 digit phones (no `+`, no area code) | Same V1 detector scope. |
-| At-rest encryption of `pii_tagged` rows (D52 Pillar 5) | V1 ships PII *tagging* and *purge* (Pillars 2+4 from #108). Encryption-at-rest is V2. |
 
 ## Cross-references
 

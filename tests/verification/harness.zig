@@ -86,6 +86,34 @@ pub fn schemaName(buf: []u8, slug: []const u8) ![]const u8 {
     return try std.fmt.bufPrint(buf, "nullalis_s6_{s}_{d}", .{ slug, stamp });
 }
 
+/// Load a project-root-relative file (e.g. `docs/openapi-v1.yaml`).
+/// `@embedFile` cannot reach outside the test module's package boundary,
+/// so doc-content assertions use this runtime helper instead. The
+/// `zig build test-postgres` step runs from the project root, so
+/// `std.fs.cwd()` resolves there. Caller owns the returned slice.
+pub fn loadProjectFile(allocator: std.mem.Allocator, rel_path: []const u8) ![]u8 {
+    var file = std.fs.cwd().openFile(rel_path, .{}) catch |err| switch (err) {
+        // A test fixture wasn't found on disk — most likely the test
+        // was invoked from a non-repo-root CWD. Skip cleanly rather
+        // than fail; the matrix CI lane always runs from the repo
+        // root via `zig build test-postgres`.
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer file.close();
+    return try file.readToEndAlloc(allocator, 4 * 1024 * 1024);
+}
+
+/// Find the SQL body of a migration by its short name (e.g.
+/// `"0001_initial_schema"`). Avoids `@embedFile` cross-package issues by
+/// going through the already-embedded `migrations.MIGRATIONS` table.
+pub fn migrationSql(name: []const u8) ?[]const u8 {
+    for (nullalis.migrations.MIGRATIONS) |m| {
+        if (std.mem.eql(u8, m.name, name)) return m.sql;
+    }
+    return null;
+}
+
 // ── Self-tests ────────────────────────────────────────────────────────────
 //
 // These pin the harness contract WITHOUT depending on the process

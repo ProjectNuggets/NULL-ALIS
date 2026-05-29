@@ -104,6 +104,7 @@ receipts, and tool side-effects honor the user's intent.
 | `memory_doctor` *(v1.14.21)* | Health report — extraction status, hydration cache, brain graph integrity, sidecar pipeline freshness | "Memory health" link in Settings → Memory |
 | `brain_graph` | Knowledge-graph traversal | Optional power-user view |
 | `memory_forget` | User-driven deletion | Privacy settings → "Forget about…" |
+| `memory_purge_pii` *(S1, prod-readiness 2026-05-28)* | Delete memories whose persist-time PII tags match the requested category (phone, email, or all). Supports `dry_run` to preview the count without deleting. V1 detector scope is phone + email ONLY — address / name out of scope. | Privacy settings → "Purge phone numbers" / "Purge email addresses" / "Purge all PII" |
 | `query_expansion` | (off by default) | Setting toggle, not a tool |
 
 **UX rule**: every fact persisted across sessions must be visible and
