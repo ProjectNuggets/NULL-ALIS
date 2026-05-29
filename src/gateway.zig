@@ -6650,6 +6650,89 @@ fn normalizedLocalAgentMemoryConfig(cfg: *const Config) config_types.MemoryConfi
     return memory_cfg;
 }
 
+/// Minimal input for the extension-WS diagnostic payload renderers.
+/// Carved off `GatewayState` so the renderers are unit-testable without
+/// constructing the full gateway state struct (which has many non-default
+/// fields wired during boot).
+pub const ExtensionDiagnosticInput = struct {
+    hub: ?*extension_ws_hub.ExtensionWsHub,
+    connections_total: u64,
+    auth_failed_total: u64,
+};
+
+/// Render the system-wide extension WS diagnostic JSON. Keys:
+///   - enabled: bool — true iff `input.hub` is non-null.
+///   - total_active: number of currently-paired users (live count from the hub).
+///   - connections_total: lifetime connections accepted.
+///   - auth_failed_total: lifetime auth_failed outcomes.
+///
+/// Returned slice is heap-allocated; caller frees via `allocator.free`.
+pub fn extensionStatusPayload(allocator: std.mem.Allocator, input: ExtensionDiagnosticInput) ![]u8 {
+    const enabled = input.hub != null;
+    const total_active: usize = if (input.hub) |hub| blk: {
+        hub.users_mu.lock();
+        defer hub.users_mu.unlock();
+        break :blk hub.users.count();
+    } else 0;
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"enabled\":{s},\"total_active\":{d},\"connections_total\":{d},\"auth_failed_total\":{d}}}",
+        .{
+            if (enabled) "true" else "false",
+            total_active,
+            input.connections_total,
+            input.auth_failed_total,
+        },
+    );
+}
+
+/// Render the per-user extension WS diagnostic JSON. Keys:
+///   - user_id: echo of the requested user_id.
+///   - paired: bool — true iff this user has a live extension conn.
+///   - connected_at_unix: i64 (seconds since epoch), 0 when not paired.
+///   - last_command_at_unix: i64 (seconds), 0 when no command yet.
+///   - last_command_tool: string ("" when no command yet).
+///   - last_command_result: string ("" when no command yet).
+pub fn extensionUserStatusPayload(allocator: std.mem.Allocator, input: ExtensionDiagnosticInput, user_id: []const u8) ![]u8 {
+    var paired = false;
+    var connected_at_unix: i64 = 0;
+    var last_at_unix: i64 = 0;
+    var last_tool: []const u8 = "";
+    var last_result: []const u8 = "";
+
+    var tool_buf: [32]u8 = undefined;
+    var result_buf: [32]u8 = undefined;
+
+    if (input.hub) |hub| {
+        if (hub.getForUser(user_id)) |conn| {
+            defer _ = conn.release();
+            paired = true;
+            const ns = conn.connected_at_ns.load(.acquire);
+            connected_at_unix = @intCast(@divTrunc(ns, std.time.ns_per_s));
+            const last = conn.snapshotLastCommand(&tool_buf, &result_buf);
+            if (last.at_ns > 0) {
+                last_at_unix = @intCast(@divTrunc(last.at_ns, std.time.ns_per_s));
+            }
+            last_tool = tool_buf[0..last.tool_len];
+            last_result = result_buf[0..last.result_len];
+        }
+    }
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"user_id\":\"{s}\",\"paired\":{s},\"connected_at_unix\":{d},\"last_command_at_unix\":{d},\"last_command_tool\":\"{s}\",\"last_command_result\":\"{s}\"}}",
+        .{
+            user_id,
+            if (paired) "true" else "false",
+            connected_at_unix,
+            last_at_unix,
+            last_tool,
+            last_result,
+        },
+    );
+}
+
 fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u8 {
     const transport_stats = http_util.transport_stats_snapshot();
     const requests_total = state.requests_total.load(.monotonic);
@@ -32319,4 +32402,46 @@ test "Wave 2A live: export bridge writes produced file + returns download URL" {
     );
     try std.testing.expectEqualStrings("404 Not Found", resp2.status);
     try std.testing.expect(std.mem.indexOf(u8, resp2.body, "artifact_not_found") != null);
+}
+
+test "extensionStatusPayload renders disabled when hub is null" {
+    const input: ExtensionDiagnosticInput = .{
+        .hub = null,
+        .connections_total = 0,
+        .auth_failed_total = 0,
+    };
+    const json = try extensionStatusPayload(std.testing.allocator, input);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"enabled\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"total_active\":0") != null);
+}
+
+test "extensionStatusPayload renders enabled + counters when hub is present" {
+    var hub = extension_ws_hub.ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    const input: ExtensionDiagnosticInput = .{
+        .hub = &hub,
+        .connections_total = 3,
+        .auth_failed_total = 1,
+    };
+    const json = try extensionStatusPayload(std.testing.allocator, input);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"total_active\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"connections_total\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"auth_failed_total\":1") != null);
+}
+
+test "extensionUserStatusPayload renders not_paired when user has no conn" {
+    var hub = extension_ws_hub.ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    const input: ExtensionDiagnosticInput = .{
+        .hub = &hub,
+        .connections_total = 0,
+        .auth_failed_total = 0,
+    };
+    const json = try extensionUserStatusPayload(std.testing.allocator, input, "alice");
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"user_id\":\"alice\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"paired\":false") != null);
 }
