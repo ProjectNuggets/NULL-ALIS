@@ -5,6 +5,7 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const mem_root = @import("../memory/root.zig");
 const Memory = mem_root.Memory;
+const observability = @import("../observability.zig");
 
 const log = std.log.scoped(.memory_forget);
 
@@ -47,7 +48,25 @@ pub const MemoryForgetTool = struct {
         };
     }
 
+    /// S5 (2026-05-29, prod-readiness) — public entry point wraps the
+    /// underlying executor with latency + result emit. See the parallel
+    /// pattern in `memory_store.zig` for rationale.
     pub fn execute(self: *MemoryForgetTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+        const start_ms = std.time.milliTimestamp();
+        const result = self.executeInner(allocator, args) catch |err| {
+            const elapsed_ms: u64 = @intCast(@max(@as(i64, 0), std.time.milliTimestamp() - start_ms));
+            observability.recordMetricGlobal(.{ .memory_op_total = .{ .op = "forget", .result = "err" } });
+            observability.recordMetricGlobal(.{ .memory_op_latency_ms = .{ .op = "forget", .value = elapsed_ms } });
+            return err;
+        };
+        const elapsed_ms: u64 = @intCast(@max(@as(i64, 0), std.time.milliTimestamp() - start_ms));
+        const label: []const u8 = if (result.success) "ok" else "err";
+        observability.recordMetricGlobal(.{ .memory_op_total = .{ .op = "forget", .result = label } });
+        observability.recordMetricGlobal(.{ .memory_op_latency_ms = .{ .op = "forget", .value = elapsed_ms } });
+        return result;
+    }
+
+    fn executeInner(self: *MemoryForgetTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const key = root.getString(args, "key") orelse
             return ToolResult.fail("Missing 'key' parameter");
         if (key.len == 0) return ToolResult.fail("'key' must not be empty");

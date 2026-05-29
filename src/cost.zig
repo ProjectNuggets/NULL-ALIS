@@ -1,4 +1,5 @@
 const std = @import("std");
+const observability = @import("observability.zig");
 
 /// Token usage information from a single API call.
 pub const TokenUsage = struct {
@@ -162,10 +163,17 @@ pub const CostTracker = struct {
         try self.session_records.append(self.allocator, record);
 
         // Persist to JSONL file — log on failure so cost data loss is visible.
+        // S5 (2026-05-29, prod-readiness) — emit `meter_receipt_total` with the
+        // appropriate result label so an SLO dashboard can chart write-failure
+        // rate. The append path is best-effort; we keep the in-memory record
+        // on failure but the chart will surface the write loss.
         self.appendToJsonl(&record) catch |err| {
+            observability.recordMetricGlobal(.{ .meter_receipt_total = .{ .result = "err_write" } });
             const log = std.log.scoped(.cost);
             log.warn("cost: failed to write usage record to JSONL ({}); in-memory record retained but may be lost on restart", .{err});
+            return;
         };
+        observability.recordMetricGlobal(.{ .meter_receipt_total = .{ .result = "ok" } });
     }
 
     /// Append a cost record to the JSONL file.

@@ -1428,6 +1428,35 @@ const MetricsRegistryObserver = struct {
                 const key = std.fmt.bufPrint(&buf, "nullalis_meter_receipt_total{{result=\"{s}\"}}", .{e.result}) catch return;
                 self.registry.incCounter(key);
             },
+            // S5 (2026-05-29, prod-readiness) — route the S4-owned
+            // extension_ws variants (emitted from src/extension_ws/hub.zig)
+            // into the chartable-signals registry so they surface on
+            // /metrics alongside the rest of the S5 catalog. The
+            // emit-site code itself stays untouched — S4 owns that file.
+            .extension_ws_command_total => |e| {
+                var buf: [192]u8 = undefined;
+                const key = if (e.tool) |t|
+                    std.fmt.bufPrint(&buf, "nullalis_extension_ws_command_total{{result=\"{s}\",tool=\"{s}\"}}", .{ e.result, t }) catch return
+                else
+                    std.fmt.bufPrint(&buf, "nullalis_extension_ws_command_total{{result=\"{s}\",tool=\"none\"}}", .{e.result}) catch return;
+                self.registry.incCounter(key);
+            },
+            .extension_ws_command_latency_ms => |v| {
+                const key = "nullalis_extension_ws_command_latency_ms";
+                self.registry.observeHistogram(key, v);
+            },
+            .extension_ws_connections_active => |_| {
+                // Gauge — the substrate's `Registry` only models
+                // counters + histograms. The LogObserver still captures
+                // the value, and a future Registry extension (or a
+                // dedicated point-in-time observation route) can surface
+                // it on /metrics. Left as a no-op rather than coerced
+                // into a counter (which would silently misrepresent
+                // gauge semantics).
+            },
+            .extension_ws_ssrf_block_total => |_| {
+                self.registry.incCounter("nullalis_extension_ws_ssrf_block_total");
+            },
             else => {}, // other variants are handled by LifecycleMetricsObserver / log-level emit.
         }
     }
@@ -7144,6 +7173,12 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
         \\# TYPE nullalis_tool_call_latency_ms histogram
         \\# HELP nullalis_meter_receipt_total Cost-tracker meter-receipt ledger emit by result.
         \\# TYPE nullalis_meter_receipt_total counter
+        \\# HELP nullalis_extension_ws_command_total Extension WS command dispatch by result and tool.
+        \\# TYPE nullalis_extension_ws_command_total counter
+        \\# HELP nullalis_extension_ws_command_latency_ms Extension WS command roundtrip latency histogram.
+        \\# TYPE nullalis_extension_ws_command_latency_ms histogram
+        \\# HELP nullalis_extension_ws_ssrf_block_total Extension WS SSRF block denials.
+        \\# TYPE nullalis_extension_ws_ssrf_block_total counter
         \\
     , .{});
     if (observability_metrics.globalRegistry()) |reg| {
@@ -11868,6 +11903,24 @@ fn handleArtifactExport(
     config_opt: ?*const Config,
     state: *GatewayState,
 ) RouteResponse {
+    // S5 (2026-05-29, prod-readiness) — artifact_export_total +
+    // artifact_export_latency_ms emit. `fmt_label` starts as "invalid"
+    // and is upgraded to the canonical lowercase format only once the
+    // query param has been validated. `result_label` is mutated per-
+    // exit-path with the documented vocabulary
+    // (ok|invalid_format|missing_artifact|state_unavailable|
+    // renderer_unavailable). The format-stays-"invalid" case correctly
+    // sticks for the input-rejection paths (405/400) where there is no
+    // validated format to label by.
+    const start_ms = std.time.milliTimestamp();
+    var fmt_label: []const u8 = "invalid";
+    var result_label: []const u8 = "invalid_format";
+    defer {
+        const elapsed_ms: u64 = @intCast(@max(@as(i64, 0), std.time.milliTimestamp() - start_ms));
+        observability.recordMetricGlobal(.{ .artifact_export_total = .{ .format = fmt_label, .result = result_label } });
+        observability.recordMetricGlobal(.{ .artifact_export_latency_ms = .{ .format = fmt_label, .value = elapsed_ms } });
+    }
+
     if (!std.mem.eql(u8, method, "POST")) {
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
     }
@@ -11896,12 +11949,16 @@ fn handleArtifactExport(
             .body = "{\"error\":\"invalid_format\",\"detail\":\"format must be one of: pdf, docx, pptx, xlsx, html\"}",
         };
     };
+    // Format validated — upgrade the metric label so the histogram and
+    // counter shard by the canonical format string from here on.
+    fmt_label = format;
 
     // Workspace_path safety: produce_document writes via std.fs.path.join +
     // std.fs.cwd().makePath. If workspace_path is somehow not absolute
     // (operator config drift), surface a controlled 500 instead of letting
     // the tool fail later in a less-actionable way.
     if (!std.fs.path.isAbsolute(user_ctx.workspace_path)) {
+        result_label = "state_unavailable";
         return .{
             .status = "500 Internal Server Error",
             .body = "{\"error\":\"workspace_not_absolute\",\"detail\":\"user workspace_path is not absolute; refusing to export\"}",
@@ -11909,6 +11966,7 @@ fn handleArtifactExport(
     }
 
     const state_mgr = state.zaki_state orelse {
+        result_label = "state_unavailable";
         return .{
             .status = "503 Service Unavailable",
             .body = "{\"error\":\"state_unavailable\",\"detail\":\"persistent state backend not configured; artifacts require postgres\"}",
@@ -11917,18 +11975,22 @@ fn handleArtifactExport(
 
     // Ownership + existence check (mirrors handleArtifactGet at :11029).
     const artifact_opt = state_mgr.getArtifactById(allocator, numeric_user_id, artifact_id) catch {
+        result_label = "state_unavailable";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read_failed\"}" };
     };
     if (artifact_opt == null) {
+        result_label = "missing_artifact";
         return .{ .status = "404 Not Found", .body = "{\"error\":\"artifact_not_found\"}" };
     }
     var artifact = artifact_opt.?;
     defer artifact.deinit(allocator);
 
     const ver_opt = state_mgr.getArtifactVersion(allocator, numeric_user_id, artifact_id, null) catch {
+        result_label = "state_unavailable";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"version_read_failed\"}" };
     };
     if (ver_opt == null) {
+        result_label = "missing_artifact";
         return .{ .status = "404 Not Found", .body = "{\"error\":\"version_not_found\"}" };
     }
     var ver = ver_opt.?;
@@ -11940,15 +12002,19 @@ fn handleArtifactExport(
     var args = std.json.ObjectMap.init(allocator);
     defer args.deinit();
     args.put("format", std.json.Value{ .string = format }) catch {
+        result_label = "state_unavailable";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
     };
     args.put("content", std.json.Value{ .string = ver.content }) catch {
+        result_label = "state_unavailable";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
     };
     args.put("title", std.json.Value{ .string = artifact.title }) catch {
+        result_label = "state_unavailable";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
     };
     args.put("theme", std.json.Value{ .string = "default" }) catch {
+        result_label = "state_unavailable";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
     };
 
@@ -11957,6 +12023,7 @@ fn handleArtifactExport(
         .branding = if (config_opt) |cfg| cfg.branding else .{},
     };
     const tool_result = pdt.execute(allocator, args) catch {
+        result_label = "renderer_unavailable";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"export_failed\",\"detail\":\"tool dispatch raised an error\"}" };
     };
     // Ownership: produce_document allocates `output` and `error_msg` with our
@@ -11984,6 +12051,11 @@ fn handleArtifactExport(
             std.mem.indexOf(u8, err, "FileNotFound") != null or
             std.mem.indexOf(u8, err, "marp-cli") != null or
             std.mem.indexOf(u8, err, "pandoc") != null;
+        // Both the renderer-missing (502) and the export-failed (500) tails
+        // map to the same metric label — operators care about "the renderer
+        // could not produce a document" as a single signal. The 500-vs-502
+        // distinction stays in the HTTP response so FE can differentiate.
+        result_label = "renderer_unavailable";
         var out: std.ArrayListUnmanaged(u8) = .empty;
         // `toOwnedSlice` zeroes the buf on success → the defer becomes a
         // no-op when we return the body; on any catch the defer cleans up.
@@ -12005,6 +12077,7 @@ fn handleArtifactExport(
 
     // Success — parse the produced filename out of the markdown link.
     const filename = parseProducedFilename(tool_result.output) orelse {
+        result_label = "renderer_unavailable";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"export_failed\",\"detail\":\"renderer succeeded but filename could not be parsed\"}" };
     };
 
@@ -12034,6 +12107,7 @@ fn handleArtifactExport(
     w.writeAll("/exports/") catch return response_build_err;
     jsonEscapeInto(w, filename) catch return response_build_err;
     w.writeAll("\"}") catch return response_build_err;
+    result_label = "ok";
     return finalizeJsonBuf(allocator, &out);
 }
 
@@ -12289,11 +12363,32 @@ const TraceShareStore = struct {
     /// subsequent reads are O(1). This is the restart-recovery path
     /// that closes the `ui-handoff.md` §7 P1 gap.
     fn getLive(self: *TraceShareStore, code: []const u8, now_unix: i64) ?TraceShareSnapshot {
+        // S5 (2026-05-29, prod-readiness) — trace_share_total{op="get"}
+        // emit. Distinguishes the four operational tails the SLO panel
+        // cares about: ok | not_found | expired | revoked. The cache-
+        // hit path can detect expired vs revoked precisely (the record
+        // is still present, just non-live). The PG fallback path can
+        // only tell ok vs not_found — the SQL view filters out expired
+        // / revoked at the source so a cache-miss lazy-load that yields
+        // null is collapsed to "not_found" by design.
+        var result_label: []const u8 = "not_found";
+        defer observability.recordMetricGlobal(.{ .trace_share_total = .{ .op = "get", .result = result_label } });
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
         if (self.by_code.get(code)) |rec_ptr| {
-            if (!rec_ptr.isLive(now_unix)) return null;
+            if (!rec_ptr.isLive(now_unix)) {
+                // isLive() returns false when revoked OR expired —
+                // surface the more specific tail when we can tell.
+                if (rec_ptr.revoked) {
+                    result_label = "revoked";
+                } else {
+                    result_label = "expired";
+                }
+                return null;
+            }
+            result_label = "ok";
             return .{
                 .user_id = rec_ptr.user_id,
                 .run_id = rec_ptr.run_id,
@@ -12344,6 +12439,7 @@ const TraceShareStore = struct {
         // would re-mint the by_owner entry on first use. The public GET
         // only consults by_code, which is now populated.
 
+        result_label = "ok";
         return .{
             .user_id = rec.user_id,
             .run_id = rec.run_id,
@@ -12375,6 +12471,13 @@ const TraceShareStore = struct {
         now_unix: i64,
         events_json: []const u8,
     ) !ShareCreateResult {
+        // S5 (2026-05-29, prod-readiness) — trace_share_total{op="create"}
+        // emit. `result_label` is mutated per-exit-path. "err" is the
+        // catch-all fallback for unanticipated error paths — the spec
+        // vocabulary is ok|cap|err for create.
+        var result_label: []const u8 = "err";
+        defer observability.recordMetricGlobal(.{ .trace_share_total = .{ .op = "create", .result = result_label } });
+
         const ttl_secs: i64 = ttl_hours * 3600;
         const expires_at = now_unix + ttl_secs;
 
@@ -12398,6 +12501,7 @@ const TraceShareStore = struct {
                 if (existing_rec.isLive(now_unix)) {
                     // Idempotent re-share — discard our fresh key_buf.
                     self.allocator.free(key_buf);
+                    result_label = "ok";
                     return .{
                         .already_existed = true,
                         .share_code = existing_rec.share_code,
@@ -12461,6 +12565,7 @@ const TraceShareStore = struct {
             }
         }
         if (live_count >= MAX_LIVE_SHARES_PER_USER) {
+            result_label = "cap";
             return error.ShareLimitReached;
         }
 
@@ -12548,6 +12653,7 @@ const TraceShareStore = struct {
         errdefer self.allocator.free(code_for_owner);
         try self.by_owner.put(self.allocator, key_buf, code_for_owner);
 
+        result_label = "ok";
         return .{
             .already_existed = false,
             .share_code = code_owned,
@@ -12565,6 +12671,13 @@ const TraceShareStore = struct {
     /// flips revoked=true so the public GET 404s on restart-recovery
     /// lookup. Returns true if either layer found something to revoke.
     fn revoke(self: *TraceShareStore, user_id: []const u8, run_id: []const u8) !bool {
+        // S5 (2026-05-29, prod-readiness) — trace_share_total{op="revoke"}
+        // emit. Spec vocabulary for revoke is ok|not_found|err. The
+        // ok-vs-not_found tail is derived from the boolean return at the
+        // end; an error path leaves the default "err" in place.
+        var result_label: []const u8 = "err";
+        defer observability.recordMetricGlobal(.{ .trace_share_total = .{ .op = "revoke", .result = result_label } });
+
         self.mutex.lock();
         defer self.mutex.unlock();
         const probe_key = try ownerKey(self.allocator, user_id, run_id);
@@ -12593,7 +12706,9 @@ const TraceShareStore = struct {
             }
         }
 
-        return found_in_cache or found_in_pg;
+        const found = found_in_cache or found_in_pg;
+        result_label = if (found) "ok" else "not_found";
+        return found;
     }
 };
 
@@ -27996,6 +28111,182 @@ test "metricsPayload S5: registry counter shows up in scrape" {
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_approval_decision_total{result=\"issued\"} 2") != null);
+}
+
+// ── S5 (2026-05-29, prod-readiness) emit-site round-trip tests ──
+//
+// Each test installs both a stack-local Registry as the global
+// chartable-signals registry AND a stack-local MetricsRegistryObserver
+// as the global metric observer, so a `recordMetricGlobal` from any
+// emit site lands a counter or histogram sample observable via the
+// rendered /metrics scrape. The tests assert end-to-end:
+//
+//   recordMetricGlobal(.{ .family = ... })
+//     → MetricsRegistryObserver.recordMetric
+//     → Registry.incCounter / observeHistogram
+//     → metricsPayload() → string match on the rendered scrape
+
+test "S5 emit-site: tool_call_total + tool_call_latency_ms register and render" {
+    const allocator = std.testing.allocator;
+    var reg = observability_metrics.Registry.init(allocator);
+    defer reg.deinit();
+    observability_metrics.setGlobalRegistry(&reg);
+    defer observability_metrics.setGlobalRegistry(null);
+
+    var mro = MetricsRegistryObserver{ .registry = &reg };
+    var mro_obs = mro.observer();
+    observability.setGlobalObserver(&mro_obs);
+    defer observability.setGlobalObserver(null);
+
+    observability.recordMetricGlobal(.{ .tool_call_total = .{ .tool = "memory_store", .result = "ok" } });
+    observability.recordMetricGlobal(.{ .tool_call_latency_ms = .{ .tool = "memory_store", .value = 42 } });
+
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_tool_call_total{tool=\"memory_store\",result=\"ok\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_tool_call_latency_ms_sum{tool=\"memory_store\"} 42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_tool_call_latency_ms_count{tool=\"memory_store\"} 1") != null);
+}
+
+test "S5 emit-site: approval_decision_total{result=\"issued\"} registers and renders" {
+    const allocator = std.testing.allocator;
+    var reg = observability_metrics.Registry.init(allocator);
+    defer reg.deinit();
+    observability_metrics.setGlobalRegistry(&reg);
+    defer observability_metrics.setGlobalRegistry(null);
+
+    var mro = MetricsRegistryObserver{ .registry = &reg };
+    var mro_obs = mro.observer();
+    observability.setGlobalObserver(&mro_obs);
+    defer observability.setGlobalObserver(null);
+
+    observability.recordMetricGlobal(.{ .approval_decision_total = .{ .result = "issued" } });
+
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_approval_decision_total{result=\"issued\"} 1") != null);
+}
+
+test "S5 emit-site: artifact_export_total + artifact_export_latency_ms register and render" {
+    const allocator = std.testing.allocator;
+    var reg = observability_metrics.Registry.init(allocator);
+    defer reg.deinit();
+    observability_metrics.setGlobalRegistry(&reg);
+    defer observability_metrics.setGlobalRegistry(null);
+
+    var mro = MetricsRegistryObserver{ .registry = &reg };
+    var mro_obs = mro.observer();
+    observability.setGlobalObserver(&mro_obs);
+    defer observability.setGlobalObserver(null);
+
+    observability.recordMetricGlobal(.{ .artifact_export_total = .{ .format = "pdf", .result = "ok" } });
+    observability.recordMetricGlobal(.{ .artifact_export_latency_ms = .{ .format = "pdf", .value = 123 } });
+
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_artifact_export_total{format=\"pdf\",result=\"ok\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_artifact_export_latency_ms_sum{format=\"pdf\"} 123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_artifact_export_latency_ms_count{format=\"pdf\"} 1") != null);
+}
+
+test "S5 emit-site: memory_op_total + memory_op_latency_ms register and render" {
+    const allocator = std.testing.allocator;
+    var reg = observability_metrics.Registry.init(allocator);
+    defer reg.deinit();
+    observability_metrics.setGlobalRegistry(&reg);
+    defer observability_metrics.setGlobalRegistry(null);
+
+    var mro = MetricsRegistryObserver{ .registry = &reg };
+    var mro_obs = mro.observer();
+    observability.setGlobalObserver(&mro_obs);
+    defer observability.setGlobalObserver(null);
+
+    observability.recordMetricGlobal(.{ .memory_op_total = .{ .op = "store", .result = "ok" } });
+    observability.recordMetricGlobal(.{ .memory_op_latency_ms = .{ .op = "store", .value = 7 } });
+
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_memory_op_total{op=\"store\",result=\"ok\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_memory_op_latency_ms_sum{op=\"store\"} 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_memory_op_latency_ms_count{op=\"store\"} 1") != null);
+}
+
+test "S5 emit-site: trace_share_total{op=\"create\",result=\"ok\"} registers and renders" {
+    const allocator = std.testing.allocator;
+    var reg = observability_metrics.Registry.init(allocator);
+    defer reg.deinit();
+    observability_metrics.setGlobalRegistry(&reg);
+    defer observability_metrics.setGlobalRegistry(null);
+
+    var mro = MetricsRegistryObserver{ .registry = &reg };
+    var mro_obs = mro.observer();
+    observability.setGlobalObserver(&mro_obs);
+    defer observability.setGlobalObserver(null);
+
+    observability.recordMetricGlobal(.{ .trace_share_total = .{ .op = "create", .result = "ok" } });
+
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_trace_share_total{op=\"create\",result=\"ok\"} 1") != null);
+}
+
+test "S5 emit-site: meter_receipt_total{result=\"ok\"} registers and renders" {
+    const allocator = std.testing.allocator;
+    var reg = observability_metrics.Registry.init(allocator);
+    defer reg.deinit();
+    observability_metrics.setGlobalRegistry(&reg);
+    defer observability_metrics.setGlobalRegistry(null);
+
+    var mro = MetricsRegistryObserver{ .registry = &reg };
+    var mro_obs = mro.observer();
+    observability.setGlobalObserver(&mro_obs);
+    defer observability.setGlobalObserver(null);
+
+    observability.recordMetricGlobal(.{ .meter_receipt_total = .{ .result = "ok" } });
+
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_meter_receipt_total{result=\"ok\"} 1") != null);
+}
+
+test "S5 emit-site: extension_ws_command_total routes through registry" {
+    const allocator = std.testing.allocator;
+    var reg = observability_metrics.Registry.init(allocator);
+    defer reg.deinit();
+    observability_metrics.setGlobalRegistry(&reg);
+    defer observability_metrics.setGlobalRegistry(null);
+
+    var mro = MetricsRegistryObserver{ .registry = &reg };
+    var mro_obs = mro.observer();
+    observability.setGlobalObserver(&mro_obs);
+    defer observability.setGlobalObserver(null);
+
+    observability.recordMetricGlobal(.{ .extension_ws_command_total = .{ .result = "ok", .tool = "extension_screenshot" } });
+
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+    const payload = try metricsPayload(allocator, &gs);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "nullalis_extension_ws_command_total{result=\"ok\",tool=\"extension_screenshot\"} 1") != null);
 }
 
 // ── jsonEscapeInto tests ────────────────────────────────────────

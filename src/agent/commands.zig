@@ -2899,6 +2899,10 @@ fn handleGenericToolApprove(self: anytype, arg: []const u8) ![]const u8 {
     if (decision == .deny) {
         const id_snapshot = pending.id;
         self.clearPendingToolApproval();
+        // S5 (2026-05-29, prod-readiness) — user-resolution tail of
+        // the approval lifecycle. The complementary "issued" emit fires
+        // at the preflight gate in `preflightToolPolicy` (root.zig).
+        observability.recordMetricGlobal(.{ .approval_decision_total = .{ .result = "user_denied" } });
         return try std.fmt.allocPrint(
             self.allocator,
             "Tool approval id={d} denied.",
@@ -2913,6 +2917,12 @@ fn handleGenericToolApprove(self: anytype, arg: []const u8) ![]const u8 {
         " (allow-always not supported for generic tool approval in v1 — ran once)"
     else
         "";
+
+    // S5 (2026-05-29, prod-readiness) — user-resolution tail of the
+    // approval lifecycle. Emit BEFORE executeApprovedPendingTool runs so
+    // the counter reflects the user decision regardless of whether the
+    // tool itself later raises an error.
+    observability.recordMetricGlobal(.{ .approval_decision_total = .{ .result = "user_approved" } });
 
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();

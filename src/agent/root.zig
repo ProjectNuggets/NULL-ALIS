@@ -2555,8 +2555,21 @@ pub const Agent = struct {
             if (self.policy) |pol| {
                 const outcome = resolveApprovalGateOutcome(meta, pol.autonomy);
                 switch (outcome) {
-                    .allow => {},
+                    .allow => {
+                        // S5 (2026-05-29, prod-readiness) — the gate ran
+                        // and the policy auto-approved. Only emitted
+                        // when a SecurityPolicy is configured AND the
+                        // approval-bypass is not active, so the counter
+                        // tracks genuine approval-relevant decisions
+                        // rather than every safe-tool dispatch.
+                        observability.recordMetricGlobal(.{ .approval_decision_total = .{ .result = "auto_approved" } });
+                    },
                     .deny => {
+                        // S5 (2026-05-29, prod-readiness) — policy-level
+                        // deny is the "blocked" tail of the approval
+                        // lifecycle. Operator-only autonomy tier rejects
+                        // any confirm-required tool outright.
+                        observability.recordMetricGlobal(.{ .approval_decision_total = .{ .result = "blocked" } });
                         return .{ .blocked = .{
                             .name = call.name,
                             .tool_call_id = call.tool_call_id,
@@ -2603,6 +2616,13 @@ pub const Agent = struct {
                             .run_id = self.current_run_id,
                         } };
                         self.observer.recordEvent(&event);
+                        // S5 (2026-05-29, prod-readiness) — approval-lifecycle
+                        // chartable signal. "issued" denotes "the gate raised
+                        // a confirm request to the user." The user-resolution
+                        // tail (user_approved / user_denied) lands at the
+                        // commands.zig `/approve` handler; this site only
+                        // emits issuance.
+                        observability.recordMetricGlobal(.{ .approval_decision_total = .{ .result = "issued" } });
                         return .{ .blocked = .{
                             .name = call.name,
                             .tool_call_id = call.tool_call_id,
@@ -5261,6 +5281,21 @@ pub const Agent = struct {
     }
 
     fn executeToolUnchecked(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
+        // S5 (2026-05-29, prod-readiness) — per-tool latency + result counter.
+        // `observed_result` defaults to "unknown_tool" so the for-loop fall-
+        // through (no matching tool name) is correctly labeled. Each exit
+        // path mutates it before its `return`:
+        //   - "invalid_args" — JSON parse or non-object args
+        //   - "err"         — `t.execute` raised OR `result.success == false`
+        //                     (covers exec-block-message refusals too)
+        //   - "ok"          — happy path
+        const start_ms = std.time.milliTimestamp();
+        var observed_result: []const u8 = "unknown_tool";
+        defer {
+            const elapsed_ms: u64 = @intCast(@max(@as(i64, 0), std.time.milliTimestamp() - start_ms));
+            observability.recordMetricGlobal(.{ .tool_call_total = .{ .tool = call.name, .result = observed_result } });
+            observability.recordMetricGlobal(.{ .tool_call_latency_ms = .{ .tool = call.name, .value = elapsed_ms } });
+        }
         for (self.tools) |t| {
             if (std.mem.eql(u8, t.name(), call.name)) {
                 // Record this dispatch against the session weight budget
@@ -5283,6 +5318,7 @@ pub const Agent = struct {
                     call.arguments_json,
                     .{},
                 ) catch {
+                    observed_result = "invalid_args";
                     return .{
                         .name = call.name,
                         .output = "Invalid arguments JSON",
@@ -5295,6 +5331,7 @@ pub const Agent = struct {
                 const args: std.json.ObjectMap = switch (parsed.value) {
                     .object => |o| o,
                     else => {
+                        observed_result = "invalid_args";
                         return .{
                             .name = call.name,
                             .output = "Arguments must be a JSON object",
@@ -5306,6 +5343,7 @@ pub const Agent = struct {
 
                 if (isExecToolName(call.name)) {
                     if (self.execBlockMessage(args)) |msg| {
+                        observed_result = "err";
                         return .{
                             .name = call.name,
                             .output = msg,
@@ -5316,6 +5354,7 @@ pub const Agent = struct {
                 }
 
                 const result = t.execute(tool_allocator, args) catch |err| {
+                    observed_result = "err";
                     return .{
                         .name = call.name,
                         .output = @errorName(err),
@@ -5323,6 +5362,7 @@ pub const Agent = struct {
                         .tool_call_id = call.tool_call_id,
                     };
                 };
+                observed_result = if (result.success) "ok" else "err";
                 return .{
                     .name = call.name,
                     .output = if (result.success) result.output else (result.error_msg orelse result.output),
@@ -5332,6 +5372,7 @@ pub const Agent = struct {
             }
         }
 
+        // observed_result stays "unknown_tool" — the defer above emits it.
         return .{
             .name = call.name,
             .output = "Unknown tool",
