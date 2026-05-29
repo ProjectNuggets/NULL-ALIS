@@ -59,11 +59,27 @@ the metric-driven view. The SLO targets themselves still live in
 | `nullalis_tool_call_total` | counter | `tool`, `result` | YES | Per-tool dispatch. Tool is canonical name (LLM-fabricated names land as `unknown` to cap cardinality). Result ∈ {ok, err, unknown_tool, invalid_args}. |
 | `nullalis_tool_call_latency_ms` | histogram | `tool` | YES | Per-tool latency. p50/p95 via `histogram_quantile()` on the scrape side. |
 | `nullalis_meter_receipt_total` | counter | `result` | NO | Cost-tracker meter-receipt ledger emit. Currently zero call sites in prod — counter ships for when wiring lands. |
-| `nullalis_extension_ws_command_total` | counter | `result`, `tool` | YES | Extension-WS commands. Result ∈ {ok, timeout, conn_closed, oom, queue_drained, command_alloc_failed, no_conn, registration_failed}. |
+| `nullalis_extension_ws_command_total` | counter | `result`, `tool` | YES | Extension-WS commands (emitted by the S4-owned hub). Result ∈ {ok, timeout, conn_closed, oom, error_other, no_conn} — the exact set the hub emits (`src/extension_ws/hub.zig`); `error_other` is the catch-all for unclassified `sendCommand` errors. |
 | `nullalis_extension_ws_command_latency_ms` | histogram | none | YES | Extension-WS command roundtrip. |
 | `nullalis_extension_ws_ssrf_block_total` | counter | none | YES | Extension-WS SSRF denials. |
 | `nullalis_gateway_degraded` | gauge | `configured`, `effective`, `reason` | **YES — gate** | 1 when configured backend != effective backend. In production this is always 0; startup is fail-loud when it would be 1, so the process exits before serving. |
 | `nullalis_metrics_registry_dropped_series_total` | counter | none | YES | Count of NEW metric series the registry refused because it hit the `MAX_SERIES` (4096) cardinality cap. **Should be 0.** A non-zero, growing value means a label dimension is exploding (an untrusted/unbounded label value) — investigate before it would have OOM'd. Alert: `increase(nullalis_metrics_registry_dropped_series_total[15m]) > 0`. |
+| `nullalis_artifact_create_total` | counter | none | NO | Artifact lifecycle — successful create. |
+| `nullalis_artifact_update_total` | counter | none | NO | Artifact lifecycle — successful update (new version). |
+| `nullalis_artifact_share_total` | counter | none | NO | Artifact lifecycle — share-link mint. |
+| `nullalis_artifact_share_revoke_total` | counter | none | NO | Artifact lifecycle — share-link revoke. |
+| `nullalis_share_create_success_total` | counter | none | NO | Trace-share mint success (first mint per record; idempotent re-mints do not increment). |
+| `nullalis_share_create_429_total` | counter | none | YES | Trace-share mint denied by the per-user spam cap (D64). A rising rate is an abuse signal. Alert: `rate(nullalis_share_create_429_total[5m]) > 0` sustained. |
+| `nullalis_produce_document_total` | counter | `format`, `result` | NO | produce_document tool dispatch. Format ∈ {pdf, docx, pptx, xlsx, html, md}; result ∈ {ok, tool_missing, render_failed, invalid_input}. |
+| `nullalis_produce_document_latency_ms` | histogram | `format` | NO | produce_document render latency by format (same bucket scheme). |
+| `nullalis_trace_query_total` | counter | none | NO | `trace_query` read-only introspection tool dispatch count. |
+| `nullalis_memory_doctor_total` | counter | none | NO | `memory_doctor` readiness-check tool dispatch count. |
+| `nullalis_moonshot_video_upload_total` | counter | `result` | NO | Moonshot Files API video upload. Result ∈ {ok, http_4xx, http_5xx, network_error, size_cap}. Dormant unless `experimental_video_upload` is enabled (see deferred-register D66). |
+| `nullalis_moonshot_video_upload_bytes` | histogram | none | NO | Moonshot video upload bytes-on-the-wire. **Bucket boundaries are unitless order-of-magnitude thresholds, not milliseconds** (the histogram substrate is shared). |
+
+> The 12 rows above are the v1.14.23 "chartable surfaces" that S5 wired into the
+> registry (`MetricsRegistryObserver` in `src/gateway.zig`). They render on every
+> scrape with HELP/TYPE; none is a V1 launch gate, but operators get them for free.
 
 The catalog above mirrors `metricsPayload()` in `src/gateway.zig` and the
 S5-family HELP/TYPE block plus the registry-driven series. If you find a
@@ -82,6 +98,14 @@ above that is not actually emitted, drop it.
 - **Histogram bucket boundaries are milliseconds** and are reused as-is for
   the byte-valued `nullalis_moonshot_video_upload_bytes` family — the
   boundaries there are unitless order-of-magnitude thresholds, not ms.
+- **Result-cache hits count in `tool_call_total` but not in subsystem metrics.**
+  Cacheable tools (`web_search`, `memory_recall`, composio) served from the
+  result cache increment `nullalis_tool_call_total` / `_latency_ms` (the agent
+  *did* dispatch the tool), but do NOT increment `nullalis_memory_op_total` —
+  a cached `memory_recall` never touched the memory subsystem. So
+  `tool_call_total{tool="memory_recall"}` ≥ `memory_op_total{op="recall"}`; the
+  difference is the cache-hit count. This is intentional: `tool_call_*` is the
+  dispatch view, `memory_op_*` is the subsystem view.
 - **Memory ops are counted twice, by design.** A `memory_store` / `recall` /
   `forget` dispatch increments BOTH `nullalis_tool_call_total{tool="memory_*"}`
   (the agent-level per-tool view) AND `nullalis_memory_op_total{op="*"}` (the
