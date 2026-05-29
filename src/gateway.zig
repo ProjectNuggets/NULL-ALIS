@@ -1189,11 +1189,25 @@ pub const GatewayState = struct {
         // (gated on `metrics_registry_owned` — a test that installs
         // its own stack-local registry via `setGlobalRegistry` would
         // otherwise have its stack memory destroyed here).
-        observability.setGlobalObserver(null);
+        //
+        // S5 review-fix F3 (2026-05-29) — shutdown protocol with grace
+        // period. A thread that has already loaded `getGlobalObserver()`
+        // via the `.acquire` atomic load holds a `*Observer` pointer
+        // that resolves through the still-loaded module's vtable; the
+        // observer's `self.registry` field, however, points at heap
+        // memory we are about to free. Without a quiesce barrier, a
+        // recordMetric call mid-shutdown would touch a freed Registry.
+        // The shutdown protocol is explicit now:
+        //   1. detachGlobalObserverAndWait() clears the global observer
+        //      pointer and waits until all in-flight recordMetricGlobal
+        //      calls that borrowed the old pointer have returned.
+        //   2. detachGlobalRegistryAndWait(reg) clears the scrape pointer
+        //      and waits until any in-flight metricsPayload render using
+        //      the old registry has returned.
+        //   3. reg.deinit(); destroy(reg).
+        observability.detachGlobalObserverAndWait();
         if (self.metrics_registry_owned) |reg| {
-            if (observability_metrics.globalRegistry() == reg) {
-                observability_metrics.setGlobalRegistry(null);
-            }
+            observability_metrics.detachGlobalRegistryAndWait(reg);
             reg.deinit();
             self.allocator.destroy(reg);
             self.metrics_registry_owned = null;
@@ -1457,7 +1471,73 @@ const MetricsRegistryObserver = struct {
             .extension_ws_ssrf_block_total => |_| {
                 self.registry.incCounter("nullalis_extension_ws_ssrf_block_total");
             },
-            else => {}, // other variants are handled by LifecycleMetricsObserver / log-level emit.
+            // S5 review-fix F2 (2026-05-29) — route the v1.14.23
+            // chartable variants that were dropped to log-only by the
+            // previous `else => {}` branch. Pre-S5 these were a silent
+            // gap: chartable per the variant doc-comments but the only
+            // observer touching them was LifecycleMetricsObserver
+            // (whose recordMetric is a literal no-op). Now they land
+            // in the registry alongside the S5 catalog.
+            .artifact_create_total => |_| {
+                self.registry.incCounter("nullalis_artifact_create_total");
+            },
+            .artifact_update_total => |_| {
+                self.registry.incCounter("nullalis_artifact_update_total");
+            },
+            .artifact_share_total => |_| {
+                self.registry.incCounter("nullalis_artifact_share_total");
+            },
+            .artifact_share_revoke_total => |_| {
+                self.registry.incCounter("nullalis_artifact_share_revoke_total");
+            },
+            .share_create_success_total => |_| {
+                self.registry.incCounter("nullalis_share_create_success_total");
+            },
+            .share_create_429_total => |_| {
+                // D64 spam-cap signal — explicitly chartable per the
+                // ObserverMetric doc-comment. Operators alert on rate
+                // increases to detect a bot/abuser hammering the
+                // share-mint endpoint.
+                self.registry.incCounter("nullalis_share_create_429_total");
+            },
+            .produce_document_total => |e| {
+                var buf: [192]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "nullalis_produce_document_total{{format=\"{s}\",result=\"{s}\"}}", .{ e.format, e.result }) catch return;
+                self.registry.incCounter(key);
+            },
+            .produce_document_latency_ms => |e| {
+                var buf: [128]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "nullalis_produce_document_latency_ms{{format=\"{s}\"}}", .{e.format}) catch return;
+                self.registry.observeHistogram(key, e.value);
+            },
+            .trace_query_total => |_| {
+                self.registry.incCounter("nullalis_trace_query_total");
+            },
+            .memory_doctor_total => |_| {
+                self.registry.incCounter("nullalis_memory_doctor_total");
+            },
+            .moonshot_video_upload_total => |e| {
+                var buf: [128]u8 = undefined;
+                const key = std.fmt.bufPrint(&buf, "nullalis_moonshot_video_upload_total{{result=\"{s}\"}}", .{e.result}) catch return;
+                self.registry.incCounter(key);
+            },
+            .moonshot_video_upload_bytes => |v| {
+                // Bytes-on-the-wire histogram per the ObserverMetric
+                // doc-comment. The substrate's histogram buckets are
+                // labeled `_ms` and use millisecond bucket boundaries,
+                // but we reuse them here because bucket boundaries
+                // (10, 50, ..., 10000, +Inf) are size-agnostic and
+                // operators recognize them as generic order-of-magnitude
+                // thresholds. Series name stays `_bytes` so dashboards
+                // know the unit.
+                self.registry.observeHistogram("nullalis_moonshot_video_upload_bytes", v);
+            },
+            // Gauges + generic variants are routed by other observers
+            // (LogObserver, OtelObserver). `request_latency_ms` /
+            // `tokens_used` / `active_sessions` / `queue_depth` stay
+            // here; a future Registry extension may add gauge support
+            // and a fan-in pass for generic histograms.
+            else => {},
         }
     }
 };
@@ -7206,9 +7286,34 @@ fn metricsPayload(allocator: std.mem.Allocator, state: *const GatewayState) ![]u
         \\# TYPE nullalis_extension_ws_command_latency_ms histogram
         \\# HELP nullalis_extension_ws_ssrf_block_total Extension WS SSRF block denials.
         \\# TYPE nullalis_extension_ws_ssrf_block_total counter
+        \\# HELP nullalis_artifact_create_total Artifact-lifecycle create counter.
+        \\# TYPE nullalis_artifact_create_total counter
+        \\# HELP nullalis_artifact_update_total Artifact-lifecycle update counter.
+        \\# TYPE nullalis_artifact_update_total counter
+        \\# HELP nullalis_artifact_share_total Artifact-lifecycle share counter (mint).
+        \\# TYPE nullalis_artifact_share_total counter
+        \\# HELP nullalis_artifact_share_revoke_total Artifact-lifecycle share-revoke counter.
+        \\# TYPE nullalis_artifact_share_revoke_total counter
+        \\# HELP nullalis_share_create_success_total Share-mint successes (first mint per record; idempotent re-mints do not increment).
+        \\# TYPE nullalis_share_create_success_total counter
+        \\# HELP nullalis_share_create_429_total Share-mint denials due to per-user spam cap (D64).
+        \\# TYPE nullalis_share_create_429_total counter
+        \\# HELP nullalis_produce_document_total produce_document tool dispatch by format and result.
+        \\# TYPE nullalis_produce_document_total counter
+        \\# HELP nullalis_produce_document_latency_ms produce_document tool latency histogram by format.
+        \\# TYPE nullalis_produce_document_latency_ms histogram
+        \\# HELP nullalis_trace_query_total trace_query tool dispatch counter.
+        \\# TYPE nullalis_trace_query_total counter
+        \\# HELP nullalis_memory_doctor_total memory_doctor tool dispatch counter.
+        \\# TYPE nullalis_memory_doctor_total counter
+        \\# HELP nullalis_moonshot_video_upload_total Moonshot Files API video upload result counter.
+        \\# TYPE nullalis_moonshot_video_upload_total counter
+        \\# HELP nullalis_moonshot_video_upload_bytes Moonshot Files API video upload bytes-on-the-wire histogram (bucket boundaries are unitless order-of-magnitude thresholds).
+        \\# TYPE nullalis_moonshot_video_upload_bytes histogram
         \\
     , .{});
-    if (observability_metrics.globalRegistry()) |reg| {
+    if (observability_metrics.borrowGlobalRegistry()) |reg| {
+        defer observability_metrics.releaseGlobalRegistry();
         try reg.render(allocator, w);
     }
 
@@ -22034,6 +22139,47 @@ pub fn runWithRole(
     var gateway_global_observer: Observer = undefined;
     const needs_local_agent = gatewayRoleNeedsLocalAgent(role, event_bus != null);
 
+    // S5 review-fix F1 (2026-05-29) — install the process-wide
+    // chartable-signals registry and compose the global observer in
+    // EVERY gateway role (.shared, .broker, .user_cell — including the
+    // daemon-mode `event_bus != null` path where `needs_local_agent` is
+    // false). Previously this lived inside the local-agent branch
+    // below; daemon/broker/user_cell gateways had no registry installed,
+    // no global observer wired, and `/metrics` showed only HELP/TYPE
+    // catalog lines with zero series.
+    //
+    // The substrate guarantees:
+    //   - `observability_metrics.globalRegistry()` returns non-null,
+    //     so `metricsPayload` renders the registry-driven section.
+    //   - `observability.getGlobalObserver()` returns non-null, so
+    //     every cross-cutting `recordMetricGlobal` site routes through
+    //     the LogObserver + LifecycleMetrics + Sentry + OTel + Registry
+    //     fan-out.
+    //   - Lifetime: the slots live on the stack here for the whole
+    //     `runWithRole` body; teardown is via `GatewayState.deinit`,
+    //     which detaches the global observer/registry and waits for
+    //     active metric emitters/scrapes before freeing the registry.
+    //
+    // OOM here is treated as configuration-level failure — propagate
+    // so the operator sees the boot error rather than silently losing
+    // the entire S5 catalog.
+    const registry_ptr = try allocator.create(observability_metrics.Registry);
+    registry_ptr.* = observability_metrics.Registry.init(allocator);
+    observability_metrics.setGlobalRegistry(registry_ptr);
+    state.metrics_registry_observer = .{ .registry = registry_ptr };
+    state.metrics_registry_owned = registry_ptr;
+
+    gateway_observer_slots = .{
+        log_obs_gateway.observer(),
+        metrics_obs_gateway.observer(),
+        sentry_runtime.globalOrFallback().observer(),
+        if (otel_obs_gateway_opt) |*otel| otel.observer() else noop_obs_gateway.observer(),
+        state.metrics_registry_observer.observer(),
+    };
+    gateway_observer_multi = .{ .observers = gateway_observer_slots[0..] };
+    gateway_global_observer = gateway_observer_multi.observer();
+    observability.setGlobalObserver(&gateway_global_observer);
+
     if (config_opt) |cfg_ptr| {
         const cfg = cfg_ptr;
         if (role == .user_cell and !cfg.tenant.enabled) {
@@ -22224,43 +22370,13 @@ pub fn runWithRole(
 
                 const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
 
-                // S5 (2026-05-29, prod-readiness) — allocate the
-                // process-wide chartable-signals registry, publish it
-                // via setGlobalRegistry so metricsPayload can scrape
-                // it, and stash a bridge observer on GatewayState so
-                // MultiObserver fan-out reaches incCounter/observeHistogram.
-                // OOM here is treated as configuration-level failure —
-                // propagate so the operator sees the boot error rather
-                // than silently losing the entire S5 catalog.
-                const reg_ptr = try allocator.create(observability_metrics.Registry);
-                reg_ptr.* = observability_metrics.Registry.init(allocator);
-                observability_metrics.setGlobalRegistry(reg_ptr);
-                state.metrics_registry_observer = .{ .registry = reg_ptr };
-                state.metrics_registry_owned = reg_ptr;
-
-                gateway_observer_slots = .{
-                    log_obs_gateway.observer(),
-                    metrics_obs_gateway.observer(),
-                    sentry_runtime.globalOrFallback().observer(),
-                    if (otel_obs_gateway_opt) |*otel| otel.observer() else noop_obs_gateway.observer(),
-                    state.metrics_registry_observer.observer(),
-                };
-                gateway_observer_multi = .{ .observers = gateway_observer_slots[0..] };
-
-                // Publish the composed multi as the process-wide
-                // observer so cross-cutting `recordMetricGlobal` sites
-                // (HTTP handlers, extension WS hub, provider upload
-                // paths) reach the S5 registry. The install must
-                // outlive this nested `if (needs_local_agent)` block
-                // for the full accept-loop lifetime, so we cannot use
-                // a nested-scope `defer setGlobalObserver(null)`.
-                // Detach happens in `GatewayState.deinit` immediately
-                // before the registry is freed, eliminating the race
-                // where a late-emit thread would read a stale global
-                // pointer mid-teardown.
-                gateway_global_observer = gateway_observer_multi.observer();
-                observability.setGlobalObserver(&gateway_global_observer);
-
+                // S5 review-fix F1 (2026-05-29) — registry + global
+                // observer install moved out of this branch up to the
+                // top of runWithRole so daemon/broker/user_cell modes
+                // also get a registry installed. The local-agent path
+                // still composes its own task_delivery + session_mgr
+                // using the same `gateway_observer_multi` that the
+                // function-level setup built; nothing changes below.
                 standalone_task_delivery = .{
                     .ledger = &(standalone_task_ledger.?),
                     .observer = gateway_observer_multi.observer(),

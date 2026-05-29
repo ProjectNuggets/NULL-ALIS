@@ -327,9 +327,13 @@ pub const ObserverMetric = union(enum) {
 // log lines, which is the right shape for those paths anyway.
 //
 // Thread-safety: the pointer is set once at boot, read many. Reads use
-// `@atomicLoad` to satisfy a tools-thread reading mid-init.
+// `@atomicLoad` to satisfy a tools-thread reading mid-init. Shutdown uses
+// an in-flight counter so the gateway can detach the pointer, wait for any
+// already-borrowed observer calls to finish, and only then free observer-
+// owned state.
 
 var global_observer: ?*Observer = null;
+var global_observer_inflight: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
 /// Install the process-wide observer. Called once by the gateway after
 /// composing its MultiObserver. Pass null at shutdown to detach.
@@ -340,6 +344,18 @@ pub fn setGlobalObserver(obs: ?*Observer) void {
 /// Borrow the current global observer (null if none installed).
 pub fn getGlobalObserver() ?*Observer {
     return @atomicLoad(?*Observer, &global_observer, .acquire);
+}
+
+/// Detach the process-wide observer and wait until every
+/// `recordMetricGlobal` call that already borrowed it has returned.
+/// This is a shutdown-only barrier; it deliberately waits without a
+/// timeout because freeing observer-owned memory while a caller still
+/// holds the observer pointer is a use-after-free.
+pub fn detachGlobalObserverAndWait() void {
+    setGlobalObserver(null);
+    while (global_observer_inflight.load(.acquire) != 0) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
 }
 
 const metric_log = std.log.scoped(.metric);
@@ -353,8 +369,15 @@ const metric_log = std.log.scoped(.metric);
 /// hot loop; it's intended for per-tool-call / per-request emit sites.
 pub fn recordMetricGlobal(metric: ObserverMetric) void {
     if (getGlobalObserver()) |obs| {
-        obs.recordMetric(&metric);
-        return;
+        _ = global_observer_inflight.fetchAdd(1, .acq_rel);
+        if (getGlobalObserver()) |current| {
+            if (current == obs) {
+                defer _ = global_observer_inflight.fetchSub(1, .acq_rel);
+                obs.recordMetric(&metric);
+                return;
+            }
+        }
+        _ = global_observer_inflight.fetchSub(1, .acq_rel);
     }
     // Graceful degradation: log the metric so the operator has a
     // grep target even when no observer is wired. Each variant gets
