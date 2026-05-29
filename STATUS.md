@@ -1,8 +1,33 @@
 # nullALIS — STATUS
 
-**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-29 — **prod-readiness Sprint S4 (extension browser readiness) shipped** (PR #111 / branch `prod-readiness/s4-extension-browser-readiness`). Prior refresh: 2026-05-25 covered the commercial v1 sprint Waves 1–5 + v1.14.22 hotfix + v1.14.23 hardening pass.
+**Hydrated:** 2026-05-10 from code truth. **Refreshed:** 2026-05-29 — **prod-readiness Sprint S6 (V1 production verification matrix) in progress** (branch `prod-readiness/s6-verification-matrix`). Prior refreshes (same day): S5 follow-up #113 merged (observability hardening), S5 #112 merged (observability + SLOs), S4 #111 merged (extension browser readiness). Prior session: 2026-05-25 covered the commercial v1 sprint Waves 1–5 + v1.14.22 hotfix + v1.14.23 hardening pass.
 
 This is the single cold-start document. If it disagrees with `.planning/STATE.md`, `PROJECT_LEDGER.md` (archived), or anything in `docs/archive/`, **this wins**.
+
+---
+
+## 2026-05-29 — Sprint S6: V1 production verification matrix (in progress)
+
+**Branch:** `prod-readiness/s6-verification-matrix`. Builds on the hardened S1–S5 stack (S1 #108, S2 #109, S3 #110, S4 #111, S5 #112 + follow-up #113 — all on `main`). S6 is the production-readiness closer: a fresh checkout must verify every V1 user-facing backend flow with two commands.
+
+What landed in the foundation commit (10e17731):
+
+- **`zig build test-postgres` named step** — runs the new `tests/verification/` aggregate. Default `zig build test` is **intentionally unchanged**; the matrix is additive.
+- **`tests/verification/harness.zig`** — canonical postgres URL resolver via `env_rebrand.getEnvOwnedWithRebrand` (`NULLALIS_POSTGRES_TEST_URL` primary + `NULLCLAW_POSTGRES_TEST_URL` legacy fallback with banner + per-key warning); per-test schema name builder (microsecond timestamp); skip-graceful semantics matching the established `tests/agent/promotion_reflection_pg_test.zig` idiom.
+- **First real consumer: `health_metrics_test.zig`** — pins the S5 chartable catalog membership (11 counters + 2 histogram families), the H1 cardinality-counter exposure invariant from #113, and counter / histogram movement assertions against `Registry.render()`.
+- **CI wiring** — `.github/workflows/ci.yml`'s `canonical-production-profile` job runs the matrix against the existing pgvector service container.
+- **Operator runbook** — `docs/operations/verification-matrix.md` with TL;DR, env vars, per-PR vs per-release cadence, surface matrix table, failure triage, restart/pod-loss expectations, the hidden-V1-surfaces list, and the explicit "what S6 does NOT cover" boundary.
+- **V1 readiness report template** — `docs/operations/v1-readiness-report.md`, marked PENDING FINAL CONSOLIDATION until S1–S6 are all on main.
+
+Per-surface tests (chat stream, mode switch, session cancel, approvals, attachments, artifacts, trace sharing, extension browser, memory tools incl. `memory_purge_pii`, GDPR D25 cascade, schema-static, observability full coverage, startup fail-loud, Composio gated lane) are scaffolded as compiling placeholders; each is filled in by a follow-up task per the plan at `docs/superpowers/plans/2026-05-29-s6-verification-matrix.md`.
+
+Verification (foundation commit):
+
+- `zig build -Dengines=base,sqlite,postgres` → exit 0
+- `zig build test -Dengines=base,sqlite,postgres --summary all` → 22/22 steps, 6891/6970 passed, 79 skipped (unchanged from main)
+- `zig build test-postgres -Dengines=base,sqlite,postgres --summary all` → 6/6 steps, 7/7 passed (live-PG tests skip-graceful without env)
+
+**V1 hidden / not-claimed (verbatim):** `/api/v1/chat/{cancel,resume,approve}` as top-level routes; live subagent interruption; bi-temporal `valid_to` classifier; per-cell isolated pods; D52 Pillar 5 at-rest encryption of `pii_tagged` rows; address/name PII detection; 7-9 digit US-local phones without `+`; end-user Composio claims; public `/metrics` (operator-only).
 
 ---
 
