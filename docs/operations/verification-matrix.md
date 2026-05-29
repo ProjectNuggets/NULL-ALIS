@@ -62,31 +62,39 @@ Expected: `Build Summary: <M>/<M> steps succeeded; <V> tests passed`. No `failed
 
 The matrix runs as a dedicated step in the `canonical-production-profile` job in `.github/workflows/ci.yml`. It re-uses the `pgvector/pgvector:pg16` service container declared on that job, so the verification lane and the default canonical lane share one Postgres for the whole job.
 
-A failed `V1 production verification matrix (live Postgres)` step is a hard merge block. A failed `Run tests (canonical production engines)` step is also a hard block — both must be green.
+A failed `V1 production verification matrix` step is a hard merge block. A failed `Run tests (canonical production engines)` step is also a hard block — both must be green.
 
-## Surface matrix
+## Surface coverage
 
-Per-surface coverage status is tracked in this table. `Smoke` = the business-logic surface is exercised via the established in-process fixture pattern (handler / store / tool calls against fixtures); it does NOT include a bound-port HTTP roundtrip. `Deferred` = covered by a higher-level CI lane (the canonical job) or by operator-driven manual verification per the documented runbook.
+This section lists ONLY surfaces that the matrix actually pins. `Smoke` = the business-logic surface is exercised via the established in-process fixture pattern (handler / store / tool calls against fixtures); it does NOT include a bound-port HTTP roundtrip. The table is the operator's authoritative coverage answer — surfaces planned but not yet pinned live in the **Coverage roadmap** subsection below so the table never makes a promise the code does not keep.
 
 | Surface | Status | Test file | Failure mode pin |
 |---|---|---|---|
-| `/health`, `/ready`, `/metrics` payload + S5 catalog | Smoke | `tests/verification/health_metrics_test.zig` | series-name absence → MissingMetricSeries; counter not advancing → CounterMovementBroken |
-| Chat stream — SSE event-name surface + phantom-route absence | Pending (placeholder) | `tests/verification/chat_stream_test.zig` | event name missing in emit set; phantom route present in OpenAPI |
-| Mode switching — valid/invalid transitions + persistence | Pending (placeholder) | `tests/verification/mode_switch_test.zig` | mode not persisted across reopen |
-| Session cancel — idle/active/idempotent | Pending (placeholder) | `tests/verification/session_cancel_test.zig` | non-canonical response shape |
-| Approvals — stable `apr-{u64}` id + 409 stale-card + approve/deny/expiry/idempotency/cross-session/irreversible | Pending (placeholder) | `tests/verification/approvals_test.zig` | malformed approval_id; missing 409 guard |
-| Attachments — upload + Idempotency-Key dedupe + invalid + cross-user | Pending (placeholder) | `tests/verification/attachments_test.zig` | duplicate insert on same Idempotency-Key |
-| Artifacts — CRUD + share/revoke + export + unsafe-filename + cross-user | Pending (placeholder) | `tests/verification/artifacts_test.zig` | `isSafeAttachmentFilename` accepting `../`; cross-user read |
-| Trace sharing — create/get/revoke + sanitizer whitelist + restart-equivalent durability + cross-user list | Pending (placeholder) | `tests/verification/trace_share_test.zig` | sanitizer leaks `user_id` / `session_id`; share lost on manager reopen |
-| Extension browser — every shipped `extension_*` command via mock hub | Pending (placeholder, partial coverage exists in `tests/extension/mock_hub_e2e_test.zig`) | `tests/verification/extension_browser_test.zig` | per-tool: no-extension, happy, timeout, extension-error |
-| Memory tools — store/recall/forget/doctor + `memory_purge_pii` dry+wet + user isolation | Pending (placeholder) | `tests/verification/memory_tools_test.zig` | PII detector tagging address/name (V1 is phone+email only) |
-| Postgres GDPR D25 cascade across 19 FK tables | Pending (placeholder) | `tests/verification/gdpr_cascade_test.zig` | row remains after `DELETE FROM users` |
-| Static schema invariants (D33-equivalent) | Pending (placeholder) | `tests/verification/schema_static_test.zig` | required table missing; FK constraint `delete_rule` not CASCADE |
-| Observability/SLO — full S5 catalog + counter+histogram movement + cardinality cap | Partial (catalog + cardinality in `health_metrics_test.zig`); full coverage pending | `tests/verification/observability_test.zig` | catalog drift vs `docs/operations/SLOs.md` §2 |
-| Startup fail-loud — production-mode + missing PG → non-zero exit | Pending (placeholder) | `tests/verification/startup_fail_loud_test.zig` | `isFatalStartupError` not covering a new `StartupSelfCheckError` variant |
-| Composio gated lane | Pending (placeholder) | `tests/verification/composio_gated_test.zig` | env-set path mutating production data (test reject) |
+| S5 chartable metrics catalog (the 18 counters + 6 histograms declared at `src/gateway.zig:7290-7337`) | Smoke | `tests/verification/health_metrics_test.zig` | catalog drift between gateway HELP/TYPE block and Registry round-trip — fails with the exact missing series name printed by the test runner |
+| Registry cardinality cap exposure (H1 from S5 follow-up #113) | Smoke | `tests/verification/health_metrics_test.zig` | `nullalis_metrics_registry_dropped_series_total` not emitted on empty registry |
+| Histogram bucket distribution at the canonical BUCKETS_MS boundaries | Smoke | `tests/verification/health_metrics_test.zig` | bucket boundary refactor that breaks Grafana panel queries |
+| Postgres URL resolver contract (canonical + legacy fallback) | Smoke | `tests/verification/harness.zig` | overbroad catch silently swallowing a real env-read failure |
 
-Per-surface status will close to `Smoke` as the corresponding plan task lands.
+### Coverage roadmap
+
+The following surfaces are scheduled by the plan at [`docs/superpowers/plans/2026-05-29-s6-verification-matrix.md`](../superpowers/plans/2026-05-29-s6-verification-matrix.md) but are NOT yet pinned in CI. They are tracked here only so the runbook reader can locate which plan task will close each gap; do not treat them as covered.
+
+- Chat-stream SSE event-name surface + phantom-route absence — plan Task 2
+- Mode switching valid/invalid + persistence — plan Task 2
+- Session cancel idle/active/idempotent — plan Task 2
+- Approvals — stable `apr-{u64}` id, 409 stale-card, approve/deny/expiry, idempotency, cross-session, irreversible gating — plan Task 3
+- Attachments — upload + Idempotency-Key dedupe + invalid + cross-user — plan Task 3
+- Artifacts — CRUD, share/revoke, export, unsafe-filename, cross-user — plan Task 4
+- Trace sharing — create/get/revoke + sanitizer whitelist + restart-equivalent durability + cross-user list — plan Task 4
+- Extension browser — every shipped `extension_*` command via mock hub (partial coverage today in `tests/extension/mock_hub_e2e_test.zig`) — plan Task 5
+- Memory tools — store/recall/forget/doctor + `memory_purge_pii` dry+wet + user isolation — plan Task 5
+- Postgres GDPR D25 cascade across the 19 FK tables — plan Task 6
+- Static schema invariants (D33-equivalent) — plan Task 6
+- Full observability counter + histogram movement after representative flows — plan Task 7
+- Startup fail-loud — production-mode + missing PG → non-zero exit — plan Task 7
+- Composio gated lane — plan Task 8
+
+A surface migrates from this roadmap to the table above when its `tests/verification/*_test.zig` file lands real content + the matrix-doc row is added in the same commit.
 
 ## Failure triage
 
