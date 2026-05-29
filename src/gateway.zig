@@ -17209,7 +17209,9 @@ fn handleApiRoute(
             .connections_total = state.extension_ws_total.load(.monotonic),
             .auth_failed_total = state.extension_ws_auth_failed_total.load(.monotonic),
         };
-        const body = extensionStatusPayload(req_allocator, input) catch "{\"error\":\"render_failed\"}";
+        const body = extensionStatusPayload(req_allocator, input) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"render_failed\"}" };
+        };
         return .{ .status = "200 OK", .body = body };
     }
     if (std.mem.startsWith(u8, base_path, "/api/v1/diagnostics/extension/users/")) {
@@ -17259,7 +17261,9 @@ fn handleApiRoute(
             .connections_total = state.extension_ws_total.load(.monotonic),
             .auth_failed_total = state.extension_ws_auth_failed_total.load(.monotonic),
         };
-        const body = extensionUserStatusPayload(req_allocator, input, path_user_id) catch "{\"error\":\"render_failed\"}";
+        const body = extensionUserStatusPayload(req_allocator, input, path_user_id) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"render_failed\"}" };
+        };
         return .{ .status = "200 OK", .body = body };
     }
 

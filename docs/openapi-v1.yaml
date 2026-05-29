@@ -1375,9 +1375,13 @@ paths:
         '400':
           description: Invalid user_id path parameter.
         '401':
-          description: Neither a valid internal token nor a matching X-Zaki-User-Id was provided.
+          description: Missing or invalid internal token.
+        '403':
+          description: User-cell gateway is pinned to a different user.
         '405':
           description: Method not allowed (only GET supported).
+        '500':
+          description: Diagnostic payload rendering failed.
 
   # ── Planned endpoint additions (SOTA program) ──────────────────────
   #
