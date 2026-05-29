@@ -177,15 +177,23 @@ pub const ExtensionWsConn = struct {
     /// the agent releases → drops to 0 → free. Safe.
     refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
 
-    /// Wall-clock nanoseconds (std.time.nanoTimestamp) when this conn was
-    /// registered with the hub. Set once in `registerConn`; never updated
-    /// thereafter. Zero means "not yet registered" (only observable on a
-    /// half-constructed conn struct).
-    connected_at_ns: std.atomic.Value(i128) = std.atomic.Value(i128).init(0),
+    /// Wall-clock nanoseconds (std.time.nanoTimestamp, truncated to i64)
+    /// when this conn was registered with the hub. Set once in
+    /// `registerConn`; never updated thereafter. Zero means "not yet
+    /// registered" (only observable on a half-constructed conn struct).
+    ///
+    /// S4 CI fix: stored as `i64` rather than `i128` because Linux
+    /// x86_64 codegen + atomic operations on `i128` hit a Zig 0.15.2
+    /// backend bug (`genSetReg called with a value larger than dst_reg`
+    /// at compile time, plus a 16-byte-alignment-induced SIGSEGV at
+    /// runtime). `i64` nanoseconds-since-epoch covers ~292 years —
+    /// safe through 2262.
+    connected_at_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
     /// Wall-clock nanoseconds of the last command dispatch result
-    /// (success OR named failure). Zero means "no command yet."
-    last_command_at_ns: std.atomic.Value(i128) = std.atomic.Value(i128).init(0),
+    /// (success OR named failure). Zero means "no command yet." See
+    /// `connected_at_ns` for the i64 rationale.
+    last_command_at_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
     /// Fixed-size scratch buffer for the last command's tool name. The
     /// max-32-byte cap is generous for the v1 tool family (longest is
@@ -495,13 +503,16 @@ pub const ExtensionWsConn = struct {
         @memcpy(self.last_command_result_buf[0..result_len], result[0..result_len]);
         self.last_command_result_len.store(result_len, .release);
 
-        self.last_command_at_ns.store(std.time.nanoTimestamp(), .release);
+        // S4 CI fix: store as i64 (see connected_at_ns rationale).
+        // nanoTimestamp returns i128; truncate via @intCast — safe
+        // until year ~2262.
+        self.last_command_at_ns.store(@intCast(std.time.nanoTimestamp()), .release);
     }
 
     /// Snapshot helper — copy the last command's tool + result into
     /// caller-owned buffers under a single mutex hold. Returns the
     /// effective lengths. Callers MUST size each `out_*` to ≥32 bytes.
-    pub fn snapshotLastCommand(self: *ExtensionWsConn, out_tool: []u8, out_result: []u8) struct { tool_len: usize, result_len: usize, at_ns: i128 } {
+    pub fn snapshotLastCommand(self: *ExtensionWsConn, out_tool: []u8, out_result: []u8) LastCommandSnapshot {
         self.last_command_mu.lock();
         defer self.last_command_mu.unlock();
 
@@ -519,6 +530,16 @@ pub const ExtensionWsConn = struct {
     }
 };
 
+/// Return shape of `ExtensionWsConn.snapshotLastCommand`. Named (not
+/// anonymous) so the Zig x86_64 backend codegens it cleanly — the
+/// previous anonymous return tripped a `genSetReg called with a value
+/// larger than dst_reg` bug in Zig 0.15.2 on Linux x86_64.
+pub const LastCommandSnapshot = struct {
+    tool_len: usize,
+    result_len: usize,
+    at_ns: i64,
+};
+
 /// Caller-owned snapshot of one paired extension. Returned by
 /// `ExtensionWsHub.listSnapshot` for the diagnostic routes.
 ///
@@ -527,8 +548,9 @@ pub const ExtensionWsConn = struct {
 /// individual allocations.
 pub const ExtensionState = struct {
     user_id: []u8,
-    connected_at_ns: i128,
-    last_command_at_ns: i128,
+    /// Nanoseconds since epoch (truncated to i64; see `ExtensionWsConn.connected_at_ns`).
+    connected_at_ns: i64,
+    last_command_at_ns: i64,
     last_command_tool: []u8,
     last_command_result: []u8,
 
@@ -608,7 +630,8 @@ pub const ExtensionWsHub = struct {
             // ALSO accounted for. See deinit/release semantics.
             .refs = std.atomic.Value(u32).init(1),
         };
-        conn.connected_at_ns.store(std.time.nanoTimestamp(), .release);
+        // S4 CI fix: truncate nanoTimestamp's i128 to i64 (safe through year ~2262).
+        conn.connected_at_ns.store(@intCast(std.time.nanoTimestamp()), .release);
 
         self.users_mu.lock();
         defer self.users_mu.unlock();
@@ -1686,7 +1709,7 @@ test "ExtensionWsConn lifecycle fields default to zero on construction" {
     // Connected timestamp is set on registerConn — not zero.
     try std.testing.expect(conn.connected_at_ns.load(.monotonic) > 0);
     // last_command_at starts at zero (no commands yet).
-    try std.testing.expectEqual(@as(i128, 0), conn.last_command_at_ns.load(.monotonic));
+    try std.testing.expectEqual(@as(i64, 0), conn.last_command_at_ns.load(.monotonic));
     // last_command_tool / last_command_result start empty.
     try std.testing.expectEqual(@as(usize, 0), conn.last_command_tool_len.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 0), conn.last_command_result_len.load(.monotonic));
@@ -1712,7 +1735,7 @@ test "ExtensionWsConn recordCommandOutcome + snapshotLastCommand round-trip" {
     const before = conn.snapshotLastCommand(&tool_buf, &result_buf);
     try std.testing.expectEqual(@as(usize, 0), before.tool_len);
     try std.testing.expectEqual(@as(usize, 0), before.result_len);
-    try std.testing.expectEqual(@as(i128, 0), before.at_ns);
+    try std.testing.expectEqual(@as(i64, 0), before.at_ns);
 
     // After a recordCommandOutcome call: snapshot returns the recorded
     // tool + result + a non-zero timestamp.
@@ -1836,7 +1859,7 @@ test "ExtensionWsHub.listSnapshot reflects registered conns with default last_co
         if (std.mem.eql(u8, s.user_id, "alice")) {
             saw_alice = true;
             try std.testing.expect(s.connected_at_ns > 0);
-            try std.testing.expectEqual(@as(i128, 0), s.last_command_at_ns);
+            try std.testing.expectEqual(@as(i64, 0), s.last_command_at_ns);
             try std.testing.expectEqualStrings("", s.last_command_tool);
             try std.testing.expectEqualStrings("", s.last_command_result);
         } else if (std.mem.eql(u8, s.user_id, "bob")) {
