@@ -177,6 +177,35 @@ pub const ExtensionWsConn = struct {
     /// the agent releases → drops to 0 → free. Safe.
     refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
 
+    /// Wall-clock nanoseconds (std.time.nanoTimestamp) when this conn was
+    /// registered with the hub. Set once in `registerConn`; never updated
+    /// thereafter. Zero means "not yet registered" (only observable on a
+    /// half-constructed conn struct).
+    connected_at_ns: std.atomic.Value(i128) = std.atomic.Value(i128).init(0),
+
+    /// Wall-clock nanoseconds of the last command dispatch result
+    /// (success OR named failure). Zero means "no command yet."
+    last_command_at_ns: std.atomic.Value(i128) = std.atomic.Value(i128).init(0),
+
+    /// Fixed-size scratch buffer for the last command's tool name. The
+    /// max-32-byte cap is generous for the v1 tool family (longest is
+    /// `extension_screenshot` at 20 bytes); future longer names get
+    /// truncated rather than allocated-per-update. Reading requires
+    /// loading `last_command_tool_len` first.
+    last_command_tool_buf: [32]u8 = [_]u8{0} ** 32,
+    last_command_tool_len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    /// Same buffer pattern for the last command's result classifier
+    /// ("ok", "timeout", "conn_closed", "oom", "no_conn", "error_other").
+    last_command_result_buf: [32]u8 = [_]u8{0} ** 32,
+    last_command_result_len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    /// Mutex protecting the two fixed-size buffers above. We use a mutex
+    /// rather than treating the buffers as atomic-byte-stores because the
+    /// snapshot fn needs to read tool + result + length consistently
+    /// (otherwise it could observe a torn pair: new length, old bytes).
+    last_command_mu: std.Thread.Mutex = .{},
+
     pub fn deinit(self: *ExtensionWsConn) void {
         // Drain any waiters with a synthetic "connection closed":
         // anyone blocked in `sendCommand` wakes via `ready.set()`,
@@ -447,6 +476,47 @@ pub const ExtensionWsConn = struct {
     pub fn close(self: *ExtensionWsConn) void {
         self.close_fn(self.close_ctx);
     }
+
+    /// Stamp the last_command_* fields with the named result class and
+    /// the dispatched tool. Called by the hub's `sendCommand` at every
+    /// terminal point (success + each error branch).
+    ///
+    /// `tool` and `result` are borrowed only for the copy; the buffers
+    /// are owned by the conn struct (fixed-size, no heap).
+    pub fn recordCommandOutcome(self: *ExtensionWsConn, tool: []const u8, result: []const u8) void {
+        self.last_command_mu.lock();
+        defer self.last_command_mu.unlock();
+
+        const tool_len = @min(tool.len, self.last_command_tool_buf.len);
+        @memcpy(self.last_command_tool_buf[0..tool_len], tool[0..tool_len]);
+        self.last_command_tool_len.store(tool_len, .release);
+
+        const result_len = @min(result.len, self.last_command_result_buf.len);
+        @memcpy(self.last_command_result_buf[0..result_len], result[0..result_len]);
+        self.last_command_result_len.store(result_len, .release);
+
+        self.last_command_at_ns.store(std.time.nanoTimestamp(), .release);
+    }
+
+    /// Snapshot helper — copy the last command's tool + result into
+    /// caller-owned buffers under a single mutex hold. Returns the
+    /// effective lengths. Callers MUST size each `out_*` to ≥32 bytes.
+    pub fn snapshotLastCommand(self: *ExtensionWsConn, out_tool: []u8, out_result: []u8) struct { tool_len: usize, result_len: usize, at_ns: i128 } {
+        self.last_command_mu.lock();
+        defer self.last_command_mu.unlock();
+
+        const tool_len = self.last_command_tool_len.load(.acquire);
+        const result_len = self.last_command_result_len.load(.acquire);
+        const tl = @min(tool_len, out_tool.len);
+        const rl = @min(result_len, out_result.len);
+        @memcpy(out_tool[0..tl], self.last_command_tool_buf[0..tl]);
+        @memcpy(out_result[0..rl], self.last_command_result_buf[0..rl]);
+        return .{
+            .tool_len = tl,
+            .result_len = rl,
+            .at_ns = self.last_command_at_ns.load(.acquire),
+        };
+    }
 };
 
 pub const ExtensionWsHub = struct {
@@ -515,6 +585,7 @@ pub const ExtensionWsHub = struct {
             // ALSO accounted for. See deinit/release semantics.
             .refs = std.atomic.Value(u32).init(1),
         };
+        conn.connected_at_ns.store(std.time.nanoTimestamp(), .release);
 
         self.users_mu.lock();
         defer self.users_mu.unlock();
@@ -1453,6 +1524,28 @@ const SoakStream = struct {
         self.written.clearRetainingCapacity();
     }
 };
+
+test "ExtensionWsConn lifecycle fields default to zero on construction" {
+    var hub = ExtensionWsHub.init(std.testing.allocator);
+    defer hub.deinit();
+    var ts = TestStream{ .allocator = std.testing.allocator };
+    defer ts.deinit();
+    const conn = try hub.registerConn(
+        "alice",
+        @ptrCast(&ts),
+        TestStream.writeText,
+        @ptrCast(&ts),
+        TestStream.close,
+    );
+    defer hub.destroyConn(conn);
+    // Connected timestamp is set on registerConn — not zero.
+    try std.testing.expect(conn.connected_at_ns.load(.monotonic) > 0);
+    // last_command_at starts at zero (no commands yet).
+    try std.testing.expectEqual(@as(i128, 0), conn.last_command_at_ns.load(.monotonic));
+    // last_command_tool / last_command_result start empty.
+    try std.testing.expectEqual(@as(usize, 0), conn.last_command_tool_len.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), conn.last_command_result_len.load(.monotonic));
+}
 
 test "soak: 50 concurrent extension WS sessions — no deadlock, no UAF, no leak" {
     // Set up: 50 workers, each its own user_id, each sending CMDS_PER_WORKER
