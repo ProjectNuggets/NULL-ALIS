@@ -352,7 +352,11 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn hasExternalIdentity(_: *@This(), _: i64) !?bool {
         return null;
     }
-    pub fn skipExternalIdentityForTests(_: *@This()) void {}
+    pub fn skipExternalIdentityForTests(_: *@This()) void {
+        if (!@import("builtin").is_test) {
+            @compileError("Manager.skipExternalIdentityForTests called outside test build — this bypass disables the public.zaki_users identity gate and is forbidden in production");
+        }
+    }
     pub fn getConfigJson(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]u8 {
         return allocator.dupe(u8, "{}");
     }
@@ -2608,10 +2612,14 @@ const ManagerImpl = struct {
     ///
     /// Production code paths MUST NOT call this. The check exists to
     /// prevent provisioning shadow users that bypass the auth surface;
-    /// disabling it in production would be a security hole. Inline
-    /// tests in this file (and matrix tests) are the only legitimate
-    /// callers.
+    /// disabling it in production would be a security hole. The
+    /// `comptime` guard below makes a production call a COMPILE-TIME
+    /// error — there is no runtime path to invoke this from a release
+    /// build. (Same pattern as `env_rebrand.resetForTests`.)
     pub fn skipExternalIdentityForTests(self: *Self) void {
+        if (!@import("builtin").is_test) {
+            @compileError("Manager.skipExternalIdentityForTests called outside test build — this bypass disables the public.zaki_users identity gate and is forbidden in production");
+        }
         self.external_identity_status = .unavailable;
     }
 
