@@ -1205,8 +1205,16 @@ pub const GatewayState = struct {
         //      and waits until any in-flight metricsPayload render using
         //      the old registry has returned.
         //   3. reg.deinit(); destroy(reg).
-        observability.detachGlobalObserverAndWait();
+        // Only the GatewayState that installed the process-wide observer
+        // + registry tears them down. `runWithRole` sets both together
+        // (setGlobalObserver + metrics_registry_owned), so ownership of the
+        // registry is the authoritative signal that THIS state also owns the
+        // observer slot. A fixture/test GatewayState that never installed
+        // them (metrics_registry_owned == null) must NOT clear a global
+        // observer some other component set — that was an unconditional
+        // clobber before this guard (review-fix: A3/B5/C3).
         if (self.metrics_registry_owned) |reg| {
+            observability.detachGlobalObserverAndWait();
             observability_metrics.detachGlobalRegistryAndWait(reg);
             reg.deinit();
             self.allocator.destroy(reg);
@@ -5365,6 +5373,23 @@ fn buildFallbackChainIntoBuf(buf: []u8, fallback_providers: []const []const u8) 
 }
 
 const StartupSelfCheckError = error{ProductionPostgresRequired};
+
+/// True when `err` is a member of `StartupSelfCheckError` — a fatal
+/// production-readiness gate failure that must fail the process loud
+/// (non-zero exit) rather than degrade silently.
+///
+/// F15 (S5 code-review pass): the daemon's gateway thread cannot `switch`
+/// on the file-private `StartupSelfCheckError` set, so it previously
+/// hard-coded `@errorName(err) == "ProductionPostgresRequired"`. That
+/// silently stops fail-looding the moment a SECOND variant is added to
+/// the set. This helper iterates the set at comptime, so any new variant
+/// is covered automatically — there is no string literal to keep in sync.
+pub fn isFatalStartupError(err: anyerror) bool {
+    inline for (@typeInfo(StartupSelfCheckError).error_set.?) |e| {
+        if (std.mem.eql(u8, @errorName(err), e.name)) return true;
+    }
+    return false;
+}
 
 fn applyStartupSelfCheck(
     state: *GatewayState,
@@ -12038,26 +12063,44 @@ fn handleArtifactExport(
     // S5 (2026-05-29, prod-readiness) — artifact_export_total +
     // artifact_export_latency_ms emit. `fmt_label` starts as "invalid"
     // and is upgraded to the canonical lowercase format only once the
-    // query param has been validated. `result_label` is mutated per-
-    // exit-path with the documented vocabulary
-    // (ok|invalid_format|invalid_input|missing_artifact|state_unavailable|
-    // renderer_unavailable).
+    // query param has been validated.
     //
-    // S5 code-review pass: `result_label` defaults to "invalid_input" — NOT
-    // "invalid_format" — because the 405 method-not-allowed, the 400
-    // invalid_artifact_id, and the 400 invalid_user_id early-exits all return
-    // BEFORE the format-allowlist runs. Defaulting to "invalid_format"
-    // previously polluted the invalid-format SLO dashboard with results
-    // attributable to method/id input rejection. The label is upgraded to
-    // "invalid_format" only inside the allowlist `else` arm (where we
-    // actually know the format was bad).
+    // result_label vocabulary (kept in lockstep with docs/operations/SLOs.md):
+    //   ok                  — export succeeded AND the response body built
+    //   invalid_input       — bad method / artifact_id / user_id (default)
+    //   invalid_format      — format query param not in the allowlist
+    //   missing_artifact    — artifact or version row not found
+    //   state_unavailable   — persistent state backend NOT configured (no PG)
+    //   state_error         — PG configured but the read FAILED (down/erroring)
+    //   internal_error      — workspace config drift / arg-map OOM / body-build OOM
+    //   renderer_unavailable— renderer BINARY missing (502 — install gap)
+    //   export_failed       — renderer ran but FAILED on the content (500)
+    //
+    // S5 code-review pass (F8–F11, 2026-05-29):
+    //  • `result_label` defaults to "invalid_input" — the 405/400 early-exits
+    //    return BEFORE the format allowlist, so defaulting to "invalid_format"
+    //    polluted the bad-format SLO panel with method/id rejections.
+    //  • OOM / config-drift failures use "internal_error", NOT "state_unavailable"
+    //    — the latter is reserved for "PG not configured" so the state-down alert
+    //    routes to the DBA only when PG is actually the cause. PG-read failures
+    //    use "state_error" so operators can tell "not configured" from "erroring".
+    //  • renderer BINARY gaps stay "renderer_unavailable" (502); content-rejection
+    //    failures are "export_failed" (500) so a renderer-down alert never fires
+    //    for user-content problems.
+    //  • The LATENCY histogram only emits once a render was actually ATTEMPTED
+    //    (`attempted_render`). Sub-millisecond input rejections would otherwise
+    //    pile into the le="10" bucket and flatten the real p99. The COUNTER still
+    //    fires on every path so rejections remain countable by result.
     const start_ms = std.time.milliTimestamp();
     var fmt_label: []const u8 = "invalid";
     var result_label: []const u8 = "invalid_input";
+    var attempted_render = false;
     defer {
-        const elapsed_ms: u64 = @intCast(@max(@as(i64, 0), std.time.milliTimestamp() - start_ms));
         observability.recordMetricGlobal(.{ .artifact_export_total = .{ .format = fmt_label, .result = result_label } });
-        observability.recordMetricGlobal(.{ .artifact_export_latency_ms = .{ .format = fmt_label, .value = elapsed_ms } });
+        if (attempted_render) {
+            const elapsed_ms: u64 = @intCast(@max(@as(i64, 0), std.time.milliTimestamp() - start_ms));
+            observability.recordMetricGlobal(.{ .artifact_export_latency_ms = .{ .format = fmt_label, .value = elapsed_ms } });
+        }
     }
 
     if (!std.mem.eql(u8, method, "POST")) {
@@ -12102,7 +12145,9 @@ fn handleArtifactExport(
     // (operator config drift), surface a controlled 500 instead of letting
     // the tool fail later in a less-actionable way.
     if (!std.fs.path.isAbsolute(user_ctx.workspace_path)) {
-        result_label = "state_unavailable";
+        // Operator-config drift, not a state-backend outage — label
+        // internal_error so the state-down alert does not page the DBA.
+        result_label = "internal_error";
         return .{
             .status = "500 Internal Server Error",
             .body = "{\"error\":\"workspace_not_absolute\",\"detail\":\"user workspace_path is not absolute; refusing to export\"}",
@@ -12119,7 +12164,9 @@ fn handleArtifactExport(
 
     // Ownership + existence check (mirrors handleArtifactGet at :11029).
     const artifact_opt = state_mgr.getArtifactById(allocator, numeric_user_id, artifact_id) catch {
-        result_label = "state_unavailable";
+        // PG is configured but the read failed — state_error (not
+        // state_unavailable, which means "no PG at all").
+        result_label = "state_error";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"read_failed\"}" };
     };
     if (artifact_opt == null) {
@@ -12130,7 +12177,7 @@ fn handleArtifactExport(
     defer artifact.deinit(allocator);
 
     const ver_opt = state_mgr.getArtifactVersion(allocator, numeric_user_id, artifact_id, null) catch {
-        result_label = "state_unavailable";
+        result_label = "state_error";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"version_read_failed\"}" };
     };
     if (ver_opt == null) {
@@ -12146,19 +12193,19 @@ fn handleArtifactExport(
     var args = std.json.ObjectMap.init(allocator);
     defer args.deinit();
     args.put("format", std.json.Value{ .string = format }) catch {
-        result_label = "state_unavailable";
+        result_label = "internal_error";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
     };
     args.put("content", std.json.Value{ .string = ver.content }) catch {
-        result_label = "state_unavailable";
+        result_label = "internal_error";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
     };
     args.put("title", std.json.Value{ .string = artifact.title }) catch {
-        result_label = "state_unavailable";
+        result_label = "internal_error";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
     };
     args.put("theme", std.json.Value{ .string = "default" }) catch {
-        result_label = "state_unavailable";
+        result_label = "internal_error";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"args_alloc_failed\"}" };
     };
 
@@ -12166,8 +12213,14 @@ fn handleArtifactExport(
         .workspace_dir = user_ctx.workspace_path,
         .branding = if (config_opt) |cfg| cfg.branding else .{},
     };
+    // From here on a render is actually attempted, so the latency
+    // histogram sample is meaningful (F8). Everything above this point
+    // is input/precondition rejection and must NOT feed the histogram.
+    attempted_render = true;
     const tool_result = pdt.execute(allocator, args) catch {
-        result_label = "renderer_unavailable";
+        // Tool dispatch raised (not a clean success=false) — treat as a
+        // failed export of user content, not a missing renderer binary.
+        result_label = "export_failed";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"export_failed\",\"detail\":\"tool dispatch raised an error\"}" };
     };
     // Ownership: produce_document allocates `output` and `error_msg` with our
@@ -12195,11 +12248,13 @@ fn handleArtifactExport(
             std.mem.indexOf(u8, err, "FileNotFound") != null or
             std.mem.indexOf(u8, err, "marp-cli") != null or
             std.mem.indexOf(u8, err, "pandoc") != null;
-        // Both the renderer-missing (502) and the export-failed (500) tails
-        // map to the same metric label — operators care about "the renderer
-        // could not produce a document" as a single signal. The 500-vs-502
-        // distinction stays in the HTTP response so FE can differentiate.
-        result_label = "renderer_unavailable";
+        // F10 (S5 code-review pass): the metric label now MIRRORS the
+        // HTTP status split. A missing renderer binary (502) is
+        // `renderer_unavailable` — an infra/install problem operators
+        // page on. A renderer that ran but rejected the user's content
+        // (500) is `export_failed` — a content problem that must NOT
+        // trip the renderer-down alert and page the on-call for nothing.
+        result_label = if (is_renderer_gap) "renderer_unavailable" else "export_failed";
         var out: std.ArrayListUnmanaged(u8) = .empty;
         // `toOwnedSlice` zeroes the buf on success → the defer becomes a
         // no-op when we return the body; on any catch the defer cleans up.
@@ -12221,10 +12276,19 @@ fn handleArtifactExport(
 
     // Success — parse the produced filename out of the markdown link.
     const filename = parseProducedFilename(tool_result.output) orelse {
-        result_label = "renderer_unavailable";
+        // Renderer ran fine; our own output parse failed. That is an
+        // export failure of OUR making, not a missing renderer — label
+        // export_failed so the renderer-down alert stays quiet.
+        result_label = "export_failed";
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"export_failed\",\"detail\":\"renderer succeeded but filename could not be parsed\"}" };
     };
 
+    // Render succeeded; from here a failure is response-serialization OOM,
+    // not a client/render/state problem. Pre-set internal_error so any
+    // `catch return response_build_err` below is labeled correctly (the
+    // default is still "invalid_input"); the happy path overwrites this to
+    // "ok" only after finalizeJsonBuf actually builds the body.
+    result_label = "internal_error";
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
@@ -12251,8 +12315,13 @@ fn handleArtifactExport(
     w.writeAll("/exports/") catch return response_build_err;
     jsonEscapeInto(w, filename) catch return response_build_err;
     w.writeAll("\"}") catch return response_build_err;
-    result_label = "ok";
-    return finalizeJsonBuf(allocator, &out);
+    // F9 (S5 code-review pass): only label "ok" once the body has
+    // actually been built. finalizeJsonBuf returns response_build_err
+    // (a 500) if toOwnedSlice OOMs — labeling "ok" before the call
+    // would report success on a request the client sees as a 500.
+    const resp = finalizeJsonBuf(allocator, &out);
+    result_label = if (std.mem.startsWith(u8, resp.status, "2")) "ok" else "internal_error";
+    return resp;
 }
 
 /// Recognize the static-literal error strings `produce_document.ToolResult.fail()`
@@ -12508,13 +12577,15 @@ const TraceShareStore = struct {
     /// that closes the `ui-handoff.md` §7 P1 gap.
     fn getLive(self: *TraceShareStore, code: []const u8, now_unix: i64) ?TraceShareSnapshot {
         // S5 (2026-05-29, prod-readiness) — trace_share_total{op="get"}
-        // emit. Distinguishes the four operational tails the SLO panel
-        // cares about: ok | not_found | expired | revoked. The cache-
-        // hit path can detect expired vs revoked precisely (the record
-        // is still present, just non-live). The PG fallback path can
-        // only tell ok vs not_found — the SQL view filters out expired
-        // / revoked at the source so a cache-miss lazy-load that yields
-        // null is collapsed to "not_found" by design.
+        // emit. Operational tails the SLO panel cares about:
+        // ok | not_found | expired | revoked | err. The cache-hit path
+        // detects expired vs revoked precisely (the record is still
+        // present, just non-live). The PG fallback path tells ok vs
+        // not_found — the SQL view filters out expired/revoked at the
+        // source, so a cache-miss lazy-load that yields a genuine null
+        // is "not_found". Backend errors and OOM on the lazy-load path
+        // are "err" (F12) so transient failures are not misread as
+        // "the share does not exist".
         var result_label: []const u8 = "not_found";
         defer observability.recordMetricGlobal(.{ .trace_share_total = .{ .op = "get", .result = result_label } });
 
@@ -12542,11 +12613,15 @@ const TraceShareStore = struct {
             };
         }
 
-        // Cache miss — try PG.
+        // Cache miss — try PG. result_label stays "not_found" only on a
+        // genuine miss; backend errors and OOM on the lazy-load path are
+        // labeled "err" so the SLO panel does not read transient PG/OOM
+        // failures as "the share does not exist" (F12).
         const mgr = self.state_mgr orelse return null;
-        var pg_row = (mgr.getTraceByShareCode(self.allocator, code, now_unix) catch |err| blk: {
+        var pg_row = (mgr.getTraceByShareCode(self.allocator, code, now_unix) catch |err| {
             log.warn("trace_share.lazy_load_failed code='{s}' err={s}", .{ code, @errorName(err) });
-            break :blk null;
+            result_label = "err";
+            return null;
         }) orelse return null;
 
         // Take ownership of the PG row's allocations by passing them
@@ -12555,12 +12630,14 @@ const TraceShareStore = struct {
         // for consistency with by_code's key requirement.
         const user_id_str = std.fmt.allocPrint(self.allocator, "{d}", .{pg_row.user_id}) catch {
             pg_row.deinit(self.allocator);
+            result_label = "err";
             return null;
         };
 
         const rec = self.allocator.create(TraceShare) catch {
             self.allocator.free(user_id_str);
             pg_row.deinit(self.allocator);
+            result_label = "err";
             return null;
         };
         rec.* = .{
@@ -12575,6 +12652,7 @@ const TraceShareStore = struct {
         self.by_code.put(self.allocator, rec.share_code, rec) catch {
             rec.deinit(self.allocator);
             self.allocator.destroy(rec);
+            result_label = "err";
             return null;
         };
         // Note: by_owner is NOT repopulated on lazy load. The composite
@@ -22127,6 +22205,25 @@ pub fn runWithRole(
     var noop_obs_gateway = observability.NoopObserver{};
     var otel_obs_gateway_opt: ?observability.OtelObserver = observability.OtelObserver.fromEnv(allocator);
     defer if (otel_obs_gateway_opt) |*otel| otel.deinit();
+    // F16 (S5 code-review pass): register agent-resource cleanup HERE —
+    // right after the optionals are declared — so every early return below
+    // (the production fail-loud gate, the pairing_guard `try`, the listen
+    // `try`) tears these down. The guards skip whichever resources a given
+    // role never allocated (daemon mode leaves them all null/empty). Order
+    // relative to `otel` and `state.deinit` (line ~22124) is preserved, so
+    // LIFO teardown is identical to the prior placement.
+    defer if (provider_bundle_opt) |*bundle| bundle.deinit();
+    defer if (mem_rt) |*rt| rt.deinit();
+    defer if (subagent_manager_opt) |mgr| {
+        mgr.deinit();
+        allocator.destroy(mgr);
+    };
+    defer if (completion_router_opt) |router| allocator.destroy(router);
+    defer if (tools_slice.len > 0) tools_mod.deinitTools(allocator, tools_slice);
+    defer if (session_mgr_opt) |*sm| sm.deinit();
+    defer if (standalone_task_ledger) |*ledger| ledger.deinit();
+    defer if (standalone_usage_rt) |*urt| urt.deinit();
+    defer if (sec_tracker_opt) |*tracker| tracker.deinit();
     var gateway_observer_slots: [5]Observer = undefined;
     var gateway_observer_multi = observability.MultiObserver{ .observers = &.{} };
     // S5 (2026-05-29) — process-wide global observer for cross-cutting
@@ -22440,12 +22537,26 @@ pub fn runWithRole(
         }
 
         applyStartupSelfCheck(&state, cfg, postgres_init_error, host) catch |err| {
-            if (err == error.ProductionPostgresRequired) {
-                const reason = if (postgres_init_error) |perr| @errorName(perr) else "postgres_init_failed";
-                log.err(
-                    "startup.production_postgres_required configured={s} effective={s} reason={s} host={s} — refusing to run degraded in production",
-                    .{ state.state_backend_configured, state.state_backend_effective, reason, host },
-                );
+            // F15 (S5 code-review pass): exhaustive switch over the
+            // StartupSelfCheckError set — `err` is typed as that set here
+            // (applyStartupSelfCheck returns StartupSelfCheckError!void), so
+            // adding a variant fails to compile until it gets a logging arm.
+            switch (err) {
+                error.ProductionPostgresRequired => {
+                    // B1 (S5 code-review pass): emit the full startup banner
+                    // before the fail-loud line so operators triaging the
+                    // exit get the complete config context (provider chain,
+                    // fallbacks, tenant/heartbeat/scheduler backend,
+                    // internal-token policy) — not just the one-line reason.
+                    // applyStartupSelfCheck populated every state.* field
+                    // before returning the error, so the banner is complete.
+                    logStartupSelfCheck(&state);
+                    const reason = if (postgres_init_error) |perr| @errorName(perr) else "postgres_init_failed";
+                    log.err(
+                        "startup.production_postgres_required configured={s} effective={s} reason={s} host={s} — refusing to run degraded in production",
+                        .{ state.state_backend_configured, state.state_backend_effective, reason, host },
+                    );
+                },
             }
             return err;
         };
@@ -22454,18 +22565,14 @@ pub fn runWithRole(
     if (state.pairing_guard == null) {
         state.pairing_guard = try PairingGuard.init(allocator, true, &.{});
     }
-    defer if (provider_bundle_opt) |*bundle| bundle.deinit();
-    defer if (mem_rt) |*rt| rt.deinit();
-    defer if (subagent_manager_opt) |mgr| {
-        mgr.deinit();
-        allocator.destroy(mgr);
-    };
-    defer if (completion_router_opt) |router| allocator.destroy(router);
-    defer if (tools_slice.len > 0) tools_mod.deinitTools(allocator, tools_slice);
-    defer if (session_mgr_opt) |*sm| sm.deinit();
-    defer if (standalone_task_ledger) |*ledger| ledger.deinit();
-    defer if (standalone_usage_rt) |*urt| urt.deinit();
-    defer if (sec_tracker_opt) |*tracker| tracker.deinit();
+    // F16 (S5 code-review pass): the agent-resource cleanup defers were
+    // hoisted up to immediately after their declarations (right below the
+    // otel defer) so they also fire on the early-return paths above —
+    // `applyStartupSelfCheck`'s production fail-loud and the `pairing_guard`
+    // `try`. Previously they were registered HERE, after those returns, so
+    // a standalone-mode fail-loud leaked every local-agent allocation.
+    // Teardown order is unchanged (registered after the otel defer, so they
+    // still tear down before the observer they emit through).
 
     // Resolve the listen address
     const addr = try std.net.Address.resolveIp(host, port);
@@ -28363,6 +28470,21 @@ test "applyStartupSelfCheck: production + postgres + zaki_state present = no err
 
     try applyStartupSelfCheck(&gs, &cfg, null, "0.0.0.0");
     try std.testing.expect(!gs.state_degraded);
+}
+
+test "isFatalStartupError: recognizes the StartupSelfCheckError set, rejects others" {
+    // F15 (S5 code-review pass): the daemon gateway thread uses this
+    // predicate (instead of a hard-coded @errorName literal) to decide
+    // fail-loud-and-exit. It iterates the StartupSelfCheckError set at
+    // comptime, so any variant added later is covered automatically. This
+    // is the unit-testable core of the fail-loud decision — the
+    // std.process.exit(1) itself cannot be exercised in-process.
+    try std.testing.expect(isFatalStartupError(error.ProductionPostgresRequired));
+    // Unrelated errors must NOT be treated as fatal startup errors —
+    // those fall through to markError + continue, not process exit.
+    try std.testing.expect(!isFatalStartupError(error.ConnectionRefused));
+    try std.testing.expect(!isFatalStartupError(error.OutOfMemory));
+    try std.testing.expect(!isFatalStartupError(error.FileNotFound));
 }
 
 // ── S5 (2026-05-29, prod-readiness) emit-site round-trip tests ──

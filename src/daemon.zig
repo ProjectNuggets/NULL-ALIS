@@ -206,14 +206,31 @@ pub fn isShutdownRequested() bool {
 /// fail-loud` log line on stderr.
 fn gatewayThread(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     const gateway = @import("gateway.zig");
+    const sentry_runtime = @import("sentry_runtime.zig");
     gateway.run(allocator, host, port, config, event_bus) catch |err| {
         // Fail-loud on the production readiness gate: thread `return` cannot
         // surface this to main, and other supervisor threads would happily
         // keep running with file-backed state — exactly the silent-degraded
-        // behavior S5 was meant to eliminate. String-match `@errorName` so we
-        // do not need to plumb the (file-private) `StartupSelfCheckError`
-        // error set out of gateway.zig.
-        if (std.mem.eql(u8, @errorName(err), "ProductionPostgresRequired")) {
+        // behavior S5 was meant to eliminate.
+        //
+        // F15 (S5 code-review pass): membership is tested via
+        // `gateway.isFatalStartupError`, which iterates the StartupSelfCheckError
+        // set at comptime. Any variant added to that set is covered
+        // automatically — no `@errorName` string literal to drift out of sync.
+        if (gateway.isFatalStartupError(err)) {
+            // F7 (S5 code-review pass): std.process.exit() runs NO deferred
+            // cleanup on any thread, so the Sentry breadcrumb that main would
+            // emit on an error return (main.zig captureError+flush) is lost on
+            // this path. Capture + flush HERE so the crash-class signal still
+            // reaches the alerting pipeline before we exit. `globalOrFallback`
+            // is a no-op runtime when Sentry is unconfigured, so this is safe
+            // unconditionally. (gateway.run's own `defer state.deinit()` has
+            // already run during unwind — observers detached, registry freed;
+            // a postgres lease, if any, cannot be released because PG is
+            // unreachable by definition on this path and expires on its TTL.)
+            const rt = sentry_runtime.globalOrFallback();
+            rt.captureError("daemon.gateway_thread", @errorName(err));
+            rt.flush(2000);
             log.err("daemon.gateway_thread: production fail-loud — exiting non-zero (reason: {s})", .{@errorName(err)});
             std.process.exit(1);
         }

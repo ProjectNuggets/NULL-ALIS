@@ -51,8 +51,8 @@ the metric-driven view. The SLO targets themselves still live in
 | `nullalis_http_pool_misses_total` | counter | none | NO | Connection-pool new opens. |
 | `nullalis_http_pool_idle_connections` | gauge | none | NO | Current idle connections in pool. |
 | `nullalis_approval_decision_total` | counter | `result` | YES | Approval lifecycle. Result ∈ {issued, auto_approved, user_approved, user_denied, blocked}. ("expired" reserved for future TTL sweep.) |
-| `nullalis_artifact_export_total` | counter | `format`, `result` | YES | Artifact-export ops. Format ∈ {pdf, docx, pptx, xlsx, html, invalid}. Result ∈ {ok, invalid_format, invalid_input, missing_artifact, state_unavailable, renderer_unavailable}. (cross_user_denied unreachable today — getArtifactById collapses "not owned" and "doesn't exist" into not-found.) |
-| `nullalis_artifact_export_latency_ms` | histogram | `format` | YES | Per-format export latency, buckets 10/50/100/250/500/1000/2500/5000/10000 ms + +Inf. |
+| `nullalis_artifact_export_total` | counter | `format`, `result` | YES | Artifact-export ops. Format ∈ {pdf, docx, pptx, xlsx, html, invalid}. Result ∈ {ok, invalid_input, invalid_format, missing_artifact, state_unavailable, state_error, internal_error, renderer_unavailable, export_failed}. `state_unavailable`=PG not configured; `state_error`=PG configured but read failed; `internal_error`=arg-map/body-build OOM or workspace config drift; `renderer_unavailable`=renderer binary missing (502); `export_failed`=renderer ran but failed on content (500). (cross_user_denied unreachable today — getArtifactById collapses "not owned" and "doesn't exist" into not-found.) |
+| `nullalis_artifact_export_latency_ms` | histogram | `format` | YES | Per-format export latency, buckets 10/50/100/250/500/1000/2500/5000/10000 ms + +Inf. **Only emitted once a render is actually attempted** — input/precondition rejections (405/400/invalid_format/missing_artifact/state_*) are counted by `_total` but excluded from the histogram so sub-ms rejections do not flatten the real p99. |
 | `nullalis_memory_op_total` | counter | `op`, `result` | YES | Memory ops. Op ∈ {store, recall, forget}. Result ∈ {ok, err}. |
 | `nullalis_memory_op_latency_ms` | histogram | `op` | YES | Memory-op latency. |
 | `nullalis_trace_share_total` | counter | `op`, `result` | YES | Trace-share. Op ∈ {create, revoke, get}. Result ∈ {ok, not_found, expired, revoked, cap, err}. |
@@ -63,11 +63,33 @@ the metric-driven view. The SLO targets themselves still live in
 | `nullalis_extension_ws_command_latency_ms` | histogram | none | YES | Extension-WS command roundtrip. |
 | `nullalis_extension_ws_ssrf_block_total` | counter | none | YES | Extension-WS SSRF denials. |
 | `nullalis_gateway_degraded` | gauge | `configured`, `effective`, `reason` | **YES — gate** | 1 when configured backend != effective backend. In production this is always 0; startup is fail-loud when it would be 1, so the process exits before serving. |
+| `nullalis_metrics_registry_dropped_series_total` | counter | none | YES | Count of NEW metric series the registry refused because it hit the `MAX_SERIES` (4096) cardinality cap. **Should be 0.** A non-zero, growing value means a label dimension is exploding (an untrusted/unbounded label value) — investigate before it would have OOM'd. Alert: `increase(nullalis_metrics_registry_dropped_series_total[15m]) > 0`. |
 
 The catalog above mirrors `metricsPayload()` in `src/gateway.zig` and the
 S5-family HELP/TYPE block plus the registry-driven series. If you find a
 metric in the source that is not listed above, add it. If you find a row
 above that is not actually emitted, drop it.
+
+### 2.1 Known limitations
+
+- **Latency is wall-clock, not monotonic.** All `*_latency_ms` histograms
+  measure elapsed time via `std.time.milliTimestamp()` (CLOCK_REALTIME),
+  matching the rest of the codebase. A backward NTP step during a sampled
+  operation is clamped to 0 ms (never negative — no UB), so a rare clock
+  correction can momentarily under-report one sample into the `le="10"`
+  bucket. This is self-correcting and does not affect counters. Do not
+  alert on a single-scrape p99 dip; alert on sustained windows.
+- **Histogram bucket boundaries are milliseconds** and are reused as-is for
+  the byte-valued `nullalis_moonshot_video_upload_bytes` family — the
+  boundaries there are unitless order-of-magnitude thresholds, not ms.
+- **Memory ops are counted twice, by design.** A `memory_store` / `recall` /
+  `forget` dispatch increments BOTH `nullalis_tool_call_total{tool="memory_*"}`
+  (the agent-level per-tool view) AND `nullalis_memory_op_total{op="*"}` (the
+  memory-subsystem view). The two are intentionally different lenses — do not
+  expect `sum(tool_call_total{tool="memory_store"})` to differ from
+  `sum(memory_op_total{op="store"})`; they track the same events. Use
+  `tool_call_*` for "what is the agent calling" dashboards and `memory_op_*`
+  for memory-subsystem health.
 
 ## 3. SLO targets
 
@@ -89,9 +111,18 @@ histogram_quantile(0.95,
   sum by (le)(rate(nullalis_memory_op_latency_ms_bucket{op="recall"}[5m]))
 ) > 800
 
-# Artifact-export error rate budget <= 1% (5m)
-sum(rate(nullalis_artifact_export_total{result!="ok"}[5m]))
+# Artifact-export SERVER error rate budget <= 1% (5m).
+# Numerator counts only server-side failures — client input rejections
+# (invalid_input, invalid_format, missing_artifact) are excluded so a
+# misbehaving client cannot trip the on-call page. state_unavailable is
+# included because it means PG is unconfigured (a server misconfig).
+sum(rate(nullalis_artifact_export_total{result=~"state_unavailable|state_error|internal_error|renderer_unavailable|export_failed"}[5m]))
   / sum(rate(nullalis_artifact_export_total[5m])) > 0.01
+
+# Renderer-down page (distinct from content failures). renderer_unavailable
+# means the binary is missing from the image — an infra fix, page infra.
+# export_failed is user-content rejection and deliberately NOT paged here.
+sum(rate(nullalis_artifact_export_total{result="renderer_unavailable"}[5m])) > 0
 
 # Extension-WS disconnect rate
 sum(rate(nullalis_extension_ws_command_total{result=~"conn_closed|no_conn"}[5m])) > 0.5
