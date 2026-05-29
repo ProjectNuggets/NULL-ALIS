@@ -57,30 +57,39 @@ pub const Registry = struct {
         self.histograms.deinit(self.allocator);
     }
 
+    /// Increment counter `series_key`. Silently drops the sample on
+    /// allocator failure (registry inserts are unbounded; OOM here is
+    /// fatal-class — we prefer to keep emitting on warm series over
+    /// crashing the runtime).
     pub fn incCounter(self: *Registry, series_key: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.counters.get(series_key)) |c| {
-            _ = c.value.fetchAdd(1, .monotonic);
-            return;
-        }
-        const owned_key = self.allocator.dupe(u8, series_key) catch return;
-        const c = self.allocator.create(Counter) catch {
-            self.allocator.free(owned_key);
-            return;
+        const c: *Counter = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.counters.get(series_key)) |existing| break :blk existing;
+            const owned_key = self.allocator.dupe(u8, series_key) catch return;
+            const new_c = self.allocator.create(Counter) catch {
+                self.allocator.free(owned_key);
+                return;
+            };
+            new_c.* = .{ .value = .{ .raw = 0 } };
+            self.counters.put(self.allocator, owned_key, new_c) catch {
+                self.allocator.free(owned_key);
+                self.allocator.destroy(new_c);
+                return;
+            };
+            break :blk new_c;
         };
-        c.* = .{ .value = .{ .raw = 1 } };
-        self.counters.put(self.allocator, owned_key, c) catch {
-            self.allocator.free(owned_key);
-            self.allocator.destroy(c);
-            return;
-        };
+        _ = c.value.fetchAdd(1, .monotonic);
     }
 
+    /// Record one sample into histogram family `family_key`. Silently
+    /// drops the sample on allocator failure (same rationale as
+    /// incCounter).
     pub fn observeHistogram(self: *Registry, family_key: []const u8, value_ms: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const h = self.histograms.get(family_key) orelse blk: {
+        const h: *Histogram = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.histograms.get(family_key)) |existing| break :blk existing;
             const owned_key = self.allocator.dupe(u8, family_key) catch return;
             const new_h = self.allocator.create(Histogram) catch {
                 self.allocator.free(owned_key);
@@ -110,6 +119,11 @@ pub const Registry = struct {
         }
     }
 
+    /// Render the entire registry as Prometheus text exposition.
+    /// The registry mutex is held for the duration of the snapshot —
+    /// callers MUST pass a non-blocking writer (typically an in-memory
+    /// buffer like ArrayList). A socket writer would stall every emit
+    /// site while the scrape is in flight.
     pub fn render(self: *Registry, allocator: std.mem.Allocator, writer: anytype) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -124,6 +138,8 @@ pub const Registry = struct {
             const split = std.mem.indexOfScalar(u8, family, '{') orelse family.len;
             const name = family[0..split];
             const labels_with_brace = family[split..];
+            std.debug.assert(labels_with_brace.len == 0 or
+                (labels_with_brace[0] == '{' and labels_with_brace[labels_with_brace.len - 1] == '}'));
             for (BUCKET_LABELS, 0..) |le, i| {
                 const bucket_line = if (labels_with_brace.len == 0)
                     try std.fmt.allocPrint(allocator, "{s}_bucket{{le=\"{s}\"}}", .{ name, le })
