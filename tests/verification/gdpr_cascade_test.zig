@@ -3,11 +3,13 @@
 //! Two complementary checks:
 //!   * STATIC: every `user_id BIGINT ... REFERENCES ... users(user_id)`
 //!     line across every migration declares `ON DELETE CASCADE`. No
-//!     count threshold — every line that PATTERN-MATCHES the user_id FK
-//!     shape must individually carry CASCADE.
-//!   * LIVE: provision a user, seed user-scoped rows (memory + working
-//!     memory), DELETE the user, and assert every seeded row is gone.
-//!     This pins the runtime FK semantics, not just the declaration.
+//!     count threshold — every line that PATTERN-MATCHES the user_id
+//!     column-declaration shape must individually carry CASCADE.
+//!   * LIVE: provision a user, seed user-scoped rows across EVERY
+//!     cascade table reachable via the Manager's public CRUD surface,
+//!     DELETE the user, and assert every seeded row is gone. Closes
+//!     the prior coverage gap where only `memories` + `working_memory`
+//!     were verified.
 
 const std = @import("std");
 const nullalis = @import("nullalis");
@@ -18,17 +20,8 @@ const harness = @import("harness.zig");
 /// True iff `line` declares a `user_id` column with an FK to
 /// `{schema}.users(user_id)`. Anchors to a COLUMN declaration so unrelated
 /// names like `creating_user_id` or `deleted_user_id` paired with an
-/// FK on the same line are NOT false-positives. Recognized shapes (both
-/// seen in migrations/*.sql):
-///   `    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON ...`
-///   `    user_id BIGINT PRIMARY KEY REFERENCES {schema}.users(user_id) ON ...`
-///   `    user_id BIGINT REFERENCES {schema}.users(user_id) ON ...`
+/// FK on the same line are NOT false-positives.
 fn lineIsUserIdFk(line: []const u8) bool {
-    // Strip leading whitespace and anchor on the column-declaration token
-    // `user_id BIGINT` (the canonical type for every owner-user FK in
-    // src/migrations/*). A line like `creating_user_id BIGINT REFERENCES
-    // {schema}.users(user_id) ON DELETE SET NULL` is correctly EXCLUDED
-    // because the leading word is `creating_user_id`, not `user_id`.
     var i: usize = 0;
     while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
     const trimmed = line[i..];
@@ -42,8 +35,6 @@ fn lineIsUserIdFk(line: []const u8) bool {
 }
 
 test "S6.11 D25 unit: lineIsUserIdFk does not false-positive on prefixed column names" {
-    // Negative pin: `creating_user_id` / `deleted_user_id` / etc. with
-    // an FK on the SAME line must NOT register as a user_id-owner FK.
     try std.testing.expect(!lineIsUserIdFk("    creating_user_id BIGINT REFERENCES {schema}.users(user_id) ON DELETE SET NULL,"));
     try std.testing.expect(!lineIsUserIdFk("    deleted_user_id BIGINT REFERENCES {schema}.users(user_id) ON DELETE CASCADE,"));
     try std.testing.expect(!lineIsUserIdFk("    -- references {schema}.users(user_id) explanatory comment"));
@@ -56,11 +47,6 @@ test "S6.11 D25 unit: lineIsUserIdFk recognizes the canonical column declaration
 }
 
 test "S6.11 D25 static: every user_id FK line declares ON DELETE CASCADE" {
-    // Walk every migration in shipping order. Every line that pattern-
-    // matches the user_id FK shape MUST carry CASCADE. No floor count;
-    // a regression that adds a new user_id FK with SET NULL or NO ACTION
-    // is caught on the offending line even if other declarations are
-    // intact.
     var total_user_fk_lines: usize = 0;
     for (migrations.MIGRATIONS) |m| {
         var lines = std.mem.splitScalar(u8, m.sql, '\n');
@@ -77,50 +63,50 @@ test "S6.11 D25 static: every user_id FK line declares ON DELETE CASCADE" {
             }
         }
     }
-    // Floor: at least one user_id FK must exist across all migrations
-    // (else the contract is vacuously satisfied). The actual count
-    // today is 19 (17 in 0001 + 1 in 0002 + 1 in 0003); a future schema
-    // refactor that drops below 1 is a real regression.
     if (total_user_fk_lines == 0) {
         std.debug.print("S6.11 D25: no user_id FK lines found across any migration\n", .{});
         return error.NoUserIdFksFound;
     }
 }
 
-// ── Live PG D25 cascade ──────────────────────────────────────────────
+// ── Live PG D25 cascade — expanded coverage ──────────────────────────
 //
-// The static check above pins what migrations DECLARE; this one pins
-// what Postgres actually DOES at delete time. A future engine choice
-// or a TRIGGER that intercepts the cascade would leave the static
-// check green while breaking the runtime contract — this test catches
-// that.
+// `provisionUser` seeds 6 of the 19 cascade tables on its own:
+//   users, user_config, heartbeat, channel_state, onboarding, sessions.
+// We then seed the remaining tables reachable via the Manager's public
+// CRUD:
+//   memories         (upsertMemory)
+//   working_memory   (upsertWorkingMemorySlot)
+//   user_secrets     (putSecret)
+//   secret_mutations (recordSecretMutation)
+//   jobs             (replaceJobsJson)
+//   artifacts        (createArtifact)
+//   trace_shares     (setTraceShare)
+//
+// = 13 of the 19 cascade tables seeded and verified at runtime. The
+// remaining 6 (messages, completion_events, memory_events, tasks,
+// telegram_updates, channel_identity_bindings, tenant_user_leases,
+// job_runs) don't have public seed APIs on Manager and are covered by
+// the static line-scan above.
 
-test "S6.11 D25 live: DELETE FROM users cascades user-scoped rows" {
+test "S6.11 D25 live: DELETE FROM users cascades EVERY publicly-seedable table" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-
     const test_url = try harness.requirePostgresUrl(allocator);
-    var schema_buf: [96]u8 = undefined;
-    const schema = try harness.schemaName(&schema_buf, "d25_cascade");
-    var mgr = try harness.newManager(allocator, test_url, schema);
-    defer harness.dropAndDeinit(&mgr, "gdpr_cascade");
+    var prov = try harness.provisionTestUser(allocator, test_url, "d25_cascade", "/tmp/nullalis-s6-d25");
+    defer harness.dropAndDeinit(&prov.mgr, "d25_cascade");
+    const uid = prov.uid;
+    const mgr = &prov.mgr;
 
-    const uid: i64 = 1;
-    try mgr.provisionUser(uid, "/tmp/nullalis-s6-d25");
+    // ── Seed every cascade table the public Manager surface reaches ──
 
-    // Seed one user-scoped row in EACH of the two surfaces with
-    // ergonomic public CRUD on Manager:
-    //   1. memories (FK user_id → users with ON DELETE CASCADE in 0001).
-    //   2. working_memory (same).
-    // The other 17 cascade tables are pinned statically above; reaching
-    // them programmatically requires more invasive helpers (see "What
-    // is NOT covered" in the matrix runbook).
-    try mgr.upsertMemory(uid, "d25-key", "tagged for cascade", .core, null);
+    try mgr.upsertMemory(uid, "d25-memory-key", "tagged for cascade", .core, null);
+
     _ = try mgr.upsertWorkingMemorySlot(
         uid,
         "d25-session",
-        2, // slot_id (non-reserved)
+        2,
         "active_goal",
         "cascade me",
         null,
@@ -128,9 +114,38 @@ test "S6.11 D25 live: DELETE FROM users cascades user-scoped rows" {
         false,
     );
 
-    // Pre-condition: BOTH seeded rows are present. (Closes the prior
-    // coverage gap where working_memory was seeded but never read back.)
-    const mem_before = try mgr.getMemory(allocator, uid, "d25-key");
+    try mgr.putSecret(uid, "d25-secret-key", "cascade-secret-value");
+    try mgr.recordSecretMutation(uid, "d25-secret-key", "put", null, "ok", null);
+    // Argument order: (uid, session_id, json_array). session_id "main"
+    // is normalized to the user's main session key (created by
+    // provisionUser); the json MUST be an array (it is fed through
+    // `jsonb_array_elements`).
+    try mgr.replaceJobsJson(uid, "main", "[{\"id\":\"d25-job\",\"job_type\":\"shell\",\"expression\":\"@once:0\"}]");
+
+    const artifact = try mgr.createArtifact(
+        allocator,
+        uid,
+        "d25-artifact-session",
+        "D25 cascade artifact",
+        "markdown",
+        "# cascade",
+        "sha256:d25",
+        1_716_000_000,
+    );
+    defer {
+        allocator.free(artifact.id);
+        allocator.free(artifact.title);
+        allocator.free(artifact.kind);
+        if (artifact.session_id) |s| allocator.free(s);
+        if (artifact.share_code) |s| allocator.free(s);
+        allocator.free(artifact.metadata_jsonb);
+    }
+
+    try mgr.setTraceShare(uid, "d25-run", "shr-d25-cascade-XYZ", "[]", 1_716_000_000, 1_716_999_999);
+
+    // ── Pre-condition: every seeded table has rows for `uid` ─────────
+
+    const mem_before = try mgr.getMemory(allocator, uid, "d25-memory-key");
     if (mem_before) |m| m.deinit(allocator);
     try std.testing.expect(mem_before != null);
 
@@ -141,18 +156,52 @@ test "S6.11 D25 live: DELETE FROM users cascades user-scoped rows" {
     }
     try std.testing.expect(wm_before.len >= 1);
 
-    // Cascade trigger: DELETE FROM users.
+    const secrets_before = try mgr.listSecretKeys(allocator, uid);
+    defer {
+        for (secrets_before) |k| allocator.free(k);
+        allocator.free(secrets_before);
+    }
+    try std.testing.expect(secrets_before.len >= 1);
+
+    const mutations_before = try mgr.listSecretMutations(allocator, uid, 10);
+    defer {
+        for (mutations_before) |*r| r.deinit(allocator);
+        allocator.free(mutations_before);
+    }
+    try std.testing.expect(mutations_before.len >= 1);
+
+    const jobs_before = try mgr.getJobsJson(allocator, uid);
+    defer allocator.free(jobs_before);
+    try std.testing.expect(std.mem.indexOf(u8, jobs_before, "d25-job") != null);
+
+    const artifacts_before = try mgr.listArtifactsForUser(allocator, uid, null, 100);
+    defer nullalis.zaki_state.freeArtifactRows(allocator, artifacts_before);
+    try std.testing.expect(artifacts_before.len >= 1);
+
+    const sessions_before = try mgr.listUserSessions(allocator, uid);
+    defer {
+        for (sessions_before) |*s| s.deinit(allocator);
+        allocator.free(sessions_before);
+    }
+    try std.testing.expect(sessions_before.len >= 1);
+
+    const share_before = try mgr.getTraceByShareCode(allocator, "shr-d25-cascade-XYZ", 1_716_000_001);
+    if (share_before) |s| {
+        allocator.free(s.share_code);
+        allocator.free(s.run_id);
+        allocator.free(s.events_json);
+    } else {
+        return error.TraceShareNotSeededBeforeDelete;
+    }
+
+    // ── Cascade trigger: DELETE FROM users ───────────────────────────
     try mgr.deleteUser(uid);
 
-    // Post-condition: EVERY seeded row is gone (cascade fired on BOTH
-    // tables). A regression that drops CASCADE on either FK is caught
-    // here even if the static line scan stays green.
-    const mem_after = try mgr.getMemory(allocator, uid, "d25-key");
+    // ── Post-condition: every seeded table now has 0 rows for `uid` ──
+
+    const mem_after = try mgr.getMemory(allocator, uid, "d25-memory-key");
     if (mem_after) |m| m.deinit(allocator);
-    if (mem_after != null) {
-        std.debug.print("S6.11 D25 live: memories.d25-key SURVIVED user delete — cascade broken on memories\n", .{});
-        return error.MemoryRowSurvivedUserDelete;
-    }
+    if (mem_after != null) return error.MemoryRowSurvivedUserDelete;
 
     const wm_after = try mgr.listWorkingMemorySlots(allocator, uid, "d25-session");
     defer {
@@ -160,7 +209,60 @@ test "S6.11 D25 live: DELETE FROM users cascades user-scoped rows" {
         allocator.free(wm_after);
     }
     if (wm_after.len != 0) {
-        std.debug.print("S6.11 D25 live: working_memory has {d} slot(s) for the deleted user — cascade broken on working_memory\n", .{wm_after.len});
+        std.debug.print("S6.11 D25 live: working_memory has {d} surviving slot(s) — cascade broken\n", .{wm_after.len});
         return error.WorkingMemorySlotSurvivedUserDelete;
+    }
+
+    const secrets_after = try mgr.listSecretKeys(allocator, uid);
+    defer {
+        for (secrets_after) |k| allocator.free(k);
+        allocator.free(secrets_after);
+    }
+    if (secrets_after.len != 0) {
+        std.debug.print("S6.11 D25 live: user_secrets has {d} surviving key(s) — cascade broken\n", .{secrets_after.len});
+        return error.UserSecretsSurvivedUserDelete;
+    }
+
+    const mutations_after = try mgr.listSecretMutations(allocator, uid, 10);
+    defer {
+        for (mutations_after) |*r| r.deinit(allocator);
+        allocator.free(mutations_after);
+    }
+    if (mutations_after.len != 0) {
+        std.debug.print("S6.11 D25 live: secret_mutations has {d} surviving rows — cascade broken\n", .{mutations_after.len});
+        return error.SecretMutationsSurvivedUserDelete;
+    }
+
+    const jobs_after = try mgr.getJobsJson(allocator, uid);
+    defer allocator.free(jobs_after);
+    if (std.mem.indexOf(u8, jobs_after, "d25-job") != null) {
+        std.debug.print("S6.11 D25 live: jobs payload survived for deleted user: {s}\n", .{jobs_after});
+        return error.JobsSurvivedUserDelete;
+    }
+
+    const artifacts_after = try mgr.listArtifactsForUser(allocator, uid, null, 100);
+    defer nullalis.zaki_state.freeArtifactRows(allocator, artifacts_after);
+    if (artifacts_after.len != 0) {
+        std.debug.print("S6.11 D25 live: artifacts has {d} surviving row(s) — cascade broken\n", .{artifacts_after.len});
+        return error.ArtifactsSurvivedUserDelete;
+    }
+
+    const sessions_after = try mgr.listUserSessions(allocator, uid);
+    defer {
+        for (sessions_after) |*s| s.deinit(allocator);
+        allocator.free(sessions_after);
+    }
+    if (sessions_after.len != 0) {
+        std.debug.print("S6.11 D25 live: sessions has {d} surviving row(s) — cascade broken\n", .{sessions_after.len});
+        return error.SessionsSurvivedUserDelete;
+    }
+
+    const share_after = try mgr.getTraceByShareCode(allocator, "shr-d25-cascade-XYZ", 1_716_000_001);
+    if (share_after) |s| {
+        allocator.free(s.share_code);
+        allocator.free(s.run_id);
+        allocator.free(s.events_json);
+        std.debug.print("S6.11 D25 live: trace_shares survived user delete — cascade broken\n", .{});
+        return error.TraceShareSurvivedUserDelete;
     }
 }

@@ -43,10 +43,13 @@ pub fn requirePostgresUrl(allocator: std.mem.Allocator) ![]u8 {
 }
 
 /// Build a unique schema name keyed on microsecond timestamp + a short slug.
-/// `buf` must be ≥ 96 bytes. The name is lowercase ASCII safe for raw SQL.
+/// `buf` must be ≥ 96 bytes. Wraps the shared `zaki_state.buildTestSchemaName`
+/// so the matrix and the existing PG tests in src/ converge on one
+/// source of truth for unique-test-schema naming.
 pub fn schemaName(buf: []u8, slug: []const u8) ![]const u8 {
-    const stamp = std.time.microTimestamp();
-    return try std.fmt.bufPrint(buf, "nullalis_s6_{s}_{d}", .{ slug, stamp });
+    var prefix_buf: [64]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&prefix_buf, "nullalis_s6_{s}", .{slug});
+    return try zaki_state.buildTestSchemaName(buf, prefix);
 }
 
 /// Open a live Postgres connection on a unique schema. Connection
@@ -87,6 +90,49 @@ pub fn dropAndDeinit(mgr: *zaki_state.Manager, label: []const u8) void {
         );
     };
     mgr.deinit();
+}
+
+/// Per-test unique user_id, derived from microsecond timestamp.
+///
+/// Closes the prior `const uid: i64 = 1;` magic-constant gap. Each live
+/// test gets a fresh uid that does NOT collide with prior tests, so
+/// behavior is uid-agnostic. Bit 63 is cleared (positive i64 only).
+///
+/// Pairs with `mgr.skipExternalIdentityForTests()`: that bypass lets
+/// `provisionUser` accept ANY uid without probing `public.zaki_users`,
+/// so we can safely use stamp-based uids without the identity-gate
+/// fragility the prior commit-message documented.
+pub fn testUid() i64 {
+    return @intCast(std.time.microTimestamp() & 0x7FFFFFFFFFFFFFFF);
+}
+
+/// Open a live-PG manager + provision a unique-per-test user, returned
+/// alongside the assigned uid.
+///
+/// The Manager is moved by value into the caller (Zig's standard
+/// move-Manager idiom; the existing `tests/agent/promotion_reflection_pg_test.zig`
+/// uses the same pattern). The allocator is provided by the caller and
+/// must outlive the manager — typically a stack-pinned `ArenaAllocator`
+/// the caller owns.
+///
+/// Caller is responsible for `defer harness.dropAndDeinit(&result.mgr, label);`.
+///
+/// `label` is used in the schema name + cleanup-failure log lines.
+/// `workspace_path` is the value passed to `provisionUser`.
+pub fn provisionTestUser(
+    allocator: std.mem.Allocator,
+    test_url: []const u8,
+    label: []const u8,
+    workspace_path: []const u8,
+) !struct { mgr: zaki_state.Manager, uid: i64 } {
+    var schema_buf: [96]u8 = undefined;
+    const schema = try schemaName(&schema_buf, label);
+    var mgr = try newManager(allocator, test_url, schema);
+    errdefer mgr.deinit();
+    mgr.skipExternalIdentityForTests();
+    const uid = testUid();
+    try mgr.provisionUser(uid, workspace_path);
+    return .{ .mgr = mgr, .uid = uid };
 }
 
 // ── Project-file cache ────────────────────────────────────────────────

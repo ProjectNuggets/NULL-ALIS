@@ -97,14 +97,22 @@ test "S6.7 artifacts: handleArtifactExportDownload calls isSafeAttachmentFilenam
         return error.ExportDownloadHandlerMissing;
     };
 
-    // Bound the handler body. The function is bounded by the next
-    // top-level `fn ` declaration (a Zig top-level function starts at
-    // column 0). Conservative ceiling at 8 KB — the handler is ~80
-    // lines today; 8 KB is comfortable headroom.
-    const ceiling = @min(fn_start + 8 * 1024, gateway_src.len);
-    const fn_region = gateway_src[fn_start..ceiling];
-    const next_top_fn = std.mem.indexOf(u8, fn_region[1..], "\nfn ") orelse fn_region.len - 1;
-    const fn_body = fn_region[0..@min(next_top_fn + 1, fn_region.len)];
+    // Bound the handler body at the canonical column-0 close-brace
+    // (`\n}\n`). This is more robust than a `\nfn ` next-fn scan:
+    //   * works for any function regardless of `fn` / `pub fn` /
+    //     `inline fn` prefix on the FOLLOWING declaration;
+    //   * doesn't false-match a `\nfn ` substring buried in a string
+    //     literal inside the handler;
+    //   * stops at the END of the function body itself, not at the
+    //     start of an arbitrary later function.
+    // A Zig top-level function's terminating `}` is at column 0,
+    // followed by a newline. Anything inside the function body is
+    // indented at least 4 spaces, so `\n}\n` is unambiguous.
+    const body_end_rel = std.mem.indexOfPos(u8, gateway_src, fn_start, "\n}\n") orelse {
+        std.debug.print("S6.7: handleArtifactExportDownload body terminator not found within 8 KB\n", .{});
+        return error.ExportDownloadHandlerBodyUnbounded;
+    };
+    const fn_body = gateway_src[fn_start .. body_end_rel + 3]; // include the `\n}\n`
 
     if (std.mem.indexOf(u8, fn_body, "isSafeAttachmentFilename") == null) {
         std.debug.print("S6.7: handleArtifactExportDownload does NOT call isSafeAttachmentFilename — path-traversal guard bypassed\n", .{});
@@ -122,15 +130,11 @@ test "S6.7 artifacts live: create + get round-trip pins the V1 artifact storage 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-
     const test_url = try harness.requirePostgresUrl(allocator);
-    var schema_buf: [96]u8 = undefined;
-    const schema = try harness.schemaName(&schema_buf, "artifact_crud");
-    var mgr = try harness.newManager(allocator, test_url, schema);
-    defer harness.dropAndDeinit(&mgr, "artifacts");
-
-    const uid: i64 = 1;
-    try mgr.provisionUser(uid, "/tmp/nullalis-s6-artifact");
+    var prov = try harness.provisionTestUser(allocator, test_url, "artifact_crud", "/tmp/nullalis-s6-artifact");
+    defer harness.dropAndDeinit(&prov.mgr, "artifact_crud");
+    const uid = prov.uid;
+    const mgr = &prov.mgr;
 
     const session_id = "artifact-test-session";
     const created = try mgr.createArtifact(

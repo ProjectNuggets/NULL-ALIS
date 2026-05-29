@@ -44,6 +44,8 @@ test "S6.8 trace share: sanitizer keep-list is bounded (redundant pin with artif
 // Postgres URL + schema, is still readable by B's `getTraceByShareCode`.
 
 test "S6.8 trace share live: share survives Manager-deinit-and-reopen" {
+    // Two-phase test — uses the same schema across two Manager
+    // lifecycles, so it can't go through the openLiveFixture helper.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -52,17 +54,18 @@ test "S6.8 trace share live: share survives Manager-deinit-and-reopen" {
     var schema_buf: [96]u8 = undefined;
     const schema = try harness.schemaName(&schema_buf, "share_durable");
 
-    const uid: i64 = 1;
+    const uid = harness.testUid();
     const run_id = "run-durability-1";
     const share_code = "shr-durable-AAAA1111";
     const events_json = "[{\"kind\":\"turn.start\"},{\"kind\":\"turn.end\"}]";
     const created_unix: i64 = 1_716_000_000;
     const expires_unix: i64 = 1_716_999_999;
 
-    // Phase 1: open Manager, mint share, close.
+    // Phase 1: open Manager, install identity bypass, mint share, close.
     {
         var mgr = try harness.newManager(allocator, test_url, schema);
         defer mgr.deinit();
+        mgr.skipExternalIdentityForTests();
         try mgr.provisionUser(uid, "/tmp/nullalis-s6-share");
         try mgr.setTraceShare(uid, run_id, share_code, events_json, created_unix, expires_unix);
     }
@@ -82,9 +85,6 @@ test "S6.8 trace share live: share survives Manager-deinit-and-reopen" {
     try std.testing.expectEqualStrings(share_code, row.share_code);
     try std.testing.expectEqualStrings(run_id, row.run_id);
     try std.testing.expectEqual(uid, row.user_id);
-    // events_json column is `JSON` (not `JSONB`) — bytes must match
-    // exactly. A JSONB normalization regression would reorder keys or
-    // strip whitespace and fail this assert.
     try std.testing.expectEqualStrings(events_json, row.events_json);
 }
 
@@ -92,17 +92,14 @@ test "S6.8 trace share live: cascade fires when the owning user is deleted" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-
     const test_url = try harness.requirePostgresUrl(allocator);
-    var schema_buf: [96]u8 = undefined;
-    const schema = try harness.schemaName(&schema_buf, "share_cascade");
-    var mgr = try harness.newManager(allocator, test_url, schema);
-    defer harness.dropAndDeinit(&mgr, "trace_share");
+    var prov = try harness.provisionTestUser(allocator, test_url, "share_cascade", "/tmp/nullalis-s6-share-cascade");
+    defer harness.dropAndDeinit(&prov.mgr, "share_cascade");
+    const uid = prov.uid;
+    const mgr = &prov.mgr;
 
-    const uid: i64 = 1;
     const run_id = "run-cascade-1";
     const share_code = "shr-cascade-BBBB2222";
-    try mgr.provisionUser(uid, "/tmp/nullalis-s6-share-cascade");
     try mgr.setTraceShare(uid, run_id, share_code, "[]", 1_716_000_000, 1_716_999_999);
 
     // DELETE FROM users — the trace_shares row must cascade away.

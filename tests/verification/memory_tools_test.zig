@@ -82,15 +82,11 @@ test "S6.10 memory_purge_pii live: phone-tagged row is deleted, email-tagged + u
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-
     const test_url = try harness.requirePostgresUrl(allocator);
-    var schema_buf: [96]u8 = undefined;
-    const schema = try harness.schemaName(&schema_buf, "purge_pii");
-    var mgr = try harness.newManager(allocator, test_url, schema);
-    defer harness.dropAndDeinit(&mgr, "memory_tools");
-
-    const uid: i64 = 1;
-    try mgr.provisionUser(uid, "/tmp/nullalis-s6-purge");
+    var prov = try harness.provisionTestUser(allocator, test_url, "purge_pii", "/tmp/nullalis-s6-purge");
+    defer harness.dropAndDeinit(&prov.mgr, "purge_pii");
+    const uid = prov.uid;
+    const mgr = &prov.mgr;
 
     // Seed three memories: phone-tagged, email-tagged, untagged. The
     // production persist path (`memory_store.zig`) writes the `pii_tags`

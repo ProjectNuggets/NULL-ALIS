@@ -320,6 +320,16 @@ pub const ArtifactHistoryRow = struct {
     }
 };
 
+/// Test-only helper: build a unique schema name of the form
+/// `<prefix>_<microTimestamp>`. `buf` must be ≥ 96 bytes. The 28+ inline
+/// `bufPrint(..., "<some_prefix>_{d}", .{microTimestamp()})` call sites
+/// in this file (and `src/session.zig` / `tests/agent/...`) should
+/// migrate to this helper in a follow-up cleanup sweep — one source of
+/// truth instead of 29.
+pub fn buildTestSchemaName(buf: []u8, prefix: []const u8) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "{s}_{d}", .{ prefix, std.time.microTimestamp() });
+}
+
 pub fn freeArtifactRows(allocator: std.mem.Allocator, list: []ArtifactRow) void {
     for (list) |*r| r.deinit(allocator);
     allocator.free(list);
@@ -342,6 +352,7 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn hasExternalIdentity(_: *@This(), _: i64) !?bool {
         return null;
     }
+    pub fn skipExternalIdentityForTests(_: *@This()) void {}
     pub fn getConfigJson(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]u8 {
         return allocator.dupe(u8, "{}");
     }
@@ -2585,6 +2596,23 @@ const ManagerImpl = struct {
             &.{ session_key_z, user_s.ptr },
             &.{ @as(c_int, @intCast(session_key.len)), @as(c_int, @intCast(user_s.len)) },
         );
+    }
+
+    /// Test-only — forcibly preset the external-identity gate so
+    /// `hasExternalIdentity` returns null without probing
+    /// `public.zaki_users`. Use this from S6 verification-matrix tests
+    /// that want to provision a synthetic `user_id` regardless of
+    /// whether the zaki_users identity table happens to exist in the
+    /// test database (which is the difference between a pristine
+    /// pgvector container vs one that's been used by prior test runs).
+    ///
+    /// Production code paths MUST NOT call this. The check exists to
+    /// prevent provisioning shadow users that bypass the auth surface;
+    /// disabling it in production would be a security hole. Inline
+    /// tests in this file (and matrix tests) are the only legitimate
+    /// callers.
+    pub fn skipExternalIdentityForTests(self: *Self) void {
+        self.external_identity_status = .unavailable;
     }
 
     pub fn hasExternalIdentity(self: *Self, user_id: i64) !?bool {
