@@ -1290,6 +1290,91 @@ paths:
         "502":
           description: Telegram API rejected disconnect operation
 
+  /api/v1/diagnostics/extension/status:
+    get:
+      summary: System-wide extension WebSocket diagnostic state
+      description: |
+        Returns the live system-wide state of the extension WebSocket surface:
+        whether the feature is enabled, how many users are currently paired,
+        and lifetime counters. Requires `X-Internal-Token` (same model as
+        `/internal/diagnostics`).
+      security:
+        - InternalToken: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [enabled, total_active, connections_total, auth_failed_total]
+                properties:
+                  enabled:
+                    type: boolean
+                  total_active:
+                    type: integer
+                    description: Live count of currently-paired users.
+                  connections_total:
+                    type: integer
+                    description: Lifetime extension WS upgrades accepted.
+                  auth_failed_total:
+                    type: integer
+                    description: Lifetime auth_ack{ok:false} outcomes.
+        '401':
+          description: Missing or invalid internal token.
+        '405':
+          description: Method not allowed (only GET supported).
+
+  /api/v1/diagnostics/extension/users/{user_id}:
+    get:
+      summary: Per-user extension pairing + last-command state
+      description: |
+        Returns whether the requested user has a live extension paired,
+        when they paired, and what their last command did. Auth model:
+        either a valid `X-Internal-Token` (operator view) OR an
+        `X-Zaki-User-Id` header that matches the path parameter (self
+        view). The `user_id` path parameter must be alphanumeric +
+        `_-.` only; anything else returns 400.
+      security:
+        - InternalToken: []
+      parameters:
+        - in: path
+          name: user_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user_id, paired, connected_at_unix, last_command_at_unix, last_command_tool, last_command_result]
+                properties:
+                  user_id:
+                    type: string
+                  paired:
+                    type: boolean
+                  connected_at_unix:
+                    type: integer
+                    description: Seconds since epoch; 0 when not paired.
+                  last_command_at_unix:
+                    type: integer
+                    description: Seconds since epoch; 0 when no command yet.
+                  last_command_tool:
+                    type: string
+                    description: Empty when no command yet.
+                  last_command_result:
+                    type: string
+                    description: One of "ok", "timeout", "conn_closed", "oom", "error_other", or empty.
+        '400':
+          description: Invalid user_id path parameter.
+        '401':
+          description: Neither a valid internal token nor a matching X-Zaki-User-Id was provided.
+        '405':
+          description: Method not allowed (only GET supported).
+
   # ── Planned endpoint additions (SOTA program) ──────────────────────
   #
   # The entries below are DEFERRED. They are NOT implemented in v0.1
@@ -1309,6 +1394,13 @@ paths:
   # SSE event vocabulary for POST /api/v1/chat/stream (tool_start,
   # tool_result, approval_required, task_update, ...) IS implemented.
   # See docs/online-agent-contract.md for the authoritative frame schema.
+  #
+  # GET /api/v1/extension/ws is a WebSocket upgrade endpoint. OpenAPI
+  # 3.0 doesn't model WebSocket routes natively; the contract is in
+  # docs/extension-ws-contract.md and the gateway source lives in
+  # src/extension_ws/server.zig. Authentication uses per-user
+  # extension tokens (config: gateway.extension_tokens) — there is
+  # NO legacy global-token fallback.
   #
   # GET /api/v1/users/{user_id}/tasks and GET /tasks/{task_id} are
   # IMPLEMENTED as read-only snapshots of the canonical TaskLedger
