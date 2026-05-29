@@ -87,10 +87,7 @@ test "S6.10 memory_purge_pii live: phone-tagged row is deleted, email-tagged + u
     var schema_buf: [96]u8 = undefined;
     const schema = try harness.schemaName(&schema_buf, "purge_pii");
     var mgr = try harness.newManager(allocator, test_url, schema);
-    defer {
-        mgr.dropSchemaForTests() catch {};
-        mgr.deinit();
-    }
+    defer harness.dropAndDeinit(&mgr, "memory_tools");
 
     const uid: i64 = 1;
     try mgr.provisionUser(uid, "/tmp/nullalis-s6-purge");

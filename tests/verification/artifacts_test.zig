@@ -127,10 +127,7 @@ test "S6.7 artifacts live: create + get round-trip pins the V1 artifact storage 
     var schema_buf: [96]u8 = undefined;
     const schema = try harness.schemaName(&schema_buf, "artifact_crud");
     var mgr = try harness.newManager(allocator, test_url, schema);
-    defer {
-        mgr.dropSchemaForTests() catch {};
-        mgr.deinit();
-    }
+    defer harness.dropAndDeinit(&mgr, "artifacts");
 
     const uid: i64 = 1;
     try mgr.provisionUser(uid, "/tmp/nullalis-s6-artifact");
@@ -157,7 +154,9 @@ test "S6.7 artifacts live: create + get round-trip pins the V1 artifact storage 
 
     try std.testing.expectEqualStrings("Verification Smoke Doc", created.title);
     try std.testing.expectEqualStrings("markdown", created.kind);
-    try std.testing.expectEqual(@as(i32, 1), created.current_version);
+    // `current_version` is `u64` (src/zaki_state.zig:250); using i32 here
+    // would coerce fine for value=1 but fail latently for values > i32 max.
+    try std.testing.expectEqual(@as(u64, 1), created.current_version);
 
     // Read back by id — must match the create response.
     const fetched = try mgr.getArtifactById(allocator, uid, created.id) orelse {

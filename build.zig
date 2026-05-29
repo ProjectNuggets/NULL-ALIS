@@ -698,10 +698,20 @@ pub fn build(b: *std.Build) void {
 
     // Sprint S6 — V1 production verification matrix. Runs only the
     // tests/verification/ aggregate. Default `test` step is unchanged.
-    // Live Postgres tests skip cleanly without NULLALIS_POSTGRES_TEST_URL.
+    //
+    // REQUIRES `-Dengines=...,postgres` AT COMPILE TIME — the matrix is
+    // the V1 live-PG lane. Running with `-Dengines=base,sqlite` (or any
+    // engine set that excludes postgres) fails at compile time via a
+    // `@compileError` at tests/verification/root.zig:14. Engine absence
+    // is NOT a runtime skip.
+    //
+    // At runtime, the live-PG tests need `NULLALIS_POSTGRES_TEST_URL` to
+    // point at a reachable Postgres. URL absence → SkipZigTest on the
+    // live-PG tests (static contract scans still run). A URL that is
+    // SET but unreachable → connection error PROPAGATES (test RED).
     const test_postgres_step = b.step(
         "test-postgres",
-        "Run the V1 production verification matrix (set NULLALIS_POSTGRES_TEST_URL for the live-PG lane)",
+        "Run the V1 production verification matrix (requires -Dengines=...,postgres; set NULLALIS_POSTGRES_TEST_URL for the live-PG lane)",
     );
     test_postgres_step.dependOn(&b.addRunArtifact(verification_tests).step);
 }

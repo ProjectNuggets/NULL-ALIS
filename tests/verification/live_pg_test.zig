@@ -33,7 +33,7 @@ test "S6.0 live PG: NULLALIS_POSTGRES_TEST_URL must be reachable when set" {
     // connection errors to SkipZigTest — a `127.0.0.1:1` URL fails with
     // (e.g.) connection-refused and the test is RED.
     var mgr = try harness.newManager(allocator, test_url, schema);
-    defer mgr.deinit();
+    defer harness.dropAndDeinit(&mgr, "connectivity");
 
     // Migration smoke — verify the freshly-created schema carries the
     // `users` table that `Manager.init` runs migrations to install. A
@@ -41,11 +41,6 @@ test "S6.0 live PG: NULLALIS_POSTGRES_TEST_URL must be reachable when set" {
     // be a subtler vacuous-green; this catches it.
     const uid: i64 = 1;
     try mgr.provisionUser(uid, "/tmp/nullalis-s6-connectivity");
-
-    // Schema-cleanup — drops the per-test schema so subsequent runs are
-    // hermetic. Pinned as a test rather than a defer so a regression
-    // that broke drop_schema also surfaces here.
-    try mgr.dropSchemaForTests();
 }
 
 test "S6.0 live PG: a freshly-init'd Manager isolates per-test schemas" {
@@ -64,15 +59,9 @@ test "S6.0 live PG: a freshly-init'd Manager isolates per-test schemas" {
     const schema_b = try harness.schemaName(&schema_b_buf, "iso_b");
 
     var mgr_a = try harness.newManager(allocator, test_url, schema_a);
-    defer {
-        mgr_a.dropSchemaForTests() catch {};
-        mgr_a.deinit();
-    }
+    defer harness.dropAndDeinit(&mgr_a, "iso_a");
     var mgr_b = try harness.newManager(allocator, test_url, schema_b);
-    defer {
-        mgr_b.dropSchemaForTests() catch {};
-        mgr_b.deinit();
-    }
+    defer harness.dropAndDeinit(&mgr_b, "iso_b");
 
     const uid: i64 = 1;
     try mgr_a.provisionUser(uid, "/tmp/nullalis-s6-iso-a");

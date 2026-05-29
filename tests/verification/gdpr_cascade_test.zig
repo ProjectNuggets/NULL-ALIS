@@ -15,15 +15,44 @@ const migrations = nullalis.migrations;
 const memory_root = nullalis.memory;
 const harness = @import("harness.zig");
 
-/// True iff `line` declares a user_id FK to {schema}.users(user_id).
-/// Recognized shapes (both seen in migrations/*.sql):
-///   `user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON ...`
-///   `user_id BIGINT PRIMARY KEY REFERENCES {schema}.users(user_id) ON ...`
-///   `user_id BIGINT REFERENCES {schema}.users(user_id) ON ...`
+/// True iff `line` declares a `user_id` column with an FK to
+/// `{schema}.users(user_id)`. Anchors to a COLUMN declaration so unrelated
+/// names like `creating_user_id` or `deleted_user_id` paired with an
+/// FK on the same line are NOT false-positives. Recognized shapes (both
+/// seen in migrations/*.sql):
+///   `    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON ...`
+///   `    user_id BIGINT PRIMARY KEY REFERENCES {schema}.users(user_id) ON ...`
+///   `    user_id BIGINT REFERENCES {schema}.users(user_id) ON ...`
 fn lineIsUserIdFk(line: []const u8) bool {
-    return std.mem.indexOf(u8, line, "user_id") != null and
-        std.mem.indexOf(u8, line, "REFERENCES") != null and
-        std.mem.indexOf(u8, line, "users(user_id)") != null;
+    // Strip leading whitespace and anchor on the column-declaration token
+    // `user_id BIGINT` (the canonical type for every owner-user FK in
+    // src/migrations/*). A line like `creating_user_id BIGINT REFERENCES
+    // {schema}.users(user_id) ON DELETE SET NULL` is correctly EXCLUDED
+    // because the leading word is `creating_user_id`, not `user_id`.
+    var i: usize = 0;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    const trimmed = line[i..];
+    if (!std.mem.startsWith(u8, trimmed, "user_id BIGINT") and
+        !std.mem.startsWith(u8, trimmed, "user_id  BIGINT"))
+    {
+        return false;
+    }
+    return std.mem.indexOf(u8, trimmed, "REFERENCES") != null and
+        std.mem.indexOf(u8, trimmed, "users(user_id)") != null;
+}
+
+test "S6.11 D25 unit: lineIsUserIdFk does not false-positive on prefixed column names" {
+    // Negative pin: `creating_user_id` / `deleted_user_id` / etc. with
+    // an FK on the SAME line must NOT register as a user_id-owner FK.
+    try std.testing.expect(!lineIsUserIdFk("    creating_user_id BIGINT REFERENCES {schema}.users(user_id) ON DELETE SET NULL,"));
+    try std.testing.expect(!lineIsUserIdFk("    deleted_user_id BIGINT REFERENCES {schema}.users(user_id) ON DELETE CASCADE,"));
+    try std.testing.expect(!lineIsUserIdFk("    -- references {schema}.users(user_id) explanatory comment"));
+}
+
+test "S6.11 D25 unit: lineIsUserIdFk recognizes the canonical column declaration shapes" {
+    try std.testing.expect(lineIsUserIdFk("    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,"));
+    try std.testing.expect(lineIsUserIdFk("    user_id BIGINT PRIMARY KEY REFERENCES {schema}.users(user_id) ON DELETE CASCADE,"));
+    try std.testing.expect(lineIsUserIdFk("    user_id BIGINT REFERENCES {schema}.users(user_id) ON DELETE SET NULL,"));
 }
 
 test "S6.11 D25 static: every user_id FK line declares ON DELETE CASCADE" {
@@ -75,10 +104,7 @@ test "S6.11 D25 live: DELETE FROM users cascades user-scoped rows" {
     var schema_buf: [96]u8 = undefined;
     const schema = try harness.schemaName(&schema_buf, "d25_cascade");
     var mgr = try harness.newManager(allocator, test_url, schema);
-    defer {
-        mgr.dropSchemaForTests() catch {};
-        mgr.deinit();
-    }
+    defer harness.dropAndDeinit(&mgr, "gdpr_cascade");
 
     const uid: i64 = 1;
     try mgr.provisionUser(uid, "/tmp/nullalis-s6-d25");
@@ -102,19 +128,39 @@ test "S6.11 D25 live: DELETE FROM users cascades user-scoped rows" {
         false,
     );
 
-    // Pre-condition: seed rows are present.
+    // Pre-condition: BOTH seeded rows are present. (Closes the prior
+    // coverage gap where working_memory was seeded but never read back.)
     const mem_before = try mgr.getMemory(allocator, uid, "d25-key");
     if (mem_before) |m| m.deinit(allocator);
     try std.testing.expect(mem_before != null);
 
+    const wm_before = try mgr.listWorkingMemorySlots(allocator, uid, "d25-session");
+    defer {
+        for (wm_before) |*slot| slot.deinit(allocator);
+        allocator.free(wm_before);
+    }
+    try std.testing.expect(wm_before.len >= 1);
+
     // Cascade trigger: DELETE FROM users.
     try mgr.deleteUser(uid);
 
-    // Post-condition: every seeded row is gone (cascade fired).
+    // Post-condition: EVERY seeded row is gone (cascade fired on BOTH
+    // tables). A regression that drops CASCADE on either FK is caught
+    // here even if the static line scan stays green.
     const mem_after = try mgr.getMemory(allocator, uid, "d25-key");
     if (mem_after) |m| m.deinit(allocator);
     if (mem_after != null) {
-        std.debug.print("S6.11 D25 live: memories.d25-key SURVIVED user delete — cascade broken\n", .{});
+        std.debug.print("S6.11 D25 live: memories.d25-key SURVIVED user delete — cascade broken on memories\n", .{});
         return error.MemoryRowSurvivedUserDelete;
+    }
+
+    const wm_after = try mgr.listWorkingMemorySlots(allocator, uid, "d25-session");
+    defer {
+        for (wm_after) |*slot| slot.deinit(allocator);
+        allocator.free(wm_after);
+    }
+    if (wm_after.len != 0) {
+        std.debug.print("S6.11 D25 live: working_memory has {d} slot(s) for the deleted user — cascade broken on working_memory\n", .{wm_after.len});
+        return error.WorkingMemorySlotSurvivedUserDelete;
     }
 }

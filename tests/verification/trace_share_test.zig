@@ -69,10 +69,7 @@ test "S6.8 trace share live: share survives Manager-deinit-and-reopen" {
 
     // Phase 2: reopen on the SAME schema. The minted share must persist.
     var mgr2 = try harness.newManager(allocator, test_url, schema);
-    defer {
-        mgr2.dropSchemaForTests() catch {};
-        mgr2.deinit();
-    }
+    defer harness.dropAndDeinit(&mgr2, "trace_share_phase2");
 
     const row = try mgr2.getTraceByShareCode(allocator, share_code, created_unix + 1) orelse {
         std.debug.print("S6.8 trace share live: share '{s}' DID NOT survive Manager reopen\n", .{share_code});
@@ -100,10 +97,7 @@ test "S6.8 trace share live: cascade fires when the owning user is deleted" {
     var schema_buf: [96]u8 = undefined;
     const schema = try harness.schemaName(&schema_buf, "share_cascade");
     var mgr = try harness.newManager(allocator, test_url, schema);
-    defer {
-        mgr.dropSchemaForTests() catch {};
-        mgr.deinit();
-    }
+    defer harness.dropAndDeinit(&mgr, "trace_share");
 
     const uid: i64 = 1;
     const run_id = "run-cascade-1";

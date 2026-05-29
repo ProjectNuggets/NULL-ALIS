@@ -71,6 +71,24 @@ pub fn newManager(
     });
 }
 
+/// Shared schema-cleanup + manager-deinit helper for live-PG tests.
+/// Drop failures are logged via `std.debug.print` (surfaced in CI logs)
+/// rather than silently swallowed — a drop failure may indicate a real
+/// test-side bug (held lock, dangling transaction) but should not turn
+/// an otherwise-passing test red. `mgr.deinit` is unconditional so the
+/// connection pool tears down even if drop fails.
+///
+/// Use as `defer harness.dropAndDeinit(&mgr, "test-slug");`.
+pub fn dropAndDeinit(mgr: *zaki_state.Manager, label: []const u8) void {
+    mgr.dropSchemaForTests() catch |err| {
+        std.debug.print(
+            "S6 cleanup ({s}): dropSchemaForTests failed: {s} — schema may leak\n",
+            .{ label, @errorName(err) },
+        );
+    };
+    mgr.deinit();
+}
+
 // ── Project-file cache ────────────────────────────────────────────────
 
 const CacheEntry = struct {
@@ -169,12 +187,22 @@ pub fn migrationSql(name: []const u8) ?[]const u8 {
 /// `path_substr` is matched as a substring of the path declaration line
 /// (so callers can pass `"/cancel:"` or `"/sessions/{key}/cancel:"` —
 /// both anchor on the canonical session-scoped route).
+///
+/// The block extends from the declaration line up to (but not including)
+/// the NEXT sibling path declaration OR the next top-level section
+/// (`components:`, `tags:`, `info:`, etc. — any line at column 0). The
+/// second terminator is critical for the last path under `paths:` —
+/// without it the block would extend into `components:` and the
+/// substring scan would silently match unrelated responses declared
+/// under e.g. `components.responses`.
+///
+/// `\r` is stripped from each line before matching so CRLF-terminated
+/// files (Windows checkouts) work without modification.
 pub fn openApiPathBlock(yaml: []const u8, path_substr: []const u8) ?[]const u8 {
-    // Find a line that starts with two spaces, is a `/`-prefixed path
-    // entry (declaration line ends with `:`), and contains path_substr.
     var line_iter = std.mem.splitScalar(u8, yaml, '\n');
     var cursor: usize = 0;
-    while (line_iter.next()) |line| : (cursor += line.len + 1) {
+    while (line_iter.next()) |raw_line| : (cursor += raw_line.len + 1) {
+        const line = trimTrailingCr(raw_line);
         if (line.len < 4) continue;
         if (line[0] != ' ' or line[1] != ' ') continue;
         if (line.len > 2 and line[2] == ' ') continue; // deeper than 2 spaces
@@ -182,21 +210,34 @@ pub fn openApiPathBlock(yaml: []const u8, path_substr: []const u8) ?[]const u8 {
         if (line[line.len - 1] != ':') continue;
         if (std.mem.indexOf(u8, line, path_substr) == null) continue;
 
-        // Found the declaring line. Block ends at the next 2-space line
-        // starting with `/` (next path entry).
-        const block_start = cursor + line.len + 1;
+        // Found the declaring line. Block ends at the NEXT sibling path
+        // entry (`  /...:`) OR the next top-level YAML section
+        // (any non-blank line at column 0 with no leading spaces).
+        const block_start = cursor + raw_line.len + 1;
         if (block_start >= yaml.len) return yaml[cursor..];
         const rest = yaml[block_start..];
         var inner_iter = std.mem.splitScalar(u8, rest, '\n');
         var inner_cursor: usize = 0;
-        while (inner_iter.next()) |inner| : (inner_cursor += inner.len + 1) {
+        while (inner_iter.next()) |raw_inner| : (inner_cursor += raw_inner.len + 1) {
+            const inner = trimTrailingCr(raw_inner);
+            // Sibling path entry: 2-space-indented `/`-prefixed.
             if (inner.len >= 3 and inner[0] == ' ' and inner[1] == ' ' and inner[2] == '/') {
+                return yaml[cursor .. block_start + inner_cursor];
+            }
+            // Top-level YAML section: column-0 non-blank, non-comment.
+            // (`components:`, `tags:`, `info:`, etc.)
+            if (inner.len >= 1 and inner[0] != ' ' and inner[0] != '#') {
                 return yaml[cursor .. block_start + inner_cursor];
             }
         }
         return yaml[cursor..];
     }
     return null;
+}
+
+fn trimTrailingCr(line: []const u8) []const u8 {
+    if (line.len > 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
+    return line;
 }
 
 // ── Self-tests ────────────────────────────────────────────────────────────
@@ -243,4 +284,36 @@ test "harness: openApiPathBlock isolates a path block and excludes sibling route
     try std.testing.expect(std.mem.indexOf(u8, bar_block, "'200'") == null);
 
     try std.testing.expect(openApiPathBlock(synth, "/nonexistent:") == null);
+}
+
+test "harness: openApiPathBlock terminates at the next top-level YAML section" {
+    // Regression pin: a path that is the LAST entry under `paths:` must
+    // NOT have its block extended into `components:` / `tags:` etc.
+    // Without this, a response code declared in `components.responses`
+    // would be falsely matched against the last path's block.
+    const synth =
+        \\paths:
+        \\  /api/v1/only-route:
+        \\    post:
+        \\      summary: the only path
+        \\components:
+        \\  responses:
+        \\    '409':
+        \\      description: shared conflict template
+    ;
+    const block = openApiPathBlock(synth, "/only-route:") orelse return error.BlockNotFound;
+    try std.testing.expect(std.mem.indexOf(u8, block, "the only path") != null);
+    // The CRITICAL assertion: the `components:` section's 409 declaration
+    // must NOT bleed into this block.
+    try std.testing.expect(std.mem.indexOf(u8, block, "'409'") == null);
+    try std.testing.expect(std.mem.indexOf(u8, block, "components") == null);
+}
+
+test "harness: openApiPathBlock tolerates CRLF line endings" {
+    // Windows-checkout safety: `\r\n` line termination must not break the
+    // path/section detection.
+    const synth = "paths:\r\n  /api/v1/foo:\r\n    post:\r\n      x: y\r\n  /api/v1/bar:\r\n    post:\r\n      x: z\r\n";
+    const foo_block = openApiPathBlock(synth, "/foo:") orelse return error.FooBlockNotFound;
+    try std.testing.expect(std.mem.indexOf(u8, foo_block, "/foo:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, foo_block, "/bar:") == null);
 }
