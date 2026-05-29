@@ -6,9 +6,7 @@ const gateway = nullalis.gateway;
 const harness = @import("harness.zig");
 
 test "S6.6 attachments: route is documented in OpenAPI" {
-    const allocator = std.testing.allocator;
-    const yaml = try harness.loadProjectFile(allocator, "docs/openapi-v1.yaml");
-    defer allocator.free(yaml);
+    const yaml = try harness.loadProjectFile("docs/openapi-v1.yaml");
     try std.testing.expect(std.mem.indexOf(u8, yaml, "/attachments") != null);
 }
 
@@ -30,9 +28,7 @@ test "S6.6 attachments: empty Idempotency-Key value parses as zero-length slice"
 }
 
 test "S6.6 attachments: failure-state surface is documented" {
-    const allocator = std.testing.allocator;
-    const yaml = try harness.loadProjectFile(allocator, "docs/openapi-v1.yaml");
-    defer allocator.free(yaml);
+    const yaml = try harness.loadProjectFile("docs/openapi-v1.yaml");
     const has_attachments = std.mem.indexOf(u8, yaml, "/attachments") != null;
     const has_4xx = std.mem.indexOf(u8, yaml, "invalid_idempotency_key") != null or
         std.mem.indexOf(u8, yaml, "'400'") != null or

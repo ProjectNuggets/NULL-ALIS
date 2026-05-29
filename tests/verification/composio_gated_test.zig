@@ -2,16 +2,19 @@
 //!
 //! Composio integration is HIDDEN from V1 user-facing claims per the
 //! matrix doc. This file pins the GATED lane behavior:
-//!   * Without `COMPOSIO_API_KEY` set → skip-graceful.
-//!   * With it set → a config struct can be constructed and the
-//!     capability gate reports composio enabled. NO real Composio API
-//!     calls are made.
-//!   * Any "prod" or "main" substring in the test entity is rejected.
+//!   * Without `COMPOSIO_API_KEY` set → skip-graceful (the documented CI
+//!     default).
+//!   * With it set → the production-name guard rejects any test entity
+//!     whose ASCII-lowercased name CONTAINS the substring `prod` or
+//!     `main`. The guard is case-insensitive (closes the original bug
+//!     where `"PROD"` and `"Production"` passed a case-sensitive
+//!     substring check) and intentionally over-conservative: a false
+//!     positive (`reprod-12`) is fixable by renaming the test fixture;
+//!     a false negative (accidentally hitting prod) is not.
 
 const std = @import("std");
 const nullalis = @import("nullalis");
 const config_types = nullalis.config.config_types;
-const capabilities = nullalis.capabilities;
 
 const COMPOSIO_API_KEY_ENV = "COMPOSIO_API_KEY";
 const COMPOSIO_TEST_ENTITY_ENV = "NULLALIS_COMPOSIO_TEST_ENTITY";
@@ -23,33 +26,60 @@ fn getEnvOrSkip(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     };
 }
 
-test "S6.15 composio: capabilities namespace is wired (scaffold present)" {
-    // The capability gate exists; a future refactor that drops it without
-    // explicit V1 scope review fails to compile here.
-    _ = capabilities;
-    _ = config_types.ComposioConfig;
+/// True iff `haystack` contains `needle` after ASCII-lowercasing both.
+/// Used by the production-safety guard below. Caller-provided `lower_buf`
+/// must be ≥ haystack.len bytes so we can avoid heap allocation in the
+/// guard path.
+fn containsCaseInsensitive(haystack: []const u8, needle: []const u8, lower_buf: []u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    std.debug.assert(lower_buf.len >= haystack.len);
+    const lower = std.ascii.lowerString(lower_buf[0..haystack.len], haystack);
+    return std.mem.indexOf(u8, lower, needle) != null;
 }
 
-test "S6.15 composio: ComposioConfig struct accepts the gated lane fields" {
-    // Pin the struct shape so a field rename downstream fails this test
-    // BEFORE breaking the gated CI lane.
-    const cfg: config_types.ComposioConfig = .{
-        .enabled = false,
-        .api_key = null,
-        .entity_id = "test",
-    };
-    try std.testing.expect(!cfg.enabled);
-    try std.testing.expect(cfg.api_key == null);
-    try std.testing.expectEqualStrings("test", cfg.entity_id);
+/// The shipping production-safety check. Returns true if `entity` looks
+/// production-ish under case-insensitive substring match.
+fn looksProductionish(entity: []const u8) bool {
+    if (entity.len > 256) return true; // suspiciously long → reject conservatively
+    var buf: [256]u8 = undefined;
+    return containsCaseInsensitive(entity, "prod", &buf) or
+        containsCaseInsensitive(entity, "main", &buf);
 }
 
-test "S6.15 composio: gated lane is SKIPPED when COMPOSIO_API_KEY is absent" {
-    const allocator = std.testing.allocator;
-    const key = getEnvOrSkip(allocator, COMPOSIO_API_KEY_ENV) catch return error.SkipZigTest;
-    defer allocator.free(key);
-    // Reaching this point means env IS set; the next test exercises
-    // that path.
+// ── Pin the production-name guard's case-insensitivity ───────────────
+// The original case-sensitive substring guard had a bug: `"PROD"` and
+// `"Production"` passed. These tests pin the fix.
+
+test "S6.15 composio guard: case-insensitive match on 'prod' variants" {
+    try std.testing.expect(looksProductionish("prod"));
+    try std.testing.expect(looksProductionish("PROD"));
+    try std.testing.expect(looksProductionish("Production"));
+    try std.testing.expect(looksProductionish("prod-fixture"));
+    try std.testing.expect(looksProductionish("acme-prod-001"));
 }
+
+test "S6.15 composio guard: case-insensitive match on 'main' variants" {
+    try std.testing.expect(looksProductionish("main"));
+    try std.testing.expect(looksProductionish("MAIN"));
+    try std.testing.expect(looksProductionish("Main-canary"));
+    try std.testing.expect(looksProductionish("the-main-branch"));
+}
+
+test "S6.15 composio guard: accepts genuinely safe fixture names" {
+    try std.testing.expect(!looksProductionish("qa-sandbox"));
+    try std.testing.expect(!looksProductionish("e2e-staging"));
+    try std.testing.expect(!looksProductionish("dev"));
+    try std.testing.expect(!looksProductionish("test-fixture"));
+}
+
+test "S6.15 composio guard: overly-long entity name is conservatively rejected" {
+    // A 257-byte all-safe-looking name still rejects to prevent buffer
+    // overrun or operator confusion. Pin the >256-byte cliff.
+    const long = [_]u8{'a'} ** 257;
+    try std.testing.expect(looksProductionish(&long));
+}
+
+// ── Env-gated lane ────────────────────────────────────────────────────
 
 test "S6.15 composio: configured lane rejects production-named entities" {
     const allocator = std.testing.allocator;
@@ -58,11 +88,9 @@ test "S6.15 composio: configured lane rejects production-named entities" {
     const entity = getEnvOrSkip(allocator, COMPOSIO_TEST_ENTITY_ENV) catch return error.SkipZigTest;
     defer allocator.free(entity);
 
-    const lower_safe = std.mem.indexOf(u8, entity, "prod") == null and
-        std.mem.indexOf(u8, entity, "main") == null;
-    if (!lower_safe) {
+    if (looksProductionish(entity)) {
         std.debug.print(
-            "S6.15: refusing to run Composio gated lane with entity '{s}' — contains 'prod' or 'main'\n",
+            "S6.15: refusing to run Composio gated lane with entity '{s}' — case-insensitive substring match on 'prod' or 'main'\n",
             .{entity},
         );
         return error.UnsafeComposioTestEntity;

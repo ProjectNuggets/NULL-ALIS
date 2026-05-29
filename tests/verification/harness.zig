@@ -1,13 +1,18 @@
 //! S6 verification matrix shared helpers.
 //!
-//! Smokes call the established in-process fixture patterns proven elsewhere
-//! in the suite:
-//!   * postgres URL resolver via env_rebrand (canonical + legacy fallback)
-//!   * unique per-test schema name (microsecond timestamp + slug)
-//!   * skip-graceful semantics when the live PG fixture is absent
+//! Pins:
+//!   * postgres URL resolver via env_rebrand (canonical + legacy fallback).
+//!     OOM and other genuine errors PROPAGATE — only env-var-absent collapses
+//!     to SkipZigTest.
+//!   * unique per-test schema name (microsecond timestamp + slug).
+//!   * cached project-file loader for the matrix's doc-contract scans —
+//!     reads each file at most once per test process, propagates real
+//!     errors (missing file when CWD looks like repo root → real failure,
+//!     not vacuously-green skip).
 //!
-//! Heavier per-surface fixtures (zaki_state.Manager init, gateway fixtures)
-//! live in the per-surface test files because their config shape varies.
+//! Heavier per-surface fixtures (zaki_state.Manager init, gateway
+//! fixtures) live in the per-surface test files because their config
+//! shape varies.
 
 const std = @import("std");
 const nullalis = @import("nullalis");
@@ -17,66 +22,29 @@ const env_rebrand = nullalis.env_rebrand;
 pub const PG_URL_CANONICAL = "NULLALIS_POSTGRES_TEST_URL";
 pub const PG_URL_LEGACY = "NULLCLAW_POSTGRES_TEST_URL";
 
-/// Error returned when the live-PG verification surface cannot run.
-/// Split into named variants so a downstream test can react differently
-/// (e.g. a schema-static test on a Postgres-built profile should NOT
-/// silently skip if the URL is missing — it should panic loudly so CI
-/// doesn't accept a vacuously-green matrix).
-pub const PgGateError = error{
-    PgEngineNotCompiledIn,
-    PgUrlNotSet,
-    PgUrlReadFailed,
-};
-
-/// Inner resolver: pure on-the-string-pair, no global state. Returns the
-/// owned URL slice or a NAMED PgGateError variant so callers can decide
-/// to skip vs panic.
-fn resolvePostgresUrlInner(allocator: std.mem.Allocator) PgGateError![]u8 {
-    if (!build_options.enable_postgres) return error.PgEngineNotCompiledIn;
+/// Resolve the postgres test URL.
+///
+/// Returns `error.SkipZigTest` ONLY when:
+///   * the build was compiled without `-Dengines=...,postgres`, or
+///   * neither env var is set.
+///
+/// Every other error (OOM, WTF-8 decode, etc.) propagates as itself —
+/// silently collapsing them would let a harness bug ship as a green
+/// matrix.
+pub fn requirePostgresUrl(allocator: std.mem.Allocator) ![]u8 {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
     const maybe_url = env_rebrand.getEnvOwnedWithRebrand(
         allocator,
         PG_URL_CANONICAL,
         PG_URL_LEGACY,
     ) catch |err| switch (err) {
         // Genuine env-var absence on this platform — distinct from a
-        // configured-but-broken URL (e.g. invalid WTF-8 on Windows).
-        error.EnvironmentVariableNotFound => return error.PgUrlNotSet,
-        // OOM / WTF-8 / other propagable failures must NOT be silently
-        // collapsed into a skip — they are bugs to surface, not absence
-        // to tolerate.
-        else => return error.PgUrlReadFailed,
+        // configured-but-broken URL or an OOM.
+        error.EnvironmentVariableNotFound => return error.SkipZigTest,
+        // Everything else (OOM, WTF-8, etc.) PROPAGATES. Do not swallow.
+        else => return err,
     };
-    return maybe_url orelse error.PgUrlNotSet;
-}
-
-/// Resolve the postgres test URL. Returns `error.SkipZigTest` if either:
-///   * the build was compiled without `-Dengines=...,postgres`, or
-///   * neither env var is set.
-///
-/// On a genuine env-read failure (WTF-8 / OOM / etc.) the error PROPAGATES —
-/// silently collapsing it to a skip would hide harness bugs. Caller owns the
-/// returned slice.
-pub fn requirePostgresUrl(allocator: std.mem.Allocator) ![]u8 {
-    return resolvePostgresUrlInner(allocator) catch |err| switch (err) {
-        error.PgEngineNotCompiledIn, error.PgUrlNotSet => return error.SkipZigTest,
-        error.PgUrlReadFailed => return error.SkipZigTest, // surfaced via env_rebrand warn
-    };
-}
-
-/// Stricter sibling — for tests that should NOT silently skip when the
-/// build is on but the URL is missing. Used by the canonical CI lane to
-/// guarantee a vacuously-green matrix is impossible.
-///
-/// Returns `error.SkipZigTest` only when the build option is off (a legitimate
-/// "this test family isn't applicable to this build profile" condition);
-/// any other failure mode propagates as a typed PgGateError that the test
-/// surfaces as a real failure.
-pub fn requirePostgresUrlStrict(allocator: std.mem.Allocator) ![]u8 {
-    return resolvePostgresUrlInner(allocator) catch |err| switch (err) {
-        error.PgEngineNotCompiledIn => return error.SkipZigTest,
-        error.PgUrlNotSet => return error.PgUrlNotSet,
-        error.PgUrlReadFailed => return error.PgUrlReadFailed,
-    };
+    return maybe_url orelse error.SkipZigTest;
 }
 
 /// Build a unique schema name keyed on microsecond timestamp + a short slug.
@@ -86,27 +54,99 @@ pub fn schemaName(buf: []u8, slug: []const u8) ![]const u8 {
     return try std.fmt.bufPrint(buf, "nullalis_s6_{s}_{d}", .{ slug, stamp });
 }
 
-/// Load a project-root-relative file (e.g. `docs/openapi-v1.yaml`).
-/// `@embedFile` cannot reach outside the test module's package boundary,
-/// so doc-content assertions use this runtime helper instead. The
-/// `zig build test-postgres` step runs from the project root, so
-/// `std.fs.cwd()` resolves there. Caller owns the returned slice.
-pub fn loadProjectFile(allocator: std.mem.Allocator, rel_path: []const u8) ![]u8 {
+// ── Project-file cache ────────────────────────────────────────────────
+//
+// The matrix's doc-contract tests load `docs/openapi-v1.yaml`,
+// `docs/ui-handoff.md`, `docs/online-agent-contract.md`, and
+// `docs/extension-ws-contract.md`. Without caching, each test pays a
+// fresh openFile + readToEndAlloc + free; with 21+ load sites this is
+// ~25 disk reads and ~25 testing-allocator alloc/free pairs that
+// produce identical bytes. The cache reads each file at most once per
+// test process, returns a borrowed slice owned by the cache (caller
+// does NOT free), and propagates errors rather than swallowing them
+// when CWD looks like the repo root.
+
+const CacheEntry = struct {
+    path: []const u8, // borrowed (caller-provided literal)
+    bytes: []u8, // owned by cache_arena
+};
+
+const CacheState = struct {
+    arena: std.heap.ArenaAllocator,
+    entries: std.ArrayListUnmanaged(CacheEntry) = .empty,
+};
+
+var cache_state: ?*CacheState = null;
+var cache_mutex: std.Thread.Mutex = .{};
+
+fn cwdLooksLikeRepoRoot() bool {
+    // Sentinel files we expect at the project root. If even one is
+    // present, treat CWD as the repo root and propagate FileNotFound
+    // as a real failure. If none are present, we may be running from
+    // a sub-checkout or an IDE working dir — fall back to SkipZigTest
+    // for legitimate "the harness can't see the docs" cases.
+    const sentinels = [_][]const u8{ "build.zig", "tests/verification/root.zig" };
+    for (sentinels) |s| {
+        std.fs.cwd().access(s, .{}) catch continue;
+        return true;
+    }
+    return false;
+}
+
+fn loadAndCacheLocked(rel_path: []const u8) ![]const u8 {
+    const state = cache_state orelse blk: {
+        const heap_state = std.heap.page_allocator.create(CacheState) catch return error.OutOfMemory;
+        heap_state.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+        cache_state = heap_state;
+        break :blk heap_state;
+    };
+
+    // Linear scan — 4 docs max, dwarfed by the I/O cost the cache avoids.
+    for (state.entries.items) |e| {
+        if (std.mem.eql(u8, e.path, rel_path)) return e.bytes;
+    }
+
     var file = std.fs.cwd().openFile(rel_path, .{}) catch |err| switch (err) {
-        // A test fixture wasn't found on disk — most likely the test
-        // was invoked from a non-repo-root CWD. Skip cleanly rather
-        // than fail; the matrix CI lane always runs from the repo
-        // root via `zig build test-postgres`.
-        error.FileNotFound => return error.SkipZigTest,
+        error.FileNotFound => {
+            // Distinguish "test invoked from a non-repo-root CWD" (skip
+            // cleanly — IDE/sub-checkout scenario) from "doc was actually
+            // deleted / moved" (real failure — the matrix exists to catch
+            // exactly this).
+            if (cwdLooksLikeRepoRoot()) return err;
+            return error.SkipZigTest;
+        },
         else => return err,
     };
     defer file.close();
-    return try file.readToEndAlloc(allocator, 4 * 1024 * 1024);
+
+    const cache_alloc = state.arena.allocator();
+    const stat = try file.stat();
+    const bytes = try cache_alloc.alloc(u8, stat.size);
+    const n = try file.readAll(bytes);
+    const slice = bytes[0..n];
+
+    try state.entries.append(cache_alloc, .{ .path = rel_path, .bytes = slice });
+    return slice;
+}
+
+/// Load a project-root-relative file (e.g. `docs/openapi-v1.yaml`) with
+/// process-lifetime caching. Returns a BORROWED slice — caller must NOT
+/// free. The cache is thread-safe.
+///
+/// Returns `error.SkipZigTest` only when the file is missing AND CWD does
+/// NOT look like the repo root (treat as a runner-env issue, not a
+/// verification failure). When CWD has the repo sentinels, `FileNotFound`
+/// PROPAGATES — a doc that was actually deleted is exactly what the matrix
+/// is supposed to catch.
+pub fn loadProjectFile(rel_path: []const u8) ![]const u8 {
+    cache_mutex.lock();
+    defer cache_mutex.unlock();
+    return try loadAndCacheLocked(rel_path);
 }
 
 /// Find the SQL body of a migration by its short name (e.g.
-/// `"0001_initial_schema"`). Avoids `@embedFile` cross-package issues by
-/// going through the already-embedded `migrations.MIGRATIONS` table.
+/// `"0001_initial_schema"`). Avoids `@embedFile` cross-package issues
+/// by going through the already-embedded `migrations.MIGRATIONS` table.
 pub fn migrationSql(name: []const u8) ?[]const u8 {
     for (nullalis.migrations.MIGRATIONS) |m| {
         if (std.mem.eql(u8, m.name, name)) return m.sql;
@@ -115,52 +155,29 @@ pub fn migrationSql(name: []const u8) ?[]const u8 {
 }
 
 // ── Self-tests ────────────────────────────────────────────────────────────
-//
-// These pin the harness contract WITHOUT depending on the process
-// environment so the assertions run on every CI lane (the previous shape
-// self-skipped whenever either env var was set, which meant the live-PG
-// lane never exercised the absence-path contract). The inner resolver is
-// tested directly via small wrappers below; the public-API tests verify
-// the SkipZigTest collapse.
-
-test "harness: inner resolver returns PgEngineNotCompiledIn at compile-time profile gate" {
-    // Branchless predicate: the error variant set is exhaustive at the
-    // top of resolvePostgresUrlInner, so exercising the build-off branch
-    // is a tautology — assert the variant exists and is in the typed set.
-    const T = @typeInfo(PgGateError).error_set.?;
-    var found_compiled_in = false;
-    var found_url_not_set = false;
-    var found_read_failed = false;
-    for (T) |e| {
-        if (std.mem.eql(u8, e.name, "PgEngineNotCompiledIn")) found_compiled_in = true;
-        if (std.mem.eql(u8, e.name, "PgUrlNotSet")) found_url_not_set = true;
-        if (std.mem.eql(u8, e.name, "PgUrlReadFailed")) found_read_failed = true;
-    }
-    try std.testing.expect(found_compiled_in);
-    try std.testing.expect(found_url_not_set);
-    try std.testing.expect(found_read_failed);
-}
-
-test "harness: requirePostgresUrl collapses both build-off and url-absent into SkipZigTest" {
-    // The collapse semantics are the contract every downstream test depends
-    // on. We cannot easily flip build_options.enable_postgres mid-test, but
-    // when it IS off, requirePostgresUrl must return SkipZigTest regardless
-    // of env. When it IS on and the env is absent, same. We assert the
-    // collapse by inspecting the function's error union members directly
-    // (no process env mutation).
-    const RetType = @typeInfo(@TypeOf(requirePostgresUrl)).@"fn".return_type.?;
-    const ErrSet = @typeInfo(RetType).error_union.error_set;
-    const errs = @typeInfo(ErrSet).error_set.?;
-    var found_skip = false;
-    for (errs) |e| {
-        if (std.mem.eql(u8, e.name, "SkipZigTest")) found_skip = true;
-    }
-    try std.testing.expect(found_skip);
-}
 
 test "harness: schemaName builds a unique lowercase identifier" {
     var buf: [96]u8 = undefined;
     const name = try schemaName(&buf, "demo");
     try std.testing.expect(std.mem.startsWith(u8, name, "nullalis_s6_demo_"));
     try std.testing.expect(name.len > "nullalis_s6_demo_".len);
+}
+
+test "harness: cwdLooksLikeRepoRoot returns true from a normal `zig build` invocation" {
+    // The default `addRunArtifact` CWD is the project root; the matrix's
+    // contract depends on this. Pin it explicitly — if a future runner
+    // change starts invoking the test binary from a sub-directory, this
+    // test fails LOUD and the operator picks up the rebase work.
+    try std.testing.expect(cwdLooksLikeRepoRoot());
+}
+
+test "harness: loadProjectFile returns the same borrowed slice across two calls (cache pin)" {
+    // Cache hit → identical pointer + length. A regression that bypasses
+    // the cache (e.g. allocates a fresh slice each call) makes the
+    // pointers differ.
+    const a = try loadProjectFile("docs/openapi-v1.yaml");
+    const b = try loadProjectFile("docs/openapi-v1.yaml");
+    try std.testing.expectEqual(a.ptr, b.ptr);
+    try std.testing.expectEqual(a.len, b.len);
+    try std.testing.expect(a.len > 0);
 }

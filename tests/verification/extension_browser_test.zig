@@ -3,55 +3,46 @@
 const std = @import("std");
 const nullalis = @import("nullalis");
 const url_sanitize = nullalis.extension_ws.url_sanitize;
+const lint = nullalis.tools.lint;
 const harness = @import("harness.zig");
 
 test "S6.9 extension: WS endpoint is documented in OpenAPI" {
-    const allocator = std.testing.allocator;
-    const yaml = try harness.loadProjectFile(allocator, "docs/openapi-v1.yaml");
-    defer allocator.free(yaml);
+    const yaml = try harness.loadProjectFile("docs/openapi-v1.yaml");
     try std.testing.expect(std.mem.indexOf(u8, yaml, "/api/v1/extension/ws") != null);
 }
 
 test "S6.9 extension: per-user token auth is the documented contract" {
-    const allocator = std.testing.allocator;
-    const contract = try harness.loadProjectFile(allocator, "docs/extension-ws-contract.md");
-    defer allocator.free(contract);
+    const contract = try harness.loadProjectFile("docs/extension-ws-contract.md");
     try std.testing.expect(std.mem.indexOf(u8, contract, "token") != null);
 }
 
 test "S6.9 extension: diagnostics routes are documented" {
-    const allocator = std.testing.allocator;
-    const yaml = try harness.loadProjectFile(allocator, "docs/openapi-v1.yaml");
-    defer allocator.free(yaml);
+    const yaml = try harness.loadProjectFile("docs/openapi-v1.yaml");
     try std.testing.expect(std.mem.indexOf(u8, yaml, "/diagnostics/extension") != null);
 }
 
-test "S6.9 extension: every shipped extension_* tool name is mentioned in the WS contract" {
-    const allocator = std.testing.allocator;
-    const contract = try harness.loadProjectFile(allocator, "docs/extension-ws-contract.md");
-    defer allocator.free(contract);
+test "S6.9 extension: every shipped extension_* tool in the lint registry is mentioned in the WS contract" {
+    // Two-sided pin: the canonical tool list lives in `src/tools/lint.zig`
+    // `ALL_TOOLS` (comptime-tested for alphabetical ordering). We iterate
+    // it here so adding a new `extension_*` tool only requires updating the
+    // lint registry — this test picks up the new name automatically.
+    // The contract doc must mention every such name.
+    const contract = try harness.loadProjectFile("docs/extension-ws-contract.md");
 
-    // The 10 shipped extension_* tools — one file per name in
-    // src/tools/extension_*.zig. Pair / status are gateway routes,
-    // not tools, so they're not in this list. A rename of any of
-    // these to a different name fails the test.
-    const tool_names = [_][]const u8{
-        "extension_navigate",
-        "extension_click",
-        "extension_type",
-        "extension_screenshot",
-        "extension_get_dom",
-        "extension_get_text",
-        "extension_list_tabs",
-        "extension_fill_form",
-        "extension_scroll",
-        "extension_wait_for",
-    };
-    for (tool_names) |name| {
+    var checked: usize = 0;
+    for (lint.ALL_TOOLS) |name| {
+        if (!std.mem.startsWith(u8, name, "extension_")) continue;
+        checked += 1;
         if (std.mem.indexOf(u8, contract, name) == null) {
-            std.debug.print("S6.9: extension tool '{s}' missing from extension-ws-contract.md\n", .{name});
+            std.debug.print("S6.9: extension tool '{s}' (from lint.ALL_TOOLS) missing from extension-ws-contract.md\n", .{name});
             return error.ExtensionToolNotDocumented;
         }
+    }
+    // Floor pin — there must be SOME extension tools in the lint registry,
+    // otherwise the filter loop was vacuously true.
+    if (checked == 0) {
+        std.debug.print("S6.9: no extension_* tools in lint.ALL_TOOLS — likely registry regression\n", .{});
+        return error.ExtensionToolsRegistryEmpty;
     }
 }
 

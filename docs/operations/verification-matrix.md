@@ -103,6 +103,7 @@ A surface migrates onto this table the same commit that lands its real assertion
 | At-rest encryption of `pii_tagged` rows (D52 Pillar 5) | V1 ships PII *tagging* + *purge* (Pillars 2+4 from #108); encryption-at-rest is V2. | Documented hidden surface. |
 | Subprocess-level startup fail-loud (exit-code check on the booted binary) | The Zig test pins the membership invariant (`isFatalStartupError` covers every variant via comptime iteration). Spawning the binary in a subprocess is operator-driven. | Documented in runbook §"Failure triage". |
 | Live cross-user PG cascade integration (insert rows, delete user, count) | The matrix pins the static migration contract; a live integration test needs per-table `seedRow` helpers on the Manager — added in a follow-up. | Static migration scan + S1's runtime tests already in `tests/agent/promotion_reflection_pg_test.zig`. |
+| Live trace-share durability roundtrip (Manager-deinit-and-reopen against same Postgres URL) | Same — needs the Manager-fixture pattern that per-surface live-PG tests still build out. | Static migration scan in `trace_share_test.zig` pins the schema-level invariant (PG-backed table + JSON snapshot + FK CASCADE). |
 
 ## Failure triage
 
@@ -121,7 +122,7 @@ If `test-postgres` fails on CI, look here first:
 | Surface | Durability |
 |---|---|
 | Sessions, messages, memories, artifacts, artifact_versions, jobs, tasks | **Durable** — Postgres-backed; survives restart. |
-| Trace shares | **Durable** — Postgres `trace_shares` table (S3 / #110). Verified by Manager-deinit-and-reopen in `trace_share_test.zig` (pending). |
+| Trace shares | **Durable** — Postgres `trace_shares` table (S3 / #110). The matrix pins the migration shape (FK CASCADE + JSON snapshot column + PK on `share_code`) statically in `trace_share_test.zig`. A live Manager-deinit-and-reopen round-trip is documented as deferred in the "What is NOT covered" section below. |
 | Approval pending-card state | **Ephemeral** — in-memory on the agent runtime. Lost on restart; resolution via the canonical `POST /api/v1/users/{uid}/sessions/{key}/approve` route requires the original session to still be running. |
 | Extension WS connections | **Ephemeral** — must re-pair after restart. |
 | Active turn cancel state | **Ephemeral** — bounded by the in-flight HTTP request. |

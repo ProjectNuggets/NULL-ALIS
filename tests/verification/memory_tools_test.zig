@@ -49,9 +49,7 @@ test "S6.10 memory: Flags.any() and Flags.count() roundtrip a mixed input" {
 }
 
 test "S6.10 memory: tool surface (store/recall/forget/doctor/purge_pii) is mentioned in the UI contract" {
-    const allocator = std.testing.allocator;
-    const ui_handoff = try harness.loadProjectFile(allocator, "docs/ui-handoff.md");
-    defer allocator.free(ui_handoff);
+    const ui_handoff = try harness.loadProjectFile("docs/ui-handoff.md");
 
     const tools = [_][]const u8{
         "memory_store",

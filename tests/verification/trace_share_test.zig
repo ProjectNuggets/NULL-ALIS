@@ -6,9 +6,7 @@ const sanitizer = nullalis.artifacts.sanitizer;
 const harness = @import("harness.zig");
 
 test "S6.8 trace share: public-share route is documented in OpenAPI" {
-    const allocator = std.testing.allocator;
-    const yaml = try harness.loadProjectFile(allocator, "docs/openapi-v1.yaml");
-    defer allocator.free(yaml);
+    const yaml = try harness.loadProjectFile("docs/openapi-v1.yaml");
     try std.testing.expect(std.mem.indexOf(u8, yaml, "/share/") != null);
 }
 

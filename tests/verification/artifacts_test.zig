@@ -7,9 +7,7 @@ const types = nullalis.artifacts.types;
 const harness = @import("harness.zig");
 
 test "S6.7 artifacts: route surface is documented in OpenAPI" {
-    const allocator = std.testing.allocator;
-    const yaml = try harness.loadProjectFile(allocator, "docs/openapi-v1.yaml");
-    defer allocator.free(yaml);
+    const yaml = try harness.loadProjectFile("docs/openapi-v1.yaml");
     try std.testing.expect(std.mem.indexOf(u8, yaml, "/artifacts") != null);
 }
 
@@ -83,5 +81,25 @@ test "S6.7 artifacts: every shipped ArtifactKind serializes via toSlice" {
         const k = @field(types.ArtifactKind, f.name);
         const wire = k.toSlice();
         try std.testing.expect(wire.len > 0);
+    }
+}
+
+test "S6.7 artifacts: export route uses the unsafe-filename guard (path-traversal pin)" {
+    // Wave 2A (#107) shipped artifact export. The download path at
+    // `gateway.zig:19623` rejects filenames that contain `..`, leading
+    // dots, or path separators via `isSafeAttachmentFilename`. The guard
+    // is file-private (lowercase fn) so we cannot call it directly from
+    // tests/verification — instead, pin its INVOCATION at the route
+    // handler. A rename that loses the guard call surfaces here.
+    const gateway_src = try harness.loadProjectFile("src/gateway.zig");
+    if (std.mem.indexOf(u8, gateway_src, "isSafeAttachmentFilename") == null) {
+        std.debug.print("S6.7: `isSafeAttachmentFilename` guard absent from src/gateway.zig — path traversal regression\n", .{});
+        return error.UnsafeFilenameGuardMissing;
+    }
+    // The guard must be CALLED, not just defined. Look for the canonical
+    // rejection body the route returns when the guard fails.
+    if (std.mem.indexOf(u8, gateway_src, "unsafe_filename") == null) {
+        std.debug.print("S6.7: `unsafe_filename` error response absent from src/gateway.zig — guard may be unwired\n", .{});
+        return error.UnsafeFilenameResponseMissing;
     }
 }

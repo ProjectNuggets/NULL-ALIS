@@ -1,26 +1,34 @@
 //! S6.11 — GDPR D25 cascade pin.
 
 const std = @import("std");
+const nullalis = @import("nullalis");
+const migrations = nullalis.migrations;
 const harness = @import("harness.zig");
 
-fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i <= haystack.len) {
-        const remaining = haystack[i..];
-        const found = std.mem.indexOf(u8, remaining, needle) orelse break;
-        n += 1;
-        i += found + needle.len;
-    }
-    return n;
-}
+const CASCADE_NEEDLE = "REFERENCES {schema}.users(user_id) ON DELETE CASCADE";
 
 test "S6.11 D25: 0001_initial_schema declares ≥17 user_id cascade FKs" {
     const sql = harness.migrationSql("0001_initial_schema") orelse return error.MigrationMissing;
-    const cascades = countOccurrences(sql, "REFERENCES {schema}.users(user_id) ON DELETE CASCADE");
+    const cascades = std.mem.count(u8, sql, CASCADE_NEEDLE);
     if (cascades < 17) {
         std.debug.print("S6.11 D25: only {d} user_id cascade FKs in 0001 (expected ≥ 17)\n", .{cascades});
         return error.MissingUserCascade;
+    }
+}
+
+test "S6.11 D25: total user_id cascade FKs across ALL shipped migrations is ≥19" {
+    // Cross-migration floor — pins the cascade contract at the WHOLE-schema
+    // level so a legitimate refactor that moves one table from 0001 into a
+    // new 0004 migration (and the cascade rides along) does NOT regress
+    // this assertion. The minimum count across all migrations only drops
+    // if a cascade was REMOVED, which is the actual contract violation.
+    var total: usize = 0;
+    for (migrations.MIGRATIONS) |m| {
+        total += std.mem.count(u8, m.sql, CASCADE_NEEDLE);
+    }
+    if (total < 19) {
+        std.debug.print("S6.11 D25: total user_id cascade FKs across all migrations = {d} (expected ≥ 19)\n", .{total});
+        return error.MissingTotalUserCascade;
     }
 }
 

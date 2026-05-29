@@ -6,23 +6,17 @@ const gateway = nullalis.gateway;
 const harness = @import("harness.zig");
 
 test "S6.3 cancel: canonical session-scoped path exists in OpenAPI" {
-    const allocator = std.testing.allocator;
-    const yaml = try harness.loadProjectFile(allocator, "docs/openapi-v1.yaml");
-    defer allocator.free(yaml);
+    const yaml = try harness.loadProjectFile("docs/openapi-v1.yaml");
     try std.testing.expect(std.mem.indexOf(u8, yaml, "/cancel:") != null);
 }
 
 test "S6.3 cancel: phantom /api/v1/chat/cancel is NOT documented" {
-    const allocator = std.testing.allocator;
-    const yaml = try harness.loadProjectFile(allocator, "docs/openapi-v1.yaml");
-    defer allocator.free(yaml);
+    const yaml = try harness.loadProjectFile("docs/openapi-v1.yaml");
     try std.testing.expect(std.mem.indexOf(u8, yaml, "  /api/v1/chat/cancel:") == null);
 }
 
 test "S6.3 cancel: idle-cancel response shape token is documented" {
-    const allocator = std.testing.allocator;
-    const yaml = try harness.loadProjectFile(allocator, "docs/openapi-v1.yaml");
-    defer allocator.free(yaml);
+    const yaml = try harness.loadProjectFile("docs/openapi-v1.yaml");
     try std.testing.expect(std.mem.indexOf(u8, yaml, "was_active") != null);
 }
 
