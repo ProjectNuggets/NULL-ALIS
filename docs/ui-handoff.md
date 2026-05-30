@@ -287,6 +287,63 @@ cap-lift design.
 **UX surface**: Settings → Integrations is the hub. Each integration
 shows connection state, last activity, and a per-integration log link.
 
+#### 2.11.1 Channel activation control plane *(S7 — 2026-05-30)*
+
+The user-facing, self-service channel setup contract. **This is what
+Settings → Channels binds to** — do not invent channel UI from the
+catalog. The surfaced set is a fixed allowlist; everything else stays
+hidden.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/v1/users/{id}/channels` | Aggregate status for the launch channels |
+| `GET /api/v1/users/{id}/channels/{channel}` | One channel's status |
+| `POST /api/v1/users/{id}/channels/{channel}/connect` | Store vault credentials + config |
+| `POST /api/v1/users/{id}/channels/{channel}/test` | Structural credential check (records `last_test`) |
+| `POST` or `DELETE` `…/channels/{channel}/disconnect` | Delete vault secrets + metadata |
+
+**Surfaced channels (bind these):** `slack`, `discord`, `email`,
+`whatsapp` are user-managed (full connect/test/disconnect). `telegram`
+appears **read-only** in the listing — keep using the dedicated
+`channels/telegram/connect|disconnect` routes for its mutation; a generic
+mutate on telegram returns `409 telegram_uses_dedicated_routes`.
+
+**Hidden channels (do NOT surface):** signal, matrix, mattermost, irc,
+line, lark, onebot, qq, nostr, maixcam, teams, imessage, webhook, cli.
+Any of these returns `404 channel_not_supported`. Teams is operator/
+enterprise backlog — not user self-service in V1.
+
+**Per-channel required fields** (flat top-level JSON on `connect`):
+
+| Channel | Required secrets (vault) | Required config (non-secret) | Optional |
+|---|---|---|---|
+| slack | `slack_bot_token` (xoxb-…), `slack_signing_secret` | — | `slack_app_token`, `team_id` |
+| discord | `discord_bot_token` | — | `application_id` |
+| email | `email_imap_password` | `imap_host`, `smtp_host`, `username` | `email_smtp_password`, `imap_port`, `smtp_port`, `from_address` |
+| whatsapp | `whatsapp_access_token`, `whatsapp_verify_token` | `phone_number_id` | `whatsapp_app_secret`, `business_account_id` |
+
+**Status object** (`ChannelControlStatus` in openapi-v1.yaml):
+`{channel, label, build_enabled, operator_configured, user_managed,
+user_connected, status, secret_refs[], config{}, last_test, endpoints{}}`.
+`status` ∈ `disabled_in_build | connected | partial | operator_managed |
+not_connected`.
+
+**Security invariants the UI can rely on:**
+- Secret **values are never returned** — `secret_refs[]` reports only
+  `present: bool`. Render saved credentials as "•••• saved" + a re-enter
+  field, exactly like Secrets & API Keys.
+- `connect` validates provider token shapes server-side (e.g. slack bot
+  token must be `xoxb-…`); a bad field returns `400 {error, key}` —
+  surface the offending `key` inline.
+- `test` is a **structural** check (presence + format), not a live
+  provider call. `last_test.detail` is machine-readable
+  (`credentials_present` / `missing_required_secret:<key>` /
+  `malformed_secret:<key>`). Do not claim "reachable" — claim
+  "credentials saved & valid". Live reachability probe is a documented
+  follow-up.
+- Requires the Postgres tenant state backend; without it the routes
+  answer `501` (show a degraded/operator-managed state, not an error).
+
 ### 2.12 SSE wire — the FULL event surface (v1.14.21 schema honesty fix)
 
 Earlier docs claimed "11 SSE event types." The wire actually carries

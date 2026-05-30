@@ -387,6 +387,18 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn deleteTelegramState(_: *@This(), _: i64) !void {
         return error.PostgresNotEnabled;
     }
+    // S7 — generic per-channel control-plane state. Non-postgres builds
+    // have no tenant state backend; the gateway guards on
+    // `state.zaki_state != null` and answers 501 before reaching these.
+    pub fn getChannelStateJson(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const u8) ![]u8 {
+        return allocator.dupe(u8, "{}");
+    }
+    pub fn putChannelStateJson(_: *@This(), _: i64, _: []const u8, _: []const u8) !void {
+        return error.PostgresNotEnabled;
+    }
+    pub fn deleteChannelStateJson(_: *@This(), _: i64, _: []const u8) !void {
+        return error.PostgresNotEnabled;
+    }
     // S7.2 — GDPR row-level user delete. Single DELETE on tenant `users`
     // cascades to every FK-linked table (17 tables per schema). Postgres
     // only; stub returns PostgresNotEnabled so the GDPR orchestrator can
@@ -2134,9 +2146,15 @@ const ManagerImpl = struct {
             \\    user_id BIGINT PRIMARY KEY REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
             \\    telegram JSONB NOT NULL DEFAULT '{}'::jsonb,
             \\    app JSONB NOT NULL DEFAULT '{}'::jsonb,
+            \\    channels JSONB NOT NULL DEFAULT '{}'::jsonb,
             \\    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             \\)
             ,
+            // S7 — back-fill the generic per-channel control-plane column
+            // on deployments whose channel_state predates it. Telegram keeps
+            // its dedicated `telegram` column; slack/discord/email/whatsapp
+            // connection metadata lives under per-channel keys in `channels`.
+            "ALTER TABLE {schema}.channel_state ADD COLUMN IF NOT EXISTS channels JSONB NOT NULL DEFAULT '{}'::jsonb",
             \\CREATE TABLE IF NOT EXISTS {schema}.telegram_updates (
             \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
             \\    update_id BIGINT NOT NULL,
@@ -2750,6 +2768,71 @@ const ManagerImpl = struct {
         const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
         const params = [_]?[*:0]const u8{user_s.ptr};
         const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    // ── S7 — generic per-channel control-plane state ───────────────────
+    //
+    // Non-secret connection metadata (status flags, account/host ids,
+    // last-test result) for the user-managed channels (slack, discord,
+    // email, whatsapp) lives under per-channel keys in the
+    // `channel_state.channels` JSONB column. Credentials NEVER land here —
+    // they go to the encrypted `user_secrets` vault via putSecret. The
+    // channel key is always a bound parameter ($2), so the caller's
+    // allowlist (channel_control.fromKey) is the only trust boundary.
+
+    /// Return the JSON object stored for `channel` (e.g. "slack"), or
+    /// "{}" when absent. Caller owns the returned slice.
+    pub fn getChannelStateJson(self: *Self, allocator: std.mem.Allocator, user_id: i64, channel: []const u8) ![]u8 {
+        const q = try self.buildQuery(
+            "SELECT COALESCE(channels->$2, '{}'::jsonb)::text FROM {schema}.channel_state WHERE user_id = $1",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const channel_z = try self.allocator.dupeZ(u8, channel);
+        defer self.allocator.free(channel_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, channel_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(channel.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return allocator.dupe(u8, "{}");
+        return dupeResultValue(allocator, result, 0, 0);
+    }
+
+    /// Merge `json` (a JSON object) under the `channel` key, preserving
+    /// other channels' state. Upserts the channel_state row if missing.
+    pub fn putChannelStateJson(self: *Self, user_id: i64, channel: []const u8, json: []const u8) !void {
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.channel_state (user_id, channels, updated_at) VALUES ($1, jsonb_build_object($2::text, $3::jsonb), NOW()) " ++
+                "ON CONFLICT (user_id) DO UPDATE SET channels = COALESCE({schema}.channel_state.channels, '{}'::jsonb) || jsonb_build_object($2::text, $3::jsonb), updated_at = NOW()",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const channel_z = try self.allocator.dupeZ(u8, channel);
+        defer self.allocator.free(channel_z);
+        const json_z = try self.allocator.dupeZ(u8, json);
+        defer self.allocator.free(json_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, channel_z, json_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(channel.len), @intCast(json.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    /// Remove the `channel` key from the user's channel_state (disconnect).
+    pub fn deleteChannelStateJson(self: *Self, user_id: i64, channel: []const u8) !void {
+        const q = try self.buildQuery(
+            "UPDATE {schema}.channel_state SET channels = COALESCE(channels, '{}'::jsonb) - $2::text, updated_at = NOW() WHERE user_id = $1",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const channel_z = try self.allocator.dupeZ(u8, channel);
+        defer self.allocator.free(channel_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, channel_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(channel.len) };
         const result = try self.execParams(q, &params, &lengths);
         c.PQclear(result);
     }

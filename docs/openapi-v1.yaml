@@ -1102,6 +1102,200 @@ paths:
         "404":
           description: Secret not found
 
+  # ── Channel activation control plane (S7) ──────────────────────────
+  # User-facing self-service setup for the V1 launch channels. Credentials
+  # are written to the encrypted secret vault; only secret *refs*
+  # (present: bool) are ever read back. Surfaced channel set is the fixed
+  # allowlist {slack, discord, email, whatsapp}; telegram appears
+  # read-only in the listing and keeps its dedicated connect/disconnect
+  # routes (a generic mutate on telegram returns 409). Every other adapter
+  # returns 404 channel_not_supported.
+  /api/v1/users/{user_id}/channels:
+    get:
+      tags: [user]
+      summary: List channel activation status for the V1 launch channels
+      description: |
+        Aggregate control-plane status for slack, discord, email, whatsapp
+        (user-managed) and telegram (read-only). Never returns secret
+        values — each secret is reported as a `present: bool` ref.
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      responses:
+        "200":
+          description: Channel status list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [channels]
+                properties:
+                  channels:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ChannelControlStatus"
+        "501":
+          description: State backend (Postgres) not wired
+
+  /api/v1/users/{user_id}/channels/{channel}:
+    get:
+      tags: [user]
+      summary: Get activation status for a single channel
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+        - $ref: "#/components/parameters/ChannelPath"
+      responses:
+        "200":
+          description: Channel status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChannelControlStatus"
+        "404":
+          description: channel_not_supported (hidden/unknown adapter)
+        "501":
+          description: State backend (Postgres) not wired
+
+  /api/v1/users/{user_id}/channels/{channel}/connect:
+    post:
+      tags: [user]
+      summary: Connect (store vault credentials + config) for a channel
+      description: |
+        Validates the provider-specific required secrets and config fields,
+        writes secrets to the encrypted vault, and persists non-secret
+        connection metadata. Returns the refreshed channel status (secret
+        values are NEVER echoed). Required fields per channel:
+          * slack:    slack_bot_token (xoxb-…), slack_signing_secret
+          * discord:  discord_bot_token
+          * email:    email_imap_password, imap_host, smtp_host, username
+          * whatsapp: whatsapp_access_token, whatsapp_verify_token,
+                      phone_number_id
+        Telegram is NOT accepted here (409 — use the dedicated route).
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+        - $ref: "#/components/parameters/ChannelPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              description: |
+                Channel-specific secret + config fields. Secret keys
+                (e.g. slack_bot_token) and config keys (e.g. imap_host)
+                are flat top-level string properties.
+      responses:
+        "200":
+          description: Connected — refreshed channel status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChannelControlStatus"
+        "400":
+          description: |
+            Validation error. Body: {error, key} where error is one of
+            missing_required_secret, invalid_secret, missing_required_config,
+            invalid_config.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChannelControlFieldError"
+        "404":
+          description: channel_not_supported
+        "409":
+          description: telegram_uses_dedicated_routes or channel_disabled_in_build
+        "501":
+          description: State backend (Postgres) not wired
+
+  /api/v1/users/{user_id}/channels/{channel}/test:
+    post:
+      tags: [user]
+      summary: Test a channel's stored credentials (structural check)
+      description: |
+        V1 test is a deterministic structural check — it verifies every
+        required secret is present in the vault and well-formed, records
+        the result as `last_test`, and returns the refreshed status. It
+        does NOT make a live outbound call to the provider (documented
+        follow-up) so it never reports a false positive requiring the
+        network. Telegram is read-only here (409).
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+        - $ref: "#/components/parameters/ChannelPath"
+      responses:
+        "200":
+          description: |
+            Refreshed status with last_test populated. last_test.detail is
+            machine-readable: credentials_present | missing_required_secret:<key>
+            | malformed_secret:<key>.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChannelControlStatus"
+        "404":
+          description: channel_not_supported
+        "409":
+          description: telegram_uses_dedicated_routes
+        "501":
+          description: State backend (Postgres) not wired
+
+  /api/v1/users/{user_id}/channels/{channel}/disconnect:
+    post:
+      tags: [user]
+      summary: Disconnect a channel (delete vault secrets + metadata)
+      description: |
+        Idempotently deletes every vault secret the channel owns and
+        clears its connection metadata. POST and DELETE are equivalent.
+        Telegram is read-only here (409 — use the dedicated route).
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+        - $ref: "#/components/parameters/ChannelPath"
+      responses:
+        "200":
+          description: Disconnected
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, channel]
+                properties:
+                  status: { type: string, example: disconnected }
+                  channel: { type: string }
+        "404":
+          description: channel_not_supported
+        "409":
+          description: telegram_uses_dedicated_routes
+        "501":
+          description: State backend (Postgres) not wired
+    delete:
+      tags: [user]
+      summary: Disconnect a channel (alias for POST)
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+        - $ref: "#/components/parameters/ChannelPath"
+      responses:
+        "200":
+          description: Disconnected
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, channel]
+                properties:
+                  status: { type: string }
+                  channel: { type: string }
+
   /api/v1/users/{user_id}/channels/telegram/connect:
     post:
       tags: [user]
@@ -2851,6 +3045,77 @@ components:
         status:
           type: string
       additionalProperties: true
+    ChannelControlStatus:
+      type: object
+      description: |
+        Per-channel activation status for the S7 control plane. Secret
+        values are never present — only `secret_refs[].present`.
+      required: [channel, label, build_enabled, operator_configured, user_managed, user_connected, status, secret_refs, config, last_test, endpoints]
+      properties:
+        channel:
+          type: string
+          example: slack
+        label:
+          type: string
+          example: Slack
+        build_enabled:
+          type: boolean
+          description: Adapter compiled into this build.
+        operator_configured:
+          type: boolean
+          description: Channel configured at the deployment/operator level.
+        user_managed:
+          type: boolean
+          description: false for telegram (dedicated routes own its mutation).
+        user_connected:
+          type: boolean
+          description: True when status == connected.
+        status:
+          type: string
+          enum: [disabled_in_build, connected, partial, operator_managed, not_connected]
+        secret_refs:
+          type: array
+          description: Vault secret refs — presence only, never values.
+          items:
+            type: object
+            required: [key, label, required, present]
+            properties:
+              key: { type: string, example: slack_bot_token }
+              label: { type: string }
+              required: { type: boolean }
+              present: { type: boolean }
+        config:
+          type: object
+          description: Non-secret display config (hosts, account ids, ports).
+          additionalProperties: { type: string }
+        last_test:
+          nullable: true
+          type: object
+          required: [ok, checked_at_s, detail]
+          properties:
+            ok: { type: boolean }
+            checked_at_s: { type: integer, format: int64 }
+            detail:
+              type: string
+              description: credentials_present | missing_required_secret:<key> | malformed_secret:<key>
+        endpoints:
+          type: object
+          required: [self, connect, test, disconnect]
+          properties:
+            self: { type: string }
+            connect: { type: string }
+            test: { type: string }
+            disconnect: { type: string }
+    ChannelControlFieldError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          enum: [missing_required_secret, invalid_secret, missing_required_config, invalid_config, secret_store_failed, secret_delete_failed]
+        key:
+          type: string
+          description: The offending field key.
     InternalDiagnosticsResponse:
       type: object
       description: |

@@ -96,6 +96,10 @@ const constantTimeEq = @import("security/pairing.zig").constantTimeEq;
 const channels = @import("channels/root.zig");
 const channel_manager = @import("channel_manager.zig");
 const channel_dispatch = @import("channels/dispatch.zig");
+// S7 — user-facing channel activation control plane (descriptors,
+// route parsing, validation, status, JSON shape). Pure logic; the
+// vault/state IO stays here in the gateway.
+const channel_control = @import("channel_control.zig");
 const bus_mod = @import("bus.zig");
 const tasks_mod = @import("tasks/root.zig");
 const usage_runtime_mod = @import("usage_runtime.zig");
@@ -17713,6 +17717,450 @@ fn handleGdprDataPurge(
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
 }
 
+// ── S7 — channel activation control plane ─────────────────────────────
+//
+// Stable, user-safe contract the ZAKI UI binds to for self-service
+// channel setup. Credentials live in the encrypted secret vault
+// (`user_secrets`); non-secret connection metadata (config, last_test)
+// lives under per-channel keys in `channel_state.channels`. Secret
+// *values* are never serialized — only `present: bool` refs. The
+// surfaced set is the fixed allowlist in `channel_control` (slack,
+// discord, email, whatsapp); telegram is read-only here and keeps its
+// dedicated routes; every other adapter 404s.
+
+fn channelBuildEnabled(ch: channel_control.Channel) bool {
+    return switch (ch) {
+        .slack => build_options.enable_channel_slack,
+        .discord => build_options.enable_channel_discord,
+        .email => build_options.enable_channel_email,
+        .whatsapp => build_options.enable_channel_whatsapp,
+        .telegram => build_options.enable_channel_telegram,
+    };
+}
+
+fn channelOperatorConfigured(config_opt: ?*const Config, ch: channel_control.Channel) bool {
+    const cfg = config_opt orelse return false;
+    return switch (ch) {
+        .slack => cfg.channels.slack.len > 0,
+        .discord => cfg.channels.discord.len > 0,
+        .email => cfg.channels.email.len > 0,
+        .whatsapp => cfg.channels.whatsapp.len > 0,
+        .telegram => cfg.channels.telegram.len > 0,
+    };
+}
+
+fn channelSecretPresent(keys: [][]const u8, target: []const u8) bool {
+    for (keys) |k| {
+        if (std.mem.eql(u8, k, target)) return true;
+    }
+    return false;
+}
+
+const ChannelKV = struct { key: []const u8, value: []const u8 };
+
+/// Serialize the per-channel storage object written into
+/// `channel_state.channels[<channel>]`. Config values are always
+/// strings in the V1 model, so re-emitting declared fields is lossless.
+fn writeChannelStateStorageJson(
+    w: anytype,
+    connected: bool,
+    configured_at_s: i64,
+    config_pairs: []const ChannelKV,
+    last_test: ?channel_control.TestResult,
+) !void {
+    try w.print("{{\"connected\":{s},\"configured_at_s\":{d},\"config\":{{", .{ if (connected) "true" else "false", configured_at_s });
+    for (config_pairs, 0..) |kv, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeByte('"');
+        try jsonEscapeInto(w, kv.key);
+        try w.writeAll("\":\"");
+        try jsonEscapeInto(w, kv.value);
+        try w.writeByte('"');
+    }
+    try w.writeAll("},\"last_test\":");
+    if (last_test) |lt| {
+        try w.print("{{\"ok\":{s},\"checked_at_s\":{d},\"detail\":\"", .{ if (lt.ok) "true" else "false", lt.checked_at_s });
+        try jsonEscapeInto(w, lt.detail);
+        try w.writeAll("\"}");
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeByte('}');
+}
+
+/// Write a single channel's control-plane status object to `w`. Reads
+/// the vault (presence only) and channel_state (config + last_test).
+fn writeChannelControlObject(
+    w: anytype,
+    req_allocator: std.mem.Allocator,
+    mgr: *zaki_state_mod.Manager,
+    user_id_str: []const u8,
+    user_id_num: i64,
+    ch: channel_control.Channel,
+    config_opt: ?*const Config,
+    present_keys: [][]const u8,
+) !void {
+    const cc = channel_control;
+    const desc = cc.descriptor(ch);
+    const build_enabled = channelBuildEnabled(ch);
+    const operator_configured = channelOperatorConfigured(config_opt, ch);
+
+    var refs_buf: [8]cc.SecretRefView = undefined;
+    var required_present: usize = 0;
+    for (desc.secrets, 0..) |s, i| {
+        const present = channelSecretPresent(present_keys, s.key);
+        if (s.required and present) required_present += 1;
+        refs_buf[i] = .{ .key = s.key, .label = s.label, .required = s.required, .present = present };
+    }
+    const refs = refs_buf[0..desc.secrets.len];
+
+    const status = cc.resolveStatus(build_enabled, operator_configured, required_present, desc.requiredSecretCount());
+
+    const state_json = mgr.getChannelStateJson(req_allocator, user_id_num, ch.key()) catch try req_allocator.dupe(u8, "{}");
+    var parsed: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(std.json.Value, req_allocator, state_json, .{}) catch null;
+    defer if (parsed) |*p| p.deinit();
+
+    var cfg_buf: [12]cc.ConfigEntry = undefined;
+    var cfg_n: usize = 0;
+    var last_test: ?cc.TestResult = null;
+    if (parsed) |p| {
+        if (p.value == .object) {
+            if (p.value.object.get("config")) |cfgval| {
+                if (cfgval == .object) {
+                    for (desc.config_fields) |f| {
+                        if (cfgval.object.get(f.key)) |v| {
+                            if (v == .string and cfg_n < cfg_buf.len) {
+                                cfg_buf[cfg_n] = .{ .key = f.key, .value = v.string };
+                                cfg_n += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            if (p.value.object.get("last_test")) |ltv| {
+                if (ltv == .object) {
+                    const ok = if (ltv.object.get("ok")) |x| (x == .bool and x.bool) else false;
+                    const checked: i64 = if (ltv.object.get("checked_at_s")) |x| (if (x == .integer) x.integer else 0) else 0;
+                    const detail: []const u8 = if (ltv.object.get("detail")) |x| (if (x == .string) x.string else "") else "";
+                    last_test = .{ .ok = ok, .checked_at_s = checked, .detail = detail };
+                }
+            }
+        }
+    }
+
+    const self_suffix = try std.fmt.allocPrint(req_allocator, "channels/{s}", .{ch.key()});
+    const connect_suffix = try std.fmt.allocPrint(req_allocator, "channels/{s}/connect", .{ch.key()});
+    const test_suffix = try std.fmt.allocPrint(req_allocator, "channels/{s}/test", .{ch.key()});
+    const disconnect_suffix = try std.fmt.allocPrint(req_allocator, "channels/{s}/disconnect", .{ch.key()});
+
+    try cc.writeChannelJson(w, .{
+        .channel = ch,
+        .build_enabled = build_enabled,
+        .operator_configured = operator_configured,
+        .user_managed = ch.userManaged(),
+        .status = status,
+        .secret_refs = refs,
+        .config = cfg_buf[0..cfg_n],
+        .last_test = last_test,
+        .endpoints = .{
+            .self = try buildUserRoutePath(req_allocator, user_id_str, self_suffix),
+            .connect = try buildUserRoutePath(req_allocator, user_id_str, connect_suffix),
+            .@"test" = try buildUserRoutePath(req_allocator, user_id_str, test_suffix),
+            .disconnect = try buildUserRoutePath(req_allocator, user_id_str, disconnect_suffix),
+        },
+    });
+}
+
+const channel_internal_error: RouteResponse = .{ .status = "500 Internal Server Error", .body = "{\"error\":\"channel_control_failed\"}" };
+
+/// Entry point for the channel control plane. Caller guarantees the
+/// subpath is under `channels` (and that the dedicated telegram/bindings
+/// routes already had their chance upstream).
+fn handleChannelControl(
+    req_allocator: std.mem.Allocator,
+    method: []const u8,
+    raw_request: []const u8,
+    subpath: []const u8,
+    scoped_user_id: []const u8,
+    state: *GatewayState,
+    config_opt: ?*const Config,
+) RouteResponse {
+    const cc = channel_control;
+    const route = cc.parseRoute(subpath) orelse return .{ .status = "404 Not Found", .body = "{\"error\":\"channel_not_supported\"}" };
+
+    if (route == .unsupported) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"channel_not_supported\"}" };
+    }
+
+    const mgr = state.zaki_state orelse return .{
+        .status = "501 Not Implemented",
+        .body = "{\"error\":\"state backend does not support channel control plane\"}",
+    };
+    const user_id_num = parseNumericUserId(scoped_user_id) catch return .{
+        .status = "400 Bad Request",
+        .body = "{\"error\":\"invalid user\"}",
+    };
+
+    switch (route) {
+        .unsupported => unreachable,
+        .list => {
+            if (!std.mem.eql(u8, method, "GET")) {
+                return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+            }
+            const keys = mgr.listSecretKeys(req_allocator, user_id_num) catch return channel_internal_error;
+            var resp: std.ArrayListUnmanaged(u8) = .empty;
+            const w = resp.writer(req_allocator);
+            w.writeAll("{\"channels\":[") catch return channel_internal_error;
+            for (cc.listed_channels, 0..) |ch, i| {
+                if (i > 0) w.writeByte(',') catch return channel_internal_error;
+                writeChannelControlObject(w, req_allocator, mgr, scoped_user_id, user_id_num, ch, config_opt, keys) catch return channel_internal_error;
+            }
+            w.writeAll("]}") catch return channel_internal_error;
+            return .{ .body = resp.toOwnedSlice(req_allocator) catch return channel_internal_error };
+        },
+        .item => |ch| {
+            if (!std.mem.eql(u8, method, "GET")) {
+                return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+            }
+            const keys = mgr.listSecretKeys(req_allocator, user_id_num) catch return channel_internal_error;
+            var resp: std.ArrayListUnmanaged(u8) = .empty;
+            const w = resp.writer(req_allocator);
+            writeChannelControlObject(w, req_allocator, mgr, scoped_user_id, user_id_num, ch, config_opt, keys) catch return channel_internal_error;
+            return .{ .body = resp.toOwnedSlice(req_allocator) catch return channel_internal_error };
+        },
+        .mutate => |m| {
+            // Telegram keeps its dedicated connect/disconnect routes so the
+            // shipped flow is never destabilised.
+            if (!m.channel.userManaged()) {
+                return .{
+                    .status = "409 Conflict",
+                    .body = "{\"error\":\"telegram_uses_dedicated_routes\",\"hint\":\"use channels/telegram/connect and channels/telegram/disconnect\"}",
+                };
+            }
+            return switch (m.action) {
+                .connect => handleChannelConnect(req_allocator, method, raw_request, scoped_user_id, user_id_num, m.channel, mgr, config_opt),
+                .@"test" => handleChannelTest(req_allocator, method, scoped_user_id, user_id_num, m.channel, mgr, config_opt),
+                .disconnect => handleChannelDisconnect(req_allocator, method, scoped_user_id, user_id_num, m.channel, mgr, config_opt),
+            };
+        },
+    }
+}
+
+fn handleChannelConnect(
+    req_allocator: std.mem.Allocator,
+    method: []const u8,
+    raw_request: []const u8,
+    scoped_user_id: []const u8,
+    user_id_num: i64,
+    ch: channel_control.Channel,
+    mgr: *zaki_state_mod.Manager,
+    config_opt: ?*const Config,
+) RouteResponse {
+    const cc = channel_control;
+    if (!std.mem.eql(u8, method, "POST")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    if (!channelBuildEnabled(ch)) {
+        return .{ .status = "409 Conflict", .body = "{\"error\":\"channel_disabled_in_build\"}" };
+    }
+    const desc = cc.descriptor(ch);
+    const body = extractBody(raw_request) orelse "{}";
+
+    // ── Validate everything BEFORE writing any secret (no half-connect).
+    var secret_vals: [8]?[]const u8 = .{null} ** 8;
+    for (desc.secrets, 0..) |s, i| {
+        const val = jsonStringField(body, s.key);
+        if (val == null) {
+            if (s.required) {
+                return jsonFieldError(req_allocator, "missing_required_secret", s.key);
+            }
+            continue;
+        }
+        if (!cc.validateSecretValue(s.key, val.?)) {
+            return jsonFieldError(req_allocator, "invalid_secret", s.key);
+        }
+        secret_vals[i] = val.?;
+    }
+
+    var config_pairs: [12]ChannelKV = undefined;
+    var config_n: usize = 0;
+    for (desc.config_fields) |f| {
+        const val = jsonStringField(body, f.key);
+        if (val == null) {
+            if (f.required) {
+                return jsonFieldError(req_allocator, "missing_required_config", f.key);
+            }
+            continue;
+        }
+        if (!cc.validateConfigValue(f, val.?)) {
+            return jsonFieldError(req_allocator, "invalid_config", f.key);
+        }
+        config_pairs[config_n] = .{ .key = f.key, .value = val.? };
+        config_n += 1;
+    }
+
+    // ── Persist secrets to the vault.
+    for (desc.secrets, 0..) |s, i| {
+        if (secret_vals[i]) |val| {
+            mgr.putSecret(user_id_num, s.key, val) catch {
+                return jsonFieldError(req_allocator, "secret_store_failed", s.key);
+            };
+        }
+    }
+
+    // ── Persist non-secret connection metadata.
+    var state_buf: std.ArrayListUnmanaged(u8) = .empty;
+    const sw = state_buf.writer(req_allocator);
+    writeChannelStateStorageJson(sw, true, std.time.timestamp(), config_pairs[0..config_n], null) catch return channel_internal_error;
+    mgr.putChannelStateJson(user_id_num, ch.key(), state_buf.items) catch return channel_internal_error;
+
+    return singleChannelResponse(req_allocator, mgr, scoped_user_id, user_id_num, ch, config_opt);
+}
+
+fn handleChannelTest(
+    req_allocator: std.mem.Allocator,
+    method: []const u8,
+    scoped_user_id: []const u8,
+    user_id_num: i64,
+    ch: channel_control.Channel,
+    mgr: *zaki_state_mod.Manager,
+    config_opt: ?*const Config,
+) RouteResponse {
+    const cc = channel_control;
+    if (!std.mem.eql(u8, method, "POST")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    const desc = cc.descriptor(ch);
+
+    // V1 test = structural credential check (presence + format) against
+    // the vault. It deliberately does NOT make a live outbound call to the
+    // provider — that stays a documented follow-up so the contract is
+    // deterministic and never reports a false "connected" requiring the
+    // network. Detail is machine-readable for the UI.
+    var ok = true;
+    var detail: []const u8 = "credentials_present";
+    for (desc.secrets) |s| {
+        if (!s.required) continue;
+        const stored = mgr.getSecret(req_allocator, user_id_num, s.key) catch {
+            return channel_internal_error;
+        };
+        if (stored == null) {
+            ok = false;
+            detail = std.fmt.allocPrint(req_allocator, "missing_required_secret:{s}", .{s.key}) catch "missing_required_secret";
+            break;
+        }
+        if (!cc.validateSecretValue(s.key, stored.?)) {
+            ok = false;
+            detail = std.fmt.allocPrint(req_allocator, "malformed_secret:{s}", .{s.key}) catch "malformed_secret";
+            break;
+        }
+    }
+    const now = std.time.timestamp();
+
+    // Re-emit the channel-state object preserving config, refreshing
+    // last_test. Config values are strings, so declared-field re-emit is
+    // lossless.
+    const existing = mgr.getChannelStateJson(req_allocator, user_id_num, ch.key()) catch try_default: {
+        break :try_default req_allocator.dupe(u8, "{}") catch return channel_internal_error;
+    };
+    var parsed: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(std.json.Value, req_allocator, existing, .{}) catch null;
+    defer if (parsed) |*p| p.deinit();
+
+    var config_pairs: [12]ChannelKV = undefined;
+    var config_n: usize = 0;
+    var connected = false;
+    var configured_at_s = now;
+    if (parsed) |p| {
+        if (p.value == .object) {
+            if (p.value.object.get("connected")) |c| {
+                if (c == .bool) connected = c.bool;
+            }
+            if (p.value.object.get("configured_at_s")) |ca| {
+                if (ca == .integer) configured_at_s = ca.integer;
+            }
+            if (p.value.object.get("config")) |cfgval| {
+                if (cfgval == .object) {
+                    for (desc.config_fields) |f| {
+                        if (cfgval.object.get(f.key)) |v| {
+                            if (v == .string and config_n < config_pairs.len) {
+                                config_pairs[config_n] = .{ .key = f.key, .value = v.string };
+                                config_n += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    var state_buf: std.ArrayListUnmanaged(u8) = .empty;
+    const sw = state_buf.writer(req_allocator);
+    writeChannelStateStorageJson(sw, connected, configured_at_s, config_pairs[0..config_n], .{ .ok = ok, .checked_at_s = now, .detail = detail }) catch return channel_internal_error;
+    mgr.putChannelStateJson(user_id_num, ch.key(), state_buf.items) catch return channel_internal_error;
+
+    return singleChannelResponse(req_allocator, mgr, scoped_user_id, user_id_num, ch, config_opt);
+}
+
+fn handleChannelDisconnect(
+    req_allocator: std.mem.Allocator,
+    method: []const u8,
+    scoped_user_id: []const u8,
+    user_id_num: i64,
+    ch: channel_control.Channel,
+    mgr: *zaki_state_mod.Manager,
+    config_opt: ?*const Config,
+) RouteResponse {
+    _ = scoped_user_id;
+    _ = config_opt;
+    const cc = channel_control;
+    const method_allowed = std.mem.eql(u8, method, "POST") or std.mem.eql(u8, method, "DELETE");
+    if (!method_allowed) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    const desc = cc.descriptor(ch);
+    // Remove every secret ref this channel owns (idempotent — not-found
+    // is fine). Then clear the connection metadata.
+    for (desc.secrets) |s| {
+        _ = mgr.deleteSecret(user_id_num, s.key) catch {
+            return jsonFieldError(req_allocator, "secret_delete_failed", s.key);
+        };
+    }
+    mgr.deleteChannelStateJson(user_id_num, ch.key()) catch return channel_internal_error;
+
+    var resp: std.ArrayListUnmanaged(u8) = .empty;
+    const w = resp.writer(req_allocator);
+    w.writeAll("{\"status\":\"disconnected\",\"channel\":\"") catch return channel_internal_error;
+    jsonEscapeInto(w, ch.key()) catch return channel_internal_error;
+    w.writeAll("\"}") catch return channel_internal_error;
+    return .{ .body = resp.toOwnedSlice(req_allocator) catch return channel_internal_error };
+}
+
+fn singleChannelResponse(
+    req_allocator: std.mem.Allocator,
+    mgr: *zaki_state_mod.Manager,
+    scoped_user_id: []const u8,
+    user_id_num: i64,
+    ch: channel_control.Channel,
+    config_opt: ?*const Config,
+) RouteResponse {
+    const keys = mgr.listSecretKeys(req_allocator, user_id_num) catch return channel_internal_error;
+    var resp: std.ArrayListUnmanaged(u8) = .empty;
+    const w = resp.writer(req_allocator);
+    writeChannelControlObject(w, req_allocator, mgr, scoped_user_id, user_id_num, ch, config_opt, keys) catch return channel_internal_error;
+    return .{ .body = resp.toOwnedSlice(req_allocator) catch return channel_internal_error };
+}
+
+fn jsonFieldError(req_allocator: std.mem.Allocator, code: []const u8, key: []const u8) RouteResponse {
+    var resp: std.ArrayListUnmanaged(u8) = .empty;
+    const w = resp.writer(req_allocator);
+    w.writeAll("{\"error\":\"") catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_request\"}" };
+    jsonEscapeInto(w, code) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_request\"}" };
+    w.writeAll("\",\"key\":\"") catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_request\"}" };
+    jsonEscapeInto(w, key) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_request\"}" };
+    w.writeAll("\"}") catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_request\"}" };
+    return .{ .status = "400 Bad Request", .body = resp.toOwnedSlice(req_allocator) catch "{\"error\":\"invalid_request\"}" };
+}
+
 fn handleApiRoute(
     // D20 (2026-04-25): `root_allocator` was only used by the deleted
     // buffered chat/stream handler's `processIncomingMessage` fallback.
@@ -18925,6 +19373,21 @@ fn handleApiRoute(
             };
         }
         return .{ .body = "{\"status\":\"disconnected\",\"channel\":\"telegram\"}" };
+    }
+
+    // ── S7 — channel activation control plane ──────────────────────────
+    // GET  channels                       — aggregate status for the
+    //                                       V1 launch channels + telegram
+    // GET  channels/{channel}             — single channel status
+    // POST channels/{channel}/connect     — store vault secrets + config
+    // POST channels/{channel}/test        — structural credential check
+    // POST channels/{channel}/disconnect  — clear secrets + metadata
+    //
+    // Runs AFTER the dedicated telegram connect/disconnect and the
+    // channel-identity bindings matchers above, so those keep their
+    // shipped behaviour. Hidden adapters (signal, matrix, …) 404 here.
+    if (std.mem.eql(u8, parsed.subpath, "channels") or std.mem.startsWith(u8, parsed.subpath, "channels/")) {
+        return handleChannelControl(req_allocator, method, raw_request, parsed.subpath, scoped_user_id, state, config_opt);
     }
 
     // ── Voice endpoints (Phase 3 — STT / TTS) ──────────────────────────
@@ -23228,6 +23691,71 @@ test "vault route — GET /secrets/:key/audit reaches audit branch (S2.16)" {
         null,
     );
     try std.testing.expectEqualStrings("503 Service Unavailable", response.status);
+}
+
+// ── S7 channel control-plane route tests (no Postgres needed) ──────────
+
+fn channelControlTestState(allocator: std.mem.Allocator, tenant_root: []const u8, tokens: *const [1][]const u8) GatewayState {
+    var state = GatewayState.init(allocator);
+    state.tenant_data_root = tenant_root;
+    state.internal_service_tokens = tokens;
+    return state;
+}
+
+test "channel control — hidden adapter 404s before any DB touch" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    var state = channelControlTestState(std.testing.allocator, tenant_root, &internal_tokens);
+    defer state.deinit();
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    // signal is in the catalog but deliberately NOT surfaced — must 404,
+    // and must do so before the state-backend check (no DB leak).
+    const raw = "GET /api/v1/users/1/channels/signal HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(std.testing.allocator, req_arena.allocator(), raw, "GET", "/api/v1/users/1/channels/signal", &state, null, null);
+    try std.testing.expectEqualStrings("404 Not Found", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "channel_not_supported") != null);
+}
+
+test "channel control — unknown action 404s" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    var state = channelControlTestState(std.testing.allocator, tenant_root, &internal_tokens);
+    defer state.deinit();
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    const raw = "POST /api/v1/users/1/channels/slack/frobnicate HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(std.testing.allocator, req_arena.allocator(), raw, "POST", "/api/v1/users/1/channels/slack/frobnicate", &state, null, null);
+    try std.testing.expectEqualStrings("404 Not Found", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "channel_not_supported") != null);
+}
+
+test "channel control — surfaced channel needs the state backend (501 without Postgres)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    var state = channelControlTestState(std.testing.allocator, tenant_root, &internal_tokens);
+    defer state.deinit();
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    const raw = "GET /api/v1/users/1/channels HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(std.testing.allocator, req_arena.allocator(), raw, "GET", "/api/v1/users/1/channels", &state, null, null);
+    try std.testing.expectEqualStrings("501 Not Implemented", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "state backend") != null);
 }
 
 test "vault route — rejects invalid secret key with 400" {
