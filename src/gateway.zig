@@ -17940,7 +17940,7 @@ fn handleChannelControl(
             return switch (m.action) {
                 .connect => handleChannelConnect(req_allocator, method, raw_request, scoped_user_id, user_id_num, m.channel, mgr, config_opt),
                 .@"test" => handleChannelTest(req_allocator, method, scoped_user_id, user_id_num, m.channel, mgr, config_opt),
-                .disconnect => handleChannelDisconnect(req_allocator, method, scoped_user_id, user_id_num, m.channel, mgr, config_opt),
+                .disconnect => handleChannelDisconnect(req_allocator, method, raw_request, user_id_num, m.channel, mgr),
             };
         },
     }
@@ -17999,12 +17999,17 @@ fn handleChannelConnect(
         config_n += 1;
     }
 
-    // ── Persist secrets to the vault.
+    // ── Persist secrets to the vault. Mirror the secret-vault audit
+    //    trail so operators can see who changed channel credentials when
+    //    (parity with the /secrets API governance).
+    const actor_id = extractZakiUserId(raw_request);
     for (desc.secrets, 0..) |s, i| {
         if (secret_vals[i]) |val| {
             mgr.putSecret(user_id_num, s.key, val) catch {
+                mgr.recordSecretMutation(user_id_num, s.key, "put", actor_id, "write_failed", "channel_connect") catch {};
                 return jsonFieldError(req_allocator, "secret_store_failed", s.key);
             };
+            mgr.recordSecretMutation(user_id_num, s.key, "put", actor_id, "ok", "channel_connect") catch {};
         }
     }
 
@@ -18104,14 +18109,11 @@ fn handleChannelTest(
 fn handleChannelDisconnect(
     req_allocator: std.mem.Allocator,
     method: []const u8,
-    scoped_user_id: []const u8,
+    raw_request: []const u8,
     user_id_num: i64,
     ch: channel_control.Channel,
     mgr: *zaki_state_mod.Manager,
-    config_opt: ?*const Config,
 ) RouteResponse {
-    _ = scoped_user_id;
-    _ = config_opt;
     const cc = channel_control;
     const method_allowed = std.mem.eql(u8, method, "POST") or std.mem.eql(u8, method, "DELETE");
     if (!method_allowed) {
@@ -18119,11 +18121,15 @@ fn handleChannelDisconnect(
     }
     const desc = cc.descriptor(ch);
     // Remove every secret ref this channel owns (idempotent — not-found
-    // is fine). Then clear the connection metadata.
+    // is fine). Then clear the connection metadata. Audit each delete for
+    // parity with the /secrets API governance.
+    const actor_id = extractZakiUserId(raw_request);
     for (desc.secrets) |s| {
-        _ = mgr.deleteSecret(user_id_num, s.key) catch {
+        const deleted = mgr.deleteSecret(user_id_num, s.key) catch {
+            mgr.recordSecretMutation(user_id_num, s.key, "delete", actor_id, "write_failed", "channel_disconnect") catch {};
             return jsonFieldError(req_allocator, "secret_delete_failed", s.key);
         };
+        mgr.recordSecretMutation(user_id_num, s.key, "delete", actor_id, if (deleted) "ok" else "not_found", "channel_disconnect") catch {};
     }
     mgr.deleteChannelStateJson(user_id_num, ch.key()) catch return channel_internal_error;
 
