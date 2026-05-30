@@ -78,6 +78,17 @@ pub fn isValidLabel(label: []const u8) bool {
     return true;
 }
 
+/// Cleartext http is allowed ONLY for loopback hosts. The literal must be
+/// followed by a real host boundary (':' port, '/' path, or end of
+/// string) so `http://localhost.evil.com` and `http://127.0.0.1@evil.com`
+/// don't slip through the loopback exception as cleartext exfil targets.
+fn isLoopbackHttp(url: []const u8, prefix: []const u8) bool {
+    if (!std.mem.startsWith(u8, url, prefix)) return false;
+    if (url.len == prefix.len) return true;
+    const next = url[prefix.len];
+    return next == ':' or next == '/';
+}
+
 /// Base URL must be a clean, bounded https URL — or http://localhost /
 /// http://127.0.0.1[...] for local dev. No whitespace / control chars.
 pub fn isValidBaseUrl(url: []const u8) bool {
@@ -86,8 +97,8 @@ pub fn isValidBaseUrl(url: []const u8) bool {
         if (ch <= 0x20 or ch == 0x7f) return false;
     }
     if (std.mem.startsWith(u8, url, "https://")) return true;
-    if (std.mem.startsWith(u8, url, "http://localhost")) return true;
-    if (std.mem.startsWith(u8, url, "http://127.0.0.1")) return true;
+    if (isLoopbackHttp(url, "http://localhost")) return true;
+    if (isLoopbackHttp(url, "http://127.0.0.1")) return true;
     return false;
 }
 
@@ -249,11 +260,25 @@ test "auth style + policy allowlists" {
 test "base_url validation: https or localhost only" {
     try std.testing.expect(isValidBaseUrl("https://api.openai.com/v1"));
     try std.testing.expect(isValidBaseUrl("http://localhost:11434/v1"));
+    try std.testing.expect(isValidBaseUrl("http://localhost"));
+    try std.testing.expect(isValidBaseUrl("http://localhost/v1"));
     try std.testing.expect(isValidBaseUrl("http://127.0.0.1:1234"));
     try std.testing.expect(!isValidBaseUrl("http://evil.com/v1")); // cleartext non-local
     try std.testing.expect(!isValidBaseUrl("ftp://x"));
     try std.testing.expect(!isValidBaseUrl("https://has space.com"));
     try std.testing.expect(!isValidBaseUrl(""));
+}
+
+test "base_url loopback boundary — no cleartext exfil bypass" {
+    // The dangerous near-misses: a host that merely STARTS with the
+    // loopback literal must NOT be treated as loopback cleartext.
+    try std.testing.expect(!isValidBaseUrl("http://localhost.evil.com/v1"));
+    try std.testing.expect(!isValidBaseUrl("http://localhostx"));
+    try std.testing.expect(!isValidBaseUrl("http://127.0.0.1.evil.com"));
+    try std.testing.expect(!isValidBaseUrl("http://127.0.0.1@evil.com"));
+    try std.testing.expect(!isValidBaseUrl("http://localhost@evil.com"));
+    // https to the same hosts is fine (TLS-authenticated, user's BYOK choice).
+    try std.testing.expect(isValidBaseUrl("https://localhost.evil.com"));
 }
 
 test "model id + api key + profile id validation" {

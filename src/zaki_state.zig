@@ -3306,7 +3306,10 @@ const ManagerImpl = struct {
     /// cascades through: user_config, user_secrets, secret_mutations,
     /// sessions, messages, completion_events, memories, memory_events,
     /// channel_state, telegram_updates, channel_identity_bindings,
+    /// extension_devices (S7), provider_profiles (S7),
     /// heartbeat, onboarding, tenant_user_leases, jobs, job_runs, tasks.
+    /// The S7 provider API key secrets live in user_secrets (already
+    /// cascaded above) under `provider_<id>_api_key`.
     ///
     /// Note: `memory_vectors` (pgvector) has no FK to users and is NOT
     /// covered by this cascade — the GDPR orchestrator deletes those
