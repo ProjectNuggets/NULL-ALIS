@@ -179,6 +179,27 @@ pub const SecretMutationRecord = struct {
     }
 };
 
+/// S7 — one row of the browser-extension device registry.
+pub const ExtensionDeviceRow = struct {
+    id: []const u8,
+    label: []const u8,
+    status: []const u8,
+    paired_at_unix: i64,
+    last_seen_at_unix: ?i64,
+    last_command: ?[]const u8,
+    last_command_at_unix: ?i64,
+    last_error: ?[]const u8,
+    last_error_at_unix: ?i64,
+
+    pub fn deinit(self: *const ExtensionDeviceRow, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.label);
+        allocator.free(self.status);
+        if (self.last_command) |v| allocator.free(v);
+        if (self.last_error) |v| allocator.free(v);
+    }
+};
+
 pub const TaskSnapshot = struct {
     id: []u8,
     session_id: ?[]u8,
@@ -397,6 +418,20 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
         return error.PostgresNotEnabled;
     }
     pub fn deleteChannelStateJson(_: *@This(), _: i64, _: []const u8) !void {
+        return error.PostgresNotEnabled;
+    }
+    // S7 — extension device registry. Non-postgres builds have no tenant
+    // backend; the gateway guards on state.zaki_state != null → 501.
+    pub fn pairExtensionDevice(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8) ![]u8 {
+        return error.PostgresNotEnabled;
+    }
+    pub fn listExtensionDevices(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]ExtensionDeviceRow {
+        return allocator.alloc(ExtensionDeviceRow, 0);
+    }
+    pub fn revokeExtensionDevice(_: *@This(), _: i64, _: []const u8) !bool {
+        return error.PostgresNotEnabled;
+    }
+    pub fn recordExtensionDeviceState(_: *@This(), _: i64, _: []const u8, _: ?[]const u8, _: ?[]const u8) !bool {
         return error.PostgresNotEnabled;
     }
     // S7.2 — GDPR row-level user delete. Single DELETE on tenant `users`
@@ -2181,6 +2216,23 @@ const ManagerImpl = struct {
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_identity_unique ON {schema}.channel_identity_bindings(channel, account_id, principal_key, scope_key, thread_key_norm)",
             "CREATE INDEX IF NOT EXISTS idx_channel_identity_user_channel ON {schema}.channel_identity_bindings(user_id, channel)",
             "CREATE INDEX IF NOT EXISTS idx_channel_identity_lookup ON {schema}.channel_identity_bindings(channel, account_id, principal_key, scope_key, thread_key_norm)",
+            // S7 — browser-extension device registry (user-facing
+            // pair/inventory/revoke + last-command/timeout state). FK to
+            // users cascades on GDPR delete.
+            \\CREATE TABLE IF NOT EXISTS {schema}.extension_devices (
+            \\    id TEXT PRIMARY KEY DEFAULT encode(gen_random_bytes(16), 'hex'),
+            \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
+            \\    label TEXT NOT NULL DEFAULT '',
+            \\    status TEXT NOT NULL DEFAULT 'active',
+            \\    paired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            \\    last_seen_at TIMESTAMPTZ,
+            \\    last_command TEXT,
+            \\    last_command_at TIMESTAMPTZ,
+            \\    last_error TEXT,
+            \\    last_error_at TIMESTAMPTZ
+            \\)
+            ,
+            "CREATE INDEX IF NOT EXISTS idx_extension_devices_user ON {schema}.extension_devices(user_id, status)",
             \\CREATE TABLE IF NOT EXISTS {schema}.heartbeat (
             \\    user_id BIGINT PRIMARY KEY REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
             \\    config JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -2835,6 +2887,137 @@ const ManagerImpl = struct {
         const lengths = [_]c_int{ @intCast(user_s.len), @intCast(channel.len) };
         const result = try self.execParams(q, &params, &lengths);
         c.PQclear(result);
+    }
+
+    // ── S7 — extension device registry ─────────────────────────────────
+
+    /// Register a new device for the user and return its server-minted id.
+    pub fn pairExtensionDevice(self: *Self, allocator: std.mem.Allocator, user_id: i64, label: []const u8) ![]u8 {
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.extension_devices (user_id, label) VALUES ($1, $2) RETURNING id",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const label_z = try self.allocator.dupeZ(u8, label);
+        defer self.allocator.free(label_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, label_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(label.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return error.DeviceInsertFailed;
+        return dupeResultValue(allocator, result, 0, 0);
+    }
+
+    /// List the user's devices, newest first.
+    pub fn listExtensionDevices(self: *Self, allocator: std.mem.Allocator, user_id: i64) ![]ExtensionDeviceRow {
+        const q = try self.buildQuery(
+            "SELECT id, label, status, EXTRACT(EPOCH FROM paired_at)::bigint, " ++
+                "EXTRACT(EPOCH FROM last_seen_at)::bigint, last_command, " ++
+                "EXTRACT(EPOCH FROM last_command_at)::bigint, last_error, " ++
+                "EXTRACT(EPOCH FROM last_error_at)::bigint " ++
+                "FROM {schema}.extension_devices WHERE user_id = $1 ORDER BY paired_at DESC",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const nrows: usize = @intCast(@max(0, c.PQntuples(result)));
+        if (nrows == 0) return allocator.alloc(ExtensionDeviceRow, 0);
+
+        const rows = try allocator.alloc(ExtensionDeviceRow, nrows);
+        var initialized: usize = 0;
+        errdefer {
+            for (rows[0..initialized]) |r| r.deinit(allocator);
+            allocator.free(rows);
+        }
+        for (0..nrows) |i| {
+            const ri: c_int = @intCast(i);
+            const id = try dupeResultValue(allocator, result, ri, 0);
+            errdefer allocator.free(id);
+            const label = try dupeResultValue(allocator, result, ri, 1);
+            errdefer allocator.free(label);
+            const status = try dupeResultValue(allocator, result, ri, 2);
+            errdefer allocator.free(status);
+
+            const paired_raw = try dupeResultValue(allocator, result, ri, 3);
+            defer allocator.free(paired_raw);
+            const paired_at_unix = std.fmt.parseInt(i64, paired_raw, 10) catch return error.InvalidTimestamp;
+
+            const last_seen = try parseNullableEpochCol(allocator, result, ri, 4);
+            const last_command: ?[]const u8 = if (c.PQgetisnull(result, ri, 5) == 1) null else try dupeResultValue(allocator, result, ri, 5);
+            errdefer if (last_command) |v| allocator.free(v);
+            const last_command_at = try parseNullableEpochCol(allocator, result, ri, 6);
+            const last_error: ?[]const u8 = if (c.PQgetisnull(result, ri, 7) == 1) null else try dupeResultValue(allocator, result, ri, 7);
+            errdefer if (last_error) |v| allocator.free(v);
+            const last_error_at = try parseNullableEpochCol(allocator, result, ri, 8);
+
+            rows[i] = .{
+                .id = id,
+                .label = label,
+                .status = status,
+                .paired_at_unix = paired_at_unix,
+                .last_seen_at_unix = last_seen,
+                .last_command = last_command,
+                .last_command_at_unix = last_command_at,
+                .last_error = last_error,
+                .last_error_at_unix = last_error_at,
+            };
+            initialized += 1;
+        }
+        return rows;
+    }
+
+    /// Mark a device revoked. Returns false if no matching device.
+    pub fn revokeExtensionDevice(self: *Self, user_id: i64, device_id: []const u8) !bool {
+        const q = try self.buildQuery(
+            "UPDATE {schema}.extension_devices SET status = 'revoked' WHERE user_id = $1 AND id = $2",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const id_z = try self.allocator.dupeZ(u8, device_id);
+        defer self.allocator.free(id_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, id_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(device_id.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const affected = c.PQcmdTuples(result);
+        if (affected == null) return false;
+        return !std.mem.eql(u8, std.mem.span(affected), "0");
+    }
+
+    /// Record runtime state (heartbeat + optional last command / error) for
+    /// an active device. Intended for the WS runtime to call; the UI reads
+    /// it back via listExtensionDevices. Returns false if no active match.
+    pub fn recordExtensionDeviceState(self: *Self, user_id: i64, device_id: []const u8, last_command: ?[]const u8, last_error: ?[]const u8) !bool {
+        const q = try self.buildQuery(
+            "UPDATE {schema}.extension_devices SET last_seen_at = NOW(), " ++
+                "last_command = COALESCE($3, last_command), " ++
+                "last_command_at = CASE WHEN $3 IS NOT NULL THEN NOW() ELSE last_command_at END, " ++
+                "last_error = COALESCE($4, last_error), " ++
+                "last_error_at = CASE WHEN $4 IS NOT NULL THEN NOW() ELSE last_error_at END " ++
+                "WHERE user_id = $1 AND id = $2 AND status = 'active'",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const id_z = try self.allocator.dupeZ(u8, device_id);
+        defer self.allocator.free(id_z);
+        const cmd_z: ?[*:0]const u8 = if (last_command) |v| (try self.allocator.dupeZ(u8, v)).ptr else null;
+        defer if (cmd_z) |p| self.allocator.free(std.mem.span(p));
+        const err_z: ?[*:0]const u8 = if (last_error) |v| (try self.allocator.dupeZ(u8, v)).ptr else null;
+        defer if (err_z) |p| self.allocator.free(std.mem.span(p));
+        const params = [_]?[*:0]const u8{ user_s.ptr, id_z, cmd_z, err_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(device_id.len), @intCast(if (last_command) |v| v.len else 0), @intCast(if (last_error) |v| v.len else 0) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const affected = c.PQcmdTuples(result);
+        if (affected == null) return false;
+        return !std.mem.eql(u8, std.mem.span(affected), "0");
     }
 
     /// S7.2 — GDPR row-level user delete. Every per-user FK references
@@ -11354,6 +11537,16 @@ fn dupeResultValue(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int
     const out = try allocator.alloc(u8, len);
     @memcpy(out, src[0..len]);
     return out;
+}
+
+/// Parse a nullable `EXTRACT(EPOCH FROM ...)::bigint` column into ?i64.
+/// Returns null when the SQL value is NULL (S7 extension device registry).
+fn parseNullableEpochCol(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int, col: c_int) !?i64 {
+    if (c.PQgetisnull(result, row, col) == 1) return null;
+    const raw = try dupeResultValue(allocator, result, row, col);
+    defer allocator.free(raw);
+    if (raw.len == 0) return null;
+    return std.fmt.parseInt(i64, raw, 10) catch return error.InvalidTimestamp;
 }
 
 fn dupeNullableResultValue(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int, col: c_int) !?[]u8 {

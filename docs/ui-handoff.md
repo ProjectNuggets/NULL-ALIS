@@ -172,6 +172,41 @@ Two completely different lanes that the user picks per use case.
 - **Tab picker** when `extension_list_tabs` returns >1 candidate — let
   the user disambiguate, don't guess.
 
+#### 2.4.1 Extension device registry *(S7 — 2026-05-30)*
+
+The HTTP contract Settings → Browser Extension & Devices binds to for
+**device management** — distinct from the operator diagnostics surface
+(`/api/v1/diagnostics/extension/*`, which is live WS hub state).
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/v1/users/{id}/extension/devices` | Device inventory |
+| `POST /api/v1/users/{id}/extension/devices` | Pair (register) a device; body `{label?}` |
+| `POST /api/v1/users/{id}/extension/devices/{device_id}/revoke` | Revoke |
+| `DELETE /api/v1/users/{id}/extension/devices/{device_id}` | Revoke (alias) |
+
+Each device (`ExtensionDevice` schema): `{id, label, status[active|revoked],
+connection_state[connected|disconnected|never_connected|revoked],
+paired_at_s, last_seen_at_s, last_command, last_command_at_s, last_error,
+last_error_at_s}`. `connection_state` is derived from `last_seen_at` vs a
+90s timeout — bind it to the live status dot.
+
+**IMPORTANT — what is wired vs gated:**
+- **Wired now:** pair (registers a device row), inventory, revoke (flips
+  status), and the timeout-derived connection state. Requires the
+  Postgres state backend (`501` otherwise).
+- **Gated (do NOT imply it works):** `last_command` / `last_error` /
+  `last_seen_at` are populated by the **WS runtime** once device-token
+  enforcement is bound into the extension WS auth path — until then they
+  read `null` and `connection_state` is `never_connected`. Binding
+  per-device token issuance + revoke **enforcement** into the
+  META-CRITICAL `extension_ws/auth.zig` validator + the mock-hub E2E is
+  the remaining gate. The current WS auth model is operator-provisioned
+  per-user tokens; revoke records management intent and the durable
+  inventory the diagnostics endpoint lacks. Surface this honestly:
+  "device registered / revoked" — not "device live" — until the runtime
+  wiring lands.
+
 ### 2.5 Document deliverables — produce_document
 
 | Format | Engine | Notes |

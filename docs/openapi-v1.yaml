@@ -1102,6 +1102,132 @@ paths:
         "404":
           description: Secret not found
 
+  # ── Extension device registry (S7 follow-up) ───────────────────────
+  # User-facing browser-extension device management. Distinct from the
+  # operator diagnostics surface (/api/v1/diagnostics/extension/*). Pair /
+  # inventory / revoke + last-command and timeout-derived connection
+  # state. NOTE: this is the management/observability layer. Binding
+  # per-device token issuance + revoke ENFORCEMENT into the WS auth path
+  # (extension_ws/auth.zig) + mock-hub E2E is a documented follow-up; the
+  # WS auth model today is operator-provisioned per-user tokens.
+  /api/v1/users/{user_id}/extension/devices:
+    get:
+      tags: [user]
+      summary: List the user's browser-extension devices
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      responses:
+        "200":
+          description: Device inventory
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [devices]
+                properties:
+                  devices:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ExtensionDevice"
+        "501":
+          description: State backend (Postgres) not wired
+    post:
+      tags: [user]
+      summary: Pair (register) a new device
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label:
+                  type: string
+                  description: Optional display label, e.g. "Work laptop".
+      responses:
+        "201":
+          description: Device registered
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [device_id, label, status, connection_state]
+                properties:
+                  device_id: { type: string }
+                  label: { type: string }
+                  status: { type: string, example: active }
+                  connection_state: { type: string, example: never_connected }
+        "400":
+          description: invalid_label
+        "501":
+          description: State backend (Postgres) not wired
+
+  /api/v1/users/{user_id}/extension/devices/{device_id}:
+    delete:
+      tags: [user]
+      summary: Revoke a device (alias for the revoke action)
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+        - name: device_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, device_id]
+                properties:
+                  status: { type: string, example: revoked }
+                  device_id: { type: string }
+        "400":
+          description: invalid_device_id
+        "404":
+          description: device_not_found
+        "501":
+          description: State backend (Postgres) not wired
+
+  /api/v1/users/{user_id}/extension/devices/{device_id}/revoke:
+    post:
+      tags: [user]
+      summary: Revoke a device
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+        - name: device_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, device_id]
+                properties:
+                  status: { type: string }
+                  device_id: { type: string }
+        "400":
+          description: invalid_device_id
+        "404":
+          description: device_not_found
+        "501":
+          description: State backend (Postgres) not wired
+
   # ── Memory governance control plane (S7 follow-up) ─────────────────
   # User-facing privacy/data primitives over the nullalis memory store.
   # All user-scoped. Postgres state backend required (else 501).
@@ -3271,6 +3397,26 @@ components:
         key:
           type: string
           description: The offending field key.
+    ExtensionDevice:
+      type: object
+      description: One browser-extension device in the user registry (S7).
+      required: [id, label, status, connection_state, paired_at_s, last_seen_at_s, last_command, last_command_at_s, last_error, last_error_at_s]
+      properties:
+        id: { type: string }
+        label: { type: string }
+        status:
+          type: string
+          enum: [active, revoked]
+        connection_state:
+          type: string
+          enum: [connected, disconnected, never_connected, revoked]
+          description: Derived from last_seen_at vs a 90s timeout (and revoke status).
+        paired_at_s: { type: integer, format: int64 }
+        last_seen_at_s: { type: integer, format: int64, nullable: true }
+        last_command: { type: string, nullable: true, description: Last extension_* tool the device ran (populated by the WS runtime). }
+        last_command_at_s: { type: integer, format: int64, nullable: true }
+        last_error: { type: string, nullable: true }
+        last_error_at_s: { type: integer, format: int64, nullable: true }
     InternalDiagnosticsResponse:
       type: object
       description: |

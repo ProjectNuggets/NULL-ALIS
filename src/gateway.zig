@@ -104,6 +104,10 @@ const channel_control = @import("channel_control.zig");
 // purge dry-run/apply, export, provenance counts). Pure logic; the
 // zaki_state memory IO stays here in the gateway.
 const memory_governance = @import("memory_governance.zig");
+// S7 follow-up — user-facing browser-extension device registry (pair,
+// inventory, revoke, last-command/timeout state). Pure logic; distinct
+// from operator diagnostics and the META-CRITICAL WS auth path.
+const extension_devices = @import("extension_devices.zig");
 const bus_mod = @import("bus.zig");
 const tasks_mod = @import("tasks/root.zig");
 const usage_runtime_mod = @import("usage_runtime.zig");
@@ -18284,6 +18288,113 @@ fn handleMemoryGovernance(
     }
 }
 
+// ── S7 follow-up — extension device registry control plane ────────────
+//
+// User-facing browser-extension device management, distinct from the
+// operator diagnostics surface. Pair / inventory / revoke + last-command
+// and timeout-derived connection state.
+//   GET  extension/devices            — inventory
+//   POST extension/devices            — pair (register) a device
+//   POST extension/devices/{id}/revoke — revoke
+//   DELETE extension/devices/{id}      — revoke (alias)
+const extension_devices_error: RouteResponse = .{ .status = "500 Internal Server Error", .body = "{\"error\":\"extension_devices_failed\"}" };
+
+fn handleExtensionDevices(
+    req_allocator: std.mem.Allocator,
+    method: []const u8,
+    raw_request: []const u8,
+    subpath: []const u8,
+    scoped_user_id: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    const ed = extension_devices;
+    const route = ed.parseRoute(subpath) orelse return .{ .status = "404 Not Found", .body = "{\"error\":\"not_found\"}" };
+    if (route == .unsupported) return .{ .status = "404 Not Found", .body = "{\"error\":\"not_found\"}" };
+
+    // Validate a malformed device id BEFORE the backend dependency check,
+    // so a bad request never reports "needs backend".
+    switch (route) {
+        .revoke, .item => |id| if (!ed.isValidDeviceId(id)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_device_id\"}" },
+        else => {},
+    }
+
+    const mgr = state.zaki_state orelse return .{
+        .status = "501 Not Implemented",
+        .body = "{\"error\":\"state backend does not support extension devices\"}",
+    };
+    const uid = parseNumericUserId(scoped_user_id) catch return .{
+        .status = "400 Bad Request",
+        .body = "{\"error\":\"invalid user\"}",
+    };
+
+    switch (route) {
+        .unsupported => unreachable,
+        .collection => {
+            if (std.mem.eql(u8, method, "GET")) {
+                const rows = mgr.listExtensionDevices(req_allocator, uid) catch return extension_devices_error;
+                const now = std.time.timestamp();
+                var resp: std.ArrayListUnmanaged(u8) = .empty;
+                const w = resp.writer(req_allocator);
+                w.writeAll("{\"devices\":[") catch return extension_devices_error;
+                for (rows, 0..) |r, i| {
+                    if (i > 0) w.writeByte(',') catch return extension_devices_error;
+                    const revoked = std.mem.eql(u8, r.status, "revoked");
+                    ed.writeDeviceJson(w, .{
+                        .id = r.id,
+                        .label = r.label,
+                        .status = r.status,
+                        .connection_state = ed.deriveConnectionState(revoked, r.last_seen_at_unix, now, ed.DEVICE_TIMEOUT_S),
+                        .paired_at_s = r.paired_at_unix,
+                        .last_seen_at_s = r.last_seen_at_unix,
+                        .last_command = r.last_command,
+                        .last_command_at_s = r.last_command_at_unix,
+                        .last_error = r.last_error,
+                        .last_error_at_s = r.last_error_at_unix,
+                    }) catch return extension_devices_error;
+                }
+                w.writeAll("]}") catch return extension_devices_error;
+                return .{ .body = resp.toOwnedSlice(req_allocator) catch return extension_devices_error };
+            }
+            if (std.mem.eql(u8, method, "POST")) {
+                const body = extractBody(raw_request) orelse "{}";
+                const label = jsonStringField(body, "label") orelse "";
+                if (!ed.isValidLabel(label)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_label\"}" };
+                const id = mgr.pairExtensionDevice(req_allocator, uid, label) catch return extension_devices_error;
+                var resp: std.ArrayListUnmanaged(u8) = .empty;
+                const w = resp.writer(req_allocator);
+                w.writeAll("{\"device_id\":\"") catch return extension_devices_error;
+                jsonEscapeInto(w, id) catch return extension_devices_error;
+                w.writeAll("\",\"label\":\"") catch return extension_devices_error;
+                jsonEscapeInto(w, label) catch return extension_devices_error;
+                w.writeAll("\",\"status\":\"active\",\"connection_state\":\"never_connected\"}") catch return extension_devices_error;
+                return .{ .status = "201 Created", .body = resp.toOwnedSlice(req_allocator) catch return extension_devices_error };
+            }
+            return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+        },
+        .revoke => |id| return revokeExtensionDeviceResponse(req_allocator, mgr, uid, id, std.mem.eql(u8, method, "POST")),
+        .item => |id| return revokeExtensionDeviceResponse(req_allocator, mgr, uid, id, std.mem.eql(u8, method, "DELETE")),
+    }
+}
+
+fn revokeExtensionDeviceResponse(
+    req_allocator: std.mem.Allocator,
+    mgr: *zaki_state_mod.Manager,
+    uid: i64,
+    device_id: []const u8,
+    method_ok: bool,
+) RouteResponse {
+    if (!method_ok) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    if (!extension_devices.isValidDeviceId(device_id)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_device_id\"}" };
+    const revoked = mgr.revokeExtensionDevice(uid, device_id) catch return extension_devices_error;
+    if (!revoked) return .{ .status = "404 Not Found", .body = "{\"error\":\"device_not_found\"}" };
+    var resp: std.ArrayListUnmanaged(u8) = .empty;
+    const w = resp.writer(req_allocator);
+    w.writeAll("{\"status\":\"revoked\",\"device_id\":\"") catch return extension_devices_error;
+    jsonEscapeInto(w, device_id) catch return extension_devices_error;
+    w.writeAll("\"}") catch return extension_devices_error;
+    return .{ .body = resp.toOwnedSlice(req_allocator) catch return extension_devices_error };
+}
+
 fn handleApiRoute(
     // D20 (2026-04-25): `root_allocator` was only used by the deleted
     // buffered chat/stream handler's `processIncomingMessage` fallback.
@@ -19517,6 +19628,12 @@ fn handleApiRoute(
     //    export / provenance counts). Distinct namespace from brain/*.
     if (std.mem.startsWith(u8, parsed.subpath, "memory/")) {
         return handleMemoryGovernance(req_allocator, method, raw_request, parsed.subpath, scoped_user_id, state);
+    }
+
+    // ── S7 — browser-extension device registry (pair / inventory /
+    //    revoke / state). User-scoped; distinct from operator diagnostics.
+    if (std.mem.startsWith(u8, parsed.subpath, "extension/devices")) {
+        return handleExtensionDevices(req_allocator, method, raw_request, parsed.subpath, scoped_user_id, state);
     }
 
     // ── Voice endpoints (Phase 3 — STT / TTS) ──────────────────────────
@@ -23920,6 +24037,43 @@ test "memory governance — counts needs the state backend (501 without Postgres
     const response = handleApiRoute(std.testing.allocator, req_arena.allocator(), raw, "GET", "/api/v1/users/1/memory/governance", &state, null, null);
     try std.testing.expectEqualStrings("501 Not Implemented", response.status);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "memory governance") != null);
+}
+
+test "extension devices — inventory needs state backend (501 without Postgres)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    var state = channelControlTestState(std.testing.allocator, tenant_root, &internal_tokens);
+    defer state.deinit();
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    const raw = "GET /api/v1/users/1/extension/devices HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(std.testing.allocator, req_arena.allocator(), raw, "GET", "/api/v1/users/1/extension/devices", &state, null, null);
+    try std.testing.expectEqualStrings("501 Not Implemented", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "extension devices") != null);
+}
+
+test "extension devices — invalid device id rejected before DB (400)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    var state = channelControlTestState(std.testing.allocator, tenant_root, &internal_tokens);
+    defer state.deinit();
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    // A non-hex id is rejected by isValidDeviceId before any query.
+    const raw = "POST /api/v1/users/1/extension/devices/not..hex/revoke HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(std.testing.allocator, req_arena.allocator(), raw, "POST", "/api/v1/users/1/extension/devices/not..hex/revoke", &state, null, null);
+    try std.testing.expectEqualStrings("400 Bad Request", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "invalid_device_id") != null);
 }
 
 test "vault route — rejects invalid secret key with 400" {
