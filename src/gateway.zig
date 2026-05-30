@@ -18021,6 +18021,10 @@ fn handleChannelConnect(
         if (secret_vals[i]) |val| {
             mgr.putSecret(user_id_num, s.key, val) catch {
                 mgr.recordSecretMutation(user_id_num, s.key, "put", actor_id, "write_failed", "channel_connect") catch {};
+                // Roll back any secrets already written for this channel so
+                // a mid-loop failure doesn't leave a half-connected vault
+                // (best-effort; deleteSecret is idempotent on absent keys).
+                for (desc.secrets) |prev| _ = mgr.deleteSecret(user_id_num, prev.key) catch {};
                 return jsonFieldError(req_allocator, "secret_store_failed", s.key);
             };
             mgr.recordSecretMutation(user_id_num, s.key, "put", actor_id, "ok", "channel_connect") catch {};
@@ -18623,8 +18627,11 @@ fn handleProviderUpdate(req_allocator: std.mem.Allocator, raw_request: []const u
     const api_key = jsonStringField(body, "api_key");
     if (api_key) |k| if (!pp.isValidApiKey(k)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_api_key\"}" };
 
-    _ = mgr.updateProviderProfile(uid, id, label, base_url, auth_style, allow_json, default_model, policy) catch return provider_profiles_error;
-
+    // Rotate the key BEFORE the metadata update so a failed key write
+    // never commits metadata changes against a stale key (mirrors the
+    // create path's rollback discipline). The vault key is independent of
+    // the row, so a metadata-update failure after a successful rotation
+    // is safe — the newer key still works and a retry reapplies metadata.
     if (api_key) |k| {
         const secret_key = providerSecretKey(req_allocator, id) catch return provider_profiles_error;
         const actor_id = extractZakiUserId(raw_request);
@@ -18634,6 +18641,7 @@ fn handleProviderUpdate(req_allocator: std.mem.Allocator, raw_request: []const u
         };
         mgr.recordSecretMutation(uid, secret_key, "put", actor_id, "ok", "provider_update") catch {};
     }
+    _ = mgr.updateProviderProfile(uid, id, label, base_url, auth_style, allow_json, default_model, policy) catch return provider_profiles_error;
     return singleProviderResponse(req_allocator, mgr, uid, id, "200 OK");
 }
 
