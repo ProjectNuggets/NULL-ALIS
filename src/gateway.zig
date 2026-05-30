@@ -108,6 +108,9 @@ const memory_governance = @import("memory_governance.zig");
 // inventory, revoke, last-command/timeout state). Pure logic; distinct
 // from operator diagnostics and the META-CRITICAL WS auth path.
 const extension_devices = @import("extension_devices.zig");
+// S7 follow-up — user-managed model-provider profiles (OpenAI-compatible
+// / BYOK). Pure logic; vault + provider_profiles IO stays here.
+const provider_profiles = @import("provider_profiles.zig");
 const bus_mod = @import("bus.zig");
 const tasks_mod = @import("tasks/root.zig");
 const usage_runtime_mod = @import("usage_runtime.zig");
@@ -18395,6 +18398,299 @@ fn revokeExtensionDeviceResponse(
     return .{ .body = resp.toOwnedSlice(req_allocator) catch return extension_devices_error };
 }
 
+// ── S7 follow-up — provider profile control plane ─────────────────────
+//
+// User-managed OpenAI-compatible / BYOK provider profiles. The API key
+// lives in the encrypted vault under `provider_<id>_api_key`; the control
+// plane never returns the value — only a secret_ref presence flag.
+//   GET    providers            — list
+//   POST   providers            — create
+//   GET    providers/{id}       — single
+//   PATCH  providers/{id}       — update (PUT alias)
+//   DELETE providers/{id}       — delete
+//   POST   providers/{id}/test  — structural credential check
+const provider_profiles_error: RouteResponse = .{ .status = "500 Internal Server Error", .body = "{\"error\":\"provider_profiles_failed\"}" };
+
+fn providerSecretKey(req_allocator: std.mem.Allocator, id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(req_allocator, "provider_{s}_api_key", .{id});
+}
+
+fn buildJsonStringArray(a: std.mem.Allocator, items: []const []const u8) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    const w = buf.writer(a);
+    try w.writeByte('[');
+    for (items, 0..) |it, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeByte('"');
+        try jsonEscapeInto(w, it);
+        try w.writeByte('"');
+    }
+    try w.writeByte(']');
+    return buf.toOwnedSlice(a);
+}
+
+fn modelInAllowlistJson(req_allocator: std.mem.Allocator, json: []const u8, model: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, req_allocator, json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .array) return false;
+    for (parsed.value.array.items) |v| {
+        if (v == .string and std.mem.eql(u8, v.string, model)) return true;
+    }
+    return false;
+}
+
+fn writeProviderView(w: anytype, req_allocator: std.mem.Allocator, mgr: *zaki_state_mod.Manager, uid: i64, row: zaki_state_mod.ProviderProfileRow) !void {
+    const secret_key = try providerSecretKey(req_allocator, row.id);
+    const present = (mgr.getSecretMetadata(req_allocator, uid, secret_key) catch null) != null;
+    try provider_profiles.writeProfileJson(w, .{
+        .id = row.id,
+        .label = row.label,
+        .provider_kind = row.provider_kind,
+        .base_url = row.base_url,
+        .auth_style = row.auth_style,
+        .model_allowlist_json = row.model_allowlist_json,
+        .default_model = row.default_model,
+        .policy_state = row.policy_state,
+        .secret_ref_key = secret_key,
+        .secret_present = present,
+        .last_test_json = row.last_test_json,
+        .created_at_s = row.created_at_unix,
+        .updated_at_s = row.updated_at_unix,
+    });
+}
+
+fn singleProviderResponse(req_allocator: std.mem.Allocator, mgr: *zaki_state_mod.Manager, uid: i64, id: []const u8, status: []const u8) RouteResponse {
+    const row = (mgr.getProviderProfile(req_allocator, uid, id) catch return provider_profiles_error) orelse return .{ .status = "404 Not Found", .body = "{\"error\":\"provider_not_found\"}" };
+    defer row.deinit(req_allocator);
+    var resp: std.ArrayListUnmanaged(u8) = .empty;
+    const w = resp.writer(req_allocator);
+    writeProviderView(w, req_allocator, mgr, uid, row) catch return provider_profiles_error;
+    return .{ .status = status, .body = resp.toOwnedSlice(req_allocator) catch return provider_profiles_error };
+}
+
+fn handleProviderProfiles(
+    req_allocator: std.mem.Allocator,
+    method: []const u8,
+    raw_request: []const u8,
+    subpath: []const u8,
+    scoped_user_id: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    const pp = provider_profiles;
+    const route = pp.parseRoute(subpath) orelse return .{ .status = "404 Not Found", .body = "{\"error\":\"not_found\"}" };
+    if (route == .unsupported) return .{ .status = "404 Not Found", .body = "{\"error\":\"not_found\"}" };
+
+    // Validate a malformed profile id before the backend dependency.
+    switch (route) {
+        .item, .@"test" => |id| if (!pp.isValidProfileId(id)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_profile_id\"}" },
+        else => {},
+    }
+
+    const mgr = state.zaki_state orelse return .{
+        .status = "501 Not Implemented",
+        .body = "{\"error\":\"state backend does not support provider profiles\"}",
+    };
+    const uid = parseNumericUserId(scoped_user_id) catch return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid user\"}" };
+
+    switch (route) {
+        .unsupported => unreachable,
+        .collection => {
+            if (std.mem.eql(u8, method, "GET")) {
+                const rows = mgr.listProviderProfiles(req_allocator, uid) catch return provider_profiles_error;
+                defer {
+                    for (rows) |*r| r.deinit(req_allocator);
+                    req_allocator.free(rows);
+                }
+                var resp: std.ArrayListUnmanaged(u8) = .empty;
+                const w = resp.writer(req_allocator);
+                w.writeAll("{\"providers\":[") catch return provider_profiles_error;
+                for (rows, 0..) |row, i| {
+                    if (i > 0) w.writeByte(',') catch return provider_profiles_error;
+                    writeProviderView(w, req_allocator, mgr, uid, row) catch return provider_profiles_error;
+                }
+                w.writeAll("]}") catch return provider_profiles_error;
+                return .{ .body = resp.toOwnedSlice(req_allocator) catch return provider_profiles_error };
+            }
+            if (std.mem.eql(u8, method, "POST")) return handleProviderCreate(req_allocator, raw_request, uid, mgr);
+            return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+        },
+        .item => |id| {
+            if (std.mem.eql(u8, method, "GET")) return singleProviderResponse(req_allocator, mgr, uid, id, "200 OK");
+            if (std.mem.eql(u8, method, "PATCH") or std.mem.eql(u8, method, "PUT")) return handleProviderUpdate(req_allocator, raw_request, uid, id, mgr);
+            if (std.mem.eql(u8, method, "DELETE")) return handleProviderDelete(req_allocator, raw_request, uid, id, mgr);
+            return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+        },
+        .@"test" => |id| {
+            if (!std.mem.eql(u8, method, "POST")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+            return handleProviderTest(req_allocator, uid, id, mgr);
+        },
+    }
+}
+
+fn handleProviderCreate(req_allocator: std.mem.Allocator, raw_request: []const u8, uid: i64, mgr: *zaki_state_mod.Manager) RouteResponse {
+    const pp = provider_profiles;
+    const body = extractBody(raw_request) orelse "{}";
+    const label = jsonStringField(body, "label") orelse "";
+    if (!pp.isValidLabel(label)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_label\"}" };
+    const kind = jsonStringField(body, "provider_kind") orelse return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_provider_kind\"}" };
+    if (!pp.isValidProviderKind(kind)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_provider_kind\"}" };
+    const base_url = jsonStringField(body, "base_url") orelse return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_base_url\"}" };
+    if (!pp.isValidBaseUrl(base_url)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_base_url\"}" };
+    const auth_style = jsonStringField(body, "auth_style") orelse "bearer";
+    if (!pp.isValidAuthStyle(auth_style)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_auth_style\"}" };
+    const api_key = jsonStringField(body, "api_key") orelse return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_api_key\"}" };
+    if (!pp.isValidApiKey(api_key)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_api_key\"}" };
+
+    var allow_json: []const u8 = "[]";
+    const arr = jsonStringArrayFieldOwned(req_allocator, body, "model_allowlist");
+    if (arr) |models| {
+        for (models) |m| if (!pp.isValidModelId(m)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_model\"}" };
+        allow_json = buildJsonStringArray(req_allocator, models) catch return provider_profiles_error;
+    }
+    const default_model = jsonStringField(body, "default_model");
+    if (default_model) |dm| {
+        if (!pp.isValidModelId(dm)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_default_model\"}" };
+        if (arr) |models| {
+            var found = false;
+            for (models) |m| {
+                if (std.mem.eql(u8, m, dm)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return .{ .status = "400 Bad Request", .body = "{\"error\":\"default_model_not_in_allowlist\"}" };
+        }
+    }
+
+    const id = mgr.createProviderProfile(req_allocator, uid, label, kind, base_url, auth_style, allow_json, default_model) catch return provider_profiles_error;
+    const secret_key = providerSecretKey(req_allocator, id) catch return provider_profiles_error;
+    const actor_id = extractZakiUserId(raw_request);
+    mgr.putSecret(uid, secret_key, api_key) catch {
+        mgr.recordSecretMutation(uid, secret_key, "put", actor_id, "write_failed", "provider_create") catch {};
+        // Roll back the orphaned profile row so a failed key save doesn't
+        // leave a keyless profile behind.
+        _ = mgr.deleteProviderProfile(uid, id) catch {};
+        return provider_profiles_error;
+    };
+    mgr.recordSecretMutation(uid, secret_key, "put", actor_id, "ok", "provider_create") catch {};
+    return singleProviderResponse(req_allocator, mgr, uid, id, "201 Created");
+}
+
+fn handleProviderUpdate(req_allocator: std.mem.Allocator, raw_request: []const u8, uid: i64, id: []const u8, mgr: *zaki_state_mod.Manager) RouteResponse {
+    const pp = provider_profiles;
+    // 404 early if the profile doesn't exist.
+    const exists = (mgr.getProviderProfile(req_allocator, uid, id) catch return provider_profiles_error) orelse return .{ .status = "404 Not Found", .body = "{\"error\":\"provider_not_found\"}" };
+    exists.deinit(req_allocator);
+
+    const body = extractBody(raw_request) orelse "{}";
+    const label = jsonStringField(body, "label");
+    if (label) |v| if (!pp.isValidLabel(v)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_label\"}" };
+    const base_url = jsonStringField(body, "base_url");
+    if (base_url) |v| if (!pp.isValidBaseUrl(v)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_base_url\"}" };
+    const auth_style = jsonStringField(body, "auth_style");
+    if (auth_style) |v| if (!pp.isValidAuthStyle(v)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_auth_style\"}" };
+    const policy = jsonStringField(body, "policy_state");
+    if (policy) |v| if (!pp.isUserSettablePolicy(v)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_policy_state\"}" };
+    const default_model = jsonStringField(body, "default_model");
+    if (default_model) |v| if (!pp.isValidModelId(v)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_default_model\"}" };
+
+    var allow_json: ?[]const u8 = null;
+    const arr = jsonStringArrayFieldOwned(req_allocator, body, "model_allowlist");
+    if (arr) |models| {
+        for (models) |m| if (!pp.isValidModelId(m)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_model\"}" };
+        allow_json = buildJsonStringArray(req_allocator, models) catch return provider_profiles_error;
+        if (default_model) |dm| {
+            var found = false;
+            for (models) |m| {
+                if (std.mem.eql(u8, m, dm)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return .{ .status = "400 Bad Request", .body = "{\"error\":\"default_model_not_in_allowlist\"}" };
+        }
+    }
+    const api_key = jsonStringField(body, "api_key");
+    if (api_key) |k| if (!pp.isValidApiKey(k)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_api_key\"}" };
+
+    _ = mgr.updateProviderProfile(uid, id, label, base_url, auth_style, allow_json, default_model, policy) catch return provider_profiles_error;
+
+    if (api_key) |k| {
+        const secret_key = providerSecretKey(req_allocator, id) catch return provider_profiles_error;
+        const actor_id = extractZakiUserId(raw_request);
+        mgr.putSecret(uid, secret_key, k) catch {
+            mgr.recordSecretMutation(uid, secret_key, "put", actor_id, "write_failed", "provider_update") catch {};
+            return provider_profiles_error;
+        };
+        mgr.recordSecretMutation(uid, secret_key, "put", actor_id, "ok", "provider_update") catch {};
+    }
+    return singleProviderResponse(req_allocator, mgr, uid, id, "200 OK");
+}
+
+fn handleProviderTest(req_allocator: std.mem.Allocator, uid: i64, id: []const u8, mgr: *zaki_state_mod.Manager) RouteResponse {
+    const pp = provider_profiles;
+    const row = (mgr.getProviderProfile(req_allocator, uid, id) catch return provider_profiles_error) orelse return .{ .status = "404 Not Found", .body = "{\"error\":\"provider_not_found\"}" };
+    defer row.deinit(req_allocator);
+    const secret_key = providerSecretKey(req_allocator, id) catch return provider_profiles_error;
+
+    // V1 structural check — base_url + key presence/format + default model
+    // membership + policy. Live provider round-trip is a documented
+    // follow-up so the contract stays deterministic and offline-safe.
+    var ok = true;
+    var detail: []const u8 = "credentials_present";
+    if (!pp.isValidBaseUrl(row.base_url)) {
+        ok = false;
+        detail = "invalid_base_url";
+    }
+    if (ok) {
+        const stored = mgr.getSecret(req_allocator, uid, secret_key) catch return provider_profiles_error;
+        if (stored == null) {
+            ok = false;
+            detail = "missing_api_key";
+        } else if (!pp.isValidApiKey(stored.?)) {
+            ok = false;
+            detail = "malformed_api_key";
+        }
+    }
+    if (ok) {
+        if (row.default_model) |dm| {
+            if (!modelInAllowlistJson(req_allocator, row.model_allowlist_json, dm)) {
+                ok = false;
+                detail = "default_model_not_in_allowlist";
+            }
+        }
+    }
+    if (ok and std.mem.eql(u8, row.policy_state, "blocked")) {
+        ok = false;
+        detail = "policy_blocked";
+    }
+
+    const now = std.time.timestamp();
+    var lt: std.ArrayListUnmanaged(u8) = .empty;
+    const lw = lt.writer(req_allocator);
+    lw.print("{{\"ok\":{s},\"checked_at_s\":{d},\"detail\":\"", .{ if (ok) "true" else "false", now }) catch return provider_profiles_error;
+    jsonEscapeInto(lw, detail) catch return provider_profiles_error;
+    lw.writeAll("\"}") catch return provider_profiles_error;
+    _ = mgr.setProviderLastTest(uid, id, lt.items) catch return provider_profiles_error;
+
+    return singleProviderResponse(req_allocator, mgr, uid, id, "200 OK");
+}
+
+fn handleProviderDelete(req_allocator: std.mem.Allocator, raw_request: []const u8, uid: i64, id: []const u8, mgr: *zaki_state_mod.Manager) RouteResponse {
+    const deleted = mgr.deleteProviderProfile(uid, id) catch return provider_profiles_error;
+    if (!deleted) return .{ .status = "404 Not Found", .body = "{\"error\":\"provider_not_found\"}" };
+    const secret_key = providerSecretKey(req_allocator, id) catch return provider_profiles_error;
+    const actor_id = extractZakiUserId(raw_request);
+    const sdel = mgr.deleteSecret(uid, secret_key) catch false;
+    mgr.recordSecretMutation(uid, secret_key, "delete", actor_id, if (sdel) "ok" else "not_found", "provider_delete") catch {};
+    var resp: std.ArrayListUnmanaged(u8) = .empty;
+    const w = resp.writer(req_allocator);
+    w.writeAll("{\"status\":\"deleted\",\"id\":\"") catch return provider_profiles_error;
+    jsonEscapeInto(w, id) catch return provider_profiles_error;
+    w.writeAll("\"}") catch return provider_profiles_error;
+    return .{ .body = resp.toOwnedSlice(req_allocator) catch return provider_profiles_error };
+}
+
 fn handleApiRoute(
     // D20 (2026-04-25): `root_allocator` was only used by the deleted
     // buffered chat/stream handler's `processIncomingMessage` fallback.
@@ -19634,6 +19930,11 @@ fn handleApiRoute(
     //    revoke / state). User-scoped; distinct from operator diagnostics.
     if (std.mem.startsWith(u8, parsed.subpath, "extension/devices")) {
         return handleExtensionDevices(req_allocator, method, raw_request, parsed.subpath, scoped_user_id, state);
+    }
+
+    // ── S7 — user-managed provider profiles (OpenAI-compatible / BYOK).
+    if (std.mem.eql(u8, parsed.subpath, "providers") or std.mem.startsWith(u8, parsed.subpath, "providers/")) {
+        return handleProviderProfiles(req_allocator, method, raw_request, parsed.subpath, scoped_user_id, state);
     }
 
     // ── Voice endpoints (Phase 3 — STT / TTS) ──────────────────────────
@@ -24074,6 +24375,43 @@ test "extension devices — invalid device id rejected before DB (400)" {
     const response = handleApiRoute(std.testing.allocator, req_arena.allocator(), raw, "POST", "/api/v1/users/1/extension/devices/not..hex/revoke", &state, null, null);
     try std.testing.expectEqualStrings("400 Bad Request", response.status);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "invalid_device_id") != null);
+}
+
+test "provider profiles — list needs state backend (501 without Postgres)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    var state = channelControlTestState(std.testing.allocator, tenant_root, &internal_tokens);
+    defer state.deinit();
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    const raw = "GET /api/v1/users/1/providers HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(std.testing.allocator, req_arena.allocator(), raw, "GET", "/api/v1/users/1/providers", &state, null, null);
+    try std.testing.expectEqualStrings("501 Not Implemented", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "provider profiles") != null);
+}
+
+test "provider profiles — malformed id rejected before DB (400)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    var state = channelControlTestState(std.testing.allocator, tenant_root, &internal_tokens);
+    defer state.deinit();
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    // "zzz" is non-hex → rejected by isValidProfileId before the 501 gate.
+    const raw = "GET /api/v1/users/1/providers/zzz HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(std.testing.allocator, req_arena.allocator(), raw, "GET", "/api/v1/users/1/providers/zzz", &state, null, null);
+    try std.testing.expectEqualStrings("400 Bad Request", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "invalid_profile_id") != null);
 }
 
 test "vault route — rejects invalid secret key with 400" {

@@ -407,6 +407,40 @@ not_connected`.
 - Requires the Postgres tenant state backend; without it the routes
   answer `501` (show a degraded/operator-managed state, not an error).
 
+#### 2.11.2 Provider profiles (OpenAI-compatible / BYOK) *(S7 — 2026-05-30)*
+
+The contract Settings → Models & Providers binds to for user-managed
+provider endpoints. The API key is vault-backed; the control plane never
+returns it. Postgres backend required (else `501`).
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/v1/users/{id}/providers` | List profiles |
+| `POST /api/v1/users/{id}/providers` | Create (label, provider_kind, base_url, auth_style?, api_key, model_allowlist[], default_model?) |
+| `GET /api/v1/users/{id}/providers/{pid}` | One profile |
+| `PATCH` (or `PUT`) `…/providers/{pid}` | Update (all fields optional; api_key rotates the secret) |
+| `DELETE /api/v1/users/{id}/providers/{pid}` | Delete profile + vault key |
+| `POST /api/v1/users/{id}/providers/{pid}/test` | Structural credential check → records last_test |
+
+**Bind notes:**
+- **Key is write-only.** `ProviderProfile` returns `secret_ref:{key,
+  present}` — never the value. Render "•••• saved" + a rotate field, same
+  as Secrets & API Keys.
+- **provider_kind / auth_style are server-validated allowlists**
+  (`openai_compatible`, `openai`, `anthropic`, … / `bearer`,
+  `api_key_header`, `query_param`). `base_url` must be `https://` or
+  `http://localhost`. A bad field returns `400 {error}` — surface it.
+- **`policy_state`**: a user may set `active` / `disabled`; `blocked` is
+  operator-only and the update route rejects it. `test` reports
+  `policy_blocked` when an operator has blocked the profile.
+- **`test` is structural** (base_url + key present/format + default model
+  in allowlist + policy) — not a live provider call. `last_test.detail`
+  is machine-readable. Live round-trip is a documented follow-up; claim
+  "profile valid", not "provider reachable".
+- This is the contract behind the deferred **model picker** (§2.10): once
+  a user adds a BYOK profile, its `model_allowlist` feeds the picker. The
+  picker strategy itself remains product-deferred.
+
 ### 2.12 SSE wire — the FULL event surface (v1.14.21 schema honesty fix)
 
 Earlier docs claimed "11 SSE event types." The wire actually carries

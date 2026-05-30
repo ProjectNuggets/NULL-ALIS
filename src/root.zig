@@ -33,6 +33,10 @@ pub const memory_governance = @import("memory_governance.zig");
 /// inventory, revoke, last-command/timeout state). Pure logic; distinct
 /// from operator diagnostics and the META-CRITICAL WS auth path.
 pub const extension_devices = @import("extension_devices.zig");
+/// S7 follow-up — user-managed model-provider profiles (OpenAI-compatible
+/// / BYOK list/create/update/test/delete) with vault-backed key refs and
+/// policy states. Pure logic; the vault + table IO lives in the gateway.
+pub const provider_profiles = @import("provider_profiles.zig");
 
 // Phase 1: Core
 pub const bus = @import("bus.zig");

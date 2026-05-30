@@ -1102,6 +1102,212 @@ paths:
         "404":
           description: Secret not found
 
+  # ── Provider profiles (S7 follow-up) ───────────────────────────────
+  # User-managed OpenAI-compatible / BYOK provider endpoints. The API key
+  # is stored in the encrypted vault under provider_<id>_api_key; the
+  # control plane never returns the value — only a secret_ref presence
+  # flag. Postgres state backend required (else 501).
+  /api/v1/users/{user_id}/providers:
+    get:
+      tags: [user]
+      summary: List provider profiles
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      responses:
+        "200":
+          description: Profiles
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [providers]
+                properties:
+                  providers:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ProviderProfile"
+        "501":
+          description: State backend (Postgres) not wired
+    post:
+      tags: [user]
+      summary: Create a provider profile
+      description: |
+        Validates provider_kind (allowlist), base_url (https or
+        http://localhost), auth_style, the API key, and the model allowlist
+        (+ default_model membership). Stores the key in the vault and
+        returns the profile (key value NEVER echoed).
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider_kind, base_url, api_key]
+              properties:
+                label: { type: string }
+                provider_kind:
+                  type: string
+                  enum: [openai_compatible, openai, anthropic, azure_openai, gemini, deepseek, moonshot, together, openrouter, groq, custom]
+                base_url: { type: string, description: "https:// or http://localhost" }
+                auth_style:
+                  type: string
+                  enum: [bearer, api_key_header, query_param]
+                  default: bearer
+                api_key: { type: string, writeOnly: true }
+                model_allowlist:
+                  type: array
+                  items: { type: string }
+                default_model: { type: string }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderProfile"
+        "400":
+          description: |
+            Validation error. Body: {error} — one of missing_provider_kind,
+            invalid_provider_kind, missing_base_url, invalid_base_url,
+            invalid_auth_style, missing_api_key, invalid_api_key,
+            invalid_model, invalid_default_model, default_model_not_in_allowlist,
+            invalid_label.
+        "501":
+          description: State backend (Postgres) not wired
+
+  /api/v1/users/{user_id}/providers/{profile_id}:
+    get:
+      tags: [user]
+      summary: Get a provider profile
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+        - name: profile_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderProfile"
+        "400":
+          description: invalid_profile_id
+        "404":
+          description: provider_not_found
+        "501":
+          description: State backend (Postgres) not wired
+    patch:
+      tags: [user]
+      summary: Update a provider profile (PUT alias)
+      description: |
+        All fields optional. policy_state accepts only active|disabled
+        (blocked is operator-only). Supplying api_key rotates the vault
+        secret.
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+        - name: profile_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label: { type: string }
+                base_url: { type: string }
+                auth_style: { type: string, enum: [bearer, api_key_header, query_param] }
+                model_allowlist: { type: array, items: { type: string } }
+                default_model: { type: string }
+                policy_state: { type: string, enum: [active, disabled] }
+                api_key: { type: string, writeOnly: true }
+      responses:
+        "200":
+          description: Updated profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderProfile"
+        "400":
+          description: validation error (see POST) or invalid_policy_state
+        "404":
+          description: provider_not_found
+        "501":
+          description: State backend (Postgres) not wired
+    delete:
+      tags: [user]
+      summary: Delete a provider profile (and its vault key)
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+        - name: profile_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, id]
+                properties:
+                  status: { type: string, example: deleted }
+                  id: { type: string }
+        "404":
+          description: provider_not_found
+        "501":
+          description: State backend (Postgres) not wired
+
+  /api/v1/users/{user_id}/providers/{profile_id}/test:
+    post:
+      tags: [user]
+      summary: Test a provider profile (structural credential check)
+      description: |
+        V1 test is deterministic and offline-safe: base_url valid + API
+        key present/well-formed + default_model in allowlist + policy not
+        blocked. Records last_test and returns the refreshed profile. A
+        live provider round-trip is a documented follow-up. last_test.detail
+        ∈ credentials_present | invalid_base_url | missing_api_key |
+        malformed_api_key | default_model_not_in_allowlist | policy_blocked.
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+        - name: profile_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Refreshed profile with last_test populated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderProfile"
+        "400":
+          description: invalid_profile_id
+        "404":
+          description: provider_not_found
+        "501":
+          description: State backend (Postgres) not wired
+
   # ── Extension device registry (S7 follow-up) ───────────────────────
   # User-facing browser-extension device management. Distinct from the
   # operator diagnostics surface (/api/v1/diagnostics/extension/*). Pair /
@@ -3417,6 +3623,38 @@ components:
         last_command_at_s: { type: integer, format: int64, nullable: true }
         last_error: { type: string, nullable: true }
         last_error_at_s: { type: integer, format: int64, nullable: true }
+    ProviderProfile:
+      type: object
+      description: A user-managed model-provider profile (S7). The API key is never returned — only a secret_ref presence flag.
+      required: [id, label, provider_kind, base_url, auth_style, model_allowlist, default_model, policy_state, secret_ref, last_test, created_at_s, updated_at_s]
+      properties:
+        id: { type: string }
+        label: { type: string }
+        provider_kind: { type: string }
+        base_url: { type: string }
+        auth_style: { type: string }
+        model_allowlist:
+          type: array
+          items: { type: string }
+        default_model: { type: string, nullable: true }
+        policy_state:
+          type: string
+          enum: [active, disabled, blocked]
+        secret_ref:
+          type: object
+          required: [key, present]
+          properties:
+            key: { type: string, example: provider_abc123_api_key }
+            present: { type: boolean }
+        last_test:
+          nullable: true
+          type: object
+          properties:
+            ok: { type: boolean }
+            checked_at_s: { type: integer, format: int64 }
+            detail: { type: string }
+        created_at_s: { type: integer, format: int64 }
+        updated_at_s: { type: integer, format: int64 }
     InternalDiagnosticsResponse:
       type: object
       description: |

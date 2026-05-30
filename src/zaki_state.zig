@@ -200,6 +200,35 @@ pub const ExtensionDeviceRow = struct {
     }
 };
 
+/// S7 — one user-managed provider profile (non-secret metadata; the API
+/// key lives in user_secrets). `model_allowlist_json` and `last_test_json`
+/// are raw JSON text from the JSONB columns.
+pub const ProviderProfileRow = struct {
+    id: []const u8,
+    label: []const u8,
+    provider_kind: []const u8,
+    base_url: []const u8,
+    auth_style: []const u8,
+    model_allowlist_json: []const u8,
+    default_model: ?[]const u8,
+    policy_state: []const u8,
+    last_test_json: ?[]const u8,
+    created_at_unix: i64,
+    updated_at_unix: i64,
+
+    pub fn deinit(self: *const ProviderProfileRow, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.label);
+        allocator.free(self.provider_kind);
+        allocator.free(self.base_url);
+        allocator.free(self.auth_style);
+        allocator.free(self.model_allowlist_json);
+        if (self.default_model) |v| allocator.free(v);
+        allocator.free(self.policy_state);
+        if (self.last_test_json) |v| allocator.free(v);
+    }
+};
+
 pub const TaskSnapshot = struct {
     id: []u8,
     session_id: ?[]u8,
@@ -432,6 +461,25 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
         return error.PostgresNotEnabled;
     }
     pub fn recordExtensionDeviceState(_: *@This(), _: i64, _: []const u8, _: ?[]const u8, _: ?[]const u8) !bool {
+        return error.PostgresNotEnabled;
+    }
+    // S7 — provider profiles. Non-postgres builds → gateway 501.
+    pub fn createProviderProfile(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8, _: []const u8, _: []const u8, _: []const u8, _: []const u8, _: ?[]const u8) ![]u8 {
+        return error.PostgresNotEnabled;
+    }
+    pub fn listProviderProfiles(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]ProviderProfileRow {
+        return allocator.alloc(ProviderProfileRow, 0);
+    }
+    pub fn getProviderProfile(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8) !?ProviderProfileRow {
+        return null;
+    }
+    pub fn updateProviderProfile(_: *@This(), _: i64, _: []const u8, _: ?[]const u8, _: ?[]const u8, _: ?[]const u8, _: ?[]const u8, _: ?[]const u8, _: ?[]const u8) !bool {
+        return error.PostgresNotEnabled;
+    }
+    pub fn setProviderLastTest(_: *@This(), _: i64, _: []const u8, _: []const u8) !bool {
+        return error.PostgresNotEnabled;
+    }
+    pub fn deleteProviderProfile(_: *@This(), _: i64, _: []const u8) !bool {
         return error.PostgresNotEnabled;
     }
     // S7.2 — GDPR row-level user delete. Single DELETE on tenant `users`
@@ -2233,6 +2281,25 @@ const ManagerImpl = struct {
             \\)
             ,
             "CREATE INDEX IF NOT EXISTS idx_extension_devices_user ON {schema}.extension_devices(user_id, status)",
+            // S7 — user-managed model-provider profiles (OpenAI-compatible
+            // / BYOK). API key lives in user_secrets; this row holds only
+            // non-secret metadata. FK cascades on GDPR delete.
+            \\CREATE TABLE IF NOT EXISTS {schema}.provider_profiles (
+            \\    id TEXT PRIMARY KEY DEFAULT encode(gen_random_bytes(16), 'hex'),
+            \\    user_id BIGINT NOT NULL REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
+            \\    label TEXT NOT NULL DEFAULT '',
+            \\    provider_kind TEXT NOT NULL,
+            \\    base_url TEXT NOT NULL,
+            \\    auth_style TEXT NOT NULL DEFAULT 'bearer',
+            \\    model_allowlist JSONB NOT NULL DEFAULT '[]'::jsonb,
+            \\    default_model TEXT,
+            \\    policy_state TEXT NOT NULL DEFAULT 'active',
+            \\    last_test JSONB,
+            \\    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            \\    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            \\)
+            ,
+            "CREATE INDEX IF NOT EXISTS idx_provider_profiles_user ON {schema}.provider_profiles(user_id)",
             \\CREATE TABLE IF NOT EXISTS {schema}.heartbeat (
             \\    user_id BIGINT PRIMARY KEY REFERENCES {schema}.users(user_id) ON DELETE CASCADE,
             \\    config JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -3013,6 +3080,219 @@ const ManagerImpl = struct {
         defer if (err_z) |p| self.allocator.free(std.mem.span(p));
         const params = [_]?[*:0]const u8{ user_s.ptr, id_z, cmd_z, err_z };
         const lengths = [_]c_int{ @intCast(user_s.len), @intCast(device_id.len), @intCast(if (last_command) |v| v.len else 0), @intCast(if (last_error) |v| v.len else 0) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const affected = c.PQcmdTuples(result);
+        if (affected == null) return false;
+        return !std.mem.eql(u8, std.mem.span(affected), "0");
+    }
+
+    // ── S7 — provider profiles ─────────────────────────────────────────
+
+    pub fn createProviderProfile(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        label: []const u8,
+        provider_kind: []const u8,
+        base_url: []const u8,
+        auth_style: []const u8,
+        model_allowlist_json: []const u8,
+        default_model: ?[]const u8,
+    ) ![]u8 {
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.provider_profiles (user_id, label, provider_kind, base_url, auth_style, model_allowlist, default_model) " ++
+                "VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7) RETURNING id",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const label_z = try self.allocator.dupeZ(u8, label);
+        defer self.allocator.free(label_z);
+        const kind_z = try self.allocator.dupeZ(u8, provider_kind);
+        defer self.allocator.free(kind_z);
+        const url_z = try self.allocator.dupeZ(u8, base_url);
+        defer self.allocator.free(url_z);
+        const auth_z = try self.allocator.dupeZ(u8, auth_style);
+        defer self.allocator.free(auth_z);
+        const allow_z = try self.allocator.dupeZ(u8, model_allowlist_json);
+        defer self.allocator.free(allow_z);
+        const dm_z: ?[*:0]const u8 = if (default_model) |v| (try self.allocator.dupeZ(u8, v)).ptr else null;
+        defer if (dm_z) |p| self.allocator.free(std.mem.span(p));
+        const params = [_]?[*:0]const u8{ user_s.ptr, label_z, kind_z, url_z, auth_z, allow_z, dm_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(label.len), @intCast(provider_kind.len), @intCast(base_url.len), @intCast(auth_style.len), @intCast(model_allowlist_json.len), @intCast(if (default_model) |v| v.len else 0) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return error.ProviderInsertFailed;
+        return dupeResultValue(allocator, result, 0, 0);
+    }
+
+    const provider_select_cols =
+        "id, label, provider_kind, base_url, auth_style, model_allowlist::text, default_model, policy_state, last_test::text, " ++
+        "EXTRACT(EPOCH FROM created_at)::bigint, EXTRACT(EPOCH FROM updated_at)::bigint";
+
+    fn parseProviderProfileRow(allocator: std.mem.Allocator, result: *c.PGresult, ri: c_int) !ProviderProfileRow {
+        const id = try dupeResultValue(allocator, result, ri, 0);
+        errdefer allocator.free(id);
+        const label = try dupeResultValue(allocator, result, ri, 1);
+        errdefer allocator.free(label);
+        const kind = try dupeResultValue(allocator, result, ri, 2);
+        errdefer allocator.free(kind);
+        const base_url = try dupeResultValue(allocator, result, ri, 3);
+        errdefer allocator.free(base_url);
+        const auth_style = try dupeResultValue(allocator, result, ri, 4);
+        errdefer allocator.free(auth_style);
+        const allow = try dupeResultValue(allocator, result, ri, 5);
+        errdefer allocator.free(allow);
+        const default_model: ?[]const u8 = if (c.PQgetisnull(result, ri, 6) == 1) null else try dupeResultValue(allocator, result, ri, 6);
+        errdefer if (default_model) |v| allocator.free(v);
+        const policy = try dupeResultValue(allocator, result, ri, 7);
+        errdefer allocator.free(policy);
+        const last_test: ?[]const u8 = if (c.PQgetisnull(result, ri, 8) == 1) null else try dupeResultValue(allocator, result, ri, 8);
+        errdefer if (last_test) |v| allocator.free(v);
+        const created_raw = try dupeResultValue(allocator, result, ri, 9);
+        defer allocator.free(created_raw);
+        const updated_raw = try dupeResultValue(allocator, result, ri, 10);
+        defer allocator.free(updated_raw);
+        return .{
+            .id = id,
+            .label = label,
+            .provider_kind = kind,
+            .base_url = base_url,
+            .auth_style = auth_style,
+            .model_allowlist_json = allow,
+            .default_model = default_model,
+            .policy_state = policy,
+            .last_test_json = last_test,
+            .created_at_unix = std.fmt.parseInt(i64, created_raw, 10) catch return error.InvalidTimestamp,
+            .updated_at_unix = std.fmt.parseInt(i64, updated_raw, 10) catch return error.InvalidTimestamp,
+        };
+    }
+
+    pub fn listProviderProfiles(self: *Self, allocator: std.mem.Allocator, user_id: i64) ![]ProviderProfileRow {
+        const q = try self.buildQuery("SELECT " ++ provider_select_cols ++ " FROM {schema}.provider_profiles WHERE user_id = $1 ORDER BY created_at DESC");
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const nrows: usize = @intCast(@max(0, c.PQntuples(result)));
+        if (nrows == 0) return allocator.alloc(ProviderProfileRow, 0);
+        const rows = try allocator.alloc(ProviderProfileRow, nrows);
+        var initialized: usize = 0;
+        errdefer {
+            for (rows[0..initialized]) |r| r.deinit(allocator);
+            allocator.free(rows);
+        }
+        for (0..nrows) |i| {
+            rows[i] = try parseProviderProfileRow(allocator, result, @intCast(i));
+            initialized += 1;
+        }
+        return rows;
+    }
+
+    pub fn getProviderProfile(self: *Self, allocator: std.mem.Allocator, user_id: i64, id: []const u8) !?ProviderProfileRow {
+        const q = try self.buildQuery("SELECT " ++ provider_select_cols ++ " FROM {schema}.provider_profiles WHERE user_id = $1 AND id = $2");
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const id_z = try self.allocator.dupeZ(u8, id);
+        defer self.allocator.free(id_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, id_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(id.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
+        return try parseProviderProfileRow(allocator, result, 0);
+    }
+
+    pub fn updateProviderProfile(
+        self: *Self,
+        user_id: i64,
+        id: []const u8,
+        label: ?[]const u8,
+        base_url: ?[]const u8,
+        auth_style: ?[]const u8,
+        model_allowlist_json: ?[]const u8,
+        default_model: ?[]const u8,
+        policy_state: ?[]const u8,
+    ) !bool {
+        const q = try self.buildQuery(
+            "UPDATE {schema}.provider_profiles SET " ++
+                "label = COALESCE($3, label), " ++
+                "base_url = COALESCE($4, base_url), " ++
+                "auth_style = COALESCE($5, auth_style), " ++
+                "model_allowlist = COALESCE($6::jsonb, model_allowlist), " ++
+                "default_model = COALESCE($7, default_model), " ++
+                "policy_state = COALESCE($8, policy_state), " ++
+                "updated_at = NOW() WHERE user_id = $1 AND id = $2",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const id_z = try self.allocator.dupeZ(u8, id);
+        defer self.allocator.free(id_z);
+        const label_z: ?[*:0]const u8 = if (label) |v| (try self.allocator.dupeZ(u8, v)).ptr else null;
+        defer if (label_z) |p| self.allocator.free(std.mem.span(p));
+        const url_z: ?[*:0]const u8 = if (base_url) |v| (try self.allocator.dupeZ(u8, v)).ptr else null;
+        defer if (url_z) |p| self.allocator.free(std.mem.span(p));
+        const auth_z: ?[*:0]const u8 = if (auth_style) |v| (try self.allocator.dupeZ(u8, v)).ptr else null;
+        defer if (auth_z) |p| self.allocator.free(std.mem.span(p));
+        const allow_z: ?[*:0]const u8 = if (model_allowlist_json) |v| (try self.allocator.dupeZ(u8, v)).ptr else null;
+        defer if (allow_z) |p| self.allocator.free(std.mem.span(p));
+        const dm_z: ?[*:0]const u8 = if (default_model) |v| (try self.allocator.dupeZ(u8, v)).ptr else null;
+        defer if (dm_z) |p| self.allocator.free(std.mem.span(p));
+        const policy_z: ?[*:0]const u8 = if (policy_state) |v| (try self.allocator.dupeZ(u8, v)).ptr else null;
+        defer if (policy_z) |p| self.allocator.free(std.mem.span(p));
+        const params = [_]?[*:0]const u8{ user_s.ptr, id_z, label_z, url_z, auth_z, allow_z, dm_z, policy_z };
+        const lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(id.len),
+            @intCast(if (label) |v| v.len else 0),
+            @intCast(if (base_url) |v| v.len else 0),
+            @intCast(if (auth_style) |v| v.len else 0),
+            @intCast(if (model_allowlist_json) |v| v.len else 0),
+            @intCast(if (default_model) |v| v.len else 0),
+            @intCast(if (policy_state) |v| v.len else 0),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const affected = c.PQcmdTuples(result);
+        if (affected == null) return false;
+        return !std.mem.eql(u8, std.mem.span(affected), "0");
+    }
+
+    pub fn setProviderLastTest(self: *Self, user_id: i64, id: []const u8, last_test_json: []const u8) !bool {
+        const q = try self.buildQuery(
+            "UPDATE {schema}.provider_profiles SET last_test = $3::jsonb, updated_at = NOW() WHERE user_id = $1 AND id = $2",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const id_z = try self.allocator.dupeZ(u8, id);
+        defer self.allocator.free(id_z);
+        const lt_z = try self.allocator.dupeZ(u8, last_test_json);
+        defer self.allocator.free(lt_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, id_z, lt_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(id.len), @intCast(last_test_json.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const affected = c.PQcmdTuples(result);
+        if (affected == null) return false;
+        return !std.mem.eql(u8, std.mem.span(affected), "0");
+    }
+
+    pub fn deleteProviderProfile(self: *Self, user_id: i64, id: []const u8) !bool {
+        const q = try self.buildQuery("DELETE FROM {schema}.provider_profiles WHERE user_id = $1 AND id = $2");
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const id_z = try self.allocator.dupeZ(u8, id);
+        defer self.allocator.free(id_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, id_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(id.len) };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
         const affected = c.PQcmdTuples(result);
