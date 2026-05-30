@@ -18559,6 +18559,9 @@ fn handleProviderCreate(req_allocator: std.mem.Allocator, raw_request: []const u
                 }
             }
             if (!found) return .{ .status = "400 Bad Request", .body = "{\"error\":\"default_model_not_in_allowlist\"}" };
+        } else {
+            const singleton = [_][]const u8{dm};
+            allow_json = buildJsonStringArray(req_allocator, &singleton) catch return provider_profiles_error;
         }
     }
 
@@ -18580,7 +18583,7 @@ fn handleProviderUpdate(req_allocator: std.mem.Allocator, raw_request: []const u
     const pp = provider_profiles;
     // 404 early if the profile doesn't exist.
     const exists = (mgr.getProviderProfile(req_allocator, uid, id) catch return provider_profiles_error) orelse return .{ .status = "404 Not Found", .body = "{\"error\":\"provider_not_found\"}" };
-    exists.deinit(req_allocator);
+    defer exists.deinit(req_allocator);
 
     const body = extractBody(raw_request) orelse "{}";
     const label = jsonStringField(body, "label");
@@ -18599,7 +18602,7 @@ fn handleProviderUpdate(req_allocator: std.mem.Allocator, raw_request: []const u
     if (arr) |models| {
         for (models) |m| if (!pp.isValidModelId(m)) return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_model\"}" };
         allow_json = buildJsonStringArray(req_allocator, models) catch return provider_profiles_error;
-        if (default_model) |dm| {
+        if (default_model orelse exists.default_model) |dm| {
             var found = false;
             for (models) |m| {
                 if (std.mem.eql(u8, m, dm)) {
@@ -18608,6 +18611,10 @@ fn handleProviderUpdate(req_allocator: std.mem.Allocator, raw_request: []const u
                 }
             }
             if (!found) return .{ .status = "400 Bad Request", .body = "{\"error\":\"default_model_not_in_allowlist\"}" };
+        }
+    } else if (default_model) |dm| {
+        if (!modelInAllowlistJson(req_allocator, exists.model_allowlist_json, dm)) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"default_model_not_in_allowlist\"}" };
         }
     }
     const api_key = jsonStringField(body, "api_key");

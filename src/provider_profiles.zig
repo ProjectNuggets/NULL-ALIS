@@ -82,11 +82,40 @@ pub fn isValidLabel(label: []const u8) bool {
 /// followed by a real host boundary (':' port, '/' path, or end of
 /// string) so `http://localhost.evil.com` and `http://127.0.0.1@evil.com`
 /// don't slip through the loopback exception as cleartext exfil targets.
+fn hasValidPortSuffix(url: []const u8, port_start: usize) bool {
+    if (port_start >= url.len) return false;
+    var end = port_start;
+    while (end < url.len and url[end] != '/') : (end += 1) {
+        if (url[end] < '0' or url[end] > '9') return false;
+    }
+    if (end == port_start) return false;
+    const port = std.fmt.parseInt(u32, url[port_start..end], 10) catch return false;
+    return port >= 1 and port <= 65535;
+}
+
 fn isLoopbackHttp(url: []const u8, prefix: []const u8) bool {
     if (!std.mem.startsWith(u8, url, prefix)) return false;
     if (url.len == prefix.len) return true;
     const next = url[prefix.len];
-    return next == ':' or next == '/';
+    if (next == '/') return true;
+    if (next == ':') return hasValidPortSuffix(url, prefix.len + 1);
+    return false;
+}
+
+fn hasHttpsAuthority(url: []const u8) bool {
+    const prefix = "https://";
+    if (!std.mem.startsWith(u8, url, prefix)) return false;
+    const rest = url[prefix.len..];
+    if (rest.len == 0) return false;
+    var authority_end: usize = 0;
+    while (authority_end < rest.len and rest[authority_end] != '/' and rest[authority_end] != '?' and rest[authority_end] != '#') : (authority_end += 1) {}
+    if (authority_end == 0) return false;
+    const authority = rest[0..authority_end];
+    if (std.mem.indexOfScalar(u8, authority, '@') != null) return false;
+    if (std.mem.indexOfScalar(u8, authority, ':')) |colon| {
+        if (!hasValidPortSuffix(rest[0..authority_end], colon + 1)) return false;
+    }
+    return true;
 }
 
 /// Base URL must be a clean, bounded https URL — or http://localhost /
@@ -96,7 +125,7 @@ pub fn isValidBaseUrl(url: []const u8) bool {
     for (url) |ch| {
         if (ch <= 0x20 or ch == 0x7f) return false;
     }
-    if (std.mem.startsWith(u8, url, "https://")) return true;
+    if (hasHttpsAuthority(url)) return true;
     if (isLoopbackHttp(url, "http://localhost")) return true;
     if (isLoopbackHttp(url, "http://127.0.0.1")) return true;
     return false;
@@ -259,6 +288,7 @@ test "auth style + policy allowlists" {
 
 test "base_url validation: https or localhost only" {
     try std.testing.expect(isValidBaseUrl("https://api.openai.com/v1"));
+    try std.testing.expect(isValidBaseUrl("https://api.openai.com:443/v1"));
     try std.testing.expect(isValidBaseUrl("http://localhost:11434/v1"));
     try std.testing.expect(isValidBaseUrl("http://localhost"));
     try std.testing.expect(isValidBaseUrl("http://localhost/v1"));
@@ -266,6 +296,12 @@ test "base_url validation: https or localhost only" {
     try std.testing.expect(!isValidBaseUrl("http://evil.com/v1")); // cleartext non-local
     try std.testing.expect(!isValidBaseUrl("ftp://x"));
     try std.testing.expect(!isValidBaseUrl("https://has space.com"));
+    try std.testing.expect(!isValidBaseUrl("https://"));
+    try std.testing.expect(!isValidBaseUrl("https:///v1"));
+    try std.testing.expect(!isValidBaseUrl("https://@evil.com/v1"));
+    try std.testing.expect(!isValidBaseUrl("https://api.openai.com:abc/v1"));
+    try std.testing.expect(!isValidBaseUrl("http://localhost:abc/v1"));
+    try std.testing.expect(!isValidBaseUrl("http://localhost:99999/v1"));
     try std.testing.expect(!isValidBaseUrl(""));
 }
 
