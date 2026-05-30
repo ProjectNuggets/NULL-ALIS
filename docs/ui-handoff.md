@@ -111,6 +111,34 @@ receipts, and tool side-effects honor the user's intent.
 editable by the user. The `memory_summary` panel is the trust gate —
 without it users won't believe the persistence.
 
+#### 2.2.1 Memory governance control plane *(S7 — 2026-05-30)*
+
+The HTTP contract Settings → Privacy & Data and Brain bind to for the
+user's own data rights. All user-scoped; Postgres state backend required
+(else `501`).
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/v1/users/{id}/memory/governance` | Provenance counts: `{total, pii:{phone, email, all}}` |
+| `POST /api/v1/users/{id}/memory/forget` | `{key}` → forget one memory by id; returns `{key, forgotten}` |
+| `POST /api/v1/users/{id}/memory/purge-pii` | `{category: phone|email|all, dry_run}` → PII purge |
+| `GET /api/v1/users/{id}/memory/export` | Full memory dump with provenance |
+
+**Bind notes:**
+- **PII purge is dry-run-first.** Always call with `dry_run:true` to show
+  "N memories would be deleted" + a `sample_keys[]` preview, then call
+  again with `dry_run:false` after explicit confirmation. The apply
+  response carries the real `deleted` count.
+- **PII scope is phone + email only** (`all` = their union). Do NOT offer
+  name/address purge — the V1 detector does not tag them; the route
+  rejects unknown categories with `400 invalid_category`.
+- **Forget is by stable id/key**, deterministic and audited. Topic-
+  substring purge is intentionally NOT a user button — it stays an
+  agent-only lever (`memory_purge_topic`) to avoid blunt over-deletion.
+- **Export** returns `{user_id, count, exported_at_s, memories[]}` with
+  per-memory provenance (`key, category, timestamp, lane, session_id,
+  valid_to, content`) — wire it to the "Download my memory" action.
+
 ### 2.3 Goal pursuit & subagents (long-horizon work)
 
 | Capability | Surface | UX |

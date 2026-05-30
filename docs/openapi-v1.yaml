@@ -1102,6 +1102,161 @@ paths:
         "404":
           description: Secret not found
 
+  # ── Memory governance control plane (S7 follow-up) ─────────────────
+  # User-facing privacy/data primitives over the nullalis memory store.
+  # All user-scoped. Postgres state backend required (else 501).
+  /api/v1/users/{user_id}/memory/governance:
+    get:
+      tags: [user]
+      summary: Memory provenance counts (total + PII per category)
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      responses:
+        "200":
+          description: Counts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [total, pii]
+                properties:
+                  total: { type: integer }
+                  pii:
+                    type: object
+                    properties:
+                      phone: { type: integer }
+                      email: { type: integer }
+                      all: { type: integer }
+        "501":
+          description: State backend (Postgres) not wired
+
+  /api/v1/users/{user_id}/memory/forget:
+    post:
+      tags: [user]
+      summary: Forget one memory by id/key
+      description: |
+        Deterministic, audited forget of a single memory by its stable
+        id/key. Topic-substring purge is intentionally NOT exposed here —
+        it stays an agent-only lever (memory_purge_topic).
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key]
+              properties:
+                key: { type: string }
+      responses:
+        "200":
+          description: Forget result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key, forgotten]
+                properties:
+                  key: { type: string }
+                  forgotten: { type: boolean }
+        "400":
+          description: missing_key
+        "501":
+          description: State backend (Postgres) not wired
+
+  /api/v1/users/{user_id}/memory/purge-pii:
+    post:
+      tags: [user]
+      summary: PII purge (dry-run or apply) for phone/email/all
+      description: |
+        V1 PII detector scope is phone + email (+ all = union). dry_run
+        true returns the candidate count + a bounded sample of affected
+        keys WITHOUT deleting. dry_run false (or omitted) deletes and
+        returns the deleted count. Name/address are out of scope.
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [category]
+              properties:
+                category:
+                  type: string
+                  enum: [phone, email, all]
+                dry_run:
+                  type: boolean
+                  default: false
+      responses:
+        "200":
+          description: Purge result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [category, dry_run, candidate_count, deleted, sample_keys]
+                properties:
+                  category: { type: string }
+                  dry_run: { type: boolean }
+                  candidate_count: { type: integer }
+                  deleted:
+                    type: integer
+                    nullable: true
+                    description: null on a dry run; count deleted on apply.
+                  sample_keys:
+                    type: array
+                    items: { type: string }
+                  sample_truncated: { type: boolean }
+        "400":
+          description: missing_category | invalid_category
+        "501":
+          description: State backend (Postgres) not wired
+
+  /api/v1/users/{user_id}/memory/export:
+    get:
+      tags: [user]
+      summary: Export all memories with provenance
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      responses:
+        "200":
+          description: Full memory dump
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user_id, count, exported_at_s, memories]
+                properties:
+                  user_id: { type: integer }
+                  count: { type: integer }
+                  exported_at_s: { type: integer, format: int64 }
+                  memories:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        key: { type: string }
+                        category: { type: string }
+                        timestamp: { type: string }
+                        lane: { type: string }
+                        session_id: { type: string, nullable: true }
+                        valid_to: { type: integer, format: int64, nullable: true }
+                        content: { type: string }
+        "501":
+          description: State backend (Postgres) not wired
+
   # ── Channel activation control plane (S7) ──────────────────────────
   # User-facing self-service setup for the V1 launch channels. Credentials
   # are written to the encrypted secret vault; only secret *refs*

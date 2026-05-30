@@ -25,6 +25,10 @@ pub const extension_ws = struct {
     pub const auth = @import("extension_ws/auth.zig");
     pub const url_sanitize = @import("extension_ws/url_sanitize.zig");
 };
+/// S7 follow-up — user-facing memory governance contract (forget by id,
+/// PII purge dry-run/apply, export, provenance counts). Pure logic; the
+/// zaki_state IO lives in the gateway.
+pub const memory_governance = @import("memory_governance.zig");
 
 // Phase 1: Core
 pub const bus = @import("bus.zig");

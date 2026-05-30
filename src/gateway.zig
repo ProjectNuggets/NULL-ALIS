@@ -100,6 +100,10 @@ const channel_dispatch = @import("channels/dispatch.zig");
 // route parsing, validation, status, JSON shape). Pure logic; the
 // vault/state IO stays here in the gateway.
 const channel_control = @import("channel_control.zig");
+// S7 follow-up — user-facing memory governance contract (forget, PII
+// purge dry-run/apply, export, provenance counts). Pure logic; the
+// zaki_state memory IO stays here in the gateway.
+const memory_governance = @import("memory_governance.zig");
 const bus_mod = @import("bus.zig");
 const tasks_mod = @import("tasks/root.zig");
 const usage_runtime_mod = @import("usage_runtime.zig");
@@ -18167,6 +18171,119 @@ fn jsonFieldError(req_allocator: std.mem.Allocator, code: []const u8, key: []con
     return .{ .status = "400 Bad Request", .body = resp.toOwnedSlice(req_allocator) catch "{\"error\":\"invalid_request\"}" };
 }
 
+// ── S7 follow-up — memory governance control plane ────────────────────
+//
+// User-facing privacy/data primitives over the existing nullalis memory
+// store. All user-scoped (caller resolves user from X-Zaki-User-Id).
+//   GET  memory/governance  — provenance counts (total + PII per category)
+//   POST memory/forget      — {key} forget one memory by id
+//   POST memory/purge-pii   — {category, dry_run} PII purge
+//   GET  memory/export      — full memory dump with provenance
+const memory_governance_error: RouteResponse = .{ .status = "500 Internal Server Error", .body = "{\"error\":\"memory_governance_failed\"}" };
+
+fn handleMemoryGovernance(
+    req_allocator: std.mem.Allocator,
+    method: []const u8,
+    raw_request: []const u8,
+    subpath: []const u8,
+    scoped_user_id: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    const mg = memory_governance;
+    const route = mg.Route.fromSubpath(subpath) orelse return .{ .status = "404 Not Found", .body = "{\"error\":\"not_found\"}" };
+    const mgr = state.zaki_state orelse return .{
+        .status = "501 Not Implemented",
+        .body = "{\"error\":\"state backend does not support memory governance\"}",
+    };
+    const uid = parseNumericUserId(scoped_user_id) catch return .{
+        .status = "400 Bad Request",
+        .body = "{\"error\":\"invalid user\"}",
+    };
+
+    switch (route) {
+        .counts => {
+            if (!std.mem.eql(u8, method, "GET")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+            const total = mgr.countMemories(uid) catch return memory_governance_error;
+            const phone = (mgr.listPiiMemoryKeys(req_allocator, uid, "phone") catch return memory_governance_error).len;
+            const email = (mgr.listPiiMemoryKeys(req_allocator, uid, "email") catch return memory_governance_error).len;
+            const all = (mgr.listPiiMemoryKeys(req_allocator, uid, "all") catch return memory_governance_error).len;
+            var resp: std.ArrayListUnmanaged(u8) = .empty;
+            const w = resp.writer(req_allocator);
+            mg.writeCounts(w, total, phone, email, all) catch return memory_governance_error;
+            return .{ .body = resp.toOwnedSlice(req_allocator) catch return memory_governance_error };
+        },
+        .forget => {
+            if (!std.mem.eql(u8, method, "POST")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+            const body = extractBody(raw_request) orelse "{}";
+            const key = jsonStringField(body, "key") orelse return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_key\"}" };
+            if (key.len == 0) return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_key\"}" };
+            const forgotten = mgr.forgetMemory(uid, key) catch return memory_governance_error;
+            var resp: std.ArrayListUnmanaged(u8) = .empty;
+            const w = resp.writer(req_allocator);
+            mg.writeForgetResult(w, key, forgotten) catch return memory_governance_error;
+            return .{ .body = resp.toOwnedSlice(req_allocator) catch return memory_governance_error };
+        },
+        .purge_pii => {
+            if (!std.mem.eql(u8, method, "POST")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+            const body = extractBody(raw_request) orelse "{}";
+            const category_str = jsonStringField(body, "category") orelse return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_category\",\"hint\":\"phone|email|all\"}" };
+            const category = mg.PiiCategory.fromKey(category_str) orelse return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_category\",\"hint\":\"phone|email|all\"}" };
+            const dry_run = jsonBoolField(body, "dry_run") orelse false;
+
+            const keys = mgr.listPiiMemoryKeys(req_allocator, uid, category.key()) catch return memory_governance_error;
+            var deleted: ?usize = null;
+            if (!dry_run and keys.len > 0) {
+                deleted = mgr.deletePiiMemoriesByCategory(req_allocator, uid, category.key()) catch return memory_governance_error;
+            } else if (!dry_run) {
+                deleted = 0;
+            }
+            var resp: std.ArrayListUnmanaged(u8) = .empty;
+            const w = resp.writer(req_allocator);
+            mg.writePurgeResult(w, category, dry_run, keys.len, deleted, keys) catch return memory_governance_error;
+            return .{ .body = resp.toOwnedSlice(req_allocator) catch return memory_governance_error };
+        },
+        .export_all => {
+            if (!std.mem.eql(u8, method, "GET")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+            const entries = mgr.listMemories(req_allocator, uid, null, null) catch return memory_governance_error;
+            var resp: std.ArrayListUnmanaged(u8) = .empty;
+            const w = resp.writer(req_allocator);
+            w.print("{{\"user_id\":{s},\"count\":{d},\"exported_at_s\":{d},\"memories\":[", .{ scoped_user_id, entries.len, std.time.timestamp() }) catch return memory_governance_error;
+            for (entries, 0..) |e, i| {
+                if (i > 0) w.writeByte(',') catch return memory_governance_error;
+                w.writeAll("{\"id\":\"") catch return memory_governance_error;
+                jsonEscapeInto(w, e.id) catch return memory_governance_error;
+                w.writeAll("\",\"key\":\"") catch return memory_governance_error;
+                jsonEscapeInto(w, e.key) catch return memory_governance_error;
+                w.writeAll("\",\"category\":\"") catch return memory_governance_error;
+                jsonEscapeInto(w, e.category.toString()) catch return memory_governance_error;
+                w.writeAll("\",\"timestamp\":\"") catch return memory_governance_error;
+                jsonEscapeInto(w, e.timestamp) catch return memory_governance_error;
+                w.writeAll("\",\"lane\":\"") catch return memory_governance_error;
+                jsonEscapeInto(w, e.lane) catch return memory_governance_error;
+                w.writeAll("\",\"session_id\":") catch return memory_governance_error;
+                if (e.session_id) |sid| {
+                    w.writeByte('"') catch return memory_governance_error;
+                    jsonEscapeInto(w, sid) catch return memory_governance_error;
+                    w.writeByte('"') catch return memory_governance_error;
+                } else {
+                    w.writeAll("null") catch return memory_governance_error;
+                }
+                w.writeAll(",\"valid_to\":") catch return memory_governance_error;
+                if (e.valid_to) |vt| {
+                    w.print("{d}", .{vt}) catch return memory_governance_error;
+                } else {
+                    w.writeAll("null") catch return memory_governance_error;
+                }
+                w.writeAll(",\"content\":\"") catch return memory_governance_error;
+                jsonEscapeInto(w, e.content) catch return memory_governance_error;
+                w.writeAll("\"}") catch return memory_governance_error;
+            }
+            w.writeAll("]}") catch return memory_governance_error;
+            return .{ .body = resp.toOwnedSlice(req_allocator) catch return memory_governance_error };
+        },
+    }
+}
+
 fn handleApiRoute(
     // D20 (2026-04-25): `root_allocator` was only used by the deleted
     // buffered chat/stream handler's `processIncomingMessage` fallback.
@@ -19394,6 +19511,12 @@ fn handleApiRoute(
     // shipped behaviour. Hidden adapters (signal, matrix, …) 404 here.
     if (std.mem.eql(u8, parsed.subpath, "channels") or std.mem.startsWith(u8, parsed.subpath, "channels/")) {
         return handleChannelControl(req_allocator, method, raw_request, parsed.subpath, scoped_user_id, state, config_opt);
+    }
+
+    // ── S7 — memory governance control plane (forget / PII purge /
+    //    export / provenance counts). Distinct namespace from brain/*.
+    if (std.mem.startsWith(u8, parsed.subpath, "memory/")) {
+        return handleMemoryGovernance(req_allocator, method, raw_request, parsed.subpath, scoped_user_id, state);
     }
 
     // ── Voice endpoints (Phase 3 — STT / TTS) ──────────────────────────
@@ -23762,6 +23885,41 @@ test "channel control — surfaced channel needs the state backend (501 without 
     const response = handleApiRoute(std.testing.allocator, req_arena.allocator(), raw, "GET", "/api/v1/users/1/channels", &state, null, null);
     try std.testing.expectEqualStrings("501 Not Implemented", response.status);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "state backend") != null);
+}
+
+test "memory governance — unknown subpath 404s" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    var state = channelControlTestState(std.testing.allocator, tenant_root, &internal_tokens);
+    defer state.deinit();
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    const raw = "GET /api/v1/users/1/memory/bogus HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(std.testing.allocator, req_arena.allocator(), raw, "GET", "/api/v1/users/1/memory/bogus", &state, null, null);
+    try std.testing.expectEqualStrings("404 Not Found", response.status);
+}
+
+test "memory governance — counts needs the state backend (501 without Postgres)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    var state = channelControlTestState(std.testing.allocator, tenant_root, &internal_tokens);
+    defer state.deinit();
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    const raw = "GET /api/v1/users/1/memory/governance HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(std.testing.allocator, req_arena.allocator(), raw, "GET", "/api/v1/users/1/memory/governance", &state, null, null);
+    try std.testing.expectEqualStrings("501 Not Implemented", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "memory governance") != null);
 }
 
 test "vault route — rejects invalid secret key with 400" {
