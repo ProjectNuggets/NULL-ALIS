@@ -37,6 +37,10 @@ pub const extension_devices = @import("extension_devices.zig");
 /// / BYOK list/create/update/test/delete) with vault-backed key refs and
 /// policy states. Pure logic; the vault + table IO lives in the gateway.
 pub const provider_profiles = @import("provider_profiles.zig");
+/// S7 follow-up — read-only operator-managed integrations inventory
+/// (Composio / OpenAPI connectors / MCP client). Pure logic; the gateway
+/// reads Config and builds the views.
+pub const integrations_inventory = @import("integrations_inventory.zig");
 
 // Phase 1: Core
 pub const bus = @import("bus.zig");

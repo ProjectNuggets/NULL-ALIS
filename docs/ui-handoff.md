@@ -350,6 +350,18 @@ cap-lift design.
 **UX surface**: Settings → Integrations is the hub. Each integration
 shows connection state, last activity, and a per-integration log link.
 
+#### 2.11.0 Integrations inventory — read-only *(S7 — 2026-05-30)*
+
+`GET /api/v1/users/{id}/integrations` returns the **operator-managed**
+status of Composio, OpenAPI connectors, and MCP client servers. Every
+entry carries `user_manageable: false` + `managed_by: "operator"` — bind
+it as a **read-only status row**, never a "Connect" button. Secret values
+are never returned (Composio → `key_present`; OpenAPI items →
+`auth_required`; MCP items → `name` + `transport` only). Use this to show
+"Configured (operator-managed)" vs "Not configured" honestly; user
+self-service for these is out of scope until a user-managed auth contract
+exists. The **user-managed** provider path is separate — see §2.11.2.
+
 #### 2.11.1 Channel activation control plane *(S7 — 2026-05-30)*
 
 The user-facing, self-service channel setup contract. **This is what

@@ -1102,6 +1102,53 @@ paths:
         "404":
           description: Secret not found
 
+  # ── Integrations inventory (S7 follow-up, read-only) ───────────────
+  # Operator-managed integrations (Composio / OpenAPI connectors / MCP
+  # client). Read-only status only — NOT user self-service. No secret
+  # values are exposed (Composio reports key_present; OpenAPI reports
+  # auth_required; MCP reports name + transport).
+  /api/v1/users/{user_id}/integrations:
+    get:
+      tags: [user]
+      summary: Read-only operator-managed integrations status
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      responses:
+        "200":
+          description: Integrations inventory
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [integrations]
+                properties:
+                  integrations:
+                    type: array
+                    items:
+                      type: object
+                      required: [kind, label, configured, user_manageable, managed_by]
+                      properties:
+                        kind:
+                          type: string
+                          enum: [composio, openapi, mcp_client]
+                        label: { type: string }
+                        configured: { type: boolean }
+                        user_manageable:
+                          type: boolean
+                          description: Always false in V1 — these are operator-managed.
+                        managed_by: { type: string, example: operator }
+                        count: { type: integer, description: "openapi / mcp_client only" }
+                        detail:
+                          type: object
+                          description: "composio only — {entity_id, key_present}"
+                        items:
+                          type: array
+                          description: "openapi: {id, mode, auth_required}; mcp_client: {name, transport}"
+                          items:
+                            type: object
+
   # ── Provider profiles (S7 follow-up) ───────────────────────────────
   # User-managed OpenAI-compatible / BYOK provider endpoints. The API key
   # is stored in the encrypted vault under provider_<id>_api_key; the

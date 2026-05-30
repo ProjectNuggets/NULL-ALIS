@@ -111,6 +111,9 @@ const extension_devices = @import("extension_devices.zig");
 // S7 follow-up — user-managed model-provider profiles (OpenAI-compatible
 // / BYOK). Pure logic; vault + provider_profiles IO stays here.
 const provider_profiles = @import("provider_profiles.zig");
+// S7 follow-up — read-only operator-managed integrations inventory
+// (Composio / OpenAPI / MCP client). Pure logic; gateway reads Config.
+const integrations_inventory = @import("integrations_inventory.zig");
 const bus_mod = @import("bus.zig");
 const tasks_mod = @import("tasks/root.zig");
 const usage_runtime_mod = @import("usage_runtime.zig");
@@ -18698,6 +18701,56 @@ fn handleProviderDelete(req_allocator: std.mem.Allocator, raw_request: []const u
     return .{ .body = resp.toOwnedSlice(req_allocator) catch return provider_profiles_error };
 }
 
+// ── S7 follow-up — read-only integrations inventory ───────────────────
+//
+// GET providers covers user-managed BYOK; THIS surface reports the
+// operator-managed integrations (Composio / OpenAPI connectors / MCP
+// client) as read-only status so the UI can show "Configured
+// (operator-managed)" without implying user self-service. No secret
+// values are exposed.
+fn handleIntegrationsInventory(
+    req_allocator: std.mem.Allocator,
+    method: []const u8,
+    config_opt: ?*const Config,
+) RouteResponse {
+    const ii = integrations_inventory;
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    const err: RouteResponse = .{ .status = "500 Internal Server Error", .body = "{\"error\":\"integrations_inventory_failed\"}" };
+
+    var composio: ii.ComposioView = .{ .configured = false, .entity_id = "default", .key_present = false };
+    var openapi_items: []ii.OpenApiItem = &.{};
+    var mcp_items: []ii.McpItem = &.{};
+
+    if (config_opt) |cfg| {
+        composio = .{
+            .configured = cfg.composio.enabled,
+            .entity_id = cfg.composio.entity_id,
+            .key_present = cfg.composio.api_key != null,
+        };
+        if (cfg.api_specs.len > 0) {
+            const items = req_allocator.alloc(ii.OpenApiItem, cfg.api_specs.len) catch return err;
+            for (cfg.api_specs, 0..) |s, i| {
+                items[i] = .{ .id = s.id, .mode = s.mode.toSlice(), .auth_required = s.auth_ref.len > 0 };
+            }
+            openapi_items = items;
+        }
+        if (cfg.mcp_servers.len > 0) {
+            const items = req_allocator.alloc(ii.McpItem, cfg.mcp_servers.len) catch return err;
+            for (cfg.mcp_servers, 0..) |m, i| {
+                items[i] = .{ .name = m.name, .transport = if (m.transport == .stdio) "stdio" else "http" };
+            }
+            mcp_items = items;
+        }
+    }
+
+    var resp: std.ArrayListUnmanaged(u8) = .empty;
+    const w = resp.writer(req_allocator);
+    ii.writeInventoryJson(w, .{ .composio = composio, .openapi = openapi_items, .mcp_client = mcp_items }) catch return err;
+    return .{ .body = resp.toOwnedSlice(req_allocator) catch return err };
+}
+
 fn handleApiRoute(
     // D20 (2026-04-25): `root_allocator` was only used by the deleted
     // buffered chat/stream handler's `processIncomingMessage` fallback.
@@ -19942,6 +19995,11 @@ fn handleApiRoute(
     // ── S7 — user-managed provider profiles (OpenAI-compatible / BYOK).
     if (std.mem.eql(u8, parsed.subpath, "providers") or std.mem.startsWith(u8, parsed.subpath, "providers/")) {
         return handleProviderProfiles(req_allocator, method, raw_request, parsed.subpath, scoped_user_id, state);
+    }
+
+    // ── S7 — read-only operator-managed integrations inventory.
+    if (std.mem.eql(u8, parsed.subpath, "integrations")) {
+        return handleIntegrationsInventory(req_allocator, method, config_opt);
     }
 
     // ── Voice endpoints (Phase 3 — STT / TTS) ──────────────────────────
@@ -24419,6 +24477,28 @@ test "provider profiles — malformed id rejected before DB (400)" {
     const response = handleApiRoute(std.testing.allocator, req_arena.allocator(), raw, "GET", "/api/v1/users/1/providers/zzz", &state, null, null);
     try std.testing.expectEqualStrings("400 Bad Request", response.status);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "invalid_profile_id") != null);
+}
+
+test "integrations inventory — read-only, no Postgres needed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    var state = channelControlTestState(std.testing.allocator, tenant_root, &internal_tokens);
+    defer state.deinit();
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+
+    // config_opt = null → all three integrations report unconfigured +
+    // operator-managed. No state backend needed (pure config surface).
+    const raw = "GET /api/v1/users/1/integrations HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(std.testing.allocator, req_arena.allocator(), raw, "GET", "/api/v1/users/1/integrations", &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "mcp_client") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"managed_by\":\"operator\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"user_manageable\":false") != null);
 }
 
 test "vault route — rejects invalid secret key with 400" {
