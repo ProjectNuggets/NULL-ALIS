@@ -136,6 +136,11 @@ pub const ObserverEvent = union(enum) {
         tool: []const u8,
         reason: []const u8,
         risk_level: []const u8,
+        approval_id: ?[]const u8 = null,
+        id: ?u64 = null,
+        tool_call_id: ?[]const u8 = null,
+        created_at: ?i64 = null,
+        expires_at: ?i64 = null,
         run_id: ?[]const u8 = null,
     },
     /// Binding principle: no silent fallback. When nullalis degrades or has a
@@ -565,7 +570,13 @@ pub const LogObserver = struct {
             .err => |e| std.log.info("error component={s} message={s}", .{ e.component, e.message }),
             .narration_frame => |e| std.log.info("narration type={s} message={s}", .{ @tagName(e.frame_type), e.message }),
             .task_update => |e| std.log.info("task.update task_id={s} status={s}", .{ e.task_id, e.status }),
-            .approval_required => |e| std.log.info("approval.required tool={s} reason={s} risk_level={s}", .{ e.tool, e.reason, e.risk_level }),
+            .approval_required => |e| std.log.info("approval.required tool={s} reason={s} risk_level={s} approval_id={s} tool_call_id={s}", .{
+                e.tool,
+                e.reason,
+                e.risk_level,
+                e.approval_id orelse "",
+                e.tool_call_id orelse "",
+            }),
             .system_notice => |e| std.log.info("system.notice kind={s} severity={s} message={s}", .{ e.kind, e.severity, e.message }),
             .memory_retrieval => |e| std.log.info("memory.retrieval available=true injected={} context_bytes={?d} candidates={?d} duration_ms={?d}", .{ e.success, e.usage_tokens, e.iteration, e.duration_ms }),
             .artifact_event => |e| std.log.info("artifact.event op={s} id={s} kind={s} version={d}", .{ e.op, e.artifact_id, e.kind, e.version }),
@@ -736,6 +747,27 @@ pub const MultiObserver = struct {
     }
 };
 
+fn writeJsonString(writer: anytype, value: []const u8) !void {
+    try writer.writeByte('"');
+    for (value) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (c < 0x20) {
+                    try writer.print("\\u{x:0>4}", .{c});
+                } else {
+                    try writer.writeByte(c);
+                }
+            },
+        }
+    }
+    try writer.writeByte('"');
+}
+
 // ── FileObserver ─────────────────────────────────────────────────────
 
 /// Appends events as JSONL to a log file.
@@ -797,7 +829,25 @@ pub const FileObserver = struct {
             .err => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"error\",\"component\":\"{s}\",\"message\":\"{s}\"}}", .{ e.component, e.message }) catch return,
             .narration_frame => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"narration_frame\",\"type\":\"{s}\",\"message\":\"{s}\"}}", .{ @tagName(e.frame_type), e.message }) catch return,
             .task_update => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"task_update\",\"task_id\":\"{s}\",\"status\":\"{s}\"}}", .{ e.task_id, e.status }) catch return,
-            .approval_required => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"approval_required\",\"tool\":\"{s}\",\"reason\":\"{s}\",\"risk_level\":\"{s}\"}}", .{ e.tool, e.reason, e.risk_level }) catch return,
+            .approval_required => |e| blk: {
+                var stream = std.io.fixedBufferStream(&buf);
+                const w = stream.writer();
+                w.writeAll("{\"event\":\"approval_required\",\"tool\":") catch return;
+                writeJsonString(w, e.tool) catch return;
+                w.writeAll(",\"reason\":") catch return;
+                writeJsonString(w, e.reason) catch return;
+                w.writeAll(",\"risk_level\":") catch return;
+                writeJsonString(w, e.risk_level) catch return;
+                w.writeAll(",\"approval_id\":") catch return;
+                writeJsonString(w, e.approval_id orelse "") catch return;
+                w.print(",\"id\":{d},\"tool_call_id\":", .{e.id orelse 0}) catch return;
+                writeJsonString(w, e.tool_call_id orelse "") catch return;
+                w.print(",\"created_at\":{d},\"expires_at\":{d}}}", .{
+                    e.created_at orelse 0,
+                    e.expires_at orelse 0,
+                }) catch return;
+                break :blk stream.getWritten();
+            },
             .system_notice => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"system_notice\",\"kind\":\"{s}\",\"severity\":\"{s}\",\"message\":\"{s}\"}}", .{ e.kind, e.severity, e.message }) catch return,
             .memory_retrieval => return,
             .artifact_event => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"artifact_event\",\"op\":\"{s}\",\"id\":\"{s}\",\"kind\":\"{s}\",\"version\":{d}}}", .{ e.op, e.artifact_id, e.kind, e.version }) catch return,
@@ -1203,10 +1253,30 @@ pub const OtelObserver = struct {
                 });
             },
             .approval_required => |e| {
+                var id_buf: [32]u8 = undefined;
+                var created_buf: [32]u8 = undefined;
+                var expires_buf: [32]u8 = undefined;
+                const id_text = if (e.id) |id|
+                    std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch ""
+                else
+                    "";
+                const created_text = if (e.created_at) |created_at|
+                    std.fmt.bufPrint(&created_buf, "{d}", .{created_at}) catch ""
+                else
+                    "";
+                const expires_text = if (e.expires_at) |expires_at|
+                    std.fmt.bufPrint(&expires_buf, "{d}", .{expires_at}) catch ""
+                else
+                    "";
                 self.addSpan("approval.required", now, now, &.{
                     .{ .key = "tool", .value = e.tool },
                     .{ .key = "reason", .value = e.reason },
                     .{ .key = "risk_level", .value = e.risk_level },
+                    .{ .key = "approval_id", .value = e.approval_id orelse "" },
+                    .{ .key = "id", .value = id_text },
+                    .{ .key = "tool_call_id", .value = e.tool_call_id orelse "" },
+                    .{ .key = "created_at", .value = created_text },
+                    .{ .key = "expires_at", .value = expires_text },
                 });
             },
             .system_notice => |e| {
@@ -1602,6 +1672,34 @@ test "FileObserver handles all event types" {
     for (&events) |*event| {
         obs.recordEvent(event);
     }
+}
+
+test "FileObserver escapes approval_required canonical fields" {
+    const path = "/tmp/nullalis_test_approval_escape.jsonl";
+    std.fs.cwd().deleteFile(path) catch {};
+    defer std.fs.cwd().deleteFile(path) catch {};
+
+    var file_obs = FileObserver{ .path = path };
+    const obs = file_obs.observer();
+    const event = ObserverEvent{ .approval_required = .{
+        .tool = "shell\"quoted",
+        .reason = "line\nbreak",
+        .risk_level = "medium",
+        .run_id = null,
+        .approval_id = "apr-7",
+        .id = 7,
+        .tool_call_id = "call\"7",
+        .created_at = 1710000000,
+        .expires_at = 1710000060,
+    } };
+    obs.recordEvent(&event);
+
+    const content = try std.fs.cwd().readFileAlloc(std.testing.allocator, path, 4096);
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"tool\":\"shell\\\"quoted\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"reason\":\"line\\nbreak\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"approval_id\":\"apr-7\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"tool_call_id\":\"call\\\"7\"") != null);
 }
 
 // ── Additional observability tests ──────────────────────────────

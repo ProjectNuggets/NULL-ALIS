@@ -27,6 +27,7 @@ const platform = @import("../platform.zig");
 const voice_mod = @import("../voice.zig");
 const voice_mode = @import("../voice_mode.zig");
 const observability = @import("../observability.zig");
+const json_util = @import("../json_util.zig");
 const tool_dispatcher = @import("../tool_mode.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
@@ -2609,10 +2610,16 @@ pub const Agent = struct {
                                 .metadata = meta,
                             } },
                         };
+                        const pending = self.pending_tool_approval.?;
                         const event = ObserverEvent{ .approval_required = .{
                             .tool = meta.name,
                             .reason = reason_text,
                             .risk_level = meta.risk_level.toSlice(),
+                            .approval_id = pending.approval_id,
+                            .id = pending.id,
+                            .tool_call_id = pending.tool_call_id,
+                            .created_at = pending.created_at_unix,
+                            .expires_at = pending.expires_at_unix,
                             .run_id = self.current_run_id,
                         } };
                         self.observer.recordEvent(&event);
@@ -3141,27 +3148,35 @@ pub const Agent = struct {
         // We report the explicit user value if set, else "default" so the
         // agent can answer truthfully without lying about a config value
         // that isn't there.
-        try w.writeAll("\",\"reasoning_effort\":\"");
+        try w.writeAll("\",\"reasoning_effort\":");
         if (agent.reasoning_effort) |re| {
-            try w.writeAll(re);
+            try json_util.appendJsonString(&out, allocator, re);
         } else {
-            try w.writeAll("default");
+            try json_util.appendJsonString(&out, allocator, "default");
         }
-        try w.writeAll("\",\"session_key\":");
+        try w.writeAll(",\"session_key\":");
         if (agent.memory_session_id) |sid| {
-            try w.print("\"{s}\"", .{sid});
+            try json_util.appendJsonString(&out, allocator, sid);
         } else {
             try w.writeAll("null");
         }
         try w.writeAll(",\"pending_tool_approval\":");
         if (agent.pending_tool_approval) |pta| {
-            try w.print("{{\"id\":{d},\"tool_name\":\"{s}\",\"risk_level\":\"{s}\"", .{
-                pta.id,
-                pta.tool_name,
-                pta.risk_level.toSlice(),
-            });
+            try w.writeAll("{\"approval_id\":");
+            try json_util.appendJsonString(&out, allocator, pta.approval_id);
+            try w.print(",\"id\":{d},\"tool_name\":", .{pta.id});
+            try json_util.appendJsonString(&out, allocator, pta.tool_name);
+            try w.writeAll(",\"risk_level\":");
+            try json_util.appendJsonString(&out, allocator, pta.risk_level.toSlice());
+            try w.print(",\"created_at\":{d},\"expires_at\":", .{pta.created_at_unix});
+            if (pta.expires_at_unix) |exp| {
+                try w.print("{d}", .{exp});
+            } else {
+                try w.writeAll("null");
+            }
             if (pta.tool_call_id) |tcid| {
-                try w.print(",\"tool_call_id\":\"{s}\"", .{tcid});
+                try w.writeAll(",\"tool_call_id\":");
+                try json_util.appendJsonString(&out, allocator, tcid);
             }
             try w.writeAll("}");
         } else {
@@ -3169,7 +3184,7 @@ pub const Agent = struct {
         }
         try w.writeAll(",\"run_id\":");
         if (agent.current_run_id) |rid| {
-            try w.print("\"{s}\"", .{rid});
+            try json_util.appendJsonString(&out, allocator, rid);
         } else {
             try w.writeAll("null");
         }

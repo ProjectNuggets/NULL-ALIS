@@ -251,6 +251,11 @@ pub const RunEventObserver = struct {
                 .tool = e.tool,
                 .reason = e.reason,
                 .risk_level = e.risk_level,
+                .approval_id = e.approval_id,
+                .id = e.id,
+                .tool_call_id = e.tool_call_id,
+                .created_at = e.created_at,
+                .expires_at = e.expires_at,
                 .run_id = e.run_id,
             } }),
             .turn_complete => self.emit(.{ .progress = .{
@@ -661,12 +666,22 @@ test "approval_required with run_id forwards run_id into approval_required frame
         .tool = "bash",
         .reason = "supervised_mutating_requires_approval",
         .risk_level = "critical",
+        .approval_id = "apr-77",
+        .id = 77,
+        .tool_call_id = "call_approve",
+        .created_at = 1770000000,
+        .expires_at = 1770000060,
         .run_id = "r-77-2",
     } };
     obs.recordEvent(&evt);
     const frame = test_sink.lastFrame().?;
     try std.testing.expect(std.mem.startsWith(u8, frame, "event: approval_required\n"));
     try std.testing.expect(std.mem.indexOf(u8, frame, "\"run_id\":\"r-77-2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"approval_id\":\"apr-77\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"id\":77") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"tool_call_id\":\"call_approve\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"created_at\":1770000000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"expires_at\":1770000060") != null);
 }
 
 test "shouldSuppressReasoningSummary deduplicates identical events within window" {

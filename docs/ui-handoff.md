@@ -602,6 +602,13 @@ When `approval_required` fires, show:
 - **Three actions** — Approve / Modify-args / Deny + auto-deny on
   timeout (60s default).
 
+Pin the card to the wire `approval_id` when it is present and echo that
+value back on resolve. Treat numeric `id` as display/debug metadata only.
+If an older `approval_required` frame arrives without `approval_id`, refresh
+session detail immediately and replace the card with the canonical pending
+approval; if refresh fails, render the card but submit without fabricating
+an approval id so the gateway uses the current-pending legacy path.
+
 Never auto-approve in the UI. Even if the user enables `autonomy=full`,
 keep the approval cards for the irreversible class (delete, send,
 purchase).

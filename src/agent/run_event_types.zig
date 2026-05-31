@@ -137,6 +137,11 @@ pub const ApprovalRequiredPayload = struct {
     tool: []const u8,
     reason: []const u8,
     risk_level: []const u8,
+    approval_id: ?[]const u8 = null,
+    id: ?u64 = null,
+    tool_call_id: ?[]const u8 = null,
+    created_at: ?i64 = null,
+    expires_at: ?i64 = null,
     run_id: ?[]const u8 = null,
 };
 
@@ -360,6 +365,17 @@ pub fn toSseFrame(allocator: std.mem.Allocator, event: RunEvent) ![]u8 {
             try w.writeAll("\",\"risk_level\":\"");
             try jsonEscapeInto(w, p.risk_level);
             try w.writeAll("\"");
+            try writeOptionalStringField(w, "approval_id", p.approval_id);
+            if (p.id) |id| {
+                try w.print(",\"id\":{d}", .{id});
+            }
+            try writeOptionalStringField(w, "tool_call_id", p.tool_call_id);
+            if (p.created_at) |created_at| {
+                try w.print(",\"created_at\":{d}", .{created_at});
+            }
+            if (p.expires_at) |expires_at| {
+                try w.print(",\"expires_at\":{d}", .{expires_at});
+            }
             try writeOptionalStringField(w, "run_id", p.run_id);
             try w.writeAll("}");
         },
@@ -844,6 +860,27 @@ test "toSseFrame includes run_id when set on approval_required" {
     defer allocator.free(frame);
     try std.testing.expect(std.mem.indexOf(u8, frame, "\"risk_level\":\"critical\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "\"run_id\":\"r-200-3\"") != null);
+}
+
+test "toSseFrame includes canonical approval fields on approval_required" {
+    const allocator = std.testing.allocator;
+    const frame = try toSseFrame(allocator, RunEvent{ .approval_required = .{
+        .tool = "produce_document",
+        .reason = "supervised_mutating_requires_approval",
+        .risk_level = "medium",
+        .approval_id = "apr-7",
+        .id = 7,
+        .tool_call_id = "call_doc",
+        .created_at = 1770000000,
+        .expires_at = 1770000060,
+        .run_id = "r-200-4",
+    } });
+    defer allocator.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"approval_id\":\"apr-7\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"id\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"tool_call_id\":\"call_doc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"created_at\":1770000000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"expires_at\":1770000060") != null);
 }
 
 test "toSseFrame omits run_id when null on approval_required" {

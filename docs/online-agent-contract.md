@@ -132,6 +132,13 @@ Field names below match the wire schema produced by
 - `reason` (string) — short machine code. The runtime emits
   `supervised_mutating_requires_approval` for the first-time gate.
 - `risk_level` (string) — tool risk tier (`low`, `medium`, `high`, `critical`).
+- `approval_id` (string, optional) — canonical stable pending-approval id
+  (`apr-<u64>`). Clients pin approval cards to this id when present.
+- `id` (uint, optional) — legacy numeric id, included for debug/display
+  and slash-command compatibility. Do not use as the primary UI key.
+- `tool_call_id` (string, optional) — provider tool-call correlation id.
+- `created_at` (int, optional) — Unix epoch seconds for the pending slot.
+- `expires_at` (int or null, optional) — null in V1 unless a future TTL is active.
 - `run_id` (string, optional).
 
 #### `task_update`
@@ -189,8 +196,10 @@ resolve the same slot.
 - **Emission.** When a tool preflight produces the verdict
   `approval_required`, the runtime emits an `approval_required` event with
   `reason = "supervised_mutating_requires_approval"` and the tool's
-  `risk_level`. The underlying tool call does not execute and is held as a
-  pending approval owned by the session.
+  `risk_level`. New frames also carry the canonical `approval_id`, numeric
+  `id`, `tool_call_id`, `created_at`, and `expires_at` fields that match
+  session detail. The underlying tool call does not execute and is held as
+  a pending approval owned by the session.
 - **Resolution via REST.** The FE calls
   `POST /api/v1/users/{user_id}/sessions/{session_key}/approve` with body
   `{"approved": bool, "approval_id": "apr-<u64>"}`. `approved: true`
