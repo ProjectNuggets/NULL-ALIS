@@ -693,7 +693,6 @@ fn resolveBrandingFromDir(
     allocator: std.mem.Allocator,
     branding: BrandingConfig,
 ) !?ResolvedBranding {
-
     const body_otf = try std.fs.path.join(allocator, &.{ branding.font_dir, branding.body_font, "otf" });
     errdefer allocator.free(body_otf);
     if (!directoryExists(body_otf)) {
@@ -946,9 +945,9 @@ fn renderPdf(
         defer allocator.free(sansfont_arg);
 
         const branded_args = [_][]const u8{
-            "pandoc",          src_path,        "-o",        out_path,
-            "--pdf-engine",    "xelatex",       "-V",        mainfont_arg,
-            "-V",              sansfont_arg,    "--metadata", meta,
+            "pandoc",       src_path,     "-o",         out_path,
+            "--pdf-engine", "xelatex",    "-V",         mainfont_arg,
+            "-V",           sansfont_arg, "--metadata", meta,
         };
         const branded_attempt = runRenderer(allocator, &branded_args, "pandoc");
         switch (branded_attempt) {
@@ -959,15 +958,11 @@ fn renderPdf(
                 // (which uses pdflatex internally) — branding loss is
                 // strictly better than no PDF.
                 const stderr = if (r.error_msg) |em| em else "";
-                const xelatex_missing = std.mem.indexOf(u8, stderr, "xelatex") != null and
-                    (std.mem.indexOf(u8, stderr, "not found") != null or
-                        std.mem.indexOf(u8, stderr, "No such file") != null or
-                        std.mem.indexOf(u8, stderr, "command not found") != null);
-                if (!xelatex_missing) {
+                if (!isBrandedPdfFallbackReason(stderr)) {
                     return r;
                 }
                 std.log.scoped(.branding).warn(
-                    "PDF branded render failed (likely xelatex missing) — retrying without branding. Install xelatex (texlive-xetex) for branded PDFs. stderr: {s}",
+                    "PDF branded render failed — retrying without branding. Install/register xelatex + brand fonts for branded PDFs. stderr: {s}",
                     .{stderr},
                 );
                 if (r.output.len > 0) allocator.free(r.output);
@@ -1058,6 +1053,20 @@ fn renderPdf(
             "Install one of: brew install pandoc  /  apt install pandoc  /  pip install weasyprint",
     );
     return ToolResult{ .success = false, .output = "", .error_msg = msg };
+}
+
+fn isBrandedPdfFallbackReason(stderr: []const u8) bool {
+    const xelatex_missing = std.mem.indexOf(u8, stderr, "xelatex") != null and
+        (std.mem.indexOf(u8, stderr, "not found") != null or
+            std.mem.indexOf(u8, stderr, "No such file") != null or
+            std.mem.indexOf(u8, stderr, "command not found") != null);
+    const font_lookup_failed =
+        std.mem.indexOf(u8, stderr, "mktextfm") != null or
+        std.mem.indexOf(u8, stderr, "mktexmf") != null or
+        std.mem.indexOf(u8, stderr, "kpathsea") != null or
+        std.mem.indexOf(u8, stderr, "I can't find file") != null or
+        std.mem.indexOf(u8, stderr, "fontspec Error") != null;
+    return xelatex_missing or font_lookup_failed;
 }
 
 /// DOCX: pandoc's font handling is via a `--reference-doc=<path>`
@@ -1942,6 +1951,19 @@ test "Wave2-HIGH4: missing-binary detection covers AccessDenied in addition to F
         .binary_missing => |bm| alloc.free(bm),
         .binary_missing_static => {},
     }
+}
+
+test "PDF branding fallback detects missing registered font" {
+    const stderr =
+        "kpathsea: Running mktextfm thmanyahsans\n" ++
+        "mktextfm: Running mf-nowin input thmanyahsans\n" ++
+        "! I can't find file `thmanyahsans'.";
+    try std.testing.expect(isBrandedPdfFallbackReason(stderr));
+}
+
+test "PDF branding fallback detects missing xelatex only when relevant" {
+    try std.testing.expect(isBrandedPdfFallbackReason("xelatex: command not found"));
+    try std.testing.expect(!isBrandedPdfFallbackReason("pandoc failed because markdown is invalid"));
 }
 
 test "Wave2-HIGH5: produced filename includes CSPRNG nonce — 100 same-title invocations yield 100 distinct paths" {
