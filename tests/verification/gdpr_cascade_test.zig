@@ -174,7 +174,7 @@ test "S6.11 D25 live: DELETE FROM users cascades EVERY publicly-seedable table" 
     defer allocator.free(jobs_before);
     try std.testing.expect(std.mem.indexOf(u8, jobs_before, "d25-job") != null);
 
-    const artifacts_before = try mgr.listArtifactsForUser(allocator, uid, null, 100);
+    const artifacts_before = try mgr.listArtifactsForUser(allocator, uid, null, null, 100);
     defer nullalis.zaki_state.freeArtifactRows(allocator, artifacts_before);
     try std.testing.expect(artifacts_before.len >= 1);
 
@@ -240,7 +240,7 @@ test "S6.11 D25 live: DELETE FROM users cascades EVERY publicly-seedable table" 
         return error.JobsSurvivedUserDelete;
     }
 
-    const artifacts_after = try mgr.listArtifactsForUser(allocator, uid, null, 100);
+    const artifacts_after = try mgr.listArtifactsForUser(allocator, uid, null, null, 100);
     defer nullalis.zaki_state.freeArtifactRows(allocator, artifacts_after);
     if (artifacts_after.len != 0) {
         std.debug.print("S6.11 D25 live: artifacts has {d} surviving row(s) — cascade broken\n", .{artifacts_after.len});

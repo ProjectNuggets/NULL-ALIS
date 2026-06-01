@@ -845,7 +845,7 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
         _: ?i64,
         _: ?[]const u8,
         _: ?[]const u8, // extraction_pass (P3)
-        _: ?i64,        // session_boundary_id (P3)
+        _: ?i64, // session_boundary_id (P3)
     ) !void {
         return;
     }
@@ -1111,6 +1111,7 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
         _: *@This(),
         allocator: std.mem.Allocator,
         _: i64,
+        _: ?[]const u8,
         _: ?[]const u8,
         _: u32,
     ) ![]ArtifactRow {
@@ -8319,8 +8320,8 @@ const ManagerImpl = struct {
         fact: ?[]const u8,
         temporal_anchor_unix: ?i64,
         episode_key: ?[]const u8,
-        extraction_pass: ?[]const u8,   // P3: pass label (e.g. "pass_a", "pass_c")
-        session_boundary_id: ?i64,      // P3: milliTimestamp at boundary fire
+        extraction_pass: ?[]const u8, // P3: pass label (e.g. "pass_a", "pass_c")
+        session_boundary_id: ?i64, // P3: milliTimestamp at boundary fire
     ) !void {
         const q = try self.buildQuery(
             "INSERT INTO {schema}.memory_edges " ++
@@ -8755,9 +8756,9 @@ const ManagerImpl = struct {
             const snippet = try dupeResultValue(allocator, result, i, 2);
             errdefer allocator.free(snippet);
             try out.append(allocator, .{
-                .memory_key  = key,
+                .memory_key = key,
                 .match_count = try std.fmt.parseInt(i64, cnt_str, 10),
-                .snippet     = snippet,
+                .snippet = snippet,
             });
         }
         return out.toOwnedSlice(allocator);
@@ -8867,7 +8868,7 @@ const ManagerImpl = struct {
         }
         var i: c_int = 0;
         while (i < tuples) : (i += 1) {
-            const key   = try dupeResultValue(allocator, result, i, 0);
+            const key = try dupeResultValue(allocator, result, i, 0);
             errdefer allocator.free(key);
             const score_str = try dupeResultValue(allocator, result, i, 1);
             defer allocator.free(score_str);
@@ -8876,7 +8877,7 @@ const ManagerImpl = struct {
             const ppr_score = std.fmt.parseFloat(f64, score_str) catch 0.0;
             const depth_i32 = std.fmt.parseInt(i32, depth_str, 10) catch 0;
             try out.append(allocator, .{
-                .key       = key,
+                .key = key,
                 .ppr_score = if (std.math.isFinite(ppr_score)) ppr_score else 0.0,
                 .min_depth = @intCast(@min(@as(i32, 255), @max(0, depth_i32))),
             });
@@ -11212,6 +11213,7 @@ const ManagerImpl = struct {
         allocator: std.mem.Allocator,
         user_id: i64,
         kind_filter: ?[]const u8,
+        session_filter: ?[]const u8,
         limit: u32,
     ) ![]ArtifactRow {
         var user_buf: [32]u8 = undefined;
@@ -11220,20 +11222,42 @@ const ManagerImpl = struct {
         var limit_buf: [32]u8 = undefined;
         const limit_s = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{capped_limit});
 
-        const q = if (kind_filter == null) try self.buildQuery(
+        const q = if (kind_filter != null and session_filter != null) try self.buildQuery(
             "SELECT id::text, COALESCE(session_id, ''), title, kind, created_at_unix, updated_at_unix, current_version, is_shared, COALESCE(share_code, ''), COALESCE(share_expires_at_unix::text, ''), metadata_jsonb::text " ++
-                "FROM {schema}.artifacts WHERE user_id = $1 ORDER BY updated_at_unix DESC LIMIT $2::int",
-        ) else try self.buildQuery(
+                "FROM {schema}.artifacts WHERE user_id = $1 AND kind = $3 AND session_id = $4 ORDER BY updated_at_unix DESC LIMIT $2::int",
+        ) else if (kind_filter != null) try self.buildQuery(
             "SELECT id::text, COALESCE(session_id, ''), title, kind, created_at_unix, updated_at_unix, current_version, is_shared, COALESCE(share_code, ''), COALESCE(share_expires_at_unix::text, ''), metadata_jsonb::text " ++
                 "FROM {schema}.artifacts WHERE user_id = $1 AND kind = $3 ORDER BY updated_at_unix DESC LIMIT $2::int",
+        ) else if (session_filter != null) try self.buildQuery(
+            "SELECT id::text, COALESCE(session_id, ''), title, kind, created_at_unix, updated_at_unix, current_version, is_shared, COALESCE(share_code, ''), COALESCE(share_expires_at_unix::text, ''), metadata_jsonb::text " ++
+                "FROM {schema}.artifacts WHERE user_id = $1 AND session_id = $3 ORDER BY updated_at_unix DESC LIMIT $2::int",
+        ) else try self.buildQuery(
+            "SELECT id::text, COALESCE(session_id, ''), title, kind, created_at_unix, updated_at_unix, current_version, is_shared, COALESCE(share_code, ''), COALESCE(share_expires_at_unix::text, ''), metadata_jsonb::text " ++
+                "FROM {schema}.artifacts WHERE user_id = $1 ORDER BY updated_at_unix DESC LIMIT $2::int",
         );
         defer self.allocator.free(q);
 
-        const result = if (kind_filter) |kind| blk: {
-            const kind_z = try self.allocator.dupeZ(u8, kind);
-            defer self.allocator.free(kind_z);
-            const params = [_]?[*:0]const u8{ user_s.ptr, limit_s.ptr, kind_z };
-            const lengths = [_]c_int{ @intCast(user_s.len), @intCast(limit_s.len), @intCast(kind.len) };
+        const kind_z_opt = if (kind_filter) |kind| try self.allocator.dupeZ(u8, kind) else null;
+        defer if (kind_z_opt) |value| self.allocator.free(value);
+        const session_z_opt = if (session_filter) |session| try self.allocator.dupeZ(u8, session) else null;
+        defer if (session_z_opt) |value| self.allocator.free(value);
+
+        const result = if (kind_filter != null and session_filter != null) blk: {
+            const params = [_]?[*:0]const u8{ user_s.ptr, limit_s.ptr, kind_z_opt.?, session_z_opt.? };
+            const lengths = [_]c_int{
+                @intCast(user_s.len),
+                @intCast(limit_s.len),
+                @intCast(kind_filter.?.len),
+                @intCast(session_filter.?.len),
+            };
+            break :blk try self.execParams(q, &params, &lengths);
+        } else if (kind_filter != null) blk: {
+            const params = [_]?[*:0]const u8{ user_s.ptr, limit_s.ptr, kind_z_opt.? };
+            const lengths = [_]c_int{ @intCast(user_s.len), @intCast(limit_s.len), @intCast(kind_filter.?.len) };
+            break :blk try self.execParams(q, &params, &lengths);
+        } else if (session_filter != null) blk: {
+            const params = [_]?[*:0]const u8{ user_s.ptr, limit_s.ptr, session_z_opt.? };
+            const lengths = [_]c_int{ @intCast(user_s.len), @intCast(limit_s.len), @intCast(session_filter.?.len) };
             break :blk try self.execParams(q, &params, &lengths);
         } else blk: {
             const params = [_]?[*:0]const u8{ user_s.ptr, limit_s.ptr };
@@ -11499,7 +11523,7 @@ const ManagerImpl = struct {
             code_z.ptr, user_s.ptr, run_z.ptr, events_z.ptr, created_s.ptr, expires_s.ptr,
         };
         const lengths = [_]c_int{
-            @intCast(share_code.len), @intCast(user_s.len), @intCast(run_id.len),
+            @intCast(share_code.len),  @intCast(user_s.len),    @intCast(run_id.len),
             @intCast(events_json.len), @intCast(created_s.len), @intCast(expires_s.len),
         };
         const result = try self.execParams(q, &params, &lengths);

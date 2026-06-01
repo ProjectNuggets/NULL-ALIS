@@ -11669,6 +11669,20 @@ fn handleArtifactList(
             return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_kind\"}" };
         }
     }
+    const session_encoded = parseQueryParam(target, "session_key");
+    var session_decoded: ?[]u8 = null;
+    defer if (session_decoded) |value| allocator.free(value);
+    if (session_encoded) |s| {
+        if (s.len == 0 or s.len > 512) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_session_key\"}" };
+        }
+        session_decoded = percentDecodePathSegment(allocator, s) catch {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_session_key\"}" };
+        };
+        if (session_decoded.?.len == 0 or std.mem.indexOfScalar(u8, session_decoded.?, 0) != null) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_session_key\"}" };
+        }
+    }
 
     const state_mgr = state.zaki_state orelse {
         // Wave 2 review HIGH#3 — was: 200 `{"artifacts":[]}` (dishonest;
@@ -11682,7 +11696,7 @@ fn handleArtifactList(
         };
     };
 
-    const rows = state_mgr.listArtifactsForUser(allocator, numeric_user_id, kind_param, limit) catch {
+    const rows = state_mgr.listArtifactsForUser(allocator, numeric_user_id, kind_param, session_decoded, limit) catch {
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"list_failed\"}" };
     };
     defer zaki_state_mod.freeArtifactRows(allocator, rows);
@@ -14140,24 +14154,37 @@ fn handleSessionContext(
     defer out.deinit(allocator);
     const w = out.writer(allocator);
     const agent = &session.agent;
-    const tokens_used = agent.tokensUsed();
-    // Normalized 0-100 pressure for the in-thread context-state badge in the
-    // V1.5 UX. Frontend buckets into normal/warning/near_limit per its own
-    // thresholds (recommended: 0-50 normal, 51-75 warning, >75 near_limit).
-    // Clamped at 100 so a stale token_limit field can't produce >100 values.
-    const pressure_percent: u8 = blk: {
-        if (agent.token_limit == 0) break :blk 0;
-        const pct = @divTrunc(tokens_used * 100, agent.token_limit);
-        if (pct > 100) break :blk 100;
-        break :blk @intCast(pct);
-    };
-    w.print("{{\"history_len\":{d},\"tokens_used\":{d},\"max_history\":{d},\"token_limit\":{d},\"context_pressure_percent\":{d}}}", .{
+    const report = agent_context_report.fromAgent(agent);
+    const report_json = agent_context_report.formatJson(allocator, report) catch return response_build_err;
+    defer allocator.free(report_json);
+
+    // `tokens_used` and `token_limit` are legacy field names kept for older
+    // clients, but they now alias the active context-window estimate rather
+    // than lifetime cumulative usage. Lifetime usage belongs in metering, not
+    // in the context pressure badge.
+    w.print("{{\"history_len\":{d},\"history_messages\":{d},\"tokens_used\":{d},\"token_estimate\":{d},\"max_history\":{d},\"token_limit\":{d},\"context_window_tokens\":{d},\"context_pressure_percent\":{d},\"token_compaction_threshold\":{d},\"token_compaction_triggered\":{},\"last_turn\":", .{
         agent.historyLen(),
-        tokens_used,
+        report.history_messages,
+        report.token_estimate,
+        report.token_estimate,
         agent.max_history_messages,
-        agent.token_limit,
-        pressure_percent,
+        report.context_window_tokens,
+        report.context_window_tokens,
+        report.context_pressure_percent,
+        report.token_compaction_threshold,
+        report.token_compaction_triggered,
     }) catch return response_build_err;
+    if (std.mem.indexOf(u8, report_json, "\"last_turn\":")) |last_turn_key| {
+        const last_turn_start = last_turn_key + "\"last_turn\":".len;
+        if (std.mem.indexOfPos(u8, report_json, last_turn_start, ",\"runtime\":")) |last_turn_end| {
+            w.writeAll(report_json[last_turn_start..last_turn_end]) catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+    } else {
+        w.writeAll("null") catch return response_build_err;
+    }
+    w.print(",\"report\":{s}}}", .{report_json}) catch return response_build_err;
     return finalizeJsonBuf(allocator, &out);
 }
 
@@ -32335,8 +32362,34 @@ test "handleSessionContext returns context metadata" {
     try std.testing.expectEqualStrings("200 OK", resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"history_len\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"tokens_used\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"token_estimate\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"context_window_tokens\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"token_compaction_threshold\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"last_turn\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"report\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"max_history\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"token_limit\"") != null);
+}
+
+test "handleSessionContext reports active context instead of cumulative usage" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const session = try mgr.getOrCreate("agent:zaki-bot:user:7:thread:ctx-pressure");
+    session.agent.token_limit = 1000;
+    session.agent.total_tokens = 99999;
+    try session.agent.history.append(std.testing.allocator, .{
+        .role = .user,
+        .content = try std.testing.allocator.dupe(u8, "short current context"),
+    });
+
+    const resp = handleSessionContext(std.testing.allocator, &mgr, "agent:zaki-bot:user:7:thread:ctx-pressure");
+    defer std.testing.allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"tokens_used\":99999") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"context_pressure_percent\":100") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"token_estimate\"") != null);
 }
 
 test "handleSessionContext returns 404 for unknown session" {
@@ -33751,6 +33804,20 @@ test "Wave 2C: list endpoint rejects invalid limit" {
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
 }
 
+test "Wave 2C: list endpoint rejects malformed encoded session key" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    const resp = handleArtifactList(
+        std.testing.allocator,
+        "GET",
+        "1",
+        &state,
+        "/api/v1/users/1/artifacts?session_key=agent%3Azaki%ZZ",
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid_session_key") != null);
+}
+
 test "Wave 2C: get endpoint rejects malformed artifact id" {
     var state = GatewayState.init(std.testing.allocator);
     defer state.deinit();
@@ -33836,7 +33903,16 @@ test "Wave 2C live: artifacts CRUD + version graph + isolation + share roundtrip
     // Test 1: createArtifact happy path + content_hash + version=1.
     const hash_v1 = try artifacts_types.computeContentHash(allocator, "# v1 body");
     defer allocator.free(hash_v1);
-    var artifact = try mgr.createArtifact(allocator, 101, null, "Plan", "markdown", "# v1 body", hash_v1, now);
+    var artifact = try mgr.createArtifact(
+        allocator,
+        101,
+        "agent:zaki-bot:user:101:thread:main",
+        "Plan",
+        "markdown",
+        "# v1 body",
+        hash_v1,
+        now,
+    );
     defer artifact.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 1), artifact.current_version);
     try std.testing.expectEqualStrings("Plan", artifact.title);
@@ -33915,12 +33991,37 @@ test "Wave 2C live: artifacts CRUD + version graph + isolation + share roundtrip
     try std.testing.expect(found_v1);
     try std.testing.expect(found_v2);
 
-    // Test 9: listArtifactsForUser returns the artifact for owner only.
-    const list_owner = try mgr.listArtifactsForUser(allocator, 101, null, 50);
-    defer zaki_state_mod.freeArtifactRows(allocator, list_owner);
-    try std.testing.expectEqual(@as(usize, 1), list_owner.len);
+    const hash_other = try artifacts_types.computeContentHash(allocator, "# other session");
+    defer allocator.free(hash_other);
+    var other_artifact = try mgr.createArtifact(
+        allocator,
+        101,
+        "agent:zaki-bot:user:101:thread:other",
+        "Other session artifact",
+        "markdown",
+        "# other session",
+        hash_other,
+        now + 180,
+    );
+    defer other_artifact.deinit(allocator);
 
-    const list_foreign = try mgr.listArtifactsForUser(allocator, 202, null, 50);
+    // Test 9: listArtifactsForUser returns artifacts for owner only.
+    const list_owner = try mgr.listArtifactsForUser(allocator, 101, null, null, 50);
+    defer zaki_state_mod.freeArtifactRows(allocator, list_owner);
+    try std.testing.expectEqual(@as(usize, 2), list_owner.len);
+
+    const list_owner_session = try mgr.listArtifactsForUser(
+        allocator,
+        101,
+        null,
+        "agent:zaki-bot:user:101:thread:main",
+        50,
+    );
+    defer zaki_state_mod.freeArtifactRows(allocator, list_owner_session);
+    try std.testing.expectEqual(@as(usize, 1), list_owner_session.len);
+    try std.testing.expectEqualStrings(artifact.id, list_owner_session[0].id);
+
+    const list_foreign = try mgr.listArtifactsForUser(allocator, 202, null, null, 50);
     defer zaki_state_mod.freeArtifactRows(allocator, list_foreign);
     try std.testing.expectEqual(@as(usize, 0), list_foreign.len);
 

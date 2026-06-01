@@ -90,7 +90,7 @@ pub const ArtifactListTool = struct {
             };
         };
 
-        const rows = smgr.listArtifactsForUser(allocator, uid, kind_filter_raw, limit) catch |err| {
+        const rows = smgr.listArtifactsForUser(allocator, uid, kind_filter_raw, null, limit) catch |err| {
             log.warn("artifact_list query failed user_id={d} err={s}", .{ uid, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "Failed to list artifacts: {s}", .{@errorName(err)});
             return ToolResult{ .success = false, .error_msg = msg, .output = "" };
