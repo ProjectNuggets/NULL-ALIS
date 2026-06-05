@@ -16,8 +16,8 @@
 //!
 //! 1. **extractMentions** — single LLM call, JSON output of EntityMentions.
 //! 2. **resolveEntity** — for each mention: cosine-match canonical form
-//!    against `memory_entities` (Mem0 0.95 threshold), or upsert as new.
-//!    Reuses `state_mgr.findEntityByCosine` + `state_mgr.upsertEntity`.
+//!    against `memory_entities` (cosine >= COREF_THRESHOLD = 0.85), or
+//!    upsert as new. Reuses `state_mgr.findEntityByCosine` + `upsertEntity`.
 //! 3. **emitCooccurrenceEdges** — for every pair of resolved entities in
 //!    the same turn, upsert a `MENTIONS` edge in `memory_edges`. The
 //!    existing `upsertMemoryEdge` ON CONFLICT logic increments weight,
@@ -58,8 +58,11 @@ const zaki_state = @import("../zaki_state.zig");
 const embeddings = @import("../memory/vector/embeddings.zig");
 
 /// Minimum cosine similarity for an entity mention to coreference an
-/// existing entity. Mirrors Mem0's 0.95 threshold (matches the existing
-/// findEntityByCosine default). Below this we mint a new entity.
+/// existing entity; below this we mint a new entity. NOTE: 0.85 here is
+/// LOOSER than the extraction-persist coref path (0.95). The divergence is
+/// flagged for the coref-hardening work — a two-threshold cascade
+/// (candidate >= 0.85, auto-merge >= 0.92 + type match) should replace both
+/// single thresholds rather than picking one global value.
 pub const COREF_THRESHOLD: f64 = 0.85;
 
 /// Max entity mentions to extract per turn. V1.13 lifted from 24 → 40

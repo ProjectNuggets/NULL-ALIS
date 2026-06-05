@@ -69,8 +69,8 @@ pub const WikiLinkTool = struct {
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
         .what = "Entity-mention extractor: identify named entities and write co-occurrence edges to the graph.",
         .use_when = &.{
-            "Manually triggering entity-edge ingestion over a specific text block (auto-trigger handles most cases)",
-            "Backfilling entity coverage for a transcript chunk that bypassed the every-3-turns auto path",
+            "Manually triggering entity-edge ingestion over a specific text block",
+            "Backfilling entity coverage for a transcript chunk (the per-turn auto-trigger was removed in V1.14.7)",
             "Verifying a piece of prose generates the expected entity coreferences before committing it to memory",
         },
         .do_not_use_for = &.{
@@ -89,8 +89,9 @@ pub const WikiLinkTool = struct {
         "events, concepts), resolves them against the entity graph (cosine " ++
         "coreference), and emits co-occurrence edges. Multilingual — works " ++
         "in any language. Idempotent — re-running over the same text bumps " ++
-        "edge weights, never duplicates rows. The agent rarely invokes this " ++
-        "directly: every-3-turns auto-trigger handles forward-flow ingestion. " ++
+        "edge weights, never duplicates rows. The per-turn auto-trigger was " ++
+        "removed in V1.14.7; forward-flow ingestion now runs (when enabled) " ++
+        "via the session-end extraction job. " ++
         "Use this tool when the user explicitly asks the agent to 'reconnect' " ++
         "or 'relink' some prose, or when re-running over older content.";
     pub const tool_params =
