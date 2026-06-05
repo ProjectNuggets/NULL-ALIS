@@ -1,0 +1,49 @@
+# deploy/k8s/browser/worker-pod.yaml
+# Single test pod for Plan 1. Plan 2 replaces this with an
+# orchestrator-managed Deployment/pool. Labels match the NetworkPolicy.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: browser-worker-0
+  namespace: browser
+  labels:
+    app: browser-worker
+spec:
+  automountServiceAccountToken: false   # workers need no K8s API access
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: worker
+      image: browser-worker:dev
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: "500m"
+          memory: 1Gi
+        limits:
+          cpu: "2"
+          memory: 2Gi
+      volumeMounts:
+        - name: home
+          mountPath: /home/browser    # $HOME: agent-browser state + daemon socket
+        - name: tmp
+          mountPath: /tmp             # writable /tmp (rootfs is read-only)
+        - name: dshm
+          mountPath: /dev/shm         # Chromium shared memory
+  volumes:
+    - name: home
+      emptyDir: {}
+    - name: tmp
+      emptyDir: {}
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 256Mi
