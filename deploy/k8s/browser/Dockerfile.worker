@@ -1,0 +1,28 @@
+# deploy/k8s/browser/Dockerfile.worker
+# Browser worker: system Chromium + agent-browser, headless, non-root.
+# Uniform across amd64/arm64 (system chromium) — avoids the missing
+# Chrome-for-Testing arm64 build. Chromium runs --no-sandbox (no setuid
+# sandbox in a container); isolation is provided by the pod + NetworkPolicy.
+FROM node:24-bookworm-slim
+
+# tini = PID1 reaper for the agent-browser daemon + chromium child procs.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates fonts-liberation tini chromium \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin agent-browser to the validated version.
+RUN npm i -g agent-browser@0.27.1
+
+# --no-sandbox wrapper; agent-browser launches Chromium via --executable-path.
+RUN printf '#!/bin/sh\nexec /usr/bin/chromium --no-sandbox --disable-dev-shm-usage "$@"\n' \
+      > /usr/local/bin/chromium-ns && chmod +x /usr/local/bin/chromium-ns
+
+# Non-root runtime user; agent-browser writes state under $HOME/.agent-browser.
+RUN useradd -m -u 10001 browser
+USER browser
+WORKDIR /home/browser
+# Note: agent-browser is invoked with --executable-path /usr/local/bin/chromium-ns
+# explicitly on first `open` (see scripts); no env contract is assumed.
+
+ENTRYPOINT ["tini","--"]
+CMD ["sleep","infinity"]
