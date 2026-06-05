@@ -4091,6 +4091,12 @@ const ManagerImpl = struct {
         metadata_json: []const u8,
         event_type: []const u8,
     ) !void {
+        // Ingestion quality gate — reject infrastructure exhaust before it
+        // becomes a memory (and before it could get a structural edge).
+        if (isLowSignalMemory(key, content)) {
+            log.info("ingestion.rejected_low_signal path=meta key={s} len={d}", .{ key, content.len });
+            return;
+        }
         if (session_id) |sid| try self.ensureSession(user_id, sid);
         // V1.6 commit 3: also write `lemmatized` for BM25 retrieval (same
         // semantics as upsertMemory; this metadata variant is the path
@@ -4247,6 +4253,37 @@ const ManagerImpl = struct {
         // graph (session source hub + first-person self hub) so it is never an
         // orphan. Best-effort; never fails the write.
         self.emitStructuralEdges(user_id, key, content, category, session_id, metadata_json);
+    }
+
+    /// Ingestion quality gate — true if `content` is infrastructure exhaust
+    /// that must never become a memory: liveness probes, ack tokens, markdown
+    /// fragments, prompt-scaffolding leaks, or empty. The live corpus showed
+    /// these were the TOP "memories" ("health check", "noted", "---", leaked
+    /// "recent_assistant:" / "From your memory bank:"). System keys are exempt
+    /// (bookkeeping rows). Conservative by design: only whole-content exact
+    /// junk tokens and known scaffolding prefixes are rejected, so real
+    /// sentences always pass — we drop noise, never signal.
+    fn isLowSignalMemory(key: []const u8, content: []const u8) bool {
+        if (isSystemMemoryKey(key)) return false;
+        const t = std.mem.trim(u8, content, " \t\r\n");
+        if (t.len == 0) return true;
+        const exact = [_][]const u8{
+            "health check", "noted",     "noted.", "ok",           "okay",
+            "k",            "kk",        "ack",    "acknowledged", "done",
+            "thanks",       "thank you", "got it", "sounds good",  "yes",
+            "no",           "yep",       "nope",   "sure",         "---",
+            "```",
+        };
+        for (exact) |e| {
+            if (std.ascii.eqlIgnoreCase(t, e)) return true;
+        }
+        const prefixes = [_][]const u8{
+            "recent_user:", "recent_assistant:", "from your memory bank:", "model=",
+        };
+        for (prefixes) |p| {
+            if (std.ascii.startsWithIgnoreCase(t, p)) return true;
+        }
+        return false;
     }
 
     /// Conservative first-person detector for self-hub anchoring. Matches
@@ -4536,6 +4573,11 @@ const ManagerImpl = struct {
     }
 
     pub fn upsertMemory(self: *Self, user_id: i64, key: []const u8, content: []const u8, category: memory_root.MemoryCategory, session_id: ?[]const u8) !void {
+        // Ingestion quality gate — reject infrastructure exhaust before storage.
+        if (isLowSignalMemory(key, content)) {
+            log.info("ingestion.rejected_low_signal path=simple key={s} len={d}", .{ key, content.len });
+            return;
+        }
         if (session_id) |sid| try self.ensureSession(user_id, sid);
         // V1.6 commit 3: also write `lemmatized` for BM25 retrieval. Existing
         // rows backfilled at migrate via `UPDATE memories SET lemmatized =
@@ -14702,6 +14744,59 @@ test "VALIDATION cohort — keystone de-orphans with meaning (before/after)" {
     try std.testing.expect(after.edges > before.edges); // rendered edges up
     try std.testing.expect(after.reach > before.reach); // recall reachability up
     try std.testing.expectEqual(@as(usize, 5), res.emitted); // 3 Helix + 2 Mia
+}
+
+// Ingestion quality gate — infrastructure exhaust (liveness probes, ack
+// tokens, markdown fragments, prompt-scaffolding leaks, empty content) must
+// never become a memory. The live corpus showed these were the TOP "memories"
+// (e.g. "health check" x277, "noted" x362). Densifying clean memories beats
+// densifying noise. Real content must still be stored.
+test "C-gate ingestion rejects infrastructure exhaust, keeps real content" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{ .backend = "postgres", .postgres = .{ .connection_string = test_url, .schema = schema } };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const r = try mgr.exec(drop_q);
+        c.PQclear(r);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-gate/workspace");
+
+    // Infra exhaust — must be REJECTED.
+    try mgr.upsertMemory(2, "j_health", "health check", .conversation, "s1");
+    try mgr.upsertMemory(2, "j_noted", "Noted.", .daily, "s1");
+    try mgr.upsertMemory(2, "j_ok", "ok", .conversation, "s1");
+    try mgr.upsertMemory(2, "j_scaffold", "recent_assistant: sure thing", .daily, "s1");
+    try mgr.upsertMemory(2, "j_empty", "   ", .core, "s1");
+    try mgr.upsertMemory(2, "j_fence", "```", .daily, "s1");
+    // Real content — must be STORED (incl. via the metadata path).
+    try mgr.upsertMemory(2, "k_fact", "User lives in Dubai and loves hiking", .core, "s1");
+    try mgr.upsertMemoryWithMetadata(2, "k_meta", "User works at KPMG", .core, "s1", "{}");
+
+    const countLike = struct {
+        fn run(m: *ManagerImpl, a: std.mem.Allocator, sch: []const u8, pat: []const u8) !i64 {
+            const q = try std.fmt.allocPrint(a, "SELECT count(*) FROM {s}.memories WHERE user_id = 2 AND key LIKE '{s}'", .{ sch, pat });
+            defer a.free(q);
+            const r = try m.exec(q);
+            defer c.PQclear(r);
+            const s = try dupeResultValue(a, r, 0, 0);
+            defer a.free(s);
+            return std.fmt.parseInt(i64, s, 10) catch -1;
+        }
+    };
+    try std.testing.expectEqual(@as(i64, 0), try countLike.run(&mgr, allocator, schema, "j%")); // all junk rejected
+    try std.testing.expectEqual(@as(i64, 2), try countLike.run(&mgr, allocator, schema, "k%")); // real content kept
 }
 
 // V1.6 commit 8 — entity coreference via cosine ≥ threshold.
