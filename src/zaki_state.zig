@@ -8838,13 +8838,17 @@ const ManagerImpl = struct {
             "  JOIN {schema}.memory_edges e " ++
             "    ON (e.source_key = p.key OR e.target_key = p.key) " ++
             "    AND e.user_id = $1 AND e.is_latest " ++
-            // C1 hardening: never traverse through the per-user speaker hub
-            // (`user:<id>` MENTIONED edges minted by the entity pipeline). The
-            // hub is non-discriminative ("user mentioned everything") and PPR
-            // has no degree normalization, so a hub touched by thousands of
-            // memories would bleed score into every node. Excluding `user:%`
-            // endpoints keeps traversal on genuine entity/fact relations.
+            // C1/structural hardening: never traverse through the structural
+            // hub nodes — the per-user speaker/self hub (`user:<id>`,
+            // MENTIONED/ABOUT_SELF) and the per-session source hub
+            // (`session:<id>`, IN_SESSION). These are non-discriminative by
+            // design (the self hub touches every first-person memory; the
+            // session hub touches every memory in a session) and PPR has no
+            // degree normalization, so traversing them would bleed score into
+            // every node. They exist to kill orphans + power focus mode, not
+            // to carry relational signal — so PPR stays on genuine relations.
             "    AND e.source_key NOT LIKE 'user:%' AND e.target_key NOT LIKE 'user:%' " ++
+            "    AND e.source_key NOT LIKE 'session:%' AND e.target_key NOT LIKE 'session:%' " ++
             "  WHERE p.depth < $3" ++
             ") " ++
             "SELECT key, SUM(score) AS ppr_score, MIN(depth)::int AS min_depth " ++
@@ -14358,15 +14362,22 @@ test "C1 PPR hub-exclusion — speaker hub does not flood traversal" {
     try mgr.upsertMemoryEdge(2, "mem_seed", "mem_a", "KNOWS", "test", 0.9);
     try mgr.upsertMemoryEdge(2, "mem_a", "mem_b", "KNOWS", "test", 0.9);
 
-    // Per-user speaker hub touches the seed AND 30 unrelated junk nodes.
+    // Per-user speaker/self hub touches the seed AND 30 unrelated junk nodes.
     // Without hub-exclusion, PPR from mem_seed walks the hub edge and floods
     // every junk_* node with score.
     try mgr.upsertMemoryEdge(2, "user:2", "mem_seed", "MENTIONED", "wiki_link", 0.9);
+    // Per-session source hub (structural orphan-killer) touches the seed AND a
+    // separate swarm of session-junk nodes — same flood risk via a different
+    // structural hub.
+    try mgr.upsertMemoryEdge(2, "mem_seed", "session:s1", "IN_SESSION", "structural", 1.0);
     var k: usize = 0;
     while (k < 30) : (k += 1) {
         var jkey_buf: [32]u8 = undefined;
         const jkey = try std.fmt.bufPrint(&jkey_buf, "junk_{d}", .{k});
         try mgr.upsertMemoryEdge(2, "user:2", jkey, "MENTIONED", "wiki_link", 0.9);
+        var sjkey_buf: [32]u8 = undefined;
+        const sjkey = try std.fmt.bufPrint(&sjkey_buf, "sjunk_{d}", .{k});
+        try mgr.upsertMemoryEdge(2, "session:s1", sjkey, "IN_SESSION", "structural", 1.0);
     }
 
     const seeds = [_][]const u8{"mem_seed"};
@@ -14379,13 +14390,16 @@ test "C1 PPR hub-exclusion — speaker hub does not flood traversal" {
     var saw_a = false;
     var saw_junk = false;
     var saw_hub = false;
+    var saw_session = false;
     for (nodes) |n| {
         if (std.mem.eql(u8, n.key, "mem_a")) saw_a = true;
-        if (std.mem.startsWith(u8, n.key, "junk_")) saw_junk = true;
+        if (std.mem.startsWith(u8, n.key, "junk_") or std.mem.startsWith(u8, n.key, "sjunk_")) saw_junk = true;
         if (std.mem.startsWith(u8, n.key, "user:")) saw_hub = true;
+        if (std.mem.startsWith(u8, n.key, "session:")) saw_session = true;
     }
     try std.testing.expect(saw_a); // genuine neighbor reached
-    try std.testing.expect(!saw_hub); // speaker hub excluded from traversal
+    try std.testing.expect(!saw_hub); // speaker/self hub excluded from traversal
+    try std.testing.expect(!saw_session); // session source hub excluded too
     try std.testing.expect(!saw_junk); // hub-only junk fan-out not reachable
 }
 
