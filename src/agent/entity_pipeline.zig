@@ -16,8 +16,9 @@
 //!
 //! 1. **extractMentions** — single LLM call, JSON output of EntityMentions.
 //! 2. **resolveEntity** — for each mention: cosine-match canonical form
-//!    against `memory_entities` (cosine >= COREF_THRESHOLD = 0.85), or
-//!    upsert as new. Reuses `state_mgr.findEntityByCosine` + `upsertEntity`.
+//!    against `memory_entities` via the coref cascade (auto-merge >= 0.92,
+//!    or 0.85 + name-containment), else upsert as new. Reuses
+//!    `state_mgr.findEntityByCosine` + `state_mgr.upsertEntity`.
 //! 3. **emitCooccurrenceEdges** — for every pair of resolved entities in
 //!    the same turn, upsert a `MENTIONS` edge in `memory_edges`. The
 //!    existing `upsertMemoryEdge` ON CONFLICT logic increments weight,
@@ -57,13 +58,22 @@ const EntityRow = memory_root.EntityRow;
 const zaki_state = @import("../zaki_state.zig");
 const embeddings = @import("../memory/vector/embeddings.zig");
 
-/// Minimum cosine similarity for an entity mention to coreference an
-/// existing entity; below this we mint a new entity. NOTE: 0.85 here is
-/// LOOSER than the extraction-persist coref path (0.95). The divergence is
-/// flagged for the coref-hardening work — a two-threshold cascade
-/// (candidate >= 0.85, auto-merge >= 0.92 + type match) should replace both
-/// single thresholds rather than picking one global value.
-pub const COREF_THRESHOLD: f64 = 0.85;
+// Coref cascade (replaces the single 0.85 auto-merge threshold, which
+// over-merged distinct entities). Resolution is now tiered so a wrong merge
+// — irreversible and corrupting — is much harder than a recoverable
+// duplicate. Both this path and the extraction-persist path (0.95) are now
+// conservative; exact-name dedup is free via upsertEntity ON CONFLICT.
+//
+//   * cosine >= AUTO_MERGE (0.92)            → merge (high confidence)
+//   * CANDIDATE (0.85) <= cosine < AUTO_MERGE → merge ONLY if one name
+//                                               word-contains the other
+//                                               (abbreviation/expansion),
+//                                               else mint a new entity
+//   * names shorter than MIN_COREF_NAME_LEN   → skip cosine entirely; merge
+//                                               only on exact name (ON CONFLICT)
+pub const COREF_CANDIDATE_THRESHOLD: f64 = 0.85;
+pub const COREF_AUTO_MERGE_THRESHOLD: f64 = 0.92;
+pub const MIN_COREF_NAME_LEN: usize = 4;
 
 /// Max entity mentions to extract per turn. V1.13 lifted from 24 → 40
 /// after audit found long multi-entity turns (e.g. user pasting a CV or
@@ -523,9 +533,9 @@ pub fn extractMentions(
 // Entity resolution + edge emission
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Resolve a single mention to an entity_id. Cosine-match the canonical
-/// form against memory_entities; if no match >= COREF_THRESHOLD, mint a
-/// new entity row.
+/// Resolve a single mention to an entity_id via the coref cascade (see the
+/// COREF_* constants): cosine auto-merge >= 0.92, or 0.85 + name-containment,
+/// else mint a new entity row (exact-name reuse handled by ON CONFLICT).
 ///
 /// Reuses zaki_state.findEntityByCosine + zaki_state.upsertEntity. The
 /// embedder is required (to generate the cosine vector).
@@ -543,24 +553,52 @@ pub fn resolveEntity(
     const emb = try embedder.embed(allocator, mention.canonical);
     defer allocator.free(emb);
 
-    // Try cosine match against existing entities for this user.
-    if (try state_mgr.findEntityByCosine(allocator, user_id, emb, COREF_THRESHOLD)) |existing| {
-        defer existing.deinit(allocator);
-        const id_copy = try allocator.dupe(u8, existing.id);
-        return .{
-            .entity_id = id_copy,
-            .canonical_name = mention.canonical,
-            .was_existing = true,
-        };
+    // Coref cascade. Short/low-signal names skip cosine entirely and rely on
+    // exact-name dedup (upsertEntity ON CONFLICT name_lower) — cosine
+    // over-merges trivially short tokens ("it", "app", "the").
+    if (mention.canonical.len >= MIN_COREF_NAME_LEN) {
+        if (try state_mgr.findEntityByCosine(allocator, user_id, emb, COREF_CANDIDATE_THRESHOLD)) |cand| {
+            defer cand.deinit(allocator);
+            if (corefDecision(cand.similarity, mention.canonical, cand.name) == .merge) {
+                const id_copy = try allocator.dupe(u8, cand.id);
+                return .{
+                    .entity_id = id_copy,
+                    .canonical_name = mention.canonical,
+                    .was_existing = true,
+                };
+            }
+            // Ambiguous band without name containment → fall through to mint
+            // (a duplicate is recoverable; a wrong merge is not).
+        }
     }
 
-    // No cosine match — mint new entity.
+    // Mint new (or reuse an exact-name match via ON CONFLICT name_lower).
     const new_id = try state_mgr.upsertEntity(allocator, user_id, mention.canonical, emb);
     return .{
         .entity_id = new_id,
         .canonical_name = mention.canonical,
         .was_existing = false,
     };
+}
+
+/// One canonical name word-contains the other (abbreviation/expansion, e.g.
+/// "Helix" vs "Helix editor"). Reuses the word-boundary matcher so "Helix"
+/// does not "contain" via a substring of "Helixir".
+fn nameContainment(a: []const u8, b: []const u8) bool {
+    return mentionsEntity(b, a) or mentionsEntity(a, b);
+}
+
+const CorefDecision = enum { merge, mint };
+
+/// Two-tier merge decision for a cosine candidate (which is already >=
+/// CANDIDATE, since findEntityByCosine filters below it):
+///   - sim >= AUTO_MERGE → merge (high-confidence cosine match).
+///   - else → merge ONLY if one name word-contains the other; otherwise mint.
+/// Conservative by construction: the ambiguous band defaults to a new entity.
+fn corefDecision(sim: f64, mention_name: []const u8, candidate_name: []const u8) CorefDecision {
+    if (sim >= COREF_AUTO_MERGE_THRESHOLD) return .merge;
+    if (sim >= COREF_CANDIDATE_THRESHOLD and nameContainment(mention_name, candidate_name)) return .merge;
+    return .mint;
 }
 
 /// Emit-result tuple — distinguishes successful upserts from skips
@@ -930,6 +968,25 @@ pub fn runOnTurn(
 // ─────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────
+
+test "corefDecision — cascade: high cosine merges, ambiguous band needs containment" {
+    // High cosine → merge regardless of names.
+    try std.testing.expectEqual(CorefDecision.merge, corefDecision(0.95, "Helix", "Vim"));
+    try std.testing.expectEqual(CorefDecision.merge, corefDecision(0.92, "Helix", "Neovim"));
+    // Ambiguous band (0.85–0.92): merge only on name containment.
+    try std.testing.expectEqual(CorefDecision.merge, corefDecision(0.88, "Helix", "Helix editor"));
+    try std.testing.expectEqual(CorefDecision.merge, corefDecision(0.86, "the Helix editor", "Helix"));
+    // Ambiguous band, unrelated names → mint (conservative, avoids wrong merge).
+    try std.testing.expectEqual(CorefDecision.mint, corefDecision(0.88, "Helix", "Neovim"));
+    try std.testing.expectEqual(CorefDecision.mint, corefDecision(0.90, "Mia Khalifa", "Mira Patel"));
+}
+
+test "nameContainment — word-boundary both directions, rejects substrings" {
+    try std.testing.expect(nameContainment("Helix", "Helix editor"));
+    try std.testing.expect(nameContainment("Helix editor", "Helix"));
+    try std.testing.expect(!nameContainment("Helix", "Helixir")); // substring, not word
+    try std.testing.expect(!nameContainment("Helix", "Neovim"));
+}
 
 test "mentionsEntity — word-boundary, case-insensitive, rejects substrings" {
     // Whole-word match, case-insensitive.
