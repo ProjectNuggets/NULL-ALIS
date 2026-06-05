@@ -1531,7 +1531,6 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                         .stage = "session_end_entity_pipeline_enqueued",
                     } };
                     self.observer.recordEvent(&ep_event);
-
                 }
             }
         }

@@ -171,7 +171,9 @@ fn expandFromSeedsPPR(
 
     // Normalise PPR scores → [0, 1] so scoreFromComponents can use ppr as centrality.
     var max_ppr: f64 = 0.0;
-    for (ppr_nodes) |n| if (n.ppr_score > max_ppr) { max_ppr = n.ppr_score; };
+    for (ppr_nodes) |n| if (n.ppr_score > max_ppr) {
+        max_ppr = n.ppr_score;
+    };
 
     var scored: std.ArrayListUnmanaged(ScoredNode) = .{};
     errdefer {
@@ -184,9 +186,9 @@ fn expandFromSeedsPPR(
         // A follow-up can JOIN memories.created_at in findEdgesPPR.
         const ppr_norm: f64 = if (max_ppr > 0.0) n.ppr_score / max_ppr else 0.0;
         try scored.append(allocator, .{
-            .key          = try allocator.dupe(u8, n.key),
+            .key = try allocator.dupe(u8, n.key),
             .hop_distance = n.min_depth,
-            .score        = scoreFromComponents(1.0, ppr_norm, n.min_depth),
+            .score = scoreFromComponents(1.0, ppr_norm, n.min_depth),
         });
     }
 
@@ -349,6 +351,12 @@ fn expandFromSeedsBFS(
             const candidates = [_][]const u8{ e.source_key, e.target_key };
             for (candidates) |cand| {
                 if (node_hops.contains(cand)) continue;
+                // Structural hubs (`user:<id>`, `session:<id>`) are
+                // non-discriminative — never admit them to the frontier, or the
+                // next hop fans out to every memory the hub touches. Mirrors the
+                // findEdgesPPR exclusion so the BFS fallback path (and the
+                // explicit NULLALIS_GRAPH_ALGORITHM=bfs path) is hub-safe too.
+                if (std.mem.startsWith(u8, cand, "user:") or std.mem.startsWith(u8, cand, "session:")) continue;
                 const owned_cand = try allocator.dupe(u8, cand);
                 try node_hops.put(allocator, owned_cand, hop + 1);
                 try next_frontier.append(allocator, owned_cand);

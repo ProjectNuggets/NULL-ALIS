@@ -4303,7 +4303,10 @@ const ManagerImpl = struct {
         // keyed on the triple itself, so legacy/compose triple facts are
         // covered regardless of their key prefix.
         if (metadata_json) |mj| {
-            if (std.mem.indexOf(u8, mj, "\"predicate\"") != null) return;
+            // Colon-anchored so a string *value* of "predicate" can't trip the
+            // skip and wrongly leave a memory orphaned; matches the JSON key
+            // shape `"predicate":` that extraction/compose triples emit.
+            if (std.mem.indexOf(u8, mj, "\"predicate\":") != null) return;
         }
 
         if (session_id) |sid| {
