@@ -1,0 +1,9 @@
+# deploy/k8s/browser/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: browser
+  labels:
+    # Enforce the PodSecurity "restricted" profile on this namespace.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

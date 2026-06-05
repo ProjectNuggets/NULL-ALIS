@@ -1,0 +1,13 @@
+# deploy/k8s/browser/resourcequota.yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: browser-quota
+  namespace: browser
+spec:
+  hard:
+    pods: "20"                 # spec §9 max_total_sessions ceiling
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
