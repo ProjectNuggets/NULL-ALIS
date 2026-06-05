@@ -3,7 +3,7 @@
 # Uniform across amd64/arm64 (system chromium) — avoids the missing
 # Chrome-for-Testing arm64 build. Chromium runs --no-sandbox (no setuid
 # sandbox in a container); isolation is provided by the pod + NetworkPolicy.
-FROM node:24-bookworm-slim
+FROM node:24-bookworm-slim@sha256:242549cd46785b480c832479a730f4f2a20865d61ea2e404fdb2a5c3d3b73ecf
 
 # tini = PID1 reaper for the agent-browser daemon + chromium child procs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
