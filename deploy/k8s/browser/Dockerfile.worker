@@ -6,6 +6,9 @@
 FROM node:24-bookworm-slim@sha256:242549cd46785b480c832479a730f4f2a20865d61ea2e404fdb2a5c3d3b73ecf
 
 # tini = PID1 reaper for the agent-browser daemon + chromium child procs.
+# chromium is intentionally NOT version-pinned: it tracks Debian bookworm security
+# updates so Chromium CVEs are patched on each rebuild (spec §8.9). Reproducibility
+# is anchored by the digest-pinned base image + the pinned agent-browser version.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates fonts-liberation tini chromium \
     && rm -rf /var/lib/apt/lists/*
@@ -14,7 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN npm i -g agent-browser@0.27.1
 
 # --no-sandbox wrapper; agent-browser launches Chromium via --executable-path.
-RUN printf '#!/bin/sh\nexec /usr/bin/chromium --no-sandbox --disable-dev-shm-usage "$@"\n' \
+# (/dev/shm is provided by the pod, so we do NOT pass --disable-dev-shm-usage.)
+RUN printf '#!/bin/sh\nexec /usr/bin/chromium --no-sandbox "$@"\n' \
       > /usr/local/bin/chromium-ns && chmod +x /usr/local/bin/chromium-ns
 
 # Non-root runtime user; agent-browser writes state under $HOME/.agent-browser.

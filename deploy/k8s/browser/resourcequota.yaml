@@ -9,5 +9,5 @@ spec:
     pods: "20"                 # spec §9 max_total_sessions ceiling
     requests.cpu: "10"
     requests.memory: 20Gi
-    limits.cpu: "20"
+    limits.cpu: "40"
     limits.memory: 40Gi

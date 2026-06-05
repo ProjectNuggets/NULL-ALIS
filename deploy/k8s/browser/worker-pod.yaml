@@ -38,6 +38,8 @@ spec:
           mountPath: /tmp             # writable /tmp (rootfs is read-only)
         - name: dshm
           mountPath: /dev/shm         # Chromium shared memory
+        - name: fontcache
+          mountPath: /var/cache/fontconfig   # fontconfig writes its cache (ro rootfs)
   volumes:
     - name: home
       emptyDir: {}
@@ -47,3 +49,5 @@ spec:
       emptyDir:
         medium: Memory
         sizeLimit: 256Mi
+    - name: fontcache
+      emptyDir: {}

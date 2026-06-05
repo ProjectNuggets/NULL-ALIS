@@ -28,6 +28,8 @@
   the block is the NetworkPolicy).
 
 ## Local dev loop
-- `k3d cluster create browser-dev` → `k3d image import browser-worker:dev`
-  → `kubectl apply -f deploy/k8s/browser/` → `./scripts/browser-worker-smoke.sh`
-  → `./scripts/browser-worker-egress-test.sh`. Teardown: `./scripts/browser-worker-teardown.sh`.
+- One-command bring-up: `./scripts/browser-worker-setup.sh` (builds the image,
+  creates the k3d cluster `browser-dev`, imports the image, applies all manifests,
+  and waits for the pod to be Ready).
+- Validate: `./scripts/browser-worker-smoke.sh` then `./scripts/browser-worker-egress-test.sh`.
+- Teardown: `./scripts/browser-worker-teardown.sh`.

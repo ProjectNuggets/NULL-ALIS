@@ -7,10 +7,11 @@ NS=browser
 POD=browser-worker-0
 
 out=$(kubectl -n "$NS" exec "$POD" -- sh -c '
+  set -e
   agent-browser --executable-path /usr/local/bin/chromium-ns open https://example.com >/dev/null 2>&1
   agent-browser snapshot 2>&1
   agent-browser close --all >/dev/null 2>&1
 ')
 echo "$out"
-echo "$out" | grep -q 'ref=e1' || { echo "FAIL: no @eN ref in snapshot"; exit 1; }
+echo "$out" | grep -qE 'ref=e[0-9]' || { echo "FAIL: no @eN ref in snapshot"; exit 1; }
 echo "PASS: headless open + @eN snapshot in pod"

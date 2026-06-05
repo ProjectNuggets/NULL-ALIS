@@ -22,6 +22,19 @@ probe() {  # host port -> REACHABLE | BLOCKED | BLOCKED:<code>
 API_IP=$(kubectl get svc kubernetes -n default -o jsonpath='{.spec.clusterIP}')
 echo "cluster API ClusterIP (RFC1918): $API_IP"
 
+echo "=== 0. positive control: a pod NOT selected by the policy must REACH the API ClusterIP ==="
+kubectl -n default run np-control --image=browser-worker:dev --image-pull-policy=IfNotPresent --restart=Never \
+  --command -- sleep 60 >/dev/null 2>&1 || true
+kubectl -n default wait --for=condition=Ready pod/np-control --timeout=60s >/dev/null 2>&1 || true
+ctrl=$(kubectl -n default exec np-control -- node -e '
+  const net=require("net");const s=net.connect({host:process.argv[1],port:443,timeout:5000});
+  s.on("connect",()=>{console.log("REACHABLE");s.destroy();process.exit(0)});
+  s.on("timeout",()=>{console.log("BLOCKED");process.exit(0)});
+  s.on("error",e=>{console.log("BLOCKED:"+e.code);process.exit(0)});' "$API_IP" 2>/dev/null || echo "EXECFAIL")
+kubectl -n default delete pod np-control --now --ignore-not-found >/dev/null 2>&1 || true
+echo "control (default ns) -> $API_IP:443 = $ctrl"
+echo "$ctrl" | grep -q REACHABLE || { echo "FAIL: control pod could not reach API ClusterIP — cannot verify NetworkPolicy enforcement (the later 'blocked' results would be inconclusive)"; exit 1; }
+
 echo "=== 1. public HTTPS must be REACHABLE ==="
 pub=$(probe example.com 443); echo "example.com:443 -> $pub"
 echo "$pub" | grep -q REACHABLE || { echo "FAIL: public HTTPS blocked unexpectedly"; exit 1; }
@@ -34,4 +47,4 @@ echo "=== 3. cloud-metadata IP must be BLOCKED ==="
 meta=$(probe 169.254.169.254 80); echo "169.254.169.254:80 -> $meta"
 echo "$meta" | grep -q BLOCKED || { echo "FAIL: metadata reachable"; exit 1; }
 
-echo "PASS: public reachable; RFC1918 + metadata blocked (NetworkPolicy enforced)"
+echo "PASS: control verified reachable; public reachable; RFC1918 + metadata blocked (NetworkPolicy enforced)"
