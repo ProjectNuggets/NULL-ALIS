@@ -1,0 +1,43 @@
+# deploy/k8s/browser/networkpolicy.yaml
+# Default-deny egress for browser-worker pods, then allow:
+#   - DNS to kube-dns
+#   - public internet EXCEPT RFC1918 / link-local / cloud-metadata / CGNAT
+# This blocks in-page fetch() to 169.254.169.254, the K8s API, and other
+# tenants' cluster IPs even after a page has loaded (SSRF layer the URL
+# pre-check cannot provide).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: browser-worker-egress
+  namespace: browser
+spec:
+  podSelector:
+    matchLabels:
+      app: browser-worker
+  policyTypes: ["Egress"]
+  egress:
+    # DNS resolution (UDP+TCP 53) to kube-dns in kube-system.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Public web (HTTP/HTTPS) — everything EXCEPT private/meta ranges.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16     # link-local + cloud metadata
+              - 100.64.0.0/10      # CGNAT
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
