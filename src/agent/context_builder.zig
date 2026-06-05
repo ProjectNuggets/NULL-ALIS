@@ -1,6 +1,7 @@
 const std = @import("std");
 const compaction = @import("compaction.zig");
 const context_cache = @import("context_cache.zig");
+const context_estimator = @import("context_estimator.zig");
 const model_capabilities = @import("model_capabilities.zig");
 const prompt = @import("prompt.zig");
 
@@ -9,6 +10,22 @@ pub const RoleCounts = struct {
     user: usize = 0,
     assistant: usize = 0,
     tool: usize = 0,
+};
+
+pub const ProviderUsage = struct {
+    available: bool = false,
+    prompt_tokens: u32 = 0,
+    completion_tokens: u32 = 0,
+    reasoning_tokens: u32 = 0,
+    total_tokens: u32 = 0,
+    cached_prompt_tokens: u32 = 0,
+    cache_hit_percent: u8 = 0,
+};
+
+pub const LastTurnDelta = struct {
+    bytes: u64 = 0,
+    token_estimate: u64 = 0,
+    pressure_points: u8 = 0,
 };
 
 pub const Snapshot = struct {
@@ -21,6 +38,10 @@ pub const Snapshot = struct {
     context_window_tokens: u64,
     context_window_source: []const u8 = "unknown",
     remaining_tokens: u64 = 0,
+    usable_input_budget_tokens: u64 = 0,
+    budget_pressure_percent: u8 = 0,
+    context_content_bytes: u64 = 0,
+    context_reasoning_bytes: u64 = 0,
     context_pressure_percent: u8,
     history_trim_limit_messages: u32,
     token_compaction_threshold: u64,
@@ -57,6 +78,11 @@ pub const Snapshot = struct {
     rollout_mode: []const u8,
     stable_prefix_cache: context_cache.StablePrefixState = .{},
     buckets: context_cache.BucketSet = .{},
+    provider_usage_last_turn: ProviderUsage = .{},
+    last_turn_delta: LastTurnDelta = .{},
+    top_context_contributor_count: usize = 0,
+    top_context_contributors: [context_estimator.TOP_CONTRIBUTOR_LIMIT]context_estimator.TopContributor =
+        [_]context_estimator.TopContributor{.{}} ** context_estimator.TOP_CONTRIBUTOR_LIMIT,
     last_turn: LastTurnContext = .{},
 };
 
@@ -78,6 +104,7 @@ pub const LastTurnContext = struct {
     auto_compacted_messages: usize = 0,
     force_compression_events: usize = 0,
     force_compressed_messages: usize = 0,
+    tool_mode: []const u8 = "no_tools",
     /// V1.14.10 A semantic shift (review fix N-02): pre-V1.14.10 this
     /// flag meant "the persistSessionCheckpoint sync call completed,
     /// data is on disk." Post-V1.14.10 (review fix M-03): it means
@@ -144,16 +171,8 @@ fn memoryContextPrefixBytes(content: []const u8) usize {
     return content.len;
 }
 
-fn tokenEstimateFromHistory(history: anytype) u64 {
-    var total_chars: u64 = 0;
-    for (history.items) |entry| {
-        total_chars += entry.content.len;
-    }
-    return (total_chars + 3) / 4;
-}
-
 fn tokenEstimateFromBytes(bytes: usize) u64 {
-    return (@as(u64, @intCast(bytes)) + 3) / 4;
+    return context_estimator.tokenEstimateFromBytes(@intCast(bytes));
 }
 
 fn pressurePercent(used_tokens: u64, context_window_tokens: u64) u8 {
@@ -166,6 +185,32 @@ fn modelProvider(model_name: []const u8) ?[]const u8 {
     const slash = std.mem.indexOfScalar(u8, model_name, '/') orelse return null;
     if (slash == 0) return null;
     return model_name[0..slash];
+}
+
+fn messageReasoningBytes(entry: anytype) usize {
+    const EntryType = @TypeOf(entry);
+    if (!@hasField(EntryType, "reasoning")) return 0;
+    if (entry.reasoning) |reasoning| return reasoning.len;
+    return 0;
+}
+
+fn providerUsageFromAgent(self: anytype) ProviderUsage {
+    const AgentType = @TypeOf(self.*);
+    if (!@hasField(AgentType, "last_turn_usage")) return .{};
+    const usage = self.last_turn_usage;
+    const cache_hit_percent: u8 = if (usage.prompt_tokens > 0)
+        @intCast(@min(@as(u32, 100), (usage.cached_prompt_tokens * 100) / usage.prompt_tokens))
+    else
+        0;
+    return .{
+        .available = usage.prompt_tokens > 0 or usage.completion_tokens > 0 or usage.total_tokens > 0,
+        .prompt_tokens = usage.prompt_tokens,
+        .completion_tokens = usage.completion_tokens,
+        .reasoning_tokens = usage.reasoning_tokens,
+        .total_tokens = usage.total_tokens,
+        .cached_prompt_tokens = usage.cached_prompt_tokens,
+        .cache_hit_percent = cache_hit_percent,
+    };
 }
 
 fn contextWindowSource(self: anytype, model_name: []const u8, context_window_tokens: u64) []const u8 {
@@ -237,11 +282,12 @@ pub fn buildSnapshot(self: anytype) Snapshot {
 
     if (@hasField(AgentType, "history")) {
         for (self.history.items) |entry| {
+            const reasoning_bytes = messageReasoningBytes(entry);
             switch (entry.role) {
                 .system => {
                     role_counts.system += 1;
                     stable_prefix_entries += 1;
-                    stable_prefix_bytes += entry.content.len;
+                    stable_prefix_bytes += entry.content.len + reasoning_bytes;
                 },
                 .user => {
                     role_counts.user += 1;
@@ -256,12 +302,12 @@ pub fn buildSnapshot(self: anytype) Snapshot {
                 .assistant => {
                     role_counts.assistant += 1;
                     recent_history_entries += 1;
-                    recent_history_bytes += entry.content.len;
+                    recent_history_bytes += entry.content.len + reasoning_bytes;
                 },
                 .tool => {
                     role_counts.tool += 1;
                     recent_history_entries += 1;
-                    recent_history_bytes += entry.content.len;
+                    recent_history_bytes += entry.content.len + reasoning_bytes;
                 },
             }
         }
@@ -291,11 +337,20 @@ pub fn buildSnapshot(self: anytype) Snapshot {
     const last_turn = if (@hasField(AgentType, "last_turn_context")) self.last_turn_context else LastTurnContext{};
     const memory_context_entries = memory_enriched_messages;
     const model_name = if (@hasField(AgentType, "model_name")) self.model_name else "";
-    const token_estimate = if (@hasField(AgentType, "history")) tokenEstimateFromHistory(self.history) else 0;
+    const context_analysis = if (@hasField(AgentType, "history"))
+        context_estimator.analyzeHistory(self.history)
+    else
+        context_estimator.Analysis{};
+    const token_estimate = context_analysis.token_estimate;
     const context_window_tokens = if (@hasField(AgentType, "token_limit")) self.token_limit else 0;
     const resolved_max_tokens = if (@hasField(AgentType, "max_tokens")) self.max_tokens else 0;
     const token_budget_policy = compaction.buildTokenBudgetPolicy(context_window_tokens, resolved_max_tokens);
     const remaining_tokens = if (context_window_tokens > token_estimate) context_window_tokens - token_estimate else 0;
+    const usable_input_budget_tokens = if (context_window_tokens > token_budget_policy.total_reserve)
+        context_window_tokens - token_budget_policy.total_reserve
+    else
+        0;
+    const provider_usage = providerUsageFromAgent(self);
 
     return .{
         .sampled_at_ms = std.time.milliTimestamp(),
@@ -306,6 +361,10 @@ pub fn buildSnapshot(self: anytype) Snapshot {
         .context_window_tokens = context_window_tokens,
         .context_window_source = contextWindowSource(self, model_name, context_window_tokens),
         .remaining_tokens = remaining_tokens,
+        .usable_input_budget_tokens = usable_input_budget_tokens,
+        .budget_pressure_percent = pressurePercent(token_estimate, usable_input_budget_tokens),
+        .context_content_bytes = context_analysis.content_bytes,
+        .context_reasoning_bytes = context_analysis.reasoning_bytes,
         .context_pressure_percent = pressurePercent(token_estimate, context_window_tokens),
         .history_trim_limit_messages = if (@hasField(AgentType, "max_history_messages")) self.max_history_messages else 0,
         .token_compaction_threshold = token_budget_policy.threshold,
@@ -373,6 +432,14 @@ pub fn buildSnapshot(self: anytype) Snapshot {
                 .fingerprint = conversation_context_fingerprint,
             },
         },
+        .provider_usage_last_turn = provider_usage,
+        .last_turn_delta = .{
+            .bytes = context_analysis.last_turn_delta_bytes,
+            .token_estimate = context_analysis.last_turn_delta_tokens,
+            .pressure_points = pressurePercent(context_analysis.last_turn_delta_tokens, context_window_tokens),
+        },
+        .top_context_contributor_count = context_analysis.top_count,
+        .top_context_contributors = context_analysis.top_contributors,
         .last_turn = last_turn,
     };
 }

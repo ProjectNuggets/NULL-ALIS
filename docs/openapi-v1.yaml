@@ -3535,6 +3535,13 @@ components:
             $ref: '#/components/schemas/TraceEvent'
     SessionContextResponse:
       type: object
+      description: |
+        Live context-window pressure for an in-memory agent session.
+        `pressure_percent` and `context_pressure_percent` are backend-calculated
+        meter values. Clients must not recompute pressure from token ratios.
+        Provider cache telemetry is exposed separately and does not reduce
+        pressure, because cached prompt tokens still occupy provider-visible
+        context.
       properties:
         status:
           type: string
@@ -3543,6 +3550,15 @@ components:
           type: boolean
         live:
           type: boolean
+        code:
+          type: string
+          nullable: true
+          enum: [session_manager_unavailable, no_active_session]
+          description: Present on unavailable envelopes; absent for live context.
+        reason:
+          type: string
+          nullable: true
+          description: User-safe reason for an unavailable context report.
         session_key:
           type: string
         sampled_at_ms:
@@ -3568,14 +3584,15 @@ components:
         tokens_used:
           type: integer
           format: int64
-          description: Legacy alias for active context-window token estimate, not cumulative lifetime usage.
+          description: Compatibility alias for live active context-window token estimate, not cumulative lifetime usage.
         token_count:
           type: integer
           format: int64
-          description: Legacy alias for active context-window token estimate.
+          description: Compatibility alias for live active context-window token estimate.
         token_estimate:
           type: integer
           format: int64
+          description: Backend estimate of provider-visible context tokens for the active window.
         context_window_used:
           type: integer
           format: int64
@@ -3588,28 +3605,75 @@ components:
         token_limit:
           type: integer
           format: int64
-          description: Legacy alias for context_window_tokens.
+          description: Compatibility alias for live context_window_tokens.
         context_window_tokens:
           type: integer
           format: int64
         remaining_tokens:
           type: integer
           format: int64
+        usable_input_budget_tokens:
+          type: integer
+          format: int64
+          description: Context window minus backend reply/tool/safety reserves.
+        budget_pressure_percent:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 100
+          description: Backend-calculated pressure against usable_input_budget_tokens.
         pressure_percent:
           type: integer
           format: int32
           minimum: 0
           maximum: 100
+          description: Canonical backend-calculated live context pressure.
         context_window_used_pct:
           type: integer
           format: int32
           minimum: 0
           maximum: 100
+          description: Compatibility alias for pressure_percent.
         context_pressure_percent:
           type: integer
           format: int32
           minimum: 0
           maximum: 100
+          description: Canonical backend-calculated live context pressure.
+        token_total_reserve:
+          type: integer
+          format: int64
+          description: Backend-owned reply/tool/safety reserve subtracted from usable input budget.
+        context_bytes:
+          type: object
+          properties:
+            content:
+              type: integer
+              format: int64
+            reasoning:
+              type: integer
+              format: int64
+              description: Retained assistant reasoning_content byte count; raw reasoning text is not exposed.
+            total:
+              type: integer
+              format: int64
+        estimator:
+          type: object
+          properties:
+            name:
+              type: string
+              example: provider_bound_chars_v1
+            version:
+              type: integer
+            method:
+              type: string
+              example: chars_per_token
+            chars_per_token:
+              type: integer
+            includes:
+              type: array
+              items:
+                type: string
         token_compaction_threshold:
           type: integer
           format: int64
@@ -3643,6 +3707,57 @@ components:
               format: int32
             recommended:
               type: boolean
+        provider_usage_last_turn:
+          type: object
+          description: Last provider-reported usage for calibration and cost diagnostics; cached tokens are not subtracted from context pressure.
+          properties:
+            available:
+              type: boolean
+            prompt_tokens:
+              type: integer
+            completion_tokens:
+              type: integer
+            reasoning_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+            cached_prompt_tokens:
+              type: integer
+            cache_hit_percent:
+              type: integer
+        cache:
+          type: object
+          description: Cache telemetry only; cache does not reduce live context pressure.
+        last_turn_delta:
+          type: object
+          properties:
+            bytes:
+              type: integer
+              format: int64
+            token_estimate:
+              type: integer
+              format: int64
+            pressure_points:
+              type: integer
+              format: int32
+            tool_mode:
+              type: string
+              enum: [native_tool_calls, xml_fallback, mixed, no_tools]
+        top_context_contributors:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              role:
+                type: string
+              source:
+                type: string
+              bytes:
+                type: integer
+              token_estimate:
+                type: integer
         last_turn:
           type: object
           nullable: true

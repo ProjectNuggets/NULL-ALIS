@@ -10,9 +10,13 @@ const saveSchedulerForContext = @import("cron_add.zig").saveSchedulerForContext;
 const message_tool = @import("message.zig");
 const runtime_resolver = @import("../delivery/runtime_resolver.zig");
 const config_mod = @import("../config.zig");
+const text_norm = @import("../memory/text_norm.zig");
 
 const MIN_ONCE_DELAY_SECS: i64 = 60;
 const AUTOMATIONS_FILENAME = "AUTOMATIONS.json";
+const DEFAULT_LIST_LIMIT: usize = 25;
+const MAX_LIST_LIMIT: usize = 100;
+const COMMAND_PREVIEW_BYTES: usize = 240;
 
 const DesiredJobKind = enum {
     auto,
@@ -48,6 +52,38 @@ const RegistryJobSpec = struct {
     delay: ?[]const u8 = null,
     command: ?[]const u8 = null,
 };
+
+const ListPagination = struct {
+    limit: usize = DEFAULT_LIST_LIMIT,
+    offset: usize = 0,
+};
+
+fn parseListPagination(args: JsonObjectMap) ListPagination {
+    var page = ListPagination{};
+    if (root.getInt(args, "limit")) |limit_raw| {
+        if (limit_raw > 0) {
+            page.limit = @min(@as(usize, @intCast(limit_raw)), MAX_LIST_LIMIT);
+        }
+    }
+    if (root.getInt(args, "offset")) |offset_raw| {
+        if (offset_raw > 0) {
+            page.offset = @as(usize, @intCast(offset_raw));
+        }
+    }
+    return page;
+}
+
+fn listPageBounds(total_count: usize, page: ListPagination) struct { shown_count: usize, end: usize, partial: bool } {
+    if (page.offset >= total_count) return .{ .shown_count = 0, .end = page.offset, .partial = false };
+    const remaining = total_count - page.offset;
+    const shown_count = @min(page.limit, remaining);
+    const end = page.offset + shown_count;
+    return .{
+        .shown_count = shown_count,
+        .end = end,
+        .partial = end < total_count,
+    };
+}
 
 fn validateOnceDelay(delay: []const u8) !void {
     const delay_secs = try cron.parseDuration(delay);
@@ -745,7 +781,7 @@ pub const ScheduleTool = struct {
     }
     pub const tool_description = "Manage scheduled tasks for the user. Preferred tool for reminders, briefs, recurring follow-ups, and other proactive jobs. Tasks may be agent-managed, delivery-managed, or raw commands depending on the request. Use schedule ensure for canonical durable job repair.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","ensure","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Task intent, reminder text, agent prompt, delivery text, or raw command depending on the task type"},"kind":{"type":"string","enum":["command","reminder","brief","report","follow_up"],"description":"Optional durable automation kind used for canonical schedule ensure and richer agent-managed jobs"},"id":{"type":"string","description":"Task ID (optional deterministic ID for create/add/once/ensure, required for get/cancel/pause/resume)"}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","ensure","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Task intent, reminder text, agent prompt, delivery text, or raw command depending on the task type"},"kind":{"type":"string","enum":["command","reminder","brief","report","follow_up"],"description":"Optional durable automation kind used for canonical schedule ensure and richer agent-managed jobs"},"id":{"type":"string","description":"Task ID (optional deterministic ID for create/add/once/ensure, required for get/cancel/pause/resume)"},"limit":{"type":"integer","description":"For list: max jobs to show (default 25, max 100)"},"offset":{"type":"integer","description":"For list: zero-based pagination offset"}},"required":["action"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -774,26 +810,59 @@ pub const ScheduleTool = struct {
                 return ToolResult.ok("No scheduled jobs.");
             }
 
-            // Format job list
+            const page = parseListPagination(args);
+            const bounds = listPageBounds(jobs.len, page);
+
             var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(allocator);
             const w = buf.writer(allocator);
-            try w.print("Scheduled jobs ({d}):\n", .{jobs.len});
-            for (jobs) |job| {
-                const flags: []const u8 = blk: {
-                    if (job.paused and job.one_shot) break :blk " [paused, one-shot]";
-                    if (job.paused) break :blk " [paused]";
-                    if (job.one_shot) break :blk " [one-shot]";
-                    break :blk "";
-                };
-                const status = job.last_status orelse "pending";
-                try w.print("- {s} | {s} | status={s}{s} | cmd: {s}\n", .{
-                    job.id,
-                    job.expression,
-                    status,
-                    flags,
-                    job.command,
+            try w.print("Scheduled jobs: total_count={d} shown_count={d} limit={d} offset={d} next_offset=", .{
+                jobs.len,
+                bounds.shown_count,
+                page.limit,
+                page.offset,
+            });
+            if (bounds.partial) {
+                try w.print("{d}", .{bounds.end});
+            } else {
+                try w.writeAll("null");
+            }
+            try w.print(" partial={s}\n", .{if (bounds.partial) "true" else "false"});
+
+            if (bounds.shown_count == 0) {
+                try w.writeAll("No jobs on this page.\n");
+            }
+
+            if (bounds.shown_count > 0) {
+                for (jobs[page.offset..bounds.end]) |job| {
+                    const flags: []const u8 = blk: {
+                        if (job.paused and job.one_shot) break :blk " [paused, one-shot]";
+                        if (job.paused) break :blk " [paused]";
+                        if (job.one_shot) break :blk " [one-shot]";
+                        break :blk "";
+                    };
+                    const status = job.last_status orelse "pending";
+                    const command_preview = text_norm.truncateUtf8(job.command, COMMAND_PREVIEW_BYTES);
+                    try w.print("- {s} | {s} | status={s}{s} | cmd_preview: {s}{s}\n", .{
+                        job.id,
+                        job.expression,
+                        status,
+                        flags,
+                        command_preview,
+                        if (job.command.len > command_preview.len) "..." else "",
+                    });
+                }
+            }
+            if (bounds.partial) {
+                try w.print("partial:true original_count={d} shown_count={d} next_offset={d}. Fetch next page with schedule action=list offset={d} limit={d}. Use schedule action=get id=<job_id> for exact command/details.\n", .{
+                    jobs.len,
+                    bounds.shown_count,
+                    bounds.end,
+                    bounds.end,
+                    page.limit,
                 });
+            } else if (jobs.len > 0) {
+                try w.writeAll("Use schedule action=get id=<job_id> for exact command/details.\n");
             }
             return ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
         }
@@ -1212,6 +1281,38 @@ test "schedule list returns success" {
     try std.testing.expect(result.success);
     // Either "No scheduled jobs." or a formatted job list
     try std.testing.expect(result.output.len > 0);
+}
+
+test "schedule list bounds large inventory with pagination metadata" {
+    var store = try TestCronStore.init();
+    defer store.deinit();
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 400, true);
+    defer scheduler.deinit();
+    var i: usize = 0;
+    while (i < 313) : (i += 1) {
+        const command = try std.fmt.allocPrint(std.testing.allocator, "echo job-{d:0>3} {s}", .{ i, "x" ** 300 });
+        defer std.testing.allocator.free(command);
+        _ = try scheduler.addJob("*/5 * * * *", command);
+    }
+    try cron.saveJobsToPath(&scheduler, store.path);
+
+    var st = ScheduleTool{};
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"action\":\"list\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer free_schedule_test_output_if_owned(result.output);
+    defer free_schedule_test_error_if_owned(result.error_msg);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "total_count=313") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "shown_count=25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "next_offset=25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "partial=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "cmd_preview:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "job-025") == null);
+    try std.testing.expect(result.output.len < 20_000);
 }
 
 test "schedule unknown action" {

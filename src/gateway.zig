@@ -11316,7 +11316,7 @@ fn handleUserDiagnosticsContext(
     const session_key = zaki_session.userMainSessionKey(&key_buf, scoped_user_id);
 
     const session = session_mgr.getIfPresent(session_key) orelse return .{
-        .body = "{\"active\":false,\"reason\":\"no_active_session\"}",
+        .body = "{\"active\":false,\"live\":false,\"code\":\"no_active_session\",\"reason\":\"no_active_session\"}",
     };
 
     session.mutex.lock();
@@ -11349,7 +11349,7 @@ fn handleUserDiagnosticsMemoryDoctor(
     const session_key = zaki_session.userMainSessionKey(&key_buf, scoped_user_id);
 
     const session = session_mgr.getIfPresent(session_key) orelse return .{
-        .body = "{\"active\":false,\"reason\":\"no_active_session\"}",
+        .body = "{\"active\":false,\"live\":false,\"code\":\"no_active_session\",\"reason\":\"no_active_session\"}",
     };
 
     session.mutex.lock();
@@ -14177,7 +14177,7 @@ fn handleSessionContext(
     // clients, but they now alias the active context-window estimate rather
     // than lifetime cumulative usage. Lifetime usage belongs in metering, not
     // in the context pressure badge.
-    w.print("\",\"history_len\":{d},\"history_messages\":{d},\"message_count\":{d},\"tokens_used\":{d},\"token_count\":{d},\"token_estimate\":{d},\"context_window_used\":{d},\"context_window_max\":{d},\"max_history\":{d},\"token_limit\":{d},\"context_window_tokens\":{d},\"remaining_tokens\":{d},\"pressure_percent\":{d},\"context_window_used_pct\":{d},\"context_pressure_percent\":{d},\"token_compaction_threshold\":{d},\"token_compaction_recommended_threshold\":{d},\"token_auto_compaction_pass_a_threshold\":{d},\"token_auto_compaction_pass_c_threshold\":{d},\"token_compaction_recommended\":{},\"token_compaction_triggered\":{},\"compaction\":{{\"nudge_percent\":{d},\"pass_a_percent\":{d},\"pass_c_percent\":{d},\"recommended\":{}}},\"last_turn\":", .{
+    w.print("\",\"history_len\":{d},\"history_messages\":{d},\"message_count\":{d},\"tokens_used\":{d},\"token_count\":{d},\"token_estimate\":{d},\"context_window_used\":{d},\"context_window_max\":{d},\"max_history\":{d},\"token_limit\":{d},\"context_window_tokens\":{d},\"remaining_tokens\":{d},\"usable_input_budget_tokens\":{d},\"budget_pressure_percent\":{d},\"pressure_percent\":{d},\"context_window_used_pct\":{d},\"context_pressure_percent\":{d}", .{
         agent.historyLen(),
         report.history_messages,
         report.history_messages,
@@ -14190,20 +14190,72 @@ fn handleSessionContext(
         report.context_window_tokens,
         report.context_window_tokens,
         report.remaining_tokens,
+        report.usable_input_budget_tokens,
+        report.budget_pressure_percent,
         report.context_pressure_percent,
         report.context_pressure_percent,
         report.context_pressure_percent,
+    }) catch return response_build_err;
+    w.print(",\"token_compaction_threshold\":{d},\"token_compaction_recommended_threshold\":{d},\"token_auto_compaction_pass_a_threshold\":{d},\"token_auto_compaction_pass_c_threshold\":{d},\"token_compaction_recommended\":{},\"token_compaction_triggered\":{},\"token_total_reserve\":{d},\"compaction\":{{\"nudge_percent\":{d},\"pass_a_percent\":{d},\"pass_c_percent\":{d},\"recommended\":{}}}", .{
         report.token_compaction_threshold,
         report.token_compaction_recommended_threshold,
         report.token_auto_compaction_pass_a_threshold,
         report.token_auto_compaction_pass_c_threshold,
         report.token_compaction_recommended,
         report.token_compaction_triggered,
+        report.token_total_reserve,
         report.compaction_recommend_percent,
         report.auto_compaction_pass_a_percent,
         report.auto_compaction_pass_c_percent,
         report.token_compaction_recommended,
     }) catch return response_build_err;
+    w.print(",\"context_bytes\":{{\"content\":{d},\"reasoning\":{d},\"total\":{d}}}", .{
+        report.context_content_bytes,
+        report.context_reasoning_bytes,
+        report.context_content_bytes + report.context_reasoning_bytes,
+    }) catch return response_build_err;
+    w.writeAll(",\"estimator\":{\"name\":\"provider_bound_chars_v1\",\"version\":1,\"method\":\"chars_per_token\",\"chars_per_token\":4,\"includes\":[\"message_content\",\"assistant_reasoning_content\",\"system_prompt\",\"tool_instructions\",\"volatile_context\",\"xml_tool_results\",\"provider_serialized_multimodal_text\"]}") catch return response_build_err;
+    w.print(",\"provider_usage_last_turn\":{{\"available\":{},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"reasoning_tokens\":{d},\"total_tokens\":{d},\"cached_prompt_tokens\":{d},\"cache_hit_percent\":{d}}},\"last_turn_delta\":{{\"bytes\":{d},\"token_estimate\":{d},\"pressure_points\":{d},\"tool_mode\":\"", .{
+        report.provider_usage_last_turn.available,
+        report.provider_usage_last_turn.prompt_tokens,
+        report.provider_usage_last_turn.completion_tokens,
+        report.provider_usage_last_turn.reasoning_tokens,
+        report.provider_usage_last_turn.total_tokens,
+        report.provider_usage_last_turn.cached_prompt_tokens,
+        report.provider_usage_last_turn.cache_hit_percent,
+        report.last_turn_delta.bytes,
+        report.last_turn_delta.token_estimate,
+        report.last_turn_delta.pressure_points,
+    }) catch return response_build_err;
+    jsonEscapeInto(w, report.last_turn.tool_mode) catch return response_build_err;
+    w.writeAll("\"},\"cache\":{\"provider\":") catch return response_build_err;
+    if (report.model_provider) |provider| {
+        w.writeAll("\"") catch return response_build_err;
+        jsonEscapeInto(w, provider) catch return response_build_err;
+        w.writeAll("\"") catch return response_build_err;
+    } else {
+        w.writeAll("null") catch return response_build_err;
+    }
+    w.print(",\"automatic\":true,\"last_cached_prompt_tokens\":{d},\"last_cache_hit_percent\":{d},\"stable_prefix\":{{\"available\":{},\"bytes\":{d},\"token_estimate\":{d}}}", .{
+        report.provider_usage_last_turn.cached_prompt_tokens,
+        report.provider_usage_last_turn.cache_hit_percent,
+        report.stable_prefix_cache.available,
+        report.buckets.stable_prefix.bytes,
+        report.buckets.stable_prefix.token_estimate,
+    }) catch return response_build_err;
+    w.writeAll("},\"top_context_contributors\":[") catch return response_build_err;
+    for (report.top_context_contributors[0..report.top_context_contributor_count], 0..) |contributor, i| {
+        if (i > 0) w.writeAll(",") catch return response_build_err;
+        w.print("{{\"index\":{d},\"role\":\"", .{contributor.index}) catch return response_build_err;
+        jsonEscapeInto(w, contributor.role) catch return response_build_err;
+        w.writeAll("\",\"source\":\"") catch return response_build_err;
+        jsonEscapeInto(w, contributor.source) catch return response_build_err;
+        w.print("\",\"bytes\":{d},\"token_estimate\":{d}}}", .{
+            contributor.bytes,
+            contributor.token_estimate,
+        }) catch return response_build_err;
+    }
+    w.writeAll("],\"last_turn\":") catch return response_build_err;
     if (std.mem.indexOf(u8, report_json, "\"last_turn\":")) |last_turn_key| {
         const last_turn_start = last_turn_key + "\"last_turn\":".len;
         if (std.mem.indexOfPos(u8, report_json, last_turn_start, ",\"runtime\":")) |last_turn_end| {
@@ -31037,6 +31089,18 @@ test "handleSessionAction context reports structured unavailable when no session
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"live\":false") != null);
 }
 
+test "handleUserDiagnosticsContext reports structured no active session" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const resp = handleUserDiagnosticsContext(std.testing.allocator, "GET", &mgr, "42");
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"code\":\"no_active_session\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"live\":false") != null);
+}
+
 // ── WP2.2 task query endpoint tests ──────────────────────────────────
 
 test "handleTaskList returns empty array when no delivery resolved" {
@@ -32450,6 +32514,14 @@ test "handleSessionContext returns context metadata" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"tokens_used\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"token_estimate\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"context_window_tokens\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"usable_input_budget_tokens\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"budget_pressure_percent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"token_total_reserve\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"estimator\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"provider_usage_last_turn\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"last_turn_delta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"top_context_contributors\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"cache\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"token_compaction_threshold\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"last_turn\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"report\"") != null);

@@ -171,6 +171,12 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
         report.context_window_tokens,
         report.context_pressure_percent,
     });
+    try std.fmt.format(w, "  usable_input_budget={d} budget_pressure={d}% content_bytes={d} reasoning_bytes={d}\n", .{
+        report.usable_input_budget_tokens,
+        report.budget_pressure_percent,
+        report.context_content_bytes,
+        report.context_reasoning_bytes,
+    });
     try std.fmt.format(w, "  policy: history_limit={d} token_compact_threshold={d} token_recommended={s}\n", .{
         report.history_trim_limit_messages,
         report.token_compaction_threshold,
@@ -246,6 +252,15 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
         boolWord(report.stable_prefix_cache.refresh_needed),
         stable_prefix_reason_text,
     });
+    try std.fmt.format(w, "  provider_usage: available={s} prompt={d} cached={d} completion={d} reasoning={d} total={d} cache_hit={d}%\n", .{
+        boolWord(report.provider_usage_last_turn.available),
+        report.provider_usage_last_turn.prompt_tokens,
+        report.provider_usage_last_turn.cached_prompt_tokens,
+        report.provider_usage_last_turn.completion_tokens,
+        report.provider_usage_last_turn.reasoning_tokens,
+        report.provider_usage_last_turn.total_tokens,
+        report.provider_usage_last_turn.cache_hit_percent,
+    });
     try w.writeAll("  buckets:\n");
     try std.fmt.format(w, "    stable_prefix: entries={d} bytes={d} tokens~={d} cache={s}\n", .{
         report.buckets.stable_prefix.entries,
@@ -283,6 +298,12 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
         report.last_turn.memory_enrich_ms,
         boolWord(report.last_turn.cache_hit),
     });
+    try std.fmt.format(w, "  last_turn_delta: bytes={d} tokens~={d} pressure_points={d} tool_mode={s}\n", .{
+        report.last_turn_delta.bytes,
+        report.last_turn_delta.token_estimate,
+        report.last_turn_delta.pressure_points,
+        report.last_turn.tool_mode,
+    });
     try std.fmt.format(w, "  trim: events={d} removed_messages={d} removed_bytes={d} history_after={d}\n", .{
         report.last_turn.trim_events,
         report.last_turn.trimmed_messages,
@@ -315,6 +336,28 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
         .context_window_tokens = report.context_window_tokens,
         .context_window_source = report.context_window_source,
         .remaining_tokens = report.remaining_tokens,
+        .usable_input_budget_tokens = report.usable_input_budget_tokens,
+        .budget_pressure_percent = report.budget_pressure_percent,
+        .estimator = .{
+            .name = "provider_bound_chars_v1",
+            .version = 1,
+            .method = "chars_per_token",
+            .chars_per_token = 4,
+            .includes = .{
+                "message_content",
+                "assistant_reasoning_content",
+                "system_prompt",
+                "tool_instructions",
+                "volatile_context",
+                "xml_tool_results",
+                "provider_serialized_multimodal_text",
+            },
+        },
+        .context_bytes = .{
+            .content = report.context_content_bytes,
+            .reasoning = report.context_reasoning_bytes,
+            .total = report.context_content_bytes + report.context_reasoning_bytes,
+        },
         .pressure_percent = report.context_pressure_percent,
         .context_pressure_percent = report.context_pressure_percent,
         .history_trim_limit_messages = report.history_trim_limit_messages,
@@ -330,6 +373,22 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
             .pass_c_percent = report.auto_compaction_pass_c_percent,
             .recommended = report.token_compaction_recommended,
         },
+        .provider_usage_last_turn = .{
+            .available = report.provider_usage_last_turn.available,
+            .prompt_tokens = report.provider_usage_last_turn.prompt_tokens,
+            .completion_tokens = report.provider_usage_last_turn.completion_tokens,
+            .reasoning_tokens = report.provider_usage_last_turn.reasoning_tokens,
+            .total_tokens = report.provider_usage_last_turn.total_tokens,
+            .cached_prompt_tokens = report.provider_usage_last_turn.cached_prompt_tokens,
+            .cache_hit_percent = report.provider_usage_last_turn.cache_hit_percent,
+        },
+        .last_turn_delta = .{
+            .bytes = report.last_turn_delta.bytes,
+            .token_estimate = report.last_turn_delta.token_estimate,
+            .pressure_points = report.last_turn_delta.pressure_points,
+            .tool_mode = report.last_turn.tool_mode,
+        },
+        .top_context_contributors = report.top_context_contributors[0..report.top_context_contributor_count],
         .token_reply_reserve = report.token_reply_reserve,
         .token_tool_reserve = report.token_tool_reserve,
         .token_safety_reserve = report.token_safety_reserve,
@@ -391,9 +450,15 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
             },
         },
         .cache = .{
+            .provider = report.model_provider,
+            .automatic = true,
+            .last_cached_prompt_tokens = report.provider_usage_last_turn.cached_prompt_tokens,
+            .last_cache_hit_percent = report.provider_usage_last_turn.cache_hit_percent,
             .stable_prefix = .{
                 .available = report.stable_prefix_cache.available,
                 .refresh_needed = report.stable_prefix_cache.refresh_needed,
+                .bytes = report.buckets.stable_prefix.bytes,
+                .token_estimate = report.buckets.stable_prefix.token_estimate,
                 .cold_start = report.stable_prefix_cache.cold_start,
                 .workspace_prompt_changed = report.stable_prefix_cache.workspace_prompt_changed,
                 .time_bucket_changed = report.stable_prefix_cache.time_bucket_changed,
@@ -447,6 +512,7 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
             .memory_context_bytes = report.last_turn.memory_context_bytes,
             .memory_enrich_ms = report.last_turn.memory_enrich_ms,
             .cache_hit = report.last_turn.cache_hit,
+            .tool_mode = report.last_turn.tool_mode,
             .trim_events = report.last_turn.trim_events,
             .trimmed_messages = report.last_turn.trimmed_messages,
             .trimmed_bytes = report.last_turn.trimmed_bytes,

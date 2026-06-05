@@ -4313,6 +4313,12 @@ pub const Agent = struct {
                 };
             }
             if (parsed_calls.len > 0) {
+                self.last_turn_context.tool_mode = if (use_native and !free_parsed_text)
+                    "native_tool_calls"
+                else if (use_native and free_parsed_text)
+                    "mixed"
+                else
+                    "xml_fallback";
                 turn_tool_iterations += 1;
                 turn_tool_calls_total += @intCast(@min(parsed_calls.len, std.math.maxInt(u32)));
                 self.recordSessionToolNames(parsed_calls);

@@ -299,6 +299,14 @@ don't enforce.
 
 See `src/workspace_templates/AUTOMATIONS.json` for the seed jobs.
 
+Tool-output safety for schedules: `schedule action=list` and `cron_list`
+return bounded provider-visible listings. Defaults are `limit=25`,
+`offset=0`; maximum `limit=100`. Responses include `total_count`,
+`shown_count`, `limit`, `offset`, `next_offset`, and `partial:true` when more
+rows exist. Long command text is compacted to a preview, and exact data remains
+available through `schedule action=get id=<job_id>` or the next paginated list
+call. Do not inject hundreds of jobs into model context in one response.
+
 ### 2.10 Model selection — the user picks, the agent routes (v1.14.22)
 
 **The flagship per-user knob.** The FE exposes a model picker; the
@@ -583,6 +591,28 @@ and capability. Design it to feel premium, not buried:
   advisory nudge, not proof that an automatic compaction pass fired. Do not
   derive the user-facing meter from cumulative usage, session-list summaries,
   or diagnostics.
+- **Meter trust rules** — the frontend must display only an explicit backend
+  `pressure_percent` / `context_pressure_percent`. If the live context endpoint
+  returns `active:false`, `live:false`, `code:"session_manager_unavailable"`,
+  `code:"no_active_session"`, or omits explicit pressure, show `--`. Do not
+  synthesize `0%`, do not divide `token_estimate / context_window_tokens`, and
+  do not let session list/detail hydration overwrite the meter.
+- **Estimator details** — context reports include `estimator`,
+  `usable_input_budget_tokens`, `budget_pressure_percent`,
+  `token_total_reserve`, `provider_usage_last_turn`, `cache`,
+  `last_turn_delta`, and `top_context_contributors`. The estimator counts the
+  provider-bound prompt shape: message content, retained Kimi
+  `reasoning_content`, system/tool instructions, volatile memory/context, XML
+  tool-call/tool-result history, and provider-serialized multimodal text
+  estimates. Raw reasoning text is never exposed; only size/count telemetry is.
+- **Cache semantics** — `provider_usage_last_turn.cached_prompt_tokens` and
+  `cache.last_cache_hit_percent` are cost/performance telemetry. They do not
+  reduce context pressure, because cached prompt tokens still occupy the
+  provider-visible context window.
+- **Compatibility aliases** — `tokens_used`, `token_count`, `token_limit`, and
+  `context_window_used_pct` are compatibility aliases for the live context
+  estimate/window. They are not lifetime usage and must not be used as a second
+  meter path.
 - **NEVER hide the picker behind a paywall** — caps were lifted; the
   central meter handles billing. Premium model availability is a
   feature, not a gate.

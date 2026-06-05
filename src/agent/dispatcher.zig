@@ -435,13 +435,18 @@ fn truncateToolOutput(allocator: std.mem.Allocator, output: []const u8, max_char
 pub fn formatToolResults(allocator: std.mem.Allocator, results: []const ToolExecutionResult) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
+    var seen_schedule_inventory: ?InventoryPageKey = null;
 
     try buf.appendSlice(allocator, "[Tool results]\n");
     for (results) |result| {
         const status_str = if (result.success) "ok" else "error";
+        const output_for_context = try boundedDuplicateInventoryOutput(allocator, result, &seen_schedule_inventory);
+        defer {
+            if (output_for_context.allocated) allocator.free(output_for_context.text);
+        }
 
         // Truncate oversized outputs to prevent context window exhaustion
-        const normalized_output = try truncateToolOutput(allocator, result.output, MAX_TOOL_RESULT_CHARS);
+        const normalized_output = try truncateToolOutput(allocator, output_for_context.text, MAX_TOOL_RESULT_CHARS);
         defer allocator.free(normalized_output);
 
         try std.fmt.format(buf.writer(allocator), "<tool_result name=\"{s}\" status=\"{s}\">\n{s}\n</tool_result>\n", .{
@@ -452,6 +457,65 @@ pub fn formatToolResults(allocator: std.mem.Allocator, results: []const ToolExec
     }
 
     return try buf.toOwnedSlice(allocator);
+}
+
+const InventoryPageKey = struct {
+    total_count: u64,
+    limit: u64,
+    offset: u64,
+};
+
+const ContextOutput = struct {
+    text: []const u8,
+    allocated: bool = false,
+};
+
+fn isScheduleInventoryTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, "schedule") or std.mem.eql(u8, name, "cron_list");
+}
+
+fn parseUnsignedAfter(text: []const u8, marker: []const u8) ?u64 {
+    const marker_start = std.mem.indexOf(u8, text, marker) orelse return null;
+    const cursor = marker_start + marker.len;
+    var end = cursor;
+    while (end < text.len and text[end] >= '0' and text[end] <= '9') : (end += 1) {}
+    if (end == cursor) return null;
+    return std.fmt.parseUnsigned(u64, text[cursor..end], 10) catch null;
+}
+
+fn inventoryPageKey(result: ToolExecutionResult) ?InventoryPageKey {
+    if (!result.success or !isScheduleInventoryTool(result.name)) return null;
+    if (std.mem.indexOf(u8, result.output, "shown_count=") == null) return null;
+    return .{
+        .total_count = parseUnsignedAfter(result.output, "total_count=") orelse return null,
+        .limit = parseUnsignedAfter(result.output, "limit=") orelse return null,
+        .offset = parseUnsignedAfter(result.output, "offset=") orelse return null,
+    };
+}
+
+fn sameInventoryPage(a: InventoryPageKey, b: InventoryPageKey) bool {
+    return a.total_count == b.total_count and a.limit == b.limit and a.offset == b.offset;
+}
+
+fn boundedDuplicateInventoryOutput(
+    allocator: std.mem.Allocator,
+    result: ToolExecutionResult,
+    seen_schedule_inventory: *?InventoryPageKey,
+) !ContextOutput {
+    const key = inventoryPageKey(result) orelse return .{ .text = result.output };
+    if (seen_schedule_inventory.*) |seen| {
+        if (sameInventoryPage(seen, key)) {
+            const text = try std.fmt.allocPrint(
+                allocator,
+                "duplicate_omitted:true\npartial:true\noriginal_bytes:{d}\nshown_bytes:0\nreason:same_turn_schedule_inventory_duplicate\npage: total_count={d} limit={d} offset={d}\nnext: use the prior schedule/cron list result for this page, request the next offset, or call `schedule action=get id=<job_id>` for exact job detail.",
+                .{ result.output.len, key.total_count, key.limit, key.offset },
+            );
+            return .{ .text = text, .allocated = true };
+        }
+    } else {
+        seen_schedule_inventory.* = key;
+    }
+    return .{ .text = result.output };
 }
 
 /// Build tool use instructions for the system prompt.
@@ -1341,6 +1405,29 @@ test "formatToolResults multiple results" {
     try std.testing.expect(std.mem.indexOf(u8, formatted, "search") != null);
     try std.testing.expect(std.mem.indexOf(u8, formatted, "file1.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, formatted, "not found") != null);
+}
+
+test "formatToolResults omits duplicate same-turn schedule inventory page" {
+    const allocator = std.testing.allocator;
+    const inventory =
+        \\Scheduled jobs: total_count=313 shown_count=25 limit=25 offset=0 next_offset=25 partial=true
+        \\- job-000 daily cmd_preview="first"
+    ;
+    const duplicate =
+        \\Cron jobs: total_count=313 shown_count=25 limit=25 offset=0 next_offset=25 partial=true
+        \\- job-000 daily cmd_preview="first"
+    ;
+    const results = [_]ToolExecutionResult{
+        .{ .name = "schedule", .output = inventory, .success = true },
+        .{ .name = "cron_list", .output = duplicate, .success = true },
+    };
+    const formatted = try formatToolResults(allocator, &results);
+    defer allocator.free(formatted);
+
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "Scheduled jobs: total_count=313") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "duplicate_omitted:true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "original_bytes:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "Cron jobs: total_count=313") == null);
 }
 
 test "truncateToolOutput preserves short output" {

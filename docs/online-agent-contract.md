@@ -371,6 +371,39 @@ Usage and cost:
   pricing is wired, otherwise explicitly reports
   `Cost estimate unavailable`. Does not mutate usage mode or counters.
 
+Context pressure:
+
+- `GET /api/v1/users/{user_id}/sessions/{session_key}/context` is the
+  canonical live context meter. It reports backend-calculated
+  `pressure_percent` / `context_pressure_percent` from the active
+  provider-bound context window, not from cumulative lifetime usage.
+- Compatibility aliases (`tokens_used`, `token_count`, `token_limit`,
+  `context_window_used_pct`) refer to the live context estimate/window
+  and must not be treated as cost or lifetime metering.
+- The report includes estimator metadata, usable input budget, reserve,
+  provider usage from the last turn, cache telemetry, last-turn delta,
+  and top contributors. Cache telemetry is diagnostic only; cached
+  prompt tokens still occupy provider-visible context and are not
+  subtracted from pressure.
+- If there is no live session manager or no active session, the response
+  is an unavailable envelope such as
+  `{"active":false,"live":false,"code":"session_manager_unavailable"}`
+  or `{"active":false,"live":false,"code":"no_active_session"}` and
+  contains no pressure value.
+
+Bounded tool output:
+
+- The runtime keeps the hybrid Kimi/tool path for V1: providers may
+  return native tool calls, Nullalis may parse XML fallback calls, and
+  history remains XML-based. Per-turn diagnostics classify this as
+  `native_tool_calls`, `xml_fallback`, `mixed`, or `no_tools`.
+- `schedule action=list` and `cron_list` are bounded by default
+  (`limit=25`, max `limit=100`, `offset` supported). They return
+  `total_count`, `shown_count`, `limit`, `offset`, `next_offset`, and
+  `partial:true` when more rows exist. Full schedule data remains
+  available through paginated list calls or exact job detail lookup; the
+  model must not infer it saw rows that were omitted.
+
 Current limitations to close or explicitly hide before production:
 
 - **Active-turn resume.** The runtime exposes idempotent cancel (above)

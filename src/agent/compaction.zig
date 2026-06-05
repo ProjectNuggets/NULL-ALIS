@@ -9,6 +9,7 @@ const log = std.log.scoped(.agent);
 const providers = @import("../providers/root.zig");
 const config_types = @import("../config_types.zig");
 const memory_mod = @import("../memory/root.zig");
+const context_estimator = @import("context_estimator.zig");
 const Provider = providers.Provider;
 const ChatMessage = providers.ChatMessage;
 const Memory = memory_mod.Memory;
@@ -194,12 +195,7 @@ pub fn buildTokenBudgetPolicy(token_limit: u64, max_tokens: u32) TokenBudgetPoli
 /// provider on the Moonshot route (`thinking.keep:"all"`) and therefore
 /// consume context window like any other message content.
 pub fn tokenEstimate(history: []const OwnedMessage) u64 {
-    var total_chars: u64 = 0;
-    for (history) |*msg| {
-        total_chars += msg.content.len;
-        if (msg.reasoning) |r| total_chars += r.len;
-    }
-    return (total_chars + 3) / 4;
+    return context_estimator.analyzeHistory(.{ .items = history }).token_estimate;
 }
 
 /// Auto-compact history using a multi-pass strategy.
