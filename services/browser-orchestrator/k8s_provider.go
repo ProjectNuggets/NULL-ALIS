@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -11,21 +12,25 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
 )
 
 func ptr[T any](v T) *T { return &v }
 
 // K8sProvider runs each browser session in its own worker Pod.
 type K8sProvider struct {
-	client    kubernetes.Interface
-	namespace string
-	image     string
-	reg       *Registry
-	waitReady func(ctx context.Context, podName string) error
+	client     kubernetes.Interface
+	restConfig *rest.Config
+	namespace  string
+	image      string
+	reg        *Registry
+	waitReady  func(ctx context.Context, podName string) error
 }
 
-func NewK8sProvider(client kubernetes.Interface, namespace, image string, reg *Registry) *K8sProvider {
-	p := &K8sProvider{client: client, namespace: namespace, image: image, reg: reg}
+func NewK8sProvider(client kubernetes.Interface, restConfig *rest.Config, namespace, image string, reg *Registry) *K8sProvider {
+	p := &K8sProvider{client: client, restConfig: restConfig, namespace: namespace, image: image, reg: reg}
 	p.waitReady = p.pollPodReady
 	return p
 }
@@ -130,4 +135,48 @@ func (p *K8sProvider) pollPodReady(ctx context.Context, podName string) error {
 		case <-time.After(2 * time.Second):
 		}
 	}
+}
+
+// Exec runs `agent-browser <args...>` inside the session's worker pod via the
+// K8s exec API (the path validated in Plan 1 with kubectl exec).
+func (p *K8sProvider) Exec(ctx context.Context, sessionID string, args []string) (ExecResult, error) {
+	podName, ok := p.reg.Pod(sessionID)
+	if !ok {
+		return ExecResult{}, fmt.Errorf("unknown session %q", sessionID)
+	}
+	cmd := append([]string{"agent-browser"}, args...)
+	req := p.client.CoreV1().RESTClient().Post().
+		Resource("pods").Name(podName).Namespace(p.namespace).SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: "worker",
+			Command:   cmd,
+			Stdout:    true,
+			Stderr:    true,
+		}, scheme.ParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(p.restConfig, "POST", req.URL())
+	if err != nil {
+		return ExecResult{}, fmt.Errorf("new executor: %w", err)
+	}
+	var stdout, stderr bytes.Buffer
+	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{Stdout: &stdout, Stderr: &stderr})
+	res := ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
+	if err != nil {
+		res.ExitCode = 1
+		return res, fmt.Errorf("exec: %w (stderr: %s)", err, stderr.String())
+	}
+	return res, nil
+}
+
+func (p *K8sProvider) DestroySession(ctx context.Context, sessionID string) error {
+	podName, ok := p.reg.Pod(sessionID)
+	if !ok {
+		return nil // idempotent
+	}
+	err := p.client.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{})
+	p.reg.Remove(sessionID)
+	if err != nil {
+		return fmt.Errorf("delete pod: %w", err)
+	}
+	return nil
 }
