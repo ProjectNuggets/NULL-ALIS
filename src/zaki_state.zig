@@ -36,6 +36,7 @@ pub const SessionInfo = struct {
 const pg_helpers = @import("memory/engines/postgres.zig");
 const zaki_session = @import("session/root.zig");
 const lane_metrics = @import("lane_metrics.zig");
+const entity_pipeline = @import("agent/entity_pipeline.zig");
 const migrations = @import("migrations.zig");
 const log = std.log.scoped(.zaki_state);
 
@@ -14548,6 +14549,68 @@ test "C-struct structural edges connect memories to session + self hub" {
     // Orphan check: fact_dubai is no longer an orphan (has an incident edge).
     const dubai_edges = try mgr.countEdgesForSource(2, "fact_dubai");
     try std.testing.expect(dubai_edges >= 1);
+}
+
+// The keystone edge: memory->entity MENTIONS. Unlike the structural session
+// hub (invisible + PPR-excluded), this edge renders on /brain/graph
+// (source=memory, target=entity) AND feeds PPR recall — it de-orphans WITH
+// meaning. Verifies word-boundary matching, render-shape target, and the
+// transient/extraction skips end-to-end against Postgres.
+test "C-keystone memory->entity MENTIONS edges de-orphan with meaning" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-keystone/workspace");
+
+    // Two resolved entities with render-shape ids (32 hex = isEntityNodeKey).
+    const resolved = [_]entity_pipeline.ResolvedEntity{
+        .{ .entity_id = @constCast(@as([]const u8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")), .canonical_name = "Helix", .was_existing = true },
+        .{ .entity_id = @constCast(@as([]const u8, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")), .canonical_name = "Mia", .was_existing = true },
+    };
+    const mems = [_]memory_root.MemoryEntry{
+        .{ .id = "i1", .key = "m_helix", .content = "I switched my editor to Helix last week", .category = .core, .timestamp = "0" },
+        .{ .id = "i2", .key = "m_mia", .content = "Mia is my sister", .category = .core, .timestamp = "0" },
+        .{ .id = "i3", .key = "m_none", .content = "the weather is nice today", .category = .core, .timestamp = "0" },
+        .{ .id = "i4", .key = "m_sub", .content = "I drank Helixir tonic", .category = .core, .timestamp = "0" },
+        .{ .id = "i5", .key = "extracted_x", .content = "User prefers Helix", .category = .core, .timestamp = "0" },
+        .{ .id = "i6", .key = "turn_x", .content = "Helix Helix Helix", .category = .conversation, .timestamp = "0" },
+    };
+
+    const res = try entity_pipeline.emitMemoryMentionEdges(allocator, &mgr, 2, &resolved, &mems, 0.9, "sess-1");
+    try std.testing.expectEqual(@as(usize, 2), res.emitted); // m_helix->Helix, m_mia->Mia
+
+    // The Helix edge: source=memory, target=entity (render shape), MENTIONS.
+    const eh = try mgr.findEdgesByKeys(allocator, 2, &[_][]const u8{"m_helix"});
+    defer memory_root.freeTypedEdges(allocator, eh);
+    try std.testing.expectEqual(@as(usize, 1), eh.len);
+    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", eh[0].target_key);
+    try std.testing.expectEqualStrings("MENTIONS", eh[0].predicate);
+
+    // Substring-only, absent, extraction, and conversation rows get NO edge.
+    for ([_][]const u8{ "m_none", "m_sub", "extracted_x", "turn_x" }) |k| {
+        const e = try mgr.findEdgesByKeys(allocator, 2, &[_][]const u8{k});
+        defer memory_root.freeTypedEdges(allocator, e);
+        try std.testing.expectEqual(@as(usize, 0), e.len);
+    }
 }
 
 // V1.6 commit 8 — entity coreference via cosine ≥ threshold.

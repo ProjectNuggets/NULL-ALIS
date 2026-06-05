@@ -87,6 +87,10 @@ pub const SPEAKER_PREDICATE: []const u8 = "MENTIONED";
 /// extraction_classifier edges.
 pub const WIKI_LINK_ATTRIBUTION: []const u8 = "wiki_link";
 
+/// Max memory->entity mention edges per memory — bounds fan-out when a single
+/// memory name-drops many known entities.
+pub const MAX_MENTION_EDGES_PER_MEMORY: usize = 8;
+
 /// One entity mention, as parsed from the LLM JSON output. Canonical is
 /// the surface form normalized for matching (LLM proposes; cosine
 /// resolution finalizes). Type is one of the seven categories the prompt
@@ -153,6 +157,9 @@ pub const RunStats = struct {
     /// an error from upsertMemoryEdge (logged + skipped per failure-soft
     /// contract). Distinct from `failed_mentions` (resolve-time failures).
     edges_skipped: usize = 0,
+    /// memory->entity MENTIONS edges emitted this run (subset of edges_emitted).
+    /// The keystone edge that renders on /brain/graph and feeds PPR recall.
+    memory_mention_edges: usize = 0,
     llm_latency_ms: i64 = 0,
     failed_mentions: usize = 0,
 };
@@ -701,6 +708,93 @@ pub fn emitSpeakerEdges(
 ///
 /// Returns RunStats. All errors are non-fatal (logged); stats reflect
 /// what actually happened.
+fn isWordChar(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_';
+}
+
+/// Word-boundary, case-insensitive containment: does `content` mention the
+/// whole word/phrase `name`? Avoids substring false matches ("Helix" must not
+/// match "Helixir") and skips trivially short names that would over-match.
+fn mentionsEntity(content: []const u8, name: []const u8) bool {
+    if (name.len < 3 or name.len > content.len) return false;
+    var start: usize = 0;
+    while (start < content.len) {
+        const rel = std.ascii.indexOfIgnoreCase(content[start..], name) orelse return false;
+        const pos = start + rel;
+        const before_ok = pos == 0 or !isWordChar(content[pos - 1]);
+        const after_idx = pos + name.len;
+        const after_ok = after_idx >= content.len or !isWordChar(content[after_idx]);
+        if (before_ok and after_ok) return true;
+        start = pos + 1;
+    }
+    return false;
+}
+
+/// Emit memory->entity MENTIONS edges — the keystone graph edge. For each
+/// session memory whose content names a resolved entity, link the MEMORY
+/// (source) to the ENTITY (target).
+///
+/// Why this edge and not the others the pipeline already emits: the
+/// user->entity speaker hub (MENTIONED) is blacklisted from /brain/graph
+/// render AND PPR-excluded; entity<->entity co-occurrence has an entity
+/// source, which the render rule (source must be a visible memory) drops.
+/// A memory->entity edge BOTH renders (source=memory, target=entity) AND
+/// feeds Personalized-PageRank recall (entity nodes aren't hub-excluded;
+/// MENTIONS carries a 0.5 prior). It de-orphans memories *with meaning* —
+/// "this memory is about X" — and makes co-occurring entities mutually
+/// reachable, which is what finally activates the co-occurrence edges.
+///
+/// Skips transient conversation rows and extraction facts (already
+/// memory->entity-linked via their triple). Idempotent (ON CONFLICT),
+/// best-effort per edge.
+pub fn emitMemoryMentionEdges(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state.Manager,
+    user_id: i64,
+    resolved: []const ResolvedEntity,
+    memories: []const memory_root.MemoryEntry,
+    confidence: f64,
+    episode_key: ?[]const u8,
+) !EmitResult {
+    var result = EmitResult{};
+    if (resolved.len == 0) return result;
+    for (memories) |m| {
+        switch (m.category) {
+            .conversation => continue, // transient turns are not graph nodes
+            else => {},
+        }
+        if (std.mem.startsWith(u8, m.key, "extracted_")) continue; // already entity-linked
+        var emitted_for_mem: usize = 0;
+        for (resolved) |r| {
+            if (emitted_for_mem >= MAX_MENTION_EDGES_PER_MEMORY) break;
+            if (r.entity_id.len == 0) continue;
+            if (!mentionsEntity(m.content, r.canonical_name)) continue;
+            const fact = std.fmt.allocPrint(allocator, "{s} mentions {s}", .{ m.key, r.canonical_name }) catch null;
+            defer if (fact) |f| allocator.free(f);
+            state_mgr.upsertMemoryEdgeRich(
+                user_id,
+                m.key, // source = the memory (so it renders + de-orphans)
+                r.entity_id, // target = the entity
+                COOCCURS_PREDICATE, // "MENTIONS" — renders + 0.5 PPR prior
+                WIKI_LINK_ATTRIBUTION,
+                confidence,
+                fact,
+                null,
+                episode_key,
+                null,
+                null,
+            ) catch |err| {
+                result.skipped += 1;
+                log.warn("entity_pipeline.mention_edge_failed mem={s} entity={s} err={s}", .{ m.key, r.entity_id, @errorName(err) });
+                continue;
+            };
+            result.emitted += 1;
+            emitted_for_mem += 1;
+        }
+    }
+    return result;
+}
+
 pub fn runOnTurn(
     allocator: std.mem.Allocator,
     provider: Provider,
@@ -795,8 +889,26 @@ pub fn runOnTurn(
         log.warn("entity_pipeline.runOnTurn: speaker edges failed err={s}", .{@errorName(err)});
         break :blk EmitResult{};
     };
-    stats.edges_emitted = cooccur.emitted + speaker.emitted;
-    stats.edges_skipped = cooccur.skipped + speaker.skipped;
+    // Memory->entity mention edges — the keystone (renders + feeds recall).
+    // Scoped to the session via episode_key; links each session memory to the
+    // entities it names. This is what makes the graph mirror "this memory is
+    // about X" and de-orphans with meaning, rather than just hub-floor edges.
+    var mention_emitted: usize = 0;
+    var mention_skipped: usize = 0;
+    if (episode_key) |sid| {
+        if (state_mgr.listMemories(allocator, user_id, null, sid)) |session_mems| {
+            defer memory_root.freeEntries(allocator, session_mems);
+            const mention = emitMemoryMentionEdges(allocator, state_mgr, user_id, resolved_list.items, session_mems, avg_conf, episode_key) catch EmitResult{};
+            mention_emitted = mention.emitted;
+            mention_skipped = mention.skipped;
+        } else |err| {
+            log.warn("entity_pipeline.runOnTurn: session memories fetch failed err={s}", .{@errorName(err)});
+        }
+    }
+
+    stats.edges_emitted = cooccur.emitted + speaker.emitted + mention_emitted;
+    stats.edges_skipped = cooccur.skipped + speaker.skipped + mention_skipped;
+    stats.memory_mention_edges = mention_emitted;
 
     log.info(
         "entity_pipeline.runOnTurn user={d} outcome={s} mentions={d} resolved={d} minted={d} edges={d} skipped={d} failed={d} llm_ms={d}",
@@ -818,6 +930,26 @@ pub fn runOnTurn(
 // ─────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────
+
+test "mentionsEntity — word-boundary, case-insensitive, rejects substrings" {
+    // Whole-word match, case-insensitive.
+    try std.testing.expect(mentionsEntity("I switched my editor to Helix today", "Helix"));
+    try std.testing.expect(mentionsEntity("i love HELIX", "helix"));
+    // Multi-word entity name.
+    try std.testing.expect(mentionsEntity("using the Helix editor daily", "Helix editor"));
+    // Boundaries at start and end of content.
+    try std.testing.expect(mentionsEntity("Mia is my sister", "Mia"));
+    try std.testing.expect(mentionsEntity("my sister is Mia", "Mia"));
+    // Substring inside a larger word must NOT match (the whole point).
+    try std.testing.expect(!mentionsEntity("I drank Helixir tonic", "Helix"));
+    try std.testing.expect(!mentionsEntity("submarine sandwich", "marine"));
+    // Absent.
+    try std.testing.expect(!mentionsEntity("the weather is nice", "Helix"));
+    // Trivially short names are skipped to avoid over-matching common tokens.
+    try std.testing.expect(!mentionsEntity("I use Go", "Go"));
+    // Name longer than content.
+    try std.testing.expect(!mentionsEntity("hi", "Helix"));
+}
 
 test "parseMentionsJson — empty array" {
     const allocator = std.testing.allocator;
