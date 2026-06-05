@@ -363,32 +363,41 @@ git commit -m "test(browser): in-pod headless + @eN snapshot smoke test"
 ```bash
 #!/usr/bin/env bash
 # scripts/browser-worker-egress-test.sh
-# Proves the NetworkPolicy blocks cloud-metadata + RFC1918 egress while
-# allowing public HTTPS. Uses the in-page fetch path (Chromium), not just
-# host curl, so it exercises the real browser egress.
+# Proves the NetworkPolicy blocks RFC1918 + cloud-metadata egress while
+# allowing public HTTPS. Uses node's TCP connect (present in the image) so we
+# distinguish "blocked at network layer" (timeout) from "reachable". The
+# Kubernetes API ClusterIP is a real RFC1918 endpoint reachable WITHOUT the
+# policy, so blocking it genuinely proves enforcement (not just an absent target).
 set -euo pipefail
 NS=browser
 POD=browser-worker-0
-EP="--executable-path /usr/local/bin/chromium-ns"
 
-# 1. Public web must WORK.
-pub=$(kubectl -n "$NS" exec "$POD" -- sh -c "
-  agent-browser $EP open https://example.com 2>&1 | tail -1
-  agent-browser close --all >/dev/null 2>&1
-")
-echo "public: $pub"
-echo "$pub" | grep -qi 'example.com' || { echo "FAIL: public web blocked unexpectedly"; exit 1; }
+probe() {  # host port -> REACHABLE | BLOCKED | BLOCKED:<code>
+  kubectl -n "$NS" exec "$POD" -- node -e '
+    const net=require("net");
+    const s=net.connect({host:process.argv[1],port:+process.argv[2],timeout:5000});
+    s.on("connect",()=>{console.log("REACHABLE");s.destroy();process.exit(0)});
+    s.on("timeout",()=>{console.log("BLOCKED");s.destroy();process.exit(0)});
+    s.on("error",e=>{console.log("BLOCKED:"+e.code);process.exit(0)});
+  ' "$1" "$2"
+}
 
-# 2. Cloud metadata must be BLOCKED (navigation should error/timeout).
-meta=$(kubectl -n "$NS" exec "$POD" -- sh -c "
-  timeout 20 agent-browser $EP open http://169.254.169.254/ 2>&1 | tail -3 || true
-  agent-browser close --all >/dev/null 2>&1
-")
-echo "metadata: $meta"
-echo "$meta" | grep -qiE 'fail|error|timeout|unreach|refused|net::' \
-  || { echo "FAIL: metadata endpoint was reachable — NetworkPolicy not enforced"; exit 1; }
+API_IP=$(kubectl get svc kubernetes -n default -o jsonpath='{.spec.clusterIP}')
+echo "cluster API ClusterIP (RFC1918): $API_IP"
 
-echo "PASS: public allowed, metadata blocked"
+echo "=== 1. public HTTPS must be REACHABLE ==="
+pub=$(probe example.com 443); echo "example.com:443 -> $pub"
+echo "$pub" | grep -q REACHABLE || { echo "FAIL: public HTTPS blocked unexpectedly"; exit 1; }
+
+echo "=== 2. in-cluster RFC1918 (API server) must be BLOCKED ==="
+api=$(probe "$API_IP" 443); echo "$API_IP:443 -> $api"
+echo "$api" | grep -q BLOCKED || { echo "FAIL: RFC1918 reachable — NetworkPolicy NOT enforced"; exit 1; }
+
+echo "=== 3. cloud-metadata IP must be BLOCKED ==="
+meta=$(probe 169.254.169.254 80); echo "169.254.169.254:80 -> $meta"
+echo "$meta" | grep -q BLOCKED || { echo "FAIL: metadata reachable"; exit 1; }
+
+echo "PASS: public reachable; RFC1918 + metadata blocked (NetworkPolicy enforced)"
 ```
 
 - [ ] **Step 2: Run it**
@@ -405,7 +414,7 @@ Expected: ends with `PASS: public allowed, metadata blocked`.
 
 ```bash
 git add scripts/browser-worker-egress-test.sh
-git commit -m "test(browser): NetworkPolicy egress test (metadata blocked, public allowed)"
+git commit -m "test(browser): NetworkPolicy egress test (RFC1918 + metadata blocked, public allowed)"
 ```
 
 ---
