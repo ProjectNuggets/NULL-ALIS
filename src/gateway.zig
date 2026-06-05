@@ -11296,6 +11296,9 @@ const agent_context_report = @import("agent/context_report.zig");
 const agent_root = @import("agent/root.zig");
 const mem_lifecycle_diag = @import("memory/lifecycle/diagnostics.zig");
 
+const session_context_unavailable_body =
+    "{\"error\":\"no_session_manager\",\"code\":\"session_manager_unavailable\",\"active\":false,\"live\":false,\"reason\":\"No live agent runtime is loaded for this user. Persisted session history can still be listed, but context pressure is only available for a live in-memory session manager.\"}";
+
 fn handleUserDiagnosticsContext(
     allocator: std.mem.Allocator,
     method: []const u8,
@@ -11306,7 +11309,7 @@ fn handleUserDiagnosticsContext(
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
     }
     const session_mgr = session_mgr_opt orelse return .{
-        .body = "{\"active\":false,\"reason\":\"session_manager_unavailable\"}",
+        .body = "{\"active\":false,\"live\":false,\"code\":\"session_manager_unavailable\",\"reason\":\"session_manager_unavailable\"}",
     };
 
     var key_buf: [zaki_session.SessionIdentity.MAX_KEY_LEN + 1]u8 = undefined;
@@ -11339,7 +11342,7 @@ fn handleUserDiagnosticsMemoryDoctor(
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
     }
     const session_mgr = session_mgr_opt orelse return .{
-        .body = "{\"active\":false,\"reason\":\"session_manager_unavailable\"}",
+        .body = "{\"active\":false,\"live\":false,\"code\":\"session_manager_unavailable\",\"reason\":\"session_manager_unavailable\"}",
     };
 
     var key_buf: [zaki_session.SessionIdentity.MAX_KEY_LEN + 1]u8 = undefined;
@@ -13554,28 +13557,28 @@ fn handleSessionList(
             // PendingToolApproval at a time), so the count is 0 or 1.
             // last_channel: origin_channel is set when the session was
             // anchored to an inbound channel; null if web/REST-only.
-            const live_mode = session.agent.execution_mode.toSlice();
-            const live_pending: u8 = if (session.agent.pending_tool_approval != null) 1 else 0;
-            const live_pressure: u8 = blk: {
-                if (session.agent.token_limit == 0) break :blk 0;
-                const pct = @divTrunc(session.agent.tokensUsed() * 100, session.agent.token_limit);
-                break :blk if (pct > 100) 100 else @as(u8, @intCast(pct));
-            };
-            w.print("\",\"message_count\":{d},\"last_active\":{d},\"live\":true,\"mode\":\"{s}\",\"pending_approval_count\":{d},\"context_pressure_percent\":{d},\"last_channel\":", .{
-                session.turn_count,
-                session.last_active,
-                live_mode,
-                live_pending,
-                live_pressure,
-            }) catch return response_build_err;
-            if (session.origin_channel) |ch| {
-                w.writeAll("\"") catch return response_build_err;
-                jsonEscapeInto(w, ch) catch return response_build_err;
-                w.writeAll("\"") catch return response_build_err;
-            } else {
-                w.writeAll("null") catch return response_build_err;
+            {
+                session.mutex.lock();
+                defer session.mutex.unlock();
+                const live_mode = session.agent.execution_mode.toSlice();
+                const live_pending: u8 = if (session.agent.pending_tool_approval != null) 1 else 0;
+                const live_report = agent_context_report.fromAgent(&session.agent);
+                w.print("\",\"message_count\":{d},\"last_active\":{d},\"live\":true,\"mode\":\"{s}\",\"pending_approval_count\":{d},\"context_pressure_percent\":{d},\"last_channel\":", .{
+                    session.turn_count,
+                    session.last_active,
+                    live_mode,
+                    live_pending,
+                    live_report.context_pressure_percent,
+                }) catch return response_build_err;
+                if (session.origin_channel) |ch| {
+                    w.writeAll("\"") catch return response_build_err;
+                    jsonEscapeInto(w, ch) catch return response_build_err;
+                    w.writeAll("\"") catch return response_build_err;
+                } else {
+                    w.writeAll("null") catch return response_build_err;
+                }
+                w.writeAll("}") catch return response_build_err;
             }
-            w.writeAll("}") catch return response_build_err;
             // Store owned copy of key (safe after mutex release)
             const key_copy = allocator.dupe(u8, entry.key_ptr.*) catch continue;
             seen_keys.put(allocator, key_copy, {}) catch allocator.free(key_copy);
@@ -13661,7 +13664,7 @@ fn handleSessionAction(
         return .{ .status = "403 Forbidden", .body = "{\"error\":\"session_not_owned\"}" };
     }
 
-    const mgr = session_mgr_opt orelse return .{ .status = "404 Not Found", .body = "{\"error\":\"no_session_manager\"}" };
+    const mgr = session_mgr_opt orelse return .{ .status = "404 Not Found", .body = session_context_unavailable_body };
 
     if (action == null) {
         // GET /sessions/{key} — session info
@@ -13914,11 +13917,7 @@ fn renderLiveSessionDetail(
 
     const mode_str = session.agent.execution_mode.toSlice();
     const pending_count: u8 = if (session.agent.pending_tool_approval != null) 1 else 0;
-    const pressure_percent: u8 = blk: {
-        if (session.agent.token_limit == 0) break :blk 0;
-        const pct = @divTrunc(session.agent.tokensUsed() * 100, session.agent.token_limit);
-        break :blk if (pct > 100) 100 else @as(u8, @intCast(pct));
-    };
+    const report = agent_context_report.fromAgent(&session.agent);
 
     w.writeAll("{\"session_key\":\"") catch return response_build_err;
     jsonEscapeInto(w, session_key) catch return response_build_err;
@@ -13929,7 +13928,7 @@ fn renderLiveSessionDetail(
         session.agent.historyLen(),
         mode_str,
         pending_count,
-        pressure_percent,
+        report.context_pressure_percent,
     }) catch return response_build_err;
 
     if (session.origin_channel) |ch| {
@@ -14158,21 +14157,52 @@ fn handleSessionContext(
     const report_json = agent_context_report.formatJson(allocator, report) catch return response_build_err;
     defer allocator.free(report_json);
 
+    w.writeAll("{\"status\":\"") catch return response_build_err;
+    jsonEscapeInto(w, report.status) catch return response_build_err;
+    w.writeAll("\",\"active\":true,\"live\":true,\"session_key\":\"") catch return response_build_err;
+    jsonEscapeInto(w, session_key) catch return response_build_err;
+    w.print("\",\"sampled_at_ms\":{d},\"model\":\"", .{report.sampled_at_ms}) catch return response_build_err;
+    jsonEscapeInto(w, report.model_name) catch return response_build_err;
+    w.writeAll("\",\"model_provider\":") catch return response_build_err;
+    if (report.model_provider) |provider| {
+        w.writeAll("\"") catch return response_build_err;
+        jsonEscapeInto(w, provider) catch return response_build_err;
+        w.writeAll("\"") catch return response_build_err;
+    } else {
+        w.writeAll("null") catch return response_build_err;
+    }
+    w.writeAll(",\"context_window_source\":\"") catch return response_build_err;
+    jsonEscapeInto(w, report.context_window_source) catch return response_build_err;
     // `tokens_used` and `token_limit` are legacy field names kept for older
     // clients, but they now alias the active context-window estimate rather
     // than lifetime cumulative usage. Lifetime usage belongs in metering, not
     // in the context pressure badge.
-    w.print("{{\"history_len\":{d},\"history_messages\":{d},\"tokens_used\":{d},\"token_estimate\":{d},\"max_history\":{d},\"token_limit\":{d},\"context_window_tokens\":{d},\"context_pressure_percent\":{d},\"token_compaction_threshold\":{d},\"token_compaction_triggered\":{},\"last_turn\":", .{
+    w.print("\",\"history_len\":{d},\"history_messages\":{d},\"message_count\":{d},\"tokens_used\":{d},\"token_count\":{d},\"token_estimate\":{d},\"context_window_used\":{d},\"context_window_max\":{d},\"max_history\":{d},\"token_limit\":{d},\"context_window_tokens\":{d},\"remaining_tokens\":{d},\"pressure_percent\":{d},\"context_window_used_pct\":{d},\"context_pressure_percent\":{d},\"token_compaction_threshold\":{d},\"token_compaction_recommended_threshold\":{d},\"token_auto_compaction_pass_a_threshold\":{d},\"token_auto_compaction_pass_c_threshold\":{d},\"token_compaction_recommended\":{},\"token_compaction_triggered\":{},\"compaction\":{{\"nudge_percent\":{d},\"pass_a_percent\":{d},\"pass_c_percent\":{d},\"recommended\":{}}},\"last_turn\":", .{
         agent.historyLen(),
+        report.history_messages,
         report.history_messages,
         report.token_estimate,
         report.token_estimate,
+        report.token_estimate,
+        report.token_estimate,
+        report.context_window_tokens,
         agent.max_history_messages,
         report.context_window_tokens,
         report.context_window_tokens,
+        report.remaining_tokens,
+        report.context_pressure_percent,
+        report.context_pressure_percent,
         report.context_pressure_percent,
         report.token_compaction_threshold,
+        report.token_compaction_recommended_threshold,
+        report.token_auto_compaction_pass_a_threshold,
+        report.token_auto_compaction_pass_c_threshold,
+        report.token_compaction_recommended,
         report.token_compaction_triggered,
+        report.compaction_recommend_percent,
+        report.auto_compaction_pass_a_percent,
+        report.auto_compaction_pass_c_percent,
+        report.token_compaction_recommended,
     }) catch return response_build_err;
     if (std.mem.indexOf(u8, report_json, "\"last_turn\":")) |last_turn_key| {
         const last_turn_start = last_turn_key + "\"last_turn\":".len;
@@ -20324,10 +20354,10 @@ fn handleApiRoute(
     // /memory doctor slash commands as JSON for the frontend PowerUserSheet.
     // Never materialize a session on demand.
     if (std.mem.eql(u8, parsed.subpath, "diagnostics/context")) {
-        return handleUserDiagnosticsContext(req_allocator, method, session_mgr_opt, scoped_user_id);
+        return handleUserDiagnosticsContext(req_allocator, method, effective_session_mgr, scoped_user_id);
     }
     if (std.mem.eql(u8, parsed.subpath, "diagnostics/memory-doctor")) {
-        return handleUserDiagnosticsMemoryDoctor(req_allocator, method, session_mgr_opt, scoped_user_id);
+        return handleUserDiagnosticsMemoryDoctor(req_allocator, method, effective_session_mgr, scoped_user_id);
     }
 
     // ── Usage summary endpoint (WP2.3) ──────────────────────────────────
@@ -30953,6 +30983,26 @@ test "handleSessionList rejects non-GET methods" {
     try std.testing.expectEqualStrings("405 Method Not Allowed", resp.status);
 }
 
+test "handleSessionList reports active context pressure instead of cumulative usage" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const session = try mgr.getOrCreate("agent:zaki-bot:user:7:thread:list-pressure");
+    session.agent.token_limit = 100;
+    session.agent.total_tokens = 99999;
+    try session.agent.history.append(std.testing.allocator, .{
+        .role = .user,
+        .content = try std.testing.allocator.dupe(u8, "short current context"),
+    });
+
+    const resp = handleSessionList(std.testing.allocator, "GET", "7", &mgr, null);
+    defer std.testing.allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"context_pressure_percent\":100") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"context_pressure_percent\":6") != null);
+}
+
 test "handleSessionAction rejects empty session key" {
     const resp = handleSessionAction(std.testing.allocator, "GET", "1", "", null, "", null);
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
@@ -30969,6 +31019,22 @@ test "handleSessionAction rejects cross-user session key" {
         null,
     );
     try std.testing.expectEqualStrings("403 Forbidden", resp.status);
+}
+
+test "handleSessionAction context reports structured unavailable when no session manager" {
+    const resp = handleSessionAction(
+        std.testing.allocator,
+        "GET",
+        "7",
+        "agent:zaki-bot:user:7:thread:no-manager/context",
+        null,
+        "",
+        null,
+    );
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"code\":\"session_manager_unavailable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"live\":false") != null);
 }
 
 // ── WP2.2 task query endpoint tests ──────────────────────────────────
@@ -32224,6 +32290,26 @@ test "handleSessionGet returns session info JSON" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"context_pressure_percent\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"last_channel\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"pending_approvals\":[]") != null);
+}
+
+test "handleSessionGet reports active context pressure instead of cumulative usage" {
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(std.testing.allocator, &mock);
+    defer mgr.deinit();
+
+    const session = try mgr.getOrCreate("agent:zaki-bot:user:42:thread:detail-pressure");
+    session.agent.token_limit = 100;
+    session.agent.total_tokens = 99999;
+    try session.agent.history.append(std.testing.allocator, .{
+        .role = .user,
+        .content = try std.testing.allocator.dupe(u8, "short current context"),
+    });
+
+    const resp = handleSessionGet(std.testing.allocator, &mgr, "agent:zaki-bot:user:42:thread:detail-pressure", null, "42");
+    defer std.testing.allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"context_pressure_percent\":100") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"context_pressure_percent\":6") != null);
 }
 
 test "handleSessionGet returns 404 for unknown session" {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const compaction = @import("compaction.zig");
 const context_cache = @import("context_cache.zig");
+const model_capabilities = @import("model_capabilities.zig");
 const prompt = @import("prompt.zig");
 
 pub const RoleCounts = struct {
@@ -11,13 +12,28 @@ pub const RoleCounts = struct {
 };
 
 pub const Snapshot = struct {
+    status: []const u8 = "live",
+    sampled_at_ms: i64 = 0,
     model_name: []const u8,
+    model_provider: ?[]const u8 = null,
     history_messages: usize,
     token_estimate: u64,
     context_window_tokens: u64,
+    context_window_source: []const u8 = "unknown",
+    remaining_tokens: u64 = 0,
     context_pressure_percent: u8,
     history_trim_limit_messages: u32,
     token_compaction_threshold: u64,
+    token_compaction_recommended_threshold: u64 = 0,
+    token_auto_compaction_pass_a_threshold: u64 = 0,
+    token_auto_compaction_pass_c_threshold: u64 = 0,
+    compaction_recommend_percent: u8 = compaction.COMPACTION_RECOMMEND_PERCENT,
+    auto_compaction_pass_a_percent: u8 = compaction.AUTO_COMPACT_PASS_A_PERCENT,
+    auto_compaction_pass_c_percent: u8 = compaction.AUTO_COMPACT_PASS_C_PERCENT,
+    token_compaction_recommended: bool,
+    /// Legacy JSON/report alias for token_compaction_recommended. Kept so
+    /// older clients do not break, but this is advisory and does not mean an
+    /// automatic compaction pass has fired.
     token_compaction_triggered: bool,
     token_reply_reserve: u64,
     token_tool_reserve: u64,
@@ -146,6 +162,28 @@ fn pressurePercent(used_tokens: u64, context_window_tokens: u64) u8 {
     return @intCast(pct);
 }
 
+fn modelProvider(model_name: []const u8) ?[]const u8 {
+    const slash = std.mem.indexOfScalar(u8, model_name, '/') orelse return null;
+    if (slash == 0) return null;
+    return model_name[0..slash];
+}
+
+fn contextWindowSource(self: anytype, model_name: []const u8, context_window_tokens: u64) []const u8 {
+    const AgentType = @TypeOf(self.*);
+    if (@hasField(AgentType, "token_limit_override")) {
+        if (self.token_limit_override != null) {
+            return "override";
+        }
+    }
+    if (model_capabilities.lookupCapabilities(model_name) != null) {
+        return "model_capability";
+    }
+    if (context_window_tokens > 0) {
+        return "default";
+    }
+    return "unknown";
+}
+
 fn conversationContextFingerprintFromAgent(self: anytype) u64 {
     const AgentType = @TypeOf(self.*);
     if (!@hasField(AgentType, "conversation_context")) return conversationContextFingerprint(null);
@@ -252,22 +290,32 @@ pub fn buildSnapshot(self: anytype) Snapshot {
     const stable_prefix_cache = context_cache.buildStablePrefixState(prompt_refresh_plan, has_system_prompt);
     const last_turn = if (@hasField(AgentType, "last_turn_context")) self.last_turn_context else LastTurnContext{};
     const memory_context_entries = memory_enriched_messages;
+    const model_name = if (@hasField(AgentType, "model_name")) self.model_name else "";
     const token_estimate = if (@hasField(AgentType, "history")) tokenEstimateFromHistory(self.history) else 0;
     const context_window_tokens = if (@hasField(AgentType, "token_limit")) self.token_limit else 0;
     const resolved_max_tokens = if (@hasField(AgentType, "max_tokens")) self.max_tokens else 0;
     const token_budget_policy = compaction.buildTokenBudgetPolicy(context_window_tokens, resolved_max_tokens);
+    const remaining_tokens = if (context_window_tokens > token_estimate) context_window_tokens - token_estimate else 0;
 
     return .{
-        .model_name = if (@hasField(AgentType, "model_name")) self.model_name else "",
+        .sampled_at_ms = std.time.milliTimestamp(),
+        .model_name = model_name,
+        .model_provider = modelProvider(model_name),
         .history_messages = if (@hasField(AgentType, "history")) self.history.items.len else 0,
         .token_estimate = token_estimate,
         .context_window_tokens = context_window_tokens,
+        .context_window_source = contextWindowSource(self, model_name, context_window_tokens),
+        .remaining_tokens = remaining_tokens,
         .context_pressure_percent = pressurePercent(token_estimate, context_window_tokens),
         .history_trim_limit_messages = if (@hasField(AgentType, "max_history_messages")) self.max_history_messages else 0,
         .token_compaction_threshold = token_budget_policy.threshold,
-        // Context v2: fire compaction at the 50% trigger (Hermes standard),
-        // not at the reserve-based 65%+ threshold. The threshold remains the
-        // force-compress guard for the emergency path.
+        .token_compaction_recommended_threshold = token_budget_policy.compaction_trigger,
+        .token_auto_compaction_pass_a_threshold = (context_window_tokens * compaction.AUTO_COMPACT_PASS_A_PERCENT) / 100,
+        .token_auto_compaction_pass_c_threshold = (context_window_tokens * compaction.AUTO_COMPACT_PASS_C_PERCENT) / 100,
+        // Context v2: 50% is an advisory marker, not an automatic compaction
+        // fire signal. Automatic passes remain owned by autoCompactHistory
+        // at 70% (Pass A) and 90% (Pass C).
+        .token_compaction_recommended = token_budget_policy.compaction_trigger > 0 and token_estimate > token_budget_policy.compaction_trigger,
         .token_compaction_triggered = token_budget_policy.compaction_trigger > 0 and token_estimate > token_budget_policy.compaction_trigger,
         .token_reply_reserve = token_budget_policy.reply_reserve,
         .token_tool_reserve = token_budget_policy.tool_reserve,
@@ -511,11 +559,18 @@ test "buildSnapshot counts roles and retrieval state" {
     };
 
     const snapshot = buildSnapshot(&fake);
+    try std.testing.expect(snapshot.sampled_at_ms > 0);
+    try std.testing.expectEqualStrings("openai", snapshot.model_provider.?);
+    try std.testing.expectEqualStrings("model_capability", snapshot.context_window_source);
     try std.testing.expectEqual(@as(usize, 4), snapshot.history_messages);
     try std.testing.expectEqual(@as(usize, 1), snapshot.memory_enriched_messages);
+    try std.testing.expectEqual(@as(u64, 1_000) - snapshot.token_estimate, snapshot.remaining_tokens);
     try std.testing.expectEqual(@as(u8, 1), snapshot.context_pressure_percent);
     try std.testing.expectEqual(@as(u32, 50), snapshot.history_trim_limit_messages);
     try std.testing.expectEqual(@as(u64, 650), snapshot.token_compaction_threshold);
+    try std.testing.expectEqual(@as(u64, 500), snapshot.token_compaction_recommended_threshold);
+    try std.testing.expectEqual(@as(u64, 700), snapshot.token_auto_compaction_pass_a_threshold);
+    try std.testing.expectEqual(@as(u64, 900), snapshot.token_auto_compaction_pass_c_threshold);
     try std.testing.expect(!snapshot.token_compaction_triggered);
     try std.testing.expectEqual(@as(u64, 300), snapshot.token_reply_reserve);
     try std.testing.expectEqual(@as(u64, 2_048), snapshot.token_tool_reserve);

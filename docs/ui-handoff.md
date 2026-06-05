@@ -575,6 +575,14 @@ and capability. Design it to feel premium, not buried:
 - **Context-window indicator** — when the conversation approaches the
   window cap, surface "180K / 256K used — pasting a large doc?
   Switch to Opus 4.7 (1M) for headroom." Auto-suggestion, not forced.
+- **Live context pressure meter** — bind to
+  `GET /api/v1/users/:id/sessions/:session_key/context`. Treat
+  `context_pressure_percent` / `pressure_percent` as the canonical display
+  value and use `context_window_tokens`, `context_window_source`, and
+  `compaction` metadata as supporting detail. `compaction.recommended` is an
+  advisory nudge, not proof that an automatic compaction pass fired. Do not
+  derive the user-facing meter from cumulative usage, session-list summaries,
+  or diagnostics.
 - **NEVER hide the picker behind a paywall** — caps were lifted; the
   central meter handles billing. Premium model availability is a
   feature, not a gate.

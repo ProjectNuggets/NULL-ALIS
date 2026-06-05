@@ -3536,10 +3536,50 @@ components:
     SessionContextResponse:
       type: object
       properties:
+        status:
+          type: string
+          enum: [live]
+        active:
+          type: boolean
+        live:
+          type: boolean
+        session_key:
+          type: string
+        sampled_at_ms:
+          type: integer
+          format: int64
+        model:
+          type: string
+        model_provider:
+          type: string
+          nullable: true
+        context_window_source:
+          type: string
+          enum: [override, model_capability, default, unknown]
         history_len:
           type: integer
           format: int64
+        history_messages:
+          type: integer
+          format: int64
+        message_count:
+          type: integer
+          format: int64
         tokens_used:
+          type: integer
+          format: int64
+          description: Legacy alias for active context-window token estimate, not cumulative lifetime usage.
+        token_count:
+          type: integer
+          format: int64
+          description: Legacy alias for active context-window token estimate.
+        token_estimate:
+          type: integer
+          format: int64
+        context_window_used:
+          type: integer
+          format: int64
+        context_window_max:
           type: integer
           format: int64
         max_history:
@@ -3548,6 +3588,67 @@ components:
         token_limit:
           type: integer
           format: int64
+          description: Legacy alias for context_window_tokens.
+        context_window_tokens:
+          type: integer
+          format: int64
+        remaining_tokens:
+          type: integer
+          format: int64
+        pressure_percent:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 100
+        context_window_used_pct:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 100
+        context_pressure_percent:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 100
+        token_compaction_threshold:
+          type: integer
+          format: int64
+        token_compaction_recommended_threshold:
+          type: integer
+          format: int64
+        token_auto_compaction_pass_a_threshold:
+          type: integer
+          format: int64
+        token_auto_compaction_pass_c_threshold:
+          type: integer
+          format: int64
+        token_compaction_recommended:
+          type: boolean
+          description: Advisory marker set when pressure crosses the backend nudge threshold; automatic compaction still fires only at backend pass thresholds.
+        token_compaction_triggered:
+          type: boolean
+          deprecated: true
+          description: Legacy alias for token_compaction_recommended; does not mean an automatic compaction pass fired.
+        compaction:
+          type: object
+          properties:
+            nudge_percent:
+              type: integer
+              format: int32
+            pass_a_percent:
+              type: integer
+              format: int32
+            pass_c_percent:
+              type: integer
+              format: int32
+            recommended:
+              type: boolean
+        last_turn:
+          type: object
+          nullable: true
+        report:
+          type: object
+          description: Full canonical context report; top-level fields are stable meter aliases for clients.
     SessionExportResponse:
       type: object
       properties:

@@ -391,7 +391,9 @@ test "D32 purgeUser accepts absolute users_root (sanity, regression guard for th
 
 test "purgeUser reports vector_rows_removed from vector store" {
     const allocator = std.testing.allocator;
-    const sqlite_mod = @import("memory/engines/sqlite.zig");
+    const build_options = @import("build_options");
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+    const sqlite_mod = memory_mod.sqlite;
     const vector_store_mod = @import("memory/vector/store.zig");
 
     var mem = try sqlite_mod.SqliteMemory.init(allocator, ":memory:");

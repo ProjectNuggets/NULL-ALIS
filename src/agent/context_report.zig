@@ -171,10 +171,10 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
         report.context_window_tokens,
         report.context_pressure_percent,
     });
-    try std.fmt.format(w, "  policy: history_limit={d} token_compact_threshold={d} token_trigger={s}\n", .{
+    try std.fmt.format(w, "  policy: history_limit={d} token_compact_threshold={d} token_recommended={s}\n", .{
         report.history_trim_limit_messages,
         report.token_compaction_threshold,
-        boolWord(report.token_compaction_triggered),
+        boolWord(report.token_compaction_recommended),
     });
     try std.fmt.format(w, "  reserve: reply={d} tool={d} safety={d} total={d}\n", .{
         report.token_reply_reserve,
@@ -306,14 +306,30 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
     defer allocator.free(continuity_refresh_reason_text);
 
     return try std.json.Stringify.valueAlloc(allocator, .{
+        .status = report.status,
+        .sampled_at_ms = report.sampled_at_ms,
         .model = report.model_name,
+        .model_provider = report.model_provider,
         .history_messages = report.history_messages,
         .token_estimate = report.token_estimate,
         .context_window_tokens = report.context_window_tokens,
+        .context_window_source = report.context_window_source,
+        .remaining_tokens = report.remaining_tokens,
+        .pressure_percent = report.context_pressure_percent,
         .context_pressure_percent = report.context_pressure_percent,
         .history_trim_limit_messages = report.history_trim_limit_messages,
         .token_compaction_threshold = report.token_compaction_threshold,
+        .token_compaction_recommended_threshold = report.token_compaction_recommended_threshold,
+        .token_auto_compaction_pass_a_threshold = report.token_auto_compaction_pass_a_threshold,
+        .token_auto_compaction_pass_c_threshold = report.token_auto_compaction_pass_c_threshold,
+        .token_compaction_recommended = report.token_compaction_recommended,
         .token_compaction_triggered = report.token_compaction_triggered,
+        .compaction = .{
+            .nudge_percent = report.compaction_recommend_percent,
+            .pass_a_percent = report.auto_compaction_pass_a_percent,
+            .pass_c_percent = report.auto_compaction_pass_c_percent,
+            .recommended = report.token_compaction_recommended,
+        },
         .token_reply_reserve = report.token_reply_reserve,
         .token_tool_reserve = report.token_tool_reserve,
         .token_safety_reserve = report.token_safety_reserve,
@@ -547,13 +563,21 @@ test "context report counts roles and memory-enriched turns" {
 
 test "context report formatters expose structured details" {
     const report = Report{
+        .sampled_at_ms = 1234,
         .model_name = "openai/gpt-5.2",
+        .model_provider = "openai",
         .history_messages = 7,
         .token_estimate = 321,
         .context_window_tokens = 1000,
+        .context_window_source = "model_capability",
+        .remaining_tokens = 679,
         .context_pressure_percent = 32,
         .history_trim_limit_messages = 80,
         .token_compaction_threshold = 650,
+        .token_compaction_recommended_threshold = 500,
+        .token_auto_compaction_pass_a_threshold = 700,
+        .token_auto_compaction_pass_c_threshold = 900,
+        .token_compaction_recommended = false,
         .token_compaction_triggered = false,
         .token_reply_reserve = 300,
         .token_tool_reserve = 2048,
@@ -636,7 +660,7 @@ test "context report formatters expose structured details" {
     const detail = try formatDetail(std.testing.allocator, report);
     defer std.testing.allocator.free(detail);
     try std.testing.expect(std.mem.indexOf(u8, detail, "budget: window=1000 pressure=32%") != null);
-    try std.testing.expect(std.mem.indexOf(u8, detail, "policy: history_limit=80 token_compact_threshold=650 token_trigger=no") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "policy: history_limit=80 token_compact_threshold=650 token_recommended=no") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "reserve: reply=300 tool=2048 safety=1024 total=3372") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "memory: enabled=yes runtime=yes") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "retrieval: mode=hybrid provider=together vector=pgvector rollout=on") != null);
@@ -656,8 +680,18 @@ test "context report formatters expose structured details" {
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"stable_prefix\":{\"available\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"buckets\":{\"stable_prefix\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"sampled_at_ms\":1234") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"model_provider\":\"openai\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"context_window_source\":\"model_capability\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"remaining_tokens\":679") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"pressure_percent\":32") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"context_pressure_percent\":32") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"token_compaction_threshold\":650") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"token_compaction_recommended_threshold\":500") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"token_auto_compaction_pass_a_threshold\":700") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"token_auto_compaction_pass_c_threshold\":900") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"token_compaction_recommended\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"compaction\":{\"nudge_percent\":50") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"token_total_reserve\":3372") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"enriched_messages\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"conversation_retention_days\":0") != null);

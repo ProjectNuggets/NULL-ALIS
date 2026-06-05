@@ -40,6 +40,13 @@ pub const DEFAULT_COMPACTION_MAX_SOURCE_CHARS: u32 = 80_000;
 /// Default token limit for context window (used by token-based compaction trigger).
 pub const DEFAULT_TOKEN_LIMIT: u64 = config_types.DEFAULT_AGENT_TOKEN_LIMIT;
 
+/// Operator-facing advisory point. Crossing this does not compact by itself.
+pub const COMPACTION_RECOMMEND_PERCENT: u8 = 50;
+/// First automatic compaction pass: deterministic middle-drop/dedup.
+pub const AUTO_COMPACT_PASS_A_PERCENT: u8 = 70;
+/// Expensive automatic compaction pass: LLM summarization.
+pub const AUTO_COMPACT_PASS_C_PERCENT: u8 = 90;
+
 pub const TrimStats = struct {
     history_before: usize = 0,
     history_after: usize = 0,
@@ -146,7 +153,7 @@ pub const TokenBudgetPolicy = struct {
     /// Earlier commits referenced 60/75/85% thresholds; that comment is
     /// stale, current truth is 70/90.
     ///
-    /// Derived as (token_limit * 50) / 100.
+    /// Derived as token_limit * COMPACTION_RECOMMEND_PERCENT / 100.
     compaction_trigger: u64,
 };
 
@@ -174,7 +181,7 @@ pub fn buildTokenBudgetPolicy(token_limit: u64, max_tokens: u32) TokenBudgetPoli
         .safety_reserve = safety_reserve,
         .total_reserve = total_reserve,
         .threshold = @max(minimum_threshold, threshold_from_reserve),
-        .compaction_trigger = (token_limit * 50) / 100,
+        .compaction_trigger = (token_limit * COMPACTION_RECOMMEND_PERCENT) / 100,
     };
 }
 
@@ -258,7 +265,7 @@ pub fn autoCompactHistory(
     // Append-only mutation downstream of the protected prefix preserves
     // cache hits on the unchanged prefix. Tool-call/tool-result pair
     // hygiene mirrors compactHistoryKeepingRecent's existing logic.
-    const cheap_threshold = (config.token_limit * 70) / 100;
+    const cheap_threshold = (config.token_limit * AUTO_COMPACT_PASS_A_PERCENT) / 100;
     if (estimate_before > cheap_threshold) {
         log.info("compaction.auto: pass=A firing (drop-from-middle)", .{});
         const reduced = dropOldestPairsFromMiddle(allocator, history, config);
@@ -266,7 +273,7 @@ pub fn autoCompactHistory(
     }
 
     // ── Pass C: Full LLM summarization at 90% ──
-    const llm_threshold = (config.token_limit * 90) / 100;
+    const llm_threshold = (config.token_limit * AUTO_COMPACT_PASS_C_PERCENT) / 100;
     if (tokenEstimate(history.items) > llm_threshold) {
         log.info("compaction.auto: pass=C firing (LLM summarization)", .{});
         // V1.8-5 fix: when Pass C fires, GUARANTEE compaction. Pre-V1.8
