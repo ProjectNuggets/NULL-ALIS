@@ -4242,6 +4242,88 @@ const ManagerImpl = struct {
                 }
             }
         }
+        // Structural orphan-killer — connect this freshly written memory to the
+        // graph (session source hub + first-person self hub) so it is never an
+        // orphan. Best-effort; never fails the write.
+        self.emitStructuralEdges(user_id, key, content, category, session_id, metadata_json);
+    }
+
+    /// Conservative first-person detector for self-hub anchoring. Matches
+    /// whole-word English first-person singular pronouns (word-boundary scan,
+    /// so "infrastructure" never matches "i"). Apostrophes are delimiters, so
+    /// "I'm"/"I've" tokenize to "i". Arabic first-person is morphological and
+    /// deferred — a missed self-link is harmless (the memory still gets its
+    /// deterministic session source edge).
+    fn isFirstPerson(content: []const u8) bool {
+        var it = std.mem.tokenizeAny(u8, content, " \t\r\n.,;:!?\"'()[]{}-/\\");
+        while (it.next()) |raw| {
+            if (raw.len == 0 or raw.len > 6) continue;
+            var buf: [6]u8 = undefined;
+            const tok = std.ascii.lowerString(buf[0..raw.len], raw);
+            const pronouns = [_][]const u8{ "i", "my", "me", "mine", "myself" };
+            for (pronouns) |p| {
+                if (std.mem.eql(u8, tok, p)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Structural orphan-killer (LLM-free, idempotent). Connects a freshly
+    /// written, graph-worthy memory to the graph so it is never an orphan:
+    ///   key -> session:<session_id>  (IN_SESSION) for guaranteed connectivity,
+    ///   key -> user:<user_id>        (ABOUT_SELF) when content is first-person
+    ///                                (anchors the focus-mode self hub).
+    /// Skips transient `conversation` rows and system keys; never anchors a hub
+    /// to itself. Both target hubs are excluded from PPR traversal
+    /// (findEdgesPPR), so they kill orphans + power focus mode without
+    /// distorting graph retrieval. Best-effort: a failed edge never fails the
+    /// memory write. Idempotent via upsertMemoryEdge's ON CONFLICT.
+    fn emitStructuralEdges(
+        self: *Self,
+        user_id: i64,
+        key: []const u8,
+        content: []const u8,
+        category: memory_root.MemoryCategory,
+        session_id: ?[]const u8,
+        metadata_json: ?[]const u8,
+    ) void {
+        // Transient conversation turns and system rows are not graph nodes.
+        if (std.mem.eql(u8, categoryToMemoryType(category), "conversation")) return;
+        if (isSystemMemoryKey(key)) return;
+        if (std.mem.startsWith(u8, key, "user:") or std.mem.startsWith(u8, key, "session:")) return;
+        // Extraction-derived facts (`extracted_<hash>`) already get a
+        // memory->entity edge from the extraction triple, so they are never
+        // orphans and need no structural source edge. Skipping them avoids
+        // redundant edges (DEG-RAG: fewer edges retrieve better) and keeps the
+        // structural layer focused on the memories that would otherwise float.
+        if (std.mem.startsWith(u8, key, "extracted_")) return;
+        // Any fact carrying an extraction triple in its metadata gets a
+        // memory->entity edge — either now (extraction_persist) or via the
+        // cmt16 JSONB backfill. Same rationale as the `extracted_` skip but
+        // keyed on the triple itself, so legacy/compose triple facts are
+        // covered regardless of their key prefix.
+        if (metadata_json) |mj| {
+            if (std.mem.indexOf(u8, mj, "\"predicate\"") != null) return;
+        }
+
+        if (session_id) |sid| {
+            if (sid.len > 0) {
+                if (std.fmt.allocPrint(self.allocator, "session:{s}", .{sid}) catch null) |sn| {
+                    defer self.allocator.free(sn);
+                    self.upsertMemoryEdge(user_id, key, sn, "IN_SESSION", "structural", 1.0) catch |err| {
+                        log.warn("structural.in_session_failed key={s} err={s}", .{ key, @errorName(err) });
+                    };
+                }
+            }
+        }
+
+        if (isFirstPerson(content)) {
+            const sn = std.fmt.allocPrint(self.allocator, "user:{d}", .{user_id}) catch return;
+            defer self.allocator.free(sn);
+            self.upsertMemoryEdge(user_id, key, sn, "ABOUT_SELF", "structural", 1.0) catch |err| {
+                log.warn("structural.about_self_failed key={s} err={s}", .{ key, @errorName(err) });
+            };
+        }
     }
 
     /// V1.5 day-3 chunk 3C — batch-check which keys exist as memories
@@ -4614,6 +4696,9 @@ const ManagerImpl = struct {
                 }
             }
         }
+        // Structural orphan-killer — same as the metadata path (see
+        // emitStructuralEdges). The simple path carries no metadata triple.
+        self.emitStructuralEdges(user_id, key, content, category, session_id, null);
     }
 
     /// V1.7 Item 2 — promote a memory row to Tier-3 (core). Sets
@@ -14403,6 +14488,65 @@ test "C1 PPR hub-exclusion — speaker hub does not flood traversal" {
     try std.testing.expect(!saw_junk); // hub-only junk fan-out not reachable
 }
 
+// Structural orphan-killer: every graph-worthy memory gets a deterministic,
+// LLM-free edge to its session source hub the moment it is written, so it is
+// never a graph orphan. First-person memories additionally anchor to the
+// self/focus hub. Transient `conversation` rows are intentionally NOT graphed.
+test "C-struct structural edges connect memories to session + self hub" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-struct/workspace");
+
+    // Graph-worthy core fact with a session → must get an IN_SESSION edge.
+    try mgr.upsertMemoryWithMetadata(2, "fact_dubai", "Lives in Dubai", .core, "sess-1", "{}");
+    // First-person fact → IN_SESSION source edge AND an ABOUT_SELF self-hub edge.
+    try mgr.upsertMemoryWithMetadata(2, "fact_self", "I love hiking in the mountains", .core, "sess-1", "{}");
+    // Transient conversation turn → NOT graphed (stays out by design).
+    try mgr.upsertMemoryWithMetadata(2, "turn_noise", "health check", .conversation, "sess-1", "{}");
+
+    const edges = try mgr.listEdgesForUser(allocator, 2);
+    defer memory_root.freeTypedEdges(allocator, edges);
+
+    var dubai_session = false;
+    var self_session = false;
+    var self_about = false;
+    var noise_any = false;
+    for (edges) |e| {
+        if (std.mem.eql(u8, e.source_key, "fact_dubai") and std.mem.eql(u8, e.target_key, "session:sess-1") and std.mem.eql(u8, e.predicate, "IN_SESSION")) dubai_session = true;
+        if (std.mem.eql(u8, e.source_key, "fact_self") and std.mem.eql(u8, e.target_key, "session:sess-1")) self_session = true;
+        if (std.mem.eql(u8, e.source_key, "fact_self") and std.mem.eql(u8, e.target_key, "user:2") and std.mem.eql(u8, e.predicate, "ABOUT_SELF")) self_about = true;
+        if (std.mem.eql(u8, e.source_key, "turn_noise")) noise_any = true;
+    }
+    try std.testing.expect(dubai_session); // every graph-worthy memory is connected
+    try std.testing.expect(self_session); // first-person fact still gets its source edge
+    try std.testing.expect(self_about); // ...plus the self-hub anchor
+    try std.testing.expect(!noise_any); // transient conversation stays out of the graph
+
+    // Orphan check: fact_dubai is no longer an orphan (has an incident edge).
+    const dubai_edges = try mgr.countEdgesForSource(2, "fact_dubai");
+    try std.testing.expect(dubai_edges >= 1);
+}
+
 // V1.6 commit 8 — entity coreference via cosine ≥ threshold.
 //
 // Acceptance: upsertEntity inserts a new entity with a deterministic embedding;
@@ -15735,15 +15879,20 @@ test "V1.7a-8a listOrphanMemories — orphans + edge-loss + hygiene + scoping" {
     try mgr.provisionUser(2, "/tmp/nullalis-zaki-v17a8a-orphans/workspace");
 
     // ── Seed memories ─────────────────────────────────────────────
-    try mgr.upsertMemory(2, "mem_orphan", "lonely fact", .core, "session-A");
-    try mgr.upsertMemory(2, "mem_with_outgoing", "has a target", .core, "session-A");
-    try mgr.upsertMemory(2, "mem_target", "is targeted", .core, "session-A");
-    try mgr.upsertMemory(2, "mem_lost_edge", "edge will be closed", .core, "session-A");
-    try mgr.upsertMemory(2, "mem_lost_partner", "partner of lost-edge", .core, "session-A");
+    // Session-less writes: as of the structural orphan-killer, a memory
+    // written WITH a session is auto-connected to its session source hub and
+    // is therefore no longer an orphan. To exercise the genuine orphan paths
+    // (no-edge, edge-loss, superseded, hygiene-filtered) we deliberately write
+    // these with no session so no structural edge is emitted.
+    try mgr.upsertMemory(2, "mem_orphan", "lonely fact", .core, null);
+    try mgr.upsertMemory(2, "mem_with_outgoing", "has a target", .core, null);
+    try mgr.upsertMemory(2, "mem_target", "is targeted", .core, null);
+    try mgr.upsertMemory(2, "mem_lost_edge", "edge will be closed", .core, null);
+    try mgr.upsertMemory(2, "mem_lost_partner", "partner of lost-edge", .core, null);
     // Hidden-key orphan (continuity summary with no edges)
-    try mgr.upsertMemory(2, "summary_latest/agent:zaki-bot:user:7:thread:main", "type=summary_latest", .daily, "session-A");
+    try mgr.upsertMemory(2, "summary_latest/agent:zaki-bot:user:7:thread:main", "type=summary_latest", .daily, null);
     // Superseded orphan (no edges + valid_to in past)
-    try mgr.upsertMemory(2, "mem_superseded_orphan", "old fact", .core, "session-A");
+    try mgr.upsertMemory(2, "mem_superseded_orphan", "old fact", .core, null);
     _ = try mgr.demoteMemoryFromCore(2, "mem_superseded_orphan", "test_close");
     const close_ts: i64 = std.time.timestamp() - 60;
     try mgr.setMemoryInvalidation(2, "mem_superseded_orphan", close_ts, close_ts);
