@@ -14613,6 +14613,97 @@ test "C-keystone memory->entity MENTIONS edges de-orphan with meaning" {
     }
 }
 
+// VALIDATION — quantified before/after on a realistic cohort. Proves the
+// keystone delivers the three value signals (orphan rate down, rendered edges
+// up, recall reachability up) rather than just flipping a counter. Prints the
+// numbers so the value is visible, then asserts the deltas.
+test "VALIDATION cohort — keystone de-orphans with meaning (before/after)" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{ .backend = "postgres", .postgres = .{ .connection_string = test_url, .schema = schema } };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const r = try mgr.exec(drop_q);
+        c.PQclear(r);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-valid/workspace");
+
+    // Seed true orphans: null session + non-first-person => no structural edge.
+    // Three name "Helix", two name "Mia", one names neither.
+    const Seed = struct { k: []const u8, c: []const u8 };
+    const seeds = [_]Seed{
+        .{ .k = "v_helix1", .c = "The Helix editor is fast and modal" },
+        .{ .k = "v_helix2", .c = "Helix replaced the old setup last month" },
+        .{ .k = "v_helix3", .c = "Config tips for the Helix workflow" },
+        .{ .k = "v_mia1", .c = "Mia joined the design team" },
+        .{ .k = "v_mia2", .c = "Mia leads the new project" },
+        .{ .k = "v_none", .c = "the weather is nice today" },
+    };
+    for (seeds) |s| try mgr.upsertMemory(2, s.k, s.c, .core, null);
+
+    const zero_emb = [_]f32{0.0} ** 1024;
+    const helix_id = try mgr.upsertEntity(allocator, 2, "Helix", &zero_emb);
+    defer allocator.free(helix_id);
+    const mia_id = try mgr.upsertEntity(allocator, 2, "Mia", &zero_emb);
+    defer allocator.free(mia_id);
+
+    const measure = struct {
+        fn run(m: *ManagerImpl, a: std.mem.Allocator) !struct { orphans: usize, edges: usize, reach: usize } {
+            const orphans = try m.listOrphanMemories(a, 2, 100);
+            const o = orphans.len;
+            memory_root.freeEntries(a, orphans);
+            const edges = try m.listEdgesForUser(a, 2);
+            const e = edges.len;
+            memory_root.freeTypedEdges(a, edges);
+            const reach = try m.findEdgesPPR(a, 2, &[_][]const u8{"v_helix1"}, 3, 100);
+            const r = reach.len;
+            for (reach) |n| n.deinit(a);
+            a.free(reach);
+            return .{ .orphans = o, .edges = e, .reach = r };
+        }
+    };
+
+    const before = try measure.run(&mgr, allocator);
+
+    const resolved = [_]entity_pipeline.ResolvedEntity{
+        .{ .entity_id = helix_id, .canonical_name = "Helix", .was_existing = true },
+        .{ .entity_id = mia_id, .canonical_name = "Mia", .was_existing = true },
+    };
+    var mems = std.ArrayListUnmanaged(memory_root.MemoryEntry){};
+    defer mems.deinit(allocator);
+    for (seeds) |s| try mems.append(allocator, .{ .id = "x", .key = s.k, .content = s.c, .category = .core, .timestamp = "0" });
+    const res = try entity_pipeline.emitMemoryMentionEdges(allocator, &mgr, 2, &resolved, mems.items, 0.9, "sess-v");
+
+    const after = try measure.run(&mgr, allocator);
+
+    std.debug.print(
+        \\
+        \\=== KEYSTONE VALIDATION (cohort: 6 memories, 2 shared entities) ===
+        \\                          BEFORE   AFTER
+        \\  orphan memories          {d:>5}   {d:>5}
+        \\  graph edges (rendered)   {d:>5}   {d:>5}
+        \\  PPR reach from v_helix1  {d:>5}   {d:>5}
+        \\  memory->entity edges emitted: {d}
+        \\
+    , .{ before.orphans, after.orphans, before.edges, after.edges, before.reach, after.reach, res.emitted });
+
+    try std.testing.expect(after.orphans < before.orphans); // orphan rate down
+    try std.testing.expect(after.edges > before.edges); // rendered edges up
+    try std.testing.expect(after.reach > before.reach); // recall reachability up
+    try std.testing.expectEqual(@as(usize, 5), res.emitted); // 3 Helix + 2 Mia
+}
+
 // V1.6 commit 8 — entity coreference via cosine ≥ threshold.
 //
 // Acceptance: upsertEntity inserts a new entity with a deterministic embedding;
