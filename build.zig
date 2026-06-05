@@ -310,6 +310,16 @@ pub fn build(b: *std.Build) void {
         break :blk parsed;
     } else if (v1) v1DefaultChannels() else defaultChannels();
 
+    // Optional substring filter forwarded to the inline `lib_tests` runner so
+    // a single test can be exercised without running the whole suite:
+    //   zig build test -Dengines=base,sqlite,postgres -Dtest-filter="PPR hub"
+    // Default (null) preserves the prior behavior of running every test.
+    const test_filter = b.option(
+        []const u8,
+        "test-filter",
+        "Only run inline tests whose name contains this substring (default: run all)",
+    );
+
     const engines_raw = b.option(
         []const u8,
         "engines",
@@ -472,7 +482,10 @@ pub fn build(b: *std.Build) void {
     }
 
     // ---------- tests ----------
-    const lib_tests = b.addTest(.{ .root_module = lib_mod });
+    const lib_tests = b.addTest(.{
+        .root_module = lib_mod,
+        .filters = if (test_filter) |tf| &.{tf} else &.{},
+    });
     if (sqlite3) |lib| {
         lib_tests.linkLibrary(lib);
     }

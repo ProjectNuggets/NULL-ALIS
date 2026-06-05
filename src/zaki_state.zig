@@ -8838,6 +8838,13 @@ const ManagerImpl = struct {
             "  JOIN {schema}.memory_edges e " ++
             "    ON (e.source_key = p.key OR e.target_key = p.key) " ++
             "    AND e.user_id = $1 AND e.is_latest " ++
+            // C1 hardening: never traverse through the per-user speaker hub
+            // (`user:<id>` MENTIONED edges minted by the entity pipeline). The
+            // hub is non-discriminative ("user mentioned everything") and PPR
+            // has no degree normalization, so a hub touched by thousands of
+            // memories would bleed score into every node. Excluding `user:%`
+            // endpoints keeps traversal on genuine entity/fact relations.
+            "    AND e.source_key NOT LIKE 'user:%' AND e.target_key NOT LIKE 'user:%' " ++
             "  WHERE p.depth < $3" ++
             ") " ++
             "SELECT key, SUM(score) AS ppr_score, MIN(depth)::int AS min_depth " ++
@@ -14309,6 +14316,77 @@ test "V1.6 commit 7 memory_edges insert + dedup + cascade-on-close" {
         defer allocator.free(closed_count_str);
         try std.testing.expectEqualStrings("2", closed_count_str); // both edges closed
     }
+}
+
+// Brain-graph activation hardening (C1) — PPR must not be flooded by the
+// per-user speaker hub (`user:<id>` MENTIONED edges minted by the entity
+// pipeline). The hub is non-discriminative ("user mentioned everything"), and
+// findEdgesPPR has no degree normalization, so before activating the entity
+// pipeline the recursive traversal must exclude `user:%` endpoints. Otherwise
+// a seed one hop from the hub bleeds score into every node the user ever
+// mentioned.
+//
+// Acceptance: from a seed whose ONLY path to a swarm of unrelated nodes runs
+// through the speaker hub, PPR returns the genuine 1-hop neighbor but NOT the
+// hub or any hub-only-reachable junk node.
+test "C1 PPR hub-exclusion — speaker hub does not flood traversal" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-ppr-hub/workspace");
+
+    // Genuine, discriminative chain: seed → A → B (KNOWS edges).
+    try mgr.upsertMemoryEdge(2, "mem_seed", "mem_a", "KNOWS", "test", 0.9);
+    try mgr.upsertMemoryEdge(2, "mem_a", "mem_b", "KNOWS", "test", 0.9);
+
+    // Per-user speaker hub touches the seed AND 30 unrelated junk nodes.
+    // Without hub-exclusion, PPR from mem_seed walks the hub edge and floods
+    // every junk_* node with score.
+    try mgr.upsertMemoryEdge(2, "user:2", "mem_seed", "MENTIONED", "wiki_link", 0.9);
+    var k: usize = 0;
+    while (k < 30) : (k += 1) {
+        var jkey_buf: [32]u8 = undefined;
+        const jkey = try std.fmt.bufPrint(&jkey_buf, "junk_{d}", .{k});
+        try mgr.upsertMemoryEdge(2, "user:2", jkey, "MENTIONED", "wiki_link", 0.9);
+    }
+
+    const seeds = [_][]const u8{"mem_seed"};
+    const nodes = try mgr.findEdgesPPR(allocator, 2, &seeds, 3, 200);
+    defer {
+        for (nodes) |n| n.deinit(allocator);
+        allocator.free(nodes);
+    }
+
+    var saw_a = false;
+    var saw_junk = false;
+    var saw_hub = false;
+    for (nodes) |n| {
+        if (std.mem.eql(u8, n.key, "mem_a")) saw_a = true;
+        if (std.mem.startsWith(u8, n.key, "junk_")) saw_junk = true;
+        if (std.mem.startsWith(u8, n.key, "user:")) saw_hub = true;
+    }
+    try std.testing.expect(saw_a); // genuine neighbor reached
+    try std.testing.expect(!saw_hub); // speaker hub excluded from traversal
+    try std.testing.expect(!saw_junk); // hub-only junk fan-out not reachable
 }
 
 // V1.6 commit 8 — entity coreference via cosine ≥ threshold.
