@@ -649,6 +649,12 @@ pub const Agent = struct {
     activation_mode: ActivationMode = .mention,
     send_mode: SendMode = .inherit,
     last_turn_usage: providers.TokenUsage = .{},
+    /// Latest provider tokenizer/preflight sample for the currently
+    /// provider-bound request. Active only while a turn is in flight before
+    /// provider usage returns; context reports fall back to it when present.
+    provider_preflight_prompt_tokens: u32 = 0,
+    provider_preflight_active: bool = false,
+    provider_preflight_source: []const u8 = "provider_preflight",
     message_timeout_secs: u64 = 0,
     provider_reliability_active: bool = false,
     compaction_keep_recent: u32 = compaction.DEFAULT_COMPACTION_KEEP_RECENT,
@@ -1316,6 +1322,7 @@ pub const Agent = struct {
             .max_summary_chars = self.compaction_max_summary_chars,
             .max_source_chars = self.compaction_max_source_chars,
             .token_limit = self.token_limit,
+            .pressure_tokens_override = context_builder.buildSnapshot(self).token_estimate,
             .max_tokens = self.max_tokens,
             .message_timeout_secs = self.message_timeout_secs,
             .max_history_messages = self.max_history_messages,
@@ -3317,6 +3324,7 @@ pub const Agent = struct {
         self.context_was_compacted = false;
         self.context_force_compressed = false;
         self.last_turn_context = .{};
+        self.clearProviderPreflightSample();
         self.clearCurrentTurnProviderOverride();
         defer self.clearCurrentTurnProviderOverride();
 
@@ -3571,45 +3579,20 @@ pub const Agent = struct {
             self.last_turn_compacted = false;
         }
 
-        // ── Response/Semantic cache check ──
-        var key_buf: [16]u8 = undefined;
-        const system_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
-            self.history.items[0].content
-        else
-            null;
-        const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, self.model_name, system_prompt, user_message);
-
-        if (self.mem_rt) |rt| {
-            if (rt.semanticCache()) |sc| {
-                if (sc.get(self.allocator, key_hex, user_message) catch null) |cached_hit| {
-                    errdefer self.allocator.free(cached_hit.response);
-                    const history_copy = try self.allocator.dupe(u8, cached_hit.response);
-                    errdefer self.allocator.free(history_copy);
-                    try self.history.append(self.allocator, .{
-                        .role = .assistant,
-                        .content = history_copy,
-                    });
-                    if (self.compact_context_enabled) {
-                        // v1.14.14 Phase 3 — route through ContextEngine.compact.
-                        if (self.context_engine_state.compact(self).compacted) {
-                            self.refreshDurableContinuityAfterCompaction();
-                        }
-                    }
-                    self.ensureDurableContinuitySeed();
-                    const cache_hit_event = ObserverEvent{ .turn_stage = .{
-                        .stage = "response_cache_hit",
-                        .run_id = self.current_run_id,
-                    } };
-                    self.observer.recordEvent(&cache_hit_event);
-                    self.last_turn_context.cache_hit = true;
-                    const complete_event = ObserverEvent{ .turn_complete = {} };
-                    self.observer.recordEvent(&complete_event);
-                    return TurnOutcome.justText(cached_hit.response);
-                }
-            }
-        }
-
-        if (self.response_cache) |rc| {
+        // ── Agent response cache check ──
+        // Semantic response caching is deliberately disabled for Agent turns:
+        // it can replay a prior answer into a different interactive context.
+        // Exact response cache is limited to background origins; foreground
+        // user/MCP prompts must reach the provider unless blocked elsewhere.
+        const allow_exact_response_cache = tools_mod.isBackgroundTurnOrigin(tools_mod.getTurnContext().origin);
+        if (allow_exact_response_cache and self.response_cache != null) {
+            var key_buf: [16]u8 = undefined;
+            const system_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
+                self.history.items[0].content
+            else
+                null;
+            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, self.model_name, system_prompt, user_message);
+            const rc = self.response_cache.?;
             if (rc.get(self.allocator, key_hex) catch null) |cached_response| {
                 errdefer self.allocator.free(cached_response);
                 const history_copy = try self.allocator.dupe(u8, cached_response);
@@ -3779,6 +3762,11 @@ pub const Agent = struct {
             // video-capable model keeps it. Runs on `messages`, the slice
             // shared by the streaming and blocking provider calls below.
             try self.routeVideoForModel(arena, messages, effective_model, iteration);
+            var prompt_cache_key_buf: [69]u8 = undefined;
+            const cache_key = self.promptCacheKey(&prompt_cache_key_buf);
+            const chat_request = self.providerChatRequest(messages, effective_model, cache_key);
+            self.sampleProviderPreflight(chat_request, effective_model, iteration);
+            defer self.provider_preflight_active = false;
 
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.provider.supportsStreaming();
@@ -3799,15 +3787,7 @@ pub const Agent = struct {
                 };
                 const stream_result = self.provider.streamChat(
                     self.allocator,
-                    .{
-                        .messages = messages,
-                        .model = effective_model,
-                        .temperature = self.temperature,
-                        .max_tokens = self.max_tokens,
-                        .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
-                        .timeout_secs = self.message_timeout_secs,
-                        .reasoning_effort = self.reasoning_effort,
-                    },
+                    chat_request,
                     effective_model,
                     self.temperature,
                     streamCallbackWithTiming,
@@ -3855,15 +3835,7 @@ pub const Agent = struct {
                         try self.routeVideoForModel(arena, retry_messages, effective_model, iteration);
                         const retry_result = self.provider.streamChat(
                             self.allocator,
-                            .{
-                                .messages = retry_messages,
-                                .model = effective_model,
-                                .temperature = self.temperature,
-                                .max_tokens = self.max_tokens,
-                                .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
-                                .timeout_secs = self.message_timeout_secs,
-                                .reasoning_effort = self.reasoning_effort,
-                            },
+                            self.providerChatRequest(retry_messages, effective_model, cache_key),
                             effective_model,
                             self.temperature,
                             streamCallbackWithTiming,
@@ -3927,15 +3899,7 @@ pub const Agent = struct {
             } else {
                 response = self.provider.chat(
                     self.allocator,
-                    .{
-                        .messages = messages,
-                        .model = effective_model,
-                        .temperature = self.temperature,
-                        .max_tokens = self.max_tokens,
-                        .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
-                        .timeout_secs = self.message_timeout_secs,
-                        .reasoning_effort = self.reasoning_effort,
-                    },
+                    chat_request,
                     effective_model,
                     self.temperature,
                 ) catch |err| retry_blk: {
@@ -3973,15 +3937,7 @@ pub const Agent = struct {
                         // matching the initial blocking call and streaming path.
                         break :retry_blk self.provider.chat(
                             self.allocator,
-                            .{
-                                .messages = recovery_msgs,
-                                .model = effective_model,
-                                .temperature = self.temperature,
-                                .max_tokens = self.max_tokens,
-                                .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
-                                .timeout_secs = self.message_timeout_secs,
-                                .reasoning_effort = self.reasoning_effort,
-                            },
+                            self.providerChatRequest(recovery_msgs, effective_model, cache_key),
                             effective_model,
                             self.temperature,
                         ) catch return err;
@@ -4010,15 +3966,7 @@ pub const Agent = struct {
                     // the retry must dispatch to the same model.
                     break :retry_blk self.provider.chat(
                         self.allocator,
-                        .{
-                            .messages = messages,
-                            .model = effective_model,
-                            .temperature = self.temperature,
-                            .max_tokens = self.max_tokens,
-                            .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
-                            .timeout_secs = self.message_timeout_secs,
-                            .reasoning_effort = self.reasoning_effort,
-                        },
+                        chat_request,
                         effective_model,
                         self.temperature,
                     ) catch |retry_err| {
@@ -4037,15 +3985,7 @@ pub const Agent = struct {
                             // turn's vision-fallback routing on the recovery call.
                             break :retry_blk self.provider.chat(
                                 self.allocator,
-                                .{
-                                    .messages = recovery_msgs,
-                                    .model = effective_model,
-                                    .temperature = self.temperature,
-                                    .max_tokens = self.max_tokens,
-                                    .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
-                                    .timeout_secs = self.message_timeout_secs,
-                                    .reasoning_effort = self.reasoning_effort,
-                                },
+                                self.providerChatRequest(recovery_msgs, effective_model, cache_key),
                                 effective_model,
                                 self.temperature,
                             ) catch return retry_err;
@@ -4083,6 +4023,7 @@ pub const Agent = struct {
             // Track tokens
             self.total_tokens += response.usage.total_tokens;
             self.last_turn_usage = response.usage;
+            self.provider_preflight_active = false;
 
             // V1.14.6 follow-up: structured cache-hit telemetry. Together
             // (vLLM), OpenRouter, and OpenAI-compat all return prompt
@@ -4646,31 +4587,16 @@ pub const Agent = struct {
                 const cache_start_ms = std.time.milliTimestamp();
                 var cached = false;
                 var cache_duration_ms: u64 = 0;
-                var store_key_buf: [16]u8 = undefined;
-                const sys_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
-                    self.history.items[0].content
-                else
-                    null;
-                const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, self.model_name, sys_prompt, user_message);
                 const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
 
-                if (self.mem_rt) |rt| {
-                    if (rt.semanticCache()) |sc| {
-                        sc.put(
-                            self.allocator,
-                            store_key_hex,
-                            self.model_name,
-                            final_text,
-                            token_count,
-                            user_message,
-                        ) catch |err| {
-                            log.warn("response_cache: semantic cache put failed ({}); cache miss on next identical query", .{err});
-                        };
-                        cached = true;
-                    }
-                }
-
-                if (self.response_cache) |rc| {
+                if (allow_exact_response_cache and self.response_cache != null) {
+                    var store_key_buf: [16]u8 = undefined;
+                    const sys_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
+                        self.history.items[0].content
+                    else
+                        null;
+                    const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, self.model_name, sys_prompt, user_message);
+                    const rc = self.response_cache.?;
                     rc.put(self.allocator, store_key_hex, self.model_name, final_text, token_count) catch |err| {
                         log.warn("response_cache: exact-match cache put failed ({}); cache miss on next identical query", .{err});
                     };
@@ -5479,6 +5405,71 @@ pub const Agent = struct {
             .allowed_dirs = allowed,
             .provider_video_upload = uploader,
             .experimental_video_upload = self.experimental_video_upload,
+        });
+    }
+
+    fn promptCacheKey(self: *Agent, buf: *[69]u8) ?[]const u8 {
+        const session_key = self.memory_session_id orelse return null;
+        if (session_key.len == 0) return null;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(session_key, &digest, .{});
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        @memcpy(buf[0..5], "zaki:");
+        @memcpy(buf[5..69], &hex);
+        return buf[0..69];
+    }
+
+    fn providerChatRequest(
+        self: *Agent,
+        messages: []const ChatMessage,
+        effective_model: []const u8,
+        prompt_cache_key: ?[]const u8,
+    ) providers.ChatRequest {
+        return .{
+            .messages = messages,
+            .model = effective_model,
+            .temperature = self.temperature,
+            .max_tokens = self.max_tokens,
+            .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
+            .prompt_cache_key = prompt_cache_key,
+            .timeout_secs = self.message_timeout_secs,
+            .reasoning_effort = self.reasoning_effort,
+        };
+    }
+
+    fn clearProviderPreflightSample(self: *Agent) void {
+        self.provider_preflight_prompt_tokens = 0;
+        self.provider_preflight_active = false;
+        self.provider_preflight_source = "provider_preflight";
+    }
+
+    fn sampleProviderPreflight(
+        self: *Agent,
+        request: providers.ChatRequest,
+        effective_model: []const u8,
+        iteration: u32,
+    ) void {
+        self.provider_preflight_active = false;
+        const maybe_estimate = self.provider.estimateTokens(self.allocator, request, effective_model) catch |err| {
+            log.info("provider.preflight unavailable provider={s} model={s} iteration={d} err={s}", .{
+                self.provider.getName(),
+                effective_model,
+                iteration,
+                @errorName(err),
+            });
+            return;
+        };
+        const estimate = maybe_estimate orelse return;
+        if (estimate.prompt_tokens == 0) return;
+        self.provider_preflight_prompt_tokens = estimate.prompt_tokens;
+        self.provider_preflight_source = estimate.source;
+        self.provider_preflight_active = true;
+        log.info("provider.preflight provider={s} model={s} iteration={d} prompt_tokens={d} source={s}", .{
+            self.provider.getName(),
+            effective_model,
+            iteration,
+            estimate.prompt_tokens,
+            estimate.source,
         });
     }
 
@@ -9387,7 +9378,7 @@ test "normal main-lane turn seeds summary_latest when compaction never runs" {
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_summary_key=timeline_summary/agent:test:user:1:main/") != null);
 }
 
-test "turn uses semantic cache when runtime semantic cache is available" {
+test "turn bypasses semantic cache for interactive correctness" {
     if (!@import("build_options").enable_sqlite) return error.SkipZigTest;
 
     const CountingProvider = struct {
@@ -9556,18 +9547,18 @@ test "turn uses semantic cache when runtime semantic cache is available" {
     try std.testing.expectEqual(@as(u32, 0), stage_observer.cache_hit_count);
 
     const sem_stats_after_first = try sem_cache.stats();
-    try std.testing.expect(sem_stats_after_first.count >= 1);
+    try std.testing.expectEqual(@as(usize, 0), sem_stats_after_first.count);
 
     const second = try agent.turn("semantic cache probe");
     defer allocator.free(second);
     try std.testing.expectEqualStrings("provider-answer", second);
-    try std.testing.expectEqual(@as(u32, 1), provider_state.calls);
+    try std.testing.expectEqual(@as(u32, 2), provider_state.calls);
     try std.testing.expectEqual(@as(u32, 2), stage_observer.turn_start_count);
     try std.testing.expectEqual(@as(u32, 2), stage_observer.complete_count);
-    try std.testing.expectEqual(@as(u32, 1), stage_observer.cache_hit_count);
+    try std.testing.expectEqual(@as(u32, 0), stage_observer.cache_hit_count);
 
     const sem_stats_after_second = try sem_cache.stats();
-    try std.testing.expect(sem_stats_after_second.hits >= 1);
+    try std.testing.expectEqual(@as(u64, 0), sem_stats_after_second.hits);
 }
 
 test "exec security deny blocks shell tool execution" {

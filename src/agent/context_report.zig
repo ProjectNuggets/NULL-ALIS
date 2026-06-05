@@ -167,6 +167,12 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
     try std.fmt.format(w, "  model: {s}\n", .{report.model_name});
     try std.fmt.format(w, "  messages: {d}\n", .{report.history_messages});
     try std.fmt.format(w, "  token_estimate: {d}\n", .{report.token_estimate});
+    try std.fmt.format(w, "  pressure_source: {s} local_estimate={d} provider_prompt={d} provider_cached={d}\n", .{
+        report.pressure_token_source,
+        report.local_token_estimate,
+        report.provider_prompt_tokens,
+        report.provider_cached_prompt_tokens,
+    });
     try std.fmt.format(w, "  budget: window={d} pressure={d}%\n", .{
         report.context_window_tokens,
         report.context_pressure_percent,
@@ -332,6 +338,10 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
         .model = report.model_name,
         .model_provider = report.model_provider,
         .history_messages = report.history_messages,
+        .pressure_token_source = report.pressure_token_source,
+        .local_token_estimate = report.local_token_estimate,
+        .provider_prompt_tokens = report.provider_prompt_tokens,
+        .provider_cached_prompt_tokens = report.provider_cached_prompt_tokens,
         .token_estimate = report.token_estimate,
         .context_window_tokens = report.context_window_tokens,
         .context_window_source = report.context_window_source,

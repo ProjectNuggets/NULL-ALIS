@@ -264,6 +264,13 @@ pub const TokenUsage = struct {
     reasoning_tokens: u32 = 0,
 };
 
+/// Provider-side input token estimate sampled before a chat call.
+pub const TokenEstimateResult = struct {
+    prompt_tokens: u32 = 0,
+    total_tokens: u32 = 0,
+    source: []const u8 = "provider_preflight",
+};
+
 /// An LLM response that may contain text, tool calls, or both.
 pub const ChatResponse = struct {
     content: ?[]const u8 = null,
@@ -351,6 +358,9 @@ pub const ChatRequest = struct {
     temperature: f64 = 0.7,
     max_tokens: ?u32 = null,
     tools: ?[]const ToolSpec = null,
+    /// Provider cache affinity hint. Only adapters that explicitly support
+    /// this field serialize it; unsupported providers silently ignore it.
+    prompt_cache_key: ?[]const u8 = null,
     /// Max seconds to wait for the HTTP response (curl --max-time). 0 = no limit.
     timeout_secs: u64 = 0,
     /// Reasoning effort for reasoning models (o1, o3, gpt-5*). null = don't send.
@@ -436,6 +446,14 @@ pub const Provider = struct {
             callback: StreamCallback,
             callback_ctx: *anyopaque,
         ) anyerror!StreamChatResult = null,
+        /// Optional provider tokenizer/preflight endpoint. Callers must
+        /// continue to work when this is absent or fails.
+        estimate_tokens: ?*const fn (
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: ChatRequest,
+            model: []const u8,
+        ) anyerror!TokenEstimateResult = null,
     };
 
     pub fn chatWithSystem(
@@ -526,6 +544,16 @@ pub const Provider = struct {
             .usage = response.usage,
             .model = response.model,
         };
+    }
+
+    pub fn estimateTokens(
+        self: Provider,
+        allocator: std.mem.Allocator,
+        request: ChatRequest,
+        model: []const u8,
+    ) !?TokenEstimateResult {
+        const f = self.vtable.estimate_tokens orelse return null;
+        return try f(self.ptr, allocator, request, model);
     }
 };
 

@@ -136,6 +136,23 @@ pub const OpenAiCompatibleProvider = struct {
         return std.fmt.allocPrint(allocator, "{s}/v1/responses", .{trimmed});
     }
 
+    /// Moonshot/Kimi tokenizer estimate endpoint. Only called when
+    /// `emit_kimi_thinking` marks this adapter as the native Moonshot path.
+    pub fn tokenEstimateUrl(self: OpenAiCompatibleProvider, allocator: std.mem.Allocator) ![]const u8 {
+        const trimmed = trimTrailingSlash(self.base_url);
+        if (std.mem.endsWith(u8, trimmed, "/tokenizers/estimate-token-count")) {
+            return try allocator.dupe(u8, trimmed);
+        }
+        if (std.mem.endsWith(u8, trimmed, "/chat/completions")) {
+            const prefix = trimmed[0 .. trimmed.len - "/chat/completions".len];
+            return std.fmt.allocPrint(allocator, "{s}/tokenizers/estimate-token-count", .{prefix});
+        }
+        if (hasExplicitApiPath(trimmed)) {
+            return std.fmt.allocPrint(allocator, "{s}/tokenizers/estimate-token-count", .{trimmed});
+        }
+        return std.fmt.allocPrint(allocator, "{s}/v1/tokenizers/estimate-token-count", .{trimmed});
+    }
+
     fn hasExplicitApiPath(url: []const u8) bool {
         // Find the path portion after scheme://host
         const after_scheme = if (std.mem.indexOf(u8, url, "://")) |idx| url[idx + 3 ..] else return false;
@@ -544,6 +561,7 @@ pub const OpenAiCompatibleProvider = struct {
         .deinit = deinitImpl,
         .stream_chat = streamChatImpl,
         .supports_streaming = supportsStreamingImpl,
+        .estimate_tokens = estimateTokensImpl,
     };
 
     fn streamChatImpl(
@@ -689,7 +707,7 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
-        const timeout_ms = requestTimeoutMs(request.timeout_secs);
+        const timeout_ms = tokenEstimateTimeoutMs(request.timeout_secs);
         const response = if (auth) |a| blk: {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "{s}: {s}", .{ a.name, a.value }) catch return error.CompatibleApiError;
@@ -752,6 +770,64 @@ pub const OpenAiCompatibleProvider = struct {
     }
 
     fn deinitImpl(_: *anyopaque) void {}
+
+    fn estimateTokensImpl(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: root.ChatRequest,
+        model: []const u8,
+    ) anyerror!root.TokenEstimateResult {
+        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        if (!self.emit_kimi_thinking) return error.UnsupportedOperation;
+        const effective_model = self.normalizeProviderModel(model);
+
+        const url = try self.tokenEstimateUrl(allocator);
+        defer allocator.free(url);
+
+        const body = try buildTokenEstimateRequestBody(allocator, request, effective_model, self.merge_system_into_user, self.emit_kimi_thinking);
+        defer allocator.free(body);
+
+        const auth = try self.authHeaderValue(allocator);
+        defer if (auth) |a| {
+            if (a.needs_free) allocator.free(a.value);
+        };
+
+        const timeout_ms = requestTimeoutMs(request.timeout_secs);
+        const response = if (auth) |a| blk: {
+            var auth_hdr_buf: [512]u8 = undefined;
+            const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "{s}: {s}", .{ a.name, a.value }) catch return error.CompatibleApiError;
+            break :blk root.request_with_mode(allocator, .{}, .{
+                .method = "POST",
+                .url = url,
+                .headers = &.{ auth_hdr, "Content-Type: application/json" },
+                .body = body,
+                .timeout_ms = timeout_ms,
+                .subsystem = .providers,
+            }) catch |err| return mapRequestError(err);
+        } else root.request_with_mode(allocator, .{}, .{
+            .method = "POST",
+            .url = url,
+            .headers = &.{"Content-Type: application/json"},
+            .body = body,
+            .timeout_ms = timeout_ms,
+            .subsystem = .providers,
+        }) catch |err| return mapRequestError(err);
+        defer allocator.free(response.body);
+
+        if (response.status_code < 200 or response.status_code >= 300) {
+            const snippet = response.body[0..@min(response.body.len, 480)];
+            log.warn("compatible.token_estimate_non2xx status={d} model={s} url={s} req_bytes={d} body_snippet={s}", .{
+                response.status_code,
+                effective_model,
+                url,
+                body.len,
+                snippet,
+            });
+            return error.CompatibleApiError;
+        }
+
+        return parseTokenEstimateResponse(allocator, response.body);
+    }
 };
 
 /// Serialize a single message's content field — delegates to shared helper in providers/helpers.zig.
@@ -860,6 +936,19 @@ fn appendReasoningContentField(
     try root.appendJsonString(buf, allocator, rc);
 }
 
+fn appendPromptCacheKeyField(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    request: ChatRequest,
+    emit_kimi_thinking: bool,
+) !void {
+    if (!emit_kimi_thinking) return;
+    const key = request.prompt_cache_key orelse return;
+    if (key.len == 0) return;
+    try buf.appendSlice(allocator, ",\"prompt_cache_key\":");
+    try root.appendJsonString(buf, allocator, key);
+}
+
 /// Build a full chat request JSON body from a ChatRequest (OpenAI-compatible format).
 ///
 /// `emit_kimi_thinking` — when true (Moonshot native route), emit Kimi's
@@ -886,6 +975,7 @@ fn buildChatRequestBody(
     try buf.append(allocator, ']');
     try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort, emit_kimi_thinking);
     if (emit_kimi_thinking) try buf.appendSlice(allocator, KIMI_THINKING_FIELD);
+    try appendPromptCacheKeyField(&buf, allocator, request, emit_kimi_thinking);
     if (request.tools) |tools| {
         if (tools.len > 0) {
             try buf.appendSlice(allocator, ",\"tools\":");
@@ -922,6 +1012,7 @@ fn buildStreamingChatRequestBody(
     try buf.append(allocator, ']');
     try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort, emit_kimi_thinking);
     if (emit_kimi_thinking) try buf.appendSlice(allocator, KIMI_THINKING_FIELD);
+    try appendPromptCacheKeyField(&buf, allocator, request, emit_kimi_thinking);
     if (request.tools) |tools| {
         if (tools.len > 0) {
             try buf.appendSlice(allocator, ",\"tools\":");
@@ -944,6 +1035,72 @@ fn buildStreamingChatRequestBody(
     try buf.appendSlice(allocator, ",\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
 
     return try buf.toOwnedSlice(allocator);
+}
+
+fn buildTokenEstimateRequestBody(
+    allocator: std.mem.Allocator,
+    request: ChatRequest,
+    model: []const u8,
+    merge_system: bool,
+    emit_kimi_thinking: bool,
+) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\"model\":\"");
+    try buf.appendSlice(allocator, model);
+    try buf.appendSlice(allocator, "\",\"messages\":[");
+    try serializeMessagesInto(&buf, allocator, request.messages, merge_system, emit_kimi_thinking);
+    try buf.append(allocator, ']');
+    if (emit_kimi_thinking) try buf.appendSlice(allocator, KIMI_THINKING_FIELD);
+    try appendPromptCacheKeyField(&buf, allocator, request, emit_kimi_thinking);
+    if (request.tools) |tools| {
+        if (tools.len > 0) {
+            try buf.appendSlice(allocator, ",\"tools\":");
+            try NNGTs_prefix_order.convertToolsSorted(&buf, allocator, tools);
+            try buf.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
+        }
+    }
+    try buf.append(allocator, '}');
+    return try buf.toOwnedSlice(allocator);
+}
+
+fn numericJsonU32(value: std.json.Value) ?u32 {
+    return switch (value) {
+        .integer => |i| if (i >= 0 and i <= std.math.maxInt(u32)) @intCast(i) else null,
+        .float => |f| if (f >= 0 and f <= @as(f64, @floatFromInt(std.math.maxInt(u32)))) @intFromFloat(f) else null,
+        else => null,
+    };
+}
+
+fn parseTokenEstimateResponse(allocator: std.mem.Allocator, body: []const u8) !root.TokenEstimateResult {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const top = parsed.value.object;
+
+    if (top.get("data")) |data_value| {
+        if (data_value == .object) {
+            if (data_value.object.get("total_tokens")) |total| {
+                if (numericJsonU32(total)) |tokens| {
+                    return .{
+                        .prompt_tokens = tokens,
+                        .total_tokens = tokens,
+                        .source = "moonshot_tokenizers_estimate",
+                    };
+                }
+            }
+        }
+    }
+    if (top.get("total_tokens")) |total| {
+        if (numericJsonU32(total)) |tokens| {
+            return .{
+                .prompt_tokens = tokens,
+                .total_tokens = tokens,
+                .source = "moonshot_tokenizers_estimate",
+            };
+        }
+    }
+    return error.NoResponseContent;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1362,6 +1519,12 @@ test "compatible requestTimeoutMs honors explicit timeout" {
     try std.testing.expectEqual(@as(u32, 120_000), requestTimeoutMs(120));
 }
 
+test "compatible tokenEstimateTimeoutMs is bounded for optional preflight" {
+    try std.testing.expectEqual(@as(u32, 10_000), tokenEstimateTimeoutMs(0));
+    try std.testing.expectEqual(@as(u32, 10_000), tokenEstimateTimeoutMs(120));
+    try std.testing.expectEqual(@as(u32, 2_000), tokenEstimateTimeoutMs(2));
+}
+
 test "vtable has stream_chat not null" {
     var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer);
     const prov = p.provider();
@@ -1695,6 +1858,11 @@ pub fn requestTimeoutMs(timeout_secs: u64) u32 {
     return @intCast(@min(timeout_secs * 1000, std.math.maxInt(u32)));
 }
 
+pub fn tokenEstimateTimeoutMs(timeout_secs: u64) u32 {
+    const requested_ms = requestTimeoutMs(timeout_secs);
+    return @min(requested_ms, 10_000);
+}
+
 test "mapRequestError preserves timeout" {
     try std.testing.expect(OpenAiCompatibleProvider.mapRequestError(error.Timeout) == error.Timeout);
     try std.testing.expect(OpenAiCompatibleProvider.mapRequestError(error.CurlFailed) == error.CompatibleApiError);
@@ -1707,7 +1875,12 @@ test "mapRequestError preserves timeout" {
 test "buildChatRequestBody emits Kimi thinking field when emit_kimi_thinking" {
     const allocator = std.testing.allocator;
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
-    const req = root.ChatRequest{ .messages = &msgs, .model = "kimi-k2.6", .reasoning_effort = "high" };
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "kimi-k2.6",
+        .reasoning_effort = "high",
+        .prompt_cache_key = "zaki:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
 
     const body = try buildChatRequestBody(allocator, req, "kimi-k2.6", 0.7, false, true);
     defer allocator.free(body);
@@ -1715,6 +1888,7 @@ test "buildChatRequestBody emits Kimi thinking field when emit_kimi_thinking" {
     // thinking field present, reasoning_effort suppressed.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\",\"keep\":\"all\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"zaki:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"") != null);
 
     // Valid JSON.
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -1724,12 +1898,18 @@ test "buildChatRequestBody emits Kimi thinking field when emit_kimi_thinking" {
 test "buildChatRequestBody omits Kimi thinking field when flag off" {
     const allocator = std.testing.allocator;
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
-    const req = root.ChatRequest{ .messages = &msgs, .model = "kimi-k2.6", .reasoning_effort = "high" };
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "kimi-k2.6",
+        .reasoning_effort = "high",
+        .prompt_cache_key = "zaki:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
 
     const body = try buildChatRequestBody(allocator, req, "kimi-k2.6", 0.7, false, false);
     defer allocator.free(body);
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
     // Non-Moonshot Kimi route still emits reasoning_effort (Together shape).
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
 }
@@ -1785,4 +1965,43 @@ test "buildRequestBody emits Kimi thinking field on Moonshot text route" {
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"enabled\",\"keep\":\"all\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
+}
+
+test "buildStreamingChatRequestBody emits Kimi prompt_cache_key" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "kimi-k2.6",
+        .prompt_cache_key = "zaki:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    };
+
+    const body = try buildStreamingChatRequestBody(allocator, req, "kimi-k2.6", 0.7, false, true);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"zaki:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+}
+
+test "buildTokenEstimateRequestBody and parseTokenEstimateResponse use Moonshot shape" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "kimi-k2.6",
+        .prompt_cache_key = "zaki:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    };
+
+    const body = try buildTokenEstimateRequestBody(allocator, req, "kimi-k2.6", false, true);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"zaki:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\"") == null);
+
+    const estimate = try parseTokenEstimateResponse(allocator, "{\"data\":{\"total_tokens\":56000}}");
+    try std.testing.expectEqual(@as(u32, 56_000), estimate.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 56_000), estimate.total_tokens);
+    try std.testing.expectEqualStrings("moonshot_tokenizers_estimate", estimate.source);
 }

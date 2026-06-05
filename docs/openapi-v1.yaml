@@ -3581,6 +3581,22 @@ components:
         message_count:
           type: integer
           format: int64
+        pressure_token_source:
+          type: string
+          enum: [provider_last_usage, provider_preflight, local_estimate]
+          description: Backend source used for the canonical pressure token count.
+        local_token_estimate:
+          type: integer
+          format: int64
+          description: Local chars-per-token fallback estimate; diagnostic only when pressure_token_source is provider-backed.
+        provider_prompt_tokens:
+          type: integer
+          format: int64
+          description: Last provider prompt_tokens sample used for pressure when pressure_token_source is provider_last_usage.
+        provider_cached_prompt_tokens:
+          type: integer
+          format: int64
+          description: Cached subset of provider_prompt_tokens; never subtracted from context pressure.
         tokens_used:
           type: integer
           format: int64
@@ -3592,7 +3608,7 @@ components:
         token_estimate:
           type: integer
           format: int64
-          description: Backend estimate of provider-visible context tokens for the active window.
+          description: Backend-selected provider-visible context tokens for the active window.
         context_window_used:
           type: integer
           format: int64

@@ -14369,11 +14369,16 @@ fn handleSessionContext(
     }
     w.writeAll(",\"context_window_source\":\"") catch return response_build_err;
     jsonEscapeInto(w, report.context_window_source) catch return response_build_err;
+    w.writeAll("\",\"pressure_token_source\":\"") catch return response_build_err;
+    jsonEscapeInto(w, report.pressure_token_source) catch return response_build_err;
     // `tokens_used` and `token_limit` are legacy field names kept for older
     // clients, but they now alias the active context-window estimate rather
     // than lifetime cumulative usage. Lifetime usage belongs in metering, not
     // in the context pressure badge.
-    w.print("\",\"history_len\":{d},\"history_messages\":{d},\"message_count\":{d},\"tokens_used\":{d},\"token_count\":{d},\"token_estimate\":{d},\"context_window_used\":{d},\"context_window_max\":{d},\"max_history\":{d},\"token_limit\":{d},\"context_window_tokens\":{d},\"remaining_tokens\":{d},\"usable_input_budget_tokens\":{d},\"budget_pressure_percent\":{d},\"pressure_percent\":{d},\"context_window_used_pct\":{d},\"context_pressure_percent\":{d}", .{
+    w.print("\",\"local_token_estimate\":{d},\"provider_prompt_tokens\":{d},\"provider_cached_prompt_tokens\":{d},\"history_len\":{d},\"history_messages\":{d},\"message_count\":{d},\"tokens_used\":{d},\"token_count\":{d},\"token_estimate\":{d},\"context_window_used\":{d},\"context_window_max\":{d},\"max_history\":{d},\"token_limit\":{d},\"context_window_tokens\":{d},\"remaining_tokens\":{d},\"usable_input_budget_tokens\":{d},\"budget_pressure_percent\":{d},\"pressure_percent\":{d},\"context_window_used_pct\":{d},\"context_pressure_percent\":{d}", .{
+        report.local_token_estimate,
+        report.provider_prompt_tokens,
+        report.provider_cached_prompt_tokens,
         agent.historyLen(),
         report.history_messages,
         report.history_messages,

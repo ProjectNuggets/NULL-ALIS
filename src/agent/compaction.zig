@@ -71,6 +71,9 @@ pub const CompactionConfig = struct {
     max_summary_chars: u32 = DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     max_source_chars: u32 = DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
     token_limit: u64 = DEFAULT_TOKEN_LIMIT,
+    /// Optional provider/preflight-selected pressure token count. When set,
+    /// threshold decisions use this instead of the local chars/4 estimator.
+    pressure_tokens_override: ?u64 = null,
     max_tokens: u32 = 0,
     message_timeout_secs: u64 = 0,
     max_history_messages: u32 = 50,
@@ -229,7 +232,7 @@ pub fn autoCompactHistory(
     if (config.token_limit == 0) return false;
 
     var compacted = false;
-    const estimate_before = tokenEstimate(history.items);
+    const estimate_before = config.pressure_tokens_override orelse tokenEstimate(history.items);
     const pressure_pct: u8 = @intCast(@min(100, (estimate_before * 100) / config.token_limit));
 
     // iter24: visibility log — so Nova can see the token-budget system is

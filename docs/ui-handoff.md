@@ -598,10 +598,14 @@ and capability. Design it to feel premium, not buried:
   synthesize `0%`, do not divide `token_estimate / context_window_tokens`, and
   do not let session list/detail hydration overwrite the meter.
 - **Estimator details** — context reports include `estimator`,
-  `usable_input_budget_tokens`, `budget_pressure_percent`,
+  `pressure_token_source`, `local_token_estimate`, `provider_prompt_tokens`,
+  `provider_cached_prompt_tokens`, `usable_input_budget_tokens`, `budget_pressure_percent`,
   `token_total_reserve`, `provider_usage_last_turn`, `cache`,
-  `last_turn_delta`, and `top_context_contributors`. The estimator counts the
-  live history prompt shape: message content, retained Kimi
+  `last_turn_delta`, and `top_context_contributors`. `token_estimate` is the
+  backend-selected pressure token count: provider `prompt_tokens` when
+  available, an active provider tokenizer/preflight sample while a request is
+  in flight, then the local estimator as fallback. The local estimator counts
+  the live history prompt shape: message content, retained Kimi
   `reasoning_content`, the assembled system prompt at `history[0]`
   (stable prompt, tool instructions, and volatile memory/context), XML
   tool-call/tool-result history, and multimodal markers present in history

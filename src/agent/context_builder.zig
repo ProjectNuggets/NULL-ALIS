@@ -22,6 +22,32 @@ pub const ProviderUsage = struct {
     cache_hit_percent: u8 = 0,
 };
 
+pub const ProviderPreflightUsage = struct {
+    available: bool = false,
+    active: bool = false,
+    prompt_tokens: u32 = 0,
+    source: []const u8 = "provider_preflight",
+};
+
+pub const PressureTokenSource = enum {
+    provider_last_usage,
+    provider_preflight,
+    local_estimate,
+
+    pub fn toSlice(self: PressureTokenSource) []const u8 {
+        return switch (self) {
+            .provider_last_usage => "provider_last_usage",
+            .provider_preflight => "provider_preflight",
+            .local_estimate => "local_estimate",
+        };
+    }
+};
+
+pub const PressureSelection = struct {
+    token_count: u64,
+    source: PressureTokenSource,
+};
+
 pub const LastTurnDelta = struct {
     bytes: u64 = 0,
     token_estimate: u64 = 0,
@@ -34,6 +60,10 @@ pub const Snapshot = struct {
     model_name: []const u8,
     model_provider: ?[]const u8 = null,
     history_messages: usize,
+    pressure_token_source: []const u8 = PressureTokenSource.local_estimate.toSlice(),
+    local_token_estimate: u64 = 0,
+    provider_prompt_tokens: u32 = 0,
+    provider_cached_prompt_tokens: u32 = 0,
     token_estimate: u64,
     context_window_tokens: u64,
     context_window_source: []const u8 = "unknown",
@@ -79,6 +109,7 @@ pub const Snapshot = struct {
     stable_prefix_cache: context_cache.StablePrefixState = .{},
     buckets: context_cache.BucketSet = .{},
     provider_usage_last_turn: ProviderUsage = .{},
+    provider_preflight: ProviderPreflightUsage = .{},
     last_turn_delta: LastTurnDelta = .{},
     top_context_contributor_count: usize = 0,
     top_context_contributors: [context_estimator.TOP_CONTRIBUTOR_LIMIT]context_estimator.TopContributor =
@@ -213,6 +244,51 @@ fn providerUsageFromAgent(self: anytype) ProviderUsage {
     };
 }
 
+fn providerPreflightFromAgent(self: anytype) ProviderPreflightUsage {
+    const AgentType = @TypeOf(self.*);
+    if (!@hasField(AgentType, "provider_preflight_prompt_tokens")) return .{};
+    const active = if (@hasField(AgentType, "provider_preflight_active"))
+        self.provider_preflight_active
+    else
+        false;
+    const available = self.provider_preflight_prompt_tokens > 0;
+    return .{
+        .available = available,
+        .active = active and available,
+        .prompt_tokens = self.provider_preflight_prompt_tokens,
+        .source = if (@hasField(AgentType, "provider_preflight_source")) self.provider_preflight_source else "provider_preflight",
+    };
+}
+
+pub fn selectPressureTokens(
+    local_token_estimate: u64,
+    provider_usage: ProviderUsage,
+    provider_preflight: ProviderPreflightUsage,
+) PressureSelection {
+    if (provider_preflight.active and provider_preflight.prompt_tokens > 0) {
+        return .{
+            .token_count = provider_preflight.prompt_tokens,
+            .source = .provider_preflight,
+        };
+    }
+    if (provider_usage.prompt_tokens > 0) {
+        return .{
+            .token_count = provider_usage.prompt_tokens,
+            .source = .provider_last_usage,
+        };
+    }
+    if (provider_preflight.available and provider_preflight.prompt_tokens > 0) {
+        return .{
+            .token_count = provider_preflight.prompt_tokens,
+            .source = .provider_preflight,
+        };
+    }
+    return .{
+        .token_count = local_token_estimate,
+        .source = .local_estimate,
+    };
+}
+
 fn contextWindowSource(self: anytype, model_name: []const u8, context_window_tokens: u64) []const u8 {
     const AgentType = @TypeOf(self.*);
     if (@hasField(AgentType, "token_limit_override")) {
@@ -341,22 +417,29 @@ pub fn buildSnapshot(self: anytype) Snapshot {
         context_estimator.analyzeHistory(self.history)
     else
         context_estimator.Analysis{};
-    const token_estimate = context_analysis.token_estimate;
+    const local_token_estimate = context_analysis.token_estimate;
     const context_window_tokens = if (@hasField(AgentType, "token_limit")) self.token_limit else 0;
     const resolved_max_tokens = if (@hasField(AgentType, "max_tokens")) self.max_tokens else 0;
     const token_budget_policy = compaction.buildTokenBudgetPolicy(context_window_tokens, resolved_max_tokens);
+    const provider_usage = providerUsageFromAgent(self);
+    const provider_preflight = providerPreflightFromAgent(self);
+    const pressure_selection = selectPressureTokens(local_token_estimate, provider_usage, provider_preflight);
+    const token_estimate = pressure_selection.token_count;
     const remaining_tokens = if (context_window_tokens > token_estimate) context_window_tokens - token_estimate else 0;
     const usable_input_budget_tokens = if (context_window_tokens > token_budget_policy.total_reserve)
         context_window_tokens - token_budget_policy.total_reserve
     else
         0;
-    const provider_usage = providerUsageFromAgent(self);
 
     return .{
         .sampled_at_ms = std.time.milliTimestamp(),
         .model_name = model_name,
         .model_provider = modelProvider(model_name),
         .history_messages = if (@hasField(AgentType, "history")) self.history.items.len else 0,
+        .pressure_token_source = pressure_selection.source.toSlice(),
+        .local_token_estimate = local_token_estimate,
+        .provider_prompt_tokens = provider_usage.prompt_tokens,
+        .provider_cached_prompt_tokens = provider_usage.cached_prompt_tokens,
         .token_estimate = token_estimate,
         .context_window_tokens = context_window_tokens,
         .context_window_source = contextWindowSource(self, model_name, context_window_tokens),
@@ -433,6 +516,7 @@ pub fn buildSnapshot(self: anytype) Snapshot {
             },
         },
         .provider_usage_last_turn = provider_usage,
+        .provider_preflight = provider_preflight,
         .last_turn_delta = .{
             .bytes = context_analysis.last_turn_delta_bytes,
             .token_estimate = context_analysis.last_turn_delta_tokens,
@@ -629,6 +713,8 @@ test "buildSnapshot counts roles and retrieval state" {
     try std.testing.expect(snapshot.sampled_at_ms > 0);
     try std.testing.expectEqualStrings("openai", snapshot.model_provider.?);
     try std.testing.expectEqualStrings("model_capability", snapshot.context_window_source);
+    try std.testing.expectEqualStrings("local_estimate", snapshot.pressure_token_source);
+    try std.testing.expectEqual(snapshot.local_token_estimate, snapshot.token_estimate);
     try std.testing.expectEqual(@as(usize, 4), snapshot.history_messages);
     try std.testing.expectEqual(@as(usize, 1), snapshot.memory_enriched_messages);
     try std.testing.expectEqual(@as(u64, 1_000) - snapshot.token_estimate, snapshot.remaining_tokens);
@@ -658,6 +744,90 @@ test "buildSnapshot counts roles and retrieval state" {
     try std.testing.expectEqual(@as(usize, 18), snapshot.buckets.recent_history.bytes);
     try std.testing.expectEqual(@as(u64, 5), snapshot.buckets.recent_history.token_estimate);
     try std.testing.expect(snapshot.stable_prefix_cache.available);
+}
+
+test "buildSnapshot uses provider prompt tokens over lower local estimate" {
+    const FakeRole = enum { system, user, assistant, tool };
+    const FakeMessage = struct {
+        role: FakeRole,
+        content: []const u8,
+    };
+    const FakeHistory = struct {
+        items: []const FakeMessage,
+    };
+    const messages = [_]FakeMessage{
+        .{ .role = .system, .content = "tiny" },
+        .{ .role = .user, .content = "hello" },
+    };
+    const fake = struct {
+        model_name: []const u8,
+        history: FakeHistory,
+        token_limit: u64,
+        max_tokens: u32,
+        max_history_messages: u32,
+        last_turn_usage: @import("../providers/root.zig").TokenUsage,
+    }{
+        .model_name = "kimi-k2.6",
+        .history = .{ .items = &messages },
+        .token_limit = 262_144,
+        .max_tokens = 32_768,
+        .max_history_messages = 50,
+        .last_turn_usage = .{
+            .prompt_tokens = 55_000,
+            .completion_tokens = 100,
+            .total_tokens = 55_100,
+            .cached_prompt_tokens = 53_000,
+        },
+    };
+
+    const snapshot = buildSnapshot(&fake);
+    try std.testing.expect(snapshot.local_token_estimate < 55_000);
+    try std.testing.expectEqual(@as(u64, 55_000), snapshot.token_estimate);
+    try std.testing.expectEqual(@as(u32, 55_000), snapshot.provider_prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 53_000), snapshot.provider_cached_prompt_tokens);
+    try std.testing.expectEqualStrings("provider_last_usage", snapshot.pressure_token_source);
+    try std.testing.expectEqual(@as(u8, 20), snapshot.context_pressure_percent);
+}
+
+test "buildSnapshot uses active provider preflight before provider usage exists" {
+    const FakeRole = enum { system, user, assistant, tool };
+    const FakeMessage = struct {
+        role: FakeRole,
+        content: []const u8,
+    };
+    const FakeHistory = struct {
+        items: []const FakeMessage,
+    };
+    const messages = [_]FakeMessage{
+        .{ .role = .system, .content = "tiny" },
+        .{ .role = .user, .content = "hello" },
+    };
+    const fake = struct {
+        model_name: []const u8,
+        history: FakeHistory,
+        token_limit: u64,
+        max_tokens: u32,
+        max_history_messages: u32,
+        provider_preflight_prompt_tokens: u32,
+        provider_preflight_active: bool,
+        provider_preflight_source: []const u8,
+    }{
+        .model_name = "kimi-k2.6",
+        .history = .{ .items = &messages },
+        .token_limit = 262_144,
+        .max_tokens = 32_768,
+        .max_history_messages = 50,
+        .provider_preflight_prompt_tokens = 56_000,
+        .provider_preflight_active = true,
+        .provider_preflight_source = "moonshot_tokenizers_estimate",
+    };
+
+    const snapshot = buildSnapshot(&fake);
+    try std.testing.expect(snapshot.local_token_estimate < 56_000);
+    try std.testing.expectEqual(@as(u64, 56_000), snapshot.token_estimate);
+    try std.testing.expectEqualStrings("provider_preflight", snapshot.pressure_token_source);
+    try std.testing.expect(snapshot.provider_preflight.available);
+    try std.testing.expect(snapshot.provider_preflight.active);
 }
 
 test "buildPromptRefreshPlan refreshes missing system prompt" {

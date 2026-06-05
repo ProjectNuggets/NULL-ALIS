@@ -390,6 +390,7 @@ pub const ReliableProvider = struct {
         .deinit = deinitImpl,
         .warmup = warmupImpl,
         .stream_chat = streamChatImpl,
+        .estimate_tokens = estimateTokensImpl,
     };
 
     /// Create a Provider interface from this ReliableProvider.
@@ -659,6 +660,33 @@ pub const ReliableProvider = struct {
     fn getNameImpl(ptr: *anyopaque) []const u8 {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
         return self.inner.getName();
+    }
+
+    fn estimateTokensImpl(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: ChatRequest,
+        model: []const u8,
+    ) anyerror!root.TokenEstimateResult {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        const models = try self.modelChain(allocator, model);
+        defer allocator.free(models);
+
+        for (models) |current_model| {
+            if (self.inner.estimateTokens(allocator, request, current_model)) |maybe| {
+                if (maybe) |result| return result;
+            } else |err| {
+                self.storeErrorName(err);
+            }
+            for (self.extras) |entry| {
+                if (entry.provider.estimateTokens(allocator, request, entry.model_override orelse current_model)) |maybe| {
+                    if (maybe) |result| return result;
+                } else |err| {
+                    self.storeErrorName(err);
+                }
+            }
+        }
+        return error.UnsupportedOperation;
     }
 
     fn streamChatImpl(
