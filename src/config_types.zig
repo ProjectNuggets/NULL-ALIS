@@ -225,6 +225,14 @@ pub const ExtractionConfig = struct {
     /// Legacy after-≥5-tool-calls skills_extraction nudge. C3 removed
     /// the trigger site; same retention rationale.
     skills_nudge_enabled: bool = false,
+    /// C4 activation: run the entity pipeline (speaker-hub + co-occurrence
+    /// MENTIONS edges + entity coreference) at session end. Unlike the legacy
+    /// flags above, this trigger SITE is live (commands.zig session-end
+    /// enqueue). Defaults TRUE so the knowledge graph actually densifies;
+    /// each session end enqueues one entity-extraction job, drained
+    /// out-of-band by the heartbeat worker (rate-limited 2 jobs/tick, 30s
+    /// timeout). Flip false via [agent.extraction] as a kill switch.
+    session_end_entity_pipeline_enabled: bool = true,
 };
 
 // Deleted: AssistantModePresetAgentConfig, AssistantModePresetSummarizerConfig,

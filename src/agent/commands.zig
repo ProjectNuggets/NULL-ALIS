@@ -1475,14 +1475,16 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         // edge bumps weight via upsertMemoryEdge ON CONFLICT — no
         // duplicate rows. Failure-soft.
         //
-        // V1.14.7 C2: gated behind extraction_cfg.per_turn_enqueue_enabled
-        // (same flag covers per-turn AND session-end enqueue paths since
-        // both write to the same extraction_queue table; both will be
-        // deleted in C3). Inline structured extraction at lines 1437-1454
-        // above (via persistExtracted on the summary's parsed.extracted_facts)
-        // is the new path and is NOT gated — it fires regardless and writes
-        // facts/edges synchronously without queueing.
-        if (self.extraction_cfg.per_turn_enqueue_enabled and self.extraction_state_mgr != null and self.extraction_user_id != null) {
+        // C4 activation: this session-end enqueue is the sole remaining
+        // producer for the entity pipeline (speaker-hub + co-occurrence
+        // MENTIONS edges + coreference). The per-turn trigger was deleted in
+        // V1.14.7, leaving this path gated behind the misnamed legacy
+        // `per_turn_enqueue_enabled` (default false), which left the whole
+        // pipeline dormant. It now keys off the dedicated, default-ON
+        // `session_end_entity_pipeline_enabled` flag. Inline structured
+        // extraction above (persistExtracted on parsed.extracted_facts) is a
+        // separate, always-on path that writes facts/edges synchronously.
+        if (self.extraction_cfg.session_end_entity_pipeline_enabled and self.extraction_state_mgr != null and self.extraction_user_id != null) {
             const smgr_ep = self.extraction_state_mgr.?;
             const uid_ep = self.extraction_user_id.?;
             {

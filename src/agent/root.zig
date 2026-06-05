@@ -13137,6 +13137,20 @@ test "ExtractionConfig defaults disable all per-turn legacy triggers (V1.14.7 C3
     try std.testing.expect(!cfg.skills_nudge_enabled);
 }
 
+test "ExtractionConfig activates session-end entity pipeline by default (C4)" {
+    // C4 activation: the entity pipeline (speaker-hub + co-occurrence/MENTIONS
+    // edges) was orphaned after V1.14.7 removed its per-turn trigger; the only
+    // remaining producer is the session-end enqueue, previously gated behind
+    // the misnamed legacy `per_turn_enqueue_enabled` (default false). A clean
+    // dedicated flag now drives it, defaulting ON so every session end enqueues
+    // one entity-extraction job (daemon-drained, rate-limited at 2 jobs/tick).
+    // Deployments flip it off via [agent.extraction] as a kill switch.
+    const cfg = config_types.ExtractionConfig{};
+    try std.testing.expect(cfg.session_end_entity_pipeline_enabled);
+    // The legacy per-turn path stays off — its trigger site is gone.
+    try std.testing.expect(!cfg.per_turn_enqueue_enabled);
+}
+
 test "AgentConfig.extraction defaults to ExtractionConfig{}" {
     // Plumbing: AgentConfig carries an ExtractionConfig field with its
     // default-initialized value. Defaults updated to false in C3.

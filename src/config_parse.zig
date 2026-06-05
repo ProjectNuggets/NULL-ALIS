@@ -971,6 +971,26 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("extraction_coverage_filter_enabled")) |v| {
                 if (v == .bool) self.agent.extraction_coverage_filter_enabled = v.bool;
             }
+            // C4 (brain-graph activation) — wire the nested [agent.extraction]
+            // ExtractionConfig block. Previously this struct had NO parser, so
+            // its "flip via TOML" docstring silently no-op'd. The session-end
+            // entity-pipeline kill switch must be reachable from config.json.
+            if (ag.object.get("extraction")) |ev| {
+                if (ev == .object) {
+                    if (ev.object.get("session_end_entity_pipeline_enabled")) |v| {
+                        if (v == .bool) self.agent.extraction.session_end_entity_pipeline_enabled = v.bool;
+                    }
+                    if (ev.object.get("per_turn_enqueue_enabled")) |v| {
+                        if (v == .bool) self.agent.extraction.per_turn_enqueue_enabled = v.bool;
+                    }
+                    if (ev.object.get("memory_nudge_enabled")) |v| {
+                        if (v == .bool) self.agent.extraction.memory_nudge_enabled = v.bool;
+                    }
+                    if (ev.object.get("skills_nudge_enabled")) |v| {
+                        if (v == .bool) self.agent.extraction.skills_nudge_enabled = v.bool;
+                    }
+                }
+            }
             // V1.14.12 (Path A) — extraction_legacy_direct_writes reader removed.
             // Field deleted from AgentConfig; the M5 gated legacy paths
             // no longer exist (deleted in commands.zig + compaction.zig).
