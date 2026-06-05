@@ -350,7 +350,7 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
                 "tool_instructions",
                 "volatile_context",
                 "xml_tool_results",
-                "provider_serialized_multimodal_text",
+                "multimodal_markers_in_history_text",
             },
         },
         .context_bytes = .{

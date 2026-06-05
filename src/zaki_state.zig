@@ -529,6 +529,9 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn listUserSessions(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]SessionInfo {
         return allocator.alloc(SessionInfo, 0);
     }
+    pub fn loadSessionMessages(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const u8) ![]memory_root.MessageEntry {
+        return allocator.alloc(memory_root.MessageEntry, 0);
+    }
     /// Stub for non-postgres builds. Real impl in postgres-backed Manager.
     pub fn deleteSession(_: *@This(), _: i64, _: []const u8) !void {
         return error.PostgresNotEnabled;

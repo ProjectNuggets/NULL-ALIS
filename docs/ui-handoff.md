@@ -601,10 +601,14 @@ and capability. Design it to feel premium, not buried:
   `usable_input_budget_tokens`, `budget_pressure_percent`,
   `token_total_reserve`, `provider_usage_last_turn`, `cache`,
   `last_turn_delta`, and `top_context_contributors`. The estimator counts the
-  provider-bound prompt shape: message content, retained Kimi
-  `reasoning_content`, system/tool instructions, volatile memory/context, XML
-  tool-call/tool-result history, and provider-serialized multimodal text
-  estimates. Raw reasoning text is never exposed; only size/count telemetry is.
+  live history prompt shape: message content, retained Kimi
+  `reasoning_content`, the assembled system prompt at `history[0]`
+  (stable prompt, tool instructions, and volatile memory/context), XML
+  tool-call/tool-result history, and multimodal markers present in history
+  text. Provider-specific multimodal serialization is calibrated from
+  `provider_usage_last_turn` when available rather than claimed as exact
+  preflight tokenization. Raw reasoning text is never exposed; only size/count
+  telemetry is.
 - **Cache semantics** — `provider_usage_last_turn.cached_prompt_tokens` and
   `cache.last_cache_hit_percent` are cost/performance telemetry. They do not
   reduce context pressure, because cached prompt tokens still occupy the

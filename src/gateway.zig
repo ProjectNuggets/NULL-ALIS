@@ -13664,16 +13664,20 @@ fn handleSessionAction(
         return .{ .status = "403 Forbidden", .body = "{\"error\":\"session_not_owned\"}" };
     }
 
-    const mgr = session_mgr_opt orelse return .{ .status = "404 Not Found", .body = session_context_unavailable_body };
-
     if (action == null) {
         // GET /sessions/{key} — session info
         if (std.mem.eql(u8, method, "GET")) {
-            return handleSessionGet(allocator, mgr, session_key, state_mgr_opt, user_id);
+            if (session_mgr_opt) |mgr| {
+                return handleSessionGet(allocator, mgr, session_key, state_mgr_opt, user_id);
+            }
+            return handlePersistedSessionGet(allocator, state_mgr_opt, session_key, user_id);
         }
         // DELETE /sessions/{key} — destroy session
         if (std.mem.eql(u8, method, "DELETE")) {
-            return handleSessionDelete(allocator, mgr, session_key, state_mgr_opt, user_id);
+            if (session_mgr_opt) |mgr| {
+                return handleSessionDelete(allocator, mgr, session_key, state_mgr_opt, user_id);
+            }
+            return handlePersistedSessionDelete(allocator, state_mgr_opt, session_key, user_id);
         }
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
     }
@@ -13682,34 +13686,201 @@ fn handleSessionAction(
 
     if (std.mem.eql(u8, act, "compact")) {
         if (!std.mem.eql(u8, method, "POST")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        const mgr = session_mgr_opt orelse return .{ .status = "404 Not Found", .body = session_context_unavailable_body };
         return handleSessionCompact(allocator, mgr, session_key);
     }
     if (std.mem.eql(u8, act, "context")) {
         if (!std.mem.eql(u8, method, "GET")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        const mgr = session_mgr_opt orelse return .{ .status = "404 Not Found", .body = session_context_unavailable_body };
         return handleSessionContext(allocator, mgr, session_key);
     }
     if (std.mem.eql(u8, act, "export")) {
         if (!std.mem.eql(u8, method, "POST") and !std.mem.eql(u8, method, "GET")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
-        return handleSessionExport(allocator, mgr, session_key);
+        if (session_mgr_opt) |mgr| {
+            return handleSessionExport(allocator, mgr, session_key);
+        }
+        return handlePersistedSessionExport(allocator, state_mgr_opt, session_key, user_id);
     }
     if (std.mem.eql(u8, act, "history")) {
         if (!std.mem.eql(u8, method, "GET")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
-        return handleSessionHistory(allocator, mgr, session_key);
+        if (session_mgr_opt) |mgr| {
+            return handleSessionHistory(allocator, mgr, session_key);
+        }
+        return handlePersistedSessionHistory(allocator, state_mgr_opt, session_key, user_id);
     }
     if (std.mem.eql(u8, act, "approve")) {
         if (!std.mem.eql(u8, method, "POST")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        const mgr = session_mgr_opt orelse return .{ .status = "404 Not Found", .body = session_context_unavailable_body };
         return handleSessionApprove(allocator, mgr, session_key, raw_request);
     }
     if (std.mem.eql(u8, act, "mode")) {
         if (!std.mem.eql(u8, method, "POST")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        const mgr = session_mgr_opt orelse return .{ .status = "404 Not Found", .body = session_context_unavailable_body };
         return handleSessionMode(allocator, mgr, session_key, raw_request);
     }
     if (std.mem.eql(u8, act, "cancel")) {
         if (!std.mem.eql(u8, method, "POST")) return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        const mgr = session_mgr_opt orelse return .{ .status = "404 Not Found", .body = session_context_unavailable_body };
         return handleSessionCancel(allocator, mgr, session_key);
     }
 
     return .{ .status = "404 Not Found", .body = "{\"error\":\"unknown_session_action\"}" };
+}
+
+fn persistedSessionExists(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state_mod.Manager,
+    numeric_user_id: i64,
+    session_key: []const u8,
+) !bool {
+    const persisted = try state_mgr.listUserSessions(allocator, numeric_user_id);
+    defer {
+        for (persisted) |*info| info.deinit(allocator);
+        allocator.free(persisted);
+    }
+    for (persisted) |info| {
+        if (std.mem.eql(u8, info.session_key, session_key)) return true;
+    }
+    return false;
+}
+
+fn handlePersistedSessionGet(
+    allocator: std.mem.Allocator,
+    state_mgr_opt: ?*zaki_state_mod.Manager,
+    session_key: []const u8,
+    user_id: []const u8,
+) RouteResponse {
+    const state_mgr = state_mgr_opt orelse return .{ .status = "404 Not Found", .body = session_context_unavailable_body };
+    const numeric_user_id = parseNumericUserId(user_id) catch return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+    if (numeric_user_id <= 0) return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+
+    const persisted = state_mgr.listUserSessions(allocator, numeric_user_id) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"session_list_failed\"}" };
+    };
+    defer {
+        for (persisted) |*info| info.deinit(allocator);
+        allocator.free(persisted);
+    }
+    for (persisted) |info| {
+        if (std.mem.eql(u8, info.session_key, session_key)) {
+            return renderPersistedSessionDetail(allocator, info);
+        }
+    }
+    return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+}
+
+fn handlePersistedSessionDelete(
+    allocator: std.mem.Allocator,
+    state_mgr_opt: ?*zaki_state_mod.Manager,
+    session_key: []const u8,
+    user_id: []const u8,
+) RouteResponse {
+    const state_mgr = state_mgr_opt orelse return .{ .status = "404 Not Found", .body = session_context_unavailable_body };
+    const numeric_user_id = parseNumericUserId(user_id) catch return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+    if (numeric_user_id <= 0) return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+
+    const exists = persistedSessionExists(allocator, state_mgr, numeric_user_id, session_key) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"session_list_failed\"}" };
+    };
+    if (!exists) {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+    }
+
+    state_mgr.deleteSession(numeric_user_id, session_key) catch |err| {
+        log.warn("session.delete.persisted_only_failed user={s} key={s} err={s}", .{
+            user_id, session_key, @errorName(err),
+        });
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"durable_delete_failed\"}" };
+    };
+    return .{ .body = "{\"status\":\"deleted\"}" };
+}
+
+fn writeMessageEntriesJson(w: anytype, entries: []const memory_mod.MessageEntry) !void {
+    for (entries, 0..) |entry, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.writeAll("{\"role\":\"");
+        try jsonEscapeInto(w, entry.role);
+        try w.writeAll("\",\"content\":\"");
+        try jsonEscapeInto(w, entry.content);
+        try w.writeAll("\"}");
+    }
+}
+
+fn buildPersistedSessionMessagesJson(
+    allocator: std.mem.Allocator,
+    state_mgr_opt: ?*zaki_state_mod.Manager,
+    session_key: []const u8,
+    user_id: []const u8,
+) struct { json: ?[]u8, err: ?RouteResponse } {
+    const state_mgr = state_mgr_opt orelse return .{ .json = null, .err = .{ .status = "404 Not Found", .body = session_context_unavailable_body } };
+    const numeric_user_id = parseNumericUserId(user_id) catch return .{ .json = null, .err = .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" } };
+    if (numeric_user_id <= 0) return .{ .json = null, .err = .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" } };
+
+    const exists = persistedSessionExists(allocator, state_mgr, numeric_user_id, session_key) catch {
+        return .{ .json = null, .err = .{ .status = "500 Internal Server Error", .body = "{\"error\":\"session_list_failed\"}" } };
+    };
+    if (!exists) {
+        return .{ .json = null, .err = .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" } };
+    }
+
+    const entries = state_mgr.loadSessionMessages(allocator, numeric_user_id, session_key) catch {
+        return .{ .json = null, .err = .{ .status = "500 Internal Server Error", .body = "{\"error\":\"history_load_failed\"}" } };
+    };
+    defer memory_mod.freeMessages(allocator, entries);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    const w = buf.writer(allocator);
+    writeMessageEntriesJson(w, entries) catch {
+        buf.deinit(allocator);
+        return .{ .json = null, .err = response_build_err };
+    };
+    const json = buf.toOwnedSlice(allocator) catch {
+        buf.deinit(allocator);
+        return .{ .json = null, .err = response_build_err };
+    };
+    return .{ .json = json, .err = null };
+}
+
+fn handlePersistedSessionHistory(
+    allocator: std.mem.Allocator,
+    state_mgr_opt: ?*zaki_state_mod.Manager,
+    session_key: []const u8,
+    user_id: []const u8,
+) RouteResponse {
+    const built = buildPersistedSessionMessagesJson(allocator, state_mgr_opt, session_key, user_id);
+    if (built.err) |err_resp| return err_resp;
+    const messages_json = built.json.?;
+    defer allocator.free(messages_json);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"messages\":[") catch return response_build_err;
+    w.writeAll(messages_json) catch return response_build_err;
+    w.writeAll("]}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+fn handlePersistedSessionExport(
+    allocator: std.mem.Allocator,
+    state_mgr_opt: ?*zaki_state_mod.Manager,
+    session_key: []const u8,
+    user_id: []const u8,
+) RouteResponse {
+    const built = buildPersistedSessionMessagesJson(allocator, state_mgr_opt, session_key, user_id);
+    if (built.err) |err_resp| return err_resp;
+    const messages_json = built.json.?;
+    defer allocator.free(messages_json);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"session_key\":\"") catch return response_build_err;
+    jsonEscapeInto(w, session_key) catch return response_build_err;
+    w.writeAll("\",\"messages\":[") catch return response_build_err;
+    w.writeAll(messages_json) catch return response_build_err;
+    w.writeAll("]}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
 }
 
 fn isSessionAction(s: []const u8) bool {
@@ -14214,7 +14385,7 @@ fn handleSessionContext(
         report.context_reasoning_bytes,
         report.context_content_bytes + report.context_reasoning_bytes,
     }) catch return response_build_err;
-    w.writeAll(",\"estimator\":{\"name\":\"provider_bound_chars_v1\",\"version\":1,\"method\":\"chars_per_token\",\"chars_per_token\":4,\"includes\":[\"message_content\",\"assistant_reasoning_content\",\"system_prompt\",\"tool_instructions\",\"volatile_context\",\"xml_tool_results\",\"provider_serialized_multimodal_text\"]}") catch return response_build_err;
+    w.writeAll(",\"estimator\":{\"name\":\"provider_bound_chars_v1\",\"version\":1,\"method\":\"chars_per_token\",\"chars_per_token\":4,\"includes\":[\"message_content\",\"assistant_reasoning_content\",\"system_prompt\",\"tool_instructions\",\"volatile_context\",\"xml_tool_results\",\"multimodal_markers_in_history_text\"]}") catch return response_build_err;
     w.print(",\"provider_usage_last_turn\":{{\"available\":{},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"reasoning_tokens\":{d},\"total_tokens\":{d},\"cached_prompt_tokens\":{d},\"cache_hit_percent\":{d}}},\"last_turn_delta\":{{\"bytes\":{d},\"token_estimate\":{d},\"pressure_points\":{d},\"tool_mode\":\"", .{
         report.provider_usage_last_turn.available,
         report.provider_usage_last_turn.prompt_tokens,
