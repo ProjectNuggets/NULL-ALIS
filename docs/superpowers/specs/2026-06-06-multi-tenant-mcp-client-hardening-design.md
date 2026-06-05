@@ -8,7 +8,7 @@ date: 2026-06-06
 
 **Author:** brainstorming session (Mohammad + Claude)
 **Date:** 2026-06-06
-**Status:** Draft — pending user review, then `writing-plans`.
+**Status:** Draft (rev 2 — incorporates reference-repo recon: opencode + claude-code). Pending user review, then `writing-plans`.
 
 > **Sibling spec.** This is **Spec A** of a two-spec set. Spec A builds the
 > per-user credential / trust / OAuth **foundation** for nullalis as an MCP
@@ -18,419 +18,431 @@ date: 2026-06-06
 > (`2026-06-06-agent-as-mcp-server-design.md`). The end state is a **symmetric
 > MCP node**: every tenant both consumes MCP servers and (if allowed) is one.
 
-> **Scope boundary.** This is a **separate workstream** from the
-> `agent-browser` K8s backend (`2026-06-05-agent-browser-default-backend-design.md`).
-> That backend uses **native tools**, not MCP. Nothing here touches it.
+> **Scope boundary.** Separate workstream from the `agent-browser` K8s backend
+> (`2026-06-05-agent-browser-default-backend-design.md`) — that uses native
+> tools, not MCP. But the **sidecar** and **per-user pod** patterns are
+> deliberately shared with it (see §3.1, §6.3).
 
 ---
 
 ## 1. Context & problem
 
-nullalis is a self-hosted Zig AI-agent gateway that can run **multi-tenant**:
-one process serves many users, each with an isolated `TenantRuntime`
-(`src/gateway.zig`). It is also an **MCP client** — it consumes external Model
-Context Protocol tool servers and exposes their tools to the agent
-(`src/mcp.zig`, `src/mcp/transport.zig`, `docs/mcp-client.md`).
+nullalis is a self-hosted Zig AI-agent gateway that runs **multi-tenant**: one
+process serves many users, each with an isolated `TenantRuntime`
+(`src/gateway.zig`). It is also an **MCP client** (`src/mcp.zig`,
+`src/mcp/transport.zig`, `docs/mcp-client.md`). A code recon (verified against
+source) plus a recon of two mature reference clients (opencode, claude-code)
+found the MCP client is **single-tenant in disguise**: correct for one user,
+latently unsafe the moment a tenant-sensitive server is wired.
 
-A code recon (verified against source for this spec) found that the MCP client
-is **single-tenant in disguise**: it works correctly for one user but has
-latent multi-tenant gaps that become live the moment a tenant-sensitive MCP
-server is wired.
+### 1.1 Already correct — do not "fix"
 
-### 1.1 What is already correct (do not "fix")
+- **`McpServer` instances are per-user** (`src/gateway.zig:1990`); the per-server
+  mutex (`src/mcp.zig:109`) only serializes *within* a user. Not a cross-tenant
+  bug; research confirms per-user instance/session is the canonical isolation
+  primitive.
+- **Tool concurrency is real but tenant-safe** — a thread per tool call
+  (`src/agent/root.zig:2969`, default-on), but threads share *that user's*
+  `McpServer`/mutex; concurrency never crosses tenants.
 
-- **`McpServer` instances are per-user.** `initMcpTools` runs inside each
-  `TenantRuntime` (`src/gateway.zig:1990`), so MCP state is isolated per user
-  and the per-server mutex (`src/mcp.zig:109`) only serializes *within* one
-  user. This is **not** a cross-tenant bug — it is the right isolation
-  primitive, and external research confirms "one instance/session per user" is
-  the canonical per-tenant isolation pattern.
-- **Tool concurrency is real but tenant-safe.** The agent spawns a thread per
-  tool call in parallel mode (`src/agent/root.zig:2969`, default-on), but those
-  threads share *that user's* `McpServer` and mutex — concurrency never crosses
-  tenants.
+### 1.2 The real gaps (verified against source)
 
-### 1.2 The real gaps (verified)
+1. **Per-user credential isolation (critical).** Credentials are **static**,
+   boot-time, operator-set — `env`/`headers`/`url` in `McpServerConfig`
+   (`src/config_types.zig:1472-1510`), **no per-user override, no substitution**
+   (`src/mcp/transport.zig:176-178`, `:465-468`). MCP exposed in tenant mode with
+   **no gating** (`src/gateway.zig:1990`). Every user → one shared identity.
+   *Latent today* (no tenant-sensitive server wired) → a time bomb, not a live
+   leak.
+2. **Scaling.** stdio spawns a child per `McpServer` (`src/mcp/transport.zig:157`)
+   eagerly at init (`src/mcp.zig:593`); per-user × per-server = **N×M children**
+   on first request.
+3. **Staleness.** `TenantRuntime`s are cached (LRU 2048 / idle TTL 1800s,
+   `src/gateway.zig:1084-1085`); MCP connects once at init; `PUT /secrets`
+   **does not** invalidate the runtime (`src/gateway.zig:19875`) while
+   `PATCH /settings` **does** (`src/gateway.zig:19574`). Connect-time credential
+   resolution ⇒ **stale token up to 30 min** after rotation.
+4. **Intra-user fairness (minor).** Mutex held across the full round-trip; no
+   per-call timeout, no per-user quota → one slow call head-of-lines the user.
 
-1. **Per-user credential isolation (critical).** MCP credentials are **static**,
-   set at boot from operator config — `env` / `headers` / `url` in
-   `McpServerConfig` (`src/config_types.zig:1472-1510`) with **no per-user
-   override and no variable substitution** (`src/mcp/transport.zig:176-178`
-   env injection, `:465-468` header injection). MCP tools are exposed in tenant
-   mode with **no gating** (`src/gateway.zig:1990`). So every user hits a shared
-   server under **one shared identity**. `config.zig:110-114` documents
-   "mcp_servers… NOT tenant-settable" but never names the cross-user identity
-   consequence. *Latent today* — no tenant-sensitive server is wired in
-   production — so this is a **time bomb, not an active leak.**
+### 1.3 Reference-repo recon — what mature clients prove (and what bites us)
 
-2. **Scaling.** stdio transport spawns one child process per `McpServer`
-   (`src/mcp/transport.zig:157`), eagerly at init (`src/mcp.zig:593`), and
-   `McpServer`s are per-user → **N users × M servers = N×M child processes**,
-   all spawned on the user's *first* request.
+We read opencode (`packages/opencode/src/mcp/*`) and claude-code
+(`src/services/mcp/*`, `mcp-server/*`, `src/server/*`, `helm/*`):
 
-3. **Staleness (discovered while designing).** `TenantRuntime`s are **cached**
-   (LRU `tenant_runtime_cache_max_users` default 2048; idle TTL
-   `tenant_runtime_idle_ttl_secs` default 1800s — `src/gateway.zig:1084-1085`).
-   MCP servers connect **once at init**. `PUT /secrets/<key>` does **not**
-   invalidate the cached runtime (`src/gateway.zig:19875`), whereas
-   `PATCH /settings` **does** (`src/gateway.zig:19574`). Any "resolve
-   credentials at connect time" design therefore serves a **stale token for up
-   to 30 minutes** after a user rotates it.
+- **OAuth is "buy, not build" — but only if you have an SDK.** Both delegate the
+  *entire* OAuth state machine (RFC 9728/8414/7591/PKCE/8707/refresh) to
+  `@modelcontextprotocol/sdk`; opencode writes only ~700 LOC of glue (provider
+  adapter + localhost callback + token storage; `oauth-provider.ts`,
+  `oauth-callback.ts`, `auth.ts`). **nullalis is Zig — no official SDK exists.**
+  Hand-rolling those RFCs in Zig is 2–4× the cost and security-critical. ⇒ we
+  introduce a **Node/TS MCP sidecar** that owns the SDK (§3.1).
+- **nullalis's HTTP transport is partial.** It is **POST-only curl**
+  (`src/mcp/transport.zig:447-511`): no GET server→client stream, no SSE
+  fallback for older servers, no `DELETE` teardown, and `tools/list_changed` is
+  *skipped* by the frame router — so a cached catalog silently goes stale.
+  opencode gets full Streamable HTTP + SSE fallback + `list_changed` re-list free
+  from the SDK (`index.ts:476-484`). ⇒ the sidecar also fixes this transport gap.
+- **The MCP ecosystem is stdio-dominated.** The plug-and-play "any MCP server"
+  case is `npx @modelcontextprotocol/server-*` (filesystem, github, …). opencode
+  invests in recursive `pgrep -P` subprocess reaping because stdio servers fork
+  grandchildren (`index.ts:533-540`). **Forbidding stdio in tenant mode (correct
+  for safety) means SaaS tenants lose this long tail** unless we add a per-user
+  execution layer (§6).
+- **The ban is validated by claude-code's failure.** Its hosted server runs
+  user stdio MCP in a **shared pod under a shared UID with full `process.env`**,
+  and a `/test` route does `execSync(\`${command} ${args}\`, {env:{...process.env}})`
+  — shell-injection RCE that **bypasses** its own command-sandbox and leaks
+  `ANTHROPIC_API_KEY` (`src/server/api/routes/mcp.ts:130-139`,
+  `security/command-sandbox.ts`). This is exactly what "no gating / shared
+  process" buys.
+- **Patterns to steal** (verified): credential **re-binding to server-URL** to
+  defeat confused-deputy (opencode `auth.ts:69`); **double-layer CSRF state**;
+  the **in-process transport** for blessed local servers — no child process
+  (claude-code `client.ts:909-943`); transport-tiered concurrency; an actionable
+  **status enum** (`needs_auth` / `needs_client_registration` / `failed` /
+  `disabled`); and a **shared/sticky session store** (both refs' in-process
+  session maps break under K8s multi-replica — directly relevant to nullalis).
+- **Anti-patterns to avoid** (verified): opencode's module-global
+  `pendingOAuthTransports` keyed by server *name* (`index.ts:119`) → cross-tenant
+  clobber if two tenants share a name; tokens at rest in **plaintext** JSON
+  (`auth.ts:80`); full `process.env` inherited into stdio children
+  (`index.ts:399`); a token-auth mode that **collapses every user to one admin
+  principal** (claude-code `api/middleware/auth.ts:50-66`).
 
-4. **Intra-user concurrency/fairness (minor).** The per-server mutex is held
-   across the full blocking round-trip; there is no per-call timeout (only a
-   per-`readLine` / curl `--max-time` budget) and no per-user concurrency quota,
-   so one slow MCP call head-of-lines that user's other MCP calls.
-
-### 1.3 Spec research — the spec-canonical multi-tenant MCP model
-
-External research against the **MCP 2025-06-18 authorization spec** and 2025
-security guidance reframed two of our early instincts:
+### 1.4 Spec-canonical model (from the MCP 2025-06-18 authorization spec)
 
 - **OAuth 2.1 is the intended multi-tenant mechanism**, not static injected
-  tokens. An MCP HTTP server is an OAuth 2.1 **Resource Server**; the client
-  runs PKCE, discovers the auth server via RFC 9728 protected-resource-metadata
-  (off a `401` + `WWW-Authenticate`), and obtains an access token
-  **audience-bound to the MCP server URI** (RFC 8707 resource indicators),
-  re-asserted on **every** request.
-  <https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization>
-- **Injecting a user's *third-party* token (e.g. their GitHub PAT) as the MCP
-  `Authorization` header is the named "token passthrough" anti-pattern** — *if*
-  the server is third-party or forwards it downstream. The MCP `Authorization`
-  token must be audience-bound to the MCP server, not to GitHub. Static-token
-  injection is legitimate only for **first-party servers you fully control**, or
-  as an explicitly **transitional** per-request-header workaround.
-  <https://modelcontextprotocol.io/docs/tutorials/security/security_best_practices>
-- **A session ID is not an identity credential.** `Mcp-Session-Id` must be
-  non-deterministic, bound per-user (`<user_id>:<session_id>`), and **never**
-  used for authentication; auth is re-validated per request.
+  tokens; access tokens are **audience-bound to the MCP server URI** (RFC 8707),
+  re-asserted **every** request.
+- **Injecting a user's *third-party* token (their GitHub PAT) as the MCP
+  `Authorization`** is the named **token-passthrough anti-pattern** — legitimate
+  only for **first-party** servers you control, or as explicit transitional debt.
+- **`Mcp-Session-Id` ≠ identity** — non-deterministic, bound `<user_id>:<session_id>`,
+  never used for auth.
 
-### 1.4 End-state goal (this spec's slice)
+### 1.5 End-state goal (this spec's slice) + honest scope
 
-> The end user can connect their agent to **any** MCP server — operator-provided
-> **or** user-registered (BYO) — and the agent acts under **that user's own
-> identity**, with **no user able to affect another**, and with credentials that
-> are correct (no token-passthrough), fresh (no staleness), and OAuth-ready.
+> The end user can connect their agent to **any *remote* MCP server** —
+> operator-provided **or** user-registered (BYO) — acting under **that user's own
+> identity**, **no user affecting another**, with credentials that are correct
+> (no passthrough), fresh (no staleness), and OAuth-ready. **Arbitrary stdio
+> servers** ("the npx long tail") are delivered in layers: bundled-in-process
+> now-ish, **per-user pod** as the named endgame (§6).
 
-(The inverse — the user's agent *being* an MCP server — is **Spec B**.)
+(The inverse — the agent *being* an MCP server — is **Spec B**.)
 
 ## 2. Goals / non-goals
 
 **Goals**
-- MCP is **off by default in tenant mode**; an operator opts in explicitly and
-  is warned precisely when a server exposes a shared identity.
-- Each tenant's agent uses **its own credential** per MCP server, resolved
-  **per request** (no staleness), via a pluggable provider (static **or**
-  delegated OAuth 2.1).
-- **stdio is forbidden in tenant mode**; HTTP-only eliminates the N×M
-  process blowup by construction.
-- **Users can register their own outbound MCP servers (BYO)**, HTTP-only, under
-  operator policy, with untrusted-server safety.
-- Per-call timeout + per-user concurrency quota so one slow call can't starve a
-  user's turn.
-- The credential / trust / OAuth core is built so **Spec B (agent-as-server)**
-  reuses it without rework.
+- MCP **off by default in tenant mode**; explicit operator opt-in; precise
+  shared-identity warning.
+- Per-tenant **own credential per server, resolved per request** (no staleness),
+  via a pluggable provider (static **or** delegated OAuth 2.1).
+- **No arbitrary stdio in a shared process, ever**; HTTP/remote-only in the
+  shared path; stdio long-tail via in-process (blessed) + per-user pod (future).
+- **BYO user-registered remote servers** under operator policy + untrusted-server
+  safety.
+- A **stateless Node/TS MCP sidecar** owns the MCP protocol (OAuth, full
+  Streamable HTTP/SSE, `list_changed`); **nullalis owns identity + the vault +
+  tenant routing**.
+- Per-call timeout + per-user concurrency quota.
+- Foundation reusable by **Spec B** without rework.
 
 **Non-goals**
-- **Single-user mode behavior is unchanged** — stdio, static config, today's
-  flow all keep working when `!tenant.enabled`.
-- We do **not** relax the per-server mutex / frame-routing (the verified
-  multi-turn stability fix). Phase 6 adds timeout + quota *around* it, not
-  inside it.
-- We do **not** build the agent-as-MCP-server surface here (Spec B).
-- We do **not** implement MCP `sampling` (still deferred, per
-  `docs/mcp-client.md`).
+- **Single-user mode unchanged** — stdio, static config, current flow all keep
+  working when `!tenant.enabled` (the native Zig client path stays for it).
+- Do **not** relax the per-server mutex / frame-routing (the verified stability
+  fix); Phase 7 adds timeout+quota *around* it.
+- Do **not** build the agent-as-MCP-server surface (Spec B).
+- Do **not** implement MCP `sampling` (still deferred).
 
 ## 3. Architecture
 
-### 3.1 The central abstraction: a per-request `CredentialResolver`
-
-Every MCP tool call resolves the requesting user's credential **fresh** and
-attaches it to **that** request — never baked at connect. Because the MCP tool
-closure already runs inside the per-user `TenantRuntime`, `user_id` is captured
-for free; "per-request" means re-reading the vault / token store **each call**,
-which:
-
-- structurally kills the staleness bug (no dependence on runtime invalidation),
-- satisfies MCP's "auth on every request" rule,
-- is the cheapest scale model (per-user MCP state shrinks to near-zero).
+### 3.1 Topology — nullalis (Zig) ⇄ MCP sidecar (Node/TS, official SDK)
 
 ```
-agent tool call  (inside user U's TenantRuntime)
-  └─ McpTool.call(args)                         src/mcp.zig (wrapper)
-       └─ resolver.resolve(U, server, request)  NEW  src/mcp/credential.zig
-            ├─ static  → credref substitution (vault / operator / user.id)
-            └─ oauth   → per-user access token (refresh on expiry)
-       └─ McpServer.callTool(args, request_auth) src/mcp.zig (auth threaded in)
-            └─ transport.request(..., request_auth) attaches per-request headers
+nullalis agent (Zig)  — per-user TenantRuntime
+  ├─ owns: tenant identity, encrypted vault (token store), credential
+  │        resolution, gating/trust/policy, tool catalog → agent, approval gates
+  │   JSON-RPC / HTTP over a local interface  (per call: user, server, RequestAuth)
+  ▼
+MCP sidecar  (Node/TS, @modelcontextprotocol/sdk)   NEW — shared, STATELESS re: secrets
+  ├─ owns: MCP protocol — Streamable HTTP (+GET stream/+DELETE), SSE fallback,
+  │        OAuth 2.1 state machine (discovery/DCR/PKCE/refresh/RFC8707),
+  │        tools/list_changed, session lifecycle
+  ├─ holds NO cross-user secret state; receives the per-user credential per
+  │  request; hands refreshed OAuth tokens BACK to nullalis to persist in vault
+  └─ keys all transient state by (user_id, server)
+        │ outbound JSON-RPC
+        ▼
+   remote MCP servers (operator-provided + user BYO)   HTTP/SSE only on this path
 ```
 
-**Provider interface (shape, not final Zig):**
+**Why a sidecar (decision):** it buys the OAuth RFCs and full Streamable
+HTTP/SSE from the official SDK (the ~700-LOC-glue reality both refs prove),
+instead of hand-rolling security-critical protocol in Zig. It reuses the exact
+**Node/TS sidecar pattern** the agent-browser spec established.
+
+**Why the sidecar is stateless about secrets (decision):** the single worst bug
+in both refs is cross-tenant secret/session state in process-global maps. By
+keeping nullalis's encrypted vault (`src/zaki_state.zig:3351`) the **sole**
+source of truth and passing the per-user credential per request — sidecar
+returning refreshed tokens to nullalis to store — we never create a second
+multi-tenant secret store. The sidecar can be killed/restarted freely.
+
+### 3.2 The central abstraction: a per-request `CredentialResolver` (nullalis side)
+
+Every MCP tool call resolves the requesting user's credential **fresh** from the
+vault / token store and passes it to the sidecar for **that** request — never
+baked at connect. The MCP tool closure already runs in the per-user
+`TenantRuntime`, so `user_id` is free; "per-request" = re-read the vault each
+call → kills staleness, satisfies "auth on every request", minimizes per-user
+state.
 
 ```
-const RequestAuth = struct { headers: []const Header, /* opaque */ };
-
-const CredentialProvider = struct {
-    /// Resolve THIS user's auth for THIS server, for ONE request.
-    /// Returns error.MissingCredential to fail closed.
-    resolve: fn (ctx: ResolveCtx) ResolveError!RequestAuth,
-};
-
-const ResolveCtx = struct {
-    user_id: []const u8,
-    server: *const McpServerConfig,
-    vault: VaultHandle,        // state_mgr.getSecret(numeric_user_id, key)
-    token_store: TokenStore,   // per-user OAuth tokens (Phase 4)
-};
+McpTool.call(args)                         (inside user U's TenantRuntime)
+  └─ resolver.resolve(U, server) -> RequestAuth   NEW src/mcp/credential.zig
+       ├─ static → credref substitution (vault / operator / user.id)
+       └─ oauth  → current per-user token (sidecar refreshes; nullalis persists)
+  └─ sidecar.callTool(user=U, server=S, auth=RequestAuth, name, args)
 ```
 
-Two providers ship: `static` (Phase 2) and `oauth` (Phase 4). The provider is
-selected by the server's `auth` field (§3.3).
+### 3.3 `credref` — the static substitution engine (pure, tested)
 
-### 3.2 `credref` — the static substitution engine
+`src/mcp/credref.zig`, no I/O. `resolve(allocator, template, ctx)`.
 
-A small, **pure, no-I/O**, fully-tested module (`src/mcp/credref.zig`).
-Interface: `resolve(allocator, template, ctx) -> ResolvedValue | error`.
-Supported forms inside any `env` value, `header` value, or `url`:
-
-| Form | Resolves to | Identity class |
+| Form | Resolves to | Class |
 |---|---|---|
-| `${user.secret:KEY}` | `getSecret(user_id, KEY)` from the encrypted `user_secrets` vault (`src/zaki_state.zig:3351`, ChaCha20Poly1305) | **per-user** |
-| `${user.id}` | the requesting user's id string (cf. Composio `entity_id = user_id`, `src/gateway.zig:1969`) | per-user (non-secret) |
-| `${operator.secret:KEY}` | operator-scoped secret (operator config map and/or process env) | **shared** |
+| `${user.secret:KEY}` | `getSecret(user_id, KEY)` (encrypted `user_secrets`) | per-user |
+| `${user.id}` | requesting user's id (cf. Composio `entity_id`) | per-user (non-secret) |
+| `${operator.secret:KEY}` | operator-scoped secret (config map / env) | **shared** |
 | `$${` | literal `${` (escape) | — |
 
-**Hard rules:**
-- **Fail closed.** A missing `${user.secret:KEY}` ⇒ `error.MissingCredential`;
-  the call returns a tool-error and the server is **absent for that user only**
-  (other users unaffected). Never an empty/blank credential on the wire.
-- **No silent passthrough.** Any unknown `${…}` token ⇒ error (never emit it
-  unexpanded).
-- There is intentionally **no `${env:VAR}` form** — raw env would be
-  indistinguishable from a per-user ref at audit time. Operator env is sourced
-  *through* `${operator.secret:KEY}`, which is statically detectable as shared.
+**Hard rules:** **fail closed** (missing `${user.secret}` ⇒ `error.MissingCredential`
+→ server absent for that user only, never a blank credential); **no silent
+passthrough** (unknown `${…}` ⇒ error); **no `${env:VAR}` form** (raw env is
+audit-opaque; operator env flows through `${operator.secret}`, statically
+detectable as shared).
 
-### 3.3 Server trust + auth classification
+### 3.4 Server trust + auth classification
 
-New `McpServerConfig` fields (`src/config_types.zig:1472`):
+New `McpServerConfig` fields:
 
 ```
-trust: enum { first_party, third_party } = .third_party,  // default safe
+trust: enum { first_party, third_party } = .third_party,  // safe default
 auth:  enum { none, static, oauth }      = .static,
-allow_shared_identity: bool = false,      // operator ack for shared-identity
+allow_shared_identity: bool = false,
 ```
 
-**Classification drives gating and the token-passthrough warning:**
+- **per-user** iff every credential value uses only `${user.*}` (or `auth=oauth`)
+  → no ack needed.
+- **shared-identity** if any value is literal-nonempty or `${operator.secret:…}`
+  → requires `allow_shared_identity=true` in tenant mode, else refused+warned.
+- **token-passthrough guard:** `third_party` **and** a `${user.secret}` in an
+  `Authorization`-class header ⇒ WARN (transitional debt; prefer `auth=oauth`).
+  `first_party + static` allowed silently.
+- **Status surfaced to operator/user** with an actionable enum (stolen from
+  opencode): `connected | disabled | failed{err} | needs_auth |
+  needs_client_registration{err}`.
 
-- A server is **per-user** iff every credential-bearing value resolves using
-  *only* `${user.*}` refs (or `auth = oauth`). Needs no acknowledgment.
-- A server is **shared-identity** if any credential value is literal-nonempty or
-  uses `${operator.secret:…}`. In tenant mode it requires
-  `allow_shared_identity = true`, else it is **refused + warned**.
-- **Token-passthrough guard:** `trust = third_party` **and** a `${user.secret}`
-  injected into an `Authorization`-class header ⇒ **WARN** (transitional debt):
-  *"server '<name>' is third_party but receives a per-user bearer — this is the
-  MCP token-passthrough anti-pattern; prefer auth=oauth."* `first_party + static`
-  is allowed silently (legitimate first-party use).
+### 3.5 Discovery / invocation split + per-user session
 
-### 3.4 Discovery / invocation split + per-user session handle
+Tool **catalog** (names/schemas) is user-independent → discovered **once per
+server** (shared), refreshed on the sidecar's `tools/list_changed`. **Invocation**
+attaches the per-user credential **per request**. Per-user state = a tiny
+**session handle** bound `<user_id>:<session_id>`, never shared across users.
+(Scope-gated OAuth catalogs fall back to per-user discovery, cached per user.)
+Credential **re-binding to server-URL** (opencode `auth.ts:69`) defeats
+confused-deputy: stored tokens are refused if the configured URL changed.
 
-A tool **catalog** (names / schemas) is user-independent, so:
+### 3.6 Gating + HTTP-only (shared path)
 
-- **Discovery** (`tools/list`, resources, prompts) is done **once per server**
-  and the catalog is **shared** across that operator-server's users. (For OAuth
-  servers whose catalog is scope-gated, discovery falls back to per-user-on-
-  first-use, cached per user — an acknowledged edge case.)
-- **Invocation** attaches the per-user credential **per request**.
-- Per-user state collapses to a tiny **session handle**: `Mcp-Session-Id` +
-  `next_id` + mutex, created lazily on first call, **bound to the user**
-  (`<user_id>:<session_id>`), evicted with the runtime. Never shared across
-  users (cross-tenant leak vector per research).
+At `initMcpTools` (`src/gateway.zig:1990`) thread the tenant flag
+(`state.tenant_enabled`, `:1081`):
+- **single-user** (`!tenant_enabled`): unchanged — native Zig client, stdio
+  included.
+- **tenant + `mcp_enabled=false`** (new `tenant.mcp_enabled`, default false): skip
+  MCP; log once.
+- **tenant + `mcp_enabled=true`**: classify per server; **stdio refused on the
+  shared path** with a clear error (→ in-process or per-user pod, §6);
+  shared-identity-without-ack refused+warned. MCP stays **additive-safe** (any
+  refusal leaves the agent on builtin tools, today's behavior at
+  `src/gateway.zig:1991`).
 
-This is lighter than today's full per-user re-discovery and matches the
-spec-blessed "shared server, per-request auth, per-user session" model.
+### 3.7 BYO — user-registered outbound servers (remote only on shared path)
 
-### 3.5 Tenant-mode gating + HTTP-only
+- **Storage:** per-user MCP registry in Postgres (the `user_config` pattern,
+  `src/zaki_state.zig:2801`), visible only to that user; merged with operator
+  servers (name collision → operator wins, user server logged shadowed).
+- **Operator policy** `tenant.mcp_byo`: `disabled` (default) / `allowlist`
+  (host/domain) / `open`.
+- **Remote-only on the shared path.** A user can never register a stdio server
+  that runs in shared infra; arbitrary stdio is only ever per-user-pod (§6.3).
+- **Untrusted-server safety:** user servers are `third_party` by construction.
+  SSRF/egress validation at registration + per request (HTTPS-only, block
+  private/link-local/metadata; optional operator egress allowlist).
+  Server-supplied tool **descriptions/results are untrusted** — surfaced with
+  provenance, no autonomy elevation, counted under existing approval gates.
+  Credentials are the user's own (`${user.secret}` or OAuth).
 
-At `initMcpTools` (`src/gateway.zig:1990`) the tenant flag (`state.tenant_enabled`,
-`src/gateway.zig:1081`) is threaded through:
+## 4. "Connect to any MCP" — capability matrix (honest)
 
-- **single-user** (`!tenant_enabled`): unchanged — full current behavior,
-  stdio included.
-- **tenant + `mcp_enabled == false`** (new `tenant.mcp_enabled` default false):
-  skip MCP entirely; log once.
-- **tenant + `mcp_enabled == true`**: per-server classification (§3.3); any
-  `stdio` server (explicit or inferred) is **refused** with a clear operator
-  error pointing to HTTP; shared-identity servers without ack are refused +
-  warned.
+| Server kind | Single-user mode | Tenant mode (this spec) |
+|---|---|---|
+| Remote HTTP/SSE, operator | ✅ today | ✅ Phase 1–4 (sidecar, per-user creds/OAuth) |
+| Remote HTTP/SSE, user BYO | n/a | ✅ Phase 6 |
+| stdio, operator-blessed/bundled | ✅ today | ✅ Phase 5 (in-process, no child proc) |
+| **stdio, arbitrary user `npx`** | ✅ today | ⛔ shared path; ✅ **Phase 8 (per-user pod)** |
 
-MCP remains **additive-safe**: any refusal/skip/resolution error leaves the
-agent running on builtin tools (today's behavior at `src/gateway.zig:1991`).
+**Bottom line:** after Phases 1–6, a SaaS tenant can connect to **any remote
+MCP** and **blessed local** servers under their own identity. **Literally any
+MCP (incl. arbitrary stdio)** requires Phase 8 (per-user pod), the named endgame
+tied to the K8s workstream.
 
-### 3.6 BYO — user-registered outbound servers
+## 5. Phases (sequenced; Phase 1 ships first)
 
-The end-user "connect to any MCP" capability. This **reverses** the
-operator-only invariant (`config.zig:110-114`) in a controlled way:
-
-- **Storage.** A per-user MCP server registry persisted in Postgres alongside
-  per-user config (`{schema}.user_config` pattern, `src/zaki_state.zig:2801`),
-  visible only to that user. Operator-provided servers and user-registered
-  servers merge into the user's effective catalog (name-collision → operator
-  wins, user server logged as shadowed).
-- **Operator policy** (new `tenant.mcp_byo` enum): `disabled` (default) /
-  `allowlist` (operator host/domain allowlist) / `open`. `disabled` means BYO is
-  off regardless of per-user settings.
-- **HTTP-only, always.** A user can **never** register a stdio server — no
-  arbitrary process spawn on shared infra. Enforced at registration and at init.
-- **Untrusted-server safety.** A user-registered server is `trust = third_party`
-  by construction. Defenses:
-  - **SSRF / egress:** validate the URL at registration and per request —
-    HTTPS-only, block private / link-local / metadata ranges, optional operator
-    egress allowlist. (Shared with Phase 4 discovery defenses.)
-  - **Tool-poisoning / prompt-injection:** server-supplied tool *descriptions*
-    and *results* are untrusted input. They are surfaced to the model with
-    provenance ("from user-registered server X"), never granted elevated
-    autonomy, and counted under the user's existing approval/autonomy gates.
-  - **Credentials:** the user's own — `${user.secret:…}` or per-user OAuth.
-- BYO reuses §3.1 resolver + §3.4 split + §4 OAuth wholesale; it adds storage +
-  policy + registration UX, not a new transport path.
-
-## 4. Phases (sequenced; Phase 1 ships first)
-
-| # | Phase | Depends on | Ships value |
+| # | Phase | Dep | Value |
 |---|---|---|---|
-| 1 | **Gating + HTTP-only** | — | Closes the latent shared-identity risk *today* |
-| 2 | **Per-request resolver + `credref` + trust classification** | 1 | Per-user identity correctness; staleness fixed |
-| 3 | **Discovery/invocation split + per-user session handle** | 2 | Scaling; spec-correct session model |
-| 4 | **Delegated OAuth 2.1 client provider** | 2 | Spec-canonical per-user auth; kills passthrough |
-| 5 | **BYO user-registered outbound servers** | 2, 4 | "Connect to any MCP" |
-| 6 | **Per-call timeout + per-user concurrency quota** | — (independent) | Intra-user fairness |
+| 1 | **Gating + shared-path HTTP-only** | — | Closes latent shared-identity risk *today* |
+| 2 | **MCP sidecar (Node/TS, SDK) for remote transports** | 1 | Full Streamable HTTP/SSE + `list_changed`; replaces POST-only curl on the tenant path |
+| 3 | **Per-request resolver + `credref` + trust class** | 2 | Per-user identity; staleness fixed |
+| 4 | **Delegated OAuth 2.1 (sidecar SDK; vault-backed tokens)** | 2,3 | Spec-canonical per-user auth; kills passthrough |
+| 5 | **In-process blessed local servers** | 2 | Common stdio-like servers, no child process |
+| 6 | **BYO user-registered remote servers** | 3,4 | "Connect to any remote MCP" |
+| 7 | **Per-call timeout + per-user quota** | — | Intra-user fairness |
+| 8 | **Per-user pod stdio execution (K8s)** *(named endgame)* | 2; K8s workstream | Literally *any* MCP incl. arbitrary `npx` |
 
-### Phase 1 — Tenant-mode gating + HTTP-only
-- New `tenant.mcp_enabled: bool = false`.
-- Thread tenant flag into `initMcpTools`; implement the three branches (§3.5).
-- Refuse stdio in tenant mode; emit the per-server shared-identity WARN.
-- **Cheapest immediate safeguard — land before any tenant-sensitive server.**
+Notes: Phase 1 is the cheap safeguard — land before any tenant-sensitive
+server. Phases 1, 3, 7 are pure-Zig and independently shippable; 2/4/5/8 involve
+the sidecar. Single-user mode keeps the native Zig client throughout (no sidecar
+dependency for solo users).
 
-### Phase 2 — Per-request resolver + `credref` + trust classification
-- `src/mcp/credref.zig` (pure, §3.2).
-- `src/mcp/credential.zig` — the resolver + `static` provider (§3.1).
-- New `McpServerConfig` fields `trust` / `auth` / `allow_shared_identity` (§3.3).
-- Thread `RequestAuth` through `McpServer.callTool` → `transport.request`;
-  resolve **per call**. Fail-closed wiring.
-- Token-passthrough WARN.
+### Per-phase specifics
+- **P1:** `tenant.mcp_enabled:bool=false`; thread flag into `initMcpTools`;
+  three branches (§3.6); refuse stdio on shared path; shared-identity WARN.
+- **P2:** sidecar service + local nullalis↔sidecar interface; route tenant-mode
+  remote MCP through it; sidecar holds no secrets (§3.1); health/restart-safe.
+- **P3:** `credref.zig` (pure) + `credential.zig` resolver + `static` provider;
+  new `McpServerConfig` fields; per-call `RequestAuth` to sidecar; fail-closed;
+  passthrough WARN; status enum.
+- **P4:** OAuth via sidecar SDK (discovery/DCR/PKCE/refresh/RFC8707); per-user
+  **browser consent** (localhost callback in sidecar, state CSRF double-checked);
+  refreshed tokens persisted to nullalis vault; SSRF defenses on discovery
+  fetches; cred re-binding to server-URL.
+- **P5:** in-process transport for a curated bundled-server set (claude-code
+  `client.ts:909-943` pattern); no `tenant.mcp_byo` exposure.
+- **P6:** per-user registry storage + merge; `tenant.mcp_byo` policy; registration
+  validation (remote-only, SSRF); untrusted provenance + autonomy handling.
+- **P7:** hard per-invocation wall-clock budget (promote `read_line_timeout_secs`
+  / curl `--max-time`); per-user concurrent-call quota → fast "MCP busy";
+  transport-tiered concurrency (throttle heavier paths); mutex/frame-routing
+  untouched; `zig build test-mcp-live` must still pass.
+- **P8 (endgame):** run a user's stdio server in that user's pod/microVM
+  (agent-browser K8s harness, `nullalis-abk8s`), bridged via the sidecar;
+  process-tree reaping; per-pod egress controls. Own brainstorm before build.
 
-### Phase 3 — Discovery/invocation split + per-user session handle
-- Hoist catalog discovery to per-server (shared); introduce the lazy per-user
-  session handle bound `<user_id>:<session_id>` (§3.4).
-- Remove redundant per-user re-discovery.
+## 6. stdio strategy (the safety law)
 
-### Phase 4 — Delegated OAuth 2.1 client provider
-- `oauth` provider plugging into the resolver.
-- PKCE; RFC 9728 protected-resource-metadata discovery via `WWW-Authenticate` on
-  `401`; RFC 8414 AS metadata; RFC 7591 dynamic client registration (SHOULD);
-  **RFC 8707 resource indicators** (audience-bind to server URI on auth + token
-  requests).
-- Per-user token store (encrypted, vault-backed) + refresh-on-expiry.
-- **SSRF defenses** on every discovery fetch: HTTPS-only, block private /
-  link-local / metadata ranges, validate redirect hops.
-- Per-user browser **consent flow** (authorize URL issuance + callback capture).
+**Arbitrary user stdio = arbitrary code execution ⇒ per-user isolation or
+nothing.** Layers:
+1. **Shared path: remote-only.** No per-user OS process; sidecar holds no
+   secrets. Safe by construction.
+2. **In-process blessed (P5):** only code nullalis ships; no child process; no
+   user-supplied commands.
+3. **Per-user pod (P8):** the *only* place arbitrary user stdio runs, isolated in
+   the user's own pod (reuses K8s). Never a shared pod (claude-code's
+   `routes/mcp.ts:130-139` is the anti-example).
 
-### Phase 5 — BYO user-registered outbound servers
-- Per-user MCP registry storage + merge (§3.6).
-- `tenant.mcp_byo` policy enum; allowlist enforcement.
-- Registration validation (HTTP-only, SSRF, optional egress allowlist).
-- Untrusted-server provenance + autonomy handling.
+## 7. Security posture (explicit)
 
-### Phase 6 — Per-call timeout + per-user concurrency quota
-- Promote `read_line_timeout_secs` / curl `--max-time` into a guaranteed
-  **per-invocation** wall-clock budget (hung call ⇒ tool-error, not a stalled
-  turn).
-- Per-user **concurrent-MCP-call quota** (small configurable N); excess ⇒ fast
-  "MCP busy" tool-error.
-- Mutex / frame-routing untouched.
-
-## 5. Security posture (explicit)
-
-- **Token passthrough:** documented as an anti-pattern; enforced via the
-  trust-class WARN (§3.3); OAuth (Phase 4) is the named correct path.
+- **Token passthrough:** documented; enforced via trust-class WARN; OAuth (P4) is
+  the correct path.
 - **Fail closed:** missing per-user credential ⇒ server absent for that user
   only; never an empty token.
-- **Session ≠ identity:** non-deterministic server-issued IDs, bound per-user,
-  never reused cross-user, never used for auth.
-- **SSRF / egress:** enforced on OAuth discovery (Phase 4) and BYO registration
-  + per-request (Phase 5) — HTTPS-only, block private/link-local/metadata.
-- **Untrusted MCP output:** server tool descriptions/results carry provenance,
-  no autonomy elevation, counted under existing approval gates.
-- **Secret hygiene:** secrets enter memory only at call time; logs carry key
-  *names* + server names, never values.
+- **Sidecar statelessness:** vault is the sole secret store; sidecar keyed by
+  `(user,server)`, restart-safe — avoids both refs' process-global cross-tenant
+  leak.
+- **Session ≠ identity:** non-deterministic, per-user bound, never auth.
+- **Confused-deputy:** credential re-binding to server-URL; per-client consent;
+  exact `redirect_uri`; single-use `state`.
+- **SSRF/egress:** on OAuth discovery (P4) and BYO registration + per request
+  (P6) and per-pod (P8) — HTTPS-only, block private/link-local/metadata.
+- **Untrusted MCP output:** provenance, no autonomy elevation, existing approval
+  gates.
+- **No principal collapse:** reject any auth mode that flattens users to one
+  identity (claude-code `auth.ts:50-66` anti-example).
+- **Secret hygiene:** secrets in memory only at call time; logs carry key *names*
+  + server names, never values.
 
-## 6. Testing strategy
+## 8. Testing strategy
 
-- **`credref` unit tests** (pure): each form, `$${` escape, missing-secret
-  fail-closed, unknown-token error, mixed literal+ref, per-user vs shared
-  classification.
-- **Resolver tests:** `static` + `oauth` providers against a mocked vault /
-  token store; refresh; expiry; `error.MissingCredential` path.
-- **Gating matrix:** single-user passthrough; tenant disabled; tenant per-user;
-  tenant `third_party + static` warns; tenant shared without ack refused; tenant
-  shared with ack allowed+warned; **tenant stdio refused**.
-- **Per-request freshness test:** rotate a user's secret mid-runtime → the
-  *next* call uses the new token (proves staleness fixed — directly targets the
-  `src/gateway.zig:19875` gap).
-- **OAuth tests:** `401 → discovery → token`; audience (`resource`) binding;
-  SSRF rejection of private-range discovery URLs.
-- **BYO tests:** registration rejects stdio; rejects private-range URL; policy
-  `disabled`/`allowlist`/`open`; operator-server name shadows user server.
-- **Concurrency:** per-call timeout returns tool-error; quota returns fast
-  busy-error; **`NULLALIS_MCP_LIVE_TEST=1 zig build test-mcp-live` still passes
-  unchanged** (frame routing not perturbed).
-- **Cross-tenant isolation:** user A's missing/invalid credential never affects
-  user B's catalog or calls.
+- **`credref` unit tests** (pure): forms, `$${` escape, fail-closed,
+  unknown-token, mixed, per-user vs shared classification.
+- **Resolver tests:** static + oauth against mocked vault/token store; refresh;
+  expiry; `MissingCredential`.
+- **Sidecar interface tests:** nullalis↔sidecar call contract; statelessness
+  (kill+restart mid-session → recovers from vault); `tools/list_changed` updates
+  catalog.
+- **Gating matrix:** single-user passthrough; tenant disabled; per-user; third
+  `+static` warns; shared without ack refused; with ack allowed+warned; **stdio
+  refused on shared path**.
+- **Per-request freshness:** rotate secret mid-runtime → next call uses new token
+  (targets the `:19875` gap directly).
+- **OAuth tests:** 401→discovery→token; audience (`resource`) binding; CSRF state
+  double-check; SSRF rejection of private-range discovery URLs; cred re-binding
+  on URL change.
+- **BYO tests:** registration rejects stdio + private-range URL; policy
+  disabled/allowlist/open; operator name shadows user server.
+- **Concurrency:** timeout → tool-error; quota → fast busy; **`NULLALIS_MCP_LIVE_TEST=1
+  zig build test-mcp-live` passes unchanged**.
+- **Cross-tenant isolation:** user A's missing/invalid cred never affects user B;
+  two tenants with the **same server name** never clobber (the opencode
+  `index.ts:119` anti-test).
 
-## 7. Documentation
+## 9. Documentation
 
-`docs/mcp-client.md` gains a **"Multi-tenant mode"** section:
-- gating (`tenant.mcp_enabled`), HTTP-only rule, the N×M rationale;
-- credential-ref table (`${user.secret}` / `${user.id}` / `${operator.secret}`,
-  `$${` escape) and fail-closed semantics;
-- trust classes (`first_party` / `third_party`), `auth` modes, OAuth setup +
-  user consent, the token-passthrough warning;
-- BYO: how a user registers a server, operator `mcp_byo` policy, HTTP-only +
-  SSRF constraints;
-- **correct the misleading `Bearer ${TOKEN}` example** (lines 33-36 today — it is
-  *not* substituted by current code) to the real `${user.secret:…}` / OAuth
-  forms.
+`docs/mcp-client.md` gains a **"Multi-tenant mode"** section: gating; the
+**sidecar** architecture + why; the capability matrix (§4); credential-ref table
++ fail-closed; trust classes + `auth` modes + OAuth/consent + passthrough
+warning; BYO (registration, `mcp_byo` policy, remote-only/SSRF); stdio strategy
+(§6). **Correct the misleading `Bearer ${TOKEN}` example** (lines 33-36 — *not*
+substituted by current code) to real `${user.secret:…}` / OAuth forms.
 
-## 8. Open questions / future work
+## 10. Confidence & open questions
 
-- **Catalog for scope-gated OAuth servers:** §3.4 falls back to per-user
-  discovery when a server's tool list varies by scope. If this proves common,
-  a per-(user,server) catalog cache with TTL may be warranted.
-- **Operator egress proxy** (Smokescreen-style) for BYO/OAuth fetches — named,
-  not specced.
-- **Spec B (agent-as-MCP-server)** consumes this foundation; see its companion
-  doc.
+**Confidence:** Phases 1, 3, 5, 7 (pure-Zig gating / creds / in-process /
+fairness): **high** — validated by code truth + both refs. Phase 2/4 (sidecar +
+OAuth): **medium-high** now that we buy the protocol via the SDK (was low when
+hand-rolled). Phase 6 (BYO remote): **high**. Phase 8 (per-user pod stdio):
+**medium** — depends on the K8s workstream; own brainstorm before build.
 
-## 9. Code-truth reference index
+**Open:**
+- Sidecar deployment shape (co-located process vs its own pod) and the
+  nullalis↔sidecar interface (local HTTP vs stdio JSON-RPC) — settle in P2.
+- Tool-count/context bloat with many BYO servers (neither ref mitigates) — may
+  need lazy/relevance-gated tool exposure.
+- Scope-gated OAuth catalogs → per-(user,server) catalog cache w/ TTL if common.
+- **Spec B** consumes this foundation (esp. the sidecar can also host the
+  *inbound* server, and the shared session-store requirement is shared).
+
+## 11. Code-truth & reference index
 
 | Claim | Evidence |
 |---|---|
 | MCP init per `TenantRuntime`, no gating | `src/gateway.zig:1990` |
 | Per-user `McpServer`, per-server mutex | `src/mcp.zig:109`, `:582-685` |
 | Static creds, no substitution | `src/config_types.zig:1472-1510`, `src/mcp/transport.zig:176-178,465-468` |
-| stdio = child per server, eager spawn | `src/mcp/transport.zig:157`, `src/mcp.zig:593` |
-| HTTP = curl per request, session cached | `src/mcp/transport.zig:447-511` |
+| HTTP = POST-only curl, no GET/DELETE/SSE | `src/mcp/transport.zig:447-511` |
+| stdio child per server, eager spawn | `src/mcp/transport.zig:157`, `src/mcp.zig:593` |
 | TenantRuntime cached LRU+TTL | `src/gateway.zig:1084-1085`, `:2609-2654` |
-| Secret PUT does not invalidate runtime | `src/gateway.zig:19875` vs `:19574` |
-| Tool concurrency real (thread/tool) | `src/agent/root.zig:2969` |
-| Encrypted per-user vault | `src/zaki_state.zig:3351` (`getSecret`/`putSecret`) |
-| "not tenant-settable" note | `src/config.zig:110-114` |
+| Secret PUT doesn't invalidate runtime | `src/gateway.zig:19875` vs `:19574` |
+| Tool concurrency real | `src/agent/root.zig:2969` |
+| Encrypted per-user vault | `src/zaki_state.zig:3351` |
 | Tenant mode flag | `src/gateway.zig:1081`, `:5424` |
 
-### External sources
-- MCP authorization (2025-06-18): <https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization>
-- MCP security best practices: <https://modelcontextprotocol.io/docs/tutorials/security/security_best_practices>
-- MCP Streamable HTTP (2025-03-26): <https://modelcontextprotocol.io/specification/2025-03-26/basic/transports>
-- Multi-user authorization discussion #234: <https://github.com/modelcontextprotocol/modelcontextprotocol/discussions/234>
-- Cloudflare enterprise MCP reference architecture: <https://blog.cloudflare.com/enterprise-mcp/>
+**Reference repos (read for rev 2):**
+- opencode: `packages/opencode/src/mcp/{index,auth,oauth-provider,oauth-callback}.ts`, `config/mcp.ts` — OAuth-as-SDK-glue (~700 LOC), all-3 transports, `list_changed`, cred re-binding (`auth.ts:69`), the module-global cross-tenant pitfall (`index.ts:119`).
+- claude-code: `src/services/mcp/client.ts` (in-process transport `:909-943`), `mcp-server/src/http.ts` (naive inbound baseline), `src/server/api/routes/mcp.ts:130-139` (stdio-in-shared-pod RCE anti-example), `helm/*` (multi-replica → shared session store needed).
+
+**External:** MCP authorization 2025-06-18 · MCP security best practices · MCP Streamable HTTP 2025-03-26 · `@modelcontextprotocol/sdk`.

@@ -57,15 +57,39 @@ nullalis MCP server endpoint              NEW surface (this spec)
 Keeping it separate keeps each spec implementable as one coherent unit
 (brainstorming decomposition rule).
 
+## 2b. Recon finding — the hard part is greenfield
+
+A recon of claude-code (which ships an `mcp-server/`) found **no reusable
+multi-tenant inbound reference**: its `mcp-server/src/http.ts` is a naive
+baseline — a single **shared static bearer** token, **off by default**
+(`if (!API_KEY) return next()`, `http.ts:34`), an **in-process** `Map` of
+sessions that breaks across K8s replicas (`http.ts:52`), and **zero tenant
+mapping** (a request maps to a transport, not a principal). Its real
+"agent-as-MCP" entrypoint (`src/entrypoints/mcp.ts`) is **single-user/local
+stdio**. So the inbound trio — **caller auth + token→tenant mapping + isolation
++ a shared/sticky session store** — is genuinely novel work. Treat `http.ts`
+as a *what-not-to-ship* baseline, not a model. This is why B is its own spec and
+why its difficulty was understated in Spec A rev 1.
+
 ## 3. Dependency contract — what Spec B needs from Spec A
 
 Spec A must build these so B can consume them without rework:
 
+- **The MCP sidecar (Node/TS, official SDK).** Spec A introduces a sidecar that
+  owns the MCP *client* protocol. The **same sidecar process can host the
+  *server* side** (the SDK's `StreamableHTTPServerTransport`), so B gets full
+  inbound Streamable HTTP/SSE + session lifecycle for free instead of
+  hand-rolling an MCP server in Zig. B adds the resource-server auth + tenant
+  routing *in front of* it.
 - **OAuth 2.1 machinery** usable in the **Resource Server** direction
   (token validation, audience/`resource` binding, discovery metadata), not only
   the client direction.
+- **A shared/sticky session store** (NOT in-process) — required from day one
+  because nullalis runs multi-replica (Helm/K8s); `<user_id>:<session_id>`
+  binding lives here.
 - **Credential/identity mapping** that turns a validated inbound token into a
-  `user_id` → `TenantRuntime` (mirror of Spec A's per-user resolver).
+  `user_id` → `TenantRuntime` (mirror of Spec A's per-user resolver), with **no
+  principal-collapse mode** (Spec A §7 anti-pattern).
 - **Trust + session model:** non-deterministic, per-user `<user_id>:<session_id>`
   binding; "never authenticate via session"; per-request re-validation — applied
   to the *inbound* path.
