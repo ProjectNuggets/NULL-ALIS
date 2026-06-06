@@ -396,3 +396,10 @@ git commit -m "feat(orchestrator): secrets RBAC + auth-state round-trip e2e"
 - e2e: auth round-trip (save → Secret → re-inject) passes against k3d; allowlist 403s a denied exec.
 
 **Carry-forward to Plan 3b:** per-user + global session **caps**, `new_session` **rate-limit**, and **Prometheus metrics** (live pod/session count, provisioning/action latency, errors). **Plan 4** then wires the native Zig `browser_*` tools + gateway gate to this orchestrator and removes the legacy browser tools.
+
+**Additional carry-forwards (from the Plan-3 dedicated code review):**
+- **(B4, IMPORTANT) Reconcile loses session meta** — `Reconcile` repopulates the registry from the `session` label but cannot restore `(userID, authProfile)`, so a session that survives an orchestrator restart skips persistence on close (silent auth-state loss). Store `authProfile` + the secret-key value as pod **annotations** so `Reconcile` restores `meta`.
+- **(B3) Deadline kill leaks + drops state** — a pod that hits `ActiveDeadlineSeconds` (900) goes `Failed` without routing through `DestroySession`, so its vault isn't persisted and its `reg`/`meta` entries leak (Reconcile only adds, never prunes). Add a periodic reconciler that prunes entries for `Failed`/gone pods, make the deadline **config**, and prefer an activity-based deadline.
+- **(B2) RBAC/secrets blast radius + no vault delete** — the orchestrator can read **all** secrets in the `browser` ns; keep the `browser-state-master` Secret in a **separate** namespace it can't read, keep the ns free of unrelated secrets, and add a **vault-delete** path + RBAC verb ("forget me"/GDPR).
+- **(B1) Per-user key in pod env** — `AGENT_BROWSER_ENCRYPTION_KEY` is readable by anyone with `get pod`/`exec` in the ns; keep that RBAC tightly held in Plan 4, and consider a projected file / stdin handoff instead of env later.
+- **(B5) persist empty-read observability** — distinguish "empty vault" from "read failed" via a metric in 3b.
