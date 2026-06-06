@@ -25,6 +25,7 @@ func NewServer(p SandboxProvider, rl *RateLimiter, store *StateStore) *Server {
 	s.mux.HandleFunc("POST /v1/sessions", s.handleNewSession)
 	s.mux.HandleFunc("DELETE /v1/sessions/{id}", s.handleCloseSession)
 	s.mux.HandleFunc("POST /v1/sessions/{id}/exec", s.handleExec)
+	s.mux.HandleFunc("GET /v1/sessions/{id}/frame", s.handleFrame)
 	s.mux.HandleFunc("DELETE /v1/state", s.handleDeleteVault)
 	return s
 }
@@ -119,6 +120,17 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 	metricExec.WithLabelValues("ok").Inc()
 	writeJSON(w, http.StatusOK, map[string]any{"stdout": res.Stdout, "stderr": res.Stderr, "exit_code": res.ExitCode})
+}
+
+func (s *Server) handleFrame(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	f, err := s.provider.Frame(ctx, r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, f)
 }
 
 func (s *Server) handleDeleteVault(w http.ResponseWriter, r *http.Request) {

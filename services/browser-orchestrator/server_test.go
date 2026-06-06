@@ -33,6 +33,9 @@ func (s stubProvider) Exec(_ context.Context, _ string, _ []string) (ExecResult,
 	return ExecResult{Stdout: s.execOut}, nil
 }
 func (s stubProvider) DestroySession(context.Context, string) error { return nil }
+func (s stubProvider) Frame(context.Context, string) (Frame, error) {
+	return Frame{PNGBase64: "AAAA", URL: "https://x", Title: "X"}, nil
+}
 
 func TestHandleExecBlocksSSRFNavigation(t *testing.T) {
 	srv := NewServer(stubProvider{}, nil, nil)
@@ -87,5 +90,21 @@ func TestNewSessionEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "abc123") {
 		t.Fatalf("body = %q, want session id abc123", rec.Body.String())
+	}
+}
+
+func TestHandleFrame(t *testing.T) {
+	srv := NewServer(stubProvider{}, nil, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/sessions/s1/frame", nil)
+	req.SetPathValue("id", "s1")
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{"AAAA", "https://x", "X"} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("body missing %q: %s", want, rec.Body.String())
+		}
 	}
 }

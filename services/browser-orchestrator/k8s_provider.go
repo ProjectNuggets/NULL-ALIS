@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -359,6 +360,29 @@ func (p *K8sProvider) Reconcile(ctx context.Context) error {
 	}
 	log.Printf("reconcile: re-adopted %d worker pod(s)", n)
 	return nil
+}
+
+// Frame captures a PNG screenshot of the current page and returns it base64-encoded
+// together with the live URL and page title.
+func (p *K8sProvider) Frame(ctx context.Context, sessionID string) (Frame, error) {
+	podName, ok := p.reg.Pod(sessionID)
+	if !ok {
+		return Frame{}, fmt.Errorf("unknown session %q", sessionID)
+	}
+	if _, err := p.Exec(ctx, sessionID, []string{"screenshot", "/tmp/vf.png"}); err != nil {
+		return Frame{}, fmt.Errorf("screenshot: %w", err)
+	}
+	b64, err := p.execRaw(ctx, podName, []string{"sh", "-c", "base64 /tmp/vf.png 2>/dev/null"}, nil)
+	if err != nil {
+		return Frame{}, fmt.Errorf("read frame: %w", err)
+	}
+	urlRes, _ := p.Exec(ctx, sessionID, []string{"get", "url"})
+	titleRes, _ := p.Exec(ctx, sessionID, []string{"get", "title"})
+	return Frame{
+		PNGBase64: strings.TrimSpace(b64),
+		URL:       strings.TrimSpace(urlRes.Stdout),
+		Title:     strings.TrimSpace(titleRes.Stdout),
+	}, nil
 }
 
 // PruneOnce removes registry/meta entries whose pods are gone or Failed (e.g. hit

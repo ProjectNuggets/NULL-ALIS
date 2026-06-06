@@ -9,6 +9,13 @@ type ExecResult struct {
 	ExitCode int
 }
 
+// Frame holds a single captured browser frame together with its current URL and title.
+type Frame struct {
+	PNGBase64 string `json:"frame"`
+	URL       string `json:"url"`
+	Title     string `json:"title"`
+}
+
 // SandboxProvider abstracts where browser sessions run. The k8s driver is the
 // default; vercel/browserbase drivers may implement the same interface later.
 type SandboxProvider interface {
@@ -19,4 +26,7 @@ type SandboxProvider interface {
 	Exec(ctx context.Context, sessionID string, args []string) (ExecResult, error)
 	// DestroySession tears the sandbox down. Idempotent.
 	DestroySession(ctx context.Context, sessionID string) error
+	// Frame captures a PNG screenshot of the current page and returns it
+	// base64-encoded together with the current URL and page title.
+	Frame(ctx context.Context, sessionID string) (Frame, error)
 }
