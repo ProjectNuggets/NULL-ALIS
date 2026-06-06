@@ -30,7 +30,7 @@ Only **shell** and **git_operations** route through `tool_sandbox_v1`. Every oth
 | **delegate** (subagent) | ❌ no | Subagent runs in-process; tools the subagent calls inherit the same sandbox config | Inherited isolation. |
 | **image_generate** | ❌ no | Provider HTTP call (e.g., OpenAI image / Together) | Outbound only; result blob written via file_write path validation. |
 | **image_info** | ❌ no | In-process header parse | No exec. |
-| **browser** (gated) | ❌ no | Headless Chromium subprocess (when feature enabled) | **Not yet wrapped — V1.5 follow-up.** |
+| **browser_*** (5 tools) | ❌ no | Gateway dispatches to a first-party orchestrator (`services/browser-orchestrator/`); worker pods are NetworkPolicy-egress-locked (blocks RFC1918 + cloud-metadata) + PodSecurity-restricted (non-root, read-only rootfs, no capabilities). URL SSRF guard applied upfront in the orchestrator (`urlguard.go`). Sandboxing the orchestrator process itself (bwrap/seccomp) is tracked as a hardening backlog item. The old headless-Chromium-subprocess path (`browser.zig`) has been removed. |
 | **composio** | ❌ no | Provider HTTP call to composio.dev | Outbound only. |
 | **mcp_call** | ❌ no | stdio child process per MCP server | **Server processes are unsandboxed by default.** Trust the MCP servers you connect. V1.5 candidate for sandbox wrap. |
 | **message_*** (tg/discord/etc.) | ❌ no | Provider HTTP call to channel API | Outbound only. |
@@ -62,9 +62,13 @@ The other categories are:
 
 `qmd` is the markdown export binary. Small surface but cleaner to put it through the same path. Trivial change.
 
-### P3 — browser subprocess
+### P3 — browser orchestrator process
 
-Headless Chromium has its own multi-process sandbox (Chromium's seccomp). Wrapping in bwrap/firejail on top is belt-and-suspenders. Defer until browser tool is V1.5+ priority.
+The browser backend is now a K8s orchestrator (`services/browser-orchestrator/`)
+dispatching to ephemeral worker pods. Worker pods are already NetworkPolicy-locked and
+PodSecurity-restricted. The remaining hardening item is applying bwrap/seccomp to the
+orchestrator process itself — tracked in the hardening backlog. The old in-process
+headless-Chromium-subprocess path has been removed.
 
 ## How to verify a tool's wrap status
 

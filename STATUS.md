@@ -72,7 +72,16 @@ CI gate green on the canonical profile: `zig build test -Dengines=base,sqlite,po
 
 ### Wave 3 — Dual-lane browser automation
 
-**Lane A: server-side Playwright MCP** (`.spike/playwright-mcp/`) — TypeScript MCP server with SSRF defense via ipaddr.js (blocks IPv4-mapped IPv6, ULA, link-local, decimal IP, trailing-dot bypasses, post-redirect via context.route interceptor).
+**Lane A: server-side agent-browser on K8s** (branch `spec/agent-browser-k8s-backend`,
+Plans 1–4, **shipped**) — Go orchestrator (`services/browser-orchestrator/`) dispatches
+`browser_*` tools to ephemeral worker pods (Chromium + CDP). Worker pods are
+NetworkPolicy-egress-locked (blocks RFC1918 + cloud-metadata), non-root, read-only
+rootfs, no capabilities. URL SSRF guard (`urlguard.go`, deny-class spec at
+`docs/ssrf-blocklist.md`) applied upfront in the orchestrator before any CDP call.
+Gateway-side tools: `browser_navigate`, `browser_exec`, `browser_screenshot`,
+`browser_get_text`, `browser_close`. The prior `.spike/playwright-mcp/` prototype
+(TypeScript MCP server) has been removed; its SSRF test vectors were ported to
+`urlguard_test.go` before deletion.
 
 **Lane B: user-browser extension** (Chrome MV3 + WebSocket back to gateway):
 - `c8393a40` — gateway WS endpoint at `/api/v1/extension/ws` + per-user hub + first `extension_navigate` tool
