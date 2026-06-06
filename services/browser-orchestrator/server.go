@@ -46,8 +46,10 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		// Exempt liveness/observability probes (matched by path).
-		if r.URL.Path == "/healthz" || r.URL.Path == "/metrics" {
+		// Exempt liveness/observability probes (GET-only, exact path —
+		// mirrors the registered "GET /healthz"/"GET /metrics" routes so a
+		// hypothetical POST to these paths is not exempted).
+		if r.Method == http.MethodGet && (r.URL.Path == "/healthz" || r.URL.Path == "/metrics") {
 			next.ServeHTTP(w, r)
 			return
 		}
