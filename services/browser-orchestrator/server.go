@@ -2,24 +2,27 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type Server struct {
-	provider SandboxProvider
-	rl       *RateLimiter
-	store    *StateStore
-	mux      *http.ServeMux
+	provider  SandboxProvider
+	rl        *RateLimiter
+	store     *StateStore
+	mux       *http.ServeMux
+	authToken string
 }
 
-func NewServer(p SandboxProvider, rl *RateLimiter, store *StateStore) *Server {
-	s := &Server{provider: p, rl: rl, store: store, mux: http.NewServeMux()}
+func NewServer(p SandboxProvider, rl *RateLimiter, store *StateStore, authToken string) *Server {
+	s := &Server{provider: p, rl: rl, store: store, mux: http.NewServeMux(), authToken: authToken}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.Handle("GET /metrics", promhttp.Handler())
 	s.mux.HandleFunc("POST /v1/sessions", s.handleNewSession)
@@ -30,7 +33,53 @@ func NewServer(p SandboxProvider, rl *RateLimiter, store *StateStore) *Server {
 	return s
 }
 
-func (s *Server) Handler() http.Handler { return s.mux }
+// Handler returns the mux wrapped in bearer-token auth middleware.
+func (s *Server) Handler() http.Handler { return s.authMiddleware(s.mux) }
+
+// authMiddleware requires "Authorization: Bearer <token>" on all routes except
+// GET /healthz and GET /metrics, when a token is configured. When authToken is
+// empty the middleware is a pass-through (auth disabled). Comparison is constant
+// time to avoid leaking the token via timing.
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.authToken == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Exempt liveness/observability probes (matched by path).
+		if r.URL.Path == "/healthz" || r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		const prefix = "Bearer "
+		got := r.Header.Get("Authorization")
+		if !strings.HasPrefix(got, prefix) ||
+			subtle.ConstantTimeCompare([]byte(got[len(prefix):]), []byte(s.authToken)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ownerOK enforces per-session ownership using the X-Nullalis-User header. It
+// returns false only on a definite mismatch: a non-empty header that disagrees
+// with a known, non-empty session owner. An absent header (trusted bearer
+// caller) or unknown owner is allowed for back-compat.
+func (s *Server) ownerOK(r *http.Request, id string) bool {
+	user := r.Header.Get("X-Nullalis-User")
+	if user == "" {
+		return true
+	}
+	if s.provider == nil {
+		return true
+	}
+	owner, ok := s.provider.Owner(id)
+	if !ok || owner == "" {
+		return true
+	}
+	return owner == user
+}
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
@@ -81,6 +130,10 @@ func (s *Server) handleNewSession(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCloseSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if !s.ownerOK(r, id) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "session owner mismatch"})
+		return
+	}
 	if err := s.provider.DestroySession(r.Context(), id); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -95,6 +148,10 @@ type execRequest struct {
 func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10) // 64 KiB cap on exec args
 	id := r.PathValue("id")
+	if !s.ownerOK(r, id) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "session owner mismatch"})
+		return
+	}
 	var req execRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Args) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body must be {\"args\":[...]} with >=1 arg"})
@@ -123,9 +180,14 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleFrame(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.ownerOK(r, id) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "session owner mismatch"})
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	f, err := s.provider.Frame(ctx, r.PathValue("id"))
+	f, err := s.provider.Frame(ctx, id)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -145,6 +207,10 @@ func (s *Server) handleDeleteVault(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" || req.AuthProfile == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "user_id and auth_profile required"})
+		return
+	}
+	if user := r.Header.Get("X-Nullalis-User"); user != "" && user != req.UserID {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "session owner mismatch"})
 		return
 	}
 	if err := s.store.Delete(r.Context(), req.UserID, req.AuthProfile); err != nil {
