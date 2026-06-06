@@ -28,27 +28,41 @@ describe("manifest.json", () => {
     expect(manifest.action?.default_popup).toBe("src/popup/index.html");
   });
 
-  it("declares the content script narrowly for http/https only", () => {
-    // We deliberately do NOT use <all_urls>: the agent automates the user's
-    // logged-in browser sessions, which are always http(s). Excluding file://,
-    // data:, blob:, ftp:, view-source: keeps the in-page injection surface to
-    // the actually-targeted protocol set. See docs/SECURITY.md.
-    const scripts = manifest.content_scripts ?? [];
-    expect(scripts.length).toBe(1);
-    expect(scripts[0].matches).toEqual(["http://*/*", "https://*/*"]);
-    expect(scripts[0].matches).not.toContain("<all_urls>");
-    expect(scripts[0].js).toContain("src/content.ts");
-    expect(scripts[0].run_at).toBe("document_idle");
+  it("declares NO declarative content_scripts (C1/H1 — on-demand injection only)", () => {
+    // The content script is no longer auto-injected into every http(s) page.
+    // It is injected ON DEMAND into consented tabs via
+    // chrome.scripting.executeScript. A declarative content_scripts block would
+    // re-introduce all-URLs reach without per-tab consent.
+    const m = manifest as Record<string, unknown>;
+    expect(m.content_scripts).toBeUndefined();
   });
 
-  it("has the minimum required permissions and NO more", () => {
-    const required = ["activeTab", "scripting", "tabs", "storage"];
+  it("declares NO web_accessible_resources (L1/L2)", () => {
+    // We removed the WAR block: the on-demand content script is a self-contained
+    // classic IIFE injected via executeScript, not a page-reachable ESM module.
+    const m = manifest as Record<string, unknown>;
+    expect(m.web_accessible_resources).toBeUndefined();
+  });
+
+  it("has the least-privilege permission set and NO more (C1/H1)", () => {
+    // `tabs` was DROPPED: we use activeTab + on-demand scripting injection.
+    // captureVisibleTab / tabs.query(active) get their data from activeTab on
+    // the consented tab; tabs.update/create/reload/sendMessage/onRemoved need
+    // no extra permission.
+    const required = ["activeTab", "scripting", "storage"];
     expect(manifest.permissions).toEqual(required);
+    expect(manifest.permissions).not.toContain("tabs");
+  });
+
+  it("declares an explicit, locked-down content_security_policy (L2)", () => {
+    const csp = manifest.content_security_policy?.extension_pages ?? "";
+    expect(csp).toContain("script-src 'self'");
+    expect(csp).toContain("object-src 'self'");
   });
 
   it("declares NO broad host_permissions in v1", () => {
-    // We rely entirely on activeTab — the content script attaches via the
-    // declarative content_scripts entry, not a runtime host permission.
+    // We rely entirely on activeTab + on-demand injection — no runtime host
+    // permission.
     expect(manifest.host_permissions).toEqual([]);
   });
 

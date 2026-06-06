@@ -11,6 +11,19 @@ import type {
   ExecuteInTabResult,
 } from "./types";
 
+// C1/H1 — re-injection guard. This script is injected ON DEMAND via
+// chrome.scripting.executeScript when the user enables the agent on a tab.
+// If the user re-enables (or the background re-injects after a navigation),
+// executeScript runs the file again in the same page. Without a guard we'd
+// register a second onMessage listener and double-handle every command. The
+// flag lives on `window` (the content script's isolated world), so it persists
+// for the page's lifetime but resets on navigation — exactly the scope we want.
+declare global {
+  interface Window {
+    __nullalisContentLoaded__?: boolean;
+  }
+}
+
 // ---------- Toast UI (injected once per page) ----------
 
 const TOAST_ID = "__nullalis_agent_toast__";
@@ -63,12 +76,22 @@ function showToast(message: string, ttlMs: number): void {
 
 // ---------- Message handler ----------
 
-chrome.runtime.onMessage.addListener(
+function installListener(): void {
+  if (window.__nullalisContentLoaded__) return;
+  window.__nullalisContentLoaded__ = true;
+
+  chrome.runtime.onMessage.addListener(
   (
     msg: BgToContentMessage,
-    _sender,
+    sender,
     sendResponse: (r: ExecuteInTabResult | undefined) => void
   ) => {
+    // C2 — only THIS extension's background may drive the content script.
+    // A message whose sender.id isn't our own extension id (or has no id at
+    // all — e.g. a page that somehow reached this listener) is ignored.
+    if (sender.id !== chrome.runtime.id) {
+      return false;
+    }
     if (msg.type === "show_toast") {
       showToast(msg.message, msg.ttl_ms ?? 2_500);
       return false;
@@ -100,4 +123,7 @@ chrome.runtime.onMessage.addListener(
     }
     return false;
   }
-);
+  );
+}
+
+installListener();

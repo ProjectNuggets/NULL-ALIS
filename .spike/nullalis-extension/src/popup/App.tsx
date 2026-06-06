@@ -97,6 +97,35 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 11,
     color: "#8a93a6",
   },
+  enable: {
+    width: "100%",
+    padding: "8px 12px",
+    border: "1px solid #1d5e3f",
+    borderRadius: 4,
+    background: "#0e7c4a",
+    color: "#fff",
+    fontWeight: 600,
+    fontSize: 12,
+    cursor: "pointer",
+    marginTop: 4,
+  },
+  tabChip: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    fontSize: 11,
+    color: "#a8b3cf",
+    marginTop: 4,
+  },
+  chipBtn: {
+    padding: "2px 8px",
+    border: "1px solid #7a1a1a",
+    borderRadius: 4,
+    background: "#3a1414",
+    color: "#f5b5b5",
+    fontSize: 11,
+    cursor: "pointer",
+  },
   url: {
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
     fontSize: 11,
@@ -184,9 +213,35 @@ export function App(): JSX.Element {
     }
   };
 
+  const onEnableTab = async (): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await send({ type: "enable_active_tab" });
+      if (!r.ok) setError("error" in r ? r.error : "could not enable this tab");
+      setStatus(await fetchStatus());
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onDisableTab = async (tabId: number): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      await send({ type: "disable_tab", tab_id: tabId });
+      setStatus(await fetchStatus());
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const connected = status?.connected ?? false;
   const authenticated = status?.authenticated ?? false;
   const hasToken = status?.has_token ?? false;
+  const consentedTabs = status?.consented_tabs ?? [];
+  const activeTabId = status?.active_tab_id ?? null;
+  const activeTabEnabled = activeTabId !== null && consentedTabs.includes(activeTabId);
 
   // Badge: green only when fully authenticated. A "connected" socket that
   // hasn't been auth_ack'd is a UX signal the user should see — pre-Wave-3-fix
@@ -265,6 +320,35 @@ export function App(): JSX.Element {
               clear token
             </button>
           </div>
+        </section>
+      )}
+
+      {hasToken && (
+        <section style={styles.section}>
+          <span style={styles.label}>agent access (this tab)</span>
+          {activeTabEnabled ? (
+            <div style={styles.tabChip}>
+              <span>
+                agent enabled on tab <code>#{activeTabId}</code>
+              </span>
+              <button
+                style={styles.chipBtn}
+                onClick={() => activeTabId !== null && void onDisableTab(activeTabId)}
+                disabled={busy}
+              >
+                disable
+              </button>
+            </div>
+          ) : (
+            <button style={styles.enable} onClick={() => void onEnableTab()} disabled={busy}>
+              Enable agent on this tab
+            </button>
+          )}
+          {consentedTabs.length > 0 && (
+            <div style={styles.meta}>
+              enabled tabs: {consentedTabs.map((t) => `#${t}`).join(", ")}
+            </div>
+          )}
         </section>
       )}
 

@@ -4,8 +4,15 @@ import { crx } from "@crxjs/vite-plugin";
 import manifest from "./manifest.json" with { type: "json" };
 
 // nullalis browser extension — Vite + @crxjs/vite-plugin handles MV3 bundling:
-// service worker, content script, popup HTML, and asset hashing all out of one
-// manifest. See docs/DEVELOPER.md for the load-unpacked workflow.
+// service worker, popup HTML, and asset hashing all out of one manifest.
+// See docs/DEVELOPER.md for the load-unpacked workflow.
+//
+// NOTE (C1/H1): the content script is NOT declared in manifest.json anymore, so
+// crxjs does not emit it here. It is built separately as a self-contained classic
+// IIFE (`dist/content.js`) by vite.content.config.ts and injected ON DEMAND via
+// chrome.scripting.executeScript into tabs the user explicitly enables. The
+// two-pass build (crxjs first, then the content bundle with emptyOutDir:false)
+// is wired in package.json's `build` script.
 export default defineConfig({
   plugins: [
     react(),
