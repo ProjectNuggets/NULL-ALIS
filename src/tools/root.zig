@@ -1609,13 +1609,13 @@ pub fn allTools(
         ns_t.* = .{ .client = bc };
         try list.append(allocator, ns_t.tool());
         const nav_t = try allocator.create(browser_navigate.BrowserNavigateTool);
-        nav_t.* = .{ .client = bc };
+        nav_t.* = .{ .client = bc, .event_bus = opts.event_bus };
         try list.append(allocator, nav_t.tool());
         const snap_t = try allocator.create(browser_snapshot.BrowserSnapshotTool);
-        snap_t.* = .{ .client = bc };
+        snap_t.* = .{ .client = bc, .event_bus = opts.event_bus };
         try list.append(allocator, snap_t.tool());
         const exec_t = try allocator.create(browser_exec.BrowserExecTool);
-        exec_t.* = .{ .client = bc };
+        exec_t.* = .{ .client = bc, .event_bus = opts.event_bus };
         try list.append(allocator, exec_t.tool());
         const close_t = try allocator.create(browser_close_session.BrowserCloseSessionTool);
         close_t.* = .{ .client = bc };

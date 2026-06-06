@@ -8,6 +8,64 @@ const BrowserNewSessionTool = @import("browser_new_session.zig").BrowserNewSessi
 const BrowserNavigateTool = @import("browser_navigate.zig").BrowserNavigateTool;
 const BrowserSnapshotTool = @import("browser_snapshot.zig").BrowserSnapshotTool;
 const BrowserCloseSessionTool = @import("browser_close_session.zig").BrowserCloseSessionTool;
+const observability = @import("../observability.zig");
+const bus = @import("../bus.zig");
+
+/// Best-effort: fetch a frame and publish it on the SSE bus so the user can
+/// watch the agent browse. Never fails the tool — a view-feed hiccup must not
+/// break the browser action.
+///
+/// `event_bus` is only a presence gate (the gateway wires it on the three
+/// action tools when the turn is streaming). The frame is actually published
+/// through the thread-local tool Observer (`root.getToolObserver()`), the same
+/// SSE-bound path artifact_create uses — `bus.Bus` carries channel messages,
+/// not ObserverEvents, so it cannot reach the per-turn SSE stream.
+///
+/// String lifetimes: the parsed `frame`/`url`/`title` slices borrow into
+/// `parsed`/`resp.body`, both live until this function returns. The observer
+/// (`RunEventObserver`) serializes `recordEvent` synchronously — `toSseFrame`
+/// copies every byte into an owned buffer before returning — so borrowing for
+/// the call duration is safe and no dupe is required (mirrors how
+/// artifact_create passes borrowed `artifact.id`/`url`).
+pub fn emitFrame(allocator: std.mem.Allocator, event_bus: anytype, client: *client_mod.OrchestratorClient, session_id: []const u8) void {
+    // The bus presence is the gate; if it's null the gateway didn't wire a
+    // streaming view-feed for this turn, so skip the orchestrator round-trip.
+    if (@typeInfo(@TypeOf(event_bus)) == .optional) {
+        if (event_bus == null) return;
+    }
+    const resp = client.getFrame(allocator, session_id) catch return;
+    defer allocator.free(resp.body);
+    if (resp.status_code != 200) return;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{}) catch return;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return,
+    };
+    const frame = if (obj.get("frame")) |v| switch (v) {
+        .string => |s| s,
+        else => "",
+    } else "";
+    const url = if (obj.get("url")) |v| switch (v) {
+        .string => |s| s,
+        else => "",
+    } else "";
+    const title = if (obj.get("title")) |v| switch (v) {
+        .string => |s| s,
+        else => "",
+    } else "";
+    if (frame.len == 0) return; // nothing to show — don't emit an empty frame
+    const obs = root.getToolObserver() orelse return;
+    const evt = observability.ObserverEvent{
+        .browser_frame = .{
+            .session_id = session_id,
+            .frame = frame,
+            .url = url,
+            .title = title,
+        },
+    };
+    obs.recordEvent(&evt);
+}
 
 /// Turn an orchestrator /exec Response into a ToolResult.
 pub fn interpretExecResponse(allocator: std.mem.Allocator, resp: client_mod.Response) !ToolResult {
@@ -36,6 +94,10 @@ pub fn interpretExecResponse(allocator: std.mem.Allocator, resp: client_mod.Resp
 
 pub const BrowserExecTool = struct {
     client: *client_mod.OrchestratorClient,
+    /// Plan 5 — when set, publish a browser_frame on the SSE bus after each
+    /// successful action so the user can watch the agent browse. null on the
+    /// CLI / test paths (no view-feed).
+    event_bus: ?*bus.Bus = null,
     pub const tool_name = "browser_exec";
     pub const tool_description = "Run a low-level agent-browser command in a browser session (passthrough). The orchestrator enforces an allowlist; eval/connect/raw-CDP are denied. Use for click/type/get/etc., e.g. args [\"click\",\"@e1\"].";
     pub const tool_params =
@@ -52,7 +114,12 @@ pub const BrowserExecTool = struct {
             const msg = try std.fmt.allocPrint(allocator, "browser orchestrator unreachable: {s}", .{@errorName(e)});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
-        return interpretExecResponse(allocator, resp);
+        const result = try interpretExecResponse(allocator, resp);
+        // Best-effort view-feed: only on the success path, never fails the tool.
+        if (result.success) {
+            if (self.event_bus) |eb| emitFrame(allocator, eb, self.client, sid);
+        }
+        return result;
     }
 };
 
