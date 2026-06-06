@@ -94,22 +94,29 @@ spec:
             httpGet:
               path: /healthz
               port: 8080
-          # ---------------------------------------------------------------
-          # optional — uncomment together with AGENT_BROWSER_STATE_MASTER_KEY_FILE
-          # above to mount the master key from a Secret as a file.
-          # volumeMounts:
-          #   - name: master-key
-          #     mountPath: /etc/browser/master-key
-          #     readOnly: true
-      # ---------------------------------------------------------------
-      # optional — uncomment together with the volumeMount above.
-      # volumes:
-      #   - name: master-key
-      #     secret:
-      #       secretName: browser-state-master
-      #       items:
-      #         - key: master-key
-      #           path: master-key
+          volumeMounts:
+            # readOnlyRootFilesystem is true, so give Go a writable temp dir.
+            - name: tmp
+              mountPath: /tmp
+            # ---------------------------------------------------------------
+            # optional — uncomment together with AGENT_BROWSER_STATE_MASTER_KEY_FILE
+            # above to mount the master key from a Secret as a file.
+            # - name: master-key
+            #   mountPath: /etc/browser/master-key
+            #   readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+        # ---------------------------------------------------------------
+        # optional — uncomment together with the volumeMount above.
+        # - name: master-key
+        #   secret:
+        #     secretName: browser-state-master
+        #     items:
+        #       - key: master-key
+        #         path: master-key
 ---
 apiVersion: v1
 kind: Service
