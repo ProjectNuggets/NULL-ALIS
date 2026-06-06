@@ -5,6 +5,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"time"
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -28,12 +30,27 @@ func main() {
 	if len(master) == 0 {
 		log.Fatal("AGENT_BROWSER_STATE_MASTER_KEY is required (fail closed)")
 	}
+	maxPerUser := atoiOr("BROWSER_MAX_SESSIONS_PER_USER", 3)
+	maxTotal := atoiOr("BROWSER_MAX_SESSIONS_TOTAL", 20)
+	deadline := atoiOr("BROWSER_SESSION_DEADLINE_SECONDS", 900)
+	perMin := atoiOr("BROWSER_NEW_SESSION_RATE_PER_MIN", 6)
+	rl := NewRateLimiter(perMin, float64(perMin)/60.0)
+
 	store := NewStateStore(client, ns)
-	provider := NewK8sProvider(client, cfg, ns, image, master, store, NewRegistry())
+	provider := NewK8sProvider(client, cfg, ns, image, master, store, maxPerUser, maxTotal, int64(deadline), NewRegistry())
 	if err := provider.Reconcile(context.Background()); err != nil {
 		log.Printf("reconcile: %v", err)
 	}
-	srv := NewServer(provider)
+	// Janitor: periodically prune sessions whose pods are gone/Failed (e.g. hit
+	// ActiveDeadlineSeconds), so registry/meta/gauge don't leak stale entries.
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			provider.PruneOnce(context.Background())
+		}
+	}()
+	srv := NewServer(provider, rl)
 	log.Printf("browser-orchestrator listening on %s (ns=%s image=%s)", addr, ns, image)
 	log.Fatal(http.ListenAndServe(addr, srv.Handler()))
 }
@@ -41,6 +58,16 @@ func main() {
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
+	}
+	return def
+}
+
+// atoiOr returns the integer value of env var k, or def if unset/unparseable.
+func atoiOr(k string, def int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
 	return def
 }

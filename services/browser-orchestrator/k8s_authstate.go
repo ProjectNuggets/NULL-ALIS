@@ -60,10 +60,12 @@ func (p *K8sProvider) persistState(ctx context.Context, sessionID, podName strin
 	res, err := p.Exec(ctx, sessionID, []string{"state", "save", "/home/browser/state.json"})
 	if err != nil {
 		log.Printf("persist: state save transport error for session %s: %v", sessionID, err)
+		metricPersistFailures.Inc()
 		return
 	}
 	if res.ExitCode != 0 {
 		log.Printf("persist: state save exited %d for session %s (stderr: %s) — not persisting", res.ExitCode, sessionID, res.Stderr)
+		metricPersistFailures.Inc()
 		return
 	}
 	b64, err := p.execRaw(ctx, podName, []string{"sh", "-c", "base64 /home/browser/state.json.enc 2>/dev/null || true"}, nil)

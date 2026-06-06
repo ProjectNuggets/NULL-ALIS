@@ -25,6 +25,10 @@ import (
 
 func ptr[T any](v T) *T { return &v }
 
+// ErrCapExceeded is returned by CreateSession when a per-user or global session
+// cap would be exceeded.
+var ErrCapExceeded = errors.New("session cap exceeded")
+
 // shortHash returns a DNS-safe short hex hash of s, used for the pod "user" label.
 func shortHash(s string) string {
 	sum := sha256.Sum256([]byte(s))
@@ -49,20 +53,36 @@ type K8sProvider struct {
 	masterKey []byte
 	store      *StateStore
 
+	maxPerUser      int
+	maxTotal        int
+	deadlineSeconds int64
+
 	mu   sync.Mutex
 	meta map[string]sessionMeta
 }
 
-func NewK8sProvider(client kubernetes.Interface, restConfig *rest.Config, namespace, image string, masterKey []byte, store *StateStore, reg *Registry) *K8sProvider {
+func NewK8sProvider(client kubernetes.Interface, restConfig *rest.Config, namespace, image string, masterKey []byte, store *StateStore, maxPerUser, maxTotal int, deadlineSeconds int64, reg *Registry) *K8sProvider {
+	if maxPerUser <= 0 {
+		maxPerUser = 3
+	}
+	if maxTotal <= 0 {
+		maxTotal = 20
+	}
+	if deadlineSeconds <= 0 {
+		deadlineSeconds = 900
+	}
 	p := &K8sProvider{
-		client:     client,
-		restConfig: restConfig,
-		namespace:  namespace,
-		image:      image,
-		reg:        reg,
-		masterKey:  masterKey,
-		store:      store,
-		meta:       map[string]sessionMeta{},
+		client:          client,
+		restConfig:      restConfig,
+		namespace:       namespace,
+		image:           image,
+		reg:             reg,
+		masterKey:       masterKey,
+		store:           store,
+		maxPerUser:      maxPerUser,
+		maxTotal:        maxTotal,
+		deadlineSeconds: deadlineSeconds,
+		meta:            map[string]sessionMeta{},
 	}
 	p.waitReady = p.pollPodReady
 	return p
@@ -77,14 +97,38 @@ func newSessionID() (string, error) {
 }
 
 func (p *K8sProvider) CreateSession(ctx context.Context, userID, authProfile string) (string, error) {
+	start := time.Now()
 	id, err := newSessionID()
 	if err != nil {
+		metricSessionCreate.WithLabelValues("error").Inc()
 		return "", err
 	}
+
+	// Race-free cap reservation: do the cap checks AND reserve the slot in one
+	// critical section, so concurrent creates can't both pass the check.
+	p.mu.Lock()
+	if len(p.meta) >= p.maxTotal || countForUser(p.meta, userID) >= p.maxPerUser {
+		p.mu.Unlock()
+		metricSessionCreate.WithLabelValues("cap_exceeded").Inc()
+		return "", ErrCapExceeded
+	}
+	p.meta[id] = sessionMeta{userID: userID, authProfile: authProfile}
+	p.mu.Unlock()
+
+	// releaseReservation frees the reserved slot on any failure path after the
+	// reservation, so a failed create doesn't leak the cap.
+	releaseReservation := func() {
+		p.mu.Lock()
+		delete(p.meta, id)
+		p.mu.Unlock()
+	}
+
 	podName := "browser-worker-" + id
 	encKey := DeriveUserKey(p.masterKey, userID)
-	pod := p.podTemplate(podName, id, encKey, userID)
+	pod := p.podTemplate(podName, id, encKey, userID, authProfile)
 	if _, err := p.client.CoreV1().Pods(p.namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		releaseReservation()
+		metricSessionCreate.WithLabelValues("error").Inc()
 		return "", fmt.Errorf("create pod: %w", err)
 	}
 	if err := p.waitReady(ctx, podName); err != nil {
@@ -92,12 +136,10 @@ func (p *K8sProvider) CreateSession(ctx context.Context, userID, authProfile str
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 		_ = p.client.CoreV1().Pods(p.namespace).Delete(cleanupCtx, podName, metav1.DeleteOptions{})
+		releaseReservation()
+		metricSessionCreate.WithLabelValues("error").Inc()
 		return "", fmt.Errorf("pod not ready: %w", err)
 	}
-
-	p.mu.Lock()
-	p.meta[id] = sessionMeta{userID: userID, authProfile: authProfile}
-	p.mu.Unlock()
 
 	// Inject the previously-saved vault (if any) so agent-browser can --state it.
 	if authProfile != "" {
@@ -108,30 +150,36 @@ func (p *K8sProvider) CreateSession(ctx context.Context, userID, authProfile str
 				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 				defer cancel()
 				_ = p.client.CoreV1().Pods(p.namespace).Delete(cleanupCtx, podName, metav1.DeleteOptions{})
-				p.mu.Lock()
-				delete(p.meta, id)
-				p.mu.Unlock()
+				releaseReservation()
+				metricSessionCreate.WithLabelValues("error").Inc()
 				return "", fmt.Errorf("inject state: %w", err)
 			}
 		}
 	}
 
+	metricCreateDuration.Observe(time.Since(start).Seconds())
+	metricSessionsActive.Inc()
+	metricSessionCreate.WithLabelValues("ok").Inc()
 	p.reg.Add(id, podName)
 	return id, nil
 }
 
 // podTemplate mirrors Plan 1's deploy/k8s/browser/worker-pod.yaml.
-func (p *K8sProvider) podTemplate(name, sessionID, encKey, userID string) *corev1.Pod {
+func (p *K8sProvider) podTemplate(name, sessionID, encKey, userID, authProfile string) *corev1.Pod {
 	userHash := shortHash(userID)
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: p.namespace,
 			Labels:    map[string]string{"app": "browser-worker", "session": sessionID, "user": userHash},
+			Annotations: map[string]string{
+				"nullalis.dev/auth-profile": authProfile,
+				"nullalis.dev/user":         userID,
+			},
 		},
 		Spec: corev1.PodSpec{
 			AutomountServiceAccountToken: ptr(false),
-			ActiveDeadlineSeconds:        ptr(int64(900)),
+			ActiveDeadlineSeconds:        ptr(p.deadlineSeconds),
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot:   ptr(true),
 				RunAsUser:      ptr(int64(10001)),
@@ -270,6 +318,7 @@ func (p *K8sProvider) DestroySession(ctx context.Context, sessionID string) erro
 	if err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete pod: %w", err)
 	}
+	metricSessionsActive.Dec()
 	p.reg.Remove(sessionID)
 	p.mu.Lock()
 	delete(p.meta, sessionID)
@@ -288,11 +337,50 @@ func (p *K8sProvider) Reconcile(ctx context.Context) error {
 	n := 0
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if sid := pod.Labels["session"]; sid != "" {
-			p.reg.Add(sid, pod.Name)
-			n++
+		sid := pod.Labels["session"]
+		if sid == "" {
+			continue
 		}
+		p.reg.Add(sid, pod.Name)
+		p.mu.Lock()
+		p.meta[sid] = sessionMeta{
+			userID:      pod.Annotations["nullalis.dev/user"],
+			authProfile: pod.Annotations["nullalis.dev/auth-profile"],
+		}
+		p.mu.Unlock()
+		metricSessionsActive.Inc()
+		n++
 	}
 	log.Printf("reconcile: re-adopted %d worker pod(s)", n)
 	return nil
+}
+
+// PruneOnce removes registry/meta entries whose pods are gone or Failed (e.g. hit
+// ActiveDeadlineSeconds), so stale sessions don't leak. Returns the count pruned.
+func (p *K8sProvider) PruneOnce(ctx context.Context) int {
+	p.mu.Lock()
+	ids := make([]string, 0, len(p.meta))
+	for id := range p.meta {
+		ids = append(ids, id)
+	}
+	p.mu.Unlock()
+	pruned := 0
+	for _, id := range ids {
+		podName, ok := p.reg.Pod(id)
+		if !ok {
+			continue
+		}
+		pod, err := p.client.CoreV1().Pods(p.namespace).Get(ctx, podName, metav1.GetOptions{})
+		gone := apierrors.IsNotFound(err)
+		failed := err == nil && pod.Status.Phase == corev1.PodFailed
+		if gone || failed {
+			p.reg.Remove(id)
+			p.mu.Lock()
+			delete(p.meta, id)
+			p.mu.Unlock()
+			metricSessionsActive.Dec()
+			pruned++
+		}
+	}
+	return pruned
 }

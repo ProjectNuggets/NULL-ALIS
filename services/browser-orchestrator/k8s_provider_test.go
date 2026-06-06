@@ -18,9 +18,12 @@ func TestCreateSessionCreatesHardenedPod(t *testing.T) {
 		image:     "browser-worker:dev",
 		reg:       NewRegistry(),
 		waitReady: func(ctx context.Context, pod string) error { return nil },
-		masterKey: []byte("0123456789abcdef0123456789abcdef"),
-		store:     NewStateStore(client, "browser"),
-		meta:      map[string]sessionMeta{},
+		masterKey:       []byte("0123456789abcdef0123456789abcdef"),
+		store:           NewStateStore(client, "browser"),
+		maxPerUser:      3,
+		maxTotal:        20,
+		deadlineSeconds: 900,
+		meta:            map[string]sessionMeta{},
 	}
 	id, err := p.CreateSession(context.Background(), "tester", "")
 	if err != nil {

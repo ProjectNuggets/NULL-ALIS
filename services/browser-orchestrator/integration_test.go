@@ -22,7 +22,7 @@ func TestE2ESessionLifecycle(t *testing.T) {
 	}
 	master := []byte("0123456789abcdef0123456789abcdef")
 	store := NewStateStore(client, "browser")
-	p := NewK8sProvider(client, cfg, "browser", "browser-worker:dev", master, store, NewRegistry())
+	p := NewK8sProvider(client, cfg, "browser", "browser-worker:dev", master, store, 3, 20, 900, NewRegistry())
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
@@ -54,7 +54,7 @@ func TestE2EAuthStateRoundTrip(t *testing.T) {
 	if err != nil { t.Fatalf("client: %v", err) }
 	master := []byte("0123456789abcdef0123456789abcdef")
 	store := NewStateStore(client, "browser")
-	p := NewK8sProvider(client, cfg, "browser", "browser-worker:dev", master, store, NewRegistry())
+	p := NewK8sProvider(client, cfg, "browser", "browser-worker:dev", master, store, 3, 20, 900, NewRegistry())
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 

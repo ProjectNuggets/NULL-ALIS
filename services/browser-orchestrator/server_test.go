@@ -9,7 +9,7 @@ import (
 )
 
 func TestHealthz(t *testing.T) {
-	srv := NewServer(nil) // healthz must not need a provider
+	srv := NewServer(nil, nil) // healthz must not need a provider
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	srv.Handler().ServeHTTP(rec, req)
@@ -35,7 +35,7 @@ func (s stubProvider) Exec(_ context.Context, _ string, _ []string) (ExecResult,
 func (s stubProvider) DestroySession(context.Context, string) error { return nil }
 
 func TestNewSessionEndpoint(t *testing.T) {
-	srv := NewServer(stubProvider{createID: "abc123"})
+	srv := NewServer(stubProvider{createID: "abc123"}, nil)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/sessions", nil)
 	srv.Handler().ServeHTTP(rec, req)

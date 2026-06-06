@@ -3,19 +3,24 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type Server struct {
 	provider SandboxProvider
+	rl       *RateLimiter
 	mux      *http.ServeMux
 }
 
-func NewServer(p SandboxProvider) *Server {
-	s := &Server{provider: p, mux: http.NewServeMux()}
+func NewServer(p SandboxProvider, rl *RateLimiter) *Server {
+	s := &Server{provider: p, rl: rl, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
+	s.mux.Handle("GET /metrics", promhttp.Handler())
 	s.mux.HandleFunc("POST /v1/sessions", s.handleNewSession)
 	s.mux.HandleFunc("DELETE /v1/sessions/{id}", s.handleCloseSession)
 	s.mux.HandleFunc("POST /v1/sessions/{id}/exec", s.handleExec)
@@ -52,10 +57,19 @@ func (s *Server) handleNewSession(w http.ResponseWriter, r *http.Request) {
 	if userID == "" {
 		userID = "default"
 	}
+	if s.rl != nil && !s.rl.Allow(userID) {
+		metricSessionCreate.WithLabelValues("rate_limited").Inc()
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 150*time.Second)
 	defer cancel()
 	id, err := s.provider.CreateSession(ctx, userID, req.AuthProfile)
 	if err != nil {
+		if errors.Is(err, ErrCapExceeded) {
+			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": err.Error()})
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -84,6 +98,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ExecAllowed(req.Args) {
+		metricExec.WithLabelValues("denied").Inc()
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "command not allowed"})
 		return
 	}
@@ -91,8 +106,10 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	res, err := s.provider.Exec(ctx, id, req.Args)
 	if err != nil {
+		metricExec.WithLabelValues("error").Inc()
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error(), "stderr": res.Stderr})
 		return
 	}
+	metricExec.WithLabelValues("ok").Inc()
 	writeJSON(w, http.StatusOK, map[string]any{"stdout": res.Stdout, "stderr": res.Stderr, "exit_code": res.ExitCode})
 }
