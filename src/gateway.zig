@@ -1998,7 +1998,15 @@ const TenantRuntime = struct {
         // agent_browser backend — bind the per-user id onto browser_new_session
         // so each session is created scoped to this tenant. No-op when the
         // backend is inactive (the tools were never registered).
-        tools_mod.bindBrowserSessionTools(builtin_tools, user_ctx.user_id);
+        //
+        // Bind the OWNED dupe (runtime.user_id, duped at the top of init),
+        // NOT user_ctx.user_id. The bound tools + shared client store this
+        // slice and the TenantRuntime is CACHED and reused across requests;
+        // user_ctx.user_id aliases per-request-arena memory that is freed/
+        // reset after the request, so binding it would leave dangling
+        // pointers (ent.user_id / ent.client.user_id) on the 2nd+ request —
+        // a use-after-free that corrupts the X-Nullalis-User ownership header.
+        tools_mod.bindBrowserSessionTools(builtin_tools, runtime.user_id);
 
         // Init MCP tools from configured servers and append to the tenant's
         // tool list. MCP servers run as long-lived subprocess(es) whose
