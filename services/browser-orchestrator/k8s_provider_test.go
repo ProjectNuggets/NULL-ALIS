@@ -120,6 +120,12 @@ func TestPodTemplateProdKnobsApplied(t *testing.T) {
 	if got := pod.Spec.NodeSelector["nullalis.dev/browser"]; got != "true" {
 		t.Errorf("NodeSelector[nullalis.dev/browser] = %q, want true", got)
 	}
+	// A value containing '=' must split on the first '=' only (strings.Cut).
+	t.Setenv("BROWSER_WORKER_NODE_SELECTOR", "k=v=w")
+	pod2 := p.podTemplate("browser-worker-y", "y", "key", "tester", "")
+	if got := pod2.Spec.NodeSelector["k"]; got != "v=w" {
+		t.Errorf("NodeSelector[k] = %q, want v=w", got)
+	}
 	found := false
 	for _, tol := range pod.Spec.Tolerations {
 		if tol.Key == "nullalis.dev/browser" && tol.Operator == corev1.TolerationOpEqual &&
@@ -153,5 +159,16 @@ func TestParseFrameBlob(t *testing.T) {
 	}
 	if _, err := parseFrameBlob("no markers here"); err == nil {
 		t.Error("expected error for missing markers")
+	}
+
+	// GNU base64 wraps at 76 columns: the FRAME section carries interior
+	// newlines that must be stripped so the base64 is one unbroken string.
+	wrapped := "@@FRAME@@\niVBORw0KGgoAAAANSUhEUg\nAAAAEAAAABCAYAAAAfFcSJ\n@@URL@@\nhttps://x\n@@TITLE@@\nX\n"
+	wf, err := parseFrameBlob(wrapped)
+	if err != nil {
+		t.Fatalf("parseFrameBlob(wrapped): %v", err)
+	}
+	if want := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"; wf.PNGBase64 != want {
+		t.Errorf("PNGBase64 = %q, want %q (no whitespace)", wf.PNGBase64, want)
 	}
 }

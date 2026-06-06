@@ -436,7 +436,10 @@ func parseFrameBlob(blob string) (Frame, error) {
 	if fi < 0 || ui < 0 || ti < 0 || !(fi < ui && ui < ti) {
 		return Frame{}, fmt.Errorf("frame: malformed capture output (missing markers)")
 	}
-	png := strings.TrimSpace(blob[fi+len(frameMark) : ui])
+	// GNU base64 wraps output at 76 columns, so the FRAME section contains
+	// interior newlines. Strip ALL whitespace (Fields splits on any whitespace
+	// incl. newlines) so the base64 is one clean unbroken string.
+	png := strings.Join(strings.Fields(blob[fi+len(frameMark):ui]), "")
 	url := strings.TrimSpace(blob[ui+len(urlMark) : ti])
 	title := strings.TrimSpace(blob[ti+len(titleMark):])
 	if png == "" {
