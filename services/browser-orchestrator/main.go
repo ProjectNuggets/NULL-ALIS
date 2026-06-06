@@ -50,7 +50,7 @@ func main() {
 			provider.PruneOnce(context.Background())
 		}
 	}()
-	srv := NewServer(provider, rl)
+	srv := NewServer(provider, rl, store)
 	log.Printf("browser-orchestrator listening on %s (ns=%s image=%s)", addr, ns, image)
 	log.Fatal(http.ListenAndServe(addr, srv.Handler()))
 }

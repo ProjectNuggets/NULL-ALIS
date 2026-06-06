@@ -14,16 +14,18 @@ import (
 type Server struct {
 	provider SandboxProvider
 	rl       *RateLimiter
+	store    *StateStore
 	mux      *http.ServeMux
 }
 
-func NewServer(p SandboxProvider, rl *RateLimiter) *Server {
-	s := &Server{provider: p, rl: rl, mux: http.NewServeMux()}
+func NewServer(p SandboxProvider, rl *RateLimiter, store *StateStore) *Server {
+	s := &Server{provider: p, rl: rl, store: store, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.Handle("GET /metrics", promhttp.Handler())
 	s.mux.HandleFunc("POST /v1/sessions", s.handleNewSession)
 	s.mux.HandleFunc("DELETE /v1/sessions/{id}", s.handleCloseSession)
 	s.mux.HandleFunc("POST /v1/sessions/{id}/exec", s.handleExec)
+	s.mux.HandleFunc("DELETE /v1/state", s.handleDeleteVault)
 	return s
 }
 
@@ -112,4 +114,25 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 	metricExec.WithLabelValues("ok").Inc()
 	writeJSON(w, http.StatusOK, map[string]any{"stdout": res.Stdout, "stderr": res.Stderr, "exit_code": res.ExitCode})
+}
+
+func (s *Server) handleDeleteVault(w http.ResponseWriter, r *http.Request) {
+	if s.store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no store"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+	var req struct {
+		UserID      string `json:"user_id"`
+		AuthProfile string `json:"auth_profile"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.UserID == "" || req.AuthProfile == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "user_id and auth_profile required"})
+		return
+	}
+	if err := s.store.Delete(r.Context(), req.UserID, req.AuthProfile); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }

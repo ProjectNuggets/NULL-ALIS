@@ -60,3 +60,15 @@ func (s *StateStore) Get(ctx context.Context, userID, profile string) ([]byte, b
 	}
 	return sec.Data["vault.enc"], true, nil
 }
+
+func (s *StateStore) Delete(ctx context.Context, userID, profile string) error {
+	name := secretName(userID, profile)
+	err := s.client.CoreV1().Secrets(s.namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil // idempotent
+	}
+	if err != nil {
+		return fmt.Errorf("delete vault: %w", err)
+	}
+	return nil
+}
