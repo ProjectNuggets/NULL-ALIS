@@ -1,6 +1,6 @@
 {
   "name": "nullalis-extension",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "nullalis browser extension — the agent drives the user's own browser with the user's own logged-in sessions",
   "type": "module",

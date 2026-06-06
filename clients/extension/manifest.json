@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "nullalis",
-  "version": "0.1.0",
-  "description": "Let the nullalis agent drive your browser using your own logged-in sessions — locally, with explicit consent per tab.",
+  "version": "1.0.0",
+  "description": "Lets the nullalis agent act in browser tabs you explicitly enable, driven only by your own self-hosted gateway. STOP anytime.",
   "minimum_chrome_version": "116",
   "action": {
     "default_title": "nullalis agent",
