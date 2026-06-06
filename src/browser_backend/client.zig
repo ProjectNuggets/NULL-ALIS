@@ -74,6 +74,15 @@ pub const OrchestratorClient = struct {
         return self.transport.sendFn(self.transport.ctx, allocator, "POST", url, body, self.timeoutSecs(&tbuf));
     }
 
+    /// GET /v1/sessions/{id}/frame -> raw Response (caller parses {frame,url,title}).
+    pub fn getFrame(self: OrchestratorClient, allocator: std.mem.Allocator, session_id: []const u8) !Response {
+        if (!validSessionId(session_id)) return error.InvalidSessionId;
+        const url = try std.fmt.allocPrint(allocator, "{s}/v1/sessions/{s}/frame", .{ self.base_url, session_id });
+        defer allocator.free(url);
+        var tbuf: [16]u8 = undefined;
+        return self.transport.sendFn(self.transport.ctx, allocator, "GET", url, null, self.timeoutSecs(&tbuf));
+    }
+
     /// DELETE /v1/sessions/{id}.
     pub fn closeSession(self: OrchestratorClient, allocator: std.mem.Allocator, session_id: []const u8) !void {
         if (!validSessionId(session_id)) return error.InvalidSessionId;
@@ -129,6 +138,20 @@ test "validSessionId accepts hex ids, rejects path injection" {
     try std.testing.expect(!validSessionId("a/b"));
     try std.testing.expect(!validSessionId("a?b"));
     try std.testing.expect(!validSessionId("a b"));
+}
+
+test "getFrame parses a canned frame response" {
+    var tt = TestTransportPub{ .body = "{\"frame\":\"AAAA\",\"url\":\"https://x\",\"title\":\"X\"}" };
+    const c = OrchestratorClient{ .base_url = "http://x", .transport = tt.transport() };
+    const resp = try c.getFrame(std.testing.allocator, "s1");
+    defer std.testing.allocator.free(resp.body);
+    try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "AAAA") != null);
+}
+
+test "getFrame rejects an injected session id" {
+    const c = OrchestratorClient{ .base_url = "http://x" };
+    try std.testing.expectError(error.InvalidSessionId, c.getFrame(std.testing.allocator, "../../admin"));
 }
 
 test "live: client drives new_session -> navigate -> snapshot(@eN) -> close" {
