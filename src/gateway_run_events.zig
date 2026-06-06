@@ -295,6 +295,18 @@ pub const RunEventObserver = struct {
                 .change_summary = e.change_summary,
                 .run_id = e.run_id,
             } }),
+            // Plan 5 — bridge browser_frame from the browser tools into a
+            // browser_frame SSE frame so the FE can render the in-app
+            // view-feed live. `emit` serializes synchronously (toSseFrame
+            // copies every byte into an owned buffer before returning), so
+            // the borrowed slices here are safe for the call duration.
+            .browser_frame => |e| self.emit(.{ .browser_frame = .{
+                .session_id = e.session_id,
+                .frame = e.frame,
+                .url = e.url,
+                .title = e.title,
+                .run_id = e.run_id,
+            } }),
             else => {},
         }
     }

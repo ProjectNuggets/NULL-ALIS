@@ -187,6 +187,22 @@ pub const ObserverEvent = union(enum) {
         change_summary: ?[]const u8 = null,
         run_id: ?[]const u8 = null,
     },
+    /// Plan 5 — in-app browser "view-feed". Emitted best-effort by the
+    /// browser_navigate / browser_snapshot / browser_exec tools after a
+    /// successful action so the user can watch the agent browse on the
+    /// existing per-turn SSE stream. RunEventObserver translates this into
+    /// a `browser_frame` SSE frame. `frame` is a base64-encoded PNG.
+    /// Slices are borrowed for the duration of the recordEvent call only —
+    /// observers serialize synchronously, so producers must NOT free them
+    /// before recordEvent returns and observers must copy to retain
+    /// (mirrors artifact_event payload lifetime).
+    browser_frame: struct {
+        session_id: []const u8,
+        frame: []const u8,
+        url: []const u8,
+        title: []const u8,
+        run_id: ?[]const u8 = null,
+    },
 };
 
 /// Numeric metrics.
@@ -580,6 +596,7 @@ pub const LogObserver = struct {
             .system_notice => |e| std.log.info("system.notice kind={s} severity={s} message={s}", .{ e.kind, e.severity, e.message }),
             .memory_retrieval => |e| std.log.info("memory.retrieval available=true injected={} context_bytes={?d} candidates={?d} duration_ms={?d}", .{ e.success, e.usage_tokens, e.iteration, e.duration_ms }),
             .artifact_event => |e| std.log.info("artifact.event op={s} id={s} kind={s} version={d}", .{ e.op, e.artifact_id, e.kind, e.version }),
+            .browser_frame => |e| std.log.info("browser.frame session_id={s} url={s} frame_bytes={d}", .{ e.session_id, e.url, e.frame.len }),
         }
     }
 
@@ -851,6 +868,9 @@ pub const FileObserver = struct {
             .system_notice => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"system_notice\",\"kind\":\"{s}\",\"severity\":\"{s}\",\"message\":\"{s}\"}}", .{ e.kind, e.severity, e.message }) catch return,
             .memory_retrieval => return,
             .artifact_event => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"artifact_event\",\"op\":\"{s}\",\"id\":\"{s}\",\"kind\":\"{s}\",\"version\":{d}}}", .{ e.op, e.artifact_id, e.kind, e.version }) catch return,
+            // The base64 PNG `frame` is omitted from the file trace — it can
+            // be large and would overflow the fixed line buffer; log size only.
+            .browser_frame => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"browser_frame\",\"session_id\":\"{s}\",\"frame_bytes\":{d}}}", .{ e.session_id, e.frame.len }) catch return,
         };
         self.appendToFile(line);
     }
@@ -1292,6 +1312,14 @@ pub const OtelObserver = struct {
                     .{ .key = "op", .value = e.op },
                     .{ .key = "artifact_id", .value = e.artifact_id },
                     .{ .key = "kind", .value = e.kind },
+                });
+            },
+            .browser_frame => |e| {
+                // Omit the base64 PNG frame from the span — only the small
+                // metadata is operationally interesting.
+                self.addSpan("browser.frame", now, now, &.{
+                    .{ .key = "session_id", .value = e.session_id },
+                    .{ .key = "url", .value = e.url },
                 });
             },
         }

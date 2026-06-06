@@ -54,6 +54,10 @@ pub const RunEventType = enum {
     /// artifact_create / artifact_update tools so the FE can refresh
     /// the artifacts panel in real time without polling.
     artifact_event,
+    /// Plan 5 — in-app browser "view-feed". Fired by the browser_navigate /
+    /// browser_snapshot / browser_exec tools after each successful action so
+    /// the user can watch the agent browse on the per-turn SSE stream.
+    browser_frame,
     done,
 
     pub fn toSlice(self: RunEventType) []const u8 {
@@ -68,6 +72,7 @@ pub const RunEventType = enum {
             .task_update => "task_update",
             .system_notice => "system_notice",
             .artifact_event => "artifact_event",
+            .browser_frame => "browser_frame",
             .done => "done",
         };
     }
@@ -198,6 +203,19 @@ pub const ArtifactEventPayload = struct {
     run_id: ?[]const u8 = null,
 };
 
+/// Plan 5 — in-app browser "view-feed" frame. Fired after each successful
+/// browser action so the FE can render a live thumbnail of what the agent
+/// sees. `frame` is a base64-encoded PNG of the current viewport; `url` and
+/// `title` describe the page. Kept on the per-turn SSE stream so the user
+/// watches the agent browse without any extra connection.
+pub const BrowserFramePayload = struct {
+    session_id: []const u8,
+    frame: []const u8,
+    url: []const u8,
+    title: []const u8,
+    run_id: ?[]const u8 = null,
+};
+
 /// Binding principle: no silent fallback. When nullalis degrades or has a
 /// notable internal state change the user deserves to know about, emit a
 /// system_notice. The frontend should render these as chrome (badge / toast)
@@ -229,6 +247,7 @@ pub const RunEvent = union(enum) {
     task_update: TaskUpdatePayload,
     system_notice: SystemNoticePayload,
     artifact_event: ArtifactEventPayload,
+    browser_frame: BrowserFramePayload,
     done: DonePayload,
 };
 
@@ -244,6 +263,7 @@ pub fn eventType(event: RunEvent) RunEventType {
         .task_update => .task_update,
         .system_notice => .system_notice,
         .artifact_event => .artifact_event,
+        .browser_frame => .browser_frame,
         .done => .done,
     };
 }
@@ -425,6 +445,19 @@ pub fn toSseFrame(allocator: std.mem.Allocator, event: RunEvent) ![]u8 {
             try writeOptionalStringField(w, "run_id", p.run_id);
             try w.writeAll("}");
         },
+        .browser_frame => |p| {
+            try w.writeAll("{\"type\":\"browser_frame\",\"session_id\":\"");
+            try jsonEscapeInto(w, p.session_id);
+            try w.writeAll("\",\"frame\":\"");
+            try jsonEscapeInto(w, p.frame);
+            try w.writeAll("\",\"url\":\"");
+            try jsonEscapeInto(w, p.url);
+            try w.writeAll("\",\"title\":\"");
+            try jsonEscapeInto(w, p.title);
+            try w.writeAll("\"");
+            try writeOptionalStringField(w, "run_id", p.run_id);
+            try w.writeAll("}");
+        },
         .done => |p| {
             try w.writeAll("{\"type\":\"done\"");
             if (p.session_id) |sid| {
@@ -512,16 +545,17 @@ fn writeOptionalStringArrayField(writer: anytype, field_name: []const u8, value:
 
 // ── Tests ────────────────────────────────────────────────────────────
 
-test "RunEventType has exactly 11 structured variants" {
+test "RunEventType has exactly 12 structured variants" {
     // Wave 2C adds artifact_event (+1 over the prior 10).
+    // Plan 5 adds browser_frame (+1, the in-app browser view-feed).
     //
     // The wire SSE surface is LARGER than this enum — the gateway also
     // emits 5 transport-only kinds (`token`, `error`, `audio_reply`,
     // `subagent_completion`, `tool_only_summary`) that intentionally
     // sit outside this tagged union. See the module-level doc block.
-    // Total wire-visible kinds = 11 structured + 5 transport-only = 16.
+    // Total wire-visible kinds = 12 structured + 5 transport-only = 17.
     const fields = @typeInfo(RunEventType).@"enum".fields;
-    try std.testing.expectEqual(@as(usize, 11), fields.len);
+    try std.testing.expectEqual(@as(usize, 12), fields.len);
 }
 
 test "RunEventType.toSlice returns correct strings" {
@@ -535,7 +569,31 @@ test "RunEventType.toSlice returns correct strings" {
     try std.testing.expectEqualStrings("task_update", RunEventType.task_update.toSlice());
     try std.testing.expectEqualStrings("system_notice", RunEventType.system_notice.toSlice());
     try std.testing.expectEqualStrings("artifact_event", RunEventType.artifact_event.toSlice());
+    try std.testing.expectEqualStrings("browser_frame", RunEventType.browser_frame.toSlice());
     try std.testing.expectEqualStrings("done", RunEventType.done.toSlice());
+}
+
+test "toSseFrame for browser_frame emits event name and the four fields" {
+    const allocator = std.testing.allocator;
+    const frame = try toSseFrame(allocator, RunEvent{ .browser_frame = .{
+        .session_id = "sess-42",
+        .frame = "iVBORw0KGgoAAAA=",
+        .url = "https://example.com/",
+        .title = "Example Domain",
+    } });
+    defer allocator.free(frame);
+
+    // SSE event line.
+    try std.testing.expect(std.mem.startsWith(u8, frame, "event: browser_frame\n"));
+    // data: JSON object carries the four fields and the equivalent
+    // "type":"browser_frame" discriminator (matches artifact_event shape).
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"type\":\"browser_frame\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"session_id\":\"sess-42\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"frame\":\"iVBORw0KGgoAAAA=\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"url\":\"https://example.com/\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"title\":\"Example Domain\"") != null);
+    // Terminates with the SSE frame delimiter.
+    try std.testing.expect(std.mem.endsWith(u8, frame, "\n\n"));
 }
 
 test "RunEvent.ready payload contains session_key" {
