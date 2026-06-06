@@ -20,7 +20,10 @@ pub const BrowserNewSessionTool = struct {
         const uid = self.user_id orelse return ToolResult.fail("browser_new_session not bound to a user (gateway-side wiring bug)");
         const profile = root.getString(args, "auth_profile") orelse "";
         const sid = self.client.newSession(allocator, uid, profile) catch |e| {
-            const msg = try std.fmt.allocPrint(allocator, "browser orchestrator could not create a session: {s}", .{@errorName(e)});
+            const msg = switch (e) {
+                error.OrchestratorRateLimited => try allocator.dupe(u8, "browser session limit reached — close an existing session (browser_close_session) and retry."),
+                else => try std.fmt.allocPrint(allocator, "browser orchestrator could not create a session: {s}", .{@errorName(e)}),
+            };
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
         defer allocator.free(sid);

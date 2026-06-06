@@ -54,6 +54,7 @@ pub const OrchestratorClient = struct {
         var tbuf: [16]u8 = undefined;
         const resp = try self.transport.sendFn(self.transport.ctx, allocator, "POST", url, body.items, self.timeoutSecs(&tbuf));
         defer allocator.free(resp.body);
+        if (resp.status_code == 429) return error.OrchestratorRateLimited;
         if (resp.status_code != 200) return error.OrchestratorError;
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{}) catch return error.OrchestratorBadResponse;
         defer parsed.deinit();
@@ -109,9 +110,15 @@ test "newSession parses session_id from a mock transport" {
 }
 
 test "newSession surfaces non-200 as error" {
-    var tt = TestTransportPub{ .body = "{\"error\":\"cap\"}", .status = 429 };
+    var tt = TestTransportPub{ .body = "{\"error\":\"cap\"}", .status = 500 };
     const c = OrchestratorClient{ .base_url = "http://x", .transport = tt.transport() };
     try std.testing.expectError(error.OrchestratorError, c.newSession(std.testing.allocator, "alice", ""));
+}
+
+test "newSession surfaces 429 as OrchestratorRateLimited" {
+    var tt = TestTransportPub{ .body = "{\"error\":\"cap\"}", .status = 429 };
+    const c = OrchestratorClient{ .base_url = "http://x", .transport = tt.transport() };
+    try std.testing.expectError(error.OrchestratorRateLimited, c.newSession(std.testing.allocator, "alice", ""));
 }
 
 test "validSessionId accepts hex ids, rejects path injection" {
@@ -134,7 +141,7 @@ test "live: client drives new_session -> navigate -> snapshot(@eN) -> close" {
 
     // open example.com (worker uses the chromium-ns wrapper for --no-sandbox)
     {
-        const resp = try c.exec(allocator, sid, "[\"--executable-path\",\"/usr/local/bin/chromium-ns\",\"open\",\"https://example.com\"]");
+        const resp = try c.exec(allocator, sid, "[\"open\",\"https://example.com\"]");
         defer allocator.free(resp.body);
         try std.testing.expectEqual(@as(u16, 200), resp.status_code);
     }

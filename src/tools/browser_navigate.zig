@@ -7,8 +7,6 @@ const client_mod = @import("../browser_backend/client.zig");
 const interpretExecResponse = @import("browser_exec.zig").interpretExecResponse;
 const writeJsonString = @import("json_escape.zig").writeJsonString;
 
-const EXEC_PATH = "/usr/local/bin/chromium-ns";
-
 pub const BrowserNavigateTool = struct {
     client: *client_mod.OrchestratorClient,
     pub const tool_name = "browser_navigate";
@@ -24,7 +22,7 @@ pub const BrowserNavigateTool = struct {
         if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) return ToolResult.fail("url must be http(s)");
         var aj: std.ArrayListUnmanaged(u8) = .empty;
         defer aj.deinit(allocator);
-        try aj.appendSlice(allocator, "[\"--executable-path\",\"" ++ EXEC_PATH ++ "\",\"open\",");
+        try aj.appendSlice(allocator, "[\"open\",");
         try writeJsonString(allocator, &aj, url);
         try aj.append(allocator, ']');
         const resp = self.client.exec(allocator, sid, aj.items) catch |e| {

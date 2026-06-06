@@ -16,7 +16,17 @@ pub fn interpretExecResponse(allocator: std.mem.Allocator, resp: client_mod.Resp
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{}) catch return ToolResult.fail("orchestrator returned malformed JSON");
     defer parsed.deinit();
     const obj = switch (parsed.value) { .object => |o| o, else => return ToolResult.fail("orchestrator returned non-object") };
+    // 200: agent-browser ran. exit_code != 0 means the command ran but failed
+    // (e.g. selector not found, wait timeout) — surface it as a tool failure so
+    // the agent doesn't act on a phantom success.
+    const exit_code: i64 = if (obj.get("exit_code")) |v| switch (v) { .integer => |i| i, else => 0 } else 0;
     const stdout = if (obj.get("stdout")) |v| switch (v) { .string => |s| s, else => "" } else "";
+    const stderr = if (obj.get("stderr")) |v| switch (v) { .string => |s| s, else => "" } else "";
+    if (exit_code != 0) {
+        const detail = if (stderr.len > 0) stderr else if (stdout.len > 0) stdout else "no output";
+        const msg = try std.fmt.allocPrint(allocator, "browser command failed (exit {d}): {s}", .{ exit_code, detail });
+        return ToolResult{ .success = false, .output = "", .error_msg = msg };
+    }
     return ToolResult{ .success = true, .output = try allocator.dupe(u8, stdout) };
 }
 
@@ -52,6 +62,17 @@ test "browser_exec returns stdout on 200" {
     defer std.testing.allocator.free(r.output);
     try std.testing.expect(r.success);
     try std.testing.expect(std.mem.indexOf(u8, r.output, "ref=e1") != null);
+}
+test "browser_exec non-zero exit on 200 is a failure" {
+    var tt = client_mod.TestTransportPub{ .body = "{\"stdout\":\"\",\"stderr\":\"no element @e99\",\"exit_code\":1}" };
+    var cl = client_mod.OrchestratorClient{ .base_url = "http://x", .transport = tt.transport() };
+    var et = BrowserExecTool{ .client = &cl };
+    const parsed = try root.parseTestArgs("{\"session_id\":\"s1\",\"args\":[\"click\",\"@e99\"]}");
+    defer parsed.deinit();
+    const r = try et.execute(std.testing.allocator, parsed.value.object);
+    defer if (r.error_msg) |m| std.testing.allocator.free(m);
+    try std.testing.expect(!r.success);
+    try std.testing.expect(std.mem.indexOf(u8, r.error_msg.?, "@e99") != null);
 }
 test "browser_exec maps 403 to a clear denial" {
     var tt = client_mod.TestTransportPub{ .body = "{}", .status = 403 };

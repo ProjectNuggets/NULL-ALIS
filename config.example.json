@@ -181,5 +181,14 @@
     }
   },
 
-  "mcp_servers": {}
+  "mcp_servers": {},
+
+  "browser": {
+    "enabled": true,
+    "backend": "agent_browser",
+    "agent_browser": {
+      "orchestrator_url": "http://browser-orchestrator.browser.svc.cluster.local:8080",
+      "timeout_ms": 60000
+    }
+  }
 }
