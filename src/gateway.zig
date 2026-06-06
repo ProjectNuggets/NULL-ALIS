@@ -22966,7 +22966,14 @@ fn handleAcceptedConnection(
         };
         defer allocator.free(entries_buf);
         for (state.extension_tokens, 0..) |e, i| {
-            entries_buf[i] = .{ .token = e.token, .user_id = e.user_id };
+            // Plan-8 — carry the optional rotation-window previous token
+            // through to the auth validator so EITHER the current or the
+            // previous token is accepted while `token_previous` is set.
+            entries_buf[i] = .{
+                .token = e.token,
+                .user_id = e.user_id,
+                .token_previous = e.token_previous,
+            };
         }
         const outcome = extension_ws_server.handleUpgrade(conn.stream, .{
             .long_allocator = allocator,

@@ -167,6 +167,41 @@ describe("WsClient auth gate", () => {
     expect(JSON.parse(ws.sent[0]!)).toEqual({ type: "pong" });
   });
 
+  it("echoes the server-issued nonce in the auth frame (Plan-8 anti-replay)", () => {
+    const messages: unknown[] = [];
+    const client = makeClient({ onMessage: (m) => messages.push(m) });
+
+    client.start();
+    const ws = MockWebSocket.instances[0]!;
+    ws.simulateOpen();
+    // No auth frame sent until the challenge arrives.
+    expect(ws.sent.length).toBe(0);
+
+    const NONCE = "abcdef01".repeat(8); // 64-char hex
+    ws.simulateMessage({ type: "challenge", nonce: NONCE });
+
+    expect(ws.sent.length).toBe(1);
+    expect(JSON.parse(ws.sent[0]!)).toEqual({
+      type: "auth",
+      token: "tok-abc",
+      extension_version: "0.1.0",
+      nonce: NONCE,
+    });
+  });
+
+  it("does NOT send auth on a malformed challenge (missing/empty nonce)", () => {
+    const client = makeClient({ onMessage: () => {} });
+    client.start();
+    const ws = MockWebSocket.instances[0]!;
+    ws.simulateOpen();
+
+    ws.simulateMessage({ type: "challenge" }); // no nonce
+    ws.simulateMessage({ type: "challenge", nonce: "" }); // empty nonce
+
+    expect(ws.sent.length).toBe(0);
+    expect(client.isAuthenticated()).toBe(false);
+  });
+
   it("DISPATCHES subsequent Commands once auth_ack{ok:true} is received", () => {
     const messages: unknown[] = [];
     const authStates: Array<{ state: string; reason?: string }> = [];

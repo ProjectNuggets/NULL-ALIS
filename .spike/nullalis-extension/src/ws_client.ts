@@ -187,12 +187,12 @@ export class WsClient {
     ws.onopen = () => {
       // Reset backoff once we have a real connection.
       this.backoffMs = this.opts.initialBackoffMs;
-      // Send the auth frame immediately so the gateway can reject early.
-      this.send({
-        type: "auth",
-        token: this.opts.token,
-        extension_version: this.opts.extensionVersion,
-      });
+      // Plan-8 — the auth frame is NO LONGER sent here. The gateway
+      // issues a per-connection `challenge` nonce first; we send `auth`
+      // (echoing that nonce) only once the challenge arrives (see
+      // onmessage). The auth timer still starts now so a gateway that
+      // never sends a challenge (or never acks) still trips the
+      // auth_timeout close.
       this.startHeartbeat();
       this.startAuthTimer();
       this.emitState(true);
@@ -217,6 +217,25 @@ export class WsClient {
       }
       if (type === "pong") {
         // No-op; we sent a ping and got the expected reply.
+        return;
+      }
+
+      // Plan-8 — per-connection anti-replay challenge. The gateway
+      // issues a fresh nonce before it waits for auth; we echo it back
+      // in the `auth` frame. Sent pre-ack, so it's handled BEFORE the
+      // authAcked gate below (like ping/pong/auth_ack).
+      if (type === "challenge") {
+        const chal = parsed as { type: "challenge"; nonce?: unknown };
+        if (typeof chal.nonce === "string" && chal.nonce.length > 0) {
+          this.send({
+            type: "auth",
+            token: this.opts.token,
+            extension_version: this.opts.extensionVersion,
+            nonce: chal.nonce,
+          });
+        }
+        // A malformed challenge (missing/empty nonce) is dropped; the
+        // auth timer will close the socket since no valid auth is sent.
         return;
       }
 

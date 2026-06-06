@@ -1144,6 +1144,14 @@ pub const GatewayConfig = struct {
 pub const ExtensionTokenEntry = struct {
     token: []const u8,
     user_id: []const u8,
+    /// Plan-8 (2026-06-06) — token rotation window. Optional PREVIOUS
+    /// token, accepted alongside `token` for the same `user_id` while
+    /// set. Operators rotate without a hard cutover: set `token` to the
+    /// new secret + `token_previous` to the old one, migrate the
+    /// extension, then drop `token_previous` so only the current token
+    /// is accepted. Config field: `"token_previous"` on each
+    /// `extension_tokens` entry. Null / omitted ⇒ no previous token.
+    token_previous: ?[]const u8 = null,
 };
 
 pub const TenantConfig = struct {

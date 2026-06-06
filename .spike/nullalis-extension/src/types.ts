@@ -42,11 +42,29 @@ export interface Pong {
   type: "pong";
 }
 
-/** Authentication frame sent by the extension immediately after the socket opens. */
+/**
+ * Server -> extension: per-connection anti-replay challenge (Plan-8).
+ * Sent by the gateway immediately after the WS upgrade, BEFORE it waits
+ * for the auth frame. The extension must echo `nonce` verbatim in its
+ * subsequent `auth` frame. A captured `auth` frame replayed on a fresh
+ * connection carries a stale nonce and is rejected by the gateway.
+ */
+export interface Challenge {
+  type: "challenge";
+  nonce: string;
+}
+
+/**
+ * Authentication frame sent by the extension after it receives the
+ * server `challenge` frame. Echoes the server-issued `nonce` alongside
+ * the long-lived token (Plan-8 anti-replay).
+ */
 export interface AuthFrame {
   type: "auth";
   token: string;
   extension_version: string;
+  /** Server-issued per-connection nonce, echoed back verbatim. */
+  nonce: string;
 }
 
 /** Server may reject the auth and close. */
@@ -56,7 +74,7 @@ export interface AuthAck {
   error?: string;
 }
 
-export type ServerMessage = Command | Ping | Pong | AuthAck;
+export type ServerMessage = Command | Ping | Pong | AuthAck | Challenge;
 export type ClientMessage = CommandResult | Ping | Pong | AuthFrame;
 
 // ---------- Background <-> popup messaging (chrome.runtime.sendMessage) ----------

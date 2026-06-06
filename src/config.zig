@@ -3934,6 +3934,43 @@ test "gateway config parses internal_service_tokens" {
     allocator.free(cfg.gateway.internal_service_tokens);
 }
 
+test "gateway config parses extension_tokens with token_previous rotation field" {
+    // Plan-8 (2026-06-06) — the rotation-window previous token must
+    // round-trip through config parsing. Entry 0 has a previous token
+    // (window open); entry 1 omits it (null); entry 2 sets "" which
+    // must normalize to null so a blank token can't be admitted.
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"gateway": {"extension_tokens": [
+        \\  {"token": "new-a", "user_id": "alice", "token_previous": "old-a"},
+        \\  {"token": "tok-b", "user_id": "bob"},
+        \\  {"token": "tok-c", "user_id": "carol", "token_previous": ""}
+        \\]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    const ext = cfg.gateway.extension_tokens;
+    try std.testing.expectEqual(@as(usize, 3), ext.len);
+
+    try std.testing.expectEqualStrings("new-a", ext[0].token);
+    try std.testing.expectEqualStrings("alice", ext[0].user_id);
+    try std.testing.expectEqualStrings("old-a", ext[0].token_previous.?);
+
+    try std.testing.expectEqualStrings("tok-b", ext[1].token);
+    try std.testing.expect(ext[1].token_previous == null);
+
+    try std.testing.expectEqualStrings("tok-c", ext[2].token);
+    // "" must normalize to null (not an empty-string previous token).
+    try std.testing.expect(ext[2].token_previous == null);
+
+    for (ext) |e| {
+        allocator.free(e.token);
+        allocator.free(e.user_id);
+        if (e.token_previous) |p| allocator.free(p);
+    }
+    allocator.free(ext);
+}
+
 test "secret runtime overrides set internal token and postgres connection string" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

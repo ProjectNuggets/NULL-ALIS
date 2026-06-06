@@ -37,6 +37,16 @@ const std = @import("std");
 pub const TokenEntry = struct {
     token: []const u8,
     user_id: []const u8,
+    /// Plan-8 (2026-06-06) — token rotation window. When non-null, this
+    /// PREVIOUS token is ALSO accepted for `user_id` alongside the
+    /// current `token`. Operators rotate without a hard cutover: set
+    /// `token` to the new secret + `token_previous` to the old one,
+    /// push the new token to the extension, then clear
+    /// `token_previous` (set null / drop the config field) once every
+    /// client has migrated. After it's cleared, only `token` is
+    /// accepted. Empty string is treated as "not set" so a config that
+    /// emits `""` doesn't accidentally admit a blank token.
+    token_previous: ?[]const u8 = null,
 };
 
 pub const AuthDecision = struct {
@@ -47,11 +57,62 @@ pub const AuthDecision = struct {
     user_id: ?[]const u8 = null,
     /// On failure, a short machine-readable reason
     /// (`"invalid_token"`, `"auth_frame_too_large"`,
-    /// `"malformed_auth_frame"`). Lands in the
+    /// `"malformed_auth_frame"`, `"bad_nonce"`). Lands in the
     /// `auth_ack{ok:false, error}` envelope verbatim — keep it
     /// alphanumeric-and-underscores so popup-rendering stays simple.
     reason: ?[]const u8 = null,
 };
+
+/// Plan-8 (2026-06-06) — per-connection anti-replay nonce.
+///
+/// Plan 7 productionized the extension lane but explicitly DECLINED
+/// HMAC request-signing as theater. The real gap it identified: a
+/// captured `auth` frame could be REPLAYED verbatim on a fresh
+/// connection because nothing in the handshake was connection-unique.
+/// (The token is a long-lived static secret; the WS `Sec-WebSocket-Key`
+/// is client-chosen and not bound to app-layer auth.)
+///
+/// Fix: the SERVER mints a fresh CSPRNG nonce per connection, sends it
+/// to the client as a `challenge` frame BEFORE waiting for auth, and
+/// the client must echo it back in its `auth` frame. The server
+/// constant-time compares the echoed nonce against the one it issued
+/// for THIS connection. Because the nonce is generated freshly per
+/// connection and the validator runs exactly once per connection, the
+/// nonce is single-use and connection-bound by construction — a
+/// replayed `auth` frame carries a STALE nonce that will never match
+/// the new connection's freshly-minted challenge.
+///
+/// Nonce shape: NONCE_RAW_BYTES of CSPRNG output, lower-hex encoded
+/// (so NONCE_HEX_LEN = 2 * NONCE_RAW_BYTES chars). Hex keeps it
+/// JSON-safe and trivially constant-time comparable.
+pub const NONCE_RAW_BYTES: usize = 32;
+pub const NONCE_HEX_LEN: usize = NONCE_RAW_BYTES * 2;
+
+/// Generate a fresh per-connection nonce into `out` (lower-hex). Uses
+/// `std.crypto.random` — a CSPRNG seeded by the OS entropy source. The
+/// caller owns `out`; it must be exactly `NONCE_HEX_LEN` bytes.
+pub fn generateNonceHex(out: *[NONCE_HEX_LEN]u8) void {
+    var raw: [NONCE_RAW_BYTES]u8 = undefined;
+    std.crypto.random.bytes(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    @memcpy(out, &hex);
+}
+
+/// Constant-time comparison for the echoed nonce. Wraps
+/// `std.crypto.timing_safe.eql` over fixed-size arrays so the compare
+/// is length-independent (the nonce is always NONCE_HEX_LEN; a wrong
+/// length fails the up-front check, which is not secret because the
+/// expected length is a public protocol constant). Exposed so the
+/// validator and tests share one implementation.
+fn constantTimeNonceEql(expected: []const u8, got: []const u8) bool {
+    if (expected.len != NONCE_HEX_LEN or got.len != NONCE_HEX_LEN) return false;
+    const Vec = [NONCE_HEX_LEN]u8;
+    var e: Vec = undefined;
+    var g: Vec = undefined;
+    @memcpy(&e, expected);
+    @memcpy(&g, got);
+    return std.crypto.timing_safe.eql(Vec, e, g);
+}
 
 /// META HIGH #2 (2026-05-25) — explicit size cap on auth-frame JSON,
 /// surfaced as a distinct rejection reason so operators can
@@ -90,6 +151,14 @@ pub const AuthValidator = struct {
     /// everything (closed-by-default — operator must configure at
     /// least one entry to admit any extension).
     entries: []const TokenEntry,
+
+    /// Plan-8 — the per-connection nonce the server issued in its
+    /// `challenge` frame. When non-null, the inbound `auth` frame MUST
+    /// echo this value verbatim (constant-time compared) IN ADDITION to
+    /// carrying a valid token. When null, no nonce is required (kept so
+    /// the validator's pure-token tests stay valid; production always
+    /// sets it).
+    expected_nonce: ?[]const u8 = null,
 
     pub fn validate(self: AuthValidator, auth_frame_json: []const u8) AuthDecision {
         // META HIGH #2: distinguish "frame is huge garbage" from "frame
@@ -147,7 +216,20 @@ pub const AuthValidator = struct {
             // length-bucket timing channel is closed. Length-mismatch
             // becomes a final-mask bit OR'd into the result instead
             // of a branchy early-exit.
-            if (constantTimeEql(entry.token, token_str)) {
+            //
+            // Plan-8 — token rotation window: a connection is admitted
+            // for this entry if it presents EITHER the current token OR
+            // the (optional, non-empty) previous token. Both compares
+            // run every iteration (no short-circuit `or`) so the
+            // accept-current-vs-accept-previous decision doesn't open a
+            // timing channel. Once `token_previous` is cleared in
+            // config, only the current token matches.
+            const cur_match = constantTimeEql(entry.token, token_str);
+            const prev_match = if (entry.token_previous) |prev| blk: {
+                if (prev.len == 0) break :blk false; // "" ⇒ not set
+                break :blk constantTimeEql(prev, token_str);
+            } else false;
+            if (cur_match or prev_match) {
                 // Don't break — keep iterating so an attacker can't
                 // time-attack "which slot did I hit." We still
                 // capture the matched index.
@@ -156,6 +238,22 @@ pub const AuthValidator = struct {
         }
 
         if (matched_idx) |idx| {
+            // Plan-8 — additive nonce check. The token matched; now the
+            // echoed nonce must ALSO match the one the server issued for
+            // this connection. A replayed `auth` frame (captured from a
+            // prior connection) carries a stale nonce and is rejected
+            // here even though its token is valid.
+            if (self.expected_nonce) |expected| {
+                const nonce_val = obj.get("nonce") orelse
+                    return .{ .ok = false, .reason = "bad_nonce" };
+                const nonce_str = switch (nonce_val) {
+                    .string => |s| s,
+                    else => return .{ .ok = false, .reason = "bad_nonce" },
+                };
+                if (!constantTimeNonceEql(expected, nonce_str)) {
+                    return .{ .ok = false, .reason = "bad_nonce" };
+                }
+            }
             // SERVER-derived user_id. The inbound frame's user_id
             // field is ignored entirely — that's the whole point of
             // CRIT #2's fix.
@@ -458,4 +556,223 @@ test "ME-02: auth still rejects wrong-length tokens" {
     const d_exact = v.validate(auth_exact);
     try std.testing.expect(d_exact.ok);
     try std.testing.expectEqualStrings("alice", d_exact.user_id.?);
+}
+
+// ── Plan-8 (2026-06-06) — anti-replay nonce tests ────────────────────
+//
+// Test names contain "extension" so `zig build test -Dtest-filter=extension`
+// selects them alongside the existing extension_ws suite.
+
+test "extension nonce: generateNonceHex is hex, full length, and random" {
+    var a: [NONCE_HEX_LEN]u8 = undefined;
+    var b: [NONCE_HEX_LEN]u8 = undefined;
+    generateNonceHex(&a);
+    generateNonceHex(&b);
+    // Lower-hex alphabet only.
+    for (a) |c| try std.testing.expect(std.ascii.isHex(c) and (c < 'A' or c > 'F'));
+    // Two draws from a CSPRNG must (astronomically) differ.
+    try std.testing.expect(!std.mem.eql(u8, &a, &b));
+}
+
+test "extension nonce: constantTimeNonceEql matches only on exact equal" {
+    var n: [NONCE_HEX_LEN]u8 = @splat('a');
+    var same: [NONCE_HEX_LEN]u8 = @splat('a');
+    var diff: [NONCE_HEX_LEN]u8 = @splat('a');
+    diff[NONCE_HEX_LEN - 1] = 'b';
+    try std.testing.expect(constantTimeNonceEql(&n, &same));
+    try std.testing.expect(!constantTimeNonceEql(&n, &diff));
+    // Wrong length never matches.
+    try std.testing.expect(!constantTimeNonceEql(&n, "abc"));
+    try std.testing.expect(!constantTimeNonceEql("abc", &n));
+}
+
+test "extension nonce: valid token + correct echoed nonce is ACCEPTED" {
+    const nonce = "a" ** NONCE_HEX_LEN;
+    const entries = [_]TokenEntry{.{ .token = "tok-alice", .user_id = "alice" }};
+    const v = AuthValidator{ .entries = &entries, .expected_nonce = nonce };
+    const auth =
+        \\{"type":"auth","token":"tok-alice","nonce":"
+    ++ nonce ++
+        \\"}
+    ;
+    const d = v.validate(auth);
+    try std.testing.expect(d.ok);
+    try std.testing.expectEqualStrings("alice", d.user_id.?);
+}
+
+test "extension nonce: valid token but MISSING nonce is REJECTED (bad_nonce)" {
+    const nonce = "a" ** NONCE_HEX_LEN;
+    const entries = [_]TokenEntry{.{ .token = "tok-alice", .user_id = "alice" }};
+    const v = AuthValidator{ .entries = &entries, .expected_nonce = nonce };
+    const auth =
+        \\{"type":"auth","token":"tok-alice"}
+    ;
+    const d = v.validate(auth);
+    try std.testing.expect(!d.ok);
+    try std.testing.expectEqualStrings("bad_nonce", d.reason.?);
+    try std.testing.expect(d.user_id == null);
+}
+
+test "extension nonce: valid token but WRONG nonce is REJECTED (replay defense)" {
+    // The replay scenario: an attacker captured a prior connection's
+    // auth frame (valid token + that connection's nonce) and replays it
+    // on a NEW connection whose freshly-minted nonce differs. The
+    // expected_nonce here models the new connection's nonce; the frame
+    // carries the stale one.
+    const this_conn_nonce = "b" ** NONCE_HEX_LEN;
+    const stale_nonce = "a" ** NONCE_HEX_LEN;
+    const entries = [_]TokenEntry{.{ .token = "tok-alice", .user_id = "alice" }};
+    const v = AuthValidator{ .entries = &entries, .expected_nonce = this_conn_nonce };
+    const auth =
+        \\{"type":"auth","token":"tok-alice","nonce":"
+    ++ stale_nonce ++
+        \\"}
+    ;
+    const d = v.validate(auth);
+    try std.testing.expect(!d.ok);
+    try std.testing.expectEqualStrings("bad_nonce", d.reason.?);
+}
+
+test "extension nonce: single-use is connection-bound (reused nonce on new conn rejected)" {
+    // "Single-use" is enforced structurally: each connection mints its
+    // own nonce and the validator runs once per connection. A second
+    // connection has a DIFFERENT expected_nonce, so echoing the first
+    // connection's (now-consumed) nonce fails the second connection's
+    // check. This test models that: conn2's validator carries nonce2,
+    // the frame echoes nonce1 → reject.
+    const nonce1 = "1" ** NONCE_HEX_LEN;
+    const nonce2 = "2" ** NONCE_HEX_LEN;
+    const entries = [_]TokenEntry{.{ .token = "tok-alice", .user_id = "alice" }};
+
+    // Conn 1: echoing nonce1 is accepted.
+    const v1 = AuthValidator{ .entries = &entries, .expected_nonce = nonce1 };
+    const auth1 =
+        \\{"type":"auth","token":"tok-alice","nonce":"
+    ++ nonce1 ++
+        \\"}
+    ;
+    try std.testing.expect(v1.validate(auth1).ok);
+
+    // Conn 2: same frame (reusing nonce1) is rejected because conn2's
+    // expected nonce is nonce2.
+    const v2 = AuthValidator{ .entries = &entries, .expected_nonce = nonce2 };
+    const d2 = v2.validate(auth1);
+    try std.testing.expect(!d2.ok);
+    try std.testing.expectEqualStrings("bad_nonce", d2.reason.?);
+}
+
+test "extension nonce: wrong token with correct nonce still REJECTED (invalid_token, additive)" {
+    // The nonce is ADDITIVE — it does not replace the token check. A
+    // bogus token short-circuits to invalid_token before the nonce is
+    // even consulted (no matched entry).
+    const nonce = "a" ** NONCE_HEX_LEN;
+    const entries = [_]TokenEntry{.{ .token = "tok-alice", .user_id = "alice" }};
+    const v = AuthValidator{ .entries = &entries, .expected_nonce = nonce };
+    const auth =
+        \\{"type":"auth","token":"bogus","nonce":"
+    ++ nonce ++
+        \\"}
+    ;
+    const d = v.validate(auth);
+    try std.testing.expect(!d.ok);
+    try std.testing.expectEqualStrings("invalid_token", d.reason.?);
+}
+
+// ── Plan-8 — token rotation window tests ─────────────────────────────
+
+test "extension rotation: NEW (current) token is accepted while window open" {
+    const nonce = "a" ** NONCE_HEX_LEN;
+    const entries = [_]TokenEntry{.{
+        .token = "tok-new",
+        .user_id = "alice",
+        .token_previous = "tok-old",
+    }};
+    const v = AuthValidator{ .entries = &entries, .expected_nonce = nonce };
+    const auth =
+        \\{"type":"auth","token":"tok-new","nonce":"
+    ++ nonce ++
+        \\"}
+    ;
+    const d = v.validate(auth);
+    try std.testing.expect(d.ok);
+    try std.testing.expectEqualStrings("alice", d.user_id.?);
+}
+
+test "extension rotation: PREVIOUS token is accepted while window open" {
+    const nonce = "a" ** NONCE_HEX_LEN;
+    const entries = [_]TokenEntry{.{
+        .token = "tok-new",
+        .user_id = "alice",
+        .token_previous = "tok-old",
+    }};
+    const v = AuthValidator{ .entries = &entries, .expected_nonce = nonce };
+    const auth =
+        \\{"type":"auth","token":"tok-old","nonce":"
+    ++ nonce ++
+        \\"}
+    ;
+    const d = v.validate(auth);
+    try std.testing.expect(d.ok);
+    try std.testing.expectEqualStrings("alice", d.user_id.?);
+}
+
+test "extension rotation: PREVIOUS token is REJECTED after window cleared" {
+    const nonce = "a" ** NONCE_HEX_LEN;
+    // token_previous cleared (null) — only the current token works now.
+    const entries = [_]TokenEntry{.{
+        .token = "tok-new",
+        .user_id = "alice",
+        .token_previous = null,
+    }};
+    const v = AuthValidator{ .entries = &entries, .expected_nonce = nonce };
+    const auth =
+        \\{"type":"auth","token":"tok-old","nonce":"
+    ++ nonce ++
+        \\"}
+    ;
+    const d = v.validate(auth);
+    try std.testing.expect(!d.ok);
+    try std.testing.expectEqualStrings("invalid_token", d.reason.?);
+}
+
+test "extension rotation: empty-string previous token is treated as not-set" {
+    const nonce = "a" ** NONCE_HEX_LEN;
+    const entries = [_]TokenEntry{.{
+        .token = "tok-new",
+        .user_id = "alice",
+        .token_previous = "", // "" must NOT admit a blank token
+    }};
+    const v = AuthValidator{ .entries = &entries, .expected_nonce = nonce };
+    // A blank-token attempt must be rejected.
+    const auth_blank =
+        \\{"type":"auth","token":"","nonce":"
+    ++ nonce ++
+        \\"}
+    ;
+    try std.testing.expect(!v.validate(auth_blank).ok);
+    // The current token still works.
+    const auth_new =
+        \\{"type":"auth","token":"tok-new","nonce":"
+    ++ nonce ++
+        \\"}
+    ;
+    try std.testing.expect(v.validate(auth_new).ok);
+}
+
+test "extension rotation: bogus token rejected even with both current and previous set" {
+    const nonce = "a" ** NONCE_HEX_LEN;
+    const entries = [_]TokenEntry{.{
+        .token = "tok-new",
+        .user_id = "alice",
+        .token_previous = "tok-old",
+    }};
+    const v = AuthValidator{ .entries = &entries, .expected_nonce = nonce };
+    const auth =
+        \\{"type":"auth","token":"definitely-not-a-token","nonce":"
+    ++ nonce ++
+        \\"}
+    ;
+    const d = v.validate(auth);
+    try std.testing.expect(!d.ok);
+    try std.testing.expectEqualStrings("invalid_token", d.reason.?);
 }

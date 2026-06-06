@@ -17,7 +17,14 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
-    sourcemap: true,
+    // Plan-8 — no sourcemaps in the shipped CRX/zip. Sourcemaps expose
+    // the full original TypeScript (including the auth/handshake logic)
+    // in the packaged extension that ships to every user's browser.
+    // `npm run build` and `npm run package` both run `vite build`, so
+    // this scopes off-sourcemaps to the shipped artifact; `npm run dev`
+    // (the Vite dev server) is unaffected and still serves maps for
+    // local debugging.
+    sourcemap: false,
     rollupOptions: {
       // crxjs injects all extension entry points from manifest.json.
       // We do not add HTML inputs here — the popup HTML is wired by the plugin.

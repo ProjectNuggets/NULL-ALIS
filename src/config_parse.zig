@@ -1720,9 +1720,19 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         const tok = item.object.get("token") orelse continue;
                         const uid = item.object.get("user_id") orelse continue;
                         if (tok != .string or uid != .string) continue;
+                        // Plan-8 — optional rotation-window previous token.
+                        // Only honored when present AND a non-empty string;
+                        // anything else (missing, null, wrong type, "") ⇒ no
+                        // previous token, so a stray field can't admit a blank.
+                        const prev: ?[]const u8 = blk: {
+                            const pv = item.object.get("token_previous") orelse break :blk null;
+                            if (pv != .string or pv.string.len == 0) break :blk null;
+                            break :blk try self.allocator.dupe(u8, pv.string);
+                        };
                         try list.append(self.allocator, .{
                             .token = try self.allocator.dupe(u8, tok.string),
                             .user_id = try self.allocator.dupe(u8, uid.string),
+                            .token_previous = prev,
                         });
                     }
                     self.gateway.extension_tokens = try list.toOwnedSlice(self.allocator);

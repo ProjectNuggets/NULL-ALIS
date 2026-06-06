@@ -71,7 +71,10 @@ describe("WsClient", () => {
     vi.useRealTimers();
   });
 
-  it("sends auth frame on open and reports connected", () => {
+  it("sends auth frame ECHOING the server nonce after challenge, and reports connected", () => {
+    // Plan-8 — the auth frame is NO LONGER sent on open. The gateway
+    // issues a per-connection `challenge` nonce first; the client sends
+    // `auth` (echoing that nonce) only once the challenge arrives.
     const messages: unknown[] = [];
     const states: Array<{ connected: boolean; error?: string }> = [];
     const client = new WsClient({
@@ -81,6 +84,7 @@ describe("WsClient", () => {
       onMessage: (m) => messages.push(m),
       onStateChange: (connected, error) => states.push({ connected, error }),
       WebSocketImpl: MockWebSocket as unknown as typeof WebSocket,
+      heartbeatMs: 0,
     });
 
     client.start();
@@ -88,17 +92,23 @@ describe("WsClient", () => {
     const ws = MockWebSocket.instances[0]!;
     ws.simulateOpen();
 
-    // Auth frame went out
+    // On open, NO auth frame yet — the client waits for the challenge.
+    expect(ws.sent.length).toBe(0);
+    expect(client.isConnected()).toBe(true);
+    expect(states.some((s) => s.connected)).toBe(true);
+
+    // Server issues the per-connection nonce; client echoes it in auth.
+    const NONCE = "deadbeef".repeat(8); // 64-char hex, shape-compatible
+    ws.simulateMessage({ type: "challenge", nonce: NONCE });
+
     expect(ws.sent.length).toBe(1);
     const sent: ClientMessage = JSON.parse(ws.sent[0]!);
     expect(sent).toEqual({
       type: "auth",
       token: "tok-abc",
       extension_version: "0.1.0",
+      nonce: NONCE,
     });
-
-    expect(client.isConnected()).toBe(true);
-    expect(states.some((s) => s.connected)).toBe(true);
   });
 
   it("auto-responds to ping with pong without surfacing it to onMessage", () => {

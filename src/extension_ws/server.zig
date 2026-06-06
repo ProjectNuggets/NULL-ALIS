@@ -438,13 +438,34 @@ pub fn handleUpgrade(stream: anytype, ctx: UpgradeContext) UpgradeOutcome {
     const resp = buildAcceptResponse(&resp_buf, accept) catch return .io_error;
     writeAll(stream, resp) catch return .io_error;
 
-    // 3. Auth handshake: wait for `{type:"auth", token, extension_version}`
-    //    inside the contract's handshake window. Ping/pong is allowed
-    //    pre-ack — auto-answered here so proxies don't drop the
-    //    connection during a slow auth.
     var arena = std.heap.ArenaAllocator.init(ctx.long_allocator);
     defer arena.deinit();
     const ra = arena.allocator();
+
+    // Plan-8 (2026-06-06) — per-connection anti-replay nonce. Mint a
+    // fresh CSPRNG nonce, send it to the client as a `challenge` frame
+    // BEFORE waiting for the auth frame, and require the client to echo
+    // it back in `auth`. A captured `auth` frame replayed on a new
+    // connection carries a stale nonce that will never match THIS
+    // connection's freshly-minted challenge. The nonce is single-use by
+    // construction: it's generated once per connection and the
+    // validator runs once per connection.
+    var nonce_buf: [auth_mod.NONCE_HEX_LEN]u8 = undefined;
+    auth_mod.generateNonceHex(&nonce_buf);
+    {
+        var chal_buf: [auth_mod.NONCE_HEX_LEN + 64]u8 = undefined;
+        const challenge = std.fmt.bufPrint(
+            &chal_buf,
+            "{{\"type\":\"challenge\",\"nonce\":\"{s}\"}}",
+            .{nonce_buf},
+        ) catch return .io_error;
+        writeText(ra, stream, challenge) catch return .io_error;
+    }
+
+    // 3. Auth handshake: wait for `{type:"auth", token, nonce,
+    //    extension_version}` inside the contract's handshake window.
+    //    Ping/pong is allowed pre-ack — auto-answered here so proxies
+    //    don't drop the connection during a slow auth.
 
     // META HIGH #1: stamp the start of the auth window so
     // waitForAuthFrame can enforce the overall deadline.
@@ -472,7 +493,13 @@ pub fn handleUpgrade(stream: anytype, ctx: UpgradeContext) UpgradeOutcome {
     };
     defer ra.free(auth_frame);
 
-    const decision = ctx.auth.validate(auth_frame);
+    // Plan-8 — bind the validator to THIS connection's nonce. The
+    // gateway hands us a validator with only the (token, user_id)
+    // entries; we graft on the per-connection expected nonce so the
+    // echoed value must match what we issued above.
+    var conn_auth = ctx.auth;
+    conn_auth.expected_nonce = &nonce_buf;
+    const decision = conn_auth.validate(auth_frame);
     if (!decision.ok) {
         // Send `auth_ack{ok:false}` then close-1008. Best-effort —
         // failures during this drain path are not interesting.
@@ -821,6 +848,195 @@ test "META HIGH #1: waitForAuthFrame admits frames within deadline" {
     const r = try waitForAuthFrame(std.testing.allocator, &s, std.time.nanoTimestamp());
     defer std.testing.allocator.free(r.?);
     try std.testing.expectEqualStrings("test", r.?);
+}
+
+// ── Plan-8 (2026-06-06) — handshake nonce integration tests ──────────
+//
+// Drive the full `handleUpgrade` over an in-memory bidirectional
+// stream. The stream yields a queued sequence of client→server bytes on
+// read and collects server→client bytes on write. Test names contain
+// "extension" so `-Dtest-filter=extension` selects them.
+
+/// In-memory duplex stream for handleUpgrade tests. `inbound` is the
+/// pre-staged client→server byte queue (masked WS frames). `outbound`
+/// accumulates everything the server writes.
+const DuplexStream = struct {
+    inbound: []const u8,
+    pos: usize = 0,
+    outbound: std.ArrayListUnmanaged(u8) = .empty,
+    allocator: std.mem.Allocator,
+
+    pub fn read(self: *@This(), out: []u8) !usize {
+        const remaining = self.inbound[self.pos..];
+        if (remaining.len == 0) return error.ConnectionClosed;
+        const n = @min(remaining.len, out.len);
+        @memcpy(out[0..n], remaining[0..n]);
+        self.pos += n;
+        return n;
+    }
+    pub fn write(self: *@This(), bytes: []const u8) !usize {
+        try self.outbound.appendSlice(self.allocator, bytes);
+        return bytes.len;
+    }
+    pub fn close(_: *@This()) void {}
+    pub fn deinit(self: *@This()) void {
+        self.outbound.deinit(self.allocator);
+    }
+};
+
+/// Build a masked client→server WS text frame carrying `payload`.
+/// Caller frees the returned slice. Mask key is fixed (test-only).
+fn maskedTextFrame(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
+    const mask = [4]u8{ 0x11, 0x22, 0x33, 0x44 };
+    std.debug.assert(payload.len <= 125); // tests use small frames
+    var out = try allocator.alloc(u8, 2 + 4 + payload.len);
+    out[0] = 0x81; // FIN + text
+    out[1] = 0x80 | @as(u8, @intCast(payload.len)); // MASK + len
+    @memcpy(out[2..6], &mask);
+    for (payload, 0..) |b, i| out[6 + i] = b ^ mask[i % 4];
+    return out;
+}
+
+const TEST_UPGRADE_REQUEST =
+    "GET /api/v1/extension/ws HTTP/1.1\r\n" ++
+    "Host: gw.example.com\r\n" ++
+    "Upgrade: websocket\r\n" ++
+    "Connection: Upgrade\r\n" ++
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+    "Sec-WebSocket-Version: 13\r\n" ++
+    "\r\n";
+
+/// Duplex stream that models a CORRECT client: it reads the server's
+/// `challenge` frame out of its own `outbound` buffer, then lazily
+/// produces a masked `auth` frame echoing that exact nonce. This lets
+/// the integration test exercise the full accept path deterministically
+/// (the nonce is server-random, so the reply can only be built AFTER
+/// observing the challenge — exactly what the real client does).
+const EchoingClientStream = struct {
+    outbound: std.ArrayListUnmanaged(u8) = .empty,
+    auth_frame: ?[]u8 = null,
+    auth_pos: usize = 0,
+    allocator: std.mem.Allocator,
+
+    pub fn read(self: *@This(), out: []u8) !usize {
+        if (self.auth_frame == null) {
+            // Build the auth frame now, echoing the nonce the server
+            // already wrote into `outbound` via its challenge frame.
+            const marker = "\"nonce\":\"";
+            const idx = std.mem.indexOf(u8, self.outbound.items, marker) orelse
+                return error.WouldBlock; // challenge not written yet
+            const after = self.outbound.items[idx + marker.len ..];
+            const nonce = after[0..auth_mod.NONCE_HEX_LEN];
+            const auth_json = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"type\":\"auth\",\"token\":\"tok-alice\",\"nonce\":\"{s}\"}}",
+                .{nonce},
+            );
+            defer self.allocator.free(auth_json);
+            self.auth_frame = try maskedTextFrame(self.allocator, auth_json);
+        }
+        const f = self.auth_frame.?;
+        const remaining = f[self.auth_pos..];
+        if (remaining.len == 0) return error.ConnectionClosed;
+        const n = @min(remaining.len, out.len);
+        @memcpy(out[0..n], remaining[0..n]);
+        self.auth_pos += n;
+        return n;
+    }
+    pub fn write(self: *@This(), bytes: []const u8) !usize {
+        try self.outbound.appendSlice(self.allocator, bytes);
+        return bytes.len;
+    }
+    pub fn close(_: *@This()) void {}
+    pub fn deinit(self: *@This()) void {
+        self.outbound.deinit(self.allocator);
+        if (self.auth_frame) |f| self.allocator.free(f);
+    }
+};
+
+test "extension handshake: server sends challenge nonce and accepts correct echo" {
+    const alloc = std.testing.allocator;
+    var s = EchoingClientStream{ .allocator = alloc };
+    defer s.deinit();
+    var hub = hub_mod.ExtensionWsHub.init(alloc);
+    defer hub.deinit();
+    const entries = [_]auth_mod.TokenEntry{.{ .token = "tok-alice", .user_id = "alice" }};
+    const outcome = handleUpgrade(&s, .{
+        .long_allocator = alloc,
+        .raw_request = TEST_UPGRADE_REQUEST,
+        .hub = &hub,
+        .auth = .{ .entries = &entries },
+    });
+    // The client echoed the correct nonce, so auth succeeds. The conn
+    // then closes when the inbound stream runs dry (ConnectionClosed),
+    // which handleUpgrade reports as a normal close.
+    try std.testing.expectEqual(UpgradeOutcome.closed_normally, outcome);
+    const out = s.outbound.items;
+    // Challenge sent with a full-length hex nonce, then a success ack.
+    const marker = "\"type\":\"challenge\",\"nonce\":\"";
+    const idx = std.mem.indexOf(u8, out, marker).?;
+    const nonce = out[idx + marker.len ..][0..auth_mod.NONCE_HEX_LEN];
+    for (nonce) |c| try std.testing.expect(std.ascii.isHex(c));
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"type\":\"auth_ack\",\"ok\":true") != null);
+}
+
+test "extension handshake: replayed (stale) nonce is rejected with auth_ack ok:false" {
+    const alloc = std.testing.allocator;
+    // A captured auth frame replayed on a fresh connection carries a
+    // nonce that (with overwhelming probability) differs from the new
+    // connection's freshly-minted one. Echo an all-zero nonce: the
+    // server's random nonce will not be all zeros, so the echo is
+    // stale → rejected. (P(random 32-byte nonce == all zeros) ≈ 2^-256.)
+    const stale = "0" ** auth_mod.NONCE_HEX_LEN;
+    const auth_json =
+        \\{"type":"auth","token":"tok-alice","nonce":"
+    ++ stale ++
+        \\"}
+    ;
+    const frame = try maskedTextFrame(alloc, auth_json);
+    defer alloc.free(frame);
+    var s = DuplexStream{ .inbound = frame, .allocator = alloc };
+    defer s.deinit();
+    var hub = hub_mod.ExtensionWsHub.init(alloc);
+    defer hub.deinit();
+    const entries = [_]auth_mod.TokenEntry{.{ .token = "tok-alice", .user_id = "alice" }};
+    const outcome = handleUpgrade(&s, .{
+        .long_allocator = alloc,
+        .raw_request = TEST_UPGRADE_REQUEST,
+        .hub = &hub,
+        .auth = .{ .entries = &entries },
+    });
+    try std.testing.expectEqual(UpgradeOutcome.auth_failed, outcome);
+    const out = s.outbound.items;
+    // The server must have sent a challenge first, then an auth_ack
+    // rejecting the stale nonce.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"type\":\"challenge\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"type\":\"auth_ack\",\"ok\":false,\"error\":\"bad_nonce\"") != null);
+    // No registration happened.
+    try std.testing.expect(hub.getForUser("alice") == null);
+}
+
+test "extension handshake: missing nonce in auth frame is rejected (bad_nonce)" {
+    const alloc = std.testing.allocator;
+    const auth_json =
+        \\{"type":"auth","token":"tok-alice"}
+    ;
+    const frame = try maskedTextFrame(alloc, auth_json);
+    defer alloc.free(frame);
+    var s = DuplexStream{ .inbound = frame, .allocator = alloc };
+    defer s.deinit();
+    var hub = hub_mod.ExtensionWsHub.init(alloc);
+    defer hub.deinit();
+    const entries = [_]auth_mod.TokenEntry{.{ .token = "tok-alice", .user_id = "alice" }};
+    const outcome = handleUpgrade(&s, .{
+        .long_allocator = alloc,
+        .raw_request = TEST_UPGRADE_REQUEST,
+        .hub = &hub,
+        .auth = .{ .entries = &entries },
+    });
+    try std.testing.expectEqual(UpgradeOutcome.auth_failed, outcome);
+    const out = s.outbound.items;
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"error\":\"bad_nonce\"") != null);
 }
 
 test "writeClose includes close code in payload" {
