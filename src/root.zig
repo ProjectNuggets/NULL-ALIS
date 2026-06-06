@@ -132,6 +132,25 @@ pub const runtime = @import("runtime.zig");
 pub const browser_backend = struct {
     pub const client = @import("browser_backend/client.zig");
 };
+/// Top-level test-collection alias for the Task-1 orchestrator client.
+/// `addTest` (lib_tests root = src/root.zig) only runs `test {}` blocks
+/// from files reachable as TOP-LEVEL module decls — a file imported only
+/// via a nested `pub const x = @import(...)` inside a struct (e.g. the
+/// `browser_backend` namespace above) is compiled+analyzed but its tests
+/// are NOT executed by `zig build test`. This top-level decl guarantees
+/// client.zig's unit tests actually run.
+pub const browser_backend_client_test = @import("browser_backend/client.zig");
+
+/// Plan 4 Task 3 — native browser_* agent tools (new_session / navigate /
+/// snapshot / exec / close). TOP-LEVEL `pub const` imports (NOT nested in
+/// a struct) so their `test {}` blocks are collected by `zig build test`
+/// (see the test-collection note above). Registration into
+/// `tools/root.zig::allTools` + gateway wiring lands in Task 4.
+pub const browser_exec = @import("tools/browser_exec.zig");
+pub const browser_navigate = @import("tools/browser_navigate.zig");
+pub const browser_snapshot = @import("tools/browser_snapshot.zig");
+pub const browser_new_session = @import("tools/browser_new_session.zig");
+pub const browser_close_session = @import("tools/browser_close_session.zig");
 
 // Phase 4b: MCP (Model Context Protocol)
 pub const mcp = @import("mcp.zig");
