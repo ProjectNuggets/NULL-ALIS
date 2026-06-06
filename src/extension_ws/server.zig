@@ -866,7 +866,10 @@ const DuplexStream = struct {
     outbound: std.ArrayListUnmanaged(u8) = .empty,
     allocator: std.mem.Allocator,
 
-    pub fn read(self: *@This(), out: []u8) !usize {
+    // Explicit error sets (supersets of what the bodies return) so the
+    // production generic readExact/pumpFrames switch arms (error.WouldBlock /
+    // error.BrokenPipe) are valid members when instantiated with this mock.
+    pub fn read(self: *@This(), out: []u8) error{ ConnectionClosed, WouldBlock, BrokenPipe }!usize {
         const remaining = self.inbound[self.pos..];
         if (remaining.len == 0) return error.ConnectionClosed;
         const n = @min(remaining.len, out.len);
@@ -874,7 +877,7 @@ const DuplexStream = struct {
         self.pos += n;
         return n;
     }
-    pub fn write(self: *@This(), bytes: []const u8) !usize {
+    pub fn write(self: *@This(), bytes: []const u8) error{ OutOfMemory, BrokenPipe }!usize {
         try self.outbound.appendSlice(self.allocator, bytes);
         return bytes.len;
     }
@@ -918,7 +921,7 @@ const EchoingClientStream = struct {
     auth_pos: usize = 0,
     allocator: std.mem.Allocator,
 
-    pub fn read(self: *@This(), out: []u8) !usize {
+    pub fn read(self: *@This(), out: []u8) error{ ConnectionClosed, WouldBlock, OutOfMemory, BrokenPipe }!usize {
         if (self.auth_frame == null) {
             // Build the auth frame now, echoing the nonce the server
             // already wrote into `outbound` via its challenge frame.
@@ -943,7 +946,7 @@ const EchoingClientStream = struct {
         self.auth_pos += n;
         return n;
     }
-    pub fn write(self: *@This(), bytes: []const u8) !usize {
+    pub fn write(self: *@This(), bytes: []const u8) error{ OutOfMemory, BrokenPipe }!usize {
         try self.outbound.appendSlice(self.allocator, bytes);
         return bytes.len;
     }
