@@ -318,11 +318,12 @@ func (p *K8sProvider) DestroySession(ctx context.Context, sessionID string) erro
 	if err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete pod: %w", err)
 	}
-	metricSessionsActive.Dec()
-	p.reg.Remove(sessionID)
-	p.mu.Lock()
-	delete(p.meta, sessionID)
-	p.mu.Unlock()
+	if p.reg.Remove(sessionID) {
+		p.mu.Lock()
+		delete(p.meta, sessionID)
+		p.mu.Unlock()
+		metricSessionsActive.Dec()
+	}
 	return nil
 }
 
@@ -374,12 +375,13 @@ func (p *K8sProvider) PruneOnce(ctx context.Context) int {
 		gone := apierrors.IsNotFound(err)
 		failed := err == nil && pod.Status.Phase == corev1.PodFailed
 		if gone || failed {
-			p.reg.Remove(id)
-			p.mu.Lock()
-			delete(p.meta, id)
-			p.mu.Unlock()
-			metricSessionsActive.Dec()
-			pruned++
+			if p.reg.Remove(id) {
+				p.mu.Lock()
+				delete(p.meta, id)
+				p.mu.Unlock()
+				metricSessionsActive.Dec()
+				pruned++
+			}
 		}
 	}
 	return pruned

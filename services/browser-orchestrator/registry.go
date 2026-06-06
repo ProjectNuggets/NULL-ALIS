@@ -25,8 +25,14 @@ func (r *Registry) Pod(sessionID string) (string, bool) {
 	return p, ok
 }
 
-func (r *Registry) Remove(sessionID string) {
+// Remove deletes the session mapping; returns true iff it was present (so callers
+// can make removal-tied side effects, e.g. a gauge decrement, happen exactly once).
+func (r *Registry) Remove(sessionID string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if _, ok := r.pods[sessionID]; !ok {
+		return false
+	}
 	delete(r.pods, sessionID)
+	return true
 }
