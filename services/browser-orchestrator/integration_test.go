@@ -95,6 +95,9 @@ func TestE2EReconcileAndDeleteVault(t *testing.T) {
 
 	id, err := p1.CreateSession(ctx, "carol", "demo")
 	if err != nil { t.Fatalf("create: %v", err) }
+	if _, err := p1.Exec(ctx, id, []string{"--executable-path", "/usr/local/bin/chromium-ns", "open", "https://example.com"}); err != nil {
+		t.Fatalf("open: %v", err)
+	}
 
 	// Simulate orchestrator restart: a fresh provider with an empty registry reconciles
 	// and must recover (userID, authProfile) from the pod annotations.
