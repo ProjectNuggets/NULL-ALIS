@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: browser-orchestrator
+  namespace: browser
+  labels:
+    app: browser-orchestrator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: browser-orchestrator
+  template:
+    metadata:
+      labels:
+        app: browser-orchestrator
+    spec:
+      serviceAccountName: browser-orchestrator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10002
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: orchestrator
+          image: browser-orchestrator:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: BROWSER_NAMESPACE
+              value: browser
+            - name: BROWSER_WORKER_IMAGE
+              value: browser-worker:dev
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: browser-orchestrator
+  namespace: browser
+spec:
+  selector:
+    app: browser-orchestrator
+  ports:
+    - port: 8080
+      targetPort: 8080
