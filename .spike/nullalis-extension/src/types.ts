@@ -23,6 +23,12 @@ export interface Command {
   args: Record<string, unknown>;
   /** Optional per-command timeout. Defaults to 30s. */
   timeout_ms?: number;
+  /**
+   * Server-issued opt-in to write password / credit-card fields (M1). The
+   * content script default-DENIES writes to input[type=password] and
+   * autocomplete=cc-* unless this is explicitly true. Defaults to false.
+   */
+  allow_sensitive?: boolean;
 }
 
 /** Extension -> gateway: result of executing a single command. */
@@ -85,7 +91,12 @@ export type PopupRequest =
   | { type: "clear_token" }
   | { type: "connect" }
   | { type: "disconnect" }
-  | { type: "stop_all" };
+  | { type: "stop_all" }
+  /** Grant the agent consent on the currently-active tab (C1/H1). Issued
+   *  from the popup on a user gesture so activeTab is granted for that tab. */
+  | { type: "enable_active_tab" }
+  /** Revoke consent for a specific tab (C1/H1). */
+  | { type: "disable_tab"; tab_id: number };
 
 export interface ConnectionStatus {
   /** Whether the extension currently has an open WS to the gateway. */
@@ -108,11 +119,23 @@ export interface ConnectionStatus {
   last_command: { tool: ToolName; command_id: string; at_ms: number } | null;
   /** Number of commands executed since the extension loaded. */
   commands_total: number;
+  /**
+   * Tab ids the user has explicitly enabled the agent on (C1/H1). The agent
+   * refuses every command targeting a tab not in this set. Cleared on STOP and
+   * on disconnect.
+   */
+  consented_tabs: number[];
+  /** The active tab's id, so the popup can offer "enable this tab". */
+  active_tab_id: number | null;
+  /** Whether the agent is latched-stopped (H4). While true no command runs and
+   *  the socket will not auto-reconnect; cleared only by an explicit connect. */
+  stopped: boolean;
 }
 
 export type PopupResponse =
   | { ok: true; status: ConnectionStatus }
   | { ok: true }
+  | { ok: true; tab_id: number }
   | { ok: false; error: string };
 
 // ---------- Background <-> content script messaging ----------

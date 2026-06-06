@@ -25,10 +25,14 @@
 
 const TOUCHED_KEY = "nullalis_touched_tabs_v1";
 const COMMANDS_TOTAL_KEY = "nullalis_commands_total_v1";
+const CONSENTED_KEY = "nullalis_consented_tabs_v1";
+const STOPPED_KEY = "nullalis_stopped_latch_v1";
 
 // In-memory mirrors. We treat `null` as "not yet hydrated".
 let touchedMirror: Set<number> | null = null;
 let commandsTotalMirror: number | null = null;
+let consentedMirror: Set<number> | null = null;
+let stoppedMirror: boolean | null = null;
 
 // ── META HIGH #4: mutex-via-promise serialized queue ──
 //
@@ -40,7 +44,14 @@ let commandsTotalMirror: number | null = null;
 
 let mutexTail: Promise<unknown> = Promise.resolve();
 
-async function runExclusive<T>(work: () => Promise<T>): Promise<T> {
+/**
+ * Run `work` exclusively against the shared session-state mutex. Exported so
+ * the STOP handler (background.ts, H4) can latch + drain touched-tab state
+ * atomically with respect to in-flight `addTouchedTab` calls — a STOP that
+ * interleaved with an `addTouchedTab` could otherwise resurrect a tab id we
+ * just promised the user we'd dropped.
+ */
+export async function runExclusive<T>(work: () => Promise<T>): Promise<T> {
   // Capture the current tail BEFORE writing back — the new tail is
   // whatever this work will resolve to. Subsequent callers wait on
   // OUR tail. We catch in the chain so a thrown error from one
@@ -70,6 +81,8 @@ async function runExclusive<T>(work: () => Promise<T>): Promise<T> {
 export function _resetForTest(): void {
   touchedMirror = null;
   commandsTotalMirror = null;
+  consentedMirror = null;
+  stoppedMirror = null;
   mutexTail = Promise.resolve();
 }
 
@@ -121,6 +134,22 @@ export async function clearTouchedTabs(): Promise<void> {
   });
 }
 
+/**
+ * Snapshot the touched-tab set AND clear it in one atomic mutex block (H4).
+ * STOP uses this so a straggler `addTouchedTab` can't slip between a separate
+ * read and clear and resurrect a tab id we already promised to drop. Returns
+ * the snapshot taken before the clear.
+ */
+export async function drainTouchedTabs(): Promise<number[]> {
+  return runExclusive(async () => {
+    const set = await hydrateTouched();
+    const snapshot = [...set];
+    touchedMirror = new Set<number>();
+    await chrome.storage.session.remove(TOUCHED_KEY);
+    return snapshot;
+  });
+}
+
 /** Bump commands_total by 1 and persist. Returns the new value.
  *  META HIGH #4: serialized via runExclusive — N concurrent calls now
  *  return exactly the values 1..N (no duplicates, no lost updates). */
@@ -137,4 +166,101 @@ export async function incrementCommandsTotal(): Promise<number> {
 /** Read current commands_total. */
 export async function getCommandsTotal(): Promise<number> {
   return hydrateCommandsTotal();
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// C1/H1 — per-tab consent set.
+//
+// The agent may ONLY act on tabs the user explicitly enabled from the popup.
+// Consent is persisted to chrome.storage.session so it survives worker
+// eviction but is wiped on browser restart (a fresh browser session starts
+// with zero consented tabs — consent is never durable across restarts). All
+// mutations go through runExclusive for the same race-safety reasons as the
+// touched-tabs set.
+// ──────────────────────────────────────────────────────────────────────────
+
+async function hydrateConsented(): Promise<Set<number>> {
+  if (consentedMirror !== null) return consentedMirror;
+  const raw = await chrome.storage.session.get(CONSENTED_KEY);
+  const arr = raw[CONSENTED_KEY];
+  const list = Array.isArray(arr)
+    ? arr.filter((n): n is number => typeof n === "number" && Number.isInteger(n))
+    : [];
+  consentedMirror = new Set<number>(list);
+  return consentedMirror;
+}
+
+/** Add `tabId` to the consented set. */
+export async function addConsentedTab(tabId: number): Promise<void> {
+  await runExclusive(async () => {
+    const set = await hydrateConsented();
+    set.add(tabId);
+    await chrome.storage.session.set({ [CONSENTED_KEY]: [...set] });
+  });
+}
+
+/** Remove `tabId` from the consented set (revocation / tab close). */
+export async function removeConsentedTab(tabId: number): Promise<void> {
+  await runExclusive(async () => {
+    const set = await hydrateConsented();
+    set.delete(tabId);
+    await chrome.storage.session.set({ [CONSENTED_KEY]: [...set] });
+  });
+}
+
+/** Wipe ALL consent. Called on STOP and on disconnect. */
+export async function clearConsentedTabs(): Promise<void> {
+  await runExclusive(async () => {
+    consentedMirror = new Set<number>();
+    await chrome.storage.session.remove(CONSENTED_KEY);
+  });
+}
+
+/** Snapshot of consented tab ids. */
+export async function getConsentedTabs(): Promise<number[]> {
+  const set = await hydrateConsented();
+  return [...set];
+}
+
+/** Is the agent allowed to act on `tabId`? */
+export async function isTabConsented(tabId: number): Promise<boolean> {
+  const set = await hydrateConsented();
+  return set.has(tabId);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// H4 — latched STOP.
+//
+// While the latch is SET: executeCommand / handleServerMessage refuse to
+// dispatch, and ensureConnection refuses to (re)connect. The latch is cleared
+// ONLY by an explicit user `connect` from the popup. Persisted to
+// storage.session so an evicted-then-revived worker still honors the latch.
+// ──────────────────────────────────────────────────────────────────────────
+
+async function hydrateStopped(): Promise<boolean> {
+  if (stoppedMirror !== null) return stoppedMirror;
+  const raw = await chrome.storage.session.get(STOPPED_KEY);
+  stoppedMirror = raw[STOPPED_KEY] === true;
+  return stoppedMirror;
+}
+
+/** Set the stopped latch. */
+export async function setStopped(): Promise<void> {
+  await runExclusive(async () => {
+    stoppedMirror = true;
+    await chrome.storage.session.set({ [STOPPED_KEY]: true });
+  });
+}
+
+/** Clear the stopped latch (explicit user connect only). */
+export async function clearStopped(): Promise<void> {
+  await runExclusive(async () => {
+    stoppedMirror = false;
+    await chrome.storage.session.set({ [STOPPED_KEY]: false });
+  });
+}
+
+/** Is the agent currently latched-stopped? */
+export async function isStopped(): Promise<boolean> {
+  return hydrateStopped();
 }
