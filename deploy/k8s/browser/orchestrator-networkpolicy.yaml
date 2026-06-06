@@ -1,0 +1,24 @@
+# Restrict the orchestrator HTTP API (:8080) to the nullalis gateway only.
+# The API is currently unauthenticated; this network policy is the access gate.
+# Operators MUST label the gateway pod(s) with nullalis.dev/browser-client: "true".
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: browser-orchestrator-ingress
+  namespace: browser
+spec:
+  podSelector:
+    matchLabels:
+      app: browser-orchestrator
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              nullalis.dev/browser-client: "true"
+        - namespaceSelector:
+            matchLabels:
+              nullalis.dev/browser-client: "true"
+      ports:
+        - protocol: TCP
+          port: 8080

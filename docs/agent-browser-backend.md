@@ -48,3 +48,7 @@
   and waits for the pod to be Ready).
 - Validate: `./scripts/browser-worker-smoke.sh` then `./scripts/browser-worker-egress-test.sh`.
 - Teardown: `./scripts/browser-worker-teardown.sh`.
+
+## Orchestrator API access control
+
+The orchestrator HTTP API (`:8080`) is unauthenticated at the app layer (app-layer auth is a tracked follow-up). `deploy/k8s/browser/orchestrator-networkpolicy.yaml` is the access gate: it restricts ingress to pods labelled `nullalis.dev/browser-client: "true"`. Operators MUST apply this label to the nullalis gateway pod(s); without it the gateway cannot reach the orchestrator.

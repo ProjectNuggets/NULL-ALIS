@@ -266,7 +266,10 @@ func (p *K8sProvider) Exec(ctx context.Context, sessionID string, args []string)
 	if !ok {
 		return ExecResult{}, fmt.Errorf("unknown session %q", sessionID)
 	}
-	cmd := append([]string{"agent-browser"}, args...)
+	// Inject the worker's chromium wrapper path so the agent never needs to pass
+	// --executable-path (which is therefore denied by the allowlist). Harmless on
+	// non-launch verbs (agent-browser ignores it once the daemon is running).
+	cmd := append([]string{"agent-browser", "--executable-path", "/usr/local/bin/chromium-ns"}, args...)
 	req := p.client.CoreV1().RESTClient().Post().
 		Resource("pods").Name(podName).Namespace(p.namespace).SubResource("exec").
 		VersionedParams(&corev1.PodExecOptions{

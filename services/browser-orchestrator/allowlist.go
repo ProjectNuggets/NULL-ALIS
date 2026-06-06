@@ -11,17 +11,16 @@ var allowedSubcommands = map[string]bool{
 	"state": true, "close": true,
 }
 
-// valueFlags consume the following token as their value.
+// valueFlags consume the following token as their value. Dangerous flags
+// (--proxy/--headers/--executable-path/--cdp/--profile/--session) are NOT here:
+// they enable exfiltration/override of a logged-in session via browser_exec.
 var valueFlags = map[string]bool{
-	"--executable-path": true, "--state": true, "--timeout": true, "--engine": true,
-	"--proxy": true, "--headers": true, "--session": true, "--session-name": true,
-	"--profile": true, "--cdp": true,
+	"--timeout": true,
 }
 
 // boolFlags consume only themselves.
 var boolFlags = map[string]bool{
-	"--headed": true, "--json": true, "--auto-connect": true, "--hide-scrollbars": true,
-	"--no-sandbox": true, "--full-page": true,
+	"--json": true, "--full-page": true, "--hide-scrollbars": true,
 }
 
 // ExecAllowed reports whether the agent-browser invocation is permitted. Fail-closed:
