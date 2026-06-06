@@ -1948,6 +1948,16 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     }
                 }
             }
+            if (br.object.get("agent_browser")) |v| {
+                if (v == .object) {
+                    if (v.object.get("orchestrator_url")) |u| {
+                        if (u == .string) self.browser.agent_browser.orchestrator_url = try self.allocator.dupe(u8, u.string);
+                    }
+                    if (v.object.get("timeout_ms")) |t| {
+                        if (t == .integer) self.browser.agent_browser.timeout_ms = @intCast(t.integer);
+                    }
+                }
+            }
         }
     }
 

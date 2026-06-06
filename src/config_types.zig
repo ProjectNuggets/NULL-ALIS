@@ -1255,6 +1255,11 @@ pub const BrowserComputerUseConfig = struct {
     max_coordinate_y: ?i64 = null,
 };
 
+pub const AgentBrowserConfig = struct {
+    orchestrator_url: []const u8 = "http://browser-orchestrator.browser.svc.cluster.local:8080",
+    timeout_ms: u64 = 60_000,
+};
+
 pub const BrowserConfig = struct {
     enabled: bool = false,
     session_name: ?[]const u8 = null,
@@ -1263,6 +1268,7 @@ pub const BrowserConfig = struct {
     native_webdriver_url: []const u8 = "http://127.0.0.1:9515",
     native_chrome_path: ?[]const u8 = null,
     computer_use: BrowserComputerUseConfig = .{},
+    agent_browser: AgentBrowserConfig = .{},
     allowed_domains: []const []const u8 = &.{},
 };
 
