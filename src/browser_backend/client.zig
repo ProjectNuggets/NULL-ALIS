@@ -98,3 +98,33 @@ test "newSession surfaces non-200 as error" {
     const c = OrchestratorClient{ .base_url = "http://x", .transport = tt.transport() };
     try std.testing.expectError(error.OrchestratorError, c.newSession(std.testing.allocator, "alice", ""));
 }
+
+test "live: client drives new_session -> navigate -> snapshot(@eN) -> close" {
+    const allocator = std.testing.allocator;
+    _ = std.posix.getenv("NULLALIS_BROWSER_LIVE_TEST") orelse return error.SkipZigTest;
+    const c = OrchestratorClient{ .base_url = "http://localhost:8080", .timeout_ms = 120_000 };
+
+    const sid = try c.newSession(allocator, "e2e-user", "");
+    defer allocator.free(sid);
+
+    // open example.com (worker uses the chromium-ns wrapper for --no-sandbox)
+    {
+        const resp = try c.exec(allocator, sid, "[\"--executable-path\",\"/usr/local/bin/chromium-ns\",\"open\",\"https://example.com\"]");
+        defer allocator.free(resp.body);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+    }
+    // snapshot must contain an @eN ref
+    {
+        const resp = try c.exec(allocator, sid, "[\"snapshot\"]");
+        defer allocator.free(resp.body);
+        try std.testing.expectEqual(@as(u16, 200), resp.status_code);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "ref=e") != null);
+    }
+    // 403 path: a denied verb is rejected by the orchestrator allowlist
+    {
+        const resp = try c.exec(allocator, sid, "[\"eval\",\"1+1\"]");
+        defer allocator.free(resp.body);
+        try std.testing.expectEqual(@as(u16, 403), resp.status_code);
+    }
+    try c.closeSession(allocator, sid);
+}
