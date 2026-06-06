@@ -3865,6 +3865,29 @@ components:
                 full_request_hash:
                   type: integer
                   format: int64
+            prompt_blocks:
+              type: array
+              description: Sanitized named prompt blocks; names, buckets, sizes, estimates, and hashes only.
+              items:
+                type: object
+                properties:
+                  name:
+                    type: string
+                    example: xml_tool_catalog
+                  bucket:
+                    type: string
+                    example: stable:xml_tools
+                  bytes:
+                    type: integer
+                    format: int64
+                  token_estimate:
+                    type: integer
+                    format: int64
+                  hash:
+                    type: integer
+                    format: int64
+                  active:
+                    type: boolean
         cache:
           type: object
           description: Cache telemetry only; cache does not reduce live context pressure.

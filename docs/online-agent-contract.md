@@ -389,9 +389,10 @@ Context pressure:
   last provider-bound request. It contains bucket sizes, counts, and hashes
   only, including system prompt buckets, tool schema size, history-by-role
   bytes, assistant reasoning bytes, XML/tool history bytes, multimodal payload
-  estimates, cache-key presence, and provider usage/preflight truth beside the
-  shape. It must not include raw prompt, user, tool, or reasoning text and must
-  not be used as a second pressure meter.
+  estimates, cache-key presence, provider usage/preflight truth beside the
+  shape, and optional `prompt_blocks` entries with sanitized names, buckets,
+  byte counts, token estimates, and hashes. It must not include raw prompt,
+  user, tool, or reasoning text and must not be used as a second pressure meter.
 - If there is no live session manager or no active session, the response
   is an unavailable envelope such as
   `{"active":false,"live":false,"code":"session_manager_unavailable"}`

@@ -55,6 +55,17 @@ pub const LastTurnDelta = struct {
     pressure_points: u8 = 0,
 };
 
+pub const PROMPT_BLOCK_LIMIT: usize = 48;
+
+pub const PromptBlock = struct {
+    name: []const u8 = "",
+    bucket: []const u8 = "",
+    bytes: u64 = 0,
+    token_estimate: u64 = 0,
+    hash: u64 = 0,
+    active: bool = false,
+};
+
 pub const PromptShape = struct {
     available: bool = false,
     method: []const u8 = "provider_request_shape_v1",
@@ -85,6 +96,8 @@ pub const PromptShape = struct {
     volatile_system_prompt_hash: u64 = 0,
     history_tail_hash: u64 = 0,
     full_request_hash: u64 = 0,
+    prompt_block_count: usize = 0,
+    prompt_blocks: [PROMPT_BLOCK_LIMIT]PromptBlock = [_]PromptBlock{.{}} ** PROMPT_BLOCK_LIMIT,
 };
 
 pub const PromptShapeCapture = struct {
@@ -248,6 +261,10 @@ fn tokenEstimateFromBytes(bytes: usize) u64 {
     return context_estimator.tokenEstimateFromBytes(@intCast(bytes));
 }
 
+fn hashBytes(bytes: []const u8) u64 {
+    return std.hash.Fnv1a_64.hash(bytes);
+}
+
 fn pressurePercent(used_tokens: u64, context_window_tokens: u64) u8 {
     if (context_window_tokens == 0) return 0;
     const pct = @min(@as(u64, 100), (used_tokens * 100) / context_window_tokens);
@@ -382,6 +399,133 @@ fn updateHashForTool(hasher: *std.hash.Fnv1a_64, tool: anytype) void {
     if (@hasField(ToolType, "parameters_json")) hasher.update(tool.parameters_json);
 }
 
+fn addPromptBlock(shape: *PromptShape, name: []const u8, bucket: []const u8, content: []const u8) void {
+    if (content.len == 0 or shape.prompt_block_count >= PROMPT_BLOCK_LIMIT) return;
+    addPromptBlockMeasured(shape, name, bucket, content.len, hashBytes(content));
+}
+
+fn addPromptBlockMeasured(shape: *PromptShape, name: []const u8, bucket: []const u8, bytes: usize, hash: u64) void {
+    if (bytes == 0 or shape.prompt_block_count >= PROMPT_BLOCK_LIMIT) return;
+    shape.prompt_blocks[shape.prompt_block_count] = .{
+        .name = name,
+        .bucket = bucket,
+        .bytes = @intCast(bytes),
+        .token_estimate = tokenEstimateFromBytes(bytes),
+        .hash = hash,
+        .active = true,
+    };
+    shape.prompt_block_count += 1;
+}
+
+const PromptBlockMarker = struct {
+    marker: []const u8,
+    name: []const u8,
+    bucket: []const u8,
+};
+
+const FoundPromptBlockMarker = struct {
+    pos: usize,
+    name: []const u8,
+    bucket: []const u8,
+};
+
+fn insertPromptMarker(found: *[PROMPT_BLOCK_LIMIT]FoundPromptBlockMarker, count: *usize, marker: FoundPromptBlockMarker) void {
+    if (count.* >= found.len) return;
+    var insert_at = count.*;
+    while (insert_at > 0 and found[insert_at - 1].pos > marker.pos) : (insert_at -= 1) {
+        found[insert_at] = found[insert_at - 1];
+    }
+    found[insert_at] = marker;
+    count.* += 1;
+}
+
+fn addPromptBlocksByMarkers(
+    shape: *PromptShape,
+    content: []const u8,
+    markers: []const PromptBlockMarker,
+    fallback_name: []const u8,
+    fallback_bucket: []const u8,
+) void {
+    if (content.len == 0) return;
+
+    var found: [PROMPT_BLOCK_LIMIT]FoundPromptBlockMarker = undefined;
+    var count: usize = 0;
+    for (markers) |marker| {
+        const pos = std.mem.indexOf(u8, content, marker.marker) orelse continue;
+        insertPromptMarker(&found, &count, .{
+            .pos = pos,
+            .name = marker.name,
+            .bucket = marker.bucket,
+        });
+    }
+
+    if (count == 0) {
+        addPromptBlock(shape, fallback_name, fallback_bucket, content);
+        return;
+    }
+
+    if (found[0].pos > 0) {
+        addPromptBlock(shape, fallback_name, fallback_bucket, content[0..found[0].pos]);
+    }
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const start = found[i].pos;
+        const end = if (i + 1 < count) found[i + 1].pos else content.len;
+        if (end > start) addPromptBlock(shape, found[i].name, found[i].bucket, content[start..end]);
+    }
+}
+
+const stable_prompt_markers = [_]PromptBlockMarker{
+    .{ .marker = "## Memory Link Types\n\n", .name = "memory_link_types", .bucket = "stable:tier1" },
+    .{ .marker = "## Brain Architecture\n\n", .name = "brain_architecture", .bucket = "stable:tier1" },
+    .{ .marker = "## Response Protocol\n\n", .name = "response_protocol", .bucket = "stable:tier1" },
+    .{ .marker = "## Channel Attachments\n\n", .name = "channel_attachments", .bucket = "stable:tier1" },
+    .{ .marker = "## Task Decomposition\n\n", .name = "task_decomposition", .bucket = "stable:tier1" },
+    .{ .marker = "## Safety\n\n", .name = "safety", .bucket = "stable:tier1" },
+    .{ .marker = "## Tools\n\n", .name = "prompt_tool_catalog", .bucket = "stable:tier2" },
+    .{ .marker = "## Runtime Capabilities\n\n", .name = "runtime_capabilities", .bucket = "stable:tier2" },
+    .{ .marker = "## Persona Calibration\n\n", .name = "persona", .bucket = "stable:tier3" },
+    .{ .marker = "## Project Context\n\n", .name = "workspace_identity_files", .bucket = "stable:tier3" },
+    .{ .marker = "## Skills\n\n", .name = "skills_full", .bucket = "stable:tier3" },
+    .{ .marker = "## Available Skills\n\n", .name = "skills_available_index", .bucket = "stable:tier3" },
+    .{ .marker = "## Workspace\n\n", .name = "workspace_paths", .bucket = "stable:tier3" },
+    .{ .marker = "## Runtime\n\n", .name = "runtime_model", .bucket = "stable:tier4" },
+    .{ .marker = "## Tool Use Protocol\n\n", .name = "xml_tool_protocol", .bucket = "stable:xml_tools" },
+    .{ .marker = "### Available Tools\n\n", .name = "xml_tool_catalog", .bucket = "stable:xml_tools" },
+};
+
+const volatile_prompt_markers = [_]PromptBlockMarker{
+    .{ .marker = "## Conversation Context\n\n", .name = "conversation_context", .bucket = "volatile:turn" },
+    .{ .marker = "## Current Date & Time\n\n", .name = "current_datetime", .bucket = "volatile:turn" },
+    .{ .marker = "<working_memory", .name = "working_memory", .bucket = "volatile:memory" },
+    .{ .marker = "<memory_for_turn", .name = "memory_for_turn", .bucket = "volatile:memory" },
+    .{ .marker = "<recent_thoughts", .name = "recent_thoughts", .bucket = "volatile:reasoning_trace" },
+    .{ .marker = "<known_weakness", .name = "known_weakness", .bucket = "volatile:self_knowledge" },
+    .{ .marker = "<task_plan", .name = "task_plan", .bucket = "volatile:working_plan" },
+    .{ .marker = "<recent_skill_traces", .name = "recent_skill_traces", .bucket = "volatile:procedural_memory" },
+};
+
+fn addSystemPromptBlocks(shape: *PromptShape, system_prompt: []const u8, stable_prefix_bytes: usize) void {
+    const stable_end = @min(stable_prefix_bytes, system_prompt.len);
+    addPromptBlocksByMarkers(
+        shape,
+        system_prompt[0..stable_end],
+        &stable_prompt_markers,
+        "stable_system_unclassified",
+        "stable:unclassified",
+    );
+    if (stable_end < system_prompt.len) {
+        addPromptBlocksByMarkers(
+            shape,
+            system_prompt[stable_end..],
+            &volatile_prompt_markers,
+            "volatile_system_unclassified",
+            "volatile:unclassified",
+        );
+    }
+}
+
 pub fn buildPromptShapeFromProviderRequest(request: anytype, capture: PromptShapeCapture) PromptShape {
     var shape = PromptShape{
         .available = true,
@@ -420,12 +564,15 @@ pub fn buildPromptShapeFromProviderRequest(request: anytype, capture: PromptShap
     if (@hasField(@TypeOf(request), "tools")) {
         if (request.tools) |tools| {
             shape.tool_schema_count = tools.len;
+            var tool_schema_hasher = std.hash.Fnv1a_64.init();
             for (tools) |tool| {
                 const bytes = toolSpecBytes(tool);
                 shape.tool_schema_bytes += bytes;
                 shape.provider_request_body_bytes_estimated += bytes + 64;
                 updateHashForTool(&request_hasher, tool);
+                updateHashForTool(&tool_schema_hasher, tool);
             }
+            addPromptBlockMeasured(&shape, "native_tool_schemas", "provider_tools", @intCast(shape.tool_schema_bytes), tool_schema_hasher.final());
         }
     }
 
@@ -447,6 +594,7 @@ pub fn buildPromptShapeFromProviderRequest(request: anytype, capture: PromptShap
                     shape.system_prompt_bytes += text_bytes;
                     if (shape.system_message_count == 1 and @hasField(@TypeOf(message), "content")) {
                         const stable_bytes = @min(capture.stable_system_prompt_bytes, message.content.len);
+                        addSystemPromptBlocks(&shape, message.content, stable_bytes);
                         if (message.content.len > stable_bytes) {
                             const volatile_slice = message.content[stable_bytes..];
                             var volatile_hasher = std.hash.Fnv1a_64.init();
@@ -1169,6 +1317,89 @@ test "buildPromptShapeFromProviderRequest buckets provider-bound request without
     try std.testing.expect(first.provider_request_body_bytes_estimated > first.provider_bound_message_bytes);
     try std.testing.expectEqual(first.full_request_hash, second.full_request_hash);
     try std.testing.expectEqual(first.volatile_system_prompt_hash, second.volatile_system_prompt_hash);
+}
+
+test "buildPromptShapeFromProviderRequest emits sanitized prompt blocks by section" {
+    const stable =
+        "## Safety\n\n" ++
+        "stable safety rules\n\n" ++
+        "## Tool Use Protocol\n\n" ++
+        "xml protocol text\n\n" ++
+        "### Available Tools\n\n" ++
+        "xml tool catalog text\n\n";
+    const volatile_prompt =
+        "## Current Date & Time\n\n" ++
+        "2026-06-06 12:00 UTC\n\n" ++
+        "<memory_for_turn>\n" ++
+        "private memory payload\n" ++
+        "</memory_for_turn>\n";
+    const system_prompt = stable ++ volatile_prompt;
+    const messages = [_]providers.ChatMessage{
+        providers.ChatMessage.system(system_prompt),
+        providers.ChatMessage.user("user text must not be serialized in prompt blocks"),
+    };
+    const tools = [_]providers.ToolSpec{
+        .{
+            .name = "schedule",
+            .description = "List scheduled jobs",
+            .parameters_json = "{\"type\":\"object\"}",
+        },
+    };
+    const request = providers.ChatRequest{
+        .messages = &messages,
+        .model = "kimi-k2.6",
+        .tools = &tools,
+    };
+
+    const shape = buildPromptShapeFromProviderRequest(request, .{
+        .stable_system_prompt_bytes = stable.len,
+        .stable_system_prompt_hash = hashBytes(stable),
+        .sampled_at_ms = 99,
+    });
+
+    try std.testing.expect(shape.prompt_block_count >= 5);
+
+    var saw_safety = false;
+    var saw_xml_protocol = false;
+    var saw_xml_catalog = false;
+    var saw_datetime = false;
+    var saw_memory = false;
+    var saw_native_tools = false;
+    for (shape.prompt_blocks[0..shape.prompt_block_count]) |block| {
+        try std.testing.expect(block.active);
+        try std.testing.expect(block.bytes > 0);
+        try std.testing.expect(block.token_estimate > 0);
+        try std.testing.expect(block.hash > 0);
+        try std.testing.expect(std.mem.indexOf(u8, block.name, "private memory payload") == null);
+        try std.testing.expect(std.mem.indexOf(u8, block.name, "user text") == null);
+
+        if (std.mem.eql(u8, block.name, "safety")) {
+            saw_safety = true;
+            try std.testing.expectEqualStrings("stable:tier1", block.bucket);
+        } else if (std.mem.eql(u8, block.name, "xml_tool_protocol")) {
+            saw_xml_protocol = true;
+            try std.testing.expectEqualStrings("stable:xml_tools", block.bucket);
+        } else if (std.mem.eql(u8, block.name, "xml_tool_catalog")) {
+            saw_xml_catalog = true;
+            try std.testing.expectEqualStrings("stable:xml_tools", block.bucket);
+        } else if (std.mem.eql(u8, block.name, "current_datetime")) {
+            saw_datetime = true;
+            try std.testing.expectEqualStrings("volatile:turn", block.bucket);
+        } else if (std.mem.eql(u8, block.name, "memory_for_turn")) {
+            saw_memory = true;
+            try std.testing.expectEqualStrings("volatile:memory", block.bucket);
+        } else if (std.mem.eql(u8, block.name, "native_tool_schemas")) {
+            saw_native_tools = true;
+            try std.testing.expectEqualStrings("provider_tools", block.bucket);
+        }
+    }
+
+    try std.testing.expect(saw_safety);
+    try std.testing.expect(saw_xml_protocol);
+    try std.testing.expect(saw_xml_catalog);
+    try std.testing.expect(saw_datetime);
+    try std.testing.expect(saw_memory);
+    try std.testing.expect(saw_native_tools);
 }
 
 test "buildPromptRefreshPlan refreshes missing system prompt" {

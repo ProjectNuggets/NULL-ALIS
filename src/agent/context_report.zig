@@ -281,6 +281,18 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
         report.prompt_shape.provider_request_body_bytes_estimated,
         report.prompt_shape.full_request_hash,
     });
+    if (report.prompt_shape.prompt_block_count > 0) {
+        try w.writeAll("  prompt_blocks:\n");
+        for (report.prompt_shape.prompt_blocks[0..report.prompt_shape.prompt_block_count]) |block| {
+            try std.fmt.format(w, "    {s}: bucket={s} bytes={d} tokens~={d} hash={d}\n", .{
+                block.name,
+                block.bucket,
+                block.bytes,
+                block.token_estimate,
+                block.hash,
+            });
+        }
+    }
     try w.writeAll("  buckets:\n");
     try std.fmt.format(w, "    stable_prefix: entries={d} bytes={d} tokens~={d} cache={s}\n", .{
         report.buckets.stable_prefix.entries,
@@ -454,6 +466,7 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
                 .history_tail_hash = report.prompt_shape.history_tail_hash,
                 .full_request_hash = report.prompt_shape.full_request_hash,
             },
+            .prompt_blocks = report.prompt_shape.prompt_blocks[0..report.prompt_shape.prompt_block_count],
         },
         .last_turn_delta = .{
             .bytes = report.last_turn_delta.bytes,
@@ -900,6 +913,7 @@ test "context report formatters expose structured details" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"assistant_reasoning_bytes\":25") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"provider_request_body_bytes_estimated\":540") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"full_request_hash\":444") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"prompt_blocks\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "private reasoning") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "user asks") == null);
 }
