@@ -126,6 +126,13 @@ pub const run_trace_store = @import("run_trace_store.zig");
 pub const heartbeat = @import("heartbeat.zig");
 pub const runtime = @import("runtime.zig");
 
+/// Plan 4 Task 1 — mockable HTTP client for the browser orchestrator.
+/// Wires Nullalis agent tools to the browser-orchestrator Go service via
+/// an injectable Transport so unit tests run without a live orchestrator.
+pub const browser_backend = struct {
+    pub const client = @import("browser_backend/client.zig");
+};
+
 // Phase 4b: MCP (Model Context Protocol)
 pub const mcp = @import("mcp.zig");
 /// Sprint 2 — nullalis AS an MCP server: exposes the tool registry over
