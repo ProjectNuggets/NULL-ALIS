@@ -1,0 +1,27 @@
+# Production kustomization for the browser backend.
+#
+# Lists ONLY the prod resources, in dependency order (namespace first so the
+# PodSecurity labels exist before workloads land; RBAC + quota + netpols before
+# the Deployment).
+#
+# Intentionally EXCLUDED:
+#   - worker-pod.yaml             Plan-1 dev fixture; in prod the orchestrator
+#                                 spawns worker pods dynamically.
+#   - orchestrator-secret.example.yaml
+#                                 Examples only. Real Secrets (browser-state-master,
+#                                 browser-orchestrator-auth, docr-creds) are created
+#                                 out-of-band — never committed. See agent-browser-deploy.md.
+#   - runtimeclass-gvisor.yaml    Cluster-scoped; apply only where the node pool's
+#                                 containerd has the runsc handler. Applied separately.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: browser
+
+resources:
+  - namespace.yaml
+  - resourcequota.yaml
+  - orchestrator-rbac.yaml
+  - networkpolicy.yaml
+  - orchestrator-networkpolicy.yaml
+  - orchestrator-deployment.yaml

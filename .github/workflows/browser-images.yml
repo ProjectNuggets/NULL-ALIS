@@ -1,0 +1,65 @@
+# Build & push the browser backend images to DigitalOcean Container Registry (DOCR).
+#
+# REQUIRED repo configuration:
+#   secrets.DOCR_TOKEN   — DigitalOcean API/registry token (used as both the
+#                          docker username AND password for registry login).
+#   vars.DOCR_REGISTRY   — full registry path, e.g. registry.digitalocean.com/nullalis
+#
+# Pushes two images tagged with the commit SHA:
+#   ${DOCR_REGISTRY}/browser-orchestrator:${github.sha}
+#   ${DOCR_REGISTRY}/browser-worker:${github.sha}
+# Wire these into deploy/k8s/browser/orchestrator-deployment.yaml
+# (image + BROWSER_WORKER_IMAGE) by replacing REPLACE_REGISTRY / REPLACE_TAG.
+name: browser-images
+
+on:
+  push:
+    paths:
+      - "services/browser-orchestrator/**"
+      - "deploy/k8s/browser/Dockerfile.worker"
+  workflow_dispatch:
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # NOTE: pin actions to a digest (@sha256:...) in prod; majors below for readability.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DOCR
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: ${{ secrets.DOCR_TOKEN }}
+          password: ${{ secrets.DOCR_TOKEN }}
+
+      # Orchestrator: Dockerfile uses `COPY . .`, so context is the service dir.
+      - name: Build & push orchestrator
+        id: orchestrator
+        uses: docker/build-push-action@v6
+        with:
+          context: services/browser-orchestrator
+          file: services/browser-orchestrator/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ vars.DOCR_REGISTRY }}/browser-orchestrator:${{ github.sha }}
+
+      # Worker: Dockerfile performs no COPY (system chromium + npm install), so
+      # the build context is irrelevant; deploy/k8s/browser is the dir holding it.
+      - name: Build & push worker
+        id: worker
+        uses: docker/build-push-action@v6
+        with:
+          context: deploy/k8s/browser
+          file: deploy/k8s/browser/Dockerfile.worker
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ vars.DOCR_REGISTRY }}/browser-worker:${{ github.sha }}
+
+      - name: Report pushed digests
+        run: |
+          echo "orchestrator: ${{ vars.DOCR_REGISTRY }}/browser-orchestrator:${{ github.sha }}@${{ steps.orchestrator.outputs.digest }}"
+          echo "worker:       ${{ vars.DOCR_REGISTRY }}/browser-worker:${{ github.sha }}@${{ steps.worker.outputs.digest }}"

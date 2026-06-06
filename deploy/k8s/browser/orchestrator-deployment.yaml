@@ -16,6 +16,14 @@ spec:
         app: browser-orchestrator
     spec:
       serviceAccountName: browser-orchestrator
+      # Pull the orchestrator (and worker) images from DigitalOcean Container
+      # Registry. Create the secret out-of-band (see orchestrator-secret.example.yaml
+      # / agent-browser-deploy.md):
+      #   kubectl -n browser create secret docker-registry docr-creds \
+      #     --docker-server=registry.digitalocean.com \
+      #     --docker-username=<token> --docker-password=<token>
+      imagePullSecrets:
+        - name: docr-creds
       securityContext:
         runAsNonRoot: true
         runAsUser: 10002
@@ -23,20 +31,53 @@ spec:
           type: RuntimeDefault
       containers:
         - name: orchestrator
-          image: browser-orchestrator:dev
+          # DOCR image — replace REPLACE_REGISTRY (e.g. nullalis) and REPLACE_TAG
+          # (e.g. the git SHA pushed by .github/workflows/browser-images.yml).
+          image: registry.digitalocean.com/REPLACE_REGISTRY/browser-orchestrator:REPLACE_TAG
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
           env:
             - name: BROWSER_NAMESPACE
               value: browser
+            # Worker image the orchestrator spawns. Same DOCR registry/tag scheme.
             - name: BROWSER_WORKER_IMAGE
-              value: browser-worker:dev
+              value: registry.digitalocean.com/REPLACE_REGISTRY/browser-worker:REPLACE_TAG
             - name: AGENT_BROWSER_STATE_MASTER_KEY
               valueFrom:
                 secretKeyRef:
                   name: browser-state-master
                   key: master-key
+            # Bearer token for the orchestrator HTTP API. If this Secret/env is
+            # unset the orchestrator disables auth and logs a WARN — the
+            # NetworkPolicy ingress gate is then the only access control.
+            - name: BROWSER_ORCHESTRATOR_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: browser-orchestrator-auth
+                  key: token
+            # ---------------------------------------------------------------
+            # optional — uncomment for a file-based master key (takes precedence
+            # over AGENT_BROWSER_STATE_MASTER_KEY). Requires the mounted secret
+            # volume below to be uncommented too.
+            # - name: AGENT_BROWSER_STATE_MASTER_KEY_FILE
+            #   value: /etc/browser/master-key/master-key
+            # ---------------------------------------------------------------
+            # optional — uncomment to have the orchestrator attach an
+            # imagePullSecret to the worker pods it spawns (DOCR private repo).
+            # - name: BROWSER_WORKER_IMAGE_PULL_SECRET
+            #   value: docr-creds
+            # ---------------------------------------------------------------
+            # optional — uncomment for stronger worker isolation via gVisor.
+            # Requires runtimeclass-gvisor.yaml applied AND a node pool whose
+            # containerd has the runsc handler configured.
+            # - name: BROWSER_WORKER_RUNTIME_CLASS
+            #   value: gvisor
+            # ---------------------------------------------------------------
+            # optional — uncomment to pin worker pods to a dedicated node pool
+            # (key=value). Pair with a node taint for hard isolation.
+            # - name: BROWSER_WORKER_NODE_SELECTOR
+            #   value: nullalis.dev/pool=browser
           resources:
             requests:
               cpu: "100m"
@@ -53,6 +94,22 @@ spec:
             httpGet:
               path: /healthz
               port: 8080
+          # ---------------------------------------------------------------
+          # optional — uncomment together with AGENT_BROWSER_STATE_MASTER_KEY_FILE
+          # above to mount the master key from a Secret as a file.
+          # volumeMounts:
+          #   - name: master-key
+          #     mountPath: /etc/browser/master-key
+          #     readOnly: true
+      # ---------------------------------------------------------------
+      # optional — uncomment together with the volumeMount above.
+      # volumes:
+      #   - name: master-key
+      #     secret:
+      #       secretName: browser-state-master
+      #       items:
+      #         - key: master-key
+      #           path: master-key
 ---
 apiVersion: v1
 kind: Service
