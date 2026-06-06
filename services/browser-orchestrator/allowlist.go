@@ -9,15 +9,17 @@ var navigationVerbs = map[string]bool{
 	"open": true, "goto": true, "navigate": true, "reload": true,
 }
 
-// navigationURL returns (url, true) if args contains a navigation verb followed
-// by a token that looks like a URL. The verb is the first non-flag token
-// (a token that does not start with '-').
-func navigationURL(args []string) (string, bool) {
+// navigationTarget returns the URL/host argument of a navigation verb, walking
+// flags exactly like ExecAllowed so a flag between the verb and the target can't
+// hide it. ok=false when the args are not a navigation command.
+//
+// The target is returned UNCONDITIONALLY (no ://-prefix requirement): scheme-less
+// args like "localhost:8080" must reach URLAllowed, which fails closed on them.
+func navigationTarget(args []string) (string, bool) {
 	i := 0
 	for i < len(args) {
 		a := args[i]
-		if strings.HasPrefix(a, "-") {
-			// Skip flag; consume value if it is a value-taking flag.
+		if len(a) > 0 && a[0] == '-' {
 			if eq := strings.IndexByte(a, '='); eq >= 0 {
 				i++
 				continue
@@ -26,21 +28,32 @@ func navigationURL(args []string) (string, bool) {
 				i += 2
 				continue
 			}
-			i++
+			i++ // boolFlags or unknown (ExecAllowed already vetted)
 			continue
 		}
-		// First non-flag token is the verb.
+		// a is the verb
 		if !navigationVerbs[a] {
 			return "", false
 		}
-		// Look for the next token as the URL argument.
-		if i+1 < len(args) {
-			next := args[i+1]
-			if strings.Contains(next, "://") || strings.HasPrefix(next, "http") {
-				return next, true
+		// next non-flag token is the target
+		j := i + 1
+		for j < len(args) {
+			t := args[j]
+			if len(t) > 0 && t[0] == '-' {
+				if eq := strings.IndexByte(t, '='); eq >= 0 {
+					j++
+					continue
+				}
+				if valueFlags[t] {
+					j += 2
+					continue
+				}
+				j++
+				continue
 			}
+			return t, true
 		}
-		return "", false
+		return "", false // verb with no target
 	}
 	return "", false
 }

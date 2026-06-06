@@ -66,6 +66,17 @@ func TestURLGuard(t *testing.T) {
 		// Decimal / hex-encoded IPv4
 		{"http://0x7f000001/", false, "hex-encoded 127.0.0.1"},
 		{"http://2130706433/", false, "decimal-encoded 127.0.0.1"},
+
+		// Non-canonical (inet_aton-style) dotted octal/hex/short-form IPv4
+		{"http://127.1/", false, "short-form 127.1 → 127.0.0.1"},
+		{"http://0x7f.0.0.1/", false, "hex octet 0x7f.0.0.1"},
+		{"http://0x7f.1/", false, "hex short-form 0x7f.1"},
+		{"http://127.000.000.001/", false, "octal-padded 127.000.000.001"},
+		{"http://0x0.0x0.0x0.0x0/", false, "all-hex zero → 0.0.0.0"},
+		{"http://0177.0.0.1/", false, "octal first octet 0177 → 127.0.0.1"},
+		{"http://example.com@127.1/", false, "userinfo @ short-form loopback"},
+		{"http://face.com/", true, "public hostname face.com"},
+		{"http://1.2.3.4/", true, "public IPv4 1.2.3.4"},
 	}
 	for _, c := range cases {
 		t.Run(c.note, func(t *testing.T) {

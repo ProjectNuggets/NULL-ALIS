@@ -55,6 +55,28 @@ func TestHandleExecBlocksSSRFNavigation(t *testing.T) {
 	}
 }
 
+func TestHandleExecBlocksSSRFEdge(t *testing.T) {
+	srv := NewServer(stubProvider{}, nil, nil)
+	for _, tc := range []struct {
+		args string
+		want int
+	}{
+		{`["goto","--json","http://127.1/"]`, 403}, // flag between verb + url + legacy-encoded loopback
+		{`["open","localhost:8080"]`, 403},          // scheme-less localhost
+		{`["open","169.254.169.254"]`, 403},         // scheme-less metadata
+		{`["goto","--full-page","https://example.com"]`, 200},
+		{`["click","@e1"]`, 200},
+	} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/sessions/s1/exec", strings.NewReader(`{"args":`+tc.args+`}`))
+		req.SetPathValue("id", "s1")
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != tc.want {
+			t.Errorf("args=%s status=%d want=%d body=%s", tc.args, rec.Code, tc.want, rec.Body.String())
+		}
+	}
+}
+
 func TestNewSessionEndpoint(t *testing.T) {
 	srv := NewServer(stubProvider{createID: "abc123"}, nil, nil)
 	rec := httptest.NewRecorder()

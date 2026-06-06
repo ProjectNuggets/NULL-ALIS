@@ -77,9 +77,66 @@ func URLAllowed(raw string) bool {
 		return false
 	}
 
+	// Catch non-canonical (inet_aton-style) IPv4: dotted octal/hex/short forms
+	// like 127.1, 0x7f.0.0.1, 127.000.000.001 that getaddrinfo/Chrome resolve to
+	// loopback/0.0.0.0 but netip.ParseAddr rejects. A real DNS hostname (e.g.
+	// example.com) makes parseLegacyIPv4 return ok=false → falls through to the
+	// public-hostname allow.
+	if a, ok := parseLegacyIPv4(host); ok {
+		return !isBlockedIP(a)
+	}
+
 	// Normal public hostname — allowed. DNS rebinding is out of scope;
 	// the pod NetworkPolicy is the enforced backstop.
 	return true
+}
+
+// parseLegacyIPv4 mirrors getaddrinfo/inet_aton: 1-4 dot-separated parts, each
+// decimal / octal(0 prefix) / hex(0x prefix); short forms fill the low octets.
+// Returns ok=false when the host is NOT a fully-numeric form (→ treat as a DNS
+// hostname). This catches 127.1, 0x7f.0.0.1, 127.000.000.001, etc.
+func parseLegacyIPv4(host string) (netip.Addr, bool) {
+	parts := strings.Split(host, ".")
+	if len(parts) == 0 || len(parts) > 4 {
+		return netip.Addr{}, false
+	}
+	nums := make([]uint64, 0, 4)
+	for _, p := range parts {
+		if p == "" {
+			return netip.Addr{}, false
+		}
+		n, err := strconv.ParseUint(p, 0, 64) // base 0: 0x→hex, 0→octal, else decimal
+		if err != nil {
+			return netip.Addr{}, false
+		}
+		nums = append(nums, n)
+	}
+	var v uint64
+	switch len(nums) {
+	case 1:
+		v = nums[0]
+	case 2:
+		if nums[0] > 0xff || nums[1] > 0xffffff {
+			return netip.Addr{}, false
+		}
+		v = nums[0]<<24 | nums[1]
+	case 3:
+		if nums[0] > 0xff || nums[1] > 0xff || nums[2] > 0xffff {
+			return netip.Addr{}, false
+		}
+		v = nums[0]<<24 | nums[1]<<16 | nums[2]
+	case 4:
+		for _, n := range nums {
+			if n > 0xff {
+				return netip.Addr{}, false
+			}
+		}
+		v = nums[0]<<24 | nums[1]<<16 | nums[2]<<8 | nums[3]
+	}
+	if v > 0xffffffff {
+		return netip.Addr{}, false
+	}
+	return netip.AddrFrom4([4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}), true
 }
 
 // isBlockedAlias returns true for hostname aliases known to resolve to
