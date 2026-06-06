@@ -175,7 +175,12 @@ but that "S-tier in 2026" demands:
   bolted-on proxy and dual auth.
 
 ## Implementation pointers
+- **Stable foundation contracts** (Transport, ToolRegistry, PolicyPlane,
+  CredentialResolver, SessionStore, Telemetry, EdgeAuthContract, ServerCatalogView)
+  — defined in **Spec A rev 5 §4**; additive-only once Phase 3 lands. Everything
+  downstream depends on these.
 - Client + foundation (registry, policy plane, per-user creds, native transports,
-  native outbound OAuth client): **Spec A rev 3**.
-- Server face (edge inbound auth, aggregator/mesh/curated exposure, shared
-  session store): **Spec B rev 3**.
+  native outbound OAuth client, conformance harness, tracing, tool-poisoning
+  defense): **Spec A rev 5**.
+- Server face (edge inbound auth, aggregator/curated exposure, **A2A first-class**,
+  shared session store): **Spec B rev 4**, consuming Spec A §4 contracts.

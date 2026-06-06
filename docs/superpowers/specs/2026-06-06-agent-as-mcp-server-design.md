@@ -88,24 +88,25 @@ mapping); hermes's `mcp serve` and openclaw's channel-bridge are single-owner. T
 multi-tenant inbound layer is ours to design — but on top of a working native
 server, not a blank page.
 
-## 3. Dependency contract — what Spec B needs from Spec A's core
+## 3. Dependency contract — the stable foundation contracts B consumes
 
-- **The shared tool registry + single policy plane** (Spec A §3.1). The server
-  face exposes a *policy-filtered view* of the registry; aggregator/curated/mesh
-  all fall out of this. No second protocol stack.
-- **Native Streamable HTTP/SSE transport** (Spec A Phase 2) — reused server-side
-  (`StreamableHTTPServerTransport` equivalent in Zig: GET stream, POST, `DELETE`,
-  SSE). This is why Phase 2 completes the native transport once, for both faces.
-- **Edge-auth integration contract:** how the validated principal is injected
-  (header/mTLS/JWT claims) and mapped to `user_id` → `TenantRuntime`, with **no
-  principal-collapse mode** (Spec A §7 anti-pattern).
-- **A shared/sticky session store** (NOT in-process; Postgres/`zaki_state`-backed)
-  — required from day one because nullalis runs multi-replica (Helm/K8s);
-  `<user_id>:<session_id>` binding lives here.
-- **Trust + session model:** non-deterministic IDs, per-user binding, "never
-  authenticate via session", per-request re-check on the inbound path.
-- **SSRF/egress posture + untrusted-input provenance** conventions, reused for
-  inbound capability exposure and (for aggregator) re-exposed upstream tools.
+Spec B is built **entirely** on the named **foundation contracts** in Spec A §4
+(stable, additive-only once Phase 3 lands). B adds the inbound layer *in front of*
+them; it introduces **no second protocol stack**.
+
+| Spec A contract (§4) | How Spec B uses it |
+|---|---|
+| **ToolRegistry** | exposes a per-principal *policy-filtered view* — agent-as-tool, aggregator, curated, A2A all fall out of one registry; provenance + fingerprinting carry through to re-exposed tools |
+| **PolicyPlane** | the same `decide(principal,tool)` + `visibleTools(principal)` governs inbound callers; deny-by-default; **no principal-collapse mode** |
+| **Transport** | reuse the native Streamable HTTP/SSE built in Spec A P2 in the **server** direction (GET stream, POST, `DELETE`, SSE) — built once, both faces |
+| **SessionStore** | inbound `<user_id>:<session_id>` binding; shared/sticky (Postgres) for K8s multi-replica; never used for auth |
+| **EdgeAuthContract** | the principal-injection + invariants (advertised resource URI == validated-token audience == canonical hub URI; strip client identity headers) are **defined in Spec A P1** and enforced here |
+| **Telemetry** | OTel GenAI spans for inbound tool/Task calls |
+| **ServerCatalogView** | the derived policy-filtered catalog the server face serves |
+
+Plus the conventions: trust + session model (non-deterministic ids, per-request
+re-check), SSRF/egress posture, untrusted-input provenance, tool-poisoning
+defense (for re-exposed upstream tools in the aggregator).
 
 ## 4. Scope sketch (to be expanded)
 
