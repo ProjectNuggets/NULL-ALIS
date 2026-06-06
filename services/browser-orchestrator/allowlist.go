@@ -2,6 +2,49 @@ package main
 
 import "strings"
 
+// navigationVerbs are agent-browser subcommands that accept a URL as their
+// first positional argument. The URL guard runs only on these verbs so
+// non-navigation commands (snapshot, click, …) are unaffected.
+var navigationVerbs = map[string]bool{
+	"open": true, "goto": true, "navigate": true, "reload": true,
+}
+
+// navigationURL returns (url, true) if args contains a navigation verb followed
+// by a token that looks like a URL. The verb is the first non-flag token
+// (a token that does not start with '-').
+func navigationURL(args []string) (string, bool) {
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		if strings.HasPrefix(a, "-") {
+			// Skip flag; consume value if it is a value-taking flag.
+			if eq := strings.IndexByte(a, '='); eq >= 0 {
+				i++
+				continue
+			}
+			if valueFlags[a] {
+				i += 2
+				continue
+			}
+			i++
+			continue
+		}
+		// First non-flag token is the verb.
+		if !navigationVerbs[a] {
+			return "", false
+		}
+		// Look for the next token as the URL argument.
+		if i+1 < len(args) {
+			next := args[i+1]
+			if strings.Contains(next, "://") || strings.HasPrefix(next, "http") {
+				return next, true
+			}
+		}
+		return "", false
+	}
+	return "", false
+}
+
 // allowedSubcommands: deny-by-default agent-browser verbs the exec endpoint may run (spec §8.6).
 var allowedSubcommands = map[string]bool{
 	"open": true, "goto": true, "navigate": true, "back": true, "forward": true, "reload": true,

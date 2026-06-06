@@ -34,6 +34,27 @@ func (s stubProvider) Exec(_ context.Context, _ string, _ []string) (ExecResult,
 }
 func (s stubProvider) DestroySession(context.Context, string) error { return nil }
 
+func TestHandleExecBlocksSSRFNavigation(t *testing.T) {
+	srv := NewServer(stubProvider{}, nil, nil)
+	for _, tc := range []struct {
+		args string
+		want int
+	}{
+		{`["open","http://169.254.169.254/"]`, 403},
+		{`["open","https://example.com"]`, 200},
+		{`["snapshot"]`, 200},
+	} {
+		rec := httptest.NewRecorder()
+		body := `{"args":` + tc.args + `}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/sessions/s1/exec", strings.NewReader(body))
+		req.SetPathValue("id", "s1")
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != tc.want {
+			t.Errorf("args=%s status=%d want=%d body=%s", tc.args, rec.Code, tc.want, rec.Body.String())
+		}
+	}
+}
+
 func TestNewSessionEndpoint(t *testing.T) {
 	srv := NewServer(stubProvider{createID: "abc123"}, nil, nil)
 	rec := httptest.NewRecorder()

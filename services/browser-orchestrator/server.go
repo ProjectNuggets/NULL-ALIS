@@ -104,6 +104,11 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "command not allowed"})
 		return
 	}
+	if url, nav := navigationURL(req.Args); nav && !URLAllowed(url) {
+		metricExec.WithLabelValues("denied").Inc()
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "url blocked by SSRF guard"})
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 	res, err := s.provider.Exec(ctx, id, req.Args)
