@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
+	executil "k8s.io/client-go/util/exec"
 )
 
 func ptr[T any](v T) *T { return &v }
@@ -54,7 +56,10 @@ func (p *K8sProvider) CreateSession(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("create pod: %w", err)
 	}
 	if err := p.waitReady(ctx, podName); err != nil {
-		_ = p.client.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{})
+		// cleanup must not inherit a cancelled/expired ctx, else the pod orphans.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		_ = p.client.CoreV1().Pods(p.namespace).Delete(cleanupCtx, podName, metav1.DeleteOptions{})
 		return "", fmt.Errorf("pod not ready: %w", err)
 	}
 	p.reg.Add(id, podName)
@@ -162,8 +167,15 @@ func (p *K8sProvider) Exec(ctx context.Context, sessionID string, args []string)
 	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{Stdout: &stdout, Stderr: &stderr})
 	res := ExecResult{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err != nil {
-		res.ExitCode = 1
-		return res, fmt.Errorf("exec: %w (stderr: %s)", err, stderr.String())
+		var codeErr executil.CodeExitError
+		if errors.As(err, &codeErr) {
+			// agent-browser ran but exited non-zero: a successful exec with a real code.
+			res.ExitCode = codeErr.Code
+			return res, nil
+		}
+		// genuine transport/timeout failure: couldn't run the command.
+		res.ExitCode = -1
+		return res, fmt.Errorf("exec transport: %w (stderr: %s)", err, stderr.String())
 	}
 	return res, nil
 }

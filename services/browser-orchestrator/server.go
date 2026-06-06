@@ -59,6 +59,7 @@ type execRequest struct {
 }
 
 func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10) // 64 KiB cap on exec args
 	id := r.PathValue("id")
 	var req execRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Args) == 0 {
