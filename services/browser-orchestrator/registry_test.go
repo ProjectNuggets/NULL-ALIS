@@ -4,7 +4,12 @@ import "testing"
 
 func TestRegistryAddGetRemove(t *testing.T) {
 	r := NewRegistry()
-	r.Add("sess-1", "browser-worker-sess-1")
+	if isNew := r.Add("sess-1", "browser-worker-sess-1"); !isNew {
+		t.Fatal("Add(sess-1) should return true for a new key")
+	}
+	if isNew := r.Add("sess-1", "browser-worker-sess-1"); isNew {
+		t.Fatal("Add(sess-1) should return false when re-adding the same key")
+	}
 	if got, ok := r.Pod("sess-1"); !ok || got != "browser-worker-sess-1" {
 		t.Fatalf("Pod(sess-1) = %q,%v; want pod,true", got, ok)
 	}

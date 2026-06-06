@@ -83,6 +83,11 @@ func (p *K8sProvider) persistState(ctx context.Context, sessionID, podName strin
 		}
 		return
 	}
+	if meta.userID == "" {
+		log.Printf("persist: empty userID for session %s (missing user annotation?) — not persisting", sessionID)
+		metricPersistFailures.Inc()
+		return
+	}
 	if err := p.store.Put(ctx, meta.userID, meta.authProfile, vault); err != nil {
 		log.Printf("persist state: put failed for %s: %v", sessionID, err)
 	}

@@ -12,10 +12,14 @@ func NewRegistry() *Registry {
 	return &Registry{pods: make(map[string]string)}
 }
 
-func (r *Registry) Add(sessionID, podName string) {
+// Add inserts/overwrites the session→pod mapping; returns true iff the key was
+// not already present (so removal-tied side effects like a gauge Inc happen once).
+func (r *Registry) Add(sessionID, podName string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	_, existed := r.pods[sessionID]
 	r.pods[sessionID] = podName
+	return !existed
 }
 
 func (r *Registry) Pod(sessionID string) (string, bool) {

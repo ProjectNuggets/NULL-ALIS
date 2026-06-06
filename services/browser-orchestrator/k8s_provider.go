@@ -342,15 +342,17 @@ func (p *K8sProvider) Reconcile(ctx context.Context) error {
 		if sid == "" {
 			continue
 		}
-		p.reg.Add(sid, pod.Name)
+		isNew := p.reg.Add(sid, pod.Name)
 		p.mu.Lock()
 		p.meta[sid] = sessionMeta{
 			userID:      pod.Annotations["nullalis.dev/user"],
 			authProfile: pod.Annotations["nullalis.dev/auth-profile"],
 		}
 		p.mu.Unlock()
-		metricSessionsActive.Inc()
-		n++
+		if isNew {
+			metricSessionsActive.Inc()
+			n++
+		}
 	}
 	log.Printf("reconcile: re-adopted %d worker pod(s)", n)
 	return nil
