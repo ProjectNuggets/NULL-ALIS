@@ -32,6 +32,11 @@ spec:
               value: browser
             - name: BROWSER_WORKER_IMAGE
               value: browser-worker:dev
+            - name: AGENT_BROWSER_STATE_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: browser-state-master
+                  key: master-key
           resources:
             requests:
               cpu: "100m"

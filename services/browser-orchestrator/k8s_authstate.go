@@ -42,16 +42,28 @@ func (p *K8sProvider) execRaw(ctx context.Context, podName string, argv []string
 // pod at /home/browser/state.json.enc using a binary-safe base64 transfer.
 func (p *K8sProvider) injectState(ctx context.Context, podName string, vault []byte) error {
 	b64 := base64.StdEncoding.EncodeToString(vault)
-	_, err := p.execRaw(ctx, podName, []string{"sh", "-c", "base64 -d > /home/browser/state.json.enc"}, []byte(b64))
-	return err
+	// A4: verify the decoded byte count matches the expected length so a truncated/
+	// corrupt write is detected and (via CreateSession's fail-closed inject) aborts.
+	cmd := fmt.Sprintf("base64 -d > /home/browser/state.json.enc && [ \"$(wc -c < /home/browser/state.json.enc)\" -eq %d ]", len(vault))
+	if _, err := p.execRaw(ctx, podName, []string{"sh", "-c", cmd}, []byte(b64)); err != nil {
+		return fmt.Errorf("inject state (write/verify): %w", err)
+	}
+	return nil
 }
 
 // persistState saves the live agent-browser vault back to the (user,profile) slot.
 // Best-effort: errors are logged, never propagated, so close always succeeds.
 func (p *K8sProvider) persistState(ctx context.Context, sessionID, podName string, meta sessionMeta) {
 	// agent-browser encrypts to /home/browser/state.json.enc because the key env is set.
-	if _, err := p.Exec(ctx, sessionID, []string{"state", "save", "/home/browser/state.json"}); err != nil {
-		log.Printf("persist state: save failed for %s: %v", sessionID, err)
+	// A3: Exec returns a non-zero process exit as (res, nil); guard on res.ExitCode
+	// so we never read/Put a stale vault after a failed save.
+	res, err := p.Exec(ctx, sessionID, []string{"state", "save", "/home/browser/state.json"})
+	if err != nil {
+		log.Printf("persist: state save transport error for session %s: %v", sessionID, err)
+		return
+	}
+	if res.ExitCode != 0 {
+		log.Printf("persist: state save exited %d for session %s (stderr: %s) — not persisting", res.ExitCode, sessionID, res.Stderr)
 		return
 	}
 	b64, err := p.execRaw(ctx, podName, []string{"sh", "-c", "base64 /home/browser/state.json.enc 2>/dev/null || true"}, nil)

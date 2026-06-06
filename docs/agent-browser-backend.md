@@ -27,6 +27,21 @@
   control pod not selected by the policy reached the API ClusterIP, confirming
   the block is the NetworkPolicy).
 
+## Master key
+- The orchestrator encrypts every user auth-state vault under the master key
+  read from `AGENT_BROWSER_STATE_MASTER_KEY`, which is wired from the
+  `browser-state-master` Secret (`deploy/k8s/browser/orchestrator-secret.example.yaml`
+  is a template — never commit a real key). Create the real Secret out-of-band:
+  ```
+  kubectl -n browser create secret generic browser-state-master \
+    --from-literal=master-key="$(openssl rand -hex 32)"
+  ```
+- The key must be >=32 bytes of CSPRNG entropy. Rotating it re-keys all user
+  vaults (they must be re-established). Keep the Secret tightly RBAC'd.
+- The orchestrator **fails closed** without it: if the Secret/env var is absent,
+  it will not start (or will refuse to persist/inject state), so auth-state is
+  never written or read unencrypted.
+
 ## Local dev loop
 - One-command bring-up: `./scripts/browser-worker-setup.sh` (builds the image,
   creates the k3d cluster `browser-dev`, imports the image, applies all manifests,
