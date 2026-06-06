@@ -97,6 +97,19 @@ dotted notation. Both sanitizers decode and re-classify:
 - Hex: `http://0x7f000001/` → 127.0.0.1 (blocked)
 - Bare `0`: `http://0/` → 0.0.0.0 (blocked)
 
+Dotted `inet_aton(3)`-style forms — octal, hex, and short (1–3 part)
+host fields — are likewise decoded the way the OS resolver
+(`getaddrinfo`/`inet_aton`) does, then re-classified by both sanitizers.
+A host that is not fully numeric (e.g. `example.com`, `face.com`) stays a
+hostname.
+
+- Short form: `http://127.1/` → 127.0.0.1 (blocked)
+- Hex octet: `http://0x7f.0.0.1/` → 127.0.0.1 (blocked)
+- Hex + short: `http://0x7f.1/` → 127.0.0.1 (blocked)
+- Octal-looking zero octets: `http://127.000.000.001/` → 127.0.0.1 (blocked)
+- Octal first octet: `http://0177.0.0.1/` → 127.0.0.1 (blocked)
+- All-hex: `http://0x0.0x0.0x0.0x0/` → 0.0.0.0 (blocked)
+
 ### 14. Host aliases
 
 DNS names known to resolve to blocked ranges:

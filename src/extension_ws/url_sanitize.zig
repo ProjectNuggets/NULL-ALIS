@@ -235,6 +235,24 @@ pub fn sanitize(url: []const u8, allowlist: []const []const u8) SanitizeResult {
         return classifyIPv4(v4);
     }
 
+    // Legacy / inet_aton-style dotted IPv4: octal, hex, and short
+    // (1–3 part) forms that `parseIPv4Dotted` rejects but the OS
+    // resolver still decodes — e.g. `127.1`, `0x7f.0.0.1`, `0177.0.0.1`,
+    // `127.000.000.001`, `0x0.0x0.0x0.0x0`. Classify against the same
+    // blocked-range logic so the extension lane (no NetworkPolicy
+    // backstop) can't be steered to loopback/RFC1918/metadata. A host
+    // that is NOT fully numeric (e.g. `example.com`, `face.com`) returns
+    // null here and falls through to the hostname path below.
+    if (parseLegacyIPv4(normalized_host)) |packed_v4| {
+        const v4: [4]u8 = .{
+            @intCast((packed_v4 >> 24) & 0xFF),
+            @intCast((packed_v4 >> 16) & 0xFF),
+            @intCast((packed_v4 >> 8) & 0xFF),
+            @intCast(packed_v4 & 0xFF),
+        };
+        return classifyIPv4(v4);
+    }
+
     // Otherwise: a normal DNS hostname. We don't resolve it ourselves
     // (that would be a network call from the validator); a malicious
     // hostname that DNS-resolves to a private IP would still be
@@ -425,6 +443,81 @@ fn parseIPv4Dotted(s: []const u8) ![4]u8 {
     }
     if (idx != 4) return error.InvalidIPv4;
     return octets;
+}
+
+/// Parse a host as a legacy / `inet_aton`-style IPv4 address, mirroring
+/// the OS resolver. The dotted forms `parseIPv4Dotted` rejects (octal,
+/// hex, short 1–3 part forms) are still decoded by `inet_aton(3)` /
+/// `getaddrinfo` and resolve to the corresponding address, so an
+/// attacker can reach loopback/RFC1918 via `127.1`, `0x7f.0.0.1`,
+/// `0177.0.0.1`, `127.000.000.001`, etc. We replicate the `inet_aton`
+/// grammar here so those forms hit `classifyIPv4`.
+///
+/// Grammar (per `inet_aton(3)`):
+///   * 1–4 dot-separated parts.
+///   * Each part is decimal, octal (leading `0`, len>1), or hex (`0x`).
+///   * Octet-width fill: 1 part → a 32-bit value; 2 parts → `a.(24-bit)`;
+///     3 parts → `a.b.(16-bit)`; 4 parts → `a.b.c.d`, each ≤255.
+///
+/// Returns the packed big-endian u32, or `null` if the host is NOT a
+/// fully numeric IPv4 (any part fails to parse / overflows) — in which
+/// case the caller treats it as a DNS hostname. Example: `face.com`
+/// returns null because `com` isn't a number; `example.com` likewise.
+fn parseLegacyIPv4(host: []const u8) ?u32 {
+    if (host.len == 0) return null;
+    // Reject a trailing dot — `parseIp4`-style hosts don't carry one at
+    // this layer (the caller already stripped a single trailing dot),
+    // but a leading/empty part (`.1`, `1..2`) is not a valid numeric IP.
+    var parts: [4]u64 = undefined;
+    var n_parts: usize = 0;
+    var it = std.mem.splitScalar(u8, host, '.');
+    while (it.next()) |part| {
+        if (n_parts >= 4) return null; // >4 parts: not numeric IPv4
+        if (part.len == 0) return null; // empty part (leading/trailing/double dot)
+
+        var base: u8 = 10;
+        var digits = part;
+        if (part.len >= 2 and part[0] == '0' and (part[1] == 'x' or part[1] == 'X')) {
+            base = 16;
+            digits = part[2..];
+            if (digits.len == 0) return null; // bare "0x"
+        } else if (part.len > 1 and part[0] == '0') {
+            base = 8;
+            digits = part[1..]; // strip leading 0; remaining must be octal
+        }
+
+        const value = std.fmt.parseUnsigned(u64, digits, base) catch return null;
+        parts[n_parts] = value;
+        n_parts += 1;
+    }
+    if (n_parts == 0) return null;
+
+    // Apply inet_aton octet-width fill rules.
+    var addr: u64 = undefined;
+    switch (n_parts) {
+        1 => {
+            // a — 32-bit value.
+            addr = parts[0];
+            if (addr > 0xFFFF_FFFF) return null;
+        },
+        2 => {
+            // a.b — a is octet 0, b fills the low 24 bits.
+            if (parts[0] > 0xFF or parts[1] > 0xFF_FFFF) return null;
+            addr = (parts[0] << 24) | parts[1];
+        },
+        3 => {
+            // a.b.c — a, b are octets; c fills the low 16 bits.
+            if (parts[0] > 0xFF or parts[1] > 0xFF or parts[2] > 0xFFFF) return null;
+            addr = (parts[0] << 24) | (parts[1] << 16) | parts[2];
+        },
+        4 => {
+            // a.b.c.d — each octet ≤255.
+            if (parts[0] > 0xFF or parts[1] > 0xFF or parts[2] > 0xFF or parts[3] > 0xFF) return null;
+            addr = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+        },
+        else => return null,
+    }
+    return @intCast(addr & 0xFFFF_FFFF);
 }
 
 /// Parse an IPv6 literal (the inner bytes between `[` and `]`, with
@@ -656,6 +749,49 @@ test "hex-encoded: 0xC0A80001 → 192.168.0.1 is rejected" {
 
 test "hex-encoded: 0x7F000001 → 127.0.0.1 is rejected" {
     try expectReject(sanitize("http://0x7F000001/", &.{}), .loopback_blocked);
+}
+
+// ── Legacy / inet_aton dotted IPv4 (SSRF parity) ─────────────────────
+// These dotted non-canonical forms decode via the OS resolver to
+// loopback / unspecified but bypassed the old `parseIPv4Dotted`
+// (which required 4 all-decimal octets) — now decoded + blocked.
+
+test "legacy IPv4: 127.1 (short form) → 127.0.0.1 is rejected" {
+    try expectReject(sanitize("http://127.1/", &.{}), .loopback_blocked);
+}
+
+test "legacy IPv4: 0x7f.0.0.1 (hex first octet) → 127.0.0.1 is rejected" {
+    try expectReject(sanitize("http://0x7f.0.0.1/", &.{}), .loopback_blocked);
+}
+
+test "legacy IPv4: 0x7f.1 (hex + short) → 127.0.0.1 is rejected" {
+    try expectReject(sanitize("http://0x7f.1/", &.{}), .loopback_blocked);
+}
+
+test "legacy IPv4: 127.000.000.001 (octal-looking zero octets) → 127.0.0.1 is rejected" {
+    try expectReject(sanitize("http://127.000.000.001/", &.{}), .loopback_blocked);
+}
+
+test "legacy IPv4: 0177.0.0.1 (octal first octet) → 127.0.0.1 is rejected" {
+    try expectReject(sanitize("http://0177.0.0.1/", &.{}), .loopback_blocked);
+}
+
+test "legacy IPv4: 0x0.0x0.0x0.0x0 → 0.0.0.0 is rejected" {
+    try expectReject(sanitize("http://0x0.0x0.0x0.0x0/", &.{}), .unspecified_address_blocked);
+}
+
+test "legacy IPv4: example.com is NOT numeric — stays a hostname (ok)" {
+    // `com` isn't a number → parseLegacyIPv4 returns null → hostname path.
+    try expectOk(sanitize("http://example.com/", &.{}));
+}
+
+test "legacy IPv4: face.com (all-hex-digit label) is NOT numeric — stays a hostname (ok)" {
+    // `face` parses as hex but `com` does not → not a numeric IPv4.
+    try expectOk(sanitize("http://face.com/", &.{}));
+}
+
+test "legacy IPv4: public 1.2.3.4 parses but is public — allowed" {
+    try expectOk(sanitize("http://1.2.3.4/", &.{}));
 }
 
 test "allowlist: localhost in allowlist is accepted" {
