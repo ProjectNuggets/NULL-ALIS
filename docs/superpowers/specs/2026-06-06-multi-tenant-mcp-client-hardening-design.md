@@ -8,7 +8,8 @@ date: 2026-06-06
 
 **Author:** brainstorming session (Mohammad + Claude)
 **Date:** 2026-06-06
-**Status:** Draft (rev 3 — **drops the Node/TS sidecar**; adopts the native-Zig
+**Status:** Draft (**rev 4** — adds S-tier hardening + reference-agent reuse §12
+after the pressure test; rev 3 dropped the Node/TS sidecar for the native-Zig
 unified-core + edge-auth architecture per
 `2026-06-06-adr-nullalis-mcp-hub-architecture.md`). Pending user review, then
 `writing-plans`.
@@ -282,9 +283,12 @@ transport/OAuth; 8 reuses the K8s harness.
 - **P3:** `credref.zig` (pure) + `credential.zig` resolver + `static` provider;
   new `McpServerConfig` fields; per-call `RequestAuth`; fail-closed; passthrough
   WARN; the **unified tool registry** + status enum.
-- **P4:** native outbound OAuth client (PKCE/discovery/refresh/RFC 8707); per-user
-  browser consent (localhost callback) for the requesting user; tokens persisted
-  to the vault; cred re-binding to server-URL; SSRF defenses on discovery fetches.
+- **P4:** native outbound OAuth client — **evolve the existing `src/auth.zig`**
+  (PKCE/RFC 7636 + device flow/RFC 8628 + credential store already implemented;
+  add discovery/refresh/RFC 8707 + per-server token scoping). Per-user browser
+  consent (localhost callback); tokens persisted to the vault (replace `auth.zig`'s
+  single-user `~/.nullalis/auth.json` with the per-user encrypted vault); cred
+  re-binding to server-URL; SSRF defenses on discovery fetches.
 - **P5:** in-process transport for a curated bundled-server set (claude-code
   `client.ts:909-943` pattern); not exposed to `tenant.mcp_byo`.
 - **P6:** per-user registry storage + merge; `tenant.mcp_byo` policy; registration
@@ -398,3 +402,67 @@ pitfall `index.ts:119`); claude-code `src/services/mcp/client.ts:909-943`
 anti-example). **No official Zig SDK** (<https://modelcontextprotocol.io/docs/sdk>);
 `mcp.zig` reference only. Architecture: see ADR
 `2026-06-06-adr-nullalis-mcp-hub-architecture.md`.
+
+## 12. S-tier hardening & reference-agent reuse (rev 4)
+
+A pressure test against best-practice gateways (IBM ContextForge, Cloudflare MCP
+Portals, Solo.io Virtual MCP) and reference agents (**hermes**, **openclaw**)
+graded the architecture: **4 of 6 core choices VALIDATED, edge-auth VALIDATED with
+conditions, native-no-SDK DEFENSIBLE** (and de-risked because the native server +
+PKCE already exist). To make the *spec* (not just the architecture) S-tier, the
+client face adds:
+
+### 12.1 Hardening (client-face items; see ADR pillars 7–11)
+- **Tool-poisoning / rug-pull defense** (new phase, alongside P3/P6): on discovery,
+  **fingerprint each server + pin tool definitions + detect changes**; treat tool
+  descriptions/results as untrusted; **scan descriptions for injection** and run an
+  **OSV/malware check before any (per-pod, P8) stdio spawn**. Over 30% of surveyed
+  MCP servers had exploitable vulns — this is not optional for BYO.
+- **OpenTelemetry GenAI tracing** (cross-cutting): emit a span per MCP tool call,
+  nested in the model-call trace (latency/error/throughput). Table stakes 2026.
+- **Conformance harness** (cross-cutting, justifies no-SDK): pin + negotiate
+  protocol versions; test Streamable-HTTP resumability (`Last-Event-Id`) + session
+  teardown against the official MCP inspector.
+- **Dynamic, permission-scoped tool filtering**: the registry returns only the
+  caller-allowed tool slice — fixes context bloat (the open question in §10) *and*
+  is a security control. Mitigates the many-BYO-servers tool-count problem.
+- **Edge-trust invariant** (client relevance): the outbound resolver **never
+  forwards an inbound token** upstream — always mints a separate per-user upstream
+  credential from the vault (confused-deputy defense; already core to §3.2).
+
+### 12.2 Concrete reuse (verified, lifts cleanly)
+- **From hermes** (`.codex-tmp/hermes-agent/tools/mcp_tool.py`, `mcp_oauth.py`):
+  MCP tool-description **injection scanning** (`_scan_mcp_description`), **OSV
+  pre-spawn malware check**, **credential redaction in errors** (`_sanitize_error`),
+  stdio **env-var allowlisting**, governed **sampling** (rate/model/loop caps),
+  and a mature PKCE OAuth client → feeds 12.1 + P4.
+- **From openclaw** (`src/agents/pi-bundle-mcp-*.ts`): **config-fingerprint catalog
+  cache + in-flight dedup**, **per-upstream failure isolation** during catalog
+  build (one bad server never kills the catalog), **tool-name namespacing +
+  collision-suffixing + provider-safe sanitization + stable sort**, and the
+  `SessionMcpRuntimeManager` lifecycle discipline (study before building P8 pods).
+  Note openclaw's gaps to *avoid*: no `list_changed` handling (we do both
+  fingerprint-cache **and** honor upstream `list_changed`, §3.5); no outbound MCP
+  OAuth (P4 is our differentiator); module-global cross-tenant state.
+
+### 12.3 Prior-art reconciliation (verified in the working repo)
+- The native MCP **server** already exists (`src/mcp_server.zig`,
+  `src/mcp/server_{auth,handlers,policy,protocol}.zig`) — Spec B **extends** it, not
+  greenfield. Its **deny-by-default exposure policy** (`server_policy.zig`: 7 safe
+  + 4 memory tools, `NULLALIS_MCP_EXPOSE_ALL`) is the proven base for curated
+  export + scoped filtering.
+- **OAuth/PKCE/device flow + store** exist (`src/auth.zig`) → P4 evolves them
+  (per-server scoping + per-user vault), not from scratch.
+
+### 12.4 A2A note (client side)
+A2A is promoted to a first-class peer protocol (ADR rev 2); the **server** side
+(Agent Cards + Task lifecycle + federation) is **Spec B**. The **client** face may
+*consume* A2A agents as delegation targets — this spec reserves the resolver +
+registry seams for that; the mesh loop guards (`max_hops`/`max_depth` + cycle
+detection) live with the A2A surface in Spec B.
+
+### 12.5 Updated confidence
+Architecture: **high** (consensus-validated + half already built). Spec-as-S-tier:
+**medium-high** once 12.1 lands — the additions are hardening, not redesign. Phase 2
+(Streamable-HTTP server-stream + conformance) and the A2A surface (Spec B) remain
+the largest net-new work.
