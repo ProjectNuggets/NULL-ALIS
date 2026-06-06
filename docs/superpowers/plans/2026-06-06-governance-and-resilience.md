@@ -333,4 +333,11 @@ git commit -m "feat(orchestrator): vault delete (B2) + secrets RBAC + reconcile/
 - B2 closed: `StateStore.Delete` + `DELETE /v1/state` + secrets `delete` RBAC; e2e deletes a vault.
 - All unit tests + the three integration e2e pass; go.mod pins held.
 
+**Plan-4 load-bearing carry-forwards (from the Plan-3b dedicated code review):**
+- **Gateway MUST authenticate + bind `user_id`** before forwarding to `POST /v1/sessions` and `DELETE /v1/state` — these endpoints trust `user_id`/`auth_profile` from the body by design (orchestrator is first-party; the gateway is the authz boundary).
+- **HTTP server hardening:** replace `http.ListenAndServe` with an `&http.Server{}` carrying `ReadTimeout`/`WriteTimeout`/`IdleTimeout` (Slowloris/connection-exhaustion), and wire a graceful `Shutdown` + a cancellable context for the janitor goroutine (currently runs forever).
+- **Rate-limiter map is unbounded** — one `*rate.Limiter` per distinct `userID`, never evicted. Cap/LRU-evict/periodically sweep, or key on the gateway-vouched principal.
+- **PII note:** the `nullalis.dev/user` pod annotation stores the raw `userID` (the label is hashed, the annotation isn't — B4 needs the raw value to re-key on reconcile). If userIDs are PII, use an HMAC the orchestrator can reverse-map, or accept + document.
+- **Deadline-killed (Failed) pods are pruned without persisting their vault** — accepted backstop behavior (the container is gone; exec to read the vault would fail anyway); documented as expected, not a silent gap.
+
 **Next: Plan 4** — native Zig `browser_*` tools + gateway gate wiring the Nullalis agent to this orchestrator, and removing the legacy `browser`/`browser_open` tools.
