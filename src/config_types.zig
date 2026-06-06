@@ -1262,13 +1262,9 @@ pub const AgentBrowserConfig = struct {
 
 pub const BrowserConfig = struct {
     enabled: bool = false,
-    session_name: ?[]const u8 = null,
     backend: []const u8 = "agent_browser",
-    native_headless: bool = true,
-    native_webdriver_url: []const u8 = "http://127.0.0.1:9515",
-    native_chrome_path: ?[]const u8 = null,
-    computer_use: BrowserComputerUseConfig = .{},
     agent_browser: AgentBrowserConfig = .{},
+    computer_use: BrowserComputerUseConfig = .{}, // reserved for the host-computer-control lane (not browser automation)
     allowed_domains: []const []const u8 = &.{},
 };
 

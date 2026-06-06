@@ -1926,18 +1926,6 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (br.object.get("backend")) |v| {
                 if (v == .string) self.browser.backend = try self.allocator.dupe(u8, v.string);
             }
-            if (br.object.get("native_headless")) |v| {
-                if (v == .bool) self.browser.native_headless = v.bool;
-            }
-            if (br.object.get("native_webdriver_url")) |v| {
-                if (v == .string) self.browser.native_webdriver_url = try self.allocator.dupe(u8, v.string);
-            }
-            if (br.object.get("native_chrome_path")) |v| {
-                if (v == .string) self.browser.native_chrome_path = try self.allocator.dupe(u8, v.string);
-            }
-            if (br.object.get("session_name")) |v| {
-                if (v == .string) self.browser.session_name = try self.allocator.dupe(u8, v.string);
-            }
             if (br.object.get("allowed_domains")) |v| {
                 if (v == .array) self.browser.allowed_domains = try parseStringArray(self.allocator, v.array);
             }

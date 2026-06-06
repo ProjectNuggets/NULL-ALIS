@@ -1835,11 +1835,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.secrets.encrypt = false;
 
     cfg.browser.enabled = true;
-    cfg.browser.session_name = "demo";
     cfg.browser.backend = "native";
-    cfg.browser.native_headless = false;
-    cfg.browser.native_webdriver_url = "http://127.0.0.1:9515";
-    cfg.browser.native_chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
     cfg.browser.computer_use.endpoint = "http://127.0.0.1:8788/v1/actions";
     cfg.browser.computer_use.api_key = "computer-use-key";
     cfg.browser.computer_use.timeout_ms = 42_000;
@@ -2499,7 +2495,7 @@ test "json parse browser section" {
     try cfg.parseJson(json);
     try std.testing.expect(cfg.browser.enabled);
     try std.testing.expectEqualStrings("auto", cfg.browser.backend);
-    try std.testing.expect(!cfg.browser.native_headless);
+    // native_headless removed (dead field); unknown JSON keys are ignored by the parser
     allocator.free(cfg.browser.backend);
 }
 
