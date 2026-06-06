@@ -119,10 +119,20 @@ if lsof -nP -iTCP:8080 -sTCP:LISTEN >/dev/null 2>&1; then
   exit 1
 fi
 
+# Generate a bearer token and export it BEFORE launching the orchestrator so
+# the orchestrator enforces bearer auth (BROWSER_ORCHESTRATOR_AUTH_TOKEN). The
+# same value stays in the environment for the Zig `live:` test below, whose
+# OrchestratorClient reads it via std.posix.getenv and sends
+# `Authorization: Bearer <token>` + `X-Nullalis-User: e2e-user` — exercising
+# the authenticated + per-session-ownership path end to end.
+export BROWSER_ORCHESTRATOR_AUTH_TOKEN="$(openssl rand -hex 32)"
+log "generated orchestrator bearer token (BROWSER_ORCHESTRATOR_AUTH_TOKEN) — auth ENABLED"
+
 log "starting orchestrator (background)..."
 (
   cd "$REPO_ROOT/services/browser-orchestrator" \
     && AGENT_BROWSER_STATE_MASTER_KEY="$(openssl rand -hex 32)" \
+       BROWSER_ORCHESTRATOR_AUTH_TOKEN="$BROWSER_ORCHESTRATOR_AUTH_TOKEN" \
        GOTOOLCHAIN=local go run .
 ) >"$ORCH_LOG" 2>&1 &
 ORCH_PID=$!

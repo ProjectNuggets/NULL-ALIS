@@ -1258,6 +1258,10 @@ pub const BrowserComputerUseConfig = struct {
 pub const AgentBrowserConfig = struct {
     orchestrator_url: []const u8 = "http://browser-orchestrator.browser.svc.cluster.local:8080",
     timeout_ms: u64 = 60_000,
+    /// Bearer token the gateway presents to the orchestrator's auth gate.
+    /// Overridden by env `BROWSER_ORCHESTRATOR_AUTH_TOKEN` at client
+    /// construction. Null/empty sends no Authorization header.
+    auth_token: ?[]const u8 = null,
 };
 
 pub const BrowserConfig = struct {

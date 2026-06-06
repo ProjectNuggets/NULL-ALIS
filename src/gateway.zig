@@ -1969,7 +1969,7 @@ const TenantRuntime = struct {
         const agent_browser_client: ?*@import("browser_backend/client.zig").OrchestratorClient =
             if (runtime.config.browser.enabled and std.mem.eql(u8, runtime.config.browser.backend, "agent_browser")) blk: {
                 const c = allocator.create(@import("browser_backend/client.zig").OrchestratorClient) catch break :blk null;
-                c.* = .{ .base_url = runtime.config.browser.agent_browser.orchestrator_url, .timeout_ms = runtime.config.browser.agent_browser.timeout_ms };
+                c.* = .{ .base_url = runtime.config.browser.agent_browser.orchestrator_url, .timeout_ms = runtime.config.browser.agent_browser.timeout_ms, .auth_token = @import("browser_backend/client.zig").resolveAuthToken(runtime.config.browser.agent_browser.auth_token) };
                 break :blk c;
             } else null;
 
@@ -23904,7 +23904,7 @@ pub fn runWithRole(
                 const standalone_agent_browser_client: ?*@import("browser_backend/client.zig").OrchestratorClient =
                     if (cfg.browser.enabled and std.mem.eql(u8, cfg.browser.backend, "agent_browser")) blk: {
                         const c = allocator.create(@import("browser_backend/client.zig").OrchestratorClient) catch break :blk null;
-                        c.* = .{ .base_url = cfg.browser.agent_browser.orchestrator_url, .timeout_ms = cfg.browser.agent_browser.timeout_ms };
+                        c.* = .{ .base_url = cfg.browser.agent_browser.orchestrator_url, .timeout_ms = cfg.browser.agent_browser.timeout_ms, .auth_token = @import("browser_backend/client.zig").resolveAuthToken(cfg.browser.agent_browser.auth_token) };
                         break :blk c;
                     } else null;
 

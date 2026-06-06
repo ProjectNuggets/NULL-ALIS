@@ -106,11 +106,12 @@ fn collectEstimatedToolNamesFromConfig(
     // tool set advertises the browser_* family iff it would really register.
     // This is an estimation-only path (no live requests are issued), so the
     // client lives for the duration of this function alongside the tools.
-    const OrchestratorClient = @import("browser_backend/client.zig").OrchestratorClient;
+    const ab_client_mod = @import("browser_backend/client.zig");
+    const OrchestratorClient = ab_client_mod.OrchestratorClient;
     var ab_client: OrchestratorClient = undefined;
     const agent_browser_client: ?*OrchestratorClient =
         if (cfg.browser.enabled and std.mem.eql(u8, cfg.browser.backend, "agent_browser")) blk: {
-            ab_client = .{ .base_url = cfg.browser.agent_browser.orchestrator_url, .timeout_ms = cfg.browser.agent_browser.timeout_ms };
+            ab_client = .{ .base_url = cfg.browser.agent_browser.orchestrator_url, .timeout_ms = cfg.browser.agent_browser.timeout_ms, .auth_token = ab_client_mod.resolveAuthToken(cfg.browser.agent_browser.auth_token) };
             break :blk &ab_client;
         } else null;
 

@@ -167,11 +167,12 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     // agent_browser backend — construct a long-lived OrchestratorClient when
     // the backend is active (CLI single-user path; allocator outlives tools).
-    const ABClient = @import("../browser_backend/client.zig").OrchestratorClient;
+    const ab_client_mod = @import("../browser_backend/client.zig");
+    const ABClient = ab_client_mod.OrchestratorClient;
     const agent_browser_client: ?*ABClient =
         if (cfg.browser.enabled and std.mem.eql(u8, cfg.browser.backend, "agent_browser")) blk: {
             const c = allocator.create(ABClient) catch break :blk null;
-            c.* = .{ .base_url = cfg.browser.agent_browser.orchestrator_url, .timeout_ms = cfg.browser.agent_browser.timeout_ms };
+            c.* = .{ .base_url = cfg.browser.agent_browser.orchestrator_url, .timeout_ms = cfg.browser.agent_browser.timeout_ms, .auth_token = ab_client_mod.resolveAuthToken(cfg.browser.agent_browser.auth_token) };
             break :blk c;
         } else null;
 

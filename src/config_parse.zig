@@ -1944,6 +1944,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (v.object.get("timeout_ms")) |t| {
                         if (t == .integer and t.integer > 0 and t.integer <= 600_000) self.browser.agent_browser.timeout_ms = @intCast(t.integer);
                     }
+                    if (v.object.get("auth_token")) |t| {
+                        if (t == .string) self.browser.agent_browser.auth_token = try self.allocator.dupe(u8, t.string);
+                    }
                 }
             }
         }

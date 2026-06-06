@@ -2889,7 +2889,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     const cli_agent_browser_client: ?*yc.browser_backend.client.OrchestratorClient =
         if (config.browser.enabled and std.mem.eql(u8, config.browser.backend, "agent_browser")) blk: {
             const c = allocator.create(yc.browser_backend.client.OrchestratorClient) catch break :blk null;
-            c.* = .{ .base_url = config.browser.agent_browser.orchestrator_url, .timeout_ms = config.browser.agent_browser.timeout_ms };
+            c.* = .{ .base_url = config.browser.agent_browser.orchestrator_url, .timeout_ms = config.browser.agent_browser.timeout_ms, .auth_token = yc.browser_backend.client.resolveAuthToken(config.browser.agent_browser.auth_token) };
             break :blk c;
         } else null;
 
@@ -3231,7 +3231,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     const cli_agent_browser_client: ?*yc.browser_backend.client.OrchestratorClient =
         if (config.browser.enabled and std.mem.eql(u8, config.browser.backend, "agent_browser")) blk: {
             const c = allocator.create(yc.browser_backend.client.OrchestratorClient) catch break :blk null;
-            c.* = .{ .base_url = config.browser.agent_browser.orchestrator_url, .timeout_ms = config.browser.agent_browser.timeout_ms };
+            c.* = .{ .base_url = config.browser.agent_browser.orchestrator_url, .timeout_ms = config.browser.agent_browser.timeout_ms, .auth_token = yc.browser_backend.client.resolveAuthToken(config.browser.agent_browser.auth_token) };
             break :blk c;
         } else null;
 

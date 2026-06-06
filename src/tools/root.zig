@@ -2522,6 +2522,12 @@ pub fn bindBrowserSessionTools(tools: []const Tool, user_id: ?[]const u8) void {
         if (std.mem.eql(u8, t.name(), browser_new_session.BrowserNewSessionTool.tool_name)) {
             const ent: *browser_new_session.BrowserNewSessionTool = @ptrCast(@alignCast(t.ptr));
             ent.user_id = user_id;
+            // The OrchestratorClient is shared across the browser_* tool family
+            // (all hold the same *client). Set the per-user id on the client so
+            // every request carries `X-Nullalis-User: <id>`, letting the
+            // orchestrator enforce per-session ownership. `user_id` must outlive
+            // the client's usage (caller owns the string).
+            ent.client.user_id = user_id;
         }
     }
 }

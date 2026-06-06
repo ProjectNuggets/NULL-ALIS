@@ -19,11 +19,11 @@ fn validSessionId(s: []const u8) bool {
 /// Default is `curl_transport`; tests supply a stub returning canned JSON.
 pub const Transport = struct {
     ctx: *anyopaque,
-    sendFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, method: []const u8, url: []const u8, body: ?[]const u8, timeout_secs: []const u8) anyerror!Response,
+    sendFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, method: []const u8, url: []const u8, headers: []const []const u8, body: ?[]const u8, timeout_secs: []const u8) anyerror!Response,
 };
 
-fn curlSend(_: *anyopaque, allocator: std.mem.Allocator, method: []const u8, url: []const u8, body: ?[]const u8, timeout_secs: []const u8) anyerror!Response {
-    const r = try http_util.curlRequest(allocator, method, url, &.{}, body, null, timeout_secs);
+fn curlSend(_: *anyopaque, allocator: std.mem.Allocator, method: []const u8, url: []const u8, headers: []const []const u8, body: ?[]const u8, timeout_secs: []const u8) anyerror!Response {
+    const r = try http_util.curlRequest(allocator, method, url, headers, body, null, timeout_secs);
     return .{ .status_code = r.status_code, .body = r.body };
 }
 var curl_ctx: u8 = 0;
@@ -33,11 +33,44 @@ pub const OrchestratorClient = struct {
     base_url: []const u8,
     timeout_ms: u64 = 60_000,
     transport: Transport = curl_transport,
+    /// Bearer token for the orchestrator's auth gate. When non-null/non-empty,
+    /// each request carries `Authorization: Bearer <token>`.
+    auth_token: ?[]const u8 = null,
+    /// Per-user id bound at tool-bind time. When non-null/non-empty, each
+    /// request carries `X-Nullalis-User: <id>` so the orchestrator can enforce
+    /// per-session ownership.
+    user_id: ?[]const u8 = null,
 
     fn timeoutSecs(self: OrchestratorClient, buf: []u8) []const u8 {
         const ms = self.timeout_ms;
         const secs = ms / 1000 +| @as(u64, @intFromBool(ms % 1000 != 0));
         return std.fmt.bufPrint(buf, "{d}", .{secs}) catch "60";
+    }
+
+    /// Build the auth/identity header list into `out` (a 2-slot slice) and the
+    /// header strings into `arena`. Returns the populated header slice. The
+    /// returned slice and its strings remain valid until `arena` is freed.
+    /// When neither field is set, returns an empty slice (preserving the
+    /// original unauthenticated behavior).
+    fn buildHeaders(self: OrchestratorClient, allocator: std.mem.Allocator, out: *[2][]const u8) ![]const []const u8 {
+        var n: usize = 0;
+        if (self.auth_token) |tok| {
+            if (tok.len > 0) {
+                out[n] = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{tok});
+                n += 1;
+            }
+        }
+        if (self.user_id) |uid| {
+            if (uid.len > 0) {
+                out[n] = try std.fmt.allocPrint(allocator, "X-Nullalis-User: {s}", .{uid});
+                n += 1;
+            }
+        }
+        return out[0..n];
+    }
+
+    fn freeHeaders(allocator: std.mem.Allocator, headers: []const []const u8) void {
+        for (headers) |h| allocator.free(h);
     }
 
     /// POST /v1/sessions {user_id, auth_profile} -> session_id (caller frees).
@@ -52,7 +85,10 @@ pub const OrchestratorClient = struct {
         try writeJsonString(allocator, &body, auth_profile);
         try body.append(allocator, '}');
         var tbuf: [16]u8 = undefined;
-        const resp = try self.transport.sendFn(self.transport.ctx, allocator, "POST", url, body.items, self.timeoutSecs(&tbuf));
+        var hbuf: [2][]const u8 = undefined;
+        const headers = try self.buildHeaders(allocator, &hbuf);
+        defer freeHeaders(allocator, headers);
+        const resp = try self.transport.sendFn(self.transport.ctx, allocator, "POST", url, headers, body.items, self.timeoutSecs(&tbuf));
         defer allocator.free(resp.body);
         if (resp.status_code == 429) return error.OrchestratorRateLimited;
         if (resp.status_code != 200) return error.OrchestratorError;
@@ -71,7 +107,10 @@ pub const OrchestratorClient = struct {
         const body = try std.fmt.allocPrint(allocator, "{{\"args\":{s}}}", .{args_json});
         defer allocator.free(body);
         var tbuf: [16]u8 = undefined;
-        return self.transport.sendFn(self.transport.ctx, allocator, "POST", url, body, self.timeoutSecs(&tbuf));
+        var hbuf: [2][]const u8 = undefined;
+        const headers = try self.buildHeaders(allocator, &hbuf);
+        defer freeHeaders(allocator, headers);
+        return self.transport.sendFn(self.transport.ctx, allocator, "POST", url, headers, body, self.timeoutSecs(&tbuf));
     }
 
     /// GET /v1/sessions/{id}/frame -> raw Response (caller parses {frame,url,title}).
@@ -80,7 +119,10 @@ pub const OrchestratorClient = struct {
         const url = try std.fmt.allocPrint(allocator, "{s}/v1/sessions/{s}/frame", .{ self.base_url, session_id });
         defer allocator.free(url);
         var tbuf: [16]u8 = undefined;
-        return self.transport.sendFn(self.transport.ctx, allocator, "GET", url, null, self.timeoutSecs(&tbuf));
+        var hbuf: [2][]const u8 = undefined;
+        const headers = try self.buildHeaders(allocator, &hbuf);
+        defer freeHeaders(allocator, headers);
+        return self.transport.sendFn(self.transport.ctx, allocator, "GET", url, headers, null, self.timeoutSecs(&tbuf));
     }
 
     /// DELETE /v1/sessions/{id}.
@@ -89,7 +131,10 @@ pub const OrchestratorClient = struct {
         const url = try std.fmt.allocPrint(allocator, "{s}/v1/sessions/{s}", .{ self.base_url, session_id });
         defer allocator.free(url);
         var tbuf: [16]u8 = undefined;
-        const resp = try self.transport.sendFn(self.transport.ctx, allocator, "DELETE", url, null, self.timeoutSecs(&tbuf));
+        var hbuf: [2][]const u8 = undefined;
+        const headers = try self.buildHeaders(allocator, &hbuf);
+        defer freeHeaders(allocator, headers);
+        const resp = try self.transport.sendFn(self.transport.ctx, allocator, "DELETE", url, headers, null, self.timeoutSecs(&tbuf));
         allocator.free(resp.body);
         if (resp.status_code != 200) return error.OrchestratorError;
     }
@@ -97,16 +142,48 @@ pub const OrchestratorClient = struct {
 
 const writeJsonString = @import("../tools/json_escape.zig").writeJsonString;
 
+/// Resolve the orchestrator bearer token: env `BROWSER_ORCHESTRATOR_AUTH_TOKEN`
+/// overrides the config value when set (and non-empty). The returned slice
+/// either points into the process environment (static for the process lifetime)
+/// or into the config (owned by the config allocator) — both outlive the
+/// client, so no copy is made.
+pub fn resolveAuthToken(config_token: ?[]const u8) ?[]const u8 {
+    if (std.posix.getenv("BROWSER_ORCHESTRATOR_AUTH_TOKEN")) |env_tok| {
+        if (env_tok.len > 0) return env_tok;
+    }
+    return config_token;
+}
+
 /// Exported test transport so tool unit tests (in other files) can inject canned responses.
 pub const TestTransportPub = struct {
     body: []const u8,
     status: u16 = 200,
-    fn send(ctx: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8, _: ?[]const u8, _: []const u8) anyerror!Response {
+    /// Records the headers received on the last `send` call so tests can assert
+    /// that the client sent the expected auth/identity headers. Each entry is a
+    /// copy owned by `header_arena`; freed in `deinit`.
+    recorded_headers: [2][]const u8 = .{ "", "" },
+    recorded_header_count: usize = 0,
+    header_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+
+    fn send(ctx: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: []const u8, headers: []const []const u8, _: ?[]const u8, _: []const u8) anyerror!Response {
         const self: *TestTransportPub = @ptrCast(@alignCast(ctx));
+        const a = self.header_arena.allocator();
+        self.recorded_header_count = @min(headers.len, self.recorded_headers.len);
+        for (headers[0..self.recorded_header_count], 0..) |h, i| {
+            self.recorded_headers[i] = try a.dupe(u8, h);
+        }
         return .{ .status_code = self.status, .body = try allocator.dupe(u8, self.body) };
     }
     pub fn transport(self: *TestTransportPub) Transport {
         return .{ .ctx = self, .sendFn = TestTransportPub.send };
+    }
+    /// Returns the recorded headers received on the last send (slice into the
+    /// internal fixed buffer; valid until the next send or deinit).
+    pub fn lastHeaders(self: *TestTransportPub) []const []const u8 {
+        return self.recorded_headers[0..self.recorded_header_count];
+    }
+    pub fn deinit(self: *TestTransportPub) void {
+        self.header_arena.deinit();
     }
 };
 
@@ -154,10 +231,62 @@ test "getFrame rejects an injected session id" {
     try std.testing.expectError(error.InvalidSessionId, c.getFrame(std.testing.allocator, "../../admin"));
 }
 
+test "client sends Authorization bearer and X-Nullalis-User headers when set" {
+    var tt = TestTransportPub{ .body = "{\"frame\":\"AAAA\"}" };
+    defer tt.deinit();
+    const c = OrchestratorClient{
+        .base_url = "http://x",
+        .transport = tt.transport(),
+        .auth_token = "t",
+        .user_id = "alice",
+    };
+    const resp = try c.getFrame(std.testing.allocator, "s1");
+    defer std.testing.allocator.free(resp.body);
+    const hdrs = tt.lastHeaders();
+    try std.testing.expectEqual(@as(usize, 2), hdrs.len);
+    try std.testing.expectEqualStrings("Authorization: Bearer t", hdrs[0]);
+    try std.testing.expectEqualStrings("X-Nullalis-User: alice", hdrs[1]);
+}
+
+test "client sends no auth/identity headers when both fields are null" {
+    var tt = TestTransportPub{ .body = "{\"frame\":\"AAAA\"}" };
+    defer tt.deinit();
+    const c = OrchestratorClient{ .base_url = "http://x", .transport = tt.transport() };
+    const resp = try c.getFrame(std.testing.allocator, "s1");
+    defer std.testing.allocator.free(resp.body);
+    try std.testing.expectEqual(@as(usize, 0), tt.lastHeaders().len);
+}
+
+test "client omits empty-string auth_token but still sends user_id" {
+    var tt = TestTransportPub{ .body = "{\"frame\":\"AAAA\"}" };
+    defer tt.deinit();
+    const c = OrchestratorClient{
+        .base_url = "http://x",
+        .transport = tt.transport(),
+        .auth_token = "",
+        .user_id = "bob",
+    };
+    const resp = try c.getFrame(std.testing.allocator, "s1");
+    defer std.testing.allocator.free(resp.body);
+    const hdrs = tt.lastHeaders();
+    try std.testing.expectEqual(@as(usize, 1), hdrs.len);
+    try std.testing.expectEqualStrings("X-Nullalis-User: bob", hdrs[0]);
+}
+
 test "live: client drives new_session -> navigate -> snapshot(@eN) -> close" {
     const allocator = std.testing.allocator;
     _ = std.posix.getenv("NULLALIS_BROWSER_LIVE_TEST") orelse return error.SkipZigTest;
-    const c = OrchestratorClient{ .base_url = "http://localhost:8080", .timeout_ms = 120_000 };
+    // The orchestrator enforces bearer auth + per-session ownership. Read the
+    // token the e2e harness exported and present a user id so the authenticated
+    // path is exercised. When unset, auth_token stays null (orchestrator with no
+    // token enforcement still works).
+    const live_token = std.posix.getenv("BROWSER_ORCHESTRATOR_AUTH_TOKEN");
+    const c = OrchestratorClient{
+        .base_url = "http://localhost:8080",
+        .timeout_ms = 120_000,
+        .auth_token = live_token,
+        .user_id = "e2e-user",
+    };
 
     const sid = try c.newSession(allocator, "e2e-user", "");
     defer allocator.free(sid);

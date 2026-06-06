@@ -374,11 +374,12 @@ pub const ChannelRuntime = struct {
         // agent_browser backend — construct a long-lived OrchestratorClient
         // when the backend is active. Same allocator as the tool slice, which
         // the channel runtime owns for its lifetime.
-        const ABClient = @import("browser_backend/client.zig").OrchestratorClient;
+        const ab_client_mod = @import("browser_backend/client.zig");
+        const ABClient = ab_client_mod.OrchestratorClient;
         const agent_browser_client: ?*ABClient =
             if (config.browser.enabled and std.mem.eql(u8, config.browser.backend, "agent_browser")) blk: {
                 const c = allocator.create(ABClient) catch break :blk null;
-                c.* = .{ .base_url = config.browser.agent_browser.orchestrator_url, .timeout_ms = config.browser.agent_browser.timeout_ms };
+                c.* = .{ .base_url = config.browser.agent_browser.orchestrator_url, .timeout_ms = config.browser.agent_browser.timeout_ms, .auth_token = ab_client_mod.resolveAuthToken(config.browser.agent_browser.auth_token) };
                 break :blk c;
             } else null;
 
