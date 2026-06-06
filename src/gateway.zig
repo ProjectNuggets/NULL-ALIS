@@ -13657,20 +13657,30 @@ fn handleSessionAction(
 ) RouteResponse {
     // Parse: {session_key} or {session_key}/{action}
     // Session keys use colons not slashes, so last slash separates key from action.
-    var session_key: []const u8 = rest;
+    var session_key_raw: []const u8 = rest;
     var action: ?[]const u8 = null;
     if (std.mem.lastIndexOfScalar(u8, rest, '/')) |slash| {
         const tail = rest[slash + 1 ..];
         // Only treat as action if it's a known action keyword
         if (isSessionAction(tail)) {
-            session_key = rest[0..slash];
+            session_key_raw = rest[0..slash];
             action = tail;
         }
     }
 
-    if (session_key.len == 0) {
+    if (session_key_raw.len == 0) {
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing session_key\"}" };
     }
+
+    const session_identity = @import("session/identity.zig");
+    if (session_key_raw.len > session_identity.SessionIdentity.MAX_KEY_LEN * 3) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"session_key too long\"}" };
+    }
+    const session_key_owned = percentDecodePathSegment(allocator, session_key_raw) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_session_key\"}" };
+    };
+    defer allocator.free(session_key_owned);
+    const session_key: []const u8 = session_key_owned;
 
     // Input validation: cap length and reject control characters (CR/LF/null)
     // to match chat stream path validation and prevent log injection.
@@ -13678,13 +13688,12 @@ fn handleSessionAction(
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"session_key too long\"}" };
     }
     for (session_key) |c| {
-        if (c < 0x20 or c == 0x7f) {
-            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid session_key\"}" };
+        if (c < 0x20 or c == 0x7f or c == '/') {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_session_key\"}" };
         }
     }
 
     // Ownership check: session must belong to this user
-    const session_identity = @import("session/identity.zig");
     if (!session_identity.isOwnedBy(session_key, user_id)) {
         return .{ .status = "403 Forbidden", .body = "{\"error\":\"session_not_owned\"}" };
     }
@@ -31311,6 +31320,63 @@ test "handleSessionAction context reports structured unavailable when no session
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"code\":\"session_manager_unavailable\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"active\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"live\":false") != null);
+}
+
+test "handleSessionAction decodes encoded session key before context ownership check" {
+    const resp = handleSessionAction(
+        std.testing.allocator,
+        "GET",
+        "7",
+        "agent%3Azaki-bot%3Auser%3A7%3Athread%3Ano-manager/context",
+        null,
+        "",
+        null,
+    );
+    try std.testing.expectEqualStrings("404 Not Found", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"code\":\"session_manager_unavailable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "session_not_owned") == null);
+}
+
+test "handleSessionAction keeps ownership check after encoded session key decode" {
+    const resp = handleSessionAction(
+        std.testing.allocator,
+        "GET",
+        "7",
+        "agent%3Azaki-bot%3Auser%3A8%3Athread%3Across-user/context",
+        null,
+        "",
+        null,
+    );
+    try std.testing.expectEqualStrings("403 Forbidden", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "session_not_owned") != null);
+}
+
+test "handleSessionAction rejects malformed encoded session key" {
+    const resp = handleSessionAction(
+        std.testing.allocator,
+        "GET",
+        "7",
+        "agent%3Azaki-bot%3Auser%3A7%3Athread%3Abad%ZZ/context",
+        null,
+        "",
+        null,
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid_session_key") != null);
+}
+
+test "handleSessionAction rejects decoded slash in session key" {
+    const resp = handleSessionAction(
+        std.testing.allocator,
+        "GET",
+        "7",
+        "agent%3Azaki-bot%3Auser%3A7%3Athread%3Abad%2Fkey/context",
+        null,
+        "",
+        null,
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid_session_key") != null);
 }
 
 test "handleUserDiagnosticsContext reports structured no active session" {

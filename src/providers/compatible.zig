@@ -707,7 +707,7 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
-        const timeout_ms = tokenEstimateTimeoutMs(request.timeout_secs);
+        const timeout_ms = chatRequestTimeoutMs(request);
         const response = if (auth) |a| blk: {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "{s}: {s}", .{ a.name, a.value }) catch return error.CompatibleApiError;
@@ -792,7 +792,7 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
-        const timeout_ms = requestTimeoutMs(request.timeout_secs);
+        const timeout_ms = tokenPreflightTimeoutMs(request);
         const response = if (auth) |a| blk: {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "{s}: {s}", .{ a.name, a.value }) catch return error.CompatibleApiError;
@@ -1525,6 +1525,18 @@ test "compatible tokenEstimateTimeoutMs is bounded for optional preflight" {
     try std.testing.expectEqual(@as(u32, 2_000), tokenEstimateTimeoutMs(2));
 }
 
+test "compatible chat and token preflight timeout policies stay distinct" {
+    const default_req = ChatRequest{ .messages = &.{} };
+    const explicit_req = ChatRequest{ .messages = &.{}, .timeout_secs = 120 };
+    const short_req = ChatRequest{ .messages = &.{}, .timeout_secs = 2 };
+
+    try std.testing.expectEqual(@as(u32, 300_000), chatRequestTimeoutMs(default_req));
+    try std.testing.expectEqual(@as(u32, 120_000), chatRequestTimeoutMs(explicit_req));
+    try std.testing.expectEqual(@as(u32, 10_000), tokenPreflightTimeoutMs(default_req));
+    try std.testing.expectEqual(@as(u32, 10_000), tokenPreflightTimeoutMs(explicit_req));
+    try std.testing.expectEqual(@as(u32, 2_000), tokenPreflightTimeoutMs(short_req));
+}
+
 test "vtable has stream_chat not null" {
     var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer);
     const prov = p.provider();
@@ -1861,6 +1873,14 @@ pub fn requestTimeoutMs(timeout_secs: u64) u32 {
 pub fn tokenEstimateTimeoutMs(timeout_secs: u64) u32 {
     const requested_ms = requestTimeoutMs(timeout_secs);
     return @min(requested_ms, 10_000);
+}
+
+fn chatRequestTimeoutMs(request: ChatRequest) u32 {
+    return requestTimeoutMs(request.timeout_secs);
+}
+
+fn tokenPreflightTimeoutMs(request: ChatRequest) u32 {
+    return tokenEstimateTimeoutMs(request.timeout_secs);
 }
 
 test "mapRequestError preserves timeout" {
