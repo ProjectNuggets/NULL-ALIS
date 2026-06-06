@@ -23,11 +23,11 @@ server.
 
 ## Install (developer mode)
 
-1. `cd .spike/nullalis-extension`
+1. `cd clients/extension`
 2. `npm install`
 3. `npm run build` → produces `dist/`
 4. In Chrome: `chrome://extensions` → enable **Developer mode** (top right) →
-   click **Load unpacked** → select `.spike/nullalis-extension/dist`.
+   click **Load unpacked** → select `clients/extension/dist`.
 5. Pin the nullalis extension from the puzzle-piece menu so the toolbar icon
    is visible.
 6. Click the icon. Paste your gateway URL (e.g. `wss://gateway.nullalis.local/ext/ws`)

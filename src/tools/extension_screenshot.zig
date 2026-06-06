@@ -4,7 +4,7 @@
 //!
 //! Pattern mirrors `extension_navigate.zig` (see Wave 3B recipe in
 //! `docs/extension-ws-contract.md`). Runs in the background service
-//! worker per `.spike/nullalis-extension/docs/ARCHITECTURE.md`.
+//! worker per `clients/extension/docs/ARCHITECTURE.md`.
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -25,7 +25,7 @@ const log = std.log.scoped(.extension_screenshot);
 /// MED-1 (v1.14.23 review): the prior text told the agent to retry with
 /// `full_page:false`, but the extension's `cmdScreenshot` always calls
 /// `chrome.tabs.captureVisibleTab` regardless of the `full_page` arg
-/// (see `.spike/nullalis-extension/src/background.ts`). The agent would
+/// (see `clients/extension/src/background.ts`). The agent would
 /// retry, get the identical capture, and fail the same way — a §14.5
 /// honesty violation (the remediation advertised an action the code
 /// can't perform). Replaced with operator-actionable guidance until the

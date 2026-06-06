@@ -5,7 +5,7 @@
 //!
 //! Pattern mirrors `extension_navigate.zig` (see Wave 3B recipe in
 //! `docs/extension-ws-contract.md`). Runs in the content script per
-//! `.spike/nullalis-extension/docs/ARCHITECTURE.md`.
+//! `clients/extension/docs/ARCHITECTURE.md`.
 
 const std = @import("std");
 const root = @import("root.zig");

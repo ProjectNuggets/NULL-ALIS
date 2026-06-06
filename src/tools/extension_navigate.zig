@@ -7,7 +7,7 @@
 //! wait_for, scroll, list_tabs) is a mechanical copy — see
 //! `docs/extension-ws-contract.md` "Add another tool" recipe.
 //!
-//! Per `.spike/nullalis-extension/docs/ARCHITECTURE.md`, `navigate`
+//! Per `clients/extension/docs/ARCHITECTURE.md`, `navigate`
 //! runs in the extension's background service worker (chrome.tabs.*).
 //! Args: `{url: string, new_tab?: bool}`. Result on success:
 //! `{tab_id, url}`. Result on failure: `{code, message}`.

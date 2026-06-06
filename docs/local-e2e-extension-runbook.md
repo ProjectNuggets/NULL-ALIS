@@ -2,7 +2,7 @@
 
 This runbook walks through testing the **extension lane** end-to-end on a
 single machine: the gateway's extension WebSocket hub (`src/extension_ws/`)
-paired with the MV3 browser extension client (`.spike/nullalis-extension/`),
+paired with the MV3 browser extension client (`clients/extension/`),
 so an agent turn can drive **your own logged-in browser** via the ten
 `extension_*` tools.
 
@@ -86,7 +86,7 @@ is empty and every auth will be rejected).
 ## Step 2 — Build the extension and load it unpacked
 
 ```bash
-cd .spike/nullalis-extension
+cd clients/extension
 npm install        # ~120 pkgs, 0 vulnerabilities on a clean v0.1 tree
 npm run build      # tsc --noEmit && vite build -> produces dist/
 # (optional) npm test   # vitest run -> 51 tests across 6 files
@@ -101,7 +101,7 @@ Load it in Chrome:
 1. Open `chrome://extensions`.
 2. Enable **Developer mode** (top-right toggle).
 3. Click **Load unpacked** and select
-   `.spike/nullalis-extension/dist`.
+   `clients/extension/dist`.
 4. Pin the **nullalis** extension from the puzzle-piece menu so the toolbar
    icon is visible.
 
@@ -140,6 +140,36 @@ Heartbeat: the extension pings every 25s and pongs inbound pings (exempt from
 the pre-ack block so proxies don't drop the handshake window). Reconnect uses
 exponential backoff with full jitter (1s → 30s), sending a fresh auth frame
 each time.
+
+---
+
+## Step 3b — Grant per-tab consent
+
+Connecting the popup is **not** sufficient on its own: the agent cannot touch
+any tab until you explicitly enable it for that tab. This is the per-tab
+consent gate added by the recent security hardening.
+
+In the popup, under **agent access (this tab)**, click
+**"Enable agent on this tab"** for the tab you want the agent to act on. The
+popup then shows that tab as enabled (e.g. `enabled tabs: #123`) and exposes a
+**Disable** toggle to revoke it.
+
+You must do this for **each** tab the agent should be allowed to drive. Until a
+tab is consented, every `extension_*` command that targets it fails with
+`consent_required` and no action is taken on the page.
+
+Notes on the consent model:
+
+- **Not durable.** Consent is per-session only — it is wiped on disconnect,
+  on **STOP**, and is never restored across browser/extension restarts. After
+  any reconnect you must re-enable each tab.
+- **Agent-opened tabs inherit consent.** A tab the agent opens (e.g. via
+  `extension_navigate` with `new_tab`) inherits consent from the
+  already-consented active tab that served as the gesture-of-record. The agent
+  cannot self-grant consent by opening tabs from nothing — if the active tab
+  isn't consented, the command throws `consent_required` and no tab is created.
+- **Tab close revokes.** Closing a tab drops it from the consented set so a
+  future tab reusing the same id can't inherit stale consent.
 
 ---
 

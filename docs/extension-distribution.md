@@ -3,7 +3,7 @@
 How to get the nullalis browser extension onto a machine, from a single
 developer loading it unpacked through to an enterprise fleet receiving a
 signed auto-updating build. Accurate to Chrome MV3 (`minimum_chrome_version`
-116). The extension source lives in `.spike/nullalis-extension/`.
+116). The extension source lives in `clients/extension/`.
 
 This doc also records the **request-signing decision** (per-message HMAC) —
 see the last section.
@@ -13,7 +13,7 @@ see the last section.
 ## 0. Build the artifacts
 
 ```bash
-cd .spike/nullalis-extension
+cd clients/extension
 npm install
 npm run build      # tsc --noEmit && vite build → dist/
 npm test           # vitest run — 51 tests (ws_client + commands + manifest)
@@ -53,7 +53,7 @@ The day-to-day path. No signing, no hosting.
 
 1. `npm run build` (or `npm run dev` for a watch-mode `dist/` with popup HMR).
 2. Chrome → `chrome://extensions` → enable **Developer mode** (top-right).
-3. **Load unpacked** → select `.spike/nullalis-extension/dist`.
+3. **Load unpacked** → select `clients/extension/dist`.
 4. Pin the extension from the puzzle-piece menu so the toolbar icon shows.
 5. Click the icon, set the gateway URL (`wss://…/api/v1/extension/ws`) and your
    per-user extension token, Save.
@@ -231,4 +231,4 @@ one of these becomes true**:
 
 Until one of those triggers fires, request signing stays deferred and this
 section is the rationale of record. Tracked alongside the other intentional
-gaps in `.spike/nullalis-extension/docs/SECURITY.md`.
+gaps in `clients/extension/docs/SECURITY.md`.

@@ -25,7 +25,7 @@ Wave 3B landed the gateway half of the browser-extension story:
   `src/tools/root.zig` and dispatch through the hub.
 
 The contract itself is locked in
-`.spike/nullalis-extension/docs/ARCHITECTURE.md` — the client
+`clients/extension/docs/ARCHITECTURE.md` — the client
 implementation lives there; this doc covers only the gateway side.
 
 ## Add another extension_* tool — recipe

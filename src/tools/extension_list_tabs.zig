@@ -4,7 +4,7 @@
 //!
 //! Pattern mirrors `extension_navigate.zig` (see Wave 3B recipe in
 //! `docs/extension-ws-contract.md`). Runs in the background service
-//! worker per `.spike/nullalis-extension/docs/ARCHITECTURE.md`. v1
+//! worker per `clients/extension/docs/ARCHITECTURE.md`. v1
 //! returns the active tab only; cross-tab orchestration is out of
 //! scope for v1 (see ARCHITECTURE.md "Out of scope for v1").
 

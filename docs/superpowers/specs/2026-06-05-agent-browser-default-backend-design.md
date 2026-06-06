@@ -36,7 +36,7 @@ Nullalis (a self-hosted Zig AI-agent gateway, deployed on a **DigitalOcean DOKS*
 
 - `src/tools/browser.zig` — `curl` fetch (`read`, dup of `web_fetch`) + system-browser launch (`open`, a no-op on headless hosts). CDP actions were stripped at v1.14.13 ("BROWSER-HONESTY").
 - `src/tools/browser_open.zig` — allowlisted system-browser launcher.
-- `src/tools/extension_*.zig` (10 tools) + `src/extension_ws/` — drive the **user's real Chrome** over a per-user WebSocket hub. Gateway side shipped (v1.0.0); client (`.spike/nullalis-extension/`) is a v0.1 prototype.
+- `src/tools/extension_*.zig` (10 tools) + `src/extension_ws/` — drive the **user's real Chrome** over a per-user WebSocket hub. Gateway side shipped (v1.0.0); client (`clients/extension/`) is a v0.1 prototype.
 - `.spike/playwright-mcp/` — an unwired Playwright MCP prototype.
 
 So today: internet **read** access exists (`web_search`/`web_fetch`/`http_request`); **interactive, headless, autonomous** browsing does **not**.
@@ -232,7 +232,7 @@ Gate on boot when `backend=="agent_browser"` && `browser.enabled`: register the 
 **Keep:** `browser.computer_use.*` — reserved for host-computer-control; annotate, don't delete.
 **Reconcile docs:** `docs/ROADMAP.md` + `docs/STATUS.md` ("Wave 3" names Playwright MCP → repoint to agent-browser-on-K8s + extension lanes); `docs/sandbox-tool-coverage.md` (`browser` row obsolete → orchestrator trust-boundary note); add `docs/agent-browser-backend.md`.
 **SSRF single source:** one documented block-list spec + parity tests shared by the Zig extension-lane sanitizer and the orchestrator sanitizer.
-**Productionize extension:** `.spike/nullalis-extension/` → shippable (real icons; **distribution = self-hosted signed CRX via private update URL** for v1; deferred HMAC request-signing).
+**Productionize extension:** `clients/extension/` → shippable (real icons; **distribution = self-hosted signed CRX via private update URL** for v1; deferred HMAC request-signing).
 
 ## 16. Rollout / phasing
 
@@ -264,5 +264,5 @@ Gate on boot when `backend=="agent_browser"` && `browser.enabled`: register the 
 - **Modified (Zig):** `src/config_types.zig` (+`agent_browser` sub-config; remove dead fields; annotate `computer_use`), `src/config_parse.zig`, `src/gateway.zig` (register browser tools, view-feed proxy + authz, action-approval surfacing, metrics), `src/capabilities.zig`, `src/tools/root.zig` (remove `browser`/`browser_open`; register `browser_*`; add `bindBrowserSessionTools`), `src/tools/metadata.zig` (browser safety metadata).
 - **Removed:** `src/tools/browser.zig`, `src/tools/browser_open.zig`, `.spike/playwright-mcp/`.
 - **Docs updated:** `docs/ROADMAP.md`, `docs/STATUS.md`, `docs/sandbox-tool-coverage.md`.
-- **Productionized:** `.spike/nullalis-extension/`.
+- **Productionized:** `clients/extension/`.
 - **Unchanged:** `src/mcp.zig`, `src/mcp/transport.zig` (not used by this backend), `src/extension_ws/*` (hub), `browser.computer_use` config.

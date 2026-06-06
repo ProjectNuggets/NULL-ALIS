@@ -64,12 +64,12 @@
 - [ ] `zig build && zig build test` green. Commit `feat(browser): client sends bearer + X-Nullalis-User; auth_token config; authenticated e2e`.
 
 ## Task 5 — Extension hardening (Zig + TS) — Plan-7 carry-forwards
-**Files:** `src/extension_ws/**` (hub), `.spike/nullalis-extension/**` (client), `.spike/nullalis-extension/vite.config.*`
+**Files:** `src/extension_ws/**` (hub), `clients/extension/**` (client), `clients/extension/vite.config.*`
 
 - [ ] **Read first** the current extension pairing/auth handshake in `src/extension_ws/` and the client. Then add a **per-connection handshake nonce** (server issues a fresh random nonce on connect; the client echoes it in the pair message; the server rejects a stale/replayed nonce) to close the replay gap noted in the Plan-7 decision. Keep it minimal and covered by a unit test on both sides.
 - [ ] **Token rotation:** allow the hub to accept a rotated token without dropping config reload semantics (support a current+previous token window, or reload from config/env), so operators can rotate the extension token without a hard cutover. Unit-test acceptance of the new token and rejection after the window.
 - [ ] **vite sourcemap:** set `build.sourcemap=false` for the shipped extension build so source isn't shipped in the CRX/zip.
-- [ ] `zig build test -Dtest-filter=extension` green; `cd .spike/nullalis-extension && npm run build && npm test` green. Commit `feat(extension): handshake nonce (anti-replay) + token rotation window + sourcemap off`.
+- [ ] `zig build test -Dtest-filter=extension` green; `cd clients/extension && npm run build && npm test` green. Commit `feat(extension): handshake nonce (anti-replay) + token rotation window + sourcemap off`.
 
 ## Task 6 — Reconcile the backlog doc + STATUS
 **Files:** `docs/superpowers/plans/2026-06-06-hardening-deploy-backlog.md`, `docs/STATUS.md`

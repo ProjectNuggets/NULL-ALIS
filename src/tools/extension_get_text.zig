@@ -4,7 +4,7 @@
 //!
 //! Pattern mirrors `extension_navigate.zig` (see Wave 3B recipe in
 //! `docs/extension-ws-contract.md`). Runs in the content script per
-//! `.spike/nullalis-extension/docs/ARCHITECTURE.md`. Cap: 100 KB of
+//! `clients/extension/docs/ARCHITECTURE.md`. Cap: 100 KB of
 //! text per call; the extension returns `truncated:true` when capped.
 
 const std = @import("std");

@@ -10,7 +10,7 @@
 ## First-time setup
 
 ```bash
-cd .spike/nullalis-extension
+cd clients/extension
 npm install
 npm run build
 ```
@@ -20,7 +20,7 @@ Then in Chrome:
 1. Open `chrome://extensions`.
 2. Toggle **Developer mode** (top-right).
 3. Click **Load unpacked**.
-4. Pick `.spike/nullalis-extension/dist`.
+4. Pick `clients/extension/dist`.
 5. Pin the extension from the puzzle-piece menu.
 
 ## Iteration loop
