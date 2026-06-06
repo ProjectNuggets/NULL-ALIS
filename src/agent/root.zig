@@ -655,6 +655,10 @@ pub const Agent = struct {
     provider_preflight_prompt_tokens: u32 = 0,
     provider_preflight_active: bool = false,
     provider_preflight_source: []const u8 = "provider_preflight",
+    /// Sanitized shape of the last provider-bound request. Contains only
+    /// byte counts, counters, booleans, and hashes; no raw prompt/user/tool
+    /// text or reasoning content is retained.
+    last_prompt_shape: context_builder.PromptShape = .{},
     message_timeout_secs: u64 = 0,
     provider_reliability_active: bool = false,
     compaction_keep_recent: u32 = compaction.DEFAULT_COMPACTION_KEEP_RECENT,
@@ -3765,6 +3769,7 @@ pub const Agent = struct {
             var prompt_cache_key_buf: [69]u8 = undefined;
             const cache_key = self.promptCacheKey(&prompt_cache_key_buf);
             const chat_request = self.providerChatRequest(messages, effective_model, cache_key);
+            self.recordPromptShape(chat_request, assemble_result);
             self.sampleProviderPreflight(chat_request, effective_model, iteration);
             defer self.provider_preflight_active = false;
 
@@ -3833,9 +3838,11 @@ pub const Agent = struct {
                         const retry_messages = self.buildProviderMessages(arena) catch |build_err| return build_err;
                         // Rebuild re-adds video parts — re-apply video routing.
                         try self.routeVideoForModel(arena, retry_messages, effective_model, iteration);
+                        const retry_request = self.providerChatRequest(retry_messages, effective_model, cache_key);
+                        self.recordPromptShape(retry_request, assemble_result);
                         const retry_result = self.provider.streamChat(
                             self.allocator,
-                            self.providerChatRequest(retry_messages, effective_model, cache_key),
+                            retry_request,
                             effective_model,
                             self.temperature,
                             streamCallbackWithTiming,
@@ -3935,9 +3942,11 @@ pub const Agent = struct {
                         // effective_model (not self.model_name) — honor the
                         // turn's vision-fallback routing on the recovery call,
                         // matching the initial blocking call and streaming path.
+                        const recovery_request = self.providerChatRequest(recovery_msgs, effective_model, cache_key);
+                        self.recordPromptShape(recovery_request, assemble_result);
                         break :retry_blk self.provider.chat(
                             self.allocator,
-                            self.providerChatRequest(recovery_msgs, effective_model, cache_key),
+                            recovery_request,
                             effective_model,
                             self.temperature,
                         ) catch return err;
@@ -3983,9 +3992,11 @@ pub const Agent = struct {
                             try self.routeVideoForModel(arena, recovery_msgs, effective_model, iteration);
                             // effective_model (not self.model_name) — honor the
                             // turn's vision-fallback routing on the recovery call.
+                            const recovery_request = self.providerChatRequest(recovery_msgs, effective_model, cache_key);
+                            self.recordPromptShape(recovery_request, assemble_result);
                             break :retry_blk self.provider.chat(
                                 self.allocator,
-                                self.providerChatRequest(recovery_msgs, effective_model, cache_key),
+                                recovery_request,
                                 effective_model,
                                 self.temperature,
                             ) catch return retry_err;
@@ -5435,6 +5446,19 @@ pub const Agent = struct {
             .timeout_secs = self.message_timeout_secs,
             .reasoning_effort = self.reasoning_effort,
         };
+    }
+
+    fn recordPromptShape(
+        self: *Agent,
+        request: providers.ChatRequest,
+        assemble_result: context_engine.AssembleResult,
+    ) void {
+        self.last_prompt_shape = context_builder.buildPromptShapeFromProviderRequest(request, .{
+            .stable_system_prompt_bytes = assemble_result.stable_prefix_bytes,
+            .stable_system_prompt_hash = assemble_result.stable_prefix_hash,
+            .history_tail_bytes = assemble_result.tail_bytes,
+            .history_tail_hash = assemble_result.tail_hash,
+        });
     }
 
     fn clearProviderPreflightSample(self: *Agent) void {

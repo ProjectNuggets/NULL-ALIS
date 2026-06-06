@@ -613,6 +613,14 @@ and capability. Design it to feel premium, not buried:
   `provider_usage_last_turn` when available rather than claimed as exact
   preflight tokenization. Raw reasoning text is never exposed; only size/count
   telemetry is.
+- **Prompt-shape diagnostics** — context reports may include `prompt_shape`.
+  This is diagnostics-only and must not drive the meter. It contains sanitized
+  bucket sizes, counts, and hashes for the last provider-bound request:
+  stable/volatile system prompt bytes, tool schema bytes, chat history bytes by
+  role, assistant reasoning bytes, XML/tool history bytes, multimodal payload
+  estimates, prompt cache key presence/length, provider truth beside the shape,
+  and an estimated provider request body byte count. It never includes raw
+  user text, prompt text, tool output, or reasoning text.
 - **Cache semantics** — `provider_usage_last_turn.cached_prompt_tokens` and
   `cache.last_cache_hit_percent` are cost/performance telemetry. They do not
   reduce context pressure, because cached prompt tokens still occupy the

@@ -3741,6 +3741,130 @@ components:
               type: integer
             cache_hit_percent:
               type: integer
+        prompt_shape:
+          type: object
+          description: |
+            Optional sanitized diagnostics for the last provider-bound request.
+            Contains bucket sizes, counts, and hashes only; raw prompt text,
+            user text, tool output, and reasoning text are never included.
+            Diagnostics-only; clients must not use this as a pressure meter.
+          properties:
+            available:
+              type: boolean
+            method:
+              type: string
+              example: provider_request_shape_v1
+            sampled_at_ms:
+              type: integer
+              format: int64
+            provider:
+              type: object
+              properties:
+                pressure_token_source:
+                  type: string
+                  enum: [provider_last_usage, provider_preflight, local_estimate]
+                prompt_tokens:
+                  type: integer
+                  format: int64
+                cached_prompt_tokens:
+                  type: integer
+                  format: int64
+                  description: Cache telemetry only; never subtracted from pressure.
+                cache_hit_percent:
+                  type: integer
+                preflight_prompt_tokens:
+                  type: integer
+                  format: int64
+                preflight_active:
+                  type: boolean
+                model:
+                  type: string
+                context_window_tokens:
+                  type: integer
+                  format: int64
+            counts:
+              type: object
+              properties:
+                messages:
+                  type: integer
+                system_messages:
+                  type: integer
+                user_messages:
+                  type: integer
+                assistant_messages:
+                  type: integer
+                tool_messages:
+                  type: integer
+                tool_schemas:
+                  type: integer
+                multimodal_parts:
+                  type: integer
+            cache:
+              type: object
+              properties:
+                prompt_cache_key_present:
+                  type: boolean
+                prompt_cache_key_bytes:
+                  type: integer
+            buckets:
+              type: object
+              properties:
+                stable_system_prompt_bytes:
+                  type: integer
+                  format: int64
+                volatile_system_prompt_bytes:
+                  type: integer
+                  format: int64
+                system_prompt_bytes:
+                  type: integer
+                  format: int64
+                tool_schema_bytes:
+                  type: integer
+                  format: int64
+                user_message_bytes:
+                  type: integer
+                  format: int64
+                assistant_message_bytes:
+                  type: integer
+                  format: int64
+                assistant_reasoning_bytes:
+                  type: integer
+                  format: int64
+                  description: Size only; raw reasoning text is never exposed.
+                tool_message_bytes:
+                  type: integer
+                  format: int64
+                xml_tool_history_bytes:
+                  type: integer
+                  format: int64
+                multimodal_payload_estimated_bytes:
+                  type: integer
+                  format: int64
+                provider_bound_message_bytes:
+                  type: integer
+                  format: int64
+                provider_request_body_bytes_estimated:
+                  type: integer
+                  format: int64
+                  description: Estimated serialized provider request size; not tokenizer truth.
+                history_tail_bytes:
+                  type: integer
+                  format: int64
+            hashes:
+              type: object
+              properties:
+                stable_system_prompt_hash:
+                  type: integer
+                  format: int64
+                volatile_system_prompt_hash:
+                  type: integer
+                  format: int64
+                history_tail_hash:
+                  type: integer
+                  format: int64
+                full_request_hash:
+                  type: integer
+                  format: int64
         cache:
           type: object
           description: Cache telemetry only; cache does not reduce live context pressure.

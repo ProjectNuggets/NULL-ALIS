@@ -267,6 +267,20 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
         report.provider_usage_last_turn.total_tokens,
         report.provider_usage_last_turn.cache_hit_percent,
     });
+    try std.fmt.format(w, "  prompt_shape: available={s} stable_system={d} volatile_system={d} tool_schema={d} history_user={d} history_assistant={d} reasoning={d} tool={d} xml_tool_history={d} multimodal_est={d} request_body_est={d} full_hash={d}\n", .{
+        boolWord(report.prompt_shape.available),
+        report.prompt_shape.stable_system_prompt_bytes,
+        report.prompt_shape.volatile_system_prompt_bytes,
+        report.prompt_shape.tool_schema_bytes,
+        report.prompt_shape.user_message_bytes,
+        report.prompt_shape.assistant_message_bytes,
+        report.prompt_shape.assistant_reasoning_bytes,
+        report.prompt_shape.tool_message_bytes,
+        report.prompt_shape.xml_tool_history_bytes,
+        report.prompt_shape.multimodal_payload_estimated_bytes,
+        report.prompt_shape.provider_request_body_bytes_estimated,
+        report.prompt_shape.full_request_hash,
+    });
     try w.writeAll("  buckets:\n");
     try std.fmt.format(w, "    stable_prefix: entries={d} bytes={d} tokens~={d} cache={s}\n", .{
         report.buckets.stable_prefix.entries,
@@ -391,6 +405,55 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
             .total_tokens = report.provider_usage_last_turn.total_tokens,
             .cached_prompt_tokens = report.provider_usage_last_turn.cached_prompt_tokens,
             .cache_hit_percent = report.provider_usage_last_turn.cache_hit_percent,
+        },
+        .prompt_shape = .{
+            .available = report.prompt_shape.available,
+            .method = report.prompt_shape.method,
+            .sampled_at_ms = report.prompt_shape.sampled_at_ms,
+            .provider = .{
+                .pressure_token_source = report.pressure_token_source,
+                .prompt_tokens = report.provider_prompt_tokens,
+                .cached_prompt_tokens = report.provider_cached_prompt_tokens,
+                .cache_hit_percent = report.provider_usage_last_turn.cache_hit_percent,
+                .preflight_prompt_tokens = report.provider_preflight.prompt_tokens,
+                .preflight_active = report.provider_preflight.active,
+                .model = report.model_name,
+                .context_window_tokens = report.context_window_tokens,
+            },
+            .counts = .{
+                .messages = report.prompt_shape.message_count,
+                .system_messages = report.prompt_shape.system_message_count,
+                .user_messages = report.prompt_shape.user_message_count,
+                .assistant_messages = report.prompt_shape.assistant_message_count,
+                .tool_messages = report.prompt_shape.tool_message_count,
+                .tool_schemas = report.prompt_shape.tool_schema_count,
+                .multimodal_parts = report.prompt_shape.multimodal_part_count,
+            },
+            .cache = .{
+                .prompt_cache_key_present = report.prompt_shape.prompt_cache_key_present,
+                .prompt_cache_key_bytes = report.prompt_shape.prompt_cache_key_bytes,
+            },
+            .buckets = .{
+                .stable_system_prompt_bytes = report.prompt_shape.stable_system_prompt_bytes,
+                .volatile_system_prompt_bytes = report.prompt_shape.volatile_system_prompt_bytes,
+                .system_prompt_bytes = report.prompt_shape.system_prompt_bytes,
+                .tool_schema_bytes = report.prompt_shape.tool_schema_bytes,
+                .user_message_bytes = report.prompt_shape.user_message_bytes,
+                .assistant_message_bytes = report.prompt_shape.assistant_message_bytes,
+                .assistant_reasoning_bytes = report.prompt_shape.assistant_reasoning_bytes,
+                .tool_message_bytes = report.prompt_shape.tool_message_bytes,
+                .xml_tool_history_bytes = report.prompt_shape.xml_tool_history_bytes,
+                .multimodal_payload_estimated_bytes = report.prompt_shape.multimodal_payload_estimated_bytes,
+                .provider_bound_message_bytes = report.prompt_shape.provider_bound_message_bytes,
+                .provider_request_body_bytes_estimated = report.prompt_shape.provider_request_body_bytes_estimated,
+                .history_tail_bytes = report.prompt_shape.history_tail_bytes,
+            },
+            .hashes = .{
+                .stable_system_prompt_hash = report.prompt_shape.stable_system_prompt_hash,
+                .volatile_system_prompt_hash = report.prompt_shape.volatile_system_prompt_hash,
+                .history_tail_hash = report.prompt_shape.history_tail_hash,
+                .full_request_hash = report.prompt_shape.full_request_hash,
+            },
         },
         .last_turn_delta = .{
             .bytes = report.last_turn_delta.bytes,
@@ -643,6 +706,10 @@ test "context report formatters expose structured details" {
         .model_name = "openai/gpt-5.2",
         .model_provider = "openai",
         .history_messages = 7,
+        .pressure_token_source = "provider_last_usage",
+        .local_token_estimate = 300,
+        .provider_prompt_tokens = 321,
+        .provider_cached_prompt_tokens = 123,
         .token_estimate = 321,
         .context_window_tokens = 1000,
         .context_window_source = "model_capability",
@@ -681,6 +748,21 @@ test "context report formatters expose structured details" {
             .workspace_prompt_changed = true,
             .workspace_fingerprint = 77,
             .current_time_bucket_min = 5,
+        },
+        .provider_usage_last_turn = .{
+            .available = true,
+            .prompt_tokens = 321,
+            .completion_tokens = 22,
+            .reasoning_tokens = 7,
+            .total_tokens = 350,
+            .cached_prompt_tokens = 123,
+            .cache_hit_percent = 38,
+        },
+        .provider_preflight = .{
+            .available = true,
+            .active = false,
+            .prompt_tokens = 330,
+            .source = "moonshot_tokenizers_estimate",
         },
         .buckets = .{
             .stable_prefix = .{ .entries = 1, .bytes = 128, .token_estimate = 32, .active = true, .cacheability = .stable },
@@ -726,6 +808,36 @@ test "context report formatters expose structured details" {
                 .fallback_bucket_bytes = 0,
             },
         },
+        .prompt_shape = .{
+            .available = true,
+            .sampled_at_ms = 5678,
+            .message_count = 4,
+            .system_message_count = 1,
+            .user_message_count = 1,
+            .assistant_message_count = 1,
+            .tool_message_count = 1,
+            .tool_schema_count = 2,
+            .multimodal_part_count = 1,
+            .prompt_cache_key_present = true,
+            .prompt_cache_key_bytes = 69,
+            .stable_system_prompt_bytes = 120,
+            .volatile_system_prompt_bytes = 8,
+            .system_prompt_bytes = 128,
+            .tool_schema_bytes = 88,
+            .user_message_bytes = 40,
+            .assistant_message_bytes = 50,
+            .assistant_reasoning_bytes = 25,
+            .tool_message_bytes = 70,
+            .xml_tool_history_bytes = 120,
+            .multimodal_payload_estimated_bytes = 512,
+            .provider_bound_message_bytes = 305,
+            .provider_request_body_bytes_estimated = 540,
+            .history_tail_bytes = 33,
+            .stable_system_prompt_hash = 111,
+            .volatile_system_prompt_hash = 222,
+            .history_tail_hash = 333,
+            .full_request_hash = 444,
+        },
     };
 
     const summary = try formatSummary(std.testing.allocator, report);
@@ -751,6 +863,7 @@ test "context report formatters expose structured details" {
     try std.testing.expect(std.mem.indexOf(u8, detail, "compaction: auto_events=1 auto_messages~=8 force_events=1 force_messages=3") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "memory_select: summary_latest=yes anchor=no durable=1 timeline=2 search=1 fallback=0 continuity_bucket=1/12 semantic_bucket=3/18 fallback_bucket=0/0 candidates=5 global_candidates=12") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "workspace_fp=77") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "prompt_shape: available=yes stable_system=120 volatile_system=8 tool_schema=88") != null);
 
     const json = try formatJson(std.testing.allocator, report);
     defer std.testing.allocator.free(json);
@@ -780,4 +893,13 @@ test "context report formatters expose structured details" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"summary_latest_used\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"workspace_prompt_fingerprint\":77") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"semantic_bucket_entries\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"prompt_shape\":{\"available\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"pressure_token_source\":\"provider_last_usage\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"cached_prompt_tokens\":123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"prompt_cache_key_present\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"assistant_reasoning_bytes\":25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"provider_request_body_bytes_estimated\":540") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"full_request_hash\":444") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "private reasoning") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "user asks") == null);
 }

@@ -14438,7 +14438,18 @@ fn handleSessionContext(
         report.last_turn_delta.pressure_points,
     }) catch return response_build_err;
     jsonEscapeInto(w, report.last_turn.tool_mode) catch return response_build_err;
-    w.writeAll("\"},\"cache\":{\"provider\":") catch return response_build_err;
+    w.writeAll("\"},\"prompt_shape\":") catch return response_build_err;
+    if (std.mem.indexOf(u8, report_json, "\"prompt_shape\":")) |prompt_shape_key| {
+        const prompt_shape_start = prompt_shape_key + "\"prompt_shape\":".len;
+        if (std.mem.indexOfPos(u8, report_json, prompt_shape_start, ",\"last_turn_delta\":")) |prompt_shape_end| {
+            w.writeAll(report_json[prompt_shape_start..prompt_shape_end]) catch return response_build_err;
+        } else {
+            w.writeAll("null") catch return response_build_err;
+        }
+    } else {
+        w.writeAll("null") catch return response_build_err;
+    }
+    w.writeAll(",\"cache\":{\"provider\":") catch return response_build_err;
     if (report.model_provider) |provider| {
         w.writeAll("\"") catch return response_build_err;
         jsonEscapeInto(w, provider) catch return response_build_err;
@@ -32809,6 +32820,8 @@ test "handleSessionContext returns context metadata" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"token_total_reserve\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"estimator\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"provider_usage_last_turn\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"prompt_shape\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"prompt_shape\":{\"available\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"last_turn_delta\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"top_context_contributors\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"cache\"") != null);

@@ -4,6 +4,7 @@ const context_cache = @import("context_cache.zig");
 const context_estimator = @import("context_estimator.zig");
 const model_capabilities = @import("model_capabilities.zig");
 const prompt = @import("prompt.zig");
+const providers = @import("../providers/root.zig");
 
 pub const RoleCounts = struct {
     system: usize = 0,
@@ -52,6 +53,46 @@ pub const LastTurnDelta = struct {
     bytes: u64 = 0,
     token_estimate: u64 = 0,
     pressure_points: u8 = 0,
+};
+
+pub const PromptShape = struct {
+    available: bool = false,
+    method: []const u8 = "provider_request_shape_v1",
+    sampled_at_ms: i64 = 0,
+    message_count: usize = 0,
+    system_message_count: usize = 0,
+    user_message_count: usize = 0,
+    assistant_message_count: usize = 0,
+    tool_message_count: usize = 0,
+    tool_schema_count: usize = 0,
+    multimodal_part_count: usize = 0,
+    prompt_cache_key_present: bool = false,
+    prompt_cache_key_bytes: usize = 0,
+    stable_system_prompt_bytes: u64 = 0,
+    volatile_system_prompt_bytes: u64 = 0,
+    system_prompt_bytes: u64 = 0,
+    tool_schema_bytes: u64 = 0,
+    user_message_bytes: u64 = 0,
+    assistant_message_bytes: u64 = 0,
+    assistant_reasoning_bytes: u64 = 0,
+    tool_message_bytes: u64 = 0,
+    xml_tool_history_bytes: u64 = 0,
+    multimodal_payload_estimated_bytes: u64 = 0,
+    provider_bound_message_bytes: u64 = 0,
+    provider_request_body_bytes_estimated: u64 = 0,
+    history_tail_bytes: u64 = 0,
+    stable_system_prompt_hash: u64 = 0,
+    volatile_system_prompt_hash: u64 = 0,
+    history_tail_hash: u64 = 0,
+    full_request_hash: u64 = 0,
+};
+
+pub const PromptShapeCapture = struct {
+    stable_system_prompt_bytes: usize = 0,
+    stable_system_prompt_hash: u64 = 0,
+    history_tail_bytes: usize = 0,
+    history_tail_hash: u64 = 0,
+    sampled_at_ms: i64 = 0,
 };
 
 pub const Snapshot = struct {
@@ -115,6 +156,7 @@ pub const Snapshot = struct {
     top_context_contributors: [context_estimator.TOP_CONTRIBUTOR_LIMIT]context_estimator.TopContributor =
         [_]context_estimator.TopContributor{.{}} ** context_estimator.TOP_CONTRIBUTOR_LIMIT,
     last_turn: LastTurnContext = .{},
+    prompt_shape: PromptShape = .{},
 };
 
 pub const LastTurnContext = struct {
@@ -223,6 +265,222 @@ fn messageReasoningBytes(entry: anytype) usize {
     if (!@hasField(EntryType, "reasoning")) return 0;
     if (entry.reasoning) |reasoning| return reasoning.len;
     return 0;
+}
+
+fn providerMessageTextBytes(message: anytype) usize {
+    const MessageType = @TypeOf(message);
+    if (@hasField(MessageType, "content_parts")) {
+        if (message.content_parts) |parts| {
+            var total: usize = 0;
+            for (parts) |part| {
+                total += contentPartEstimatedBytes(part);
+            }
+            return total;
+        }
+    }
+    if (@hasField(MessageType, "content")) return message.content.len;
+    return 0;
+}
+
+fn contentPartEstimatedBytes(part: anytype) usize {
+    return switch (part) {
+        .text => |text| text.len,
+        .image_url => |image| image.url.len + 256,
+        .image_base64 => |image| image.data.len + image.media_type.len + 64,
+        .video_base64 => |video| video.data.len + video.media_type.len + 64,
+        .video_file_ref => |video| video.url.len + video.media_type.len + 256,
+    };
+}
+
+fn contentPartCount(message: anytype) usize {
+    const MessageType = @TypeOf(message);
+    if (!@hasField(MessageType, "content_parts")) return 0;
+    if (message.content_parts) |parts| return parts.len;
+    return 0;
+}
+
+fn reasoningBytes(message: anytype) usize {
+    const MessageType = @TypeOf(message);
+    if (@hasField(MessageType, "reasoning_content")) {
+        if (message.reasoning_content) |reasoning| return reasoning.len;
+    }
+    return 0;
+}
+
+fn toolSpecBytes(tool: anytype) usize {
+    const ToolType = @TypeOf(tool);
+    var bytes: usize = 0;
+    if (@hasField(ToolType, "name")) bytes += tool.name.len;
+    if (@hasField(ToolType, "description")) bytes += tool.description.len;
+    if (@hasField(ToolType, "parameters_json")) bytes += tool.parameters_json.len;
+    return bytes;
+}
+
+fn looksLikeXmlToolHistory(content: []const u8) bool {
+    return std.mem.indexOf(u8, content, "<tool_call") != null or
+        std.mem.indexOf(u8, content, "<tool_result") != null or
+        std.mem.indexOf(u8, content, "</tool_call") != null or
+        std.mem.indexOf(u8, content, "</tool_result") != null or
+        std.mem.indexOf(u8, content, "<tool name=") != null;
+}
+
+fn updateHashForOptional(hasher: *std.hash.Fnv1a_64, label: []const u8, value: anytype) void {
+    hasher.update(label);
+    if (value) |slice| hasher.update(slice);
+}
+
+fn updateHashForMessage(hasher: *std.hash.Fnv1a_64, message: anytype) void {
+    hasher.update(@tagName(message.role));
+    hasher.update("\n");
+    if (@hasField(@TypeOf(message), "name")) updateHashForOptional(hasher, "name:", message.name);
+    if (@hasField(@TypeOf(message), "tool_call_id")) updateHashForOptional(hasher, "tool_call_id:", message.tool_call_id);
+    if (@hasField(@TypeOf(message), "content_parts")) {
+        if (message.content_parts) |parts| {
+            hasher.update("parts:");
+            for (parts) |part| {
+                switch (part) {
+                    .text => |text| {
+                        hasher.update("text:");
+                        hasher.update(text);
+                    },
+                    .image_url => |image| {
+                        hasher.update("image_url:");
+                        hasher.update(image.url);
+                        hasher.update(image.detail.toSlice());
+                    },
+                    .image_base64 => |image| {
+                        hasher.update("image_base64:");
+                        hasher.update(image.media_type);
+                        hasher.update(image.data);
+                    },
+                    .video_base64 => |video| {
+                        hasher.update("video_base64:");
+                        hasher.update(video.media_type);
+                        hasher.update(video.data);
+                    },
+                    .video_file_ref => |video| {
+                        hasher.update("video_file_ref:");
+                        hasher.update(video.media_type);
+                        hasher.update(video.url);
+                    },
+                }
+            }
+        } else if (@hasField(@TypeOf(message), "content")) {
+            hasher.update(message.content);
+        }
+    } else if (@hasField(@TypeOf(message), "content")) {
+        hasher.update(message.content);
+    }
+    if (@hasField(@TypeOf(message), "reasoning_content")) updateHashForOptional(hasher, "reasoning:", message.reasoning_content);
+}
+
+fn updateHashForTool(hasher: *std.hash.Fnv1a_64, tool: anytype) void {
+    const ToolType = @TypeOf(tool);
+    hasher.update("tool:");
+    if (@hasField(ToolType, "name")) hasher.update(tool.name);
+    if (@hasField(ToolType, "description")) hasher.update(tool.description);
+    if (@hasField(ToolType, "parameters_json")) hasher.update(tool.parameters_json);
+}
+
+pub fn buildPromptShapeFromProviderRequest(request: anytype, capture: PromptShapeCapture) PromptShape {
+    var shape = PromptShape{
+        .available = true,
+        .sampled_at_ms = if (capture.sampled_at_ms > 0) capture.sampled_at_ms else std.time.milliTimestamp(),
+        .stable_system_prompt_bytes = capture.stable_system_prompt_bytes,
+        .stable_system_prompt_hash = capture.stable_system_prompt_hash,
+        .history_tail_bytes = capture.history_tail_bytes,
+        .history_tail_hash = capture.history_tail_hash,
+    };
+    var request_hasher = std.hash.Fnv1a_64.init();
+
+    if (@hasField(@TypeOf(request), "model")) {
+        shape.provider_request_body_bytes_estimated += request.model.len;
+        request_hasher.update("model:");
+        request_hasher.update(request.model);
+    }
+    if (@hasField(@TypeOf(request), "prompt_cache_key")) {
+        if (request.prompt_cache_key) |key| {
+            shape.prompt_cache_key_present = true;
+            shape.prompt_cache_key_bytes = key.len;
+            shape.provider_request_body_bytes_estimated += key.len;
+            request_hasher.update("prompt_cache_key_present");
+        }
+    }
+    if (@hasField(@TypeOf(request), "max_tokens")) {
+        if (request.max_tokens != null) shape.provider_request_body_bytes_estimated += 16;
+    }
+    if (@hasField(@TypeOf(request), "reasoning_effort")) {
+        if (request.reasoning_effort) |effort| {
+            shape.provider_request_body_bytes_estimated += effort.len;
+            request_hasher.update("reasoning_effort:");
+            request_hasher.update(effort);
+        }
+    }
+
+    if (@hasField(@TypeOf(request), "tools")) {
+        if (request.tools) |tools| {
+            shape.tool_schema_count = tools.len;
+            for (tools) |tool| {
+                const bytes = toolSpecBytes(tool);
+                shape.tool_schema_bytes += bytes;
+                shape.provider_request_body_bytes_estimated += bytes + 64;
+                updateHashForTool(&request_hasher, tool);
+            }
+        }
+    }
+
+    if (@hasField(@TypeOf(request), "messages")) {
+        shape.message_count = request.messages.len;
+        for (request.messages) |message| {
+            const text_bytes = providerMessageTextBytes(message);
+            const msg_reasoning_bytes = reasoningBytes(message);
+            const parts = contentPartCount(message);
+            shape.provider_bound_message_bytes += text_bytes + msg_reasoning_bytes;
+            shape.provider_request_body_bytes_estimated += text_bytes + msg_reasoning_bytes + 64;
+            shape.multimodal_part_count += parts;
+            if (parts > 0) shape.multimodal_payload_estimated_bytes += text_bytes;
+            updateHashForMessage(&request_hasher, message);
+
+            switch (message.role) {
+                .system => {
+                    shape.system_message_count += 1;
+                    shape.system_prompt_bytes += text_bytes;
+                    if (shape.system_message_count == 1 and @hasField(@TypeOf(message), "content")) {
+                        const stable_bytes = @min(capture.stable_system_prompt_bytes, message.content.len);
+                        if (message.content.len > stable_bytes) {
+                            const volatile_slice = message.content[stable_bytes..];
+                            var volatile_hasher = std.hash.Fnv1a_64.init();
+                            volatile_hasher.update(volatile_slice);
+                            shape.volatile_system_prompt_hash = volatile_hasher.final();
+                        }
+                    }
+                },
+                .user => {
+                    shape.user_message_count += 1;
+                    shape.user_message_bytes += text_bytes;
+                },
+                .assistant => {
+                    shape.assistant_message_count += 1;
+                    shape.assistant_message_bytes += text_bytes;
+                    shape.assistant_reasoning_bytes += msg_reasoning_bytes;
+                    if (@hasField(@TypeOf(message), "content") and looksLikeXmlToolHistory(message.content)) {
+                        shape.xml_tool_history_bytes += text_bytes;
+                    }
+                },
+                .tool => {
+                    shape.tool_message_count += 1;
+                    shape.tool_message_bytes += text_bytes;
+                    if (@hasField(@TypeOf(message), "content")) shape.xml_tool_history_bytes += text_bytes;
+                },
+            }
+        }
+    }
+
+    if (shape.system_prompt_bytes > shape.stable_system_prompt_bytes) {
+        shape.volatile_system_prompt_bytes = shape.system_prompt_bytes - shape.stable_system_prompt_bytes;
+    }
+    shape.full_request_hash = request_hasher.final();
+    return shape;
 }
 
 fn providerUsageFromAgent(self: anytype) ProviderUsage {
@@ -425,6 +683,7 @@ pub fn buildSnapshot(self: anytype) Snapshot {
     const provider_preflight = providerPreflightFromAgent(self);
     const pressure_selection = selectPressureTokens(local_token_estimate, provider_usage, provider_preflight);
     const token_estimate = pressure_selection.token_count;
+    const prompt_shape = if (@hasField(AgentType, "last_prompt_shape")) self.last_prompt_shape else PromptShape{};
     const remaining_tokens = if (context_window_tokens > token_estimate) context_window_tokens - token_estimate else 0;
     const usable_input_budget_tokens = if (context_window_tokens > token_budget_policy.total_reserve)
         context_window_tokens - token_budget_policy.total_reserve
@@ -525,6 +784,7 @@ pub fn buildSnapshot(self: anytype) Snapshot {
         .top_context_contributor_count = context_analysis.top_count,
         .top_context_contributors = context_analysis.top_contributors,
         .last_turn = last_turn,
+        .prompt_shape = prompt_shape,
     };
 }
 
@@ -828,6 +1088,87 @@ test "buildSnapshot uses active provider preflight before provider usage exists"
     try std.testing.expectEqualStrings("provider_preflight", snapshot.pressure_token_source);
     try std.testing.expect(snapshot.provider_preflight.available);
     try std.testing.expect(snapshot.provider_preflight.active);
+}
+
+test "buildPromptShapeFromProviderRequest buckets provider-bound request without raw content" {
+    const stable = "stable system contract\n";
+    const volatile_prompt = "volatile clock and memory";
+    const system_prompt = stable ++ volatile_prompt;
+    const assistant_text = "<tool_call name=\"schedule.list\">{}</tool_call>";
+    const reasoning_text = "private reasoning bytes";
+    const tool_text = "<tool_result>{\"jobs\":[1,2,3]}</tool_result>";
+    const image_payload = "AQIDBA==";
+    const parts = [_]providers.ContentPart{
+        providers.makeTextPart("look at this"),
+        providers.makeBase64ImagePart(image_payload, "image/png"),
+    };
+    const messages = [_]providers.ChatMessage{
+        providers.ChatMessage.system(system_prompt),
+        providers.ChatMessage.user("user asks a private question"),
+        .{
+            .role = .assistant,
+            .content = assistant_text,
+            .reasoning_content = reasoning_text,
+        },
+        providers.ChatMessage.toolMsg(tool_text, "tool-1"),
+        .{
+            .role = .user,
+            .content = "",
+            .content_parts = &parts,
+        },
+    };
+    const tools = [_]providers.ToolSpec{
+        .{
+            .name = "schedule.list",
+            .description = "List scheduled jobs",
+            .parameters_json = "{\"type\":\"object\"}",
+        },
+    };
+    const request = providers.ChatRequest{
+        .messages = &messages,
+        .model = "kimi-k2.6",
+        .max_tokens = 1024,
+        .tools = &tools,
+        .prompt_cache_key = "zaki:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .reasoning_effort = "high",
+    };
+
+    const first = buildPromptShapeFromProviderRequest(request, .{
+        .stable_system_prompt_bytes = stable.len,
+        .stable_system_prompt_hash = 1234,
+        .history_tail_bytes = 42,
+        .history_tail_hash = 5678,
+        .sampled_at_ms = 99,
+    });
+    const second = buildPromptShapeFromProviderRequest(request, .{
+        .stable_system_prompt_bytes = stable.len,
+        .stable_system_prompt_hash = 1234,
+        .history_tail_bytes = 42,
+        .history_tail_hash = 5678,
+        .sampled_at_ms = 99,
+    });
+
+    try std.testing.expect(first.available);
+    try std.testing.expectEqual(@as(i64, 99), first.sampled_at_ms);
+    try std.testing.expectEqual(@as(usize, messages.len), first.message_count);
+    try std.testing.expectEqual(@as(usize, 1), first.system_message_count);
+    try std.testing.expectEqual(@as(usize, 2), first.user_message_count);
+    try std.testing.expectEqual(@as(usize, 1), first.assistant_message_count);
+    try std.testing.expectEqual(@as(usize, 1), first.tool_message_count);
+    try std.testing.expectEqual(@as(usize, 1), first.tool_schema_count);
+    try std.testing.expectEqual(@as(usize, 2), first.multimodal_part_count);
+    try std.testing.expect(first.prompt_cache_key_present);
+    try std.testing.expectEqual(@as(u64, stable.len), first.stable_system_prompt_bytes);
+    try std.testing.expectEqual(@as(u64, volatile_prompt.len), first.volatile_system_prompt_bytes);
+    try std.testing.expectEqual(@as(u64, system_prompt.len), first.system_prompt_bytes);
+    try std.testing.expectEqual(@as(u64, assistant_text.len), first.assistant_message_bytes);
+    try std.testing.expectEqual(@as(u64, reasoning_text.len), first.assistant_reasoning_bytes);
+    try std.testing.expectEqual(@as(u64, tool_text.len), first.tool_message_bytes);
+    try std.testing.expectEqual(@as(u64, assistant_text.len + tool_text.len), first.xml_tool_history_bytes);
+    try std.testing.expect(first.multimodal_payload_estimated_bytes > image_payload.len);
+    try std.testing.expect(first.provider_request_body_bytes_estimated > first.provider_bound_message_bytes);
+    try std.testing.expectEqual(first.full_request_hash, second.full_request_hash);
+    try std.testing.expectEqual(first.volatile_system_prompt_hash, second.volatile_system_prompt_hash);
 }
 
 test "buildPromptRefreshPlan refreshes missing system prompt" {
