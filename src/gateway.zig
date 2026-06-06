@@ -1960,14 +1960,26 @@ const TenantRuntime = struct {
         ) catch usage_runtime_mod.UsageRuntime.init(allocator);
         runtime.usage_rt = usage_rt;
 
+        // agent_browser backend — construct a long-lived OrchestratorClient
+        // when the backend is active. Allocated with the same tenant-runtime
+        // `allocator` as `builtin_tools`, so it outlives the tool slice (the
+        // browser_* tools hold a *OrchestratorClient). The gateway's tenant
+        // runtime allocator is freed as a unit on teardown, so a single
+        // create() with no explicit free is safe here.
+        const agent_browser_client: ?*@import("browser_backend/client.zig").OrchestratorClient =
+            if (runtime.config.browser.enabled and std.mem.eql(u8, runtime.config.browser.backend, "agent_browser")) blk: {
+                const c = allocator.create(@import("browser_backend/client.zig").OrchestratorClient) catch break :blk null;
+                c.* = .{ .base_url = runtime.config.browser.agent_browser.orchestrator_url, .timeout_ms = runtime.config.browser.agent_browser.timeout_ms };
+                break :blk c;
+            } else null;
+
         const builtin_tools = tools_mod.allTools(allocator, runtime.config.workspace_dir, .{
             .config = &runtime.config,
             .http_enabled = runtime.config.http_request.enabled,
-            .browser_enabled = runtime.config.browser.enabled,
             .screenshot_enabled = true,
             .composio_api_key = if (runtime.config.composio.enabled) runtime.config.composio.api_key else null,
             .composio_entity_id = user_ctx.user_id,
-            .browser_open_domains = if (runtime.config.browser.allowed_domains.len > 0) runtime.config.browser.allowed_domains else null,
+            .agent_browser_client = agent_browser_client,
             .agents = runtime.config.agents,
             .fallback_api_key = resolved_api_key,
             .event_bus = event_bus,
@@ -1982,6 +1994,11 @@ const TenantRuntime = struct {
             .run_trace_store = runtime.trace_store,
         }) catch &.{};
         errdefer if (builtin_tools.len > 0) tools_mod.deinitTools(allocator, builtin_tools);
+
+        // agent_browser backend — bind the per-user id onto browser_new_session
+        // so each session is created scoped to this tenant. No-op when the
+        // backend is inactive (the tools were never registered).
+        tools_mod.bindBrowserSessionTools(builtin_tools, user_ctx.user_id);
 
         // Init MCP tools from configured servers and append to the tenant's
         // tool list. MCP servers run as long-lived subprocess(es) whose
@@ -23880,14 +23897,24 @@ pub fn runWithRole(
                     .observer = gateway_observer_multi.observer(),
                 };
 
+                // agent_browser backend — construct a long-lived
+                // OrchestratorClient for the standalone/local-agent path
+                // when the backend is active. Same allocator as tools_slice;
+                // the standalone runtime allocator outlives the tool set.
+                const standalone_agent_browser_client: ?*@import("browser_backend/client.zig").OrchestratorClient =
+                    if (cfg.browser.enabled and std.mem.eql(u8, cfg.browser.backend, "agent_browser")) blk: {
+                        const c = allocator.create(@import("browser_backend/client.zig").OrchestratorClient) catch break :blk null;
+                        c.* = .{ .base_url = cfg.browser.agent_browser.orchestrator_url, .timeout_ms = cfg.browser.agent_browser.timeout_ms };
+                        break :blk c;
+                    } else null;
+
                 // Tools.
                 tools_slice = tools_mod.allTools(allocator, cfg.workspace_dir, .{
                     .config = cfg,
                     .http_enabled = cfg.http_request.enabled,
-                    .browser_enabled = cfg.browser.enabled,
                     .screenshot_enabled = true,
                     .composio_api_key = if (cfg.composio.enabled) cfg.composio.api_key else null,
-                    .browser_open_domains = if (cfg.browser.allowed_domains.len > 0) cfg.browser.allowed_domains else null,
+                    .agent_browser_client = standalone_agent_browser_client,
                     .agents = cfg.agents,
                     .fallback_api_key = resolved_api_key,
                     .event_bus = event_bus,
@@ -23897,6 +23924,12 @@ pub fn runWithRole(
                     .subagent_manager = subagent_manager_opt,
                     .task_delivery = if (standalone_task_delivery) |*d| d else null,
                 }) catch &.{};
+
+                // agent_browser backend — single-user local path has no
+                // distinct tenant id; bind a stable "local" user so
+                // browser_new_session creates a scoped session rather than
+                // failing the not-bound guard.
+                tools_mod.bindBrowserSessionTools(tools_slice, "local");
 
                 var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, gateway_observer_multi.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
                 if (sec_policy_opt) |*policy| {

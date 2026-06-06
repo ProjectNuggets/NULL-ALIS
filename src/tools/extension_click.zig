@@ -38,7 +38,7 @@ pub const ExtensionClickTool = struct {
         .do_not_use_for = &.{
             "extension_type — for typing characters into an input rather than clicking it",
             "extension_navigate — for following a link to a known URL without clicking",
-            "browser_open — for opening a fresh URL in the user's default browser",
+            "browser_navigate — for loading a fresh URL in a remote agent_browser session instead of the user's live tab",
         },
         .cost_note = "Drives the user's real browser session — actions are visible and may affect logged-in state.",
         .completion_hint = "Returns the clicked selector when the extension confirms the click landed.",

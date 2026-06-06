@@ -98,7 +98,11 @@ pub const brain_graph = @import("brain_graph.zig");
 /// the rest of the suite.
 pub const wiki_link = @import("wiki_link.zig");
 pub const delegate = @import("delegate.zig");
-pub const browser = @import("browser.zig");
+pub const browser_new_session = @import("browser_new_session.zig");
+pub const browser_navigate = @import("browser_navigate.zig");
+pub const browser_snapshot = @import("browser_snapshot.zig");
+pub const browser_exec = @import("browser_exec.zig");
+pub const browser_close_session = @import("browser_close_session.zig");
 pub const image = @import("image.zig");
 pub const image_generate = @import("image_generate.zig");
 pub const produce_document = @import("produce_document.zig");
@@ -113,7 +117,6 @@ pub const result_cache = @import("result_cache.zig");
 pub const skill_registry = @import("skill_registry.zig");
 pub const runtime_info = @import("runtime_info.zig");
 pub const screenshot = @import("screenshot.zig");
-pub const browser_open = @import("browser_open.zig");
 pub const cron_add = @import("cron_add.zig");
 pub const cron_list = @import("cron_list.zig");
 pub const cron_remove = @import("cron_remove.zig");
@@ -661,20 +664,6 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .cost_class = .c,
     },
     .{
-        // Full browser session — heavy.
-        .name = browser.BrowserTool.tool_name,
-        .flags = .{ .mutating = true },
-        .risk_level = .medium,
-        .cost_class = .c,
-    },
-    .{
-        // Local open URL — cheap.
-        .name = browser_open.BrowserOpenTool.tool_name,
-        .flags = .{ .mutating = true },
-        .risk_level = .medium,
-        .cost_class = .a,
-    },
-    .{
         // Composio is action-dependent: list/get are read-only but execute
         // can mutate third-party state. Conservative here; background policy
         // handles the read-only execute whitelist for proactive turns.
@@ -868,6 +857,17 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .risk_level = .high,
         .cost_class = .b,
     },
+
+    // agent_browser backend — browser_* tool family. Drives a per-user
+    // remote headless browser session via the orchestrator. Gated on
+    // `config.browser.enabled and backend == "agent_browser"`. new_session
+    // and exec are the heaviest (session spin-up / arbitrary CDP step);
+    // snapshot is read-only; close is cheap teardown.
+    .{ .name = browser_new_session.BrowserNewSessionTool.tool_name, .flags = .{ .mutating = true }, .risk_level = .high, .cost_class = .b },
+    .{ .name = browser_navigate.BrowserNavigateTool.tool_name, .flags = .{ .mutating = true }, .risk_level = .high, .cost_class = .b },
+    .{ .name = browser_snapshot.BrowserSnapshotTool.tool_name, .flags = .{ .read_only = true }, .risk_level = .medium, .cost_class = .a },
+    .{ .name = browser_exec.BrowserExecTool.tool_name, .flags = .{ .mutating = true }, .risk_level = .high, .cost_class = .c },
+    .{ .name = browser_close_session.BrowserCloseSessionTool.tool_name, .flags = .{ .mutating = true }, .risk_level = .low, .cost_class = .a },
 };
 
 /// Return the static default metadata registry for built-in tools.
@@ -1159,10 +1159,15 @@ pub fn allTools(
         tool_profile: ToolProfile = .main,
         config: ?*const @import("../config.zig").Config = null,
         http_enabled: bool = false,
-        browser_enabled: bool = false,
         screenshot_enabled: bool = false,
         composio_api_key: ?[]const u8 = null,
-        browser_open_domains: ?[]const []const u8 = null,
+        /// agent_browser backend — when non-null, the `browser_*` tool
+        /// family is registered and bound to this orchestrator client.
+        /// Constructed by the gateway only when
+        /// `config.browser.enabled and backend == "agent_browser"`. The
+        /// client must outlive the returned `[]Tool` (gateway allocates
+        /// it with the same long-lived allocator).
+        agent_browser_client: ?*@import("../browser_backend/client.zig").OrchestratorClient = null,
         // hardware_boards: removed D19 (2026-04-25) — V1 stripped the
         // hardware surface. The legacy-caller stub at line 1035 went
         // with it; restore from git history if a fork ever reintroduces
@@ -1565,12 +1570,6 @@ pub fn allTools(
         try list.append(allocator, wst.tool());
     }
 
-    if (opts.browser_enabled) {
-        const bt = try allocator.create(browser.BrowserTool);
-        bt.* = .{};
-        try list.append(allocator, bt.tool());
-    }
-
     if (opts.screenshot_enabled) {
         const sst = try allocator.create(screenshot.ScreenshotTool);
         sst.* = .{ .workspace_dir = workspace_dir };
@@ -1600,10 +1599,27 @@ pub fn allTools(
         }
     }
 
-    if (opts.browser_open_domains) |domains| {
-        const bot = try allocator.create(browser_open.BrowserOpenTool);
-        bot.* = .{ .allowed_domains = domains };
-        try list.append(allocator, bot.tool());
+    // agent_browser backend — browser_* tool family. Registered only when
+    // the gateway constructed an OrchestratorClient (config.browser.enabled
+    // and backend == "agent_browser"); otherwise the model would see tools
+    // that fail every dispatch. `browser_new_session` is bound to the
+    // per-user id post-construction via bindBrowserSessionTools.
+    if (opts.agent_browser_client) |bc| {
+        const ns_t = try allocator.create(browser_new_session.BrowserNewSessionTool);
+        ns_t.* = .{ .client = bc };
+        try list.append(allocator, ns_t.tool());
+        const nav_t = try allocator.create(browser_navigate.BrowserNavigateTool);
+        nav_t.* = .{ .client = bc };
+        try list.append(allocator, nav_t.tool());
+        const snap_t = try allocator.create(browser_snapshot.BrowserSnapshotTool);
+        snap_t.* = .{ .client = bc };
+        try list.append(allocator, snap_t.tool());
+        const exec_t = try allocator.create(browser_exec.BrowserExecTool);
+        exec_t.* = .{ .client = bc };
+        try list.append(allocator, exec_t.tool());
+        const close_t = try allocator.create(browser_close_session.BrowserCloseSessionTool);
+        close_t.* = .{ .client = bc };
+        try list.append(allocator, close_t.tool());
     }
 
     // Wave 3B — extension_* tool family. Only register when the
@@ -2497,6 +2513,19 @@ pub fn bindExtensionTools(tools: []const Tool, user_id: ?[]const u8) void {
     }
 }
 
+/// agent_browser backend — bind the per-user id onto the session-creating
+/// tool. Only `browser_new_session` needs the user (it spins up a per-user
+/// orchestrator session); navigate/snapshot/exec/close operate on an opaque
+/// session id the model already holds, so they need no per-user binding.
+pub fn bindBrowserSessionTools(tools: []const Tool, user_id: ?[]const u8) void {
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), browser_new_session.BrowserNewSessionTool.tool_name)) {
+            const ent: *browser_new_session.BrowserNewSessionTool = @ptrCast(@alignCast(t.ptr));
+            ent.user_id = user_id;
+        }
+    }
+}
+
 /// Wire audit memory into tools that support command logging (currently: shell).
 /// Called after memory initialization, similar to bindMemoryRuntime.
 pub fn bindAuditMemory(tools: []const Tool, mem: memory_mod.Memory, session_id: ?[]const u8) void {
@@ -2938,7 +2967,6 @@ test "all tools includes extras when enabled" {
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
         .config = &cfg,
         .http_enabled = true,
-        .browser_enabled = true,
     });
     defer deinitTools(std.testing.allocator, tools);
     // base 36 + delegate + spawn (both v1 default-on as of 2026-05-23,
@@ -2946,18 +2974,21 @@ test "all tools includes extras when enabled" {
     // + 1 V1.5 todo + 1 V1.5 day-3 compose_memory + 1 calculator
     // + 1 file_read_hashed + 1 file_edit_hashed (nullclaw cherry-pick)
     // + 1 memory_archive + 1 memory_demote (V1.6 cmt11)
-    // + http_request + web_fetch + web_search + browser
+    // + http_request + web_fetch + web_search
     // + brain_graph (V1.7-ship S2a)
     // + memory_maintain (V1.9-5 truth-maintenance toolkit)
     // + time_now (V1.9-DX1 wall-clock tool)
-    // + wiki_link (V1.12 entity-mention extractor) = 46.
-    // + produce_document (Wave 2A: first-class PDF/DOCX/XLSX/PPTX/HTML) = 47.
-    // + 4 artifact_* (Wave 2C: canvas/artifacts backend) = 51.
+    // + wiki_link (V1.12 entity-mention extractor) = 45.
+    // + produce_document (Wave 2A: first-class PDF/DOCX/XLSX/PPTX/HTML) = 46.
+    // + 4 artifact_* (Wave 2C: canvas/artifacts backend) = 50.
     // + 4 artifact_share/revoke/diff/history + 2 memory_doctor/trace_query
-    //   (2026-05-25 surface-audit close) = 57.
+    //   (2026-05-25 surface-audit close) = 56.
     // + memory_purge_pii (D52 Pillar 4, prod-readiness Sprint 1,
-    //   2026-05-28) = 58.
-    try std.testing.expectEqual(@as(usize, 58), tools.len);
+    //   2026-05-28) = 57.
+    // (legacy `browser` tool removed — agent_browser backend's browser_*
+    //  family registers only when an OrchestratorClient is passed, which
+    //  this test does not do, so the count stays at 57.)
+    try std.testing.expectEqual(@as(usize, 57), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -3331,12 +3362,12 @@ test "defaultMetadataRegistry classifies known mutating tools" {
     // tools still classify" test below.
     const registry = defaultMetadataRegistry();
     const mutating = [_][]const u8{
-        "shell",          "file_write",   "file_edit",   "file_append",
-        "git_operations", "memory_store", "memory_edit", "memory_forget",
-        "schedule",       "message",      "pushover",    "cron_add",
-        "cron_remove",    "cron_update",  "cron_run",    "http_request",
-        "browser",        "browser_open", "composio",    "skill_registry",
-        "task_stop",
+        "shell",                "file_write",         "file_edit",   "file_append",
+        "git_operations",       "memory_store",       "memory_edit", "memory_forget",
+        "schedule",             "message",            "pushover",    "cron_add",
+        "cron_remove",          "cron_update",        "cron_run",    "http_request",
+        "browser_new_session",  "browser_navigate",   "browser_exec", "browser_close_session",
+        "composio",             "skill_registry",     "task_stop",
     };
     for (mutating) |name| {
         const m = metadata.lookupMetadata(name, registry) orelse {

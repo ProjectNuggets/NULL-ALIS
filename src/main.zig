@@ -2884,14 +2884,22 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     // project_subagent_received_bug for CLI users.
     subagent_manager.attachCompletionDelivery(null, cliSubagentCompletionDelivery);
 
+    // agent_browser backend — construct a long-lived OrchestratorClient when
+    // the backend is active (CLI single-user path; allocator outlives tools).
+    const cli_agent_browser_client: ?*yc.browser_backend.client.OrchestratorClient =
+        if (config.browser.enabled and std.mem.eql(u8, config.browser.backend, "agent_browser")) blk: {
+            const c = allocator.create(yc.browser_backend.client.OrchestratorClient) catch break :blk null;
+            c.* = .{ .base_url = config.browser.agent_browser.orchestrator_url, .timeout_ms = config.browser.agent_browser.timeout_ms };
+            break :blk c;
+        } else null;
+
     // Create tools (for system prompt and tool calling)
     const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
         .config = config,
         .http_enabled = config.http_request.enabled,
-        .browser_enabled = config.browser.enabled,
         .screenshot_enabled = true,
         .composio_api_key = if (config.composio.enabled) config.composio.api_key else null,
-        .browser_open_domains = if (config.browser.allowed_domains.len > 0) config.browser.allowed_domains else null,
+        .agent_browser_client = cli_agent_browser_client,
         .mcp_tools = mcp_tools,
         .agents = config.agents,
         .fallback_api_key = resolved_api_key,
@@ -2901,6 +2909,8 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .subagent_manager = &subagent_manager,
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
+    // agent_browser backend — single-user CLI path; bind a stable "local" user.
+    yc.tools.bindBrowserSessionTools(tools, "local");
 
     if (mcp_tools) |mt| {
         std.debug.print("  MCP tools: {d}\n", .{mt.len});
@@ -3216,14 +3226,22 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     // for the service-mode CLI entry point as well.
     subagent_manager.attachCompletionDelivery(null, cliSubagentCompletionDelivery);
 
+    // agent_browser backend — construct a long-lived OrchestratorClient when
+    // the backend is active (CLI single-user path; allocator outlives tools).
+    const cli_agent_browser_client: ?*yc.browser_backend.client.OrchestratorClient =
+        if (config.browser.enabled and std.mem.eql(u8, config.browser.backend, "agent_browser")) blk: {
+            const c = allocator.create(yc.browser_backend.client.OrchestratorClient) catch break :blk null;
+            c.* = .{ .base_url = config.browser.agent_browser.orchestrator_url, .timeout_ms = config.browser.agent_browser.timeout_ms };
+            break :blk c;
+        } else null;
+
     // Create tools (for system prompt and tool calling)
     const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
         .config = &config,
         .http_enabled = config.http_request.enabled,
-        .browser_enabled = config.browser.enabled,
         .screenshot_enabled = true,
         .composio_api_key = if (config.composio.enabled) config.composio.api_key else null,
-        .browser_open_domains = if (config.browser.allowed_domains.len > 0) config.browser.allowed_domains else null,
+        .agent_browser_client = cli_agent_browser_client,
         .mcp_tools = mcp_tools,
         .agents = config.agents,
         .fallback_api_key = resolved_api_key,
@@ -3233,6 +3251,8 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .subagent_manager = &subagent_manager,
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
+    // agent_browser backend — single-user CLI path; bind a stable "local" user.
+    yc.tools.bindBrowserSessionTools(tools, "local");
 
     if (mcp_tools) |mt| {
         std.debug.print("  MCP tools: {d}\n", .{mt.len});

@@ -165,13 +165,22 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     // surfaces to stderr instead of being silently discarded.
     subagent_manager.attachCompletionDelivery(null, cliSubagentCompletionDelivery);
 
+    // agent_browser backend — construct a long-lived OrchestratorClient when
+    // the backend is active (CLI single-user path; allocator outlives tools).
+    const ABClient = @import("../browser_backend/client.zig").OrchestratorClient;
+    const agent_browser_client: ?*ABClient =
+        if (cfg.browser.enabled and std.mem.eql(u8, cfg.browser.backend, "agent_browser")) blk: {
+            const c = allocator.create(ABClient) catch break :blk null;
+            c.* = .{ .base_url = cfg.browser.agent_browser.orchestrator_url, .timeout_ms = cfg.browser.agent_browser.timeout_ms };
+            break :blk c;
+        } else null;
+
     // Create tools (with agents config for delegate depth enforcement)
     const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
         .config = &cfg,
         .http_enabled = cfg.http_request.enabled,
-        .browser_enabled = cfg.browser.enabled,
         .composio_api_key = if (cfg.composio.enabled) cfg.composio.api_key else null,
-        .browser_open_domains = if (cfg.browser.allowed_domains.len > 0) cfg.browser.allowed_domains else null,
+        .agent_browser_client = agent_browser_client,
         .mcp_tools = mcp_tools,
         .agents = cfg.agents,
         .fallback_api_key = resolved_api_key,
@@ -181,6 +190,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .subagent_manager = &subagent_manager,
     });
     defer tools_mod.deinitTools(allocator, tools);
+    // agent_browser backend — single-user CLI path; bind a stable "local" user.
+    tools_mod.bindBrowserSessionTools(tools, "local");
 
     // Create memory (optional — don't fail if it can't init)
     var mem_rt = memory_mod.initRuntimeWithOptions(allocator, &cfg.memory, cfg.workspace_dir, .{

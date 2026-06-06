@@ -371,15 +371,25 @@ pub const ChannelRuntime = struct {
             .tracker = policy_tracker,
         };
 
+        // agent_browser backend — construct a long-lived OrchestratorClient
+        // when the backend is active. Same allocator as the tool slice, which
+        // the channel runtime owns for its lifetime.
+        const ABClient = @import("browser_backend/client.zig").OrchestratorClient;
+        const agent_browser_client: ?*ABClient =
+            if (config.browser.enabled and std.mem.eql(u8, config.browser.backend, "agent_browser")) blk: {
+                const c = allocator.create(ABClient) catch break :blk null;
+                c.* = .{ .base_url = config.browser.agent_browser.orchestrator_url, .timeout_ms = config.browser.agent_browser.timeout_ms };
+                break :blk c;
+            } else null;
+
         // Tools
         const tools = tools_mod.allTools(allocator, config.workspace_dir, .{
             .tool_profile = tool_profile,
             .config = config,
             .http_enabled = config.http_request.enabled,
-            .browser_enabled = config.browser.enabled,
             .screenshot_enabled = true,
             .composio_api_key = if (config.composio.enabled) config.composio.api_key else null,
-            .browser_open_domains = if (config.browser.allowed_domains.len > 0) config.browser.allowed_domains else null,
+            .agent_browser_client = agent_browser_client,
             .mcp_tools = mcp_tools,
             .agents = config.agents,
             .fallback_api_key = resolved_key,
@@ -390,6 +400,9 @@ pub const ChannelRuntime = struct {
             .subagent_manager = subagent_manager,
         }) catch &.{};
         errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
+        // agent_browser backend — channel runtime is per-account; bind a
+        // stable "local" user so browser_new_session passes its bound guard.
+        tools_mod.bindBrowserSessionTools(tools, "local");
 
         // Optional memory backend
         var mem_rt = memory_mod.initRuntimeWithOptions(allocator, &config.memory, config.workspace_dir, .{

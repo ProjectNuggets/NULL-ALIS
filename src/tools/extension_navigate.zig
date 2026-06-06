@@ -60,7 +60,7 @@ pub const ExtensionNavigateTool = struct {
             "Following up an extension_* action (click, fill_form) with a navigation to the next step in a workflow",
         },
         .do_not_use_for = &.{
-            "browser_open — for opening a URL in the user's default browser without the live extension session",
+            "browser_navigate — for navigating a remote agent_browser session instead of the user's live extension tab",
             "web_fetch — for reading public HTML from a URL without driving the browser",
             "web_search — for finding a URL from a query rather than navigating to a known one",
         },

@@ -45,9 +45,12 @@ const optional_tool_names = [_][]const u8{
     "http_request",
     "web_fetch",
     "web_search",
-    "browser",
+    "browser_new_session",
+    "browser_navigate",
+    "browser_snapshot",
+    "browser_exec",
+    "browser_close_session",
     "composio",
-    "browser_open",
     "message",
     // hardware_board_info, hardware_memory, i2c, spi: removed D19
     // (2026-04-25). Hardware/IoT tool surface stripped in V1
@@ -82,9 +85,11 @@ fn optionalToolEnabledByConfig(cfg: *const Config, name: []const u8) bool {
     if (std.mem.eql(u8, name, "http_request")) return cfg.http_request.enabled;
     if (std.mem.eql(u8, name, "web_fetch")) return cfg.http_request.enabled;
     if (std.mem.eql(u8, name, "web_search")) return cfg.http_request.enabled;
-    if (std.mem.eql(u8, name, "browser")) return cfg.browser.enabled;
+    // agent_browser backend — the five browser_* tools are the only
+    // browser_-prefixed optional names, so a prefix check is safe and
+    // keeps this in lockstep with optional_tool_names.
+    if (std.mem.startsWith(u8, name, "browser_")) return cfg.browser.enabled and std.mem.eql(u8, cfg.browser.backend, "agent_browser");
     if (std.mem.eql(u8, name, "composio")) return cfg.composio.enabled and cfg.composio.api_key != null;
-    if (std.mem.eql(u8, name, "browser_open")) return cfg.browser.allowed_domains.len > 0;
     // message depends on event_bus wiring at runtime, not config alone.
     if (std.mem.eql(u8, name, "message")) return false;
     // hardware_board_info / hardware_memory / i2c / spi gates removed
@@ -96,13 +101,25 @@ fn collectEstimatedToolNamesFromConfig(
     allocator: std.mem.Allocator,
     cfg: *const Config,
 ) ![]const []const u8 {
+    // agent_browser backend — mirror the gateway: construct a throwaway
+    // OrchestratorClient only when the backend is active, so the estimated
+    // tool set advertises the browser_* family iff it would really register.
+    // This is an estimation-only path (no live requests are issued), so the
+    // client lives for the duration of this function alongside the tools.
+    const OrchestratorClient = @import("browser_backend/client.zig").OrchestratorClient;
+    var ab_client: OrchestratorClient = undefined;
+    const agent_browser_client: ?*OrchestratorClient =
+        if (cfg.browser.enabled and std.mem.eql(u8, cfg.browser.backend, "agent_browser")) blk: {
+            ab_client = .{ .base_url = cfg.browser.agent_browser.orchestrator_url, .timeout_ms = cfg.browser.agent_browser.timeout_ms };
+            break :blk &ab_client;
+        } else null;
+
     const estimated_tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
         .config = cfg,
         .http_enabled = cfg.http_request.enabled,
-        .browser_enabled = cfg.browser.enabled,
         .screenshot_enabled = true,
         .composio_api_key = if (cfg.composio.enabled) cfg.composio.api_key else null,
-        .browser_open_domains = if (cfg.browser.allowed_domains.len > 0) cfg.browser.allowed_domains else null,
+        .agent_browser_client = agent_browser_client,
         .agents = cfg.agents,
         .tools_config = cfg.tools,
         .allowed_paths = cfg.autonomy.allowed_paths,

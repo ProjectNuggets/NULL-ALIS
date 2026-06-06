@@ -36,8 +36,11 @@ pub const ALL_TOOLS = [_][]const u8{
     "artifact_share",
     "artifact_update",
     "brain_graph",
-    "browser",
-    "browser_open",
+    "browser_close_session",
+    "browser_exec",
+    "browser_navigate",
+    "browser_new_session",
+    "browser_snapshot",
     "calculator",
     "compose_memory",
     "composio",
@@ -264,6 +267,10 @@ pub const production_tool_count: usize = ALL_TOOLS.len;
 // This catches the kind of swap that produced ME-03 (`image_info`
 // before `image_generate`) before any test runs.
 comptime {
+    // ALL_TOOLS grew past the point where the default 1000-branch budget
+    // covers the per-entry std.mem.order comparison loop; raise the quota
+    // so the alpha-order invariant keeps compiling as the catalog grows.
+    @setEvalBranchQuota(10_000);
     var i: usize = 1;
     while (i < ALL_TOOLS.len) : (i += 1) {
         if (std.mem.order(u8, ALL_TOOLS[i - 1], ALL_TOOLS[i]) != .lt) {

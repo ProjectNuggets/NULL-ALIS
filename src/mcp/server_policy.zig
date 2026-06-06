@@ -29,7 +29,7 @@ const std = @import("std");
 /// and why:
 ///   shell, git_operations               — arbitrary code execution
 ///   file_write/edit/append/*_hashed      — filesystem mutation
-///   browser, browser_open, screenshot    — local environment control
+///   browser_* (agent_browser), screenshot — remote/local environment control
 ///   composio, image_generate             — third-party side effects / cost
 ///   message, pushover                    — outbound delivery (spoofing)
 ///   delegate, spawn                      — recursive agent invocation
@@ -144,7 +144,7 @@ test "server_policy: dangerous tools are excluded from the safe subset" {
     try testing.expect(!isSafeToExpose("git_operations"));
     try testing.expect(!isSafeToExpose("file_write"));
     try testing.expect(!isSafeToExpose("file_edit"));
-    try testing.expect(!isSafeToExpose("browser"));
+    try testing.expect(!isSafeToExpose("browser_exec"));
     try testing.expect(!isSafeToExpose("composio"));
     try testing.expect(!isSafeToExpose("message"));
     try testing.expect(!isSafeToExpose("delegate"));
