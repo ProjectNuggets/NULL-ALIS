@@ -149,6 +149,11 @@ test "live: browser_* tools drive a session end to end" {
     if (std.posix.getenv("NULLALIS_BROWSER_LIVE_TEST") == null) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var client = client_mod.OrchestratorClient{ .base_url = "http://localhost:8080", .timeout_ms = 120_000 };
+    // The orchestrator enforces bearer auth + per-session ownership: send the
+    // token the e2e harness exports, and the X-Nullalis-User matching the
+    // session owner ("e2e-tools") so exec/snapshot/close are authorized.
+    if (std.posix.getenv("BROWSER_ORCHESTRATOR_AUTH_TOKEN")) |tok| client.auth_token = tok;
+    client.user_id = "e2e-tools";
 
     // browser_new_session (bound to a user, like the gateway does)
     var ns = BrowserNewSessionTool{ .client = &client, .user_id = "e2e-tools" };
