@@ -20,11 +20,13 @@ func TestE2ESessionLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client: %v", err)
 	}
-	p := NewK8sProvider(client, cfg, "browser", "browser-worker:dev", NewRegistry())
+	master := []byte("0123456789abcdef0123456789abcdef")
+	store := NewStateStore(client, "browser")
+	p := NewK8sProvider(client, cfg, "browser", "browser-worker:dev", master, store, NewRegistry())
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
-	id, err := p.CreateSession(ctx)
+	id, err := p.CreateSession(ctx, "default", "")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}

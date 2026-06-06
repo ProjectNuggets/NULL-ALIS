@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -21,6 +25,18 @@ import (
 
 func ptr[T any](v T) *T { return &v }
 
+// shortHash returns a DNS-safe short hex hash of s, used for the pod "user" label.
+func shortHash(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:8])
+}
+
+// sessionMeta tracks the owning user and auth profile for a live session, so
+// DestroySession can persist the vault back to the right (user,profile) slot.
+type sessionMeta struct {
+	userID, authProfile string
+}
+
 // K8sProvider runs each browser session in its own worker Pod.
 type K8sProvider struct {
 	client     kubernetes.Interface
@@ -29,10 +45,25 @@ type K8sProvider struct {
 	image      string
 	reg        *Registry
 	waitReady  func(ctx context.Context, podName string) error
+
+	masterKey []byte
+	store      *StateStore
+
+	mu   sync.Mutex
+	meta map[string]sessionMeta
 }
 
-func NewK8sProvider(client kubernetes.Interface, restConfig *rest.Config, namespace, image string, reg *Registry) *K8sProvider {
-	p := &K8sProvider{client: client, restConfig: restConfig, namespace: namespace, image: image, reg: reg}
+func NewK8sProvider(client kubernetes.Interface, restConfig *rest.Config, namespace, image string, masterKey []byte, store *StateStore, reg *Registry) *K8sProvider {
+	p := &K8sProvider{
+		client:     client,
+		restConfig: restConfig,
+		namespace:  namespace,
+		image:      image,
+		reg:        reg,
+		masterKey:  masterKey,
+		store:      store,
+		meta:       map[string]sessionMeta{},
+	}
 	p.waitReady = p.pollPodReady
 	return p
 }
@@ -45,13 +76,14 @@ func newSessionID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func (p *K8sProvider) CreateSession(ctx context.Context) (string, error) {
+func (p *K8sProvider) CreateSession(ctx context.Context, userID, authProfile string) (string, error) {
 	id, err := newSessionID()
 	if err != nil {
 		return "", err
 	}
 	podName := "browser-worker-" + id
-	pod := p.podTemplate(podName, id)
+	encKey := DeriveUserKey(p.masterKey, userID)
+	pod := p.podTemplate(podName, id, encKey, userID)
 	if _, err := p.client.CoreV1().Pods(p.namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
 		return "", fmt.Errorf("create pod: %w", err)
 	}
@@ -62,20 +94,44 @@ func (p *K8sProvider) CreateSession(ctx context.Context) (string, error) {
 		_ = p.client.CoreV1().Pods(p.namespace).Delete(cleanupCtx, podName, metav1.DeleteOptions{})
 		return "", fmt.Errorf("pod not ready: %w", err)
 	}
+
+	p.mu.Lock()
+	p.meta[id] = sessionMeta{userID: userID, authProfile: authProfile}
+	p.mu.Unlock()
+
+	// Inject the previously-saved vault (if any) so agent-browser can --state it.
+	if authProfile != "" {
+		vault, ok, _ := p.store.Get(ctx, userID, authProfile)
+		if ok && len(vault) > 0 {
+			if err := p.injectState(ctx, podName, vault); err != nil {
+				// A failed inject must not silently drop the user's auth state.
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+				defer cancel()
+				_ = p.client.CoreV1().Pods(p.namespace).Delete(cleanupCtx, podName, metav1.DeleteOptions{})
+				p.mu.Lock()
+				delete(p.meta, id)
+				p.mu.Unlock()
+				return "", fmt.Errorf("inject state: %w", err)
+			}
+		}
+	}
+
 	p.reg.Add(id, podName)
 	return id, nil
 }
 
 // podTemplate mirrors Plan 1's deploy/k8s/browser/worker-pod.yaml.
-func (p *K8sProvider) podTemplate(name, sessionID string) *corev1.Pod {
+func (p *K8sProvider) podTemplate(name, sessionID, encKey, userID string) *corev1.Pod {
+	userHash := shortHash(userID)
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: p.namespace,
-			Labels:    map[string]string{"app": "browser-worker", "session": sessionID},
+			Labels:    map[string]string{"app": "browser-worker", "session": sessionID, "user": userHash},
 		},
 		Spec: corev1.PodSpec{
 			AutomountServiceAccountToken: ptr(false),
+			ActiveDeadlineSeconds:        ptr(int64(900)),
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot:   ptr(true),
 				RunAsUser:      ptr(int64(10001)),
@@ -86,6 +142,7 @@ func (p *K8sProvider) podTemplate(name, sessionID string) *corev1.Pod {
 				Image:           p.image,
 				ImagePullPolicy: corev1.PullIfNotPresent,
 				Command:         []string{"tini", "--", "sleep", "infinity"},
+				Env:             []corev1.EnvVar{{Name: "AGENT_BROWSER_ENCRYPTION_KEY", Value: encKey}},
 				SecurityContext: &corev1.SecurityContext{
 					AllowPrivilegeEscalation: ptr(false),
 					ReadOnlyRootFilesystem:   ptr(true),
@@ -125,6 +182,18 @@ func (p *K8sProvider) pollPodReady(ctx context.Context, podName string) error {
 	for {
 		pod, err := p.client.CoreV1().Pods(p.namespace).Get(ctx, podName, metav1.GetOptions{})
 		if err == nil {
+			if pod.Status.Phase == corev1.PodFailed {
+				return fmt.Errorf("pod %s failed: %s", podName, pod.Status.Reason)
+			}
+			for _, cs := range pod.Status.ContainerStatuses {
+				if cs.State.Waiting != nil {
+					switch cs.State.Waiting.Reason {
+					case "ImagePullBackOff", "ErrImagePull", "CrashLoopBackOff":
+						return fmt.Errorf("pod %s container %s stuck: %s (%s)",
+							podName, cs.Name, cs.State.Waiting.Reason, cs.State.Waiting.Message)
+					}
+				}
+			}
 			for _, c := range pod.Status.Conditions {
 				if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
 					return nil
@@ -185,10 +254,45 @@ func (p *K8sProvider) DestroySession(ctx context.Context, sessionID string) erro
 	if !ok {
 		return nil // idempotent
 	}
-	err := p.client.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{})
-	p.reg.Remove(sessionID)
-	if err != nil {
+
+	p.mu.Lock()
+	meta := p.meta[sessionID]
+	p.mu.Unlock()
+
+	// Best-effort persist the encrypted vault back to its (user,profile) slot.
+	if meta.authProfile != "" {
+		p.persistState(ctx, sessionID, podName, meta)
+	}
+
+	err := p.client.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
+		GracePeriodSeconds: ptr(int64(5)),
+	})
+	if err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete pod: %w", err)
 	}
+	p.reg.Remove(sessionID)
+	p.mu.Lock()
+	delete(p.meta, sessionID)
+	p.mu.Unlock()
+	return nil
+}
+
+// Reconcile re-adopts pre-existing worker pods into the registry after a restart,
+// keyed by the "session" label. The pod ActiveDeadlineSeconds is the GC backstop
+// for anything not re-adopted or closed.
+func (p *K8sProvider) Reconcile(ctx context.Context) error {
+	pods, err := p.client.CoreV1().Pods(p.namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=browser-worker"})
+	if err != nil {
+		return fmt.Errorf("reconcile list: %w", err)
+	}
+	n := 0
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if sid := pod.Labels["session"]; sid != "" {
+			p.reg.Add(sid, pod.Name)
+			n++
+		}
+	}
+	log.Printf("reconcile: re-adopted %d worker pod(s)", n)
 	return nil
 }

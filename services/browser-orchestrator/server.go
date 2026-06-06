@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"time"
 )
@@ -34,10 +35,26 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+type newSessionRequest struct {
+	UserID      string `json:"user_id"`
+	AuthProfile string `json:"auth_profile"`
+}
+
 func (s *Server) handleNewSession(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10) // 8 KiB cap
+	var req newSessionRequest
+	// An empty/absent body is fine: both fields default to empty.
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid body"})
+		return
+	}
+	userID := req.UserID
+	if userID == "" {
+		userID = "default"
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 150*time.Second)
 	defer cancel()
-	id, err := s.provider.CreateSession(ctx)
+	id, err := s.provider.CreateSession(ctx, userID, req.AuthProfile)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -64,6 +81,10 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	var req execRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Args) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body must be {\"args\":[...]} with >=1 arg"})
+		return
+	}
+	if !ExecAllowed(req.Args) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "command not allowed"})
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)

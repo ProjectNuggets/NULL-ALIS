@@ -26,7 +26,9 @@ type stubProvider struct {
 	execOut  string
 }
 
-func (s stubProvider) CreateSession(context.Context) (string, error) { return s.createID, nil }
+func (s stubProvider) CreateSession(context.Context, string, string) (string, error) {
+	return s.createID, nil
+}
 func (s stubProvider) Exec(_ context.Context, _ string, _ []string) (ExecResult, error) {
 	return ExecResult{Stdout: s.execOut}, nil
 }

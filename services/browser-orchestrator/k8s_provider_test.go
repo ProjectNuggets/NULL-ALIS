@@ -18,8 +18,11 @@ func TestCreateSessionCreatesHardenedPod(t *testing.T) {
 		image:     "browser-worker:dev",
 		reg:       NewRegistry(),
 		waitReady: func(ctx context.Context, pod string) error { return nil },
+		masterKey: []byte("0123456789abcdef0123456789abcdef"),
+		store:     NewStateStore(client, "browser"),
+		meta:      map[string]sessionMeta{},
 	}
-	id, err := p.CreateSession(context.Background())
+	id, err := p.CreateSession(context.Background(), "tester", "")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -59,5 +62,14 @@ func TestCreateSessionCreatesHardenedPod(t *testing.T) {
 	}
 	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
 		t.Error("pod must set automountServiceAccountToken=false")
+	}
+	var encKey string
+	for _, e := range pod.Spec.Containers[0].Env {
+		if e.Name == "AGENT_BROWSER_ENCRYPTION_KEY" {
+			encKey = e.Value
+		}
+	}
+	if encKey == "" {
+		t.Error("container must set AGENT_BROWSER_ENCRYPTION_KEY env to a non-empty per-user key")
 	}
 }
