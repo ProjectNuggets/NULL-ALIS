@@ -4,6 +4,10 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const client_mod = @import("../browser_backend/client.zig");
+const BrowserNewSessionTool = @import("browser_new_session.zig").BrowserNewSessionTool;
+const BrowserNavigateTool = @import("browser_navigate.zig").BrowserNavigateTool;
+const BrowserSnapshotTool = @import("browser_snapshot.zig").BrowserSnapshotTool;
+const BrowserCloseSessionTool = @import("browser_close_session.zig").BrowserCloseSessionTool;
 
 /// Turn an orchestrator /exec Response into a ToolResult.
 pub fn interpretExecResponse(allocator: std.mem.Allocator, resp: client_mod.Response) !ToolResult {
@@ -74,6 +78,57 @@ test "browser_exec non-zero exit on 200 is a failure" {
     try std.testing.expect(!r.success);
     try std.testing.expect(std.mem.indexOf(u8, r.error_msg.?, "@e99") != null);
 }
+test "live: browser_* tools drive a session end to end" {
+    if (std.posix.getenv("NULLALIS_BROWSER_LIVE_TEST") == null) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var client = client_mod.OrchestratorClient{ .base_url = "http://localhost:8080", .timeout_ms = 120_000 };
+
+    // browser_new_session (bound to a user, like the gateway does)
+    var ns = BrowserNewSessionTool{ .client = &client, .user_id = "e2e-tools" };
+    const ns_args = try root.parseTestArgs("{}");
+    defer ns_args.deinit();
+    const ns_res = try ns.execute(allocator, ns_args.value.object);
+    defer if (ns_res.output.len > 0) allocator.free(ns_res.output);
+    defer if (ns_res.error_msg) |m| allocator.free(m);
+    try std.testing.expect(ns_res.success);
+    // parse session_id out of {"session_id":"..."}
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, ns_res.output, .{});
+    defer parsed.deinit();
+    const sid = parsed.value.object.get("session_id").?.string;
+
+    // browser_navigate
+    var nav = BrowserNavigateTool{ .client = &client };
+    const nav_json = try std.fmt.allocPrint(allocator, "{{\"session_id\":\"{s}\",\"url\":\"https://example.com\"}}", .{sid});
+    defer allocator.free(nav_json);
+    const nav_args = try root.parseTestArgs(nav_json);
+    defer nav_args.deinit();
+    const nav_res = try nav.execute(allocator, nav_args.value.object);
+    defer if (nav_res.output.len > 0) allocator.free(nav_res.output);
+    defer if (nav_res.error_msg) |m| allocator.free(m);
+    try std.testing.expect(nav_res.success);
+
+    // browser_snapshot -> @eN
+    var snap = BrowserSnapshotTool{ .client = &client };
+    const snap_json = try std.fmt.allocPrint(allocator, "{{\"session_id\":\"{s}\"}}", .{sid});
+    defer allocator.free(snap_json);
+    const snap_args = try root.parseTestArgs(snap_json);
+    defer snap_args.deinit();
+    const snap_res = try snap.execute(allocator, snap_args.value.object);
+    defer if (snap_res.output.len > 0) allocator.free(snap_res.output);
+    defer if (snap_res.error_msg) |m| allocator.free(m);
+    try std.testing.expect(snap_res.success);
+    try std.testing.expect(std.mem.indexOf(u8, snap_res.output, "ref=e") != null);
+
+    // browser_close_session
+    var close = BrowserCloseSessionTool{ .client = &client };
+    const close_args = try root.parseTestArgs(snap_json);
+    defer close_args.deinit();
+    const close_res = try close.execute(allocator, close_args.value.object);
+    defer if (close_res.output.len > 0) allocator.free(close_res.output);
+    defer if (close_res.error_msg) |m| allocator.free(m);
+    try std.testing.expect(close_res.success);
+}
+
 test "browser_exec maps 403 to a clear denial" {
     var tt = client_mod.TestTransportPub{ .body = "{}", .status = 403 };
     var cl = client_mod.OrchestratorClient{ .base_url = "http://x", .transport = tt.transport() };
