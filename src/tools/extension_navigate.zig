@@ -99,9 +99,8 @@ pub const ExtensionNavigateTool = struct {
         const url = root.getString(args, "url") orelse return ToolResult.fail("missing 'url' parameter");
         if (url.len == 0) return ToolResult.fail("'url' must be a non-empty string");
 
-        // SSRF defense FIRST — before any hub dispatch. Mirrors the
-        // playwright-mcp sanitizer for the server-side browser; this
-        // path closes the same bypass classes for the USER-side
+        // SSRF defense FIRST — before any hub dispatch. Implements the
+        // deny classes from `docs/ssrf-blocklist.md` for the USER-side
         // browser (cloud metadata, RFC1918, loopback, IPv6 link-local,
         // IPv4-mapped IPv6, decimal/hex-encoded IPs, localhost.
         // trailing-dot aliases, etc.). Operator escape: a hostname in

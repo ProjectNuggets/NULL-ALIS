@@ -1,14 +1,15 @@
 //! URL sanitization — SSRF defense for the gateway-side `extension_*`
 //! tool family.
 //!
-//! Symmetric to `.spike/playwright-mcp/src/sanitize.ts` for the
-//! server-side browser. Same threat model: an attacker prompt (or
-//! upstream prompt-injection) can drive the tool dispatcher to navigate
-//! the user's REAL browser at `http://169.254.169.254/`, RFC1918,
-//! loopback, IPv6 link-local / unique-local, or DNS aliases that
-//! resolve to any of the above. Every bypass class playwright-mcp's
-//! `sanitizeUrl` closes for the SERVER-side browser is closed here for
-//! the USER-side browser.
+//! Implements the deny classes specified in `docs/ssrf-blocklist.md`
+//! (the single authoritative source). The in-cluster orchestrator lane
+//! (`services/browser-orchestrator/urlguard.go`) implements the same
+//! classes for the server-side browser. Same threat model: an attacker
+//! prompt (or upstream prompt-injection) can drive the tool dispatcher
+//! to navigate the user's REAL browser at `http://169.254.169.254/`,
+//! RFC1918, loopback, IPv6 link-local / unique-local, or DNS aliases
+//! that resolve to any of the above. Any change to the deny classes MUST
+//! update both sanitizers and their parity tests (see docs/ssrf-blocklist.md).
 //!
 //! Default-deny matches AGENTS.md §3.5 (secure-by-default, least
 //! privilege). Operators with a legitimate need to drive a LAN service
@@ -240,10 +241,10 @@ pub fn sanitize(url: []const u8, allowlist: []const []const u8) SanitizeResult {
     // dispatched. That's a known v2 hardening — DNS rebinding defense
     // would require either pre-resolving + pinning or a `Host:` header
     // override, neither of which is in v1 scope. The symmetric server-
-    // side `playwright-mcp` defense also doesn't pre-resolve (it
-    // relies on the route interceptor catching the actual dispatched
-    // request); the gateway-side equivalent would be intercepting in
-    // the extension's `cmdNavigate` — out of scope for this CRIT 1 fix.
+    // side orchestrator-lane `urlguard.go` defense also doesn't pre-
+    // resolve (it relies on the pod NetworkPolicy as the enforced backstop);
+    // the gateway-side equivalent would be intercepting in the extension's
+    // `cmdNavigate` — out of scope for this CRIT 1 fix.
     return .{ .ok = {} };
 }
 
@@ -251,7 +252,7 @@ pub fn sanitize(url: []const u8, allowlist: []const []const u8) SanitizeResult {
 
 /// Classify an IPv4 address. Returns `.ok` if the address is in the
 /// "unicast" range (the open internet) or rejects with a specific
-/// reason. Mirrors the JS `classifyIPv4` in `playwright-mcp/sanitize.ts`.
+/// reason. See `docs/ssrf-blocklist.md` §3–6 for the deny-class spec.
 fn classifyIPv4(v4: [4]u8) SanitizeResult {
     // 0.0.0.0/8 - "this network" / unspecified
     if (v4[0] == 0) {
