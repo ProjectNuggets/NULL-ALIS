@@ -33,3 +33,8 @@
 - Orchestrator HTTP `ReadTimeout`/`WriteTimeout`/`IdleTimeout` + graceful shutdown + cancellable janitor context.
 - Rate-limiter per-user bucket map is unbounded (cap/LRU/sweep).
 - `EXEC_PATH` is now injected by the orchestrator (✅ resolves the earlier carry-forward).
+
+## D. Plan-5 view-feed carry-forwards (all LOW, from the dedicated review)
+- **Frame-fetch latency:** each `browser_frame` emit adds 4 k8s-exec round-trips (`screenshot`+`base64`+`get url`+`get title`) on the turn's critical path after each browser action (`k8s_provider.go` `Frame()`). If latency bites: collapse to one `get`, or fire-and-forget the frame off the critical path. Privacy/memory are clean (PNG never logged; synchronous copy — no UAF).
+- **`/tmp/vf.png` fixed path:** same-session concurrent `Frame()` calls could race on the file (benign — torn read → dropped frame; mem-backed emptyDir). Use a per-call temp name if it ever matters.
+- **`url` logged** in the log/otel sink arms (PNG is not) — consistent with existing URL logging; revisit if URL-logging policy tightens.

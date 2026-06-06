@@ -55,7 +55,7 @@ The `data:` line carries a JSON object with exactly these fields:
 | `title`      | string           | yes            | Current page `<title>` |
 | `run_id`     | string           | no (optional)  | Turn-level correlation id; omitted when absent (see §1.4 of `online-agent-contract.md`) |
 
-No other fields are emitted. The four always-present fields (`type`,
+No other fields are emitted. The five always-present fields (`type`,
 `session_id`, `frame`, `url`, `title`) are never null and never omitted.
 `run_id` is omitted from the object when the runtime does not supply one.
 
