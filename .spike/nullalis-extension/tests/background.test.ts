@@ -326,6 +326,86 @@ describe("C1/H1: per-tab consent enforcement", () => {
   });
 });
 
+describe("C1/H1: navigate {new_tab:true} consent inheritance", () => {
+  it("refuses new_tab when the active tab is NOT consented (no tab created)", async () => {
+    await import("../src/background");
+    await flush();
+    const ws = authenticate();
+    await flush();
+
+    // No enable_active_tab — active tab 1 is not consented.
+    const created: unknown[] = [];
+    const realCreate = (globalThis as unknown as { chrome: { tabs: { create: unknown } } }).chrome.tabs.create;
+    (globalThis as unknown as { chrome: { tabs: { create: unknown } } }).chrome.tabs.create = async (a: { url: string }) => {
+      created.push(a);
+      return (realCreate as (a: { url: string }) => Promise<unknown>)(a);
+    };
+
+    ws.message({ command_id: "nt1", tool: "navigate", args: { url: "https://example.com/", new_tab: true } });
+    await flush();
+
+    const r = sentResults(ws).find((x) => x.command_id === "nt1")!;
+    expect(r.ok).toBe(false);
+    expect(r.error?.code).toBe("consent_required");
+    // No tab was created.
+    expect(created).toEqual([]);
+  });
+
+  it("with a consented active tab: creates the new tab, marks it consented+touched, and a subsequent command on it succeeds", async () => {
+    await import("../src/background");
+    await flush();
+    const ws = authenticate();
+    await flush();
+
+    // Enable the active tab (tab 1) — the gesture-of-record.
+    await popup({ type: "enable_active_tab" });
+    await flush();
+
+    ws.message({ command_id: "nt2", tool: "navigate", args: { url: "https://example.com/next", new_tab: true } });
+    await flush();
+
+    const r = sentResults(ws).find((x) => x.command_id === "nt2")!;
+    expect(r.ok).toBe(true);
+    // Mock tabs.create returns id 99.
+    expect((r.result as { tab_id: number }).tab_id).toBe(99);
+
+    // The new tab is consented: a command run against it (make it the active
+    // tab) is allowed.
+    activeTab = { id: 99, title: "next", url: "https://example.com/next" };
+    tabResponder = () => ({ clicked: "#y" });
+    ws.message({ command_id: "nt2b", tool: "click", args: { selector: "#y" } });
+    await flush();
+
+    const r2 = sentResults(ws).find((x) => x.command_id === "nt2b")!;
+    expect(r2.ok).toBe(true);
+    expect(r2.result).toEqual({ clicked: "#y" });
+
+    // The new tab is also in the consented set surfaced to the popup.
+    const status = (await popup({ type: "get_status" })) as { ok: true; status: { consented_tabs: number[] } };
+    expect(status.status.consented_tabs).toContain(99);
+  });
+
+  it("STOP reloads an agent-opened tab", async () => {
+    await import("../src/background");
+    await flush();
+    const ws = authenticate();
+    await flush();
+
+    await popup({ type: "enable_active_tab" });
+    await flush();
+
+    ws.message({ command_id: "nt3", tool: "navigate", args: { url: "https://example.com/n", new_tab: true } });
+    await flush();
+    expect(sentResults(ws).find((x) => x.command_id === "nt3")!.ok).toBe(true);
+
+    await popup({ type: "stop_all" });
+    await flush();
+
+    // The agent-opened tab (id 99) is among the reloaded tabs.
+    expect(reloadCalls).toContain(99);
+  });
+});
+
 describe("H4: latched, in-flight-cancelling STOP", () => {
   it("refuses a command issued right after STOP with `stopped`", async () => {
     await import("../src/background");

@@ -82,6 +82,37 @@ describe("checkNavigateUrl — blocked hosts (SSRF classes)", () => {
   });
 });
 
+describe("checkNavigateUrl — gateway parity (IPv4-mapped IPv6 + trailing dot)", () => {
+  // The WHATWG URL parser normalizes [::ffff:127.0.0.1] -> [::ffff:7f00:1], so
+  // these exercise the hex-hextet decode path. Mirrors url_sanitize.zig /
+  // urlguard.go on the gateway side.
+  it("blocks IPv4-mapped loopback http://[::ffff:127.0.0.1]/", () => {
+    const r = checkNavigateUrl("http://[::ffff:127.0.0.1]/");
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBeTruthy();
+  });
+
+  it("blocks IPv4-mapped metadata http://[::ffff:169.254.169.254]/", () => {
+    const r = checkNavigateUrl("http://[::ffff:169.254.169.254]/");
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBeTruthy();
+  });
+
+  it("blocks trailing-dot localhost http://localhost./", () => {
+    const r = checkNavigateUrl("http://localhost./");
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBeTruthy();
+  });
+
+  it("still allows a normal public host https://example.com", () => {
+    expect(checkNavigateUrl("https://example.com").ok).toBe(true);
+  });
+
+  it("does NOT block a public IPv4-mapped address http://[::ffff:93.184.216.34]/", () => {
+    expect(checkNavigateUrl("http://[::ffff:93.184.216.34]/").ok).toBe(true);
+  });
+});
+
 describe("checkNavigateUrl — malformed", () => {
   it("rejects a non-absolute URL", () => {
     expect(checkNavigateUrl("/relative/path").ok).toBe(false);

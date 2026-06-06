@@ -59,8 +59,16 @@ tab" claim. It is implemented, not aspirational:
    `screenshot`, and `list_tabs` all reject with
    `{ ok:false, error:{ code:"consent_required" } }` if the active tab is not in
    `consentedTabs`. There is no code path that acts on a non-consented tab.
-   (A brand-new tab the agent itself opens via `navigate new_tab:true` is
-   implicitly consented — you asked, via an already-enabled tab, to open it.)
+   (A new tab the agent opens via `navigate new_tab:true` follows a bounded
+   **consent-inheritance** model: it is allowed ONLY when the current active
+   tab is already consented — that already-enabled tab is the gesture-of-record.
+   If the active tab is not consented, `navigate new_tab:true` is rejected with
+   `consent_required` and no tab is created. When allowed, the URL still passes
+   the SSRF allowlist and the new tab is added to BOTH the consented and touched
+   sets, so the agent may drive it and STOP reloads it. The agent can never
+   self-grant consent out of nothing — every consented tab traces back to a tab
+   the user explicitly enabled. The popup shows the count of currently-enabled
+   tabs so the agent's full reach is visible.)
 3. **Revocation is immediate and total.**
    - **STOP** sets a latch, aborts in-flight commands, reloads touched tabs,
      severs the socket, AND clears the entire `consentedTabs` set.
@@ -106,6 +114,10 @@ back online.
   `view-source:`, `blob:` and any loopback / RFC1918 / link-local /
   `169.254.*` / cloud-metadata / `*.local` host — so a compromised gateway
   can't pivot through the browser to internal services or run script URLs.
+  This mirrors the gateway's own SSRF guard (`url_sanitize.zig` / `urlguard.go`),
+  including IPv4-mapped IPv6 (`[::ffff:127.0.0.1]` / `[::ffff:169.254.169.254]`,
+  whether the parser hands us the dotted or hex-hextet form) and trailing-dot
+  FQDN-root hosts (`localhost.`), both of which decode to a blocked address.
 - **Sensitive-field write guard.** `type` / `fill_form` default-DENY writing to
   `input[type=password]` and `autocomplete=cc-*` fields. The server must set an
   explicit `allow_sensitive:true` on the command to write them, and when it

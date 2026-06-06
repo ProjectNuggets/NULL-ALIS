@@ -177,7 +177,7 @@ On failure:
 
 | Tool          | Runs in                | Args                                                      | Result                                                  |
 | ------------- | ---------------------- | --------------------------------------------------------- | ------------------------------------------------------- |
-| `navigate`    | background (chrome.tabs) | `url` (http/https public host only — SSRF allowlist), optional `new_tab: boolean` | `{ tab_id, url }` / `url_blocked` on a disallowed scheme or host |
+| `navigate`    | background (chrome.tabs) | `url` (http/https public host only — SSRF allowlist), optional `new_tab: boolean` (requires the active tab to already be consented; the opened tab inherits consent + is touched) | `{ tab_id, url }` / `url_blocked` on a disallowed scheme or host / `consent_required` if `new_tab` without a consented active tab |
 | `click`       | content script         | `selector`                                                | `{ clicked }`                                           |
 | `type`        | content script         | `selector`, `text`; password/`cc-*` fields need `allow_sensitive: true` | `{ typed, sensitive }` / `sensitive_field_blocked`     |
 | `fill_form`   | content script         | `fields: [{ selector, text }, ...]`; sensitive fields need `allow_sensitive: true` | `{ filled, sensitive }`                                 |

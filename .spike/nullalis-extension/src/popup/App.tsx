@@ -345,9 +345,18 @@ export function App(): JSX.Element {
             </button>
           )}
           {consentedTabs.length > 0 && (
-            <div style={styles.meta}>
-              enabled tabs: {consentedTabs.map((t) => `#${t}`).join(", ")}
-            </div>
+            <>
+              {/* Scope visibility: the agent can drive every consented tab,
+                  INCLUDING tabs it opened itself via navigate{new_tab:true}
+                  (those inherit consent from the already-enabled active tab).
+                  Surfacing the count so the user sees the full reach. */}
+              <div style={styles.meta}>
+                agent has {consentedTabs.length} tab{consentedTabs.length === 1 ? "" : "s"} enabled
+              </div>
+              <div style={styles.meta}>
+                enabled tabs: {consentedTabs.map((t) => `#${t}`).join(", ")}
+              </div>
+            </>
           )}
         </section>
       )}

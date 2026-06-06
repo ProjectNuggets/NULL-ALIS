@@ -296,9 +296,17 @@ async function cmdNavigate(args: Record<string, unknown>): Promise<{ tab_id: num
 
   const newTab = args.new_tab === true;
   if (newTab) {
-    // A brand-new tab the agent creates is implicitly consented — the user
-    // asked (via an already-consented tab's command stream) to open it, and we
-    // record it so the agent can keep driving it and STOP can reload it.
+    // C1/H1 — opening a NEW tab is only allowed when the CURRENT active tab is
+    // already consented. That already-consented tab is the gesture-of-record:
+    // the agent may not self-grant consent by opening tabs out of nothing. If
+    // the active tab isn't consented, requireConsentedActiveTab throws
+    // `consent_required` and no tab is created.
+    //
+    // Consent-inheritance model: agent-opened tabs inherit consent from the
+    // already-consented active tab; the new tab IS added to consented + touched
+    // (so the agent can drive it and STOP reloads it). This is bounded because
+    // it required an already-consented active tab as the gesture-of-record.
+    await requireConsentedActiveTab();
     const tab = await chrome.tabs.create({ url });
     if (tab.id !== undefined) {
       await addTouchedTab(tab.id);

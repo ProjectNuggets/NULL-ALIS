@@ -29,9 +29,73 @@ function unbracket(host: string): string {
   return host;
 }
 
+/**
+ * Classify a bare IPv4 dotted-quad as a blocked SSRF range (loopback / RFC1918
+ * / link-local / metadata / "this host"). Returns false for anything that isn't
+ * a dotted-quad or is a public address. Shared by the bare-v4 path and the
+ * IPv4-mapped-IPv6 path so the two stay in lock-step.
+ */
+function isBlockedV4(host: string): boolean {
+  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!v4) return false;
+  const a = Number(v4[1]);
+  const b = Number(v4[2]);
+  // 127.0.0.0/8 — loopback.
+  if (a === 127) return true;
+  // 10.0.0.0/8 — RFC1918.
+  if (a === 10) return true;
+  // 192.168.0.0/16 — RFC1918.
+  if (a === 192 && b === 168) return true;
+  // 172.16.0.0/12 — RFC1918 (172.16 – 172.31).
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  // 169.254.0.0/16 — link-local (includes the 169.254.169.254 metadata IP).
+  if (a === 169 && b === 254) return true;
+  // 0.0.0.0/8 — "this host".
+  if (a === 0) return true;
+  return false;
+}
+
+/**
+ * If `host` is an IPv4-mapped IPv6 address (::ffff:<v4>), return the embedded
+ * dotted-quad so the v4 classifier can run on it; otherwise null.
+ *
+ * The WHATWG URL parser normalizes `[::ffff:127.0.0.1]` to the hex hextet form
+ * `::ffff:7f00:1`, but a raw/unparsed host may carry the dotted form
+ * `::ffff:127.0.0.1`. We handle BOTH:
+ *   - dotted form: take the trailing dotted-quad verbatim.
+ *   - hex form: decode the last two hextets (the low 32 bits) to a dotted quad.
+ * `host` is already unbracketed + lowercased.
+ */
+function mappedV4(host: string): string | null {
+  if (!host.startsWith("::ffff:")) return null;
+  const rest = host.slice("::ffff:".length);
+
+  // Dotted form, e.g. "::ffff:127.0.0.1".
+  if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(rest)) {
+    return rest;
+  }
+
+  // Hex form, e.g. "::ffff:7f00:1" — last two hextets hold the v4's 32 bits.
+  const hextets = rest.split(":");
+  if (hextets.length !== 2) return null;
+  const hi = parseInt(hextets[0], 16);
+  const lo = parseInt(hextets[1], 16);
+  if (!Number.isInteger(hi) || !Number.isInteger(lo)) return null;
+  if (hi < 0 || hi > 0xffff || lo < 0 || lo > 0xffff) return null;
+  return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+}
+
 /** Is this host one of the blocked SSRF classes? `host` is already lowercased. */
 function isBlockedHost(rawHost: string): boolean {
-  const host = unbracket(rawHost.toLowerCase());
+  let host = unbracket(rawHost.toLowerCase());
+
+  // Strip a single trailing dot — the FQDN root label. `localhost.` and
+  // `printer.local.` resolve identically to their dot-less forms, so we must
+  // classify them the same way (gateway parity: url_sanitize.zig / urlguard.go).
+  // Bare IPv4 never carries a trailing dot once parsed, but strip defensively.
+  if (host.endsWith(".")) {
+    host = host.slice(0, -1);
+  }
 
   // Exact loopback / unspecified names + addresses.
   if (host === "localhost" || host === "::1" || host === "::" || host === "0.0.0.0") {
@@ -48,23 +112,16 @@ function isBlockedHost(rawHost: string): boolean {
     return true;
   }
 
+  // IPv4-mapped IPv6 (::ffff:127.0.0.1 / ::ffff:7f00:1) — re-classify the
+  // embedded v4 so a mapped loopback/metadata/RFC1918 address can't slip past.
+  const embedded = mappedV4(host);
+  if (embedded && isBlockedV4(embedded)) {
+    return true;
+  }
+
   // IPv4 dotted-quad ranges.
-  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (v4) {
-    const a = Number(v4[1]);
-    const b = Number(v4[2]);
-    // 127.0.0.0/8 — loopback.
-    if (a === 127) return true;
-    // 10.0.0.0/8 — RFC1918.
-    if (a === 10) return true;
-    // 192.168.0.0/16 — RFC1918.
-    if (a === 192 && b === 168) return true;
-    // 172.16.0.0/12 — RFC1918 (172.16 – 172.31).
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    // 169.254.0.0/16 — link-local (includes the 169.254.169.254 metadata IP).
-    if (a === 169 && b === 254) return true;
-    // 0.0.0.0/8 — "this host".
-    if (a === 0) return true;
+  if (isBlockedV4(host)) {
+    return true;
   }
 
   // IPv6 unique-local fc00::/7 (fc.. / fd..) and link-local fe80::/10.
