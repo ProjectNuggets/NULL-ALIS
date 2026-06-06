@@ -7,6 +7,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "icons": "bash scripts/gen-icons.sh",
+    "package": "npm run build && cd dist && zip -r ../nullalis-extension.zip . && cd ..",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",

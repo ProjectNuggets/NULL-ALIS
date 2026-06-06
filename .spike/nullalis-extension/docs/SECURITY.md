@@ -72,12 +72,20 @@ When you install this extension, you are trusting that:
 
 These are tracked and intentional, not blind spots:
 
-- **No result-frame HMAC signing.** A compromised gateway today can already
-  drive the browser, so signing the result doesn't help against gateway
-  compromise. The real risk this addresses is a MITM-injected gateway URL
-  that intercepts results before the real gateway sees them. Mitigation:
-  always use `wss://` to a hostname under a cert your machine trusts. The
-  HMAC-sign-results work is v1.1.
+- **No result-frame HMAC signing — deliberately deferred, not a TODO.** Over
+  `wss://` (TLS) the record layer already gives every frame integrity +
+  confidentiality, and the per-user token already authenticates the channel
+  constant-time server-side (`src/extension_ws/auth.zig`) from inside the
+  trusted background service worker (the token never reaches page scripts).
+  HMAC keyed by that same token would re-prove channel authenticity TLS + auth
+  already prove, and defends against neither real threat (a compromised gateway
+  can drive the browser directly; a compromised extension surface holds the
+  token and could mint a valid MAC). It is therefore theater here. The token
+  *is* long-lived/reusable across reconnects with no per-session nonce, but the
+  honest fix for that is token rotation + a handshake nonce, not result HMAC.
+  Full rationale + the trigger that would change this (a non-TLS deployment, or
+  rotating tokens) is in `../../docs/extension-distribution.md` →
+  "Request signing".
 - **No per-origin allow-lists.** The agent can act on any tab you're
   focused on. v1.1 will let you say "allow nullalis on github.com and
   gmail.com only."
@@ -85,9 +93,6 @@ These are tracked and intentional, not blind spots:
   recent command and a count, but there's no scrollable history. The
   gateway side has the full audit trail; the extension is intentionally
   stateless beyond the auth config.
-- **The placeholder icons (`public/icon-*.png`) are tiny PNG stubs.** They
-  are visually distinct enough to not be confused with another extension
-  during dev, but real branding lands at Chrome Web Store publish time.
 - **No CSP/permissions policy lockdown in `manifest.json`** beyond the MV3
   defaults. We deliberately omit `content_security_policy` because the MV3
   defaults are stricter than anything we'd write and we want them.

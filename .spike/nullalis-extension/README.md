@@ -74,13 +74,15 @@ non-loopback scenario — your auth token rides this connection.)
 - **Viewport screenshots only.** `screenshot(full_page: true)` returns the
   visible viewport with `full_page: true` echoed back. Scroll-and-stitch
   full-page screenshots are v1.1.
-- **Placeholder icons.** The `public/icon-*.png` files are placeholders;
-  real branding lands when we publish to the Chrome Web Store.
-- **No request-signing yet.** The plan is HMAC of `command_id + result hash`
-  using the token as the secret, so the gateway can verify result frames
-  weren't tampered with by a compromised extension surface. The wire format
-  is already designed to accept the signature field; the impl is a v1.1 item
-  tracked in `docs/SECURITY.md`.
+- **No request-signing.** Per-message HMAC is **deliberately deferred** — over
+  `wss`/TLS with per-user constant-time token auth in the trusted service
+  worker, it adds no attacker work over what the channel already provides. See
+  the "Request signing" section of `../../docs/extension-distribution.md` for
+  the full threat-model rationale and the concrete trigger (a non-TLS
+  deployment, or token rotation) that would justify revisiting it.
+
+Branded icons (`public/icon-{16,48,128}.png`) are real, generated reproducibly
+via `npm run icons` (see `scripts/gen-icons.sh`).
 
 ## Architecture pointer
 
