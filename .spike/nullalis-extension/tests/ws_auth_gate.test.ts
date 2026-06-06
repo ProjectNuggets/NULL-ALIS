@@ -65,6 +65,12 @@ class MockWebSocket {
       this.onmessage(new MessageEvent("message", { data: JSON.stringify(payload) }));
     }
   }
+  /** Feed a raw string frame straight to onmessage (for the size-cap test). */
+  simulateRawMessage(data: string): void {
+    if (this.onmessage) {
+      this.onmessage(new MessageEvent("message", { data }));
+    }
+  }
 }
 
 function makeClient(opts: {
@@ -219,6 +225,30 @@ describe("WsClient auth gate", () => {
     expect(authStates.some((s) => s.state === "authenticated")).toBe(true);
 
     // Now Commands flow through to onMessage.
+    ws.simulateMessage(SAMPLE_COMMAND);
+    expect(messages).toEqual([SAMPLE_COMMAND]);
+  });
+
+  it("M4: drops an oversized inbound frame BEFORE JSON.parse (no onMessage, no crash)", () => {
+    const messages: unknown[] = [];
+    const client = makeClient({ onMessage: (m) => messages.push(m) });
+
+    client.start();
+    const ws = MockWebSocket.instances[0]!;
+    ws.simulateOpen();
+    ws.simulateMessage({ type: "auth_ack", ok: true });
+    expect(client.isAuthenticated()).toBe(true);
+
+    // Build a >8MB string that, were it parsed, would be a valid command.
+    // The cap must drop it before JSON.parse so it never reaches onMessage.
+    const huge = '{"command_id":"big","tool":"get_dom","args":{"x":"' +
+      "a".repeat(8 * 1024 * 1024 + 16) + '"}}';
+    expect(huge.length).toBeGreaterThan(8 * 1024 * 1024);
+    ws.simulateRawMessage(huge);
+
+    expect(messages).toEqual([]);
+
+    // A normal-size command still flows after the oversized one is dropped.
     ws.simulateMessage(SAMPLE_COMMAND);
     expect(messages).toEqual([SAMPLE_COMMAND]);
   });

@@ -92,6 +92,63 @@ describe("commands.cmdType", () => {
   });
 });
 
+describe("commands.cmdType sensitive-field guard (M1)", () => {
+  beforeEach(() => setBody(""));
+  it("blocks writing input[type=password] without allow_sensitive", () => {
+    setBody('<input id="p" type="password" />');
+    try {
+      cmdType(document, { selector: "#p", text: "hunter2" });
+      throw new Error("should have thrown");
+    } catch (err) {
+      expect(err).toBeInstanceOf(CommandError);
+      expect((err as CommandError).code).toBe("sensitive_field_blocked");
+    }
+    // Value must NOT have been written.
+    expect((document.getElementById("p") as HTMLInputElement).value).toBe("");
+  });
+
+  it("blocks autocomplete=cc-number without allow_sensitive", () => {
+    setBody('<input id="c" autocomplete="cc-number" />');
+    try {
+      cmdType(document, { selector: "#c", text: "4111111111111111" });
+      throw new Error("should have thrown");
+    } catch (err) {
+      expect(err).toBeInstanceOf(CommandError);
+      expect((err as CommandError).code).toBe("sensitive_field_blocked");
+    }
+  });
+
+  it("allows password write when allowSensitive=true and flags sensitive", () => {
+    setBody('<input id="p" type="password" />');
+    const r = cmdType(document, { selector: "#p", text: "hunter2" }, true);
+    expect(r.sensitive).toBe(true);
+    expect((document.getElementById("p") as HTMLInputElement).value).toBe("hunter2");
+  });
+
+  it("non-sensitive field reports sensitive=false", () => {
+    setBody('<input id="q" />');
+    const r = cmdType(document, { selector: "#q", text: "hi" });
+    expect(r.sensitive).toBe(false);
+  });
+
+  it("runContentCommand honors Command.allow_sensitive", async () => {
+    setBody('<input id="p" type="password" />');
+    // Without the flag → blocked.
+    await expect(
+      runContentCommand(
+        { command_id: "1", tool: "type", args: { selector: "#p", text: "x" } },
+        document,
+      ),
+    ).rejects.toBeInstanceOf(CommandError);
+    // With the flag → allowed.
+    const ok = await runContentCommand(
+      { command_id: "2", tool: "type", args: { selector: "#p", text: "x" }, allow_sensitive: true },
+      document,
+    );
+    expect(ok).toEqual({ typed: 1, sensitive: true });
+  });
+});
+
 describe("commands.cmdFillForm", () => {
   beforeEach(() => setBody(""));
   it("fills multiple fields in order", () => {
@@ -181,7 +238,7 @@ describe("commands.runContentCommand", () => {
       { command_id: "1", tool: "type", args: { selector: "#q", text: "hi" } },
       document
     );
-    expect(result).toEqual({ typed: 2 });
+    expect(result).toEqual({ typed: 2, sensitive: false });
   });
   it("rejects background-only tool", async () => {
     await expect(

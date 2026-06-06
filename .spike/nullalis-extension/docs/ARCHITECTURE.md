@@ -33,16 +33,33 @@
   in the active tab.
 - Talks to the popup via `chrome.runtime.onMessage` for status updates,
   token management, and the STOP action.
-- MV3 evicts idle workers (~30s). All persistent state lives in
-  `chrome.storage.local` (token, gateway URL) — the in-memory `status` object
-  is rebuilt on revive.
+- Enforces per-tab consent (C1/H1): every tab-touching command checks the
+  `consentedTabs` set and rejects with `consent_required` otherwise. Wraps each
+  command in a per-command timeout (H3) and honors the STOP latch (H4).
+- Validates the sender of popup-control messages (C2): they must come from this
+  extension's own pages, not a content script or another extension.
+- MV3 evicts idle workers (~30s). Durable config (token, gateway URL) lives in
+  `chrome.storage.local`; session-scoped state (touched tabs, consented tabs,
+  command count, the STOP latch) lives in `chrome.storage.session` so it
+  survives worker eviction but resets on browser restart. The in-memory
+  `status` object is rebuilt on revive.
 
 ### Content script (`src/content.ts`)
 
-- Installed via `manifest.json` content_scripts for `http://*/*` and
-  `https://*/*` only (NOT `<all_urls>` — we exclude `file://`, `data:`,
-  `blob:`, `ftp:`, `view-source:` etc. since the agent only automates
-  the user's web-based logged-in sessions). Runs at `document_idle`.
+- **Injected ON DEMAND, never declaratively.** There is no `content_scripts`
+  entry in `manifest.json`. The background injects the content script via
+  `chrome.scripting.executeScript({ target:{tabId}, files:["content.js"] })`
+  only when the user enables the agent on a tab from the popup (C1/H1). Pages
+  the user never enables receive no extension code.
+- Built as a SINGLE self-contained classic IIFE at `dist/content.js` by
+  `vite.content.config.ts` (a second build pass). This is required because
+  `executeScript({files})` injects a classic script, not an ESM module, and
+  needs a stable author-known path. All of `src/commands.ts` is inlined, so no
+  `web_accessible_resources` is needed.
+- Validates `sender.id === chrome.runtime.id` so only this extension's
+  background can drive it (C2), and guards against double-injection
+  (`window.__nullalisContentLoaded__`) so re-enabling a tab doesn't register a
+  second listener.
 - Listens for `ExecuteInTab` and `ShowToast` messages from the background.
 - Dispatches `ExecuteInTab.command` against the page's real `document` via
   the same pure functions used in unit tests (`src/commands.ts`).
@@ -66,44 +83,60 @@
 The gateway must speak this protocol on its `/ext/ws` endpoint (or wherever it
 chooses to host the extension socket — the path is configurable in the popup).
 
-### Handshake
+### Handshake (challenge / nonce first)
 
-1. Extension opens the socket.
-2. Extension immediately sends:
+The extension does NOT send auth on open. The gateway speaks first with a
+per-connection anti-replay challenge (Plan-8); the extension echoes the nonce.
+
+1. Extension opens the socket. It sends NOTHING yet — it waits for the
+   challenge. (The auth timer starts now, so a gateway that never challenges
+   still trips `auth_timeout`.)
+2. Gateway issues a fresh per-connection nonce:
 
    ```json
-   { "type": "auth", "token": "<bearer token>", "extension_version": "0.1.0" }
+   { "type": "challenge", "nonce": "<64-char hex>" }
    ```
 
-3. Gateway validates the token. If valid, gateway MAY respond with:
+3. Extension echoes the nonce verbatim in its auth frame:
+
+   ```json
+   {
+     "type": "auth",
+     "token": "<bearer token>",
+     "extension_version": "0.1.0",
+     "nonce": "<the nonce from step 2>"
+   }
+   ```
+
+   A captured `auth` frame replayed on a fresh connection carries a stale nonce
+   and is rejected. A malformed challenge (missing/empty nonce) is ignored and
+   the auth timer eventually closes the socket.
+
+4. Gateway validates token + nonce and responds:
 
    ```json
    { "type": "auth_ack", "ok": true }
    ```
 
-   If invalid, gateway MAY respond:
+   or, on failure:
 
    ```json
    { "type": "auth_ack", "ok": false, "error": "invalid_token" }
    ```
 
-   and then close the socket with code 1008 (policy violation).
+   then closes with code 1008 (policy violation).
 
-4. The extension DOES block on `auth_ack` (since 2026-05-25, Wave 3
-   review CRITICAL #5). Inbound `Command` frames received before
-   `auth_ack{ok:true}` are dropped on the floor and not dispatched. If
-   `auth_ack` doesn't arrive within `authTimeoutMs` (default 5s), the
-   extension closes the socket with code 1008 and surfaces
-   `last_error: "auth_timeout"` in the popup. `auth_ack{ok:false}`
-   closes with `last_error: "auth_failed: <reason>"`. Ping/pong is
-   exempt — heartbeat must work pre-ack so proxies don't drop the
-   connection during the handshake window.
+5. The extension blocks on `auth_ack` (since 2026-05-25, Wave 3 review
+   CRITICAL #5). Inbound `Command` frames received before `auth_ack{ok:true}`
+   are dropped and not dispatched. If `auth_ack` doesn't arrive within
+   `authTimeoutMs` (default 5s), the extension closes the socket with code 1008
+   and surfaces `last_error: "auth_timeout"` in the popup. `auth_ack{ok:false}`
+   closes with `last_error: "auth_failed: <reason>"`. Ping/pong is exempt —
+   heartbeat must work pre-ack so proxies don't drop the connection during the
+   handshake window.
 
-   Gateways MUST send `auth_ack` immediately after validating the token.
-   The pre-fix "we just close the socket on bad auth" behavior also
-   works (the extension reconnects with backoff) but is less informative
-   for the user — a fast `auth_ack{ok:false}` produces a clean popup
-   message; a silent close produces a generic "closed (code 1006)".
+   Inbound frames are also size-capped: any frame larger than 8 MB is dropped
+   before `JSON.parse` (M4).
 
 ### Commands
 
@@ -144,10 +177,10 @@ On failure:
 
 | Tool          | Runs in                | Args                                                      | Result                                                  |
 | ------------- | ---------------------- | --------------------------------------------------------- | ------------------------------------------------------- |
-| `navigate`    | background (chrome.tabs) | `url`, optional `new_tab: boolean`                       | `{ tab_id, url }`                                       |
+| `navigate`    | background (chrome.tabs) | `url` (http/https public host only — SSRF allowlist), optional `new_tab: boolean` | `{ tab_id, url }` / `url_blocked` on a disallowed scheme or host |
 | `click`       | content script         | `selector`                                                | `{ clicked }`                                           |
-| `type`        | content script         | `selector`, `text`                                        | `{ typed }`                                             |
-| `fill_form`   | content script         | `fields: [{ selector, text }, ...]`                       | `{ filled }`                                            |
+| `type`        | content script         | `selector`, `text`; password/`cc-*` fields need `allow_sensitive: true` | `{ typed, sensitive }` / `sensitive_field_blocked`     |
+| `fill_form`   | content script         | `fields: [{ selector, text }, ...]`; sensitive fields need `allow_sensitive: true` | `{ filled, sensitive }`                                 |
 | `screenshot`  | background             | optional `full_page: boolean`                             | `{ data_url: "data:image/png;base64,...", full_page }`  |
 | `get_text`    | content script         | optional `selector`                                       | `{ text, truncated }` (cap 100 KB)                      |
 | `get_dom`     | content script         | optional `selector`                                       | `{ html, truncated }` (cap 1 MB)                        |
@@ -166,7 +199,11 @@ gateway should treat absence of either as a half-open connection and close.
 The extension uses exponential backoff with full jitter:
 `delay = random(0, current_backoff)`, with `current_backoff` doubling on each
 failure from 1s up to 30s. On a successful open, `current_backoff` resets.
-The gateway should expect a fresh `auth` frame on every reconnect.
+The gateway must issue a fresh `challenge` on every reconnect and expect a fresh
+nonce-echoing `auth` frame in response (auth state never carries across sockets).
+
+Reconnect is suppressed while the STOP latch is set (H4): only an explicit
+**connect** from the popup clears the latch and allows the socket to reopen.
 
 ## Why this split (background vs content)?
 

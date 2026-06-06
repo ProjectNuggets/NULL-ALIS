@@ -67,16 +67,50 @@ export function cmdClick(doc: Document, args: Record<string, unknown>): { clicke
 }
 
 /**
+ * Is this element a sensitive field we must not write to without explicit
+ * server opt-in? (M1) Covers password inputs and credit-card autocomplete
+ * tokens (cc-number, cc-csc, cc-exp, ...).
+ */
+export function isSensitiveField(el: Element): boolean {
+  if (el instanceof HTMLInputElement && el.type.toLowerCase() === "password") {
+    return true;
+  }
+  // autocomplete may carry section/billing tokens, e.g. "section-foo cc-number".
+  const ac = el.getAttribute("autocomplete");
+  if (ac) {
+    for (const token of ac.toLowerCase().split(/\s+/)) {
+      if (token.startsWith("cc-")) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Type text into an input/textarea. Uses native value setter + dispatched
  * "input" event so frameworks (React, Vue) pick up the change.
+ *
+ * M1 — default-DENY writes to sensitive fields (password, autocomplete=cc-*)
+ * unless `allowSensitive` is true (set from the server-issued
+ * Command.allow_sensitive flag). Throws `sensitive_field_blocked` otherwise.
  */
-export function cmdType(doc: Document, args: Record<string, unknown>): { typed: number } {
+export function cmdType(
+  doc: Document,
+  args: Record<string, unknown>,
+  allowSensitive = false,
+): { typed: number; sensitive: boolean } {
   const selector = asString(args, "selector");
   const text = asString(args, "text");
   const el = doc.querySelector(selector);
   if (!el) throw new CommandError("not_found", `no element matches ${selector}`);
   if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) {
     throw new CommandError("not_typeable", `element ${selector} is not input/textarea`);
+  }
+  const sensitive = isSensitiveField(el);
+  if (sensitive && !allowSensitive) {
+    throw new CommandError(
+      "sensitive_field_blocked",
+      `refusing to write sensitive field ${selector} without allow_sensitive`,
+    );
   }
   // React-friendly value setter: use the native prototype setter then dispatch
   // input + change so controlled inputs notice the change.
@@ -86,7 +120,7 @@ export function cmdType(doc: Document, args: Record<string, unknown>): { typed: 
   else el.value = text;
   el.dispatchEvent(new Event("input", { bubbles: true }));
   el.dispatchEvent(new Event("change", { bubbles: true }));
-  return { typed: text.length };
+  return { typed: text.length, sensitive };
 }
 
 /**
@@ -95,22 +129,27 @@ export function cmdType(doc: Document, args: Record<string, unknown>): { typed: 
  */
 export function cmdFillForm(
   doc: Document,
-  args: Record<string, unknown>
-): { filled: number } {
+  args: Record<string, unknown>,
+  allowSensitive = false,
+): { filled: number; sensitive: boolean } {
   const fields = args["fields"];
   if (!Array.isArray(fields)) {
     throw new CommandError("invalid_args", "fields must be an array");
   }
   let filled = 0;
+  let sensitive = false;
   for (let i = 0; i < fields.length; i++) {
     const f = fields[i];
     if (!f || typeof f !== "object") {
       throw new CommandError("invalid_args", `fields[${i}] must be an object`);
     }
-    cmdType(doc, f as Record<string, unknown>);
+    // M1 — the per-field sensitive guard runs inside cmdType; we propagate
+    // allowSensitive and remember if any field was sensitive for the toast.
+    const r = cmdType(doc, f as Record<string, unknown>, allowSensitive);
+    if (r.sensitive) sensitive = true;
     filled++;
   }
-  return { filled };
+  return { filled, sensitive };
 }
 
 /**
@@ -233,14 +272,20 @@ export function cmdScroll(doc: Document, args: Record<string, unknown>): { scrol
  * navigate / screenshot / list_tabs go through chrome.* in the background
  * service worker and are dispatched there, not here.
  */
-export const CONTENT_COMMANDS: Record<string, (doc: Document, args: Record<string, unknown>) => unknown | Promise<unknown>> = {
-  click: cmdClick,
-  type: cmdType,
-  fill_form: cmdFillForm,
-  get_text: cmdGetText,
-  get_dom: cmdGetDom,
-  wait_for: cmdWaitFor,
-  scroll: cmdScroll,
+type ContentCommandFn = (
+  doc: Document,
+  args: Record<string, unknown>,
+  allowSensitive: boolean,
+) => unknown | Promise<unknown>;
+
+export const CONTENT_COMMANDS: Record<string, ContentCommandFn> = {
+  click: (doc, args) => cmdClick(doc, args),
+  type: (doc, args, allow) => cmdType(doc, args, allow),
+  fill_form: (doc, args, allow) => cmdFillForm(doc, args, allow),
+  get_text: (doc, args) => cmdGetText(doc, args),
+  get_dom: (doc, args) => cmdGetDom(doc, args),
+  wait_for: (doc, args) => cmdWaitFor(doc, args),
+  scroll: (doc, args) => cmdScroll(doc, args),
 };
 
 /** Tools that must run in the background service worker, not the content script. */
@@ -284,5 +329,7 @@ export async function runContentCommand(c: Command, doc: Document): Promise<unkn
   if (!fn) {
     throw new CommandError("unknown_tool", `tool ${c.tool} is not a content-script command`);
   }
-  return await fn(doc, c.args);
+  // M1 — the server-issued allow_sensitive flag gates writes to password /
+  // credit-card fields. Defaults to false (deny).
+  return await fn(doc, c.args, c.allow_sensitive === true);
 }

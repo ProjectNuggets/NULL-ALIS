@@ -36,15 +36,56 @@ When you install this extension, you are trusting that:
 - No `eval()`, `Function(string)`, or other dynamic-code-execution surfaces
   exist in any extension context. Selectors are passed to `querySelector`,
   which is safe by design (it's not an `eval`).
-- The extension does NOT request `<all_urls>` host permission. The content
-  script attaches declaratively, and the background uses `activeTab` only,
-  so the agent's reach is gated by user focus.
-- The declarative content-script injection itself is also narrowed: it only
-  matches `http://*/*` and `https://*/*`, not `<all_urls>`. `file://`,
-  `data:`, `blob:`, `ftp:`, and `view-source:` documents do NOT get the
-  content script injected — they're outside the use case (the agent
-  automates web-based logged-in sessions) and were prior in-page surface
-  with no purpose.
+- The extension does NOT request `<all_urls>` host permission, and as of the
+  consent redesign it does NOT request the broad `tabs` permission either. The
+  full permission set is exactly `activeTab`, `scripting`, `storage`.
+- **There is NO declarative content script.** The agent's in-page code is
+  injected ON DEMAND — only into tabs you explicitly enable — via
+  `chrome.scripting.executeScript`. Pages you never enable never receive any
+  extension code.
+
+## Per-tab consent (the real model)
+
+This is the core of the security model and the manifest's "explicit consent per
+tab" claim. It is implemented, not aspirational:
+
+1. **Nothing runs until you opt in.** Open the popup on a tab and click
+   **"Enable agent on this tab."** That click is a user gesture, so Chrome
+   grants `activeTab` for that tab; the background then (a) records the tab id
+   in a `consentedTabs` set persisted in `chrome.storage.session`, and (b)
+   injects the content script into that one tab.
+2. **Every tab-touching command checks consent.** `click`, `type`, `fill_form`,
+   `get_text`, `get_dom`, `wait_for`, `scroll`, `navigate` (same-tab),
+   `screenshot`, and `list_tabs` all reject with
+   `{ ok:false, error:{ code:"consent_required" } }` if the active tab is not in
+   `consentedTabs`. There is no code path that acts on a non-consented tab.
+   (A brand-new tab the agent itself opens via `navigate new_tab:true` is
+   implicitly consented — you asked, via an already-enabled tab, to open it.)
+3. **Revocation is immediate and total.**
+   - **STOP** sets a latch, aborts in-flight commands, reloads touched tabs,
+     severs the socket, AND clears the entire `consentedTabs` set.
+   - **Disconnect** clears the entire `consentedTabs` set.
+   - **Closing a tab** removes it from the set (`chrome.tabs.onRemoved`).
+   - The popup has a per-tab **disable** control.
+   - Consent lives in `chrome.storage.session`, so a browser restart wipes it —
+     consent is never durable across restarts.
+4. **v1 scope note:** for v1, navigation *within* an already-consented tab keeps
+   consent (we don't re-prompt on every in-tab navigation). Switching focus to a
+   different, non-enabled tab does not grant the agent anything.
+
+## Latched STOP
+
+The STOP button is a hard kill, not a soft pause. Pressing it:
+- sets a `stopped` latch (persisted to `chrome.storage.session`) — while set,
+  no command is dispatched (they return a `stopped` error) and the socket will
+  NOT auto-reconnect, even across service-worker eviction/revival;
+- aborts and awaits any in-flight command before reloading;
+- reloads every tab the agent touched this browser session;
+- clears all per-tab consent and severs the WebSocket.
+
+The latch is cleared **only** by an explicit **connect** from the popup. An
+idle-worker revival or browser restart cannot silently bring a stopped agent
+back online.
 
 ## Mitigations in v1
 
@@ -57,7 +98,20 @@ When you install this extension, you are trusting that:
   and reloads every tab the agent has touched in the current session,
   discarding any half-typed input or in-flight form.
 - **Active-tab-only operation.** The agent can only act on the tab you are
-  currently focused on. Switch tabs and the agent's reach goes with you.
+  currently focused on AND have explicitly enabled. Switch tabs and the agent's
+  reach goes with you.
+- **`navigate` URL allowlist (SSRF defense).** The one command that takes an
+  attacker-influenceable URL only accepts `http:`/`https:` to public hosts. It
+  rejects `javascript:`, `data:`, `file:`, `chrome:`, `about:`,
+  `view-source:`, `blob:` and any loopback / RFC1918 / link-local /
+  `169.254.*` / cloud-metadata / `*.local` host — so a compromised gateway
+  can't pivot through the browser to internal services or run script URLs.
+- **Sensitive-field write guard.** `type` / `fill_form` default-DENY writing to
+  `input[type=password]` and `autocomplete=cc-*` fields. The server must set an
+  explicit `allow_sensitive:true` on the command to write them, and when it
+  does the in-page toast says so.
+- **Inbound frame size cap.** WebSocket frames larger than 8 MB are dropped
+  before parsing so a hostile gateway can't OOM or stall the service worker.
 - **No `webRequest` permission.** The extension cannot intercept or modify
   network traffic.
 - **No `cookies` permission.** The extension cannot read or set cookies
@@ -86,16 +140,25 @@ These are tracked and intentional, not blind spots:
   Full rationale + the trigger that would change this (a non-TLS deployment, or
   rotating tokens) is in `../../docs/extension-distribution.md` →
   "Request signing".
-- **No per-origin allow-lists.** The agent can act on any tab you're
-  focused on. v1.1 will let you say "allow nullalis on github.com and
-  gmail.com only."
+- **No per-origin allow-lists.** Consent is per-tab, not per-origin: enabling a
+  tab enables the agent on whatever that tab navigates to next. v1.1 will let
+  you say "allow nullalis on github.com and gmail.com only."
 - **No command audit log inside the extension.** The popup shows the most
   recent command and a count, but there's no scrollable history. The
   gateway side has the full audit trail; the extension is intentionally
   stateless beyond the auth config.
-- **No CSP/permissions policy lockdown in `manifest.json`** beyond the MV3
-  defaults. We deliberately omit `content_security_policy` because the MV3
-  defaults are stricter than anything we'd write and we want them.
+
+## Manifest hardening (implemented)
+
+- **Explicit, locked-down CSP.** `manifest.json` declares
+  `content_security_policy.extension_pages = "script-src 'self'; object-src
+  'self'"`. This pins the popup / extension-page script + object sources to the
+  extension's own origin on top of the MV3 defaults.
+- **No `web_accessible_resources`.** Removed entirely — the on-demand content
+  script is a self-contained classic script injected via `executeScript`, not a
+  page-reachable module, so nothing in the extension is exposed to page script.
+- **Least-privilege permissions.** Exactly `activeTab`, `scripting`, `storage`.
+  `tabs` was dropped; `<all_urls>` / host permissions were never requested.
 
 ## Reporting
 

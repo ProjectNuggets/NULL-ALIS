@@ -65,6 +65,13 @@ const DEFAULT_MAX_BACKOFF = 30_000;
 const DEFAULT_HEARTBEAT = 25_000;
 const DEFAULT_AUTH_TIMEOUT = 5_000;
 
+// M4 — inbound frame size cap. A misbehaving / hostile gateway could stream a
+// multi-hundred-MB frame to OOM the service worker or pin the main thread in
+// JSON.parse. We drop any string frame larger than this BEFORE parsing.
+// Legitimate command frames are tiny; get_dom/get_text results flow the OTHER
+// direction (extension → gateway) and are capped in commands.ts.
+const MAX_INBOUND_FRAME_BYTES = 8 * 1024 * 1024; // 8 MB
+
 // WebSocket readyState constants by literal value. We don't reference
 // `WebSocket.OPEN` because in some test/runtime environments the WebSocket
 // constructor's static fields aren't populated when an injected mock is used.
@@ -199,9 +206,18 @@ export class WsClient {
     };
 
     ws.onmessage = (ev: MessageEvent) => {
+      // M4 — drop oversized frames before we ever touch JSON.parse. We only
+      // ever expect string frames; a non-string frame (Blob/ArrayBuffer) is
+      // outside the protocol and parses to "" → dropped below.
+      const data = typeof ev.data === "string" ? ev.data : "";
+      if (data.length > MAX_INBOUND_FRAME_BYTES) {
+        // Silently drop — same policy as malformed frames: a misbehaving
+        // gateway must not be able to crash the extension.
+        return;
+      }
       let parsed: ServerMessage;
       try {
-        parsed = JSON.parse(typeof ev.data === "string" ? ev.data : "") as ServerMessage;
+        parsed = JSON.parse(data) as ServerMessage;
       } catch {
         // Malformed frame from server — drop silently. By design: a misbehaving
         // gateway shouldn't crash the extension. See docs/silent-catches-policy.md.
