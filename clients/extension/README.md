@@ -15,11 +15,16 @@ model — only the execution location differs.
 
 ## Status
 
-**v0.1 / scaffold.** Loads unpacked in Chrome. Connects (or fails to connect)
-to a gateway WebSocket. Executes the full command surface against the active
-tab. Gateway-side wiring is implemented in a follow-up nullalis commit; until
-then, you can verify the extension by pointing it at any WebSocket echo
-server.
+**v1.0.0 — production / Chrome Web Store-ready.** Security-reviewed and
+hardened: least-privilege manifest (`activeTab`/`scripting`/`storage`, explicit
+CSP, no host permissions, no page-load content scripts, no remote code),
+**explicit per-tab consent** (the agent acts only on tabs you enable from the
+popup; on-demand programmatic injection), a latched **STOP** kill-switch, a
+challenge/nonce auth handshake, navigate SSRF allowlist, and per-command
+timeouts. 118 tests. Gateway-side wiring (`src/extension_ws/` + `extension_*`
+tools) is implemented. Store submission package lives in `store/`
+(`LISTING.md`, `SUBMISSION.md`, assets); see `docs/extension-distribution.md`
+for the install paths (unpacked / self-hosted CRX / Web Store).
 
 ## Install (developer mode)
 
