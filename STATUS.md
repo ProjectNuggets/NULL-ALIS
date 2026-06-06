@@ -73,15 +73,34 @@ CI gate green on the canonical profile: `zig build test -Dengines=base,sqlite,po
 ### Wave 3 — Dual-lane browser automation
 
 **Lane A: server-side agent-browser on K8s** (branch `spec/agent-browser-k8s-backend`,
-Plans 1–4, **shipped**) — Go orchestrator (`services/browser-orchestrator/`) dispatches
-`browser_*` tools to ephemeral worker pods (Chromium + CDP). Worker pods are
-NetworkPolicy-egress-locked (blocks RFC1918 + cloud-metadata), non-root, read-only
-rootfs, no capabilities. URL SSRF guard (`urlguard.go`, deny-class spec at
-`docs/ssrf-blocklist.md`) applied upfront in the orchestrator before any CDP call.
-Gateway-side tools: `browser_navigate`, `browser_exec`, `browser_screenshot`,
-`browser_get_text`, `browser_close`. The prior `.spike/playwright-mcp/` prototype
-(TypeScript MCP server) has been removed; its SSRF test vectors were ported to
-`urlguard_test.go` before deletion.
+Plans 1–4 + Plan 8 hardening/closure, **code-complete + hardened; deploy = ops-only**)
+— Go orchestrator (`services/browser-orchestrator/`) dispatches `browser_*` tools to
+ephemeral worker pods (Chromium + CDP). Worker pods are NetworkPolicy-egress-locked
+(blocks RFC1918 + cloud-metadata), non-root, read-only rootfs, no capabilities. URL
+SSRF guard (`urlguard.go`, deny-class spec at `docs/ssrf-blocklist.md`) applied upfront
+in the orchestrator before any CDP call. Gateway-side tools: `browser_navigate`,
+`browser_exec`, `browser_screenshot`, `browser_get_text`, `browser_close`. The prior
+`.spike/playwright-mcp/` prototype (TypeScript MCP server) has been removed; its SSRF
+test vectors were ported to `urlguard_test.go` before deletion.
+
+**Plan 8 (`docs/superpowers/plans/2026-06-06-backlog-closure.md`) closed the entire
+hardening/deploy backlog as code** (`2026-06-06-hardening-deploy-backlog.md`, all items
+A1–A5/B6–B9/C/D1–D3 marked CLOSED): bearer auth (`BROWSER_ORCHESTRATOR_AUTH_TOKEN`,
+constant-time, `/healthz`+`/metrics` exempt) + per-session ownership (`X-Nullalis-User`
+vs stored owner, 403 on mismatch); graceful SIGINT/SIGTERM lifecycle + HTTP timeouts +
+cancellable janitor; bounded rate-limiter (`lastSeen` + cap + idle/replenished sweep);
+single-round-trip `Frame()` with a unique temp file (was 4 round-trips + a `/tmp/vf.png`
+race); master-key loadable from file (`AGENT_BROWSER_STATE_MASTER_KEY_FILE`); env-gated
+worker pod prod knobs (`BROWSER_WORKER_IMAGE_PULL_SECRET`/`_RUNTIME_CLASS`/`_NODE_SELECTOR`);
+DOCR image CI (`.github/workflows/browser-images.yml`) + `imagePullSecrets`; kustomize +
+`scripts/deploy-browser.sh`; extension handshake nonce (anti-replay) + token rotation
+window + vite sourcemap off. The Zig client sends bearer + `X-Nullalis-User` on every
+request. A1/A2/A5/D3 closed by decision (no code). **Residual is ops-only** — create the
+3 Secrets, set CI DOCR creds, optional gVisor/tainted node pool, run `deploy-browser.sh`,
+validate the CNI enforces NetworkPolicy on DOKS; see the runbook
+`docs/agent-browser-deploy.md`. **Honest caveat:** the CI→DOCR pipeline and gVisor
+RuntimeClass are authored but **not yet exercised on a real DOKS cluster** (no DOCR creds
+/ managed cluster here) — confirm on first live deploy.
 
 **Lane B: user-browser extension** (Chrome MV3 + WebSocket back to gateway):
 - `c8393a40` — gateway WS endpoint at `/api/v1/extension/ws` + per-user hub + first `extension_navigate` tool
