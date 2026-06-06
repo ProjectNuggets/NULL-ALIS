@@ -3,6 +3,18 @@ const http_util = @import("../http_util.zig");
 
 pub const Response = struct { status_code: u16, body: []u8 };
 
+/// session ids are orchestrator-generated hex; restrict to a safe charset so an
+/// agent-supplied id can't inject path/query metacharacters into the URL.
+fn validSessionId(s: []const u8) bool {
+    if (s.len == 0 or s.len > 128) return false;
+    for (s) |ch| {
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or ch == '-' or ch == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 /// Injectable transport so tools are unit-testable without a live orchestrator.
 /// Default is `curl_transport`; tests supply a stub returning canned JSON.
 pub const Transport = struct {
@@ -23,7 +35,8 @@ pub const OrchestratorClient = struct {
     transport: Transport = curl_transport,
 
     fn timeoutSecs(self: OrchestratorClient, buf: []u8) []const u8 {
-        const secs = (self.timeout_ms + 999) / 1000;
+        const ms = self.timeout_ms;
+        const secs = ms / 1000 +| @as(u64, @intFromBool(ms % 1000 != 0));
         return std.fmt.bufPrint(buf, "{d}", .{secs}) catch "60";
     }
 
@@ -51,6 +64,7 @@ pub const OrchestratorClient = struct {
 
     /// POST /v1/sessions/{id}/exec {args} -> raw Response (caller frees body).
     pub fn exec(self: OrchestratorClient, allocator: std.mem.Allocator, session_id: []const u8, args_json: []const u8) !Response {
+        if (!validSessionId(session_id)) return error.InvalidSessionId;
         const url = try std.fmt.allocPrint(allocator, "{s}/v1/sessions/{s}/exec", .{ self.base_url, session_id });
         defer allocator.free(url);
         const body = try std.fmt.allocPrint(allocator, "{{\"args\":{s}}}", .{args_json});
@@ -61,6 +75,7 @@ pub const OrchestratorClient = struct {
 
     /// DELETE /v1/sessions/{id}.
     pub fn closeSession(self: OrchestratorClient, allocator: std.mem.Allocator, session_id: []const u8) !void {
+        if (!validSessionId(session_id)) return error.InvalidSessionId;
         const url = try std.fmt.allocPrint(allocator, "{s}/v1/sessions/{s}", .{ self.base_url, session_id });
         defer allocator.free(url);
         var tbuf: [16]u8 = undefined;
@@ -97,6 +112,16 @@ test "newSession surfaces non-200 as error" {
     var tt = TestTransportPub{ .body = "{\"error\":\"cap\"}", .status = 429 };
     const c = OrchestratorClient{ .base_url = "http://x", .transport = tt.transport() };
     try std.testing.expectError(error.OrchestratorError, c.newSession(std.testing.allocator, "alice", ""));
+}
+
+test "validSessionId accepts hex ids, rejects path injection" {
+    try std.testing.expect(validSessionId("ad559f86565be951f73e92307dfde5a2"));
+    try std.testing.expect(validSessionId("sess-abc_123"));
+    try std.testing.expect(!validSessionId(""));
+    try std.testing.expect(!validSessionId("../../v1/admin"));
+    try std.testing.expect(!validSessionId("a/b"));
+    try std.testing.expect(!validSessionId("a?b"));
+    try std.testing.expect(!validSessionId("a b"));
 }
 
 test "live: client drives new_session -> navigate -> snapshot(@eN) -> close" {
