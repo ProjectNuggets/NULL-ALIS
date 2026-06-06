@@ -76,3 +76,82 @@ func TestCreateSessionCreatesHardenedPod(t *testing.T) {
 		t.Error("container must set AGENT_BROWSER_ENCRYPTION_KEY env to a non-empty per-user key")
 	}
 }
+
+func newTestProvider() *K8sProvider {
+	return &K8sProvider{
+		namespace:       "browser",
+		image:           "browser-worker:dev",
+		deadlineSeconds: 900,
+		meta:            map[string]sessionMeta{},
+	}
+}
+
+func TestPodTemplateProdKnobsUnsetByDefault(t *testing.T) {
+	p := newTestProvider()
+	pod := p.podTemplate("browser-worker-x", "x", "key", "tester", "")
+	if pod.Spec.RuntimeClassName != nil {
+		t.Errorf("RuntimeClassName = %v, want nil when env unset", *pod.Spec.RuntimeClassName)
+	}
+	if len(pod.Spec.NodeSelector) != 0 {
+		t.Errorf("NodeSelector = %v, want empty when env unset", pod.Spec.NodeSelector)
+	}
+	if len(pod.Spec.ImagePullSecrets) != 0 {
+		t.Errorf("ImagePullSecrets = %v, want empty when env unset", pod.Spec.ImagePullSecrets)
+	}
+	if len(pod.Spec.Tolerations) != 0 {
+		t.Errorf("Tolerations = %v, want empty when env unset", pod.Spec.Tolerations)
+	}
+}
+
+func TestPodTemplateProdKnobsApplied(t *testing.T) {
+	t.Setenv("BROWSER_WORKER_IMAGE_PULL_SECRET", "regcred")
+	t.Setenv("BROWSER_WORKER_RUNTIME_CLASS", "gvisor")
+	t.Setenv("BROWSER_WORKER_NODE_SELECTOR", "nullalis.dev/browser=true")
+
+	p := newTestProvider()
+	pod := p.podTemplate("browser-worker-x", "x", "key", "tester", "")
+
+	if len(pod.Spec.ImagePullSecrets) != 1 || pod.Spec.ImagePullSecrets[0].Name != "regcred" {
+		t.Errorf("ImagePullSecrets = %v, want [{regcred}]", pod.Spec.ImagePullSecrets)
+	}
+	if pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName != "gvisor" {
+		t.Errorf("RuntimeClassName = %v, want gvisor", pod.Spec.RuntimeClassName)
+	}
+	if got := pod.Spec.NodeSelector["nullalis.dev/browser"]; got != "true" {
+		t.Errorf("NodeSelector[nullalis.dev/browser] = %q, want true", got)
+	}
+	found := false
+	for _, tol := range pod.Spec.Tolerations {
+		if tol.Key == "nullalis.dev/browser" && tol.Operator == corev1.TolerationOpEqual &&
+			tol.Value == "true" && tol.Effect == corev1.TaintEffectNoSchedule {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Tolerations = %v, want nullalis.dev/browser=true:NoSchedule", pod.Spec.Tolerations)
+	}
+}
+
+func TestParseFrameBlob(t *testing.T) {
+	blob := "@@FRAME@@\niVBORw0KGgo=\n@@URL@@\nhttps://example.com\n@@TITLE@@\nExample\n"
+	f, err := parseFrameBlob(blob)
+	if err != nil {
+		t.Fatalf("parseFrameBlob: %v", err)
+	}
+	if f.PNGBase64 != "iVBORw0KGgo=" {
+		t.Errorf("PNGBase64 = %q", f.PNGBase64)
+	}
+	if f.URL != "https://example.com" {
+		t.Errorf("URL = %q", f.URL)
+	}
+	if f.Title != "Example" {
+		t.Errorf("Title = %q", f.Title)
+	}
+
+	if _, err := parseFrameBlob("@@FRAME@@\n\n@@URL@@\n\n@@TITLE@@\n\n"); err == nil {
+		t.Error("expected error for empty FRAME section")
+	}
+	if _, err := parseFrameBlob("no markers here"); err == nil {
+		t.Error("expected error for missing markers")
+	}
+}

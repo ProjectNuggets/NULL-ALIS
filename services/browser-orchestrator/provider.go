@@ -29,4 +29,6 @@ type SandboxProvider interface {
 	// Frame captures a PNG screenshot of the current page and returns it
 	// base64-encoded together with the current URL and page title.
 	Frame(ctx context.Context, sessionID string) (Frame, error)
+	// Owner returns the userID that created the session, and whether it is known.
+	Owner(sessionID string) (string, bool)
 }

@@ -36,6 +36,7 @@ func (s stubProvider) DestroySession(context.Context, string) error { return nil
 func (s stubProvider) Frame(context.Context, string) (Frame, error) {
 	return Frame{PNGBase64: "AAAA", URL: "https://x", Title: "X"}, nil
 }
+func (s stubProvider) Owner(string) (string, bool) { return "test-user", true }
 
 func TestHandleExecBlocksSSRFNavigation(t *testing.T) {
 	srv := NewServer(stubProvider{}, nil, nil)

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -168,7 +169,7 @@ func (p *K8sProvider) CreateSession(ctx context.Context, userID, authProfile str
 // podTemplate mirrors Plan 1's deploy/k8s/browser/worker-pod.yaml.
 func (p *K8sProvider) podTemplate(name, sessionID, encKey, userID, authProfile string) *corev1.Pod {
 	userHash := shortHash(userID)
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: p.namespace,
@@ -224,6 +225,28 @@ func (p *K8sProvider) podTemplate(name, sessionID, encKey, userID, authProfile s
 			},
 		},
 	}
+
+	// Production-only scheduling/runtime knobs, applied only when their env var is
+	// set. When all are unset the pod spec is byte-for-byte unchanged (local k3d).
+	if v := os.Getenv("BROWSER_WORKER_IMAGE_PULL_SECRET"); v != "" {
+		pod.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{Name: v}}
+	}
+	if v := os.Getenv("BROWSER_WORKER_RUNTIME_CLASS"); v != "" {
+		pod.Spec.RuntimeClassName = ptr(v)
+	}
+	if v := os.Getenv("BROWSER_WORKER_NODE_SELECTOR"); v != "" {
+		if k, val, ok := strings.Cut(v, "="); ok && k != "" {
+			pod.Spec.NodeSelector = map[string]string{k: val}
+			pod.Spec.Tolerations = append(pod.Spec.Tolerations, corev1.Toleration{
+				Key:      "nullalis.dev/browser",
+				Operator: corev1.TolerationOpEqual,
+				Value:    "true",
+				Effect:   corev1.TaintEffectNoSchedule,
+			})
+		}
+	}
+
+	return pod
 }
 
 func (p *K8sProvider) pollPodReady(ctx context.Context, podName string) error {
@@ -331,6 +354,17 @@ func (p *K8sProvider) DestroySession(ctx context.Context, sessionID string) erro
 	return nil
 }
 
+// Owner returns the userID that created the session, and whether it is known.
+func (p *K8sProvider) Owner(sessionID string) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	m, ok := p.meta[sessionID]
+	if !ok {
+		return "", false
+	}
+	return m.userID, true
+}
+
 // Reconcile re-adopts pre-existing worker pods into the registry after a restart,
 // keyed by the "session" label. The pod ActiveDeadlineSeconds is the GC backstop
 // for anything not re-adopted or closed.
@@ -362,27 +396,53 @@ func (p *K8sProvider) Reconcile(ctx context.Context) error {
 	return nil
 }
 
+// frameScript captures a screenshot to a unique temp file and emits the PNG
+// (base64), current URL, and page title as delimited sections so the whole frame
+// can be read back in a single pod-exec round-trip. agent-browser is on PATH in
+// the worker and ignores --executable-path once the daemon is up, so the get
+// verbs don't need it. This command is orchestrator-controlled (no agent input),
+// so running it via execRaw — which bypasses the verb-allowlist — is correct here.
+const frameScript = `f=$(mktemp /tmp/vf.XXXXXX.png); agent-browser screenshot "$f" >/dev/null 2>&1; printf '@@FRAME@@\n'; base64 "$f" 2>/dev/null; printf '@@URL@@\n'; agent-browser get url 2>/dev/null; printf '@@TITLE@@\n'; agent-browser get title 2>/dev/null; rm -f "$f"`
+
 // Frame captures a PNG screenshot of the current page and returns it base64-encoded
-// together with the live URL and page title.
+// together with the live URL and page title, in a single pod-exec round-trip.
 func (p *K8sProvider) Frame(ctx context.Context, sessionID string) (Frame, error) {
 	podName, ok := p.reg.Pod(sessionID)
 	if !ok {
 		return Frame{}, fmt.Errorf("unknown session %q", sessionID)
 	}
-	if _, err := p.Exec(ctx, sessionID, []string{"screenshot", "/tmp/vf.png"}); err != nil {
-		return Frame{}, fmt.Errorf("screenshot: %w", err)
-	}
-	b64, err := p.execRaw(ctx, podName, []string{"sh", "-c", "base64 /tmp/vf.png 2>/dev/null"}, nil)
+	out, err := p.execRaw(ctx, podName, []string{"sh", "-c", frameScript}, nil)
 	if err != nil {
-		return Frame{}, fmt.Errorf("read frame: %w", err)
+		return Frame{}, fmt.Errorf("capture frame: %w", err)
 	}
-	urlRes, _ := p.Exec(ctx, sessionID, []string{"get", "url"})
-	titleRes, _ := p.Exec(ctx, sessionID, []string{"get", "title"})
-	return Frame{
-		PNGBase64: strings.TrimSpace(b64),
-		URL:       strings.TrimSpace(urlRes.Stdout),
-		Title:     strings.TrimSpace(titleRes.Stdout),
-	}, nil
+	frame, err := parseFrameBlob(out)
+	if err != nil {
+		return Frame{}, err
+	}
+	return frame, nil
+}
+
+// parseFrameBlob splits the delimited output of frameScript into a Frame. It
+// requires all three markers and a non-empty FRAME section, else returns an error.
+func parseFrameBlob(blob string) (Frame, error) {
+	const (
+		frameMark = "@@FRAME@@\n"
+		urlMark   = "@@URL@@\n"
+		titleMark = "@@TITLE@@\n"
+	)
+	fi := strings.Index(blob, frameMark)
+	ui := strings.Index(blob, urlMark)
+	ti := strings.Index(blob, titleMark)
+	if fi < 0 || ui < 0 || ti < 0 || !(fi < ui && ui < ti) {
+		return Frame{}, fmt.Errorf("frame: malformed capture output (missing markers)")
+	}
+	png := strings.TrimSpace(blob[fi+len(frameMark) : ui])
+	url := strings.TrimSpace(blob[ui+len(urlMark) : ti])
+	title := strings.TrimSpace(blob[ti+len(titleMark):])
+	if png == "" {
+		return Frame{}, fmt.Errorf("frame: empty screenshot")
+	}
+	return Frame{PNGBase64: png, URL: url, Title: title}, nil
 }
 
 // PruneOnce removes registry/meta entries whose pods are gone or Failed (e.g. hit
