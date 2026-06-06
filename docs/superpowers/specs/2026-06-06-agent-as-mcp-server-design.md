@@ -4,118 +4,120 @@ status: stub
 date: 2026-06-06
 ---
 
-# Design (companion stub): Agent-as-MCP-server — the inbound surface
+# Design (companion stub): Agent-as-MCP-server — the inbound surface (native Zig + edge auth)
 
 **Author:** brainstorming session (Mohammad + Claude)
 **Date:** 2026-06-06
-**Status:** **Stub** — scoped, not yet designed in full. Depends on Spec A.
+**Status:** **Stub** (rev 3 — conforms to `2026-06-06-adr-nullalis-mcp-hub-architecture.md`:
+native-Zig server face over the unified core, **inbound auth at the edge**, **no
+sidecar**). Full design after Spec A's core (registry + policy plane + native
+transports) lands.
 
-> **Sibling spec.** This is **Spec B** of a two-spec set. It **consumes the
-> foundation** built by **Spec A**
-> (`2026-06-06-multi-tenant-mcp-client-hardening-design.md`) and turns nullalis
-> from an MCP *client* into a *bidirectional* MCP node: each user's agent can
-> **be** an MCP server that external clients call. This stub captures scope and
-> the dependency contract so Spec A is designed with B's needs in mind; it will
-> be expanded into a full design (its own brainstorm → spec → plan) **after Spec
-> A's OAuth/credential foundation lands.**
+> **Sibling spec.** Spec B is the **server half** of the MCP hub; **Spec A**
+> (`2026-06-06-multi-tenant-mcp-client-hardening-design.md`) is the **client half
+> + the shared unified core**. Per the ADR, both faces are **two views over one
+> native-Zig core** — the server face exposes a policy-filtered view of the same
+> tool registry the client face populates. This stub captures scope + the
+> dependency contract so Spec A builds the core with B's needs in mind.
 
 ---
 
-## 1. The end-state half this covers
+## 1. The end-state half this covers — all four server purposes
 
 The symmetric end state: *"any user's Agent should be able to be an MCP server
-itself, if allowed."* Where Spec A makes nullalis a correct multi-tenant MCP
-**client** (outbound — consuming servers under each user's identity), Spec B
-makes each tenant a multi-tenant MCP **server** (inbound — exposing the user's
-agent / a scoped subset of their tools to external MCP clients like Claude
-Desktop, Cursor, or *another* nullalis user's agent).
+itself, if allowed."* The four confirmed purposes are **emergent properties of
+the unified core**, not separate builds:
+
+- **Agent-as-a-tool** — expose the user's agent as one invokable registry entry.
+- **Aggregator / gateway** — re-expose the client-face-discovered upstream tools
+  (already in the registry) as one clean endpoint.
+- **Curated tool/skill export** — a policy filter on the registry per principal.
+- **Agent mesh (A2A)** — a "delegate-to-agent" registry entry; another nullalis
+  connects client→server. Needs a call-depth/origin loop guard.
 
 ```
-External MCP client (Claude Desktop / Cursor / another agent)
-   │  JSON-RPC over Streamable HTTP, Authorization: Bearer <audience-bound token>
+External MCP client (Claude Desktop / Cursor / another nullalis agent)
+   │  JSON-RPC over Streamable HTTP, Authorization: Bearer <token>
    ▼
-nullalis MCP server endpoint              NEW surface (this spec)
-   ├─ OAuth 2.1 Resource Server: validate token, derive user_id
-   ├─ route to THAT user's TenantRuntime ONLY  (hard tenant isolation)
-   ├─ expose: the agent as a tool, and/or a scoped subset of the user's tools
-   └─ per-user <user_id>:<session_id> binding, per-request re-validation
+EDGE auth (OIDC/OAuth proxy / API gateway / IdP)   ← validates token (ADR)
+   │  injects validated principal (user identity) — token crypto is NOT our code
+   ▼
+nullalis native MCP server face (Zig)              NEW surface (this spec)
+   ├─ emit MCP metadata: /.well-known/oauth-protected-resource + WWW-Authenticate
+   ├─ map injected principal → user_id → THAT user's TenantRuntime ONLY
+   ├─ expose the policy-filtered slice of the SHARED tool registry
+   └─ per-user <user_id>:<session_id> binding; per-request re-check
 ```
 
 ## 2. Why it is a separate spec (not a Spec-A phase)
 
-- **Inverse role.** In Spec A nullalis is the OAuth **client**; here it is the
-  OAuth **Resource Server** — it must *issue/validate* audience-bound tokens
-  (RFC 8707), implement RFC 9728 protected-resource-metadata, and reject
-  passthrough tokens. New responsibilities, not a new provider.
-- **New endpoint surface.** A served MCP Streamable-HTTP endpoint (request
-  routing, session lifecycle, capability negotiation) — a distinct subsystem
-  from the curl-based client transport.
-- **Distinct threat model.** Inbound, internet-facing: authn/authz of *callers*,
-  capability scoping, abuse/rate limiting, and the cross-tenant-isolation
-  guarantee that an inbound call can reach exactly one user's runtime.
-
-Keeping it separate keeps each spec implementable as one coherent unit
-(brainstorming decomposition rule).
+- **Inverse data-flow + new endpoint surface.** A *served* MCP Streamable-HTTP
+  endpoint (inbound request routing, session lifecycle, capability negotiation)
+  is a distinct subsystem from the client transport — even though both are native
+  Zig over the same core.
+- **Distinct threat model.** Internet-facing inbound: caller authz (at the edge),
+  capability scoping, abuse/rate limiting, and the hard guarantee that an inbound
+  call reaches exactly one user's runtime.
+- **Auth is at the edge (ADR), not in-app.** nullalis does **not** hand-roll an
+  OAuth resource-server; the edge validates tokens and injects identity. The Zig
+  server face only emits MCP-specific metadata/challenge and trusts the injected
+  principal. This is the key simplification rev 2 lacked.
 
 ## 2b. Recon finding — the hard part is greenfield
 
-A recon of claude-code (which ships an `mcp-server/`) found **no reusable
-multi-tenant inbound reference**: its `mcp-server/src/http.ts` is a naive
-baseline — a single **shared static bearer** token, **off by default**
-(`if (!API_KEY) return next()`, `http.ts:34`), an **in-process** `Map` of
-sessions that breaks across K8s replicas (`http.ts:52`), and **zero tenant
-mapping** (a request maps to a transport, not a principal). Its real
-"agent-as-MCP" entrypoint (`src/entrypoints/mcp.ts`) is **single-user/local
-stdio**. So the inbound trio — **caller auth + token→tenant mapping + isolation
-+ a shared/sticky session store** — is genuinely novel work. Treat `http.ts`
-as a *what-not-to-ship* baseline, not a model. This is why B is its own spec and
-why its difficulty was understated in Spec A rev 1.
+claude-code ships an `mcp-server/`, but it is **no reusable multi-tenant inbound
+reference**: a single **shared static bearer**, **off by default**
+(`if (!API_KEY) return next()`, `http.ts:34`), an **in-process** session `Map`
+that breaks across K8s replicas (`http.ts:52`), and **zero tenant mapping**. Its
+real agent-as-MCP entrypoint (`src/entrypoints/mcp.ts`) is single-user/local
+stdio. So the inbound trio — **edge-validated caller identity → tenant mapping →
+isolation + a shared/sticky session store** — is genuinely novel work. Treat
+`http.ts` as a *what-not-to-ship* baseline.
 
-## 3. Dependency contract — what Spec B needs from Spec A
+## 3. Dependency contract — what Spec B needs from Spec A's core
 
-Spec A must build these so B can consume them without rework:
-
-- **The MCP sidecar (Node/TS, official SDK).** Spec A introduces a sidecar that
-  owns the MCP *client* protocol. The **same sidecar process can host the
-  *server* side** (the SDK's `StreamableHTTPServerTransport`), so B gets full
-  inbound Streamable HTTP/SSE + session lifecycle for free instead of
-  hand-rolling an MCP server in Zig. B adds the resource-server auth + tenant
-  routing *in front of* it.
-- **OAuth 2.1 machinery** usable in the **Resource Server** direction
-  (token validation, audience/`resource` binding, discovery metadata), not only
-  the client direction.
-- **A shared/sticky session store** (NOT in-process) — required from day one
-  because nullalis runs multi-replica (Helm/K8s); `<user_id>:<session_id>`
-  binding lives here.
-- **Credential/identity mapping** that turns a validated inbound token into a
-  `user_id` → `TenantRuntime` (mirror of Spec A's per-user resolver), with **no
+- **The shared tool registry + single policy plane** (Spec A §3.1). The server
+  face exposes a *policy-filtered view* of the registry; aggregator/curated/mesh
+  all fall out of this. No second protocol stack.
+- **Native Streamable HTTP/SSE transport** (Spec A Phase 2) — reused server-side
+  (`StreamableHTTPServerTransport` equivalent in Zig: GET stream, POST, `DELETE`,
+  SSE). This is why Phase 2 completes the native transport once, for both faces.
+- **Edge-auth integration contract:** how the validated principal is injected
+  (header/mTLS/JWT claims) and mapped to `user_id` → `TenantRuntime`, with **no
   principal-collapse mode** (Spec A §7 anti-pattern).
-- **Trust + session model:** non-deterministic, per-user `<user_id>:<session_id>`
-  binding; "never authenticate via session"; per-request re-validation — applied
-  to the *inbound* path.
-- **SSRF/egress posture** and **untrusted-input provenance** conventions, reused
-  for inbound capability exposure.
+- **A shared/sticky session store** (NOT in-process; Postgres/`zaki_state`-backed)
+  — required from day one because nullalis runs multi-replica (Helm/K8s);
+  `<user_id>:<session_id>` binding lives here.
+- **Trust + session model:** non-deterministic IDs, per-user binding, "never
+  authenticate via session", per-request re-check on the inbound path.
+- **SSRF/egress posture + untrusted-input provenance** conventions, reused for
+  inbound capability exposure and (for aggregator) re-exposed upstream tools.
 
 ## 4. Scope sketch (to be expanded)
 
 **In scope (future full spec):**
 - A per-user MCP server endpoint, addressable/token-scoped, routed to the owning
-  `TenantRuntime`.
+  `TenantRuntime` via the edge-injected principal.
 - Per-user **opt-in** + operator **policy gate** ("if allowed").
-- **Capability scoping:** which of the user's tools/skills (or just an
-  "invoke-agent" tool) are exposed, per token/scope.
-- OAuth 2.1 Resource Server: token validation, audience binding, consent.
-- Hard tenant isolation of inbound calls; abuse/rate controls.
+- **Capability scoping** per token/scope across all four purposes (agent-as-tool,
+  aggregator, curated, mesh).
+- MCP metadata emission (`/.well-known/oauth-protected-resource`,
+  `WWW-Authenticate`) — the only auth-adjacent code nullalis owns; validation is
+  the edge's job.
+- Hard tenant isolation of inbound calls; abuse/rate controls; mesh loop guard.
 
 **Open questions for B's brainstorm:**
-- Exposure granularity: whole-agent-as-tool vs curated tool/skill subset?
-- Token issuance: does nullalis act as its own Authorization Server, or
-  delegate to an external IdP?
-- Addressing: one endpoint with token-selected tenant, vs per-user URLs?
-- Relationship to the existing channel/gateway auth surfaces.
+- Exposure granularity per purpose and per principal.
+- **Edge choice:** which OIDC/OAuth proxy or gateway (oauth2-proxy / Envoy / cloud
+  gateway / the existing nullalis gateway auth) and the principal-injection
+  contract.
+- Addressing: one endpoint with token-selected tenant vs per-user URLs.
+- Mesh: depth/origin headers + policy for agent-to-agent calls.
+- Relationship to the existing channel/gateway auth surfaces (likely the edge).
 
 ## 5. Next action
 
-Expand this stub into a full design **after Spec A Phase 4 (OAuth) lands**, via a
-dedicated brainstorm → spec → `writing-plans` cycle. Do not begin B's
-implementation before A's foundation exists.
+Expand this stub into a full design **after Spec A's unified core (Phases 2–3:
+native transport + registry/policy plane) lands**, via a dedicated brainstorm →
+spec → `writing-plans` cycle. Do not begin B's implementation before the core
+exists.
