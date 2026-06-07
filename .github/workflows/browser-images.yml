@@ -22,6 +22,11 @@ on:
 jobs:
   build-push:
     runs-on: ubuntu-latest
+    # Skip cleanly (green) until DOCR is configured. `vars.DOCR_REGISTRY` is the
+    # "DOCR is wired" signal — set it (and the DOCR_TOKEN secret) to enable the
+    # build+push. Without it this job is skipped, not failed, so unrelated pushes
+    # that touch services/browser-orchestrator don't red the run.
+    if: ${{ vars.DOCR_REGISTRY != '' }}
     steps:
       - uses: actions/checkout@v4
 
