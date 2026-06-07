@@ -632,7 +632,7 @@ pub fn buildToolInstructionsForSurface(
 ) ![]const u8 {
     if (tools.len == 0 or plan.mode == .no_tools) return allocator.dupe(u8, "");
     return switch (plan.mode) {
-        .native_minimal, .native_strict_canary => allocator.dupe(u8, ""),
+        .native_strict_canary => allocator.dupe(u8, ""),
         .native_with_xml_fallback => buildMinimalXmlFallbackInstructions(allocator),
         .xml_full => buildFullXmlToolInstructions(allocator, tools),
         .no_tools => allocator.dupe(u8, ""),

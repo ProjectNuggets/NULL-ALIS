@@ -1,7 +1,6 @@
 const std = @import("std");
 
 pub const Mode = enum {
-    native_minimal,
     native_with_xml_fallback,
     native_strict_canary,
     xml_full,
@@ -9,7 +8,6 @@ pub const Mode = enum {
 
     pub fn toSlice(self: Mode) []const u8 {
         return switch (self) {
-            .native_minimal => "native_minimal",
             .native_with_xml_fallback => "native_with_xml_fallback",
             .native_strict_canary => "native_strict_canary",
             .xml_full => "xml_full",
@@ -134,7 +132,7 @@ test "select maps provider matrix to provider-bound tool surfaces" {
                     try std.testing.expect(plan.xml_tool_catalog_present);
                     try std.testing.expect(!plan.prompt_tool_catalog_present);
                 },
-                .no_tools, .native_minimal => return error.UnexpectedProviderMatrixMode,
+                .no_tools => return error.UnexpectedProviderMatrixMode,
             }
         }
 

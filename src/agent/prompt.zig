@@ -768,7 +768,7 @@ fn buildToolsSection(w: anytype, tools: anytype, plan: tool_surface.Plan) !void 
         return;
     }
 
-    if (plan.mode == .native_with_xml_fallback or plan.mode == .native_minimal or plan.mode == .native_strict_canary) {
+    if (plan.mode == .native_with_xml_fallback or plan.mode == .native_strict_canary) {
         try w.writeAll("The executable tool catalog is supplied through the provider-native tools field for this turn. Use native tool calls when the provider exposes that channel. Do not restate tool schemas in prose.\n\n");
         return;
     }
