@@ -17,6 +17,7 @@ result
 .direnv/
 
 # Local agent/editor state
+.nullalis-runtime/
 .claude/projects/
 .claude/worktrees/
 .claude/settings.local.json

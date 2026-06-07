@@ -4969,6 +4969,12 @@ fn tenantOwnershipUsesPostgresLease(state: *const GatewayState) bool {
     return state.zaki_state != null and std.mem.eql(u8, state.state_backend_effective, "postgres");
 }
 
+fn tenantLockBackendLabel(state: *const GatewayState) []const u8 {
+    if (!state.tenant_enabled or !state.ownership_lock_enabled or state.owner_instance_id.len == 0) return "disabled";
+    if (tenantOwnershipUsesPostgresLease(state)) return "postgres_lease";
+    return "file_lock";
+}
+
 const OwnershipLockConflictInfo = struct {
     allocator: std.mem.Allocator,
     retry_after_ms: u32,
@@ -5510,7 +5516,7 @@ fn logStartupSelfCheck(state: *const GatewayState) void {
     providers.sse.logStreamingTransportBanner();
 
     log.info(
-        "startup.self_check config_path={s} tenant_enabled={s} heartbeat_enabled={s} heartbeat_interval_minutes={d} state_configured={s} state_effective={s} degraded={s} pg_host={s} pg_port={d} pg_schema={s} scheduler_backend={s} webhook_mode={s} chat_provider={s} chat_fallbacks={s} embedding_provider={s} internal_auth_required={s} internal_token_configured={s} internal_token_policy_ok={s} internal_token_policy_reason={s}",
+        "startup.self_check config_path={s} tenant_enabled={s} heartbeat_enabled={s} heartbeat_interval_minutes={d} state_configured={s} state_effective={s} degraded={s} pg_host={s} pg_port={d} pg_schema={s} scheduler_backend={s} tenant_lock_backend={s} webhook_mode={s} chat_provider={s} chat_fallbacks={s} embedding_provider={s} internal_auth_required={s} internal_token_configured={s} internal_token_policy_ok={s} internal_token_policy_reason={s}",
         .{
             state.configPath(),
             if (state.tenant_enabled_configured) "true" else "false",
@@ -5523,6 +5529,7 @@ fn logStartupSelfCheck(state: *const GatewayState) void {
             state.postgres_port,
             state.postgresSchema(),
             state.scheduler_backend,
+            tenantLockBackendLabel(state),
             state.webhook_mode,
             state.chat_provider_effective,
             state.chatFallbackChain(),
@@ -7991,11 +7998,7 @@ fn internalDiagnosticsPayload(
     const bus_inbound_len: usize = if (state.event_bus) |eb| eb.inboundLen() else 0;
     const bus_outbound_len: usize = if (state.event_bus) |eb| eb.outboundLen() else 0;
     const bus_capacity: usize = if (state.event_bus) |eb| eb.queueCapacity() else bus_mod.QUEUE_CAPACITY;
-    const tenant_lock_backend: []const u8 = blk: {
-        if (!state.tenant_enabled or !state.ownership_lock_enabled or state.owner_instance_id.len == 0) break :blk "disabled";
-        if (tenantOwnershipUsesPostgresLease(state)) break :blk "postgres_lease";
-        break :blk "file_lock";
-    };
+    const tenant_lock_backend = tenantLockBackendLabel(state);
     const owned_users_count: usize = blk: {
         if (!state.tenant_enabled or !state.ownership_lock_enabled or state.owner_instance_id.len == 0) break :blk 0;
         if (tenantOwnershipUsesPostgresLease(state)) {
@@ -8690,6 +8693,8 @@ fn internalDiagnosticsPayload(
     try json_util.appendJsonKeyValue(&buf, allocator, "postgres_schema", state.postgresSchema());
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKeyValue(&buf, allocator, "scheduler_backend", state.scheduler_backend);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "tenant_lock_backend", tenant_lock_backend);
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKeyValue(&buf, allocator, "webhook_mode", state.webhook_mode);
     try buf.appendSlice(allocator, ",");
@@ -29773,6 +29778,8 @@ test "internalDiagnosticsPayload includes runtime_mode and bus fields" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"owned_users_count\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"chat_stream_require_explicit_session_key\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tenant_lock_backend\":\"file_lock\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"startup_self_check\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"tenant_lock_backend\":\"file_lock\",\"webhook_mode\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"tenant_lock_lease_secs\":300") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"chat_stream_lane_counts\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"thread\":1") != null);

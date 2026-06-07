@@ -18,6 +18,7 @@ const Config = @import("../config.zig").Config;
 const capabilities_mod = @import("../capabilities.zig");
 const prompt = @import("prompt.zig");
 const dispatcher = @import("dispatcher.zig");
+const tool_surface = @import("tool_surface.zig");
 const procedural_memory = @import("procedural_memory.zig");
 const narration = @import("narration.zig");
 const bench_self = @import("bench_self.zig");
@@ -136,6 +137,7 @@ pub const AssembleResult = struct {
     stable_prefix_hash: u64 = 0,
     /// Byte count covered by `stable_prefix_hash`. 0 if hash is 0.
     stable_prefix_bytes: usize = 0,
+    tool_surface_plan: tool_surface.Plan = .{},
     /// FNV-1a 64-bit hash of the kept-history tail (last ≤4 non-system
     /// messages) at assemble time. v1.14.14.1 Finding 2.
     tail_hash: u64 = 0,
@@ -593,6 +595,11 @@ pub const ContextEngine = struct {
         );
 
         const stable_prefix_state = context_cache.buildStablePrefixState(refresh_plan, snapshot.has_system_prompt);
+        const provider_supports_native_tools = if (@hasField(@TypeOf(agent.*), "provider"))
+            agent.provider.supportsNativeTools()
+        else
+            false;
+        const tool_surface_plan = tool_surface.select(provider_supports_native_tools, agent.tools.len);
 
         // S5.7 — memoized Config fetch. Replaces a per-turn
         // `Config.load` + JSON parse + deinit triad. The cached_config
@@ -773,6 +780,7 @@ pub const ContextEngine = struct {
             .workspace_dir = agent.workspace_dir,
             .model_name = agent.model_name,
             .tools = agent.tools,
+            .tool_surface_plan = tool_surface_plan,
             .capabilities_section = capabilities_section,
             .conversation_context = agent.conversation_context,
             .sections = .{ .persona = persona_section },
@@ -787,7 +795,7 @@ pub const ContextEngine = struct {
         const stable_prompt = try prompt.buildStableSystemPrompt(allocator, prompt_ctx);
         defer allocator.free(stable_prompt);
 
-        const tool_instructions = try dispatcher.buildToolInstructions(allocator, agent.tools);
+        const tool_instructions = try dispatcher.buildToolInstructionsForSurface(allocator, agent.tools, tool_surface_plan);
         defer allocator.free(tool_instructions);
 
         const volatile_prompt = try prompt.buildVolatileSystemPrompt(allocator, prompt_ctx);
@@ -909,6 +917,7 @@ pub const ContextEngine = struct {
             .compaction_recommended = snapshot.token_compaction_triggered,
             .stable_prefix_hash = stable_prefix_hash,
             .stable_prefix_bytes = stable_prefix_len,
+            .tool_surface_plan = tool_surface_plan,
             .tail_hash = tail_hash,
             .tail_bytes = tail_bytes,
         };

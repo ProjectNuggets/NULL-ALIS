@@ -3782,6 +3782,56 @@ components:
                 context_window_tokens:
                   type: integer
                   format: int64
+            tool_surface:
+              type: object
+              description: Sanitized diagnostics for the selected provider-bound tool surface. Diagnostics-only; never used for pressure math.
+              properties:
+                mode:
+                  type: string
+                  enum: [native_minimal, native_with_xml_fallback, xml_full, no_tools]
+                provider_supports_native_tools:
+                  type: boolean
+                native_tool_count:
+                  type: integer
+                native_tool_schemas_present:
+                  type: boolean
+                xml_tool_catalog_present:
+                  type: boolean
+                prompt_tool_catalog_present:
+                  type: boolean
+                xml_fallback_protocol_present:
+                  type: boolean
+                native_tool_schema_bytes:
+                  type: integer
+                  format: int64
+                xml_tool_catalog_bytes:
+                  type: integer
+                  format: int64
+                prompt_tool_catalog_bytes:
+                  type: integer
+                  format: int64
+                largest_tool_schemas:
+                  type: array
+                  description: Largest native tool schemas by sanitized name, byte counts, and hash only.
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      description_bytes:
+                        type: integer
+                        format: int64
+                      parameters_bytes:
+                        type: integer
+                        format: int64
+                      bytes:
+                        type: integer
+                        format: int64
+                      hash:
+                        type: integer
+                        format: int64
+                      active:
+                        type: boolean
             counts:
               type: object
               properties:

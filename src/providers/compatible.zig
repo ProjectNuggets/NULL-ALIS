@@ -854,6 +854,13 @@ fn serializeMessagesInto(
                 try buf.appendSlice(allocator, ",\"tool_call_id\":");
                 try root.appendJsonString(buf, allocator, tc_id);
             }
+            if (msg.name) |name| {
+                try buf.appendSlice(allocator, ",\"name\":");
+                try root.appendJsonString(buf, allocator, name);
+            }
+            if (msg.role == .assistant) {
+                try root.appendOpenAIToolCalls(buf, allocator, msg.tool_calls);
+            }
             try appendReasoningContentField(buf, allocator, msg, emit_kimi_thinking);
             try buf.append(allocator, '}');
         }
@@ -909,6 +916,13 @@ fn serializeMessagesInto(
         if (msg.tool_call_id) |tc_id| {
             try buf.appendSlice(allocator, ",\"tool_call_id\":");
             try root.appendJsonString(buf, allocator, tc_id);
+        }
+        if (msg.name) |name| {
+            try buf.appendSlice(allocator, ",\"name\":");
+            try root.appendJsonString(buf, allocator, name);
+        }
+        if (msg.role == .assistant) {
+            try root.appendOpenAIToolCalls(buf, allocator, msg.tool_calls);
         }
         try appendReasoningContentField(buf, allocator, msg, emit_kimi_thinking);
         try buf.append(allocator, '}');
@@ -1957,6 +1971,36 @@ test "buildChatRequestBody round-trips assistant reasoning_content on Moonshot r
     // User messages carry no reasoning_content.
     try std.testing.expect(messages.items[0].object.get("reasoning_content") == null);
     try std.testing.expect(messages.items[2].object.get("reasoning_content") == null);
+}
+
+test "buildChatRequestBody serializes assistant native tool calls and tool results" {
+    const allocator = std.testing.allocator;
+    const calls = [_]root.ToolCall{
+        .{ .id = "call_1", .name = "memory_recall", .arguments = "{\"query\":\"project\"}" },
+    };
+    const msgs = [_]ChatMessage{
+        .{ .role = .assistant, .content = "", .tool_calls = &calls },
+        .{ .role = .tool, .name = "memory_recall", .tool_call_id = "call_1", .content = "{\"status\":\"ok\"}" },
+    };
+    const req = root.ChatRequest{ .messages = &msgs, .model = "kimi-k2.6" };
+    const body = try buildChatRequestBody(allocator, req, "kimi-k2.6", 0.7, false, true);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("messages").?.array.items;
+    const assistant = messages[0].object;
+    const tool_calls = assistant.get("tool_calls").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", tool_calls[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("function", tool_calls[0].object.get("type").?.string);
+    const function = tool_calls[0].object.get("function").?.object;
+    try std.testing.expectEqualStrings("memory_recall", function.get("name").?.string);
+    try std.testing.expectEqualStrings("{\"query\":\"project\"}", function.get("arguments").?.string);
+    const tool_msg = messages[1].object;
+    try std.testing.expectEqualStrings("tool", tool_msg.get("role").?.string);
+    try std.testing.expectEqualStrings("call_1", tool_msg.get("tool_call_id").?.string);
+    try std.testing.expectEqualStrings("memory_recall", tool_msg.get("name").?.string);
 }
 
 test "buildChatRequestBody never emits reasoning_content when flag off" {

@@ -619,9 +619,12 @@ and capability. Design it to feel premium, not buried:
   stable/volatile system prompt bytes, tool schema bytes, chat history bytes by
   role, assistant reasoning bytes, XML/tool history bytes, multimodal payload
   estimates, prompt cache key presence/length, provider truth beside the shape,
-  an estimated provider request body byte count, and optional `prompt_blocks`
-  entries with sanitized block names, buckets, bytes, token estimates, and
-  hashes only. It never includes raw
+  an estimated provider request body byte count, selected tool-surface mode, and
+  optional `prompt_blocks` entries with sanitized block names, buckets, bytes,
+  token estimates, and hashes only. Tool-surface diagnostics identify whether
+  native schemas, full XML catalog, compact XML fallback protocol, or prose
+  catalog were present, and list the largest native schemas by sanitized name,
+  bytes, and hash. It never includes raw
   user text, prompt text, tool output, or reasoning text.
 - **Cache semantics** — `provider_usage_last_turn.cached_prompt_tokens` and
   `cache.last_cache_hit_percent` are cost/performance telemetry. They do not

@@ -584,6 +584,7 @@ const OpenAiStreamCtx = struct {
     /// null = provider didn't emit usage; finalize falls back to char-count
     /// estimation as before.
     stream_usage: ?SseUsage = null,
+    stream_tool_call_chunks: u32 = 0,
 
     /// Live-stream XML tool-call suppression state. When the model falls back
     /// to emitting `<invoke>`/`<tool_call>` XML inside content (Kimi K2.5
@@ -595,6 +596,7 @@ const OpenAiStreamCtx = struct {
     xml_suppress_depth: u32 = 0,
     xml_tail: [15]u8 = undefined,
     xml_tail_len: usize = 0,
+    task_plan_residue_guard: usize = 0,
 
     fn deinit(self: *OpenAiStreamCtx) void {
         self.accumulated.deinit(self.allocator);
@@ -607,9 +609,10 @@ const OpenAiStreamCtx = struct {
     }
 };
 
-/// Filter a text delta chunk so that content inside `<invoke>...</invoke>`
-/// and `<tool_call>...</tool_call>` XML blocks doesn't reach the live
-/// user-facing callback. The filtering is stateful across chunks using
+/// Filter a text delta chunk so that content inside internal XML blocks does
+/// not reach the live user-facing callback. Covers tool-call fallback markup
+/// and backend-private `<task_plan>...</task_plan>` planning blocks. The
+/// filtering is stateful across chunks using
 /// `xml_tail` as carry-over (since an opening tag may be split across
 /// chunk boundaries). Returns a slice into `scratch` containing the
 /// filtered text to emit.
@@ -637,18 +640,29 @@ fn filterLiveXmlBlocks(
     var i: usize = 0;
     while (i < scan_end) {
         if (ctx.xml_suppress_depth == 0) {
+            const residue_len = taskPlanResiduePrefixLen(buf[i..], ctx.task_plan_residue_guard > 0);
+            if (residue_len > 0) {
+                i += residue_len;
+                ctx.task_plan_residue_guard = 32;
+                continue;
+            }
             if (std.mem.startsWith(u8, buf[i..], "<invoke ") or
-                std.mem.startsWith(u8, buf[i..], "<tool_call>"))
+                std.mem.startsWith(u8, buf[i..], "<tool_call>") or
+                std.mem.startsWith(u8, buf[i..], "<task_plan>"))
             {
                 ctx.xml_suppress_depth += 1;
                 if (std.mem.startsWith(u8, buf[i..], "<invoke ")) {
                     i += "<invoke ".len;
+                } else if (std.mem.startsWith(u8, buf[i..], "<task_plan>")) {
+                    ctx.task_plan_residue_guard = 32;
+                    i += "<task_plan>".len;
                 } else {
                     i += "<tool_call>".len;
                 }
                 continue;
             }
             try scratch.append(ctx.allocator, buf[i]);
+            if (ctx.task_plan_residue_guard > 0) ctx.task_plan_residue_guard -= 1;
             i += 1;
         } else {
             if (std.mem.startsWith(u8, buf[i..], "</invoke>")) {
@@ -661,13 +675,20 @@ fn filterLiveXmlBlocks(
                 i += "</tool_call>".len;
                 continue;
             }
+            if (std.mem.startsWith(u8, buf[i..], "</task_plan>")) {
+                ctx.xml_suppress_depth -|= 1;
+                ctx.task_plan_residue_guard = 32;
+                i += "</task_plan>".len;
+                continue;
+            }
             // Character inside suppression block — drop it.
             i += 1;
         }
     }
 
     // Save the hold-back portion as next carry.
-    const new_carry = buf[scan_end..];
+    const carry_start = if (i > scan_end) @min(i, buf.len) else scan_end;
+    const new_carry = buf[carry_start..];
     if (new_carry.len > ctx.xml_tail.len) {
         // Shouldn't happen because hold_back <= 15, but be defensive.
         const start = new_carry.len - ctx.xml_tail.len;
@@ -679,6 +700,34 @@ fn filterLiveXmlBlocks(
     }
 
     return scratch.items;
+}
+
+fn taskPlanResiduePrefixLen(buf: []const u8, allow_tiny_tail: bool) usize {
+    const residues = [_][]const u8{
+        "</task_plan>",
+        "/task_plan>",
+        "task_plan>",
+        "ask_plan>",
+        "sk_plan>",
+        "k_plan>",
+        "_plan>",
+        "plan>",
+    };
+    for (residues) |residue| {
+        if (std.mem.startsWith(u8, buf, residue)) return residue.len;
+    }
+    if (allow_tiny_tail) {
+        const tiny_residues = [_][]const u8{
+            "lan>",
+            "an>",
+            "n>",
+            ">",
+        };
+        for (tiny_residues) |residue| {
+            if (std.mem.startsWith(u8, buf, residue)) return residue.len;
+        }
+    }
+    return 0;
 }
 
 /// On stream finalize, flush the xml_tail carry-over through the filter
@@ -694,18 +743,29 @@ fn flushLiveXmlTail(
     var i: usize = 0;
     while (i < buf.len) {
         if (ctx.xml_suppress_depth == 0) {
+            const residue_len = taskPlanResiduePrefixLen(buf[i..], ctx.task_plan_residue_guard > 0);
+            if (residue_len > 0) {
+                i += residue_len;
+                ctx.task_plan_residue_guard = 32;
+                continue;
+            }
             if (std.mem.startsWith(u8, buf[i..], "<invoke ") or
-                std.mem.startsWith(u8, buf[i..], "<tool_call>"))
+                std.mem.startsWith(u8, buf[i..], "<tool_call>") or
+                std.mem.startsWith(u8, buf[i..], "<task_plan>"))
             {
                 ctx.xml_suppress_depth += 1;
                 if (std.mem.startsWith(u8, buf[i..], "<invoke ")) {
                     i += "<invoke ".len;
+                } else if (std.mem.startsWith(u8, buf[i..], "<task_plan>")) {
+                    ctx.task_plan_residue_guard = 32;
+                    i += "<task_plan>".len;
                 } else {
                     i += "<tool_call>".len;
                 }
                 continue;
             }
             try scratch.append(ctx.allocator, buf[i]);
+            if (ctx.task_plan_residue_guard > 0) ctx.task_plan_residue_guard -= 1;
             i += 1;
         } else {
             if (std.mem.startsWith(u8, buf[i..], "</invoke>")) {
@@ -718,10 +778,17 @@ fn flushLiveXmlTail(
                 i += "</tool_call>".len;
                 continue;
             }
+            if (std.mem.startsWith(u8, buf[i..], "</task_plan>")) {
+                ctx.xml_suppress_depth -|= 1;
+                ctx.task_plan_residue_guard = 32;
+                i += "</task_plan>".len;
+                continue;
+            }
             i += 1;
         }
     }
     ctx.xml_tail_len = 0;
+    ctx.task_plan_residue_guard = 0;
     return scratch.items;
 }
 
@@ -782,6 +849,9 @@ fn processSseEvent(ctx: *OpenAiStreamCtx, event: SseLineResult) !bool {
 
     for (event.tool_call_deltas) |delta| {
         try appendToolCallDelta(ctx, delta);
+    }
+    if (event.tool_call_deltas.len > 0) {
+        ctx.stream_tool_call_chunks += @intCast(@min(event.tool_call_deltas.len, std.math.maxInt(u32) - ctx.stream_tool_call_chunks));
     }
 
     return true;
@@ -892,6 +962,7 @@ fn finalizeOpenAiStream(ctx: *OpenAiStreamCtx) !root.StreamChatResult {
         .tool_calls = try buildToolCalls(ctx.allocator, ctx.tool_call_accumulators.items),
         .usage = usage_out,
         .model = "",
+        .stream_tool_call_chunks = ctx.stream_tool_call_chunks,
     };
 }
 
@@ -964,6 +1035,68 @@ test "stream filter strips <tool_call> block" {
     try std.testing.expect(std.mem.indexOf(u8, captured.items, "</tool_call>") == null);
     try std.testing.expect(std.mem.indexOf(u8, captured.items, "Before.") != null);
     try std.testing.expect(std.mem.indexOf(u8, captured.items, "After.") != null);
+}
+
+test "stream filter strips internal <task_plan> block split across chunks" {
+    var captured: std.ArrayListUnmanaged(u8) = .empty;
+    defer captured.deinit(std.testing.allocator);
+    var ctx = OpenAiStreamCtx{
+        .allocator = std.testing.allocator,
+        .callback = captureTextDelta,
+        .callback_ctx = @ptrCast(&captured),
+    };
+    defer ctx.deinit();
+
+    const chunks = [_][]const u8{
+        "Thinking.\n<task_",
+        "plan><summary>Private plan</summary><step>Call schedule</step></task_",
+        "plan>\nVisible summary.",
+    };
+    var scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    for (chunks) |chunk| {
+        const filtered = try filterLiveXmlBlocks(&ctx, chunk, &scratch);
+        try captured.appendSlice(std.testing.allocator, filtered);
+    }
+    const tail = try flushLiveXmlTail(&ctx, &scratch);
+    try captured.appendSlice(std.testing.allocator, tail);
+
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "<task_plan>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "</task_plan>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "/task_plan>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "sk_plan>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "Private plan") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "Thinking.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "Visible summary.") != null);
+}
+
+test "stream filter does not replay consumed task_plan closing suffix" {
+    var captured: std.ArrayListUnmanaged(u8) = .empty;
+    defer captured.deinit(std.testing.allocator);
+    var ctx = OpenAiStreamCtx{
+        .allocator = std.testing.allocator,
+        .callback = captureTextDelta,
+        .callback_ctx = @ptrCast(&captured),
+    };
+    defer ctx.deinit();
+
+    const chunks = [_][]const u8{
+        "<task_plan><summary>Private plan</summary></task_pla",
+        "n>Visible summary.",
+    };
+    var scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    for (chunks) |chunk| {
+        const filtered = try filterLiveXmlBlocks(&ctx, chunk, &scratch);
+        try captured.appendSlice(std.testing.allocator, filtered);
+    }
+    const tail = try flushLiveXmlTail(&ctx, &scratch);
+    try captured.appendSlice(std.testing.allocator, tail);
+
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "</task_plan>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "n>Visible") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "Private plan") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "Visible summary.") != null);
 }
 
 test "stream filter handles tag split across chunk boundary" {
@@ -1642,6 +1775,7 @@ test "openai stream accumulates split tool calls and visible text" {
     try std.testing.expectEqualStrings("call_abc", result.tool_calls[0].id);
     try std.testing.expectEqualStrings("web_search", result.tool_calls[0].name);
     try std.testing.expectEqualStrings("{\"query\":\"HRS news\"}", result.tool_calls[0].arguments);
+    try std.testing.expectEqual(@as(u32, 2), result.stream_tool_call_chunks);
 }
 
 test "openai stream captures authoritative usage from final chunk" {

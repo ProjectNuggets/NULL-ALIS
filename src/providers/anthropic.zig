@@ -499,6 +499,61 @@ fn serializeAnthropicContent(
     }
 }
 
+fn appendAnthropicToolInput(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    arguments: []const u8,
+) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, arguments, .{}) catch {
+        try buf.appendSlice(allocator, "{}");
+        return;
+    };
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .object => try std.fmt.format(buf.writer(allocator), "{f}", .{std.json.fmt(parsed.value, .{})}),
+        else => try buf.appendSlice(allocator, "{}"),
+    }
+}
+
+fn serializeAnthropicAssistantNativeContent(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    msg: ChatMessage,
+) !void {
+    try buf.append(allocator, '[');
+    var emitted: usize = 0;
+    if (msg.content.len > 0) {
+        try buf.appendSlice(allocator, "{\"type\":\"text\",\"text\":");
+        try root.appendJsonString(buf, allocator, msg.content);
+        try buf.append(allocator, '}');
+        emitted += 1;
+    }
+    for (msg.tool_calls) |tc| {
+        if (emitted > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"type\":\"tool_use\",\"id\":");
+        try root.appendJsonString(buf, allocator, tc.id);
+        try buf.appendSlice(allocator, ",\"name\":");
+        try root.appendJsonString(buf, allocator, tc.name);
+        try buf.appendSlice(allocator, ",\"input\":");
+        try appendAnthropicToolInput(buf, allocator, tc.arguments);
+        try buf.append(allocator, '}');
+        emitted += 1;
+    }
+    try buf.append(allocator, ']');
+}
+
+fn serializeAnthropicToolResultContent(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    msg: ChatMessage,
+) !void {
+    try buf.appendSlice(allocator, "[{\"type\":\"tool_result\",\"tool_use_id\":");
+    try root.appendJsonString(buf, allocator, msg.tool_call_id orelse "unknown");
+    try buf.appendSlice(allocator, ",\"content\":");
+    try root.appendJsonString(buf, allocator, msg.content);
+    try buf.appendSlice(allocator, "}]");
+}
+
 /// F-CB1: identify byte-positions in the messages array where cache
 /// breakpoints should be placed (the last 3 user messages — combined
 /// with the system-prompt breakpoint that's always set, this consumes
@@ -579,7 +634,13 @@ fn buildChatRequestBody(
         try buf.appendSlice(allocator, "{\"role\":\"");
         try buf.appendSlice(allocator, role_str);
         try buf.appendSlice(allocator, "\",\"content\":");
-        try serializeAnthropicContent(&buf, allocator, msg, bp_table[idx]);
+        if (msg.role == .assistant and msg.tool_calls.len > 0) {
+            try serializeAnthropicAssistantNativeContent(&buf, allocator, msg);
+        } else if (msg.role == .tool) {
+            try serializeAnthropicToolResultContent(&buf, allocator, msg);
+        } else {
+            try serializeAnthropicContent(&buf, allocator, msg, bp_table[idx]);
+        }
         try buf.append(allocator, '}');
     }
 
@@ -650,7 +711,13 @@ fn buildStreamingChatRequestBody(
         try buf.appendSlice(allocator, "{\"role\":\"");
         try buf.appendSlice(allocator, role_str);
         try buf.appendSlice(allocator, "\",\"content\":");
-        try serializeAnthropicContent(&buf, allocator, msg, bp_table[idx]);
+        if (msg.role == .assistant and msg.tool_calls.len > 0) {
+            try serializeAnthropicAssistantNativeContent(&buf, allocator, msg);
+        } else if (msg.role == .tool) {
+            try serializeAnthropicToolResultContent(&buf, allocator, msg);
+        } else {
+            try serializeAnthropicContent(&buf, allocator, msg, bp_table[idx]);
+        }
         try buf.append(allocator, '}');
     }
 
@@ -1011,6 +1078,63 @@ test "buildChatRequestBody defaults max_tokens to runtime fallback" {
     const max_tokens = parsed.value.object.get("max_tokens").?;
     try std.testing.expect(max_tokens == .integer);
     try std.testing.expectEqual(@as(i64, config_types.DEFAULT_MODEL_MAX_TOKENS), max_tokens.integer);
+}
+
+test "buildChatRequestBody serializes native tool transcript blocks" {
+    const allocator = std.testing.allocator;
+    const calls = [_]root.ToolCall{.{
+        .id = "toolu_1",
+        .name = "memory_recall",
+        .arguments = "{\"query\":\"native transcript\"}",
+    }};
+    const msgs = [_]root.ChatMessage{
+        .{ .role = .assistant, .content = "I will check.", .tool_calls = &calls },
+        .{ .role = .tool, .name = "memory_recall", .tool_call_id = "toolu_1", .content = "{\"status\":\"ok\"}" },
+    };
+    const req = root.ChatRequest{ .messages = &msgs };
+    const body = try buildChatRequestBody(allocator, req, "claude-3-opus", 0.7);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+
+    const assistant_content = messages[0].object.get("content").?.array.items;
+    try std.testing.expectEqualStrings("text", assistant_content[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("tool_use", assistant_content[1].object.get("type").?.string);
+    try std.testing.expectEqualStrings("toolu_1", assistant_content[1].object.get("id").?.string);
+    try std.testing.expectEqualStrings("memory_recall", assistant_content[1].object.get("name").?.string);
+    try std.testing.expectEqualStrings("native transcript", assistant_content[1].object.get("input").?.object.get("query").?.string);
+
+    try std.testing.expectEqualStrings("user", messages[1].object.get("role").?.string);
+    const tool_result = messages[1].object.get("content").?.array.items[0].object;
+    try std.testing.expectEqualStrings("tool_result", tool_result.get("type").?.string);
+    try std.testing.expectEqualStrings("toolu_1", tool_result.get("tool_use_id").?.string);
+    try std.testing.expectEqualStrings("{\"status\":\"ok\"}", tool_result.get("content").?.string);
+}
+
+test "buildStreamingChatRequestBody serializes native tool transcript blocks" {
+    const allocator = std.testing.allocator;
+    const calls = [_]root.ToolCall{.{
+        .id = "toolu_stream",
+        .name = "schedule",
+        .arguments = "{\"action\":\"list\"}",
+    }};
+    const msgs = [_]root.ChatMessage{
+        .{ .role = .assistant, .content = "", .tool_calls = &calls },
+        .{ .role = .tool, .name = "schedule", .tool_call_id = "toolu_stream", .content = "{\"partial\":false}" },
+    };
+    const req = root.ChatRequest{ .messages = &msgs };
+    const body = try buildStreamingChatRequestBody(allocator, req, "claude-3-opus", 0.7);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqualStrings("tool_use", messages[0].object.get("content").?.array.items[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("tool_result", messages[1].object.get("content").?.array.items[0].object.get("type").?.string);
+    try std.testing.expect(parsed.value.object.get("stream").?.bool);
 }
 
 test "buildStreamingChatRequestBody contains same messages as non-streaming" {

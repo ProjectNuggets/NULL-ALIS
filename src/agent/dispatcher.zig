@@ -1,5 +1,6 @@
 const std = @import("std");
 const providers = @import("../providers/root.zig");
+const tool_surface = @import("tool_surface.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Dispatcher — tool call parsing and result formatting
@@ -400,7 +401,7 @@ pub fn parseXmlToolCalls(
 /// Net effect: typical real-world tool returns (logs, code files,
 /// memory queries, search results) NEVER hit this cap now. Only
 /// pathological cases trigger truncation.
-const MAX_TOOL_RESULT_CHARS: usize = 200000;
+pub const MAX_TOOL_RESULT_CONTEXT_CHARS: usize = 24_000;
 
 /// Truncate tool output to fit within the context budget.
 /// Keeps the first and last portions so the LLM sees both the beginning
@@ -430,23 +431,107 @@ fn truncateToolOutput(allocator: std.mem.Allocator, output: []const u8, max_char
     });
 }
 
+pub const ContextBoundedResult = struct {
+    tool: []const u8,
+    status: []const u8,
+    partial: bool,
+    original_bytes: usize,
+    shown_bytes: usize,
+    content_preview: []const u8,
+    result_hash: u64,
+    next_call: []const u8 = "",
+};
+
+fn resultHash(result: ToolExecutionResult) u64 {
+    var hasher = std.hash.Fnv1a_64.init();
+    hasher.update(result.name);
+    hasher.update("\x00");
+    hasher.update(if (result.success) "ok" else "error");
+    hasher.update("\x00");
+    hasher.update(result.output);
+    if (result.tool_call_id) |id| {
+        hasher.update("\x00");
+        hasher.update(id);
+    }
+    return hasher.final();
+}
+
+fn partialRetrievalHint(result: ToolExecutionResult) []const u8 {
+    if (std.mem.eql(u8, result.name, "schedule")) {
+        return "Use schedule list with the next offset/limit, or call the exact schedule detail path for a specific job id.";
+    }
+    if (std.mem.eql(u8, result.name, "cron_list")) {
+        return "Use cron_list with the next offset/limit, or call the exact cron detail/update path for a specific job id.";
+    }
+    if (std.mem.startsWith(u8, result.name, "memory_")) {
+        return "Use a narrower memory query, explicit key/id, limit, offset, or transcript_read for exact historical detail.";
+    }
+    if (std.mem.startsWith(u8, result.name, "composio")) {
+        return "Use the returned id/cursor if present, or rerun the Composio tool with narrower filters to fetch omitted detail.";
+    }
+    if (std.mem.indexOf(u8, result.name, "web") != null or std.mem.indexOf(u8, result.name, "http") != null) {
+        return "Fetch the specific URL/section/id or use a narrower query to retrieve omitted detail.";
+    }
+    if (std.mem.indexOf(u8, result.name, "file") != null or std.mem.indexOf(u8, result.name, "shell") != null) {
+        return "Use targeted offsets/ranges/commands to retrieve omitted detail; do not assume the omitted bytes were visible.";
+    }
+    return "Call the same tool with narrower query, limit/offset/cursor, explicit id, or targeted parameters to retrieve omitted detail.";
+}
+
+fn formatBoundedResultJson(
+    allocator: std.mem.Allocator,
+    result: ToolExecutionResult,
+    seen_inventory_pages: ?*SeenInventoryPages,
+) ![]const u8 {
+    const output_for_context = if (seen_inventory_pages) |pages|
+        try boundedDuplicateInventoryOutput(allocator, result, pages)
+    else
+        ContextOutput{ .text = result.output };
+    defer {
+        if (output_for_context.allocated) allocator.free(output_for_context.text);
+    }
+
+    const normalized_output = try truncateToolOutput(allocator, output_for_context.text, MAX_TOOL_RESULT_CONTEXT_CHARS);
+    defer allocator.free(normalized_output);
+
+    const partial = output_for_context.allocated or output_for_context.text.len > MAX_TOOL_RESULT_CONTEXT_CHARS;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"tool\":");
+    try providers.appendJsonString(&buf, allocator, result.name);
+    try w.writeAll(",\"status\":");
+    try providers.appendJsonString(&buf, allocator, if (result.success) "ok" else "error");
+    try w.print(",\"partial\":{},\"original_bytes\":{d},\"shown_bytes\":{d},\"result_hash\":\"{x}\",\"content_preview\":", .{
+        partial,
+        result.output.len,
+        normalized_output.len,
+        resultHash(result),
+    });
+    try providers.appendJsonString(&buf, allocator, normalized_output);
+    if (partial) {
+        try w.writeAll(",\"next_call\":");
+        try providers.appendJsonString(&buf, allocator, partialRetrievalHint(result));
+    }
+    try w.writeAll("}");
+    return try buf.toOwnedSlice(allocator);
+}
+
+pub fn formatBoundedToolResultContent(allocator: std.mem.Allocator, result: ToolExecutionResult) ![]const u8 {
+    return formatBoundedResultJson(allocator, result, null);
+}
+
 /// Format tool execution results as XML for the next LLM turn.
 /// Normalizes output: truncates oversized results, structures errors clearly.
 pub fn formatToolResults(allocator: std.mem.Allocator, results: []const ToolExecutionResult) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    var seen_schedule_inventory: ?InventoryPageKey = null;
+    var seen_inventory_pages = SeenInventoryPages{};
 
     try buf.appendSlice(allocator, "[Tool results]\n");
     for (results) |result| {
         const status_str = if (result.success) "ok" else "error";
-        const output_for_context = try boundedDuplicateInventoryOutput(allocator, result, &seen_schedule_inventory);
-        defer {
-            if (output_for_context.allocated) allocator.free(output_for_context.text);
-        }
-
-        // Truncate oversized outputs to prevent context window exhaustion
-        const normalized_output = try truncateToolOutput(allocator, output_for_context.text, MAX_TOOL_RESULT_CHARS);
+        const normalized_output = try formatBoundedResultJson(allocator, result, &seen_inventory_pages);
         defer allocator.free(normalized_output);
 
         try std.fmt.format(buf.writer(allocator), "<tool_result name=\"{s}\" status=\"{s}\">\n{s}\n</tool_result>\n", .{
@@ -460,9 +545,15 @@ pub fn formatToolResults(allocator: std.mem.Allocator, results: []const ToolExec
 }
 
 const InventoryPageKey = struct {
+    tool_name: []const u8,
     total_count: u64,
     limit: u64,
     offset: u64,
+};
+
+const SeenInventoryPages = struct {
+    schedule: ?InventoryPageKey = null,
+    cron_list: ?InventoryPageKey = null,
 };
 
 const ContextOutput = struct {
@@ -487,6 +578,7 @@ fn inventoryPageKey(result: ToolExecutionResult) ?InventoryPageKey {
     if (!result.success or !isScheduleInventoryTool(result.name)) return null;
     if (std.mem.indexOf(u8, result.output, "shown_count=") == null) return null;
     return .{
+        .tool_name = result.name,
         .total_count = parseUnsignedAfter(result.output, "total_count=") orelse return null,
         .limit = parseUnsignedAfter(result.output, "limit=") orelse return null,
         .offset = parseUnsignedAfter(result.output, "offset=") orelse return null,
@@ -494,32 +586,74 @@ fn inventoryPageKey(result: ToolExecutionResult) ?InventoryPageKey {
 }
 
 fn sameInventoryPage(a: InventoryPageKey, b: InventoryPageKey) bool {
-    return a.total_count == b.total_count and a.limit == b.limit and a.offset == b.offset;
+    return std.mem.eql(u8, a.tool_name, b.tool_name) and
+        a.total_count == b.total_count and
+        a.limit == b.limit and
+        a.offset == b.offset;
+}
+
+fn seenInventorySlot(pages: *SeenInventoryPages, tool_name: []const u8) ?*?InventoryPageKey {
+    if (std.mem.eql(u8, tool_name, "schedule")) return &pages.schedule;
+    if (std.mem.eql(u8, tool_name, "cron_list")) return &pages.cron_list;
+    return null;
 }
 
 fn boundedDuplicateInventoryOutput(
     allocator: std.mem.Allocator,
     result: ToolExecutionResult,
-    seen_schedule_inventory: *?InventoryPageKey,
+    seen_inventory_pages: *SeenInventoryPages,
 ) !ContextOutput {
     const key = inventoryPageKey(result) orelse return .{ .text = result.output };
-    if (seen_schedule_inventory.*) |seen| {
+    const seen_slot = seenInventorySlot(seen_inventory_pages, key.tool_name) orelse return .{ .text = result.output };
+    if (seen_slot.*) |seen| {
         if (sameInventoryPage(seen, key)) {
             const text = try std.fmt.allocPrint(
                 allocator,
-                "duplicate_omitted:true\npartial:true\noriginal_bytes:{d}\nshown_bytes:0\nreason:same_turn_schedule_inventory_duplicate\npage: total_count={d} limit={d} offset={d}\nnext: use the prior schedule/cron list result for this page, request the next offset, or call `schedule action=get id=<job_id>` for exact job detail.",
-                .{ result.output.len, key.total_count, key.limit, key.offset },
+                "duplicate_omitted:true\npartial:true\noriginal_bytes:{d}\nshown_bytes:0\nreason:same_turn_{s}_inventory_duplicate\npage: tool={s} total_count={d} limit={d} offset={d}\nnext: use the prior {s} result for this page, request the next offset, or call the exact job detail path if needed.",
+                .{ result.output.len, key.tool_name, key.tool_name, key.total_count, key.limit, key.offset, key.tool_name },
             );
             return .{ .text = text, .allocated = true };
         }
     } else {
-        seen_schedule_inventory.* = key;
+        seen_slot.* = key;
     }
     return .{ .text = result.output };
 }
 
 /// Build tool use instructions for the system prompt.
 pub fn buildToolInstructions(allocator: std.mem.Allocator, tools: anytype) ![]const u8 {
+    return buildFullXmlToolInstructions(allocator, tools);
+}
+
+pub fn buildToolInstructionsForSurface(
+    allocator: std.mem.Allocator,
+    tools: anytype,
+    plan: tool_surface.Plan,
+) ![]const u8 {
+    if (tools.len == 0 or plan.mode == .no_tools) return allocator.dupe(u8, "");
+    return switch (plan.mode) {
+        .native_minimal, .native_strict_canary => allocator.dupe(u8, ""),
+        .native_with_xml_fallback => buildMinimalXmlFallbackInstructions(allocator),
+        .xml_full => buildFullXmlToolInstructions(allocator, tools),
+        .no_tools => allocator.dupe(u8, ""),
+    };
+}
+
+fn buildMinimalXmlFallbackInstructions(allocator: std.mem.Allocator) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeAll("\n## Tool Use Protocol\n\n");
+    try w.writeAll("Use provider-native tool calls when that channel is available.\n");
+    try w.writeAll("If the provider cannot emit a native tool call, emit actual <tool_call> tags using the same tool names and argument schemas supplied through the native tools field:\n\n");
+    try w.writeAll("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
+    try w.writeAll("CRITICAL: Output actual <tool_call> tags only on fallback -- never describe a pending tool action. After tool execution, results appear in <tool_result> tags.\n\n");
+
+    return try buf.toOwnedSlice(allocator);
+}
+
+fn buildFullXmlToolInstructions(allocator: std.mem.Allocator, tools: anytype) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
@@ -1407,19 +1541,15 @@ test "formatToolResults multiple results" {
     try std.testing.expect(std.mem.indexOf(u8, formatted, "not found") != null);
 }
 
-test "formatToolResults omits duplicate same-turn schedule inventory page" {
+test "formatToolResults omits duplicate same-turn inventory page for same tool" {
     const allocator = std.testing.allocator;
     const inventory =
         \\Scheduled jobs: total_count=313 shown_count=25 limit=25 offset=0 next_offset=25 partial=true
         \\- job-000 daily cmd_preview="first"
     ;
-    const duplicate =
-        \\Cron jobs: total_count=313 shown_count=25 limit=25 offset=0 next_offset=25 partial=true
-        \\- job-000 daily cmd_preview="first"
-    ;
     const results = [_]ToolExecutionResult{
         .{ .name = "schedule", .output = inventory, .success = true },
-        .{ .name = "cron_list", .output = duplicate, .success = true },
+        .{ .name = "schedule", .output = inventory, .success = true },
     };
     const formatted = try formatToolResults(allocator, &results);
     defer allocator.free(formatted);
@@ -1427,7 +1557,61 @@ test "formatToolResults omits duplicate same-turn schedule inventory page" {
     try std.testing.expect(std.mem.indexOf(u8, formatted, "Scheduled jobs: total_count=313") != null);
     try std.testing.expect(std.mem.indexOf(u8, formatted, "duplicate_omitted:true") != null);
     try std.testing.expect(std.mem.indexOf(u8, formatted, "original_bytes:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, formatted, "Cron jobs: total_count=313") == null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "reason:same_turn_schedule_inventory_duplicate") != null);
+}
+
+test "formatToolResults does not conflate schedule and cron inventory pages" {
+    const allocator = std.testing.allocator;
+    const schedule_inventory =
+        \\Scheduled jobs: total_count=313 shown_count=25 limit=25 offset=0 next_offset=25 partial=true
+        \\- job-000 daily cmd_preview="first"
+    ;
+    const cron_inventory =
+        \\Cron jobs: total_count=313 shown_count=25 limit=25 offset=0 next_offset=25 partial=true
+        \\- job-000 daily runtime=enabled cmd_preview="first"
+    ;
+    const results = [_]ToolExecutionResult{
+        .{ .name = "schedule", .output = schedule_inventory, .success = true },
+        .{ .name = "cron_list", .output = cron_inventory, .success = true },
+    };
+    const formatted = try formatToolResults(allocator, &results);
+    defer allocator.free(formatted);
+
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "Scheduled jobs: total_count=313") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "Cron jobs: total_count=313") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "duplicate_omitted:true") == null);
+}
+
+test "formatToolResults dedupes schedule and cron independently" {
+    const allocator = std.testing.allocator;
+    const schedule_inventory =
+        \\Scheduled jobs: total_count=313 shown_count=25 limit=25 offset=0 next_offset=25 partial=true
+        \\- job-000 daily cmd_preview="first"
+    ;
+    const cron_inventory =
+        \\Cron jobs: total_count=313 shown_count=25 limit=25 offset=0 next_offset=25 partial=true
+        \\- job-000 daily runtime=enabled cmd_preview="first"
+    ;
+    const results = [_]ToolExecutionResult{
+        .{ .name = "schedule", .output = schedule_inventory, .success = true },
+        .{ .name = "cron_list", .output = cron_inventory, .success = true },
+        .{ .name = "schedule", .output = schedule_inventory, .success = true },
+        .{ .name = "cron_list", .output = cron_inventory, .success = true },
+    };
+    const formatted = try formatToolResults(allocator, &results);
+    defer allocator.free(formatted);
+
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "Scheduled jobs: total_count=313") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "Cron jobs: total_count=313") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "reason:same_turn_schedule_inventory_duplicate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "reason:same_turn_cron_list_inventory_duplicate") != null);
+}
+
+test "seenInventorySlot only accepts known inventory tools" {
+    var pages = SeenInventoryPages{};
+    try std.testing.expect(seenInventorySlot(&pages, "schedule") != null);
+    try std.testing.expect(seenInventorySlot(&pages, "cron_list") != null);
+    try std.testing.expect(seenInventorySlot(&pages, "memory_list") == null);
 }
 
 test "truncateToolOutput preserves short output" {
@@ -1453,7 +1637,7 @@ test "truncateToolOutput truncates oversized output with marker" {
 
 test "formatToolResults truncates oversized tool output" {
     const allocator = std.testing.allocator;
-    const big_output = "X" ** (MAX_TOOL_RESULT_CHARS + 1000);
+    const big_output = "X" ** (MAX_TOOL_RESULT_CONTEXT_CHARS + 1000);
     const results = [_]ToolExecutionResult{
         .{ .name = "shell", .output = big_output, .success = true },
     };
@@ -1463,6 +1647,30 @@ test "formatToolResults truncates oversized tool output" {
     try std.testing.expect(std.mem.indexOf(u8, formatted, "characters truncated") != null);
     // And should be smaller than the raw output
     try std.testing.expect(formatted.len < big_output.len);
+}
+
+test "formatBoundedToolResultContent emits partial envelope without raw full output" {
+    const allocator = std.testing.allocator;
+    const big_output = "A" ** (MAX_TOOL_RESULT_CONTEXT_CHARS + 1024);
+    const result = ToolExecutionResult{
+        .name = "memory_recall",
+        .output = big_output,
+        .success = true,
+        .tool_call_id = "call_1",
+    };
+    const formatted = try formatBoundedToolResultContent(allocator, result);
+    defer allocator.free(formatted);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, formatted, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("memory_recall", obj.get("tool").?.string);
+    try std.testing.expectEqualStrings("ok", obj.get("status").?.string);
+    try std.testing.expect(obj.get("partial").?.bool);
+    try std.testing.expectEqual(@as(i64, big_output.len), obj.get("original_bytes").?.integer);
+    try std.testing.expect(obj.get("shown_bytes").?.integer < big_output.len);
+    try std.testing.expect(obj.get("content_preview").?.string.len < big_output.len);
+    try std.testing.expect(obj.get("next_call") != null);
 }
 
 // Bug 3 regression: unmatched close brace/bracket must not underflow depth (usize).
@@ -1533,6 +1741,52 @@ test "buildToolInstructions empty tools" {
     try std.testing.expect(std.mem.indexOf(u8, instructions, "memory_timeline") != null);
     try std.testing.expect(std.mem.indexOf(u8, instructions, "semantic lookup") != null);
     try std.testing.expect(std.mem.indexOf(u8, instructions, "exact-history deep dives") != null);
+}
+
+test "buildToolInstructionsForSurface emits minimal XML fallback without full catalog" {
+    const allocator = std.testing.allocator;
+    const MockTool = struct {
+        fn name(_: @This()) []const u8 {
+            return "schedule";
+        }
+        fn description(_: @This()) []const u8 {
+            return "List scheduled jobs";
+        }
+        fn parametersJson(_: @This()) []const u8 {
+            return "{\"type\":\"object\"}";
+        }
+    };
+    const tools = [_]MockTool{.{}};
+    const instructions = try buildToolInstructionsForSurface(allocator, tools[0..], tool_surface.select(true, tools.len));
+    defer allocator.free(instructions);
+
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "Tool Use Protocol") != null);
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "<tool_call>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "native tools field") != null);
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "### Available Tools") == null);
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "{\"type\":\"object\"}") == null);
+}
+
+test "buildToolInstructionsForSurface emits full XML catalog for non-native providers" {
+    const allocator = std.testing.allocator;
+    const MockTool = struct {
+        fn name(_: @This()) []const u8 {
+            return "schedule";
+        }
+        fn description(_: @This()) []const u8 {
+            return "List scheduled jobs";
+        }
+        fn parametersJson(_: @This()) []const u8 {
+            return "{\"type\":\"object\"}";
+        }
+    };
+    const tools = [_]MockTool{.{}};
+    const instructions = try buildToolInstructionsForSurface(allocator, tools[0..], tool_surface.select(false, tools.len));
+    defer allocator.free(instructions);
+
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "### Available Tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "**schedule**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "{\"type\":\"object\"}") != null);
 }
 
 test "parseToolCalls three consecutive calls" {

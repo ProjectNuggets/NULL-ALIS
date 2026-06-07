@@ -8,6 +8,7 @@ const platform = @import("../platform.zig");
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
 const skills_mod = @import("../skills.zig");
+const tool_surface = @import("tool_surface.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // System Prompt Builder
@@ -233,6 +234,7 @@ pub const PromptContext = struct {
     workspace_dir: []const u8,
     model_name: []const u8,
     tools: []const Tool,
+    tool_surface_plan: tool_surface.Plan = .{},
     capabilities_section: ?[]const u8 = null,
     conversation_context: ?ConversationContext = null,
     sections: PromptSections = .{},
@@ -407,9 +409,10 @@ pub fn buildStableSystemPrompt(
 
     // ─── Tier 2: deploy-config (changes when tool list changes) ──
 
-    // Tools catalog. Sorted by name for byte-stable bytes within the
-    // section across runs. ~8-15 KB.
-    try buildToolsSection(w, ctx.tools);
+    // Tool surface policy. The full provider-bound catalog is emitted by the
+    // selected ToolSurfacePlan, so native-capable turns do not duplicate it in
+    // both prompt prose and native schema payloads.
+    try buildToolsSection(w, ctx.tools, ctx.tool_surface_plan);
 
     // Capabilities derived from config + tool flags. Optional. ~2-5 KB.
     if (ctx.capabilities_section) |section| {
@@ -632,7 +635,8 @@ fn buildConversationContextSection(w: anytype, cc_opt: ?ConversationContext) !vo
 /// Only emitted when a request has 3 or more distinct steps.
 fn buildTaskDecompositionSection(w: anytype) !void {
     try w.writeAll("## Task Decomposition\n\n");
-    try w.writeAll("When a user request involves 3 or more distinct steps, decompose it into a structured plan before executing.\n\n");
+    try w.writeAll("For internal execution planning on multi-step work, use this private run plan. It is ephemeral agent state, not a user-visible todo list.\n\n");
+    try w.writeAll("Use `<task_plan>` when a request has 3+ dependent steps or needs progress continuity. Do not call the `todo` tool just to plan your own work; `todo` is only for user-owned persistent checklists.\n\n");
     try w.writeAll("Emit a `<task_plan>` block in your response:\n");
     try w.writeAll("```\n");
     try w.writeAll("<task_plan>\n");
@@ -645,6 +649,8 @@ fn buildTaskDecompositionSection(w: anytype) !void {
     try w.writeAll("Rules:\n");
     try w.writeAll("- Only decompose when the request genuinely has multiple distinct steps.\n");
     try w.writeAll("- Simple questions or single-tool operations do not need a plan.\n");
+    try w.writeAll("- `todo` is not the internal planner; use it only when the user explicitly asks to create/manage a visible todo, checklist, or task list, or asks you to track a durable session checklist.\n");
+    try w.writeAll("- If the user says \"plan this\" or asks for an implementation plan, write the plan in prose or `<task_plan>`; do not persist it via `todo` unless asked.\n");
     try w.writeAll("- After emitting the plan, execute step 1 immediately in the same turn.\n");
     try w.writeAll("- Do not re-emit the plan on subsequent iterations — execute the next pending step.\n\n");
 }
@@ -744,7 +750,7 @@ fn buildIdentitySection(
     try injectPreferredMemoryFile(allocator, w, workspace_dir);
 }
 
-fn buildToolsSection(w: anytype, tools: anytype) !void {
+fn buildToolsSection(w: anytype, tools: anytype, plan: tool_surface.Plan) !void {
     // S5.4 — sort tools by name for byte-stable prompt prefix. Without this,
     // any caller whose tool slice order depends on hashmap enumeration,
     // insertion history, or flag-dependent registration would drift the
@@ -756,6 +762,21 @@ fn buildToolsSection(w: anytype, tools: anytype) !void {
     // Any slice whose element has .name() .description() .parametersJson()
     // methods satisfies the shape.
     try w.writeAll("## Tools\n\n");
+
+    if (tools.len == 0) {
+        try w.writeAll("No tools are available for this turn. Answer directly and do not invent tool execution.\n\n");
+        return;
+    }
+
+    if (plan.mode == .native_with_xml_fallback or plan.mode == .native_minimal or plan.mode == .native_strict_canary) {
+        try w.writeAll("The executable tool catalog is supplied through the provider-native tools field for this turn. Use native tool calls when the provider exposes that channel. Do not restate tool schemas in prose.\n\n");
+        return;
+    }
+
+    if (plan.mode == .xml_full) {
+        try w.writeAll("The executable tool catalog is supplied in the XML tool protocol block below. Use those exact tool names and JSON arguments. Do not restate tool schemas in prose.\n\n");
+        return;
+    }
 
     var idx_buf: [256]usize = undefined;
     const n = @min(tools.len, idx_buf.len);
@@ -899,7 +920,7 @@ fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("**Recovery — `memory_purge_topic`.** When the user says \"forget what you said about X\" / \"you've been wrong about X\" / \"start fresh on X\", or you detect yourself compounding errors on a topic across turns, call `memory_purge_topic topic=X`. Deletes your own prior autosaves / checkpoints / summaries containing X — does NOT touch user-stored memories. Then re-verify with a grounding tool. For user-authored corrections, use `memory_edit` or `memory_forget` with a specific key instead.\n\n");
 
     // ── Multi-task discipline (compressed) ───────────────────────────
-    try w.writeAll("**Multi-task discipline — `todo`.** When the user requests 3+ distinct tasks (numbered list, comma-separated, sequence patterns like \"first X, then Y, then Z\"), call `todo create` BEFORE acting. Set `depends_on` for genuine prerequisites. Show the plan in your reply as natural prose. Flip status with `todo update` (`pending` → `in_progress` → `completed`/`blocked`) on each material change. Read latest with `todo list` before resuming so user reorders are respected. Per-session scope. Don't use `todo` for single-task requests — that's overhead the user didn't ask for.\n\n");
+    try w.writeAll("**User-visible checklists — `todo`.** Use `todo` only for persistent, user-owned checklists in this conversation: explicit todo/checklist/task-list requests, user-provided lists they want tracked, or long work where you need to show and maintain visible progress across turns. Do not use `todo` for private execution planning, hidden launch validation steps, or ordinary tool sequencing; use `<task_plan>` or concise prose instead. When you create a todo list, keep the returned `list_id`; read latest with `todo list` before updating if you do not have it, include `list_id` on every update, and update statuses only after real progress.\n\n");
 
     // ── compose_memory + memory transparency (merged) ────────────────
     try w.writeAll("**Memory consolidation — `compose_memory`.** When 2+ existing memories cluster around the same fact (multiple notes on user preferences, scattered observations on a recurring topic), read the sources via `memory_recall`/`memory_list`, then `compose_memory create` with the synthesis text + `references[]` of source keys (min 2, max 50). Use for: \"what do you know about X\" answers pulling from multiple notes; crystallizing preferences observed across sessions; uniting insights from extended discussion. Don't use for single-source rewrites (use `memory_edit`) or unrelated merges. Sources stay visible as audit.\n\n");
@@ -1814,7 +1835,7 @@ test "buildToolsSection emits tools sorted by name regardless of input order [S5
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
-    try buildToolsSection(buf.writer(allocator), reversed[0..]);
+    try buildToolsSection(buf.writer(allocator), reversed[0..], .{});
 
     const out = buf.items;
     const alpha_pos = std.mem.indexOf(u8, out, "**alpha**") orelse return error.AlphaMissing;
@@ -1826,8 +1847,74 @@ test "buildToolsSection emits tools sorted by name regardless of input order [S5
     // Byte-stability: same input twice produces byte-identical output.
     var buf2: std.ArrayListUnmanaged(u8) = .empty;
     defer buf2.deinit(allocator);
-    try buildToolsSection(buf2.writer(allocator), reversed[0..]);
+    try buildToolsSection(buf2.writer(allocator), reversed[0..], .{});
     try std.testing.expectEqualStrings(buf.items, buf2.items);
+}
+
+test "buildToolsSection emits compact native surface without schema catalog" {
+    const allocator = std.testing.allocator;
+    const MockTool = struct {
+        tool_name: []const u8,
+        tool_desc: []const u8,
+        tool_params: []const u8,
+        fn name(self: @This()) []const u8 {
+            return self.tool_name;
+        }
+        fn description(self: @This()) []const u8 {
+            return self.tool_desc;
+        }
+        fn parametersJson(self: @This()) []const u8 {
+            return self.tool_params;
+        }
+    };
+    const tools = [_]MockTool{
+        .{ .tool_name = "schedule", .tool_desc = "List scheduled jobs", .tool_params = "{\"type\":\"object\"}" },
+    };
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buildToolsSection(buf.writer(allocator), tools[0..], tool_surface.select(true, tools.len));
+
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "## Tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "provider-native tools field") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "Parameters:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "{\"type\":\"object\"}") == null);
+}
+
+test "buildToolsSection emits compact native-strict canary surface without schema catalog" {
+    const allocator = std.testing.allocator;
+    const MockTool = struct {
+        tool_name: []const u8,
+        tool_desc: []const u8,
+        tool_params: []const u8,
+        fn name(self: @This()) []const u8 {
+            return self.tool_name;
+        }
+        fn description(self: @This()) []const u8 {
+            return self.tool_desc;
+        }
+        fn parametersJson(self: @This()) []const u8 {
+            return self.tool_params;
+        }
+    };
+    const tools = [_]MockTool{
+        .{ .tool_name = "schedule", .tool_desc = "List scheduled jobs", .tool_params = "{\"type\":\"object\"}" },
+    };
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buildToolsSection(buf.writer(allocator), tools[0..], .{
+        .mode = .native_strict_canary,
+        .provider_supports_native_tools = true,
+        .native_tool_count = tools.len,
+        .native_tool_schemas_present = true,
+        .native_strict_canary = true,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "## Tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "provider-native tools field") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "Parameters:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "{\"type\":\"object\"}") == null);
 }
 
 test "buildStableSystemPrompt is byte-stable across back-to-back calls with identical inputs" {
@@ -2083,6 +2170,31 @@ test "buildSafetySection does not contain turn classification text" {
     try std.testing.expect(std.mem.indexOf(u8, output, "Precedence: verified runtime state") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Preferred tool paths") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Never claim that an action has started or is in progress") != null);
+}
+
+test "task planning prompt keeps internal plans separate from todo" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+    try buildTaskDecompositionSection(w);
+
+    const output = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, output, "<task_plan>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "ephemeral agent state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Do not call the `todo` tool just to plan your own work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "user-owned persistent checklists") != null);
+}
+
+test "response protocol scopes todo to user-visible durable checklists" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+    try buildResponseProtocolSection(w);
+
+    const output = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, output, "User-visible checklists") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Do not use `todo` for private execution planning") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "include `list_id` on every update") != null);
 }
 
 test "buildConversationContextSection with null produces empty output" {

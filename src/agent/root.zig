@@ -57,6 +57,7 @@ pub const context_cache = @import("context_cache.zig");
 pub const context_tokens = @import("context_tokens.zig");
 pub const context_report = @import("context_report.zig");
 pub const context_engine = @import("context_engine.zig");
+pub const tool_surface = @import("tool_surface.zig");
 pub const max_tokens_resolver = @import("max_tokens.zig");
 pub const prompt = @import("prompt.zig");
 pub const narration = @import("narration.zig");
@@ -850,10 +851,27 @@ pub const Agent = struct {
         /// freed by `deinit`. Null for user/system/tool messages and for
         /// assistant turns where the model emitted no reasoning.
         reasoning: ?[]const u8 = null,
+        /// Provider-native assistant tool calls. Allocator-owned when
+        /// non-empty; only serialized for providers that support the
+        /// OpenAI-compatible native transcript shape.
+        tool_calls: []providers.ToolCall = &.{},
+        /// Optional tool result message name. Allocator-owned when set.
+        name: ?[]const u8 = null,
+        /// Optional native tool-call id for `.tool` messages. Allocator-owned
+        /// when set.
+        tool_call_id: ?[]const u8 = null,
 
         pub fn deinit(self: *const OwnedMessage, allocator: std.mem.Allocator) void {
             allocator.free(self.content);
             if (self.reasoning) |r| allocator.free(r);
+            for (self.tool_calls) |tc| {
+                if (tc.id.len > 0) allocator.free(tc.id);
+                if (tc.name.len > 0) allocator.free(tc.name);
+                if (tc.arguments.len > 0) allocator.free(tc.arguments);
+            }
+            if (self.tool_calls.len > 0) allocator.free(self.tool_calls);
+            if (self.name) |name| allocator.free(name);
+            if (self.tool_call_id) |id| allocator.free(id);
         }
 
         fn toChatMessage(self: *const OwnedMessage) ChatMessage {
@@ -861,6 +879,9 @@ pub const Agent = struct {
                 .role = self.role,
                 .content = self.content,
                 .reasoning_content = self.reasoning,
+                .tool_calls = self.tool_calls,
+                .name = self.name,
+                .tool_call_id = self.tool_call_id,
             };
         }
     };
@@ -1734,11 +1755,194 @@ pub const Agent = struct {
     fn looksLikeToolCallMarkupPrefix(line: []const u8) bool {
         // Canonical opener — full or partial prefix.
         if (matchesAsciiPrefixPartially(line, "<tool_call>")) return true;
-        // Residue shapes — must be exact-prefix matches so a stray substring
-        // mid-sentence doesn't hold a legitimate reply.
-        if (std.mem.startsWith(u8, line, "tool_call>")) return true;
-        if (std.mem.startsWith(u8, line, "ool_call>")) return true;
+        // Residue shapes — match partial prefixes too. Providers can split
+        // the first bytes of a malformed opener (`o` + `ol_call>...`) before
+        // the stream has enough bytes to identify the residue. Holding only
+        // the complete `ool_call>` shape lets the first chunk leak.
+        if (matchesAsciiPrefixPartially(line, "tool_call>")) return true;
+        if (matchesAsciiPrefixPartially(line, "ool_call>")) return true;
         return false;
+    }
+
+    fn toolModeForParsedCalls(use_native: bool, xml_fallback_ran: bool, parsed_call_count: usize) []const u8 {
+        if (parsed_call_count == 0) return "no_tools";
+        if (use_native and !xml_fallback_ran) return "native_tool_calls";
+        if (use_native and xml_fallback_ran) return "mixed";
+        return "xml_fallback";
+    }
+
+    fn supportsProviderNativeTranscript(self: *const Agent) bool {
+        if (!self.provider.supportsNativeTools()) return false;
+        const provider_name = self.provider.getName();
+        return containsAsciiIgnoreCase(provider_name, "openai") or
+            containsAsciiIgnoreCase(provider_name, "openrouter") or
+            containsAsciiIgnoreCase(provider_name, "moonshot") or
+            containsAsciiIgnoreCase(provider_name, "kimi") or
+            containsAsciiIgnoreCase(provider_name, "compatible") or
+            containsAsciiIgnoreCase(provider_name, "together") or
+            containsAsciiIgnoreCase(provider_name, "groq") or
+            containsAsciiIgnoreCase(provider_name, "deepseek") or
+            containsAsciiIgnoreCase(provider_name, "xai") or
+            containsAsciiIgnoreCase(provider_name, "fireworks") or
+            containsAsciiIgnoreCase(provider_name, "mistral") or
+            containsAsciiIgnoreCase(provider_name, "perplexity") or
+            containsAsciiIgnoreCase(provider_name, "anthropic") or
+            containsAsciiIgnoreCase(provider_name, "router");
+    }
+
+    fn ensureNativeToolCallIds(
+        self: *Agent,
+        calls: []ParsedToolCall,
+        iteration: u32,
+    ) !u32 {
+        var synthesized: u32 = 0;
+        for (calls, 0..) |*call, idx| {
+            if (call.tool_call_id != null) continue;
+            const id = try std.fmt.allocPrint(self.allocator, "xml_fallback_{d}_{d}", .{ iteration, idx });
+            call.tool_call_id = id;
+            synthesized += 1;
+        }
+        return synthesized;
+    }
+
+    fn cloneParsedCallsAsProviderToolCalls(
+        self: *Agent,
+        calls: []const ParsedToolCall,
+    ) ![]providers.ToolCall {
+        if (calls.len == 0) return &.{};
+        const cloned = try self.allocator.alloc(providers.ToolCall, calls.len);
+        errdefer self.allocator.free(cloned);
+        var initialized: usize = 0;
+        errdefer {
+            for (cloned[0..initialized]) |tc| {
+                if (tc.id.len > 0) self.allocator.free(tc.id);
+                if (tc.name.len > 0) self.allocator.free(tc.name);
+                if (tc.arguments.len > 0) self.allocator.free(tc.arguments);
+            }
+        }
+        for (calls, 0..) |call, i| {
+            const id = call.tool_call_id orelse "";
+            cloned[i] = .{
+                .id = try self.allocator.dupe(u8, id),
+                .name = try self.allocator.dupe(u8, call.name),
+                .arguments = try self.allocator.dupe(u8, call.arguments_json),
+            };
+            initialized += 1;
+        }
+        return cloned;
+    }
+
+    fn appendNativeToolResultHistory(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        results: []const ToolExecutionResult,
+    ) !void {
+        for (results) |result| {
+            const bounded = try dispatcher.formatBoundedToolResultContent(arena, result);
+            const scrubbed = try providers.scrubToolOutput(arena, bounded);
+            const content = try self.allocator.dupe(u8, scrubbed);
+            errdefer self.allocator.free(content);
+            const tool_name = try self.allocator.dupe(u8, result.name);
+            errdefer self.allocator.free(tool_name);
+            const tool_call_id = if (result.tool_call_id) |id|
+                try self.allocator.dupe(u8, id)
+            else
+                try self.allocator.dupe(u8, "unknown");
+            errdefer self.allocator.free(tool_call_id);
+            try self.history.append(self.allocator, .{
+                .role = .tool,
+                .content = content,
+                .name = tool_name,
+                .tool_call_id = tool_call_id,
+            });
+            self.last_turn_context.native_tool_result_messages += 1;
+            self.last_turn_context.bounded_result_count += 1;
+        }
+    }
+
+    fn persistActiveTaskPlan(self: *Agent) void {
+        const mem = self.mem orelse return;
+        const session_key = self.memory_session_id orelse return;
+        if (session_key.len == 0) return;
+        const plan = if (self.active_task_plan) |*p| p else return;
+        const key = task_planner.storageKey(self.allocator, session_key) catch |err| {
+            log.warn("task_plan.persist key_alloc_failed err={s}", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(key);
+        const encoded = task_planner.serializePlan(self.allocator, plan) catch |err| {
+            log.warn("task_plan.persist serialize_failed plan_id={s} err={s}", .{ plan.plan_id, @errorName(err) });
+            return;
+        };
+        defer self.allocator.free(encoded);
+        mem.store(key, encoded, .core, self.memory_session_id) catch |err| {
+            log.warn("task_plan.persist store_failed plan_id={s} err={s}", .{ plan.plan_id, @errorName(err) });
+            return;
+        };
+        log.info("task_plan.persisted plan_id={s} revision={d} status={s}", .{ plan.plan_id, plan.revision, plan.status.toSlice() });
+    }
+
+    fn loadActiveTaskPlanFromMemory(self: *Agent) void {
+        if (self.active_task_plan != null) return;
+        const mem = self.mem orelse return;
+        const session_key = self.memory_session_id orelse return;
+        if (session_key.len == 0) return;
+        const key = task_planner.storageKey(self.allocator, session_key) catch |err| {
+            log.warn("task_plan.load key_alloc_failed err={s}", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(key);
+        const entry_opt = mem.get(self.allocator, key) catch |err| {
+            log.info("task_plan.load unavailable session={s} err={s}", .{ session_key, @errorName(err) });
+            return;
+        };
+        var entry = entry_opt orelse return;
+        defer entry.deinit(self.allocator);
+        var plan = (task_planner.deserializePlan(self.allocator, entry.content) catch |err| {
+            log.warn("task_plan.load parse_failed session={s} err={s}", .{ session_key, @errorName(err) });
+            return;
+        }) orelse return;
+        if (plan.status != .active) {
+            plan.deinit(self.allocator);
+            return;
+        }
+        if (plan.session_key.len == 0) {
+            task_planner.bindPlanToSession(self.allocator, &plan, session_key, self.current_run_id, null) catch |err| {
+                log.warn("task_plan.load bind_failed plan_id={s} err={s}", .{ plan.plan_id, @errorName(err) });
+            };
+        }
+        self.active_task_plan = plan;
+        log.info("task_plan.loaded plan_id={s} revision={d} current_step={d}", .{
+            self.active_task_plan.?.plan_id,
+            self.active_task_plan.?.revision,
+            self.active_task_plan.?.current_step,
+        });
+    }
+
+    fn replaceActiveTaskPlan(self: *Agent, parsed_plan: task_planner.TaskPlan) !void {
+        var new_plan = parsed_plan;
+        var supersedes: ?[]const u8 = null;
+        if (self.active_task_plan) |*old_plan| {
+            old_plan.status = .abandoned;
+            old_plan.updated_at_ms = std.time.milliTimestamp();
+            old_plan.revision += 1;
+            self.persistActiveTaskPlan();
+            supersedes = old_plan.plan_id;
+        }
+        try task_planner.bindPlanToSession(self.allocator, &new_plan, self.memory_session_id orelse "", self.current_run_id, supersedes);
+        if (self.active_task_plan) |*old_plan| old_plan.deinit(self.allocator);
+        self.active_task_plan = new_plan;
+        self.persistActiveTaskPlan();
+        if (self.active_task_plan) |*plan| task_planner.emitPlanCreated(self.observer, plan);
+    }
+
+    fn toolCallIdsPresent(calls: []const ParsedToolCall) bool {
+        if (calls.len == 0) return false;
+        for (calls) |call| {
+            const id = call.tool_call_id orelse return false;
+            if (id.len == 0) return false;
+        }
+        return true;
     }
 
     /// D53 third defense layer (2026-05-24): when streaming a chunk through
@@ -2258,8 +2462,14 @@ pub const Agent = struct {
         self: *Agent,
         arena: std.mem.Allocator,
         results: []const ToolExecutionResult,
+        native_transcript_active: bool,
     ) !void {
         if (results.len == 0) return;
+
+        if (native_transcript_active) {
+            try self.appendNativeToolResultHistory(arena, results);
+            return;
+        }
 
         const formatted_results = try dispatcher.formatToolResults(arena, results);
         const scrubbed_results = try providers.scrubToolOutput(arena, formatted_results);
@@ -2267,6 +2477,8 @@ pub const Agent = struct {
             .role = .user,
             .content = try self.allocator.dupe(u8, scrubbed_results),
         });
+        self.last_turn_context.xml_history_messages += 1;
+        self.last_turn_context.bounded_result_count += @intCast(@min(results.len, std.math.maxInt(u32)));
     }
 
     pub const PendingApprovalSnapshot = struct {
@@ -3291,6 +3503,7 @@ pub const Agent = struct {
         // as a <task_plan> prompt block. These two flags stay turn-local.
         var task_plan_checked = false;
         var task_plan_complete_emitted = false;
+        var task_plan_created_this_turn = false;
 
         // **D1.7** — accumulator for task_ids spawned during this turn
         // (via the `spawn` tool — `delegate` is synchronous and inlines
@@ -3331,6 +3544,7 @@ pub const Agent = struct {
         self.clearProviderPreflightSample();
         self.clearCurrentTurnProviderOverride();
         defer self.clearCurrentTurnProviderOverride();
+        self.loadActiveTaskPlanFromMemory();
 
         const turn_start_event = ObserverEvent{ .turn_stage = .{
             .stage = "turn_start",
@@ -3768,7 +3982,7 @@ pub const Agent = struct {
             try self.routeVideoForModel(arena, messages, effective_model, iteration);
             var prompt_cache_key_buf: [69]u8 = undefined;
             const cache_key = self.promptCacheKey(&prompt_cache_key_buf);
-            const chat_request = self.providerChatRequest(messages, effective_model, cache_key);
+            const chat_request = self.providerChatRequest(messages, effective_model, cache_key, assemble_result.tool_surface_plan);
             self.recordPromptShape(chat_request, assemble_result);
             self.sampleProviderPreflight(chat_request, effective_model, iteration);
             defer self.provider_preflight_active = false;
@@ -3838,7 +4052,7 @@ pub const Agent = struct {
                         const retry_messages = self.buildProviderMessages(arena) catch |build_err| return build_err;
                         // Rebuild re-adds video parts — re-apply video routing.
                         try self.routeVideoForModel(arena, retry_messages, effective_model, iteration);
-                        const retry_request = self.providerChatRequest(retry_messages, effective_model, cache_key);
+                        const retry_request = self.providerChatRequest(retry_messages, effective_model, cache_key, assemble_result.tool_surface_plan);
                         self.recordPromptShape(retry_request, assemble_result);
                         const retry_result = self.provider.streamChat(
                             self.allocator,
@@ -3885,6 +4099,7 @@ pub const Agent = struct {
                     .usage = stream_result.usage,
                     .model = stream_result.model,
                     .reasoning_content = stream_result.reasoning_content,
+                    .stream_tool_call_chunks = stream_result.stream_tool_call_chunks,
                 };
 
                 // Binding rule: no silent fallback. If the reliable wrapper
@@ -3942,7 +4157,7 @@ pub const Agent = struct {
                         // effective_model (not self.model_name) — honor the
                         // turn's vision-fallback routing on the recovery call,
                         // matching the initial blocking call and streaming path.
-                        const recovery_request = self.providerChatRequest(recovery_msgs, effective_model, cache_key);
+                        const recovery_request = self.providerChatRequest(recovery_msgs, effective_model, cache_key, assemble_result.tool_surface_plan);
                         self.recordPromptShape(recovery_request, assemble_result);
                         break :retry_blk self.provider.chat(
                             self.allocator,
@@ -3992,7 +4207,7 @@ pub const Agent = struct {
                             try self.routeVideoForModel(arena, recovery_msgs, effective_model, iteration);
                             // effective_model (not self.model_name) — honor the
                             // turn's vision-fallback routing on the recovery call.
-                            const recovery_request = self.providerChatRequest(recovery_msgs, effective_model, cache_key);
+                            const recovery_request = self.providerChatRequest(recovery_msgs, effective_model, cache_key, assemble_result.tool_surface_plan);
                             self.recordPromptShape(recovery_request, assemble_result);
                             break :retry_blk self.provider.chat(
                                 self.allocator,
@@ -4086,10 +4301,8 @@ pub const Agent = struct {
                 const extracted_plan = task_planner.extractTextAndPlan(raw_response_text);
                 if (extracted_plan.plan_xml) |plan_xml| {
                     if (try task_planner.parseTaskPlan(self.allocator, plan_xml)) |parsed_plan| {
-                        // v1.14.18-A G4 — replace the retained plan: free the
-                        // prior turn's plan before storing this turn's.
-                        if (self.active_task_plan) |*old_plan| old_plan.deinit(self.allocator);
-                        self.active_task_plan = parsed_plan;
+                        try self.replaceActiveTaskPlan(parsed_plan);
+                        task_plan_created_this_turn = true;
                         if (extracted_plan.text.len > 0 and extracted_plan.text_after.len > 0) {
                             response_text = try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ extracted_plan.text, extracted_plan.text_after });
                         } else if (extracted_plan.text_after.len > 0) {
@@ -4100,7 +4313,10 @@ pub const Agent = struct {
                     }
                 }
             }
-            const use_native = response.hasToolCalls();
+            const native_surface_active = assemble_result.tool_surface_plan.sendsNativeTools();
+            const native_transcript_active = native_surface_active and self.supportsProviderNativeTranscript();
+            const response_has_native_tool_calls = response.hasToolCalls();
+            const use_native = native_surface_active or response_has_native_tool_calls;
 
             // ── Native reasoning_content: kept for model's own context; NOT emitted as narration ──
             // The model's raw reasoning_content remains available downstream
@@ -4121,11 +4337,14 @@ pub const Agent = struct {
             var parsed_calls: []ParsedToolCall = &.{};
             var parsed_text: []const u8 = "";
             var assistant_history_content: []const u8 = "";
+            var assistant_native_tool_calls: []providers.ToolCall = &.{};
+            var assistant_native_tool_calls_transferred = false;
 
             // Track what we need to free
             var free_parsed_calls = false;
             var free_parsed_text = false;
             var free_assistant_history = false;
+            var native_canary_rejected_xml_count: usize = 0;
 
             defer {
                 if (free_parsed_calls) {
@@ -4138,6 +4357,14 @@ pub const Agent = struct {
                 }
                 if (free_parsed_text and parsed_text.len > 0) self.allocator.free(parsed_text);
                 if (free_assistant_history and assistant_history_content.len > 0) self.allocator.free(assistant_history_content);
+                if (!assistant_native_tool_calls_transferred and assistant_native_tool_calls.len > 0) {
+                    for (assistant_native_tool_calls) |tc| {
+                        if (tc.id.len > 0) self.allocator.free(tc.id);
+                        if (tc.name.len > 0) self.allocator.free(tc.name);
+                        if (tc.arguments.len > 0) self.allocator.free(tc.arguments);
+                    }
+                    self.allocator.free(assistant_native_tool_calls);
+                }
             }
 
             if (use_native) {
@@ -4152,10 +4379,32 @@ pub const Agent = struct {
                     free_parsed_calls = false;
 
                     const xml_parsed = try dispatcher.parseToolCalls(self.allocator, response_text);
-                    parsed_calls = xml_parsed.calls;
-                    free_parsed_calls = true;
-                    parsed_text = xml_parsed.text;
-                    free_parsed_text = true;
+                    if (assemble_result.tool_surface_plan.native_strict_canary and xml_parsed.calls.len > 0) {
+                        native_canary_rejected_xml_count = xml_parsed.calls.len;
+                        for (xml_parsed.calls) |call| {
+                            self.allocator.free(call.name);
+                            self.allocator.free(call.arguments_json);
+                            if (call.tool_call_id) |id| self.allocator.free(id);
+                        }
+                        self.allocator.free(xml_parsed.calls);
+                        parsed_calls = &.{};
+                        free_parsed_calls = false;
+                        parsed_text = if (xml_parsed.text.len > 0)
+                            xml_parsed.text
+                        else
+                            try self.allocator.dupe(u8, "Native tool canary rejected XML-formatted tool calls; no tool was executed.");
+                        free_parsed_text = true;
+                    } else {
+                        parsed_calls = xml_parsed.calls;
+                        free_parsed_calls = true;
+                        parsed_text = xml_parsed.text;
+                        free_parsed_text = true;
+                    }
+                }
+
+                if (native_transcript_active and parsed_calls.len > 0) {
+                    self.last_turn_context.synthesized_tool_call_ids += try self.ensureNativeToolCallIds(parsed_calls, iteration);
+                    assistant_native_tool_calls = try self.cloneParsedCallsAsProviderToolCalls(parsed_calls);
                 }
 
                 // Build history with the STRIPPED text when XML fallback ran — otherwise
@@ -4164,11 +4413,14 @@ pub const Agent = struct {
                 // reinforcing the fallback pattern until /reset. Use response_text only
                 // when no stripping happened (native tool_calls, no XML found).
                 const history_text = if (free_parsed_text and parsed_text.len > 0) parsed_text else response_text;
-                assistant_history_content = try dispatcher.buildAssistantHistoryWithToolCalls(
-                    self.allocator,
-                    history_text,
-                    parsed_calls,
-                );
+                assistant_history_content = if (native_transcript_active)
+                    try self.allocator.dupe(u8, history_text)
+                else
+                    try dispatcher.buildAssistantHistoryWithToolCalls(
+                        self.allocator,
+                        history_text,
+                        parsed_calls,
+                    );
                 free_assistant_history = true;
                 const parse_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - parse_start_ms));
                 log.info("turn.stage stage=parse_provider_response iteration={d} duration_ms={d} tool_calls={d}", .{
@@ -4221,6 +4473,31 @@ pub const Agent = struct {
 
             // Determine display text
             const display_text = if (parsed_text.len > 0) parsed_text else response_text;
+            if (parsed_calls.len > 0 or native_canary_rejected_xml_count > 0 or turn_tool_calls_total == 0) {
+                const xml_fallback_ran_this_iteration = free_parsed_text and parsed_calls.len > 0;
+                self.last_turn_context.tool_mode = if (native_canary_rejected_xml_count > 0)
+                    "no_tools"
+                else
+                    toolModeForParsedCalls(response_has_native_tool_calls, free_parsed_text, parsed_calls.len);
+                self.last_turn_context.native_tools_sent = native_surface_active;
+                self.last_turn_context.tool_choice = if (native_surface_active) "auto" else "none";
+                self.last_turn_context.provider_finish_reason = "unknown";
+                self.last_turn_context.native_tool_call_count = @intCast(@min(response.tool_calls.len, std.math.maxInt(u32)));
+                self.last_turn_context.xml_fallback_call_count = if (native_canary_rejected_xml_count > 0)
+                    @intCast(@min(native_canary_rejected_xml_count, std.math.maxInt(u32)))
+                else if (xml_fallback_ran_this_iteration)
+                    @intCast(@min(parsed_calls.len, std.math.maxInt(u32)))
+                else
+                    0;
+                self.last_turn_context.xml_fallback_reason = if (native_canary_rejected_xml_count > 0)
+                    "native_strict_canary_xml_rejected"
+                else if (xml_fallback_ran_this_iteration)
+                    if (native_surface_active) "native_empty_or_xml_content" else "provider_returned_xml_content"
+                else
+                    "none";
+                self.last_turn_context.stream_tool_call_chunks = response.stream_tool_call_chunks;
+                self.last_turn_context.tool_call_ids_present = toolCallIdsPresent(parsed_calls);
+            }
 
             // v1.14.18-A F3: Parse goal-loop reflection from LLM response
             // Update active goal state before continuing with tool dispatch
@@ -4265,12 +4542,6 @@ pub const Agent = struct {
                 };
             }
             if (parsed_calls.len > 0) {
-                self.last_turn_context.tool_mode = if (use_native and !free_parsed_text)
-                    "native_tool_calls"
-                else if (use_native and free_parsed_text)
-                    "mixed"
-                else
-                    "xml_fallback";
                 turn_tool_iterations += 1;
                 turn_tool_calls_total += @intCast(@min(parsed_calls.len, std.math.maxInt(u32)));
                 self.recordSessionToolNames(parsed_calls);
@@ -4426,6 +4697,25 @@ pub const Agent = struct {
                         .content = hist_content,
                         .reasoning = hist_reasoning,
                     });
+                }
+
+                if (!task_plan_created_this_turn) {
+                    if (self.active_task_plan) |*plan| {
+                        if (plan.current_step < plan.steps.len) {
+                            const step_index = plan.current_step;
+                            const step = &plan.steps[step_index];
+                            if (step.expected_tool == null and step.status != .done and step.status != .failed) {
+                                try plan.markStepDoneWithResult(self.allocator, step_index, null, "final response");
+                                task_planner.emitStepDone(self.observer, plan, step_index, true);
+                                plan.advanceStep();
+                                if (!task_plan_complete_emitted and plan.isComplete()) {
+                                    task_planner.emitPlanComplete(self.observer, plan);
+                                    task_plan_complete_emitted = true;
+                                }
+                                self.persistActiveTaskPlan();
+                            }
+                        }
+                    }
                 }
 
                 const compact_start_ms = std.time.milliTimestamp();
@@ -4781,7 +5071,14 @@ pub const Agent = struct {
                 .role = .assistant,
                 .content = assistant_content,
                 .reasoning = assistant_reasoning,
+                .tool_calls = if (native_transcript_active) assistant_native_tool_calls else &.{},
             });
+            if (native_transcript_active and assistant_native_tool_calls.len > 0) {
+                assistant_native_tool_calls_transferred = true;
+                self.last_turn_context.native_transcript_rendered = true;
+            } else if (parsed_calls.len > 0) {
+                self.last_turn_context.xml_history_messages += 1;
+            }
 
             // Execute tool calls (serial by default, optional parallel dispatcher)
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
@@ -4790,8 +5087,10 @@ pub const Agent = struct {
             if (self.active_task_plan) |*plan| {
                 for (parsed_calls, 0..) |call, call_idx| {
                     const plan_index = plan.current_step + @as(u32, @intCast(call_idx));
+                    try plan.markStepRunningWithTool(self.allocator, plan_index, call.name);
                     task_planner.emitStepProgress(self.observer, plan, plan_index, call.name);
                 }
+                self.persistActiveTaskPlan();
             }
             const dispatch_start_ms = std.time.milliTimestamp();
             const used_parallel_dispatch = self.shouldParallelDispatch(parsed_calls);
@@ -4812,20 +5111,20 @@ pub const Agent = struct {
                 for (results_buf.items) |result| {
                     if (plan.current_step >= plan.steps.len) break;
                     const step_index = plan.current_step;
-                    if (plan.currentStep()) |step| {
-                        step.tool_used = result.name;
-                    }
                     if (result.success) {
-                        plan.markStepDone("completed");
+                        try plan.markStepDoneWithResult(self.allocator, step_index, result.name, "completed");
                     } else {
-                        plan.markStepFailed();
+                        const failure_summary = if (result.output.len > 0) result.output else "tool failed";
+                        try plan.markStepFailedWithError(self.allocator, step_index, result.name, failure_summary);
                     }
                     task_planner.emitStepDone(self.observer, plan, step_index, result.success);
                     plan.advanceStep();
+                    self.persistActiveTaskPlan();
                 }
                 if (!task_plan_complete_emitted and plan.isComplete()) {
                     task_planner.emitPlanComplete(self.observer, plan);
                     task_plan_complete_emitted = true;
+                    self.persistActiveTaskPlan();
                 }
             }
 
@@ -4860,7 +5159,7 @@ pub const Agent = struct {
             }
 
             if (self.pending_tool_approval) |pending| {
-                try self.appendPendingApprovalToolHistory(arena, results_buf.items);
+                try self.appendPendingApprovalToolHistory(arena, results_buf.items, native_transcript_active);
                 const approval_text = try std.fmt.allocPrint(
                     self.allocator,
                     "Approval required for tool {s} (id={d}, risk={s}, reason={s}). Use /approve {d} allow-once|deny",
@@ -4894,18 +5193,28 @@ pub const Agent = struct {
 
             // Format tool results, scrub credentials, add reflection prompt, and add to history
             const reflect_start_ms = std.time.milliTimestamp();
-            const formatted_results = try dispatcher.formatToolResults(arena, results_buf.items);
-            const scrubbed_results = try providers.scrubToolOutput(arena, formatted_results);
             const reflection_prompt = getReflectionPrompt(self.execution_mode);
-            const with_reflection = try std.fmt.allocPrint(
-                arena,
-                "{s}\n\n{s}",
-                .{ scrubbed_results, reflection_prompt },
-            );
-            try self.history.append(self.allocator, .{
-                .role = .user,
-                .content = try self.allocator.dupe(u8, with_reflection),
-            });
+            if (native_transcript_active) {
+                try self.appendNativeToolResultHistory(arena, results_buf.items);
+                try self.history.append(self.allocator, .{
+                    .role = .user,
+                    .content = try self.allocator.dupe(u8, reflection_prompt),
+                });
+            } else {
+                const formatted_results = try dispatcher.formatToolResults(arena, results_buf.items);
+                const scrubbed_results = try providers.scrubToolOutput(arena, formatted_results);
+                const with_reflection = try std.fmt.allocPrint(
+                    arena,
+                    "{s}\n\n{s}",
+                    .{ scrubbed_results, reflection_prompt },
+                );
+                try self.history.append(self.allocator, .{
+                    .role = .user,
+                    .content = try self.allocator.dupe(u8, with_reflection),
+                });
+                self.last_turn_context.xml_history_messages += 1;
+                self.last_turn_context.bounded_result_count += @intCast(@min(results_buf.items.len, std.math.maxInt(u32)));
+            }
 
             // v1.14.18-A F3: Inject goal-loop reflection prompt for next iteration
             // This SYSTEM message teaches the model to emit <reflection goal_status="...">
@@ -5435,13 +5744,14 @@ pub const Agent = struct {
         messages: []const ChatMessage,
         effective_model: []const u8,
         prompt_cache_key: ?[]const u8,
+        tool_surface_plan: tool_surface.Plan,
     ) providers.ChatRequest {
         return .{
             .messages = messages,
             .model = effective_model,
             .temperature = self.temperature,
             .max_tokens = self.max_tokens,
-            .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
+            .tools = if (tool_surface_plan.sendsNativeTools()) self.tool_specs else null,
             .prompt_cache_key = prompt_cache_key,
             .timeout_secs = self.message_timeout_secs,
             .reasoning_effort = self.reasoning_effort,
@@ -5458,6 +5768,7 @@ pub const Agent = struct {
             .stable_system_prompt_hash = assemble_result.stable_prefix_hash,
             .history_tail_bytes = assemble_result.tail_bytes,
             .history_tail_hash = assemble_result.tail_hash,
+            .tool_surface_plan = assemble_result.tool_surface_plan,
         });
     }
 
@@ -11266,6 +11577,119 @@ test "Agent streaming follow-through retries false in-progress claims" {
     try std.testing.expect(std.mem.indexOf(u8, recorder.chunks.items, "done") != null);
 }
 
+test "Agent streaming holds partial XML residue before final scrub" {
+    const ResidueProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "unexpected chat path"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn streamChat(
+            _: *anyopaque,
+            allocator: std.mem.Allocator,
+            _: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            callback(callback_ctx, providers.StreamChunk.textDelta("o"));
+            callback(callback_ctx, providers.StreamChunk.textDelta("ol_call>\n\nclean answer"));
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = try allocator.dupe(u8, "ool_call>\n\nclean answer"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "residue-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const StreamRecorder = struct {
+        chunks: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            if (chunk.delta.len == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.chunks.appendSlice(std.testing.allocator, chunk.delta) catch {};
+        }
+
+        fn deinit(self: *@This()) void {
+            self.chunks.deinit(std.testing.allocator);
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = ResidueProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ResidueProvider.chatWithSystem,
+        .chat = ResidueProvider.chat,
+        .supportsNativeTools = ResidueProvider.supportsNativeTools,
+        .getName = ResidueProvider.getName,
+        .deinit = ResidueProvider.deinitFn,
+        .supports_streaming = ResidueProvider.supportsStreaming,
+        .stream_chat = ResidueProvider.streamChat,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var recorder = StreamRecorder{};
+    defer recorder.deinit();
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+        .stream_callback = StreamRecorder.onChunk,
+        .stream_ctx = @ptrCast(&recorder),
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("answer plainly");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("clean answer", response);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.chunks.items, "ool_call>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.chunks.items, "tool_call>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.chunks.items, "clean answer") != null);
+}
+
 test "Agent shouldForceActionFollowThrough detects english deferred promise" {
     try std.testing.expect(Agent.shouldForceActionFollowThrough("I'll try again with a different filename now."));
     try std.testing.expect(Agent.shouldForceActionFollowThrough("let me check that and get back in a moment"));
@@ -11322,6 +11746,10 @@ test "Agent looksLikeToolCallMarkupPrefix holds streaming tool-call markup" {
     try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("tool_call>\n{\"name\":\"spawn\"}"));
     try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("ool_call>"));
     try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("ool_call>\nGot it..."));
+    try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("t"));
+    try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("tool"));
+    try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("o"));
+    try std.testing.expect(Agent.looksLikeToolCallMarkupPrefix("oo"));
 }
 
 test "Agent looksLikeToolCallMarkupPrefix lets normal replies stream" {
@@ -11332,6 +11760,14 @@ test "Agent looksLikeToolCallMarkupPrefix lets normal replies stream" {
     // Residue substrings mid-line must NOT hold — only exact-prefix matches.
     try std.testing.expect(!Agent.looksLikeToolCallMarkupPrefix("Use tool_call> markup like this in docs."));
     try std.testing.expect(!Agent.looksLikeToolCallMarkupPrefix("see ool_call> appendix"));
+}
+
+test "Agent toolModeForParsedCalls classifies native XML fallback and no-tools paths" {
+    try std.testing.expectEqualStrings("native_tool_calls", Agent.toolModeForParsedCalls(true, false, 1));
+    try std.testing.expectEqualStrings("mixed", Agent.toolModeForParsedCalls(true, true, 1));
+    try std.testing.expectEqualStrings("xml_fallback", Agent.toolModeForParsedCalls(false, true, 1));
+    try std.testing.expectEqualStrings("xml_fallback", Agent.toolModeForParsedCalls(false, false, 1));
+    try std.testing.expectEqualStrings("no_tools", Agent.toolModeForParsedCalls(true, false, 0));
 }
 
 // D53 third defense layer (2026-05-24): the streaming pass_through path
@@ -12482,6 +12918,109 @@ test "turn returns approval prompt without another provider roundtrip" {
     try std.testing.expect(std.mem.indexOf(u8, response, "/approve 1 allow-once|deny") != null);
     try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
     try std.testing.expect(agent.pending_tool_approval != null);
+}
+
+test "turn executes XML fallback tool call through shared dispatch path" {
+    const XmlFallbackProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+        saw_native_tools: bool = false,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (request.tools != null) self.saw_native_tools = true;
+
+            if (self.call_count == 1) {
+                return .{
+                    .content = try allocator.dupe(u8,
+                        \\I will inspect the runtime.
+                        \\<tool_call>
+                        \\{"name":"runtime_info","arguments":{}}
+                        \\</tool_call>
+                    ),
+                    .tool_calls = &.{},
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, "runtime inspected"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "xml-fallback-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = XmlFallbackProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = XmlFallbackProvider.chatWithSystem,
+        .chat = XmlFallbackProvider.chat,
+        .supportsNativeTools = XmlFallbackProvider.supportsNativeTools,
+        .getName = XmlFallbackProvider.getName,
+        .deinit = XmlFallbackProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var runtime_impl = CountingRuntimeInfoTool{};
+    const tool_list = [_]Tool{runtime_impl.tool()};
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |tool, i| {
+        specs[i] = .{
+            .name = tool.name(),
+            .description = tool.description(),
+            .parameters_json = tool.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("inspect runtime");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("runtime inspected", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 1), runtime_impl.call_count);
+    try std.testing.expect(!provider_state.saw_native_tools);
+    try std.testing.expectEqualStrings("xml_fallback", agent.last_turn_context.tool_mode);
 }
 
 test "turn preserves prior tool results in history before approval prompt" {

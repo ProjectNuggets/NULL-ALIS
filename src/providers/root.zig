@@ -214,6 +214,10 @@ pub const ChatMessage = struct {
     /// the `messages` array; the Moonshot-compatible request builder emits
     /// this field when set. Borrowed (not owned by ChatMessage).
     reasoning_content: ?[]const u8 = null,
+    /// Optional provider-native tool calls for assistant messages. When set,
+    /// OpenAI-compatible serializers emit `tool_calls` instead of laundering
+    /// prior native calls back into the prompt as XML text.
+    tool_calls: []const ToolCall = &.{},
 
     pub fn system(content: []const u8) ChatMessage {
         return .{ .role = .system, .content = content };
@@ -238,6 +242,29 @@ pub const ToolCall = struct {
     name: []const u8,
     arguments: []const u8,
 };
+
+/// Append OpenAI-compatible assistant `tool_calls` to a message object.
+/// The function writes a leading comma so callers can invoke it after the
+/// required `role` and `content` fields.
+pub fn appendOpenAIToolCalls(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    tool_calls: []const ToolCall,
+) !void {
+    if (tool_calls.len == 0) return;
+    try buf.appendSlice(allocator, ",\"tool_calls\":[");
+    for (tool_calls, 0..) |tc, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"id\":");
+        try appendJsonString(buf, allocator, tc.id);
+        try buf.appendSlice(allocator, ",\"type\":\"function\",\"function\":{\"name\":");
+        try appendJsonString(buf, allocator, tc.name);
+        try buf.appendSlice(allocator, ",\"arguments\":");
+        try appendJsonString(buf, allocator, tc.arguments);
+        try buf.appendSlice(allocator, "}}");
+    }
+    try buf.append(allocator, ']');
+}
 
 /// Token usage stats from a provider response.
 pub const TokenUsage = struct {
@@ -279,6 +306,9 @@ pub const ChatResponse = struct {
     model: []const u8 = "",
     /// Optional reasoning/thinking content from models that support it (e.g. Claude extended thinking).
     reasoning_content: ?[]const u8 = null,
+    /// Streaming diagnostic: number of provider-native tool-call delta
+    /// chunks observed before assembly. Zero for non-streaming responses.
+    stream_tool_call_chunks: u32 = 0,
 
     /// True when the LLM wants to invoke at least one tool.
     pub fn hasToolCalls(self: ChatResponse) bool {
@@ -335,6 +365,9 @@ pub const StreamChatResult = struct {
     /// Reasoning/thinking content accumulated during streaming.
     /// Populated by providers that stream thinking blocks (Claude, GLM, Kimi).
     reasoning_content: ?[]const u8 = null,
+    /// Number of `delta.tool_calls` chunks seen while streaming. Diagnostic
+    /// only; tool calls are parsed after stream completion.
+    stream_tool_call_chunks: u32 = 0,
     /// Non-null when the primary provider/model failed and a fallback was
     /// used. Value is the name of the fallback provider that succeeded
     /// (e.g. "openrouter" when primary "together" failed). Caller (agent

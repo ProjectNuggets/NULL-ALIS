@@ -1031,6 +1031,7 @@ pub fn classifyArtifactKey(key: []const u8) ArtifactRole {
     // Continuity: injectable/searchable continuity artifacts
     if (std.mem.eql(u8, key, "context_anchor_current")) return .continuity;
     if (std.mem.startsWith(u8, key, "summary_latest/")) return .continuity;
+    if (std.mem.startsWith(u8, key, "agent_plan/")) return .continuity;
     if (std.mem.startsWith(u8, key, "durable_fact/")) return .continuity;
     if (std.mem.startsWith(u8, key, "session_summary/")) return .continuity;
     if (std.mem.startsWith(u8, key, "timeline_summary/")) return .continuity;
@@ -1082,6 +1083,7 @@ pub const BRAIN_HIDDEN_PREFIXES = [_][]const u8{
     "summary_latest/",
     "session_summary/",
     "timeline_summary/",
+    "agent_plan/",
     // V1.14.12 (Memory audit Finding 1 fix, 2026-05-19) — durable_fact/*
     // was previously hidden under "continuity", but session-end extraction
     // writes USER-AUTHORED facts to this prefix (commands.zig:1341).
@@ -1187,6 +1189,7 @@ pub fn isSystemManagedMemoryKey(key: []const u8) bool {
         // become editable), timeline_summary needs to be explicitly listed
         // here to stay protected.
         std.mem.startsWith(u8, key, "timeline_summary/") or
+        std.mem.startsWith(u8, key, "agent_plan/") or
         std.mem.startsWith(u8, key, "durable_fact/") or
         isAppendOnlyMemoryKey(key);
 }
@@ -2938,9 +2941,17 @@ test "V1.14.12 (Memory audit Finding 1): existing hidden continuity stays hidden
     // prefixes (timeline_summary, summary_latest, etc.) remain hidden.
     try std.testing.expect(!isBrainVisibleKey("timeline_summary/agent:zaki-bot:user:1:main/1700000000"));
     try std.testing.expect(!isBrainVisibleKey("summary_latest/agent:zaki-bot:user:1:main"));
+    try std.testing.expect(!isBrainVisibleKey("agent_plan/current/agent:zaki-bot:user:1:main"));
     try std.testing.expect(!isBrainVisibleKey("compaction_summary/agent:zaki-bot:user:1:main/1"));
     try std.testing.expect(!isBrainVisibleKey("autosave_user_123"));
     try std.testing.expect(!isBrainVisibleKey("session_checkpoint_1700000000"));
+}
+
+test "agent_plan memory is protected system bookkeeping" {
+    const key = "agent_plan/current/agent:zaki-bot:user:1:main";
+    try std.testing.expectEqual(ArtifactRole.continuity, classifyArtifactKey(key));
+    try std.testing.expect(!isBrainVisibleKey(key));
+    try std.testing.expect(!isEditableMemoryEntry(key, .core));
 }
 
 test "classifyArtifactKey: continuity — durable_fact" {

@@ -234,6 +234,13 @@ pub const OpenRouterProvider = struct {
                 try buf.appendSlice(allocator, ",\"tool_call_id\":");
                 try root.appendJsonString(&buf, allocator, tc_id);
             }
+            if (msg.name) |name| {
+                try buf.appendSlice(allocator, ",\"name\":");
+                try root.appendJsonString(&buf, allocator, name);
+            }
+            if (msg.role == .assistant) {
+                try root.appendOpenAIToolCalls(&buf, allocator, msg.tool_calls);
+            }
 
             try buf.append(allocator, '}');
         }
@@ -482,6 +489,13 @@ pub const OpenRouterProvider = struct {
                 try buf.appendSlice(allocator, ",\"tool_call_id\":");
                 try root.appendJsonString(&buf, allocator, tc_id);
             }
+            if (msg.name) |name| {
+                try buf.appendSlice(allocator, ",\"name\":");
+                try root.appendJsonString(&buf, allocator, name);
+            }
+            if (msg.role == .assistant) {
+                try root.appendOpenAIToolCalls(&buf, allocator, msg.tool_calls);
+            }
             try buf.append(allocator, '}');
         }
 
@@ -523,6 +537,13 @@ pub const OpenRouterProvider = struct {
             if (msg.tool_call_id) |tc_id| {
                 try buf.appendSlice(allocator, ",\"tool_call_id\":");
                 try root.appendJsonString(&buf, allocator, tc_id);
+            }
+            if (msg.name) |name| {
+                try buf.appendSlice(allocator, ",\"name\":");
+                try root.appendJsonString(&buf, allocator, name);
+            }
+            if (msg.role == .assistant) {
+                try root.appendOpenAIToolCalls(&buf, allocator, msg.tool_calls);
             }
             try buf.append(allocator, '}');
         }

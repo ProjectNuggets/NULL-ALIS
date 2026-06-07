@@ -4843,6 +4843,7 @@ const ManagerImpl = struct {
             "summary_fallback/",
             "timeline_summary/",
             "summary_latest/",
+            "agent_plan/",
             "context_anchor_",
             "audit_shell/",
             "memory_health_",
@@ -12055,6 +12056,7 @@ test "BRAIN_USER_KEY_FILTER mirrors memory_root.isBrainVisibleKey" {
         .{ .key = "compaction_summary/foo", .expect_visible = false },
         .{ .key = "summary_fallback/foo", .expect_visible = false },
         .{ .key = "compaction_dropped/foo", .expect_visible = false },
+        .{ .key = "agent_plan/current/agent:zaki-bot:user:1:thread:main", .expect_visible = false },
         .{ .key = "context_anchor_current", .expect_visible = false },
 
         // ── Index (hidden) ─────────────────────────────────────────────

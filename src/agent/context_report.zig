@@ -6,6 +6,15 @@ const context_cache = @import("context_cache.zig");
 pub const RoleCounts = context_builder.RoleCounts;
 pub const Report = context_builder.Snapshot;
 
+const ToolSchemaJson = struct {
+    name: []const u8,
+    description_bytes: u64,
+    parameters_bytes: u64,
+    bytes: u64,
+    hash: u64,
+    active: bool,
+};
+
 pub fn fromAgent(self: anytype) Report {
     return context_builder.buildSnapshot(self);
 }
@@ -267,7 +276,7 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
         report.provider_usage_last_turn.total_tokens,
         report.provider_usage_last_turn.cache_hit_percent,
     });
-    try std.fmt.format(w, "  prompt_shape: available={s} stable_system={d} volatile_system={d} tool_schema={d} history_user={d} history_assistant={d} reasoning={d} tool={d} xml_tool_history={d} multimodal_est={d} request_body_est={d} full_hash={d}\n", .{
+    try std.fmt.format(w, "  prompt_shape: available={s} stable_system={d} volatile_system={d} tool_schema={d} history_user={d} history_assistant={d} reasoning={d} native_tool_calls={d} tool={d} xml_tool_history={d} multimodal_est={d} request_body_est={d} full_hash={d}\n", .{
         boolWord(report.prompt_shape.available),
         report.prompt_shape.stable_system_prompt_bytes,
         report.prompt_shape.volatile_system_prompt_bytes,
@@ -275,6 +284,7 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
         report.prompt_shape.user_message_bytes,
         report.prompt_shape.assistant_message_bytes,
         report.prompt_shape.assistant_reasoning_bytes,
+        report.prompt_shape.native_tool_call_bytes,
         report.prompt_shape.tool_message_bytes,
         report.prompt_shape.xml_tool_history_bytes,
         report.prompt_shape.multimodal_payload_estimated_bytes,
@@ -336,6 +346,20 @@ pub fn formatDetail(allocator: std.mem.Allocator, report: Report) ![]u8 {
         report.last_turn_delta.pressure_points,
         report.last_turn.tool_mode,
     });
+    try std.fmt.format(w, "  tool_diagnostics: native_sent={s} tool_choice={s} native_calls={d} xml_fallback_calls={d} xml_reason={s} stream_chunks={d} ids_present={s} native_transcript={s} native_tool_results={d} xml_history_messages={d} synthesized_ids={d} bounded_results={d}\n", .{
+        boolWord(report.last_turn.native_tools_sent),
+        report.last_turn.tool_choice,
+        report.last_turn.native_tool_call_count,
+        report.last_turn.xml_fallback_call_count,
+        report.last_turn.xml_fallback_reason,
+        report.last_turn.stream_tool_call_chunks,
+        boolWord(report.last_turn.tool_call_ids_present),
+        boolWord(report.last_turn.native_transcript_rendered),
+        report.last_turn.native_tool_result_messages,
+        report.last_turn.xml_history_messages,
+        report.last_turn.synthesized_tool_call_ids,
+        report.last_turn.bounded_result_count,
+    });
     try std.fmt.format(w, "  trim: events={d} removed_messages={d} removed_bytes={d} history_after={d}\n", .{
         report.last_turn.trim_events,
         report.last_turn.trimmed_messages,
@@ -357,6 +381,18 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
     defer allocator.free(transcript_retention_text);
     const continuity_refresh_reason_text = try continuityRefreshReasonText(allocator, report);
     defer allocator.free(continuity_refresh_reason_text);
+    var largest_tool_schemas: [context_builder.TOOL_SCHEMA_DIAGNOSTIC_LIMIT]ToolSchemaJson = undefined;
+    const largest_tool_schema_count = @min(report.prompt_shape.tool_schema_diagnostic_count, context_builder.TOOL_SCHEMA_DIAGNOSTIC_LIMIT);
+    for (report.prompt_shape.largest_tool_schemas[0..largest_tool_schema_count], 0..) |*diag, i| {
+        largest_tool_schemas[i] = .{
+            .name = diag.nameSlice(),
+            .description_bytes = diag.description_bytes,
+            .parameters_bytes = diag.parameters_bytes,
+            .bytes = diag.bytes,
+            .hash = diag.hash,
+            .active = diag.active,
+        };
+    }
 
     return try std.json.Stringify.valueAlloc(allocator, .{
         .status = report.status,
@@ -432,6 +468,20 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
                 .model = report.model_name,
                 .context_window_tokens = report.context_window_tokens,
             },
+            .tool_surface = .{
+                .mode = report.prompt_shape.tool_surface_mode,
+                .provider_supports_native_tools = report.prompt_shape.provider_supports_native_tools,
+                .native_tool_count = report.prompt_shape.native_tool_count,
+                .native_tool_schemas_present = report.prompt_shape.native_tool_schemas_present,
+                .xml_tool_catalog_present = report.prompt_shape.xml_tool_catalog_present,
+                .prompt_tool_catalog_present = report.prompt_shape.prompt_tool_catalog_present,
+                .xml_fallback_protocol_present = report.prompt_shape.xml_fallback_protocol_present,
+                .native_strict_canary = report.prompt_shape.native_strict_canary,
+                .native_tool_schema_bytes = report.prompt_shape.native_tool_schema_bytes,
+                .xml_tool_catalog_bytes = report.prompt_shape.xml_tool_catalog_bytes,
+                .prompt_tool_catalog_bytes = report.prompt_shape.prompt_tool_catalog_bytes,
+                .largest_tool_schemas = largest_tool_schemas[0..largest_tool_schema_count],
+            },
             .counts = .{
                 .messages = report.prompt_shape.message_count,
                 .system_messages = report.prompt_shape.system_message_count,
@@ -453,6 +503,7 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
                 .user_message_bytes = report.prompt_shape.user_message_bytes,
                 .assistant_message_bytes = report.prompt_shape.assistant_message_bytes,
                 .assistant_reasoning_bytes = report.prompt_shape.assistant_reasoning_bytes,
+                .native_tool_call_bytes = report.prompt_shape.native_tool_call_bytes,
                 .tool_message_bytes = report.prompt_shape.tool_message_bytes,
                 .xml_tool_history_bytes = report.prompt_shape.xml_tool_history_bytes,
                 .multimodal_payload_estimated_bytes = report.prompt_shape.multimodal_payload_estimated_bytes,
@@ -473,6 +524,19 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
             .token_estimate = report.last_turn_delta.token_estimate,
             .pressure_points = report.last_turn_delta.pressure_points,
             .tool_mode = report.last_turn.tool_mode,
+            .native_tools_sent = report.last_turn.native_tools_sent,
+            .tool_choice = report.last_turn.tool_choice,
+            .provider_finish_reason = report.last_turn.provider_finish_reason,
+            .native_tool_call_count = report.last_turn.native_tool_call_count,
+            .xml_fallback_call_count = report.last_turn.xml_fallback_call_count,
+            .xml_fallback_reason = report.last_turn.xml_fallback_reason,
+            .stream_tool_call_chunks = report.last_turn.stream_tool_call_chunks,
+            .tool_call_ids_present = report.last_turn.tool_call_ids_present,
+            .native_transcript_rendered = report.last_turn.native_transcript_rendered,
+            .native_tool_result_messages = report.last_turn.native_tool_result_messages,
+            .xml_history_messages = report.last_turn.xml_history_messages,
+            .synthesized_tool_call_ids = report.last_turn.synthesized_tool_call_ids,
+            .bounded_result_count = report.last_turn.bounded_result_count,
         },
         .top_context_contributors = report.top_context_contributors[0..report.top_context_contributor_count],
         .token_reply_reserve = report.token_reply_reserve,
@@ -599,6 +663,19 @@ pub fn formatJson(allocator: std.mem.Allocator, report: Report) ![]u8 {
             .memory_enrich_ms = report.last_turn.memory_enrich_ms,
             .cache_hit = report.last_turn.cache_hit,
             .tool_mode = report.last_turn.tool_mode,
+            .native_tools_sent = report.last_turn.native_tools_sent,
+            .tool_choice = report.last_turn.tool_choice,
+            .provider_finish_reason = report.last_turn.provider_finish_reason,
+            .native_tool_call_count = report.last_turn.native_tool_call_count,
+            .xml_fallback_call_count = report.last_turn.xml_fallback_call_count,
+            .xml_fallback_reason = report.last_turn.xml_fallback_reason,
+            .stream_tool_call_chunks = report.last_turn.stream_tool_call_chunks,
+            .tool_call_ids_present = report.last_turn.tool_call_ids_present,
+            .native_transcript_rendered = report.last_turn.native_transcript_rendered,
+            .native_tool_result_messages = report.last_turn.native_tool_result_messages,
+            .xml_history_messages = report.last_turn.xml_history_messages,
+            .synthesized_tool_call_ids = report.last_turn.synthesized_tool_call_ids,
+            .bounded_result_count = report.last_turn.bounded_result_count,
             .trim_events = report.last_turn.trim_events,
             .trimmed_messages = report.last_turn.trimmed_messages,
             .trimmed_bytes = report.last_turn.trimmed_bytes,
@@ -714,7 +791,7 @@ test "context report counts roles and memory-enriched turns" {
 }
 
 test "context report formatters expose structured details" {
-    const report = Report{
+    var report = Report{
         .sampled_at_ms = 1234,
         .model_name = "openai/gpt-5.2",
         .model_provider = "openai",
@@ -852,6 +929,14 @@ test "context report formatters expose structured details" {
             .full_request_hash = 444,
         },
     };
+    report.prompt_shape.tool_schema_diagnostic_count = 1;
+    report.prompt_shape.largest_tool_schemas[0].name_len = 12;
+    @memcpy(report.prompt_shape.largest_tool_schemas[0].name[0..12], "composio\x00pad");
+    report.prompt_shape.largest_tool_schemas[0].description_bytes = 9;
+    report.prompt_shape.largest_tool_schemas[0].parameters_bytes = 11;
+    report.prompt_shape.largest_tool_schemas[0].bytes = 20;
+    report.prompt_shape.largest_tool_schemas[0].hash = 42;
+    report.prompt_shape.largest_tool_schemas[0].active = true;
 
     const summary = try formatSummary(std.testing.allocator, report);
     defer std.testing.allocator.free(summary);
@@ -908,6 +993,9 @@ test "context report formatters expose structured details" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"semantic_bucket_entries\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"prompt_shape\":{\"available\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"pressure_token_source\":\"provider_last_usage\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_surface\":{\"mode\":\"no_tools\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"largest_tool_schemas\":[{\"name\":\"composio\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\u0000") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"cached_prompt_tokens\":123") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"prompt_cache_key_present\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"assistant_reasoning_bytes\":25") != null);

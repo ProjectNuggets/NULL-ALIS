@@ -5,6 +5,7 @@ const context_estimator = @import("context_estimator.zig");
 const model_capabilities = @import("model_capabilities.zig");
 const prompt = @import("prompt.zig");
 const providers = @import("../providers/root.zig");
+const tool_surface = @import("tool_surface.zig");
 
 pub const RoleCounts = struct {
     system: usize = 0,
@@ -56,6 +57,8 @@ pub const LastTurnDelta = struct {
 };
 
 pub const PROMPT_BLOCK_LIMIT: usize = 48;
+pub const TOOL_SCHEMA_DIAGNOSTIC_LIMIT: usize = 8;
+pub const TOOL_SCHEMA_NAME_LIMIT: usize = 64;
 
 pub const PromptBlock = struct {
     name: []const u8 = "",
@@ -64,6 +67,25 @@ pub const PromptBlock = struct {
     token_estimate: u64 = 0,
     hash: u64 = 0,
     active: bool = false,
+};
+
+pub const ToolSchemaDiagnostic = struct {
+    name: [TOOL_SCHEMA_NAME_LIMIT]u8 = [_]u8{0} ** TOOL_SCHEMA_NAME_LIMIT,
+    name_len: usize = 0,
+    description_bytes: u64 = 0,
+    parameters_bytes: u64 = 0,
+    bytes: u64 = 0,
+    hash: u64 = 0,
+    active: bool = false,
+
+    pub fn nameSlice(self: *const ToolSchemaDiagnostic) []const u8 {
+        const limit = @min(self.name_len, self.name.len);
+        var end: usize = 0;
+        while (end < limit) : (end += 1) {
+            if (self.name[end] == 0) break;
+        }
+        return self.name[0..end];
+    }
 };
 
 pub const PromptShape = struct {
@@ -77,6 +99,17 @@ pub const PromptShape = struct {
     tool_message_count: usize = 0,
     tool_schema_count: usize = 0,
     multimodal_part_count: usize = 0,
+    tool_surface_mode: []const u8 = tool_surface.Mode.no_tools.toSlice(),
+    provider_supports_native_tools: bool = false,
+    native_tool_count: usize = 0,
+    native_tool_schemas_present: bool = false,
+    xml_tool_catalog_present: bool = false,
+    prompt_tool_catalog_present: bool = false,
+    xml_fallback_protocol_present: bool = false,
+    native_strict_canary: bool = false,
+    native_tool_schema_bytes: u64 = 0,
+    xml_tool_catalog_bytes: u64 = 0,
+    prompt_tool_catalog_bytes: u64 = 0,
     prompt_cache_key_present: bool = false,
     prompt_cache_key_bytes: usize = 0,
     stable_system_prompt_bytes: u64 = 0,
@@ -86,6 +119,7 @@ pub const PromptShape = struct {
     user_message_bytes: u64 = 0,
     assistant_message_bytes: u64 = 0,
     assistant_reasoning_bytes: u64 = 0,
+    native_tool_call_bytes: u64 = 0,
     tool_message_bytes: u64 = 0,
     xml_tool_history_bytes: u64 = 0,
     multimodal_payload_estimated_bytes: u64 = 0,
@@ -98,6 +132,9 @@ pub const PromptShape = struct {
     full_request_hash: u64 = 0,
     prompt_block_count: usize = 0,
     prompt_blocks: [PROMPT_BLOCK_LIMIT]PromptBlock = [_]PromptBlock{.{}} ** PROMPT_BLOCK_LIMIT,
+    tool_schema_diagnostic_count: usize = 0,
+    largest_tool_schemas: [TOOL_SCHEMA_DIAGNOSTIC_LIMIT]ToolSchemaDiagnostic =
+        [_]ToolSchemaDiagnostic{.{}} ** TOOL_SCHEMA_DIAGNOSTIC_LIMIT,
 };
 
 pub const PromptShapeCapture = struct {
@@ -106,6 +143,7 @@ pub const PromptShapeCapture = struct {
     history_tail_bytes: usize = 0,
     history_tail_hash: u64 = 0,
     sampled_at_ms: i64 = 0,
+    tool_surface_plan: tool_surface.Plan = .{},
 };
 
 pub const Snapshot = struct {
@@ -191,6 +229,19 @@ pub const LastTurnContext = struct {
     force_compression_events: usize = 0,
     force_compressed_messages: usize = 0,
     tool_mode: []const u8 = "no_tools",
+    native_tools_sent: bool = false,
+    tool_choice: []const u8 = "none",
+    provider_finish_reason: []const u8 = "unknown",
+    native_tool_call_count: u32 = 0,
+    xml_fallback_call_count: u32 = 0,
+    xml_fallback_reason: []const u8 = "none",
+    stream_tool_call_chunks: u32 = 0,
+    tool_call_ids_present: bool = false,
+    native_transcript_rendered: bool = false,
+    native_tool_result_messages: u32 = 0,
+    xml_history_messages: u32 = 0,
+    synthesized_tool_call_ids: u32 = 0,
+    bounded_result_count: u32 = 0,
     /// V1.14.10 A semantic shift (review fix N-02): pre-V1.14.10 this
     /// flag meant "the persistSessionCheckpoint sync call completed,
     /// data is on disk." Post-V1.14.10 (review fix M-03): it means
@@ -333,6 +384,24 @@ fn toolSpecBytes(tool: anytype) usize {
     return bytes;
 }
 
+fn toolDescriptionBytes(tool: anytype) usize {
+    const ToolType = @TypeOf(tool);
+    if (@hasField(ToolType, "description")) return tool.description.len;
+    return 0;
+}
+
+fn toolParametersBytes(tool: anytype) usize {
+    const ToolType = @TypeOf(tool);
+    if (@hasField(ToolType, "parameters_json")) return tool.parameters_json.len;
+    return 0;
+}
+
+fn toolName(tool: anytype) []const u8 {
+    const ToolType = @TypeOf(tool);
+    if (@hasField(ToolType, "name")) return tool.name;
+    return "unknown";
+}
+
 fn looksLikeXmlToolHistory(content: []const u8) bool {
     return std.mem.indexOf(u8, content, "<tool_call") != null or
         std.mem.indexOf(u8, content, "<tool_result") != null or
@@ -389,6 +458,17 @@ fn updateHashForMessage(hasher: *std.hash.Fnv1a_64, message: anytype) void {
         hasher.update(message.content);
     }
     if (@hasField(@TypeOf(message), "reasoning_content")) updateHashForOptional(hasher, "reasoning:", message.reasoning_content);
+    if (@hasField(@TypeOf(message), "tool_calls")) {
+        hasher.update("tool_calls:");
+        for (message.tool_calls) |tc| {
+            hasher.update(tc.id);
+            hasher.update("\x00");
+            hasher.update(tc.name);
+            hasher.update("\x00");
+            hasher.update(tc.arguments);
+            hasher.update("\x00");
+        }
+    }
 }
 
 fn updateHashForTool(hasher: *std.hash.Fnv1a_64, tool: anytype) void {
@@ -399,6 +479,58 @@ fn updateHashForTool(hasher: *std.hash.Fnv1a_64, tool: anytype) void {
     if (@hasField(ToolType, "parameters_json")) hasher.update(tool.parameters_json);
 }
 
+fn toolHash(tool: anytype) u64 {
+    var hasher = std.hash.Fnv1a_64.init();
+    updateHashForTool(&hasher, tool);
+    return hasher.final();
+}
+
+fn copyToolName(dest: *[TOOL_SCHEMA_NAME_LIMIT]u8, value: []const u8) usize {
+    @memset(dest[0..], 0);
+    var out: usize = 0;
+    for (value) |byte| {
+        if (out >= TOOL_SCHEMA_NAME_LIMIT) break;
+        if (byte == 0) break;
+        dest[out] = if (byte < 0x20 or byte == 0x7f) '_' else byte;
+        out += 1;
+    }
+    return out;
+}
+
+fn toolSchemaDiagnostic(tool: anytype) ToolSchemaDiagnostic {
+    var diag = ToolSchemaDiagnostic{
+        .description_bytes = @intCast(toolDescriptionBytes(tool)),
+        .parameters_bytes = @intCast(toolParametersBytes(tool)),
+        .bytes = @intCast(toolSpecBytes(tool)),
+        .hash = toolHash(tool),
+        .active = true,
+    };
+    diag.name_len = copyToolName(&diag.name, toolName(tool));
+    return diag;
+}
+
+fn insertLargestToolSchema(shape: *PromptShape, diag: ToolSchemaDiagnostic) void {
+    if (!diag.active or diag.bytes == 0) return;
+    var insert_at: usize = shape.tool_schema_diagnostic_count;
+    var i: usize = 0;
+    while (i < shape.tool_schema_diagnostic_count) : (i += 1) {
+        if (diag.bytes > shape.largest_tool_schemas[i].bytes) {
+            insert_at = i;
+            break;
+        }
+    }
+    if (insert_at >= TOOL_SCHEMA_DIAGNOSTIC_LIMIT) return;
+    const old_count = shape.tool_schema_diagnostic_count;
+    if (shape.tool_schema_diagnostic_count < TOOL_SCHEMA_DIAGNOSTIC_LIMIT) {
+        shape.tool_schema_diagnostic_count += 1;
+    }
+    var j = @min(old_count, TOOL_SCHEMA_DIAGNOSTIC_LIMIT - 1);
+    while (j > insert_at) : (j -= 1) {
+        shape.largest_tool_schemas[j] = shape.largest_tool_schemas[j - 1];
+    }
+    shape.largest_tool_schemas[insert_at] = diag;
+}
+
 fn addPromptBlock(shape: *PromptShape, name: []const u8, bucket: []const u8, content: []const u8) void {
     if (content.len == 0 or shape.prompt_block_count >= PROMPT_BLOCK_LIMIT) return;
     addPromptBlockMeasured(shape, name, bucket, content.len, hashBytes(content));
@@ -406,6 +538,12 @@ fn addPromptBlock(shape: *PromptShape, name: []const u8, bucket: []const u8, con
 
 fn addPromptBlockMeasured(shape: *PromptShape, name: []const u8, bucket: []const u8, bytes: usize, hash: u64) void {
     if (bytes == 0 or shape.prompt_block_count >= PROMPT_BLOCK_LIMIT) return;
+    if (std.mem.eql(u8, name, "prompt_tool_catalog")) {
+        shape.prompt_tool_catalog_bytes += @intCast(bytes);
+    } else if (std.mem.eql(u8, name, "xml_tool_catalog")) {
+        shape.xml_tool_catalog_present = true;
+        shape.xml_tool_catalog_bytes += @intCast(bytes);
+    }
     shape.prompt_blocks[shape.prompt_block_count] = .{
         .name = name,
         .bucket = bucket,
@@ -527,6 +665,7 @@ fn addSystemPromptBlocks(shape: *PromptShape, system_prompt: []const u8, stable_
 }
 
 pub fn buildPromptShapeFromProviderRequest(request: anytype, capture: PromptShapeCapture) PromptShape {
+    const captured_plan = capture.tool_surface_plan;
     var shape = PromptShape{
         .available = true,
         .sampled_at_ms = if (capture.sampled_at_ms > 0) capture.sampled_at_ms else std.time.milliTimestamp(),
@@ -534,6 +673,14 @@ pub fn buildPromptShapeFromProviderRequest(request: anytype, capture: PromptShap
         .stable_system_prompt_hash = capture.stable_system_prompt_hash,
         .history_tail_bytes = capture.history_tail_bytes,
         .history_tail_hash = capture.history_tail_hash,
+        .tool_surface_mode = captured_plan.mode.toSlice(),
+        .provider_supports_native_tools = captured_plan.provider_supports_native_tools,
+        .native_tool_count = captured_plan.native_tool_count,
+        .native_tool_schemas_present = captured_plan.native_tool_schemas_present,
+        .xml_tool_catalog_present = captured_plan.xml_tool_catalog_present,
+        .prompt_tool_catalog_present = captured_plan.prompt_tool_catalog_present,
+        .xml_fallback_protocol_present = captured_plan.xml_fallback_protocol_present,
+        .native_strict_canary = captured_plan.native_strict_canary,
     };
     var request_hasher = std.hash.Fnv1a_64.init();
 
@@ -568,10 +715,14 @@ pub fn buildPromptShapeFromProviderRequest(request: anytype, capture: PromptShap
             for (tools) |tool| {
                 const bytes = toolSpecBytes(tool);
                 shape.tool_schema_bytes += bytes;
+                shape.native_tool_schema_bytes += bytes;
                 shape.provider_request_body_bytes_estimated += bytes + 64;
                 updateHashForTool(&request_hasher, tool);
                 updateHashForTool(&tool_schema_hasher, tool);
+                insertLargestToolSchema(&shape, toolSchemaDiagnostic(tool));
             }
+            shape.native_tool_schemas_present = tools.len > 0;
+            if (shape.native_tool_count == 0) shape.native_tool_count = tools.len;
             addPromptBlockMeasured(&shape, "native_tool_schemas", "provider_tools", @intCast(shape.tool_schema_bytes), tool_schema_hasher.final());
         }
     }
@@ -583,7 +734,13 @@ pub fn buildPromptShapeFromProviderRequest(request: anytype, capture: PromptShap
             const msg_reasoning_bytes = reasoningBytes(message);
             const parts = contentPartCount(message);
             shape.provider_bound_message_bytes += text_bytes + msg_reasoning_bytes;
-            shape.provider_request_body_bytes_estimated += text_bytes + msg_reasoning_bytes + 64;
+            var native_tool_call_bytes: usize = 0;
+            if (@hasField(@TypeOf(message), "tool_calls")) {
+                for (message.tool_calls) |tc| {
+                    native_tool_call_bytes += tc.id.len + tc.name.len + tc.arguments.len + 72;
+                }
+            }
+            shape.provider_request_body_bytes_estimated += text_bytes + msg_reasoning_bytes + native_tool_call_bytes + 64;
             shape.multimodal_part_count += parts;
             if (parts > 0) shape.multimodal_payload_estimated_bytes += text_bytes;
             updateHashForMessage(&request_hasher, message);
@@ -611,6 +768,7 @@ pub fn buildPromptShapeFromProviderRequest(request: anytype, capture: PromptShap
                     shape.assistant_message_count += 1;
                     shape.assistant_message_bytes += text_bytes;
                     shape.assistant_reasoning_bytes += msg_reasoning_bytes;
+                    shape.native_tool_call_bytes += native_tool_call_bytes;
                     if (@hasField(@TypeOf(message), "content") and looksLikeXmlToolHistory(message.content)) {
                         shape.xml_tool_history_bytes += text_bytes;
                     }
@@ -1400,6 +1558,85 @@ test "buildPromptShapeFromProviderRequest emits sanitized prompt blocks by secti
     try std.testing.expect(saw_datetime);
     try std.testing.expect(saw_memory);
     try std.testing.expect(saw_native_tools);
+}
+
+test "buildPromptShapeFromProviderRequest reports tool surface diagnostics" {
+    const stable =
+        "## Tools\n\n" ++
+        "The executable tool catalog is supplied through the provider-native tools field.\n\n" ++
+        "## Tool Use Protocol\n\n" ++
+        "minimal fallback protocol only\n\n";
+    const messages = [_]providers.ChatMessage{
+        providers.ChatMessage.system(stable),
+        providers.ChatMessage.user("user text must not leak"),
+    };
+    const tools = [_]providers.ToolSpec{
+        .{
+            .name = "small",
+            .description = "small tool",
+            .parameters_json = "{}",
+        },
+        .{
+            .name = "large_tool",
+            .description = "larger tool",
+            .parameters_json = "{\"type\":\"object\",\"properties\":{\"alpha\":{\"type\":\"string\"},\"beta\":{\"type\":\"string\"}}}",
+        },
+    };
+    const plan = tool_surface.select(true, tools.len);
+    const request = providers.ChatRequest{
+        .messages = &messages,
+        .model = "kimi-k2.6",
+        .tools = &tools,
+    };
+
+    const shape = buildPromptShapeFromProviderRequest(request, .{
+        .stable_system_prompt_bytes = stable.len,
+        .stable_system_prompt_hash = hashBytes(stable),
+        .sampled_at_ms = 99,
+        .tool_surface_plan = plan,
+    });
+
+    try std.testing.expectEqualStrings("native_with_xml_fallback", shape.tool_surface_mode);
+    try std.testing.expect(shape.provider_supports_native_tools);
+    try std.testing.expect(shape.native_tool_schemas_present);
+    try std.testing.expect(shape.xml_fallback_protocol_present);
+    try std.testing.expect(!shape.xml_tool_catalog_present);
+    try std.testing.expect(!shape.prompt_tool_catalog_present);
+    try std.testing.expectEqual(@as(usize, tools.len), shape.native_tool_count);
+    try std.testing.expect(shape.native_tool_schema_bytes > 0);
+    try std.testing.expect(shape.tool_schema_diagnostic_count == 2);
+    try std.testing.expectEqualStrings("large_tool", shape.largest_tool_schemas[0].nameSlice());
+    try std.testing.expect(shape.largest_tool_schemas[0].parameters_bytes > shape.largest_tool_schemas[1].parameters_bytes);
+    for (shape.prompt_blocks[0..shape.prompt_block_count]) |block| {
+        try std.testing.expect(std.mem.indexOf(u8, block.name, "user text") == null);
+        try std.testing.expect(std.mem.indexOf(u8, block.name, "larger tool") == null);
+    }
+}
+
+test "tool schema diagnostics sanitize padded dynamic tool names" {
+    const ToolLike = struct {
+        name: []const u8,
+        description: []const u8,
+        parameters_json: []const u8,
+    };
+    const tool = ToolLike{
+        .name = "composio\x00\x00\nhidden",
+        .description = "dynamic tool",
+        .parameters_json = "{}",
+    };
+    const diag = toolSchemaDiagnostic(tool);
+    try std.testing.expectEqualStrings("composio", diag.nameSlice());
+    try std.testing.expect(std.mem.indexOfScalar(u8, diag.nameSlice(), 0) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, diag.nameSlice(), '\n') == null);
+}
+
+test "tool schema diagnostic nameSlice trims defensive null padding" {
+    var diag = ToolSchemaDiagnostic{
+        .name_len = 12,
+    };
+    @memcpy(diag.name[0..12], "composio\x00pad");
+
+    try std.testing.expectEqualStrings("composio", diag.nameSlice());
 }
 
 test "buildPromptRefreshPlan refreshes missing system prompt" {

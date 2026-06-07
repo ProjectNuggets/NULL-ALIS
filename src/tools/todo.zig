@@ -8,8 +8,9 @@
 //!   memory entry with key `todo:<list_id>` + content = JSON of the list state.
 //!   Category = .daily so it scopes per-session and benefits from existing
 //!   retention policies.
-//! - When user requests 3+ distinct tasks, the agent's prompt directive routes
-//!   it here BEFORE executing, so the plan is visible to the user.
+//! - This is for user-visible durable checklists in the current conversation.
+//!   Internal execution planning belongs to `<task_plan>` in the agent loop,
+//!   not to persisted todos.
 //!
 //! Bi-temporal note (Graphiti pattern, V1.5 schema): when a todo item gets
 //! re-prioritized or the list is replaced, we don't mutate — we add a new
@@ -40,6 +41,10 @@ pub const MAX_ITEM_TITLE_LEN = 240;
 
 /// Maximum list title length.
 pub const MAX_LIST_TITLE_LEN = 120;
+
+/// Recent duplicate-create window. Protects the session from repeated
+/// identical checklist creation when the model retries or reformats a call.
+pub const DUPLICATE_CREATE_WINDOW_SECS: i64 = 300;
 
 /// Status of a single todo item.
 pub const TodoStatus = enum {
@@ -74,16 +79,17 @@ pub const TodoTool = struct {
     pub const tool_name = "todo";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Session-scoped structured todo list with status tracking (pending/in_progress/completed/blocked).",
+        .what = "User-visible session todo list with status tracking (pending/in_progress/completed/blocked).",
         .use_when = &.{
-            "User asks for 3+ distinct things (numbered, comma-separated, or 'first X then Y then Z')",
-            "Showing the user a plan up front before executing multi-step work",
-            "Tracking dependencies between sub-steps so the model respects ordering",
+            "User explicitly asks for a todo list, checklist, task list, or status-tracked plan",
+            "User provides multiple tasks they want tracked visibly across this conversation",
+            "Long-running work needs a durable progress checklist the user can inspect or revise",
         },
         .do_not_use_for = &.{
             "task_list — for spawned background subagent tasks rather than in-conversation todos",
             "schedule — for time-based proactive jobs rather than transient session todos",
             "memory_store — for durable facts rather than transient task tracking",
+            "context_snapshot — for current agent state; do not use todo for private internal execution plans",
         },
     };
 
@@ -91,22 +97,22 @@ pub const TodoTool = struct {
         @import("lint.zig").lintToolDescription("todo", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
     }
     pub const tool_description =
-        "Create and manage structured task lists with status tracking. " ++
-        "When the user requests 3+ distinct tasks (numbered, comma-separated, " ++
-        "or 'first X then Y then Z'), CALL THIS BEFORE acting — show the plan " ++
-        "to the user, then execute and update item status (pending / " ++
-        "in_progress / completed / blocked) as you progress. Per-session " ++
-        "scope — each conversation has its own todos. Reason about " ++
-        "dependencies via depends_on; respect ordering.";
+        "Create and manage user-visible session todo lists with status tracking. " ++
+        "Use only when the user explicitly wants a todo/checklist/task list, " ++
+        "or when long work needs a durable progress checklist the user can " ++
+        "inspect or revise. Do not use this for private internal planning, " ++
+        "hidden validation steps, or ordinary tool sequencing — use prose or " ++
+        "<task_plan> for that. Per-session scope. On update, always include " ++
+        "the returned list_id, item_id, and status unless exactly one session list exists.";
     pub const tool_params =
         \\{"type":"object","properties":{
-        \\"action":{"type":"string","enum":["create","update","list"],"description":"create=new list with items, update=change one item's status, list=read the current session's todos"},
+        \\"action":{"type":"string","enum":["create","update","list","current","start","complete","block"],"description":"create=user-visible list with items, update=change one item's status, list/current=read current session todos, start/complete/block=convenience status updates"},
         \\"title":{"type":"string","description":"List title (action=create)"},
-        \\"items":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"depends_on":{"type":"array","items":{"type":"integer"}}},"required":["title"]},"description":"Items to add (action=create). Each item gets an integer id 1..N. depends_on lists prerequisite item ids."},
-        \\"list_id":{"type":"string","description":"Target list (action=update required; action=list optional — defaults to most-recent in this session)"},
-        \\"item_id":{"type":"integer","description":"Target item id (action=update)"},
+        \\"items":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"depends_on":{"type":"array","items":{"type":"integer"}}},"required":["title"]},"description":"User-visible items to add (action=create), not private internal planning steps. Each item gets an integer id 1..N. depends_on lists prerequisite item ids."},
+        \\"list_id":{"type":"string","description":"Target list (action=update/start/complete/block optional only when exactly one session list exists; action=list/current optional — defaults to most-recent in this session)"},
+        \\"item_id":{"type":"integer","description":"Target item id (action=update/start/complete/block)"},
         \\"status":{"type":"string","enum":["pending","in_progress","completed","blocked"],"description":"New status (action=update)"},
-        \\"note":{"type":"string","description":"Optional note on the status change (action=update)"}
+        \\"note":{"type":"string","description":"Optional note on the status change (action=update/block)"}
         \\},"required":["action"]}
     ;
 
@@ -135,10 +141,13 @@ pub const TodoTool = struct {
         };
 
         if (std.mem.eql(u8, action, "create")) return executeCreate(allocator, m, session_id, args);
-        if (std.mem.eql(u8, action, "update")) return executeUpdate(allocator, m, session_id, args);
-        if (std.mem.eql(u8, action, "list")) return executeList(allocator, m, session_id, args);
+        if (std.mem.eql(u8, action, "update")) return executeUpdate(allocator, m, session_id, args, null);
+        if (std.mem.eql(u8, action, "start")) return executeUpdate(allocator, m, session_id, args, .in_progress);
+        if (std.mem.eql(u8, action, "complete")) return executeUpdate(allocator, m, session_id, args, .completed);
+        if (std.mem.eql(u8, action, "block")) return executeUpdate(allocator, m, session_id, args, .blocked);
+        if (std.mem.eql(u8, action, "list") or std.mem.eql(u8, action, "current")) return executeList(allocator, m, session_id, args);
 
-        return ToolResult.fail("Unknown action — must be one of: create, update, list");
+        return ToolResult.fail("Unknown action — must be one of: create, update, list, current, start, complete, block");
     }
 };
 
@@ -246,6 +255,16 @@ fn executeCreate(
 
     try w.print("],\"created_at\":{d},\"updated_at\":{d}}}", .{ ts_secs, ts_secs });
 
+    if (try findRecentDuplicateList(allocator, m, session_id, trimmed_title, items_val)) |duplicate_id| {
+        defer allocator.free(duplicate_id);
+        const result = try std.fmt.allocPrint(
+            allocator,
+            "Todo list already exists with same title/items (list_id={s}); returning existing list instead of creating a duplicate. To update it, call todo with action=update, list_id=\"{s}\", item_id=<id>, and status=pending|in_progress|completed|blocked.",
+            .{ duplicate_id, duplicate_id },
+        );
+        return ToolResult{ .success = true, .output = result };
+    }
+
     // Persist via the memory layer. Use .daily so it scopes per-session and
     // honors retention. Vector-sync is irrelevant for todos (we don't recall
     // them semantically); memory_recall sweep won't surface them as content.
@@ -256,11 +275,19 @@ fn executeCreate(
 
     log.info("todo.create list_id={s} session={s} items={d}", .{ list_id, session_id, items_val.array.items.len });
 
-    const result = try std.fmt.allocPrint(
-        allocator,
-        "Created todo list \"{s}\" (id={s}) with {d} item{s}. Show this plan to the user, then update item status as you work through it.",
-        .{ trimmed_title, list_id, items_val.array.items.len, if (items_val.array.items.len == 1) "" else "s" },
-    );
+    var result_buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer result_buf.deinit(allocator);
+    const rw = result_buf.writer(allocator);
+    try rw.writeAll("Created user-visible todo list ");
+    try writeJsonString(rw, trimmed_title);
+    try rw.print(" (list_id={s}) with {d} item{s}. To update it, call todo with action=update, list_id=\"{s}\", item_id=<1..{d}>, and status=pending|in_progress|completed|blocked.", .{
+        list_id,
+        items_val.array.items.len,
+        if (items_val.array.items.len == 1) "" else "s",
+        list_id,
+        items_val.array.items.len,
+    });
+    const result = try result_buf.toOwnedSlice(allocator);
     return ToolResult{ .success = true, .output = result };
 }
 
@@ -271,25 +298,21 @@ fn executeUpdate(
     m: Memory,
     session_id: []const u8,
     args: JsonObjectMap,
+    status_override: ?TodoStatus,
 ) !ToolResult {
-    const list_id = root.getString(args, "list_id") orelse
-        return ToolResult.fail("Missing 'list_id' for action=update");
-    if (list_id.len == 0) return ToolResult.fail("'list_id' must not be empty");
-
     const item_id_int = root.getInt(args, "item_id") orelse
-        return ToolResult.fail("Missing 'item_id' for action=update (integer)");
+        return ToolResult.fail("Missing 'item_id' for todo status update (integer)");
     if (item_id_int < 1) return ToolResult.fail("'item_id' must be >= 1");
     const item_id: usize = @intCast(item_id_int);
 
-    const status_str = root.getString(args, "status") orelse
-        return ToolResult.fail("Missing 'status' for action=update");
-    const status = TodoStatus.fromString(status_str) orelse
-        return ToolResult.fail("'status' must be one of: pending, in_progress, completed, blocked");
+    const status = status_override orelse blk: {
+        const status_str = root.getString(args, "status") orelse
+            return ToolResult.fail("Missing 'status' for action=update");
+        break :blk TodoStatus.fromString(status_str) orelse
+            return ToolResult.fail("'status' must be one of: pending, in_progress, completed, blocked");
+    };
 
     const note_opt = root.getString(args, "note");
-
-    const memory_key = try std.fmt.allocPrint(allocator, "{s}{s}", .{ TODO_KEY_PREFIX, list_id });
-    defer allocator.free(memory_key);
 
     // Read current list. Memory.list scoped by category+session retrieves all
     // .daily entries; we filter by exact key match.
@@ -302,18 +325,13 @@ fn executeUpdate(
         allocator.free(existing_entries);
     }
 
-    var existing_content: ?[]const u8 = null;
-    for (existing_entries) |*entry| {
-        if (std.mem.eql(u8, entry.key, memory_key)) {
-            existing_content = entry.content;
-            break;
-        }
-    }
+    const resolved = try resolveUpdateTarget(allocator, existing_entries, root.getString(args, "list_id"));
+    if (!resolved.success) return ToolResult{ .success = false, .output = "", .error_msg = resolved.error_msg };
+    const target_index = resolved.index.?;
+    const list_id = existing_entries[target_index].key[TODO_KEY_PREFIX.len..];
+    const memory_key = existing_entries[target_index].key;
 
-    const content = existing_content orelse {
-        const msg = try std.fmt.allocPrint(allocator, "Todo list '{s}' not found in this session", .{list_id});
-        return ToolResult{ .success = false, .output = "", .error_msg = msg };
-    };
+    const content = existing_entries[target_index].content;
 
     // Parse, mutate the matching item, re-serialize.
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch {
@@ -383,8 +401,8 @@ fn executeUpdate(
 
     const result = try std.fmt.allocPrint(
         allocator,
-        "Item {d} → {s}. List summary: {d}/{d} completed, {d} in progress, {d} blocked.",
-        .{ item_id, status.toSlice(), n_completed, total, n_in_progress, n_blocked },
+        "Todo list_id={s}: item {d} -> {s}. List summary: {d}/{d} completed, {d} in progress, {d} blocked.",
+        .{ list_id, item_id, status.toSlice(), n_completed, total, n_in_progress, n_blocked },
     );
     return ToolResult{ .success = true, .output = result };
 }
@@ -441,14 +459,193 @@ fn executeList(
         return ToolResult{ .success = true, .output = try allocator.dupe(u8, "(no todo lists in this session yet)") };
     };
 
-    // Return the JSON content directly — agent sees the structure and can
-    // narrate it back to the user.
     const content = entries[target_index].content;
-    const out = try allocator.dupe(u8, content);
+    const list_id = entries[target_index].key[TODO_KEY_PREFIX.len..];
+    const out = try formatTodoListOperational(allocator, list_id, content);
     return ToolResult{ .success = true, .output = out };
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────
+
+const ResolveTarget = struct {
+    success: bool,
+    index: ?usize = null,
+    error_msg: ?[]const u8 = null,
+};
+
+fn resolveUpdateTarget(
+    allocator: std.mem.Allocator,
+    entries: []const mem_root.MemoryEntry,
+    list_id_opt: ?[]const u8,
+) !ResolveTarget {
+    if (list_id_opt) |list_id| {
+        if (list_id.len == 0) return .{ .success = false, .error_msg = try allocator.dupe(u8, "'list_id' must not be empty") };
+        for (entries, 0..) |*entry, i| {
+            if (!std.mem.startsWith(u8, entry.key, TODO_KEY_PREFIX)) continue;
+            if (std.mem.eql(u8, entry.key[TODO_KEY_PREFIX.len..], list_id)) return .{ .success = true, .index = i };
+        }
+        return .{
+            .success = false,
+            .error_msg = try std.fmt.allocPrint(allocator, "Todo list '{s}' not found in this session", .{list_id}),
+        };
+    }
+
+    var count: usize = 0;
+    var only_index: usize = 0;
+    for (entries, 0..) |*entry, i| {
+        if (!std.mem.startsWith(u8, entry.key, TODO_KEY_PREFIX)) continue;
+        count += 1;
+        only_index = i;
+    }
+    if (count == 1) return .{ .success = true, .index = only_index };
+    if (count == 0) {
+        return .{
+            .success = false,
+            .error_msg = "No todo lists exist in this session. Create one first with action=create.",
+        };
+    }
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("Multiple todo lists exist in this session; include list_id. candidates:");
+    for (entries) |*entry| {
+        if (!std.mem.startsWith(u8, entry.key, TODO_KEY_PREFIX)) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, entry.content, .{}) catch null;
+        defer if (parsed) |*value| value.deinit();
+        const title = if (parsed) |value|
+            if (value.value == .object) todoTitleFromObject(value.value.object) orelse "(untitled)" else "(untitled)"
+        else
+            "(untitled)";
+        try w.print(" list_id={s} title=", .{entry.key[TODO_KEY_PREFIX.len..]});
+        try writeJsonString(w, title);
+        try w.writeByte(';');
+    }
+    return .{ .success = false, .error_msg = try buf.toOwnedSlice(allocator) };
+}
+
+fn findRecentDuplicateList(
+    allocator: std.mem.Allocator,
+    m: Memory,
+    session_id: []const u8,
+    title: []const u8,
+    items_val: std.json.Value,
+) !?[]u8 {
+    const entries = m.list(allocator, .daily, session_id) catch return null;
+    defer {
+        for (entries) |*e| e.deinit(allocator);
+        allocator.free(entries);
+    }
+
+    const now = std.time.timestamp();
+    for (entries) |*entry| {
+        if (!std.mem.startsWith(u8, entry.key, TODO_KEY_PREFIX)) continue;
+        const updated_at = parseUpdatedAt(entry.content) orelse continue;
+        if (now - updated_at > DUPLICATE_CREATE_WINDOW_SECS) continue;
+        if (try todoListMatchesCreateArgs(allocator, entry.content, title, items_val)) {
+            const duplicate_id = try allocator.dupe(u8, entry.key[TODO_KEY_PREFIX.len..]);
+            return duplicate_id;
+        }
+    }
+    return null;
+}
+
+fn todoListMatchesCreateArgs(
+    allocator: std.mem.Allocator,
+    json_str: []const u8,
+    title: []const u8,
+    items_val: std.json.Value,
+) !bool {
+    if (items_val != .array) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const obj = parsed.value.object;
+    const existing_title = todoTitleFromObject(obj) orelse return false;
+    if (!try normalizedTextEquals(allocator, existing_title, title)) return false;
+    const existing_items = obj.get("items") orelse return false;
+    if (existing_items != .array) return false;
+    if (existing_items.array.items.len != items_val.array.items.len) return false;
+    for (existing_items.array.items, 0..) |existing_item, idx| {
+        if (existing_item != .object) return false;
+        const existing_item_title_val = existing_item.object.get("title") orelse return false;
+        if (existing_item_title_val != .string) return false;
+        const requested_item = items_val.array.items[idx];
+        if (requested_item != .object) return false;
+        const requested_title_val = requested_item.object.get("title") orelse return false;
+        if (requested_title_val != .string) return false;
+        if (!try normalizedTextEquals(allocator, existing_item_title_val.string, requested_title_val.string)) return false;
+    }
+    return true;
+}
+
+fn normalizedTextEquals(allocator: std.mem.Allocator, a: []const u8, b: []const u8) !bool {
+    const na = try normalizedText(allocator, a);
+    defer allocator.free(na);
+    const nb = try normalizedText(allocator, b);
+    defer allocator.free(nb);
+    return std.mem.eql(u8, na, nb);
+}
+
+fn normalizedText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var last_space = true;
+    for (std.mem.trim(u8, text, " \t\r\n")) |c| {
+        if (std.ascii.isWhitespace(c)) {
+            if (!last_space) try buf.append(allocator, ' ');
+            last_space = true;
+        } else {
+            try buf.append(allocator, std.ascii.toLower(c));
+            last_space = false;
+        }
+    }
+    if (buf.items.len > 0 and buf.items[buf.items.len - 1] == ' ') _ = buf.pop();
+    return buf.toOwnedSlice(allocator);
+}
+
+fn todoTitleFromObject(obj: std.json.ObjectMap) ?[]const u8 {
+    const title_val = obj.get("title") orelse return null;
+    if (title_val != .string) return null;
+    return title_val.string;
+}
+
+fn formatTodoListOperational(allocator: std.mem.Allocator, list_id: []const u8, content: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch {
+        return allocator.dupe(u8, "Stored todo list is malformed JSON.");
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return allocator.dupe(u8, "Stored todo list is not a JSON object.");
+    const obj = parsed.value.object;
+    const title = todoTitleFromObject(obj) orelse "(untitled)";
+    const items = obj.get("items") orelse return allocator.dupe(u8, "Stored todo list missing items.");
+    if (items != .array) return allocator.dupe(u8, "Stored todo list items are malformed.");
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.print("current_list_id={s}\n", .{list_id});
+    try w.writeAll("title=");
+    try writeJsonString(w, title);
+    try w.writeByte('\n');
+    try w.writeAll("items:\n");
+    for (items.array.items) |item| {
+        if (item != .object) continue;
+        const id_val = item.object.get("id") orelse continue;
+        const item_title_val = item.object.get("title") orelse continue;
+        const status_val = item.object.get("status") orelse continue;
+        if (id_val != .integer or item_title_val != .string or status_val != .string) continue;
+        try w.print("- id={d} status={s} title=", .{ id_val.integer, status_val.string });
+        try writeJsonString(w, item_title_val.string);
+        try w.writeByte('\n');
+    }
+    try w.print("update_examples:\n- todo action=start list_id=\"{s}\" item_id=<id>\n- todo action=complete list_id=\"{s}\" item_id=<id>\n- todo action=block list_id=\"{s}\" item_id=<id> note=\"reason\"\n", .{
+        list_id,
+        list_id,
+        list_id,
+    });
+    return buf.toOwnedSlice(allocator);
+}
 
 /// Best-effort extract `updated_at` integer from a list JSON.
 /// Returns null if the field is missing or the JSON is malformed.
@@ -502,12 +699,13 @@ test "TodoTool tool_name + schema sanity" {
     var t_struct = TodoTool{};
     const t = t_struct.tool();
     try testing.expectEqualStrings("todo", t.name());
-    try testing.expect(std.mem.indexOf(u8, TodoTool.tool_description, "task") != null or
-        std.mem.indexOf(u8, TodoTool.tool_description, "todo") != null);
+    try testing.expect(std.mem.indexOf(u8, TodoTool.tool_description, "user-visible") != null);
+    try testing.expect(std.mem.indexOf(u8, TodoTool.tool_description, "private internal planning") != null);
     try testing.expect(std.mem.indexOf(u8, TodoTool.tool_params, "create") != null);
     try testing.expect(std.mem.indexOf(u8, TodoTool.tool_params, "update") != null);
     try testing.expect(std.mem.indexOf(u8, TodoTool.tool_params, "list") != null);
     try testing.expect(std.mem.indexOf(u8, TodoTool.tool_params, "depends_on") != null);
+    try testing.expect(std.mem.indexOf(u8, TodoTool.tool_params, "not private internal planning steps") != null);
 }
 
 test "executeCreate args shape — missing items detected" {
@@ -521,6 +719,188 @@ test "executeCreate args shape — missing items detected" {
     // schema/contract is exercised at the registration/dispatch layer
     // via the metadata test above + the TodoTool tool_name pin.
     try testing.expect(args.get("items") == null);
+}
+
+test "todo create output includes list_id and exact update recovery shape" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:1:todo-test" });
+    defer root.clearTurnContext();
+
+    var tt = TodoTool{ .memory = mem };
+    const t = tt.tool();
+    const parsed = try root.parseTestArgs(
+        "{\"action\":\"create\",\"title\":\"Launch validation\",\"items\":[{\"title\":\"Check schedule\"},{\"title\":\"Report findings\",\"depends_on\":[1]}]}",
+    );
+    defer parsed.deinit();
+
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Created user-visible todo list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "list_id=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "action=update") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "item_id=<1..2>") != null);
+}
+
+test "todo duplicate create returns existing list instead of creating another" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:1:todo-duplicate-test" });
+    defer root.clearTurnContext();
+
+    var tt = TodoTool{ .memory = mem };
+    const t = tt.tool();
+    const parsed = try root.parseTestArgs(
+        "{\"action\":\"create\",\"title\":\"Launch validation\",\"items\":[{\"title\":\"Check schedule\"},{\"title\":\"Report findings\"}]}",
+    );
+    defer parsed.deinit();
+
+    const first = try t.execute(allocator, parsed.value.object);
+    defer if (first.output.len > 0) allocator.free(first.output);
+    try std.testing.expect(first.success);
+
+    const second = try t.execute(allocator, parsed.value.object);
+    defer if (second.output.len > 0) allocator.free(second.output);
+    try std.testing.expect(second.success);
+    try std.testing.expect(std.mem.indexOf(u8, second.output, "already exists") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.output, "instead of creating a duplicate") != null);
+}
+
+test "todo complete can omit list_id when exactly one session list exists" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:1:todo-default-list-test" });
+    defer root.clearTurnContext();
+
+    var tt = TodoTool{ .memory = mem };
+    const t = tt.tool();
+    const create_args = try root.parseTestArgs(
+        "{\"action\":\"create\",\"title\":\"Single list\",\"items\":[{\"title\":\"One\"}]}",
+    );
+    defer create_args.deinit();
+    const created = try t.execute(allocator, create_args.value.object);
+    defer if (created.output.len > 0) allocator.free(created.output);
+    try std.testing.expect(created.success);
+
+    const complete_args = try root.parseTestArgs("{\"action\":\"complete\",\"item_id\":1}");
+    defer complete_args.deinit();
+    const completed = try t.execute(allocator, complete_args.value.object);
+    defer if (completed.output.len > 0) allocator.free(completed.output);
+    try std.testing.expect(completed.success);
+    try std.testing.expect(std.mem.indexOf(u8, completed.output, "-> completed") != null);
+
+    const current_args = try root.parseTestArgs("{\"action\":\"current\"}");
+    defer current_args.deinit();
+    const current = try t.execute(allocator, current_args.value.object);
+    defer if (current.output.len > 0) allocator.free(current.output);
+    try std.testing.expect(current.success);
+    try std.testing.expect(std.mem.indexOf(u8, current.output, "current_list_id=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, current.output, "status=completed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, current.output, "update_examples:") != null);
+}
+
+test "todo current JSON-quotes user titles in operational output" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:1:todo-escape-test" });
+    defer root.clearTurnContext();
+
+    var tt = TodoTool{ .memory = mem };
+    const t = tt.tool();
+    const create_args = try root.parseTestArgs(
+        "{\"action\":\"create\",\"title\":\"Launch\\nInjected header\",\"items\":[{\"title\":\"One\\n- id=999 status=completed title=Fake\"}]}",
+    );
+    defer create_args.deinit();
+    const created = try t.execute(allocator, create_args.value.object);
+    defer if (created.output.len > 0) allocator.free(created.output);
+    try std.testing.expect(created.success);
+
+    const current_args = try root.parseTestArgs("{\"action\":\"current\"}");
+    defer current_args.deinit();
+    const current = try t.execute(allocator, current_args.value.object);
+    defer if (current.output.len > 0) allocator.free(current.output);
+
+    try std.testing.expect(current.success);
+    try std.testing.expect(std.mem.indexOf(u8, current.output, "Launch\\nInjected header") != null);
+    try std.testing.expect(std.mem.indexOf(u8, current.output, "One\\n- id=999") != null);
+    try std.testing.expect(std.mem.indexOf(u8, current.output, "Launch\nInjected header") == null);
+    try std.testing.expect(std.mem.indexOf(u8, current.output, "One\n- id=999") == null);
+}
+
+test "todo update without list_id returns recoverable multiple-list candidates" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:1:todo-multiple-list-test" });
+    defer root.clearTurnContext();
+
+    var tt = TodoTool{ .memory = mem };
+    const t = tt.tool();
+    const first_args = try root.parseTestArgs(
+        "{\"action\":\"create\",\"title\":\"First\",\"items\":[{\"title\":\"One\"}]}",
+    );
+    defer first_args.deinit();
+    const first = try t.execute(allocator, first_args.value.object);
+    defer if (first.output.len > 0) allocator.free(first.output);
+    try std.testing.expect(first.success);
+
+    const second_args = try root.parseTestArgs(
+        "{\"action\":\"create\",\"title\":\"Second\",\"items\":[{\"title\":\"Two\"}]}",
+    );
+    defer second_args.deinit();
+    const second = try t.execute(allocator, second_args.value.object);
+    defer if (second.output.len > 0) allocator.free(second.output);
+    try std.testing.expect(second.success);
+
+    const update_args = try root.parseTestArgs("{\"action\":\"complete\",\"item_id\":1}");
+    defer update_args.deinit();
+    const result = try t.execute(allocator, update_args.value.object);
+    defer if (result.error_msg) |msg| allocator.free(msg);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Multiple todo lists") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "list_id=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "First") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Second") != null);
+}
+
+test "todo update missing list_id tells model how to recover" {
+    const allocator = std.testing.allocator;
+    var none_mem = mem_root.NoneMemory.init();
+    defer none_mem.deinit();
+    const mem = none_mem.memory();
+
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:1:todo-test" });
+    defer root.clearTurnContext();
+
+    var tt = TodoTool{ .memory = mem };
+    const t = tt.tool();
+    const parsed = try root.parseTestArgs("{\"action\":\"update\",\"item_id\":1,\"status\":\"completed\"}");
+    defer parsed.deinit();
+
+    const result = try t.execute(allocator, parsed.value.object);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "No todo lists exist") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "action=create") != null);
 }
 
 test "MAX_ITEMS bound is sane" {

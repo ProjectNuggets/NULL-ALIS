@@ -390,9 +390,13 @@ Context pressure:
   only, including system prompt buckets, tool schema size, history-by-role
   bytes, assistant reasoning bytes, XML/tool history bytes, multimodal payload
   estimates, cache-key presence, provider usage/preflight truth beside the
-  shape, and optional `prompt_blocks` entries with sanitized names, buckets,
-  byte counts, token estimates, and hashes. It must not include raw prompt,
-  user, tool, or reasoning text and must not be used as a second pressure meter.
+  shape, the selected provider-bound tool surface, and optional `prompt_blocks`
+  entries with sanitized names, buckets, byte counts, token estimates, and
+  hashes. Tool-surface diagnostics report whether native schemas, the full XML
+  catalog, the compact XML fallback protocol, or the prose catalog were present,
+  plus the largest native tool schemas by sanitized name, bytes, and hash. It
+  must not include raw prompt, user, tool, or reasoning text and must not be used
+  as a second pressure meter.
 - If there is no live session manager or no active session, the response
   is an unavailable envelope such as
   `{"active":false,"live":false,"code":"session_manager_unavailable"}`
@@ -405,6 +409,13 @@ Bounded tool output:
   return native tool calls, Nullalis may parse XML fallback calls, and
   history remains XML-based. Per-turn diagnostics classify this as
   `native_tool_calls`, `xml_fallback`, `mixed`, or `no_tools`.
+- Provider-capable turns use a provider-native tool schema surface plus a
+  compact XML fallback protocol. They must not duplicate the full prose catalog,
+  full XML catalog, and native schema payload in the same request. Providers
+  without reliable native tools use the full XML catalog path.
+- Kimi/Moonshot stays on `native_with_xml_fallback` for V1. Promotion to
+  `native_minimal` requires live success data showing reliable native tool-call
+  compliance for schedule/cron, memory, approval-gated, and multi-tool turns.
 - `schedule action=list` and `cron_list` are bounded by default
   (`limit=25`, max `limit=100`, `offset` supported). They return
   `total_count`, `shown_count`, `limit`, `offset`, `next_offset`, and
