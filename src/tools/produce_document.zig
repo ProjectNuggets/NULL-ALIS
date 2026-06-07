@@ -58,9 +58,221 @@ const MAX_SOURCE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_TITLE_LEN: usize = 80;
 
 const DEFAULT_TITLE: []const u8 = "untitled";
+const DEFAULT_MARP_THEME_NAME: []const u8 = "zaki-default";
 
 /// Renderer subprocess output cap — well above any reasonable stderr blurb.
 const RENDERER_OUTPUT_CAP: usize = 1 * 1024 * 1024;
+
+const HTML_DOCUMENT_STYLE =
+    \\:root {
+    \\  --artifact-page-bg: #f6f4ef;
+    \\  --artifact-paper-bg: #fffefa;
+    \\  --artifact-ink: #171714;
+    \\  --artifact-muted: #5e625f;
+    \\  --artifact-line: #ded8ca;
+    \\  --artifact-accent: #0f6f5c;
+    \\  --artifact-accent-soft: #e5f2ee;
+    \\}
+    \\html {
+    \\  background: var(--artifact-page-bg);
+    \\}
+    \\body {
+    \\  max-width: 860px;
+    \\  margin: 0 auto;
+    \\  padding: 56px 44px 72px;
+    \\  background: var(--artifact-paper-bg);
+    \\  color: var(--artifact-ink);
+    \\  font-family: var(--artifact-body-font);
+    \\  font-size: 16px;
+    \\  line-height: 1.68;
+    \\}
+    \\body::before {
+    \\  content: "";
+    \\  display: block;
+    \\  width: 56px;
+    \\  height: 5px;
+    \\  margin-bottom: 28px;
+    \\  background: var(--artifact-accent);
+    \\}
+    \\h1, h2, h3, h4 {
+    \\  color: var(--artifact-ink);
+    \\  font-family: var(--artifact-display-font);
+    \\  line-height: 1.12;
+    \\  margin: 1.8em 0 0.55em;
+    \\}
+    \\h1 {
+    \\  margin-top: 0;
+    \\  font-size: 2.55rem;
+    \\  letter-spacing: 0;
+    \\}
+    \\h2 {
+    \\  padding-top: 0.9rem;
+    \\  border-top: 1px solid var(--artifact-line);
+    \\  font-size: 1.55rem;
+    \\}
+    \\h3 {
+    \\  font-size: 1.12rem;
+    \\}
+    \\p {
+    \\  margin: 0 0 1rem;
+    \\}
+    \\strong {
+    \\  font-weight: 700;
+    \\}
+    \\a {
+    \\  color: var(--artifact-accent);
+    \\  text-decoration-thickness: 0.08em;
+    \\  text-underline-offset: 0.18em;
+    \\}
+    \\blockquote {
+    \\  margin: 1.35rem 0;
+    \\  padding: 0.95rem 1.1rem;
+    \\  border-left: 4px solid var(--artifact-accent);
+    \\  background: var(--artifact-accent-soft);
+    \\  color: var(--artifact-ink);
+    \\}
+    \\ul, ol {
+    \\  padding-left: 1.35rem;
+    \\}
+    \\li + li {
+    \\  margin-top: 0.35rem;
+    \\}
+    \\table {
+    \\  width: 100%;
+    \\  border-collapse: collapse;
+    \\  margin: 1.4rem 0 1.8rem;
+    \\  font-size: 0.94rem;
+    \\}
+    \\th, td {
+    \\  padding: 0.68rem 0.78rem;
+    \\  border: 1px solid var(--artifact-line);
+    \\  vertical-align: top;
+    \\}
+    \\th {
+    \\  background: #eeebe2;
+    \\  color: var(--artifact-ink);
+    \\  text-align: left;
+    \\  font-weight: 700;
+    \\}
+    \\tr:nth-child(even) td {
+    \\  background: #faf8f2;
+    \\}
+    \\code {
+    \\  padding: 0.12rem 0.28rem;
+    \\  border-radius: 4px;
+    \\  background: #ece8dd;
+    \\  font-size: 0.92em;
+    \\}
+    \\pre {
+    \\  overflow-x: auto;
+    \\  padding: 1rem;
+    \\  border: 1px solid var(--artifact-line);
+    \\  border-radius: 8px;
+    \\  background: #161713;
+    \\  color: #f8f5ea;
+    \\  line-height: 1.5;
+    \\}
+    \\pre code {
+    \\  padding: 0;
+    \\  background: transparent;
+    \\  color: inherit;
+    \\}
+    \\hr {
+    \\  border: 0;
+    \\  border-top: 1px solid var(--artifact-line);
+    \\  margin: 2rem 0;
+    \\}
+    \\@media print {
+    \\  html, body {
+    \\    background: #fff;
+    \\  }
+    \\  body {
+    \\    max-width: none;
+    \\    padding: 0;
+    \\  }
+    \\}
+;
+
+const MARP_DEFAULT_THEME_CSS =
+    \\/* @theme zaki-default */
+    \\
+    \\@import 'default';
+    \\
+    \\section {
+    \\  width: 1280px;
+    \\  height: 720px;
+    \\  padding: 54px 68px 48px;
+    \\  background: #fffefa;
+    \\  color: #171714;
+    \\  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    \\  font-size: 30px;
+    \\  line-height: 1.22;
+    \\}
+    \\section::before {
+    \\  content: "";
+    \\  position: absolute;
+    \\  left: 68px;
+    \\  top: 38px;
+    \\  width: 64px;
+    \\  height: 5px;
+    \\  background: #0f6f5c;
+    \\}
+    \\section::after {
+    \\  color: #777b76;
+    \\  font-size: 17px;
+    \\}
+    \\h1, h2 {
+    \\  margin: 0 0 24px;
+    \\  color: #171714;
+    \\  font-weight: 800;
+    \\  line-height: 1.02;
+    \\  letter-spacing: 0;
+    \\}
+    \\h1 {
+    \\  max-width: 980px;
+    \\  font-size: 62px;
+    \\}
+    \\h2 {
+    \\  font-size: 44px;
+    \\}
+    \\p {
+    \\  max-width: 980px;
+    \\}
+    \\ul, ol {
+    \\  margin: 16px 0 0;
+    \\  padding-left: 1.15em;
+    \\}
+    \\li {
+    \\  margin: 0 0 13px;
+    \\}
+    \\strong {
+    \\  color: #0f6f5c;
+    \\}
+    \\blockquote {
+    \\  margin: 24px 0 0;
+    \\  padding: 18px 24px;
+    \\  border-left: 6px solid #0f6f5c;
+    \\  background: #e5f2ee;
+    \\}
+    \\table {
+    \\  width: 100%;
+    \\  border-collapse: collapse;
+    \\  font-size: 22px;
+    \\}
+    \\th, td {
+    \\  padding: 12px 14px;
+    \\  border: 1px solid #ded8ca;
+    \\}
+    \\th {
+    \\  background: #eeebe2;
+    \\  text-align: left;
+    \\}
+    \\code {
+    \\  background: #ece8dd;
+    \\  border-radius: 5px;
+    \\  padding: 0.08em 0.26em;
+    \\}
+;
 
 pub const ProduceDocumentTool = struct {
     /// Workspace root where attachments/sources/ and attachments/produced/
@@ -106,42 +318,75 @@ pub const ProduceDocumentTool = struct {
         "python3 + pandas + openpyxl (xlsx) in the runtime image. If a required binary " ++
         "is missing the tool returns a clear error with the install hint — surface that " ++
         "to the user verbatim; do NOT try to install binaries via shell (sandbox blocks it).\n\n" ++
-        // ─── Format templates (2026-05-24) — the agent picks the right
-        // shape AND can pattern-match against these without round-trips:
+        // ─── Format templates — the model copies these patterns, so
+        // they must encode document quality, not just syntax.
         "## How to format `content` per `format`\n\n" ++
+        "## Artifact quality gate\n" ++
+        "Before calling this tool, make the source read like a final deliverable: a specific\n" ++
+        "title, a useful opening answer, scannable sections, concrete numbers/names when\n" ++
+        "known, explicit assumptions when unknown, and no placeholders like TBD/lorem ipsum.\n" ++
+        "Do not include process notes such as \"I created this\" or instructions about how to\n" ++
+        "use the document. If the user gave sparse input, create a polished first draft with\n" ++
+        "clearly labeled assumptions instead of an empty template.\n\n" ++
         "### pdf / docx / html — markdown source\n" ++
         "Use standard markdown. Headings (`#`/`##`), bullet lists (`- `), numbered lists\n" ++
         "(`1. `), tables (pipe syntax), code blocks (triple backticks), blockquotes (`> `),\n" ++
         "links (`[text](url)`), images (`![alt](path)`). pandoc handles the rest. Keep\n" ++
         "headings shallow (2-3 levels) for readable PDFs.\n\n" ++
-        "EXAMPLE (PDF / market research):\n" ++
+        "Default decision-doc blueprint:\n" ++
+        "1. `# <specific title>`\n" ++
+        "2. `## One-page brief` — 3-5 sentences that answer the user's ask directly.\n" ++
+        "3. `## What matters` — 3-6 bullets, each with a concrete implication.\n" ++
+        "4. `## Options / plan / analysis` — the main body; use tables for comparisons.\n" ++
+        "5. `## Recommendation` — the decision, rationale, and what to do next.\n" ++
+        "6. `## Risks and assumptions` — only real caveats, not generic hedging.\n\n" ++
+        "EXAMPLE (decision brief):\n" ++
         "```\n" ++
-        "# Market Research — Personal AI Agents 2026\n\n" ++
-        "## Executive Summary\n" ++
-        "Three vendors dominate: Claude Code, Manus, nullalis.\n\n" ++
-        "## Competitive Landscape\n" ++
-        "| Vendor | Strength | Weakness |\n" ++
+        "# Launch Readiness Brief — Agent Artifacts\n\n" ++
+        "## One-page brief\n" ++
+        "The artifact experience is close to launch, but the last-mile quality bar is the\n" ++
+        "document itself: every export should look share-ready before the user edits it.\n" ++
+        "The highest-leverage move is to standardize creation blueprints and improve the\n" ++
+        "default rendering path for HTML, PPTX, and spreadsheet exports.\n\n" ++
+        "## What matters\n" ++
+        "- First impression: the opening page/slide must state a useful answer, not a template.\n" ++
+        "- Editability: artifacts should preserve clean headings and tables so revisions are local.\n" ++
+        "- Export trust: PDF/DOCX/PPTX/XLSX/HTML should keep structure when downloaded.\n\n" ++
+        "## Options\n" ++
+        "| Option | Upside | Tradeoff |\n" ++
         "|---|---|---|\n" ++
-        "| Claude Code | Native memory | No mobile |\n" ++
-        "| Manus | Browser autonomy | Per-task only |\n\n" ++
+        "| Prompt-only blueprints | Fastest quality lift | Depends on model compliance |\n" ++
+        "| Renderer themes | Improves every export | Does not fix weak source content |\n" ++
+        "| Structured workbook/deck specs | Best long-term control | Larger schema change |\n\n" ++
         "## Recommendation\n" ++
-        "> Focus on persistent memory + multi-channel.\n" ++
+        "Ship prompt blueprints and renderer themes now, then add structured workbook/deck\n" ++
+        "specs once the default surface is stable.\n\n" ++
+        "## Risks and assumptions\n" ++
+        "- Assumption: users prefer a strong editable draft over a blank form.\n" ++
+        "- Risk: renderer dependencies may be missing in smaller deployments.\n" ++
         "```\n\n" ++
         "### xlsx — CSV source\n" ++
-        "Plain CSV with a header row, then data rows. Use commas as separators; quote\n" ++
-        "values containing commas with `\"...\"`. The renderer turns each comma into a cell.\n\n" ++
-        "EXAMPLE (XLSX / expense report):\n" ++
+        "Plain CSV with a header row, then data rows. Use commas as separators; quote values\n" ++
+        "containing commas with `\"...\"`. Make the sheet useful, not just raw data: include\n" ++
+        "clear column names, units, status/owner fields when relevant, and summary rows when\n" ++
+        "the user asked for a model, budget, plan, or tracker. Avoid formulas from untrusted\n" ++
+        "input; use numeric values and explanatory columns instead.\n\n" ++
+        "EXAMPLE (XLSX / launch tracker):\n" ++
         "```\n" ++
-        "Date,Category,Description,Amount\n" ++
-        "2026-05-01,Travel,\"Flight, BER → JFK\",542.10\n" ++
-        "2026-05-02,Lodging,Hotel,189.00\n" ++
+        "Workstream,Owner,Status,Priority,Next Step,Due Date,Risk\n" ++
+        "Artifact templates,Product,In progress,High,Approve default document blueprint,2026-06-10,Medium\n" ++
+        "Renderer themes,Engineering,In progress,High,Verify PPTX and HTML export styling,2026-06-11,Low\n" ++
+        "Share page,Frontend,Ready,Medium,Run recipient smoke test,2026-06-12,Low\n" ++
+        "SUMMARY,,3 workstreams,2 high-priority,,,\n" ++
         "```\n\n" ++
         "### pptx — markdown with `---` slide separators (Marp convention)\n" ++
         "Each `---` on its own line starts a new slide. First H1 on a slide is the title;\n" ++
-        "the rest is body. Use bullets / short lines (each slide is a few seconds of read).\n" ++
+        "the rest is body. Write decks as executive narrative, not prose pasted onto slides:\n" ++
+        "one idea per slide, 3-5 bullets max, strong section titles, and a final decision or\n" ++
+        "next-step slide. Use tables only when comparison is the point.\n" ++
         "The Marp `marp: true` frontmatter is AUTO-PREPENDED so you don't include it —\n" ++
         "just write slide content. Pick a theme via the optional `theme` param:\n" ++
-        "  - `default` (clean white, sans, projector-friendly) — best general use\n" ++
+        "  - `default` (ZAKI editorial theme, crisp white/ink/accent) — best general use\n" ++
         "  - `gaia` (warm cream, serif accents, book-feel) — best for talks\n" ++
         "  - `uncover` (bold black/white, big type) — best for keynote / lecture\n" ++
         "  - `thmanyah` (brand typography) — AVAILABLE ONLY WHEN the operator has\n" ++
@@ -160,20 +405,23 @@ pub const ProduceDocumentTool = struct {
         "richer style application; if absent the tool logs a hint and produces a\n" ++
         "plain DOCX. Branding is NOT a per-user preference — do not expose a\n" ++
         "branding choice to users; it is an operator-level brand decision.\n\n" ++
-        "EXAMPLE (PPTX / kickoff deck):\n" ++
+        "EXAMPLE (PPTX / product decision deck):\n" ++
         "```\n" ++
-        "# Project Kickoff\n" ++
-        "**Q3 2026**\n" ++
+        "# Agent Artifacts Should Feel Finished\n" ++
+        "**Decision deck — June 2026**\n" ++
         "---\n" ++
-        "# Why Now\n" ++
-        "- Market signal: customer X asked\n" ++
-        "- Tech ready: substrates verified\n" ++
-        "- Team capacity: 2 engineers freed up\n" ++
+        "# The Current Gap\n" ++
+        "- The canvas and share mechanics work\n" ++
+        "- The first draft still reads too generic\n" ++
+        "- Export quality depends on renderer defaults\n" ++
         "---\n" ++
-        "# Plan\n" ++
-        "1. Discovery (week 1-2)\n" ++
-        "2. Build (week 3-6)\n" ++
-        "3. Beta (week 7-8)\n" ++
+        "# What Changes Now\n" ++
+        "- Strong blueprints for docs, sheets, decks, and HTML\n" ++
+        "- Styled HTML and PPTX defaults\n" ++
+        "- Versioned artifacts remain the authoring surface\n" ++
+        "---\n" ++
+        "# Decision\n" ++
+        "> Treat every artifact as a share-ready deliverable on the first pass.\n" ++
         "```\n\n" ++
         "## When to use produce_document vs alternatives\n" ++
         "- For a quick 1-3 paragraph reply → answer INLINE, don't produce a doc.\n" ++
@@ -184,7 +432,7 @@ pub const ProduceDocumentTool = struct {
         "- For raw markdown / code the user will copy → file_write.";
 
     pub const tool_params =
-        \\{"type":"object","properties":{"format":{"type":"string","enum":["pdf","docx","xlsx","pptx","html"],"description":"Output format. pdf/docx/html accept markdown input; xlsx accepts CSV; pptx accepts markdown with --- slide separators."},"content":{"type":"string","description":"Source content. Markdown for pdf/docx/html/pptx, CSV for xlsx. Required."},"title":{"type":"string","description":"Document title — used for the output filename and (where supported) document metadata. Default 'untitled'. Will be sanitized to filesystem-safe characters."},"theme":{"type":"string","enum":["default","gaia","uncover","thmanyah"],"description":"Marp theme for PPTX slides. Ignored for non-pptx formats. 'default' = clean white background, dark text. 'gaia' = warm cream background with serif accents, good for talks. 'uncover' = bold black-on-white, lecture/keynote style. 'thmanyah' = brand typography (AVAILABLE ONLY when operator has deployed branding fonts; otherwise returns a clear error). Default 'default'."}},"required":["format","content"]}
+        \\{"type":"object","properties":{"format":{"type":"string","enum":["pdf","docx","xlsx","pptx","html"],"description":"Output format. pdf/docx/html accept markdown input; xlsx accepts CSV; pptx accepts markdown with --- slide separators."},"content":{"type":"string","description":"Source content. Markdown for pdf/docx/html/pptx, CSV for xlsx. Required."},"title":{"type":"string","description":"Document title — used for the output filename and (where supported) document metadata. Default 'untitled'. Will be sanitized to filesystem-safe characters."},"theme":{"type":"string","enum":["default","gaia","uncover","thmanyah"],"description":"Marp theme for PPTX slides. Ignored for non-pptx formats. 'default' = ZAKI editorial theme with crisp white/ink/accent styling. 'gaia' = warm cream background with serif accents, good for talks. 'uncover' = bold black-on-white, lecture/keynote style. 'thmanyah' = brand typography (AVAILABLE ONLY when operator has deployed branding fonts; otherwise returns a clear error). Default 'default'."}},"required":["format","content"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -261,10 +509,11 @@ pub const ProduceDocumentTool = struct {
         // frontmatter to actually treat the markdown as slides. We auto-
         // prepend that frontmatter so the agent's `content` can be pure
         // slide markdown (---separated H1 + body) without per-call ritual.
-        // Three built-in Marp themes are exposed:
-        //   - default — clean white background, dark text (general use)
-        //   - gaia    — warm cream + serif accents (talks / decks)
-        //   - uncover — bold black-on-white (lecture / keynote)
+        // Themes:
+        //   - default — generated ZAKI editorial theme (general use)
+        //   - gaia    — Marp built-in warm cream + serif accents
+        //   - uncover — Marp built-in bold black-on-white
+        //   - thmanyah — generated brand theme when operator fonts exist
         // For non-pptx formats this param is ignored (with a hint in the
         // tool schema).
         const theme_raw = root.getString(args, "theme") orelse "default";
@@ -390,7 +639,7 @@ pub const ProduceDocumentTool = struct {
                 const fm = try std.fmt.allocPrint(
                     allocator,
                     "---\nmarp: true\ntheme: {s}\npaginate: true\nsize: 16:9\n---\n\n",
-                    .{theme.toSlice()},
+                    .{marpThemeName(theme)},
                 );
                 defer allocator.free(fm);
                 src_file.writeAll(fm) catch |err| {
@@ -499,13 +748,12 @@ fn parseFormat(s: []const u8) ?Format {
     return null;
 }
 
-/// 2026-05-25 (Wave 3 hardening) — Marp built-in theme for PPTX. Three
-/// supported variants; each is a recognized Marp theme key that ships
-/// with marp-cli so no per-tenant theme file deploy is needed.
+/// 2026-06 S-tier artifact polish — supported PPTX theme values. The
+/// user-facing `default` value maps to a generated `zaki-default` Marp
+/// theme, while `gaia` and `uncover` still map to Marp built-ins.
 ///
-/// Visual character (per Marp docs + verified visually):
-///   - default — clean white background, Helvetica-style sans, dark text.
-///               Best general-purpose; reads well in projector light.
+/// Visual character:
+///   - default — crisp white/ink/accent editorial theme for general use.
 ///   - gaia    — warm cream background, serif body, slight color accents.
 ///               Better for human talks where a printed-book feel helps.
 ///   - uncover — bold black-on-white, large type, bullet-emphasis style.
@@ -538,6 +786,15 @@ fn parseTheme(s: []const u8) ?Theme {
     if (std.ascii.eqlIgnoreCase(t, "uncover")) return .uncover;
     if (std.ascii.eqlIgnoreCase(t, "thmanyah")) return .thmanyah;
     return null;
+}
+
+fn marpThemeName(theme: Theme) []const u8 {
+    return switch (theme) {
+        .default_theme => DEFAULT_MARP_THEME_NAME,
+        .gaia => "gaia",
+        .uncover => "uncover",
+        .thmanyah => "thmanyah",
+    };
 }
 
 // ── Branding resolution ──────────────────────────────────────────────
@@ -825,6 +1082,32 @@ pub fn cssFontFaceBlock(
         "h1, h2, h3, h4, h5, h6 {{ font-family: '{s}', Georgia, 'Times New Roman', serif; }}\n",
         .{rb.display_font_family},
     );
+
+    return buf.toOwnedSlice(allocator);
+}
+
+fn buildHtmlHeaderContent(
+    allocator: std.mem.Allocator,
+    resolved_branding: ?ResolvedBranding,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeAll("<style>\n");
+    if (resolved_branding) |rb| {
+        const face_block = try cssFontFaceBlock(allocator, rb, .file);
+        defer allocator.free(face_block);
+        try w.writeAll(face_block);
+        try w.print(
+            ":root {{ --artifact-body-font: '{s}', system-ui, -apple-system, 'Segoe UI', sans-serif; --artifact-display-font: '{s}', Georgia, 'Times New Roman', serif; }}\n",
+            .{ rb.body_font_family, rb.display_font_family },
+        );
+    } else {
+        try w.writeAll(":root { --artifact-body-font: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --artifact-display-font: Georgia, 'Times New Roman', serif; }\n");
+    }
+    try w.writeAll(HTML_DOCUMENT_STYLE);
+    try w.writeAll("</style>\n");
 
     return buf.toOwnedSlice(allocator);
 }
@@ -1168,8 +1451,38 @@ fn renderXlsx(
     defer allocator.free(out_lit);
     const py_script = try std.fmt.allocPrint(
         allocator,
-        "import pandas as pd; pd.read_csv({s}).to_excel({s}, index=False)",
-        .{ src_lit, out_lit },
+        \\import pandas as pd
+        \\from openpyxl import load_workbook
+        \\from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        \\from openpyxl.utils import get_column_letter
+        \\df = pd.read_csv({s})
+        \\df.to_excel({s}, index=False, sheet_name='Artifact')
+        \\wb = load_workbook({s})
+        \\ws = wb.active
+        \\ws.freeze_panes = 'A2'
+        \\ws.auto_filter.ref = ws.dimensions
+        \\header_fill = PatternFill('solid', fgColor='0F6F5C')
+        \\header_font = Font(bold=True, color='FFFFFF')
+        \\thin = Side(style='thin', color='DED8CA')
+        \\for cell in ws[1]:
+        \\    cell.fill = header_fill
+        \\    cell.font = header_font
+        \\    cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+        \\for row in ws.iter_rows():
+        \\    for cell in row:
+        \\        cell.border = Border(top=thin, left=thin, right=thin, bottom=thin)
+        \\        cell.alignment = Alignment(vertical='top', wrap_text=True)
+        \\for col in ws.columns:
+        \\    letter = get_column_letter(col[0].column)
+        \\    max_len = 0
+        \\    for cell in col:
+        \\        value = '' if cell.value is None else str(cell.value)
+        \\        if len(value) > max_len:
+        \\            max_len = len(value)
+        \\    ws.column_dimensions[letter].width = min(max(max_len + 2, 12), 42)
+        \\wb.save({s})
+    ,
+        .{ src_lit, out_lit, out_lit, out_lit },
     );
     defer allocator.free(py_script);
     const pandas_argv = [_][]const u8{ "python3", "-c", py_script };
@@ -1193,7 +1506,38 @@ fn renderXlsx(
     // Pure-stdlib fallback: csv → openpyxl, no pandas needed.
     const fallback_script = try std.fmt.allocPrint(
         allocator,
-        "import csv, openpyxl;wb=openpyxl.Workbook();ws=wb.active;\nimport io\nwith open({s}, newline='', encoding='utf-8') as f:\n    for row in csv.reader(f):\n        ws.append(row)\nwb.save({s})",
+        \\import csv, openpyxl
+        \\from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        \\from openpyxl.utils import get_column_letter
+        \\wb = openpyxl.Workbook()
+        \\ws = wb.active
+        \\ws.title = 'Artifact'
+        \\with open({s}, newline='', encoding='utf-8') as f:
+        \\    for row in csv.reader(f):
+        \\        ws.append(row)
+        \\ws.freeze_panes = 'A2'
+        \\ws.auto_filter.ref = ws.dimensions
+        \\header_fill = PatternFill('solid', fgColor='0F6F5C')
+        \\header_font = Font(bold=True, color='FFFFFF')
+        \\thin = Side(style='thin', color='DED8CA')
+        \\for cell in ws[1]:
+        \\    cell.fill = header_fill
+        \\    cell.font = header_font
+        \\    cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+        \\for row in ws.iter_rows():
+        \\    for cell in row:
+        \\        cell.border = Border(top=thin, left=thin, right=thin, bottom=thin)
+        \\        cell.alignment = Alignment(vertical='top', wrap_text=True)
+        \\for col in ws.columns:
+        \\    letter = get_column_letter(col[0].column)
+        \\    max_len = 0
+        \\    for cell in col:
+        \\        value = '' if cell.value is None else str(cell.value)
+        \\        if len(value) > max_len:
+        \\            max_len = len(value)
+        \\    ws.column_dimensions[letter].width = min(max(max_len + 2, 12), 42)
+        \\wb.save({s})
+    ,
         .{ src_lit, out_lit },
     );
     defer allocator.free(fallback_script);
@@ -1236,13 +1580,10 @@ fn renderXlsx(
     };
 }
 
-/// PPTX (Marp): when theme=thmanyah AND branding is resolved, generate a
-/// `<workspace>/branding/marp/thmanyah.css` theme on the fly (containing
-/// @font-face declarations with file:// URLs to the operator's font dir)
-/// and pass `--theme-set` so marp picks it up. The dynamic generation is
-/// idempotent (overwritten every call) — operators who want a frozen
-/// theme can drop their own thmanyah.css at the same path before the
-/// first call and it'll be overwritten only when this code path runs.
+/// PPTX (Marp): the exported "default" is a generated ZAKI theme, not
+/// raw Marp defaults. When theme=thmanyah AND branding is resolved, we
+/// generate a branded sibling theme with @font-face declarations. Both
+/// paths write under `<workspace>/branding/marp/` and pass `--theme-set`.
 fn renderPptx(
     allocator: std.mem.Allocator,
     src_path: []const u8,
@@ -1251,24 +1592,12 @@ fn renderPptx(
     workspace_dir: []const u8,
     resolved_branding: ?ResolvedBranding,
 ) !ToolResult {
-    // Branding-gated thmanyah theme writes a CSS file under
-    // <workspace>/branding/marp/ then tells marp to look there for
-    // additional themes. Other themes (default/gaia/uncover) skip this
-    // path entirely — marp ships them built-in.
+    // Default and thmanyah write first-class themes. Gaia/uncover stay
+    // Marp built-ins because those are intentionally distinct user picks.
     var theme_dir_opt: ?[]u8 = null;
     defer if (theme_dir_opt) |td| allocator.free(td);
 
-    if (theme == .thmanyah) {
-        // execute() already validated that branding is resolved (theme
-        // requires branding); this is just an extra debug guard.
-        const rb = resolved_branding orelse {
-            return ToolResult{
-                .success = false,
-                .output = "",
-                .error_msg = try allocator.dupe(u8, "internal: theme=thmanyah reached renderPptx with null branding"),
-            };
-        };
-
+    if (theme == .default_theme or theme == .thmanyah) {
         const theme_dir = try std.fs.path.join(allocator, &.{ workspace_dir, "branding", "marp" });
         errdefer allocator.free(theme_dir);
         std.fs.cwd().makePath(theme_dir) catch |err| switch (err) {
@@ -1284,24 +1613,43 @@ fn renderPptx(
             },
         };
 
-        const face_block = try cssFontFaceBlock(allocator, rb, .file);
-        defer allocator.free(face_block);
+        const css = if (theme == .default_theme) blk: {
+            break :blk try allocator.dupe(u8, MARP_DEFAULT_THEME_CSS);
+        } else blk: {
+            // execute() already validated that branding is resolved (theme
+            // requires branding); this is just an extra debug guard.
+            const rb = resolved_branding orelse {
+                allocator.free(theme_dir);
+                return ToolResult{
+                    .success = false,
+                    .output = "",
+                    .error_msg = try allocator.dupe(u8, "internal: theme=thmanyah reached renderPptx with null branding"),
+                };
+            };
+            const face_block = try cssFontFaceBlock(allocator, rb, .file);
+            defer allocator.free(face_block);
 
-        // The /* @theme thmanyah */ comment is REQUIRED by marp-cli to
-        // recognize the file as a registered theme keyed by the name
-        // we used in the frontmatter (`theme: thmanyah`).
-        const css = try std.fmt.allocPrint(
-            allocator,
-            "/* @theme thmanyah */\n\n" ++
-                "@import 'default';\n\n" ++
-                "{s}\n" ++
-                "section {{ font-family: '{s}', system-ui, sans-serif; }}\n" ++
-                "section h1, section h2, section h3 {{ font-family: '{s}', Georgia, serif; }}\n",
-            .{ face_block, rb.body_font_family, rb.display_font_family },
-        );
+            // The /* @theme thmanyah */ comment is REQUIRED by marp-cli to
+            // recognize the file as a registered theme keyed by the name
+            // we used in the frontmatter (`theme: thmanyah`).
+            break :blk try std.fmt.allocPrint(
+                allocator,
+                "/* @theme thmanyah */\n\n" ++
+                    "@import 'default';\n\n" ++
+                    "{s}\n" ++
+                    "section {{ background: #fffefa; color: #171714; font-family: '{s}', system-ui, sans-serif; padding: 54px 68px 48px; }}\n" ++
+                    "section::before {{ content: \"\"; position: absolute; left: 68px; top: 38px; width: 64px; height: 5px; background: #0f6f5c; }}\n" ++
+                    "section::after {{ color: #777b76; font-size: 17px; }}\n" ++
+                    "section h1, section h2, section h3 {{ color: #171714; font-family: '{s}', Georgia, serif; letter-spacing: 0; }}\n" ++
+                    "section h1 {{ font-size: 62px; line-height: 1.02; }}\n" ++
+                    "section blockquote {{ border-left: 6px solid #0f6f5c; background: #e5f2ee; }}\n",
+                .{ face_block, rb.body_font_family, rb.display_font_family },
+            );
+        };
         defer allocator.free(css);
 
-        const css_path = try std.fs.path.join(allocator, &.{ theme_dir, "thmanyah.css" });
+        const css_filename: []const u8 = if (theme == .default_theme) "zaki-default.css" else "thmanyah.css";
+        const css_path = try std.fs.path.join(allocator, &.{ theme_dir, css_filename });
         defer allocator.free(css_path);
         const f = std.fs.createFileAbsolute(css_path, .{}) catch |err| {
             allocator.free(theme_dir);
@@ -1325,9 +1673,8 @@ fn renderPptx(
         theme_dir_opt = theme_dir;
     }
 
-    // marp-cli: markdown → pptx with --- as slide separator. When theme
-    // is thmanyah we add --theme-set <dir> so the dynamically-written
-    // CSS theme is registered.
+    // marp-cli: markdown → pptx with --- as slide separator. Generated
+    // default/thmanyah themes pass --theme-set so Marp registers them.
     var argv_buf: [8][]const u8 = undefined;
     var argv_len: usize = 0;
     argv_buf[argv_len] = "marp";
@@ -1370,14 +1717,11 @@ fn renderPptx(
     };
 }
 
-/// HTML: pandoc --standalone produces a full HTML document. When
-/// branding is resolved we write a `<style>` block containing
-/// @font-face declarations + body/heading rules to a temp file under
-/// `<src_dir>/.branding_header.html` and pass it via `-H`. URLs are
-/// absolute `file://` so the produced HTML renders correctly when
-/// opened locally; for landing-page deployments served from a static
-/// origin, the operator's post-processing layer can rewrite the
-/// `file://...` URLs to served paths.
+/// HTML: pandoc --standalone produces a full HTML document. We always
+/// pass a small document CSS header so HTML exports look share-ready by
+/// default; when branding is resolved, that header also includes
+/// @font-face declarations. Font URLs are absolute `file://` paths so
+/// local renders work; static deploys may rewrite them later.
 fn renderHtml(
     allocator: std.mem.Allocator,
     src_path: []const u8,
@@ -1395,42 +1739,33 @@ fn renderHtml(
         allocator.free(hp);
     };
 
-    if (resolved_branding) |rb| {
-        const src_dir = std.fs.path.dirname(src_path) orelse "/tmp";
-        const header_path = try std.fs.path.join(allocator, &.{ src_dir, ".branding_header.html" });
-        errdefer allocator.free(header_path);
+    const src_dir = std.fs.path.dirname(src_path) orelse "/tmp";
+    const header_path = try std.fs.path.join(allocator, &.{ src_dir, ".artifact_header.html" });
+    errdefer allocator.free(header_path);
 
-        const face_block = try cssFontFaceBlock(allocator, rb, .file);
-        defer allocator.free(face_block);
+    const header_content = try buildHtmlHeaderContent(allocator, resolved_branding);
+    defer allocator.free(header_content);
 
-        const header_content = try std.fmt.allocPrint(
+    const f = std.fs.createFileAbsolute(header_path, .{}) catch |err| {
+        allocator.free(header_path);
+        const msg = try std.fmt.allocPrint(
             allocator,
-            "<style>\n{s}</style>\n",
-            .{face_block},
+            "Failed to create HTML document header '{s}': {s}",
+            .{ header_path, @errorName(err) },
         );
-        defer allocator.free(header_content);
-
-        const f = std.fs.createFileAbsolute(header_path, .{}) catch |err| {
-            allocator.free(header_path);
-            const msg = try std.fmt.allocPrint(
-                allocator,
-                "Failed to create HTML branding header '{s}': {s}",
-                .{ header_path, @errorName(err) },
-            );
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-        defer f.close();
-        f.writeAll(header_content) catch |err| {
-            allocator.free(header_path);
-            const msg = try std.fmt.allocPrint(
-                allocator,
-                "Failed to write HTML branding header: {s}",
-                .{@errorName(err)},
-            );
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-        header_path_opt = header_path;
-    }
+        return ToolResult{ .success = false, .output = "", .error_msg = msg };
+    };
+    defer f.close();
+    f.writeAll(header_content) catch |err| {
+        allocator.free(header_path);
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "Failed to write HTML document header: {s}",
+            .{@errorName(err)},
+        );
+        return ToolResult{ .success = false, .output = "", .error_msg = msg };
+    };
+    header_path_opt = header_path;
 
     var argv_buf: [10][]const u8 = undefined;
     var argv_len: usize = 0;
@@ -1635,6 +1970,15 @@ test "produce_document tool name + schema" {
     try std.testing.expect(std.mem.indexOf(u8, ProduceDocumentTool.tool_params, "pdf") != null);
     try std.testing.expect(std.mem.indexOf(u8, ProduceDocumentTool.tool_params, "xlsx") != null);
     try std.testing.expect(std.mem.indexOf(u8, ProduceDocumentTool.tool_params, "pptx") != null);
+}
+
+test "produce_document description pins S-tier artifact blueprints" {
+    const desc = ProduceDocumentTool.tool_description;
+    try std.testing.expect(std.mem.indexOf(u8, desc, "Artifact quality gate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desc, "Default decision-doc blueprint") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desc, "EXAMPLE (XLSX / launch tracker)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desc, "ZAKI editorial theme") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desc, "no placeholders") != null);
 }
 
 test "produce_document rejects missing format" {
@@ -2136,6 +2480,19 @@ test "cssFontFaceBlock emits valid @font-face declarations" {
     try std.testing.expect(std.mem.indexOf(u8, css, "h1, h2, h3") != null);
 }
 
+test "HTML header emits share-ready document CSS without branding" {
+    const alloc = std.testing.allocator;
+    const header = try buildHtmlHeaderContent(alloc, null);
+    defer alloc.free(header);
+
+    try std.testing.expect(std.mem.indexOf(u8, header, "<style>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "--artifact-paper-bg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "max-width: 860px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "blockquote") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "table") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "@font-face") == null);
+}
+
 test "parseTheme accepts thmanyah" {
     try std.testing.expectEqual(@as(?Theme, .thmanyah), parseTheme("thmanyah"));
     try std.testing.expectEqual(@as(?Theme, .thmanyah), parseTheme("THMANYAH"));
@@ -2144,6 +2501,13 @@ test "parseTheme accepts thmanyah" {
     try std.testing.expectEqual(@as(?Theme, .gaia), parseTheme("gaia"));
     try std.testing.expectEqual(@as(?Theme, .uncover), parseTheme("uncover"));
     try std.testing.expectEqual(@as(?Theme, null), parseTheme("nope"));
+}
+
+test "marpThemeName maps default to generated ZAKI theme" {
+    try std.testing.expectEqualStrings(DEFAULT_MARP_THEME_NAME, marpThemeName(.default_theme));
+    try std.testing.expectEqualStrings("gaia", marpThemeName(.gaia));
+    try std.testing.expectEqualStrings("uncover", marpThemeName(.uncover));
+    try std.testing.expectEqualStrings("thmanyah", marpThemeName(.thmanyah));
 }
 
 test "PPTX with theme=thmanyah but no branding returns clear error" {
@@ -2188,6 +2552,54 @@ test "PPTX with theme=thmanyah but no branding returns clear error" {
     try std.testing.expect(std.mem.indexOf(u8, msg, "thmanyah") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "branding") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "font_dir") != null);
+}
+
+test "PPTX default theme writes generated ZAKI theme CSS" {
+    const alloc = std.testing.allocator;
+    const ts = std.time.milliTimestamp();
+    const ws = try std.fmt.allocPrint(alloc, "/tmp/pd_zaki_default_theme_{d}", .{ts});
+    defer alloc.free(ws);
+    std.fs.makeDirAbsolute(ws) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    defer std.fs.deleteTreeAbsolute(ws) catch {};
+
+    var pd = ProduceDocumentTool{
+        .workspace_dir = ws,
+        .branding = .{
+            .font_dir = "/tmp/pd_default_theme_no_fonts_here_xyz_42",
+            .body_font = "x",
+            .display_font = "y",
+        },
+    };
+    const t = pd.tool();
+    var args = std.json.ObjectMap.init(alloc);
+    defer args.deinit();
+    try args.put("format", std.json.Value{ .string = "pptx" });
+    try args.put("content", std.json.Value{ .string = "# Decision\n---\n# Next Steps" });
+    try args.put("theme", std.json.Value{ .string = "default" });
+
+    const result = try t.execute(alloc, args);
+    defer {
+        if (result.output.len > 0) alloc.free(result.output);
+        if (result.error_msg) |m| alloc.free(m);
+    }
+
+    const css_path = try std.fs.path.join(alloc, &.{ ws, "branding", "marp", "zaki-default.css" });
+    defer alloc.free(css_path);
+    const css_file = std.fs.openFileAbsolute(css_path, .{}) catch |err| {
+        std.debug.print("expected zaki-default.css at '{s}', got {s}\n", .{ css_path, @errorName(err) });
+        return err;
+    };
+    defer css_file.close();
+    var buf: [8192]u8 = undefined;
+    const n = try css_file.readAll(&buf);
+    try std.testing.expect(n > 0);
+    const content = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, content, "@theme zaki-default") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "#0f6f5c") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "blockquote") != null);
 }
 
 test "PPTX with theme=thmanyah + branding writes the marp theme CSS" {

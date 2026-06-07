@@ -2920,11 +2920,11 @@ paths:
             schema:
               type: object
               properties:
-                ttl_secs:
+                expires_in_hours:
                   type: integer
-                  minimum: 60
-                  maximum: 2592000
-                  description: Time-to-live in seconds. Defaults to 604800 (7 days); max 2592000 (30 days).
+                  minimum: 1
+                  maximum: 720
+                  description: Time-to-live in hours. Defaults to 168 (7 days); max 720 (30 days).
       responses:
         '200':
           description: Share minted

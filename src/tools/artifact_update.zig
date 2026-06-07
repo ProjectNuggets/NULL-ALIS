@@ -22,23 +22,26 @@ pub const ArtifactUpdateTool = struct {
 
     pub const tool_name = "artifact_update";
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Append a new version to an existing artifact, becoming its current version.",
+        .what = "Revise an existing artifact by appending a complete new current version.",
         .use_when = &.{
             "Revising an artifact the user (or a prior turn) created",
             "Incorporating user feedback into a side-panel document",
-            "Producing a follow-up draft of a plan/report/code listing",
+            "Polishing a draft into a more share-ready report, brief, deck outline, table, page, or diagram",
+            "The same artifact id should remain open while version history records the change",
         },
         .do_not_use_for = &.{
             "artifact_create — when no prior artifact exists yet",
+            "artifact_get — when you need to read the current body before revising it",
             "file_edit — for in-place edits to workspace files",
             "memory_edit — for revising stored knowledge graph facts",
         },
         .cost_note = "Local Postgres write; one row appended to artifact_versions.",
-        .completion_hint = "Returns the new version number.",
+        .completion_hint = "Returns the new version number; summarize what changed.",
         .see_also = &.{
             "artifact_create — start a new artifact",
             "artifact_get — read the latest or a historical version",
             "artifact_list — discover existing artifacts by kind",
+            "artifact_diff — review what changed between two artifact versions",
         },
     };
     comptime {
@@ -46,11 +49,14 @@ pub const ArtifactUpdateTool = struct {
     }
 
     pub const tool_description =
-        "Append a new version to an existing artifact. Use after artifact_create when the " ++
-        "user asks for revisions; the artifact stays at the same id, just gains a new " ++
-        "current_version with the new content.";
+        "Append a complete new version to an existing artifact. Use after artifact_create when the " ++
+        "user asks for revisions, polish, restructuring, or follow-up edits; keep the same artifact id so the canvas " ++
+        "and public/share/export lifecycle stay attached. The content field is a full replacement body, not a patch " ++
+        "fragment. Preserve the artifact kind, improve the whole draft, and make the result share-ready: clear opening " ++
+        "answer, useful headings, concise sections, tables where helpful, explicit assumptions when context is sparse, " ++
+        "and no placeholders, lorem ipsum, or meta commentary. If you have not seen the current body, call artifact_get first.";
     pub const tool_params =
-        \\{"type":"object","properties":{"id":{"type":"string","description":"Artifact UUID returned by artifact_create."},"content":{"type":"string","description":"Full replacement content for the new version."},"change_summary":{"type":"string","description":"Optional 1-line summary of what changed (rendered in the version history)."}},"required":["id","content"]}
+        \\{"type":"object","properties":{"id":{"type":"string","description":"Artifact UUID returned by artifact_create or artifact_list."},"content":{"type":"string","description":"Full replacement content for the new version, not a diff or partial patch. Must be complete and share-ready."},"change_summary":{"type":"string","description":"Optional 1-line summary of what changed (rendered in the version history)."}},"required":["id","content"]}
     ;
 
     pub const tool_metadata: @import("metadata.zig").ToolMetadata = .{
@@ -170,6 +176,17 @@ test "artifact_update schema requires id and content" {
     try std.testing.expect(std.mem.indexOf(u8, schema, "\"content\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "\"change_summary\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "\"required\":[\"id\",\"content\"]") != null);
+}
+
+test "artifact_update guidance pins same-artifact full replacement behavior" {
+    var t = ArtifactUpdateTool{};
+    const desc = t.tool().description();
+    const schema = t.tool().parametersJson();
+    try std.testing.expect(std.mem.indexOf(u8, desc, "same artifact id should remain open") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desc, "complete new current version") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desc, "artifact_get") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desc, "share-ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "not a diff or partial patch") != null);
 }
 
 test "artifact_update rejects missing id" {

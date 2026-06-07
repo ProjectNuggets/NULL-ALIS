@@ -988,11 +988,13 @@ fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("- **A chart, logo, diagram, or illustration:** **`image_generate`** — Together-hosted FLUX/SD models, image lands in workspace as markdown the FE renders inline.\n\n");
     try w.writeAll("**Honesty rule:** if `produce_document` returns an install-hint error (pandoc / marp-cli / pandas missing), surface that to the user VERBATIM and offer an alternative (HTML if PDF fails, CSV if XLSX fails, plain markdown via `file_write` as a last resort). Do NOT try to install binaries via `shell` — the sandbox blocks it.\n\n");
     try w.writeAll("**Artifact lifecycle pattern (the canvas play):**\n");
+    try w.writeAll("0. Artifact quality bar: make the canvas share-ready on first creation — clear title, strong opening answer, useful headings, concise sections, tables where they help, explicit assumptions when inputs are sparse, no placeholders, no lorem ipsum, no meta commentary about how you made it.\n");
+    try w.writeAll("0a. Artifact blueprints: report/brief = one-page brief → what matters → options/analysis → recommendation → risks/assumptions; deck = title slide → current gap → decision options → recommendation → next steps, one idea per slide; spreadsheet = clean CSV with headers, owner/status/priority/date/risk columns when relevant, summary rows when useful; HTML artifact = complete semantic HTML with inline CSS, responsive layout, real copy, and no external scripts.\n");
     try w.writeAll("1. User asks for something substantial → `artifact_create(title, kind=markdown, content=<v1 draft>)`. Tell the user the canvas is open.\n");
     try w.writeAll("2. User requests changes → `artifact_update(id, new_content, change_summary=<one line>)`. The version bumps; the user sees the diff.\n");
     try w.writeAll("3. User asks to share → call `artifact_share(artifact_id, expires_in_hours?)` — mints an opaque public URL with a default 7-day TTL (max 30 days). Returns `{share_code, share_url, expires_at}`. Surface the URL inline so the user can copy it. To unpublish: `artifact_revoke_share(artifact_id)`. The UI also exposes a Share button on the artifact card; both paths land on the same backend.\n");
     try w.writeAll("4. User asks 'what changed since v3?' or to inspect history → use `artifact_history(artifact_id)` for the version list or `artifact_diff(artifact_id, from_version, to_version)` for a specific revision comparison.\n");
-    try w.writeAll("5. User asks to export → call `produce_document(format=pdf|docx|pptx|xlsx, content=<artifact content>, title=<artifact title>)`. The user gets a downloadable file alongside the live canvas.\n\n");
+    try w.writeAll("5. User asks to export → call `produce_document(format=pdf|docx|pptx|xlsx|html, content=<artifact content>, title=<artifact title>)`. The user gets a downloadable file alongside the live canvas.\n\n");
     // v1.14.23 WARN 4.A — Introspection tools narration.
     // The schema-level tool catalog already advertises these (via
     // `buildToolInstructions` in dispatcher.zig), but the prompt's
@@ -1804,6 +1806,22 @@ test "buildStableSystemPrompt excludes datetime and conversation context" {
     try std.testing.expect(std.mem.indexOf(u8, stable, "## Current Date & Time") == null);
     // But must contain identity/tools/runtime — the stable inputs.
     try std.testing.expect(std.mem.indexOf(u8, stable, "## Runtime") != null);
+}
+
+test "buildStableSystemPrompt includes S-tier artifact blueprints" {
+    const allocator = std.testing.allocator;
+    const stable = try buildStableSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer allocator.free(stable);
+
+    try std.testing.expect(std.mem.indexOf(u8, stable, "Artifact quality bar") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stable, "Artifact blueprints") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stable, "report/brief = one-page brief") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stable, "spreadsheet = clean CSV") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stable, "HTML artifact = complete semantic HTML") != null);
 }
 
 test "buildToolsSection emits tools sorted by name regardless of input order [S5.4]" {

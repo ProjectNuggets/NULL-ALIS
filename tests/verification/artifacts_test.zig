@@ -11,6 +11,12 @@ test "S6.7 artifacts: route surface is documented in OpenAPI" {
     try std.testing.expect(std.mem.indexOf(u8, yaml, "/artifacts") != null);
 }
 
+test "S6.7 artifacts: share request body documents expires_in_hours" {
+    const yaml = try harness.loadProjectFile("docs/openapi-v1.yaml");
+    try std.testing.expect(std.mem.indexOf(u8, yaml, "expires_in_hours:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, yaml, "ttl_secs:") == null);
+}
+
 test "S6.7 artifacts: public-share whitelist is tightly bounded" {
     try std.testing.expect(sanitizer.isPublicField("title"));
     try std.testing.expect(sanitizer.isPublicField("kind"));
