@@ -2569,6 +2569,13 @@ paths:
         supported in v1; the legacy slash-command `/exec` flow uses a
         separate operator-only path (Gate 3, not surfaced here).
 
+        Supervised mode auto-approves only local editable artifact writes
+        (`artifact_create`, `artifact_update`). Public artifact sharing
+        (`artifact_share`), rendered file generation (`produce_document`),
+        shell, filesystem writes, browser/session tools, integrations,
+        unknown/MCP tools, and other mutating tools still use this pending
+        approval flow when policy requires confirmation.
+
         Sprint 2 (prod-readiness 2026-05-28) — stable approval id +
         stale-card guard:
 

@@ -3027,6 +3027,14 @@ fn handleGenericToolApprove(self: anytype, arg: []const u8) ![]const u8 {
     // through the caller's inferred union.
     const continuation_result: anyerror![]const u8 = self.turn(synthetic);
     if (continuation_result) |continuation| {
+        if (std.mem.trim(u8, continuation, " \t\r\n").len == 0) {
+            self.allocator.free(continuation);
+            return try std.fmt.allocPrint(
+                self.allocator,
+                "Approved tool (id={d}) {s}.{s}\n{s}",
+                .{ id_snapshot, success_word, always_note, result.output },
+            );
+        }
         return continuation;
     } else |err| {
         return try std.fmt.allocPrint(
@@ -5227,6 +5235,52 @@ test "parseUsageMode still accepts cost (keeps /usage cost working)" {
     const UsageModeLocal = enum { off, tokens, full, cost };
     const m = parseUsageMode(UsageModeLocal, "cost") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(UsageModeLocal.cost, m);
+}
+
+test "generic approval fallback returns tool output when continuation is empty" {
+    const PendingApproval = struct {
+        id: u64,
+        tool_name: []const u8,
+        risk_level: tool_metadata_mod.RiskLevel,
+        reason: []const u8,
+    };
+    const FakeAgent = struct {
+        allocator: std.mem.Allocator,
+        approval_continues_turn: bool = true,
+        pending_tool_approval: ?PendingApproval = .{
+            .id = 41,
+            .tool_name = "artifact_create",
+            .risk_level = .low,
+            .reason = "supervised_mutating_requires_approval",
+        },
+        turn_calls: usize = 0,
+
+        fn executeApprovedPendingTool(_: *@This(), _: std.mem.Allocator) !struct {
+            success: bool,
+            output: []const u8,
+        } {
+            return .{ .success = true, .output = "artifact row created" };
+        }
+
+        fn clearPendingToolApproval(self: *@This()) void {
+            self.pending_tool_approval = null;
+        }
+
+        fn turn(self: *@This(), _: []const u8) ![]const u8 {
+            self.turn_calls += 1;
+            return try self.allocator.dupe(u8, " \n\t ");
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var fake = FakeAgent{ .allocator = allocator };
+    const response = try handleGenericToolApprove(&fake, "allow-once");
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.turn_calls);
+    try std.testing.expect(fake.pending_tool_approval == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Approved tool (id=41) succeeded.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "artifact row created") != null);
 }
 
 // ── /help categorized discovery surface ─────────────────────────────────

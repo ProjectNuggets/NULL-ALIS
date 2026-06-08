@@ -61,7 +61,7 @@ pub const ArtifactUpdateTool = struct {
 
     pub const tool_metadata: @import("metadata.zig").ToolMetadata = .{
         .name = tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .a,
     };

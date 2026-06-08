@@ -2274,6 +2274,10 @@ pub const Agent = struct {
         }
     };
 
+    fn preflightBlockEmitsToolResult(source: ToolPreflightSource) bool {
+        return source != .approval_required;
+    }
+
     const ToolPreflightDecision = union(enum) {
         allowed: ToolPreflightAllowed,
         blocked: ToolPreflightBlocked,
@@ -2934,7 +2938,40 @@ pub const Agent = struct {
             // (tool_name, args_json) — would have leaked on first
             // opt-in. Caught in self-review before any tool was
             // flagged cacheable; no live data exposure.
-            const cache_meta = self.metadataForToolCall(call);
+            const tool_timer = std.time.milliTimestamp();
+            const preflight = self.preflightToolPolicy(call);
+            const cache_meta = switch (preflight) {
+                .allowed => |allowed| allowed.metadata,
+                .blocked => |decision| {
+                    const result = decision.toToolExecutionResult();
+                    const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
+                    if (preflightBlockEmitsToolResult(decision.source)) {
+                        const tool_event = ObserverEvent{ .tool_call = .{
+                            .tool = call.name,
+                            .duration_ms = tool_duration,
+                            .success = result.success,
+                            .tool_use_id = tool_use_id,
+                            .output_preview = result.output,
+                            .output_truncated = result.output.len > 256,
+                            .result_summary = "failed",
+                            .command = command,
+                            .files = files,
+                            .run_id = self.current_run_id,
+                        } };
+                        self.observer.recordEvent(&tool_event);
+
+                        hooks_mod.runHooks(self.allocator, self.hooks, .tool_end, .{
+                            .tool_name = call.name,
+                            .tool_success = result.success,
+                            .session_key = self.memory_session_id,
+                            .workspace_dir = self.workspace_dir,
+                        });
+                    }
+                    try results_buf.append(self.allocator, result);
+                    if (self.pending_tool_approval != null) break;
+                    continue;
+                },
+            };
             var cache_scope_buf: [256]u8 = undefined;
             const cache_scope: []const u8 = blk_scope: {
                 if (!cache_meta.flags.cacheable) break :blk_scope "";
@@ -2951,7 +2988,6 @@ pub const Agent = struct {
                 };
             };
             var cache_hit_used: bool = false;
-            const tool_timer = std.time.milliTimestamp();
             const result = blk: {
                 if (cache_meta.flags.cacheable) {
                     if (result_cache_mod.global.get(tool_allocator, cache_scope, call.name, call.arguments_json)) |hit| {
@@ -2964,7 +3000,7 @@ pub const Agent = struct {
                         };
                     }
                 }
-                break :blk self.executeTool(tool_allocator, call);
+                break :blk self.executeToolUnchecked(tool_allocator, call);
             };
             const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
 
@@ -3129,6 +3165,9 @@ pub const Agent = struct {
         defer self.allocator.free(blocked);
         @memset(blocked, false);
 
+        var blocked_sources = try self.allocator.alloc(ToolPreflightSource, parsed_calls.len);
+        defer self.allocator.free(blocked_sources);
+
         var ordered_results = try self.allocator.alloc(ToolExecutionResult, parsed_calls.len);
         defer self.allocator.free(ordered_results);
 
@@ -3166,6 +3205,7 @@ pub const Agent = struct {
             switch (self.preflightToolPolicy(call)) {
                 .blocked => |decision| {
                     blocked[i] = true;
+                    blocked_sources[i] = decision.source;
                     ordered_results[i] = decision.toToolExecutionResult();
                     continue;
                 },
@@ -3215,19 +3255,21 @@ pub const Agent = struct {
             const file_hint = toolFileFromCall(call);
             var files_buf: [1][]const u8 = undefined;
             const files = filesFromHint(file_hint, &files_buf);
-            const tool_event = ObserverEvent{ .tool_call = .{
-                .tool = call.name,
-                .duration_ms = ordered_durations[i],
-                .success = result.success,
-                .tool_use_id = tool_use_id,
-                .output_preview = result.output,
-                .output_truncated = result.output.len > 256,
-                .result_summary = if (result.success) "completed" else "failed",
-                .command = command,
-                .files = files,
-                .run_id = self.current_run_id,
-            } };
-            self.observer.recordEvent(&tool_event);
+            if (!blocked[i] or preflightBlockEmitsToolResult(blocked_sources[i])) {
+                const tool_event = ObserverEvent{ .tool_call = .{
+                    .tool = call.name,
+                    .duration_ms = ordered_durations[i],
+                    .success = result.success,
+                    .tool_use_id = tool_use_id,
+                    .output_preview = result.output,
+                    .output_truncated = result.output.len > 256,
+                    .result_summary = if (result.success) "completed" else "failed",
+                    .command = command,
+                    .files = files,
+                    .run_id = self.current_run_id,
+                } };
+                self.observer.recordEvent(&tool_event);
+            }
             try results_buf.append(self.allocator, result);
         }
     }
@@ -12389,6 +12431,72 @@ test "approval gate: supervised read-only tool auto-approves without pending" {
     try std.testing.expect(agent.pending_tool_approval == null);
 }
 
+test "approval gate: supervised local artifact writes auto-approve while public and unknown tools still require approval" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+    var agent = try makeSupervisedAgent(allocator, &policy, noop.observer());
+    defer agent.deinit();
+
+    const create_call = ParsedToolCall{ .name = "artifact_create", .arguments_json = "{}", .tool_call_id = null };
+    const create_result = agent.preflightToolPolicy(create_call);
+    try std.testing.expect(create_result == .allowed);
+    try std.testing.expect(agent.pending_tool_approval == null);
+
+    const update_call = ParsedToolCall{ .name = "artifact_update", .arguments_json = "{}", .tool_call_id = null };
+    const update_result = agent.preflightToolPolicy(update_call);
+    try std.testing.expect(update_result == .allowed);
+    try std.testing.expect(agent.pending_tool_approval == null);
+
+    const share_call = ParsedToolCall{ .name = "artifact_share", .arguments_json = "{}", .tool_call_id = null };
+    const share_result = agent.preflightToolPolicy(share_call);
+    try std.testing.expect(share_result == .blocked);
+    try std.testing.expectEqual(Agent.ToolPreflightSource.approval_required, share_result.blocked.source);
+    try std.testing.expect(agent.pending_tool_approval != null);
+    agent.clearPendingToolApproval();
+
+    const shell_call = ParsedToolCall{ .name = "shell", .arguments_json = "{\"command\":\"echo hi\"}", .tool_call_id = null };
+    const shell_result = agent.preflightToolPolicy(shell_call);
+    try std.testing.expect(shell_result == .blocked);
+    try std.testing.expectEqual(Agent.ToolPreflightSource.approval_required, shell_result.blocked.source);
+    agent.clearPendingToolApproval();
+
+    const unknown_call = ParsedToolCall{ .name = "mcp_unknown_tool", .arguments_json = "{}", .tool_call_id = null };
+    const unknown_result = agent.preflightToolPolicy(unknown_call);
+    try std.testing.expect(unknown_result == .blocked);
+    try std.testing.expectEqual(Agent.ToolPreflightSource.approval_required, unknown_result.blocked.source);
+}
+
+test "approval gate: artifact auto-approve still respects plan and read-only modes" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+
+    {
+        const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+        var agent = try makeSupervisedAgent(allocator, &policy, noop.observer());
+        defer agent.deinit();
+        agent.execution_mode = .plan;
+
+        const call = ParsedToolCall{ .name = "artifact_create", .arguments_json = "{}", .tool_call_id = null };
+        const result = agent.preflightToolPolicy(call);
+        try std.testing.expect(result == .blocked);
+        try std.testing.expectEqual(Agent.ToolPreflightSource.execution_mode, result.blocked.source);
+        try std.testing.expect(agent.pending_tool_approval == null);
+    }
+
+    {
+        const policy = SecurityPolicy{ .autonomy = .read_only, .workspace_dir = "/tmp" };
+        var agent = try makeSupervisedAgent(allocator, &policy, noop.observer());
+        defer agent.deinit();
+
+        const call = ParsedToolCall{ .name = "artifact_create", .arguments_json = "{}", .tool_call_id = null };
+        const result = agent.preflightToolPolicy(call);
+        try std.testing.expect(result == .blocked);
+        try std.testing.expect(result.blocked.source != .approval_required);
+        try std.testing.expect(agent.pending_tool_approval == null);
+    }
+}
+
 test "approval gate: operator-only tool denies under supervised" {
     const meta = tool_metadata.ToolMetadata{
         .name = "admin_ops",
@@ -12815,6 +12923,34 @@ test "approval-required tool stops serial dispatch before later safe tools run" 
     try std.testing.expect(std.mem.indexOf(u8, results_buf.items[0].output, "Approval required") != null);
     try std.testing.expectEqual(@as(usize, 0), tracker.count());
     try std.testing.expectEqual(@as(usize, 0), runtime_impl.call_count);
+}
+
+test "approval-required checkpoint emits no failed tool_result observer event" {
+    const allocator = std.testing.allocator;
+    var capture = CapturingToolEventObserver.init(allocator);
+    defer capture.deinit();
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+    var agent = try makeSupervisedAgent(allocator, &policy, capture.observer());
+    defer agent.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const calls = [_]ParsedToolCall{.{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"echo hi\"}",
+        .tool_call_id = "call-approval-checkpoint",
+    }};
+    var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
+    defer results_buf.deinit(allocator);
+    try results_buf.ensureTotalCapacity(allocator, calls.len);
+    try agent.executeToolCallsSerial(arena.allocator(), 0, calls[0..], &results_buf);
+
+    try std.testing.expectEqual(@as(usize, 1), results_buf.items.len);
+    try std.testing.expect(agent.pending_tool_approval != null);
+    try std.testing.expect(std.mem.indexOf(u8, results_buf.items[0].output, "Approval required") != null);
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    try std.testing.expectEqual(@as(@TypeOf(capture.events.items[0].kind), .start), capture.events.items[0].kind);
 }
 
 test "turn returns approval prompt without another provider roundtrip" {

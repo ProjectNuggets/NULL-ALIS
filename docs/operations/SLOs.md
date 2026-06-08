@@ -81,6 +81,12 @@ the metric-driven view. The SLO targets themselves still live in
 > registry (`MetricsRegistryObserver` in `src/gateway.zig`). They render on every
 > scrape with HELP/TYPE; none is a V1 launch gate, but operators get them for free.
 
+Artifact `artifact_create` and `artifact_update` are local editable writes
+that auto-approve in supervised mode. They count as
+`nullalis_approval_decision_total{result="auto_approved"}`, not
+`result="issued"`. Public artifact sharing and rendered file generation
+remain confirmation-gated when policy requires approval.
+
 The catalog above mirrors `metricsPayload()` in `src/gateway.zig` and the
 S5-family HELP/TYPE block plus the registry-driven series. If you find a
 metric in the source that is not listed above, add it. If you find a row

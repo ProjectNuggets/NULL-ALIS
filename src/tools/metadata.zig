@@ -20,6 +20,11 @@ pub const ToolFlags = packed struct {
     background_safe: bool = false,
     operator_only: bool = false,
     concurrency_safe: bool = false,
+    /// Narrow supervised-mode bypass for local, editable artifact writes.
+    /// `ToolMetadata.validate()` constrains this to low-risk, class-A,
+    /// non-operator mutating tools so it cannot silently broaden to shell,
+    /// integrations, sharing, or rendered file generation.
+    supervised_auto_approve: bool = false,
     /// **D1.14** — opts a tool into the generalized
     /// `tools/result_cache.zig` cache. When true, the dispatcher
     /// checks the cache for a matching `(tool_name, args_json,
@@ -35,6 +40,9 @@ pub const ToolFlags = packed struct {
     /// Validate that flags are not contradictory.
     pub fn validate(self: ToolFlags) error{ContradictoryFlags}!void {
         if (self.read_only and self.mutating) return error.ContradictoryFlags;
+        if (self.supervised_auto_approve and !self.mutating) return error.ContradictoryFlags;
+        if (self.supervised_auto_approve and self.read_only) return error.ContradictoryFlags;
+        if (self.supervised_auto_approve and self.operator_only) return error.ContradictoryFlags;
         // D1.14 — caching a mutating tool is wrong; subsequent calls
         // would return stale results that miss prior writes.
         if (self.cacheable and self.mutating) return error.ContradictoryFlags;
@@ -169,6 +177,18 @@ pub const ToolMetadata = struct {
             .approval_hint = "Unknown tool — conservative policy applied",
         };
     }
+
+    pub fn validate(self: ToolMetadata) error{ ContradictoryFlags, InvalidAutoApproveMetadata }!void {
+        try self.flags.validate();
+        if (self.flags.supervised_auto_approve) {
+            if (!self.flags.mutating or self.flags.read_only or self.flags.operator_only) {
+                return error.InvalidAutoApproveMetadata;
+            }
+            if (self.risk_level != .low or self.cost_class != .a) {
+                return error.InvalidAutoApproveMetadata;
+            }
+        }
+    }
 };
 
 // ── Tool descriptions (structured agent-facing documentation) ──
@@ -282,6 +302,7 @@ test "ToolFlags defaults are all false" {
     try std.testing.expect(!flags.background_safe);
     try std.testing.expect(!flags.operator_only);
     try std.testing.expect(!flags.concurrency_safe);
+    try std.testing.expect(!flags.supervised_auto_approve);
 }
 
 test "ToolMetadata conservative default is mutating" {
@@ -289,7 +310,42 @@ test "ToolMetadata conservative default is mutating" {
     try std.testing.expect(m.flags.mutating);
     try std.testing.expect(!m.flags.read_only);
     try std.testing.expect(!m.flags.background_safe);
+    try std.testing.expect(!m.flags.supervised_auto_approve);
     try std.testing.expectEqual(RiskLevel.high, m.risk_level);
+}
+
+test "ToolMetadata validates supervised auto-approve as low-risk class-a mutating only" {
+    const ok = ToolMetadata{
+        .name = "artifact_create",
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    };
+    try ok.validate();
+
+    const high_risk = ToolMetadata{
+        .name = "artifact_share",
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
+        .risk_level = .medium,
+        .cost_class = .a,
+    };
+    try std.testing.expectError(error.InvalidAutoApproveMetadata, high_risk.validate());
+
+    const expensive = ToolMetadata{
+        .name = "produce_document",
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
+        .risk_level = .low,
+        .cost_class = .b,
+    };
+    try std.testing.expectError(error.InvalidAutoApproveMetadata, expensive.validate());
+
+    const read_only = ToolMetadata{
+        .name = "artifact_get",
+        .flags = .{ .read_only = true, .supervised_auto_approve = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    };
+    try std.testing.expectError(error.ContradictoryFlags, read_only.validate());
 }
 
 test "metadataFor uses declared metadata" {

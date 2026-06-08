@@ -182,14 +182,23 @@ absence of correlation, not as an error.
 7. A `tool_start` for a given `tool_use_id` precedes its `tool_result`.
 8. When an `approval_required` is emitted, the underlying tool does **not**
    run until the operator resolves it via `/approve` (see Section 2).
+9. `approval_required` is a waiting checkpoint, not an executed tool
+   failure. New runtimes do not emit a failed `tool_result` for that
+   checkpoint; clients should render the approval event as blocked/pending.
 
 ## 2. Approval Behavior
 
 Supervised mutating tools gate their execution through a generic,
-single-slot approval queue. The runtime exposes ONE canonical model;
-the REST surface (`POST /api/v1/users/{user_id}/sessions/{session_key}/approve`)
-and the operator slash command (`/approve allow-once | deny`) both
-resolve the same slot.
+single-slot approval queue except for the narrow local editable artifact
+exception: `artifact_create` and `artifact_update` are auto-approved in
+supervised mode because they only write authenticated, editable canvas
+state. Public sharing (`artifact_share`), rendered file generation
+(`produce_document`), shell, filesystem writes, browser/session tools,
+integrations, unknown/MCP tools, and other mutating tools remain approval
+gated by their metadata. The runtime exposes ONE canonical model; the REST
+surface (`POST /api/v1/users/{user_id}/sessions/{session_key}/approve`)
+and the operator slash command (`/approve allow-once | deny`) both resolve
+the same slot.
 
 ### Runtime semantics (as implemented)
 
@@ -199,7 +208,16 @@ resolve the same slot.
   `risk_level`. New frames also carry the canonical `approval_id`, numeric
   `id`, `tool_call_id`, `created_at`, and `expires_at` fields that match
   session detail. The underlying tool call does not execute and is held as
-  a pending approval owned by the session.
+  a pending approval owned by the session. This event is not paired with a
+  failed `tool_result`; provider transcript hygiene still receives an
+  internal blocked result, but stream clients should treat the visible state
+  as waiting for approval.
+- **Artifact local-edit exception.** In supervised mode,
+  `artifact_create` and `artifact_update` resolve to `auto_approve` and
+  execute immediately. They should increment
+  `approval_decision_total{result="auto_approved"}` through the same
+  approval policy path. `artifact_share` remains approval-gated because it
+  mints a public URL.
 - **Resolution via REST.** The FE calls
   `POST /api/v1/users/{user_id}/sessions/{session_key}/approve` with body
   `{"approved": bool, "approval_id": "apr-<u64>"}`. `approved: true`

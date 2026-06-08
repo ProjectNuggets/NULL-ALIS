@@ -75,6 +75,16 @@ test "S6.5 approvals: irreversible-action surface is documented as requiring app
     try std.testing.expect(std.mem.indexOf(u8, contract, "supervised_mutating_requires_approval") != null);
 }
 
+test "S6.5 approvals: local artifact edit exception is documented without exempting public share" {
+    const contract = try harness.loadProjectFile("docs/online-agent-contract.md");
+    const yaml = try harness.loadProjectFile("docs/openapi-v1.yaml");
+    try std.testing.expect(std.mem.indexOf(u8, contract, "artifact_create") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contract, "artifact_update") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contract, "artifact_share` remains approval-gated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, yaml, "artifact_create") != null);
+    try std.testing.expect(std.mem.indexOf(u8, yaml, "artifact_share") != null);
+}
+
 test "S6.5 approvals: approval_id_mismatch error code is documented in OpenAPI" {
     const yaml = try harness.loadProjectFile("docs/openapi-v1.yaml");
     if (std.mem.indexOf(u8, yaml, "approval_id_mismatch") == null) {

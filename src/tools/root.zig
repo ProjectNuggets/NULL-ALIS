@@ -719,13 +719,13 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     // create + update mutate; get + list are read-only.
     .{
         .name = artifact_create.ArtifactCreateTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .a,
     },
     .{
         .name = artifact_update.ArtifactUpdateTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -3338,8 +3338,25 @@ test "defaultMetadataRegistry has unique tool names" {
 test "defaultMetadataRegistry flags all validate" {
     const registry = defaultMetadataRegistry();
     for (registry) |entry| {
-        try entry.flags.validate();
+        try entry.validate();
     }
+}
+
+test "defaultMetadataRegistry auto-approves only local editable artifact writes" {
+    const registry = defaultMetadataRegistry();
+    const create = metadata.lookupMetadata("artifact_create", registry) orelse return error.TestUnexpectedResult;
+    const update = metadata.lookupMetadata("artifact_update", registry) orelse return error.TestUnexpectedResult;
+    const share = metadata.lookupMetadata("artifact_share", registry) orelse return error.TestUnexpectedResult;
+    const produce = metadata.lookupMetadata("produce_document", registry) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(create.flags.mutating);
+    try std.testing.expect(create.flags.supervised_auto_approve);
+    try std.testing.expect(update.flags.mutating);
+    try std.testing.expect(update.flags.supervised_auto_approve);
+
+    try std.testing.expect(share.flags.mutating);
+    try std.testing.expect(!share.flags.supervised_auto_approve);
+    try std.testing.expect(!produce.flags.supervised_auto_approve);
 }
 
 test "defaultMetadataRegistry classifies known read-only tools" {
@@ -3368,12 +3385,12 @@ test "defaultMetadataRegistry classifies known mutating tools" {
     // tools still classify" test below.
     const registry = defaultMetadataRegistry();
     const mutating = [_][]const u8{
-        "shell",                "file_write",         "file_edit",   "file_append",
-        "git_operations",       "memory_store",       "memory_edit", "memory_forget",
-        "schedule",             "message",            "pushover",    "cron_add",
-        "cron_remove",          "cron_update",        "cron_run",    "http_request",
-        "browser_new_session",  "browser_navigate",   "browser_exec", "browser_close_session",
-        "composio",             "skill_registry",     "task_stop",
+        "shell",               "file_write",       "file_edit",    "file_append",
+        "git_operations",      "memory_store",     "memory_edit",  "memory_forget",
+        "schedule",            "message",          "pushover",     "cron_add",
+        "cron_remove",         "cron_update",      "cron_run",     "http_request",
+        "browser_new_session", "browser_navigate", "browser_exec", "browser_close_session",
+        "composio",            "skill_registry",   "task_stop",
     };
     for (mutating) |name| {
         const m = metadata.lookupMetadata(name, registry) orelse {
@@ -3420,17 +3437,18 @@ test "defaultMetadataRegistry only whitelists expected background_safe tools" {
         // that needs to summarize "last week's artifacts" etc). The
         // create + update variants are explicitly NOT background-safe
         // (mutating; require an authenticated turn context).
-        "artifact_get", "artifact_list",
+        "artifact_get",       "artifact_list",
         // 2026-05-25 surface-audit close — read-only artifact diff +
         // history tools. Same posture as get + list: safe to run from
         // a cron summary job. The mutating share + revoke_share
         // variants are explicitly NOT here.
-        "artifact_diff", "artifact_history",
+        "artifact_diff",    "artifact_history",
         // 2026-05-25 surface-audit close — memory_doctor + trace_query
         // are pure in-process diagnostics. Memory doctor inspects RAM
         // counters + capabilities; trace_query reads a bounded RAM
         // store. Both are safe to run from a scheduled lane.
-        "memory_doctor", "trace_query",
+          "memory_doctor",
+        "trace_query",
     };
 
     // Everything in the whitelist must be background_safe.
