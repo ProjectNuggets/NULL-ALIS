@@ -1198,10 +1198,11 @@ fn sanitizeTitle(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 
 // ── Renderer dispatch ────────────────────────────────────────────────
 
-/// PDF: try pandoc → wkhtmltopdf → weasyprint. Each fallback is attempted
-/// only if the binary genuinely could not be invoked (FileNotFound), not if
-/// the renderer ran but errored on the input. That keeps the error surfaced
-/// to the agent specific and actionable.
+/// PDF: try pandoc+xelatex → pandoc default LaTeX → wkhtmltopdf → weasyprint.
+/// The xelatex path is first because pdflatex rejects common Unicode input
+/// (emoji, symbols, non-Latin text) that the UI artifact surface can produce.
+/// Fallbacks are attempted only for infrastructure gaps or the known pdflatex
+/// Unicode failure shape, not for arbitrary renderer/content failures.
 ///
 /// Branding: when `resolved_branding` is non-null we ask pandoc to use
 /// xelatex (the only pdflatex variant that handles OTF/TTF natively) and
@@ -1220,6 +1221,7 @@ fn renderPdf(
 ) !ToolResult {
     const meta = try metadataArg(allocator, "title", title);
     defer allocator.free(meta);
+    var pandoc_spawn_missing = false;
 
     if (resolved_branding) |rb| {
         const mainfont_arg = try std.fmt.allocPrint(allocator, "mainfont={s}", .{rb.body_font_family});
@@ -1252,53 +1254,76 @@ fn renderPdf(
                 if (r.error_msg) |em| allocator.free(em);
                 // Fall through to plain pandoc path below.
             },
-            .binary_missing => |bm| allocator.free(bm),
-            .binary_missing_static => {},
+            .binary_missing => |bm| {
+                allocator.free(bm);
+                pandoc_spawn_missing = true;
+            },
+            .binary_missing_static => pandoc_spawn_missing = true,
         }
     }
 
-    // Plain pandoc (no branding, or branded retry fell through).
-    const pandoc_args = [_][]const u8{
-        "pandoc",     src_path, "-o", out_path,
-        "--metadata", meta,
-    };
+    if (!pandoc_spawn_missing) {
+        const xelatex_args = [_][]const u8{
+            "pandoc",       src_path,  "-o",         out_path,
+            "--pdf-engine", "xelatex", "--metadata", meta,
+        };
 
-    const pandoc_attempt = runRenderer(allocator, &pandoc_args, "pandoc");
-    switch (pandoc_attempt) {
-        .success => |s| return s,
-        .ran_but_failed => |r| {
-            // HI-04 / CR-03 (v1.14.22): pandoc returned non-zero, but it
-            // may have run successfully INTO a missing LaTeX engine —
-            // exactly the shape the D63 Dockerfile produced before the
-            // texlive-xetex install. Mirror the xelatex-missing
-            // detection above; when pandoc's stderr indicates a missing
-            // pdf engine, fall through to weasyprint instead of
-            // surfacing pandoc's cryptic "pdflatex: not found".
-            const stderr = if (r.error_msg) |em| em else "";
-            const latex_engine_missing =
-                (std.mem.indexOf(u8, stderr, "pdflatex") != null and
-                    (std.mem.indexOf(u8, stderr, "not found") != null or
-                        std.mem.indexOf(u8, stderr, "No such file") != null or
-                        std.mem.indexOf(u8, stderr, "command not found") != null)) or
-                (std.mem.indexOf(u8, stderr, "xelatex") != null and
-                    (std.mem.indexOf(u8, stderr, "not found") != null or
-                        std.mem.indexOf(u8, stderr, "No such file") != null or
-                        std.mem.indexOf(u8, stderr, "command not found") != null)) or
-                std.mem.indexOf(u8, stderr, "latex engine") != null;
+        const xelatex_attempt = runRenderer(allocator, &xelatex_args, "pandoc");
+        switch (xelatex_attempt) {
+            .success => |s| return s,
+            .ran_but_failed => |r| {
+                const stderr = if (r.error_msg) |em| em else "";
+                if (!isPlainXelatexFallbackReason(stderr)) {
+                    return r;
+                }
+                std.log.scoped(.produce_document).warn(
+                    "pandoc xelatex PDF render failed due to missing xelatex/font support — retrying default pandoc PDF path. Install texlive-xetex for Unicode-safe PDFs. stderr: {s}",
+                    .{stderr},
+                );
+                freeRendererFailure(allocator, r);
+                // Fall through to default pandoc path below.
+            },
+            .binary_missing => |bm| {
+                allocator.free(bm);
+                pandoc_spawn_missing = true;
+            },
+            .binary_missing_static => pandoc_spawn_missing = true,
+        }
+    }
 
-            if (!latex_engine_missing) return r;
+    if (!pandoc_spawn_missing) {
+        // Default pandoc PDF path, kept as compatibility fallback for hosts
+        // that have pandoc+pdflatex but have not installed texlive-xetex.
+        const pandoc_args = [_][]const u8{
+            "pandoc",     src_path, "-o", out_path,
+            "--metadata", meta,
+        };
 
-            std.log.scoped(.produce_document).warn(
-                "pandoc PDF render failed (LaTeX engine missing) — falling through to weasyprint. Install texlive-xetex for native LaTeX rendering. stderr: {s}",
-                .{stderr},
-            );
-            if (r.output.len > 0) allocator.free(r.output);
-            if (r.error_msg) |em| allocator.free(em);
-            // Fall through to wkhtmltopdf / weasyprint below.
-        },
-        .binary_missing => |bm| allocator.free(bm),
-        // Wave 2 review HIGH#1 — static message; do NOT free.
-        .binary_missing_static => {},
+        const pandoc_attempt = runRenderer(allocator, &pandoc_args, "pandoc");
+        switch (pandoc_attempt) {
+            .success => |s| return s,
+            .ran_but_failed => |r| {
+                // HI-04 / CR-03 (v1.14.22): pandoc returned non-zero, but it
+                // may have run successfully INTO a missing LaTeX engine —
+                // exactly the shape the D63 Dockerfile produced before the
+                // texlive-xetex install. Unicode failures from pdflatex have
+                // the same operator action: use xelatex or an HTML renderer.
+                const stderr = if (r.error_msg) |em| em else "";
+                if (!isLatexEngineMissing(stderr) and !isPdfLatexUnicodeFailure(stderr)) {
+                    return r;
+                }
+
+                std.log.scoped(.produce_document).warn(
+                    "default pandoc PDF render failed due to LaTeX capability gap — falling through to wkhtmltopdf/weasyprint. Install texlive-xetex for Unicode-safe PDFs. stderr: {s}",
+                    .{stderr},
+                );
+                freeRendererFailure(allocator, r);
+                // Fall through to wkhtmltopdf / weasyprint below.
+            },
+            .binary_missing => |bm| allocator.free(bm),
+            // Wave 2 review HIGH#1 — static message; do NOT free.
+            .binary_missing_static => {},
+        }
     }
 
     // pandoc missing — try wkhtmltopdf.
@@ -1338,11 +1363,13 @@ fn renderPdf(
     return ToolResult{ .success = false, .output = "", .error_msg = msg };
 }
 
+fn freeRendererFailure(allocator: std.mem.Allocator, result: ToolResult) void {
+    if (result.output.len > 0) allocator.free(result.output);
+    if (result.error_msg) |em| allocator.free(em);
+}
+
 fn isBrandedPdfFallbackReason(stderr: []const u8) bool {
-    const xelatex_missing = std.mem.indexOf(u8, stderr, "xelatex") != null and
-        (std.mem.indexOf(u8, stderr, "not found") != null or
-            std.mem.indexOf(u8, stderr, "No such file") != null or
-            std.mem.indexOf(u8, stderr, "command not found") != null);
+    const xelatex_missing = isLatexBinaryMissing(stderr, "xelatex");
     const font_lookup_failed =
         std.mem.indexOf(u8, stderr, "mktextfm") != null or
         std.mem.indexOf(u8, stderr, "mktexmf") != null or
@@ -1350,6 +1377,28 @@ fn isBrandedPdfFallbackReason(stderr: []const u8) bool {
         std.mem.indexOf(u8, stderr, "I can't find file") != null or
         std.mem.indexOf(u8, stderr, "fontspec Error") != null;
     return xelatex_missing or font_lookup_failed;
+}
+
+fn isPlainXelatexFallbackReason(stderr: []const u8) bool {
+    return isBrandedPdfFallbackReason(stderr) or isLatexEngineMissing(stderr);
+}
+
+fn isLatexEngineMissing(stderr: []const u8) bool {
+    return isLatexBinaryMissing(stderr, "pdflatex") or
+        isLatexBinaryMissing(stderr, "xelatex") or
+        std.mem.indexOf(u8, stderr, "latex engine") != null;
+}
+
+fn isLatexBinaryMissing(stderr: []const u8, binary_name: []const u8) bool {
+    return std.mem.indexOf(u8, stderr, binary_name) != null and
+        (std.mem.indexOf(u8, stderr, "not found") != null or
+            std.mem.indexOf(u8, stderr, "No such file") != null or
+            std.mem.indexOf(u8, stderr, "command not found") != null);
+}
+
+fn isPdfLatexUnicodeFailure(stderr: []const u8) bool {
+    return std.mem.indexOf(u8, stderr, "LaTeX Error: Unicode character") != null and
+        std.mem.indexOf(u8, stderr, "not set up for use with LaTeX") != null;
 }
 
 /// DOCX: pandoc's font handling is via a `--reference-doc=<path>`
@@ -2308,6 +2357,54 @@ test "PDF branding fallback detects missing registered font" {
 test "PDF branding fallback detects missing xelatex only when relevant" {
     try std.testing.expect(isBrandedPdfFallbackReason("xelatex: command not found"));
     try std.testing.expect(!isBrandedPdfFallbackReason("pandoc failed because markdown is invalid"));
+}
+
+test "PDF renderer classifiers distinguish pdflatex Unicode failure from arbitrary pandoc errors" {
+    const unicode_stderr =
+        "pandoc exit=43: Error producing PDF.\n" ++
+        "! LaTeX Error: Unicode character ❌ (U+274C) not set up for use with LaTeX.";
+    try std.testing.expect(isPdfLatexUnicodeFailure(unicode_stderr));
+    try std.testing.expect(!isPdfLatexUnicodeFailure("pandoc exit=43: markdown syntax error"));
+    try std.testing.expect(isLatexEngineMissing("pdflatex: command not found"));
+    try std.testing.expect(isPlainXelatexFallbackReason("xelatex: No such file or directory"));
+}
+
+test "produce_document PDF uses Unicode-safe renderer when pandoc and xelatex are installed" {
+    const allocator = std.testing.allocator;
+    if (!rendererBinaryAvailable(allocator, "pandoc")) return error.SkipZigTest;
+    if (!rendererBinaryAvailable(allocator, "xelatex")) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(ws);
+
+    var pd = ProduceDocumentTool{ .workspace_dir = ws };
+    var args = std.json.ObjectMap.init(allocator);
+    defer args.deinit();
+    try args.put("format", std.json.Value{ .string = "pdf" });
+    try args.put("title", std.json.Value{ .string = "Unicode PDF Smoke" });
+    try args.put("content", std.json.Value{ .string = "# Status\n\nStatus: ❌" });
+
+    const result = try pd.execute(allocator, args);
+    defer {
+        if (result.output.len > 0) allocator.free(result.output);
+        if (result.error_msg) |em| allocator.free(em);
+    }
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, ".pdf") != null);
+}
+
+fn rendererBinaryAvailable(allocator: std.mem.Allocator, binary_name: []const u8) bool {
+    const argv = [_][]const u8{ binary_name, "--version" };
+    const result = process_util.run(allocator, &argv, .{
+        .max_output_bytes = 16 * 1024,
+        .timeout_ns = 10 * std.time.ns_per_s,
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return result.success;
 }
 
 test "Wave2-HIGH5: produced filename includes CSPRNG nonce — 100 same-title invocations yield 100 distinct paths" {

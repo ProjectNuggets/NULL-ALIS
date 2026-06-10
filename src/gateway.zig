@@ -12153,6 +12153,29 @@ fn producedContentType(format: []const u8) []const u8 {
     return "application/octet-stream";
 }
 
+fn isArtifactExportRendererUnavailable(err: []const u8) bool {
+    if (std.mem.indexOf(u8, err, "renderer not available") != null) return true;
+    if (std.mem.indexOf(u8, err, "not installed") != null) return true;
+    if (std.mem.indexOf(u8, err, "Failed to invoke") != null) return true;
+    if (std.mem.indexOf(u8, err, "FileNotFound") != null) return true;
+    if (std.mem.indexOf(u8, err, "command not found") != null) return true;
+    if (std.mem.indexOf(u8, err, "No such file or directory") != null) return true;
+    if (std.mem.indexOf(u8, err, "No module named") != null) return true;
+    if (std.mem.indexOf(u8, err, "ModuleNotFoundError") != null) return true;
+    if (std.mem.indexOf(u8, err, "install:") != null) return true;
+    if (std.mem.indexOf(u8, err, "Install:") != null) return true;
+    if (std.mem.indexOf(u8, err, "Install via:") != null) return true;
+
+    const latex_binary_missing =
+        (std.mem.indexOf(u8, err, "pdflatex") != null or
+            std.mem.indexOf(u8, err, "xelatex") != null) and
+        (std.mem.indexOf(u8, err, "not found") != null or
+            std.mem.indexOf(u8, err, "No such file") != null);
+    if (latex_binary_missing) return true;
+
+    return false;
+}
+
 fn handleArtifactExport(
     allocator: std.mem.Allocator,
     method: []const u8,
@@ -12343,14 +12366,10 @@ fn handleArtifactExport(
         // so callers can distinguish "binary not installed in image" from
         // "user-provided content was rejected". `produce_document` includes
         // install-hint phrases like "install:" / "not found" / "Install" in
-        // those error strings.
-        const is_renderer_gap = std.mem.indexOf(u8, err, "install:") != null or
-            std.mem.indexOf(u8, err, "Install:") != null or
-            std.mem.indexOf(u8, err, "install ") != null or
-            std.mem.indexOf(u8, err, "not found") != null or
-            std.mem.indexOf(u8, err, "FileNotFound") != null or
-            std.mem.indexOf(u8, err, "marp-cli") != null or
-            std.mem.indexOf(u8, err, "pandoc") != null;
+        // those error strings. Keep this classifier narrow: a renderer
+        // process that ran and rejected content (for example, pandoc exit=43
+        // on a LaTeX Unicode error) is `export_failed`, not infrastructure.
+        const is_renderer_gap = isArtifactExportRendererUnavailable(err);
         // F10 (S5 code-review pass): the metric label now MIRRORS the
         // HTTP status split. A missing renderer binary (502) is
         // `renderer_unavailable` — an infra/install problem operators
@@ -35101,6 +35120,16 @@ test "producedContentType returns the right MIME for each format" {
     );
     try std.testing.expectEqualStrings("text/html; charset=utf-8", producedContentType("html"));
     try std.testing.expectEqualStrings("application/octet-stream", producedContentType("???"));
+}
+
+test "artifact export renderer classifier keeps pandoc content failures out of renderer_unavailable" {
+    const unicode_err =
+        "pandoc exit=43: Error producing PDF. " ++
+        "! LaTeX Error: Unicode character ❌ (U+274C) not set up for use with LaTeX.";
+    try std.testing.expect(!isArtifactExportRendererUnavailable(unicode_err));
+    try std.testing.expect(isArtifactExportRendererUnavailable("pandoc not installed — required for HTML rendering. Install via: brew install pandoc"));
+    try std.testing.expect(isArtifactExportRendererUnavailable("Failed to invoke pandoc: FileNotFound"));
+    try std.testing.expect(isArtifactExportRendererUnavailable("ModuleNotFoundError: No module named 'openpyxl'"));
 }
 
 // ─── Wave 2A — export bridge handler ───────────────────────────────────
