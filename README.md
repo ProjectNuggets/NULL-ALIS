@@ -17,22 +17,27 @@ Scope of this declaration:
 - Defer larger upstream ports to controlled cherry-pick/upsert tracks.
 - Prioritize clean reproducibility over new feature intake.
 
-Current verified baseline:
-- Full tests pass: `zig build test --summary all` (`4709` passed, `25` skipped).
+Current verified baseline (2026-06-10, code truth at HEAD):
+- Full tests pass on the canonical production profile:
+  `zig build test -Dengines=base,sqlite,postgres -Dchannels=cli,telegram --summary all`.
 - Build passes with production engines: `zig build -Dengines=base,sqlite,postgres`.
-- Postgres-backed tenant runtime is the authoritative state path when configured.
-- Current validated `zaki_bot` runtime posture is Together-first:
-  `together-ai/moonshotai/kimi-k2.5` primary, `openrouter` fallback,
-  `together-ai` embeddings.
-- Chat SSE contract is stable, with additive `progress` events for live UX (`status/progress/token/done`).
+- Postgres-backed tenant runtime is the authoritative state path; the `zaki_bot`
+  profile hard-fails startup without it (`src/config.zig` validation).
+- `zaki_bot` profile model posture (code default, `src/config.zig:applyProfileDefaults`):
+  **Moonshot-native `kimi-k2.6` primary**, `together/moonshotai/Kimi-K2.6` cross-provider
+  fallback, `together` embeddings + extraction sidecar. `TOGETHER_API_KEY` is mandatory.
+  A rendered deployment config may pin a different primary; the deployed value is owned
+  by `zaki-infra` (see [config authority map](docs/config-authority-map.md)).
+- Chat SSE contract is stable, with per-turn `usage_tokens`/`input_tokens`/`output_tokens`/
+  `cost_usd` on the `done` frame (WO-03).
 
 References:
-- [V1 ship-readiness criteria](docs/v1-ship-readiness-criteria.md)
-- [V1 triage (must / nice / defer)](docs/v1-triage.md)
+- [V1 production readiness report](docs/operations/v1-readiness-report.md) — the signed backend baseline
+- [V1 verification matrix](docs/operations/verification-matrix.md)
 - [ZAKI runtime contract](docs/zaki-runtime-contract.md)
 - [ops runbook](docs/reliability-ops-runbook.md)
 - [SLO targets](docs/SLO.md)
-- [historical releases](docs/archive/releases/) — v0.1 declaration, public posture, v1.1 plan
+- [historical releases](docs/archive/) — v0.1 declaration, ship-readiness criteria, v1-triage (archived 2026-05-22)
 
 ## What nullALIS Is
 
@@ -116,9 +121,10 @@ Ops stack:
 - Reference manifests and handoff docs live under `deploy/k8s/zaki-bot/` for local/dev and contract reference.
 
 Current-truth rule:
-1. Read [V1 ship-readiness criteria](docs/v1-ship-readiness-criteria.md) first.
-2. Use [ZAKI runtime contract](docs/zaki-runtime-contract.md) as the deployment/runtime contract.
-3. Treat `docs/archive/*` and `deploy/k8s/zaki-bot/*` as historical/reference unless a current document says otherwise.
+1. **Code truth beats doc truth.** When a doc disagrees with `src/`, the code wins; fix or archive the doc in the same pass.
+2. Read [V1 production readiness report](docs/operations/v1-readiness-report.md) first.
+3. Use [ZAKI runtime contract](docs/zaki-runtime-contract.md) as the deployment/runtime contract.
+4. Treat `docs/archive/*` and `deploy/k8s/zaki-bot/*` as historical/reference unless a current document says otherwise.
 
 ## Architecture At a Glance
 

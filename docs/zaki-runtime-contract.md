@@ -7,14 +7,25 @@ tags: [prose, prose/docs]
 This document defines the production runtime contract for running Nullalis as the
 internal agent service behind `zaki-prod`.
 
-Current validated baseline:
+Current validated baseline (code truth at HEAD, 2026-06-10 — see
+`src/config.zig:applyProfileDefaults` for the authoritative defaults):
 - `profile = "zaki_bot"`
-- primary chat model = `together-ai/moonshotai/kimi-k2.5`
-- chat fallback chain = `openrouter`
-- embedding provider = `together-ai`
-- `state.backend = "postgres"`
+- primary chat model = `moonshot` / `kimi-k2.6` (Moonshot native API; Kimi
+  `thinking` cross-turn reasoning round-trip enabled on this route)
+- chat fallback chain = `together/moonshotai/Kimi-K2.6` (auto-injected by the
+  profile when the operator does not pin a different primary; Together receives
+  its own model ID via the per-provider override)
+- embedding provider = `together`; extraction sidecar =
+  `together` / `meta-llama/Llama-3.3-70B-Instruct-Turbo`
+- `TOGETHER_API_KEY` is mandatory (profile validation hard-fails without it)
+- `state.backend = "postgres"` (hard requirement)
 - `scheduler_backend = "postgres"`
 - `degraded = false`
+
+Historical note: the pre-2026-05-21 baseline was Together-first
+`moonshotai/kimi-k2.5` with `openrouter` fallback. The deployed value is owned
+by the `zaki-infra` rendered config; this section documents the code default
+that applies when the rendered config does not pin a primary.
 
 Frozen ZAKI memory contract:
 - Postgres is the canonical durable source of truth.
@@ -61,10 +72,13 @@ Never store per-user config in Helm values, ConfigMaps, or env vars.
 The deployed config file should contain non-secret settings only:
 
 - `profile: "zaki_bot"`
-- `agents.defaults.model.primary: "together-ai/moonshotai/kimi-k2.5"`
-- `agents.defaults.model.fallbacks[0]: "openrouter/<validated-fallback-model>"`
-- `models.providers["together-ai"].base_url: "https://api.together.xyz/v1"`
-- `models.providers["openrouter"].base_url: "https://openrouter.ai/api/v1"` when fallback is enabled
+- `agents.defaults.model.primary` — omit to inherit the profile default
+  (`moonshot/kimi-k2.6` + auto-injected Together fallback), or pin explicitly.
+  If pinned to a non-default model, the profile does NOT auto-inject a
+  fallback — set `reliability.fallback_providers` explicitly.
+- `models.providers["moonshot"].base_url: "https://api.moonshot.ai/v1"`
+- `models.providers["together"].base_url: "https://api.together.xyz/v1"`
+  (required — embeddings, sidecar, and the fallback route run on Together)
 - `gateway.host`
 - `gateway.port`
 - `tenant.enabled`
@@ -86,9 +100,14 @@ silently drift back to `public.memory_embeddings`.
 
 Supported secret env inputs for the ZAKI deployment path:
 
-- `TOGETHER_API_KEY`
-- `NULLCLAW_INTERNAL_SERVICE_TOKEN`
-- `NULLCLAW_POSTGRES_CONNECTION_STRING`
+- `MOONSHOT_API_KEY` (primary route; read by the `moonshot`/`kimi` providers —
+  `src/providers/api_key.zig`)
+- `TOGETHER_API_KEY` (mandatory: fallback route + embeddings + sidecar)
+- `NULLALIS_INTERNAL_SERVICE_TOKEN`
+- `NULLALIS_POSTGRES_CONNECTION_STRING`
+- Capability keys, fail-soft when absent: `GROQ_API_KEY` (voice STT),
+  `COMPOSIO_API_KEY` (integrations), `EXA_API_KEY`/`BRAVE_API_KEY` (web search),
+  `BROWSER_ORCHESTRATOR_AUTH_TOKEN` (server-side browser lane)
 
 Backward-compatible fallbacks still supported during migration:
 
