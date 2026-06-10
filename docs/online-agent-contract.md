@@ -151,9 +151,21 @@ Field names below match the wire schema produced by
 #### `done`
 - `session_id` (string, optional).
 - `message_id` (int, optional).
-- `usage_tokens` (uint, optional) — tokens consumed in the turn.
-- `cost_usd` (number, optional).
+- `usage_tokens` (uint, optional) — tokens consumed in the turn
+  (input + output).
+- `input_tokens` (uint, optional) — input tokens consumed in the turn.
+- `output_tokens` (uint, optional) — output tokens consumed in the turn.
+- `cost_usd` (number, optional) — provider-reported cost for the turn.
+  Only present when the runtime has real cost data (`cost_available`
+  semantics — see the usage endpoint); absence means "cost unknown",
+  never "free".
 - `run_id` (string, optional).
+
+Since WO-03 (2026-06-10) the runtime emits `usage_tokens`,
+`input_tokens`, `output_tokens`, and `cost_usd` as **per-turn deltas**
+computed from before/after UsageRuntime snapshots (the same mechanism
+as `turn_weight`/`session_weight`). They are omitted on paths without a
+usage runtime (file-tenant / CLI fallback).
 
 ### 1.4 Correlation IDs: `run_id` vs `tool_use_id`
 

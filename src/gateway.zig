@@ -9524,9 +9524,28 @@ fn sseDoneFrameToolOnly(
 /// wired or no tools ran.
 /// `session_weight`: cumulative session weight at the moment of emit.
 /// null when UsageRuntime wasn't wired.
+///
+/// 2026-06-10 (WO-03): the contract has documented optional
+/// `usage_tokens`/`cost_usd` on the done frame since V1 — they were
+/// never emitted. Now they are, as PER-TURN deltas from the same
+/// before/after UsageRuntime snapshot turn_weight uses, so the ZAKI
+/// BFF can settle its unit-wallet on real provider cost instead of
+/// estimates.
+///
+/// `usage_tokens`: total tokens consumed this turn (input + output).
+/// `input_tokens` / `output_tokens`: per-direction breakdown of
+/// usage_tokens.
+/// `cost_usd`: provider-reported cost for this turn. Only set when the
+/// usage runtime has real cost data (mirrors handleUserUsage's
+/// `cost_available` gate: session cost > 0); null otherwise so clients
+/// never mistake "pricing not wired" for "free turn".
 pub const SpendSummary = struct {
     turn_weight: ?u64 = null,
     session_weight: ?u64 = null,
+    usage_tokens: ?u64 = null,
+    input_tokens: ?u64 = null,
+    output_tokens: ?u64 = null,
+    cost_usd: ?f64 = null,
 
     pub const none: SpendSummary = .{};
 };
@@ -9537,6 +9556,18 @@ fn writeSpendFields(w: anytype, spend: SpendSummary) !void {
     }
     if (spend.session_weight) |sw| {
         try w.print(",\"session_weight\":{d}", .{sw});
+    }
+    if (spend.usage_tokens) |ut| {
+        try w.print(",\"usage_tokens\":{d}", .{ut});
+    }
+    if (spend.input_tokens) |it| {
+        try w.print(",\"input_tokens\":{d}", .{it});
+    }
+    if (spend.output_tokens) |ot| {
+        try w.print(",\"output_tokens\":{d}", .{ot});
+    }
+    if (spend.cost_usd) |cu| {
+        try w.print(",\"cost_usd\":{d}", .{cu});
     }
 }
 
@@ -10617,8 +10648,17 @@ fn handleApiChatStreamSseConnection(
     // Defaults to null on paths that don't have a UsageRuntime
     // (file-tenant or CLI-style fallback); the done frame omits the
     // fields when null.
+    //
+    // 2026-06-10 (WO-03): same before/after-snapshot pattern now also
+    // feeds per-turn token + cost deltas (usage_tokens / input_tokens /
+    // output_tokens / cost_usd) so the ZAKI BFF settles on real
+    // provider cost instead of estimates.
     var spend_usage_rt: ?*usage_runtime_mod.UsageRuntime = null;
     var session_weight_before: u64 = 0;
+    var session_tokens_before: u64 = 0;
+    var session_input_before: u64 = 0;
+    var session_output_before: u64 = 0;
+    var session_cost_before: f64 = 0;
     const outcome: ReplyOutcome = blk: {
         if (state.tenant_enabled) {
             const cfg = config_opt orelse {
@@ -10635,6 +10675,11 @@ fn handleApiChatStreamSseConnection(
             };
             spend_usage_rt = tenant_runtime.usage_rt;
             session_weight_before = tenant_runtime.usage_rt.sessionWeight();
+            const totals_before = tenant_runtime.usage_rt.sessionTotals();
+            session_tokens_before = totals_before.total;
+            session_input_before = totals_before.input;
+            session_output_before = totals_before.output;
+            session_cost_before = totals_before.cost;
             // Tenant runtime path: stream tokens directly to SSE for live delivery.
             break :blk .{ .ok = tenant_runtime.processMessageWithTurnOptions(
                 session_key,
@@ -10836,10 +10881,44 @@ fn handleApiChatStreamSseConnection(
     // weight. spend_usage_rt is set in the tenant blk above; the file-
     // tenant / CLI fallback paths leave it null and the done frame omits
     // the fields cleanly.
+    //
+    // 2026-06-10 (WO-03): the same before/after snapshot now yields the
+    // per-turn token + cost deltas the contract documented but never
+    // emitted (usage_tokens / input_tokens / output_tokens / cost_usd).
+    // Token deltas require after >= before — the counters are
+    // monotonically non-decreasing for the session lifetime, so a
+    // negative delta means snapshot skew and we emit null rather than a
+    // lie. cost_usd additionally requires real cost data (session cost
+    // > 0 — same `cost_available` gate handleUserUsage applies), so a
+    // pricing-not-wired runtime never reports turns as free.
     const spend: SpendSummary = if (spend_usage_rt) |urt| spend_blk: {
         const after = urt.sessionWeight();
         const turn = if (after >= session_weight_before) after - session_weight_before else 0;
-        break :spend_blk .{ .turn_weight = turn, .session_weight = after };
+        const totals_after = urt.sessionTotals();
+        const usage_tokens: ?u64 = if (totals_after.total >= session_tokens_before)
+            totals_after.total - session_tokens_before
+        else
+            null;
+        const input_tokens: ?u64 = if (totals_after.input >= session_input_before)
+            totals_after.input - session_input_before
+        else
+            null;
+        const output_tokens: ?u64 = if (totals_after.output >= session_output_before)
+            totals_after.output - session_output_before
+        else
+            null;
+        const cost_usd: ?f64 = if (totals_after.cost > 0.0 and totals_after.cost >= session_cost_before)
+            totals_after.cost - session_cost_before
+        else
+            null;
+        break :spend_blk .{
+            .turn_weight = turn,
+            .session_weight = after,
+            .usage_tokens = usage_tokens,
+            .input_tokens = input_tokens,
+            .output_tokens = output_tokens,
+            .cost_usd = cost_usd,
+        };
     } else .{};
     const done_owned = blk: {
         if (is_tool_only) {
@@ -30936,6 +31015,31 @@ test "baseline: sseDoneFrame is always terminal with type:done" {
     defer std.testing.allocator.free(frame_minimal);
     try std.testing.expect(std.mem.indexOf(u8, frame_minimal, "\"type\":\"done\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame_minimal, "session_id") == null);
+}
+
+test "writeSpendFields emits per-turn usage and cost when present" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try writeSpendFields(buf.writer(std.testing.allocator), .{
+        .turn_weight = 2,
+        .session_weight = 5,
+        .usage_tokens = 1234,
+        .input_tokens = 1000,
+        .output_tokens = 234,
+        .cost_usd = 0.0123,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"usage_tokens\":1234") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"input_tokens\":1000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"output_tokens\":234") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"cost_usd\":0.0123") != null);
+}
+
+test "writeSpendFields omits cost fields when absent" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try writeSpendFields(buf.writer(std.testing.allocator), .{ .turn_weight = 1 });
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "cost_usd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "usage_tokens") == null);
 }
 
 // V1.11 (2026-05-07) — Move 6 (no-placeholder UX). Two new SSE builders
