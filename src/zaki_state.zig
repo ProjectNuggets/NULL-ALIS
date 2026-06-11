@@ -17,6 +17,54 @@ const text_norm = @import("memory/text_norm.zig");
 const cron_mod = @import("cron.zig");
 const security_secrets = @import("security/secrets.zig");
 
+/// W1.1 (Fix 4) — fail-closed precondition for the entity/edge write path.
+///
+/// The W1.1 threadlocal write-boundary assertion in `zaki_postgres.zig`
+/// covers `implStore`/`implStoreWithMetadata` only. The async extraction
+/// worker (daemon heartbeat → `entity_pipeline.runOnTurn`) writes
+/// entities/edges via `upsertEntity`/`upsertMemoryEdgeRich` DIRECTLY on the
+/// Manager — it does NOT install the per-turn `ToolTenantContext`
+/// threadlocal, so that assertion does not run on this path. Isolation here
+/// relies on the queue-row `user_id` parameterized into SQL.
+///
+/// This is the defensive complement: every entity/edge write carries an
+/// explicit `user_id` argument, and a `user_id <= 0` is never a legitimate
+/// tenant (valid tenants are positive `zaki_users` ids). A zero/negative id
+/// means an uninitialized or corrupted caller — refuse before the row can
+/// land. Localized: a single integer precondition, no threadlocal, no new
+/// parameters threaded through call sites, no hot-path cost beyond one
+/// compare. Fires loud (Sentry) like the W1.1 assertion so the corruption
+/// is observable rather than silently writing under a bogus id.
+pub const EntityEdgeWriteUserIdViolation = error.EntityEdgeWriteUserIdViolation;
+
+fn assertEntityEdgeWriteUserId(user_id: i64) !void {
+    if (user_id > 0) return; // happy path — zero behavior change
+
+    var msg_buf: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &msg_buf,
+        "refused entity/edge write with non-positive user_id={d}",
+        .{user_id},
+    ) catch "refused entity/edge write with non-positive user_id (omitted)";
+    if (!builtin.is_test) {
+        std.log.err("zaki_state: {s}", .{msg});
+    }
+    sentry_runtime.globalOrFallback().captureError("entity_edge_user_id_violation", msg);
+    return error.EntityEdgeWriteUserIdViolation;
+}
+
+test "assertEntityEdgeWriteUserId accepts positive user_id" {
+    try assertEntityEdgeWriteUserId(1);
+    try assertEntityEdgeWriteUserId(2);
+    try assertEntityEdgeWriteUserId(std.math.maxInt(i64));
+}
+
+test "assertEntityEdgeWriteUserId refuses zero and negative user_id (Fix 4)" {
+    try std.testing.expectError(error.EntityEdgeWriteUserIdViolation, assertEntityEdgeWriteUserId(0));
+    try std.testing.expectError(error.EntityEdgeWriteUserIdViolation, assertEntityEdgeWriteUserId(-1));
+    try std.testing.expectError(error.EntityEdgeWriteUserIdViolation, assertEntityEdgeWriteUserId(std.math.minInt(i64)));
+}
+
 /// Session metadata returned by listUserSessions. Defined at module level
 /// so both the mock and real Postgres implementations can use it.
 pub const SessionInfo = struct {
@@ -8518,6 +8566,10 @@ const ManagerImpl = struct {
         extraction_pass: ?[]const u8, // P3: pass label (e.g. "pass_a", "pass_c")
         session_boundary_id: ?i64, // P3: milliTimestamp at boundary fire
     ) !void {
+        // W1.1 (Fix 4) — fail-closed on a bogus tenant id before the row
+        // can land. The async extraction worker bypasses the threadlocal
+        // write-boundary assertion; this guards the explicit user_id arg.
+        try assertEntityEdgeWriteUserId(user_id);
         const q = try self.buildQuery(
             "INSERT INTO {schema}.memory_edges " ++
                 "(user_id, source_key, target_key, predicate, attribution, confidence, valid_from, " ++
@@ -9232,6 +9284,10 @@ const ManagerImpl = struct {
         name: []const u8,
         embedding: []const f32,
     ) ![]u8 {
+        // W1.1 (Fix 4) — fail-closed on a bogus tenant id before the row
+        // can land. The async extraction worker bypasses the threadlocal
+        // write-boundary assertion; this guards the explicit user_id arg.
+        try assertEntityEdgeWriteUserId(user_id);
         // pgvector literal
         var emb_buf: std.ArrayListUnmanaged(u8) = .{};
         defer emb_buf.deinit(allocator);

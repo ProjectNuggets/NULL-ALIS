@@ -107,6 +107,21 @@ pub const ZakiPostgresMemory = struct {
     /// context is UNSET (`numeric_user_id == null` — e.g. an internal/MCP path
     /// that never installs the threadlocal) we SKIP the check and proceed: a
     /// missing context must never block a legitimate write.
+    ///
+    /// SCOPE (Fix 4 — precise coverage):
+    ///   COVERS: the `implStore` / `implStoreWithMetadata` memory-write path
+    ///     (the `memory` rows), where a per-turn `ToolTenantContext`
+    ///     threadlocal carries the turn's authenticated tenant to compare
+    ///     against this handle's bound `user_id`.
+    ///   DOES NOT COVER: the entity/edge write path
+    ///     (`Manager.upsertEntity` / `Manager.upsertMemoryEdgeRich`) driven
+    ///     by the ASYNC extraction worker (daemon heartbeat →
+    ///     `entity_pipeline.runOnTurn`). That path writes directly on the
+    ///     Manager and never installs the threadlocal context, so THIS
+    ///     assertion does not run there. Isolation on the entity/edge path
+    ///     relies on the queue-row `user_id` parameterized into SQL, plus a
+    ///     defensive non-positive-id precondition guard
+    ///     (`assertEntityEdgeWriteUserId` in `zaki_state.zig`).
     fn assertTenantWriteBoundary(self: *Self) !void {
         const ctx_user_id = tools_mod.getTenantContext().numeric_user_id orelse {
             // Context unset: no authenticated tenant to compare against. Never

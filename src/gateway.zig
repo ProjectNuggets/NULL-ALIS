@@ -2687,14 +2687,42 @@ fn getTenantRuntime(
             }
             sentry_runtime.globalOrFallback().captureError("tenant_runtime_key_mismatch", msg);
 
-            // Evict the skewed entry under the held mutex. fetchRemove(key) pulls
-            // the entry that .get(key) just matched and deinit() frees that one
-            // runtime exactly once — same evict-under-lock pattern the
-            // pending_destroy branch below uses, so no double-free and no
-            // iterator is held. Then fall through to create a FRESH runtime for
-            // user_ctx.user_id.
-            if (state.tenant_runtimes.fetchRemove(user_ctx.user_id)) |kv| {
-                kv.value.deinit();
+            // Evict the skewed entry. CRITICAL (Fix 2 — use-after-free): a
+            // concurrent turn may already hold this runtime pointer. The
+            // turn-start path in session.zig increments session.active_refs
+            // AFTER getTenantRuntime returns and the tenant_runtime_mutex is
+            // released, so by the time we are here on a LATER fetch a sibling
+            // turn can be mid-flight on this very runtime. An inline deinit()
+            // would free it underneath that turn. Gate on hasActiveTurns()
+            // exactly like the idle sweep (pruneTenantRuntimeCache) and the
+            // pending_destroy branch below:
+            //
+            //   - No active turns → safe to deinit() inline under the mutex,
+            //     then fall through to create a FRESH runtime for
+            //     user_ctx.user_id (request still succeeds).
+            //
+            //   - Active turns → DON'T free. Mark pending_destroy and leave
+            //     the skewed entry IN the map so the 1s maintenance sweep
+            //     frees it once turns drain (same lifecycle as the settings-
+            //     PATCH race). We must NOT serve the skewed runtime (it is
+            //     bound to the wrong tenant — the whole point of W1.2) and we
+            //     must NOT replace it in the map this turn (that would orphan
+            //     the still-referenced runtime from the sweep → leak), so the
+            //     request fails closed; the next request retries onto a fresh
+            //     runtime after the sweep reclaims the doomed one.
+            if (!runtime.session_mgr.hasActiveTurns()) {
+                if (state.tenant_runtimes.fetchRemove(user_ctx.user_id)) |kv| {
+                    kv.value.deinit();
+                }
+            } else {
+                runtime.pending_destroy.store(true, .release);
+                if (!builtin.is_test) {
+                    log.warn(
+                        "tenant.runtime.key_mismatch_active_turns — marked skewed entry pending_destroy; cache_key={s} bound_user_id={s}",
+                        .{ user_ctx.user_id, runtime.user_id },
+                    );
+                }
+                return error.TenantRuntimeKeyMismatchDraining;
             }
         } else if (!runtime.pending_destroy.load(.acquire)) {
             runtime.last_used_s.store(now_s, .release);
@@ -10694,22 +10722,25 @@ fn handleApiChatStreamSseConnection(
         err: struct { code: []const u8, msg: []const u8 },
     };
     // 2026-05-24 (v1.14.20) — spend-meter feed for the zaki-prod central
-    // usage meter. Captured BEFORE processMessage so the done frame can
-    // emit turn_weight = session_weight_after - session_weight_before.
+    // usage meter. The done frame emits per-turn token + cost + weight so
+    // the ZAKI BFF settles on real provider cost instead of estimates.
     // Defaults to null on paths that don't have a UsageRuntime
     // (file-tenant or CLI-style fallback); the done frame omits the
     // fields when null.
     //
-    // 2026-06-10 (WO-03): same before/after-snapshot pattern now also
-    // feeds per-turn token + cost deltas (usage_tokens / input_tokens /
-    // output_tokens / cost_usd) so the ZAKI BFF settles on real
-    // provider cost instead of estimates.
+    // 2026-06-11 (WO-03 hardening): the prior before/after diff of the
+    // PER-USER (shared) UsageRuntime cumulative — taken under two separate
+    // locks — was NOT concurrency-safe. Two concurrent turns for the SAME
+    // user (two tabs/lanes; the UserPreparationGate releases before the
+    // turn runs and sibling session_keys share one usage_rt) could
+    // interleave their recordTurn accumulation so one turn's
+    // `after - before` swallowed the other's tokens/cost → mis-billed
+    // done frame. Replaced with an ATOMIC per-turn delta: beginTurnDelta()
+    // arms a thread-local accumulator on THIS worker thread (one turn runs
+    // end-to-end on one worker), recordTurn/recordWeight add into it under
+    // the same lock that updates the shared totals, and takeTurnDelta()
+    // returns exactly THIS turn's own contribution after processMessage.
     var spend_usage_rt: ?*usage_runtime_mod.UsageRuntime = null;
-    var session_weight_before: u64 = 0;
-    var session_tokens_before: u64 = 0;
-    var session_input_before: u64 = 0;
-    var session_output_before: u64 = 0;
-    var session_cost_before: f64 = 0;
     const outcome: ReplyOutcome = blk: {
         if (state.tenant_enabled) {
             const cfg = config_opt orelse {
@@ -10725,12 +10756,13 @@ fn handleApiChatStreamSseConnection(
                 }
             };
             spend_usage_rt = tenant_runtime.usage_rt;
-            session_weight_before = tenant_runtime.usage_rt.sessionWeight();
-            const totals_before = tenant_runtime.usage_rt.sessionTotals();
-            session_tokens_before = totals_before.total;
-            session_input_before = totals_before.input;
-            session_output_before = totals_before.output;
-            session_cost_before = totals_before.cost;
+            // WO-03: arm the per-turn delta accumulator on THIS worker
+            // thread. recordTurn/recordWeight calls during the agent loop
+            // (which runs synchronously on this same thread) accumulate into
+            // a thread-local; takeTurnDelta() below reads exactly this turn's
+            // contribution, immune to a concurrent same-user turn racing the
+            // shared session cumulative.
+            tenant_runtime.usage_rt.beginTurnDelta();
             // Tenant runtime path: stream tokens directly to SSE for live delivery.
             break :blk .{ .ok = tenant_runtime.processMessageWithTurnOptions(
                 session_key,
@@ -10933,42 +10965,30 @@ fn handleApiChatStreamSseConnection(
     // tenant / CLI fallback paths leave it null and the done frame omits
     // the fields cleanly.
     //
-    // 2026-06-10 (WO-03): the same before/after snapshot now yields the
-    // per-turn token + cost deltas the contract documented but never
-    // emitted (usage_tokens / input_tokens / output_tokens / cost_usd).
-    // Token deltas require after >= before — the counters are
-    // monotonically non-decreasing for the session lifetime, so a
-    // negative delta means snapshot skew and we emit null rather than a
-    // lie. cost_usd additionally requires real cost data (session cost
-    // > 0 — same `cost_available` gate handleUserUsage applies), so a
-    // pricing-not-wired runtime never reports turns as free.
+    // 2026-06-11 (WO-03 hardening): per-turn token/cost/weight now come
+    // from takeTurnDelta() — exactly this turn's own recordTurn/recordWeight
+    // accumulation, captured atomically on this worker thread. This is
+    // concurrency-safe: a concurrent same-user turn on another worker has
+    // its own thread-local accumulator, so it can never leak into or out of
+    // this delta (the prior before/after diff of the shared cumulative
+    // could). `session_weight` (cumulative) is still read live for the
+    // meter's running total.
+    //
+    // Fix 3: cost_usd is gated on whether THIS turn was actually priced
+    // (delta.cost_priced) — NOT on session-cumulative cost > 0. An
+    // unpriced-model turn after a priced one has cumulative > 0 but
+    // cost_priced=false, so it emits NO cost field (null → BFF falls back to
+    // its own estimate) rather than a real `cost_usd: 0` the BFF would
+    // settle at $0 for a billable turn.
     const spend: SpendSummary = if (spend_usage_rt) |urt| spend_blk: {
-        const after = urt.sessionWeight();
-        const turn = if (after >= session_weight_before) after - session_weight_before else 0;
-        const totals_after = urt.sessionTotals();
-        const usage_tokens: ?u64 = if (totals_after.total >= session_tokens_before)
-            totals_after.total - session_tokens_before
-        else
-            null;
-        const input_tokens: ?u64 = if (totals_after.input >= session_input_before)
-            totals_after.input - session_input_before
-        else
-            null;
-        const output_tokens: ?u64 = if (totals_after.output >= session_output_before)
-            totals_after.output - session_output_before
-        else
-            null;
-        const cost_usd: ?f64 = if (totals_after.cost > 0.0 and totals_after.cost >= session_cost_before)
-            totals_after.cost - session_cost_before
-        else
-            null;
+        const delta = urt.takeTurnDelta();
         break :spend_blk .{
-            .turn_weight = turn,
-            .session_weight = after,
-            .usage_tokens = usage_tokens,
-            .input_tokens = input_tokens,
-            .output_tokens = output_tokens,
-            .cost_usd = cost_usd,
+            .turn_weight = delta.weight,
+            .session_weight = urt.sessionWeight(),
+            .usage_tokens = delta.total_tokens,
+            .input_tokens = delta.input_tokens,
+            .output_tokens = delta.output_tokens,
+            .cost_usd = if (delta.cost_priced) delta.cost_usd else null,
         };
     } else .{};
     const done_owned = blk: {
@@ -29628,6 +29648,89 @@ test "W1.2: getTenantRuntime refuses a key-value-skewed cached runtime and serve
         defer state.tenant_runtime_mutex.unlock();
         try std.testing.expectEqual(fetched, state.tenant_runtimes.get("2").?);
     }
+}
+
+test "W1.2 (Fix 2): skewed entry with an active turn is marked pending_destroy, NOT inline-deinit'd (use-after-free guard)" {
+    // Fix 2 — use-after-free. The mismatch branch must NOT inline-deinit a
+    // skewed runtime while a concurrent turn still holds its pointer
+    // (session.active_refs incremented after getTenantRuntime returns + the
+    // mutex is released). It must instead mark pending_destroy and let the
+    // maintenance sweep reclaim it once turns drain — mirroring the idle
+    // sweep and the pending_destroy branch.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    const base_config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/base-config.json", .{tenant_root});
+    defer std.testing.allocator.free(base_config_path);
+    try writeFile(base_config_path, "{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"openrouter/test/mock-model\"}}},\"memory\":{\"search\":{\"enabled\":false}}}\n");
+
+    var cfg = makeTenantRuntimeTestConfig(std.testing.allocator, tenant_root, base_config_path);
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_enabled = true;
+    state.tenant_data_root = tenant_root;
+    state.tenant_runtime_cache_max_users = 8;
+    state.tenant_runtime_idle_ttl_secs = 0;
+
+    var user_ctx_1 = try provisionTenantRuntimeTestUser(std.testing.allocator, &state, "1");
+    defer user_ctx_1.deinit(std.testing.allocator);
+    const runtime_1 = try getTenantRuntime(&state, &cfg, &user_ctx_1);
+    try std.testing.expectEqualStrings("1", runtime_1.user_id);
+
+    var user_ctx_2 = try provisionTenantRuntimeTestUser(std.testing.allocator, &state, "2");
+    defer user_ctx_2.deinit(std.testing.allocator);
+
+    // Pin an ACTIVE TURN on runtime_1: create a session and bump active_refs
+    // so hasActiveTurns() returns true (models a concurrent in-flight turn
+    // holding the runtime pointer). Clear it before teardown so deinit is clean.
+    const pinned_session = try runtime_1.session_mgr.getOrCreate("zaki_app:active-turn");
+    pinned_session.active_refs = 1;
+    try std.testing.expect(runtime_1.session_mgr.hasActiveTurns());
+
+    // Inject the skew: key "2" → runtime_1 (bound to "1"). Same faithful
+    // key-ownership handling as the sibling W1.2 test.
+    {
+        state.tenant_runtime_mutex.lock();
+        defer state.tenant_runtime_mutex.unlock();
+        _ = state.tenant_runtimes.fetchRemove("1"); // detach, keep alive
+        try state.tenant_runtimes.put(state.allocator, user_ctx_2.user_id, runtime_1);
+    }
+
+    // Fetch for user 2. With an active turn on the skewed runtime, the guard
+    // must FAIL CLOSED (not serve the wrong tenant, not free the in-use
+    // runtime) and mark it pending_destroy for the sweep.
+    try std.testing.expectError(error.TenantRuntimeKeyMismatchDraining, getTenantRuntime(&state, &cfg, &user_ctx_2));
+
+    // The skewed runtime was NOT freed (still live, active turn intact) and is
+    // marked for deferred destruction, still present in the map under key "2".
+    try std.testing.expect(runtime_1.pending_destroy.load(.acquire));
+    {
+        state.tenant_runtime_mutex.lock();
+        defer state.tenant_runtime_mutex.unlock();
+        try std.testing.expectEqual(runtime_1, state.tenant_runtimes.get("2").?);
+    }
+
+    // Sweep while the turn is still active → must NOT reclaim it (hasActiveTurns).
+    runTenantRuntimeMaintenance(&state, std.time.timestamp());
+    {
+        state.tenant_runtime_mutex.lock();
+        defer state.tenant_runtime_mutex.unlock();
+        try std.testing.expectEqual(runtime_1, state.tenant_runtimes.get("2").?);
+    }
+
+    // Turn drains → next sweep reclaims the doomed runtime, freeing it exactly
+    // once (deinit), no leak, no double-free.
+    pinned_session.active_refs = 0;
+    runTenantRuntimeMaintenance(&state, std.time.timestamp());
+    {
+        state.tenant_runtime_mutex.lock();
+        defer state.tenant_runtime_mutex.unlock();
+        try std.testing.expect(state.tenant_runtimes.get("2") == null);
+    }
+    // state.deinit() must now have nothing skewed left to free.
 }
 
 test "tenant runtime maintenance prunes cache outside request path" {

@@ -77,6 +77,47 @@ pub const UsageReport = struct {
     }
 };
 
+// ── Per-turn delta accumulator (WO-03 concurrency-safe) ──────────────
+
+/// The cost/token/weight a single HTTP turn contributed to the shared
+/// per-user UsageRuntime. An HTTP turn drives the agent loop, which calls
+/// `recordTurn` (and `recordWeight`) one-or-more times — once per provider
+/// response in a multi-step tool turn. The done frame must report exactly
+/// THIS turn's accumulation, never a concurrent turn's.
+///
+/// `cost_priced` is true iff at least one `recordTurn` in the window
+/// carried a non-zero (priced) cost. It is the per-turn analogue of
+/// handleUserUsage's `cost_available` gate: an unpriced-model turn (pricing
+/// table returned 0) reports `cost_priced=false` so the done frame emits NO
+/// real `cost_usd: 0` for a billable turn (which the BFF would settle at $0).
+pub const TurnDelta = struct {
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    total_tokens: u64 = 0,
+    cost_usd: f64 = 0.0,
+    weight: u64 = 0,
+    cost_priced: bool = false,
+};
+
+/// Thread-local per-turn delta accumulator. The gateway worker pool handles
+/// one HTTP turn end-to-end on a single worker thread (gateway.zig accept →
+/// queue → gatewayWorkerMain runs handleChatStream synchronously, including
+/// the full agent loop). So a turn is bounded to one thread for its whole
+/// lifetime: `recordTurn`/`recordWeight` calls during the agent loop run on
+/// the same thread that called `beginTurnDelta`, and concurrent turns for
+/// the SAME user land on DIFFERENT worker threads with independent
+/// accumulators — no interleaving, unlike a before/after diff of the shared
+/// cumulative under two separate locks.
+///
+/// `tracking` gates accumulation so paths that never call `beginTurnDelta`
+/// (CLI /cost, tests) pay nothing and leave the slot clean for the next turn
+/// that DOES track. Reset on every `beginTurnDelta`.
+const TurnDeltaTls = struct {
+    tracking: bool = false,
+    delta: TurnDelta = .{},
+};
+threadlocal var turn_delta_tls: TurnDeltaTls = .{};
+
 // ── UsageRuntime ─────────────────────────────────────────────────────
 
 pub const MAX_TURNS_TRACKED: usize = 1024;
@@ -170,6 +211,20 @@ pub const UsageRuntime = struct {
         self.session_output_tokens += output_tokens;
         self.session_total_tokens += input_tokens + output_tokens;
         self.session_cost_usd += cost_usd;
+
+        // WO-03: accumulate THIS turn's own contribution into the
+        // thread-local delta when the calling thread opened a tracking
+        // window (`beginTurnDelta`). Done under the SAME lock as the
+        // session totals so the value the done frame later reads is exactly
+        // what THIS turn added — never a concurrent turn's. `cost_priced`
+        // latches true on any non-zero priced contribution (Fix 3).
+        if (turn_delta_tls.tracking) {
+            turn_delta_tls.delta.input_tokens += input_tokens;
+            turn_delta_tls.delta.output_tokens += output_tokens;
+            turn_delta_tls.delta.total_tokens += input_tokens + output_tokens;
+            turn_delta_tls.delta.cost_usd += cost_usd;
+            if (cost_usd > 0.0) turn_delta_tls.delta.cost_priced = true;
+        }
 
         // Ring buffer: drop oldest if at capacity, freeing its owned model.
         if (self.turns.items.len >= MAX_TURNS_TRACKED) {
@@ -359,6 +414,38 @@ pub const UsageRuntime = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.session_weight_total +|= weight;
+        // WO-03: mirror the per-turn delta accumulation for tool-weight so
+        // the done frame's `turn_weight` reflects only THIS turn, immune to
+        // a concurrent same-user turn racing the shared session counter.
+        if (turn_delta_tls.tracking) {
+            turn_delta_tls.delta.weight +|= weight;
+        }
+    }
+
+    /// WO-03: open a per-turn delta tracking window on the CALLING thread.
+    /// Resets the thread-local accumulator and arms accumulation in
+    /// subsequent `recordTurn`/`recordWeight` calls on this same thread.
+    /// The gateway calls this immediately before driving the turn, in place
+    /// of taking before-snapshots of the shared cumulative totals.
+    ///
+    /// Idempotent within a thread: a fresh `beginTurnDelta` always starts
+    /// from zero, so a path that began-but-never-took (e.g. an error before
+    /// `takeTurnDelta`) cannot leak into the next turn on that worker.
+    pub fn beginTurnDelta(self: *UsageRuntime) void {
+        _ = self;
+        turn_delta_tls = .{ .tracking = true, .delta = .{} };
+    }
+
+    /// WO-03: close the per-turn delta window on the CALLING thread and
+    /// return what THIS turn accumulated. Disarms tracking so any stray
+    /// later `recordTurn` (there should be none) does not corrupt the next
+    /// turn. Returns a zeroed delta if `beginTurnDelta` was never called on
+    /// this thread.
+    pub fn takeTurnDelta(self: *UsageRuntime) TurnDelta {
+        _ = self;
+        const out = turn_delta_tls.delta;
+        turn_delta_tls = .{ .tracking = false, .delta = .{} };
+        return out;
     }
 
     /// Current session-accumulated tool-weight. Zero at session start,
@@ -767,6 +854,140 @@ test "D5 — monthlyTotalUsd returns 0 when no path configured" {
     defer rt.deinit();
     rt.recordTurn("m", 100, 50, 5.0, 100);
     try std.testing.expect(rt.monthlyTotalUsd(std.time.timestamp()) == 0.0);
+}
+
+// ── WO-03 — per-turn delta accumulator tests ────────────────────────
+
+test "WO-03 — takeTurnDelta returns only this turn's recordTurn contributions" {
+    const allocator = std.testing.allocator;
+    var rt = UsageRuntime.init(allocator);
+    defer rt.deinit();
+
+    // A prior priced turn inflates the SHARED session cumulative.
+    rt.recordTurn("priced", 1000, 500, 5.0, 100);
+
+    // Now open a turn window and record two provider responses (multi-step
+    // tool turn). The delta must be EXACTLY this turn's accumulation, not
+    // the session-cumulative which already carries the prior turn's $5.
+    rt.beginTurnDelta();
+    rt.recordTurn("m", 100, 50, 0.001, 100);
+    rt.recordTurn("m", 200, 80, 0.002, 100);
+    const d = rt.takeTurnDelta();
+
+    try std.testing.expectEqual(@as(u64, 300), d.input_tokens);
+    try std.testing.expectEqual(@as(u64, 130), d.output_tokens);
+    try std.testing.expectEqual(@as(u64, 430), d.total_tokens);
+    try std.testing.expect(@abs(d.cost_usd - 0.003) < 1e-9);
+    try std.testing.expect(d.cost_priced);
+
+    // Shared session totals still reflect ALL turns (unchanged behavior):
+    // prior 1500 + this turn 430 = 1930.
+    const totals = rt.sessionTotals();
+    try std.testing.expectEqual(@as(u64, 1930), totals.total);
+    try std.testing.expect(@abs(totals.cost - 5.003) < 1e-9);
+}
+
+test "WO-03 — takeTurnDelta without beginTurnDelta returns zeroed delta" {
+    const allocator = std.testing.allocator;
+    var rt = UsageRuntime.init(allocator);
+    defer rt.deinit();
+    rt.recordTurn("m", 100, 50, 1.0, 100); // not tracked
+    const d = rt.takeTurnDelta();
+    try std.testing.expectEqual(@as(u64, 0), d.total_tokens);
+    try std.testing.expectEqual(@as(f64, 0.0), d.cost_usd);
+    try std.testing.expect(!d.cost_priced);
+}
+
+test "WO-03 — beginTurnDelta resets any leftover accumulation" {
+    const allocator = std.testing.allocator;
+    var rt = UsageRuntime.init(allocator);
+    defer rt.deinit();
+
+    // Turn that began but never took (e.g. errored before takeTurnDelta).
+    rt.beginTurnDelta();
+    rt.recordTurn("m", 999, 999, 9.0, 100);
+
+    // Next turn on the same (thread) worker must start from zero.
+    rt.beginTurnDelta();
+    rt.recordTurn("m", 1, 2, 0.5, 100);
+    const d = rt.takeTurnDelta();
+    try std.testing.expectEqual(@as(u64, 1), d.input_tokens);
+    try std.testing.expectEqual(@as(u64, 2), d.output_tokens);
+    try std.testing.expect(@abs(d.cost_usd - 0.5) < 1e-9);
+}
+
+test "WO-03 (Fix 3) — unpriced turn after a priced one reports cost_priced=false" {
+    const allocator = std.testing.allocator;
+    var rt = UsageRuntime.init(allocator);
+    defer rt.deinit();
+
+    // Priced turn first → session cumulative cost > 0.
+    rt.recordTurn("priced", 100, 50, 2.5, 100);
+
+    // Unpriced-model turn (pricing table returned 0) AFTER it.
+    rt.beginTurnDelta();
+    rt.recordTurn("unpriced", 100, 50, 0.0, 100);
+    const d = rt.takeTurnDelta();
+
+    // Even though session cumulative is > 0, THIS turn was not priced.
+    try std.testing.expectEqual(@as(f64, 0.0), d.cost_usd);
+    try std.testing.expect(!d.cost_priced);
+    // Tokens still flow (they're not gated on pricing).
+    try std.testing.expectEqual(@as(u64, 150), d.total_tokens);
+}
+
+test "WO-03 — takeTurnDelta captures tool-weight for the turn" {
+    const allocator = std.testing.allocator;
+    var rt = UsageRuntime.init(allocator);
+    defer rt.deinit();
+
+    rt.recordWeight(7); // before the window — must not count
+    rt.beginTurnDelta();
+    rt.recordWeight(1);
+    rt.recordWeight(5);
+    const d = rt.takeTurnDelta();
+    try std.testing.expectEqual(@as(u64, 6), d.weight);
+    // Session-cumulative weight still includes the pre-window contribution.
+    try std.testing.expectEqual(@as(u64, 13), rt.sessionWeight());
+}
+
+test "WO-03 — concurrent same-runtime turns get independent thread-local deltas" {
+    const allocator = std.testing.allocator;
+    var rt = UsageRuntime.init(allocator);
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn run(r: *UsageRuntime, cost: f64, tokens: u64, out: *TurnDelta, barrier: *std.atomic.Value(u32)) void {
+            r.beginTurnDelta();
+            r.recordTurn("m", tokens, tokens, cost, 1);
+            // Spin so both threads interleave recordTurn calls against the
+            // shared session cumulative before either takes its delta.
+            _ = barrier.fetchAdd(1, .seq_cst);
+            while (barrier.load(.seq_cst) < 2) {}
+            r.recordTurn("m", tokens, tokens, cost, 1);
+            out.* = r.takeTurnDelta();
+        }
+    };
+
+    var barrier = std.atomic.Value(u32).init(0);
+    var a_out: TurnDelta = .{};
+    var b_out: TurnDelta = .{};
+    const ta = try std.Thread.spawn(.{}, Worker.run, .{ &rt, 1.0, 100, &a_out, &barrier });
+    const tb = try std.Thread.spawn(.{}, Worker.run, .{ &rt, 2.0, 200, &b_out, &barrier });
+    ta.join();
+    tb.join();
+
+    // Each thread's delta reflects only its own two recordTurn calls, never
+    // the other's — despite both racing the shared session cumulative.
+    try std.testing.expect(@abs(a_out.cost_usd - 2.0) < 1e-9);
+    try std.testing.expectEqual(@as(u64, 400), a_out.total_tokens);
+    try std.testing.expect(@abs(b_out.cost_usd - 4.0) < 1e-9);
+    try std.testing.expectEqual(@as(u64, 800), b_out.total_tokens);
+
+    // Shared session cumulative is the sum of all four recordTurn calls.
+    const totals = rt.sessionTotals();
+    try std.testing.expectEqual(@as(u64, 1200), totals.total);
+    try std.testing.expect(@abs(totals.cost - 6.0) < 1e-9);
 }
 
 test "D5 — yearMonthOrdinal handles year boundaries correctly" {
