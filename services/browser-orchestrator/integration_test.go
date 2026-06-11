@@ -22,7 +22,7 @@ func TestE2ESessionLifecycle(t *testing.T) {
 	}
 	master := []byte("0123456789abcdef0123456789abcdef")
 	store := NewStateStore(client, "browser")
-	p := NewK8sProvider(client, cfg, "browser", "browser-worker:dev", master, store, 3, 20, 900, NewRegistry())
+	p := NewK8sProvider(client, cfg, "browser", "browser-worker:dev", master, store, 3, 20, 900, 0, NewRegistry())
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
@@ -54,7 +54,7 @@ func TestE2EAuthStateRoundTrip(t *testing.T) {
 	if err != nil { t.Fatalf("client: %v", err) }
 	master := []byte("0123456789abcdef0123456789abcdef")
 	store := NewStateStore(client, "browser")
-	p := NewK8sProvider(client, cfg, "browser", "browser-worker:dev", master, store, 3, 20, 900, NewRegistry())
+	p := NewK8sProvider(client, cfg, "browser", "browser-worker:dev", master, store, 3, 20, 900, 0, NewRegistry())
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -89,7 +89,7 @@ func TestE2EReconcileAndDeleteVault(t *testing.T) {
 	if err != nil { t.Fatalf("client: %v", err) }
 	master := []byte("0123456789abcdef0123456789abcdef")
 	store := NewStateStore(client, "browser")
-	p1 := NewK8sProvider(client, cfg, "browser", "browser-worker:dev", master, store, 3, 20, 900, NewRegistry())
+	p1 := NewK8sProvider(client, cfg, "browser", "browser-worker:dev", master, store, 3, 20, 900, 0, NewRegistry())
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -101,7 +101,7 @@ func TestE2EReconcileAndDeleteVault(t *testing.T) {
 
 	// Simulate orchestrator restart: a fresh provider with an empty registry reconciles
 	// and must recover (userID, authProfile) from the pod annotations.
-	p2 := NewK8sProvider(client, cfg, "browser", "browser-worker:dev", master, store, 3, 20, 900, NewRegistry())
+	p2 := NewK8sProvider(client, cfg, "browser", "browser-worker:dev", master, store, 3, 20, 900, 0, NewRegistry())
 	if err := p2.Reconcile(ctx); err != nil { t.Fatalf("reconcile: %v", err) }
 	if err := p2.DestroySession(ctx, id); err != nil { t.Fatalf("destroy via reconciled provider: %v", err) }
 	if _, ok, _ := store.Get(ctx, "carol", "demo"); !ok {
