@@ -443,6 +443,28 @@ pub const TraceShareRow = struct {
     }
 };
 
+/// **Wave 2 (nullALIS metering completeness)** — input to `insertTurnUsage`.
+/// One durable `zaki_bot.turn_usage` row per agent turn (migration 0004).
+/// All slices are borrowed for the duration of the call (the impl dupes what
+/// it needs for the libpq params), so the caller may free them after return.
+pub const TurnUsageInput = struct {
+    user_id: i64,
+    session_key: []const u8,
+    /// Deterministic per-turn id (the agent's run_id). `(user_id, turn_key)`
+    /// is UNIQUE; the insert uses ON CONFLICT DO NOTHING for idempotency.
+    turn_key: []const u8,
+    /// "http" | "daemon" — see EntryKind.toSlice / migration 0004.
+    entry_kind: []const u8,
+    /// TurnOrigin enum value: user|heartbeat|scheduler|wake|proactive|mcp.
+    turn_origin: []const u8,
+    model: []const u8,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: f64,
+    /// false → pricing table had no entry; the BFF settles tokens, not $0.
+    cost_available: bool,
+};
+
 pub const ArtifactVersionRow = struct {
     artifact_id: []u8,
     version: u64,
@@ -776,6 +798,13 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     }
     /// V1.7 Item 1 — stub for non-postgres builds; episode events no-op.
     pub fn insertEpisodeEvent(_: *@This(), _: i64, _: []const u8, _: []const u8, _: []const u8) !void {
+        return;
+    }
+    /// Wave 2 (metering completeness) — stub for non-postgres builds; the
+    /// durable turn_usage ledger requires Postgres, so this no-ops. The
+    /// agent's persist call site is best-effort and never relies on a row
+    /// actually landing, so a no-op here is correct for sqlite/base builds.
+    pub fn insertTurnUsage(_: *@This(), _: TurnUsageInput) !void {
         return;
     }
     pub fn forgetMemory(_: *@This(), _: i64, _: []const u8) !bool {
@@ -9818,6 +9847,82 @@ const ManagerImpl = struct {
         return std.fmt.parseInt(i64, id_str, 10) catch -1;
     }
 
+    /// **Wave 2 (nullALIS metering completeness)** — insert ONE durable
+    /// `turn_usage` row (migration 0004). Called at every agent turn
+    /// completion, INDEPENDENT of whether the session has an in-memory
+    /// usage runtime, so cron/heartbeat/channel turns (which emit no SSE
+    /// done frame) leave a reconcilable accounting record.
+    ///
+    /// Idempotent: `ON CONFLICT (user_id, turn_key) DO NOTHING` (inferred via
+    /// the `idx_turn_usage_idem` unique index) so a retried turn with the same
+    /// run_id never double-inserts — the BFF sweep then reconciles exactly
+    /// once. `reconciled_at` defaults to NULL; the BFF sweep claims the row.
+    ///
+    /// `created_at` is left to the column DEFAULT now() so the row carries the
+    /// DB clock, not the engine's. Any DB-layer failure surfaces to GlitchTip
+    /// automatically via `capturePostgresExecFailure` inside `execParams`; the
+    /// caller (agent persistTurnUsageRow) treats the returned error as
+    /// best-effort.
+    pub fn insertTurnUsage(self: *Self, row: TurnUsageInput) !void {
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.turn_usage " ++
+                "(user_id, session_key, turn_key, entry_kind, turn_origin, " ++
+                " model, input_tokens, output_tokens, cost_usd, cost_available) " ++
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) " ++
+                "ON CONFLICT (user_id, turn_key) DO NOTHING",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{row.user_id});
+        const session_z = try self.allocator.dupeZ(u8, row.session_key);
+        defer self.allocator.free(session_z);
+        const turn_key_z = try self.allocator.dupeZ(u8, row.turn_key);
+        defer self.allocator.free(turn_key_z);
+        const entry_kind_z = try self.allocator.dupeZ(u8, row.entry_kind);
+        defer self.allocator.free(entry_kind_z);
+        const origin_z = try self.allocator.dupeZ(u8, row.turn_origin);
+        defer self.allocator.free(origin_z);
+        // model may be empty (unknown); store NULL in that case so the column
+        // stays honestly "no model recorded" rather than an empty string.
+        const model_z = try self.allocator.dupeZ(u8, row.model);
+        defer self.allocator.free(model_z);
+        var in_buf: [32]u8 = undefined;
+        const in_s = try std.fmt.bufPrintZ(&in_buf, "{d}", .{row.input_tokens});
+        var out_buf: [32]u8 = undefined;
+        const out_s = try std.fmt.bufPrintZ(&out_buf, "{d}", .{row.output_tokens});
+        var cost_buf: [64]u8 = undefined;
+        const cost_s = try std.fmt.bufPrintZ(&cost_buf, "{d:.10}", .{row.cost_usd});
+        const cost_avail_s: [*:0]const u8 = if (row.cost_available) "true" else "false";
+
+        const params = [_]?[*:0]const u8{
+            user_s.ptr,
+            session_z,
+            turn_key_z,
+            entry_kind_z,
+            origin_z,
+            if (row.model.len == 0) null else model_z,
+            in_s.ptr,
+            out_s.ptr,
+            cost_s.ptr,
+            cost_avail_s,
+        };
+        const lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(row.session_key.len),
+            @intCast(row.turn_key.len),
+            @intCast(row.entry_kind.len),
+            @intCast(row.turn_origin.len),
+            @intCast(row.model.len),
+            @intCast(in_s.len),
+            @intCast(out_s.len),
+            @intCast(cost_s.len),
+            @intCast(std.mem.len(cost_avail_s)),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
     /// List the most-recent N skill execution traces for (user, skill_name).
     /// Used at the start of a skill invocation to inject "what worked
     /// last time" into the prompt. Returns owned slice; caller calls
@@ -12391,6 +12496,278 @@ test "V1.6 schema migration applies cleanly + memory_entities round-trips" {
             std.debug.print("V1.6 index missing: {s}\n", .{idx_name});
             return error.MissingIndex;
         }
+    }
+}
+
+test "Wave 2 — insertTurnUsage persists http + daemon rows; ON CONFLICT idempotent; usage_rt-independent" {
+    // Metering completeness keystone. Proves the durable per-turn ledger:
+    //   (1) migration 0004 applies cleanly on a fresh schema,
+    //   (2) insertTurnUsage writes a row with the right entry_kind / origin /
+    //       tokens / cost / cost_available, reconciled_at NULL,
+    //   (3) ON CONFLICT (user_id, turn_key) DO NOTHING is idempotent — a
+    //       retried turn never double-inserts (the BFF then reconciles once),
+    //   (4) the write is identical whether or not the session had a usage_rt:
+    //       the agent calls insertTurnUsage unconditionally, so we exercise
+    //       both an http row (usage_rt-backed, settled live) and a daemon row
+    //       (usage_rt == null, reconcilable) and assert BOTH land.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_turnusage", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    // Fresh migrate then re-migrate — 0004 must be idempotent on both.
+    try mgr.migrate();
+    try mgr.migrate();
+
+    // FK target: users(user_id) must exist before we can insert turn_usage.
+    try mgr.provisionUser(7, "/tmp/nullalis-zaki-bot-test-user-7/workspace");
+
+    // (2) daemon row — the metering-hole case (usage_rt == null upstream).
+    try mgr.insertTurnUsage(.{
+        .user_id = 7,
+        .session_key = "agent:zaki-bot:user:7:thread:cron:nightly",
+        .turn_key = "r-100-1",
+        .entry_kind = "daemon",
+        .turn_origin = "scheduler",
+        .model = "moonshotai/kimi-k2",
+        .input_tokens = 1200,
+        .output_tokens = 350,
+        .cost_usd = 0.0042,
+        .cost_available = true,
+    });
+
+    // (4) http row — the live-settled case. Same call shape; usage_rt only
+    // affects the in-memory done frame, never this durable write.
+    try mgr.insertTurnUsage(.{
+        .user_id = 7,
+        .session_key = "agent:zaki-bot:user:7:thread:main",
+        .turn_key = "r-200-1",
+        .entry_kind = "http",
+        .turn_origin = "user",
+        .model = "anthropic/claude-sonnet-4",
+        .input_tokens = 80,
+        .output_tokens = 40,
+        .cost_usd = 0.0,
+        .cost_available = false, // unpriced → BFF settles tokens, not $0
+    });
+
+    // Read the daemon row back and assert every field.
+    {
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT session_key, entry_kind, turn_origin, model, input_tokens, " ++
+                "output_tokens, cost_usd, cost_available, reconciled_at " ++
+                "FROM {s}.turn_usage WHERE user_id = 7 AND turn_key = 'r-100-1'",
+            .{schema},
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+
+        const session_key = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(session_key);
+        const entry_kind = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(entry_kind);
+        const origin = try dupeResultValue(allocator, result, 0, 2);
+        defer allocator.free(origin);
+        const model = try dupeResultValue(allocator, result, 0, 3);
+        defer allocator.free(model);
+        const input_tokens = try dupeResultValue(allocator, result, 0, 4);
+        defer allocator.free(input_tokens);
+        const output_tokens = try dupeResultValue(allocator, result, 0, 5);
+        defer allocator.free(output_tokens);
+        const cost_available = try dupeResultValue(allocator, result, 0, 7);
+        defer allocator.free(cost_available);
+
+        try std.testing.expectEqualStrings("agent:zaki-bot:user:7:thread:cron:nightly", session_key);
+        try std.testing.expectEqualStrings("daemon", entry_kind);
+        try std.testing.expectEqualStrings("scheduler", origin);
+        try std.testing.expectEqualStrings("moonshotai/kimi-k2", model);
+        try std.testing.expectEqualStrings("1200", input_tokens);
+        try std.testing.expectEqualStrings("350", output_tokens);
+        try std.testing.expectEqualStrings("t", cost_available);
+        // reconciled_at must start NULL (the BFF sweep claims it later).
+        try std.testing.expect(c.PQgetisnull(result, 0, 8) == 1);
+    }
+
+    // http row landed too, with model + cost_available distinct from daemon.
+    {
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT entry_kind, cost_available FROM {s}.turn_usage " ++
+                "WHERE user_id = 7 AND turn_key = 'r-200-1'",
+            .{schema},
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+        const entry_kind = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(entry_kind);
+        const cost_available = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(cost_available);
+        try std.testing.expectEqualStrings("http", entry_kind);
+        try std.testing.expectEqualStrings("f", cost_available);
+    }
+
+    // (3) Idempotency: re-insert the daemon turn_key with DIFFERENT values.
+    // ON CONFLICT DO NOTHING must keep exactly one row carrying the ORIGINAL
+    // values — a retried turn never duplicates and never overwrites.
+    try mgr.insertTurnUsage(.{
+        .user_id = 7,
+        .session_key = "agent:zaki-bot:user:7:thread:cron:nightly",
+        .turn_key = "r-100-1",
+        .entry_kind = "daemon",
+        .turn_origin = "scheduler",
+        .model = "moonshotai/kimi-k2",
+        .input_tokens = 999999, // would be wrong if it overwrote
+        .output_tokens = 999999,
+        .cost_usd = 9.99,
+        .cost_available = true,
+    });
+    {
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT count(*)::int, max(input_tokens)::bigint FROM {s}.turn_usage " ++
+                "WHERE user_id = 7 AND turn_key = 'r-100-1'",
+            .{schema},
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const count = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(count);
+        const max_input = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(max_input);
+        try std.testing.expectEqualStrings("1", count); // still exactly one row
+        try std.testing.expectEqualStrings("1200", max_input); // original preserved
+    }
+
+    // Total rows for the user: the daemon + the http row = 2.
+    {
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT count(*)::int FROM {s}.turn_usage WHERE user_id = 7",
+            .{schema},
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const count = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(count);
+        try std.testing.expectEqualStrings("2", count);
+    }
+
+    // Sweep-index sanity: the partial index for the BFF reconciliation sweep
+    // exists on the fresh schema.
+    {
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT count(*)::int FROM pg_indexes WHERE schemaname = '{s}' " ++
+                "AND indexname = 'idx_turn_usage_sweep'",
+            .{schema},
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const count = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(count);
+        try std.testing.expectEqualStrings("1", count);
+    }
+
+    // Cleanup the throwaway schema.
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+}
+
+test "Wave 2 — turn_usage FK CASCADE deletes a user's usage rows on user delete (GDPR purge parity)" {
+    // The turn_usage FK to {schema}.users(user_id) ON DELETE CASCADE must
+    // make a user's metering rows vanish when the user is purged — same
+    // guarantee every other tenant-scoped table relies on. A future schema
+    // edit that drops CASCADE would orphan billing rows past account deletion.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_tucascade", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(11, "/tmp/nullalis-zaki-bot-test-user-11/workspace");
+    try mgr.insertTurnUsage(.{
+        .user_id = 11,
+        .session_key = "agent:zaki-bot:user:11:thread:main",
+        .turn_key = "r-1-1",
+        .entry_kind = "daemon",
+        .turn_origin = "heartbeat",
+        .model = "moonshotai/kimi-k2",
+        .input_tokens = 10,
+        .output_tokens = 5,
+        .cost_usd = 0.0001,
+        .cost_available = true,
+    });
+
+    // Delete the user row → CASCADE should remove the turn_usage row.
+    {
+        const del_q = try std.fmt.allocPrint(allocator, "DELETE FROM {s}.users WHERE user_id = 11", .{schema});
+        defer allocator.free(del_q);
+        const result = try mgr.exec(del_q);
+        c.PQclear(result);
+    }
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT count(*)::int FROM {s}.turn_usage WHERE user_id = 11", .{schema});
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const count = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(count);
+        try std.testing.expectEqualStrings("0", count);
+    }
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
     }
 }
 

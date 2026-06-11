@@ -3538,6 +3538,43 @@ pub const Agent = struct {
         var turn_memory_enrich_ms: u64 = 0;
         var turn_compaction_ms: u64 = 0;
         defer self.session_total_tool_count +%= turn_tool_calls_total; // v1.14.18-A F3
+
+        // ── Wave 2 (metering completeness) — durable per-turn usage ──────
+        // Accumulate THIS turn's token + cost contribution across every LLM
+        // iteration. These are hoisted OUT of the `if (self.usage_rt)` guard
+        // (see the per-iteration recordTurn site below) so the values exist
+        // even when `usage_rt == null` — i.e. for cron / heartbeat / channel
+        // turns, which is the entire point of this work. `turn_usage_priced`
+        // latches true on any non-zero priced contribution, mirroring the
+        // done-frame `cost_priced` gate so an unpriced-but-billable turn
+        // reports `cost_available = false` rather than a bogus $0.
+        var turn_usage_input: u64 = 0;
+        var turn_usage_output: u64 = 0;
+        var turn_usage_cost: f64 = 0.0;
+        var turn_usage_priced: bool = false;
+        var turn_usage_any: bool = false;
+        // The model name is COPIED into this turn-lived stack buffer each
+        // iteration — NOT borrowed from `response.model`, which is freed via
+        // `freeResponseFields` before this turn's exit defer runs (a W1.2-class
+        // use-after-free otherwise). Sized for the longest provider/model slug
+        // ("anthropic/claude-sonnet-4", "moonshotai/kimi-k2", …); longer names
+        // are truncated for the record rather than risking a dangling slice.
+        var turn_usage_model_buf: [128]u8 = undefined;
+        var turn_usage_model_len: usize = 0;
+        // Persist ONE durable `turn_usage` row on EVERY turnOutcome exit path
+        // (8 returns), INDEPENDENT of `usage_rt`. Registered here — after
+        // `current_run_id` is minted (~root.zig:3526) and BEFORE the
+        // `self.current_run_id = null` defer at ~3531 — so LIFO ordering lets
+        // it read the live run_id (the turn_key) before that null-out fires.
+        // Best-effort: a usage-write failure must NEVER fail the turn.
+        defer self.persistTurnUsageRow(.{
+            .input_tokens = turn_usage_input,
+            .output_tokens = turn_usage_output,
+            .cost_usd = turn_usage_cost,
+            .cost_available = turn_usage_priced,
+            .model = turn_usage_model_buf[0..turn_usage_model_len],
+            .had_llm_response = turn_usage_any,
+        });
         var turn_first_token_ms: ?u64 = null;
         var turn_first_token_upper_bound_ms: ?u64 = null;
         // v1.14.18-A G4 — active_task_plan is now an Agent field (see decl);
@@ -4313,7 +4350,17 @@ pub const Agent = struct {
                 cached_tok,
                 hit_pct,
             });
-            if (self.usage_rt) |urt| {
+            // ── Per-iteration token + cost computation ──────────────────
+            // **Wave 2 (metering completeness):** this computation is HOISTED
+            // OUT of the `if (self.usage_rt)` guard so it runs on EVERY LLM
+            // iteration of EVERY turn — including cron/heartbeat/channel turns
+            // whose SessionManager has `usage_rt == null`. The result is
+            // accumulated into the turn-local `turn_usage_*` vars, which the
+            // turn-scoped `persistTurnUsageRow` defer (registered at turn
+            // start) writes as ONE durable row. Recording into the in-memory
+            // `usage_rt` (the live done-frame path) stays gated on usage_rt
+            // being present — only the DURABLE persist is unconditional.
+            {
                 const input: u64 = @intCast(response.usage.prompt_tokens);
                 const output: u64 = @intCast(response.usage.completion_tokens);
                 // WP5.1: consult the static provider pricing table. When
@@ -4327,13 +4374,28 @@ pub const Agent = struct {
                     input,
                     output,
                 ) orelse 0.0;
-                urt.recordTurn(
-                    priced_model,
-                    input,
-                    output,
-                    cost_usd,
-                    0, // Duration refined when timing context available
-                );
+
+                // Accumulate THIS turn's durable usage (independent of usage_rt).
+                turn_usage_input += input;
+                turn_usage_output += output;
+                turn_usage_cost += cost_usd;
+                if (cost_usd > 0.0) turn_usage_priced = true;
+                // Copy (not borrow) the model — last iteration's model wins.
+                // `priced_model` may alias `response.model`, freed before the
+                // turn-end persist defer runs; the copy keeps it valid.
+                turn_usage_model_len = @min(priced_model.len, turn_usage_model_buf.len);
+                @memcpy(turn_usage_model_buf[0..turn_usage_model_len], priced_model[0..turn_usage_model_len]);
+                turn_usage_any = true;
+
+                if (self.usage_rt) |urt| {
+                    urt.recordTurn(
+                        priced_model,
+                        input,
+                        output,
+                        cost_usd,
+                        0, // Duration refined when timing context available
+                    );
+                }
             }
 
             const raw_response_text = response.contentOrEmpty();
@@ -5579,6 +5641,90 @@ pub const Agent = struct {
             .spawned_task_ids = ids,
             .iterations_used = turn_tool_iterations,
             .loop_detected = loop_detected,
+        };
+    }
+
+    /// **Wave 2 (nullALIS metering completeness)** — input to the durable
+    /// per-turn usage persist. Aggregated across the turn's LLM iterations.
+    pub const TurnUsagePersist = struct {
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_usd: f64,
+        /// Mirrors the done-frame `cost_priced` gate — false when the pricing
+        /// table had no entry for the model (so the BFF settles tokens, not $0).
+        cost_available: bool,
+        model: []const u8,
+        /// False when the turn produced no LLM response at all (slash command,
+        /// cached reply, early bail). We skip the durable row in that case —
+        /// there is genuinely no model usage to account for.
+        had_llm_response: bool,
+    };
+
+    /// **Wave 2 (nullALIS metering completeness)** — persist ONE durable
+    /// `turn_usage` row at turn completion, INDEPENDENT of `self.usage_rt`.
+    ///
+    /// This is the keystone: cron / heartbeat / channel turns run the same
+    /// agent loop but with `usage_rt == null`, so today they record NOTHING —
+    /// no done frame, no wallet signal, real model cost lost to accounting.
+    /// This write is NOT gated on usage_rt, so those turns now leave a durable,
+    /// origin/entry-tagged row the BFF can reconcile into the wallet.
+    ///
+    /// State manager + numeric user_id are read from the thread-local TENANT
+    /// context (the SAME handle memory writes use), not from `self.extraction_*`
+    /// — those agent fields are only wired on the gateway path, whereas the
+    /// tenant context is set on the gateway, daemon (cron/heartbeat), AND
+    /// channel inbound paths. `turn_origin` + `entry_kind` come from the
+    /// thread-local TURN context.
+    ///
+    /// **Best-effort:** a usage-write failure must NEVER fail the turn. Any
+    /// error is logged at warn and swallowed. DB-layer failures additionally
+    /// flow to GlitchTip automatically via the Manager's W1.4
+    /// `capturePostgresExecFailure` inside execParams.
+    ///
+    /// Skipped (no durable row) when, by design:
+    ///   - the turn produced no LLM response (`had_llm_response == false`)
+    ///   - no Postgres state manager is bound (file-mode / polling channel —
+    ///     there is no durable store to write to)
+    ///   - no numeric user_id is resolvable (anonymous / un-tenanted turn)
+    ///   - no run_id was minted (turn_key source) for this turn
+    fn persistTurnUsageRow(self: *Agent, usage: TurnUsagePersist) void {
+        if (!usage.had_llm_response) return;
+
+        const tenant_ctx = tools_mod.getTenantContext();
+        const state_mgr = tenant_ctx.state_mgr orelse return;
+        const user_id = tenant_ctx.numeric_user_id orelse return;
+
+        // turn_key = the per-turn run_id (deterministic + unique within a
+        // session; `r-<turn_start_ms>-<counter>`). Without it we cannot
+        // guarantee idempotency, so skip rather than risk a dup row.
+        const turn_key = self.current_run_id orelse return;
+
+        const turn_ctx = tools_mod.getTurnContext();
+        const session_key = turn_ctx.session_key orelse
+            self.memory_session_id orelse
+            tenant_ctx.session_key orelse
+            "";
+
+        state_mgr.insertTurnUsage(.{
+            .user_id = user_id,
+            .session_key = session_key,
+            .turn_key = turn_key,
+            .entry_kind = turn_ctx.entry_kind.toSlice(),
+            .turn_origin = turn_ctx.origin.toSlice(),
+            .model = usage.model,
+            .input_tokens = usage.input_tokens,
+            .output_tokens = usage.output_tokens,
+            .cost_usd = usage.cost_usd,
+            .cost_available = usage.cost_available,
+        }) catch |err| {
+            // Best-effort: never fail the turn on a metering write. The
+            // Manager already routed any DB-layer failure to GlitchTip (W1.4).
+            log.warn("turn_usage.persist failed (non-fatal) entry_kind={s} origin={s} user_id={d} err={s}", .{
+                turn_ctx.entry_kind.toSlice(),
+                turn_ctx.origin.toSlice(),
+                user_id,
+                @errorName(err),
+            });
         };
     }
 

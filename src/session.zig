@@ -226,6 +226,13 @@ pub const SessionManager = struct {
     pub const ProcessMessageOptions = struct {
         message_turn_context: ?tools_mod.MessageTurnContext = null,
         turn_origin: tools_mod.TurnOrigin = .user,
+        /// Wave 2 (metering completeness) — dispatch-path discriminator for
+        /// the durable `turn_usage` ledger, INDEPENDENT of `turn_origin`.
+        /// Defaults to `.http` (gateway path, settled live); the daemon
+        /// (cron/heartbeat) + channel inbound paths set `.daemon` so their
+        /// turns — which run with `usage_rt = null` and emit no done frame —
+        /// still write a reconcilable durable row.
+        entry_kind: tools_mod.EntryKind = .http,
         progress_observer: ?Observer = null,
         stream_callback: ?providers.StreamCallback = null,
         stream_ctx: ?*anyopaque = null,
@@ -772,8 +779,17 @@ pub const SessionManager = struct {
         conversation_context: ?ConversationContext,
         message_turn_context: ?tools_mod.MessageTurnContext,
     ) ![]const u8 {
+        // Wave 2 (metering completeness): every caller of this entry point is
+        // a channel / messaging inbound turn (Telegram/WhatsApp webhooks + the
+        // bus inbound dispatch + the polling loop). These run the agent loop
+        // with `usage_rt = null` and emit NO SSE done frame, so they record
+        // nothing today. Tag them `.daemon` so the durable `turn_usage` row
+        // gets written and the BFF can reconcile them into the wallet. The
+        // interactive HTTP chat path uses `processMessageWithContext` /
+        // `processMessageWithTurnOptions` directly and stays `.http`.
         return self.processMessageWithContext(session_key, content, conversation_context, .{
             .message_turn_context = message_turn_context,
+            .entry_kind = .daemon,
         });
     }
 
@@ -848,6 +864,7 @@ pub const SessionManager = struct {
         defer tools_mod.clearMessageTurnContext();
         tools_mod.setTurnContext(.{
             .origin = options.turn_origin,
+            .entry_kind = options.entry_kind,
             .session_key = session_key,
             .provider = session.agent.default_provider,
             .model = session.agent.model_name,

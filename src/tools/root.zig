@@ -1798,8 +1798,38 @@ pub const TurnOrigin = enum {
     }
 };
 
+/// Wave 2 (metering completeness) — coarse discriminator for which dispatch
+/// path drove this turn, INDEPENDENT of `TurnOrigin`. The two are orthogonal:
+/// a channel inbound turn carries `origin = .user` (it IS a user message) but
+/// runs through the daemon/bus dispatch with `usage_rt = null`, so it must be
+/// tagged `.daemon` for the durable `turn_usage` ledger. Do NOT infer this
+/// from `TurnOrigin` — channel turns would be misclassified as http.
+///
+///   .http   — the gateway request path; turn is settled live via the SSE
+///             done frame. `turn_usage` rows exist for audit only; the BFF
+///             reconciliation sweep MUST NOT re-debit them.
+///   .daemon — cron / heartbeat / channel path. `usage_rt` is null, so there
+///             is no done frame; the durable `turn_usage` row is the ONLY
+///             accounting signal and the BFF sweep reconciles it into the
+///             wallet.
+pub const EntryKind = enum {
+    http,
+    daemon,
+
+    pub fn toSlice(self: EntryKind) []const u8 {
+        return switch (self) {
+            .http => "http",
+            .daemon => "daemon",
+        };
+    }
+};
+
 pub const RuntimeTurnContext = struct {
     origin: TurnOrigin = .user,
+    /// Wave 2 — dispatch-path discriminator for durable turn-usage metering.
+    /// Defaults to `.http`; daemon (cron/heartbeat) + channel inbound paths
+    /// set `.daemon` explicitly via `ProcessMessageOptions.entry_kind`.
+    entry_kind: EntryKind = .http,
     session_key: ?[]const u8 = null,
     provider: ?[]const u8 = null,
     model: ?[]const u8 = null,

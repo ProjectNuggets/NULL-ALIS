@@ -1489,6 +1489,10 @@ fn runCronAgentTurnWithBus(
 
     return runtime.session_mgr.processMessageWithContext(session_key, effective_prompt, null, .{
         .turn_origin = turn_origin,
+        // Wave 2 (metering completeness): cron / heartbeat / wake / proactive
+        // turns run with `usage_rt = null` (no SSE done frame). Tag `.daemon`
+        // so the durable `turn_usage` row is written + reconcilable by the BFF.
+        .entry_kind = .daemon,
     });
 }
 

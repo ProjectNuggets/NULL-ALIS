@@ -97,6 +97,16 @@ pub const MIGRATIONS = [_]Migration{
         .name = "0003_trace_shares",
         .sql = @embedFile("migrations/0003_trace_shares.sql"),
     },
+    .{
+        // Wave 2 (2026-06-11, nullALIS metering completeness) — durable
+        // per-turn usage ledger. See `src/migrations/0004_turn_usage.sql`
+        // for the rationale + schema. Written on EVERY turn completion
+        // (http + daemon) so cron/heartbeat/channel turns — which record
+        // NOTHING today (usage_rt = null) — become reconcilable by the BFF.
+        .version = 4,
+        .name = "0004_turn_usage",
+        .sql = @embedFile("migrations/0004_turn_usage.sql"),
+    },
 };
 
 /// Trait the runner's caller must satisfy: a method that takes a
@@ -395,6 +405,50 @@ test "MIGRATIONS array is in strict ascending version order with no gaps" {
         try std.testing.expect(m.version == prev + 1);
         prev = m.version;
     }
+}
+
+test "Wave 2 — migration 0004_turn_usage is registered with the durable metering schema" {
+    // Static contract test (no live DB): assert the durable per-turn usage
+    // ledger migration exists in the MIGRATIONS array with the load-bearing
+    // structural invariants the BFF reconciliation sweep + idempotency depend
+    // on. A future edit that drops any of these silently breaks metering
+    // completeness (daemon turns stop being reconcilable, or get double-
+    // debited) — this catches it at compile-test time without a Postgres.
+    const found = blk: {
+        for (MIGRATIONS) |m| {
+            if (m.version == 4) break :blk m;
+        }
+        return error.Migration0004NotFound;
+    };
+    try std.testing.expectEqualStrings("0004_turn_usage", found.name);
+    const sql = found.sql;
+
+    // Idempotent create (applies cleanly on fresh AND existing staging DB).
+    try std.testing.expect(std.mem.indexOf(u8, sql, "CREATE TABLE IF NOT EXISTS {schema}.turn_usage") != null);
+
+    // FK to {schema}.users with ON DELETE CASCADE (GDPR purge cascade parity).
+    try std.testing.expect(std.mem.indexOf(u8, sql, "REFERENCES {schema}.users(user_id) ON DELETE CASCADE") != null);
+
+    // The two discriminators the BFF reconciles on.
+    try std.testing.expect(std.mem.indexOf(u8, sql, "entry_kind") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "turn_origin") != null);
+
+    // Reconciliation columns.
+    try std.testing.expect(std.mem.indexOf(u8, sql, "cost_available") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "reconciled_at") != null);
+
+    // Idempotency: UNIQUE (user_id, turn_key) — the ON CONFLICT target.
+    try std.testing.expect(std.mem.indexOf(u8, sql, "CREATE UNIQUE INDEX IF NOT EXISTS idx_turn_usage_idem") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "(user_id, turn_key)") != null);
+
+    // Sweep index: partial on (entry_kind, reconciled_at) WHERE NULL.
+    try std.testing.expect(std.mem.indexOf(u8, sql, "idx_turn_usage_sweep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "WHERE reconciled_at IS NULL") != null);
+
+    // Transactional (no CREATE INDEX CONCURRENTLY) so the runner wraps it
+    // in BEGIN/COMMIT — a mid-migration failure rolls back cleanly.
+    try std.testing.expect(!found.concurrent_only);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "CONCURRENTLY") == null);
 }
 
 test "S10.4 — initial schema declares cross-schema FK to public.zaki_users with CASCADE" {
