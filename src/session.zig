@@ -315,19 +315,82 @@ pub const SessionManager = struct {
         self.sessions.deinit(self.allocator);
     }
 
+    /// P0-3 — wall-clock shutdown budget.
+    ///
+    /// Returns true once `now_ms - start_ms` has met or exceeded
+    /// `budget_ms`, signalling the flush loop to stop doing heavy
+    /// (potentially-blocking) passes for the remaining sessions. A
+    /// `budget_ms` of 0 disables the budget entirely (legacy behaviour:
+    /// flush every session synchronously). Pure + clock-injectable so the
+    /// budget arithmetic is unit-testable without a real wall clock.
+    pub fn shutdownBudgetExceeded(start_ms: i64, now_ms: i64, budget_ms: u64) bool {
+        if (budget_ms == 0) return false;
+        const elapsed = now_ms - start_ms;
+        if (elapsed < 0) return false;
+        return @as(u64, @intCast(elapsed)) >= budget_ms;
+    }
+
     pub fn flushSessionsForShutdown(self: *SessionManager, reason: []const u8) usize {
+        return self.flushSessionsForShutdownClocked(
+            reason,
+            self.config.reliability.shutdown_flush_budget_ms,
+            self.config.reliability.shutdown_join_timeout_ms,
+            std.time.milliTimestamp,
+        );
+    }
+
+    /// P0-3 — budget-aware shutdown flush with an injectable clock.
+    ///
+    /// Writes the deterministic shutdown checkpoint/anchor for every active
+    /// session (the acceptance-critical durable continuity), bounding total
+    /// wall-clock time:
+    ///   - Per session, the in-flight lifecycle worker join is bounded by
+    ///     `join_timeout_ms` (was an unbounded `Thread.join`) so one stuck
+    ///     worker cannot stall the whole flush.
+    ///   - Once `budget_ms` of wall-clock has elapsed, the remaining
+    ///     sessions SKIP the lifecycle join entirely and persist ONLY their
+    ///     raw/deterministic checkpoint — the hard backstop that keeps a
+    ///     runtime with many active sessions / slow IO well under the 180s
+    ///     k8s grace (no SIGKILL / exit 137).
+    ///
+    /// `now_fn` is injected so tests can drive elapsed time with a fake
+    /// monotonic clock; production passes `std.time.milliTimestamp`.
+    /// Returns the number of sessions flushed (always all of them — the
+    /// budget skips heavy work, never the deterministic write).
+    pub fn flushSessionsForShutdownClocked(
+        self: *SessionManager,
+        reason: []const u8,
+        budget_ms: u64,
+        join_timeout_ms: u64,
+        now_fn: *const fn () i64,
+    ) usize {
         var flushed: usize = 0;
+        const start_ms = now_fn();
+        var heavy_skipped: usize = 0;
+        const join_timeout: i64 = @intCast(join_timeout_ms);
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             const session = entry.value_ptr.*;
             session.mutex.lock();
             syncSessionOriginToAgent(session);
-            // Join any in-flight async lifecycle worker before writing the authoritative
-            // shutdown checkpoint so the final anchor content reflects the shutdown reason.
-            session.agent.joinLifecycleThreadIfPresent();
+            if (shutdownBudgetExceeded(start_ms, now_fn(), budget_ms)) {
+                // Budget exhausted: skip the (potentially-blocking) lifecycle
+                // join for this and all remaining sessions and persist only
+                // the deterministic checkpoint so shutdown completes promptly.
+                heavy_skipped += 1;
+            } else {
+                // Join any in-flight async lifecycle worker — bounded so a
+                // stuck worker can't stall teardown — before writing the
+                // authoritative shutdown checkpoint so the final anchor
+                // content reflects the shutdown reason.
+                _ = session.agent.joinLifecycleThreadWithTimeout(join_timeout);
+            }
             session.agent.persistSessionCheckpoint(reason);
             session.mutex.unlock();
             flushed += 1;
+        }
+        if (heavy_skipped > 0) {
+            log.warn("session.shutdown_flush budget_exceeded budget_ms={d} heavy_skipped={d} flushed={d}", .{ budget_ms, heavy_skipped, flushed });
         }
         return flushed;
     }
@@ -2152,6 +2215,110 @@ test "flushSessionsForShutdown persists continuity for active sessions" {
     const latest = (try mem.get(testing.allocator, "summary_latest/shutdown:checkpoint")) orelse return error.TestUnexpectedResult;
     defer latest.deinit(testing.allocator);
     try testing.expect(std.mem.indexOf(u8, latest.content, "session=shutdown:checkpoint") != null);
+}
+
+test "P0-3: shutdownBudgetExceeded honors budget, zero disables, ignores clock skew" {
+    // Zero budget = disabled (legacy: flush everything synchronously).
+    try testing.expect(!SessionManager.shutdownBudgetExceeded(0, 1_000_000, 0));
+    // Under budget.
+    try testing.expect(!SessionManager.shutdownBudgetExceeded(1000, 1000 + 24_999, 25_000));
+    // Exactly at budget → exceeded.
+    try testing.expect(SessionManager.shutdownBudgetExceeded(1000, 1000 + 25_000, 25_000));
+    // Past budget → exceeded.
+    try testing.expect(SessionManager.shutdownBudgetExceeded(1000, 1000 + 25_001, 25_000));
+    // Backwards clock skew never spuriously trips the budget.
+    try testing.expect(!SessionManager.shutdownBudgetExceeded(5000, 1000, 25_000));
+}
+
+// P0-3 — fake monotonic clock for the clocked-flush tests. A single
+// test runs at a time within a file, so a module-level atomic seam is
+// safe and keeps the `now_fn` signature (`*const fn () i64`) pure.
+var test_flush_clock_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0);
+fn testFlushClockNow() i64 {
+    return test_flush_clock_ms.load(.acquire);
+}
+
+test "P0-3: flushSessionsForShutdownClocked skips heavy join past budget but still writes deterministic checkpoint" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.memory.auto_save = true;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    const first_reply = try sm.processMessage("shutdown:budget", "hello", null);
+    defer testing.allocator.free(first_reply);
+
+    const session = sm.getIfPresent("shutdown:budget") orelse return error.TestUnexpectedResult;
+
+    // Park a lifecycle worker that blocks until released, and register it
+    // as the session's in-flight lifecycle thread. An UNBOUNDED join would
+    // deadlock the flush here; the budget must skip it.
+    var release = std.atomic.Value(bool).init(false);
+    const Blocker = struct {
+        fn run(rel: *std.atomic.Value(bool), in_flight: *std.atomic.Value(bool)) void {
+            while (!rel.load(.acquire)) std.Thread.sleep(1 * std.time.ns_per_ms);
+            in_flight.store(false, .release);
+        }
+    };
+    session.agent.lifecycle_in_flight.store(true, .release);
+    const blocker = try std.Thread.spawn(.{}, Blocker.run, .{ &release, &session.agent.lifecycle_in_flight });
+    session.agent.lifecycle_thread_mu.lock();
+    session.agent.lifecycle_thread = blocker;
+    session.agent.lifecycle_thread_mu.unlock();
+
+    // Fake clock already past a tiny budget on the FIRST budget check →
+    // heavy join is skipped for the (only) session.
+    test_flush_clock_ms.store(0, .release);
+    const budget_ms: u64 = 10;
+    const start_then_jump = struct {
+        fn now() i64 {
+            // Advance the clock far past the budget on every read so the
+            // budget trips on the first per-session check.
+            return test_flush_clock_ms.fetchAdd(1_000, .acq_rel) + 1_000;
+        }
+    };
+
+    // This call must return promptly (NOT block on the parked worker).
+    const flushed = sm.flushSessionsForShutdownClocked("shutdown", budget_ms, 5_000, start_then_jump.now);
+    try testing.expectEqual(@as(usize, 1), flushed);
+
+    // Deterministic checkpoint/anchor must still be written despite the skip.
+    const anchor = (try mem.get(testing.allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
+    defer anchor.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=shutdown") != null);
+
+    // Release + reap the parked worker so deinit doesn't see it in-flight.
+    release.store(true, .release);
+    _ = session.agent.waitForLifecycleIdle(5_000);
+}
+
+test "P0-3: flushSessionsForShutdownClocked under budget still flushes every session" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.memory.auto_save = true;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    const r1 = try sm.processMessage("under:a", "hello", null);
+    defer testing.allocator.free(r1);
+    const r2 = try sm.processMessage("under:b", "hello", null);
+    defer testing.allocator.free(r2);
+
+    // Frozen clock → budget never trips; both sessions flush via the
+    // normal (bounded-join) path.
+    test_flush_clock_ms.store(1000, .release);
+    const flushed = sm.flushSessionsForShutdownClocked("shutdown", 25_000, 5_000, testFlushClockNow);
+    try testing.expectEqual(@as(usize, 2), flushed);
 }
 
 test "evictIdle preserves recent sessions" {

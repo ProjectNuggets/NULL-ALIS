@@ -154,6 +154,19 @@ pub const ReliabilityConfig = struct {
     channel_max_backoff_secs: u64 = 60,
     scheduler_poll_secs: u64 = 15,
     scheduler_retries: u32 = 2,
+    /// P0-3 — wall-clock budget for the synchronous shutdown flush
+    /// (`SessionManager.flushSessionsForShutdown`). Once elapsed flush
+    /// time exceeds this, the remaining sessions skip the unbounded
+    /// lifecycle-worker join and persist only their deterministic
+    /// checkpoint/anchor, so shutdown completes well under the 180s k8s
+    /// grace and never triggers SIGKILL (exit 137). 0 = no budget
+    /// (legacy behaviour: flush every session synchronously).
+    shutdown_flush_budget_ms: u64 = 25_000,
+    /// P0-3 — per-session bound on the lifecycle-worker join during the
+    /// shutdown flush. A stuck worker is skipped after this many ms so a
+    /// single hung session cannot stall teardown indefinitely. The
+    /// worker is a detached background thread reaped by process exit.
+    shutdown_join_timeout_ms: u64 = 5_000,
     fallback_providers: []const []const u8 = &.{},
     api_keys: []const []const u8 = &.{},
     model_fallbacks: []const ModelFallbackEntry = &.{},

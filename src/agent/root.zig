@@ -111,6 +111,14 @@ const DEFAULT_MAX_HISTORY: u32 = 50;
 /// against repeated LLM summary calls on a tightly-packed session saving little.
 const COMPACTION_MIN_SAVINGS_PERCENT: u8 = 10;
 
+/// P0-3 — hard ceiling on how long `Agent.deinit` will wait for a stuck
+/// lifecycle worker to drain before tearing down regardless. The default
+/// path retries `deinitWithTimeout(30_000)` in a loop; without a cap a
+/// permanently-hung worker stalls teardown past the 180s k8s grace and
+/// triggers SIGKILL (exit 137). 90s gives a slow-but-live worker ample
+/// room while still leaving headroom under the grace window.
+const DEINIT_MAX_DRAIN_WAIT_MS: i64 = 90_000;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Agent
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1141,12 +1149,52 @@ pub const Agent = struct {
         if (thread) |t| t.join();
     }
 
+    /// P0-3 — bounded lifecycle-worker join for the shutdown path.
+    ///
+    /// `joinLifecycleThreadIfPresent` blocks indefinitely on `Thread.join`,
+    /// so a single hung worker can stall teardown past the k8s grace and
+    /// trigger SIGKILL (exit 137). This variant waits up to `timeout_ms`
+    /// for the worker to *finish* (observed via the `lifecycle_in_flight`
+    /// atomic the worker clears LAST, after all its memory effects) and
+    /// only then performs the join — which returns immediately because the
+    /// worker is already done.
+    ///
+    /// Returns `true` if the worker drained (or none was present) and the
+    /// handle was joined; `false` if it was still running past the budget,
+    /// in which case the join is SKIPPED and the handle left in place. The
+    /// worker is a detached background thread that completes on its own or
+    /// is reaped at process exit — skipping the join trades a clean join
+    /// for a bounded shutdown, which is the correct shutdown-time choice.
+    pub fn joinLifecycleThreadWithTimeout(self: *Agent, timeout_ms: i64) bool {
+        if (!self.waitForLifecycleIdle(timeout_ms)) {
+            log.warn("Agent.shutdown: lifecycle worker still active after {d}ms — skipping join to keep teardown bounded", .{timeout_ms});
+            return false;
+        }
+        // waitForLifecycleIdle already joined the (now-finished) handle.
+        return true;
+    }
+
     /// Default Agent.deinit waits in 30s chunks until lifecycle work
     /// drains. Shutdown may take longer under provider contention, but
     /// this path must not release memory while a worker still has a
     /// live Agent pointer.
+    ///
+    /// P0-3: the wait is now bounded by `DEINIT_MAX_DRAIN_WAIT_MS`. A
+    /// permanently-hung worker previously spun this loop forever, stalling
+    /// teardown past the 180s k8s grace → SIGKILL (exit 137). Past the
+    /// cap we STOP draining and return WITHOUT freeing — the worker still
+    /// holds a live Agent pointer, so freeing would be a use-after-free.
+    /// The Agent object is intentionally leaked; the process is shutting
+    /// down anyway and the OS reclaims everything on exit. Trading a
+    /// one-time leak for a bounded shutdown is the correct shutdown-time
+    /// choice (same leak contract as `deinitWithTimeout` returning false).
     pub fn deinit(self: *Agent) void {
+        const deadline_ms = std.time.milliTimestamp() + DEINIT_MAX_DRAIN_WAIT_MS;
         while (!self.deinitWithTimeout(30_000)) {
+            if (std.time.milliTimestamp() >= deadline_ms) {
+                log.warn("Agent.deinit: lifecycle worker still active after {d}ms budget; abandoning teardown (intentional leak) to keep shutdown bounded", .{DEINIT_MAX_DRAIN_WAIT_MS});
+                return;
+            }
             log.warn("Agent.deinit: lifecycle worker still active; waiting before teardown", .{});
         }
     }
@@ -7693,6 +7741,41 @@ test "waitForLifecycleIdle joins completed lifecycle worker" {
     try std.testing.expect(agent.waitForLifecycleIdle(1_000));
     try std.testing.expect(done.load(.acquire));
     try std.testing.expect(agent.lifecycle_thread == null);
+}
+
+test "P0-3: joinLifecycleThreadWithTimeout returns false and skips join when worker is stuck" {
+    var agent = try makeTestAgent(std.testing.allocator);
+    defer agent.deinit();
+
+    // Park a worker that stays "in flight" until released. A bounded join
+    // must give up after the budget rather than block on it.
+    var release = std.atomic.Value(bool).init(false);
+    const Blocker = struct {
+        fn run(rel: *std.atomic.Value(bool), in_flight: *std.atomic.Value(bool)) void {
+            while (!rel.load(.acquire)) std.Thread.sleep(1 * std.time.ns_per_ms);
+            in_flight.store(false, .release);
+        }
+    };
+    agent.lifecycle_in_flight.store(true, .release);
+    const blocker = try std.Thread.spawn(.{}, Blocker.run, .{ &release, &agent.lifecycle_in_flight });
+    agent.lifecycle_thread_mu.lock();
+    agent.lifecycle_thread = blocker;
+    agent.lifecycle_thread_mu.unlock();
+
+    // Budget elapses without the worker draining → false, handle left in place.
+    try std.testing.expect(!agent.joinLifecycleThreadWithTimeout(20));
+    try std.testing.expect(agent.lifecycle_thread != null);
+
+    // Release the worker, then a generous bounded join succeeds and reaps it.
+    release.store(true, .release);
+    try std.testing.expect(agent.joinLifecycleThreadWithTimeout(5_000));
+    try std.testing.expect(agent.lifecycle_thread == null);
+}
+
+test "P0-3: joinLifecycleThreadWithTimeout returns true when no worker is present" {
+    var agent = try makeTestAgent(std.testing.allocator);
+    defer agent.deinit();
+    try std.testing.expect(agent.joinLifecycleThreadWithTimeout(0));
 }
 
 fn find_tool_by_name(tools: []const Tool, name: []const u8) ?Tool {
