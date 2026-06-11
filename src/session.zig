@@ -100,6 +100,22 @@ pub const Session = struct {
         if (self.origin_account_id) |value| allocator.free(value);
     }
 
+    /// P0-3 follow-up — `deinit` bounded by a SHARED absolute wall-clock
+    /// `deadline_ms` instead of letting `Agent.deinit` wait up to its own
+    /// fixed ~90s. The aggregate shutdown path passes one deadline to
+    /// every session so the sum of all per-session drains is bounded by a
+    /// single global budget. Only `Agent.deinit` can block; the rest of
+    /// the teardown is non-blocking, so this only changes the drain bound.
+    pub fn deinitByDeadline(self: *Session, allocator: Allocator, deadline_ms: i64) void {
+        if (self.last_turn_outcome) |*outcome| outcome.deinit(self.agent.allocator);
+        self.agent.deinitByDeadline(deadline_ms);
+        allocator.free(self.session_key);
+        if (self.origin_channel) |value| allocator.free(value);
+        if (self.origin_lane) |value| allocator.free(value);
+        if (self.origin_chat_id) |value| allocator.free(value);
+        if (self.origin_account_id) |value| allocator.free(value);
+    }
+
     /// D1.3 getter for the most recently completed turn's outcome.
     /// Returns a freshly-allocated deep copy of the most recently
     /// completed turn's outcome, or null if no turn has run yet.
@@ -301,6 +317,18 @@ pub const SessionManager = struct {
     }
 
     pub fn deinit(self: *SessionManager) void {
+        // P0-3 follow-up — one shared wall-clock deadline bounds the WHOLE
+        // teardown (flush pass + the per-session Agent.deinit drain loop,
+        // each otherwise up to ~90s). Without it, S sessions could cost up
+        // to S*90s of unbounded deinit AFTER the flush budget, which a
+        // fleet-wide IO hang could push past the 180s k8s grace (SIGKILL /
+        // exit 137). The deadline is set once here so every session shares
+        // the same global wall-clock budget.
+        const deinit_budget_ms = self.config.reliability.shutdown_deinit_budget_ms;
+        const deinit_deadline_ms: ?i64 = if (deinit_budget_ms == 0)
+            null
+        else
+            std.time.milliTimestamp() + @as(i64, @intCast(deinit_budget_ms));
         if (!builtin.is_test) {
             const flushed = self.flushSessionsForShutdown("shutdown");
             if (flushed > 0) {
@@ -309,7 +337,11 @@ pub const SessionManager = struct {
         }
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
-            entry.value_ptr.*.deinit(self.allocator);
+            if (deinit_deadline_ms) |deadline| {
+                entry.value_ptr.*.deinitByDeadline(self.allocator, deadline);
+            } else {
+                entry.value_ptr.*.deinit(self.allocator);
+            }
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.sessions.deinit(self.allocator);

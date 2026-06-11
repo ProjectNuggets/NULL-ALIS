@@ -167,6 +167,17 @@ pub const ReliabilityConfig = struct {
     /// single hung session cannot stall teardown indefinitely. The
     /// worker is a detached background thread reaped by process exit.
     shutdown_join_timeout_ms: u64 = 5_000,
+    /// P0-3 follow-up — GLOBAL wall-clock budget for an entire
+    /// `SessionManager.deinit` (flush pass + the per-session
+    /// `Agent.deinit` drain loop, which is otherwise unbounded at up to
+    /// `DEINIT_MAX_DRAIN_WAIT_MS` ~90s EACH). One shared deadline is
+    /// threaded across both loops so a fleet-wide IO hang costs at most
+    /// this budget per tenant runtime instead of `sessions * 90s`,
+    /// keeping aggregate shutdown well under the 180s k8s grace (no
+    /// SIGKILL / exit 137). MUST be >= shutdown_flush_budget_ms; the
+    /// deinit loop gets whatever wall-clock remains after the flush.
+    /// 0 = no global cap (legacy: each Agent.deinit waits up to ~90s).
+    shutdown_deinit_budget_ms: u64 = 60_000,
     fallback_providers: []const []const u8 = &.{},
     api_keys: []const []const u8 = &.{},
     model_fallbacks: []const ModelFallbackEntry = &.{},

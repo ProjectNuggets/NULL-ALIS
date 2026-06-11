@@ -640,6 +640,7 @@ pub const Config = struct {
         try w.print("    \"scheduler_retries\": {d},\n", .{self.reliability.scheduler_retries});
         try w.print("    \"shutdown_flush_budget_ms\": {d},\n", .{self.reliability.shutdown_flush_budget_ms});
         try w.print("    \"shutdown_join_timeout_ms\": {d},\n", .{self.reliability.shutdown_join_timeout_ms});
+        try w.print("    \"shutdown_deinit_budget_ms\": {d},\n", .{self.reliability.shutdown_deinit_budget_ms});
 
         try w.print("    \"fallback_providers\": ", .{});
         try writeStringArray(w, self.reliability.fallback_providers);

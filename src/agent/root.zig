@@ -1189,12 +1189,34 @@ pub const Agent = struct {
     /// one-time leak for a bounded shutdown is the correct shutdown-time
     /// choice (same leak contract as `deinitWithTimeout` returning false).
     pub fn deinit(self: *Agent) void {
-        const deadline_ms = std.time.milliTimestamp() + DEINIT_MAX_DRAIN_WAIT_MS;
-        while (!self.deinitWithTimeout(30_000)) {
-            if (std.time.milliTimestamp() >= deadline_ms) {
-                log.warn("Agent.deinit: lifecycle worker still active after {d}ms budget; abandoning teardown (intentional leak) to keep shutdown bounded", .{DEINIT_MAX_DRAIN_WAIT_MS});
+        self.deinitByDeadline(std.time.milliTimestamp() + DEINIT_MAX_DRAIN_WAIT_MS);
+    }
+
+    /// P0-3 follow-up — deinit bounded by an absolute wall-clock
+    /// `deadline_ms` instead of the fixed `DEINIT_MAX_DRAIN_WAIT_MS`
+    /// window. `Agent.deinit` delegates here with `now + 90s`; the
+    /// aggregate shutdown path (`SessionManager.deinit`) passes a SHARED
+    /// deadline so the sum of all per-session deinits is bounded by ONE
+    /// global budget rather than `sessions * 90s`. Once the deadline has
+    /// passed, the per-attempt drain budget collapses to 0 (no waiting):
+    /// a still-running worker is left in place and the Agent is
+    /// intentionally leaked (same contract as the fixed-cap path) so
+    /// fleet-wide teardown stays well under the 180s k8s grace.
+    pub fn deinitByDeadline(self: *Agent, deadline_ms: i64) void {
+        while (true) {
+            const remaining = deadline_ms - std.time.milliTimestamp();
+            if (remaining <= 0) {
+                // Final attempt with a zero drain budget: tear down now if
+                // the worker is already idle, otherwise abandon (leak) to
+                // keep shutdown bounded.
+                if (!self.deinitWithTimeout(0)) {
+                    log.warn("Agent.deinit: lifecycle worker still active at shutdown deadline; abandoning teardown (intentional leak) to keep shutdown bounded", .{});
+                }
                 return;
             }
+            // Drain in <=30s chunks, never overshooting the shared deadline.
+            const chunk: i64 = if (remaining < 30_000) remaining else 30_000;
+            if (self.deinitWithTimeout(chunk)) return;
             log.warn("Agent.deinit: lifecycle worker still active; waiting before teardown", .{});
         }
     }
@@ -7776,6 +7798,47 @@ test "P0-3: joinLifecycleThreadWithTimeout returns true when no worker is presen
     var agent = try makeTestAgent(std.testing.allocator);
     defer agent.deinit();
     try std.testing.expect(agent.joinLifecycleThreadWithTimeout(0));
+}
+
+test "P0-3 follow-up: deinitByDeadline with an already-passed deadline returns promptly on a stuck worker" {
+    // Backstop for the AGGREGATE shutdown bound: SessionManager.deinit passes
+    // ONE shared wall-clock deadline to every session's Agent.deinit. Once the
+    // shared deadline is consumed by earlier slow sessions, a later session
+    // with a permanently-stuck lifecycle worker MUST tear down without waiting
+    // (no ~90s DEINIT_MAX_DRAIN_WAIT_MS per session) — otherwise S sessions
+    // could cost up to S*90s and blow the 180s k8s grace (SIGKILL / exit 137).
+    var agent = try makeTestAgent(std.testing.allocator);
+
+    var release = std.atomic.Value(bool).init(false);
+    const Blocker = struct {
+        fn run(rel: *std.atomic.Value(bool), in_flight: *std.atomic.Value(bool)) void {
+            while (!rel.load(.acquire)) std.Thread.sleep(1 * std.time.ns_per_ms);
+            in_flight.store(false, .release);
+        }
+    };
+    agent.lifecycle_in_flight.store(true, .release);
+    const blocker = try std.Thread.spawn(.{}, Blocker.run, .{ &release, &agent.lifecycle_in_flight });
+
+    // Deadline already in the past → no per-attempt wait. Must return well
+    // under the ~90s fixed cap; assert it returns in a tiny bounded window.
+    const before_ms = std.time.milliTimestamp();
+    agent.deinitByDeadline(before_ms - 1);
+    const elapsed_ms = std.time.milliTimestamp() - before_ms;
+    try std.testing.expect(elapsed_ms < 5_000);
+
+    // The stuck worker still holds a live Agent pointer, so deinitByDeadline
+    // intentionally left the Agent intact (leaked, not freed). Release the
+    // worker and reap the thread so the test itself doesn't leak the handle.
+    release.store(true, .release);
+    blocker.join();
+    // Worker drained — now a real teardown is safe and frees the Agent.
+    agent.deinit();
+}
+
+test "P0-3 follow-up: deinitByDeadline tears down cleanly when no worker is in flight" {
+    var agent = try makeTestAgent(std.testing.allocator);
+    // Generous deadline; no worker → immediate clean teardown (frees memory).
+    agent.deinitByDeadline(std.time.milliTimestamp() + 30_000);
 }
 
 fn find_tool_by_name(tools: []const Tool, name: []const u8) ?Tool {
