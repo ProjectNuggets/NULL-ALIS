@@ -14,11 +14,11 @@ import (
 func TestCreateSessionCreatesHardenedPod(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	p := &K8sProvider{
-		client:    client,
-		namespace: "browser",
-		image:     "browser-worker:dev",
-		reg:       NewRegistry(),
-		waitReady: func(ctx context.Context, pod string) error { return nil },
+		client:          client,
+		namespace:       "browser",
+		image:           "browser-worker:dev",
+		reg:             NewRegistry(),
+		waitReady:       func(ctx context.Context, pod string) error { return nil },
 		masterKey:       []byte("0123456789abcdef0123456789abcdef"),
 		store:           NewStateStore(client, "browser"),
 		maxPerUser:      3,
@@ -225,5 +225,37 @@ func TestWorkerResourcesDefault(t *testing.T) {
 	r := pod.Spec.Containers[0].Resources
 	if r.Requests.Memory().String() != "1Gi" || r.Limits.Memory().String() != "2Gi" {
 		t.Fatalf("default mem changed: %v / %v", r.Requests.Memory(), r.Limits.Memory())
+	}
+}
+
+func TestValidateWorkerResourceEnv(t *testing.T) {
+	// all unset -> nil
+	if err := validateWorkerResourceEnv(); err != nil {
+		t.Fatalf("unset env should be valid, got %v", err)
+	}
+	// valid override -> nil
+	t.Setenv("BROWSER_WORKER_MEM_LIMIT", "1280Mi")
+	if err := validateWorkerResourceEnv(); err != nil {
+		t.Fatalf("valid quantity should pass, got %v", err)
+	}
+	// malformed -> error (no panic)
+	t.Setenv("BROWSER_WORKER_MEM_LIMIT", "2 GB")
+	if err := validateWorkerResourceEnv(); err == nil {
+		t.Fatalf("malformed quantity must return an error")
+	}
+}
+
+func TestReapIdleOnceDisabled(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	p := NewK8sProvider(client, nil, "browser", "img", []byte("k"), nil, 3, 20, 900, 0, NewRegistry())
+	p.reg.Add("s", "browser-worker-s")
+	p.mu.Lock()
+	p.meta["s"] = sessionMeta{userID: "u", lastActivity: time.Now().Add(-time.Hour)}
+	p.mu.Unlock()
+	if n := p.ReapIdleOnce(context.Background()); n != 0 {
+		t.Fatalf("disabled reaper must be a no-op, reaped %d", n)
+	}
+	if _, ok := p.reg.Pod("s"); !ok {
+		t.Fatalf("session must be kept when idle-reaper disabled")
 	}
 }

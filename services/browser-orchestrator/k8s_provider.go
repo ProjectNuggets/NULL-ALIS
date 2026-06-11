@@ -54,7 +54,7 @@ type K8sProvider struct {
 	waitReady  func(ctx context.Context, podName string) error
 
 	masterKey []byte
-	store      *StateStore
+	store     *StateStore
 
 	maxPerUser      int
 	maxTotal        int
@@ -77,13 +77,13 @@ func NewK8sProvider(client kubernetes.Interface, restConfig *rest.Config, namesp
 		deadlineSeconds = 900
 	}
 	p := &K8sProvider{
-		client:          client,
-		restConfig:      restConfig,
-		namespace:       namespace,
-		image:           image,
-		reg:             reg,
-		masterKey:       masterKey,
-		store:           store,
+		client:             client,
+		restConfig:         restConfig,
+		namespace:          namespace,
+		image:              image,
+		reg:                reg,
+		masterKey:          masterKey,
+		store:              store,
 		maxPerUser:         maxPerUser,
 		maxTotal:           maxTotal,
 		deadlineSeconds:    deadlineSeconds,
@@ -168,6 +168,23 @@ func (p *K8sProvider) CreateSession(ctx context.Context, userID, authProfile str
 	metricSessionCreate.WithLabelValues("ok").Inc()
 	p.reg.Add(id, podName)
 	return id, nil
+}
+
+// validateWorkerResourceEnv parse-checks any worker-resource overrides at startup
+// so a malformed quantity is a loud rollout failure (CrashLoopBackOff) rather than
+// a per-request panic on a live node (workerResources uses MustParse on the hot path).
+func validateWorkerResourceEnv() error {
+	for _, k := range []string{
+		"BROWSER_WORKER_CPU_REQUEST", "BROWSER_WORKER_MEM_REQUEST",
+		"BROWSER_WORKER_CPU_LIMIT", "BROWSER_WORKER_MEM_LIMIT",
+	} {
+		if v := os.Getenv(k); v != "" {
+			if _, err := resource.ParseQuantity(v); err != nil {
+				return fmt.Errorf("%s=%q is not a valid k8s quantity: %w", k, v, err)
+			}
+		}
+	}
+	return nil
 }
 
 // workerResources reads optional per-worker resource overrides from env, falling

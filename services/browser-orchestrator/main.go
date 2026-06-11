@@ -56,6 +56,10 @@ func main() {
 	perMin := atoiOr("BROWSER_NEW_SESSION_RATE_PER_MIN", 6)
 	rl := NewRateLimiter(perMin, float64(perMin)/60.0)
 
+	if err := validateWorkerResourceEnv(); err != nil {
+		log.Fatalf("worker resource config: %v", err)
+	}
+
 	store := NewStateStore(client, ns)
 	provider := NewK8sProvider(client, cfg, ns, image, master, store, maxPerUser, maxTotal, int64(deadline), int64(idleTimeout), NewRegistry())
 	if err := provider.Reconcile(context.Background()); err != nil {
