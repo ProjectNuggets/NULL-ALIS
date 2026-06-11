@@ -38,7 +38,65 @@ const zaki_session = @import("session/root.zig");
 const lane_metrics = @import("lane_metrics.zig");
 const entity_pipeline = @import("agent/entity_pipeline.zig");
 const migrations = @import("migrations.zig");
+const sentry_runtime = @import("sentry_runtime.zig");
 const log = std.log.scoped(.zaki_state);
+
+// ── W1.4 postgres-error → GlitchTip capture ──────────────────────────────
+//
+// Raw `log.err("postgres ... failed")` lines at the SQL-execution boundary are
+// the engine's most important silent failures (FK violations like
+// `insert ... memories violates ... fkey`, constraint failures, connection
+// drops) — they returned `error.ExecFailed` to the caller and showed up only as
+// a stderr line, never as an actionable GlitchTip issue. This mirrors W1.1's
+// fire-and-forget `sentry_runtime.globalOrFallback().captureError(...)`: bounded
+// message into a fixed stack buffer, no allocation, no re-entrancy into the DB
+// layer. Targeted at the handful of exec/execParams failure sites only — NOT a
+// global std.log logFn override (that would flood + double-emit W1.1/W1.2's own
+// captures). Component is "postgres_exec" so every DB execution failure becomes
+// one GlitchTip issue carrying the PQerrorMessage text + an operation hint.
+//
+// Test-safe: like W1.1's loud `log.err`, the GlitchTip capture is gated on
+// `!builtin.is_test` so negative-path tests that intentionally provoke an
+// ExecFailed don't spuriously emit. In production the disabled-stub fallback
+// makes captureError a no-op when Sentry isn't configured, so this is always
+// safe to call.
+fn capturePostgresExecFailure(op: []const u8, pg_err: [*c]const u8) void {
+    if (builtin.is_test) return;
+    var buf: [512]u8 = undefined;
+    const err_text = std.mem.span(@as([*:0]const u8, @ptrCast(pg_err)));
+    const msg = formatPostgresExecFailure(&buf, op, err_text);
+    sentry_runtime.globalOrFallback().captureError("postgres_exec", msg);
+}
+
+/// Pure, allocation-free formatter for the GlitchTip message: `"{op}: {pg_err}"`
+/// bounded to `buf`. If the combined message overflows, falls back to a bounded
+/// prefix of the postgres error text (the load-bearing part) rather than
+/// dropping the issue. Extracted from `capturePostgresExecFailure` so the
+/// bounding logic is unit-testable without a live DB or Sentry runtime (the
+/// `captureError` wrapper itself is `!builtin.is_test`-gated, fire-and-forget).
+fn formatPostgresExecFailure(buf: []u8, op: []const u8, err_text: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}: {s}", .{ op, err_text }) catch blk: {
+        const cut = @min(err_text.len, buf.len -| 1);
+        break :blk std.fmt.bufPrint(buf, "{s}", .{err_text[0..cut]}) catch op;
+    };
+}
+
+test "W1.4: postgres exec-failure message carries op + PQerrorMessage text" {
+    var buf: [512]u8 = undefined;
+    // The exact staging FK-violation shape this task targets.
+    const pg_err = "ERROR:  insert or update on table \"memories\" violates foreign key constraint \"memories_user_id_fkey\"";
+    const msg = formatPostgresExecFailure(&buf, "postgres exec params failed", pg_err);
+    try std.testing.expect(std.mem.startsWith(u8, msg, "postgres exec params failed: "));
+    try std.testing.expect(std.mem.indexOf(u8, msg, "memories_user_id_fkey") != null);
+}
+
+test "W1.4: postgres exec-failure message is bounded to the buffer" {
+    var buf: [64]u8 = undefined;
+    const long_err = "x" ** 4096; // far larger than buf
+    const msg = formatPostgresExecFailure(&buf, "postgres exec failed", long_err);
+    try std.testing.expect(msg.len <= buf.len);
+    try std.testing.expect(msg.len > 0);
+}
 
 const c = if (build_options.enable_postgres) @cImport({
     @cInclude("libpq-fe.h");
@@ -1254,6 +1312,7 @@ const ManagerImpl = struct {
                 // runner's logged-error check, failing the build even though
                 // the test itself passed. Production (is_test=false) still logs.
                 if (!builtin.is_test) log.err("postgres txn exec failed: {s}", .{c.PQerrorMessage(self.lease.conn)});
+                capturePostgresExecFailure("postgres txn exec failed", c.PQerrorMessage(self.lease.conn));
                 c.PQclear(result);
                 return error.ExecFailed;
             }
@@ -1286,6 +1345,7 @@ const ManagerImpl = struct {
                 if (c.PQstatus(self.lease.conn) != c.CONNECTION_OK) self.conn_healthy = false;
                 // Finding C fix (2026-05-21): gate on !builtin.is_test — see TxnLease.exec.
                 if (!builtin.is_test) log.err("postgres txn execParams failed: {s}", .{c.PQerrorMessage(self.lease.conn)});
+                capturePostgresExecFailure("postgres txn execParams failed", c.PQerrorMessage(self.lease.conn));
                 c.PQclear(result);
                 return error.ExecFailed;
             }
@@ -10883,6 +10943,7 @@ const ManagerImpl = struct {
             if (c.PQstatus(conn) != c.CONNECTION_OK) conn_healthy = false;
             // Finding C fix (2026-05-21): gate on !builtin.is_test — see TxnLease.exec.
             if (!builtin.is_test) log.err("postgres exec failed: {s}", .{c.PQerrorMessage(conn)});
+            capturePostgresExecFailure("postgres exec failed", c.PQerrorMessage(conn));
             c.PQclear(result);
             return error.ExecFailed;
         }
@@ -11009,6 +11070,7 @@ const ManagerImpl = struct {
             conn_healthy = false;
             // Finding C fix (2026-05-21): gate on !builtin.is_test — see TxnLease.exec.
             if (!builtin.is_test) log.err("postgres exec params returned null status={d}: {s}; query={s}", .{ c.PQstatus(conn), c.PQerrorMessage(conn), query });
+            capturePostgresExecFailure("postgres exec params returned null result", c.PQerrorMessage(conn));
             return error.ExecFailed;
         };
 
@@ -11017,6 +11079,7 @@ const ManagerImpl = struct {
             if (c.PQstatus(conn) != c.CONNECTION_OK) conn_healthy = false;
             // Finding C fix (2026-05-21): gate on !builtin.is_test — see TxnLease.exec.
             if (!builtin.is_test) log.err("postgres exec params failed: {s}", .{c.PQerrorMessage(conn)});
+            capturePostgresExecFailure("postgres exec params failed", c.PQerrorMessage(conn));
             c.PQclear(result);
             return error.ExecFailed;
         }
