@@ -23003,6 +23003,91 @@ fn setListenerNonBlocking(server: *std.net.Server) void {
     _ = std.posix.fcntl(server.stream.handle, std.posix.F.SETFL, flags | @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }))) catch {};
 }
 
+// ── P0-1: acceptor-thread liveness fast-path ─────────────────────────
+//
+// Kubernetes liveness/readiness probes (`GET /health`, `GET /ready`) must
+// be answered even when every worker is busy. Before P0-1 the acceptor
+// thread also ran tenant-runtime maintenance inline, so a 30-75s eviction
+// could starve the accept loop and make /health time out → liveness kill.
+// P0-1 moves maintenance to its own thread AND serves these probes inline
+// on the acceptor (before enqueueing), so a saturated worker pool can never
+// stall a probe.
+
+/// Classification of a peeked HTTP request line for the acceptor fast-path.
+const ProbeClass = enum { health, ready, other };
+
+/// Classify a peeked request preview as a cheap liveness/readiness probe.
+///
+/// Returns `.health` / `.ready` ONLY when `preview` contains a COMPLETE
+/// request line (CRLF-terminated) whose method is exactly `GET` and whose
+/// target base-path (the portion before any `?`) is exactly `/health` or
+/// `/ready`. Anything else — a different method, a different path, or a
+/// preview that has not yet received the full request line — returns
+/// `.other`, so the connection falls through to the normal worker path
+/// unchanged. Parsing mirrors handleAcceptedConnection's own request-line
+/// split so the fast-path and slow-path agree on what these targets are.
+fn classifyProbeRequestLine(preview: []const u8) ProbeClass {
+    // Require the full request line so a truncated peek (e.g. "GET /healt")
+    // or a longer path peeked mid-flight (e.g. "GET /healthz" arriving as
+    // "GET /health") is never misclassified — we only act on a settled line.
+    const line_end = std.mem.indexOf(u8, preview, "\r\n") orelse return .other;
+    const first_line = preview[0..line_end];
+    var parts = std.mem.splitScalar(u8, first_line, ' ');
+    const method = parts.next() orelse return .other;
+    if (!std.mem.eql(u8, method, "GET")) return .other;
+    const target = parts.next() orelse return .other;
+    const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
+    if (std.mem.eql(u8, base_path, "/health")) return .health;
+    if (std.mem.eql(u8, base_path, "/ready")) return .ready;
+    return .other;
+}
+
+/// Peek (without consuming) the start of an accepted connection and, if it
+/// is a `GET /health` / `GET /ready` probe, serve it inline on the acceptor
+/// thread and return true (the caller must then close the connection). The
+/// response bytes are byte-for-byte identical to the worker path
+/// (handleAcceptedConnection's `.health` / `.ready` cases). Returns false
+/// for anything else — including a peek that would block or has not yet
+/// received the full request line — so the caller enqueues it normally;
+/// MSG_PEEK leaves the bytes in the socket buffer for the worker to re-read.
+///
+/// This MUST NOT block the acceptor thread: the peek is a single
+/// non-blocking recv(MSG_PEEK | MSG_DONTWAIT). Accepted sockets do NOT
+/// inherit the listener's O_NONBLOCK, so MSG_DONTWAIT is required to keep
+/// this one recv from blocking; on WouldBlock / short read / any error we
+/// bail to the slow path (enqueue) rather than wait. MSG_PEEK leaves the
+/// bytes in the socket buffer for the worker to re-read on the slow path.
+fn tryServeProbeInline(state: *GatewayState, conn: std.net.Server.Connection) bool {
+    var peek_buf: [256]u8 = undefined;
+    const peek_flags: u32 = std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT;
+    const n = std.posix.recv(conn.stream.handle, &peek_buf, peek_flags) catch return false;
+    if (n == 0) return false;
+    const class = classifyProbeRequestLine(peek_buf[0..n]);
+    switch (class) {
+        .other => return false,
+        .health => {
+            _ = state.requests_total.fetchAdd(1, .monotonic);
+            const body = if (isHealthOk()) "{\"status\":\"ok\"}" else "{\"status\":\"degraded\"}";
+            sendHttpResponse(conn.stream, "200 OK", "application/json", body) catch {};
+            return true;
+        },
+        .ready => {
+            _ = state.requests_total.fetchAdd(1, .monotonic);
+            if (state.draining.load(.acquire)) {
+                sendHttpResponse(conn.stream, "503 Service Unavailable", "application/json", "{\"status\":\"draining\"}") catch {};
+                return true;
+            }
+            // Mirror the worker path: route through the canonical handleReady.
+            // Use a short-lived arena for its allocation, freed before return.
+            var arena = std.heap.ArenaAllocator.init(state.allocator);
+            defer arena.deinit();
+            const ready_resp = handleReady(arena.allocator());
+            sendHttpResponse(conn.stream, ready_resp.http_status, "application/json", ready_resp.body) catch {};
+            return true;
+        },
+    }
+}
+
 fn handleAcceptedConnection(
     allocator: std.mem.Allocator,
     config_opt: ?*const Config,
@@ -23763,6 +23848,35 @@ fn userCellRegistrationMain(ctx: *UserCellRegistrationContext) void {
     }
 }
 
+// ── P0-1: dedicated tenant-runtime maintenance thread ────────────────
+//
+// Before P0-1 the accept loop ran runTenantRuntimeMaintenance (→ evictIdle)
+// inline on the acceptor thread's `error.WouldBlock` branch, holding
+// tenant_runtime_mutex for the whole sweep. A long eviction starved the
+// accept loop and blocked /health → liveness kill. This thread runs the
+// SAME maintenance on the SAME interval, acquiring tenant_runtime_mutex
+// exactly as before, but off the acceptor thread. It is spawned once at
+// gateway start and joined on teardown BEFORE state.deinit() tears down the
+// tenant runtimes it touches.
+
+const MaintenanceContext = struct {
+    state: *GatewayState,
+};
+
+fn tenantRuntimeMaintenanceMain(ctx: *MaintenanceContext) void {
+    var last_run_s: i64 = 0;
+    while (!ctx.state.shutdown_requested.load(.acquire)) {
+        const now_s = std.time.timestamp();
+        if (now_s - last_run_s >= TENANT_RUNTIME_MAINTENANCE_INTERVAL_SECS) {
+            runTenantRuntimeMaintenance(ctx.state, now_s);
+            last_run_s = now_s;
+        }
+        // Sleep in short increments so shutdown is observed promptly (the
+        // accept loop tears down within ~50ms; match that responsiveness).
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+}
+
 pub fn runWithRole(
     allocator: std.mem.Allocator,
     host: []const u8,
@@ -24299,9 +24413,30 @@ pub fn runWithRole(
         for (worker_threads) |thread| thread.join();
     }
 
-    var last_tenant_runtime_maintenance_s: i64 = 0;
+    // P0-1: dedicated tenant-runtime maintenance thread. Runs evictIdle +
+    // cache pruning off the acceptor thread so a long eviction can never
+    // starve the accept loop / block liveness. Joined here (defer registered
+    // AFTER state.deinit's defer, so it fires BEFORE state is torn down — the
+    // maintenance thread touches state.tenant_runtimes under
+    // tenant_runtime_mutex). The 2MB stack matches the heaviest comparable
+    // worker (scheduler); the eviction checkpoint is deterministic post-P0-2,
+    // so this is conservative headroom for the store/vector-sync call graph.
+    var maintenance_ctx = MaintenanceContext{ .state = &state };
+    const maintenance_thread = try std.Thread.spawn(
+        .{ .stack_size = 2 * 1024 * 1024 },
+        tenantRuntimeMaintenanceMain,
+        .{&maintenance_ctx},
+    );
+    defer {
+        state.shutdown_requested.store(true, .release);
+        maintenance_thread.join();
+    }
 
     // Accept loop — one acceptor thread, bounded queue + worker pool.
+    // Tenant-runtime maintenance no longer runs here (P0-1) — see
+    // tenantRuntimeMaintenanceMain. /health and /ready probes are served
+    // INLINE below before enqueueing so a saturated worker pool can never
+    // stall a liveness probe.
     while (true) {
         if (state.shutdown_requested.load(.acquire) and
             state.in_flight_requests.load(.acquire) == 0 and
@@ -24312,16 +24447,20 @@ pub fn runWithRole(
 
         const conn = server.accept() catch |err| switch (err) {
             error.WouldBlock => {
-                const now_s = std.time.timestamp();
-                if (now_s - last_tenant_runtime_maintenance_s >= TENANT_RUNTIME_MAINTENANCE_INTERVAL_SECS) {
-                    runTenantRuntimeMaintenance(&state, now_s);
-                    last_tenant_runtime_maintenance_s = now_s;
-                }
+                // No heavy work on the acceptor thread (P0-1) — just back off.
                 std.Thread.sleep(50 * std.time.ns_per_ms);
                 continue;
             },
             else => continue,
         };
+        // P0-1 fast-path: answer GET /health and GET /ready inline on the
+        // acceptor thread and close — never enqueue. Bytes are identical to
+        // the worker path; a non-probe (or a peek that can't classify yet)
+        // returns false and falls through to the normal queue unchanged.
+        if (tryServeProbeInline(&state, conn)) {
+            conn.stream.close();
+            continue;
+        }
         if (!request_queue.push(conn)) {
             _ = state.overload_rejected_total.fetchAdd(1, .monotonic);
             sendHttpResponseRetryAfter(
@@ -29315,6 +29454,57 @@ test "GatewayState init has empty whatsapp_app_secret" {
     var state = GatewayState.init(std.testing.allocator);
     defer state.deinit();
     try std.testing.expectEqualStrings("", state.whatsapp_app_secret);
+}
+
+// ── P0-1: acceptor-thread probe fast-path classifier tests ───────────
+//
+// The acceptor fast-path itself requires a live socket (verified under
+// load at staging retest — full saturation + /health latency). Here we pin
+// the smallest extractable, race-free unit: classifyProbeRequestLine, which
+// decides whether a peeked request line is a GET /health or GET /ready
+// probe the acceptor may answer inline without enqueueing.
+
+test "P0-1 classifier: GET /health is a health probe" {
+    try std.testing.expectEqual(ProbeClass.health, classifyProbeRequestLine("GET /health HTTP/1.1\r\nHost: x\r\n\r\n"));
+}
+
+test "P0-1 classifier: GET /ready is a ready probe" {
+    try std.testing.expectEqual(ProbeClass.ready, classifyProbeRequestLine("GET /ready HTTP/1.1\r\nHost: x\r\n\r\n"));
+}
+
+test "P0-1 classifier: health/ready accept a query string" {
+    try std.testing.expectEqual(ProbeClass.health, classifyProbeRequestLine("GET /health?probe=1 HTTP/1.1\r\n\r\n"));
+    try std.testing.expectEqual(ProbeClass.ready, classifyProbeRequestLine("GET /ready?x=1 HTTP/1.1\r\n\r\n"));
+}
+
+test "P0-1 classifier: only GET is fast-pathed" {
+    // Non-GET requests to these paths must fall through to the worker so the
+    // existing dispatch (and any future method handling) is unchanged.
+    try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("POST /health HTTP/1.1\r\n\r\n"));
+    try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("HEAD /ready HTTP/1.1\r\n\r\n"));
+}
+
+test "P0-1 classifier: non-probe paths are not fast-pathed" {
+    try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("GET / HTTP/1.1\r\n\r\n"));
+    try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("GET /metrics HTTP/1.1\r\n\r\n"));
+    try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("GET /api/v1/chat HTTP/1.1\r\n\r\n"));
+}
+
+test "P0-1 classifier: prefix paths are NOT misclassified" {
+    // A longer path must never be mistaken for the exact probe path.
+    try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("GET /healthz HTTP/1.1\r\n\r\n"));
+    try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("GET /health/extra HTTP/1.1\r\n\r\n"));
+    try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("GET /readyz HTTP/1.1\r\n\r\n"));
+}
+
+test "P0-1 classifier: a partial request line (no CRLF) is not classified" {
+    // A peek that has not yet received the full request line must return
+    // .other so the connection falls through to the normal worker path —
+    // never a guess on a truncated path like "GET /healt".
+    try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("GET /healt"));
+    try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("GET /health HTTP/1.1"));
+    try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine(""));
+    try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("GE"));
 }
 
 // ── /ready endpoint tests ────────────────────────────────────────────
