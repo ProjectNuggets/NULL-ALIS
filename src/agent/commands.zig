@@ -1140,9 +1140,35 @@ fn emitLifecycleSummarizerStage(self: anytype, duration_ms: u64, summarized_coun
     self.observer.recordEvent(&event);
 }
 
+/// True when a session-end checkpoint must NOT run a heavy inline memory
+/// pass — i.e. it is triggered by a non-interactive lifecycle event
+/// (process shutdown or idle/TTL eviction) rather than an explicit user
+/// action. These run on the maintenance / shutdown paths where a 30-75s
+/// blocking LLM summarizer + inline boundary extraction would stall the
+/// runtime (P0-2). For these reasons the checkpoint persists only the
+/// deterministic checkpoint/anchor and ENQUEUES boundary extraction to the
+/// daemon lane instead of doing it inline.
+fn isNonInteractiveCheckpointReason(reason: []const u8) bool {
+    return std.mem.eql(u8, reason, "shutdown") or
+        std.mem.eql(u8, reason, "idle_evict") or
+        std.mem.eql(u8, reason, "ttl_evict");
+}
+
 fn shouldUseDeterministicSessionSummary(reason: []const u8) bool {
     return std.mem.eql(u8, reason, "compaction:auto") or
-        std.mem.eql(u8, reason, "summary_seed:auto");
+        std.mem.eql(u8, reason, "summary_seed:auto") or
+        // P0-2: shutdown + idle/TTL eviction must skip the blocking LLM
+        // summarizer (summary_provider.chat) and use the deterministic
+        // structured fallback summary — see isNonInteractiveCheckpointReason.
+        isNonInteractiveCheckpointReason(reason);
+}
+
+/// True when the inline session-end boundary extraction (extractAtBoundary)
+/// must be skipped because the checkpoint is non-interactive (P0-2). The
+/// entity pipeline is still enqueued to the daemon lane downstream, so the
+/// extraction is not dropped — only moved off the blocking path.
+fn shouldSkipInlineBoundaryExtraction(reason: []const u8) bool {
+    return isNonInteractiveCheckpointReason(reason);
 }
 
 fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, session_id: []const u8, reason: []const u8, now_s: i64, now_iso: []const u8) bool {
@@ -1437,7 +1463,14 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         // a contradiction judge, but this legacy session-end path only has
         // judge-backed extraction config available. Avoid routing arbitrary
         // chat providers through the structured extraction parser.
-        if (self.history.items.len > 0) {
+        //
+        // P0-2: on non-interactive checkpoints (shutdown / idle_evict /
+        // ttl_evict) this inline pass is SKIPPED — extractAtBoundary is a
+        // blocking LLM-backed extraction that would stall the maintenance /
+        // shutdown path. The entity pipeline is still enqueued to the daemon
+        // lane below (enqueueExtractionJob), so the extraction is moved
+        // off-thread, not dropped.
+        if (self.history.items.len > 0 and !shouldSkipInlineBoundaryExtraction(reason)) {
             var msgs_buf = std.ArrayListUnmanaged(providers.ChatMessage).initCapacity(self.allocator, self.history.items.len) catch null;
             if (msgs_buf) |*buf| {
                 defer buf.deinit(self.allocator);
@@ -5412,4 +5445,54 @@ test "HELP_TEXT covers additional implemented commands" {
     try expectHelpContains(HELP_TEXT, "/allowlist");
     try expectHelpContains(HELP_TEXT, "/voice");
     try expectHelpContains(HELP_TEXT, "/compact");
+}
+
+// ── P0-2: non-interactive checkpoint reasons skip inline heavy memory work ──
+//
+// These pure-predicate tests pin the gate that governs whether
+// persistSessionCheckpointDetailed runs a blocking inline LLM summarizer
+// (summary_provider.chat) and inline boundary extraction (extractAtBoundary).
+// `shouldUseDeterministicSessionSummary` true => the deterministic structured
+// fallback path runs and summary_provider.chat is NEVER reached (commands.zig
+// line ~1169-1180 break/return before the .chat call at ~1203).
+// `shouldSkipInlineBoundaryExtraction` true => the inline extractAtBoundary
+// block is skipped (the entity pipeline is still enqueued downstream).
+// Together they assert ZERO inline provider.chat for the three evict reasons.
+
+test "P0-2: shutdown/idle_evict/ttl_evict use deterministic summary (no inline provider.chat)" {
+    try std.testing.expect(shouldUseDeterministicSessionSummary("shutdown"));
+    try std.testing.expect(shouldUseDeterministicSessionSummary("idle_evict"));
+    try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_evict"));
+}
+
+test "P0-2: existing deterministic reasons still hold" {
+    // Regression guard — the pre-existing deterministic reasons must remain.
+    try std.testing.expect(shouldUseDeterministicSessionSummary("compaction:auto"));
+    try std.testing.expect(shouldUseDeterministicSessionSummary("summary_seed:auto"));
+}
+
+test "P0-2: interactive reasons still take the LLM summary path" {
+    // Manual / interactive checkpoints keep the inline LLM summarizer — only
+    // the non-interactive lifecycle reasons are diverted off the blocking path.
+    try std.testing.expect(!shouldUseDeterministicSessionSummary("compaction:manual"));
+    try std.testing.expect(!shouldUseDeterministicSessionSummary("reset:manual"));
+    try std.testing.expect(!shouldUseDeterministicSessionSummary(""));
+}
+
+test "P0-2: inline boundary extraction is skipped exactly for the evict reasons" {
+    try std.testing.expect(shouldSkipInlineBoundaryExtraction("shutdown"));
+    try std.testing.expect(shouldSkipInlineBoundaryExtraction("idle_evict"));
+    try std.testing.expect(shouldSkipInlineBoundaryExtraction("ttl_evict"));
+    // Interactive / auto reasons keep the inline extraction pass.
+    try std.testing.expect(!shouldSkipInlineBoundaryExtraction("compaction:manual"));
+    try std.testing.expect(!shouldSkipInlineBoundaryExtraction("compaction:auto"));
+    try std.testing.expect(!shouldSkipInlineBoundaryExtraction("summary_seed:auto"));
+}
+
+test "P0-2: isNonInteractiveCheckpointReason classifies lifecycle reasons" {
+    try std.testing.expect(isNonInteractiveCheckpointReason("shutdown"));
+    try std.testing.expect(isNonInteractiveCheckpointReason("idle_evict"));
+    try std.testing.expect(isNonInteractiveCheckpointReason("ttl_evict"));
+    try std.testing.expect(!isNonInteractiveCheckpointReason("compaction:auto"));
+    try std.testing.expect(!isNonInteractiveCheckpointReason("compaction:manual"));
 }
