@@ -286,6 +286,13 @@ const CRON_WAKE_REASON_NEXT_HEARTBEAT_PREFIX = "cron.next_heartbeat:";
 const HEARTBEAT_SWEEP_INTERVAL_SECS: i64 = 30;
 const HEARTBEAT_WAKE_MAX_DRAIN_PER_TICK: usize = 4;
 
+/// P0-5: per-provider retry budget for the extraction worker's provider bundle.
+/// 0 → a single attempt per provider, so a hung LLM upstream costs at most one
+/// per-job `--max-time` (~30s) instead of `(provider_retries+1) × max_time`
+/// (up to 90s with the default), which stalled the heartbeat loop. Scoped to
+/// the extraction worker only; interactive chat keeps the configured retries.
+const EXTRACTION_PROVIDER_RETRIES: u32 = 0;
+
 fn ignoreSigpipe() void {
     switch (builtin.os.tag) {
         .windows, .wasi => return,
@@ -1069,7 +1076,19 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
             break :init_worker;
         };
         errdefer allocator.destroy(bundle_ptr);
-        bundle_ptr.* = providers.runtime_bundle.RuntimeProviderBundle.init(allocator, config) catch |err| {
+        // P0-5: the extraction worker shares the daemon heartbeat thread, so a
+        // hung LLM upstream must not amplify into (provider_retries+1) × max_time
+        // (up to 3×30s = 90s with the default provider_retries=2). Cap THIS
+        // bundle's retries to EXTRACTION_PROVIDER_RETRIES=0 so the worst case is
+        // a single per-job timeout (~30s); extraction is best-effort and
+        // already re-queues on failure (markExtractionJobFailed). The override
+        // is scoped to this worker bundle only — interactive chat turns use a
+        // separate bundle that keeps the full configured retry budget.
+        bundle_ptr.* = providers.runtime_bundle.RuntimeProviderBundle.initWithRetryOverride(
+            allocator,
+            config,
+            EXTRACTION_PROVIDER_RETRIES,
+        ) catch |err| {
             log.warn("extraction_queue.worker.bundle_init_failed err={s}", .{@errorName(err)});
             allocator.destroy(bundle_ptr);
             break :init_worker;

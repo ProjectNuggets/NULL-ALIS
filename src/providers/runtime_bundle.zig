@@ -33,6 +33,30 @@ pub const RuntimeProviderBundle = struct {
     sidecar_model: []const u8 = "",
 
     pub fn init(allocator: std.mem.Allocator, cfg: *const Config) !RuntimeProviderBundle {
+        return initWithRetryOverride(allocator, cfg, null);
+    }
+
+    /// Like `init`, but caps the reliable wrapper's per-provider retry count to
+    /// `retry_override` when provided (leaving `cfg.reliability.provider_retries`
+    /// untouched for every other consumer).
+    ///
+    /// P0-5: the daemon extraction worker uses this with `0` so a hung upstream
+    /// costs at most one `--max-time` (not `(provider_retries+1) × max_time`,
+    /// which was up to 3×30s = 90s and stalled the heartbeat loop). Interactive
+    /// chat turns keep the full configured retry budget via plain `init`.
+    pub fn initWithRetryOverride(
+        allocator: std.mem.Allocator,
+        cfg: *const Config,
+        retry_override: ?u32,
+    ) !RuntimeProviderBundle {
+        // Effective retry count for THIS bundle. The override caps but never
+        // raises the configured value, so an extraction worker can only ever
+        // shrink the retry budget, never expand it.
+        const effective_retries: u32 = if (retry_override) |ov|
+            @min(ov, cfg.reliability.provider_retries)
+        else
+            cfg.reliability.provider_retries;
+
         var bundle = RuntimeProviderBundle{ .allocator = allocator };
         errdefer bundle.deinit();
 
@@ -92,7 +116,7 @@ pub const RuntimeProviderBundle = struct {
 
         const extra_count = cfg.reliability.fallback_providers.len + rotating_key_count;
         const need_reliable =
-            cfg.reliability.provider_retries > 0 or
+            effective_retries > 0 or
             cfg.reliability.model_fallbacks.len > 0 or
             extra_count > 0;
 
@@ -190,7 +214,7 @@ pub const RuntimeProviderBundle = struct {
         const reliable_ptr = try allocator.create(reliable.ReliableProvider);
         var reliable_impl = reliable.ReliableProvider.initWithProvider(
             bundle.provider(),
-            cfg.reliability.provider_retries,
+            effective_retries,
             cfg.reliability.provider_backoff_ms,
         );
 
@@ -352,4 +376,75 @@ test "RuntimeProviderBundle turns reliability api_keys into fallback providers" 
     try std.testing.expect(bundle.extra_keys != null);
     try std.testing.expectEqualStrings("key-b", bundle.extra_keys.?[0].?);
     try std.testing.expectEqualStrings("key-c", bundle.extra_keys.?[1].?);
+}
+
+test "RuntimeProviderBundle retry override 0 with no fallbacks yields single-attempt provider" {
+    // P0-5: the daemon extraction worker must bound its total time. The
+    // reliable wrapper's retry count is the lever (it amplifies a hung
+    // upstream into (retries+1) × max_time = up to 3×30s = 90s). Passing
+    // override=0 with no fallbacks means a single attempt — no reliable
+    // wrapper is needed — while the shared config knob (used by interactive
+    // chat) is left untouched.
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.reliability.provider_retries = 2; // global default — chat keeps this
+    cfg.reliability.provider_backoff_ms = 50;
+
+    var bundle = try RuntimeProviderBundle.initWithRetryOverride(std.testing.allocator, &cfg, 0);
+    defer bundle.deinit();
+
+    // override=0 + no fallbacks/model-fallbacks → no reliable wrapper, so
+    // bundle.provider() is the primary provider (exactly one attempt).
+    try std.testing.expect(bundle.reliable_ptr == null);
+    _ = bundle.provider();
+
+    // The shared config knob is not mutated by the override.
+    try std.testing.expectEqual(@as(u32, 2), cfg.reliability.provider_retries);
+}
+
+test "RuntimeProviderBundle retry override caps reliable max_retries when fallbacks exist" {
+    // When fallbacks are configured the reliable wrapper is still needed, but
+    // its per-provider retry budget is capped to the override (not the global
+    // provider_retries). This bounds the extraction worker's worst case while
+    // preserving cross-provider failover.
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_provider = "openrouter",
+        .providers = &.{
+            .{ .name = "openrouter", .api_key = "primary-key" },
+        },
+    };
+    cfg.reliability.provider_retries = 2; // global default — chat keeps this
+    cfg.reliability.provider_backoff_ms = 50;
+    cfg.reliability.fallback_providers = &.{"together"};
+
+    var bundle = try RuntimeProviderBundle.initWithRetryOverride(std.testing.allocator, &cfg, 0);
+    defer bundle.deinit();
+
+    try std.testing.expect(bundle.reliable_ptr != null);
+    try std.testing.expectEqual(@as(u32, 0), bundle.reliable_ptr.?.max_retries);
+    try std.testing.expectEqual(@as(u32, 2), cfg.reliability.provider_retries);
+}
+
+test "RuntimeProviderBundle init delegates with no retry override (chat path unchanged)" {
+    // The plain init() path used by interactive chat must keep the global
+    // provider_retries — the override is opt-in for the extraction worker only.
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.reliability.provider_retries = 2;
+    cfg.reliability.provider_backoff_ms = 50;
+
+    var bundle = try RuntimeProviderBundle.init(std.testing.allocator, &cfg);
+    defer bundle.deinit();
+
+    try std.testing.expect(bundle.reliable_ptr != null);
+    try std.testing.expectEqual(@as(u32, 2), bundle.reliable_ptr.?.max_retries);
 }

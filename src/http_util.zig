@@ -21,6 +21,17 @@ pub const CurlResponse = struct {
 
 const STATUS_MARKER = "\n__NULLCLAW_STATUS__:";
 
+/// P0-5: TCP connect-phase deadline for every curl invocation, in seconds.
+///
+/// `--max-time` alone bounds the *total* request; if an upstream completes the
+/// TCP handshake but then hangs, curl waits the full `--max-time` and returns
+/// `(28) … 0 bytes received`. `--connect-timeout` caps only the connect phase
+/// so a dead/hung upstream fails fast. 5s is generous for a healthy connect
+/// (real handshakes complete in tens of ms) while cutting the worst case from
+/// the full `--max-time` to ~5s. Universally safe for all callers — including
+/// SSE, where it bounds only the connect, not the (intentionally long) read.
+const CONNECT_TIMEOUT_SECS = "5";
+
 fn curlExitHint(code: u8) []const u8 {
     return switch (code) {
         3 => "url_malformed",
@@ -152,6 +163,12 @@ pub fn curlPostWithProxy(
     argc += 1;
     argv_buf[argc] = "-s";
     argc += 1;
+    // P0-5: bound the TCP connect phase so a hung upstream fails fast even
+    // when no --max-time is supplied (max_time here is optional).
+    argv_buf[argc] = "--connect-timeout";
+    argc += 1;
+    argv_buf[argc] = CONNECT_TIMEOUT_SECS;
+    argc += 1;
     argv_buf[argc] = "-X";
     argc += 1;
     argv_buf[argc] = "POST";
@@ -250,6 +267,11 @@ pub fn curlGetWithProxy(
     argv_buf[argc] = "-sf";
     argc += 1;
     argv_buf[argc] = "-L";
+    argc += 1;
+    // P0-5: cap the TCP connect phase alongside the total --max-time deadline.
+    argv_buf[argc] = "--connect-timeout";
+    argc += 1;
+    argv_buf[argc] = CONNECT_TIMEOUT_SECS;
     argc += 1;
     argv_buf[argc] = "--max-time";
     argc += 1;
@@ -352,6 +374,11 @@ pub fn curlRequestResolved(
     argc += 1;
     argv_buf[argc] = "-sS";
     argc += 1;
+    // P0-5: cap the TCP connect phase alongside the total --max-time deadline.
+    argv_buf[argc] = "--connect-timeout";
+    argc += 1;
+    argv_buf[argc] = CONNECT_TIMEOUT_SECS;
+    argc += 1;
     argv_buf[argc] = "--max-time";
     argc += 1;
     argv_buf[argc] = timeout_secs;
@@ -441,6 +468,75 @@ pub fn curlRequestResolved(
     };
 }
 
+/// Parameters for `buildCurlArgs`. Mirrors the variable parts of a
+/// `curlRequest` invocation so the argv construction can be unit-tested
+/// without spawning a subprocess.
+pub const CurlArgsSpec = struct {
+    method: []const u8,
+    url: []const u8,
+    headers: []const []const u8,
+    has_body: bool,
+    proxy: ?[]const u8,
+    timeout_secs: []const u8,
+};
+
+/// Pure builder for the `curlRequest` argv. Fills `argv_buf` and returns the
+/// number of slots used. Always emits both `--max-time` (total deadline) and
+/// `--connect-timeout` (P0-5: TCP connect-phase deadline) so a hung upstream
+/// fails fast. Extracted from `curlRequest` so the flag set is deterministic
+/// and testable.
+fn buildCurlArgs(argv_buf: *[64][]const u8, spec: CurlArgsSpec) usize {
+    var argc: usize = 0;
+
+    argv_buf[argc] = "curl";
+    argc += 1;
+    argv_buf[argc] = "-sS";
+    argc += 1;
+    argv_buf[argc] = "--connect-timeout";
+    argc += 1;
+    argv_buf[argc] = CONNECT_TIMEOUT_SECS;
+    argc += 1;
+    argv_buf[argc] = "--max-time";
+    argc += 1;
+    argv_buf[argc] = spec.timeout_secs;
+    argc += 1;
+    argv_buf[argc] = "--request";
+    argc += 1;
+    argv_buf[argc] = spec.method;
+    argc += 1;
+    argv_buf[argc] = "--write-out";
+    argc += 1;
+    argv_buf[argc] = STATUS_MARKER ++ "%{http_code}";
+    argc += 1;
+
+    if (spec.proxy) |p| {
+        argv_buf[argc] = "--proxy";
+        argc += 1;
+        argv_buf[argc] = p;
+        argc += 1;
+    }
+
+    for (spec.headers) |hdr| {
+        if (argc + 2 > argv_buf.len) break;
+        argv_buf[argc] = "-H";
+        argc += 1;
+        argv_buf[argc] = hdr;
+        argc += 1;
+    }
+
+    if (spec.has_body) {
+        argv_buf[argc] = "--data-binary";
+        argc += 1;
+        argv_buf[argc] = "@-";
+        argc += 1;
+    }
+
+    argv_buf[argc] = spec.url;
+    argc += 1;
+
+    return argc;
+}
+
 pub fn curlRequest(
     allocator: Allocator,
     method: []const u8,
@@ -451,49 +547,14 @@ pub fn curlRequest(
     timeout_secs: []const u8,
 ) !CurlResponse {
     var argv_buf: [64][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-sS";
-    argc += 1;
-    argv_buf[argc] = "--max-time";
-    argc += 1;
-    argv_buf[argc] = timeout_secs;
-    argc += 1;
-    argv_buf[argc] = "--request";
-    argc += 1;
-    argv_buf[argc] = method;
-    argc += 1;
-    argv_buf[argc] = "--write-out";
-    argc += 1;
-    argv_buf[argc] = STATUS_MARKER ++ "%{http_code}";
-    argc += 1;
-
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
-
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
-
-    if (body != null) {
-        argv_buf[argc] = "--data-binary";
-        argc += 1;
-        argv_buf[argc] = "@-";
-        argc += 1;
-    }
-
-    argv_buf[argc] = url;
-    argc += 1;
+    const argc = buildCurlArgs(&argv_buf, .{
+        .method = method,
+        .url = url,
+        .headers = headers,
+        .has_body = body != null,
+        .proxy = proxy,
+        .timeout_secs = timeout_secs,
+    });
 
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = if (body != null) .Pipe else .Ignore;
@@ -668,6 +729,13 @@ pub fn curlGetSSE(
     argc += 1;
     argv_buf[argc] = "-N";
     argc += 1;
+    // P0-5: cap only the TCP connect phase. --max-time still bounds the total
+    // SSE stream; --connect-timeout just makes a dead upstream fail fast at
+    // connect rather than after the (intentionally long) stream deadline.
+    argv_buf[argc] = "--connect-timeout";
+    argc += 1;
+    argv_buf[argc] = CONNECT_TIMEOUT_SECS;
+    argc += 1;
     argv_buf[argc] = "--max-time";
     argc += 1;
     argv_buf[argc] = timeout_secs;
@@ -751,4 +819,39 @@ test "subsystem_supports_native disables providers" {
         try std.testing.expect(subsystem_supports_native(.channels));
     }
     try std.testing.expect(!subsystem_supports_native(.system));
+}
+
+/// Returns the index of `needle` in `argv`, or null if absent.
+fn argvIndexOf(argv: []const []const u8, needle: []const u8) ?usize {
+    for (argv, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, needle)) return i;
+    }
+    return null;
+}
+
+test "buildCurlArgs includes --connect-timeout with configured value" {
+    // P0-5: every curl invocation must fail fast on a dead/hung upstream by
+    // bounding the TCP connect phase, not just the total deadline (--max-time).
+    var argv_buf: [64][]const u8 = undefined;
+    const headers = [_][]const u8{"Authorization: Bearer test"};
+    const argc = buildCurlArgs(&argv_buf, .{
+        .method = "POST",
+        .url = "https://upstream.example/v1/chat",
+        .headers = headers[0..],
+        .has_body = true,
+        .proxy = null,
+        .timeout_secs = "30",
+    });
+    const argv = argv_buf[0..argc];
+
+    const ct_idx = argvIndexOf(argv, "--connect-timeout") orelse
+        return error.MissingConnectTimeout;
+    try std.testing.expect(ct_idx + 1 < argv.len);
+    try std.testing.expectEqualStrings(CONNECT_TIMEOUT_SECS, argv[ct_idx + 1]);
+
+    // --max-time must still be present and unchanged (connect-timeout is
+    // additive, not a replacement for the total deadline).
+    const mt_idx = argvIndexOf(argv, "--max-time") orelse return error.MissingMaxTime;
+    try std.testing.expect(mt_idx + 1 < argv.len);
+    try std.testing.expectEqualStrings("30", argv[mt_idx + 1]);
 }
