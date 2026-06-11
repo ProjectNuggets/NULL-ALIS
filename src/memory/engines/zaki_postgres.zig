@@ -269,6 +269,64 @@ test "W1.1: store REFUSES when tenant context user_id != bound user_id" {
     try std.testing.expect(capture.saw_mismatch);
 }
 
+test "W1.1: storeWithMetadata REFUSES when tenant context user_id != bound user_id" {
+    // Covers the SECOND write boundary: `implStoreWithMetadata` (compose_memory
+    // path) also calls `assertTenantWriteBoundary`. W1.1 guarded both store
+    // paths but only the plain `store` path had a refusal test; this closes
+    // that gap so a cross-tenant write can never slip in through the
+    // metadata-bearing path either. Same disabled-stub semantics as the plain
+    // `store` test: the guard fires first, so the stub's PostgresNotEnabled is
+    // never reached and the boundary error surfaces.
+    if (build_options.enable_postgres) return error.SkipZigTest;
+    var mgr = zaki_state.Manager{};
+    defer mgr.deinit();
+    var mem = ZakiPostgresMemory.init(std.testing.allocator, &mgr, 16);
+
+    var capture = CapturingObserver{};
+    var obs = capture.observer();
+    tools_mod.setToolObserver(&obs);
+    defer tools_mod.clearToolObserver();
+
+    // A lifecycle bug hands this turn the wrong context: authenticated user is
+    // 33 but the memory handle is bound to 16. The metadata write must fail
+    // closed, exactly as the plain store path does.
+    tools_mod.setTenantContext(.{ .numeric_user_id = 33 });
+    defer tools_mod.clearTenantContext();
+
+    const result = mem.memory().storeWithMetadata(
+        "k",
+        "v",
+        .{ .daily = {} },
+        null,
+        "{\"synthesized_by\":\"agent\",\"references\":[\"a\",\"b\"]}",
+    );
+    try std.testing.expectError(error.TenantWriteBoundaryViolation, result);
+    // ...and LOUD: the violation must reach the observer chain on this path too.
+    try std.testing.expect(capture.saw_mismatch);
+}
+
+test "W1.1: storeWithMetadata PROCEEDS when tenant context user_id matches bound user_id" {
+    // Same-tenant metadata write must pass the guard and reach the manager
+    // (PostgresNotEnabled on the disabled stub — NOT the boundary error),
+    // proving the metadata-path guard does not refuse a legitimate write.
+    if (build_options.enable_postgres) return error.SkipZigTest;
+    var mgr = zaki_state.Manager{};
+    defer mgr.deinit();
+    var mem = ZakiPostgresMemory.init(std.testing.allocator, &mgr, 16);
+
+    tools_mod.setTenantContext(.{ .numeric_user_id = 16 });
+    defer tools_mod.clearTenantContext();
+
+    const result = mem.memory().storeWithMetadata(
+        "k",
+        "v",
+        .{ .daily = {} },
+        null,
+        "{\"synthesized_by\":\"agent\"}",
+    );
+    try std.testing.expectError(error.PostgresNotEnabled, result);
+}
+
 test "W1.1: store PROCEEDS when tenant context user_id matches bound user_id" {
     if (build_options.enable_postgres) return error.SkipZigTest;
     var mgr = zaki_state.Manager{};

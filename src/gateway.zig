@@ -2646,27 +2646,78 @@ fn getTenantRuntime(
     defer state.tenant_runtime_mutex.unlock();
 
     if (state.tenant_runtimes.get(user_ctx.user_id)) |runtime| {
-        if (!runtime.pending_destroy.load(.acquire)) {
-            runtime.last_used_s.store(now_s, .release);
-            return runtime;
-        }
-        // Runtime is marked for destruction. If no active turns, destroy now
-        // and create a fresh one below. If turns are active, the request must
-        // wait — returning the doomed runtime would use stale config.
-        if (!runtime.session_mgr.hasActiveTurns()) {
-            // Safe to destroy immediately under the mutex — no concurrent users
+        // W1.2 — fetch-boundary tenant invariant guard.
+        //
+        // The cache is keyed by user_id, and every runtime stores its OWN bound
+        // user_id (a duped string set at init). Under correct operation these
+        // are always equal. But the W1.1 root cause showed a lifecycle bug can
+        // produce key↔value skew — the cache hands a turn a runtime bound to a
+        // DIFFERENT user. W1.1 guards the WRITE boundary (refuse the bad write);
+        // W1.2 catches the same corruption one layer earlier, at FETCH, so a
+        // mis-keyed entry is never served at all.
+        //
+        // Happy path cost: a single `mem.eql` on the matched key (zero alloc,
+        // zero extra lock — we are already under tenant_runtime_mutex).
+        if (!std.mem.eql(u8, runtime.user_id, user_ctx.user_id)) {
+            // Cache corruption / key-value skew. Make it LOUD and fail SAFELY:
+            // evict the bad entry and fall through to create a fresh runtime
+            // correctly bound to user_ctx.user_id, so the request still
+            // succeeds on a correct runtime.
+            //
+            // AGENTS.md §3.6: a `log.err` trips the default test runner's
+            // err-counter and would fail the W1.2 test that drives this exact
+            // path; gate the loud stderr line on `!is_test`. The observer event
+            // + Sentry capture below fire unconditionally so the guard's
+            // observability is still asserted in tests. (Mirrors W1.1's
+            // assertTenantWriteBoundary emit style.)
+            if (!builtin.is_test) {
+                log.err(
+                    "tenant.runtime.key_mismatch — refusing skewed cache entry; cache_key={s} bound_user_id={s}",
+                    .{ user_ctx.user_id, runtime.user_id },
+                );
+            }
+            var msg_buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &msg_buf,
+                "tenant runtime key mismatch: cache_key={s} bound_user_id={s}",
+                .{ user_ctx.user_id, runtime.user_id },
+            ) catch "tenant runtime key mismatch (ids omitted)";
+            if (tools_mod.getToolObserver()) |obs| {
+                obs.recordEvent(&.{ .err = .{ .component = "tenant_runtime_key_mismatch", .message = msg } });
+            }
+            sentry_runtime.globalOrFallback().captureError("tenant_runtime_key_mismatch", msg);
+
+            // Evict the skewed entry under the held mutex. fetchRemove(key) pulls
+            // the entry that .get(key) just matched and deinit() frees that one
+            // runtime exactly once — same evict-under-lock pattern the
+            // pending_destroy branch below uses, so no double-free and no
+            // iterator is held. Then fall through to create a FRESH runtime for
+            // user_ctx.user_id.
             if (state.tenant_runtimes.fetchRemove(user_ctx.user_id)) |kv| {
                 kv.value.deinit();
             }
-            log.info("tenant.runtime.replaced user={s}", .{user_ctx.user_id});
-        } else {
-            // Active turns still running on the doomed runtime. New requests
-            // arriving during this drain window will also use the old config.
-            // This is a tradeoff: brief stale-config window (microseconds to
-            // seconds) vs blocking/erroring the request. Acceptable for launch.
-            // The runtime will be replaced on the next sweep once turns drain.
+        } else if (!runtime.pending_destroy.load(.acquire)) {
             runtime.last_used_s.store(now_s, .release);
             return runtime;
+        } else {
+            // Runtime is marked for destruction. If no active turns, destroy now
+            // and create a fresh one below. If turns are active, the request must
+            // wait — returning the doomed runtime would use stale config.
+            if (!runtime.session_mgr.hasActiveTurns()) {
+                // Safe to destroy immediately under the mutex — no concurrent users
+                if (state.tenant_runtimes.fetchRemove(user_ctx.user_id)) |kv| {
+                    kv.value.deinit();
+                }
+                log.info("tenant.runtime.replaced user={s}", .{user_ctx.user_id});
+            } else {
+                // Active turns still running on the doomed runtime. New requests
+                // arriving during this drain window will also use the old config.
+                // This is a tradeoff: brief stale-config window (microseconds to
+                // seconds) vs blocking/erroring the request. Acceptable for launch.
+                // The runtime will be replaced on the next sweep once turns drain.
+                runtime.last_used_s.store(now_s, .release);
+                return runtime;
+            }
         }
     }
 
@@ -29507,6 +29558,76 @@ test "getTenantRuntime does not prune inline on request path" {
     defer state.tenant_runtime_mutex.unlock();
     try std.testing.expect(state.tenant_runtimes.get("1") != null);
     try std.testing.expect(state.tenant_runtimes.get("2") != null);
+}
+
+test "W1.2: getTenantRuntime refuses a key-value-skewed cached runtime and serves a fresh correct one" {
+    // W1.2 fetch-boundary guard. Models cache corruption: the cache is keyed by
+    // user_id, but a lifecycle bug has left key "2" pointing at a runtime whose
+    // own bound user_id is "1" (key-value skew). A naive `.get("2")` would hand
+    // user 2's turn a runtime bound to user 1 — exactly the W1.1 root cause, one
+    // layer earlier. The guard must detect the skew, NOT return the wrong
+    // runtime, evict the bad entry, and create a fresh runtime correctly bound
+    // to "2" so the request still succeeds.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    const base_config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/base-config.json", .{tenant_root});
+    defer std.testing.allocator.free(base_config_path);
+    try writeFile(base_config_path, "{\"agents\":{\"defaults\":{\"model\":{\"primary\":\"openrouter/test/mock-model\"}}},\"memory\":{\"search\":{\"enabled\":false}}}\n");
+
+    var cfg = makeTenantRuntimeTestConfig(std.testing.allocator, tenant_root, base_config_path);
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_enabled = true;
+    state.tenant_data_root = tenant_root;
+    state.tenant_runtime_cache_max_users = 8;
+    state.tenant_runtime_idle_ttl_secs = 0;
+
+    var user_ctx_1 = try provisionTenantRuntimeTestUser(std.testing.allocator, &state, "1");
+    defer user_ctx_1.deinit(std.testing.allocator);
+    const runtime_1 = try getTenantRuntime(&state, &cfg, &user_ctx_1);
+
+    var user_ctx_2 = try provisionTenantRuntimeTestUser(std.testing.allocator, &state, "2");
+    defer user_ctx_2.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("1", runtime_1.user_id);
+
+    // Inject the skew: rebind cache key "2" → runtime_1 (whose own bound user_id
+    // is "1"). We do this faithfully w.r.t. key-string ownership so the eviction
+    // path frees exactly once and leaks nothing:
+    //   - Remove runtime_1's correct "1"→runtime_1 entry from the map WITHOUT
+    //     destroying the runtime (fetchRemove, drop the kv, do NOT deinit).
+    //   - Insert a "2"→runtime_1 entry whose KEY is user_ctx_2.user_id (a
+    //     test-owned string, freed by user_ctx_2's defer). runtime_1.user_id
+    //     ("1") is no longer used as a live map key, so when the guard evicts
+    //     and deinit()s runtime_1, freeing its "1" string is safe.
+    {
+        state.tenant_runtime_mutex.lock();
+        defer state.tenant_runtime_mutex.unlock();
+        _ = state.tenant_runtimes.fetchRemove("1"); // detach, keep runtime alive
+        try state.tenant_runtimes.put(state.allocator, user_ctx_2.user_id, runtime_1);
+        // Sanity: the cache now hands the WRONG runtime back for key "2".
+        try std.testing.expectEqual(runtime_1, state.tenant_runtimes.get("2").?);
+        try std.testing.expectEqualStrings("1", state.tenant_runtimes.get("2").?.user_id);
+    }
+
+    // Fetch for user 2. The guard must NOT serve runtime_1 (bound to user 1); it
+    // must evict the skewed entry and create a fresh runtime correctly bound to
+    // "2" so the request still succeeds.
+    const fetched = try getTenantRuntime(&state, &cfg, &user_ctx_2);
+    try std.testing.expect(fetched != runtime_1); // never the wrong-tenant runtime
+    try std.testing.expectEqualStrings("2", fetched.user_id); // correct binding
+    try std.testing.expect(!fetched.pending_destroy.load(.acquire));
+
+    // And the cache is repaired: key "2" now maps to the fresh, correct runtime.
+    {
+        state.tenant_runtime_mutex.lock();
+        defer state.tenant_runtime_mutex.unlock();
+        try std.testing.expectEqual(fetched, state.tenant_runtimes.get("2").?);
+    }
 }
 
 test "tenant runtime maintenance prunes cache outside request path" {
