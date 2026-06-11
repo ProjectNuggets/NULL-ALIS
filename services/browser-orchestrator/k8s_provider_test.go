@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -13,11 +14,11 @@ import (
 func TestCreateSessionCreatesHardenedPod(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	p := &K8sProvider{
-		client:    client,
-		namespace: "browser",
-		image:     "browser-worker:dev",
-		reg:       NewRegistry(),
-		waitReady: func(ctx context.Context, pod string) error { return nil },
+		client:          client,
+		namespace:       "browser",
+		image:           "browser-worker:dev",
+		reg:             NewRegistry(),
+		waitReady:       func(ctx context.Context, pod string) error { return nil },
 		masterKey:       []byte("0123456789abcdef0123456789abcdef"),
 		store:           NewStateStore(client, "browser"),
 		maxPerUser:      3,
@@ -170,5 +171,91 @@ func TestParseFrameBlob(t *testing.T) {
 	}
 	if want := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"; wf.PNGBase64 != want {
 		t.Errorf("PNGBase64 = %q, want %q (no whitespace)", wf.PNGBase64, want)
+	}
+}
+
+func TestReapIdleOnce(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	p := NewK8sProvider(client, nil, "browser", "img", []byte("k"), nil, 3, 20, 900, 120, NewRegistry())
+	idle := "sess-idle"
+	p.reg.Add(idle, "browser-worker-idle")
+	p.mu.Lock()
+	p.meta[idle] = sessionMeta{userID: "u1", lastActivity: time.Now().Add(-200 * time.Second)}
+	p.mu.Unlock()
+	_, _ = client.CoreV1().Pods("browser").Create(context.Background(),
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "browser-worker-idle", Namespace: "browser"}}, metav1.CreateOptions{})
+	active := "sess-active"
+	p.reg.Add(active, "browser-worker-active")
+	p.mu.Lock()
+	p.meta[active] = sessionMeta{userID: "u2", lastActivity: time.Now()}
+	p.mu.Unlock()
+	_, _ = client.CoreV1().Pods("browser").Create(context.Background(),
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "browser-worker-active", Namespace: "browser"}}, metav1.CreateOptions{})
+	reaped := p.ReapIdleOnce(context.Background())
+	if reaped != 1 {
+		t.Fatalf("expected 1 reaped, got %d", reaped)
+	}
+	if _, ok := p.reg.Pod(idle); ok {
+		t.Fatalf("idle session should be gone from registry")
+	}
+	if _, ok := p.reg.Pod(active); !ok {
+		t.Fatalf("active session must be kept")
+	}
+}
+
+func TestWorkerResourcesFromEnv(t *testing.T) {
+	t.Setenv("BROWSER_WORKER_CPU_REQUEST", "300m")
+	t.Setenv("BROWSER_WORKER_MEM_REQUEST", "512Mi")
+	t.Setenv("BROWSER_WORKER_CPU_LIMIT", "1500m")
+	t.Setenv("BROWSER_WORKER_MEM_LIMIT", "1280Mi")
+	p := NewK8sProvider(fake.NewSimpleClientset(), nil, "browser", "img", []byte("k"), nil, 3, 20, 900, 0, NewRegistry())
+	pod := p.podTemplate("w", "s", "ek", "u", "")
+	r := pod.Spec.Containers[0].Resources
+	if r.Requests.Memory().String() != "512Mi" || r.Limits.Memory().String() != "1280Mi" {
+		t.Fatalf("mem req/limit not from env: %v / %v", r.Requests.Memory(), r.Limits.Memory())
+	}
+	if r.Requests.Cpu().String() != "300m" || r.Limits.Cpu().String() != "1500m" {
+		t.Fatalf("cpu req/limit not from env: %v / %v", r.Requests.Cpu(), r.Limits.Cpu())
+	}
+}
+
+func TestWorkerResourcesDefault(t *testing.T) {
+	p := NewK8sProvider(fake.NewSimpleClientset(), nil, "browser", "img", []byte("k"), nil, 3, 20, 900, 0, NewRegistry())
+	pod := p.podTemplate("w", "s", "ek", "u", "")
+	r := pod.Spec.Containers[0].Resources
+	if r.Requests.Memory().String() != "1Gi" || r.Limits.Memory().String() != "2Gi" {
+		t.Fatalf("default mem changed: %v / %v", r.Requests.Memory(), r.Limits.Memory())
+	}
+}
+
+func TestValidateWorkerResourceEnv(t *testing.T) {
+	// all unset -> nil
+	if err := validateWorkerResourceEnv(); err != nil {
+		t.Fatalf("unset env should be valid, got %v", err)
+	}
+	// valid override -> nil
+	t.Setenv("BROWSER_WORKER_MEM_LIMIT", "1280Mi")
+	if err := validateWorkerResourceEnv(); err != nil {
+		t.Fatalf("valid quantity should pass, got %v", err)
+	}
+	// malformed -> error (no panic)
+	t.Setenv("BROWSER_WORKER_MEM_LIMIT", "2 GB")
+	if err := validateWorkerResourceEnv(); err == nil {
+		t.Fatalf("malformed quantity must return an error")
+	}
+}
+
+func TestReapIdleOnceDisabled(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	p := NewK8sProvider(client, nil, "browser", "img", []byte("k"), nil, 3, 20, 900, 0, NewRegistry())
+	p.reg.Add("s", "browser-worker-s")
+	p.mu.Lock()
+	p.meta["s"] = sessionMeta{userID: "u", lastActivity: time.Now().Add(-time.Hour)}
+	p.mu.Unlock()
+	if n := p.ReapIdleOnce(context.Background()); n != 0 {
+		t.Fatalf("disabled reaper must be a no-op, reaped %d", n)
+	}
+	if _, ok := p.reg.Pod("s"); !ok {
+		t.Fatalf("session must be kept when idle-reaper disabled")
 	}
 }

@@ -41,6 +41,7 @@ func shortHash(s string) string {
 // DestroySession can persist the vault back to the right (user,profile) slot.
 type sessionMeta struct {
 	userID, authProfile string
+	lastActivity        time.Time
 }
 
 // K8sProvider runs each browser session in its own worker Pod.
@@ -53,17 +54,19 @@ type K8sProvider struct {
 	waitReady  func(ctx context.Context, podName string) error
 
 	masterKey []byte
-	store      *StateStore
+	store     *StateStore
 
 	maxPerUser      int
 	maxTotal        int
 	deadlineSeconds int64
 
+	idleTimeoutSeconds int64 // 0 disables the idle-reaper (backward compatible)
+
 	mu   sync.Mutex
 	meta map[string]sessionMeta
 }
 
-func NewK8sProvider(client kubernetes.Interface, restConfig *rest.Config, namespace, image string, masterKey []byte, store *StateStore, maxPerUser, maxTotal int, deadlineSeconds int64, reg *Registry) *K8sProvider {
+func NewK8sProvider(client kubernetes.Interface, restConfig *rest.Config, namespace, image string, masterKey []byte, store *StateStore, maxPerUser, maxTotal int, deadlineSeconds int64, idleTimeoutSeconds int64, reg *Registry) *K8sProvider {
 	if maxPerUser <= 0 {
 		maxPerUser = 3
 	}
@@ -74,17 +77,18 @@ func NewK8sProvider(client kubernetes.Interface, restConfig *rest.Config, namesp
 		deadlineSeconds = 900
 	}
 	p := &K8sProvider{
-		client:          client,
-		restConfig:      restConfig,
-		namespace:       namespace,
-		image:           image,
-		reg:             reg,
-		masterKey:       masterKey,
-		store:           store,
-		maxPerUser:      maxPerUser,
-		maxTotal:        maxTotal,
-		deadlineSeconds: deadlineSeconds,
-		meta:            map[string]sessionMeta{},
+		client:             client,
+		restConfig:         restConfig,
+		namespace:          namespace,
+		image:              image,
+		reg:                reg,
+		masterKey:          masterKey,
+		store:              store,
+		maxPerUser:         maxPerUser,
+		maxTotal:           maxTotal,
+		deadlineSeconds:    deadlineSeconds,
+		idleTimeoutSeconds: idleTimeoutSeconds,
+		meta:               map[string]sessionMeta{},
 	}
 	p.waitReady = p.pollPodReady
 	return p
@@ -114,7 +118,7 @@ func (p *K8sProvider) CreateSession(ctx context.Context, userID, authProfile str
 		metricSessionCreate.WithLabelValues("cap_exceeded").Inc()
 		return "", ErrCapExceeded
 	}
-	p.meta[id] = sessionMeta{userID: userID, authProfile: authProfile}
+	p.meta[id] = sessionMeta{userID: userID, authProfile: authProfile, lastActivity: time.Now()}
 	p.mu.Unlock()
 
 	// releaseReservation frees the reserved slot on any failure path after the
@@ -166,6 +170,39 @@ func (p *K8sProvider) CreateSession(ctx context.Context, userID, authProfile str
 	return id, nil
 }
 
+// validateWorkerResourceEnv parse-checks any worker-resource overrides at startup
+// so a malformed quantity is a loud rollout failure (CrashLoopBackOff) rather than
+// a per-request panic on a live node (workerResources uses MustParse on the hot path).
+func validateWorkerResourceEnv() error {
+	for _, k := range []string{
+		"BROWSER_WORKER_CPU_REQUEST", "BROWSER_WORKER_MEM_REQUEST",
+		"BROWSER_WORKER_CPU_LIMIT", "BROWSER_WORKER_MEM_LIMIT",
+	} {
+		if v := os.Getenv(k); v != "" {
+			if _, err := resource.ParseQuantity(v); err != nil {
+				return fmt.Errorf("%s=%q is not a valid k8s quantity: %w", k, v, err)
+			}
+		}
+	}
+	return nil
+}
+
+// workerResources reads optional per-worker resource overrides from env, falling
+// back to the validated defaults (500m/1Gi req, 2/2Gi limit) so prod/local
+// behaviour is unchanged when unset.
+func workerResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(envOr("BROWSER_WORKER_CPU_REQUEST", "500m")),
+			corev1.ResourceMemory: resource.MustParse(envOr("BROWSER_WORKER_MEM_REQUEST", "1Gi")),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(envOr("BROWSER_WORKER_CPU_LIMIT", "2")),
+			corev1.ResourceMemory: resource.MustParse(envOr("BROWSER_WORKER_MEM_LIMIT", "2Gi")),
+		},
+	}
+}
+
 // podTemplate mirrors Plan 1's deploy/k8s/browser/worker-pod.yaml.
 func (p *K8sProvider) podTemplate(name, sessionID, encKey, userID, authProfile string) *corev1.Pod {
 	userHash := shortHash(userID)
@@ -198,16 +235,7 @@ func (p *K8sProvider) podTemplate(name, sessionID, encKey, userID, authProfile s
 					ReadOnlyRootFilesystem:   ptr(true),
 					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 				},
-				Resources: corev1.ResourceRequirements{
-					Requests: corev1.ResourceList{
-						corev1.ResourceCPU:    resource.MustParse("500m"),
-						corev1.ResourceMemory: resource.MustParse("1Gi"),
-					},
-					Limits: corev1.ResourceList{
-						corev1.ResourceCPU:    resource.MustParse("2"),
-						corev1.ResourceMemory: resource.MustParse("2Gi"),
-					},
-				},
+				Resources: workerResources(),
 				VolumeMounts: []corev1.VolumeMount{
 					{Name: "home", MountPath: "/home/browser"},
 					{Name: "tmp", MountPath: "/tmp"},
@@ -233,6 +261,9 @@ func (p *K8sProvider) podTemplate(name, sessionID, encKey, userID, authProfile s
 	}
 	if v := os.Getenv("BROWSER_WORKER_RUNTIME_CLASS"); v != "" {
 		pod.Spec.RuntimeClassName = ptr(v)
+	}
+	if v := os.Getenv("BROWSER_WORKER_PRIORITY_CLASS"); v != "" {
+		pod.Spec.PriorityClassName = v
 	}
 	if v := os.Getenv("BROWSER_WORKER_NODE_SELECTOR"); v != "" {
 		if k, val, ok := strings.Cut(v, "="); ok && k != "" {
@@ -290,6 +321,13 @@ func (p *K8sProvider) Exec(ctx context.Context, sessionID string, args []string)
 	if !ok {
 		return ExecResult{}, fmt.Errorf("unknown session %q", sessionID)
 	}
+	// Refresh idle clock: an exec is activity (drives the idle-reaper).
+	p.mu.Lock()
+	if m, ok := p.meta[sessionID]; ok {
+		m.lastActivity = time.Now()
+		p.meta[sessionID] = m
+	}
+	p.mu.Unlock()
 	// Inject the worker's chromium wrapper path so the agent never needs to pass
 	// --executable-path (which is therefore denied by the allowlist). Harmless on
 	// non-launch verbs (agent-browser ignores it once the daemon is running).
@@ -383,8 +421,9 @@ func (p *K8sProvider) Reconcile(ctx context.Context) error {
 		isNew := p.reg.Add(sid, pod.Name)
 		p.mu.Lock()
 		p.meta[sid] = sessionMeta{
-			userID:      pod.Annotations["nullalis.dev/user"],
-			authProfile: pod.Annotations["nullalis.dev/auth-profile"],
+			userID:       pod.Annotations["nullalis.dev/user"],
+			authProfile:  pod.Annotations["nullalis.dev/auth-profile"],
+			lastActivity: time.Now(),
 		}
 		p.mu.Unlock()
 		if isNew {
@@ -477,4 +516,31 @@ func (p *K8sProvider) PruneOnce(ctx context.Context) int {
 		}
 	}
 	return pruned
+}
+
+// ReapIdleOnce destroys sessions whose lastActivity is older than
+// idleTimeoutSeconds — the defense against an agent that opens a browser
+// session and never calls browser_close_session (the pod would otherwise hold
+// a scarce slot until the hard ActiveDeadlineSeconds). No-op when the timeout
+// is 0 (disabled). Returns the count reaped.
+func (p *K8sProvider) ReapIdleOnce(ctx context.Context) int {
+	if p.idleTimeoutSeconds <= 0 {
+		return 0
+	}
+	cutoff := time.Now().Add(-time.Duration(p.idleTimeoutSeconds) * time.Second)
+	p.mu.Lock()
+	var stale []string
+	for id, m := range p.meta {
+		if m.lastActivity.Before(cutoff) {
+			stale = append(stale, id)
+		}
+	}
+	p.mu.Unlock()
+	reaped := 0
+	for _, id := range stale {
+		if err := p.DestroySession(ctx, id); err == nil {
+			reaped++
+		}
+	}
+	return reaped
 }

@@ -52,11 +52,16 @@ func main() {
 	maxPerUser := atoiOr("BROWSER_MAX_SESSIONS_PER_USER", 3)
 	maxTotal := atoiOr("BROWSER_MAX_SESSIONS_TOTAL", 20)
 	deadline := atoiOr("BROWSER_SESSION_DEADLINE_SECONDS", 900)
+	idleTimeout := atoiOr("BROWSER_SESSION_IDLE_TIMEOUT_SECONDS", 0)
 	perMin := atoiOr("BROWSER_NEW_SESSION_RATE_PER_MIN", 6)
 	rl := NewRateLimiter(perMin, float64(perMin)/60.0)
 
+	if err := validateWorkerResourceEnv(); err != nil {
+		log.Fatalf("worker resource config: %v", err)
+	}
+
 	store := NewStateStore(client, ns)
-	provider := NewK8sProvider(client, cfg, ns, image, master, store, maxPerUser, maxTotal, int64(deadline), NewRegistry())
+	provider := NewK8sProvider(client, cfg, ns, image, master, store, maxPerUser, maxTotal, int64(deadline), int64(idleTimeout), NewRegistry())
 	if err := provider.Reconcile(context.Background()); err != nil {
 		log.Printf("reconcile: %v", err)
 	}
@@ -74,6 +79,7 @@ func main() {
 				return
 			case <-t.C:
 				provider.PruneOnce(context.Background())
+				provider.ReapIdleOnce(context.Background())
 			}
 		}
 	}()
@@ -104,7 +110,7 @@ func main() {
 		WriteTimeout: 0,
 	}
 
-	log.Printf("browser-orchestrator listening on %s (ns=%s image=%s)", addr, ns, image)
+	log.Printf("browser-orchestrator listening on %s (ns=%s image=%s idle=%ds deadline=%ds)", addr, ns, image, idleTimeout, deadline)
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- httpSrv.ListenAndServe() }()
