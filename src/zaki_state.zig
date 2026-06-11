@@ -10715,7 +10715,52 @@ const ManagerImpl = struct {
         }
     }
 
+    /// P0-6: self-heal the parent {schema}.users row at the session-write
+    /// chokepoint. Some lanes (notably the daemon cron/heartbeat lane) reach
+    /// session/memory writes without ever calling provisionUser, so a write to
+    /// {schema}.sessions / {schema}.memories could fault on
+    /// sessions_user_id_fkey / memories_user_id_fkey for a user_id whose parent
+    /// row was never provisioned (observed in GlitchTip for user_ids 72, 75).
+    ///
+    /// This idempotent upsert closes that gap. It runs on every session write,
+    /// so it must stay cheap and must NOT change behavior for already-provisioned
+    /// users — ON CONFLICT (user_id) DO NOTHING makes a present row a no-op
+    /// (workspace_path and every other column are left untouched).
+    ///
+    /// SECONDARY FK: {schema}.users.user_id ALSO REFERENCES public.zaki_users(id)
+    /// (users_user_id_fkey). A bogus user_id would therefore fault on THAT
+    /// constraint as a raw postgres error. We gate on hasExternalIdentity first —
+    /// exactly as provisionUser does — so a genuinely unknown id surfaces as the
+    /// clean typed error.IdentityUserNotFound instead of a raw *_user_id_fkey.
+    /// When the identity table is absent (standalone/dev deploys), the probe
+    /// returns null and we proceed in compatibility mode, same as provisionUser.
+    fn ensureUserRow(self: *Self, user_id: i64) !void {
+        if (try self.hasExternalIdentity(user_id)) |exists| {
+            if (!exists) return error.IdentityUserNotFound;
+        }
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        // Derive a default workspace_path the same {data_root}/{user_id}/workspace
+        // shape provisionUser uses (see tenantWorkspacePathForUser in main.zig).
+        // The Manager has no tenant config, so we fall back to the documented
+        // default data_root. ON CONFLICT DO NOTHING means this default is only
+        // ever stored when the row was missing entirely — a real provisionUser
+        // run (or an existing row) keeps the authoritative path.
+        var workspace_buf: [64]u8 = undefined;
+        const workspace_s = try std.fmt.bufPrintZ(&workspace_buf, "/data/users/{d}/workspace", .{user_id});
+        try self.execParamsNoResult(
+            "INSERT INTO {schema}.users (user_id, workspace_path) VALUES ($1, $2) " ++
+                "ON CONFLICT (user_id) DO NOTHING",
+            &.{ user_s.ptr, workspace_s.ptr },
+            &.{ @as(c_int, @intCast(user_s.len)), @as(c_int, @intCast(workspace_s.len)) },
+        );
+    }
+
     fn ensureSession(self: *Self, user_id: i64, session_id: []const u8) !void {
+        // P0-6: self-heal the parent users row before any session write so a
+        // never-provisioned user_id (daemon cron/heartbeat lane) cannot fault on
+        // sessions_user_id_fkey. Bogus ids surface as error.IdentityUserNotFound.
+        try self.ensureUserRow(user_id);
         const q = try self.buildQuery(
             "INSERT INTO {schema}.sessions (id, user_id, session_key, kind, title) VALUES ($1, $2, $1, $3, $4) " ++
                 "ON CONFLICT (session_key) DO NOTHING",
@@ -13343,6 +13388,174 @@ test "setMemorySource preserves updated_at for attribution-only enrichment" {
     defer source.deinit(allocator);
     try std.testing.expectEqualStrings("session-A", source.session_id.?);
     try std.testing.expectEqualStrings("snippet A", source.snippet.?);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// P0-6 (2026-06-11) — ensureUserRow self-heals the parent users row at
+// the ensureSession chokepoint, closing the sessions_user_id_fkey /
+// memories_user_id_fkey violations seen in GlitchTip (user_ids 72, 75).
+//
+// Two tests:
+//   (1) compat-mode integration (runs in the default suite) — covers
+//       acceptance (a) self-heal succeeds and (c) zero regression for an
+//       already-provisioned user. public.zaki_users is absent (the suite's
+//       standing contract — every other PG test relies on it being absent
+//       so provisionUser runs in compatibility mode), so the self-heal
+//       INSERT lands on the tenant users PK without an FK probe.
+//   (2) live-identity rejection (opt-in via NULLALIS_PG_IDENTITY_TEST=1) —
+//       covers acceptance (b). It must create the SHARED public.zaki_users
+//       table to make hasExternalIdentity return a definitive false for a
+//       bogus id; that mutation would break the other PG test binaries that
+//       run in parallel and assume the table is absent, so it is gated off
+//       by default (same precedent as NULLALIS_MCP_LIVE_TEST). It restores
+//       the prior state on the way out.
+// ─────────────────────────────────────────────────────────────────────
+test "P0-6 ensureUserRow self-heals missing users row at session write (compat mode)" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+
+    const user_id: i64 = 72;
+
+    // ── (a) users row ABSENT → a session write must self-heal it ──────────────
+    // No provisionUser call: the parent users row does not exist yet, so a
+    // pre-P0-6 write would fault on sessions_user_id_fkey. ensureUserRow at the
+    // ensureSession chokepoint must create the parent row first and succeed.
+    try mgr.saveSessionMessage(user_id, "agent:zaki-bot:user:72:main", "user", "hello");
+
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT workspace_path FROM {s}.users WHERE user_id = {d}", .{ schema_q, user_id });
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+        const ws = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(ws);
+        // Default workspace_path derived the {data_root}/{user_id}/workspace way.
+        try std.testing.expectEqualStrings("/data/users/72/workspace", ws);
+    }
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}.messages WHERE user_id = {d}", .{ schema_q, user_id });
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const cnt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(cnt);
+        try std.testing.expectEqualStrings("1", cnt);
+    }
+
+    // ── (c) zero regression for an already-provisioned user ──────────────────
+    // provisionUser seeds a real workspace_path; the self-heal upsert is
+    // ON CONFLICT (user_id) DO NOTHING, so a subsequent session write must NOT
+    // overwrite it (the placeholder default never clobbers an existing row).
+    try mgr.provisionUser(user_id, "/data/users/72/real-workspace");
+    try mgr.saveSessionMessage(user_id, "agent:zaki-bot:user:72:system", "user", "again");
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT workspace_path FROM {s}.users WHERE user_id = {d}", .{ schema_q, user_id });
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const ws = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(ws);
+        try std.testing.expectEqualStrings("/data/users/72/real-workspace", ws);
+    }
+}
+
+test "P0-6 ensureUserRow rejects bogus id with typed identity error (live zaki_users)" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    // Opt-in: this test creates the SHARED public.zaki_users table, which the
+    // other parallel PG test binaries assume is absent. Gated off by default to
+    // avoid flaking them; run explicitly with NULLALIS_PG_IDENTITY_TEST=1.
+    const gate = std.process.getEnvVarOwned(std.heap.page_allocator, "NULLALIS_PG_IDENTITY_TEST") catch {
+        std.debug.print("[p0-6-identity] skipped (set NULLALIS_PG_IDENTITY_TEST=1 to run)\n", .{});
+        return error.SkipZigTest;
+    };
+    defer std.heap.page_allocator.free(gate);
+
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+
+    // Clean tenant schema.
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+
+    // Stand up the secondary FK target BEFORE migrate so users_user_id_fkey
+    // actually attaches and a bogus id would genuinely fault on it (proving the
+    // identity gate — not luck — is what produces the clean typed error). Seed a
+    // valid id; ensure the bogus id is genuinely absent. Restore on the way out.
+    const valid_id: i64 = 72;
+    const bogus_id: i64 = 999_972;
+    {
+        const r1 = try mgr.exec("CREATE TABLE IF NOT EXISTS public.zaki_users (id BIGINT PRIMARY KEY)");
+        c.PQclear(r1);
+        const seed = try std.fmt.allocPrint(allocator, "INSERT INTO public.zaki_users (id) VALUES ({d}) ON CONFLICT (id) DO NOTHING", .{valid_id});
+        defer allocator.free(seed);
+        const r2 = try mgr.exec(seed);
+        c.PQclear(r2);
+        const del = try std.fmt.allocPrint(allocator, "DELETE FROM public.zaki_users WHERE id = {d}", .{bogus_id});
+        defer allocator.free(del);
+        const r3 = try mgr.exec(del);
+        c.PQclear(r3);
+    }
+    defer {
+        // Restore: drop the shared FK target we created so the suite's standing
+        // "public.zaki_users is absent" contract holds for the next run.
+        const r = mgr.exec("DROP TABLE IF EXISTS public.zaki_users CASCADE") catch null;
+        if (r) |res| c.PQclear(res);
+    }
+
+    try mgr.migrate();
+
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+
+    // ── (a-control) valid id self-heals even with the FK attached ─────────────
+    try mgr.saveSessionMessage(valid_id, "agent:zaki-bot:user:72:main", "user", "hello");
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}.users WHERE user_id = {d}", .{ schema_q, valid_id });
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const cnt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(cnt);
+        try std.testing.expectEqualStrings("1", cnt);
+    }
+
+    // ── (b) bogus id → clean typed identity error, NEVER a raw *_user_id_fkey ──
+    const err = mgr.saveSessionMessage(bogus_id, "agent:zaki-bot:user:999972:main", "user", "nope");
+    try std.testing.expectError(error.IdentityUserNotFound, err);
+    {
+        // And nothing leaked into the tenant tables for the bogus id.
+        const q = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}.users WHERE user_id = {d}", .{ schema_q, bogus_id });
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const cnt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(cnt);
+        try std.testing.expectEqualStrings("0", cnt);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
