@@ -4198,6 +4198,7 @@ test {
     _ = memory_lru;
     _ = lucid;
     _ = postgres;
+    _ = @import("engines/zaki_postgres.zig");
     _ = redis;
     _ = lancedb;
     _ = registry;
