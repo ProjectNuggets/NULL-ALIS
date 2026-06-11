@@ -1,70 +1,60 @@
-# Build & push the browser backend images to DigitalOcean Container Registry (DOCR).
-#
-# REQUIRED repo configuration:
-#   secrets.DOCR_TOKEN   — DigitalOcean API/registry token (used as both the
-#                          docker username AND password for registry login).
-#   vars.DOCR_REGISTRY   — full registry path, e.g. registry.digitalocean.com/nullalis
-#
-# Pushes two images tagged with the commit SHA:
-#   ${DOCR_REGISTRY}/browser-orchestrator:${github.sha}
-#   ${DOCR_REGISTRY}/browser-worker:${github.sha}
-# Wire these into deploy/k8s/browser/orchestrator-deployment.yaml
-# (image + BROWSER_WORKER_IMAGE) by replacing REPLACE_REGISTRY / REPLACE_TAG.
+# Build & push the browser backend images to GitHub Container Registry (GHCR),
+# the same registry the staging cluster already pulls from (pull secret
+# ghcr-projectnuggets). Two images tagged with the commit SHA:
+#   ghcr.io/projectnuggets/browser-orchestrator:${github.sha}
+#   ghcr.io/projectnuggets/browser-worker:${github.sha}
 name: browser-images
 
 on:
   push:
+    branches: [main]
     paths:
       - "services/browser-orchestrator/**"
       - "deploy/k8s/browser/Dockerfile.worker"
   workflow_dispatch:
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   build-push:
     runs-on: ubuntu-latest
-    # Skip cleanly (green) until DOCR is configured. `vars.DOCR_REGISTRY` is the
-    # "DOCR is wired" signal — set it (and the DOCR_TOKEN secret) to enable the
-    # build+push. Without it this job is skipped, not failed, so unrelated pushes
-    # that touch services/browser-orchestrator don't red the run.
-    if: ${{ vars.DOCR_REGISTRY != '' }}
     steps:
       - uses: actions/checkout@v4
 
-      # NOTE: pin actions to a digest (@sha256:...) in prod; majors below for readability.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to DOCR
+      - name: Log in to ghcr.io
         uses: docker/login-action@v3
         with:
-          registry: registry.digitalocean.com
-          username: ${{ secrets.DOCR_TOKEN }}
-          password: ${{ secrets.DOCR_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Orchestrator: Dockerfile uses `COPY . .`, so context is the service dir.
+      # Single-arch amd64: the staging node is amd64. (Add linux/arm64 for prod.)
       - name: Build & push orchestrator
         id: orchestrator
         uses: docker/build-push-action@v6
         with:
           context: services/browser-orchestrator
           file: services/browser-orchestrator/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
-          tags: ${{ vars.DOCR_REGISTRY }}/browser-orchestrator:${{ github.sha }}
+          tags: ghcr.io/projectnuggets/browser-orchestrator:${{ github.sha }}
 
-      # Worker: Dockerfile performs no COPY (system chromium + npm install), so
-      # the build context is irrelevant; deploy/k8s/browser is the dir holding it.
       - name: Build & push worker
         id: worker
         uses: docker/build-push-action@v6
         with:
           context: deploy/k8s/browser
           file: deploy/k8s/browser/Dockerfile.worker
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
-          tags: ${{ vars.DOCR_REGISTRY }}/browser-worker:${{ github.sha }}
+          tags: ghcr.io/projectnuggets/browser-worker:${{ github.sha }}
 
       - name: Report pushed digests
         run: |
-          echo "orchestrator: ${{ vars.DOCR_REGISTRY }}/browser-orchestrator:${{ github.sha }}@${{ steps.orchestrator.outputs.digest }}"
-          echo "worker:       ${{ vars.DOCR_REGISTRY }}/browser-worker:${{ github.sha }}@${{ steps.worker.outputs.digest }}"
+          echo "orchestrator: ghcr.io/projectnuggets/browser-orchestrator:${{ github.sha }}@${{ steps.orchestrator.outputs.digest }}"
+          echo "worker:       ghcr.io/projectnuggets/browser-worker:${{ github.sha }}@${{ steps.worker.outputs.digest }}"
