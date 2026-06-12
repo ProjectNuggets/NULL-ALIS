@@ -53,6 +53,26 @@ const EXTERNAL_IDENTITY_REPROBE_MS: i64 = 5 * 60 * 1000;
 // maxInt, so this is unambiguous.
 const EXTERNAL_IDENTITY_PIN_FOREVER: i64 = std.math.maxInt(i64);
 
+// P1-3 (2026-06-12): extraction-queue backpressure cap. The daemon worker
+// drains the queue at MAX_JOBS_PER_TICK=2 (src/daemon.zig), but the producer
+// side (enqueueExtractionJob, called from session-end / boundary paths) was
+// unbounded: a burst of session_end checkpoints (mass idle-eviction, a
+// reconnect storm, or a single chatty session re-ending repeatedly) could grow
+// `extraction_queue` without bound, costing unbounded PG rows and a worker
+// backlog that never drains. Two defenses, applied at enqueue time:
+//   (1) coalesce — a pending job for the same (user, session, job_type) is
+//       reused (oldest-wins): the new enqueue returns the existing job id and
+//       inserts nothing. session_end/wiki_link extraction is idempotent w.r.t.
+//       re-runs, so coalescing a duplicate (session,kind) never loses work.
+//   (2) depth cap — if pending depth is at/over the cap, the oldest pending
+//       job is dropped (and logged) to make room for the newer one. Newer
+//       work is more representative of current session state; the dropped
+//       slice's raw bytes still live in conversation_messages and re-extract
+//       on the next idle pass. The cap is global (across users) because the
+//       worker is global; per-cell pod isolation keeps single-user load well
+//       under it in practice.
+const EXTRACTION_QUEUE_DEPTH_CAP: usize = 256;
+
 /// Pure TTL decision for the external-identity fail-open cache (P1-9).
 /// Returns true when `hasExternalIdentity` should re-probe `public.zaki_users`
 /// rather than short-circuit on the cached `.unavailable` state. Factored out
@@ -9802,9 +9822,24 @@ const ManagerImpl = struct {
     // heartbeat worker (process). Worker uses SELECT FOR UPDATE SKIP
     // LOCKED to claim jobs concurrency-safe.
 
-    /// Enqueue a job. Returns the new job's BIGSERIAL id (negative on
+    /// Enqueue a job. Returns the job's BIGSERIAL id (negative on
     /// non-postgres / missing-table). payload_json must be valid JSON;
     /// caller is responsible for serialization.
+    ///
+    /// P1-3 backpressure: the producer side is bounded so a session_end /
+    /// boundary burst can never grow `extraction_queue` without limit (the
+    /// daemon worker only drains 2 jobs/tick). Two defenses run in ONE atomic
+    /// statement (CTE chain — same race-safety property as the claim path):
+    ///   1. coalesce — if a pending row already exists for this exact
+    ///      (user_id, session_id, job_type), reuse it (oldest-wins): return
+    ///      its id and insert nothing. Extraction is idempotent over re-runs,
+    ///      so collapsing a duplicate (session,kind) never loses work and
+    ///      never drops the *only* job for a session.
+    ///   2. depth cap — when not coalescing and pending depth is at/over
+    ///      EXTRACTION_QUEUE_DEPTH_CAP, drop the oldest surplus pending rows
+    ///      (FIFO eviction) to make room before inserting the newer job. Any
+    ///      eviction is logged. The dropped slices' raw bytes still live in
+    ///      conversation_messages and re-extract on the next idle pass.
     pub fn enqueueExtractionJob(
         self: *Self,
         user_id: i64,
@@ -9812,10 +9847,44 @@ const ManagerImpl = struct {
         job_type: []const u8,
         payload_json: []const u8,
     ) !i64 {
+        // One statement, evaluated top-down:
+        //   existing  — the pending dupe (if any) for this (user,session,kind).
+        //   capacity  — current pending depth; how many oldest rows to evict
+        //               so that post-insert depth ≤ cap. Only computed when
+        //               there's no dupe to coalesce onto.
+        //   evicted   — DELETE the oldest surplus pending rows (FIFO), skipping
+        //               this run if we're coalescing. RETURNING ids → drop log.
+        //   inserted  — INSERT the new job, but ONLY when no dupe exists.
+        // Final SELECT returns (id, source) where source ∈ {coalesced,
+        // inserted}; evicted ids are surfaced as a count for the drop log.
         const q = try self.buildQuery(
-            "INSERT INTO {schema}.extraction_queue " ++
-                "(user_id, session_id, job_type, payload) " ++
-                "VALUES ($1, $2, $3, $4::jsonb) RETURNING id",
+            "WITH existing AS (" ++
+                "  SELECT id FROM {schema}.extraction_queue" ++
+                "  WHERE status = 'pending' AND user_id = $1 AND session_id = $2 AND job_type = $3" ++
+                "  ORDER BY enqueued_at ASC, id ASC LIMIT 1" ++
+                "), surplus AS (" ++
+                // Number of OLDEST pending rows to drop so that after the new
+                // insert the pending depth is exactly the cap: drop
+                // (current_pending + 1 - cap), floored at 0. Only when we are
+                // NOT coalescing (a coalesce inserts nothing, so no eviction).
+                "  SELECT GREATEST(" ++
+                "    (SELECT count(*) FROM {schema}.extraction_queue WHERE status = 'pending')" ++
+                "    + 1 - $5::bigint, 0) AS n" ++
+                "), evicted AS (" ++
+                "  DELETE FROM {schema}.extraction_queue WHERE id IN (" ++
+                "    SELECT id FROM {schema}.extraction_queue" ++
+                "    WHERE status = 'pending' AND NOT EXISTS (SELECT 1 FROM existing)" ++
+                "    ORDER BY enqueued_at ASC, id ASC" ++
+                "    LIMIT (SELECT n FROM surplus)" ++
+                "  ) RETURNING id" ++
+                "), inserted AS (" ++
+                "  INSERT INTO {schema}.extraction_queue (user_id, session_id, job_type, payload)" ++
+                "  SELECT $1, $2, $3, $4::jsonb WHERE NOT EXISTS (SELECT 1 FROM existing)" ++
+                "  RETURNING id" ++
+                ")" ++
+                "SELECT COALESCE((SELECT id FROM existing), (SELECT id FROM inserted)) AS id," ++
+                "       (SELECT count(*) FROM evicted) AS evicted_n," ++
+                "       (SELECT count(*) FROM existing) AS coalesced_n",
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
@@ -9826,16 +9895,46 @@ const ManagerImpl = struct {
         defer self.allocator.free(jt_z);
         const pl_z = try self.allocator.dupeZ(u8, payload_json);
         defer self.allocator.free(pl_z);
-        const params = [_]?[*:0]const u8{ user_s.ptr, sid_z, jt_z, pl_z };
+        var cap_buf: [16]u8 = undefined;
+        const cap_s = try std.fmt.bufPrintZ(&cap_buf, "{d}", .{EXTRACTION_QUEUE_DEPTH_CAP});
+        const params = [_]?[*:0]const u8{ user_s.ptr, sid_z, jt_z, pl_z, cap_s.ptr };
         const lengths = [_]c_int{
             @intCast(user_s.len),
             @intCast(session_id.len),
             @intCast(job_type.len),
             @intCast(payload_json.len),
+            @intCast(cap_s.len),
         };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
         if (c.PQntuples(result) == 0) return -1;
+
+        const evicted_str = try dupeResultValue(self.allocator, result, 0, 1);
+        defer self.allocator.free(evicted_str);
+        const evicted_n = std.fmt.parseInt(usize, evicted_str, 10) catch 0;
+        if (evicted_n > 0) {
+            // P1-3: surplus pending jobs dropped to keep the queue bounded.
+            // Visible drop log so an operator can correlate lost extraction
+            // with a producer burst rather than discovering a silent gap.
+            log.warn(
+                "extraction_queue.backpressure_drop evicted={d} cap={d} user={d} reason=depth_cap",
+                .{ evicted_n, EXTRACTION_QUEUE_DEPTH_CAP, user_id },
+            );
+        }
+
+        const coalesced_str = try dupeResultValue(self.allocator, result, 0, 2);
+        defer self.allocator.free(coalesced_str);
+        const coalesced_n = std.fmt.parseInt(usize, coalesced_str, 10) catch 0;
+        if (coalesced_n > 0) {
+            log.debug(
+                "extraction_queue.coalesced session={s} kind={s} user={d}",
+                .{ session_id, job_type, user_id },
+            );
+        }
+
+        // id column may be NULL only in the impossible case of neither
+        // existing nor inserted producing a row; guard defensively.
+        if (c.PQgetisnull(result, 0, 0) != 0) return -1;
         const id_str = try dupeResultValue(self.allocator, result, 0, 0);
         defer self.allocator.free(id_str);
         return std.fmt.parseInt(i64, id_str, 10) catch -1;
@@ -18120,5 +18219,113 @@ test "V1.7a-9c recomputeCommunitiesForUser — end-to-end pipeline + namer + cac
         );
         try std.testing.expectEqual(@as(usize, 0), stats.edges_loaded);
         try std.testing.expectEqual(@as(usize, 0), stats.communities_found);
+    }
+}
+
+test "P1-3 extraction-queue backpressure — coalesce dupes + depth cap keeps queue bounded under burst" {
+    // Producer-side backpressure for the extraction queue. Proves:
+    //   (1) coalesce — re-enqueuing the SAME (user, session, job_type) while a
+    //       pending job exists reuses it (returns the same id, inserts no new
+    //       row). A session_end burst for one session can never grow the queue.
+    //   (2) depth cap — bursting DISTINCT-session jobs past
+    //       EXTRACTION_QUEUE_DEPTH_CAP drops the oldest pending job per insert
+    //       so pending depth stays bounded at the cap, never unbounded.
+    //   (3) correctness — coalesce never drops the only job for a session; the
+    //       reused id still points at a real pending row.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_xqbp", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+
+    // FK target: extraction_queue.user_id REFERENCES users(user_id).
+    try mgr.provisionUser(5, "/tmp/nullalis-zaki-bot-test-user-5/workspace");
+
+    // ── (1) Coalesce: same (user, session, kind) enqueued repeatedly ──────
+    const first_id = try mgr.enqueueExtractionJob(5, "sess-A", "session_end", "{\"transcript_text\":\"first\"}");
+    try std.testing.expect(first_id > 0);
+    var dup_i: usize = 0;
+    while (dup_i < 20) : (dup_i += 1) {
+        const dup_id = try mgr.enqueueExtractionJob(5, "sess-A", "session_end", "{\"transcript_text\":\"again\"}");
+        // Oldest-wins: every re-enqueue returns the original pending id.
+        try std.testing.expectEqual(first_id, dup_id);
+    }
+    // After 1 + 20 enqueues for the same key, exactly one pending row exists.
+    try std.testing.expectEqual(@as(usize, 1), try mgr.countPendingExtractionJobs());
+
+    // Distinct job_type for the same session is NOT coalesced (different work).
+    const wiki_id = try mgr.enqueueExtractionJob(5, "sess-A", "wiki_link", "{\"turn_text\":\"hello world wiki\"}");
+    try std.testing.expect(wiki_id > 0);
+    try std.testing.expect(wiki_id != first_id);
+    try std.testing.expectEqual(@as(usize, 2), try mgr.countPendingExtractionJobs());
+
+    // ── (2) Depth cap: burst DISTINCT sessions well past the cap ──────────
+    // Clear the two coalesce-phase rows first so the cap math is clean.
+    {
+        const clear_q = try std.fmt.allocPrint(allocator, "DELETE FROM {s}.extraction_queue", .{schema});
+        defer allocator.free(clear_q);
+        const r = try mgr.exec(clear_q);
+        c.PQclear(r);
+    }
+    try std.testing.expectEqual(@as(usize, 0), try mgr.countPendingExtractionJobs());
+
+    const burst: usize = EXTRACTION_QUEUE_DEPTH_CAP + 100;
+    var b: usize = 0;
+    while (b < burst) : (b += 1) {
+        var sid_buf: [48]u8 = undefined;
+        const sid = try std.fmt.bufPrint(&sid_buf, "burst-sess-{d}", .{b});
+        _ = try mgr.enqueueExtractionJob(5, sid, "session_end", "{\"transcript_text\":\"burst payload here\"}");
+        // Invariant after EVERY enqueue: depth never exceeds the cap.
+        const depth = try mgr.countPendingExtractionJobs();
+        try std.testing.expect(depth <= EXTRACTION_QUEUE_DEPTH_CAP);
+    }
+    // Final depth is exactly the cap (saturated, not unbounded).
+    try std.testing.expectEqual(EXTRACTION_QUEUE_DEPTH_CAP, try mgr.countPendingExtractionJobs());
+
+    // The surviving rows are the NEWEST cap-many sessions (oldest dropped).
+    {
+        const min_q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT session_id FROM {s}.extraction_queue ORDER BY enqueued_at ASC, id ASC LIMIT 1",
+            .{schema},
+        );
+        defer allocator.free(min_q);
+        const r = try mgr.exec(min_q);
+        defer c.PQclear(r);
+        try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(r));
+        const oldest_sid = try dupeResultValue(allocator, r, 0, 0);
+        defer allocator.free(oldest_sid);
+        // burst-sess-0 .. burst-sess-(burst-cap-1) were evicted; the oldest
+        // survivor must be at index (burst - cap) = 100.
+        const expected_oldest = "burst-sess-100";
+        try std.testing.expectEqualStrings(expected_oldest, oldest_sid);
+    }
+
+    // Teardown.
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
     }
 }
