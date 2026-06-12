@@ -641,6 +641,7 @@ pub const Config = struct {
         try w.print("    \"shutdown_flush_budget_ms\": {d},\n", .{self.reliability.shutdown_flush_budget_ms});
         try w.print("    \"shutdown_join_timeout_ms\": {d},\n", .{self.reliability.shutdown_join_timeout_ms});
         try w.print("    \"shutdown_deinit_budget_ms\": {d},\n", .{self.reliability.shutdown_deinit_budget_ms});
+        try w.print("    \"liveness_deadlock_threshold_ms\": {d},\n", .{self.reliability.liveness_deadlock_threshold_ms});
 
         try w.print("    \"fallback_providers\": ", .{});
         try writeStringArray(w, self.reliability.fallback_providers);
@@ -1671,6 +1672,9 @@ test "save roundtrip preserves reliability settings" {
     cfg.reliability.shutdown_flush_budget_ms = 18_000;
     cfg.reliability.shutdown_join_timeout_ms = 3_000;
     cfg.reliability.shutdown_deinit_budget_ms = 45_000;
+    // C3 — non-default liveness watchdog threshold proves the parser branch
+    // picks it up (a save->load round-trip used to revert it to the default).
+    cfg.reliability.liveness_deadlock_threshold_ms = 240_000;
     cfg.reliability.fallback_providers = &.{ "openrouter", "groq" };
     cfg.reliability.api_keys = &.{ "rk_a", "rk_b" };
     cfg.reliability.model_fallbacks = &model_fallbacks;
@@ -1699,6 +1703,7 @@ test "save roundtrip preserves reliability settings" {
     try std.testing.expectEqual(@as(u64, 18_000), loaded.reliability.shutdown_flush_budget_ms);
     try std.testing.expectEqual(@as(u64, 3_000), loaded.reliability.shutdown_join_timeout_ms);
     try std.testing.expectEqual(@as(u64, 45_000), loaded.reliability.shutdown_deinit_budget_ms);
+    try std.testing.expectEqual(@as(u64, 240_000), loaded.reliability.liveness_deadlock_threshold_ms);
     try std.testing.expectEqual(@as(usize, 2), loaded.reliability.fallback_providers.len);
     try std.testing.expectEqualStrings("openrouter", loaded.reliability.fallback_providers[0]);
     try std.testing.expectEqualStrings("groq", loaded.reliability.fallback_providers[1]);

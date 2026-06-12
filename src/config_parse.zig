@@ -858,6 +858,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (rel.object.get("shutdown_deinit_budget_ms")) |v| {
                 if (v == .integer) self.reliability.shutdown_deinit_budget_ms = @intCast(v.integer);
             }
+            // C3 — liveness deadlock watchdog threshold. Parsed here (not just
+            // serialized) so a save->load round-trip preserves an operator's
+            // tuned value, avoiding the Finding-#4 regression class.
+            if (rel.object.get("liveness_deadlock_threshold_ms")) |v| {
+                if (v == .integer) self.reliability.liveness_deadlock_threshold_ms = @intCast(v.integer);
+            }
             // Finding-#4-class fix (2026-05-22): vision_fallback had a struct
             // (VisionFallbackConfig) and its docstring even calls the unset
             // state "a current regression" — but no parser, so `provider`/

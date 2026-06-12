@@ -178,6 +178,20 @@ pub const ReliabilityConfig = struct {
     /// deinit loop gets whatever wall-clock remains after the flush.
     /// 0 = no global cap (legacy: each Agent.deinit waits up to ~90s).
     shutdown_deinit_budget_ms: u64 = 60_000,
+    /// C3 — liveness deadlock watchdog threshold. P0-1 made `GET /health`
+    /// cheap on the acceptor thread, so it keeps passing even if EVERY
+    /// gateway worker deadlocks while the acceptor stays alive — the pod
+    /// would never restart. The watchdog flags the runtime UNHEALTHY only
+    /// when BOTH hold: there is PENDING queued-but-unstarted work AND no
+    /// worker has completed any request for longer than this threshold.
+    /// An idle runtime (no queued work) is NEVER flagged — no progress is
+    /// not a deadlock — and a busy-but-progressing pool resets the clock on
+    /// each completion, so neither false-positives into a restart loop.
+    /// Default is GENEROUS (180s) — comfortably longer than the longest
+    /// expected turn — so only a genuinely wedged pool trips it. 0 disables
+    /// the watchdog entirely (cheap /health reverts to acceptor-liveness
+    /// only). Measured against std.time.milliTimestamp deltas.
+    liveness_deadlock_threshold_ms: u64 = 180_000,
     fallback_providers: []const []const u8 = &.{},
     api_keys: []const []const u8 = &.{},
     model_fallbacks: []const ModelFallbackEntry = &.{},
