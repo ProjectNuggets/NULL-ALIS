@@ -13522,6 +13522,127 @@ test "P0-4 — durable approvals: persist→rehydrate→resolve→idempotent-rep
     }
 }
 
+test "P1-5 — messages persist+reload tool_calls/reasoning (with AND without); old rows unchanged" {
+    // P1-5 acceptance keystone (PG): a reloaded transcript carries tool_calls
+    // + reasoning for a turn that had them, AND a turn without them loads
+    // exactly as before (flat text, NULL extras). Also proves strict backward
+    // compatibility: the legacy `saveSessionMessage` (no extras) writes a row
+    // that reads back with null tool_calls/reasoning — identical to a
+    // pre-migration-0006 row.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_p1_5fidelity", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    defer {
+        if (pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw())) |schema_q| {
+            defer allocator.free(schema_q);
+            if (std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q})) |drop_q| {
+                defer allocator.free(drop_q);
+                if (mgr.exec(drop_q)) |result| {
+                    c.PQclear(result);
+                } else |_| {}
+            } else |_| {}
+        } else |_| {}
+    }
+    try mgr.migrate();
+
+    const uid: i64 = 77;
+    const sid = "agent:zaki-bot:user:77:thread:main";
+    const tc_json = "[{\"id\":\"call_1\",\"name\":\"shell\",\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}]";
+    const reasoning = "the user asked to list files, so I will run ls";
+
+    // (a) A user row — no extras (the common case). Then an assistant turn
+    // WITH tool_calls + reasoning. Then an assistant turn WITHOUT (flat text).
+    try mgr.saveSessionMessage(uid, sid, "user", "list the files");
+    try mgr.saveSessionMessageRich(uid, sid, "assistant", "running ls", tc_json, reasoning);
+    try mgr.saveSessionMessage(uid, sid, "assistant", "here are your files"); // legacy path → NULL extras
+
+    const entries = try mgr.loadSessionMessages(allocator, uid, sid);
+    defer memory_root.freeMessages(allocator, entries);
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+
+    // Row 0: user — flat, no extras.
+    try std.testing.expectEqualStrings("user", entries[0].role);
+    try std.testing.expectEqualStrings("list the files", entries[0].content);
+    try std.testing.expect(entries[0].tool_calls_json == null);
+    try std.testing.expect(entries[0].reasoning == null);
+
+    // Row 1: assistant WITH tool_calls + reasoning — round-trips verbatim.
+    try std.testing.expectEqualStrings("assistant", entries[1].role);
+    try std.testing.expectEqualStrings("running ls", entries[1].content);
+    try std.testing.expect(entries[1].tool_calls_json != null);
+    try std.testing.expect(entries[1].reasoning != null);
+    try std.testing.expectEqualStrings(reasoning, entries[1].reasoning.?);
+    // tool_calls is a JSONB column → PG may normalize whitespace; assert the
+    // structural payload survived (id/name/arguments all present) rather than
+    // a byte-for-byte match.
+    try std.testing.expect(std.mem.indexOf(u8, entries[1].tool_calls_json.?, "call_1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entries[1].tool_calls_json.?, "shell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entries[1].tool_calls_json.?, "ls") != null);
+
+    // Row 2: assistant WITHOUT extras — loads exactly as a pre-0006 flat row.
+    try std.testing.expectEqualStrings("assistant", entries[2].role);
+    try std.testing.expectEqualStrings("here are your files", entries[2].content);
+    try std.testing.expect(entries[2].tool_calls_json == null);
+    try std.testing.expect(entries[2].reasoning == null);
+
+    // (b) Backward-compat at the SQL level: an OLD pod's INSERT names only
+    // (id, session_id, user_id, role, source, content) and never references
+    // the new columns — simulate it directly to prove the new columns are
+    // invisible to old code and default NULL. The new loadSessionMessages
+    // reads it back with null extras.
+    {
+        try mgr.ensureSession(uid, sid);
+        const q = try mgr.buildQuery(
+            "INSERT INTO {schema}.messages (id, session_id, user_id, role, source, content) " ++
+                "VALUES (encode(gen_random_bytes(16),'hex'), " ++
+                "(SELECT id FROM {schema}.sessions WHERE session_key = $2 AND user_id = $1), $1, 'user', 'app', $3)",
+        );
+        defer allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{uid});
+        const sid_z = try allocator.dupeZ(u8, sid);
+        defer allocator.free(sid_z);
+        const content_z = try allocator.dupeZ(u8, "old-pod write");
+        defer allocator.free(content_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, sid_z, content_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(sid.len), @intCast("old-pod write".len) };
+        const r = try mgr.execParams(q, &params, &lengths);
+        c.PQclear(r);
+    }
+    const entries2 = try mgr.loadSessionMessages(allocator, uid, sid);
+    defer memory_root.freeMessages(allocator, entries2);
+    try std.testing.expectEqual(@as(usize, 4), entries2.len);
+    // The old-pod row is last (created_at ASC, id ASC after the prior three);
+    // find it by content and assert null extras.
+    var saw_old_pod = false;
+    for (entries2) |e| {
+        if (std.mem.eql(u8, e.content, "old-pod write")) {
+            saw_old_pod = true;
+            try std.testing.expect(e.tool_calls_json == null);
+            try std.testing.expect(e.reasoning == null);
+        }
+    }
+    try std.testing.expect(saw_old_pod);
+}
+
 // D62 (2026-05-25) — wire migrations.run() from zaki_state.migrate.
 //
 // Static contract test: verifies `migrations.MIGRATIONS` is non-empty,

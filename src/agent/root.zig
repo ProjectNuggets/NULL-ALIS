@@ -7319,6 +7319,110 @@ test "Agent loadHistory handles zero-length content safely" {
     try std.testing.expectEqualStrings("persisted reply", agent.history.items[1].content);
 }
 
+test "P1-5 — serializeToolCalls round-trips through parsePersistedToolCalls" {
+    const allocator = std.testing.allocator;
+    const calls = [_]providers.ToolCall{
+        .{ .id = "call_1", .name = "shell", .arguments = "{\"cmd\":\"ls -la\"}" },
+        .{ .id = "call_2", .name = "read_file", .arguments = "{\"path\":\"/tmp/x\"}" },
+    };
+    const json = (try serializeToolCallsAlloc(allocator, &calls)).?;
+    defer allocator.free(json);
+
+    const parsed = try parsePersistedToolCalls(allocator, json);
+    defer freeOwnedToolCalls(allocator, parsed);
+    try std.testing.expectEqual(@as(usize, 2), parsed.len);
+    try std.testing.expectEqualStrings("call_1", parsed[0].id);
+    try std.testing.expectEqualStrings("shell", parsed[0].name);
+    try std.testing.expectEqualStrings("{\"cmd\":\"ls -la\"}", parsed[0].arguments);
+    try std.testing.expectEqualStrings("call_2", parsed[1].id);
+    try std.testing.expectEqualStrings("read_file", parsed[1].name);
+    try std.testing.expectEqualStrings("{\"path\":\"/tmp/x\"}", parsed[1].arguments);
+
+    // Empty slice → null (column stays NULL → row loads as flat text).
+    try std.testing.expect((try serializeToolCallsAlloc(allocator, &.{})) == null);
+    // A malformed payload degrades to an empty slice rather than erroring.
+    const bad = try parsePersistedToolCalls(allocator, "not json at all");
+    defer freeOwnedToolCalls(allocator, bad);
+    try std.testing.expectEqual(@as(usize, 0), bad.len);
+}
+
+test "P1-5 — loadHistory replays an assistant turn's tool_calls + reasoning; flat rows unchanged" {
+    // The agent-side reload acceptance: an assistant entry carrying
+    // tool_calls_json + reasoning (as loadSessionMessages returns) is replayed
+    // into the OwnedMessage with structured tool_calls + reasoning, while a
+    // plain entry (no extras — old row) loads exactly as flat text.
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    // Use the real MessageEntry shape (optional tool_calls_json / reasoning),
+    // mirroring what loadSessionMessages / sqlite loadMessages return.
+    const entries = [_]memory_mod.MessageEntry{
+        // Old-style flat user row — no extras.
+        .{ .role = "user", .content = "list the files" },
+        // Assistant turn WITH a tool call + reasoning.
+        .{
+            .role = "assistant",
+            .content = "running ls",
+            .tool_calls_json = "[{\"id\":\"call_1\",\"name\":\"shell\",\"arguments\":\"{}\"}]",
+            .reasoning = "user wants a listing",
+        },
+        // Old-style flat assistant row — no extras (must load unchanged).
+        .{ .role = "assistant", .content = "here are your files" },
+    };
+
+    try agent.loadHistory(entries[0..]);
+    try std.testing.expectEqual(@as(usize, 3), agent.historyLen());
+
+    // Row 0: flat user — no tool_calls / reasoning.
+    try std.testing.expect(agent.history.items[0].role == .user);
+    try std.testing.expectEqual(@as(usize, 0), agent.history.items[0].tool_calls.len);
+    try std.testing.expect(agent.history.items[0].reasoning == null);
+
+    // Row 1: assistant WITH replayed structure.
+    try std.testing.expect(agent.history.items[1].role == .assistant);
+    try std.testing.expectEqualStrings("running ls", agent.history.items[1].content);
+    try std.testing.expectEqual(@as(usize, 1), agent.history.items[1].tool_calls.len);
+    try std.testing.expectEqualStrings("call_1", agent.history.items[1].tool_calls[0].id);
+    try std.testing.expectEqualStrings("shell", agent.history.items[1].tool_calls[0].name);
+    try std.testing.expect(agent.history.items[1].reasoning != null);
+    try std.testing.expectEqualStrings("user wants a listing", agent.history.items[1].reasoning.?);
+
+    // Row 2: flat assistant — loads unchanged (no extras).
+    try std.testing.expect(agent.history.items[2].role == .assistant);
+    try std.testing.expectEqualStrings("here are your files", agent.history.items[2].content);
+    try std.testing.expectEqual(@as(usize, 0), agent.history.items[2].tool_calls.len);
+    try std.testing.expect(agent.history.items[2].reasoning == null);
+
+    // And the persist-side accessor surfaces the most-recent turn's extras.
+    // History tail is [assistant(call_1), assistant(flat)] → tool_calls come
+    // from the call-bearing message, reasoning from the same. (Aggregated
+    // across the trailing assistant run.)
+    const extras = try agent.lastAssistantTranscriptExtras(allocator);
+    defer if (extras.tool_calls_json) |tcj| allocator.free(tcj);
+    try std.testing.expect(extras.tool_calls_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, extras.tool_calls_json.?, "call_1") != null);
+    try std.testing.expect(extras.reasoning != null);
+    try std.testing.expectEqualStrings("user wants a listing", extras.reasoning.?);
+}
+
 test "dispatcher module reexport" {
     _ = dispatcher.ParsedToolCall;
     _ = dispatcher.ToolExecutionResult;

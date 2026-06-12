@@ -2144,6 +2144,61 @@ test "sqlite sessionStore saveMessage + loadMessages roundtrip" {
     try std.testing.expectEqualStrings("hi there", msgs[1].content);
 }
 
+test "P1-5 — sqlite sessionStore saveMessageRich roundtrips tool_calls/reasoning; plain rows unchanged" {
+    const allocator = std.testing.allocator;
+    var mem = try SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    // Plain user row (no extras) + assistant turn WITH extras (via the
+    // SessionStore.saveMessageRich wrapper) + plain assistant row (the wrapper
+    // falls back to saveMessage because there are no extras).
+    try store.saveMessage("s1", "user", "list files");
+    try store.saveMessageRich(
+        "s1",
+        "assistant",
+        "running ls",
+        "[{\"id\":\"call_1\",\"name\":\"shell\",\"arguments\":\"{}\"}]",
+        "user wants a listing",
+    );
+    try store.saveMessageRich("s1", "assistant", "done", null, null);
+
+    const msgs = try store.loadMessages(allocator, "s1");
+    defer root.freeMessages(allocator, msgs);
+
+    try std.testing.expectEqual(@as(usize, 3), msgs.len);
+    // user — no extras.
+    try std.testing.expect(msgs[0].tool_calls_json == null);
+    try std.testing.expect(msgs[0].reasoning == null);
+    // assistant WITH extras — round-trips.
+    try std.testing.expectEqualStrings("running ls", msgs[1].content);
+    try std.testing.expect(msgs[1].tool_calls_json != null);
+    try std.testing.expectEqualStrings("[{\"id\":\"call_1\",\"name\":\"shell\",\"arguments\":\"{}\"}]", msgs[1].tool_calls_json.?);
+    try std.testing.expect(msgs[1].reasoning != null);
+    try std.testing.expectEqualStrings("user wants a listing", msgs[1].reasoning.?);
+    // assistant WITHOUT extras — loads unchanged (NULL columns → null).
+    try std.testing.expectEqualStrings("done", msgs[2].content);
+    try std.testing.expect(msgs[2].tool_calls_json == null);
+    try std.testing.expect(msgs[2].reasoning == null);
+}
+
+test "P1-5 — sqlite migrateMessageTranscript is idempotent on repeated boot" {
+    // The columns are added by CREATE TABLE on a fresh DB; migrateMessageTranscript
+    // covers in-place upgrade and must be safe to call repeatedly (duplicate
+    // column name treated as no-op), mirroring migrateSessionId / migrateValidTo.
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    // init already ran it once; calling again must not fail.
+    try mem.migrateMessageTranscript();
+    try mem.migrateMessageTranscript();
+    // And a rich save still works afterward.
+    const store = mem.sessionStore();
+    try store.saveMessageRich("s", "assistant", "x", "[]", "r");
+    const msgs = try store.loadMessages(std.testing.allocator, "s");
+    defer root.freeMessages(std.testing.allocator, msgs);
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+}
+
 test "sqlite sessionStore clearMessages" {
     const allocator = std.testing.allocator;
     var mem = try SqliteMemory.init(allocator, ":memory:");
