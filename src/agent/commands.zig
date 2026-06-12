@@ -1142,16 +1142,29 @@ fn emitLifecycleSummarizerStage(self: anytype, duration_ms: u64, summarized_coun
 
 /// True when a session-end checkpoint must NOT run a heavy inline memory
 /// pass — i.e. it is triggered by a non-interactive lifecycle event
-/// (process shutdown or idle/TTL eviction) rather than an explicit user
-/// action. These run on the maintenance / shutdown paths where a 30-75s
-/// blocking LLM summarizer + inline boundary extraction would stall the
-/// runtime (P0-2). For these reasons the checkpoint persists only the
-/// deterministic checkpoint/anchor and ENQUEUES boundary extraction to the
-/// daemon lane instead of doing it inline.
+/// (process shutdown, idle/TTL eviction, or TTL in-place recycle) rather
+/// than an explicit user action. These run on the maintenance / shutdown
+/// paths where a 30-75s blocking LLM summarizer + inline boundary
+/// extraction would stall the runtime (P0-2). For these reasons the
+/// checkpoint persists only the deterministic checkpoint/anchor and
+/// ENQUEUES boundary extraction to the daemon lane instead of doing it
+/// inline.
+///
+/// P1-6 (audit, part a): `ttl_recycle` was the remaining inline-boundary
+/// gap. recycleSessionInPlace (session.zig ~813) checkpoints the EXPIRED
+/// agent with reason "ttl_recycle" — and crucially it runs synchronously
+/// in front of a fresh incoming user turn (sendMessage → sessionIsTtlExpired
+/// → recycleSessionInPlace). Leaving it interactive meant a brownout-era
+/// 30s+ blocking extractAtBoundary was injected ahead of the user's first
+/// message to a recycled session. It is a maintenance-lane event just like
+/// idle_evict/ttl_evict, so it joins the set: the deterministic summary +
+/// off-thread enqueueExtractionJob path covers it with zero loss (the
+/// session-end entity-pipeline enqueue below is unconditional on the gate).
 fn isNonInteractiveCheckpointReason(reason: []const u8) bool {
     return std.mem.eql(u8, reason, "shutdown") or
         std.mem.eql(u8, reason, "idle_evict") or
-        std.mem.eql(u8, reason, "ttl_evict");
+        std.mem.eql(u8, reason, "ttl_evict") or
+        std.mem.eql(u8, reason, "ttl_recycle");
 }
 
 fn shouldUseDeterministicSessionSummary(reason: []const u8) bool {
@@ -5536,6 +5549,8 @@ test "P0-2: shutdown/idle_evict/ttl_evict use deterministic summary (no inline p
     try std.testing.expect(shouldUseDeterministicSessionSummary("shutdown"));
     try std.testing.expect(shouldUseDeterministicSessionSummary("idle_evict"));
     try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_evict"));
+    // P1-6 (audit, part a): ttl_recycle joins the deterministic set.
+    try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_recycle"));
 }
 
 test "P0-2: existing deterministic reasons still hold" {
@@ -5556,6 +5571,8 @@ test "P0-2: inline boundary extraction is skipped exactly for the evict reasons"
     try std.testing.expect(shouldSkipInlineBoundaryExtraction("shutdown"));
     try std.testing.expect(shouldSkipInlineBoundaryExtraction("idle_evict"));
     try std.testing.expect(shouldSkipInlineBoundaryExtraction("ttl_evict"));
+    // P1-6 (audit, part a): ttl_recycle's inline boundary work routes off-path.
+    try std.testing.expect(shouldSkipInlineBoundaryExtraction("ttl_recycle"));
     // Interactive / auto reasons keep the inline extraction pass.
     try std.testing.expect(!shouldSkipInlineBoundaryExtraction("compaction:manual"));
     try std.testing.expect(!shouldSkipInlineBoundaryExtraction("compaction:auto"));
@@ -5567,5 +5584,20 @@ test "P0-2: isNonInteractiveCheckpointReason classifies lifecycle reasons" {
     try std.testing.expect(isNonInteractiveCheckpointReason("idle_evict"));
     try std.testing.expect(isNonInteractiveCheckpointReason("ttl_evict"));
     try std.testing.expect(!isNonInteractiveCheckpointReason("compaction:auto"));
+    try std.testing.expect(!isNonInteractiveCheckpointReason("compaction:manual"));
+}
+
+test "P1-6 audit: ttl_recycle is non-interactive — inline boundary extraction routed off the turn path" {
+    // recycleSessionInPlace checkpoints the expired agent with "ttl_recycle"
+    // synchronously in front of a fresh incoming user turn. It MUST be
+    // classified non-interactive so the blocking extractAtBoundary + inline
+    // LLM summarizer are skipped (boundary work still rides the unconditional
+    // enqueueExtractionJob lane). Pin all three gates together.
+    try std.testing.expect(isNonInteractiveCheckpointReason("ttl_recycle"));
+    try std.testing.expect(shouldSkipInlineBoundaryExtraction("ttl_recycle"));
+    try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_recycle"));
+    // Interactive reasons remain unaffected — the gate widened by exactly one.
+    try std.testing.expect(!isNonInteractiveCheckpointReason("reset:manual"));
+    try std.testing.expect(!isNonInteractiveCheckpointReason("api_compact"));
     try std.testing.expect(!isNonInteractiveCheckpointReason("compaction:manual"));
 }
