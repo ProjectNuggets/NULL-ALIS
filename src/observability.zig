@@ -379,6 +379,57 @@ pub fn detachGlobalObserverAndWait() void {
     }
 }
 
+// ── C3: mid-turn liveness progress heartbeat ─────────────────────────
+//
+// The gateway's deadlock watchdog (gateway.zig: livenessDeadlockDetected)
+// trips when queued work sits while the worker pool makes no
+// queue-service progress for longer than the threshold. "Progress" was
+// originally only a worker POP or request COMPLETION (gatewayWorkerMain).
+// But a single agentic turn runs SYNCHRONOUSLY on the worker thread and
+// has NO overall wall-clock bound (agent.max_tool_iterations defaults to
+// maxInt(u32); only each provider.chat call is bounded by
+// message_timeout_secs). So if every worker is simultaneously inside one
+// long multi-iteration turn while requests queue, NO pop/completion fires
+// for the whole turn — a HEALTHY, progressing pod would look wedged and
+// get 503'd into a restart loop.
+//
+// This hook closes that gap WITHOUT threading a pointer through every one
+// of the dozens of processMessage call sites. The gateway installs a
+// pointer to its `last_worker_progress_ms` atomic at boot; the agent turn
+// calls `recordProgressHeartbeat()` as it makes progress (once per
+// tool-loop iteration and once per provider stream chunk — see
+// agent/root.zig). Each call stamps the current wall-clock time into the
+// SAME atomic the watchdog reads, so any worker making mid-turn progress
+// keeps the pool clock fresh. With this heartbeat, the only window with no
+// refresh is a single uninterrupted provider call (bounded by
+// message_timeout_secs ≈ 300s via curl --max-time), so the watchdog
+// threshold only has to clear that one call, not a whole unbounded turn.
+//
+// Mirrors the global-observer convention: set-once-at-boot, read-many,
+// detached at shutdown. The target atomic lives inside GatewayState, which
+// outlives every worker (workers are joined before state teardown), and
+// the gateway detaches (sets null) only after workers have stopped, so the
+// pointer is never dangling when a worker dereferences it. A null pointer
+// (tests, standalone CLI) makes this a cheap no-op.
+var progress_heartbeat: ?*std.atomic.Value(i64) = null;
+
+/// Install the process-wide liveness progress sink. Called once by the
+/// gateway at boot with &state.last_worker_progress_ms; pass null at
+/// shutdown (after workers have joined) to detach.
+pub fn setProgressHeartbeat(slot: ?*std.atomic.Value(i64)) void {
+    @atomicStore(?*std.atomic.Value(i64), &progress_heartbeat, slot, .release);
+}
+
+/// Stamp the current wall-clock time into the installed progress sink, if
+/// any. Safe to call from any worker thread and a no-op when no sink is
+/// installed. Deliberately tiny + lock-free so it is cheap to call on the
+/// per-iteration and per-stream-chunk hot paths.
+pub fn recordProgressHeartbeat() void {
+    if (@atomicLoad(?*std.atomic.Value(i64), &progress_heartbeat, .acquire)) |slot| {
+        slot.store(std.time.milliTimestamp(), .release);
+    }
+}
+
 const metric_log = std.log.scoped(.metric);
 
 /// Emit a metric to the global observer if one is registered; otherwise

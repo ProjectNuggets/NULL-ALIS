@@ -187,44 +187,56 @@ pub const ReliabilityConfig = struct {
     /// threshold. An idle runtime (no queued work) is NEVER flagged — no
     /// progress is not a deadlock.
     ///
-    /// What "progress" means (Finding C3-2 — the 3× model below was provably
-    /// wrong): the clock (`last_worker_progress_ms`) advances when a worker
-    /// either PICKS UP queued work (pops it off the queue) OR COMPLETES a
-    /// request — see `gatewayWorkerMain`. It is NOT "time since last
-    /// completion". This distinction is the whole correctness argument:
-    /// `handleAcceptedConnection` runs a chat-stream turn SYNCHRONOUSLY on the
-    /// worker thread, and a single agentic turn has NO wall-clock bound —
-    /// `max_tool_iterations` defaults to maxInt(u32) (effectively unbounded)
-    /// and the turn loop has no overall deadline; only each individual
-    /// provider.chat call is bounded by `agent.message_timeout_secs` (default
-    /// 300s, curl --max-time). So a legitimately PROGRESSING turn can run far
-    /// past ANY fixed multiple of `message_timeout_secs`; there is no finite
-    /// `iterations × timeout` ceiling to derive a "worst-case turn" from while
-    /// iterations are uncapped. A "time since last completion" watchdog would
-    /// therefore false-positive a HEALTHY pool whenever `gateway.max_workers`
-    /// (default 16) workers are all busy on long turns while new requests queue
-    /// (`queued_requests > 0`), 503-ing a progressing pod into a restart loop
-    /// — the exact failure the watchdog was meant to prevent. Advancing on POP
-    /// fixes this: as long as the pool keeps draining the queue (any worker
-    /// returning from its turn to pop the next item), the clock advances and
-    /// the predicate stays false under sustained slow load. The watchdog trips
-    /// only when queued work sits with NO worker popping or completing ANYTHING
-    /// for the whole window — a genuine wedge.
+    /// What "progress" means (heartbeat model — supersedes the earlier 3×
+    /// "several chained calls" justification AND the pop-or-complete-only
+    /// model, both of which were wrong about the worst case): the clock
+    /// (`last_worker_progress_ms`) is refreshed by THREE sources:
+    ///   1. a worker POPPING queued work off the queue (request start), and
+    ///   2. a worker COMPLETING a request — both in `gatewayWorkerMain`; and,
+    ///      critically,
+    ///   3. a MID-TURN HEARTBEAT emitted by the agent turn itself — once per
+    ///      tool-loop iteration AND once per provider stream chunk (see
+    ///      agent/root.zig + observability.recordProgressHeartbeat). The
+    ///      gateway installs a pointer to this atomic at boot
+    ///      (observability.setProgressHeartbeat) and any worker making
+    ///      progress on a turn stamps it.
     ///
-    /// Choosing the default: with progress = pop-or-complete, the threshold
-    /// must exceed the longest a healthy pool can go WITHOUT servicing the
-    /// queue at all — i.e. the longest single uninterrupted in-flight turn
-    /// during which every worker is simultaneously occupied and none returns to
-    /// pop. That is operator-dependent and, with uncapped `max_tool_iterations`,
-    /// formally unbounded; the 900s (15 min) default is a generous practical
-    /// ceiling for the common case (workers cycle through turns and keep
-    /// draining the queue well inside it). Operators running pathologically long
-    /// single turns should EITHER set a finite `agent.max_tool_iterations` (so a
-    /// real `iterations × message_timeout_secs` ceiling exists) OR raise this
-    /// threshold above their longest expected uninterrupted turn. 0 disables the
-    /// watchdog entirely (cheap /health reverts to acceptor-liveness only).
-    /// Measured against std.time.milliTimestamp deltas.
-    liveness_deadlock_threshold_ms: u64 = 900_000,
+    /// Why the heartbeat is the whole correctness argument:
+    /// `handleAcceptedConnection` runs a chat-stream turn SYNCHRONOUSLY on the
+    /// worker thread, and a single agentic turn has NO overall wall-clock
+    /// bound — `max_tool_iterations` defaults to maxInt(u32) (effectively
+    /// unbounded) and the turn loop has no overall deadline; only each
+    /// individual provider.chat call is bounded by `agent.message_timeout_secs`
+    /// (default 300s, enforced by curl --max-time). WITHOUT the heartbeat, a
+    /// pool with every `gateway.max_workers` (default 16) worker simultaneously
+    /// inside one long multi-iteration turn while new requests queue
+    /// (`queued_requests > 0`) emits NO pop/completion for the whole turn — an
+    /// unbounded window — so the watchdog would 503 a HEALTHY, progressing pod
+    /// into a restart loop (the exact failure it was meant to prevent). WITH
+    /// the heartbeat, every iteration and every stream chunk of a progressing
+    /// turn refreshes the clock, so the only window left with NO refresh at all
+    /// is a SINGLE uninterrupted provider call — which is itself bounded by
+    /// `message_timeout_secs` (≈ 300s, curl --max-time). The watchdog trips
+    /// only when queued work sits with NO pop, NO completion, and NO turn
+    /// heartbeat from ANY worker for the whole window — a genuine wedge.
+    ///
+    /// TRUE worst-case no-heartbeat window: `agent.message_timeout_secs`
+    /// (default 300s) — the longest a healthy, progressing pool can go without
+    /// stamping the clock is one maximally long provider call during which all
+    /// workers are simultaneously blocked inside their own such call. (Even
+    /// then, the first to return a chunk or finish refreshes it.)
+    ///
+    /// Choosing the default: the threshold must comfortably exceed that
+    /// worst-case window so even ALL workers simultaneously inside one
+    /// max-length provider call never false-trip. The default is
+    /// 2× `message_timeout_secs` = 600_000 ms (600s / 10 min) — double the
+    /// worst-case window for ample margin against clock skew and scheduling
+    /// jitter. Operators who raise `message_timeout_secs` should raise this in
+    /// proportion (keep it ≥ 2× the configured provider call timeout).
+    /// 0 disables the watchdog entirely (cheap /health reverts to
+    /// acceptor-liveness only). Measured against std.time.milliTimestamp
+    /// deltas.
+    liveness_deadlock_threshold_ms: u64 = 600_000,
     fallback_providers: []const []const u8 = &.{},
     api_keys: []const []const u8 = &.{},
     model_fallbacks: []const ModelFallbackEntry = &.{},

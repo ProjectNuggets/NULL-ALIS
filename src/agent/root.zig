@@ -277,6 +277,13 @@ pub const Agent = struct {
 
     fn streamCallbackWithTiming(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
         const ctx: *StreamTimingContext = @ptrCast(@alignCast(ctx_ptr));
+        // C3 (mid-turn heartbeat) — refresh the liveness progress sink on
+        // EVERY stream chunk, not just per iteration, so even a single long
+        // uninterrupted streaming provider call (one tool-loop iteration, no
+        // pop/completion for its whole duration) keeps the watchdog clock
+        // fresh while tokens flow. Cheap lock-free no-op when no sink is
+        // installed.
+        observability.recordProgressHeartbeat();
         if (!ctx.first_token_recorded and chunk.delta.len > 0) {
             ctx.first_token_recorded = true;
             const first_token_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - ctx.provider_start_ms));
@@ -4216,6 +4223,17 @@ pub const Agent = struct {
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
             _ = iter_arena.reset(.retain_capacity);
             const arena = iter_arena.allocator();
+
+            // C3 (mid-turn heartbeat) — this turn runs SYNCHRONOUSLY on a
+            // gateway worker thread and the tool loop has no overall
+            // wall-clock bound (max_tool_iterations defaults to maxInt(u32)),
+            // so a long multi-iteration turn can outlast the liveness
+            // deadlock threshold while emitting no pop/completion. Stamp the
+            // global progress sink at the START of every iteration so a
+            // PROGRESSING pool keeps the watchdog clock fresh even when every
+            // worker is busy and new requests queue. No-op (cheap atomic load)
+            // when no sink is installed (tests / standalone CLI).
+            observability.recordProgressHeartbeat();
 
             // v1.14.18-B G3 — stamp the iteration counter onto the
             // NarrationObserver so any frames emitted during this

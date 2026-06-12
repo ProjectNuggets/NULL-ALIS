@@ -23138,31 +23138,38 @@ fn classifyProbeRequestLine(preview: []const u8) ProbeClass {
 //   1. there is PENDING queued-but-unstarted work (RequestQueue depth > 0),
 //      AND
 //   2. the worker pool has made NO QUEUE-SERVICE PROGRESS for longer than the
-//      threshold — where "progress" means a worker PICKED UP (popped) or
-//      COMPLETED any request. See gatewayWorkerMain: the clock advances on
-//      BOTH the pop (request start) and the completion.
+//      threshold — where "progress" means a worker PICKED UP (popped) a
+//      request, COMPLETED one, OR emitted a MID-TURN HEARTBEAT. See
+//      gatewayWorkerMain (clock advances on BOTH the pop and the completion)
+//      and observability.recordProgressHeartbeat (the agent turn stamps the
+//      clock once per tool-loop iteration and once per provider stream chunk).
 //
-// Finding C3-2 — why "progress" is pop-or-complete, not "last completion":
+// Finding C3-2 + heartbeat — why "progress" is pop-or-complete-OR-heartbeat,
+// not "last completion":
 //   `handleAcceptedConnection` runs a chat-stream turn SYNCHRONOUSLY on the
-//   worker thread, and a single agentic turn has NO wall-clock bound
+//   worker thread, and a single agentic turn has NO overall wall-clock bound
 //   (max_tool_iterations defaults to maxInt(u32); only each provider.chat call
 //   is bounded by message_timeout_secs). A "time since last completion"
 //   watchdog therefore false-positives a HEALTHY pool whenever all workers are
 //   busy on long-but-progressing turns while requests queue — exactly the
-//   restart loop it was meant to prevent. Advancing the clock when a worker
-//   POPS the next queued item makes the predicate measure whether the pool is
-//   still draining the queue, not how long one turn happens to take.
+//   restart loop it was meant to prevent. Advancing on POP measures whether
+//   the pool is still draining the queue; the mid-turn HEARTBEAT goes further
+//   and refreshes the clock WHILE a turn runs, so even all workers stuck
+//   inside one long multi-iteration turn (no pop/completion for its whole
+//   duration) keep the clock fresh. The only window left with no refresh is a
+//   single uninterrupted provider call (bounded by message_timeout_secs).
 //
 // Why both gates, and why this is restart-loop-safe:
 //   * IDLE runtime  → queue_depth == 0 → never flagged. "No progress" is not
 //     a deadlock; a freshly-booted or quiet pod has simply had nothing to do.
-//   * BUSY runtime  → every pop AND every completion bumps the progress
-//     timestamp, so as long as the pool keeps servicing the queue the gap
+//   * BUSY runtime  → every pop, every completion, AND every turn iteration /
+//     stream chunk bumps the progress timestamp, so as long as the pool keeps
+//     servicing the queue OR any worker keeps making turn progress the gap
 //     stays small and the predicate stays false even under sustained load with
 //     a continuously non-empty queue and long individual turns.
-//   * WEDGED runtime → work is queued (depth > 0) yet NO worker pops or
-//     completes ANYTHING, so once the gap exceeds the GENEROUS threshold the
-//     predicate trips exactly once the pool is genuinely stuck.
+//   * WEDGED runtime → work is queued (depth > 0) yet NO worker pops,
+//     completes, OR heartbeats ANYTHING, so once the gap exceeds the GENEROUS
+//     threshold the predicate trips exactly once the pool is genuinely stuck.
 // A threshold of 0 disables the watchdog (cheap /health reverts to pure
 // acceptor liveness).
 //
@@ -24143,13 +24150,28 @@ pub fn runWithRole(
     state.event_bus = event_bus;
     // C3 — seed the liveness progress clock to boot time BEFORE any worker
     // exists. The watchdog measures the gap since the last queue-service
-    // progress (a worker popping or completing a request); without this seed
-    // the timestamp would be epoch 0, making the first queued request before
-    // any worker activity look like a multi-decade wedge. From boot the gap
-    // only crosses the (generous, default-900s) threshold if the pool
-    // genuinely never pops or completes a request. milliTimestamp is
-    // wall-clock, as used throughout this file.
+    // progress (a worker popping or completing a request, or a mid-turn
+    // heartbeat — see setProgressHeartbeat below); without this seed the
+    // timestamp would be epoch 0, making the first queued request before any
+    // worker activity look like a multi-decade wedge. From boot the gap only
+    // crosses the (generous, default-600s / 2× message_timeout_secs)
+    // threshold if the pool genuinely never pops, completes, or heartbeats a
+    // request. milliTimestamp is wall-clock, as used throughout this file.
     state.last_worker_progress_ms.store(std.time.milliTimestamp(), .release);
+    // C3 (mid-turn heartbeat) — install the process-wide progress sink so an
+    // agentic turn refreshes THIS atomic as it makes progress (per tool-loop
+    // iteration and per provider stream chunk; see agent/root.zig +
+    // observability.recordProgressHeartbeat). Without this, a pool with every
+    // worker busy inside one long multi-iteration turn (turns have no overall
+    // wall-clock bound — max_tool_iterations defaults to maxInt(u32)) emits no
+    // pop/completion for the whole turn and a HEALTHY pod would look wedged.
+    // The sink points at state.last_worker_progress_ms, which lives for the
+    // whole runWithRole body and outlives every worker. This defer is
+    // registered BEFORE the worker spawn/join defer (below) so, under LIFO,
+    // it runs AFTER all workers have joined — the pointer is never detached
+    // while a worker could still dereference it.
+    observability.setProgressHeartbeat(&state.last_worker_progress_ms);
+    defer observability.setProgressHeartbeat(null);
 
     var owned_config: ?Config = null;
     var config_opt: ?*const Config = null;
@@ -29864,6 +29886,91 @@ test "C3 Finding C3-2: a recent POP clears the watchdog even with no recent comp
     // If even pops stop (no worker pops or completes anything) the gap grows
     // again and a genuine wedge still trips once past the threshold.
     try std.testing.expect(livenessDeadlockDetected(&state, 595_000 + 180_001));
+}
+
+test "C3 heartbeat: busy-but-PROGRESSING pool (periodic mid-turn heartbeats) is NOT flagged" {
+    // The exact restart-loop bug this fix closes: every worker is busy inside
+    // one long multi-iteration turn while requests queue (queued_requests > 0),
+    // so NO worker pops or completes anything for far longer than the OLD 900s
+    // threshold — but each turn IS progressing and emits a mid-turn heartbeat
+    // per iteration / per stream chunk. The heartbeat refreshes the SAME atomic
+    // the watchdog reads (last_worker_progress_ms), so a progressing pool is
+    // never mistaken for a wedge.
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.liveness_deadlock_threshold_ms = 600_000; // the shipped default
+
+    // Wire the global progress sink at the SAME atomic gatewayWorkerMain seeds
+    // and the watchdog reads — this is exactly what runWithRole installs at
+    // boot. Detach at end so no other test sees a dangling sink.
+    observability.setProgressHeartbeat(&state.last_worker_progress_ms);
+    defer observability.setProgressHeartbeat(null);
+
+    // Pending work sits the entire time; no worker ever pops/completes.
+    state.queued_requests.store(12, .release);
+    // Last pop/completion is ANCIENT — under a pop-or-complete-only model with
+    // all workers stuck inside one long turn, the gap would blow past BOTH the
+    // old 900s and the new 600s threshold and false-trip.
+    state.last_worker_progress_ms.store(0, .release);
+
+    // Model a turn that runs well past the OLD 900s ceiling: simulate periodic
+    // mid-turn heartbeats. Each recordProgressHeartbeat() stamps the real
+    // monotonic-ish clock into the sink; we then evaluate the predicate against
+    // that fresh stamp. As long as a heartbeat lands within the threshold
+    // window, the pool is never flagged — no matter how long the overall turn
+    // runs (here ~1200s of simulated turn time, well past 900s AND 600s).
+    var simulated_turn_elapsed_ms: i64 = 0;
+    const heartbeat_interval_ms: i64 = 5_000; // an iteration / stream chunk cadence
+    while (simulated_turn_elapsed_ms < 1_200_000) : (simulated_turn_elapsed_ms += heartbeat_interval_ms) {
+        // A worker makes progress (tool-loop iteration or stream chunk): the
+        // turn calls recordProgressHeartbeat(), stamping `now` into the sink.
+        observability.recordProgressHeartbeat();
+        const fresh = state.last_worker_progress_ms.load(.acquire);
+        // The watchdog evaluates a hair after the heartbeat (well inside the
+        // threshold): a freshly-heartbeated, progressing pool is NOT flagged
+        // even though queued_requests > 0 and no completion has occurred.
+        try std.testing.expect(!livenessDeadlockDetected(&state, fresh + 1_000));
+    }
+
+    // Sanity: the sink really advanced the clock far from the ancient seed.
+    try std.testing.expect(state.last_worker_progress_ms.load(.acquire) > 0);
+}
+
+test "C3 heartbeat: a STUCK pool (queued work, NO heartbeat past threshold) IS flagged" {
+    // The counterpart: once the heartbeats STOP (no pop, no completion, no
+    // turn iteration / stream chunk from ANY worker) while work is queued, the
+    // gap grows past the threshold and the watchdog correctly trips — the pool
+    // is genuinely wedged.
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.liveness_deadlock_threshold_ms = 600_000;
+
+    observability.setProgressHeartbeat(&state.last_worker_progress_ms);
+    defer observability.setProgressHeartbeat(null);
+
+    // A heartbeat lands, then the pool wedges: no further heartbeat/pop/complete.
+    observability.recordProgressHeartbeat();
+    const last_beat = state.last_worker_progress_ms.load(.acquire);
+    state.queued_requests.store(7, .release);
+
+    // Just before the threshold elapses since the last heartbeat → not yet.
+    try std.testing.expect(!livenessDeadlockDetected(&state, last_beat + 600_000));
+    // Past the threshold with NO heartbeat in between → genuine wedge, flagged.
+    try std.testing.expect(livenessDeadlockDetected(&state, last_beat + 600_001));
+
+    // And idle (queue drains) with the same stale clock is never flagged — the
+    // primary restart-loop guard still holds.
+    state.queued_requests.store(0, .release);
+    try std.testing.expect(!livenessDeadlockDetected(&state, last_beat + 10_000_000));
+}
+
+test "C3 heartbeat: no sink installed makes recordProgressHeartbeat a safe no-op" {
+    // Tests / standalone CLI never install the sink. recordProgressHeartbeat()
+    // must be a harmless no-op (cheap atomic load of a null pointer), touching
+    // no state and never crashing.
+    observability.setProgressHeartbeat(null);
+    observability.recordProgressHeartbeat();
+    observability.recordProgressHeartbeat();
 }
 
 // A connection with an invalid handle for queue-mechanics tests. NEVER do I/O
