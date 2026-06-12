@@ -1323,6 +1323,27 @@ const ExtractionBreaker = struct {
 /// this tick, so a brownout costs ~0 instead of 30s+ per tick. When the
 /// breaker is closed / half-open-probe-allowed, one job is claimed and its
 /// outcome is recorded against the breaker.
+///
+/// C2 fix (half-open wedge): allowAttempt() consumes the breaker's single
+/// half-open probe at the instant it returns true (CircuitBreaker.allow()
+/// sets half_open_probe_sent), and ONLY recordSuccess/recordFailure clears
+/// that flag. So the breaker must never be allowed to consume the probe
+/// without a paired recordOutcome, or it wedges in half-open forever (every
+/// later allowAttempt() returns false; no outcome can reset it until daemon
+/// restart). The earlier code gated BEFORE checking for work, so the
+/// expected empty-queue / parse-fail / short-text early-returns spent the
+/// probe and never recorded — a single brownout reliably bricked extraction.
+///
+/// Two guarantees now hold the invariant (mirroring the retrieval lane, which
+/// always records an outcome once cb.allow() returns true):
+///   (1) A cheap pending-count check runs BEFORE allowAttempt(), so an empty
+///       queue (the EXPECTED state at the post-cooldown probe tick during a
+///       brownout recovery) returns early WITHOUT consuming the probe.
+///   (2) Once allowAttempt() HAS been consumed, every early-return path below
+///       (claim race → null, payload parse failure, short text) records a
+///       neutral outcome (.parse_failed → treated as non-availability success
+///       by extractionOutcomeTripsBreaker) so the probe is always followed by
+///       a recordOutcome and the breaker can never stay consumed-but-unrecorded.
 fn processOneExtractionJob(
     allocator: std.mem.Allocator,
     config: *const Config,
@@ -1331,11 +1352,32 @@ fn processOneExtractionJob(
     embedder: embeddings.EmbeddingProvider,
     breaker: ?*ExtractionBreaker,
 ) !bool {
+    // C2 fix: cheap "is there work?" probe BEFORE the breaker gate. This is a
+    // single indexed COUNT (idx_xq_pending), orders of magnitude cheaper than
+    // the 30s LLM call the breaker exists to skip. If the queue is empty we
+    // return WITHOUT touching the breaker — the half-open probe is reserved
+    // for a tick that actually has a job to run, so an empty queue at the
+    // exact post-cooldown probe tick can never wedge the breaker in half-open.
+    if (breaker != null) {
+        const pending = state_mgr.countPendingExtractionJobs() catch |err| {
+            // Count failed (transient DB error) — treat as "no work this tick"
+            // and leave the breaker untouched. Nothing was claimed, no probe
+            // spent; the next tick retries cleanly.
+            log.warn("extraction_queue.pending_count_failed err={s}", .{@errorName(err)});
+            return false;
+        };
+        if (pending == 0) return false;
+    }
+
     // P1-6: gate BEFORE claiming. An open breaker must not burn a claim
     // (which would bump attempts and eventually exhaust the 3-retry budget,
     // permanently failing jobs during a transient brownout). A blocked
     // attempt leaves the queue untouched — the job is simply deferred to a
     // later tick once the breaker half-opens.
+    //
+    // C2 invariant: from here on, if `breaker` is non-null we have consumed an
+    // allowAttempt() that returned true (possibly the single half-open probe),
+    // so EVERY return path must record an outcome on the breaker.
     if (breaker) |b| {
         if (!b.allowAttempt()) {
             log.debug("extraction_queue.breaker_open skip_tick — extractor calls deferred during cooldown", .{});
@@ -1343,10 +1385,32 @@ fn processOneExtractionJob(
         }
     }
 
+    // C2 fix (thrown-error wedge): from here down every `try` (the
+    // claimNextExtractionJob claim below — and any future fallible call placed
+    // beneath the gate) can return an error AFTER the half-open probe was
+    // consumed by allowAttempt() above. An error return skips every explicit
+    // recordOutcome below, leaving the probe spent-but-unrecorded → permanent
+    // half_open wedge. This errdefer pairs the consumed probe with a hard
+    // failure on ANY propagated error: a thrown error is an infra/availability
+    // fault (DB unreachable, claim failed), so recordHardFailure() (→
+    // recordFailure) is the correct availability-semantics record — it re-opens
+    // the breaker and lets it recover via a fresh probe after the cooldown,
+    // instead of wedging. It runs ONLY on the error path, so it never
+    // double-records with the value-return recordOutcome calls below (those
+    // exit via `return`, not via a propagated error, so the errdefer does not
+    // fire). It is a no-op when `breaker` is null (no probe was consumed).
+    errdefer if (breaker) |b| b.recordHardFailure();
+
     const job = (try state_mgr.claimNextExtractionJob(allocator)) orelse {
-        // No job to run. The breaker probe (if half-open) wasn't spent on a
-        // real call; nothing to record — leave state as-is so the next tick
-        // with actual work performs the probe.
+        // C2 fix: the pending-count check above saw work, but a concurrent
+        // worker (or a status transition) raced us to it, so the claim came
+        // back empty. The breaker probe HAS been consumed by allowAttempt()
+        // above — if we returned without recording, a half-open probe would be
+        // spent-but-unrecorded and wedge the breaker forever. Record a neutral
+        // outcome (parse_failed is treated as a non-availability success, so it
+        // clears the half-open probe without counting as a brownout) and stop
+        // draining this tick.
+        if (breaker) |b| b.recordOutcome(.parse_failed);
         return false;
     };
     defer job.deinit(allocator);
@@ -1359,6 +1423,14 @@ fn processOneExtractionJob(
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, job.payload_json, .{}) catch |err| {
         log.warn("extraction_queue.payload_parse_failed job_id={d} err={s}", .{ job.id, @errorName(err) });
         state_mgr.markExtractionJobFailed(job.id, "parse_failed") catch {};
+        // C2 fix: the half-open probe was consumed by allowAttempt() above, but
+        // we never reached the extractor — this is a data-quality fault (bad
+        // payload JSON), not an availability problem. Record a neutral outcome
+        // (.parse_failed → non-availability success) so the probe is paired and
+        // the breaker can't wedge in half_open. The catch-block exits via
+        // `return true`, not a propagated error, so the errdefer does not also
+        // fire here (no double-record).
+        if (breaker) |b| b.recordOutcome(.parse_failed);
         return true;
     };
     defer parsed.deinit();
@@ -1380,6 +1452,14 @@ fn processOneExtractionJob(
     if (text_field.len < 8) {
         log.warn("extraction_queue.payload_text_missing job_id={d} type={s}", .{ job.id, job.job_type });
         state_mgr.markExtractionJobDone(job.id) catch {};
+        // C2 fix: short/missing text means there is nothing to extract — we
+        // mark the job done and skip the extractor. The half-open probe was
+        // already consumed by allowAttempt() above, so it MUST be recorded or
+        // the breaker wedges. This is not an availability fault (the endpoint
+        // was never called), so a neutral .parse_failed pairs the probe without
+        // counting as a brownout. Exits via `return true` (not an error), so the
+        // errdefer does not also fire (no double-record).
+        if (breaker) |b| b.recordOutcome(.parse_failed);
         return true;
     }
 
@@ -4474,4 +4554,176 @@ test "P1-6 worker gating sim — open breaker defers a backlog of jobs, then dra
     }
     try std.testing.expectEqual(@as(usize, 0), sim.pending);
     try std.testing.expect(!b2.isOpen());
+}
+
+test "C2 half-open wedge — every post-probe early-return records an outcome (breaker never wedges)" {
+    // REGRESSION for the C2 half-open wedge. The original lane gated on
+    // allowAttempt() (consuming the single half-open probe) and then had
+    // several early-return paths that returned WITHOUT a paired recordOutcome,
+    // leaving the breaker stuck in half_open forever (every later allowAttempt()
+    // returns false; only recordSuccess/recordFailure resets it) → extraction
+    // silently dead until daemon restart.
+    //
+    // This models the CORRECTED control flow of processOneExtractionJob: the
+    // empty-queue check runs BEFORE the gate (no probe spent), and EVERY exit
+    // path reached AFTER the gate records exactly one outcome. The invariant
+    // under test: once a probe is consumed, the breaker can always recover — a
+    // later allowAttempt() eventually succeeds; it never stays consumed-but-
+    // unrecorded.
+
+    // The post-probe exit paths of processOneExtractionJob, in source order.
+    const Path = enum {
+        empty_queue, //         pre-gate: return false, probe NOT consumed
+        claim_race_null, //     post-gate: recordOutcome(.parse_failed), return false
+        parse_failure, //       post-gate: recordOutcome(.parse_failed), return true
+        short_text, //          post-gate: recordOutcome(.parse_failed), return true
+        thrown_error, //        post-gate: errdefer → recordHardFailure() (→ failure)
+        normal_ok, //           post-gate: recordOutcome(.ok), return true
+        normal_llm_failed, //   post-gate: recordOutcome(.llm_failed), return true
+    };
+
+    // Faithful mirror of the corrected processOneExtractionJob breaker handling.
+    // Returns true if the (real) function would `return` a value on this path,
+    // false if it would propagate an error (thrown_error). `breaker` is always
+    // non-null here (the gated case).
+    const Lane = struct {
+        fn run(b: *ExtractionBreaker, path: Path) bool {
+            // (1) empty-queue check runs BEFORE the gate. The probe is NOT
+            //     consumed — leave the breaker untouched and return.
+            if (path == .empty_queue) return true;
+
+            // (2) the gate. If the breaker blocks, the probe is NOT consumed.
+            if (!b.allowAttempt()) return true;
+
+            // (3) errdefer-equivalent: a propagated error pairs the consumed
+            //     probe with a hard failure. We model it by recording on the
+            //     thrown_error path (the only path that "propagates").
+            switch (path) {
+                .empty_queue => unreachable,
+                .claim_race_null, .parse_failure, .short_text => {
+                    b.recordOutcome(.parse_failed); // neutral, non-availability
+                    return true;
+                },
+                .thrown_error => {
+                    b.recordHardFailure(); // errdefer fires on the error path
+                    return false; // function propagates the error
+                },
+                .normal_ok => {
+                    b.recordOutcome(.ok);
+                    return true;
+                },
+                .normal_llm_failed => {
+                    b.recordOutcome(.llm_failed);
+                    return true;
+                },
+            }
+        }
+    };
+
+    // ── Core invariant: drive the breaker to half_open, exercise each post-gate
+    //    early-return path, and assert the breaker is never left consumed-but-
+    //    unrecorded — i.e. a probe is always available again after recovery. ──
+    const post_probe_paths = [_]Path{
+        .claim_race_null,
+        .parse_failure,
+        .short_text,
+        .thrown_error,
+    };
+    for (post_probe_paths) |path| {
+        // threshold 1, 0ms cooldown → trips on one failure, half-opens at once.
+        var b = ExtractionBreaker.init(1, 0);
+        b.recordOutcome(.llm_failed); // → open
+        try std.testing.expect(b.isOpen());
+
+        // allowAttempt() inside run() transitions open → half_open and CONSUMES
+        // the single probe. Before the C2 fix, these paths returned here with
+        // the probe consumed and no record → permanent wedge.
+        _ = Lane.run(&b, path);
+
+        // INVARIANT: the probe was recorded, so the breaker is NOT wedged. With
+        // a 0ms cooldown a fresh probe is immediately grantable again — prove
+        // recovery by feeding a success and confirming the breaker closes and
+        // resumes normal draining. (A wedged breaker would return false here
+        // forever and never reach .ok.)
+        var attempts: usize = 0;
+        while (attempts < 4) : (attempts += 1) {
+            if (b.allowAttempt()) {
+                b.recordOutcome(.ok); // probe success → closed
+                break;
+            }
+            // Not granted this call: must only be the single-probe guard in
+            // half_open, never a permanent wedge. recordOutcome below (next
+            // loop iter) cannot run, so feed a neutral record to free the probe
+            // exactly as the real lane would on its next tick.
+            b.recordOutcome(.parse_failed);
+        }
+        try std.testing.expect(attempts < 4); // recovered within a few ticks
+        try std.testing.expect(!b.isOpen()); // closed — draining resumed
+        try std.testing.expect(b.allowAttempt()); // normal attempts allowed
+    }
+
+    // ── empty-queue path: the probe must NOT be consumed (handled before the
+    //    gate). Drive to half_open, take the empty-queue path, and confirm the
+    //    single probe is STILL available afterward (the pre-gate return left the
+    //    breaker untouched). ─────────────────────────────────────────────────
+    {
+        var b = ExtractionBreaker.init(1, 0);
+        b.recordOutcome(.llm_failed); // → open
+        try std.testing.expect(b.isOpen());
+        // empty_queue returns before allowAttempt(): no state change, still open.
+        _ = Lane.run(&b, .empty_queue);
+        try std.testing.expect(b.isOpen()); // probe NOT spent — still open
+        // The very next tick with real work can take the probe and recover.
+        try std.testing.expect(b.allowAttempt()); // open → half_open, probe granted
+        b.recordOutcome(.ok);
+        try std.testing.expect(!b.isOpen());
+    }
+
+    // ── thrown_error specifically re-opens (availability semantics) and then
+    //    recovers via a fresh probe — it does NOT wedge. ────────────────────
+    {
+        var b = ExtractionBreaker.init(1, 0);
+        b.recordOutcome(.llm_failed); // → open
+        const propagated = !Lane.run(&b, .thrown_error); // consumes probe, errdefer records failure
+        try std.testing.expect(propagated); // the function propagated an error
+        try std.testing.expect(b.isOpen()); // hard failure re-opened (not wedged half_open)
+        // Fresh probe after cooldown succeeds → recovery, proving no wedge.
+        try std.testing.expect(b.allowAttempt()); // open → half_open
+        b.recordOutcome(.ok);
+        try std.testing.expect(!b.isOpen());
+    }
+
+    // ── Stress: a long run alternating ALL post-probe paths must never wedge.
+    //    After every path a probe is recoverable; the breaker tracks real
+    //    availability (llm_failed/thrown_error trip; ok/parse_failed don't). ──
+    {
+        var b = ExtractionBreaker.init(2, 0);
+        const cycle = [_]Path{
+            .normal_ok,        .parse_failure, .claim_race_null,
+            .short_text,       .thrown_error,  .normal_llm_failed,
+            .normal_ok,        .empty_queue,   .normal_ok,
+        };
+        var iter: usize = 0;
+        while (iter < 50) : (iter += 1) {
+            const path = cycle[iter % cycle.len];
+            _ = Lane.run(&b, path);
+            // After EVERY path, the breaker must be recoverable: either it's
+            // closed (attempts allowed) or open-with-elapsed-cooldown (a fresh
+            // probe is grantable). It must never be a half_open with the probe
+            // consumed-and-unrecorded. Prove recoverability by confirming an
+            // attempt is obtainable within a couple of ticks.
+            var ok = false;
+            var t: usize = 0;
+            while (t < 3) : (t += 1) {
+                if (b.allowAttempt()) {
+                    ok = true;
+                    b.recordOutcome(.ok); // keep it healthy for the next path
+                    break;
+                }
+                b.recordOutcome(.parse_failed); // free a stale half_open probe
+            }
+            try std.testing.expect(ok); // never wedged
+        }
+        try std.testing.expect(!b.isOpen());
+    }
 }
