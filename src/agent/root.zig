@@ -40,6 +40,7 @@ const hooks_mod = @import("../hooks.zig");
 const execution_mode_mod = @import("execution_mode.zig");
 const ExecutionMode = execution_mode_mod.ExecutionMode;
 const tool_metadata = @import("../tools/metadata.zig");
+const approval_summary = @import("approval_summary.zig");
 const abort_mod = @import("abort.zig");
 const CancellationToken = abort_mod.CancellationToken;
 const goal_loop = @import("goal_loop.zig");
@@ -3070,11 +3071,34 @@ pub const Agent = struct {
                         } };
                     },
                     .require_confirm => {
-                        const reason_text: []const u8 = "supervised_mutating_requires_approval";
+                        // Human-readable, SAFE description of WHAT is being
+                        // approved (e.g. "Run a shell command: …"). This flows
+                        // into the stored `pending.reason` and the
+                        // `approval_required` event so the FE card shows the
+                        // action, not just the risk. `buildApprovalReason`
+                        // owns the returned slice; on alloc failure we fall
+                        // back to a STATIC literal (and must NOT free that).
+                        //
+                        // Lifetime (CR-01 awareness): `reason_text` must stay
+                        // alive across BOTH the `setPendingToolApproval` call
+                        // (which dupes it into `pending.reason`) AND the
+                        // synchronous `observer.recordEvent` below (the
+                        // observer copies/serializes `e.reason` in-call). We
+                        // free it after the last live use and BEFORE returning;
+                        // the returned `blocked.reason` deliberately carries a
+                        // STATIC literal (the caller never reads it for the
+                        // `.approval_required` source — see
+                        // `preflightBlockEmitsToolResult`), so no owned slice
+                        // escapes this scope.
+                        const reason_text: []const u8 = approval_summary.buildApprovalReason(self.allocator, call, meta) catch approval_summary.generic_fallback;
+                        const reason_owned = reason_text.ptr != approval_summary.generic_fallback.ptr;
+                        defer if (reason_owned) self.allocator.free(reason_text);
+
                         _ = self.setPendingToolApproval(call, meta, reason_text) catch |err| switch (err) {
                             // Collision: a prior pending approval is unresolved.
                             // Leave it untouched, do not emit another event, and
                             // tell the caller to resolve the existing one first.
+                            // (`reason_text` is freed by the `defer` above.)
                             error.PendingToolApprovalAlreadyExists => return .{ .blocked = .{
                                 .name = call.name,
                                 .tool_call_id = call.tool_call_id,
@@ -3085,13 +3109,16 @@ pub const Agent = struct {
                                 .risk_level = meta.risk_level,
                                 .metadata = meta,
                             } },
-                            // Out-of-memory or other allocation failure: fail closed.
+                            // Out-of-memory or other allocation failure: fail
+                            // closed. Return a STATIC reason (never the owned
+                            // `reason_text`, which the `defer` frees on the way
+                            // out — avoids returning a dangling pointer).
                             else => return .{ .blocked = .{
                                 .name = call.name,
                                 .tool_call_id = call.tool_call_id,
                                 .output = "Approval required but could not register pending state",
                                 .source = .approval_required,
-                                .reason = reason_text,
+                                .reason = "supervised_mutating_requires_approval",
                                 .mode = self.execution_mode,
                                 .risk_level = meta.risk_level,
                                 .metadata = meta,
@@ -3117,12 +3144,18 @@ pub const Agent = struct {
                         // commands.zig `/approve` handler; this site only
                         // emits issuance.
                         observability.recordMetricGlobal(.{ .approval_decision_total = .{ .result = "issued" } });
+                        // Return a STATIC reason: the descriptive `reason_text`
+                        // has already been consumed (duped into pending +
+                        // emitted in the event) and is freed by the `defer` on
+                        // this return. The caller never reads `blocked.reason`
+                        // for the `.approval_required` source, so a static
+                        // literal here keeps lifetime trivially correct.
                         return .{ .blocked = .{
                             .name = call.name,
                             .tool_call_id = call.tool_call_id,
                             .output = "Approval required. Use /approve allow-once|deny",
                             .source = .approval_required,
-                            .reason = reason_text,
+                            .reason = "supervised_mutating_requires_approval",
                             .mode = self.execution_mode,
                             .risk_level = meta.risk_level,
                             .metadata = meta,
@@ -7510,6 +7543,7 @@ test {
     _ = learning;
     _ = run_event_types;
     _ = transcript;
+    _ = approval_summary;
 }
 
 // ── Additional agent tests ──────────────────────────────────────
@@ -13189,14 +13223,53 @@ test "approval gate: supervised mutating tool registers pending + emits event" {
     try std.testing.expectEqual(tool_metadata.RiskLevel.critical, pending.risk_level);
     try std.testing.expect(pending.id != 0);
 
-    // Approval event was emitted with only safe fields.
+    // Approval event was emitted with safe fields + a descriptive reason.
     try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
     const evt = capture.events.items[0];
     try std.testing.expectEqualStrings("shell", evt.tool);
     try std.testing.expectEqualStrings("critical", evt.risk_level);
-    // The emitted payload must not leak raw argument content.
-    try std.testing.expect(std.mem.indexOf(u8, evt.raw_data, "echo hi") == null);
-    try std.testing.expect(std.mem.indexOf(u8, evt.raw_data, "command") == null);
+    // saas-v1/approval-card-summary: the reason now DESCRIBES the action so
+    // the FE card says what is being approved (a truncated command preview is
+    // intentional — it is the user's own command). The raw JSON shape (key
+    // names, braces, quotes) is still summarized away, never echoed verbatim.
+    //
+    // NOTE: assert against `raw_data` (the OWNED blob the observer copies in
+    // `recordEvent`), NOT `evt.reason` — the latter borrows the agent's owned
+    // `reason_text`, which is freed right after the synchronous emit. The SSE
+    // observer serializes in-call, so this mirrors the real wire payload.
+    try std.testing.expect(std.mem.indexOf(u8, evt.raw_data, "Run a shell command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evt.raw_data, "echo hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evt.raw_data, "\"command\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, evt.raw_data, "arguments_json") == null);
+}
+
+test "approval gate: descriptive reason redacts sensitive-key values" {
+    // saas-v1/approval-card-summary — the approval card surfaces the action,
+    // but a value carried under a sensitive KEY (token/secret/password/…) must
+    // NEVER reach the reason / event payload. shell is mutating + critical.
+    const allocator = std.testing.allocator;
+    var capture = CapturingApprovalObserver.init(allocator);
+    defer capture.deinit();
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+    var agent = try makeSupervisedAgent(allocator, &policy, capture.observer());
+    defer agent.deinit();
+
+    const call = ParsedToolCall{
+        .name = "shell",
+        .arguments_json = "{\"command\":\"curl x\",\"api_key\":\"sk-LEAKME-123\",\"password\":\"hunter2\"}",
+        .tool_call_id = "call_sec",
+    };
+    _ = agent.preflightToolPolicy(call);
+    try std.testing.expect(agent.pending_tool_approval != null);
+    const pending = agent.pending_tool_approval.?;
+    // Reason describes the action; sensitive values are absent.
+    try std.testing.expect(std.mem.indexOf(u8, pending.reason, "Run a shell command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending.reason, "sk-LEAKME-123") == null);
+    try std.testing.expect(std.mem.indexOf(u8, pending.reason, "hunter2") == null);
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    const evt = capture.events.items[0];
+    try std.testing.expect(std.mem.indexOf(u8, evt.raw_data, "sk-LEAKME-123") == null);
+    try std.testing.expect(std.mem.indexOf(u8, evt.raw_data, "hunter2") == null);
 }
 
 test "P0-4: rehydratePendingToolApproval restores snapshot with owned slices + re-emits card" {
@@ -14609,9 +14682,11 @@ test "/permissions reports pending tool approval and does not clear it" {
     defer agent.deinit();
 
     // shell is mutating + critical risk; supervised => registers pending approval.
+    // The `command` value is a safe preview (the user's own command); the
+    // sensitive-KEY value below must be redacted out of the rendered reason.
     const call = ParsedToolCall{
         .name = "shell",
-        .arguments_json = "{\"command\":\"echo secret-arg\"}",
+        .arguments_json = "{\"command\":\"echo hello\",\"api_key\":\"sk-LEAKME\"}",
         .tool_call_id = "call_xyz",
     };
     _ = agent.preflightToolPolicy(call);
@@ -14624,13 +14699,16 @@ test "/permissions reports pending tool approval and does not clear it" {
     try std.testing.expect(std.mem.indexOf(u8, resp, "Pending tool approval:") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "tool: shell") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "risk: critical") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "supervised_mutating_requires_approval") != null);
+    // saas-v1/approval-card-summary: reason now DESCRIBES the action (with a
+    // truncated command preview) instead of the old static token.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Run a shell command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "echo hello") != null);
     const id_str = try std.fmt.allocPrint(allocator, "id: {d}", .{pending_id});
     defer allocator.free(id_str);
     try std.testing.expect(std.mem.indexOf(u8, resp, id_str) != null);
 
-    // Raw generic arguments must never leak.
-    try std.testing.expect(std.mem.indexOf(u8, resp, "secret-arg") == null);
+    // Sensitive-KEY values and raw argument JSON shape must never leak.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "sk-LEAKME") == null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "arguments_json") == null);
 
     // Report is read-only: the pending approval must still be present.
