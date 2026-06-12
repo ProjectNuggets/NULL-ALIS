@@ -1126,10 +1126,13 @@ pub const GatewayState = struct {
     // and decremented when a worker pops a connection, so the acceptor-thread
     // /health fast-path can read "is there pending work?" without taking the
     // queue mutex. `last_worker_progress_ms` is the monotonic-ish wall-clock
-    // (std.time.milliTimestamp) of the most recent COMPLETED request; every
-    // worker bumps it after handling a connection. Seeded to boot time in
-    // runWithRole. `liveness_deadlock_threshold_ms` is the config knob copied
-    // in at boot (0 disables). See livenessDeadlockDetected.
+    // (std.time.milliTimestamp) of the most recent QUEUE-SERVICE PROGRESS —
+    // a worker either POPPING (starting) or COMPLETING a request; every worker
+    // bumps it both when it pops a connection and after handling it (Finding
+    // C3-2: advancing on pop keeps a pool that is busy on long-but-progressing
+    // turns from looking wedged). Seeded to boot time in runWithRole.
+    // `liveness_deadlock_threshold_ms` is the config knob copied in at boot
+    // (0 disables). See livenessDeadlockDetected.
     queued_requests: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     last_worker_progress_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     liveness_deadlock_threshold_ms: u64 = 0,
@@ -23134,18 +23137,32 @@ fn classifyProbeRequestLine(preview: []const u8) ProbeClass {
 // restart loop. We flag UNHEALTHY only when BOTH conditions hold:
 //   1. there is PENDING queued-but-unstarted work (RequestQueue depth > 0),
 //      AND
-//   2. no worker has completed any request for longer than the threshold.
+//   2. the worker pool has made NO QUEUE-SERVICE PROGRESS for longer than the
+//      threshold — where "progress" means a worker PICKED UP (popped) or
+//      COMPLETED any request. See gatewayWorkerMain: the clock advances on
+//      BOTH the pop (request start) and the completion.
 //
-// Why both, and why this is restart-loop-safe:
+// Finding C3-2 — why "progress" is pop-or-complete, not "last completion":
+//   `handleAcceptedConnection` runs a chat-stream turn SYNCHRONOUSLY on the
+//   worker thread, and a single agentic turn has NO wall-clock bound
+//   (max_tool_iterations defaults to maxInt(u32); only each provider.chat call
+//   is bounded by message_timeout_secs). A "time since last completion"
+//   watchdog therefore false-positives a HEALTHY pool whenever all workers are
+//   busy on long-but-progressing turns while requests queue — exactly the
+//   restart loop it was meant to prevent. Advancing the clock when a worker
+//   POPS the next queued item makes the predicate measure whether the pool is
+//   still draining the queue, not how long one turn happens to take.
+//
+// Why both gates, and why this is restart-loop-safe:
 //   * IDLE runtime  → queue_depth == 0 → never flagged. "No progress" is not
 //     a deadlock; a freshly-booted or quiet pod has simply had nothing to do.
-//   * BUSY runtime  → each completed request bumps the progress timestamp, so
-//     ms_since_last_completion stays small and the predicate stays false even
-//     under sustained load with a continuously non-empty queue.
-//   * WEDGED runtime → work is queued (depth > 0) yet NO completion advances
-//     the clock, so once the gap exceeds the GENEROUS threshold (default 180s,
-//     longer than the longest expected turn) the predicate trips exactly once
-//     the pool is genuinely stuck.
+//   * BUSY runtime  → every pop AND every completion bumps the progress
+//     timestamp, so as long as the pool keeps servicing the queue the gap
+//     stays small and the predicate stays false even under sustained load with
+//     a continuously non-empty queue and long individual turns.
+//   * WEDGED runtime → work is queued (depth > 0) yet NO worker pops or
+//     completes ANYTHING, so once the gap exceeds the GENEROUS threshold the
+//     predicate trips exactly once the pool is genuinely stuck.
 // A threshold of 0 disables the watchdog (cheap /health reverts to pure
 // acceptor liveness).
 //
@@ -23153,12 +23170,12 @@ fn classifyProbeRequestLine(preview: []const u8) ProbeClass {
 // (wedged / idle / busy) are unit-testable without spinning real threads.
 fn isWorkerPoolDeadlocked(
     queue_depth: usize,
-    ms_since_last_completion: u64,
+    ms_since_last_progress: u64,
     threshold_ms: u64,
 ) bool {
     if (threshold_ms == 0) return false; // watchdog disabled
     if (queue_depth == 0) return false; // idle / drained — never a deadlock
-    return ms_since_last_completion > threshold_ms;
+    return ms_since_last_progress > threshold_ms;
 }
 
 /// Evaluate the liveness deadlock predicate against live gateway state.
@@ -23180,9 +23197,9 @@ fn livenessDeadlockDetected(state: *const GatewayState, now_ms: i64) bool {
     const queue_depth = state.queued_requests.load(.acquire);
     if (queue_depth == 0) return false;
     const last_progress_ms = state.last_worker_progress_ms.load(.acquire);
-    // Before the first completion the timestamp is the boot time (seeded in
-    // runWithRole), so an all-stuck-from-boot pool with queued work is still
-    // caught once the boot-to-now gap exceeds the threshold.
+    // Before any worker pops or completes, the timestamp is the boot time
+    // (seeded in runWithRole), so an all-stuck-from-boot pool with queued work
+    // is still caught once the boot-to-now gap exceeds the threshold.
     const gap_ms: u64 = if (now_ms > last_progress_ms)
         @intCast(now_ms - last_progress_ms)
     else
@@ -23966,13 +23983,29 @@ fn gatewayWorkerMain(ctx: *GatewayWorkerContext) void {
         // so this fetchSub can never run before its paired fetchAdd and the
         // unsigned counter can never wrap below zero.
         _ = ctx.state.queued_requests.fetchSub(1, .acq_rel);
-        handleAcceptedConnection(ctx.allocator, ctx.config_opt, ctx.state, ctx.session_mgr_opt, conn);
-        // C3 — a worker just COMPLETED a request: advance the liveness
-        // progress clock. This is the heartbeat that proves the worker pool
-        // (not just the acceptor) is alive; a wedged pool never reaches here
-        // so the gap grows until the watchdog trips. std.time.milliTimestamp
-        // is wall-clock (as used elsewhere in this file); see
+        // C3 (Finding C3-2) — a worker just PICKED UP queued work: that pop is
+        // itself forward progress of the pool, so advance the liveness clock
+        // BEFORE handling, not only at completion. This is the fix for the
+        // all-workers-busy-on-long-turns false-positive: `handleAcceptedConnection`
+        // runs a chat-stream turn SYNCHRONOUSLY and a single agentic turn has no
+        // wall-clock bound (max_tool_iterations defaults to maxInt(u32); only
+        // each provider.chat call is bounded by message_timeout_secs), so a
+        // legitimately PROGRESSING turn can run far past any fixed threshold.
+        // If the clock only advanced at completion, every worker streaming one
+        // long turn while requests queue (queued_requests > 0) would look
+        // "stalled" and the watchdog would 503 a HEALTHY pod into a restart
+        // loop. By advancing on pop, the watchdog measures whether the pool is
+        // still SERVICING the queue: as long as any worker keeps draining
+        // queued work (returning from its turn to popWait → pop), the clock
+        // advances and the predicate stays false. It trips only when queued
+        // work sits with NO worker popping or completing ANYTHING for the whole
+        // threshold window — a genuine wedge. std.time.milliTimestamp is
+        // wall-clock (as used elsewhere in this file); see
         // livenessDeadlockDetected for the backward-step fail-safe note.
+        ctx.state.last_worker_progress_ms.store(std.time.milliTimestamp(), .release);
+        handleAcceptedConnection(ctx.allocator, ctx.config_opt, ctx.state, ctx.session_mgr_opt, conn);
+        // C3 — and again at COMPLETION, so a pool that picks up one request and
+        // then quietly drains the rest still keeps the clock fresh between pops.
         ctx.state.last_worker_progress_ms.store(std.time.milliTimestamp(), .release);
     }
 }
@@ -24109,12 +24142,13 @@ pub fn runWithRole(
     }
     state.event_bus = event_bus;
     // C3 — seed the liveness progress clock to boot time BEFORE any worker
-    // exists. The watchdog measures the gap since the last completion; without
-    // this seed the timestamp would be epoch 0, making the first queued
-    // request before any completion look like a multi-decade wedge. From boot
-    // the gap only crosses the (generous, default-180s) threshold if the pool
-    // genuinely never completes a request. milliTimestamp is wall-clock, as
-    // used throughout this file.
+    // exists. The watchdog measures the gap since the last queue-service
+    // progress (a worker popping or completing a request); without this seed
+    // the timestamp would be epoch 0, making the first queued request before
+    // any worker activity look like a multi-decade wedge. From boot the gap
+    // only crosses the (generous, default-900s) threshold if the pool
+    // genuinely never pops or completes a request. milliTimestamp is
+    // wall-clock, as used throughout this file.
     state.last_worker_progress_ms.store(std.time.milliTimestamp(), .release);
 
     var owned_config: ?Config = null;
@@ -29726,12 +29760,14 @@ test "P0-1 classifier: a partial request line (no CRLF) is not classified" {
 // ── C3: liveness deadlock watchdog predicate tests ───────────────────
 //
 // The watchdog predicate is a PURE function of (queue_depth,
-// ms_since_last_completion, threshold_ms) so the three acceptance cases —
+// ms_since_last_progress, threshold_ms) so the three acceptance cases —
 // WEDGED, IDLE, BUSY — are pinned here without spinning real worker threads.
-// The whole point is no restart-loop risk: idle and busy must NEVER flag.
+// "progress" = a worker popped (started) OR completed any request (Finding
+// C3-2). The whole point is no restart-loop risk: idle and busy must NEVER flag.
 
-test "C3 predicate: WEDGED pool (pending work + no completion past threshold) is flagged" {
-    // 5 requests queued, last completion 200s ago, 180s threshold → deadlock.
+test "C3 predicate: WEDGED pool (pending work + no pop/complete past threshold) is flagged" {
+    // 5 requests queued, no worker popped or completed for 200s, 180s
+    // threshold → deadlock.
     try std.testing.expect(isWorkerPoolDeadlocked(5, 200_000, 180_000));
     // Exactly one request stuck is enough — depth > 0 is the gate, not a count.
     try std.testing.expect(isWorkerPoolDeadlocked(1, 181_000, 180_000));
@@ -29747,9 +29783,12 @@ test "C3 predicate: IDLE runtime (no pending work) is NEVER flagged" {
 }
 
 test "C3 predicate: BUSY-but-progressing runtime is NOT flagged" {
-    // Pending work exists, but a worker completed a request recently
-    // (gap < threshold) → the pool is making progress, never flagged even
-    // with a continuously non-empty queue under sustained load.
+    // Pending work exists, but the pool serviced the queue recently — a worker
+    // popped or completed a request (gap < threshold) → the pool is making
+    // progress, never flagged even with a continuously non-empty queue under
+    // sustained load and long individual turns (Finding C3-2: a pop counts as
+    // progress, so all-workers-busy-on-long-turns that still drains the queue
+    // is not mistaken for a wedge).
     try std.testing.expect(!isWorkerPoolDeadlocked(50, 1_000, 180_000));
     try std.testing.expect(!isWorkerPoolDeadlocked(1, 179_999, 180_000));
     // Boundary: a gap exactly AT the threshold is not yet a deadlock (strict >).
@@ -29793,6 +29832,38 @@ test "C3 livenessDeadlockDetected: wedged state via injected timestamps" {
     state.queued_requests.store(4, .release);
     state.last_worker_progress_ms.store(1_000, .release);
     try std.testing.expect(!livenessDeadlockDetected(&state, 300_000));
+}
+
+test "C3 Finding C3-2: a recent POP clears the watchdog even with no recent completion" {
+    // The regression this guards: all workers busy on long, PROGRESSING turns
+    // while requests queue. A single agentic turn has no wall-clock bound
+    // (max_tool_iterations defaults to maxInt(u32); only each provider.chat is
+    // bounded by message_timeout_secs), so a "time since last COMPLETION"
+    // watchdog would 503 a healthy pool into a restart loop. The fix advances
+    // last_worker_progress_ms when a worker POPS the next queued item too
+    // (gatewayWorkerMain stores it before handling), so a pool that is still
+    // draining the queue keeps the clock fresh between completions.
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.liveness_deadlock_threshold_ms = 180_000;
+
+    // Pending work, and the last COMPLETION was ancient (a worker has been
+    // inside one long turn for ~600s) — under the old "since completion" model
+    // this would FALSE-POSITIVE as wedged.
+    state.queued_requests.store(8, .release);
+    state.last_worker_progress_ms.store(0, .release); // ancient
+    try std.testing.expect(livenessDeadlockDetected(&state, 600_000));
+
+    // Now a worker returns from its turn and POPS the next queued request:
+    // gatewayWorkerMain stores milliTimestamp() on pop. Model that the pop
+    // happened ~5s ago. Queue is STILL non-empty (more work behind it), yet
+    // the pool is plainly progressing — must NOT be flagged.
+    state.last_worker_progress_ms.store(595_000, .release); // popped 5s before "now"
+    try std.testing.expect(!livenessDeadlockDetected(&state, 600_000));
+
+    // If even pops stop (no worker pops or completes anything) the gap grows
+    // again and a genuine wedge still trips once past the threshold.
+    try std.testing.expect(livenessDeadlockDetected(&state, 595_000 + 180_001));
 }
 
 // A connection with an invalid handle for queue-mechanics tests. NEVER do I/O

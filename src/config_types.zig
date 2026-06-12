@@ -182,32 +182,48 @@ pub const ReliabilityConfig = struct {
     /// cheap on the acceptor thread, so it keeps passing even if EVERY
     /// gateway worker deadlocks while the acceptor stays alive — the pod
     /// would never restart. The watchdog flags the runtime UNHEALTHY only
-    /// when BOTH hold: there is PENDING queued-but-unstarted work AND no
-    /// worker has completed any request for longer than this threshold.
-    /// An idle runtime (no queued work) is NEVER flagged — no progress is
-    /// not a deadlock — and a busy-but-progressing pool resets the clock on
-    /// each completion, so neither false-positives into an empty/healthy pool.
+    /// when BOTH hold: there is PENDING queued-but-unstarted work AND the
+    /// worker pool has not made QUEUE-SERVICE PROGRESS for longer than this
+    /// threshold. An idle runtime (no queued work) is NEVER flagged — no
+    /// progress is not a deadlock.
     ///
-    /// The default MUST comfortably exceed a realistic worst-case TURN, not
-    /// just a single LLM call, or the watchdog false-positives a HEALTHY but
-    /// busy pool into a restart loop. `handleAcceptedConnection` runs a
-    /// chat-stream turn SYNCHRONOUSLY on the worker thread and only advances
-    /// `last_worker_progress_ms` at request COMPLETION — there is no mid-turn
-    /// heartbeat — so a worker streaming one long turn looks "stalled" to the
-    /// watchdog for the whole turn. A single upstream LLM call is already
-    /// bounded by `agent.message_timeout_secs` (default 300s, curl
-    /// --max-time), and an agentic multi-call turn can chain SEVERAL such
-    /// calls, so the true worst-case turn is a small multiple of that ceiling.
-    /// With `gateway.max_workers` (default 16) every worker can be legitimately
-    /// occupied by a long turn while new requests queue (`queued_requests > 0`)
-    /// — exactly the predicate's non-disabled branch. The default below is
-    /// therefore set to ~3× `message_timeout_secs` (900s) so a healthy pool
-    /// under sustained slow load is never killed, while a GENUINELY wedged
-    /// pool (no completion for 15 min with pending work) still trips. Operators
-    /// running longer agentic turns should raise this further (rule of thumb:
-    /// >= a few × `message_timeout_secs`). 0 disables the watchdog entirely
-    /// (cheap /health reverts to acceptor-liveness only). Measured against
-    /// std.time.milliTimestamp deltas.
+    /// What "progress" means (Finding C3-2 — the 3× model below was provably
+    /// wrong): the clock (`last_worker_progress_ms`) advances when a worker
+    /// either PICKS UP queued work (pops it off the queue) OR COMPLETES a
+    /// request — see `gatewayWorkerMain`. It is NOT "time since last
+    /// completion". This distinction is the whole correctness argument:
+    /// `handleAcceptedConnection` runs a chat-stream turn SYNCHRONOUSLY on the
+    /// worker thread, and a single agentic turn has NO wall-clock bound —
+    /// `max_tool_iterations` defaults to maxInt(u32) (effectively unbounded)
+    /// and the turn loop has no overall deadline; only each individual
+    /// provider.chat call is bounded by `agent.message_timeout_secs` (default
+    /// 300s, curl --max-time). So a legitimately PROGRESSING turn can run far
+    /// past ANY fixed multiple of `message_timeout_secs`; there is no finite
+    /// `iterations × timeout` ceiling to derive a "worst-case turn" from while
+    /// iterations are uncapped. A "time since last completion" watchdog would
+    /// therefore false-positive a HEALTHY pool whenever `gateway.max_workers`
+    /// (default 16) workers are all busy on long turns while new requests queue
+    /// (`queued_requests > 0`), 503-ing a progressing pod into a restart loop
+    /// — the exact failure the watchdog was meant to prevent. Advancing on POP
+    /// fixes this: as long as the pool keeps draining the queue (any worker
+    /// returning from its turn to pop the next item), the clock advances and
+    /// the predicate stays false under sustained slow load. The watchdog trips
+    /// only when queued work sits with NO worker popping or completing ANYTHING
+    /// for the whole window — a genuine wedge.
+    ///
+    /// Choosing the default: with progress = pop-or-complete, the threshold
+    /// must exceed the longest a healthy pool can go WITHOUT servicing the
+    /// queue at all — i.e. the longest single uninterrupted in-flight turn
+    /// during which every worker is simultaneously occupied and none returns to
+    /// pop. That is operator-dependent and, with uncapped `max_tool_iterations`,
+    /// formally unbounded; the 900s (15 min) default is a generous practical
+    /// ceiling for the common case (workers cycle through turns and keep
+    /// draining the queue well inside it). Operators running pathologically long
+    /// single turns should EITHER set a finite `agent.max_tool_iterations` (so a
+    /// real `iterations × message_timeout_secs` ceiling exists) OR raise this
+    /// threshold above their longest expected uninterrupted turn. 0 disables the
+    /// watchdog entirely (cheap /health reverts to acceptor-liveness only).
+    /// Measured against std.time.milliTimestamp deltas.
     liveness_deadlock_threshold_ms: u64 = 900_000,
     fallback_providers: []const []const u8 = &.{},
     api_keys: []const []const u8 = &.{},
