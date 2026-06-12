@@ -32879,6 +32879,66 @@ test "Sprint 2 — handleSessionApprove 409s when nothing is pending and id sent
     try std.testing.expectEqualStrings("409 Conflict", resp.status);
 }
 
+test "P0-4 — handleSessionApprove replays an already-resolved approval as 200 (not 409)" {
+    // Idempotent replay (sub-step d). An approval_id that was ALREADY resolved
+    // in the durable ledger must replay the ORIGINAL outcome with 200 instead
+    // of 409 — so the FE's approve-retry / double-click / reconnect is safe.
+    // Wires a real Postgres extraction_state_mgr (the ledger the gateway
+    // consults) and seeds an already-'approved' durable row; the gateway then
+    // sees a stale-card mismatch (no live in-RAM pending) but must replay 200.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_gwreplay", .{std.time.microTimestamp()}) catch return error.SkipZigTest;
+    // Manager.init runs migrations (incl. 0005 pending_approvals) internally.
+    var state_mgr = zaki_state_mod.Manager.init(allocator, .{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    }) catch return error.SkipZigTest;
+    defer state_mgr.deinit();
+
+    const session_key = "agent:zaki-bot:user:77:thread:gw-replay";
+    // Seed a durable approval and resolve it (approved) directly through the
+    // Manager — the state the gateway's idempotent-replay branch reads.
+    state_mgr.upsertPendingApproval(.{
+        .approval_id = "apr-99",
+        .session_key = session_key,
+        .user_id = 77,
+        .tool_name = "shell",
+        .tool_call_id = null,
+        .arguments_json = "{}",
+        .reason = "seed",
+        .risk_level = "high",
+    }) catch return error.SkipZigTest;
+    try state_mgr.resolvePendingApproval("apr-99", true, "user");
+
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(allocator, &mock);
+    defer mgr.deinit();
+    mgr.extraction_state_mgr = &state_mgr;
+    mgr.extraction_user_id = 77;
+
+    // A live session with NO open pending (the durable row is already
+    // resolved; rehydration finds nothing to restore).
+    _ = try mgr.getOrCreate(session_key);
+
+    // FE re-clicks the already-resolved card → mismatch (no live pending) but
+    // the durable ledger says 'approved' → 200 replay, not 409.
+    const body = "{\"approved\":true,\"approval_id\":\"apr-99\"}";
+    const req = std.fmt.comptimePrint(
+        "POST /approve HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    const resp = handleSessionApprove(allocator, &mgr, session_key, req);
+    defer if (resp.body.len > 0 and std.mem.indexOf(u8, resp.body, "\"replay\":true") != null) allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"replay\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"approved\"") != null);
+}
+
 test "Sprint 2 — handleSessionApprove backwards-compat: no approval_id passes through" {
     var mock = TestMockProvider{};
     var mgr = testCrudSessionManager(std.testing.allocator, &mock);
