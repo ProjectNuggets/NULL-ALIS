@@ -64,6 +64,18 @@ pub const RiskLevel = enum {
             .critical => "critical",
         };
     }
+
+    /// Inverse of `toSlice` for round-tripping a RiskLevel through durable
+    /// storage (P0-4 pending_approvals rehydration). Unknown values default
+    /// to `.medium` — a conservative mid-tier so a corrupted/legacy row never
+    /// silently downgrades a high-risk approval to low.
+    pub fn fromSlice(s: []const u8) RiskLevel {
+        if (std.mem.eql(u8, s, "low")) return .low;
+        if (std.mem.eql(u8, s, "medium")) return .medium;
+        if (std.mem.eql(u8, s, "high")) return .high;
+        if (std.mem.eql(u8, s, "critical")) return .critical;
+        return .medium;
+    }
 };
 
 /// Billing cost class per plan-v02 §4.4 — metering input for entitlement

@@ -2698,6 +2698,93 @@ pub const Agent = struct {
         };
     }
 
+    /// Owned-slice snapshot used to restore a pending approval from durable
+    /// storage on session (re)build. Mirrors the columns of
+    /// `{schema}.pending_approvals`. All slices are BORROWED — the agent dupes
+    /// what it keeps, so the caller may free them after the call returns.
+    pub const RehydratedApproval = struct {
+        approval_id: []const u8,
+        tool_name: []const u8,
+        tool_call_id: ?[]const u8,
+        arguments_json: []const u8,
+        reason: []const u8,
+        risk_level: []const u8,
+        created_at_unix: i64,
+    };
+
+    /// **P0-4** — restore a pending tool approval from a durable snapshot
+    /// (read back by `Manager.loadOpenPendingApproval` on session reload) and
+    /// re-emit the `approval_required` event so a reconnecting / restarted
+    /// client re-renders the card.
+    ///
+    /// Idempotent-ish: refuses to clobber a live in-RAM pending (returns
+    /// `error.PendingToolApprovalAlreadyExists`, same contract as
+    /// setPendingToolApproval) — on a fresh session reload there is never one,
+    /// so this only guards a double-rehydrate.
+    ///
+    /// `approval_id` is the durable wire id (`apr-<N>`). We parse the numeric
+    /// `<N>` and advance `pending_tool_approval_id_counter` past it so a
+    /// post-rehydration NEW approval in this session cannot mint a colliding
+    /// id. A malformed id (no `apr-` prefix) is tolerated — the counter is
+    /// just left as-is.
+    ///
+    /// Best-effort emit: the snapshot restore is the load-bearing part; if the
+    /// event emit path has no live observer it simply no-ops.
+    pub fn rehydratePendingToolApproval(self: *Agent, snap: RehydratedApproval) !void {
+        if (self.pending_tool_approval != null) return error.PendingToolApprovalAlreadyExists;
+
+        const approval_id = try self.allocator.dupe(u8, snap.approval_id);
+        errdefer self.allocator.free(approval_id);
+        const tool_name = try self.allocator.dupe(u8, snap.tool_name);
+        errdefer self.allocator.free(tool_name);
+        const args_copy = try self.allocator.dupe(u8, snap.arguments_json);
+        errdefer self.allocator.free(args_copy);
+        const reason_copy = try self.allocator.dupe(u8, snap.reason);
+        errdefer self.allocator.free(reason_copy);
+        var tool_call_id_copy: ?[]const u8 = null;
+        errdefer if (tool_call_id_copy) |id| self.allocator.free(id);
+        if (snap.tool_call_id) |id| {
+            if (id.len > 0) tool_call_id_copy = try self.allocator.dupe(u8, id);
+        }
+
+        // Recover the numeric id from `apr-<N>` so /approve <id> still matches
+        // and so the per-session counter never re-mints this id.
+        var numeric_id: u64 = 0;
+        if (std.mem.startsWith(u8, snap.approval_id, "apr-")) {
+            numeric_id = std.fmt.parseInt(u64, snap.approval_id["apr-".len..], 10) catch 0;
+        }
+        if (numeric_id > self.pending_tool_approval_id_counter) {
+            self.pending_tool_approval_id_counter = numeric_id;
+        }
+
+        self.pending_tool_approval = .{
+            .id = numeric_id,
+            .approval_id = approval_id,
+            .tool_name = tool_name,
+            .tool_call_id = tool_call_id_copy,
+            .arguments_json = args_copy,
+            .reason = reason_copy,
+            .risk_level = tool_metadata.RiskLevel.fromSlice(snap.risk_level),
+            .created_at_unix = snap.created_at_unix,
+            .expires_at_unix = null,
+        };
+
+        // Re-emit so a reconnecting / restarted client re-renders the card.
+        const pending = self.pending_tool_approval.?;
+        const event = ObserverEvent{ .approval_required = .{
+            .tool = pending.tool_name,
+            .reason = pending.reason,
+            .risk_level = pending.risk_level.toSlice(),
+            .approval_id = pending.approval_id,
+            .id = pending.id,
+            .tool_call_id = pending.tool_call_id,
+            .created_at = pending.created_at_unix,
+            .expires_at = pending.expires_at_unix,
+            .run_id = self.current_run_id,
+        } };
+        self.observer.recordEvent(&event);
+    }
+
     /// Execute the currently pending approved tool exactly once.
     /// Bypasses the generic approval preflight but preserves other gates.
     /// Returned output may borrow either static storage or memory owned by
@@ -12783,6 +12870,89 @@ test "approval gate: supervised mutating tool registers pending + emits event" {
     // The emitted payload must not leak raw argument content.
     try std.testing.expect(std.mem.indexOf(u8, evt.raw_data, "echo hi") == null);
     try std.testing.expect(std.mem.indexOf(u8, evt.raw_data, "command") == null);
+}
+
+test "P0-4: rehydratePendingToolApproval restores snapshot with owned slices + re-emits card" {
+    // Simulated restart: a durable snapshot (read back from
+    // {schema}.pending_approvals by loadOpenPendingApproval) is restored into
+    // a freshly-built agent that has NO in-RAM pending. Proves the restore
+    // owns its slices (survives the borrowed input being freed), recovers the
+    // numeric id from `apr-<N>` so /approve <id> still matches, advances the
+    // id counter past it, and re-emits the approval_required card so a
+    // reconnecting client re-renders.
+    const allocator = std.testing.allocator;
+    var capture = CapturingApprovalObserver.init(allocator);
+    defer capture.deinit();
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+    var agent = try makeSupervisedAgent(allocator, &policy, capture.observer());
+    defer agent.deinit();
+
+    // No live pending before rehydration (fresh post-restart agent).
+    try std.testing.expect(agent.pending_tool_approval == null);
+
+    // Borrowed input — own buffers we free right after, to prove the restore
+    // duped everything.
+    const approval_id = try allocator.dupe(u8, "apr-7");
+    const tool_name = try allocator.dupe(u8, "shell");
+    const tool_call_id = try allocator.dupe(u8, "call_restart");
+    const args = try allocator.dupe(u8, "{\"command\":\"rm -rf /tmp/x\"}");
+    const reason = try allocator.dupe(u8, "supervised_mutating_requires_approval");
+    const risk = try allocator.dupe(u8, "critical");
+
+    try agent.rehydratePendingToolApproval(.{
+        .approval_id = approval_id,
+        .tool_name = tool_name,
+        .tool_call_id = tool_call_id,
+        .arguments_json = args,
+        .reason = reason,
+        .risk_level = risk,
+        .created_at_unix = 1_700_000_000,
+    });
+
+    // Free the borrowed inputs — the agent must have duped them.
+    allocator.free(approval_id);
+    allocator.free(tool_name);
+    allocator.free(tool_call_id);
+    allocator.free(args);
+    allocator.free(reason);
+    allocator.free(risk);
+
+    // Snapshot restored.
+    try std.testing.expect(agent.pending_tool_approval != null);
+    const pending = agent.pending_tool_approval.?;
+    try std.testing.expectEqualStrings("apr-7", pending.approval_id);
+    try std.testing.expectEqualStrings("shell", pending.tool_name);
+    try std.testing.expectEqualStrings("call_restart", pending.tool_call_id.?);
+    try std.testing.expectEqualStrings("{\"command\":\"rm -rf /tmp/x\"}", pending.arguments_json);
+    try std.testing.expectEqualStrings("supervised_mutating_requires_approval", pending.reason);
+    try std.testing.expectEqual(tool_metadata.RiskLevel.critical, pending.risk_level);
+    // Numeric id recovered from `apr-7` so /approve 7 still matches.
+    try std.testing.expectEqual(@as(u64, 7), pending.id);
+    // Counter advanced past the rehydrated id so a NEW approval can't collide.
+    try std.testing.expectEqual(@as(u64, 7), agent.pending_tool_approval_id_counter);
+    // NO TTL — expiry stays null.
+    try std.testing.expect(pending.expires_at_unix == null);
+
+    // Card re-emitted for the reconnecting client.
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    const evt = capture.events.items[0];
+    try std.testing.expectEqualStrings("shell", evt.tool);
+    try std.testing.expectEqualStrings("critical", evt.risk_level);
+    // Still non-sensitive: no raw argument content in the emitted card.
+    try std.testing.expect(std.mem.indexOf(u8, evt.raw_data, "rm -rf") == null);
+
+    // Double-rehydrate is refused (does not clobber the live pending).
+    try std.testing.expectError(error.PendingToolApprovalAlreadyExists, agent.rehydratePendingToolApproval(.{
+        .approval_id = "apr-7",
+        .tool_name = "shell",
+        .tool_call_id = null,
+        .arguments_json = "{}",
+        .reason = "x",
+        .risk_level = "low",
+        .created_at_unix = 0,
+    }));
+
+    agent.clearPendingToolApproval();
 }
 
 test "approval gate: supervised read-only tool auto-approves without pending" {

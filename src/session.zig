@@ -553,6 +553,38 @@ pub const SessionManager = struct {
             }
         }
 
+        // P0-4: re-hydrate a durable pending tool approval. On a pod restart /
+        // session eviction the in-RAM `pending_tool_approval` was lost; the
+        // history above is durable but the approval SNAPSHOT lives in
+        // {schema}.pending_approvals. Restore the open row + re-emit the
+        // approval_required event so a reconnecting client re-renders the
+        // card and the user's Approve click resolves instead of 404-ing.
+        //
+        // Failure-soft: postgres unavailable / no open row → no-op. Best-
+        // effort, exactly like the identity-pin block below: a rehydration
+        // failure must never block session creation.
+        if (self.extraction_state_mgr) |smgr| {
+            const open_row = smgr.loadOpenPendingApproval(self.allocator, owned_key) catch |err| blk: {
+                log.warn("session.approval_rehydrate_failed err={s}", .{@errorName(err)});
+                break :blk null;
+            };
+            if (open_row) |row_val| {
+                var row = row_val;
+                defer row.deinit(self.allocator);
+                session.agent.rehydratePendingToolApproval(.{
+                    .approval_id = row.approval_id,
+                    .tool_name = row.tool_name,
+                    .tool_call_id = row.tool_call_id,
+                    .arguments_json = row.arguments_json,
+                    .reason = row.reason,
+                    .risk_level = row.risk_level,
+                    .created_at_unix = row.created_at_unix,
+                }) catch |err| {
+                    log.warn("session.approval_rehydrate_restore_failed err={s}", .{@errorName(err)});
+                };
+            }
+        }
+
         // V1.13 follow-up #1 — pin user identity facts into working
         // memory slot 0 at session creation. listIdentityFacts pulls
         // the user's pinned identity store; we bundle the top facts
