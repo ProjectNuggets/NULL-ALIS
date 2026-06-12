@@ -2822,6 +2822,34 @@ fn isHealthOk() bool {
     return true;
 }
 
+/// C3 — the canonical `GET /health` response, shared byte-for-byte by the
+/// acceptor-thread fast-path (tryServeProbeInline) and the worker path
+/// (handleAcceptedConnection) so a probe served on either thread is identical.
+///
+/// Liveness semantics:
+///   * worker pool WEDGED (deadlock watchdog trips) → 503 + "deadlocked".
+///     This is the ONLY case that fails the probe, so the kube liveness probe
+///     restarts a pod whose acceptor is alive but whose workers are all stuck
+///     — the silent-wedge gap P0-1's cheap /health left open. The watchdog
+///     predicate is conservative (pending work AND no completion past a
+///     generous threshold) so idle/busy pods never trip it → no restart loop.
+///   * registry not all-ok → 200 + "degraded" (UNCHANGED pre-C3 behaviour;
+///     component degradation is a readiness/observability signal, not a
+///     liveness kill — flipping it to 503 here would be an out-of-scope
+///     behaviour change).
+///   * otherwise → 200 + "ok".
+const HealthFastPathResponse = struct { status: []const u8, body: []const u8 };
+
+fn healthFastPathResponse(state: *const GatewayState) HealthFastPathResponse {
+    if (livenessDeadlockDetected(state, std.time.milliTimestamp())) {
+        return .{ .status = "503 Service Unavailable", .body = "{\"status\":\"deadlocked\"}" };
+    }
+    if (isHealthOk()) {
+        return .{ .status = "200 OK", .body = "{\"status\":\"ok\"}" };
+    }
+    return .{ .status = "200 OK", .body = "{\"status\":\"degraded\"}" };
+}
+
 /// Readiness response — encapsulates HTTP status and body for /ready.
 pub const ReadyResponse = struct {
     http_status: []const u8,
@@ -23187,8 +23215,11 @@ fn tryServeProbeInline(state: *GatewayState, conn: std.net.Server.Connection) bo
         .other => return false,
         .health => {
             _ = state.requests_total.fetchAdd(1, .monotonic);
-            const body = if (isHealthOk()) "{\"status\":\"ok\"}" else "{\"status\":\"degraded\"}";
-            sendHttpResponse(conn.stream, "200 OK", "application/json", body) catch {};
+            // C3 — the watchdog rides this cheap acceptor fast-path: a wedged
+            // worker pool returns 503 here so liveness fails even though the
+            // acceptor itself is alive.
+            const resp = healthFastPathResponse(state);
+            sendHttpResponse(conn.stream, resp.status, "application/json", resp.body) catch {};
             return true;
         },
         .ready => {
@@ -23463,7 +23494,12 @@ fn handleAcceptedConnection(
         response_body = webhook_ctx.response_body;
     } else if (control_route_map.get(base_path)) |route| switch (route) {
         .health => {
-            response_body = if (isHealthOk()) "{\"status\":\"ok\"}" else "{\"status\":\"degraded\"}";
+            // C3 — same canonical response as the acceptor fast-path so a
+            // probe served on either thread is byte-identical (incl. the
+            // 503 "deadlocked" liveness fail when the worker pool is wedged).
+            const health_resp = healthFastPathResponse(state);
+            response_status = health_resp.status;
+            response_body = health_resp.body;
         },
         .ready => {
             if (state.draining.load(.acquire)) {
@@ -23903,7 +23939,19 @@ const GatewayWorkerContext = struct {
 fn gatewayWorkerMain(ctx: *GatewayWorkerContext) void {
     while (true) {
         const conn = ctx.queue.popWait() orelse break;
+        // C3 — this request left the queue (no longer pending/unstarted).
+        // Decrement BEFORE handling so the watchdog's "pending work" gate
+        // reflects only requests that have not yet been picked up by a worker.
+        // saturating subtract guards against any miscount underflow.
+        _ = ctx.state.queued_requests.fetchSub(1, .acq_rel);
         handleAcceptedConnection(ctx.allocator, ctx.config_opt, ctx.state, ctx.session_mgr_opt, conn);
+        // C3 — a worker just COMPLETED a request: advance the liveness
+        // progress clock. This is the heartbeat that proves the worker pool
+        // (not just the acceptor) is alive; a wedged pool never reaches here
+        // so the gap grows until the watchdog trips. std.time.milliTimestamp
+        // is wall-clock (as used elsewhere in this file); see
+        // livenessDeadlockDetected for the backward-step fail-safe note.
+        ctx.state.last_worker_progress_ms.store(std.time.milliTimestamp(), .release);
     }
 }
 
@@ -24038,6 +24086,14 @@ pub fn runWithRole(
         state.pinned_user_id_owned = true;
     }
     state.event_bus = event_bus;
+    // C3 — seed the liveness progress clock to boot time BEFORE any worker
+    // exists. The watchdog measures the gap since the last completion; without
+    // this seed the timestamp would be epoch 0, making the first queued
+    // request before any completion look like a multi-decade wedge. From boot
+    // the gap only crosses the (generous, default-180s) threshold if the pool
+    // genuinely never completes a request. milliTimestamp is wall-clock, as
+    // used throughout this file.
+    state.last_worker_progress_ms.store(std.time.milliTimestamp(), .release);
 
     var owned_config: ?Config = null;
     var config_opt: ?*const Config = null;
@@ -24213,6 +24269,10 @@ pub fn runWithRole(
         state.extension_tokens = cfg.gateway.extension_tokens;
         state.extension_browser_allowlist = cfg.gateway.extension_browser_allowlist;
         state.require_explicit_chat_stream_session_key = cfg.gateway.require_explicit_chat_stream_session_key;
+        // C3 — copy the liveness deadlock watchdog threshold from config so the
+        // acceptor-thread /health fast-path can evaluate the predicate without
+        // touching the Config object. 0 disables the watchdog.
+        state.liveness_deadlock_threshold_ms = cfg.reliability.liveness_deadlock_threshold_ms;
         // Wave 3B — instantiate the extension WS hub when enabled.
         // Hub state is global to the process (one connection per user
         // across the whole gateway); destroyed in the deferred-cleanup
@@ -24581,7 +24641,12 @@ pub fn runWithRole(
             conn.stream.close();
             continue;
         }
-        if (!request_queue.push(conn)) {
+        if (request_queue.push(conn)) {
+            // C3 — request is now queued-but-unstarted (pending work). The
+            // worker that pops it decrements this in gatewayWorkerMain. The
+            // watchdog reads this depth without taking the queue mutex.
+            _ = state.queued_requests.fetchAdd(1, .acq_rel);
+        } else {
             _ = state.overload_rejected_total.fetchAdd(1, .monotonic);
             sendHttpResponseRetryAfter(
                 conn.stream,
@@ -29697,6 +29762,62 @@ test "C3 livenessDeadlockDetected: wedged state via injected timestamps" {
     state.queued_requests.store(4, .release);
     state.last_worker_progress_ms.store(1_000, .release);
     try std.testing.expect(!livenessDeadlockDetected(&state, 300_000));
+}
+
+test "C3 healthFastPathResponse: wedged pool fails liveness with 503 deadlocked" {
+    // End-to-end at the response level (what the cheap /health fast-path
+    // actually emits), exercising the same helper used by both the acceptor
+    // inline path and the worker path.
+    health.reset();
+    health.markComponentOk("gateway"); // registry all-ok, so only the watchdog matters
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.liveness_deadlock_threshold_ms = 180_000;
+
+    // WEDGED: pending work + last completion far in the past relative to now.
+    // (We can't inject `now` into the helper — it reads milliTimestamp — so we
+    // place last progress well before "now" by parking it near epoch; the gap
+    // is decades, comfortably past 180s, with pending work present.)
+    state.queued_requests.store(3, .release);
+    state.last_worker_progress_ms.store(0, .release);
+    const wedged = healthFastPathResponse(&state);
+    try std.testing.expectEqualStrings("503 Service Unavailable", wedged.status);
+    try std.testing.expectEqualStrings("{\"status\":\"deadlocked\"}", wedged.body);
+
+    // IDLE: no pending work → 200 ok even though progress is ancient.
+    state.queued_requests.store(0, .release);
+    const idle = healthFastPathResponse(&state);
+    try std.testing.expectEqualStrings("200 OK", idle.status);
+    try std.testing.expectEqualStrings("{\"status\":\"ok\"}", idle.body);
+
+    // BUSY: pending work but a worker just completed (progress ~= now) → 200 ok.
+    state.queued_requests.store(3, .release);
+    state.last_worker_progress_ms.store(std.time.milliTimestamp(), .release);
+    const busy = healthFastPathResponse(&state);
+    try std.testing.expectEqualStrings("200 OK", busy.status);
+    try std.testing.expectEqualStrings("{\"status\":\"ok\"}", busy.body);
+
+    health.reset();
+}
+
+test "C3 healthFastPathResponse: degraded registry stays 200 (liveness unchanged)" {
+    // A degraded component is a readiness/observability signal, not a liveness
+    // kill — the watchdog must NOT promote it to 503. This pins that the only
+    // 503 path through cheap /health is a genuine worker-pool deadlock.
+    health.reset();
+    health.markComponentError("database", "connection refused");
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.liveness_deadlock_threshold_ms = 180_000;
+    state.queued_requests.store(0, .release); // not wedged
+
+    const resp = healthFastPathResponse(&state);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expectEqualStrings("{\"status\":\"degraded\"}", resp.body);
+
+    health.reset();
 }
 
 // ── /ready endpoint tests ────────────────────────────────────────────
