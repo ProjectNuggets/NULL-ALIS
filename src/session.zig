@@ -1300,6 +1300,27 @@ pub const SessionManager = struct {
     /// Phase 2: checkpoint each candidate (no manager mutex, may do LLM calls).
     /// Phase 3: remove from map (manager mutex held, fast).
     pub fn evictIdle(self: *SessionManager, max_idle_secs: u64) usize {
+        return self.evictIdleShutdownAware(max_idle_secs, null);
+    }
+
+    /// Wave-E — eviction sweep that is responsive to a shutdown flag.
+    ///
+    /// The dedicated tenant-maintenance thread (P0-1) passes
+    /// `&state.shutdown_requested` so the sweep checks shutdown BETWEEN
+    /// sessions (Phase 2) and bails out promptly after SIGTERM rather than
+    /// grinding through every candidate. Combined with the per-session bounded
+    /// lifecycle-worker join (also Wave-E, below), this guarantees the
+    /// maintenance thread exits within ~one bounded eviction of a shutdown
+    /// request, so the teardown's `maintenance_thread.join()` completes and the
+    /// P0-3 shutdown budgets always run (no exit-137 via this path).
+    ///
+    /// `shutdown_flag == null` preserves the legacy run-to-completion behaviour
+    /// (all existing non-shutdown callers / tests).
+    pub fn evictIdleShutdownAware(
+        self: *SessionManager,
+        max_idle_secs: u64,
+        shutdown_flag: ?*const std.atomic.Value(bool),
+    ) usize {
         const now = std.time.timestamp();
 
         // Phase 1: Collect candidate sessions while holding manager mutex (fast scan only).
@@ -1333,19 +1354,57 @@ pub const SessionManager = struct {
         var to_remove: std.ArrayListUnmanaged([]const u8) = .{};
         defer to_remove.deinit(self.allocator);
 
-        for (candidates.items) |session| {
+        // Wave-E — per-session bound on the lifecycle-worker join. P0-1 moved
+        // this sweep onto the dedicated tenant-maintenance thread, which holds
+        // `tenant_runtime_mutex` across every session. The previous UNBOUNDED
+        // `joinLifecycleThreadIfPresent()` here would block that maintenance
+        // thread FOREVER if a session's lifecycle worker is genuinely hung (the
+        // exact case P0-3 exists to bound), so at SIGTERM the teardown's
+        // `maintenance_thread.join()` never returned and the P0-3 shutdown
+        // budgets never ran → exit-137 at the k8s grace. Reuse the SAME bounded
+        // mechanism the shutdown-flush path uses
+        // (`Agent.joinLifecycleThreadWithTimeout`, src/agent/root.zig ~1175):
+        // wait up to `evict_join_timeout_ms` for the worker to drain, then join.
+        const evict_join_timeout: i64 = @intCast(self.config.reliability.evict_join_timeout_ms);
+        var deferred: usize = 0;
+        for (candidates.items, 0..) |session, idx| {
+            // Wave-E — shutdown-responsive sweep. After SIGTERM, stop processing
+            // further candidates and bail out promptly so the maintenance thread
+            // exits within ~one bounded eviction. The remaining candidates still
+            // hold their session mutex (locked in Phase 1), so unlock them all
+            // before breaking. They are simply LEFT LIVE (not evicted this
+            // sweep); shutdown teardown flushes them via the P0-3 path.
+            if (shutdown_flag) |flag| {
+                if (flag.load(.acquire)) {
+                    for (candidates.items[idx..]) |remaining| remaining.mutex.unlock();
+                    break;
+                }
+            }
             defer session.mutex.unlock();
             syncSessionOriginToAgent(session);
             // Join any async lifecycle worker spawned by a previous processMessage before
             // writing the authoritative evict checkpoint.  Without this, a worker that
             // finished after our write would overwrite the "idle_evict"/"ttl_evict" anchor.
-            session.agent.joinLifecycleThreadIfPresent();
+            //
+            // BOUNDED: if the worker does NOT drain within the budget, SKIP/DEFER
+            // evicting this session — leave it LIVE in the map (retried on the
+            // next sweep) rather than blocking the maintenance thread. Writing
+            // the checkpoint while the worker is still in flight would also race
+            // the same agent state/memory keys, so we skip the write too (same
+            // race-avoidance contract as `flushSessionsForShutdownClocked`).
+            if (!session.agent.joinLifecycleThreadWithTimeout(evict_join_timeout)) {
+                deferred += 1;
+                continue;
+            }
             if (sessionIsTtlExpired(session, now)) {
                 session.agent.persistSessionCheckpoint("ttl_evict");
             } else {
                 session.agent.persistSessionCheckpoint("idle_evict");
             }
             to_remove.append(self.allocator, session.session_key) catch continue;
+        }
+        if (deferred > 0) {
+            log.warn("session.evict deferred={d} reason=lifecycle_worker_join_timeout timeout_ms={d}", .{ deferred, self.config.reliability.evict_join_timeout_ms });
         }
 
         // Phase 3: Remove from map (manager mutex held, fast).
@@ -2392,6 +2451,112 @@ test "P0-3: shutdownBudgetExceeded honors budget, zero disables, ignores clock s
 var test_flush_clock_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0);
 fn testFlushClockNow() i64 {
     return test_flush_clock_ms.load(.acquire);
+}
+
+// Wave-E — park a lifecycle worker on `session` that blocks until `release`
+// is set, registering it as the session's in-flight lifecycle thread. An
+// UNBOUNDED join would deadlock on it. Returns the spawned thread; callers
+// MUST set release and reap (waitForLifecycleIdle) before the session is torn
+// down. Mirrors the P0-3 flush-test Blocker pattern.
+fn parkStuckLifecycleWorker(
+    session: *Session,
+    release: *std.atomic.Value(bool),
+) !std.Thread {
+    const Blocker = struct {
+        fn run(rel: *std.atomic.Value(bool), in_flight: *std.atomic.Value(bool)) void {
+            while (!rel.load(.acquire)) std.Thread.sleep(1 * std.time.ns_per_ms);
+            in_flight.store(false, .release);
+        }
+    };
+    session.agent.lifecycle_in_flight.store(true, .release);
+    const blocker = try std.Thread.spawn(.{}, Blocker.run, .{ release, &session.agent.lifecycle_in_flight });
+    session.agent.lifecycle_thread_mu.lock();
+    session.agent.lifecycle_thread = blocker;
+    session.agent.lifecycle_thread_mu.unlock();
+    return blocker;
+}
+
+test "Wave-E: evictIdle with a STUCK lifecycle worker returns within the bound and DEFERS the session (does not block)" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.memory.auto_save = true;
+    // Tight bound so the test is fast; the point is that the join is BOUNDED.
+    cfg.reliability.evict_join_timeout_ms = 50;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    const reply = try sm.processMessage("evict:stuck", "hello", null);
+    testing.allocator.free(reply);
+    const session = sm.getIfPresent("evict:stuck") orelse return error.TestUnexpectedResult;
+
+    // Park a worker that never finishes within the bound.
+    var release = std.atomic.Value(bool).init(false);
+    _ = try parkStuckLifecycleWorker(session, &release);
+
+    // evictIdle(0) makes the session idle-eligible. With the bounded join it
+    // must return PROMPTLY (~evict_join_timeout_ms, NOT block on the parked
+    // worker) and evict 0 — the session is DEFERRED (left live), retried next
+    // sweep.
+    const start_ms = std.time.milliTimestamp();
+    const evicted = sm.evictIdle(0);
+    const elapsed_ms = std.time.milliTimestamp() - start_ms;
+
+    try testing.expectEqual(@as(usize, 0), evicted);
+    // Bounded: well under any "unbounded hang". Generous ceiling for CI jitter.
+    try testing.expect(elapsed_ms < 5_000);
+    // Session is STILL present (deferred, not evicted).
+    try testing.expect(sm.getIfPresent("evict:stuck") != null);
+
+    // Release + reap so deinit doesn't see the worker in flight.
+    release.store(true, .release);
+    _ = session.agent.waitForLifecycleIdle(5_000);
+}
+
+test "Wave-E: evictIdleShutdownAware bails BETWEEN sessions when shutdown is set (maintenance thread exits promptly)" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.memory.auto_save = true;
+    cfg.reliability.evict_join_timeout_ms = 50;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    // Two idle-eligible sessions; one parks a stuck worker.
+    const r1 = try sm.processMessage("evict:a", "hi", null);
+    testing.allocator.free(r1);
+    const r2 = try sm.processMessage("evict:b", "hi", null);
+    testing.allocator.free(r2);
+    const session_b = sm.getIfPresent("evict:b") orelse return error.TestUnexpectedResult;
+
+    var release = std.atomic.Value(bool).init(false);
+    _ = try parkStuckLifecycleWorker(session_b, &release);
+
+    // Shutdown already requested → the sweep observes it BETWEEN sessions and
+    // bails out, evicting nothing and (critically) returning promptly even
+    // though one session's worker is stuck. This is what lets the maintenance
+    // thread exit promptly after SIGTERM.
+    var shutdown_flag = std.atomic.Value(bool).init(true);
+    const start_ms = std.time.milliTimestamp();
+    const evicted = sm.evictIdleShutdownAware(0, &shutdown_flag);
+    const elapsed_ms = std.time.milliTimestamp() - start_ms;
+
+    try testing.expectEqual(@as(usize, 0), evicted);
+    try testing.expect(elapsed_ms < 5_000);
+    // Both sessions remain live (sweep bailed before evicting either).
+    try testing.expect(sm.getIfPresent("evict:a") != null);
+    try testing.expect(sm.getIfPresent("evict:b") != null);
+
+    release.store(true, .release);
+    _ = session_b.agent.waitForLifecycleIdle(5_000);
 }
 
 test "P0-3: flushSessionsForShutdownClocked skips heavy join past budget and returns promptly without racing the in-flight worker" {

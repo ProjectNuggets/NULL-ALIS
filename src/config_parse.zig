@@ -864,6 +864,13 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (rel.object.get("liveness_deadlock_threshold_ms")) |v| {
                 if (v == .integer) self.reliability.liveness_deadlock_threshold_ms = @intCast(v.integer);
             }
+            // Wave-E — per-session lifecycle-worker join bound for the IDLE/TTL
+            // eviction sweep (SessionManager.evictIdle). Parsed here (not just
+            // defaulted) so an operator can tune it and a save->load round-trip
+            // preserves the value (Finding-#4 regression class).
+            if (rel.object.get("evict_join_timeout_ms")) |v| {
+                if (v == .integer) self.reliability.evict_join_timeout_ms = @intCast(v.integer);
+            }
             // Finding-#4-class fix (2026-05-22): vision_fallback had a struct
             // (VisionFallbackConfig) and its docstring even calls the unset
             // state "a current regression" — but no parser, so `provider`/

@@ -2653,11 +2653,29 @@ fn runTenantRuntimeMaintenance(state: *GatewayState, now_s: i64) void {
     defer state.tenant_runtime_mutex.unlock();
     var it = state.tenant_runtimes.iterator();
     while (it.next()) |entry| {
+        // Wave-E — shutdown-responsive sweep. Check shutdown BETWEEN runtimes
+        // (and `evictIdleShutdownAware` checks it BETWEEN sessions) so the
+        // maintenance thread bails out of an in-progress sweep promptly after
+        // SIGTERM instead of grinding through every tenant. Bailing here leaves
+        // `tenant_runtime_mutex` held only for the moment it takes to return;
+        // the deferred unlock releases it as the function returns, so the
+        // teardown's `maintenance_thread.join()` is never blocked behind a
+        // long sweep. (The map mutex is intentionally held across the sweep —
+        // releasing it per-runtime would expose the snapshotted runtime
+        // pointers to a concurrent inline `deinit()` on the getTenantRuntime
+        // key-mismatch path; correctness/atomicity first. The per-session
+        // lifecycle join is now BOUNDED, so the mutex is never held across an
+        // unbounded operation.)
+        if (state.shutdown_requested.load(.acquire)) return;
         const runtime = entry.value_ptr.*;
         if (runtime.config.agent.session_idle_timeout_secs > 0) {
-            _ = runtime.session_mgr.evictIdle(runtime.config.agent.session_idle_timeout_secs);
+            _ = runtime.session_mgr.evictIdleShutdownAware(
+                runtime.config.agent.session_idle_timeout_secs,
+                &state.shutdown_requested,
+            );
         }
     }
+    if (state.shutdown_requested.load(.acquire)) return;
     pruneTenantRuntimeCache(state, now_s);
 }
 
@@ -23164,21 +23182,36 @@ fn classifyProbeRequestLine(preview: []const u8) ProbeClass {
 //     servicing the queue OR any worker keeps making turn progress the gap
 //     stays small and the predicate stays false even under sustained load with
 //     a continuously non-empty queue and long individual turns.
-//   * WEDGED runtime → work is queued (depth > 0) yet NO worker pops,
-//     completes, OR heartbeats ANYTHING, so once the gap exceeds the GENEROUS
-//     threshold the predicate trips exactly once the pool is genuinely stuck.
+//   * WEDGED runtime → work is present (queued depth > 0 OR a request is
+//     in flight) yet NO worker pops, completes, OR heartbeats ANYTHING, so
+//     once the gap exceeds the GENEROUS threshold the predicate trips exactly
+//     once the pool is genuinely stuck.
 // A threshold of 0 disables the watchdog (cheap /health reverts to pure
 // acceptor liveness).
 //
-// This is a PURE function of injected inputs so the three acceptance cases
-// (wedged / idle / busy) are unit-testable without spinning real threads.
+// Wave-E fix — work-present is `queue_depth > 0 OR in_flight > 0`, not just
+// `queue_depth > 0`. The old gate only saw queued-but-UNSTARTED work, so a
+// pool where every worker has already POPPED its request and then wedged
+// mid-handling (so queue_depth drains to 0 while in_flight_requests > 0) and
+// no NEW traffic arrives to re-grow the queue was NEVER flagged — the exact
+// all-workers-wedged-with-no-new-traffic case the watchdog exists to catch.
+// Adding in_flight is restart-loop-safe: the C3 mid-turn heartbeat refreshes
+// `last_worker_progress_ms` for any legitimately-long single turn, so an
+// in-flight-but-progressing request keeps the gap small and is not flagged.
+//
+// This is a PURE function of injected inputs so the four acceptance cases
+// (queued-wedged / in-flight-wedged / idle / busy) are unit-testable without
+// spinning real threads.
 fn isWorkerPoolDeadlocked(
     queue_depth: usize,
+    in_flight_depth: u64,
     ms_since_last_progress: u64,
     threshold_ms: u64,
 ) bool {
     if (threshold_ms == 0) return false; // watchdog disabled
-    if (queue_depth == 0) return false; // idle / drained — never a deadlock
+    // Work is present if anything is queued OR any request is in flight. An
+    // all-workers-popped-then-wedged pool has queue_depth == 0 but in_flight > 0.
+    if (queue_depth == 0 and in_flight_depth == 0) return false; // idle / drained — never a deadlock
     return ms_since_last_progress > threshold_ms;
 }
 
@@ -23199,7 +23232,14 @@ fn livenessDeadlockDetected(state: *const GatewayState, now_ms: i64) bool {
     const threshold_ms = state.liveness_deadlock_threshold_ms;
     if (threshold_ms == 0) return false;
     const queue_depth = state.queued_requests.load(.acquire);
-    if (queue_depth == 0) return false;
+    // Wave-E fix — also count IN-FLIGHT requests as work present. A pool where
+    // every worker has already popped its request and wedged mid-handling has
+    // queue_depth == 0 (nothing left queued) but in_flight_requests > 0; with
+    // no new traffic to re-grow the queue, the old queue-only gate would never
+    // flag it. See isWorkerPoolDeadlocked for the restart-loop-safety argument
+    // (the C3 heartbeat keeps a progressing in-flight request from tripping).
+    const in_flight = state.in_flight_requests.load(.acquire);
+    if (queue_depth == 0 and in_flight == 0) return false;
     const last_progress_ms = state.last_worker_progress_ms.load(.acquire);
     // Before any worker pops or completes, the timestamp is the boot time
     // (seeded in runWithRole), so an all-stuck-from-boot pool with queued work
@@ -23208,7 +23248,7 @@ fn livenessDeadlockDetected(state: *const GatewayState, now_ms: i64) bool {
         @intCast(now_ms - last_progress_ms)
     else
         0;
-    return isWorkerPoolDeadlocked(queue_depth, gap_ms, threshold_ms);
+    return isWorkerPoolDeadlocked(queue_depth, in_flight, gap_ms, threshold_ms);
 }
 
 /// Peek (without consuming) the start of an accepted connection and, if it
@@ -24689,6 +24729,20 @@ pub fn runWithRole(
         .{&maintenance_ctx},
     );
     defer {
+        // Wave-E — set shutdown_requested BEFORE joining. The maintenance thread
+        // is now shutdown-responsive: it checks shutdown_requested at the loop
+        // top (stops starting new sweeps), BETWEEN runtimes, and (via
+        // evictIdleShutdownAware) BETWEEN sessions, and every per-session
+        // lifecycle-worker join is BOUNDED (evict_join_timeout_ms). So once this
+        // store is visible the thread exits within at most ~one bounded
+        // eviction — the plain `join()` below can no longer hang. That is the
+        // primary guarantee: teardown reaches state.deinit() (and thus the P0-3
+        // shutdown_flush_budget_ms / shutdown_deinit_budget_ms budgets) instead
+        // of stalling here forever → no exit-137 via this path. No timed-join
+        // backstop is used: the maintenance thread touches tenant_runtimes/mutex,
+        // so abandoning it and then freeing those (state.deinit) would be a UAF;
+        // per the P0-3 philosophy we rely on prompt exit rather than free-under-
+        // a-live-thread.
         state.shutdown_requested.store(true, .release);
         maintenance_thread.join();
     }
@@ -29787,18 +29841,30 @@ test "P0-1 classifier: a partial request line (no CRLF) is not classified" {
 test "C3 predicate: WEDGED pool (pending work + no pop/complete past threshold) is flagged" {
     // 5 requests queued, no worker popped or completed for 200s, 180s
     // threshold → deadlock.
-    try std.testing.expect(isWorkerPoolDeadlocked(5, 200_000, 180_000));
+    try std.testing.expect(isWorkerPoolDeadlocked(5, 0, 200_000, 180_000));
     // Exactly one request stuck is enough — depth > 0 is the gate, not a count.
-    try std.testing.expect(isWorkerPoolDeadlocked(1, 181_000, 180_000));
+    try std.testing.expect(isWorkerPoolDeadlocked(1, 0, 181_000, 180_000));
+}
+
+test "C3 predicate (Wave-E): IN-FLIGHT-only wedge (queue drained, no new traffic) is flagged" {
+    // All workers POPPED their requests then wedged mid-handling: the queue
+    // drained to 0 but in_flight_requests stays > 0, and no new traffic arrives
+    // to re-grow the queue. The OLD queue-only gate (queue_depth == 0 → idle)
+    // would NEVER flag this — the exact false-negative this fix closes. With
+    // in_flight > 0 counted as work present, a no-progress gap past the
+    // threshold now trips.
+    try std.testing.expect(isWorkerPoolDeadlocked(0, 4, 200_000, 180_000));
+    try std.testing.expect(isWorkerPoolDeadlocked(0, 1, 181_000, 180_000));
+    // Queue empty AND nothing in flight → still idle, never flagged (below).
 }
 
 test "C3 predicate: IDLE runtime (no pending work) is NEVER flagged" {
-    // No queued work → not a deadlock, no matter how long since last progress.
-    // "No progress" on an idle pool is normal, not a wedge — this is the
-    // primary restart-loop guard.
-    try std.testing.expect(!isWorkerPoolDeadlocked(0, 10_000_000, 180_000));
-    try std.testing.expect(!isWorkerPoolDeadlocked(0, 200_000, 180_000));
-    try std.testing.expect(!isWorkerPoolDeadlocked(0, 0, 180_000));
+    // No queued work AND nothing in flight → not a deadlock, no matter how long
+    // since last progress. "No progress" on an idle pool is normal, not a wedge
+    // — this is the primary restart-loop guard.
+    try std.testing.expect(!isWorkerPoolDeadlocked(0, 0, 10_000_000, 180_000));
+    try std.testing.expect(!isWorkerPoolDeadlocked(0, 0, 200_000, 180_000));
+    try std.testing.expect(!isWorkerPoolDeadlocked(0, 0, 0, 180_000));
 }
 
 test "C3 predicate: BUSY-but-progressing runtime is NOT flagged" {
@@ -29808,16 +29874,22 @@ test "C3 predicate: BUSY-but-progressing runtime is NOT flagged" {
     // sustained load and long individual turns (Finding C3-2: a pop counts as
     // progress, so all-workers-busy-on-long-turns that still drains the queue
     // is not mistaken for a wedge).
-    try std.testing.expect(!isWorkerPoolDeadlocked(50, 1_000, 180_000));
-    try std.testing.expect(!isWorkerPoolDeadlocked(1, 179_999, 180_000));
+    try std.testing.expect(!isWorkerPoolDeadlocked(50, 0, 1_000, 180_000));
+    try std.testing.expect(!isWorkerPoolDeadlocked(1, 0, 179_999, 180_000));
     // Boundary: a gap exactly AT the threshold is not yet a deadlock (strict >).
-    try std.testing.expect(!isWorkerPoolDeadlocked(3, 180_000, 180_000));
+    try std.testing.expect(!isWorkerPoolDeadlocked(3, 0, 180_000, 180_000));
+    // Wave-E: an IN-FLIGHT request that is PROGRESSING (recent heartbeat keeps
+    // the gap small) is likewise not flagged, even with the queue drained — the
+    // restart-loop-safety guarantee for the new in_flight gate.
+    try std.testing.expect(!isWorkerPoolDeadlocked(0, 4, 1_000, 180_000));
+    try std.testing.expect(!isWorkerPoolDeadlocked(0, 1, 179_999, 180_000));
 }
 
 test "C3 predicate: threshold 0 disables the watchdog" {
     // Even a clearly wedged pool is not flagged when the knob is 0 — the
     // operator kill-switch reverts cheap /health to pure acceptor liveness.
-    try std.testing.expect(!isWorkerPoolDeadlocked(100, 999_999_999, 0));
+    try std.testing.expect(!isWorkerPoolDeadlocked(100, 0, 999_999_999, 0));
+    try std.testing.expect(!isWorkerPoolDeadlocked(0, 100, 999_999_999, 0));
 }
 
 test "C3 livenessDeadlockDetected: wedged state via injected timestamps" {
@@ -29825,10 +29897,12 @@ test "C3 livenessDeadlockDetected: wedged state via injected timestamps" {
     defer state.deinit();
     state.liveness_deadlock_threshold_ms = 180_000;
 
-    // Boot: progress seeded to t=0, no queued work → not flagged regardless
-    // of how far `now` has advanced (idle-from-boot is not a deadlock).
+    // Boot: progress seeded to t=0, no queued work and nothing in flight →
+    // not flagged regardless of how far `now` has advanced (idle-from-boot is
+    // not a deadlock).
     state.last_worker_progress_ms.store(0, .release);
     state.queued_requests.store(0, .release);
+    state.in_flight_requests.store(0, .release);
     try std.testing.expect(!livenessDeadlockDetected(&state, 10_000_000));
 
     // Work arrives and a worker last completed at t=1000ms; now=300_000ms →
@@ -29845,6 +29919,18 @@ test "C3 livenessDeadlockDetected: wedged state via injected timestamps" {
     state.queued_requests.store(0, .release);
     state.last_worker_progress_ms.store(1_000, .release);
     try std.testing.expect(!livenessDeadlockDetected(&state, 300_000));
+
+    // Wave-E: queue is empty but a request is IN FLIGHT (worker popped then
+    // wedged) with ancient progress → WEDGED, now caught via the in_flight gate.
+    state.queued_requests.store(0, .release);
+    state.in_flight_requests.store(2, .release);
+    state.last_worker_progress_ms.store(1_000, .release);
+    try std.testing.expect(livenessDeadlockDetected(&state, 300_000));
+
+    // Same in-flight request but PROGRESSING (recent heartbeat) → cleared.
+    state.last_worker_progress_ms.store(299_500, .release);
+    try std.testing.expect(!livenessDeadlockDetected(&state, 300_000));
+    state.in_flight_requests.store(0, .release);
 
     // Threshold 0 disables even with a wedged-looking state.
     state.liveness_deadlock_threshold_ms = 0;

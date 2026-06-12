@@ -237,6 +237,25 @@ pub const ReliabilityConfig = struct {
     /// acceptor-liveness only). Measured against std.time.milliTimestamp
     /// deltas.
     liveness_deadlock_threshold_ms: u64 = 600_000,
+    /// Wave-E (P0-1/P0-3 follow-up) — per-session bound on the lifecycle-worker
+    /// join inside the IDLE/TTL eviction sweep (`SessionManager.evictIdle`).
+    ///
+    /// P0-3 already bounds the lifecycle join on the SHUTDOWN-flush path; the
+    /// runtime eviction path (run from the dedicated tenant-maintenance thread,
+    /// P0-1) still used the UNBOUNDED `Agent.joinLifecycleThreadIfPresent`. A
+    /// genuinely hung worker (the exact case P0-3 exists to bound) latched by
+    /// an eviction sweep would block the maintenance thread FOREVER while
+    /// holding `tenant_runtime_mutex`, so at SIGTERM the teardown's
+    /// `maintenance_thread.join()` never returned → the P0-3 shutdown budgets
+    /// never ran → exit-137 at the k8s grace. This bounds each eviction's
+    /// worker-join: if the worker does not drain within this window, the
+    /// session is LEFT LIVE (deferred, retried on the next sweep) instead of
+    /// blocking. The worker is a detached thread reaped on process exit.
+    ///
+    /// Default 5_000 ms matches `shutdown_join_timeout_ms` (the analogous
+    /// shutdown-path bound). 0 = no bound (legacy unbounded join — NOT
+    /// recommended; reintroduces the hang).
+    evict_join_timeout_ms: u64 = 5_000,
     fallback_providers: []const []const u8 = &.{},
     api_keys: []const []const u8 = &.{},
     model_fallbacks: []const ModelFallbackEntry = &.{},
