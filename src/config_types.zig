@@ -186,12 +186,29 @@ pub const ReliabilityConfig = struct {
     /// worker has completed any request for longer than this threshold.
     /// An idle runtime (no queued work) is NEVER flagged — no progress is
     /// not a deadlock — and a busy-but-progressing pool resets the clock on
-    /// each completion, so neither false-positives into a restart loop.
-    /// Default is GENEROUS (180s) — comfortably longer than the longest
-    /// expected turn — so only a genuinely wedged pool trips it. 0 disables
-    /// the watchdog entirely (cheap /health reverts to acceptor-liveness
-    /// only). Measured against std.time.milliTimestamp deltas.
-    liveness_deadlock_threshold_ms: u64 = 180_000,
+    /// each completion, so neither false-positives into an empty/healthy pool.
+    ///
+    /// The default MUST comfortably exceed a realistic worst-case TURN, not
+    /// just a single LLM call, or the watchdog false-positives a HEALTHY but
+    /// busy pool into a restart loop. `handleAcceptedConnection` runs a
+    /// chat-stream turn SYNCHRONOUSLY on the worker thread and only advances
+    /// `last_worker_progress_ms` at request COMPLETION — there is no mid-turn
+    /// heartbeat — so a worker streaming one long turn looks "stalled" to the
+    /// watchdog for the whole turn. A single upstream LLM call is already
+    /// bounded by `agent.message_timeout_secs` (default 300s, curl
+    /// --max-time), and an agentic multi-call turn can chain SEVERAL such
+    /// calls, so the true worst-case turn is a small multiple of that ceiling.
+    /// With `gateway.max_workers` (default 16) every worker can be legitimately
+    /// occupied by a long turn while new requests queue (`queued_requests > 0`)
+    /// — exactly the predicate's non-disabled branch. The default below is
+    /// therefore set to ~3× `message_timeout_secs` (900s) so a healthy pool
+    /// under sustained slow load is never killed, while a GENUINELY wedged
+    /// pool (no completion for 15 min with pending work) still trips. Operators
+    /// running longer agentic turns should raise this further (rule of thumb:
+    /// >= a few × `message_timeout_secs`). 0 disables the watchdog entirely
+    /// (cheap /health reverts to acceptor-liveness only). Measured against
+    /// std.time.milliTimestamp deltas.
+    liveness_deadlock_threshold_ms: u64 = 900_000,
     fallback_providers: []const []const u8 = &.{},
     api_keys: []const []const u8 = &.{},
     model_fallbacks: []const ModelFallbackEntry = &.{},
