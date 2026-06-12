@@ -2358,6 +2358,23 @@ const TenantRuntime = struct {
         // identical in kind to the embedded-Agent one. Leak them instead;
         // the process is exiting and the OS reclaims everything. We still
         // tear down everything the abandoned worker does NOT touch.
+        //
+        // P0-3 review fix #2 — the abandoned worker ALSO dereferences the
+        // observer chain on EVERY run: `persistSessionCheckpointDetailed`'s
+        // `defer` always calls `self.observer.recordEvent(...)`, and that
+        // observer is `session_mgr.observer` = this runtime's `observer_multi`
+        // (wired at init), which fans out through `observer_slots` into
+        // `log_obs`, `metrics_obs`, `trace_store`, `otel_obs`, sentry. It also
+        // reads `self.config` / `self.workspace_path` (the Agent's
+        // `workspace_dir` aliases the latter) via `exportSessionToQmd`.
+        // `observer_multi`, `observer_slots`, `metrics_obs`, `noop_obs`,
+        // `config`, and `workspace_path` all live INSIDE this struct, so
+        // `destroy(self)` — plus the separate `trace_store` / `log_obs` /
+        // `otel_obs` heap frees — would free observer memory out from under
+        // the running worker. When abandoned we therefore LEAK the observer
+        // chain, `workspace_path`, and the runtime struct itself, freeing only
+        // the resources the deterministic post-P0-2 worker provably never
+        // touches. The process is exiting; the OS reclaims the leak.
         const abandoned = self.session_mgr.abandoned_live_workers;
         if (self.tools.len > 0) tools_mod.deinitTools(self.allocator, self.tools);
         if (self.subagent_manager) |mgr| {
@@ -2367,31 +2384,31 @@ const TenantRuntime = struct {
         if (self.completion_router) |router| {
             self.allocator.destroy(router);
         }
-        if (!abandoned) {
-            if (self.pg_session_store) |store| {
-                store.deinit();
-                self.allocator.destroy(store);
-            }
-            if (self.mem_rt) |*rt| rt.deinit();
-        } else {
-            log.warn("tenant.shutdown_abandon — lifecycle worker(s) still in flight; leaking mem_rt + pg_session_store to avoid use-after-free", .{});
-        }
         if (self.sec_tracker) |*tracker| tracker.deinit();
         self.usage_rt.deinit();
         self.allocator.destroy(self.usage_rt);
-        self.trace_store.deinit();
-        self.allocator.destroy(self.trace_store);
         self.task_ledger.deinit();
         self.allocator.destroy(self.task_delivery);
         self.allocator.destroy(self.task_ledger);
         self.provider_bundle.deinit();
+        self.allocator.free(self.user_id);
+        if (abandoned) {
+            log.warn("tenant.shutdown_abandon — lifecycle worker(s) still in flight; leaking mem_rt + pg_session_store + observer chain + runtime to avoid use-after-free", .{});
+            return;
+        }
+        if (self.pg_session_store) |store| {
+            store.deinit();
+            self.allocator.destroy(store);
+        }
+        if (self.mem_rt) |*rt| rt.deinit();
+        self.trace_store.deinit();
+        self.allocator.destroy(self.trace_store);
         self.allocator.destroy(self.log_obs);
         if (self.otel_obs) |otel| {
             otel.deinit();
             self.allocator.destroy(otel);
         }
         self.allocator.free(self.workspace_path);
-        self.allocator.free(self.user_id);
         self.allocator.destroy(self);
     }
 

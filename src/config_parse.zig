@@ -844,6 +844,20 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (rel.object.get("scheduler_retries")) |v| {
                 if (v == .integer) self.reliability.scheduler_retries = @intCast(v.integer);
             }
+            // Finding-#4-class fix (P0-3 review): these three shutdown-budget
+            // knobs are emitted by `Config.save` (config.zig writeConfig) but
+            // had no parser, so a save->load round-trip silently reverted any
+            // operator-supplied value to the struct default — the advertised
+            // config field was untunable. Parse them as the siblings above do.
+            if (rel.object.get("shutdown_flush_budget_ms")) |v| {
+                if (v == .integer) self.reliability.shutdown_flush_budget_ms = @intCast(v.integer);
+            }
+            if (rel.object.get("shutdown_join_timeout_ms")) |v| {
+                if (v == .integer) self.reliability.shutdown_join_timeout_ms = @intCast(v.integer);
+            }
+            if (rel.object.get("shutdown_deinit_budget_ms")) |v| {
+                if (v == .integer) self.reliability.shutdown_deinit_budget_ms = @intCast(v.integer);
+            }
             // Finding-#4-class fix (2026-05-22): vision_fallback had a struct
             // (VisionFallbackConfig) and its docstring even calls the unset
             // state "a current regression" — but no parser, so `provider`/

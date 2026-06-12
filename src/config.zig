@@ -1666,6 +1666,11 @@ test "save roundtrip preserves reliability settings" {
     cfg.reliability.channel_max_backoff_secs = 90;
     cfg.reliability.scheduler_poll_secs = 20;
     cfg.reliability.scheduler_retries = 3;
+    // P0-3 review — non-default values prove the new parser branches actually
+    // pick these up (a save->load round-trip used to revert them to defaults).
+    cfg.reliability.shutdown_flush_budget_ms = 18_000;
+    cfg.reliability.shutdown_join_timeout_ms = 3_000;
+    cfg.reliability.shutdown_deinit_budget_ms = 45_000;
     cfg.reliability.fallback_providers = &.{ "openrouter", "groq" };
     cfg.reliability.api_keys = &.{ "rk_a", "rk_b" };
     cfg.reliability.model_fallbacks = &model_fallbacks;
@@ -1691,6 +1696,9 @@ test "save roundtrip preserves reliability settings" {
     try std.testing.expectEqual(@as(u64, 90), loaded.reliability.channel_max_backoff_secs);
     try std.testing.expectEqual(@as(u64, 20), loaded.reliability.scheduler_poll_secs);
     try std.testing.expectEqual(@as(u32, 3), loaded.reliability.scheduler_retries);
+    try std.testing.expectEqual(@as(u64, 18_000), loaded.reliability.shutdown_flush_budget_ms);
+    try std.testing.expectEqual(@as(u64, 3_000), loaded.reliability.shutdown_join_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 45_000), loaded.reliability.shutdown_deinit_budget_ms);
     try std.testing.expectEqual(@as(usize, 2), loaded.reliability.fallback_providers.len);
     try std.testing.expectEqualStrings("openrouter", loaded.reliability.fallback_providers[0]);
     try std.testing.expectEqualStrings("groq", loaded.reliability.fallback_providers[1]);
