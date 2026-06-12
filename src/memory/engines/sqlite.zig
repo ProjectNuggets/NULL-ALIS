@@ -75,6 +75,7 @@ pub const SqliteMemory = struct {
         try self_.migrate();
         try self_.migrateSessionId();
         try self_.migrateValidTo();
+        try self_.migrateMessageTranscript();
         return self_;
     }
 
@@ -166,6 +167,8 @@ pub const SqliteMemory = struct {
             \\  session_id TEXT NOT NULL,
             \\  role TEXT NOT NULL,
             \\  content TEXT NOT NULL,
+            \\  tool_calls TEXT,
+            \\  reasoning TEXT,
             \\  created_at TEXT DEFAULT (datetime('now'))
             \\);
             \\CREATE TABLE IF NOT EXISTS completion_events (
@@ -287,6 +290,35 @@ pub const SqliteMemory = struct {
         if (rc2 != c.SQLITE_OK) {
             self.logExecFailure("valid_to migration", "CREATE INDEX IF NOT EXISTS idx_memories_valid_to", rc2, err_msg2);
             if (err_msg2) |msg| c.sqlite3_free(msg);
+        }
+    }
+
+    /// P1-5 transcript fidelity — add the NULLABLE `tool_calls` + `reasoning`
+    /// columns to an EXISTING `messages` table that predates them. Fresh DBs
+    /// already get the columns from the CREATE TABLE above; this covers the
+    /// upgrade-in-place case. Same idempotent idiom as migrateSessionId /
+    /// migrateValidTo (sqlite lacks `ADD COLUMN IF NOT EXISTS`, so a
+    /// "duplicate column name" error is treated as a no-op). Backward-compat:
+    /// the columns are nullable; old rows + old code paths are unaffected.
+    pub fn migrateMessageTranscript(self: *Self) !void {
+        const adds = [_][]const u8{
+            "ALTER TABLE messages ADD COLUMN tool_calls TEXT;",
+            "ALTER TABLE messages ADD COLUMN reasoning TEXT;",
+        };
+        for (adds) |stmt| {
+            var err_msg: [*c]u8 = null;
+            const rc = c.sqlite3_exec(self.db, stmt.ptr, null, null, &err_msg);
+            if (rc != c.SQLITE_OK) {
+                var ignore_error = false;
+                if (err_msg) |msg| {
+                    const msg_text = std.mem.span(msg);
+                    ignore_error = std.mem.indexOf(u8, msg_text, "duplicate column name") != null;
+                }
+                if (!ignore_error) {
+                    self.logExecFailure("message transcript migration", stmt, rc, err_msg);
+                }
+                if (err_msg) |msg| c.sqlite3_free(msg);
+            }
         }
     }
 
@@ -527,6 +559,52 @@ pub const SqliteMemory = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
     }
 
+    /// P1-5 transcript fidelity — persist role + content PLUS an assistant
+    /// turn's tool_calls (JSON) + reasoning into the nullable columns. NULL
+    /// args bind SQL NULL, so a row with no extras is identical to one written
+    /// by plain `saveMessage` (loads as flat text). Strictly additive.
+    pub fn saveMessageRich(
+        self: *Self,
+        session_id: []const u8,
+        role_str: []const u8,
+        content: []const u8,
+        tool_calls_json: ?[]const u8,
+        reasoning: ?[]const u8,
+    ) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const sql = "INSERT INTO messages (session_id, role, content, tool_calls, reasoning) VALUES (?, ?, ?, ?, ?)";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 2, role_str.ptr, @intCast(role_str.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 3, content.ptr, @intCast(content.len), SQLITE_STATIC);
+        if (tool_calls_json) |tc| {
+            if (tc.len > 0) {
+                _ = c.sqlite3_bind_text(stmt, 4, tc.ptr, @intCast(tc.len), SQLITE_STATIC);
+            } else {
+                _ = c.sqlite3_bind_null(stmt, 4);
+            }
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 4);
+        }
+        if (reasoning) |r| {
+            if (r.len > 0) {
+                _ = c.sqlite3_bind_text(stmt, 5, r.ptr, @intCast(r.len), SQLITE_STATIC);
+            } else {
+                _ = c.sqlite3_bind_null(stmt, 5);
+            }
+        } else {
+            _ = c.sqlite3_bind_null(stmt, 5);
+        }
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
+    }
+
     /// A single persisted message entry (role + content).
     pub const MessageEntry = root.MessageEntry;
 
@@ -536,7 +614,7 @@ pub const SqliteMemory = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const sql = "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id ASC";
+        const sql = "SELECT role, content, tool_calls, reasoning FROM messages WHERE session_id = ? ORDER BY id ASC";
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -549,6 +627,8 @@ pub const SqliteMemory = struct {
             for (list.items) |entry| {
                 allocator.free(entry.role);
                 allocator.free(entry.content);
+                if (entry.tool_calls_json) |tc| allocator.free(tc);
+                if (entry.reasoning) |r| allocator.free(r);
             }
             list.deinit(allocator);
         }
@@ -561,9 +641,35 @@ pub const SqliteMemory = struct {
 
             if (role_ptr == null or content_ptr == null) continue;
 
+            // tool_calls / reasoning are NULL for old rows + non-tool turns —
+            // sqlite3_column_text returns null → we store null and the entry
+            // loads exactly as a flat-text row did before this column existed.
+            const role_dup = try allocator.dupe(u8, role_ptr[0..role_len]);
+            errdefer allocator.free(role_dup);
+            const content_dup = try allocator.dupe(u8, content_ptr[0..content_len]);
+            errdefer allocator.free(content_dup);
+
+            var tool_calls_dup: ?[]u8 = null;
+            errdefer if (tool_calls_dup) |tc| allocator.free(tc);
+            const tc_ptr = c.sqlite3_column_text(stmt, 2);
+            if (tc_ptr != null) {
+                const tc_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 2));
+                if (tc_len > 0) tool_calls_dup = try allocator.dupe(u8, tc_ptr[0..tc_len]);
+            }
+
+            var reasoning_dup: ?[]u8 = null;
+            errdefer if (reasoning_dup) |r| allocator.free(r);
+            const r_ptr = c.sqlite3_column_text(stmt, 3);
+            if (r_ptr != null) {
+                const r_len: usize = @intCast(c.sqlite3_column_bytes(stmt, 3));
+                if (r_len > 0) reasoning_dup = try allocator.dupe(u8, r_ptr[0..r_len]);
+            }
+
             try list.append(allocator, .{
-                .role = try allocator.dupe(u8, role_ptr[0..role_len]),
-                .content = try allocator.dupe(u8, content_ptr[0..content_len]),
+                .role = role_dup,
+                .content = content_dup,
+                .tool_calls_json = tool_calls_dup,
+                .reasoning = reasoning_dup,
             });
         }
 
@@ -712,6 +818,11 @@ pub const SqliteMemory = struct {
         return self_.saveMessage(session_id, role, content);
     }
 
+    fn implSessionSaveMessageRich(ptr: *anyopaque, session_id: []const u8, role: []const u8, content: []const u8, tool_calls_json: ?[]const u8, reasoning: ?[]const u8) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.saveMessageRich(session_id, role, content, tool_calls_json, reasoning);
+    }
+
     fn implSessionLoadMessages(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8) anyerror![]root.MessageEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         return self_.loadMessages(allocator, session_id);
@@ -744,6 +855,7 @@ pub const SqliteMemory = struct {
 
     const session_vtable = root.SessionStore.VTable{
         .saveMessage = &implSessionSaveMessage,
+        .saveMessageRich = &implSessionSaveMessageRich,
         .loadMessages = &implSessionLoadMessages,
         .clearMessages = &implSessionClearMessages,
         .clearAutoSaved = &implSessionClearAutoSaved,

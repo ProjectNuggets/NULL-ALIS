@@ -1660,6 +1660,7 @@ const ManagerImpl = struct {
                 .ptr = self,
                 .vtable = &.{
                     .saveMessage = saveMessage,
+                    .saveMessageRich = saveMessageRich,
                     .loadMessages = loadMessages,
                     .clearMessages = clearMessages,
                     .clearAutoSaved = clearAutoSaved,
@@ -1673,6 +1674,14 @@ const ManagerImpl = struct {
         fn saveMessage(ptr: *anyopaque, session_id: []const u8, role: []const u8, content: []const u8) anyerror!void {
             const self: *UserSessionStore = @ptrCast(@alignCast(ptr));
             try self.manager.saveSessionMessage(self.user_id, session_id, role, content);
+        }
+
+        /// P1-5 — bridge the optional rich save to the Manager's column-aware
+        /// persist path so a reloaded assistant turn carries its tool_calls +
+        /// reasoning.
+        fn saveMessageRich(ptr: *anyopaque, session_id: []const u8, role: []const u8, content: []const u8, tool_calls_json: ?[]const u8, reasoning: ?[]const u8) anyerror!void {
+            const self: *UserSessionStore = @ptrCast(@alignCast(ptr));
+            try self.manager.saveSessionMessageRich(self.user_id, session_id, role, content, tool_calls_json, reasoning);
         }
 
         fn loadMessages(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8) anyerror![]memory_root.MessageEntry {
@@ -4090,9 +4099,29 @@ const ManagerImpl = struct {
     }
 
     pub fn saveSessionMessage(self: *Self, user_id: i64, session_id: []const u8, role: []const u8, content: []const u8) !void {
+        return self.saveSessionMessageRich(user_id, session_id, role, content, null, null);
+    }
+
+    /// P1-5 transcript fidelity — persist an assistant turn's role + content
+    /// PLUS its native tool_calls (JSON array) and reasoning into the
+    /// migration-0006 NULLABLE columns. `tool_calls_json` / `reasoning` are
+    /// null for ordinary user/system rows and for assistant turns with none,
+    /// in which case the columns stay NULL and the row loads exactly as a
+    /// pre-0006 row (flat text). The column list is explicit, so an older pod
+    /// (pre-0006 schema) is unaffected — it simply never calls this path.
+    pub fn saveSessionMessageRich(
+        self: *Self,
+        user_id: i64,
+        session_id: []const u8,
+        role: []const u8,
+        content: []const u8,
+        tool_calls_json: ?[]const u8,
+        reasoning: ?[]const u8,
+    ) !void {
         try self.ensureSession(user_id, session_id);
         const q = try self.buildQuery(
-            "INSERT INTO {schema}.messages (id, session_id, user_id, role, source, content) VALUES ($1, $2, $3, $4, 'app', $5)",
+            "INSERT INTO {schema}.messages (id, session_id, user_id, role, source, content, tool_calls, reasoning) " ++
+                "VALUES ($1, $2, $3, $4, 'app', $5, $6, $7)",
         );
         defer self.allocator.free(q);
         const message_id = try self.randomHexId(self.allocator, 16);
@@ -4107,15 +4136,42 @@ const ManagerImpl = struct {
         defer self.allocator.free(role_z);
         const content_z = try self.allocator.dupeZ(u8, content);
         defer self.allocator.free(content_z);
-        const params = [_]?[*:0]const u8{ message_id_z, session_z, user_s.ptr, role_z, content_z };
-        const lengths = [_]c_int{ @intCast(message_id.len), @intCast(session_id.len), @intCast(user_s.len), @intCast(role.len), @intCast(content.len) };
+        const tool_calls_z: ?[:0]u8 = if (tool_calls_json) |tc|
+            (if (tc.len > 0) try self.allocator.dupeZ(u8, tc) else null)
+        else
+            null;
+        defer if (tool_calls_z) |tc| self.allocator.free(tc);
+        const reasoning_z: ?[:0]u8 = if (reasoning) |r|
+            (if (r.len > 0) try self.allocator.dupeZ(u8, r) else null)
+        else
+            null;
+        defer if (reasoning_z) |r| self.allocator.free(r);
+        const params = [_]?[*:0]const u8{
+            message_id_z,
+            session_z,
+            user_s.ptr,
+            role_z,
+            content_z,
+            if (tool_calls_z) |tc| tc.ptr else null,
+            if (reasoning_z) |r| r.ptr else null,
+        };
+        const lengths = [_]c_int{
+            @intCast(message_id.len),
+            @intCast(session_id.len),
+            @intCast(user_s.len),
+            @intCast(role.len),
+            @intCast(content.len),
+            @intCast(if (tool_calls_z) |tc| tc.len else 0),
+            @intCast(if (reasoning_z) |r| r.len else 0),
+        };
         const result = try self.execParams(q, &params, &lengths);
         c.PQclear(result);
     }
 
     pub fn loadSessionMessages(self: *Self, allocator: std.mem.Allocator, user_id: i64, session_id: []const u8) ![]memory_root.MessageEntry {
         const q = try self.buildQuery(
-            "SELECT role, content FROM {schema}.messages WHERE user_id = $1 AND session_id = $2 ORDER BY created_at ASC, id ASC",
+            "SELECT role, content, tool_calls, reasoning FROM {schema}.messages " ++
+                "WHERE user_id = $1 AND session_id = $2 ORDER BY created_at ASC, id ASC",
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
@@ -4134,6 +4190,8 @@ const ManagerImpl = struct {
             for (out[0..initialized]) |entry| {
                 allocator.free(entry.role);
                 allocator.free(entry.content);
+                if (entry.tool_calls_json) |tc| allocator.free(tc);
+                if (entry.reasoning) |r| allocator.free(r);
             }
             allocator.free(out);
         }
@@ -4143,9 +4201,18 @@ const ManagerImpl = struct {
             const role = try dupeResultValue(allocator, result, row, 0);
             errdefer allocator.free(role);
             const content = try dupeResultValue(allocator, result, row, 1);
+            errdefer allocator.free(content);
+            // tool_calls / reasoning are NULL for old rows + non-tool turns —
+            // dupeNullableResultValue returns null, so the entry loads exactly
+            // as a flat-text row would have before migration 0006.
+            const tool_calls_json = try dupeNullableResultValue(allocator, result, row, 2);
+            errdefer if (tool_calls_json) |tc| allocator.free(tc);
+            const reasoning = try dupeNullableResultValue(allocator, result, row, 3);
             out[i] = .{
                 .role = role,
                 .content = content,
+                .tool_calls_json = tool_calls_json,
+                .reasoning = reasoning,
             };
             initialized += 1;
         }

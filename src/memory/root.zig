@@ -163,6 +163,17 @@ pub const SemanticCache = semantic_cache.SemanticCache;
 pub const MessageEntry = struct {
     role: []const u8,
     content: []const u8,
+    /// P1-5 transcript fidelity — the assistant turn's native tool calls,
+    /// serialized as a JSON array of {"id","name","arguments"} objects
+    /// (matches the `{schema}.messages.tool_calls` JSONB column). Null for
+    /// user/system/tool rows, for assistant turns with no tool calls, and
+    /// for rows written before migration 0006 (old rows load exactly as
+    /// before — flat text). When set, the load path is allocator-owned.
+    tool_calls_json: ?[]const u8 = null,
+    /// P1-5 — the model's reasoning/CoT trace for an assistant turn
+    /// (`{schema}.messages.reasoning` TEXT). Null when none / pre-0006.
+    /// Allocator-owned when set.
+    reasoning: ?[]const u8 = null,
 };
 
 pub const CompletionEvent = struct {
@@ -183,10 +194,12 @@ pub const CompletionEvent = struct {
     }
 };
 
-pub fn freeMessages(allocator: std.mem.Allocator, messages: []MessageEntry) void {
+pub fn freeMessages(allocator: std.mem.Allocator, messages: []const MessageEntry) void {
     for (messages) |entry| {
         allocator.free(entry.role);
         allocator.free(entry.content);
+        if (entry.tool_calls_json) |tc| allocator.free(tc);
+        if (entry.reasoning) |r| allocator.free(r);
     }
     allocator.free(messages);
 }
@@ -212,9 +225,39 @@ pub const SessionStore = struct {
         saveCompletionEvent: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, channel: ?[]const u8, account_id: ?[]const u8, chat_id: ?[]const u8, content: []const u8) anyerror![]u8,
         loadCompletionEvents: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8) anyerror![]CompletionEvent,
         deleteCompletionEvent: *const fn (ptr: *anyopaque, event_id: []const u8) anyerror!void,
+        /// P1-5 transcript fidelity — OPTIONAL rich save that also persists an
+        /// assistant turn's `tool_calls` (JSON array) + `reasoning`. Nullable
+        /// + defaulted so every existing vtable construction site is unchanged
+        /// (additive). When a backend leaves this null, `SessionStore.
+        /// saveMessageRich` transparently falls back to `saveMessage` (the
+        /// extras are simply not persisted — strictly backward-compatible).
+        saveMessageRich: ?*const fn (ptr: *anyopaque, session_id: []const u8, role: []const u8, content: []const u8, tool_calls_json: ?[]const u8, reasoning: ?[]const u8) anyerror!void = null,
     };
 
     pub fn saveMessage(self: SessionStore, session_id: []const u8, role: []const u8, content: []const u8) !void {
+        return self.vtable.saveMessage(self.ptr, session_id, role, content);
+    }
+
+    /// Persist a message with optional transcript-fidelity extras. Routes to
+    /// the backend's `saveMessageRich` when available AND when there is
+    /// actually something extra to store; otherwise falls back to the plain
+    /// `saveMessage` (so backends without the rich slot, and rows with no
+    /// extras, behave exactly as before).
+    pub fn saveMessageRich(
+        self: SessionStore,
+        session_id: []const u8,
+        role: []const u8,
+        content: []const u8,
+        tool_calls_json: ?[]const u8,
+        reasoning: ?[]const u8,
+    ) !void {
+        const has_extras = (tool_calls_json != null and tool_calls_json.?.len > 0) or
+            (reasoning != null and reasoning.?.len > 0);
+        if (has_extras) {
+            if (self.vtable.saveMessageRich) |rich| {
+                return rich(self.ptr, session_id, role, content, tool_calls_json, reasoning);
+            }
+        }
         return self.vtable.saveMessage(self.ptr, session_id, role, content);
     }
 

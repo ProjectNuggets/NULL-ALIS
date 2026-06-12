@@ -545,11 +545,10 @@ pub const SessionManager = struct {
             if (entries.len > 0) {
                 session.agent.loadHistory(entries) catch {};
                 session.agent.enforceHistoryBounds();
-                for (entries) |entry| {
-                    self.allocator.free(entry.role);
-                    self.allocator.free(entry.content);
-                }
-                self.allocator.free(entries);
+                // loadHistory copies what it needs into the OwnedMessage; free
+                // every field of the loaded entries (incl. P1-5
+                // tool_calls_json / reasoning) via the canonical helper.
+                memory_mod.freeMessages(self.allocator, entries);
             }
         }
 
@@ -1197,8 +1196,24 @@ pub const SessionManager = struct {
                 // incomplete; /history export would under-report.
                 store.saveMessage(session_key, "user", content) catch |err|
                     log.warn("session.saveMessage_user_failed session={s} err={s}", .{ session_key, @errorName(err) });
-                store.saveMessage(session_key, "assistant", response) catch |err|
-                    log.warn("session.saveMessage_assistant_failed session={s} err={s}", .{ session_key, @errorName(err) });
+                // P1-5 transcript fidelity — persist the assistant turn WITH
+                // its native tool_calls + reasoning (from history) so a
+                // reloaded transcript carries the structure instead of
+                // degrading to flat text. saveMessageRich falls back to plain
+                // saveMessage when the turn had neither (→ NULL columns, loads
+                // as before) or the backend has no rich slot. We hold
+                // session.mutex here, so the history pointers the extras borrow
+                // are valid; the serialized tool_calls_json is owned and freed
+                // right after the write. A serialization OOM degrades to a flat
+                // assistant save rather than dropping the turn entirely.
+                if ((&session.agent).lastAssistantTranscriptExtras(self.allocator)) |extras| {
+                    defer if (extras.tool_calls_json) |tcj| self.allocator.free(tcj);
+                    store.saveMessageRich(session_key, "assistant", response, extras.tool_calls_json, extras.reasoning) catch |err|
+                        log.warn("session.saveMessage_assistant_failed session={s} err={s}", .{ session_key, @errorName(err) });
+                } else |_| {
+                    store.saveMessage(session_key, "assistant", response) catch |err|
+                        log.warn("session.saveMessage_assistant_failed session={s} err={s}", .{ session_key, @errorName(err) });
+                }
             }
         }
         const persist_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - persist_start_ms));

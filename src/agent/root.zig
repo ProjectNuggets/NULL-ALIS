@@ -6784,9 +6784,40 @@ pub const Agent = struct {
                 .user;
             const content_copy = try dupeHistoryBytes(self.allocator, entry.content);
             errdefer self.allocator.free(content_copy);
+
+            // P1-5 transcript fidelity — replay a persisted assistant turn's
+            // tool_calls + reasoning back into the OwnedMessage so a reloaded
+            // (post-restart / post-eviction) turn carries its native
+            // transcript structure instead of degrading to flat text. The
+            // fields are read via @hasField so loadHistory keeps working for
+            // callers passing a plain {role, content} struct (e.g. tests) and
+            // for old rows where they are null. Only assistant turns carry
+            // them; user/system rows ignore any stray values.
+            var reasoning_copy: ?[]const u8 = null;
+            errdefer if (reasoning_copy) |r| self.allocator.free(r);
+            var tool_calls_copy: []providers.ToolCall = &.{};
+            errdefer freeOwnedToolCalls(self.allocator, tool_calls_copy);
+
+            if (role == .assistant) {
+                if (@hasField(@TypeOf(entry), "reasoning")) {
+                    if (entry.reasoning) |r| {
+                        if (r.len > 0) reasoning_copy = try dupeHistoryBytes(self.allocator, r);
+                    }
+                }
+                if (@hasField(@TypeOf(entry), "tool_calls_json")) {
+                    if (entry.tool_calls_json) |tcj| {
+                        if (tcj.len > 0) {
+                            tool_calls_copy = try parsePersistedToolCalls(self.allocator, tcj);
+                        }
+                    }
+                }
+            }
+
             try self.history.append(self.allocator, .{
                 .role = role,
                 .content = content_copy,
+                .reasoning = reasoning_copy,
+                .tool_calls = tool_calls_copy,
             });
         }
     }
@@ -6813,6 +6844,47 @@ pub const Agent = struct {
         }
         return result;
     }
+
+    /// P1-5 transcript fidelity — the most recent assistant turn's serialized
+    /// tool_calls + reasoning, for the session persist path to store alongside
+    /// the assistant `messages` row.
+    ///
+    /// `tool_calls_json` is allocator-OWNED (caller frees) and is the JSON
+    /// array shape persisted in `{schema}.messages.tool_calls`; null when the
+    /// turn emitted no native tool calls. `reasoning` BORROWS from history (do
+    /// NOT free — valid only while the session lock is held), or null.
+    ///
+    /// "The turn" = the trailing run of assistant messages at the end of
+    /// history (everything after the last non-assistant message). The agent
+    /// appends one assistant message per tool-loop iteration; the iteration
+    /// that emitted native tool_calls carries them, while the final text reply
+    /// may be a separate text-only assistant message. We therefore aggregate
+    /// across the trailing assistant run: take the tool_calls from the most
+    /// recent assistant message that HAS any (the executed calls), and the
+    /// reasoning from the most recent assistant message that has reasoning.
+    /// Returns nulls for a plain text-only turn (→ columns stay NULL, row
+    /// loads exactly as before).
+    pub fn lastAssistantTranscriptExtras(
+        self: *const Agent,
+        allocator: std.mem.Allocator,
+    ) !struct { tool_calls_json: ?[]u8, reasoning: ?[]const u8 } {
+        var tool_calls: []const providers.ToolCall = &.{};
+        var reasoning: ?[]const u8 = null;
+        var i: usize = self.history.items.len;
+        while (i > 0) {
+            i -= 1;
+            const msg = &self.history.items[i];
+            if (msg.role != .assistant) break; // walked past the current turn
+            if (tool_calls.len == 0 and msg.tool_calls.len > 0) tool_calls = msg.tool_calls;
+            if (reasoning == null) {
+                if (msg.reasoning) |r| {
+                    if (r.len > 0) reasoning = r;
+                }
+            }
+        }
+        const tcj = try serializeToolCallsAlloc(allocator, tool_calls);
+        return .{ .tool_calls_json = tcj, .reasoning = reasoning };
+    }
 };
 
 fn dupeHistoryBytes(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
@@ -6820,6 +6892,112 @@ fn dupeHistoryBytes(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, source.len);
     const src: [*]align(1) const u8 = @ptrCast(source.ptr);
     std.mem.copyForwards(u8, out, src[0..source.len]);
+    return out;
+}
+
+/// Free an owned `[]providers.ToolCall` slice using the same per-field
+/// contract as `OwnedMessage.deinit` (free each non-empty id/name/arguments,
+/// then the slice). Used by `loadHistory`'s errdefer and is symmetric with
+/// `parsePersistedToolCalls`.
+fn freeOwnedToolCalls(allocator: std.mem.Allocator, tool_calls: []providers.ToolCall) void {
+    for (tool_calls) |tc| {
+        if (tc.id.len > 0) allocator.free(tc.id);
+        if (tc.name.len > 0) allocator.free(tc.name);
+        if (tc.arguments.len > 0) allocator.free(tc.arguments);
+    }
+    if (tool_calls.len > 0) allocator.free(tool_calls);
+}
+
+/// P1-5 — serialize an assistant turn's native tool_calls to the JSON array
+/// shape persisted in `{schema}.messages.tool_calls`:
+///   [{"id":"…","name":"…","arguments":"…"}, …]
+/// `arguments` is the raw provider arguments string, stored as a JSON STRING
+/// (not re-parsed) so the bytes the model emitted round-trip verbatim.
+/// Returns null for an empty slice (nothing to persist → column stays NULL).
+/// Caller owns the returned slice.
+pub fn serializeToolCallsAlloc(
+    allocator: std.mem.Allocator,
+    tool_calls: []const providers.ToolCall,
+) !?[]u8 {
+    if (tool_calls.len == 0) return null;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '[');
+    for (tool_calls, 0..) |tc, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"id\":");
+        try providers.appendJsonString(&buf, allocator, tc.id);
+        try buf.appendSlice(allocator, ",\"name\":");
+        try providers.appendJsonString(&buf, allocator, tc.name);
+        try buf.appendSlice(allocator, ",\"arguments\":");
+        try providers.appendJsonString(&buf, allocator, tc.arguments);
+        try buf.append(allocator, '}');
+    }
+    try buf.append(allocator, ']');
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// P1-5 — parse the persisted `tool_calls` JSON array back into an owned
+/// `[]providers.ToolCall`. Symmetric with `serializeToolCallsAlloc`. Each
+/// id/name/arguments is individually allocator-owned (matching the
+/// `OwnedMessage.deinit` / `freeOwnedToolCalls` free contract). A malformed
+/// or non-array payload yields an empty slice rather than an error — a
+/// reloaded transcript degrades to flat text rather than failing the whole
+/// session rehydrate (defensive: the column is operator/data-controlled-ish
+/// and a corrupt row must not brick the session).
+fn parsePersistedToolCalls(allocator: std.mem.Allocator, json: []const u8) ![]providers.ToolCall {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return &.{};
+    defer parsed.deinit();
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return &.{},
+    };
+    if (arr.items.len == 0) return &.{};
+
+    const out = try allocator.alloc(providers.ToolCall, arr.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        // Free the per-field allocations of the elements built so far, then
+        // the full backing slice exactly once (out.len, not the sub-slice —
+        // freeing a wrong-length slice is UB).
+        for (out[0..initialized]) |tc| {
+            if (tc.id.len > 0) allocator.free(tc.id);
+            if (tc.name.len > 0) allocator.free(tc.name);
+            if (tc.arguments.len > 0) allocator.free(tc.arguments);
+        }
+        allocator.free(out);
+    }
+
+    for (arr.items, 0..) |item, i| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => {
+                // Skip a non-object element by emitting an empty call; keeps
+                // indices aligned and the free contract simple.
+                out[i] = .{ .id = "", .name = "", .arguments = "" };
+                initialized += 1;
+                continue;
+            },
+        };
+        const id_s = if (obj.get("id")) |v| (switch (v) {
+            .string => |s| s,
+            else => "",
+        }) else "";
+        const name_s = if (obj.get("name")) |v| (switch (v) {
+            .string => |s| s,
+            else => "",
+        }) else "";
+        const args_s = if (obj.get("arguments")) |v| (switch (v) {
+            .string => |s| s,
+            else => "",
+        }) else "";
+        out[i] = .{
+            .id = if (id_s.len > 0) try allocator.dupe(u8, id_s) else "",
+            .name = if (name_s.len > 0) try allocator.dupe(u8, name_s) else "",
+            .arguments = if (args_s.len > 0) try allocator.dupe(u8, args_s) else "",
+        };
+        initialized += 1;
+    }
     return out;
 }
 

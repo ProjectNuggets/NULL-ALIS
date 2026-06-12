@@ -14826,13 +14826,10 @@ fn handleSessionHistory(
         const entries = store.loadMessages(allocator, session_key) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"history_load_failed\"}" };
         };
-        defer {
-            for (entries) |entry| {
-                allocator.free(entry.role);
-                allocator.free(entry.content);
-            }
-            allocator.free(entries);
-        }
+        // Free every field of the loaded entries (incl. P1-5 tool_calls_json /
+        // reasoning) via the canonical helper so the new nullable columns
+        // don't leak on this read path.
+        defer memory_mod.freeMessages(allocator, entries);
 
         var out: std.ArrayListUnmanaged(u8) = .empty;
         defer out.deinit(allocator);
