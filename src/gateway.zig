@@ -23879,6 +23879,18 @@ const RequestQueue = struct {
     cond: std.Thread.Condition = .{},
     closed: bool = false,
     items: std.ArrayListUnmanaged(std.net.Server.Connection) = .empty,
+    // C3 — the shadow depth counter the cheap /health watchdog reads
+    // (GatewayState.queued_requests). The increment is performed HERE, inside
+    // push() under the queue mutex (add-before-enqueue), so it is always
+    // published before the connection becomes poppable. This pairs with the
+    // worker's pop-then-`fetchSub` in gatewayWorkerMain: a worker can only pop
+    // an item that was already counted, so the matching increment is always
+    // observed before its decrement and the unsigned counter can never wrap
+    // (Finding C3-1 — the old acceptor-side fetchAdd ran AFTER push released
+    // the mutex, letting a worker decrement first and transiently underflow to
+    // ~1.8e19, false-positiving the deadlock watchdog). Optional so the queue
+    // can be used without a wired counter (e.g. unit tests).
+    depth_counter: ?*std.atomic.Value(usize) = null,
 
     fn init(allocator: std.mem.Allocator, max_queued: usize) RequestQueue {
         return .{
@@ -23900,6 +23912,12 @@ const RequestQueue = struct {
         if (self.closed) return false;
         if (self.items.items.len >= self.max_queued) return false;
         self.items.append(self.allocator, conn) catch return false;
+        // C3 — bump the watchdog depth counter while still holding the queue
+        // mutex, BEFORE signalling a waiter. The matching decrement happens in
+        // the worker only after popWait() re-acquires this same mutex and pops
+        // the item, so the increment strictly happens-before any decrement of
+        // it; the counter can never be decremented below its enqueued value.
+        if (self.depth_counter) |counter| _ = counter.fetchAdd(1, .acq_rel);
         self.cond.signal();
         return true;
     }
@@ -23942,7 +23960,11 @@ fn gatewayWorkerMain(ctx: *GatewayWorkerContext) void {
         // C3 — this request left the queue (no longer pending/unstarted).
         // Decrement BEFORE handling so the watchdog's "pending work" gate
         // reflects only requests that have not yet been picked up by a worker.
-        // saturating subtract guards against any miscount underflow.
+        // This pop happened-after the matching increment in RequestQueue.push
+        // (both serialized on the queue mutex: push increments under the lock
+        // before signalling, popWait re-acquires the lock to remove the item),
+        // so this fetchSub can never run before its paired fetchAdd and the
+        // unsigned counter can never wrap below zero.
         _ = ctx.state.queued_requests.fetchSub(1, .acq_rel);
         handleAcceptedConnection(ctx.allocator, ctx.config_opt, ctx.state, ctx.session_mgr_opt, conn);
         // C3 — a worker just COMPLETED a request: advance the liveness
@@ -24567,6 +24589,12 @@ pub fn runWithRole(
         2;
 
     var request_queue = RequestQueue.init(allocator, max_queued_requests);
+    // C3 — wire the watchdog depth counter so push() increments it under the
+    // queue mutex (add-before-enqueue). This must pair with the worker's
+    // pop-then-fetchSub; doing the add here (not in the acceptor after push
+    // returns) prevents the add/sub ordering race that could underflow the
+    // unsigned counter and false-positive the deadlock watchdog.
+    request_queue.depth_counter = &state.queued_requests;
     defer request_queue.deinit();
 
     var worker_contexts = try allocator.alloc(GatewayWorkerContext, max_workers);
@@ -24643,9 +24671,12 @@ pub fn runWithRole(
         }
         if (request_queue.push(conn)) {
             // C3 — request is now queued-but-unstarted (pending work). The
-            // worker that pops it decrements this in gatewayWorkerMain. The
-            // watchdog reads this depth without taking the queue mutex.
-            _ = state.queued_requests.fetchAdd(1, .acq_rel);
+            // increment of state.queued_requests happens INSIDE push() under
+            // the queue mutex (add-before-enqueue), not here: doing it here
+            // (after push released the mutex) raced the worker's pop-then-sub
+            // and could underflow the unsigned counter, false-positiving the
+            // deadlock watchdog. The worker that pops it decrements in
+            // gatewayWorkerMain; the watchdog reads the depth lock-free.
         } else {
             _ = state.overload_rejected_total.fetchAdd(1, .monotonic);
             sendHttpResponseRetryAfter(
@@ -29762,6 +29793,124 @@ test "C3 livenessDeadlockDetected: wedged state via injected timestamps" {
     state.queued_requests.store(4, .release);
     state.last_worker_progress_ms.store(1_000, .release);
     try std.testing.expect(!livenessDeadlockDetected(&state, 300_000));
+}
+
+// A connection with an invalid handle for queue-mechanics tests. NEVER do I/O
+// on it and NEVER let RequestQueue.deinit() run with items still queued (deinit
+// closes streams) — drain via popWait() so close() is never reached.
+fn fakeConnForTest() std.net.Server.Connection {
+    return .{
+        .stream = .{ .handle = -1 },
+        .address = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
+    };
+}
+
+test "C3 RequestQueue.push increments the watchdog depth counter under the queue mutex" {
+    // The Finding-C3-1 fix moves the queued_requests increment from the
+    // acceptor (after push() returned, racing the worker's pop-then-sub) into
+    // push() itself, under the queue mutex. Pin the new contract: push bumps
+    // the wired counter, and a paired popWait()+fetchSub returns it to zero
+    // with no underflow.
+    var counter = std.atomic.Value(usize).init(0);
+    var q = RequestQueue.init(std.testing.allocator, 8);
+    q.depth_counter = &counter;
+    defer q.deinit();
+
+    try std.testing.expect(q.push(fakeConnForTest()));
+    try std.testing.expectEqual(@as(usize, 1), counter.load(.acquire));
+    try std.testing.expect(q.push(fakeConnForTest()));
+    try std.testing.expectEqual(@as(usize, 2), counter.load(.acquire));
+
+    // Drain exactly as a worker would: pop, then fetchSub (mirrors
+    // gatewayWorkerMain). Counter returns to zero; no wrap.
+    _ = q.popWait().?;
+    _ = counter.fetchSub(1, .acq_rel);
+    try std.testing.expectEqual(@as(usize, 1), counter.load(.acquire));
+    _ = q.popWait().?;
+    _ = counter.fetchSub(1, .acq_rel);
+    try std.testing.expectEqual(@as(usize, 0), counter.load(.acquire));
+
+    // An overflow-rejected push (queue full) must NOT bump the counter — the
+    // add is coupled to a successful enqueue.
+    var full = RequestQueue.init(std.testing.allocator, 1);
+    full.depth_counter = &counter;
+    defer full.deinit();
+    try std.testing.expect(full.push(fakeConnForTest())); // fills capacity
+    try std.testing.expectEqual(@as(usize, 1), counter.load(.acquire));
+    try std.testing.expect(!full.push(fakeConnForTest())); // rejected, no bump
+    try std.testing.expectEqual(@as(usize, 1), counter.load(.acquire));
+    _ = full.popWait().?; // drain so deinit() closes nothing
+    _ = counter.fetchSub(1, .acq_rel);
+}
+
+test "C3 RequestQueue add/sub ordering: concurrent push+pop never underflows the counter" {
+    // Regression for Finding-C3-1: with the increment done in the acceptor
+    // AFTER push() released the queue mutex, a worker could pop the connection
+    // and fetchSub BEFORE the matching fetchAdd, transiently wrapping the
+    // unsigned counter to ~1.8e19 and false-positiving the deadlock watchdog.
+    // Now push() increments under the queue mutex (happens-before the pop), so
+    // the decrement can never precede its increment. Stress it: a producer
+    // pushes N items while a consumer pops+subs them concurrently; the counter
+    // must always stay within [0, N] (never a huge wrapped value) and settle
+    // back to the exact residual depth.
+    var counter = std.atomic.Value(usize).init(0);
+    var q = RequestQueue.init(std.testing.allocator, 4096);
+    q.depth_counter = &counter;
+    defer q.deinit();
+
+    const N: usize = 2000;
+    const Ctx = struct {
+        q: *RequestQueue,
+        counter: *std.atomic.Value(usize),
+        n: usize,
+        max_seen: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        underflowed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        popped: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    };
+    var ctx = Ctx{ .q = &q, .counter = &counter, .n = N };
+
+    const producer = struct {
+        fn run(c: *Ctx) void {
+            var i: usize = 0;
+            while (i < c.n) : (i += 1) {
+                while (!c.q.push(fakeConnForTest())) {
+                    std.Thread.yield() catch {};
+                }
+                // Sample the counter from the producer side too; it must never
+                // exceed N (a wrap would read as a near-usize-max value).
+                const v = c.counter.load(.acquire);
+                if (v > c.max_seen.load(.acquire)) c.max_seen.store(v, .release);
+                if (v > c.n) c.underflowed.store(true, .release);
+            }
+        }
+    };
+    const consumer = struct {
+        fn run(c: *Ctx) void {
+            var got: usize = 0;
+            while (got < c.n) {
+                const conn = c.q.popWait() orelse break;
+                _ = conn;
+                // Mirror gatewayWorkerMain: decrement on pop. If a wrap ever
+                // happened this would read as a huge value before sub.
+                const before = c.counter.load(.acquire);
+                if (before == 0 or before > c.n) c.underflowed.store(true, .release);
+                _ = c.counter.fetchSub(1, .acq_rel);
+                got += 1;
+            }
+            c.popped.store(got, .release);
+        }
+    };
+
+    var t_prod = try std.Thread.spawn(.{}, producer.run, .{&ctx});
+    var t_cons = try std.Thread.spawn(.{}, consumer.run, .{&ctx});
+    t_prod.join();
+    t_cons.join();
+
+    try std.testing.expect(!ctx.underflowed.load(.acquire));
+    try std.testing.expect(ctx.max_seen.load(.acquire) <= N);
+    try std.testing.expectEqual(N, ctx.popped.load(.acquire));
+    // All produced items consumed → counter settles back to zero, no wrap.
+    try std.testing.expectEqual(@as(usize, 0), counter.load(.acquire));
 }
 
 test "C3 healthFastPathResponse: wedged pool fails liveness with 503 deadlocked" {
