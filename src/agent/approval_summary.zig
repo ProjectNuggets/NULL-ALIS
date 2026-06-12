@@ -124,7 +124,7 @@ fn appendSummary(
         if (args) |a| {
             if (safeStr(a, "url")) |url| {
                 try buf.appendSlice(gpa, ": ");
-                try appendSanitized(buf, gpa, url);
+                try appendUrl(buf, gpa, url, max_reason_len);
             }
         }
         return;
@@ -238,7 +238,7 @@ fn appendSummary(
             }
             if (safeStr(a, "url")) |url| {
                 try buf.appendSlice(gpa, " ");
-                try appendSanitized(buf, gpa, url);
+                try appendUrl(buf, gpa, url, max_reason_len);
             }
         }
         return;
@@ -336,6 +336,35 @@ fn appendSanitized(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u
     try appendSanitizedTrunc(buf, gpa, s, max_reason_len);
 }
 
+/// Append a URL with its **query string and fragment stripped** before
+/// sanitizing/truncating. A URL field name is never "sensitive" (redaction
+/// keys on the field name, not the value), so a raw URL like
+/// `https://api.example.com/x?access_token=SECRET` would otherwise flow
+/// verbatim into the reason → the approval event → the run trace → the app
+/// log. The approver needs the destination host+path, NOT the secret-bearing
+/// query, so we drop everything from the first `?` or `#` (whichever comes
+/// first). Fail-soft: input with no `?`/`#` is rendered as-is; non-URL input
+/// (no `//`) is still cut at the first `?`/`#` if present, then shown
+/// sanitized+truncated — never worse than before, never crashes.
+fn appendUrl(
+    buf: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    raw_url: []const u8,
+    max_len: usize,
+) !void {
+    // Cut at the earliest query (`?`) or fragment (`#`) delimiter. This keeps
+    // `scheme://host[:port]/path` and discards `?query` / `#fragment` wholesale
+    // — the safe, simple choice (vs. per-param redaction). Applies to non-URL
+    // input too: still strictly removes any trailing secret-bearing query.
+    const q = std.mem.indexOfScalar(u8, raw_url, '?');
+    const h = std.mem.indexOfScalar(u8, raw_url, '#');
+    const cut: usize = if (q != null and h != null)
+        @min(q.?, h.?)
+    else
+        q orelse h orelse raw_url.len;
+    try appendSanitizedTrunc(buf, gpa, raw_url[0..cut], max_len);
+}
+
 /// Append `s` sanitized, truncated to at most `limit` source bytes AND never
 /// exceeding the global `max_reason_len` total. Control chars (`< 0x20`) and
 /// DEL (`0x7f`) become a single space; runs of whitespace are collapsed so the
@@ -350,6 +379,9 @@ fn appendSanitizedTrunc(
     var consumed: usize = 0;
     var last_was_space = endsWithSpace(buf.items);
     var truncated = false;
+    // Length of `buf` at the start of the most recently appended codepoint, so
+    // we can back the cut off to a UTF-8 boundary if we truncate mid-sequence.
+    var last_cp_start: usize = buf.items.len;
     for (s, 0..) |c, idx| {
         if (consumed >= limit) {
             truncated = idx < s.len;
@@ -369,10 +401,25 @@ fn appendSanitizedTrunc(
         } else {
             last_was_space = false;
         }
+        // Remember where this codepoint begins (ASCII and UTF-8 lead bytes are
+        // < 0x80 or >= 0xC0; continuation bytes are 0x80..0xBF). `ch` is the
+        // sanitized byte, but multi-byte sequences are passed through verbatim
+        // (every byte >= 0x80, so never rewritten to space), so the source
+        // boundary structure is preserved in the output.
+        if (ch < 0x80 or ch >= 0xC0) last_cp_start = buf.items.len;
         try buf.append(gpa, ch);
         consumed += 1;
     }
     if (truncated) {
+        // If we stopped partway through a multi-byte UTF-8 sequence, back the
+        // cut off to the start of that codepoint so we never leave a lone
+        // continuation byte (or partial sequence) before the ellipsis. We only
+        // wrote whole bytes, so if the tail isn't a complete, valid sequence,
+        // drop back to `last_cp_start`.
+        const tail = buf.items[last_cp_start..];
+        if (tail.len > 0 and !std.unicode.utf8ValidateSlice(tail)) {
+            buf.shrinkRetainingCapacity(last_cp_start);
+        }
         // "…" is 3 UTF-8 bytes; only add it if there's room.
         if (buf.items.len + 3 <= max_reason_len + 3) {
             try buf.appendSlice(gpa, "…");
@@ -425,6 +472,110 @@ test "browser_navigate renders Open web page: <url>" {
     );
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("Open web page: https://example.com/path", r);
+}
+
+test "browser_navigate strips URL query/fragment (no secret leak)" {
+    const r = try buildApprovalReason(
+        testing.allocator,
+        callOf("browser_navigate", "{\"url\":\"https://api.example.com/x?access_token=SECRET&api_key=sk-LEAKME\"}"),
+        test_meta,
+    );
+    defer testing.allocator.free(r);
+    // Host + path survive…
+    try testing.expect(std.mem.indexOf(u8, r, "https://api.example.com/x") != null);
+    // …but the secret-bearing query is gone entirely.
+    try testing.expect(std.mem.indexOf(u8, r, "SECRET") == null);
+    try testing.expect(std.mem.indexOf(u8, r, "access_token") == null);
+    try testing.expect(std.mem.indexOf(u8, r, "sk-LEAKME") == null);
+}
+
+test "http_request strips URL query (no secret leak)" {
+    const r = try buildApprovalReason(
+        testing.allocator,
+        callOf("http_request", "{\"method\":\"POST\",\"url\":\"https://api.example.com/x?token=SECRET\"}"),
+        test_meta,
+    );
+    defer testing.allocator.free(r);
+    try testing.expect(std.mem.indexOf(u8, r, "https://api.example.com/x") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "POST") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "SECRET") == null);
+    try testing.expect(std.mem.indexOf(u8, r, "token=") == null);
+}
+
+test "URL fragment is also stripped" {
+    const r = try buildApprovalReason(
+        testing.allocator,
+        callOf("browser_navigate", "{\"url\":\"https://example.com/page#secret-anchor\"}"),
+        test_meta,
+    );
+    defer testing.allocator.free(r);
+    try testing.expectEqualStrings("Open web page: https://example.com/page", r);
+}
+
+test "URL without query/fragment is rendered as-is" {
+    const r = try buildApprovalReason(
+        testing.allocator,
+        callOf("web_fetch", "{\"url\":\"https://example.com/a/b/c\"}"),
+        test_meta,
+    );
+    defer testing.allocator.free(r);
+    try testing.expectEqualStrings("Fetch web page: https://example.com/a/b/c", r);
+}
+
+test "appendUrl is fail-soft on non-URL input (still strips any query)" {
+    // No "//" scheme separator — fall back to sanitized+truncated, but still
+    // cut at the first '?' so a trailing query can't leak.
+    const r = try buildApprovalReason(
+        testing.allocator,
+        callOf("web_fetch", "{\"url\":\"not-a-url?token=SECRET\"}"),
+        test_meta,
+    );
+    defer testing.allocator.free(r);
+    try testing.expect(std.mem.indexOf(u8, r, "not-a-url") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "SECRET") == null);
+}
+
+test "UTF-8-safe truncation: multi-byte url never leaves a lone continuation byte" {
+    // A long run of 2-byte 'é' (0xC3 0xA9) that overruns the cap — the cut must
+    // land on a codepoint boundary so the result stays valid UTF-8.
+    var url: [4000]u8 = undefined;
+    var i: usize = 0;
+    while (i + 1 < url.len) : (i += 2) {
+        url[i] = 0xC3;
+        url[i + 1] = 0xA9;
+    }
+    const args = try std.fmt.allocPrint(testing.allocator, "{{\"url\":\"https://x/{s}\"}}", .{url[0 .. url.len - (url.len % 2)]});
+    defer testing.allocator.free(args);
+
+    const r = try buildApprovalReason(testing.allocator, callOf("browser_navigate", args), test_meta);
+    defer testing.allocator.free(r);
+    try testing.expect(r.len <= max_reason_len + 3);
+    try testing.expect(std.unicode.utf8ValidateSlice(r));
+}
+
+test "UTF-8-safe truncation: multi-byte 3-byte command stays valid" {
+    // 3-byte CJK '漢' (0xE6 0xBC 0xA2) repeated past the 60-byte command cap.
+    // A single leading ASCII byte shifts the 60-byte cut to byte 59 of the
+    // 漢-run (59 % 3 == 2 → lands MID-sequence), so this genuinely exercises
+    // the codepoint-boundary back-off (without the fix it would leave a lone
+    // continuation byte before the ellipsis → invalid UTF-8).
+    var cmd: [600]u8 = undefined;
+    cmd[0] = 'x';
+    var i: usize = 1;
+    while (i + 2 < cmd.len) : (i += 3) {
+        cmd[i] = 0xE6;
+        cmd[i + 1] = 0xBC;
+        cmd[i + 2] = 0xA2;
+    }
+    const n = i; // whole 漢 codepoints only (plus the leading 'x')
+    const args = try std.fmt.allocPrint(testing.allocator, "{{\"command\":\"{s}\"}}", .{cmd[0..n]});
+    defer testing.allocator.free(args);
+
+    const r = try buildApprovalReason(testing.allocator, callOf("shell", args), test_meta);
+    defer testing.allocator.free(r);
+    try testing.expect(std.unicode.utf8ValidateSlice(r));
+    // The 漢 chars that survived must be intact (no partial trailing sequence).
+    try testing.expect(std.mem.indexOf(u8, r, "漢") != null);
 }
 
 test "sensitive token value is redacted (not present in output)" {
