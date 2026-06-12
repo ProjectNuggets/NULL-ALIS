@@ -2347,6 +2347,18 @@ const TenantRuntime = struct {
 
     fn deinit(self: *TenantRuntime) void {
         self.session_mgr.deinit();
+        // P0-3 review fix — if `session_mgr.deinit()` ABANDONED any live
+        // lifecycle worker (worker still in flight past the shared shutdown
+        // deadline; its Session + embedded Agent were intentionally leaked,
+        // not freed), that worker still dereferences the shared resources it
+        // captured: `persistSessionCheckpointDetailed` calls `mem.store(...)`
+        // and `mem_rt.syncVectorAfterStore(...)` and may write through the
+        // session store. Destroying `mem_rt` / `pg_session_store` here would
+        // free those out from under the running worker — a use-after-free
+        // identical in kind to the embedded-Agent one. Leak them instead;
+        // the process is exiting and the OS reclaims everything. We still
+        // tear down everything the abandoned worker does NOT touch.
+        const abandoned = self.session_mgr.abandoned_live_workers;
         if (self.tools.len > 0) tools_mod.deinitTools(self.allocator, self.tools);
         if (self.subagent_manager) |mgr| {
             mgr.deinit();
@@ -2355,11 +2367,15 @@ const TenantRuntime = struct {
         if (self.completion_router) |router| {
             self.allocator.destroy(router);
         }
-        if (self.pg_session_store) |store| {
-            store.deinit();
-            self.allocator.destroy(store);
+        if (!abandoned) {
+            if (self.pg_session_store) |store| {
+                store.deinit();
+                self.allocator.destroy(store);
+            }
+            if (self.mem_rt) |*rt| rt.deinit();
+        } else {
+            log.warn("tenant.shutdown_abandon — lifecycle worker(s) still in flight; leaking mem_rt + pg_session_store to avoid use-after-free", .{});
         }
-        if (self.mem_rt) |*rt| rt.deinit();
         if (self.sec_tracker) |*tracker| tracker.deinit();
         self.usage_rt.deinit();
         self.allocator.destroy(self.usage_rt);

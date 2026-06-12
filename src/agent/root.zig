@@ -1189,7 +1189,7 @@ pub const Agent = struct {
     /// one-time leak for a bounded shutdown is the correct shutdown-time
     /// choice (same leak contract as `deinitWithTimeout` returning false).
     pub fn deinit(self: *Agent) void {
-        self.deinitByDeadline(std.time.milliTimestamp() + DEINIT_MAX_DRAIN_WAIT_MS);
+        _ = self.deinitByDeadline(std.time.milliTimestamp() + DEINIT_MAX_DRAIN_WAIT_MS);
     }
 
     /// P0-3 follow-up — deinit bounded by an absolute wall-clock
@@ -1202,7 +1202,19 @@ pub const Agent = struct {
     /// a still-running worker is left in place and the Agent is
     /// intentionally leaked (same contract as the fixed-cap path) so
     /// fleet-wide teardown stays well under the 180s k8s grace.
-    pub fn deinitByDeadline(self: *Agent, deadline_ms: i64) void {
+    ///
+    /// P0-3 review fix — returns whether the Agent was actually torn down
+    /// (`true` = worker drained, Agent-owned memory freed, the embedding
+    /// Session and any shared resources the worker referenced are now safe
+    /// to free) or ABANDONED (`false` = a worker is still in flight; the
+    /// Agent is intentionally leaked and STILL holds live pointers into
+    /// `self.history`/`self.mem`/`self.mem_rt`/`self.allocator`, so the
+    /// caller MUST NOT free the embedding Session or those shared
+    /// resources). Previously this returned void, leaving the caller
+    /// (`SessionManager.deinit`) to unconditionally `destroy()` the Session
+    /// — a use-after-free on the still-running worker's `agent` pointer
+    /// (the Agent is embedded by value in Session).
+    pub fn deinitByDeadline(self: *Agent, deadline_ms: i64) bool {
         while (true) {
             const remaining = deadline_ms - std.time.milliTimestamp();
             if (remaining <= 0) {
@@ -1211,12 +1223,13 @@ pub const Agent = struct {
                 // keep shutdown bounded.
                 if (!self.deinitWithTimeout(0)) {
                     log.warn("Agent.deinit: lifecycle worker still active at shutdown deadline; abandoning teardown (intentional leak) to keep shutdown bounded", .{});
+                    return false;
                 }
-                return;
+                return true;
             }
             // Drain in <=30s chunks, never overshooting the shared deadline.
             const chunk: i64 = if (remaining < 30_000) remaining else 30_000;
-            if (self.deinitWithTimeout(chunk)) return;
+            if (self.deinitWithTimeout(chunk)) return true;
             log.warn("Agent.deinit: lifecycle worker still active; waiting before teardown", .{});
         }
     }
@@ -7822,9 +7835,13 @@ test "P0-3 follow-up: deinitByDeadline with an already-passed deadline returns p
     // Deadline already in the past → no per-attempt wait. Must return well
     // under the ~90s fixed cap; assert it returns in a tiny bounded window.
     const before_ms = std.time.milliTimestamp();
-    agent.deinitByDeadline(before_ms - 1);
+    const drained = agent.deinitByDeadline(before_ms - 1);
     const elapsed_ms = std.time.milliTimestamp() - before_ms;
     try std.testing.expect(elapsed_ms < 5_000);
+    // P0-3 review fix — the abandon path MUST signal `false` so the caller
+    // (SessionManager.deinit) knows NOT to free the embedding Session while
+    // the worker still holds a live Agent pointer.
+    try std.testing.expect(!drained);
 
     // The stuck worker still holds a live Agent pointer, so deinitByDeadline
     // intentionally left the Agent intact (leaked, not freed). Release the
@@ -7838,7 +7855,9 @@ test "P0-3 follow-up: deinitByDeadline with an already-passed deadline returns p
 test "P0-3 follow-up: deinitByDeadline tears down cleanly when no worker is in flight" {
     var agent = try makeTestAgent(std.testing.allocator);
     // Generous deadline; no worker → immediate clean teardown (frees memory).
-    agent.deinitByDeadline(std.time.milliTimestamp() + 30_000);
+    // P0-3 review fix — `true` signals the caller it's safe to free the
+    // embedding Session and shared resources.
+    try std.testing.expect(agent.deinitByDeadline(std.time.milliTimestamp() + 30_000));
 }
 
 fn find_tool_by_name(tools: []const Tool, name: []const u8) ?Tool {

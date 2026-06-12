@@ -106,14 +106,27 @@ pub const Session = struct {
     /// every session so the sum of all per-session drains is bounded by a
     /// single global budget. Only `Agent.deinit` can block; the rest of
     /// the teardown is non-blocking, so this only changes the drain bound.
-    pub fn deinitByDeadline(self: *Session, allocator: Allocator, deadline_ms: i64) void {
+    ///
+    /// P0-3 review fix — returns whether the Session was fully torn down.
+    /// `false` means `Agent.deinitByDeadline` ABANDONED a still-running
+    /// lifecycle worker (intentional leak): that worker still dereferences
+    /// the embedded `self.agent` (and the shared mem/mem_rt/session_store
+    /// it points at), so the CALLER MUST NOT `destroy(self)` — the Agent is
+    /// embedded by value, so freeing the Session frees the very memory the
+    /// worker reads/writes. We therefore also skip freeing the outer
+    /// Session-owned allocations (session_key/origin_*) in the abandoned
+    /// case, leaving the leaked Session internally consistent; the process
+    /// is exiting and the OS reclaims everything.
+    pub fn deinitByDeadline(self: *Session, allocator: Allocator, deadline_ms: i64) bool {
         if (self.last_turn_outcome) |*outcome| outcome.deinit(self.agent.allocator);
-        self.agent.deinitByDeadline(deadline_ms);
+        const drained = self.agent.deinitByDeadline(deadline_ms);
+        if (!drained) return false;
         allocator.free(self.session_key);
         if (self.origin_channel) |value| allocator.free(value);
         if (self.origin_lane) |value| allocator.free(value);
         if (self.origin_chat_id) |value| allocator.free(value);
         if (self.origin_account_id) |value| allocator.free(value);
+        return true;
     }
 
     /// D1.3 getter for the most recently completed turn's outcome.
@@ -239,6 +252,18 @@ pub const SessionManager = struct {
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
 
+    /// P0-3 review fix — set true by `deinit` when at least one Session was
+    /// ABANDONED (its lifecycle worker was still in flight past the shared
+    /// shutdown deadline, so the Session + embedded Agent were intentionally
+    /// leaked rather than freed). `TenantRuntime.deinit` reads this AFTER
+    /// `session_mgr.deinit()` returns: when true it must SKIP destroying the
+    /// shared resources those abandoned workers still dereference (mem_rt,
+    /// pg_session_store), since `persistSessionCheckpointDetailed` calls
+    /// `mem.store(...)` / `mem_rt.syncVectorAfterStore(...)` on them. Leaking
+    /// those at process exit is correct; freeing them under a live worker is
+    /// a use-after-free.
+    abandoned_live_workers: bool = false,
+
     pub const ProcessMessageOptions = struct {
         message_turn_context: ?tools_mod.MessageTurnContext = null,
         turn_origin: tools_mod.TurnOrigin = .user,
@@ -337,12 +362,26 @@ pub const SessionManager = struct {
         }
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
-            if (deinit_deadline_ms) |deadline| {
-                entry.value_ptr.*.deinitByDeadline(self.allocator, deadline);
+            const session = entry.value_ptr.*;
+            const drained = if (deinit_deadline_ms) |deadline|
+                session.deinitByDeadline(self.allocator, deadline)
+            else blk: {
+                session.deinit(self.allocator);
+                break :blk true;
+            };
+            // P0-3 review fix — only free the Session when its lifecycle
+            // worker actually drained. If it was abandoned (worker still in
+            // flight past the shared deadline), the worker still holds a live
+            // pointer to the embedded Agent; `destroy` here would free the
+            // very memory the worker reads/writes (use-after-free). Leak the
+            // Session instead — the process is exiting — and record that a
+            // shared-resource teardown downstream must also be skipped.
+            if (drained) {
+                self.allocator.destroy(session);
             } else {
-                entry.value_ptr.*.deinit(self.allocator);
+                self.abandoned_live_workers = true;
+                log.warn("session.shutdown_abandon session={s} — lifecycle worker still in flight; leaking Session to avoid use-after-free", .{session.session_key});
             }
-            self.allocator.destroy(entry.value_ptr.*);
         }
         self.sessions.deinit(self.allocator);
     }
@@ -400,29 +439,53 @@ pub const SessionManager = struct {
         const start_ms = now_fn();
         var heavy_skipped: usize = 0;
         const join_timeout: i64 = @intCast(join_timeout_ms);
+        var race_skipped: usize = 0;
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             const session = entry.value_ptr.*;
             session.mutex.lock();
             syncSessionOriginToAgent(session);
+            // `worker_idle` gates the synchronous checkpoint below. The async
+            // lifecycle worker operates on `session.agent` fields DIRECTLY and
+            // does NOT take `session.mutex`, so holding the mutex here gives no
+            // protection against it. Running `persistSessionCheckpoint` while
+            // that worker is still inside `persistSessionCheckpointDetailed`
+            // would have two threads racing the same agent state (history
+            // iteration, allocator, observer) and writing the same memory keys
+            // (session_checkpoint_*, context_anchor_current) with no sync — a
+            // data race. So we only do the synchronous write when the worker
+            // is confirmed idle.
+            var worker_idle: bool = undefined;
             if (shutdownBudgetExceeded(start_ms, now_fn(), budget_ms)) {
                 // Budget exhausted: skip the (potentially-blocking) lifecycle
-                // join for this and all remaining sessions and persist only
-                // the deterministic checkpoint so shutdown completes promptly.
+                // join for this and all remaining sessions. Probe the in-flight
+                // atomic with a zero-wait so an already-finished worker still
+                // lets us write the deterministic checkpoint; a live one does
+                // not, and we skip the sync write to avoid the race.
                 heavy_skipped += 1;
+                worker_idle = session.agent.waitForLifecycleIdle(0);
             } else {
                 // Join any in-flight async lifecycle worker — bounded so a
                 // stuck worker can't stall teardown — before writing the
                 // authoritative shutdown checkpoint so the final anchor
-                // content reflects the shutdown reason.
-                _ = session.agent.joinLifecycleThreadWithTimeout(join_timeout);
+                // content reflects the shutdown reason. A `false` here means
+                // the worker is STILL running past the join budget, so the
+                // sync write would race it.
+                worker_idle = session.agent.joinLifecycleThreadWithTimeout(join_timeout);
             }
-            session.agent.persistSessionCheckpoint(reason);
+            if (worker_idle) {
+                session.agent.persistSessionCheckpoint(reason);
+            } else {
+                // The async worker is still in flight writing the same
+                // checkpoint/anchor with live data; let it own the write
+                // rather than racing a duplicate synchronous one.
+                race_skipped += 1;
+            }
             session.mutex.unlock();
             flushed += 1;
         }
-        if (heavy_skipped > 0) {
-            log.warn("session.shutdown_flush budget_exceeded budget_ms={d} heavy_skipped={d} flushed={d}", .{ budget_ms, heavy_skipped, flushed });
+        if (heavy_skipped > 0 or race_skipped > 0) {
+            log.warn("session.shutdown_flush budget_exceeded budget_ms={d} heavy_skipped={d} race_skipped={d} flushed={d}", .{ budget_ms, heavy_skipped, race_skipped, flushed });
         }
         return flushed;
     }
@@ -2270,7 +2333,7 @@ fn testFlushClockNow() i64 {
     return test_flush_clock_ms.load(.acquire);
 }
 
-test "P0-3: flushSessionsForShutdownClocked skips heavy join past budget but still writes deterministic checkpoint" {
+test "P0-3: flushSessionsForShutdownClocked skips heavy join past budget and returns promptly without racing the in-flight worker" {
     var mock = MockProvider{ .response = "ok" };
     var cfg = testConfig();
     cfg.memory.auto_save = true;
@@ -2319,12 +2382,21 @@ test "P0-3: flushSessionsForShutdownClocked skips heavy join past budget but sti
     const flushed = sm.flushSessionsForShutdownClocked("shutdown", budget_ms, 5_000, start_then_jump.now);
     try testing.expectEqual(@as(usize, 1), flushed);
 
-    // Deterministic checkpoint/anchor must still be written despite the skip.
-    const anchor = (try mem.get(testing.allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
-    defer anchor.deinit(testing.allocator);
-    try testing.expect(std.mem.indexOf(u8, anchor.content, "last_reason=shutdown") != null);
+    // P0-3 review fix — with the worker still in flight, the flush must NOT
+    // run a synchronous persistSessionCheckpoint: the async worker operates on
+    // the same agent state / memory keys WITHOUT taking session.mutex, so a
+    // concurrent sync write would be a data race. The worker owns the write;
+    // the flush defers to it. Hence no anchor is written by the flush here.
+    const anchor_during = try mem.get(testing.allocator, "context_anchor_current");
+    if (anchor_during) |a| {
+        a.deinit(testing.allocator);
+        return error.TestUnexpectedResult;
+    }
 
     // Release + reap the parked worker so deinit doesn't see it in-flight.
+    // (This fake worker only flips the in-flight atomic; the real worker would
+    // additionally have written the deterministic checkpoint via
+    // persistSessionCheckpointDetailed — the path the flush deferred to.)
     release.store(true, .release);
     _ = session.agent.waitForLifecycleIdle(5_000);
 }
@@ -2351,6 +2423,109 @@ test "P0-3: flushSessionsForShutdownClocked under budget still flushes every ses
     test_flush_clock_ms.store(1000, .release);
     const flushed = sm.flushSessionsForShutdownClocked("shutdown", 25_000, 5_000, testFlushClockNow);
     try testing.expectEqual(@as(usize, 2), flushed);
+}
+
+test "P0-3 review: deinit abandons (does not destroy) a Session whose lifecycle worker is still in flight" {
+    // Lifetime hazard the prior tests sidestepped: the bounded-deinit abandon
+    // path must NOT `destroy()` the Session while a worker still dereferences
+    // the embedded Agent. We park a real in-flight worker, force the deinit
+    // budget to expire immediately, and assert deinit LEAKS the Session
+    // (signalled via abandoned_live_workers) instead of freeing it under the
+    // live worker. Then we drain the worker and free the leaked Session by
+    // hand — proving the freed-only-after-drain contract end to end.
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    // Tiny non-zero deinit budget → the shared deadline is already in the past
+    // by the time the per-session drain runs, so a still-in-flight worker is
+    // abandoned with a zero drain budget (never blocks).
+    cfg.reliability.shutdown_deinit_budget_ms = 1;
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, null, null);
+
+    const session = try sm.getOrCreate("abandon:lifetime");
+
+    // Park a worker registered as the session's in-flight lifecycle thread.
+    // It holds the in_flight flag until released — exactly the abandon case.
+    var release = std.atomic.Value(bool).init(false);
+    const Blocker = struct {
+        fn run(rel: *std.atomic.Value(bool), in_flight: *std.atomic.Value(bool)) void {
+            while (!rel.load(.acquire)) std.Thread.sleep(1 * std.time.ns_per_ms);
+            in_flight.store(false, .release);
+        }
+    };
+    session.agent.lifecycle_in_flight.store(true, .release);
+    const blocker = try std.Thread.spawn(.{}, Blocker.run, .{ &release, &session.agent.lifecycle_in_flight });
+    session.agent.lifecycle_thread_mu.lock();
+    session.agent.lifecycle_thread = blocker;
+    session.agent.lifecycle_thread_mu.unlock();
+
+    // Stash the pointer; deinit must leak (NOT free) this exact Session.
+    const leaked_session = session;
+
+    // deinit drains under the already-expired shared deadline. The worker is
+    // still in flight → the Session is abandoned, not destroyed.
+    sm.deinit();
+    try testing.expect(sm.abandoned_live_workers);
+
+    // Now release + reap the worker. Once it drains, freeing is finally safe —
+    // exactly the ordering the production contract enforces. Doing this by hand
+    // both reaps the thread and frees the intentionally-leaked Session so the
+    // test allocator stays leak-clean.
+    release.store(true, .release);
+    try testing.expect(leaked_session.agent.waitForLifecycleIdle(5_000));
+    leaked_session.deinit(testing.allocator);
+    testing.allocator.destroy(leaked_session);
+}
+
+test "P0-3 review: flushSessionsForShutdownClocked skips the racy sync checkpoint while a worker is in flight" {
+    // Data race the prior flush tests didn't cover: when the bounded join
+    // times out (or the budget skips it) with a worker still running, the
+    // synchronous persistSessionCheckpoint MUST be skipped — otherwise it
+    // races the worker on the same agent state / memory keys. We park a live
+    // worker, drive a tiny join timeout, and assert NO synchronous anchor is
+    // written by the flush (the worker owns that write).
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.memory.auto_save = true;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("abandon:race");
+
+    var release = std.atomic.Value(bool).init(false);
+    const Blocker = struct {
+        fn run(rel: *std.atomic.Value(bool), in_flight: *std.atomic.Value(bool)) void {
+            while (!rel.load(.acquire)) std.Thread.sleep(1 * std.time.ns_per_ms);
+            in_flight.store(false, .release);
+        }
+    };
+    session.agent.lifecycle_in_flight.store(true, .release);
+    const blocker = try std.Thread.spawn(.{}, Blocker.run, .{ &release, &session.agent.lifecycle_in_flight });
+    session.agent.lifecycle_thread_mu.lock();
+    session.agent.lifecycle_thread = blocker;
+    session.agent.lifecycle_thread_mu.unlock();
+
+    // Frozen clock → budget never trips; the bounded join (tiny timeout) is the
+    // gate. The worker is still in flight, so the join returns false and the
+    // sync checkpoint is SKIPPED — no anchor should be written by the flush.
+    test_flush_clock_ms.store(1000, .release);
+    const flushed = sm.flushSessionsForShutdownClocked("shutdown", 25_000, 5, testFlushClockNow);
+    try testing.expectEqual(@as(usize, 1), flushed);
+
+    const anchor_during = try mem.get(testing.allocator, "context_anchor_current");
+    if (anchor_during) |a| {
+        a.deinit(testing.allocator);
+        return error.TestUnexpectedResult; // sync write should have been skipped
+    }
+
+    // Release + reap the worker so deinit doesn't re-enter the abandon path.
+    release.store(true, .release);
+    try testing.expect(session.agent.waitForLifecycleIdle(5_000));
 }
 
 test "evictIdle preserves recent sessions" {
