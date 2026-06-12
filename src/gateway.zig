@@ -1121,6 +1121,18 @@ pub const GatewayState = struct {
     chat_stream_session_key_wrong_user_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     chat_stream_session_key_invalid_lane_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     in_flight_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    // C3 — liveness deadlock watchdog inputs. `queued_requests` mirrors the
+    // RequestQueue depth (queued-but-unstarted work); it is bumped on push
+    // and decremented when a worker pops a connection, so the acceptor-thread
+    // /health fast-path can read "is there pending work?" without taking the
+    // queue mutex. `last_worker_progress_ms` is the monotonic-ish wall-clock
+    // (std.time.milliTimestamp) of the most recent COMPLETED request; every
+    // worker bumps it after handling a connection. Seeded to boot time in
+    // runWithRole. `liveness_deadlock_threshold_ms` is the config knob copied
+    // in at boot (0 disables). See livenessDeadlockDetected.
+    queued_requests: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    last_worker_progress_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    liveness_deadlock_threshold_ms: u64 = 0,
     drain_rejected_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     overload_rejected_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -23081,6 +23093,75 @@ fn classifyProbeRequestLine(preview: []const u8) ProbeClass {
     return .other;
 }
 
+// ── C3: liveness deadlock watchdog ───────────────────────────────────
+//
+// P0-1 made `GET /health` cheap on the acceptor thread, which proves the
+// ACCEPTOR is alive. It does NOT prove the WORKER POOL is alive: if every
+// gateway worker deadlocks while the acceptor keeps accepting, cheap /health
+// keeps returning 200 and the pod is never restarted by the kube liveness
+// probe — a silent wedge.
+//
+// The watchdog closes that gap with a deliberately CONSERVATIVE predicate so
+// it can ride the cheap acceptor fast-path without false-positiving into a
+// restart loop. We flag UNHEALTHY only when BOTH conditions hold:
+//   1. there is PENDING queued-but-unstarted work (RequestQueue depth > 0),
+//      AND
+//   2. no worker has completed any request for longer than the threshold.
+//
+// Why both, and why this is restart-loop-safe:
+//   * IDLE runtime  → queue_depth == 0 → never flagged. "No progress" is not
+//     a deadlock; a freshly-booted or quiet pod has simply had nothing to do.
+//   * BUSY runtime  → each completed request bumps the progress timestamp, so
+//     ms_since_last_completion stays small and the predicate stays false even
+//     under sustained load with a continuously non-empty queue.
+//   * WEDGED runtime → work is queued (depth > 0) yet NO completion advances
+//     the clock, so once the gap exceeds the GENEROUS threshold (default 180s,
+//     longer than the longest expected turn) the predicate trips exactly once
+//     the pool is genuinely stuck.
+// A threshold of 0 disables the watchdog (cheap /health reverts to pure
+// acceptor liveness).
+//
+// This is a PURE function of injected inputs so the three acceptance cases
+// (wedged / idle / busy) are unit-testable without spinning real threads.
+fn isWorkerPoolDeadlocked(
+    queue_depth: usize,
+    ms_since_last_completion: u64,
+    threshold_ms: u64,
+) bool {
+    if (threshold_ms == 0) return false; // watchdog disabled
+    if (queue_depth == 0) return false; // idle / drained — never a deadlock
+    return ms_since_last_completion > threshold_ms;
+}
+
+/// Evaluate the liveness deadlock predicate against live gateway state.
+///
+/// Reads the queued-but-unstarted request count (RequestQueue depth) and the
+/// monotonic last-worker-progress timestamp recorded by `gatewayWorkerMain`,
+/// and compares the elapsed-since-progress gap against the configured
+/// threshold. `now_ms` is injected (caller passes `std.time.milliTimestamp()`)
+/// so the predicate stays testable. Returns true ONLY when the pool is
+/// genuinely wedged — see `isWorkerPoolDeadlocked`.
+///
+/// Note: `std.time.milliTimestamp` is wall-clock (not strictly monotonic), as
+/// used elsewhere in this codebase; a backward clock step only ever makes the
+/// computed gap SMALLER, which is fail-safe here (it can delay a true-positive
+/// but never manufactures a false-positive restart).
+fn livenessDeadlockDetected(state: *const GatewayState, now_ms: i64) bool {
+    const threshold_ms = state.liveness_deadlock_threshold_ms;
+    if (threshold_ms == 0) return false;
+    const queue_depth = state.queued_requests.load(.acquire);
+    if (queue_depth == 0) return false;
+    const last_progress_ms = state.last_worker_progress_ms.load(.acquire);
+    // Before the first completion the timestamp is the boot time (seeded in
+    // runWithRole), so an all-stuck-from-boot pool with queued work is still
+    // caught once the boot-to-now gap exceeds the threshold.
+    const gap_ms: u64 = if (now_ms > last_progress_ms)
+        @intCast(now_ms - last_progress_ms)
+    else
+        0;
+    return isWorkerPoolDeadlocked(queue_depth, gap_ms, threshold_ms);
+}
+
 /// Peek (without consuming) the start of an accepted connection and, if it
 /// is a `GET /health` / `GET /ready` probe, serve it inline on the acceptor
 /// thread and return true (the caller must then close the connection). The
@@ -29544,6 +29625,78 @@ test "P0-1 classifier: a partial request line (no CRLF) is not classified" {
     try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("GET /health HTTP/1.1"));
     try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine(""));
     try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("GE"));
+}
+
+// ── C3: liveness deadlock watchdog predicate tests ───────────────────
+//
+// The watchdog predicate is a PURE function of (queue_depth,
+// ms_since_last_completion, threshold_ms) so the three acceptance cases —
+// WEDGED, IDLE, BUSY — are pinned here without spinning real worker threads.
+// The whole point is no restart-loop risk: idle and busy must NEVER flag.
+
+test "C3 predicate: WEDGED pool (pending work + no completion past threshold) is flagged" {
+    // 5 requests queued, last completion 200s ago, 180s threshold → deadlock.
+    try std.testing.expect(isWorkerPoolDeadlocked(5, 200_000, 180_000));
+    // Exactly one request stuck is enough — depth > 0 is the gate, not a count.
+    try std.testing.expect(isWorkerPoolDeadlocked(1, 181_000, 180_000));
+}
+
+test "C3 predicate: IDLE runtime (no pending work) is NEVER flagged" {
+    // No queued work → not a deadlock, no matter how long since last progress.
+    // "No progress" on an idle pool is normal, not a wedge — this is the
+    // primary restart-loop guard.
+    try std.testing.expect(!isWorkerPoolDeadlocked(0, 10_000_000, 180_000));
+    try std.testing.expect(!isWorkerPoolDeadlocked(0, 200_000, 180_000));
+    try std.testing.expect(!isWorkerPoolDeadlocked(0, 0, 180_000));
+}
+
+test "C3 predicate: BUSY-but-progressing runtime is NOT flagged" {
+    // Pending work exists, but a worker completed a request recently
+    // (gap < threshold) → the pool is making progress, never flagged even
+    // with a continuously non-empty queue under sustained load.
+    try std.testing.expect(!isWorkerPoolDeadlocked(50, 1_000, 180_000));
+    try std.testing.expect(!isWorkerPoolDeadlocked(1, 179_999, 180_000));
+    // Boundary: a gap exactly AT the threshold is not yet a deadlock (strict >).
+    try std.testing.expect(!isWorkerPoolDeadlocked(3, 180_000, 180_000));
+}
+
+test "C3 predicate: threshold 0 disables the watchdog" {
+    // Even a clearly wedged pool is not flagged when the knob is 0 — the
+    // operator kill-switch reverts cheap /health to pure acceptor liveness.
+    try std.testing.expect(!isWorkerPoolDeadlocked(100, 999_999_999, 0));
+}
+
+test "C3 livenessDeadlockDetected: wedged state via injected timestamps" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.liveness_deadlock_threshold_ms = 180_000;
+
+    // Boot: progress seeded to t=0, no queued work → not flagged regardless
+    // of how far `now` has advanced (idle-from-boot is not a deadlock).
+    state.last_worker_progress_ms.store(0, .release);
+    state.queued_requests.store(0, .release);
+    try std.testing.expect(!livenessDeadlockDetected(&state, 10_000_000));
+
+    // Work arrives and a worker last completed at t=1000ms; now=300_000ms →
+    // 299s with no completion and pending work → WEDGED.
+    state.queued_requests.store(4, .release);
+    state.last_worker_progress_ms.store(1_000, .release);
+    try std.testing.expect(livenessDeadlockDetected(&state, 300_000));
+
+    // A worker just completed (progress catches up to ~now) → BUSY, cleared.
+    state.last_worker_progress_ms.store(299_500, .release);
+    try std.testing.expect(!livenessDeadlockDetected(&state, 300_000));
+
+    // Queue drains to empty while progress stays old → IDLE, not flagged.
+    state.queued_requests.store(0, .release);
+    state.last_worker_progress_ms.store(1_000, .release);
+    try std.testing.expect(!livenessDeadlockDetected(&state, 300_000));
+
+    // Threshold 0 disables even with a wedged-looking state.
+    state.liveness_deadlock_threshold_ms = 0;
+    state.queued_requests.store(4, .release);
+    state.last_worker_progress_ms.store(1_000, .release);
+    try std.testing.expect(!livenessDeadlockDetected(&state, 300_000));
 }
 
 // ── /ready endpoint tests ────────────────────────────────────────────
