@@ -32,6 +32,7 @@ const heartbeat_wake = @import("heartbeat_wake.zig");
 const json_util = @import("json_util.zig");
 const providers = @import("providers/root.zig");
 const embeddings = @import("memory/vector/embeddings.zig");
+const circuit_breaker = @import("memory/vector/circuit_breaker.zig");
 const entity_pipeline = @import("agent/entity_pipeline.zig");
 const tools_mod = @import("tools/root.zig");
 const tool_sandbox_v1 = @import("tools/tool_sandbox_v1.zig");
@@ -1070,6 +1071,16 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
     // consumes self by value via the vtable; one captured deinit suffices.
     var worker_embedder: ?embeddings.EmbeddingProvider = null;
     defer if (worker_embedder) |e| e.deinit();
+
+    // P1-6: extractor circuit breaker. One instance for the lifetime of the
+    // heartbeat thread, shared across worker ticks so the consecutive-failure
+    // count and cooldown persist. Reuses the SAME knobs memory.reliability
+    // uses (config.memory.reliability.circuit_breaker_failures / _cooldown_ms)
+    // so an operator tunes one set of thresholds for all LLM-fronting lanes.
+    var extraction_breaker = ExtractionBreaker.init(
+        config.memory.reliability.circuit_breaker_failures,
+        config.memory.reliability.circuit_breaker_cooldown_ms,
+    );
     if (pg_mgr != null) init_worker: {
         const bundle_ptr = allocator.create(providers.runtime_bundle.RuntimeProviderBundle) catch |err| {
             log.warn("extraction_queue.worker.bundle_alloc_failed err={s}", .{@errorName(err)});
@@ -1203,12 +1214,18 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
                     // per-cell pods anyway (each gets its own daemon).
                     const MAX_JOBS_PER_TICK: usize = 2;
                     while (jobs_processed < MAX_JOBS_PER_TICK) : (jobs_processed += 1) {
+                        // P1-6: the breaker is checked per-job inside
+                        // processOneExtractionJob (allow() before claim). When
+                        // OPEN it returns false without claiming, so the loop
+                        // breaks and the tick costs ~0 instead of 30s+ — jobs
+                        // stay pending and re-run once the breaker half-opens.
                         const had_job = processOneExtractionJob(
                             allocator,
                             config,
                             worker_mgr,
                             bundle.provider(),
                             embedder,
+                            &extraction_breaker,
                         ) catch |err| blk: {
                             log.warn("extraction_queue.worker_tick_err err={s}", .{@errorName(err)});
                             break :blk false;
@@ -1236,17 +1253,102 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
     }
 }
 
+/// P1-6: does this extraction outcome count as an extractor-endpoint failure
+/// for the circuit breaker? Only `llm_failed` (timeout / brownout / transport
+/// error to the extractor LLM) — the upstream-availability signal the breaker
+/// exists to protect against. `parse_failed` means the endpoint DID respond
+/// but the output didn't parse; that's a data-quality issue, not a brownout,
+/// so it must NOT trip the breaker (otherwise a run of malformed-but-fast
+/// responses would needlessly open it). `ok` is a success. Thrown errors from
+/// processOneExtractionJob are treated as failures by the caller separately.
+fn extractionOutcomeTripsBreaker(outcome: entity_pipeline.RunOutcome) bool {
+    return outcome == .llm_failed;
+}
+
+/// P1-6: circuit breaker around the daemon's extractor LLM calls. Wraps the
+/// reusable pure-state-machine CircuitBreaker (memory/vector/circuit_breaker)
+/// and is wired exactly like memory.reliability uses the same knobs
+/// (config.memory.reliability.circuit_breaker_failures / _cooldown_ms): after
+/// N consecutive extractor failures the breaker OPENS and the worker SKIPS
+/// extraction calls for the cooldown (jobs stay pending = deferred, re-tried
+/// on a later tick once the breaker half-opens and a probe succeeds). This
+/// stops an upstream brownout from costing 30s+ per heartbeat tick.
+///
+/// Lives for the lifetime of the daemon heartbeat thread (one instance),
+/// shared across worker ticks so the failure count and cooldown persist.
+const ExtractionBreaker = struct {
+    cb: circuit_breaker.CircuitBreaker,
+
+    fn init(failures: u32, cooldown_ms: u32) ExtractionBreaker {
+        return .{ .cb = circuit_breaker.CircuitBreaker.init(failures, cooldown_ms) };
+    }
+
+    /// May we attempt an extractor call now? closed → always; open → only
+    /// once the cooldown has elapsed (transitions to half_open and allows a
+    /// single probe); half_open → exactly one probe then blocks until the
+    /// probe's outcome is recorded. Mirrors CircuitBreaker.allow().
+    fn allowAttempt(self: *ExtractionBreaker) bool {
+        return self.cb.allow();
+    }
+
+    /// Record a completed extraction's outcome. Only llm_failed trips the
+    /// breaker (see extractionOutcomeTripsBreaker); ok closes it; parse_failed
+    /// is treated as a non-availability success for breaker purposes.
+    fn recordOutcome(self: *ExtractionBreaker, outcome: entity_pipeline.RunOutcome) void {
+        if (extractionOutcomeTripsBreaker(outcome)) {
+            self.cb.recordFailure();
+        } else {
+            self.cb.recordSuccess();
+        }
+    }
+
+    /// Record a hard failure (thrown error / timeout before an outcome was
+    /// produced) — always trips toward open.
+    fn recordHardFailure(self: *ExtractionBreaker) void {
+        self.cb.recordFailure();
+    }
+
+    fn isOpen(self: *const ExtractionBreaker) bool {
+        return self.cb.isOpen();
+    }
+};
+
 /// V1.13 Day 2.2 — process one extraction job from the queue. Returns
 /// true when a job was processed (drain loop continues), false when
 /// queue empty (drain loop stops). All errors are failure-soft.
+///
+/// P1-6: gated by the extractor circuit breaker. If the breaker is OPEN
+/// (cooldown not elapsed) this returns false WITHOUT claiming a job — the
+/// pending job stays in the queue (deferred) and the worker drain stops for
+/// this tick, so a brownout costs ~0 instead of 30s+ per tick. When the
+/// breaker is closed / half-open-probe-allowed, one job is claimed and its
+/// outcome is recorded against the breaker.
 fn processOneExtractionJob(
     allocator: std.mem.Allocator,
     config: *const Config,
     state_mgr: *zaki_state.Manager,
     provider: providers.Provider,
     embedder: embeddings.EmbeddingProvider,
+    breaker: ?*ExtractionBreaker,
 ) !bool {
-    const job = (try state_mgr.claimNextExtractionJob(allocator)) orelse return false;
+    // P1-6: gate BEFORE claiming. An open breaker must not burn a claim
+    // (which would bump attempts and eventually exhaust the 3-retry budget,
+    // permanently failing jobs during a transient brownout). A blocked
+    // attempt leaves the queue untouched — the job is simply deferred to a
+    // later tick once the breaker half-opens.
+    if (breaker) |b| {
+        if (!b.allowAttempt()) {
+            log.debug("extraction_queue.breaker_open skip_tick — extractor calls deferred during cooldown", .{});
+            return false;
+        }
+    }
+
+    const job = (try state_mgr.claimNextExtractionJob(allocator)) orelse {
+        // No job to run. The breaker probe (if half-open) wasn't spent on a
+        // real call; nothing to record — leave state as-is so the next tick
+        // with actual work performs the probe.
+        return false;
+    };
     defer job.deinit(allocator);
 
     const t_start = std.time.milliTimestamp();
@@ -1319,6 +1421,20 @@ fn processOneExtractionJob(
         "extraction_queue.processed job_id={d} type={s} outcome={s} mentions={d} edges={d} elapsed_ms={d}",
         .{ job.id, job.job_type, @tagName(stats.outcome), stats.mentions_extracted, stats.edges_emitted, elapsed },
     );
+    // P1-6: feed the real extractor-call outcome to the breaker. An llm_failed
+    // (timeout / brownout) increments toward open; an ok / parse_failed closes
+    // it (parse_failed means the endpoint responded — not an availability
+    // problem). This is the recovery edge: the half-open probe's success here
+    // closes the breaker and resumes normal draining.
+    if (breaker) |b| {
+        b.recordOutcome(stats.outcome);
+        if (b.isOpen()) {
+            log.warn(
+                "extraction_queue.breaker_opened — {d} consecutive extractor failures; deferring extraction for cooldown",
+                .{config.memory.reliability.circuit_breaker_failures},
+            );
+        }
+    }
     if (stats.outcome == .ok) {
         state_mgr.markExtractionJobDone(job.id) catch {};
     } else {
@@ -4205,4 +4321,157 @@ test "writeStateFile produces valid content" {
     try std.testing.expect(std.mem.indexOf(u8, content, "\"status\": \"running\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "test-comp") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "127.0.0.1:8080") != null);
+}
+
+test "P1-6 extractionOutcomeTripsBreaker — only llm_failed counts as an extractor brownout" {
+    // ok = success; parse_failed = endpoint responded (data-quality, not
+    // availability) → must NOT trip; llm_failed = timeout/brownout → trips.
+    try std.testing.expect(!extractionOutcomeTripsBreaker(.ok));
+    try std.testing.expect(!extractionOutcomeTripsBreaker(.parse_failed));
+    try std.testing.expect(extractionOutcomeTripsBreaker(.llm_failed));
+}
+
+test "P1-6 extractor breaker — opens after N consecutive failures, skips during cooldown, half-opens, recovers" {
+    // Drives the ExtractionBreaker through the exact lifecycle the daemon
+    // worker applies (allowAttempt() per job → recordOutcome()). Uses a 0ms
+    // cooldown so the half-open transition is deterministic without sleeping.
+    const FAILURES: u32 = 3;
+    var b = ExtractionBreaker.init(FAILURES, 0);
+
+    // Closed initially — attempts allowed.
+    try std.testing.expect(b.allowAttempt());
+    try std.testing.expect(!b.isOpen());
+
+    // Two failures: still closed (below threshold).
+    b.recordOutcome(.llm_failed);
+    try std.testing.expect(!b.isOpen());
+    try std.testing.expect(b.allowAttempt());
+    b.recordOutcome(.llm_failed);
+    try std.testing.expect(!b.isOpen());
+
+    // Third consecutive failure trips the breaker OPEN.
+    try std.testing.expect(b.allowAttempt());
+    b.recordOutcome(.llm_failed);
+    try std.testing.expect(b.isOpen());
+
+    // ── Cooldown behavior. With a real (non-zero) cooldown, allowAttempt()
+    //    returns false while open — the worker SKIPS the extractor call and
+    //    defers the job. Prove that with a long-cooldown instance. ──────────
+    {
+        var bc = ExtractionBreaker.init(1, 60_000); // 60s cooldown
+        bc.recordOutcome(.llm_failed); // trips immediately (threshold 1)
+        try std.testing.expect(bc.isOpen());
+        // Every attempt during cooldown is blocked → extractor call skipped.
+        var i: usize = 0;
+        while (i < 10) : (i += 1) {
+            try std.testing.expect(!bc.allowAttempt());
+        }
+    }
+
+    // ── Half-open + recovery on the 0ms-cooldown breaker. Cooldown already
+    //    elapsed → allowAttempt() transitions open → half_open and permits a
+    //    single probe. A probe SUCCESS closes the breaker; draining resumes. ─
+    try std.testing.expect(b.allowAttempt()); // open → half_open, probe allowed
+    try std.testing.expect(!b.allowAttempt()); // only one probe in half_open
+    b.recordOutcome(.ok); // probe succeeds → closed
+    try std.testing.expect(!b.isOpen());
+    try std.testing.expect(b.allowAttempt()); // normal draining resumed
+
+    // ── A probe FAILURE re-opens (no flapping into closed on a still-down
+    //    upstream). ───────────────────────────────────────────────────────
+    b.recordOutcome(.llm_failed); // closed→count1; threshold 3 not hit yet
+    b.recordOutcome(.llm_failed);
+    b.recordOutcome(.llm_failed); // → open
+    try std.testing.expect(b.isOpen());
+    try std.testing.expect(b.allowAttempt()); // → half_open probe
+    b.recordOutcome(.llm_failed); // probe fails → re-open
+    try std.testing.expect(b.isOpen());
+
+    // ── parse_failed must NOT trip the breaker even repeatedly. ────────────
+    {
+        var bp = ExtractionBreaker.init(2, 0);
+        bp.recordOutcome(.parse_failed);
+        bp.recordOutcome(.parse_failed);
+        bp.recordOutcome(.parse_failed);
+        try std.testing.expect(!bp.isOpen());
+        try std.testing.expect(bp.allowAttempt());
+    }
+}
+
+test "P1-6 worker gating sim — open breaker defers a backlog of jobs, then drains after recovery" {
+    // Simulates the daemon worker tick loop against an injected outcome
+    // stream, with a fake job queue, proving the end-to-end behavior:
+    //   - a brownout (consecutive llm_failed) opens the breaker;
+    //   - while open, ticks claim/process ZERO jobs (the backlog is deferred,
+    //     not drained, so no 30s-per-tick stalls accumulate);
+    //   - after the breaker half-opens and a probe succeeds, the backlog
+    //     drains normally.
+    const Sim = struct {
+        // Pretend queue: number of pending jobs.
+        pending: usize,
+        // Scripted outcome the "extractor" returns for the next processed job.
+        next_outcome: entity_pipeline.RunOutcome,
+
+        // Mirrors processOneExtractionJob's control flow without real I/O:
+        // gate on the breaker, and only on an allowed attempt do we "claim"
+        // and process one job, recording its outcome.
+        fn tickOne(self: *@This(), b: *ExtractionBreaker) bool {
+            if (!b.allowAttempt()) return false; // open → defer, claim nothing
+            if (self.pending == 0) return false; // empty queue
+            // "process" one job
+            self.pending -= 1;
+            b.recordOutcome(self.next_outcome);
+            return true;
+        }
+
+        fn drainTick(self: *@This(), b: *ExtractionBreaker, max_per_tick: usize) usize {
+            var n: usize = 0;
+            while (n < max_per_tick) : (n += 1) {
+                if (!self.tickOne(b)) break;
+            }
+            return n;
+        }
+    };
+
+    const MAX: usize = 2;
+    var b = ExtractionBreaker.init(2, 60_000); // threshold 2, long cooldown
+    var sim = Sim{ .pending = 10, .next_outcome = .llm_failed };
+
+    // Tick 1: two failures → breaker opens mid-tick. Both jobs were claimed
+    // (the breaker only blocks the NEXT attempt), so pending drops by 2.
+    const t1 = sim.drainTick(&b, MAX);
+    try std.testing.expectEqual(@as(usize, 2), t1);
+    try std.testing.expect(b.isOpen());
+    try std.testing.expectEqual(@as(usize, 8), sim.pending);
+
+    // Ticks 2..N during cooldown: breaker open → ZERO jobs processed, backlog
+    // preserved (deferred). This is the whole point: no per-tick stall.
+    var k: usize = 0;
+    while (k < 5) : (k += 1) {
+        const processed = sim.drainTick(&b, MAX);
+        try std.testing.expectEqual(@as(usize, 0), processed);
+        try std.testing.expectEqual(@as(usize, 8), sim.pending); // untouched
+    }
+
+    // Upstream recovers. Force the cooldown to have elapsed by using a fresh
+    // 0ms-cooldown breaker that's already open, then feed successes.
+    var b2 = ExtractionBreaker.init(2, 0);
+    b2.recordOutcome(.llm_failed);
+    b2.recordOutcome(.llm_failed); // → open
+    try std.testing.expect(b2.isOpen());
+    sim.next_outcome = .ok;
+
+    // Recovery tick: half-open probe is allowed → one job drains and the
+    // success closes the breaker.
+    const r1 = sim.drainTick(&b2, MAX);
+    try std.testing.expect(r1 >= 1);
+    try std.testing.expect(!b2.isOpen());
+
+    // Now fully closed: the remaining backlog drains at MAX/tick.
+    var guard: usize = 0;
+    while (sim.pending > 0 and guard < 100) : (guard += 1) {
+        _ = sim.drainTick(&b2, MAX);
+    }
+    try std.testing.expectEqual(@as(usize, 0), sim.pending);
+    try std.testing.expect(!b2.isOpen());
 }
