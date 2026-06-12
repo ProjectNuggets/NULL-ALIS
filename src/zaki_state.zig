@@ -4331,7 +4331,15 @@ const ManagerImpl = struct {
             log.info("ingestion.rejected_low_signal path=meta key={s} len={d}", .{ key, content.len });
             return;
         }
-        if (session_id) |sid| try self.ensureSession(user_id, sid);
+        // P1-8 (2026-06-12): self-heal the parent users row on EVERY lane.
+        // With a session, ensureSession → ensureUserRow guards the FK. The
+        // session-less lane (brain_compose gateway passes session_id=null,
+        // extraction can too) previously skipped that guard entirely and
+        // faulted memories_user_id_fkey for a never-provisioned user. Call
+        // ensureUserRow directly on the null branch so the FK can't fault on
+        // ANY lane. ensureUserRow also enforces the identity gate (bogus ids
+        // surface as error.IdentityUserNotFound rather than an orphan write).
+        if (session_id) |sid| try self.ensureSession(user_id, sid) else try self.ensureUserRow(user_id);
         // V1.6 commit 3: also write `lemmatized` for BM25 retrieval (same
         // semantics as upsertMemory; this metadata variant is the path
         // compose_memory takes).
@@ -4812,7 +4820,11 @@ const ManagerImpl = struct {
             log.info("ingestion.rejected_low_signal path=simple key={s} len={d}", .{ key, content.len });
             return;
         }
-        if (session_id) |sid| try self.ensureSession(user_id, sid);
+        // P1-8 (2026-06-12): self-heal the parent users row on EVERY lane —
+        // the session-less branch (session_id == null) must still ensure the
+        // users row exists or memories_user_id_fkey can fault. See the
+        // matching note in upsertMemoryWithMetadataAndEventType.
+        if (session_id) |sid| try self.ensureSession(user_id, sid) else try self.ensureUserRow(user_id);
         // V1.6 commit 3: also write `lemmatized` for BM25 retrieval. Existing
         // rows backfilled at migrate via `UPDATE memories SET lemmatized =
         // lower(content) WHERE lemmatized IS NULL` — new writes use the
@@ -14085,6 +14097,77 @@ test "P1-7 provisionUser is atomic — mid-provision failure leaves no partial r
     }
     {
         const q = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}.sessions WHERE user_id = {d}", .{ schema_q, user_id });
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const cnt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(cnt);
+        try std.testing.expectEqualStrings("1", cnt);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// P1-8 (2026-06-12) — close the FK class on the SESSION-LESS memory write
+// lane. upsertMemory / upsertMemoryWithMetadataAndEventType gate
+// ensureSession (hence ensureUserRow) behind `if (session_id) |sid|`, and
+// the brain_compose gateway handler writes with session_id=null. Pre-P1-8
+// a null-session write for a never-provisioned user bypassed ensureUserRow
+// entirely and faulted memories_user_id_fkey. P1-8 adds an ensureUserRow
+// call on the null-session branch so the parent users row self-heals and
+// the memory lands on ANY lane.
+// ─────────────────────────────────────────────────────────────────────
+test "P1-8 session-less memory write self-heals users row (no memories_user_id_fkey)" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = initPostgresTestManagerWithPool(allocator, 4, 5000) catch return error.SkipZigTest;
+    defer mgr.deinit();
+
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+
+    const user_id: i64 = 8181;
+
+    // NO provisionUser, NO session: this is the brain_compose lane —
+    // upsertMemoryWithMetadata(..., session_id = null, ...). Pre-P1-8 this
+    // skips ensureSession (so ensureUserRow never runs) and the INSERT
+    // faults on memories_user_id_fkey (the parent users row is absent).
+    // compat mode: public.zaki_users is absent → hasExternalIdentity
+    // returns null → ensureUserRow inserts the row on the tenant PK.
+    try mgr.upsertMemoryWithMetadata(
+        user_id,
+        "compose:p1_8_no_session",
+        "a fact composed with no session",
+        .core,
+        null,
+        \\{"synthesized_by":"user"}
+        ,
+    );
+
+    // The parent users row self-healed.
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT workspace_path FROM {s}.users WHERE user_id = {d}", .{ schema_q, user_id });
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+        const ws = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(ws);
+        try std.testing.expectEqualStrings("/data/users/8181/workspace", ws);
+    }
+    // And the memory landed.
+    {
+        const entry = (try mgr.getMemory(allocator, user_id, "compose:p1_8_no_session")) orelse return error.TestUnexpectedResult;
+        defer entry.deinit(allocator);
+        try std.testing.expectEqualStrings("a fact composed with no session", entry.content);
+    }
+
+    // The simple upsertMemory null-session path is also gated — exercise it
+    // for a fresh never-provisioned id to prove the same self-heal.
+    const user_id2: i64 = 8282;
+    try mgr.upsertMemory(user_id2, "p1_8_simple_no_session", "simple null-session fact", .core, null);
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}.users WHERE user_id = {d}", .{ schema_q, user_id2 });
         defer allocator.free(q);
         const result = try mgr.exec(q);
         defer c.PQclear(result);
