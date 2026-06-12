@@ -13555,6 +13555,159 @@ test "D62 — migrate() populates schema_migrations with every registered versio
     }
 }
 
+test "P1-10 — full migration set applied TWICE is a clean no-op (schema fingerprint stable)" {
+    // P1-10 acceptance keystone (rollout/rollback safety): applying the full
+    // migration set TWICE against a fresh pgvector PG must leave the schema
+    // BYTE-IDENTICAL after the second apply — i.e. every forward migration is
+    // idempotent, so a re-apply (rolling update re-runs migrate() on every pod
+    // boot; an interrupted-then-retried migrate; a pod restart) is a pure
+    // no-op and never errors. We assert this by snapshotting a full schema
+    // fingerprint (tables + every column with its nullability/type + every
+    // index) after migrate #1, running migrate() again, re-snapshotting, and
+    // asserting the two fingerprints are equal. A non-idempotent statement
+    // would either (a) error on the second apply — caught because migrate()
+    // returns the error — or (b) mutate the schema (e.g. duplicate index) —
+    // caught by the fingerprint diff.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_p1_10idem", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+
+    // Fresh schema.
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    defer {
+        if (pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw())) |schema_q| {
+            defer allocator.free(schema_q);
+            if (std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q})) |drop_q| {
+                defer allocator.free(drop_q);
+                if (mgr.exec(drop_q)) |result| {
+                    c.PQclear(result);
+                } else |_| {}
+            } else |_| {}
+        } else |_| {}
+    }
+
+    // A full-schema fingerprint: every column (table, name, nullability,
+    // data type, ordinal) PLUS every index (name + definition), ordered
+    // deterministically. Captured as one concatenated string so the whole
+    // schema can be compared with a single equality assertion.
+    const fingerprint = struct {
+        fn snapshot(a: std.mem.Allocator, m: *ManagerImpl, sch: []const u8) ![]u8 {
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer out.deinit(a);
+
+            // Columns.
+            {
+                const q = try std.fmt.allocPrint(
+                    a,
+                    "SELECT table_name, ordinal_position, column_name, is_nullable, data_type " ++
+                        "FROM information_schema.columns WHERE table_schema = '{s}' " ++
+                        "ORDER BY table_name, ordinal_position",
+                    .{sch},
+                );
+                defer a.free(q);
+                const r = try m.exec(q);
+                defer c.PQclear(r);
+                const rows: usize = @intCast(c.PQntuples(r));
+                for (0..rows) |i| {
+                    const ri: c_int = @intCast(i);
+                    for (0..5) |col| {
+                        const v = try dupeResultValue(a, r, ri, @intCast(col));
+                        defer a.free(v);
+                        try out.appendSlice(a, v);
+                        try out.append(a, '|');
+                    }
+                    try out.append(a, '\n');
+                }
+            }
+            try out.appendSlice(a, "==INDEXES==\n");
+            // Indexes (name + full definition — catches a duplicate index or a
+            // changed predicate that a name-only check would miss).
+            {
+                const q = try std.fmt.allocPrint(
+                    a,
+                    "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = '{s}' " ++
+                        "ORDER BY indexname",
+                    .{sch},
+                );
+                defer a.free(q);
+                const r = try m.exec(q);
+                defer c.PQclear(r);
+                const rows: usize = @intCast(c.PQntuples(r));
+                for (0..rows) |i| {
+                    const ri: c_int = @intCast(i);
+                    const name = try dupeResultValue(a, r, ri, 0);
+                    defer a.free(name);
+                    const def = try dupeResultValue(a, r, ri, 1);
+                    defer a.free(def);
+                    try out.appendSlice(a, name);
+                    try out.append(a, '|');
+                    try out.appendSlice(a, def);
+                    try out.append(a, '\n');
+                }
+            }
+            return out.toOwnedSlice(a);
+        }
+    };
+
+    // Migrate #1 (fresh).
+    try mgr.migrate();
+    const fp1 = try fingerprint.snapshot(allocator, &mgr, schema);
+    defer allocator.free(fp1);
+
+    // Migrate #2 — must not error and must not mutate the schema.
+    try mgr.migrate();
+    const fp2 = try fingerprint.snapshot(allocator, &mgr, schema);
+    defer allocator.free(fp2);
+
+    if (!std.mem.eql(u8, fp1, fp2)) {
+        std.debug.print(
+            "P1-10: schema fingerprint changed on second migrate apply (NOT idempotent)\n--- after apply #1 ---\n{s}\n--- after apply #2 ---\n{s}\n",
+            .{ fp1, fp2 },
+        );
+        return error.MigrationNotIdempotent;
+    }
+
+    // Sanity: the fingerprint actually captured the durable tables this task
+    // touches (guards against an empty/degenerate snapshot silently passing).
+    try std.testing.expect(std.mem.indexOf(u8, fp1, "pending_approvals") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fp1, "turn_usage") != null);
+    // The 0006 transcript-fidelity columns must be present after migrate.
+    try std.testing.expect(std.mem.indexOf(u8, fp1, "messages|") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fp1, "tool_calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fp1, "reasoning") != null);
+
+    // Every registered version recorded exactly once (no duplicate inserts on
+    // re-apply — the framework's version tracking short-circuits).
+    {
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT version, COUNT(*) FROM {s}.schema_migrations GROUP BY version HAVING COUNT(*) > 1",
+            .{schema},
+        );
+        defer allocator.free(q);
+        const r = try mgr.exec(q);
+        defer c.PQclear(r);
+        try std.testing.expectEqual(@as(c_int, 0), c.PQntuples(r));
+    }
+}
+
 test "v1.14.23 WARN-3 — artifact_versions has exactly ONE index after fresh migrate (no _artifact_ver duplicate)" {
     // Pre-fix, the inline-loop path in zaki_state.migrate() created
     // `idx_artifact_versions_artifact_ver` while migrations.run() created
