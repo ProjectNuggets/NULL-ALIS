@@ -37,6 +37,36 @@ const security_secrets = @import("security/secrets.zig");
 /// is observable rather than silently writing under a bogus id.
 pub const EntityEdgeWriteUserIdViolation = error.EntityEdgeWriteUserIdViolation;
 
+// P1-9 (2026-06-12): how long the `external_identity_status = .unavailable`
+// fail-open short-circuit stays latched before `hasExternalIdentity`
+// re-probes `public.zaki_users`. A genuinely-absent table keeps the
+// noisy-log mitigation (it re-latches each window, ~1 probe per window
+// instead of ~200 per session); a transient probe failure self-heals on
+// the next re-probe after the window elapses. 5 minutes balances "don't
+// hammer a known-absent table" against "don't leave identity verification
+// disabled for an entire long-lived Manager after one blip."
+const EXTERNAL_IDENTITY_REPROBE_MS: i64 = 5 * 60 * 1000;
+
+// Sentinel latch time meaning "never re-probe" — used by the test-only
+// `skipExternalIdentityForTests` bypass so the TTL re-probe (P1-9) can't
+// undo the pin mid-test. No real wall-clock milliTimestamp ever equals
+// maxInt, so this is unambiguous.
+const EXTERNAL_IDENTITY_PIN_FOREVER: i64 = std.math.maxInt(i64);
+
+/// Pure TTL decision for the external-identity fail-open cache (P1-9).
+/// Returns true when `hasExternalIdentity` should re-probe `public.zaki_users`
+/// rather than short-circuit on the cached `.unavailable` state. Factored out
+/// (no Manager / no live PG) so the TTL boundary is unit-testable.
+///   - `is_unavailable` false        → not latched → must probe (true).
+///   - since == PIN_FOREVER          → test pin → never re-probe (false).
+///   - latched, now < since+ttl      → within window → short-circuit (false).
+///   - latched, now >= since+ttl     → window elapsed → re-probe (true).
+fn shouldReprobeExternalIdentity(is_unavailable: bool, since_ms: i64, now_ms: i64, ttl_ms: i64) bool {
+    if (!is_unavailable) return true;
+    if (since_ms == EXTERNAL_IDENTITY_PIN_FOREVER) return false;
+    return (now_ms - since_ms) >= ttl_ms;
+}
+
 fn assertEntityEdgeWriteUserId(user_id: i64) !void {
     if (user_id > 0) return; // happy path — zero behavior change
 
@@ -1560,7 +1590,19 @@ const ManagerImpl = struct {
     // failure sets this flag true; subsequent calls short-circuit
     // silently. Reset to .unknown on a new connection (future: cell
     // pod hot-swap).
+    //
+    // P1-9 (2026-06-12): the `.unavailable` short-circuit is now TTL'd.
+    // Pre-P1-9 a SINGLE transient probe failure (e.g. a momentary
+    // ExecFailed / ConnectionFailed while public.zaki_users was reachable
+    // but the conn blipped) latched `.unavailable` for the whole Manager
+    // lifetime — permanently disabling identity verification and silently
+    // turning the gate fully fail-open. We keep the fail-open behavior
+    // WITHIN the TTL window (so the noisy-log mitigation still holds for a
+    // genuinely-absent table) but re-probe after the window so a transient
+    // failure self-heals. `external_identity_unavailable_since_ms` is the
+    // monotonic-ish wall-clock (milliTimestamp) of the latching failure.
     external_identity_status: enum { unknown, available, unavailable } = .unknown,
+    external_identity_unavailable_since_ms: i64 = 0,
 
     pub const ClaimedJob = struct {
         id: []u8,
@@ -2997,16 +3039,34 @@ const ManagerImpl = struct {
             @compileError("Manager.skipExternalIdentityForTests called outside test build — this bypass disables the public.zaki_users identity gate and is forbidden in production");
         }
         self.external_identity_status = .unavailable;
+        // P1-9: pin the latch FOREVER so the new TTL re-probe doesn't undo
+        // the test bypass mid-test (a 0 timestamp would otherwise read as
+        // "window long elapsed" → re-probe).
+        self.external_identity_unavailable_since_ms = EXTERNAL_IDENTITY_PIN_FOREVER;
     }
 
     pub fn hasExternalIdentity(self: *Self, user_id: i64) !?bool {
         // F6 (2026-05-10): short-circuit when we've already learned the
         // `public.zaki_users` table doesn't exist in this deployment.
         // The first call probes; if it fails with a missing-table error,
-        // every subsequent call returns null silently. Without this guard
-        // a long bench logged ~200 identical `relation does not exist`
-        // errors.
-        if (self.external_identity_status == .unavailable) {
+        // subsequent calls within the TTL window return null silently.
+        // Without this guard a long bench logged ~200 identical
+        // `relation does not exist` errors.
+        //
+        // P1-9 (2026-06-12): the short-circuit is TTL'd. A SINGLE transient
+        // probe failure no longer latches `.unavailable` forever (which
+        // would permanently disable identity verification — fully fail-open
+        // for the Manager's whole life). Within EXTERNAL_IDENTITY_REPROBE_MS
+        // we keep failing open (preserves F6's noisy-log mitigation for a
+        // genuinely-absent table); after the window we re-probe so a
+        // transient blip self-heals back to `.available`.
+        const now_ms = std.time.milliTimestamp();
+        if (!shouldReprobeExternalIdentity(
+            self.external_identity_status == .unavailable,
+            self.external_identity_unavailable_since_ms,
+            now_ms,
+            EXTERNAL_IDENTITY_REPROBE_MS,
+        )) {
             return null;
         }
 
@@ -3018,16 +3078,22 @@ const ManagerImpl = struct {
         const result = self.execParams(query, &.{user_s.ptr}, &.{@as(c_int, @intCast(user_s.len))}) catch |err| switch (err) {
             // Compatibility mode: keep provisioning behavior when the identity
             // table is inaccessible in this runtime. F6: cache the
-            // unavailability so the next 200 calls don't repeat the noisy
-            // error log.
+            // unavailability so the next calls (within the TTL) don't repeat
+            // the noisy error log. P1-9: (re)stamp the latch time so the
+            // window restarts from THIS failure — a still-absent table
+            // re-latches each window (~1 probe/window), a recovered table
+            // probes once and flips back to `.available` below.
             error.ExecFailed, error.ConnectionFailed => {
                 self.external_identity_status = .unavailable;
+                self.external_identity_unavailable_since_ms = now_ms;
                 return null;
             },
             else => return err,
         };
         defer c.PQclear(result);
 
+        // Successful probe — clear any prior `.unavailable` latch so the
+        // gate is fully re-enabled (self-heal complete).
         self.external_identity_status = .available;
         return c.PQntuples(result) > 0;
     }
@@ -14258,6 +14324,104 @@ test "P1-8 daemon lane ensureUserProvisioned self-heals users row (no *_user_id_
         defer allocator.free(cnt);
         try std.testing.expectEqualStrings("1", cnt);
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// P1-9 (2026-06-12) — external-identity fail-open cache TTL. The
+// `.unavailable` short-circuit in hasExternalIdentity is TTL'd so a
+// transient probe failure self-heals instead of permanently disabling
+// identity verification. The TTL boundary lives in the pure
+// shouldReprobeExternalIdentity helper, unit-tested here (no PG needed).
+// ─────────────────────────────────────────────────────────────────────
+test "P1-9 external-identity TTL: re-probe boundary" {
+    const ttl: i64 = EXTERNAL_IDENTITY_REPROBE_MS;
+    const base: i64 = 1_000_000_000_000; // arbitrary wall-clock ms
+
+    // Not latched (.unknown / .available) → always probe.
+    try std.testing.expect(shouldReprobeExternalIdentity(false, 0, base, ttl));
+    try std.testing.expect(shouldReprobeExternalIdentity(false, base, base, ttl));
+
+    // Latched, BEFORE the window elapses → fail open (no re-probe).
+    try std.testing.expect(!shouldReprobeExternalIdentity(true, base, base, ttl)); // 0ms since latch
+    try std.testing.expect(!shouldReprobeExternalIdentity(true, base, base + ttl - 1, ttl)); // just inside
+
+    // Latched, AT/AFTER the window → re-probe (self-heal opportunity).
+    try std.testing.expect(shouldReprobeExternalIdentity(true, base, base + ttl, ttl)); // exact boundary
+    try std.testing.expect(shouldReprobeExternalIdentity(true, base, base + ttl + 1, ttl));
+    try std.testing.expect(shouldReprobeExternalIdentity(true, base, base + 10 * ttl, ttl));
+
+    // Test-pin sentinel → NEVER re-probe even far past any window.
+    try std.testing.expect(!shouldReprobeExternalIdentity(true, EXTERNAL_IDENTITY_PIN_FOREVER, base, ttl));
+    try std.testing.expect(!shouldReprobeExternalIdentity(true, EXTERNAL_IDENTITY_PIN_FOREVER, EXTERNAL_IDENTITY_PIN_FOREVER, ttl));
+}
+
+// P1-9 — live-DB self-heal: a single transient probe failure latches
+// `.unavailable`, but a re-probe after the TTL window flips the gate back
+// to `.available`. Drives the real hasExternalIdentity against pgvector PG:
+// stand up public.zaki_users, force the latch via the stash/rename trick,
+// rewind the latch timestamp past the TTL to simulate the window elapsing,
+// then confirm the next call re-probes and clears the latch.
+test "P1-9 hasExternalIdentity self-heals after TTL window (live PG)" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    // Opt-in: mutates the SHARED public.zaki_users table other parallel PG
+    // test binaries assume is absent — same gate/precedent as the P0-6
+    // live-identity test. Run with NULLALIS_PG_IDENTITY_TEST=1.
+    const gate = std.process.getEnvVarOwned(std.heap.page_allocator, "NULLALIS_PG_IDENTITY_TEST") catch {
+        std.debug.print("[p1-9-ttl] skipped (set NULLALIS_PG_IDENTITY_TEST=1 to run)\n", .{});
+        return error.SkipZigTest;
+    };
+    defer std.heap.page_allocator.free(gate);
+
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 5000) catch return error.SkipZigTest;
+    defer mgr.deinit();
+
+    const valid_id: i64 = 71;
+    // Stand up the shared identity table with a valid id seeded. Restore
+    // (drop) on the way out so the suite's "table absent" contract holds.
+    {
+        const r1 = try mgr.exec("CREATE TABLE IF NOT EXISTS public.zaki_users (id BIGINT PRIMARY KEY)");
+        c.PQclear(r1);
+        const seed = try std.fmt.allocPrint(allocator, "INSERT INTO public.zaki_users (id) VALUES ({d}) ON CONFLICT (id) DO NOTHING", .{valid_id});
+        defer allocator.free(seed);
+        const r2 = try mgr.exec(seed);
+        c.PQclear(r2);
+    }
+    defer {
+        const r = mgr.exec("DROP TABLE IF EXISTS public.zaki_users CASCADE") catch null;
+        if (r) |res| c.PQclear(res);
+    }
+
+    // Baseline: probe succeeds, gate available, valid id resolves true.
+    try std.testing.expectEqual(@as(?bool, true), try mgr.hasExternalIdentity(valid_id));
+    try std.testing.expect(mgr.external_identity_status == .available);
+
+    // Induce a transient probe failure by renaming the table away, then
+    // probing once → latches `.unavailable` (fail-open returns null).
+    {
+        const r = try mgr.exec("ALTER TABLE public.zaki_users RENAME TO zaki_users_p1_9_stash");
+        c.PQclear(r);
+    }
+    try std.testing.expectEqual(@as(?bool, null), try mgr.hasExternalIdentity(valid_id));
+    try std.testing.expect(mgr.external_identity_status == .unavailable);
+
+    // Restore the table — the "transient" failure is over.
+    {
+        const r = try mgr.exec("ALTER TABLE public.zaki_users_p1_9_stash RENAME TO zaki_users");
+        c.PQclear(r);
+    }
+
+    // WITHIN the TTL window the gate stays fail-open (still null) — proves
+    // we keep the noisy-log mitigation and don't hammer the probe.
+    try std.testing.expectEqual(@as(?bool, null), try mgr.hasExternalIdentity(valid_id));
+    try std.testing.expect(mgr.external_identity_status == .unavailable);
+
+    // Simulate the TTL window elapsing by rewinding the latch timestamp
+    // past the re-probe horizon. The next call must re-probe → succeed →
+    // self-heal back to `.available` and resolve the valid id true.
+    mgr.external_identity_unavailable_since_ms -= (EXTERNAL_IDENTITY_REPROBE_MS + 1);
+    try std.testing.expectEqual(@as(?bool, true), try mgr.hasExternalIdentity(valid_id));
+    try std.testing.expect(mgr.external_identity_status == .available);
 }
 
 // ─────────────────────────────────────────────────────────────────────
