@@ -465,6 +465,48 @@ pub const TurnUsageInput = struct {
     cost_available: bool,
 };
 
+/// **P0-4 (Wave A agent-runtime resilience)** — input to
+/// `upsertPendingApproval`. One durable `{schema}.pending_approvals` row per
+/// in-flight tool approval (migration 0005). All slices are borrowed for the
+/// duration of the call (the impl dupes what it needs for the libpq params),
+/// so the caller may free them after return.
+pub const PendingApprovalInput = struct {
+    /// Stable wire id (`apr-<u64>`) — PRIMARY KEY, also the FE card pin.
+    approval_id: []const u8,
+    session_key: []const u8,
+    /// FK to `{schema}.users(user_id)`. The write self-heals this parent
+    /// row via ensureUserRow first, so the FK can never fault.
+    user_id: i64,
+    tool_name: []const u8,
+    tool_call_id: ?[]const u8,
+    arguments_json: []const u8,
+    reason: []const u8,
+    /// RiskLevel slice ("low" | "medium" | "high" | ...).
+    risk_level: []const u8,
+};
+
+/// **P0-4** — a rehydrated open approval snapshot read back from
+/// `{schema}.pending_approvals` on session (re)build. Owned slices; caller
+/// must call `deinit`.
+pub const PendingApprovalRow = struct {
+    approval_id: []u8,
+    tool_name: []u8,
+    tool_call_id: ?[]u8,
+    arguments_json: []u8,
+    reason: []u8,
+    risk_level: []u8,
+    created_at_unix: i64,
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.approval_id);
+        allocator.free(self.tool_name);
+        if (self.tool_call_id) |id| allocator.free(id);
+        allocator.free(self.arguments_json);
+        allocator.free(self.reason);
+        allocator.free(self.risk_level);
+    }
+};
+
 pub const ArtifactVersionRow = struct {
     artifact_id: []u8,
     version: u64,
@@ -806,6 +848,23 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     /// actually landing, so a no-op here is correct for sqlite/base builds.
     pub fn insertTurnUsage(_: *@This(), _: TurnUsageInput) !void {
         return;
+    }
+    /// P0-4 (durable approvals) — stubs for non-postgres builds. The durable
+    /// approvals ledger requires Postgres; without it approvals stay
+    /// RAM-only (pre-P0-4 behavior). Persist no-ops, rehydrate finds nothing,
+    /// resolve no-ops, status replay reports "no durable row".
+    pub fn upsertPendingApproval(_: *@This(), _: PendingApprovalInput) !void {
+        return;
+    }
+    pub fn loadOpenPendingApproval(_: *@This(), _: std.mem.Allocator, _: []const u8) !?PendingApprovalRow {
+        return null;
+    }
+    pub fn resolvePendingApproval(_: *@This(), _: []const u8, _: bool, _: []const u8) !void {
+        return;
+    }
+    pub fn pendingApprovalStatus(_: *@This(), allocator: std.mem.Allocator, _: []const u8) !?[]u8 {
+        _ = allocator;
+        return null;
     }
     pub fn forgetMemory(_: *@This(), _: i64, _: []const u8) !bool {
         return error.PostgresNotEnabled;
@@ -9923,6 +9982,193 @@ const ManagerImpl = struct {
         c.PQclear(result);
     }
 
+    // ── P0-4: durable, resumable, idempotent tool approvals (migration 0005) ──
+    //
+    // Persists the in-RAM approval SNAPSHOT (`Agent.pending_tool_approval`)
+    // so a pod restart / session eviction no longer 404s the user's Approve
+    // click. Conversation history is already durable in `{schema}.messages`;
+    // only the snapshot was missing.
+
+    /// Persist (or re-persist) a pending approval snapshot. `ON CONFLICT
+    /// (approval_id) DO NOTHING` so a duplicate persist of the SAME approval
+    /// (e.g. a re-issue of an identical id) is a no-op rather than an error —
+    /// the FIRST write wins, exactly mirroring the in-RAM
+    /// `PendingToolApprovalAlreadyExists` reject. `status` defaults to
+    /// 'pending'; an already-resolved row is left untouched.
+    ///
+    /// FK-safe: calls `ensureUserRow` FIRST (the SAME P0-6 chokepoint session
+    /// writes use) so the `user_id` FK to `{schema}.users` cannot fault, and
+    /// a bogus id surfaces as `error.IdentityUserNotFound` (not a raw
+    /// `*_user_id_fkey`).
+    pub fn upsertPendingApproval(self: *Self, row: PendingApprovalInput) !void {
+        // P0-4: self-heal the parent users row before the approval write so a
+        // never-provisioned user_id cannot fault on
+        // pending_approvals_user_id_fkey. Bogus ids surface as
+        // error.IdentityUserNotFound.
+        try self.ensureUserRow(row.user_id);
+
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.pending_approvals " ++
+                "(approval_id, session_key, user_id, tool_name, tool_call_id, " ++
+                " arguments_json, reason, risk_level, status) " ++
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending') " ++
+                "ON CONFLICT (approval_id) DO NOTHING",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{row.user_id});
+        const approval_z = try self.allocator.dupeZ(u8, row.approval_id);
+        defer self.allocator.free(approval_z);
+        const session_z = try self.allocator.dupeZ(u8, row.session_key);
+        defer self.allocator.free(session_z);
+        const tool_z = try self.allocator.dupeZ(u8, row.tool_name);
+        defer self.allocator.free(tool_z);
+        const call_id_z: ?[:0]u8 = if (row.tool_call_id) |id| try self.allocator.dupeZ(u8, id) else null;
+        defer if (call_id_z) |z| self.allocator.free(z);
+        const args_z = try self.allocator.dupeZ(u8, row.arguments_json);
+        defer self.allocator.free(args_z);
+        const reason_z = try self.allocator.dupeZ(u8, row.reason);
+        defer self.allocator.free(reason_z);
+        const risk_z = try self.allocator.dupeZ(u8, row.risk_level);
+        defer self.allocator.free(risk_z);
+
+        const params = [_]?[*:0]const u8{
+            approval_z.ptr,
+            session_z.ptr,
+            user_s.ptr,
+            tool_z.ptr,
+            if (call_id_z) |z| z.ptr else null,
+            args_z.ptr,
+            reason_z.ptr,
+            risk_z.ptr,
+        };
+        const lengths = [_]c_int{
+            @intCast(row.approval_id.len),
+            @intCast(row.session_key.len),
+            @intCast(user_s.len),
+            @intCast(row.tool_name.len),
+            if (row.tool_call_id) |id| @intCast(id.len) else 0,
+            @intCast(row.arguments_json.len),
+            @intCast(row.reason.len),
+            @intCast(row.risk_level.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    /// Rehydration read: return THE open ('pending') approval for a session,
+    /// or null when none is open. Used by `getOrCreateInternal` after
+    /// `loadHistory` to restore `agent.pending_tool_approval` + re-emit the
+    /// approval_required event. v1 invariant: at most one pending per session
+    /// (`LIMIT 1`, newest first as a defensive tiebreak). Caller owns the
+    /// returned row and must call `deinit`.
+    pub fn loadOpenPendingApproval(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        session_key: []const u8,
+    ) !?PendingApprovalRow {
+        const q = try self.buildQuery(
+            "SELECT approval_id, tool_name, tool_call_id, arguments_json, " ++
+                "reason, risk_level, EXTRACT(EPOCH FROM created_at)::bigint " ++
+                "FROM {schema}.pending_approvals " ++
+                "WHERE session_key = $1 AND status = 'pending' " ++
+                "ORDER BY created_at DESC LIMIT 1",
+        );
+        defer self.allocator.free(q);
+        const session_z = try self.allocator.dupeZ(u8, session_key);
+        defer self.allocator.free(session_z);
+        const params = [_]?[*:0]const u8{session_z.ptr};
+        const lengths = [_]c_int{@intCast(session_key.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
+
+        var out: PendingApprovalRow = undefined;
+        var filled: usize = 0;
+        errdefer {
+            if (filled > 0) allocator.free(out.approval_id);
+            if (filled > 1) allocator.free(out.tool_name);
+            if (filled > 2) {
+                if (out.tool_call_id) |id| allocator.free(id);
+            }
+            if (filled > 3) allocator.free(out.arguments_json);
+            if (filled > 4) allocator.free(out.reason);
+            if (filled > 5) allocator.free(out.risk_level);
+        }
+        out.approval_id = try dupeResultValue(allocator, result, 0, 0);
+        filled += 1;
+        out.tool_name = try dupeResultValue(allocator, result, 0, 1);
+        filled += 1;
+        out.tool_call_id = try dupeNullableResultValue(allocator, result, 0, 2);
+        filled += 1;
+        out.arguments_json = try dupeResultValue(allocator, result, 0, 3);
+        filled += 1;
+        out.reason = try dupeResultValue(allocator, result, 0, 4);
+        filled += 1;
+        out.risk_level = try dupeResultValue(allocator, result, 0, 5);
+        filled += 1;
+        const created_raw = try dupeResultValue(allocator, result, 0, 6);
+        defer allocator.free(created_raw);
+        out.created_at_unix = std.fmt.parseInt(i64, created_raw, 10) catch 0;
+        return out;
+    }
+
+    /// Settle the durable row on resolve: flip `status` to 'approved' |
+    /// 'denied' and stamp `resolved_at` / `resolved_by`. Only transitions a
+    /// row that is still 'pending' (`AND status = 'pending'`), so the FIRST
+    /// resolve wins and a concurrent/duplicate resolve is a no-op — the
+    /// idempotent-replay path then reads the terminal status set here.
+    pub fn resolvePendingApproval(
+        self: *Self,
+        approval_id: []const u8,
+        approved: bool,
+        resolved_by: []const u8,
+    ) !void {
+        const new_status: [*:0]const u8 = if (approved) "approved" else "denied";
+        const q = try self.buildQuery(
+            "UPDATE {schema}.pending_approvals " ++
+                "SET status = $2, resolved_at = NOW(), resolved_by = $3 " ++
+                "WHERE approval_id = $1 AND status = 'pending'",
+        );
+        defer self.allocator.free(q);
+        const approval_z = try self.allocator.dupeZ(u8, approval_id);
+        defer self.allocator.free(approval_z);
+        const by_z = try self.allocator.dupeZ(u8, resolved_by);
+        defer self.allocator.free(by_z);
+        const params = [_]?[*:0]const u8{ approval_z.ptr, new_status, by_z.ptr };
+        const lengths = [_]c_int{
+            @intCast(approval_id.len),
+            @intCast(std.mem.len(new_status)),
+            @intCast(resolved_by.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    /// Idempotent-replay ledger lookup: return the durable `status` for an
+    /// `approval_id` ('pending' | 'approved' | 'denied'), or null when no row
+    /// exists. The gateway uses this to replay an already-resolved approval's
+    /// original outcome with HTTP 200 instead of 409. Caller owns the slice.
+    pub fn pendingApprovalStatus(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        approval_id: []const u8,
+    ) !?[]u8 {
+        const q = try self.buildQuery(
+            "SELECT status FROM {schema}.pending_approvals WHERE approval_id = $1",
+        );
+        defer self.allocator.free(q);
+        const approval_z = try self.allocator.dupeZ(u8, approval_id);
+        defer self.allocator.free(approval_z);
+        const params = [_]?[*:0]const u8{approval_z.ptr};
+        const lengths = [_]c_int{@intCast(approval_id.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
+        return try dupeResultValue(allocator, result, 0, 0);
+    }
+
     /// List the most-recent N skill execution traces for (user, skill_name).
     /// Used at the start of a skill invocation to inject "what worked
     /// last time" into the prompt. Returns owned slice; caller calls
@@ -12806,6 +13052,172 @@ test "Wave 2 — turn_usage FK CASCADE deletes a user's usage rows on user delet
         defer allocator.free(count);
         try std.testing.expectEqualStrings("0", count);
     }
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+}
+
+// P0-4 (2026-06-12, Wave A) — static contract for migration 0005. No
+// postgres required: pure SQL-string assertions so it runs in every build.
+// Guards the acceptance invariant "NO expires_at / NO TTL anywhere" plus the
+// FK + status-CHECK shape the durable-approvals logic relies on.
+test "P0-4 — migration 0005 has pending_approvals, FK, status CHECK, and NO TTL" {
+    var saw: bool = false;
+    for (migrations.MIGRATIONS) |m| {
+        if (m.version == 5 and std.mem.eql(u8, m.name, "0005_pending_approvals")) {
+            saw = true;
+            try std.testing.expect(std.mem.indexOf(u8, m.sql, "CREATE TABLE IF NOT EXISTS {schema}.pending_approvals") != null);
+            // FK to the parent users row (FK-safe via ensureUserRow).
+            try std.testing.expect(std.mem.indexOf(u8, m.sql, "REFERENCES {schema}.users(user_id) ON DELETE CASCADE") != null);
+            // Status ledger drives idempotent replay.
+            try std.testing.expect(std.mem.indexOf(u8, m.sql, "CHECK (status IN ('pending', 'approved', 'denied'))") != null);
+            // ACCEPTANCE: no TTL / no expiry column or sweep anywhere.
+            try std.testing.expect(std.mem.indexOf(u8, m.sql, "expires_at") == null);
+            try std.testing.expect(std.mem.indexOf(u8, m.sql, "TTL") == null);
+        }
+    }
+    try std.testing.expect(saw);
+}
+
+test "P0-4 — durable approvals: persist→rehydrate→resolve→idempotent-replay; FK-safe; no TTL" {
+    // The durable-approvals keystone. Proves migration 0005 + the four
+    // Manager methods together deliver the acceptance contract:
+    //   (1) migration 0005 applies cleanly on a fresh schema (idempotent on
+    //       re-migrate),
+    //   (2) upsertPendingApproval persists the snapshot FK-safely (it funnels
+    //       through ensureUserRow, so the parent users row self-heals),
+    //   (3) loadOpenPendingApproval rehydrates the open row after a simulated
+    //       restart — exposing the SAME card data,
+    //   (4) resolvePendingApproval settles status + resolved_at; once resolved
+    //       the open-row read returns null (no double-resume),
+    //   (5) pendingApprovalStatus is the idempotent-replay ledger: a repeat
+    //       resolve is a no-op and the original status is what replays,
+    //   (6) ON CONFLICT (approval_id) DO NOTHING makes a duplicate persist of
+    //       the same id a no-op (the FIRST snapshot wins).
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_pendappr", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    // (1) Fresh migrate then re-migrate — 0005 must be idempotent on both.
+    try mgr.migrate();
+    try mgr.migrate();
+
+    const sk = "agent:zaki-bot:user:42:thread:main";
+
+    // (2) Persist WITHOUT a prior provisionUser call — upsertPendingApproval
+    // must self-heal the parent users row via ensureUserRow (FK-safe). The
+    // FK target public.zaki_users(42) is seeded by the test harness; with no
+    // identity table present (pure-fixture DBs) it proceeds in compat mode.
+    try mgr.upsertPendingApproval(.{
+        .approval_id = "apr-1",
+        .session_key = sk,
+        .user_id = 42,
+        .tool_name = "shell",
+        .tool_call_id = "tc-1",
+        .arguments_json = "{\"cmd\":\"ls -la\"}",
+        .reason = "supervised_mutating_requires_approval",
+        .risk_level = "high",
+    });
+
+    // (3) Simulated restart: rehydrate the open row for the session. Same
+    // card data must come back.
+    {
+        var row = (try mgr.loadOpenPendingApproval(allocator, sk)) orelse {
+            try std.testing.expect(false);
+            unreachable;
+        };
+        defer row.deinit(allocator);
+        try std.testing.expectEqualStrings("apr-1", row.approval_id);
+        try std.testing.expectEqualStrings("shell", row.tool_name);
+        try std.testing.expectEqualStrings("tc-1", row.tool_call_id.?);
+        try std.testing.expectEqualStrings("{\"cmd\":\"ls -la\"}", row.arguments_json);
+        try std.testing.expectEqualStrings("supervised_mutating_requires_approval", row.reason);
+        try std.testing.expectEqualStrings("high", row.risk_level);
+    }
+
+    // (6) Duplicate persist of the SAME approval_id is a no-op (first wins).
+    // A different tool_name on the conflicting insert must NOT overwrite.
+    try mgr.upsertPendingApproval(.{
+        .approval_id = "apr-1",
+        .session_key = sk,
+        .user_id = 42,
+        .tool_name = "DIFFERENT_should_not_win",
+        .tool_call_id = null,
+        .arguments_json = "{}",
+        .reason = "x",
+        .risk_level = "low",
+    });
+    {
+        var row = (try mgr.loadOpenPendingApproval(allocator, sk)).?;
+        defer row.deinit(allocator);
+        try std.testing.expectEqualStrings("shell", row.tool_name); // unchanged
+    }
+
+    // (5) Pre-resolve ledger status is 'pending'.
+    {
+        const st = (try mgr.pendingApprovalStatus(allocator, "apr-1")).?;
+        defer allocator.free(st);
+        try std.testing.expectEqualStrings("pending", st);
+    }
+
+    // (4) Resolve = approve. Status settles, resolved_at stamped.
+    try mgr.resolvePendingApproval("apr-1", true, "user");
+    {
+        const st = (try mgr.pendingApprovalStatus(allocator, "apr-1")).?;
+        defer allocator.free(st);
+        try std.testing.expectEqualStrings("approved", st);
+    }
+    // Once resolved, the open-row read returns null (no double-resume).
+    try std.testing.expect((try mgr.loadOpenPendingApproval(allocator, sk)) == null);
+    // resolved_at must be set.
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT (resolved_at IS NOT NULL)::int, resolved_by FROM {s}.pending_approvals WHERE approval_id = 'apr-1'", .{schema});
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const resolved_set = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(resolved_set);
+        try std.testing.expectEqualStrings("1", resolved_set);
+        const by = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(by);
+        try std.testing.expectEqualStrings("user", by);
+    }
+
+    // (5) Idempotent replay: a SECOND resolve (even a contradictory deny) is
+    // a no-op — the original 'approved' status is preserved, so the gateway
+    // replays the original outcome with 200 instead of 409.
+    try mgr.resolvePendingApproval("apr-1", false, "user");
+    {
+        const st = (try mgr.pendingApprovalStatus(allocator, "apr-1")).?;
+        defer allocator.free(st);
+        try std.testing.expectEqualStrings("approved", st); // NOT 'denied'
+    }
+
+    // Unknown id → null status (gateway treats as "not previously resolved").
+    try std.testing.expect((try mgr.pendingApprovalStatus(allocator, "apr-nope")) == null);
+
     {
         const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
         defer allocator.free(schema_q);

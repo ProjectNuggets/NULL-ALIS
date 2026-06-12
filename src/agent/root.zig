@@ -2639,7 +2639,63 @@ pub const Agent = struct {
             .created_at_unix = std.time.timestamp(),
             .expires_at_unix = null,
         };
+        // P0-4: persist the durable snapshot so a pod restart / session
+        // eviction no longer 404s the user's Approve click. Best-effort —
+        // a persistence failure must NOT fail the approval gate (the in-RAM
+        // pending is still set; the only cost is no rehydration after a
+        // restart). Routed AFTER the in-RAM set so the live path is never
+        // blocked on the DB.
+        self.persistPendingApprovalSnapshot();
         return new_id;
+    }
+
+    /// **P0-4** — persist the just-set `pending_tool_approval` snapshot to the
+    /// durable `{schema}.pending_approvals` ledger (migration 0005).
+    ///
+    /// State manager + numeric user_id are read from the thread-local TENANT
+    /// context — the SAME handle `persistTurnUsageRow` and memory writes use,
+    /// set on the gateway, daemon, AND channel inbound paths. The Manager's
+    /// `upsertPendingApproval` funnels through `ensureUserRow` (P0-6) first,
+    /// so the FK to `{schema}.users` can never fault.
+    ///
+    /// **Best-effort:** a write failure must NEVER fail the turn / approval
+    /// gate. Any error is logged at warn and swallowed. Skipped (no durable
+    /// row, RAM-only fallback = pre-P0-4 behavior) when:
+    ///   - no Postgres state manager is bound (file-mode / sqlite)
+    ///   - no numeric user_id is resolvable (anonymous / un-tenanted turn)
+    ///   - no session_key is resolvable (cannot scope the rehydration read)
+    fn persistPendingApprovalSnapshot(self: *Agent) void {
+        const pending = self.pending_tool_approval orelse return;
+
+        const tenant_ctx = tools_mod.getTenantContext();
+        const state_mgr = tenant_ctx.state_mgr orelse return;
+        const user_id = tenant_ctx.numeric_user_id orelse return;
+
+        const turn_ctx = tools_mod.getTurnContext();
+        const session_key = self.memory_session_id orelse
+            turn_ctx.session_key orelse
+            tenant_ctx.session_key orelse
+            return;
+        if (session_key.len == 0) return;
+
+        state_mgr.upsertPendingApproval(.{
+            .approval_id = pending.approval_id,
+            .session_key = session_key,
+            .user_id = user_id,
+            .tool_name = pending.tool_name,
+            .tool_call_id = pending.tool_call_id,
+            .arguments_json = pending.arguments_json,
+            .reason = pending.reason,
+            .risk_level = pending.risk_level.toSlice(),
+        }) catch |err| {
+            // Best-effort: never fail the approval gate on a persist write.
+            // The Manager already routed any DB-layer failure to GlitchTip.
+            log.warn("pending_approval.persist failed (non-fatal) approval_id={s} user_id={d} err={s}", .{
+                pending.approval_id,
+                user_id,
+                @errorName(err),
+            });
+        };
     }
 
     /// Execute the currently pending approved tool exactly once.

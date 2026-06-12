@@ -107,6 +107,19 @@ pub const MIGRATIONS = [_]Migration{
         .name = "0004_turn_usage",
         .sql = @embedFile("migrations/0004_turn_usage.sql"),
     },
+    .{
+        // Wave A (2026-06-12, agent-runtime resilience) — P0-4 durable,
+        // resumable, idempotent tool approvals. See
+        // `src/migrations/0005_pending_approvals.sql` for the rationale +
+        // schema. Persists the in-RAM approval SNAPSHOT so a pod restart /
+        // session eviction no longer 404s the user's Approve click — the
+        // session rehydrates the open row on (re)build and resolves it.
+        // NO expires_at / NO TTL. FK-safe via the P0-6 ensureUserRow
+        // chokepoint.
+        .version = 5,
+        .name = "0005_pending_approvals",
+        .sql = @embedFile("migrations/0005_pending_approvals.sql"),
+    },
 };
 
 /// Trait the runner's caller must satisfy: a method that takes a
