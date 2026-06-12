@@ -14887,16 +14887,17 @@ fn handleSessionApprove(
     };
     const approved = input.approved;
 
-    // Pin session with active_refs to prevent eviction between check and processMessage.
-    // processMessage calls getOrCreate internally, which would silently mint a new
-    // session if the original was evicted — defeating the existence guard.
-    mgr.mutex.lock();
-    const session = mgr.sessions.get(session_key) orelse {
-        mgr.mutex.unlock();
-        return .{ .status = "404 Not Found", .body = "{\"error\":\"session_not_found\"}" };
+    // P0-4: resolve-by-durable-id. Previously a session that wasn't live in
+    // RAM (pod restart / eviction) returned 404 and the Approve click was
+    // dead. Now we get-or-(re)build + pin in one step; the (re)build path
+    // rehydrates the durable pending approval from {schema}.pending_approvals
+    // (see getOrCreateInternal), so a previously-issued approval resolves
+    // instead of 404-ing. Pinning (active_refs += 1) is done atomically inside
+    // getOrCreatePinned so eviction cannot race the pin between (re)build and
+    // processMessage (which calls getOrCreate internally).
+    const session = mgr.getOrCreatePinned(session_key) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"approval_failed\"}" };
     };
-    session.active_refs += 1; // Pin — eviction skips active_refs > 0
-    mgr.mutex.unlock();
 
     // Sprint 2 (2026-05-28) — stale-card guard. When the FE sends an
     // `approval_id` it's pinning to a SPECIFIC approval card; if the
@@ -14933,9 +14934,32 @@ fn handleSessionApprove(
             false;
         if (!matches) {
             session.mutex.unlock();
-            mgr.mutex.lock();
-            if (session.active_refs > 0) session.active_refs -= 1;
-            mgr.mutex.unlock();
+
+            // P0-4: idempotent replay. Before 409-ing on a mismatch, consult
+            // the durable ledger. If THIS approval_id was ALREADY resolved
+            // (approved|denied), a duplicate approve/deny click must replay
+            // the ORIGINAL outcome with 200 — not 409. This makes the FE's
+            // approve-retry (network flake, double click, reconnect) safe.
+            // Only the 'pending' (still-open) and missing-row cases fall
+            // through to the existing 409 stale-card contract.
+            if (mgr.extraction_state_mgr) |smgr| {
+                if (smgr.pendingApprovalStatus(allocator, claimed_id) catch null) |status_owned| {
+                    defer allocator.free(status_owned);
+                    if (std.mem.eql(u8, status_owned, "approved") or
+                        std.mem.eql(u8, status_owned, "denied"))
+                    {
+                        mgr.releasePin(session);
+                        const replay_body = std.fmt.allocPrint(
+                            allocator,
+                            "{{\"status\":\"{s}\",\"replay\":true,\"message\":\"approval already resolved\"}}",
+                            .{status_owned},
+                        ) catch return .{ .status = "200 OK", .body = "{\"status\":\"resolved\",\"replay\":true}" };
+                        return .{ .status = "200 OK", .body = replay_body };
+                    }
+                }
+            }
+
+            mgr.releasePin(session);
             return .{
                 .status = "409 Conflict",
                 .body = "{\"error\":\"approval_id_mismatch\",\"hint\":\"the pending approval changed or was already resolved; refresh the session before retrying\"}",

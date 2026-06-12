@@ -676,6 +676,20 @@ pub const SessionManager = struct {
         return self.getOrCreateInternal(session_key, true);
     }
 
+    /// **P0-4** — get-or-(re)build a session AND pin it (active_refs += 1) in
+    /// one mutex-held step, so eviction cannot race the pin. The (re)build
+    /// path rehydrates a durable pending approval (see getOrCreateInternal),
+    /// so a caller resolving an approval against an evicted/restarted session
+    /// no longer 404s. Caller MUST balance with `releasePin`.
+    pub fn getOrCreatePinned(self: *SessionManager, session_key: []const u8) !*Session {
+        return self.acquireSessionForTurn(session_key);
+    }
+
+    /// Release a pin acquired via `getOrCreatePinned`.
+    pub fn releasePin(self: *SessionManager, session: *Session) void {
+        self.releaseSessionRef(session);
+    }
+
     fn releaseSessionRef(self: *SessionManager, session: *Session) void {
         self.mutex.lock();
         defer self.mutex.unlock();

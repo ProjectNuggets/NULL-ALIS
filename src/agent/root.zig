@@ -2582,6 +2582,33 @@ pub const Agent = struct {
         return .{ .exec_id = self.pending_exec_id, .command = cmd };
     }
 
+    /// **P0-4 (sub-step e)** — settle the durable `{schema}.pending_approvals`
+    /// row on resolve: flip `status` to 'approved' | 'denied' and stamp
+    /// `resolved_at` (via `Manager.resolvePendingApproval`, which only
+    /// transitions a still-'pending' row, so the FIRST resolve wins).
+    ///
+    /// Decision-aware: the caller (the /approve handler) knows approve-vs-deny,
+    /// whereas `clearPendingToolApproval` (called from many non-resolution
+    /// sites too) does not — so the settle is driven from the resolution
+    /// points, NOT from the RAM clear. Once settled, the durable terminal
+    /// status drives idempotent replay (a duplicate approve/deny → 200 with
+    /// the original status, not 409).
+    ///
+    /// `approval_id` is passed explicitly because the caller settles BEFORE
+    /// clearPendingToolApproval frees the in-RAM slices. State manager is read
+    /// from the thread-local tenant context (same handle the persist path
+    /// uses). Best-effort: a failure must never fail the resolution.
+    pub fn settlePendingApprovalDurable(self: *Agent, approval_id: []const u8, approved: bool) void {
+        _ = self;
+        const tenant_ctx = tools_mod.getTenantContext();
+        const state_mgr = tenant_ctx.state_mgr orelse return;
+        state_mgr.resolvePendingApproval(approval_id, approved, "user") catch |err| {
+            log.warn("pending_approval.settle failed (non-fatal) approval_id={s} approved={any} err={s}", .{
+                approval_id, approved, @errorName(err),
+            });
+        };
+    }
+
     pub fn clearPendingToolApproval(self: *Agent) void {
         const pending = self.pending_tool_approval orelse return;
         self.allocator.free(pending.approval_id);
@@ -13110,6 +13137,11 @@ test "/approve deny clears pending tool approval and does not execute" {
     var noop = observability.NoopObserver{};
     const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
     var agent = try makeSupervisedAgent(allocator, &policy, noop.observer());
+    // P0-4: deny now starts a continuation turn (feed the model a denial note
+    // so it can adapt). This no-provider test only exercises the resolution +
+    // clear, so disable the continuation — mirrors the approve-path
+    // no-provider tests, which also set this false.
+    agent.approval_continues_turn = false;
     defer agent.deinit();
 
     const call = ParsedToolCall{ .name = "shell", .arguments_json = "{}", .tool_call_id = null };
@@ -13122,6 +13154,85 @@ test "/approve deny clears pending tool approval and does not execute" {
     try std.testing.expect(agent.pending_tool_approval == null);
     // Legacy shell pending was never registered via this path.
     try std.testing.expect(agent.pending_exec_command == null);
+}
+
+test "P0-4: /approve deny feeds the model a denial note + continues the turn" {
+    // Deny must no longer dead-stop: it feeds the model a short denial note
+    // and starts a continuation turn so the model can adapt. With a mock
+    // provider that echoes a fixed reply, the /approve deny response is the
+    // MODEL's continuation output (not the bare "denied." ack), proving the
+    // continuation turn ran.
+    const DenyEchoProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "Understood — I will not run that tool. Here is an alternative plan.");
+        }
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "Understood — I will not run that tool. Here is an alternative plan."),
+                .tool_calls = &.{},
+                .usage = .{ .prompt_tokens = 4, .completion_tokens = 6, .total_tokens = 10 },
+                .model = try allocator.dupe(u8, "text-model"),
+            };
+        }
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+        fn supportsVision(_: *anyopaque) bool {
+            return false;
+        }
+        fn supportsVisionForModel(_: *anyopaque, _: []const u8) bool {
+            return false;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "deny-echo";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var dummy: u8 = 0;
+    const vtable = Provider.VTable{
+        .chatWithSystem = DenyEchoProvider.chatWithSystem,
+        .chat = DenyEchoProvider.chat,
+        .supportsNativeTools = DenyEchoProvider.supportsNativeTools,
+        .supports_vision = DenyEchoProvider.supportsVision,
+        .supports_vision_for_model = DenyEchoProvider.supportsVisionForModel,
+        .getName = DenyEchoProvider.getName,
+        .deinit = DenyEchoProvider.deinitFn,
+    };
+    const prov = Provider{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
+
+    var noop = observability.NoopObserver{};
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = prov,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "text-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        // Production default — deny continues the turn.
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .policy = &policy,
+    };
+    defer agent.deinit();
+
+    const call = ParsedToolCall{ .name = "shell", .arguments_json = "{}", .tool_call_id = null };
+    _ = agent.preflightToolPolicy(call);
+    try std.testing.expect(agent.pending_tool_approval != null);
+
+    const resp = (try agent.handleSlashCommand("/approve deny")).?;
+    defer allocator.free(resp);
+    // The reply is the model's continuation, NOT the bare ack — proving the
+    // denial note was fed and the turn continued.
+    try std.testing.expect(std.mem.indexOf(u8, resp, "alternative plan") != null);
+    try std.testing.expect(agent.pending_tool_approval == null);
 }
 
 test "/approve with wrong id leaves pending tool approval untouched" {

@@ -2932,11 +2932,69 @@ fn handleGenericToolApprove(self: anytype, arg: []const u8) ![]const u8 {
 
     if (decision == .deny) {
         const id_snapshot = pending.id;
-        self.clearPendingToolApproval();
+        // HI-03-parity: clone the tool name into an owned buffer BEFORE
+        // clearPendingToolApproval frees the pending slices, so the denial
+        // note below can name the tool without aliasing freed memory.
+        const tool_name_owned = try self.allocator.dupe(u8, pending.tool_name);
+        defer self.allocator.free(tool_name_owned);
+        // P0-4 (e): settle the durable row BEFORE the RAM clear frees the id.
+        if (@hasDecl(@TypeOf(self.*), "settlePendingApprovalDurable")) {
+            const approval_id_owned = try self.allocator.dupe(u8, pending.approval_id);
+            defer self.allocator.free(approval_id_owned);
+            self.clearPendingToolApproval();
+            self.settlePendingApprovalDurable(approval_id_owned, false);
+        } else {
+            self.clearPendingToolApproval();
+        }
         // S5 (2026-05-29, prod-readiness) — user-resolution tail of
         // the approval lifecycle. The complementary "issued" emit fires
         // at the preflight gate in `preflightToolPolicy` (root.zig).
         observability.recordMetricGlobal(.{ .approval_decision_total = .{ .result = "user_denied" } });
+
+        // P0-4: feed the model a short denial note + start a continuation turn
+        // so it can ADAPT (try a different approach, ask the user, explain)
+        // instead of dead-stopping. Previously deny returned here with no
+        // continuation — the turn just ended and the model never learned the
+        // user rejected its tool call. Gated on `approval_continues_turn`
+        // (same gate as the approve path): legacy tests without a live
+        // provider keep the direct-reply behavior.
+        const continues_turn = if (@hasField(@TypeOf(self.*), "approval_continues_turn"))
+            self.approval_continues_turn
+        else
+            true;
+
+        if (continues_turn) {
+            const synthetic = try std.fmt.allocPrint(
+                self.allocator,
+                "[The user DENIED your request to run the tool `{s}` (approval id={d}). " ++
+                    "Do not attempt to run it again. Adapt: either propose a different " ++
+                    "approach that does not require that tool, ask the user a clarifying " ++
+                    "question, or explain what you can still do without it.]",
+                .{ tool_name_owned, id_snapshot },
+            );
+            defer self.allocator.free(synthetic);
+
+            const continuation_result: anyerror![]const u8 = self.turn(synthetic);
+            if (continuation_result) |continuation| {
+                if (std.mem.trim(u8, continuation, " \t\r\n").len == 0) {
+                    self.allocator.free(continuation);
+                    return try std.fmt.allocPrint(
+                        self.allocator,
+                        "Tool approval id={d} denied.",
+                        .{id_snapshot},
+                    );
+                }
+                return continuation;
+            } else |_| {
+                // Continuation failed — fall back to the plain ack.
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "Tool approval id={d} denied.",
+                    .{id_snapshot},
+                );
+            }
+        }
+
         return try std.fmt.allocPrint(
             self.allocator,
             "Tool approval id={d} denied.",
@@ -2957,6 +3015,21 @@ fn handleGenericToolApprove(self: anytype, arg: []const u8) ![]const u8 {
     // the counter reflects the user decision regardless of whether the
     // tool itself later raises an error.
     observability.recordMetricGlobal(.{ .approval_decision_total = .{ .result = "user_approved" } });
+
+    // P0-4 (e): settle the durable row to 'approved' BEFORE execute (which is
+    // also where the metric settles). The user's decision is "approved"
+    // regardless of whether the tool later errors — and settling here, while
+    // `pending` is still live, captures the id once for ALL approve exit paths
+    // (failure / legacy-no-turn / continuation) without scattering the settle
+    // across each clearPendingToolApproval site. Duplicate settles are no-ops
+    // (resolvePendingApproval only transitions a still-'pending' row).
+    if (@hasDecl(@TypeOf(self.*), "settlePendingApprovalDurable")) {
+        const approval_id_owned = self.allocator.dupe(u8, pending.approval_id) catch null;
+        if (approval_id_owned) |aid| {
+            defer self.allocator.free(aid);
+            self.settlePendingApprovalDurable(aid, true);
+        }
+    }
 
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
