@@ -120,6 +120,20 @@ pub const MIGRATIONS = [_]Migration{
         .name = "0005_pending_approvals",
         .sql = @embedFile("migrations/0005_pending_approvals.sql"),
     },
+    .{
+        // Wave C C4 (2026-06-12, agent-runtime resilience) — P1-5 transcript
+        // fidelity. Adds NULLABLE `tool_calls` (JSONB) + `reasoning` (TEXT)
+        // columns to {schema}.messages so a reloaded assistant turn carries
+        // its native tool-call/reasoning structure instead of degrading to
+        // flat text on a pod restart / session eviction. See
+        // `src/migrations/0006_message_transcript_fidelity.sql` for the
+        // rationale + the backward-compat (rolling update + rollback) and
+        // idempotency contracts. Strictly additive + nullable: an older pod
+        // ignores the columns; new code reads old (NULL) rows unchanged.
+        .version = 6,
+        .name = "0006_message_transcript_fidelity",
+        .sql = @embedFile("migrations/0006_message_transcript_fidelity.sql"),
+    },
 };
 
 /// Trait the runner's caller must satisfy: a method that takes a
@@ -462,6 +476,84 @@ test "Wave 2 — migration 0004_turn_usage is registered with the durable meteri
     // in BEGIN/COMMIT — a mid-migration failure rolls back cleanly.
     try std.testing.expect(!found.concurrent_only);
     try std.testing.expect(std.mem.indexOf(u8, sql, "CONCURRENTLY") == null);
+}
+
+test "Wave C C4 — migration 0006 adds NULLABLE tool_calls + reasoning, idempotently + backward-compatibly" {
+    // Static contract test (no live DB): the transcript-fidelity migration
+    // must add the two columns the reload path depends on, and must do so in
+    // a way that is (a) idempotent on re-apply and (b) backward-compatible
+    // with an older pod during a rolling update / after a rollback. A future
+    // edit that drops the IF NOT EXISTS guard (breaks double-apply) or makes
+    // a column NOT NULL (breaks old-pod inserts that omit it) is caught here
+    // at compile-test time without a Postgres.
+    const found = blk: {
+        for (MIGRATIONS) |m| {
+            if (m.version == 6) break :blk m;
+        }
+        return error.Migration0006NotFound;
+    };
+    try std.testing.expectEqualStrings("0006_message_transcript_fidelity", found.name);
+    const sql = found.sql;
+
+    // Both columns added, NULLABLE (no NOT NULL / no DEFAULT that would
+    // rewrite the table or break an old-pod insert that omits them).
+    try std.testing.expect(std.mem.indexOf(u8, sql, "ADD COLUMN IF NOT EXISTS tool_calls JSONB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "ADD COLUMN IF NOT EXISTS reasoning TEXT") != null);
+    // Belt-and-suspenders: neither add declares NOT NULL.
+    try std.testing.expect(std.mem.indexOf(u8, sql, "tool_calls JSONB NOT NULL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "reasoning TEXT NOT NULL") == null);
+
+    // Transactional (no CREATE INDEX CONCURRENTLY) so the runner wraps it
+    // in BEGIN/COMMIT — a mid-migration failure rolls back cleanly.
+    try std.testing.expect(!found.concurrent_only);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "CONCURRENTLY") == null);
+}
+
+test "Wave C C4 — every registered migration is idempotently re-appliable (no unguarded DDL)" {
+    // P1-10 acceptance, enforced as a STATIC invariant across the WHOLE
+    // migration set (not just the new one): applying the full set twice must
+    // be a clean no-op. Any CREATE TABLE / CREATE [UNIQUE] INDEX / ADD COLUMN
+    // that omits its IF NOT EXISTS guard, or any bare ADD CONSTRAINT outside a
+    // DO-block existence guard, would fault on the second apply. This walks
+    // every migration's SQL and fails if it finds such an unguarded statement,
+    // so a future migration that forgets a guard is caught at compile-test
+    // time — independent of whether a Postgres double-apply test happens to
+    // exercise that exact table.
+    for (MIGRATIONS) |m| {
+        try assertGuardedDdl(m);
+    }
+}
+
+fn assertGuardedDdl(m: Migration) !void {
+    // Scan line-by-line for the leading DDL keyword of each guarded statement
+    // kind, requiring the idempotency guard on the same logical statement.
+    // We tolerate ADD CONSTRAINT / ADD PRIMARY KEY ONLY when the migration
+    // wraps them in a DO-block existence guard (0001's FK + tasks re-key).
+    var line_iter = std.mem.tokenizeAny(u8, m.sql, "\n");
+    while (line_iter.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (std.mem.startsWith(u8, line, "--")) continue;
+        const upper_has = struct {
+            fn f(hay: []const u8, needle: []const u8) bool {
+                return std.ascii.indexOfIgnoreCase(hay, needle) != null;
+            }
+        }.f;
+        if (upper_has(line, "CREATE TABLE ")) {
+            try std.testing.expect(upper_has(line, "IF NOT EXISTS"));
+        }
+        if (upper_has(line, "CREATE INDEX ") or upper_has(line, "CREATE UNIQUE INDEX ")) {
+            try std.testing.expect(upper_has(line, "IF NOT EXISTS"));
+        }
+        if (upper_has(line, "ADD COLUMN ")) {
+            try std.testing.expect(upper_has(line, "IF NOT EXISTS"));
+        }
+        // Bare top-level ADD CONSTRAINT / ADD PRIMARY KEY are allowed ONLY
+        // inside a DO-block existence guard; require the migration to contain
+        // a DO $$ block when it uses either form.
+        if (upper_has(line, "ADD CONSTRAINT ") or upper_has(line, "ADD PRIMARY KEY")) {
+            try std.testing.expect(std.mem.indexOf(u8, m.sql, "DO $$") != null);
+        }
+    }
 }
 
 test "S10.4 — initial schema declares cross-schema FK to public.zaki_users with CASCADE" {
