@@ -2907,37 +2907,72 @@ const ManagerImpl = struct {
         const session_key = zaki_session.userMainSessionKey(&key_buf, user_s);
         const session_key_z = try self.allocator.dupeZ(u8, session_key);
         defer self.allocator.free(session_key_z);
-        try self.execParamsNoResult(
+
+        // P1-7 (2026-06-12): all 6 provisioning inserts run inside a SINGLE
+        // connection-pinned transaction (same TxnLease pattern as
+        // createArtifact). Pre-P1-7 each was a separate autocommit
+        // statement on a (potentially different) pooled connection, so a
+        // mid-provision failure (e.g. the heartbeat insert) left a
+        // half-provisioned user — a users row with no config/sessions, or
+        // vice versa. Wrapping in one txn makes provisioning all-or-nothing:
+        // any failed insert rolls the whole batch back. The runtime
+        // self-heal paths (P0-6 ensureUserRow, P1-8 below) backfill the
+        // users row defensively, but provisioning itself must not leave a
+        // torn state behind.
+        var txn = try self.beginTransaction();
+        defer txn.deinit();
+
+        try self.txnExecNoResult(
+            &txn,
             "INSERT INTO {schema}.users (user_id, workspace_path) VALUES ($1, $2) " ++
                 "ON CONFLICT (user_id) DO UPDATE SET workspace_path = EXCLUDED.workspace_path, updated_at = NOW()",
             &.{ user_s.ptr, workspace_z },
             &.{ @as(c_int, @intCast(user_s.len)), @as(c_int, @intCast(workspace_path.len)) },
         );
-        try self.execParamsNoResult(
+        try self.txnExecNoResult(
+            &txn,
             "INSERT INTO {schema}.user_config (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
             &.{user_s.ptr},
             &.{@as(c_int, @intCast(user_s.len))},
         );
-        try self.execParamsNoResult(
+        try self.txnExecNoResult(
+            &txn,
             "INSERT INTO {schema}.heartbeat (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
             &.{user_s.ptr},
             &.{@as(c_int, @intCast(user_s.len))},
         );
-        try self.execParamsNoResult(
+        try self.txnExecNoResult(
+            &txn,
             "INSERT INTO {schema}.channel_state (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
             &.{user_s.ptr},
             &.{@as(c_int, @intCast(user_s.len))},
         );
-        try self.execParamsNoResult(
+        try self.txnExecNoResult(
+            &txn,
             "INSERT INTO {schema}.onboarding (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
             &.{user_s.ptr},
             &.{@as(c_int, @intCast(user_s.len))},
         );
-        try self.execParamsNoResult(
+        try self.txnExecNoResult(
+            &txn,
             "INSERT INTO {schema}.sessions (id, user_id, session_key, kind, title) VALUES ($1, $2, $1, 'main', 'Main') ON CONFLICT (session_key) DO NOTHING",
             &.{ session_key_z, user_s.ptr },
             &.{ @as(c_int, @intCast(session_key.len)), @as(c_int, @intCast(user_s.len)) },
         );
+
+        try txn.commit();
+    }
+
+    /// Run a parameterized, no-result-needed write on an open TxnLease.
+    /// Mirrors `execParamsNoResult` (schema substitution via buildQuery)
+    /// but pins the statement to the transaction's connection instead of
+    /// acquiring a one-shot pool conn. Used by provisionUser (P1-7) so the
+    /// provisioning inserts share one all-or-nothing transaction.
+    fn txnExecNoResult(self: *Self, txn: *TxnLease, template: []const u8, params: []const ?[*:0]const u8, lengths: []const c_int) !void {
+        const query = try self.buildQuery(template);
+        defer self.allocator.free(query);
+        const result = try txn.execParams(query, params, lengths);
+        c.PQclear(result);
     }
 
     /// Test-only — forcibly preset the external-identity gate so
@@ -13967,6 +14002,95 @@ test "P0-6 ensureUserRow rejects bogus id with typed identity error (live zaki_u
         const cnt = try dupeResultValue(allocator, result, 0, 0);
         defer allocator.free(cnt);
         try std.testing.expectEqualStrings("0", cnt);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// P1-7 (2026-06-12) — provisionUser is ATOMIC. The 6 provisioning inserts
+// (users, user_config, heartbeat, channel_state, onboarding, sessions)
+// run inside a single connection-pinned transaction, so a mid-provision
+// failure rolls back ALL of them — no half-provisioned state where the
+// users row exists but its config/heartbeat/sessions don't (or vice
+// versa). Pre-P1-7 each insert was a separate autocommit statement on a
+// (potentially different) pooled connection, so a failure on insert N
+// left rows 1..N-1 committed.
+//
+// Induce a deterministic mid-provision failure by DROPPING one of the
+// later insert targets (onboarding, the 5th insert) so its INSERT faults.
+// Acceptance: the FIRST insert's users row must NOT survive (proving the
+// whole batch rolled back), and after restoring the table a clean
+// re-provision must land all 6 rows.
+// ─────────────────────────────────────────────────────────────────────
+test "P1-7 provisionUser is atomic — mid-provision failure leaves no partial rows" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = initPostgresTestManagerWithPool(allocator, 4, 5000) catch return error.SkipZigTest;
+    defer mgr.deinit();
+
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+
+    const user_id: i64 = 4242;
+
+    // Snapshot the onboarding DDL so we can recreate it after the induced
+    // failure. Simplest deterministic break: drop the table so the 5th
+    // insert (onboarding) faults with `relation does not exist`. The
+    // first four inserts (users, user_config, heartbeat, channel_state)
+    // and the BEGIN have already run on the pinned txn conn; an atomic
+    // provisionUser must ROLLBACK them.
+    {
+        const drop_q = try std.fmt.allocPrint(allocator, "ALTER TABLE {s}.onboarding RENAME TO onboarding_p1_7_stash", .{schema_q});
+        defer allocator.free(drop_q);
+        const r = try mgr.exec(drop_q);
+        c.PQclear(r);
+    }
+
+    // The provision MUST fail (onboarding insert faults).
+    const provision_err = mgr.provisionUser(user_id, "/data/users/4242/workspace");
+    try std.testing.expectError(error.ExecFailed, provision_err);
+
+    // Restore the table BEFORE the assertions/re-provision below.
+    {
+        const restore_q = try std.fmt.allocPrint(allocator, "ALTER TABLE {s}.onboarding_p1_7_stash RENAME TO onboarding", .{schema_q});
+        defer allocator.free(restore_q);
+        const r = try mgr.exec(restore_q);
+        c.PQclear(r);
+    }
+
+    // ── ATOMICITY ASSERTION — NO partial rows ──
+    // The users row from the (committed, pre-P1-7) first insert must be
+    // gone: the whole transaction rolled back. Pre-P1-7 this row would
+    // survive (separate autocommit insert) → count == 1 → test fails.
+    inline for (.{ "users", "user_config", "heartbeat", "channel_state" }) |tbl| {
+        const q = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}.{s} WHERE user_id = {d}", .{ schema_q, tbl, user_id });
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const cnt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(cnt);
+        try std.testing.expectEqualStrings("0", cnt);
+    }
+
+    // ── RECOVERY — a clean re-provision lands all 6 rows ──
+    try mgr.provisionUser(user_id, "/data/users/4242/workspace");
+    inline for (.{ "users", "user_config", "heartbeat", "channel_state", "onboarding" }) |tbl| {
+        const q = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}.{s} WHERE user_id = {d}", .{ schema_q, tbl, user_id });
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const cnt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(cnt);
+        try std.testing.expectEqualStrings("1", cnt);
+    }
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}.sessions WHERE user_id = {d}", .{ schema_q, user_id });
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const cnt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(cnt);
+        try std.testing.expectEqualStrings("1", cnt);
     }
 }
 
