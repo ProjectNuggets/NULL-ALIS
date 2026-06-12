@@ -1497,6 +1497,41 @@ fn runCronAgentTurnWithBus(
         tenant_state_mgr = zaki_state.Manager.init(allocator, runtime_cfg.state) catch null;
     }
     defer if (tenant_state_mgr) |*mgr| mgr.deinit();
+
+    // P1-8 (2026-06-12): gate the daemon cron/heartbeat/wake lane on the
+    // parent users row. A scheduled turn for a never-provisioned (but
+    // identity-valid) user would otherwise write session / message /
+    // memory / turn_usage rows whose user_id FK points at a missing
+    // users row, faulting *_user_id_fkey. ensureUserProvisioned self-heals
+    // the row first (ON CONFLICT DO NOTHING — no-op when already present).
+    // An identity-invalid user_id returns error.IdentityUserNotFound: skip
+    // the turn entirely rather than emit orphan rows. All other failures
+    // are best-effort (logged, turn proceeds) so a transient state-mgr
+    // hiccup doesn't silently drop every scheduled turn — the downstream
+    // P0-6 ensureSession self-heal still backstops the session lane.
+    if (tenant_state_mgr) |*mgr| {
+        if (numeric_user_id) |uid| {
+            mgr.ensureUserProvisioned(uid) catch |err| {
+                // Compared by value (not an exhaustive switch) so this block
+                // also compiles for the non-postgres stub Manager, whose
+                // error set doesn't contain IdentityUserNotFound. In base
+                // builds tenant_state_mgr is always null (stub init fails),
+                // so this is dead there — but it must still typecheck.
+                if (err == error.IdentityUserNotFound) {
+                    log.info("cron.skipped reason=identity_user_not_found user={s} job_id={s}", .{
+                        scheduler.context_user_id orelse "-",
+                        job.id,
+                    });
+                    return allocator.dupe(u8, "");
+                }
+                log.warn("cron.ensure_user_provisioned_failed user={s} job_id={s} err={s}", .{
+                    scheduler.context_user_id orelse "-",
+                    job.id,
+                    @errorName(err),
+                });
+            };
+        }
+    }
     tools_mod.setTenantContext(.{
         .user_id = scheduler.context_user_id,
         .numeric_user_id = numeric_user_id,

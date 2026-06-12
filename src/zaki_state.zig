@@ -570,6 +570,9 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn provisionUser(_: *@This(), _: i64, _: []const u8) !void {
         return error.PostgresNotEnabled;
     }
+    pub fn ensureUserProvisioned(_: *@This(), _: i64) !void {
+        return error.PostgresNotEnabled;
+    }
     pub fn hasExternalIdentity(_: *@This(), _: i64) !?bool {
         return null;
     }
@@ -11049,6 +11052,18 @@ const ManagerImpl = struct {
         );
     }
 
+    /// P1-8 (2026-06-12): public entry to the internal ensureUserRow
+    /// self-heal so the daemon cron/heartbeat/wake lane can guarantee the
+    /// parent users row exists BEFORE a scheduled turn writes any
+    /// user-scoped rows (sessions, messages, memories, turn_usage). A
+    /// scheduled turn for a never-provisioned-but-identity-valid user
+    /// otherwise faults on a *_user_id_fkey. Identity-invalid ids surface
+    /// as error.IdentityUserNotFound (same gate as ensureUserRow /
+    /// provisionUser), so this never creates a shadow user.
+    pub fn ensureUserProvisioned(self: *Self, user_id: i64) !void {
+        return self.ensureUserRow(user_id);
+    }
+
     fn ensureSession(self: *Self, user_id: i64, session_id: []const u8) !void {
         // P0-6: self-heal the parent users row before any session write so a
         // never-provisioned user_id (daemon cron/heartbeat lane) cannot fault on
@@ -14168,6 +14183,74 @@ test "P1-8 session-less memory write self-heals users row (no memories_user_id_f
     try mgr.upsertMemory(user_id2, "p1_8_simple_no_session", "simple null-session fact", .core, null);
     {
         const q = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}.users WHERE user_id = {d}", .{ schema_q, user_id2 });
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const cnt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(cnt);
+        try std.testing.expectEqualStrings("1", cnt);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// P1-8 (2026-06-12) — daemon cron/heartbeat/wake lane gate. The daemon
+// (daemon.zig runScheduledJobTurnWithRuntime) calls
+// Manager.ensureUserProvisioned BEFORE a scheduled turn, so a turn for a
+// never-provisioned user provisions-first instead of writing orphan rows
+// that fault *_user_id_fkey. This test exercises that public chokepoint
+// directly (the full runtime+scheduler harness needed to drive
+// runScheduledJobTurnWithRuntime end to end does not exist in the test
+// suite; this covers the exact mechanism the daemon-lane fix relies on):
+//   (a) never-provisioned user → users row self-heals.
+//   (c) already-provisioned user → no-op, authoritative workspace_path
+//       preserved (ON CONFLICT DO NOTHING).
+// Acceptance (b) — bogus-id rejection on the live-identity path — is
+// covered by the P0-6 live-identity test, since ensureUserProvisioned
+// delegates to the same ensureUserRow identity gate.
+// ─────────────────────────────────────────────────────────────────────
+test "P1-8 daemon lane ensureUserProvisioned self-heals users row (no *_user_id_fkey)" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+
+    const user_id: i64 = 5151;
+
+    // ── (a) never-provisioned → self-heal ──
+    try mgr.ensureUserProvisioned(user_id);
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT workspace_path FROM {s}.users WHERE user_id = {d}", .{ schema_q, user_id });
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+        const ws = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(ws);
+        try std.testing.expectEqualStrings("/data/users/5151/workspace", ws);
+    }
+
+    // ── (c) already-provisioned → no-op, authoritative path preserved ──
+    try mgr.provisionUser(user_id, "/data/users/5151/real-workspace");
+    try mgr.ensureUserProvisioned(user_id); // must NOT clobber the real path
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT workspace_path FROM {s}.users WHERE user_id = {d}", .{ schema_q, user_id });
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const ws = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(ws);
+        try std.testing.expectEqualStrings("/data/users/5151/real-workspace", ws);
+    }
+
+    // And a session write for the provisioned user lands cleanly (the
+    // daemon turn's downstream write — no FK fault on the parent row).
+    try mgr.saveSessionMessage(user_id, "agent:zaki-bot:user:5151:main", "user", "scheduled turn");
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}.messages WHERE user_id = {d}", .{ schema_q, user_id });
         defer allocator.free(q);
         const result = try mgr.exec(q);
         defer c.PQclear(result);
