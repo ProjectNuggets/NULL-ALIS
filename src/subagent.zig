@@ -19,6 +19,9 @@ const tasks_mod = @import("tasks/root.zig");
 const zaki_session = @import("session/root.zig");
 const zaki_state = @import("zaki_state.zig");
 const heartbeat_wake = @import("heartbeat_wake.zig");
+const build_options = @import("build_options");
+const env_rebrand = @import("env_rebrand.zig");
+const config_types = @import("config_types.zig");
 
 const log = std.log.scoped(.subagent);
 const TASK_LEDGER_FILE_NAME = "subagent_tasks.jsonl";
@@ -251,9 +254,56 @@ pub const SubagentManager = struct {
         delivery: CompletionDeliveryFn,
     ) void {
         self.mutex.lock();
-        defer self.mutex.unlock();
         self.completion_delivery_ctx = ctx;
         self.completion_delivery = delivery;
+        self.mutex.unlock();
+
+        // Startup recovery: re-deliver any completions that were persisted
+        // but not confirmed-delivered before the previous pod restart.
+        // Only runs when both the PG ledger AND the delivery callback are
+        // wired — mirrors the gateway.zig wiring order where
+        // attachPostgresLedger is called first, attachCompletionDelivery
+        // second (Task 1.6).
+        if (self.ledger_user_id) |uid| {
+            self.recoverPendingSubagentResults(uid);
+        }
+    }
+
+    /// Re-deliver completions that were persisted but not confirmed-delivered
+    /// before a restart. Idempotent: each row is marked delivered after waking
+    /// so a second restart won't re-fire the same completion. Best-effort:
+    /// logs and continues on any error. Frees every row (deinit + free slice).
+    /// Phase-1 recovery content is a minimal marker; Phase 2 will re-hydrate
+    /// the full result text from result_json — do NOT parse result_json here.
+    pub fn recoverPendingSubagentResults(self: *SubagentManager, user_id: i64) void {
+        const sm = self.ledger_state_mgr orelse return;
+        const rows = sm.loadPendingSubagentResults(self.allocator, user_id) catch |err| {
+            log.warn("subagent: recovery load failed user_id={d}: {}", .{ user_id, err });
+            return;
+        };
+        defer {
+            for (rows) |*r| r.deinit(self.allocator);
+            self.allocator.free(rows);
+        }
+        for (rows) |row| {
+            // Re-deliver a minimal Phase-1 marker to the parent session history.
+            // Phase 2 (Task 2.3) will parse result_json and deliver the real text.
+            if (self.completion_delivery) |delivery| {
+                const content = std.fmt.allocPrint(
+                    self.allocator,
+                    "[Subagent task_id={d} completed — recovered after restart]",
+                    .{row.task_id},
+                ) catch continue;
+                defer self.allocator.free(content);
+                delivery(self.completion_delivery_ctx, row.session_key, content) catch {};
+            }
+            // Wake the parent's heartbeat turn so the recovery is processed.
+            var ubuf: [32]u8 = undefined;
+            const uid_s: ?[]const u8 = std.fmt.bufPrint(&ubuf, "{d}", .{user_id}) catch null;
+            heartbeat_wake.enqueue(uid_s, "subagent_completion:recovered") catch {};
+            // Mark delivered so a subsequent restart doesn't re-fire this row.
+            sm.markSubagentResultDelivered(row.result_id) catch {};
+        }
     }
 
     /// Attach a canonical TaskDelivery so subagent lifecycle transitions
@@ -1921,6 +1971,137 @@ const BlockingCompletionRunner = struct {
         self.mutex.unlock();
     }
 };
+
+// ── Task 1.6 tests: startup recovery ─────────────────────────────────
+
+// Non-PG unit test: calling recoverPendingSubagentResults on a manager
+// with ledger_state_mgr=null is a clean no-op — no crash, no wake enqueued.
+// This runs locally (no Postgres required) and must be GREEN.
+test "recoverPendingSubagentResults with null ledger_state_mgr is a no-op" {
+    heartbeat_wake.clearForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    // ledger_state_mgr is null — must return immediately with no side effects.
+    mgr.recoverPendingSubagentResults(42);
+
+    // No wake must have been enqueued.
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount());
+    // No delivery must have happened.
+    try std.testing.expect(recorder.content == null);
+}
+
+// PG-guarded recovery test: seed a pending row, call recovery, assert a wake
+// was enqueued for the user and the row is now marked delivered.
+// Skips cleanly when Postgres is not configured (local / CI without DB).
+test "recoverPendingSubagentResults re-delivers and wakes for pending rows" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(
+        allocator,
+        "NULLALIS_POSTGRES_TEST_URL",
+        "NULLCLAW_POSTGRES_TEST_URL",
+    ) catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    heartbeat_wake.clearForTest();
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_recover", .{std.time.microTimestamp()});
+    const state_cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var state_mgr = try zaki_state.Manager.init(allocator, state_cfg);
+    defer state_mgr.deinit();
+
+    // Cleanup on exit.
+    {
+        const pg_helpers = @import("memory/engines/postgres.zig");
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, state_mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const res = try state_mgr.exec(drop_q);
+        _ = res;
+    }
+    try state_mgr.migrate();
+
+    // Seed one pending row for user_id=42, session_key contains "user:42".
+    try state_mgr.upsertSubagentResult(.{
+        .result_id = "subagent:77",
+        .user_id = 42,
+        .session_key = "agent:zaki-bot:user:42:main",
+        .task_id = 77,
+        .result_json = "{\"status\":\"completed\",\"text\":\"recovered answer\"}",
+    });
+
+    // Build a manager with the PG ledger and a recording delivery.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(allocator, &cfg, null, .{});
+    defer mgr.deinit();
+    // Attach ledger FIRST (mirrors gateway.zig wiring order).
+    mgr.attachPostgresLedger(&state_mgr, 42);
+    // Attach delivery SECOND — triggers recovery.
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+
+    // A wake must have been enqueued for user "42".
+    const req = heartbeat_wake.dequeue();
+    try std.testing.expect(req != null);
+    var mutable_req = req.?;
+    defer mutable_req.deinit();
+    try std.testing.expectEqualStrings("42", mutable_req.user_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, mutable_req.reason, "subagent_completion:recovered") != null);
+
+    // The delivery callback must have been called.
+    try std.testing.expect(recorder.content != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.content.?, "77") != null);
+
+    // The row must now be marked delivered (not pending).
+    const rows = try state_mgr.loadPendingSubagentResults(allocator, 42);
+    defer {
+        for (rows) |r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 0), rows.len);
+
+    // Drop test schema.
+    {
+        const pg_helpers = @import("memory/engines/postgres.zig");
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, state_mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const res = try state_mgr.exec(drop_q);
+        _ = res;
+    }
+}
 
 // ── Task 1.5 test: duplicate completion is idempotent ─────────────────
 
