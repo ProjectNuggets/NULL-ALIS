@@ -400,14 +400,16 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .cost_class = .b,
     },
     .{
+        // coordinator_dispatch: the coordinator reads spawned-task status.
         .name = task_list.TaskListTool.tool_name,
-        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true, .coordinator_dispatch = true },
         .risk_level = .low,
         .cost_class = .a,
     },
     .{
+        // coordinator_dispatch: the coordinator reads a spawned task's result.
         .name = task_get.TaskGetTool.tool_name,
-        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true, .coordinator_dispatch = true },
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -609,30 +611,35 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     },
     .{
         // Spawns a full subagent turn — potentially many LLM calls + tools.
+        // coordinator_dispatch: the coordinator delegates work through it.
         .name = delegate.DelegateTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .coordinator_dispatch = true },
         .risk_level = .high,
         .cost_class = .c,
     },
     .{
         // Spawns a long-running task — same reasoning as delegate.
+        // coordinator_dispatch: the coordinator dispatches a single subagent.
         .name = spawn.SpawnTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .coordinator_dispatch = true },
         .risk_level = .high,
         .cost_class = .c,
     },
     .{
         // Phase 4 G3 — fan-out N subagents under one batch. High cost (N× credits).
-        // Gated off by default; Phase 5 enables via fanout_enabled.
+        // Registered when multiagent is enabled (Phase 5 T3); self-gated to
+        // Superpowers turns. coordinator_dispatch: the coordinator's primary
+        // fan-out primitive.
         .name = spawn_many.SpawnManyTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .coordinator_dispatch = true },
         .risk_level = .high,
         .cost_class = .c,
     },
     .{
         // Phase 4 G3 — read-only batch result query. Low cost.
+        // coordinator_dispatch: the coordinator collects fan-out results.
         .name = subagent_batch_result.SubagentBatchResultTool.tool_name,
-        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true, .coordinator_dispatch = true },
         .risk_level = .low,
         .cost_class = .a,
     },

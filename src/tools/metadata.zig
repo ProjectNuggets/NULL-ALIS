@@ -36,6 +36,16 @@ pub const ToolFlags = packed struct {
     /// this — caching a write is a data-loss bug, not a performance
     /// win.
     cacheable: bool = false,
+    /// **Phase 5 (Superpowers mode)** — marks a tool as a *coordination
+    /// dispatch* primitive: the coordinator uses it to plan, fan out, and
+    /// collect work (spawn, spawn_many, delegate, subagent_batch_result,
+    /// task_get, task_list) rather than to do direct grunt work. The
+    /// `.coordinator` execution mode allows a tool when it is either
+    /// `read_only` OR `coordinator_dispatch` — so the coordinator can read,
+    /// plan, and dispatch, but a pure-mutating non-dispatch tool (file_write,
+    /// shell, …) stays blocked. Orthogonal to `mutating`: spawn_many mutates
+    /// (it spawns subagents) AND is a dispatch tool.
+    coordinator_dispatch: bool = false,
 
     /// Validate that flags are not contradictory.
     pub fn validate(self: ToolFlags) error{ContradictoryFlags}!void {

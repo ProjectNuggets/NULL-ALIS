@@ -281,6 +281,14 @@ pub const PromptContext = struct {
     /// `known_weakness_block` and before `skill_traces_block`. Empty until
     /// the agent emits a `<task_plan>`.
     task_plan_block: ?[]const u8 = null,
+    /// Phase 5 (Superpowers mode) — when true, the volatile prompt emits the
+    /// coordinator section (see `buildCoordinatorSection`): you are the
+    /// coordinator, see the `coordinator` skill, run
+    /// plan→dispatch→review→synthesize→deliver. Set from
+    /// `agent.superpowers_mode` where this context is built
+    /// (`context_engine.assemble`). Volatile (per-turn) because superpowers is
+    /// a per-turn signal — a normal turn never emits it.
+    coordinator_mode: bool = false,
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -458,6 +466,23 @@ pub fn buildStableSystemPrompt(
 /// Keep this small (target < 2000 tokens) so that cache savings from the
 /// stable block dominate. Memory, if present in ctx.memory_slot, is the
 /// largest contributor and comes from memory_loader.loadTurnMemorySlot.
+/// Phase 5 (Superpowers mode) — the coordinator framing section. Emitted in
+/// the volatile block when `ctx.coordinator_mode` is set. One concise
+/// paragraph: you are the coordinator, see the `coordinator` skill, run
+/// plan→dispatch→review→synthesize→deliver. The detailed step-by-step
+/// playbook lives in the per-turn reflection prompt
+/// (`reflection_prompt_coordinator` in agent/root.zig); this section just
+/// installs the role + points at the skill.
+fn buildCoordinatorSection(w: anytype) !void {
+    try w.writeAll(
+        "## ⚡ Superpowers — Coordinator mode\n\n" ++
+        "You are the **coordinator** for this turn: orchestrate, don't grind. " ++
+        "Decompose the goal, briefly plan, dispatch the independent sub-tasks to subagents (use `spawn_many` to fan out in one batch), review every result, then **synthesize** them into a single coherent deliverable in your own voice — never dump raw subagent output. " ++
+        "See the `coordinator` skill for the full plan→dispatch→review→synthesize→deliver playbook. " ++
+        "Fanning out burns credits (N subagents ≈ N× cost), so only parallelize when the work is genuinely independent.\n\n",
+    );
+}
+
 pub fn buildVolatileSystemPrompt(
     allocator: std.mem.Allocator,
     ctx: PromptContext,
@@ -473,6 +498,14 @@ pub fn buildVolatileSystemPrompt(
 
     // DateTime section — current UTC time. Always changes turn-to-turn.
     try appendDateTimeSection(allocator, w, ctx.workspace_dir);
+
+    // Phase 5 (Superpowers mode) — coordinator framing. Emitted near the top
+    // (after datetime, before recalled memory) so the coordinator role anchors
+    // the turn before any loaded context. Per-turn / volatile: a normal turn
+    // leaves coordinator_mode=false and never sees it.
+    if (ctx.coordinator_mode) {
+        try buildCoordinatorSection(w);
+    }
 
     // V1.13 Day 1 — Working Memory block. Renders BEFORE retrieved
     // memory so the agent sees pinned identity / active goals / open
@@ -1986,6 +2019,36 @@ test "buildVolatileSystemPrompt includes datetime and optional memory slot" {
     try std.testing.expect(std.mem.indexOf(u8, volatile_out, "## Current Date & Time") != null);
     try std.testing.expect(std.mem.indexOf(u8, volatile_out, "<memory_for_turn>") != null);
     try std.testing.expect(std.mem.indexOf(u8, volatile_out, "test fact") != null);
+}
+
+test "buildVolatileSystemPrompt emits coordinator section when coordinator_mode is set" {
+    const allocator = std.testing.allocator;
+    const volatile_out = try buildVolatileSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .coordinator_mode = true,
+    });
+    defer allocator.free(volatile_out);
+
+    // One concise paragraph: you are the coordinator, see the `coordinator`
+    // skill, run plan→dispatch→review→synthesize→deliver.
+    try std.testing.expect(std.mem.indexOf(u8, volatile_out, "coordinator") != null);
+    try std.testing.expect(std.mem.indexOf(u8, volatile_out, "Superpowers") != null);
+    try std.testing.expect(std.mem.indexOf(u8, volatile_out, "synthesize") != null);
+}
+
+test "buildVolatileSystemPrompt omits coordinator section when coordinator_mode is false" {
+    const allocator = std.testing.allocator;
+    const volatile_out = try buildVolatileSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        // coordinator_mode defaults to false — a normal turn never sees it.
+    });
+    defer allocator.free(volatile_out);
+
+    try std.testing.expect(std.mem.indexOf(u8, volatile_out, "⚡ Superpowers") == null);
 }
 
 test "buildVolatileSystemPrompt G-07: skill_traces_block renders after memory_slot" {
