@@ -956,6 +956,12 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn markSubagentResultDelivered(_: *@This(), _: []const u8) !void {
         return;
     }
+    /// Subagent Pass Phase 1 stub — non-PG build has no durable row, so
+    /// the durable gate is always "not delivered" (false). The in-memory
+    /// guard in completeTask() handles idempotency for the non-PG path.
+    pub fn subagentResultStatusIsDelivered(_: *@This(), _: []const u8) !bool {
+        return false;
+    }
     pub fn forgetMemory(_: *@This(), _: i64, _: []const u8) !bool {
         return error.PostgresNotEnabled;
     }
@@ -10591,6 +10597,27 @@ const ManagerImpl = struct {
         const lengths = [_]c_int{@intCast(result_id.len)};
         const result = try self.execParams(q, &params, &lengths);
         c.PQclear(result);
+    }
+
+    /// Return true if the durable row for result_id has status='delivered'.
+    /// Used as the cross-restart idempotency gate in completeTask: if we
+    /// crashed between persist and deliver, recovery re-delivers; if we
+    /// already delivered and then restart with a stale 'pending' state,
+    /// this returns true and we skip. Mirrors pendingApprovalStatus (~L10472).
+    pub fn subagentResultStatusIsDelivered(self: *Self, result_id: []const u8) !bool {
+        const q = try self.buildQuery(
+            "SELECT status FROM {schema}.subagent_results WHERE result_id = $1",
+        );
+        defer self.allocator.free(q);
+        const id_z = try self.allocator.dupeZ(u8, result_id);
+        defer self.allocator.free(id_z);
+        const params = [_]?[*:0]const u8{id_z.ptr};
+        const lengths = [_]c_int{@intCast(result_id.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return false;
+        const status_raw = std.mem.span(c.PQgetvalue(result, 0, 0));
+        return std.mem.eql(u8, status_raw, "delivered");
     }
 
     /// List the most-recent N skill execution traces for (user, skill_name).

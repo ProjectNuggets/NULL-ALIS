@@ -656,6 +656,29 @@ pub const SubagentManager = struct {
         var origin_channel: []const u8 = "system";
         var origin_chat_id: []const u8 = "agent";
         var request_session_key: []const u8 = "agent";
+        // result_id buffer hoisted here so it's available after the lock
+        // for the durable gate (subagentResultStatusIsDelivered) and
+        // mark-after-deliver (markSubagentResultDelivered).
+        var result_id_buf: [40]u8 = undefined;
+        var result_id_slice: ?[]const u8 = null;
+        // ── Layer A: in-memory idempotency gate ──────────────────────────
+        // If the task is already in a terminal state, do not re-deliver or
+        // re-wake. This covers the common same-process duplicate path; the
+        // durable subagentResultStatusIsDelivered gate covers cross-restart.
+        var already_terminal = false;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.tasks.get(task_id)) |state| {
+                if (state.status == .completed or state.status == .failed or state.status == .cancelled) {
+                    already_terminal = true;
+                }
+            }
+        }
+        if (already_terminal) {
+            log.info("subagent: idempotent completion skipped task_id={d} (already terminal in-memory)", .{task_id});
+            return;
+        }
         {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -678,13 +701,16 @@ pub const SubagentManager = struct {
                 // between persist and deliver is recovered by
                 // loadPendingSubagentResults on boot (Task 1.6).
                 // Best-effort: PG failure is warned but does NOT block delivery.
+                // Fill result_id_slice using the hoisted buffer; available
+                // after the lock for the durable gate and mark-delivered.
+                result_id_slice = formatSubagentResultId(&result_id_buf, task_id) catch null;
+
                 if (self.ledger_state_mgr) |sm| {
                     if (state.session_key) |skey| {
                         if (zaki_session.parseUserIdFromSessionKey(skey)) |uid_str| {
                             const uid_num = std.fmt.parseInt(i64, uid_str, 10) catch null;
                             if (uid_num) |user_id| {
-                                var idbuf: [40]u8 = undefined;
-                                if (formatSubagentResultId(&idbuf, task_id)) |result_id| {
+                                if (result_id_slice) |result_id| {
                                     // Phase 1 payload: minimal {status,text}. Phase 2 swaps to full SubagentResult JSON.
                                     const status_str: []const u8 = if (state.status == .failed) "failed" else "completed";
                                     const text_src: []const u8 = state.result orelse (state.error_msg orelse "");
@@ -702,7 +728,7 @@ pub const SubagentManager = struct {
                                             .result_json = pj,
                                         }) catch |err| log.warn("subagent: durable persist failed task_id={d}: {}", .{ task_id, err });
                                     }
-                                } else |_| {}
+                                }
                             }
                         }
                     }
@@ -725,6 +751,23 @@ pub const SubagentManager = struct {
                             };
                         }
                     }
+                }
+            }
+        }
+
+        // ── Layer B: durable idempotency gate (cross-restart) ────────────
+        // If PG is attached, check whether this result_id has already been
+        // marked 'delivered' in the durable outbox. This fires on restart
+        // recovery: a pod crash AFTER persist but BEFORE mark-delivered
+        // correctly re-delivers (status is still 'pending'); a pod crash
+        // AFTER mark-delivered skips (status is 'delivered'). Layer A
+        // (in-memory) already handles the same-process duplicate path.
+        if (self.ledger_state_mgr) |sm| {
+            if (result_id_slice) |rid| {
+                const already_delivered = sm.subagentResultStatusIsDelivered(rid) catch false;
+                if (already_delivered) {
+                    log.info("subagent: idempotent delivery skipped task_id={d} (durable status=delivered)", .{task_id});
+                    return;
                 }
             }
         }
@@ -866,6 +909,20 @@ pub const SubagentManager = struct {
                 );
             }
             self.allocator.free(content);
+        }
+
+        // ── Mark durable row delivered (idempotency: first deliver wins) ──
+        // Flip the outbox row from 'pending' to 'delivered' NOW that we
+        // have successfully routed the result. If we crash here (after
+        // delivery, before mark), recovery re-delivers once more — safe
+        // because the parent's session dedup on task_id prevents a visible
+        // duplicate. The mark is best-effort: a PG failure is logged but
+        // does not block the wake.
+        if (self.ledger_state_mgr) |sm| {
+            if (result_id_slice) |rid| {
+                sm.markSubagentResultDelivered(rid) catch |err|
+                    log.warn("subagent: mark-delivered failed task_id={d}: {}", .{ task_id, err });
+            }
         }
 
         // ── Wake parent turn (push, not poll) ──────────────────────────────
@@ -1864,6 +1921,67 @@ const BlockingCompletionRunner = struct {
         self.mutex.unlock();
     }
 };
+
+// ── Task 1.5 test: duplicate completion is idempotent ─────────────────
+
+test "duplicate completion of same task_id is idempotent (no double wake)" {
+    heartbeat_wake.clearForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "idem-task"),
+        .task_summary = try std.testing.allocator.dupe(u8, "idempotency check"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "idempotency check"),
+        .session_key = try std.testing.allocator.dupe(u8, "agent:zaki-bot:user:42:main"),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 7, state);
+
+    _ = mgr.markTaskRunning(7);
+    // First completion: delivers + enqueues one wake
+    mgr.completeTask(7, "first result", null);
+
+    // Second completion for the same task_id: task is already terminal.
+    // Drain the queue BEFORE the second call so coalescing can't mask double-enqueue
+    {
+        const first_req = heartbeat_wake.dequeue();
+        try std.testing.expect(first_req != null);
+        var mutable_first = first_req.?;
+        defer mutable_first.deinit();
+    }
+    // Queue must now be empty
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount());
+
+    // Remember what the recorder captured from the first delivery
+    const first_content_len = if (recorder.content) |c| c.len else @as(usize, 0);
+
+    // In-memory guard: completeTask sees state.status==.completed → skips deliver+wake entirely.
+    mgr.completeTask(7, "second result — must be ignored", null);
+
+    // No additional wake must have been enqueued
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount());
+
+    // The recorder content must NOT have changed (no second delivery)
+    const second_content_len = if (recorder.content) |c| c.len else @as(usize, 0);
+    try std.testing.expectEqual(first_content_len, second_content_len);
+}
 
 // ── Task 1.4 test: completeTask enqueues a heartbeat wake ─────────────
 
