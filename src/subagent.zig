@@ -13,11 +13,24 @@ const Allocator = std.mem.Allocator;
 const bus_mod = @import("bus.zig");
 const config_mod = @import("config.zig");
 const channel_loop = @import("channel_loop.zig");
+const tools_mod = @import("tools/root.zig");
 const json_util = @import("json_util.zig");
 const observability = @import("observability.zig");
 const tasks_mod = @import("tasks/root.zig");
 const zaki_session = @import("session/root.zig");
 const zaki_state = @import("zaki_state.zig");
+const subagent_result = @import("subagent_result.zig");
+const SubagentResult = subagent_result.SubagentResult;
+/// Re-export the Phase-2 result value types so callers that already import the
+/// subagent module (gateway, agent/commands) can reference
+/// `subagent.SubagentResult` / `subagent.SubagentStatus` without a second
+/// import of subagent_result.zig.
+pub const SubagentResultType = SubagentResult;
+pub const SubagentStatus = subagent_result.Status;
+const heartbeat_wake = @import("heartbeat_wake.zig");
+const build_options = @import("build_options");
+const env_rebrand = @import("env_rebrand.zig");
+const config_types = @import("config_types.zig");
 
 const log = std.log.scoped(.subagent);
 const TASK_LEDGER_FILE_NAME = "subagent_tasks.jsonl";
@@ -45,7 +58,10 @@ pub const TaskState = struct {
     runtime_session_key: ?[]const u8 = null,
     origin_channel: ?[]const u8 = null,
     origin_chat_id: ?[]const u8 = null,
-    result: ?[]const u8 = null,
+    /// Phase 2: structured completion value (manager-allocator-owned slices).
+    /// Freed via freeSubagentResult. Phase 1 stored only `?[]const u8` text;
+    /// the text now lives in `result.?.text` and rides alongside metadata.
+    result: ?SubagentResult = null,
     error_msg: ?[]const u8 = null,
     started_at: i64,
     completed_at: ?i64 = null,
@@ -208,7 +224,7 @@ pub const SubagentManager = struct {
             if (state.thread) |thread| {
                 thread.join();
             }
-            if (state.result) |r| self.allocator.free(r);
+            if (state.result) |*r| freeSubagentResult(self.allocator, r);
             if (state.error_msg) |e| self.allocator.free(e);
             if (state.session_key) |sk| self.allocator.free(sk);
             if (state.runtime_session_key) |sk| self.allocator.free(sk);
@@ -250,9 +266,78 @@ pub const SubagentManager = struct {
         delivery: CompletionDeliveryFn,
     ) void {
         self.mutex.lock();
-        defer self.mutex.unlock();
         self.completion_delivery_ctx = ctx;
         self.completion_delivery = delivery;
+        self.mutex.unlock();
+
+        // Startup recovery: re-deliver any completions that were persisted
+        // but not confirmed-delivered before the previous pod restart.
+        // Only runs when both the PG ledger AND the delivery callback are
+        // wired — mirrors the gateway.zig wiring order where
+        // attachPostgresLedger is called first, attachCompletionDelivery
+        // second (Task 1.6).
+        if (self.ledger_user_id) |uid| {
+            self.recoverPendingSubagentResults(uid);
+        }
+    }
+
+    /// Re-deliver completions that were persisted but not confirmed-delivered
+    /// before a restart. Idempotent: each row is marked delivered after waking
+    /// so a second restart won't re-fire the same completion. Best-effort:
+    /// logs and continues on any error. Frees every row (deinit + free slice).
+    ///
+    /// Phase 2 (Task 2.3): the durable row's `result_json` now holds a full
+    /// `SubagentResult`. We parse it and re-deliver the REAL answer text (with
+    /// the task_id in the header for parent-side correlation), so a recovered
+    /// turn carries the actual answer — not just a marker. If parsing fails
+    /// (legacy/minimal row, corrupt JSON), we fall back to the marker-only
+    /// content so recovery still wakes the parent.
+    pub fn recoverPendingSubagentResults(self: *SubagentManager, user_id: i64) void {
+        const sm = self.ledger_state_mgr orelse return;
+        const rows = sm.loadPendingSubagentResults(self.allocator, user_id) catch |err| {
+            log.warn("subagent: recovery load failed user_id={d}: {}", .{ user_id, err });
+            return;
+        };
+        defer {
+            for (rows) |*r| r.deinit(self.allocator);
+            self.allocator.free(rows);
+        }
+        for (rows) |row| {
+            // Re-deliver to the parent session history. Rehydrate the full text
+            // from result_json; the parsed arena is freed by `defer` before the
+            // next iteration.
+            if (self.completion_delivery) |delivery| {
+                const content: ?[]u8 = blk: {
+                    if (SubagentResult.fromJsonAlloc(self.allocator, row.result_json)) |parsed_const| {
+                        var parsed = parsed_const;
+                        defer parsed.deinit(self.allocator);
+                        break :blk std.fmt.allocPrint(
+                            self.allocator,
+                            "[Subagent task_id={d} completed — recovered after restart]\n{s}",
+                            .{ row.task_id, parsed.value.text },
+                        ) catch null;
+                    } else |err| {
+                        // Parse failure — fall back to the marker-only content.
+                        log.warn("subagent: recovery result_json parse failed task_id={d}: {} — delivering marker", .{ row.task_id, err });
+                        break :blk std.fmt.allocPrint(
+                            self.allocator,
+                            "[Subagent task_id={d} completed — recovered after restart]",
+                            .{row.task_id},
+                        ) catch null;
+                    }
+                };
+                if (content) |c| {
+                    defer self.allocator.free(c);
+                    delivery(self.completion_delivery_ctx, row.session_key, c) catch {};
+                }
+            }
+            // Wake the parent's heartbeat turn so the recovery is processed.
+            var ubuf: [32]u8 = undefined;
+            const uid_s: ?[]const u8 = std.fmt.bufPrint(&ubuf, "{d}", .{user_id}) catch null;
+            heartbeat_wake.enqueue(uid_s, "subagent_completion:recovered") catch {};
+            // Mark delivered so a subsequent restart doesn't re-fire this row.
+            sm.markSubagentResultDelivered(row.result_id) catch {};
+        }
     }
 
     /// Attach a canonical TaskDelivery so subagent lifecycle transitions
@@ -268,6 +353,7 @@ pub const SubagentManager = struct {
         if (formatted.len != tasks_mod.ledger.TASK_ID_LEN) return null;
         return formatted;
     }
+
 
     /// Spawn a background subagent. Returns task_id immediately.
     pub fn spawn(
@@ -387,11 +473,27 @@ pub const SubagentManager = struct {
         return null;
     }
 
-    pub fn getTaskResult(self: *SubagentManager, task_id: u64) ?[]const u8 {
+    /// Return the full structured result for a task (Phase 2). The returned
+    /// `SubagentResult` borrows manager-owned slices guarded by the manager
+    /// lifetime — copy out anything you need to retain past the next mutation.
+    pub fn getTaskResult(self: *SubagentManager, task_id: u64) ?SubagentResult {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.tasks.get(task_id)) |state| {
             return state.result;
+        }
+        return null;
+    }
+
+    /// Return just the final-answer text for a task — the manual query path
+    /// (`task_get` tool, callers that only relay the answer). Borrowed slice,
+    /// manager-lifetime; copy if retaining. Null when the task is unknown or
+    /// produced no result.
+    pub fn getTaskResultText(self: *SubagentManager, task_id: u64) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.tasks.get(task_id)) |state| {
+            if (state.result) |r| return r.text;
         }
         return null;
     }
@@ -416,7 +518,7 @@ pub const SubagentManager = struct {
         while (it.next()) |entry| {
             const state = entry.value_ptr.*;
             if (state.thread) |thread| thread.join();
-            if (state.result) |value| self.allocator.free(value);
+            if (state.result) |*value| freeSubagentResult(self.allocator, value);
             if (state.error_msg) |value| self.allocator.free(value);
             if (state.session_key) |value| self.allocator.free(value);
             if (state.runtime_session_key) |value| self.allocator.free(value);
@@ -533,8 +635,13 @@ pub const SubagentManager = struct {
             break :blk null;
         };
         errdefer if (runtime_session_key) |value| self.allocator.free(value);
-        const result = if (snapshot.result) |value| try self.allocator.dupe(u8, value) else null;
-        errdefer if (result) |value| self.allocator.free(value);
+        // Phase 2: the durable task-snapshot row carries only the text result;
+        // wrap it into a minimal SubagentResult (status inferred from the row).
+        const result: ?SubagentResult = if (snapshot.result) |value|
+            try subagentResultFromText(self.allocator, parseTaskStatus(snapshot.status), value)
+        else
+            null;
+        errdefer if (result) |*value| freeSubagentResult(self.allocator, value);
         const error_msg = if (snapshot.error_msg) |value| try self.allocator.dupe(u8, value) else null;
         errdefer if (error_msg) |value| self.allocator.free(value);
 
@@ -576,8 +683,13 @@ pub const SubagentManager = struct {
         errdefer if (origin_channel) |value| self.allocator.free(value);
         const origin_chat_id = if (snapshot.origin_chat_id) |value| try self.allocator.dupe(u8, value) else null;
         errdefer if (origin_chat_id) |value| self.allocator.free(value);
-        const result = if (snapshot.result) |value| try self.allocator.dupe(u8, value) else null;
-        errdefer if (result) |value| self.allocator.free(value);
+        // Phase 2: the file-ledger snapshot stores only the text result; wrap
+        // it into a minimal SubagentResult (status inferred from the row).
+        const result: ?SubagentResult = if (snapshot.result) |value|
+            try subagentResultFromText(self.allocator, snapshot.status, value)
+        else
+            null;
+        errdefer if (result) |*value| freeSubagentResult(self.allocator, value);
         const error_msg = if (snapshot.error_msg) |value| try self.allocator.dupe(u8, value) else null;
         errdefer if (error_msg) |value| self.allocator.free(value);
 
@@ -619,7 +731,10 @@ pub const SubagentManager = struct {
                     state.label,
                     state.task_prompt,
                     taskStatusText(state.status),
-                    state.result,
+                    // Phase 2: the task-snapshot row stores the text only; the
+                    // full structured result lives in the durable outbox
+                    // (subagent_results.result_json) via completeTask.
+                    if (state.result) |r| r.text else null,
                     state.error_msg,
                     state.started_at,
                     if (state.status == .queued) null else state.started_at,
@@ -633,9 +748,17 @@ pub const SubagentManager = struct {
     }
 
     /// Mark a task as completed or failed. Thread-safe.
-    fn completeTask(self: *SubagentManager, task_id: u64, result: ?[]const u8, err_msg: ?[]const u8) void {
+    ///
+    /// Phase 2: `result` is the structured `SubagentResult` the subagent
+    /// produced (success path). The early-failure callers (runtime init / model
+    /// errors) pass `result == null` and an `err_msg` string instead; in that
+    /// case a minimal failed result is synthesized for the durable row and the
+    /// delivery. The incoming result's slices are duped into the manager
+    /// allocator (via dupeSubagentResult) so they outlive the subagent thread's
+    /// arena; freeSubagentResult releases them.
+    fn completeTask(self: *SubagentManager, task_id: u64, result: ?SubagentResult, err_msg: ?[]const u8) void {
         // Dupe result/error into manager's allocator (source may be arena-backed)
-        const owned_result = if (result) |r| self.allocator.dupe(u8, r) catch null else null;
+        const owned_result: ?SubagentResult = if (result) |r| (dupeSubagentResult(self.allocator, r) catch null) else null;
         const owned_err = if (err_msg) |e| self.allocator.dupe(u8, e) catch null else null;
 
         // HI-01 fix (2026-05-07): if the task entry was removed from the
@@ -646,7 +769,7 @@ pub const SubagentManager = struct {
         // transfer explicitly and free on the failure path.
         var transferred = false;
         defer if (!transferred) {
-            if (owned_result) |r| self.allocator.free(r);
+            if (owned_result) |*r| freeSubagentResult(self.allocator, r);
             if (owned_err) |e| self.allocator.free(e);
         };
 
@@ -654,40 +777,124 @@ pub const SubagentManager = struct {
         var origin_channel: []const u8 = "system";
         var origin_chat_id: []const u8 = "agent";
         var request_session_key: []const u8 = "agent";
+        // result_id buffer hoisted here so it's available after the lock
+        // for the durable gate (subagentResultStatusIsDelivered) and
+        // mark-after-deliver (markSubagentResultDelivered).
+        var result_id_buf: [40]u8 = undefined;
+        var result_id_slice: ?[]const u8 = null;
+        // ── In-memory idempotency gate + first-completion (single lock) ─────
+        // Layer A (terminal check) and the first-completion mutation are now
+        // combined into ONE lock acquisition to eliminate the TOCTOU gap that
+        // existed when they were two separate acquisitions (review I-B1).
+        // On the already-terminal path `transferred` stays false, so the
+        // `defer if (!transferred)` above frees owned_result/owned_err exactly
+        // once — no leak, no double-free.
+        var should_deliver = false;
         {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.tasks.get(task_id)) |state| {
-                if (state.result) |value| self.allocator.free(value);
-                if (state.error_msg) |value| self.allocator.free(value);
-                state.status = if (owned_err != null) .failed else .completed;
-                state.result = owned_result;
-                state.error_msg = owned_err;
-                transferred = true;
-                state.completed_at = std.time.milliTimestamp();
-                self.persistTaskSnapshotLocked(task_id, state);
-                label = state.label;
-                origin_channel = state.origin_channel orelse "system";
-                origin_chat_id = state.origin_chat_id orelse "agent";
-                request_session_key = state.session_key orelse origin_chat_id;
+                if (state.status == .completed or state.status == .failed or state.status == .cancelled) {
+                    // Already terminal — idempotent skip.
+                    // owned_result/owned_err are freed by the `defer if (!transferred)` above.
+                } else {
+                    if (state.result) |*value| freeSubagentResult(self.allocator, value);
+                    if (state.error_msg) |value| self.allocator.free(value);
+                    state.status = if (owned_err != null) .failed else .completed;
+                    state.result = owned_result;
+                    state.error_msg = owned_err;
+                    transferred = true;
+                    state.completed_at = std.time.milliTimestamp();
+                    self.persistTaskSnapshotLocked(task_id, state);
+                    label = state.label;
+                    origin_channel = state.origin_channel orelse "system";
+                    origin_chat_id = state.origin_chat_id orelse "agent";
+                    request_session_key = state.session_key orelse origin_chat_id;
 
-                // Mirror terminal transition into the canonical ledger
-                // (WP2.1). Result/error strings are owned by the subagent
-                // state; we pass null here to avoid cross-owning a pointer
-                // into the ledger, which does not manage string lifetimes.
-                if (self.task_delivery) |td| {
-                    var id_buf: [tasks_mod.ledger.TASK_ID_LEN]u8 = undefined;
-                    if (formatCanonicalTaskId(&id_buf, task_id)) |id_slice| {
-                        if (state.status == .failed) {
-                            td.markFailed(id_slice, null) catch |err| {
-                                log.warn("subagent: failed to mirror failed status for task #{d}: {}", .{ task_id, err });
-                            };
-                        } else {
-                            td.markSucceeded(id_slice, null) catch |err| {
-                                log.warn("subagent: failed to mirror succeeded status for task #{d}: {}", .{ task_id, err });
-                            };
+                    // ── Durable outbox persist (Phase 1) ─────────────────────
+                    // Write the completion BEFORE we deliver/wake so a crash
+                    // between persist and deliver is recovered by
+                    // loadPendingSubagentResults on boot (Task 1.6).
+                    // Best-effort: PG failure is warned but does NOT block delivery.
+                    // Fill result_id_slice using the hoisted buffer; available
+                    // after the lock for the durable gate and mark-delivered.
+                    result_id_slice = formatSubagentResultId(&result_id_buf, task_id) catch null;
+
+                    if (self.ledger_state_mgr) |sm| {
+                        if (state.session_key) |skey| {
+                            if (zaki_session.parseUserIdFromSessionKey(skey)) |uid_str| {
+                                const uid_num = std.fmt.parseInt(i64, uid_str, 10) catch null;
+                                if (uid_num) |user_id| {
+                                    if (result_id_slice) |result_id| {
+                                        // Phase 2 payload: the FULL SubagentResult JSON (status,
+                                        // text, artifacts, tokens, turns, tools_used, err,
+                                        // duration_ms) — replacing the Phase-1 minimal
+                                        // {status,text}. Recovery (Task 2.3) re-hydrates the real
+                                        // text from this. When the task failed before producing a
+                                        // structured result, synthesize a minimal failed result
+                                        // from the error string so the row is still well-formed.
+                                        const persist_result: SubagentResult = state.result orelse .{
+                                            .status = .failed,
+                                            .text = state.error_msg orelse "",
+                                            .err = state.error_msg,
+                                        };
+                                        const payload = persist_result.toJsonAlloc(self.allocator) catch null;
+                                        if (payload) |pj| {
+                                            defer self.allocator.free(pj);
+                                            sm.upsertSubagentResult(.{
+                                                .result_id = result_id,
+                                                .user_id = user_id,
+                                                .session_key = skey,
+                                                .task_id = @intCast(task_id),
+                                                .result_json = pj,
+                                            }) catch |err| log.warn("subagent: durable persist failed task_id={d}: {}", .{ task_id, err });
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
+
+                    // Mirror terminal transition into the canonical ledger
+                    // (WP2.1). Result/error strings are owned by the subagent
+                    // state; we pass null here to avoid cross-owning a pointer
+                    // into the ledger, which does not manage string lifetimes.
+                    if (self.task_delivery) |td| {
+                        var id_buf: [tasks_mod.ledger.TASK_ID_LEN]u8 = undefined;
+                        if (formatCanonicalTaskId(&id_buf, task_id)) |id_slice| {
+                            if (state.status == .failed) {
+                                td.markFailed(id_slice, null) catch |err| {
+                                    log.warn("subagent: failed to mirror failed status for task #{d}: {}", .{ task_id, err });
+                                };
+                            } else {
+                                td.markSucceeded(id_slice, null) catch |err| {
+                                    log.warn("subagent: failed to mirror succeeded status for task #{d}: {}", .{ task_id, err });
+                                };
+                            }
+                        }
+                    }
+                    should_deliver = true;
+                } // end else (not already terminal)
+            }
+        }
+        if (!should_deliver) {
+            log.info("subagent: idempotent completion skipped task_id={d} (already terminal)", .{task_id});
+            return;
+        }
+
+        // ── Layer B: durable idempotency gate (cross-restart) ────────────
+        // If PG is attached, check whether this result_id has already been
+        // marked 'delivered' in the durable outbox. This fires on restart
+        // recovery: a pod crash AFTER persist but BEFORE mark-delivered
+        // correctly re-delivers (status is still 'pending'); a pod crash
+        // AFTER mark-delivered skips (status is 'delivered'). Layer A
+        // (in-memory) already handles the same-process duplicate path.
+        if (self.ledger_state_mgr) |sm| {
+            if (result_id_slice) |rid| {
+                const already_delivered = sm.subagentResultStatusIsDelivered(rid) catch false;
+                if (already_delivered) {
+                    log.info("subagent: idempotent delivery skipped task_id={d} (durable status=delivered)", .{task_id});
+                    return;
                 }
             }
         }
@@ -726,12 +933,17 @@ pub const SubagentManager = struct {
         // "no output" framing is also rewritten so the parent has a clear
         // recovery path ("re-run with a more specific task, or compute
         // directly") instead of silently relaying an empty bubble.
-        const has_real_result = if (owned_result) |r| r.len > 0 else false;
+        const has_real_result = if (owned_result) |r| r.text.len > 0 else false;
         const content = if (has_real_result)
+            // Phase 2: deliver the result text plus a one-line metadata footer
+            // so the parent agent sees structured signal (tokens/turns/duration),
+            // not just text. The footer is intentionally compact and machine-
+            // greppable. Zero-valued metrics are still emitted for shape
+            // stability (a subagent that produced no measurable usage shows 0s).
             std.fmt.allocPrint(
                 self.allocator,
-                "[Subagent '{s}' task_id={d} completed]\n{s}",
-                .{ label, task_id, owned_result.? },
+                "[Subagent '{s}' task_id={d} completed]\n{s}\n[tokens={d} turns={d} duration_ms={d}]",
+                .{ label, task_id, owned_result.?.text, owned_result.?.tokens, owned_result.?.turns, owned_result.?.duration_ms },
             ) catch return
         else if (owned_err) |e|
             std.fmt.allocPrint(
@@ -830,6 +1042,34 @@ pub const SubagentManager = struct {
             }
             self.allocator.free(content);
         }
+
+        // ── Mark durable row delivered (idempotency: first deliver wins) ──
+        // Flip the outbox row from 'pending' to 'delivered' NOW that we
+        // have successfully routed the result. If we crash here (after
+        // delivery, before mark), recovery re-delivers once more — safe
+        // because the parent's session dedup on task_id prevents a visible
+        // duplicate. The mark is best-effort: a PG failure is logged but
+        // does not block the wake.
+        if (self.ledger_state_mgr) |sm| {
+            if (result_id_slice) |rid| {
+                sm.markSubagentResultDelivered(rid) catch |err|
+                    log.warn("subagent: mark-delivered failed task_id={d}: {}", .{ task_id, err });
+            }
+        }
+
+        // ── Wake parent turn (push, not poll) ──────────────────────────────
+        // Enqueue a heartbeat wake for the parent's user so the daemon's
+        // heartbeat thread drains it and fires a forced turn via
+        // processMessageWithContext. This replaces any polling job.
+        // Safe to call from the subagent thread: heartbeat_wake.enqueue()
+        // is mutex-guarded and uses c_allocator internally.
+        // Do NOT call processMessageWithContext directly from this thread.
+        if (zaki_session.parseUserIdFromSessionKey(request_session_key)) |uid_str| {
+            var rbuf: [64]u8 = undefined;
+            const reason = std.fmt.bufPrint(&rbuf, "subagent_completion:{d}", .{task_id}) catch "subagent_completion";
+            heartbeat_wake.enqueue(uid_str, reason) catch |err|
+                log.warn("subagent: wake enqueue failed task_id={d}: {}", .{ task_id, err });
+        }
     }
 
     /// Transition a queued task to running. Returns true if the
@@ -925,6 +1165,15 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
     // the thread exit so the cancelled state is observable by callers.
     if (!ctx.manager.markTaskRunning(ctx.task_id)) return;
 
+    // Phase 2: measure wall-clock run duration (mark-running → completion) so
+    // the SubagentResult carries `duration_ms`. This is the one piece of
+    // metadata we can capture WITHOUT touching the agent-loop control flow.
+    // turns/tokens/tools_used are NOT exposed by processMessageWithContext's
+    // text-only return and the subagent's isolated ChannelRuntime carries no
+    // usage_rt (that is gateway-wired only), so they stay at their zero
+    // defaults here — Phase 3 may surface them if the loop is taught to.
+    const run_started_at = std.time.milliTimestamp();
+
     // Test path: injected runner bypasses the full runtime (used in unit tests).
     if (ctx.manager.completion_runner) |runner| {
         const system_prompt = "You are a background subagent. Complete the assigned task concisely and accurately.";
@@ -939,7 +1188,12 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
             ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
             return;
         };
-        ctx.manager.completeTask(ctx.task_id, result, null);
+        const dur_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - run_started_at));
+        ctx.manager.completeTask(ctx.task_id, .{
+            .status = .completed,
+            .text = result,
+            .duration_ms = dur_ms,
+        }, null);
         return;
     }
 
@@ -955,6 +1209,33 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         return;
     };
     defer runtime.deinit();
+
+    // Phase 3 (Subagent Pass) — make the subagent's artifact_create functional
+    // and capture what it produces.
+    //
+    // (1) The subagent runtime is built via allTools(.subagent), which registers
+    //     artifact_create but leaves its state_mgr/user_id UNBOUND (the parent
+    //     gateway binds those via bindStateMgrTenant; this isolated runtime never
+    //     was). Bind them from the manager's ledger handles so the subagent
+    //     persists artifacts to the SAME tenant schema/user as the parent —
+    //     otherwise artifact_create returns "state manager not bound".
+    if (ctx.manager.ledger_state_mgr) |sm| {
+        if (ctx.manager.ledger_user_id) |uid| {
+            tools_mod.bindStateMgrTenant(runtime.tools, sm, uid);
+        }
+    }
+
+    // (2) Install an ArtifactCollector for this turn. We pass it as the
+    //     `progress_observer` to processMessageWithContext (NOT via the
+    //     thread-local setToolObserver, which the inner agent loop overwrites
+    //     and then clears). The session combines base+progress into the turn's
+    //     agent.observer, which the loop installs as the tool observer — so the
+    //     artifact_create tool's emitted `artifact_event`s reach the collector.
+    //     The collector owns its duped refs until deinit; completeTask
+    //     deep-copies them into the manager allocator (dupeSubagentResult), so
+    //     deinit after the handoff is UAF-free.
+    var artifact_collector = subagent_result.ArtifactCollector.init(ctx.manager.allocator);
+    defer artifact_collector.deinit();
 
     var session_buf: [128]u8 = undefined;
     const session_key = deriveTaskRuntimeSessionKey(&session_buf, ctx.request_session_key, ctx.task_id);
@@ -999,14 +1280,30 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         session_key,
         framed_task,
         null,
-        .{ .turn_origin = .proactive },
+        .{
+            .turn_origin = .proactive,
+            // Phase 3: capture artifact_event emissions from the subagent's
+            // tools into artifact_collector for the SubagentResult.
+            .progress_observer = artifact_collector.observer(),
+        },
     ) catch |err| {
         ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
         return;
     };
     defer ctx.manager.allocator.free(result);
 
-    ctx.manager.completeTask(ctx.task_id, result, null);
+    const dur_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - run_started_at));
+    // Phase 3: hand the captured artifacts to completeTask, which deep-copies
+    // them into the manager allocator (dupeSubagentResult) so they ride back to
+    // the parent in the durable result_json + delivery. refs() is a borrowed
+    // view valid until artifact_collector.deinit() (deferred above) — safe
+    // because completeTask copies before this function returns.
+    ctx.manager.completeTask(ctx.task_id, .{
+        .status = .completed,
+        .text = result,
+        .duration_ms = dur_ms,
+        .artifacts = artifact_collector.refs(),
+    }, null);
 }
 
 fn summarizeTaskForDisplay(allocator: Allocator, task: []const u8) ![]u8 {
@@ -1046,7 +1343,7 @@ const LedgerSnapshot = struct {
 
 fn freeTaskState(allocator: Allocator, state: *TaskState) void {
     if (state.thread) |thread| thread.join();
-    if (state.result) |value| allocator.free(value);
+    if (state.result) |*value| freeSubagentResult(allocator, value);
     if (state.error_msg) |value| allocator.free(value);
     if (state.session_key) |value| allocator.free(value);
     if (state.runtime_session_key) |value| allocator.free(value);
@@ -1074,6 +1371,103 @@ pub fn parseTaskStatus(raw: []const u8) TaskStatus {
     if (std.mem.eql(u8, raw, "completed")) return .completed;
     if (std.mem.eql(u8, raw, "cancelled")) return .cancelled;
     return .failed;
+}
+
+/// Format the durable outbox result_id for a given task_id.
+/// Result is always "subagent:<task_id>" — stable, human-readable, unique per manager.
+fn formatSubagentResultId(buf: []u8, task_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "subagent:{d}", .{task_id});
+}
+
+/// Free every slice owned by a `SubagentResult` stored in `TaskState.result`.
+/// The result and all its slices (`text`, each `ArtifactRef`'s strings, every
+/// `tools_used` entry plus the outer arrays, and `err`) are allocated in the
+/// manager allocator by `dupeSubagentResult`. Call this everywhere the old
+/// `state.result` text was freed. Idempotent only in the sense that it must be
+/// called exactly once per stored result (no double-free): callers null the
+/// field or replace it immediately after.
+pub fn freeSubagentResult(allocator: Allocator, result: *const SubagentResult) void {
+    allocator.free(result.text);
+    for (result.artifacts) |art| {
+        allocator.free(art.id);
+        allocator.free(art.kind);
+        allocator.free(art.title);
+        allocator.free(art.url);
+    }
+    allocator.free(result.artifacts);
+    for (result.tools_used) |name| allocator.free(name);
+    allocator.free(result.tools_used);
+    if (result.err) |e| allocator.free(e);
+}
+
+/// Deep-copy a `SubagentResult` into `allocator` so it outlives the source
+/// (which is typically the subagent thread's arena). Mirrors how Phase 1 duped
+/// the text result into the manager allocator. On any allocation failure the
+/// partial copy is rolled back (no leak) and the error is propagated.
+fn dupeSubagentResult(allocator: Allocator, src: SubagentResult) !SubagentResult {
+    const text = try allocator.dupe(u8, src.text);
+    errdefer allocator.free(text);
+
+    const artifacts = try allocator.alloc(subagent_result.ArtifactRef, src.artifacts.len);
+    var arts_done: usize = 0;
+    errdefer {
+        var i: usize = 0;
+        while (i < arts_done) : (i += 1) {
+            allocator.free(artifacts[i].id);
+            allocator.free(artifacts[i].kind);
+            allocator.free(artifacts[i].title);
+            allocator.free(artifacts[i].url);
+        }
+        allocator.free(artifacts);
+    }
+    for (src.artifacts, 0..) |art, i| {
+        const id = try allocator.dupe(u8, art.id);
+        errdefer allocator.free(id);
+        const kind = try allocator.dupe(u8, art.kind);
+        errdefer allocator.free(kind);
+        const title = try allocator.dupe(u8, art.title);
+        errdefer allocator.free(title);
+        const url = try allocator.dupe(u8, art.url);
+        artifacts[i] = .{ .id = id, .kind = kind, .title = title, .url = url, .version = art.version };
+        arts_done = i + 1;
+    }
+
+    const tools = try allocator.alloc([]const u8, src.tools_used.len);
+    var tools_done: usize = 0;
+    errdefer {
+        var i: usize = 0;
+        while (i < tools_done) : (i += 1) allocator.free(tools[i]);
+        allocator.free(tools);
+    }
+    for (src.tools_used, 0..) |name, i| {
+        tools[i] = try allocator.dupe(u8, name);
+        tools_done = i + 1;
+    }
+
+    const err = if (src.err) |e| try allocator.dupe(u8, e) else null;
+
+    return .{
+        .status = src.status,
+        .text = text,
+        .artifacts = artifacts,
+        .tokens = src.tokens,
+        .turns = src.turns,
+        .tools_used = tools,
+        .err = err,
+        .duration_ms = src.duration_ms,
+    };
+}
+
+/// Build a minimal manager-owned `SubagentResult` from a recovered text
+/// snapshot (file ledger / PG task-snapshot rows that only carry the text).
+/// Used by the snapshot→TaskState rehydration paths, which historically stored
+/// just the text. Status is inferred from the snapshot's task status.
+fn subagentResultFromText(allocator: Allocator, status: TaskStatus, text: []const u8) !SubagentResult {
+    const owned = try allocator.dupe(u8, text);
+    return .{
+        .status = if (status == .failed) .failed else .completed,
+        .text = owned,
+    };
 }
 
 fn isTaskSessionKey(session_key: []const u8) bool {
@@ -1126,7 +1520,9 @@ fn appendLedgerSnapshot(allocator: Allocator, path: []const u8, task_id: u64, st
     try buf.appendSlice(allocator, ",\"origin_chat_id\":");
     try appendOptionalJsonString(&buf, allocator, state.origin_chat_id);
     try buf.appendSlice(allocator, ",\"result\":");
-    try appendOptionalJsonString(&buf, allocator, state.result);
+    // Phase 2: the file ledger persists the text only (legacy recovery path);
+    // the structured result rides in the PG durable outbox via completeTask.
+    try appendOptionalJsonString(&buf, allocator, if (state.result) |r| r.text else null);
     try buf.appendSlice(allocator, ",\"error\":");
     try appendOptionalJsonString(&buf, allocator, state.error_msg);
     try buf.writer(allocator).print(",\"started_at\":{d},\"completed_at\":", .{state.started_at});
@@ -1341,10 +1737,65 @@ test "SubagentManager completeTask updates state" {
 
     _ = mgr.markTaskRunning(1);
     try std.testing.expectEqual(TaskStatus.running, mgr.getTaskStatus(1).?);
-    mgr.completeTask(1, "done!", null);
+    mgr.completeTask(1, .{ .status = .completed, .text = "done!" }, null);
 
     try std.testing.expectEqual(TaskStatus.completed, mgr.getTaskStatus(1).?);
-    try std.testing.expectEqualStrings("done!", mgr.getTaskResult(1).?);
+    // getTaskResultText returns the text (the manual-query/task_get path).
+    try std.testing.expectEqualStrings("done!", mgr.getTaskResultText(1).?);
+    // getTaskResult returns the full structured value.
+    try std.testing.expectEqual(subagent_result.Status.completed, mgr.getTaskResult(1).?.status);
+}
+
+// ── Task 2.2 test: a completed task's stored SubagentResult carries metadata ──
+
+test "completeTask stores structured SubagentResult metadata" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "meta-task"),
+        .task_summary = try std.testing.allocator.dupe(u8, "carry metadata"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "carry metadata"),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 1, state);
+    _ = mgr.markTaskRunning(1);
+
+    // Drive completeTask with a fully-populated SubagentResult (slices live in
+    // test memory; completeTask dupes them into the manager allocator).
+    const tools = [_][]const u8{ "shell", "produce_document" };
+    mgr.completeTask(1, .{
+        .status = .completed,
+        .text = "structured answer",
+        .tokens = 4321,
+        .turns = 5,
+        .tools_used = &tools,
+        .duration_ms = 999,
+    }, null);
+
+    // Read it back via getTaskResult and assert every field survived the dupe.
+    const got = mgr.getTaskResult(1).?;
+    try std.testing.expectEqual(subagent_result.Status.completed, got.status);
+    try std.testing.expectEqualStrings("structured answer", got.text);
+    try std.testing.expectEqual(@as(u64, 4321), got.tokens);
+    try std.testing.expectEqual(@as(u32, 5), got.turns);
+    try std.testing.expectEqual(@as(u64, 999), got.duration_ms);
+    try std.testing.expectEqual(@as(usize, 2), got.tools_used.len);
+    try std.testing.expectEqualStrings("shell", got.tools_used[0]);
+    try std.testing.expectEqualStrings("produce_document", got.tools_used[1]);
+    // The stored slices must be manager-owned copies, NOT the test's stack slice.
+    try std.testing.expect(got.tools_used.ptr != &tools);
 }
 
 test "SubagentManager completeTask with error" {
@@ -1407,7 +1858,7 @@ test "SubagentManager completeTask routes via bus" {
     try mgr.tasks.put(std.testing.allocator, 1, state);
 
     _ = mgr.markTaskRunning(1);
-    mgr.completeTask(1, "result text", null);
+    mgr.completeTask(1, .{ .status = .completed, .text = "result text" }, null);
 
     // Check bus received the message — verify depth increased
     var msg = try waitForInboundMessage(&bus, 50);
@@ -1448,7 +1899,7 @@ test "SubagentManager completeTask falls back to local completion delivery witho
     try mgr.tasks.put(std.testing.allocator, 1, state);
 
     _ = mgr.markTaskRunning(1);
-    mgr.completeTask(1, "result text", null);
+    mgr.completeTask(1, .{ .status = .completed, .text = "result text" }, null);
 
     try std.testing.expect(recorder.session_key != null);
     try std.testing.expect(recorder.content != null);
@@ -1500,7 +1951,7 @@ test "SubagentManager completeTask prefers completion_delivery over bus when bot
     try mgr.tasks.put(std.testing.allocator, 1, state);
 
     _ = mgr.markTaskRunning(1);
-    mgr.completeTask(1, "tenant result payload", null);
+    mgr.completeTask(1, .{ .status = .completed, .text = "tenant result payload" }, null);
 
     // completion_delivery recorder must have received the content.
     try std.testing.expect(recorder.session_key != null);
@@ -1676,7 +2127,7 @@ test "SubagentManager recovers completed task from file ledger" {
 
     try std.testing.expectEqual(@as(u64, 2), recovered.next_id);
     try std.testing.expectEqual(TaskStatus.completed, recovered.getTaskStatus(1).?);
-    try std.testing.expectEqualStrings("completed: recover me", recovered.getTaskResult(1).?);
+    try std.testing.expectEqualStrings("completed: recover me", recovered.getTaskResultText(1).?);
 }
 
 test "SubagentManager recovery marks in-flight task as failed explicitly" {
@@ -1808,6 +2259,362 @@ const BlockingCompletionRunner = struct {
     }
 };
 
+// ── Task 1.6 tests: startup recovery ─────────────────────────────────
+
+// Non-PG unit test: calling recoverPendingSubagentResults on a manager
+// with ledger_state_mgr=null is a clean no-op — no crash, no wake enqueued.
+// This runs locally (no Postgres required) and must be GREEN.
+test "recoverPendingSubagentResults with null ledger_state_mgr is a no-op" {
+    heartbeat_wake.clearForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    // ledger_state_mgr is null — must return immediately with no side effects.
+    mgr.recoverPendingSubagentResults(42);
+
+    // No wake must have been enqueued.
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount());
+    // No delivery must have happened.
+    try std.testing.expect(recorder.content == null);
+}
+
+// PG-guarded recovery test: seed a pending row, call recovery, assert a wake
+// was enqueued for the user and the row is now marked delivered.
+// Skips cleanly when Postgres is not configured (local / CI without DB).
+test "recoverPendingSubagentResults re-delivers and wakes for pending rows" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(
+        allocator,
+        "NULLALIS_POSTGRES_TEST_URL",
+        "NULLCLAW_POSTGRES_TEST_URL",
+    ) catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    heartbeat_wake.clearForTest();
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_recover", .{std.time.microTimestamp()});
+    const state_cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var state_mgr = try zaki_state.Manager.init(allocator, state_cfg);
+    defer state_mgr.deinit();
+
+    // Cleanup on exit.
+    {
+        const pg_helpers = @import("memory/engines/postgres.zig");
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, state_mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const res = try state_mgr.exec(drop_q);
+        _ = res;
+    }
+    try state_mgr.migrate();
+
+    // Seed one pending row for user_id=42, session_key contains "user:42".
+    try state_mgr.upsertSubagentResult(.{
+        .result_id = "subagent:77",
+        .user_id = 42,
+        .session_key = "agent:zaki-bot:user:42:main",
+        .task_id = 77,
+        .result_json = "{\"status\":\"completed\",\"text\":\"recovered answer\"}",
+    });
+
+    // Build a manager with the PG ledger and a recording delivery.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(allocator, &cfg, null, .{});
+    defer mgr.deinit();
+    // Attach ledger FIRST (mirrors gateway.zig wiring order).
+    mgr.attachPostgresLedger(&state_mgr, 42);
+    // Attach delivery SECOND — triggers recovery.
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+
+    // A wake must have been enqueued for user "42".
+    const req = heartbeat_wake.dequeue();
+    try std.testing.expect(req != null);
+    var mutable_req = req.?;
+    defer mutable_req.deinit();
+    try std.testing.expectEqualStrings("42", mutable_req.user_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, mutable_req.reason, "subagent_completion:recovered") != null);
+
+    // The delivery callback must have been called — with the task_id in the
+    // header AND (Phase 2, Task 2.3) the rehydrated result text from the row.
+    try std.testing.expect(recorder.content != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.content.?, "77") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.content.?, "recovered answer") != null);
+
+    // The row must now be marked delivered (not pending).
+    const rows = try state_mgr.loadPendingSubagentResults(allocator, 42);
+    defer {
+        for (rows) |r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 0), rows.len);
+
+    // Drop test schema.
+    {
+        const pg_helpers = @import("memory/engines/postgres.zig");
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, state_mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const res = try state_mgr.exec(drop_q);
+        _ = res;
+    }
+}
+
+// ── Task 2.3 test: recovery re-hydrates the FULL result text ──────────
+// Seed a pending row whose result_json is a complete SubagentResult (status,
+// text, metadata) — exactly what Phase-2 completeTask now writes — and assert
+// recovery delivers the actual ANSWER TEXT (not a bare marker). PG-guarded;
+// skips cleanly without a test Postgres.
+test "recoverPendingSubagentResults re-hydrates full result text from durable row" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(
+        allocator,
+        "NULLALIS_POSTGRES_TEST_URL",
+        "NULLCLAW_POSTGRES_TEST_URL",
+    ) catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    heartbeat_wake.clearForTest();
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_rehydrate", .{std.time.microTimestamp()});
+    const state_cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var state_mgr = try zaki_state.Manager.init(allocator, state_cfg);
+    defer state_mgr.deinit();
+
+    {
+        const pg_helpers = @import("memory/engines/postgres.zig");
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, state_mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        _ = try state_mgr.exec(drop_q);
+    }
+    try state_mgr.migrate();
+
+    // Build the durable payload exactly the way Phase-2 completeTask does:
+    // serialize a full SubagentResult via toJsonAlloc.
+    const seeded = SubagentResult{
+        .status = .completed,
+        .text = "the fully rehydrated answer body",
+        .tokens = 2048,
+        .turns = 4,
+        .duration_ms = 1234,
+    };
+    const seeded_json = try seeded.toJsonAlloc(allocator);
+    defer allocator.free(seeded_json);
+
+    try state_mgr.upsertSubagentResult(.{
+        .result_id = "subagent:91",
+        .user_id = 42,
+        .session_key = "agent:zaki-bot:user:42:main",
+        .task_id = 91,
+        .result_json = seeded_json,
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(allocator, &cfg, null, .{});
+    defer mgr.deinit();
+    mgr.attachPostgresLedger(&state_mgr, 42);
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+
+    // Wake enqueued for the user.
+    const req = heartbeat_wake.dequeue();
+    try std.testing.expect(req != null);
+    var mutable_req = req.?;
+    defer mutable_req.deinit();
+    try std.testing.expectEqualStrings("42", mutable_req.user_id.?);
+
+    // The delivered content must carry the ACTUAL answer text (rehydrated from
+    // the full SubagentResult JSON), plus the task_id for correlation.
+    try std.testing.expect(recorder.content != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.content.?, "the fully rehydrated answer body") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.content.?, "91") != null);
+
+    // Row marked delivered.
+    const rows = try state_mgr.loadPendingSubagentResults(allocator, 42);
+    defer {
+        for (rows) |r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 0), rows.len);
+
+    {
+        const pg_helpers = @import("memory/engines/postgres.zig");
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, state_mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        _ = try state_mgr.exec(drop_q);
+    }
+}
+
+// ── Task 1.5 test: duplicate completion is idempotent ─────────────────
+
+test "duplicate completion of same task_id is idempotent (no double wake)" {
+    heartbeat_wake.clearForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "idem-task"),
+        .task_summary = try std.testing.allocator.dupe(u8, "idempotency check"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "idempotency check"),
+        .session_key = try std.testing.allocator.dupe(u8, "agent:zaki-bot:user:42:main"),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 7, state);
+
+    _ = mgr.markTaskRunning(7);
+    // First completion: delivers + enqueues one wake
+    mgr.completeTask(7, .{ .status = .completed, .text = "first result" }, null);
+
+    // Second completion for the same task_id: task is already terminal.
+    // Drain the queue BEFORE the second call so coalescing can't mask double-enqueue
+    {
+        const first_req = heartbeat_wake.dequeue();
+        try std.testing.expect(first_req != null);
+        var mutable_first = first_req.?;
+        defer mutable_first.deinit();
+    }
+    // Queue must now be empty
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount());
+
+    // Remember what the recorder captured from the first delivery
+    const first_content_len = if (recorder.content) |c| c.len else @as(usize, 0);
+
+    // In-memory guard: completeTask sees state.status==.completed → skips deliver+wake entirely.
+    mgr.completeTask(7, .{ .status = .completed, .text = "second result — must be ignored" }, null);
+
+    // No additional wake must have been enqueued
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount());
+
+    // The recorder content must NOT have changed (no second delivery)
+    const second_content_len = if (recorder.content) |c| c.len else @as(usize, 0);
+    try std.testing.expectEqual(first_content_len, second_content_len);
+}
+
+// ── Task 1.4 test: completeTask enqueues a heartbeat wake ─────────────
+
+test "completeTask enqueues a heartbeat wake for the parent user" {
+    heartbeat_wake.clearForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "wake-test-task"),
+        .task_summary = try std.testing.allocator.dupe(u8, "test wake enqueue"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "test wake enqueue"),
+        .session_key = try std.testing.allocator.dupe(u8, "agent:zaki-bot:user:42:main"),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 7, state);
+
+    _ = mgr.markTaskRunning(7);
+    mgr.completeTask(7, .{ .status = .completed, .text = "wake result" }, null);
+
+    const req = heartbeat_wake.dequeue();
+    try std.testing.expect(req != null);
+    var mutable_req = req.?;
+    defer mutable_req.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, mutable_req.reason, "subagent_completion") != null);
+    // user_id "42" must be present so the daemon wakes the right user
+    try std.testing.expectEqualStrings("42", mutable_req.user_id.?);
+}
+
+// ── Task 1.3 test: formatSubagentResultId ─────────────────────────────
+
+test "formatSubagentResultId formats stable id" {
+    var buf: [40]u8 = undefined;
+    const id = try formatSubagentResultId(&buf, 7);
+    try std.testing.expectEqualStrings("subagent:7", id);
+}
+
+test "formatSubagentResultId handles large task_id" {
+    var buf: [40]u8 = undefined;
+    const id = try formatSubagentResultId(&buf, 123456789);
+    try std.testing.expectEqualStrings("subagent:123456789", id);
+}
+
 const RecordingCompletionDelivery = struct {
     session_key: ?[]const u8 = null,
     content: ?[]const u8 = null,
@@ -1843,7 +2650,7 @@ test "SubagentManager spawn e2e completes and publishes bus message" {
     try waitForTaskTerminal(&mgr, task_id, 2_000);
 
     try std.testing.expectEqual(TaskStatus.completed, mgr.getTaskStatus(task_id).?);
-    try std.testing.expectEqualStrings("completed: summarize this", mgr.getTaskResult(task_id).?);
+    try std.testing.expectEqualStrings("completed: summarize this", mgr.getTaskResultText(task_id).?);
     var msg = try waitForInboundMessage(&bus, 250);
     defer msg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("agent", msg.channel);
@@ -2158,7 +2965,7 @@ test "SubagentManager cancelQueued refuses terminal task" {
         .label = try std.testing.allocator.dupe(u8, "done"),
         .task_summary = try std.testing.allocator.dupe(u8, "done summary"),
         .task_prompt = try std.testing.allocator.dupe(u8, "done prompt"),
-        .result = try std.testing.allocator.dupe(u8, "ok"),
+        .result = .{ .status = .completed, .text = try std.testing.allocator.dupe(u8, "ok") },
         .started_at = std.time.milliTimestamp(),
         .completed_at = std.time.milliTimestamp(),
     };

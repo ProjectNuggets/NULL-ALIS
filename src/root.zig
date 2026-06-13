@@ -159,6 +159,9 @@ pub const mcp = @import("mcp.zig");
 /// provider. The inverse of `mcp` (the client). Entry: `nullalis mcp serve`.
 pub const mcp_server = @import("mcp_server.zig");
 pub const subagent = @import("subagent.zig");
+/// Subagent Pass Phase 2 — structured completion value object
+/// (status/text/artifacts/tokens/turns/tools/duration) + JSON (de)serialize.
+pub const subagent_result = @import("subagent_result.zig");
 
 // Phase 4c: Auth
 pub const auth = @import("auth.zig");

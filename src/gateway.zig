@@ -30551,8 +30551,18 @@ test "W1.2: getTenantRuntime refuses a key-value-skewed cached runtime and serve
     // must evict the skewed entry and create a fresh runtime correctly bound to
     // "2" so the request still succeeds.
     const fetched = try getTenantRuntime(&state, &cfg, &user_ctx_2);
-    try std.testing.expect(fetched != runtime_1); // never the wrong-tenant runtime
-    try std.testing.expectEqualStrings("2", fetched.user_id); // correct binding
+    // NOTE: do NOT assert `fetched != runtime_1` by pointer. The guard evicts
+    // (deinit + free) the skewed runtime_1 and then allocates a FRESH runtime,
+    // which the allocator may legitimately place at runtime_1's just-freed
+    // address — so `runtime_1` is now a dangling pointer and a pointer-identity
+    // check is unsound and allocator/platform-dependent (it held on macOS but
+    // the freed slot is reused on linux-x86_64 → false pointer-equality → the
+    // test failed on Linux only). The "never serve the wrong-tenant runtime"
+    // guarantee is expressed SOUNDLY by the binding assertion below: a runtime
+    // bound to "2" is by definition not runtime_1's wrong-tenant ("1") binding,
+    // and a truly broken guard that returned the un-evicted runtime_1 would read
+    // user_id "1" here and still fail the test.
+    try std.testing.expectEqualStrings("2", fetched.user_id); // correct binding — the real guarantee
     try std.testing.expect(!fetched.pending_destroy.load(.acquire));
 
     // And the cache is repaired: key "2" now maps to the fresh, correct runtime.
@@ -32823,7 +32833,12 @@ const StopTestFixture = struct {
                 std.time.milliTimestamp()
             else
                 null,
-            .result = if (status == .completed) try alloc.dupe(u8, "done") else null,
+            // Phase 2: TaskState.result is a structured SubagentResult; only
+            // `text` is heap-owned (default empty slices are comptime &.{}).
+            .result = if (status == .completed)
+                subagent_mod.SubagentResultType{ .status = .completed, .text = try alloc.dupe(u8, "done") }
+            else
+                null,
         };
         try fx.mgr.tasks.put(alloc, numeric_id, state);
         // Mirror into the canonical ledger so getTaskSnapshot sees it.

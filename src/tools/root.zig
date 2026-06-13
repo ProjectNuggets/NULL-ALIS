@@ -2594,6 +2594,17 @@ pub fn subagentTools(
         http_enabled: bool = false,
         allowed_paths: []const []const u8 = &.{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
+        // Phase 3 (Subagent Pass): tenant handles so the subagent's
+        // artifact_create persists to the SAME schema/user as the parent and
+        // emits the artifact_event the ArtifactCollector captures. Optional —
+        // when null the tool is still registered but degrades to a clear
+        // "state manager not bound" error (matches allTools' bind-later shape).
+        state_mgr: ?*zaki_state.Manager = null,
+        user_id: ?i64 = null,
+        // produce_document branding (operator typography). Empty/default ⇒
+        // system fonts. produce_document writes a downloadable file to the
+        // workspace; its output is NOT surfaced via the artifact_event path.
+        branding: produce_document.BrandingConfig = .{},
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -2629,6 +2640,26 @@ pub fn subagentTools(
         ht.* = .{};
         try list.append(allocator, ht.tool());
     }
+
+    // Phase 3 (Subagent Pass) — artifact handoff. The subagent can now produce
+    // user-visible deliverables the parent re-surfaces.
+    //
+    // artifact_create is the keystone: it persists a versioned side-panel
+    // artifact to {schema}.artifacts (same tenant as the parent — state_mgr +
+    // user_id bound here) AND emits an `artifact_event` ObserverEvent that the
+    // ArtifactCollector (installed as the subagent thread's tool observer)
+    // captures into SubagentResult.artifacts. Constructed exactly like
+    // allTools() does (fields state_mgr + user_id; see artifact_create.zig).
+    const act = try allocator.create(artifact_create.ArtifactCreateTool);
+    act.* = .{ .state_mgr = opts.state_mgr, .user_id = opts.user_id };
+    try list.append(allocator, act.tool());
+
+    // produce_document — a one-shot rendered file (pdf/docx/xlsx/pptx/html) in
+    // the subagent workspace. It emits NO observer event, so its output is a
+    // downloadable-file capability, not an auto-surfaced canvas artifact.
+    const pdt = try allocator.create(produce_document.ProduceDocumentTool);
+    pdt.* = .{ .workspace_dir = workspace_dir, .branding = opts.branding };
+    try list.append(allocator, pdt.tool());
 
     return list.toOwnedSlice(allocator);
 }
@@ -3766,6 +3797,22 @@ test "canonicalMetadataForCall falls back to base metadata on invalid JSON" {
     const bad = canonicalMetadataForCall(allocator, "shell", "not-json");
     try std.testing.expect(bad.flags.mutating);
     try std.testing.expect(!bad.flags.read_only);
+}
+
+test "subagentTools includes the artifact tools" {
+    const tools = try subagentTools(std.testing.allocator, ".", .{});
+    defer {
+        for (tools) |t| t.deinit(std.testing.allocator);
+        std.testing.allocator.free(tools);
+    }
+    var has_artifact = false;
+    var has_doc = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "artifact_create")) has_artifact = true;
+        if (std.mem.eql(u8, t.name(), "produce_document")) has_doc = true;
+    }
+    try std.testing.expect(has_artifact);
+    try std.testing.expect(has_doc);
 }
 
 test {

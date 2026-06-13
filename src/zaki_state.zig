@@ -557,6 +557,31 @@ pub const PendingApprovalRow = struct {
     }
 };
 
+/// **Subagent Pass Phase 1** — borrowed-slice input for upsertSubagentResult.
+/// Caller owns the memory; the function dupes everything it needs to persist.
+pub const SubagentResultInput = struct {
+    result_id: []const u8,   // formatted "subagent:<task_id>"
+    user_id: i64,
+    session_key: []const u8,
+    task_id: i64,
+    result_json: []const u8, // Phase-1: {status,text}; Phase-2: full SubagentResult JSON
+};
+
+/// **Subagent Pass Phase 1** — an owned-slice row rehydrated from
+/// {schema}.subagent_results. Call deinit() to free all slices.
+pub const SubagentResultRow = struct {
+    result_id: []const u8,
+    session_key: []const u8,
+    task_id: i64,
+    result_json: []const u8,
+
+    pub fn deinit(self: SubagentResultRow, allocator: std.mem.Allocator) void {
+        allocator.free(self.result_id);
+        allocator.free(self.session_key);
+        allocator.free(self.result_json);
+    }
+};
+
 pub const ArtifactVersionRow = struct {
     artifact_id: []u8,
     version: u64,
@@ -918,6 +943,24 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn pendingApprovalStatus(_: *@This(), allocator: std.mem.Allocator, _: []const u8) !?[]u8 {
         _ = allocator;
         return null;
+    }
+    /// Subagent Pass Phase 1 — stubs for non-postgres builds. The durable
+    /// subagent-results ledger requires Postgres; without it completions stay
+    /// ephemeral (no outbox, no restart recovery).
+    pub fn upsertSubagentResult(_: *@This(), _: SubagentResultInput) !void {
+        return;
+    }
+    pub fn loadPendingSubagentResults(_: *@This(), allocator: std.mem.Allocator, _: i64) ![]SubagentResultRow {
+        return allocator.alloc(SubagentResultRow, 0);
+    }
+    pub fn markSubagentResultDelivered(_: *@This(), _: []const u8) !void {
+        return;
+    }
+    /// Subagent Pass Phase 1 stub — non-PG build has no durable row, so
+    /// the durable gate is always "not delivered" (false). The in-memory
+    /// guard in completeTask() handles idempotency for the non-PG path.
+    pub fn subagentResultStatusIsDelivered(_: *@This(), _: []const u8) !bool {
+        return false;
     }
     pub fn forgetMemory(_: *@This(), _: i64, _: []const u8) !bool {
         return error.PostgresNotEnabled;
@@ -1774,7 +1817,10 @@ const ManagerImpl = struct {
         };
     }
 
-    fn schemaRaw(self: *const Self) []const u8 {
+    /// Raw (unquoted) tenant schema name. `pub` so cross-module tests (e.g. the
+    /// subagent_results PG recovery tests in subagent.zig) can build the
+    /// DROP SCHEMA cleanup query under the postgres engine.
+    pub fn schemaRaw(self: *const Self) []const u8 {
         return self.schema_raw_buf[0..self.schema_raw_len];
     }
 
@@ -1951,7 +1997,11 @@ const ManagerImpl = struct {
         self.pool_entries.clearRetainingCapacity();
     }
 
-    fn migrate(self: *Self) !void {
+    /// Apply the embedded schema migrations for this tenant. Called internally
+    /// by `init`; also `pub` so cross-module PG tests (subagent_results
+    /// recovery in subagent.zig) can re-create the schema after a DROP in
+    /// setup/teardown under the postgres engine.
+    pub fn migrate(self: *Self) !void {
         const statements = [_][]const u8{
             "CREATE SCHEMA IF NOT EXISTS {schema}",
             "CREATE EXTENSION IF NOT EXISTS pgcrypto",
@@ -10451,6 +10501,132 @@ const ManagerImpl = struct {
         return try dupeResultValue(allocator, result, 0, 0);
     }
 
+    // -----------------------------------------------------------------------
+    // Subagent Pass Phase 1 — durable subagent_results outbox (mirrors P0-4).
+    // -----------------------------------------------------------------------
+
+    /// Persist a subagent completion to the durable outbox BEFORE waking the
+    /// parent. Idempotent: ON CONFLICT (result_id) DO NOTHING means a second
+    /// write for the same task_id is a no-op. Self-heals the parent users row
+    /// via ensureUserRow so the FK can never fault.
+    pub fn upsertSubagentResult(self: *Self, row: SubagentResultInput) !void {
+        try self.ensureUserRow(row.user_id);
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.subagent_results " ++
+                "(result_id, user_id, session_key, task_id, result_json, status) " ++
+                "VALUES ($1, $2, $3, $4, $5, 'pending') " ++
+                "ON CONFLICT (result_id) DO NOTHING",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{row.user_id});
+        var task_buf: [32]u8 = undefined;
+        const task_s = try std.fmt.bufPrintZ(&task_buf, "{d}", .{row.task_id});
+        const id_z = try self.allocator.dupeZ(u8, row.result_id);
+        defer self.allocator.free(id_z);
+        const session_z = try self.allocator.dupeZ(u8, row.session_key);
+        defer self.allocator.free(session_z);
+        const json_z = try self.allocator.dupeZ(u8, row.result_json);
+        defer self.allocator.free(json_z);
+
+        const params = [_]?[*:0]const u8{ id_z.ptr, user_s.ptr, session_z.ptr, task_s.ptr, json_z.ptr };
+        const lengths = [_]c_int{
+            @intCast(row.result_id.len),
+            @intCast(user_s.len),
+            @intCast(row.session_key.len),
+            @intCast(task_s.len),
+            @intCast(row.result_json.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    /// Return all 'pending' subagent_results rows for a user, ordered by
+    /// created_at ASC (oldest first, so recovery re-delivers in order).
+    /// Caller owns the returned slice and each row; call row.deinit() then
+    /// free the slice.
+    pub fn loadPendingSubagentResults(self: *Self, allocator: std.mem.Allocator, user_id: i64) ![]SubagentResultRow {
+        const q = try self.buildQuery(
+            "SELECT result_id, session_key, task_id, result_json " ++
+                "FROM {schema}.subagent_results " ++
+                "WHERE user_id = $1 AND status = 'pending' ORDER BY created_at ASC",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const res = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(res);
+
+        const n: usize = @intCast(c.PQntuples(res));
+        var out: std.ArrayListUnmanaged(SubagentResultRow) = .{};
+        errdefer {
+            for (out.items) |r| r.deinit(allocator);
+            out.deinit(allocator);
+        }
+        try out.ensureTotalCapacity(allocator, n);
+        for (0..n) |i| {
+            const ri: c_int = @intCast(i);
+            const id = try dupeResultValue(allocator, res, ri, 0);
+            errdefer allocator.free(id);
+            const sk = try dupeResultValue(allocator, res, ri, 1);
+            errdefer allocator.free(sk);
+            const tid_raw = try dupeResultValue(allocator, res, ri, 2);
+            const tid = std.fmt.parseInt(i64, tid_raw, 10) catch 0;
+            allocator.free(tid_raw);
+            const rj = try dupeResultValue(allocator, res, ri, 3);
+            errdefer allocator.free(rj);
+            try out.append(allocator, .{
+                .result_id = id,
+                .session_key = sk,
+                .task_id = tid,
+                .result_json = rj,
+            });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Flip a row from 'pending' to 'delivered' and stamp delivered_at.
+    /// Only updates rows that are still pending (first deliver wins; a
+    /// concurrent or duplicate mark-delivered is a no-op).
+    pub fn markSubagentResultDelivered(self: *Self, result_id: []const u8) !void {
+        const q = try self.buildQuery(
+            "UPDATE {schema}.subagent_results " ++
+                "SET status = 'delivered', delivered_at = NOW() " ++
+                "WHERE result_id = $1 AND status = 'pending'",
+        );
+        defer self.allocator.free(q);
+        const id_z = try self.allocator.dupeZ(u8, result_id);
+        defer self.allocator.free(id_z);
+        const params = [_]?[*:0]const u8{id_z.ptr};
+        const lengths = [_]c_int{@intCast(result_id.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
+    /// Return true if the durable row for result_id has status='delivered'.
+    /// Used as the cross-restart idempotency gate in completeTask: if we
+    /// crashed between persist and deliver, recovery re-delivers; if we
+    /// already delivered and then restart with a stale 'pending' state,
+    /// this returns true and we skip. Mirrors pendingApprovalStatus (~L10472).
+    pub fn subagentResultStatusIsDelivered(self: *Self, result_id: []const u8) !bool {
+        const q = try self.buildQuery(
+            "SELECT status FROM {schema}.subagent_results WHERE result_id = $1",
+        );
+        defer self.allocator.free(q);
+        const id_z = try self.allocator.dupeZ(u8, result_id);
+        defer self.allocator.free(id_z);
+        const params = [_]?[*:0]const u8{id_z.ptr};
+        const lengths = [_]c_int{@intCast(result_id.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return false;
+        const status_raw = std.mem.span(c.PQgetvalue(result, 0, 0));
+        return std.mem.eql(u8, status_raw, "delivered");
+    }
+
     /// List the most-recent N skill execution traces for (user, skill_name).
     /// Used at the start of a skill invocation to inject "what worked
     /// last time" into the prompt. Returns owned slice; caller calls
@@ -11669,7 +11845,11 @@ const ManagerImpl = struct {
         return allocator.dupe(u8, out[0..]);
     }
 
-    fn exec(self: *Self, query: []const u8) !*c.PGresult {
+    /// Execute a raw SQL statement on a pooled connection. `pub` so
+    /// cross-module PG tests (e.g. the subagent_results recovery tests in
+    /// subagent.zig) can run DROP SCHEMA setup/teardown under the postgres
+    /// engine. Caller owns the returned *PGresult (PQclear it).
+    pub fn exec(self: *Self, query: []const u8) !*c.PGresult {
         var lease = self.acquireConn(self.lock_timeout_ms) catch |err| switch (err) {
             error.ConnectionPoolBusy => return error.ConnectionFailed,
             else => return err,
@@ -13511,6 +13691,79 @@ test "P0-4 — durable approvals: persist→rehydrate→resolve→idempotent-rep
 
     // Unknown id → null status (gateway treats as "not previously resolved").
     try std.testing.expect((try mgr.pendingApprovalStatus(allocator, "apr-nope")) == null);
+
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+}
+
+test "subagent_results upsert is idempotent and loads pending" {
+    // Subagent Pass Phase 1 keystone (PG). Proves migration 0007 +
+    // the three Manager methods deliver the contract:
+    //   (1) upsertSubagentResult persists FK-safely (funnels through ensureUserRow),
+    //   (2) ON CONFLICT (result_id) DO NOTHING makes a duplicate persist a no-op,
+    //   (3) loadPendingSubagentResults returns the pending row,
+    //   (4) markSubagentResultDelivered flips status; subsequent load returns 0 rows.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_subares", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    // Migrate: 0007 must apply cleanly (idempotent on re-migrate).
+    try mgr.migrate();
+    try mgr.migrate();
+
+    const input = SubagentResultInput{
+        .result_id = "subagent:7",
+        .user_id = 42,
+        .session_key = "agent:zaki-bot:user:42:main",
+        .task_id = 7,
+        .result_json = "{\"status\":\"completed\",\"text\":\"done\"}",
+    };
+
+    // (1) Persist WITHOUT a prior provisionUser call — must self-heal via ensureUserRow.
+    try mgr.upsertSubagentResult(input);
+
+    // (2) Duplicate persist is a no-op (ON CONFLICT DO NOTHING).
+    try mgr.upsertSubagentResult(input);
+
+    // (3) Load pending: exactly one row with the right task_id.
+    const rows = try mgr.loadPendingSubagentResults(allocator, 42);
+    defer {
+        for (rows) |r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(i64, 7), rows[0].task_id);
+    try std.testing.expectEqualStrings("subagent:7", rows[0].result_id);
+    try std.testing.expectEqualStrings("agent:zaki-bot:user:42:main", rows[0].session_key);
+
+    // (4) Mark delivered → subsequent load returns 0 rows.
+    try mgr.markSubagentResultDelivered("subagent:7");
+    const rows2 = try mgr.loadPendingSubagentResults(allocator, 42);
+    defer allocator.free(rows2);
+    try std.testing.expectEqual(@as(usize, 0), rows2.len);
 
     {
         const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());

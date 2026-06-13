@@ -3272,7 +3272,7 @@ fn freeSubagentTaskState(manager: *subagent_mod.SubagentManager, state: *subagen
     if (state.thread) |thread| {
         thread.join();
     }
-    if (state.result) |r| manager.allocator.free(r);
+    if (state.result) |*r| subagent_mod.freeSubagentResult(manager.allocator, r);
     if (state.error_msg) |e| manager.allocator.free(e);
     if (state.session_key) |sk| manager.allocator.free(sk);
     if (state.runtime_session_key) |sk| manager.allocator.free(sk);
@@ -3298,7 +3298,9 @@ fn taskOutcomeLabel(state: *const subagent_mod.TaskState) []const u8 {
 
 fn taskResultSnippet(state: *const subagent_mod.TaskState) []const u8 {
     if (state.error_msg) |err_msg| return err_msg;
-    if (state.result) |result| return result;
+    // Phase 2: state.result is a structured SubagentResult; the snippet is the
+    // human-readable final-answer text.
+    if (state.result) |result| return result.text;
     return "";
 }
 
@@ -3490,7 +3492,9 @@ test "formatSubagentList shows task summary and outcome" {
         .task_summary = try std.testing.allocator.dupe(u8, "inspect routing"),
         .task_prompt = try std.testing.allocator.dupe(u8, "inspect routing"),
         .session_key = try std.testing.allocator.dupe(u8, "agent:zaki-bot:user:1:main"),
-        .result = try std.testing.allocator.dupe(u8, "routing ok"),
+        // Phase 2: result is a structured SubagentResult. Only `text` is heap-
+        // owned here; the default empty slices are comptime &.{} (free-safe).
+        .result = .{ .status = .completed, .text = try std.testing.allocator.dupe(u8, "routing ok") },
         .started_at = std.time.milliTimestamp(),
         .completed_at = std.time.milliTimestamp(),
     };
@@ -3743,7 +3747,7 @@ fn handleSubagentsCommand(self: anytype, arg: []const u8) ![]const u8 {
             return try std.fmt.allocPrint(
                 self.allocator,
                 "Task #{d}: {s} [{s}]\nTask: {s}\nOutcome: {s}\nResult:\n{s}",
-                .{ task_id, state.label, taskStatusLabel(state.status), state.task_summary, taskOutcomeLabel(state), result },
+                .{ task_id, state.label, taskStatusLabel(state.status), state.task_summary, taskOutcomeLabel(state), result.text },
             );
         }
         return try std.fmt.allocPrint(

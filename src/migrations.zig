@@ -134,6 +134,16 @@ pub const MIGRATIONS = [_]Migration{
         .name = "0006_message_transcript_fidelity",
         .sql = @embedFile("migrations/0006_message_transcript_fidelity.sql"),
     },
+    .{
+        // Subagent Pass Phase 1 (2026-06-13) — durable outbox for subagent
+        // completions. A row is written BEFORE the parent is woken; status
+        // flips pending -> delivered once the parent has been notified, so a
+        // crash between persist and deliver is recovered by re-delivering
+        // 'pending' rows on startup. Mirrors the pending_approvals pattern.
+        .version = 7,
+        .name = "0007_subagent_results",
+        .sql = @embedFile("migrations/0007_subagent_results.sql"),
+    },
 };
 
 /// Trait the runner's caller must satisfy: a method that takes a
