@@ -19,9 +19,10 @@
 //! 1. **Reject heuristics** — drop facts whose `predicate` is in the
 //!    rejected-predicate blacklist (covers cases where the LLM emitted
 //!    meta-narrative despite the prompt's anti-meta rules).
-//! 2. **MD5 content_hash dedup** — if a memory with identical
+//! 2. **SHA-256 content_hash dedup** — if a memory with identical
 //!    normalized content already exists for this user, skip silently
-//!    (Mem0-style pre-filter, gap #13 from audit).
+//!    (Mem0-style pre-filter, gap #13 from audit). Previously used MD5
+//!    (dead layer — 32-char hex can never match a 64-char SHA-256 column).
 //! 3. **Cosine similarity dedup** — if cosine vs recent rows in same
 //!    session > 0.92 (D4 mitigation), skip.
 //! 4. **Key derivation** — `extracted_<unix_ns>_<hex8>` shape so
@@ -278,12 +279,15 @@ inline fn isRejectedPredicate(predicate: []const u8) bool {
     return false;
 }
 
-/// Compute MD5 hex of normalized content for V1.6 5b.3 dedup pre-filter.
-/// Mirrors `zaki_state.computeContentHash` semantics so the hash matches
-/// what the upsert path stores in the `content_hash` column.
-fn computeMd5Hex(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
-    var digest: [16]u8 = undefined;
-    std.crypto.hash.Md5.hash(content, &digest, .{});
+/// Compute SHA-256 hex of content for the V1.6 5b.3 dedup pre-filter.
+/// Produces a 64-char hex string that matches the `content_hash` column,
+/// which is populated by `zaki_state.computeContentHash` (also SHA-256).
+/// Previous implementation used MD5 (32-char hex), making it impossible
+/// for the dedup query to ever match a stored hash — the layer was
+/// silently dead. Fixed in P1 of the memory-phase-0.5 patch series.
+fn computeContentHashHex(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(content, &digest, .{});
     const out = try allocator.alloc(u8, digest.len * 2);
     _ = security_secrets.hexEncode(&digest, out);
     return out;
@@ -821,12 +825,12 @@ pub fn persistExtracted(
             continue;
         }
 
-        // Step 2 (V1.6 5b.3 WR-1): MD5 content_hash dedup. Compaction
+        // Step 2 (V1.6 5b.3 WR-1): SHA-256 content_hash dedup. Compaction
         // Pass C re-summarizes prior prose summaries on each trigger,
         // causing the LLM to re-emit the same atomic facts. Skip if a
         // memory with identical normalized content already exists for
         // this user. Cheap — uses idx_memories_hash directly.
-        const content_hash = computeMd5Hex(allocator, m.text) catch |err| {
+        const content_hash = computeContentHashHex(allocator, m.text) catch |err| {
             log.warn("extraction.hash_failed err={s}", .{@errorName(err)});
             result.failed_count += 1;
             continue;
@@ -1779,4 +1783,20 @@ test "V1.14.12 (M1 + Path A): WriteOrigin enum count guards against silent addit
     // (attribution="extraction_classifier") by metadata alone. Not a
     // hygiene gap — different schema layer (memory_edges, not memories).
     try std.testing.expectEqual(@as(usize, 6), @typeInfo(WriteOrigin).@"enum".fields.len);
+}
+
+test "content-hash helper matches the stored content_hash algorithm (SHA-256, 64 hex)" {
+    const a = std.testing.allocator;
+    const h = try computeContentHashHex(a, "user lives in Hamburg");
+    defer a.free(h);
+    // SHA-256 produces a 32-byte digest → 64 hex chars.
+    try std.testing.expectEqual(@as(usize, 64), h.len);
+    // Must match what zaki_state stores in the content_hash column.
+    // zaki_state.computeContentHash is private, so replicate it here.
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("user lives in Hamburg", &digest, .{});
+    const want = try a.alloc(u8, 64);
+    defer a.free(want);
+    _ = security_secrets.hexEncode(&digest, want);
+    try std.testing.expectEqualStrings(want, h);
 }
