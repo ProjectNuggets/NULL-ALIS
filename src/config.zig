@@ -95,6 +95,11 @@ pub const Config = struct {
     // Top-level fields
     profile: []const u8 = "standard",
     providers: []const ProviderEntry = &.{},
+    /// Operator-configurable image generation model override.
+    /// Empty (default) → image_generate uses DEFAULT_TEXT_MODEL ("black-forest-labs/FLUX.1-schnell").
+    /// Set per-environment, e.g. staging: "black-forest-labs/FLUX.2-pro".
+    /// Passed as model_override to bindImageGenerate at all bind sites.
+    image_model: []const u8 = "",
     audio_media: AudioMediaConfig = .{},
     default_provider: []const u8 = "openrouter",
     default_model: ?[]const u8 = null,
@@ -1224,6 +1229,7 @@ const config_field_accounting = [_]ConfigFieldAccount{
     .{ .name = "config_path", .disposition = .runtime_or_derived },
     .{ .name = "profile", .disposition = .json_parsed },
     .{ .name = "providers", .disposition = .json_parsed },
+    .{ .name = "image_model", .disposition = .json_parsed },
     .{ .name = "audio_media", .disposition = .json_parsed },
     .{ .name = "default_provider", .disposition = .json_parsed },
     .{ .name = "default_model", .disposition = .json_parsed },
@@ -4304,4 +4310,25 @@ test "save and parse preserve profile" {
 
     try std.testing.expectEqualStrings("zaki_bot", loaded.profile);
     try std.testing.expect(loaded.http_request.enabled);
+}
+
+test "image_model config: parsed and defaults to empty" {
+    // Parse {"image_model": "black-forest-labs/FLUX.2-pro"} → config.image_model is set.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = arena.allocator() };
+    try cfg.parseJson(
+        \\{"image_model": "black-forest-labs/FLUX.2-pro"}
+    );
+    try std.testing.expectEqualStrings("black-forest-labs/FLUX.2-pro", cfg.image_model);
+}
+
+test "image_model config: absent key defaults to empty string" {
+    // When image_model is absent from config, it must default to "" so bindImageGenerate
+    // passes "" to image_generate, which then falls back to DEFAULT_TEXT_MODEL (schnell).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = arena.allocator() };
+    try cfg.parseJson("{}");
+    try std.testing.expectEqualStrings("", cfg.image_model);
 }

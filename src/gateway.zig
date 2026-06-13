@@ -2272,7 +2272,7 @@ const TenantRuntime = struct {
         tools_mod.bindImageGenerate(
             runtime.tools,
             tools_mod.lookupProviderApiKey(runtime.config.providers, "together"),
-            "",
+            runtime.config.image_model,
         );
         if (runtime.subagent_manager) |mgr| {
             mgr.attachTaskDelivery(runtime.task_delivery);
@@ -24571,7 +24571,7 @@ pub fn runWithRole(
                 tools_mod.bindImageGenerate(
                     tools_slice,
                     tools_mod.lookupProviderApiKey(cfg.providers, "together"),
-                    "",
+                    cfg.image_model,
                 );
                 session_mgr_opt = sm;
                 if (subagent_manager_opt) |mgr| {
