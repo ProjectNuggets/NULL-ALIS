@@ -347,37 +347,40 @@ pub const ArtifactCollector = struct {
         defer self.mutex.unlock();
         // Dupe every borrowed slice — the ObserverEvent payload is only valid
         // for the duration of recordEvent (mirrors artifact_event lifetime).
-        const id = self.allocator.dupe(u8, ae.artifact_id) catch return;
-        errdefer self.allocator.free(id);
-        const kind = self.allocator.dupe(u8, ae.kind) catch {
-            self.allocator.free(id);
-            return;
+        // captureLocked returns void (never error-returns), so cleanup on an
+        // allocation/append failure is done explicitly on each path — every
+        // slice already duped is freed before bailing, so there is no leak and
+        // no partial ArtifactRef in the list.
+        const ref = buildOwnedRef(self.allocator, ae) orelse return;
+        self.list.append(self.allocator, ref) catch {
+            self.allocator.free(ref.id);
+            self.allocator.free(ref.kind);
+            self.allocator.free(ref.title);
+            self.allocator.free(ref.url);
         };
-        errdefer self.allocator.free(kind);
-        const title = self.allocator.dupe(u8, ae.title) catch {
-            self.allocator.free(id);
-            self.allocator.free(kind);
-            return;
+    }
+
+    /// Dupe the four borrowed slices into owned memory, returning a complete
+    /// ArtifactRef or null on the first allocation failure (freeing whatever
+    /// was already duped). Keeps captureLocked's success path linear.
+    fn buildOwnedRef(allocator: std.mem.Allocator, ae: anytype) ?ArtifactRef {
+        const id = allocator.dupe(u8, ae.artifact_id) catch return null;
+        const kind = allocator.dupe(u8, ae.kind) catch {
+            allocator.free(id);
+            return null;
         };
-        errdefer self.allocator.free(title);
-        const url = self.allocator.dupe(u8, ae.url) catch {
-            self.allocator.free(id);
-            self.allocator.free(kind);
-            self.allocator.free(title);
-            return;
+        const title = allocator.dupe(u8, ae.title) catch {
+            allocator.free(id);
+            allocator.free(kind);
+            return null;
         };
-        self.list.append(self.allocator, .{
-            .id = id,
-            .kind = kind,
-            .title = title,
-            .url = url,
-            .version = ae.version,
-        }) catch {
-            self.allocator.free(id);
-            self.allocator.free(kind);
-            self.allocator.free(title);
-            self.allocator.free(url);
+        const url = allocator.dupe(u8, ae.url) catch {
+            allocator.free(id);
+            allocator.free(kind);
+            allocator.free(title);
+            return null;
         };
+        return .{ .id = id, .kind = kind, .title = title, .url = url, .version = ae.version };
     }
 
     fn recordMetricThunk(ptr: *anyopaque, metric: *const observability.ObserverMetric) void {
