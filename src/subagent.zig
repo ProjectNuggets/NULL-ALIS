@@ -653,6 +653,89 @@ pub const SubagentManager = struct {
         return null;
     }
 
+    // ── Phase 4 G3 — getBatchResults ────────────────────────────────────────
+
+    /// One row in the getBatchResults response. All slices are duped into the
+    /// caller's `allocator` and must be freed. Use freeBatchResultEntries to
+    /// release the slice at once, or free each field individually:
+    ///   allocator.free(entry.task_id_str); allocator.free(entry.status);
+    ///   allocator.free(entry.text); if (entry.err) |e| allocator.free(e);
+    pub const BatchResultEntry = struct {
+        task_id: u64,
+        status: []const u8, // dupe into caller allocator
+        text: []const u8, // dupe into caller allocator
+        err: ?[]const u8, // dupe into caller allocator, or null
+    };
+
+    /// Free all entries in a BatchResultEntry slice returned by getBatchResults,
+    /// then free the slice itself. Convenience helper for callers.
+    pub fn freeBatchResultEntries(allocator: Allocator, entries: []BatchResultEntry) void {
+        for (entries) |e| {
+            allocator.free(e.status);
+            allocator.free(e.text);
+            if (e.err) |err| allocator.free(err);
+        }
+        allocator.free(entries);
+    }
+
+    /// Phase 4 G3 — Collect the result of every task in a batch.
+    ///
+    /// H7: Returns `error.UnknownBatch` when `batch_id` is not found (expired or
+    /// never existed) so the caller can surface a clear "batch not found" message
+    /// rather than returning empty/None ambiguously.
+    ///
+    /// Returns one `BatchResultEntry` per task_id recorded in the batch (all
+    /// states: queued, running, completed, failed, timeout — whatever is current).
+    /// Strings are duped into `allocator`; caller must free via
+    /// `freeBatchResultEntries` or manually.
+    pub fn getBatchResults(self: *SubagentManager, allocator: Allocator, batch_id: []const u8) ![]BatchResultEntry {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // H7 — unknown batch → clear error
+        const ids = self.batches.taskIds(batch_id) orelse return error.UnknownBatch;
+
+        var entries: std.ArrayListUnmanaged(BatchResultEntry) = .{};
+        errdefer {
+            for (entries.items) |e| {
+                allocator.free(e.status);
+                allocator.free(e.text);
+                if (e.err) |err| allocator.free(err);
+            }
+            entries.deinit(allocator);
+        }
+
+        for (ids) |task_id| {
+            const state = self.tasks.get(task_id);
+
+            const status_str: []const u8 = if (state) |st| @tagName(st.status) else "unknown";
+            const status_duped = try allocator.dupe(u8, status_str);
+            errdefer allocator.free(status_duped);
+
+            const text_str: []const u8 = if (state) |st|
+                (if (st.result) |r| r.text else "")
+            else
+                "";
+            const text_duped = try allocator.dupe(u8, text_str);
+            errdefer allocator.free(text_duped);
+
+            const err_duped: ?[]const u8 = if (state) |st|
+                (if (st.error_msg) |em| try allocator.dupe(u8, em) else null)
+            else
+                null;
+            errdefer if (err_duped) |e| allocator.free(e);
+
+            try entries.append(allocator, .{
+                .task_id = task_id,
+                .status = status_duped,
+                .text = text_duped,
+                .err = err_duped,
+            });
+        }
+
+        return entries.toOwnedSlice(allocator);
+    }
+
     pub fn getRunningCount(self: *SubagentManager) u32 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -3419,4 +3502,61 @@ test "spawnMany rejects when N > remaining capacity (all-or-nothing, no partial)
 
     // No tasks should have been spawned (running count unchanged = 0)
     try std.testing.expectEqual(@as(u32, 0), mgr.getRunningCount());
+}
+
+// ── Phase 4 G3 tests (TDD — getBatchResults + H7) ─────────────────────────────
+
+test "getBatchResults returns entries for spawned tasks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.completion_runner = immediateCompletionRunner;
+    defer mgr.deinit();
+
+    const specs = [_]SubagentManager.SpawnSpec{
+        .{ .task = "task alpha", .label = "alpha" },
+        .{ .task = "task beta", .label = "beta" },
+    };
+    const handle = try mgr.spawnMany(&specs, "agent:zaki-bot:user:99:main", "agent", "chat:99", 60_000);
+    defer {
+        std.testing.allocator.free(handle.batch_id);
+        std.testing.allocator.free(handle.task_ids);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), handle.task_ids.len);
+
+    const entries = try mgr.getBatchResults(std.testing.allocator, handle.batch_id);
+    defer SubagentManager.freeBatchResultEntries(std.testing.allocator, entries);
+
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    // Every entry must have a task_id from the batch
+    for (entries) |e| {
+        var found = false;
+        for (handle.task_ids) |tid| {
+            if (e.task_id == tid) { found = true; break; }
+        }
+        try std.testing.expect(found);
+        // status must be a valid non-empty string
+        try std.testing.expect(e.status.len > 0);
+    }
+}
+
+test "getBatchResults H7 — unknown batch_id returns error.UnknownBatch" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const result = mgr.getBatchResults(std.testing.allocator, "batch:9999:0");
+    try std.testing.expectError(error.UnknownBatch, result);
 }
