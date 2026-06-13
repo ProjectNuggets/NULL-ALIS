@@ -1100,6 +1100,10 @@ pub const SessionManager = struct {
             .session_key = session_key,
             .provider = session.agent.default_provider,
             .model = session.agent.model_name,
+            // Phase 5 T3 — propagate the per-turn Superpowers flag to tools.
+            // The fan-out tools (spawn_many / subagent_batch_result) self-gate
+            // on this; a non-Superpowers turn cannot fan out.
+            .superpowers_mode = options.turn_superpowers_mode,
         });
         defer tools_mod.clearTurnContext();
 

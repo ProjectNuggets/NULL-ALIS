@@ -1,9 +1,10 @@
 //! spawn_many tool — fan out N subagents under one batch.
 //!
-//! Gated off-by-default: registered only when `opts.fanout_enabled = true`
-//! AND `opts.tool_profile == .main`. Phase 5 will wire the Superpowers signal
-//! to set fanout_enabled. Excluded from subagentTools() — subagents must not
-//! fan out (depth guard).
+//! Registered in the MAIN profile when multiagent is enabled (same gate as
+//! spawn/delegate), then SELF-GATED at execute() to ⚡ Superpowers turns: a
+//! non-Superpowers turn refuses before any spawn (the safety invariant — only
+//! a coordinator turn may fan out). Excluded from subagentTools() — subagents
+//! must not fan out (depth guard).
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -25,7 +26,7 @@ pub const SpawnManyTool = struct {
     pub const tool_name = "spawn_many";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Fan out up to 8 parallel subagents under one batch; all results arrive together.",
+        .what = "Superpowers-only: fan out up to 8 parallel subagents under one batch.",
         .use_when = &.{
             "multiple self-contained research tasks that are genuinely parallel (e.g. 'summarise A, B, C simultaneously')",
             "coordinator workflow where you want to collect ALL subagent results in one go before continuing",
@@ -41,6 +42,7 @@ pub const SpawnManyTool = struct {
     }
 
     pub const tool_description =
+        "⚡ Superpowers mode only — available when the user enables the Superpowers reasoning toggle. " ++
         "Fan out up to 8 parallel subagents under a single batch. " ++
         "Returns batch_id + task_ids immediately. " ++
         "Results are delivered together as a system message when all complete, " ++
@@ -63,6 +65,16 @@ pub const SpawnManyTool = struct {
     }
 
     pub fn execute(self: *SpawnManyTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+        // Phase 5 T3 — Superpowers self-gate (SAFETY INVARIANT). Fan-out is a
+        // coordinator-only capability that burns N× credits. This runs FIRST,
+        // before any arg parsing or spawn, so a non-Superpowers turn can never
+        // fan out — defense-in-depth on top of the not-presented-to-provider
+        // filter (the tool is filtered out of a normal turn's tool list). The
+        // per-turn flag arrives via the turn context the session installs.
+        if (!root.getTurnContext().superpowers_mode) {
+            return ToolResult.fail("spawn_many is only available in ⚡ Superpowers mode — enable it from the reasoning toggle.");
+        }
+
         // Parse tasks array first so parameter errors surface before manager check.
         const tasks_val = args.get("tasks") orelse
             return ToolResult.fail("Missing 'tasks' parameter");
@@ -203,6 +215,9 @@ test "spawn_many schema contains tasks and budget_seconds" {
 }
 
 test "spawn_many missing tasks parameter" {
+    // Run as a Superpowers turn so we exercise arg validation past the T3 gate.
+    root.setTurnContext(.{ .superpowers_mode = true });
+    defer root.clearTurnContext();
     var st = SpawnManyTool{};
     const t = st.tool();
     const parsed = try root.parseTestArgs("{}");
@@ -213,6 +228,8 @@ test "spawn_many missing tasks parameter" {
 }
 
 test "spawn_many without manager fails" {
+    root.setTurnContext(.{ .superpowers_mode = true });
+    defer root.clearTurnContext();
     var st = SpawnManyTool{};
     const t = st.tool();
     const parsed = try root.parseTestArgs("{\"tasks\":[{\"task\":\"do something\"}]}");
@@ -223,6 +240,8 @@ test "spawn_many without manager fails" {
 }
 
 test "spawn_many empty tasks array rejected" {
+    root.setTurnContext(.{ .superpowers_mode = true });
+    defer root.clearTurnContext();
     var st = SpawnManyTool{};
     const t = st.tool();
     const parsed = try root.parseTestArgs("{\"tasks\":[]}");
@@ -232,6 +251,8 @@ test "spawn_many empty tasks array rejected" {
 }
 
 test "spawn_many rejects more than 8 tasks" {
+    root.setTurnContext(.{ .superpowers_mode = true });
+    defer root.clearTurnContext();
     var st = SpawnManyTool{};
     const t = st.tool();
     const parsed = try root.parseTestArgs(
@@ -258,6 +279,11 @@ test "spawn_many fanout succeeds and returns batch_id + task_ids" {
     var manager = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
     defer manager.deinit();
 
+    // Phase 5 T3 — fan-out is a Superpowers-only capability; the happy path
+    // runs on a Superpowers turn.
+    root.setTurnContext(.{ .superpowers_mode = true });
+    defer root.clearTurnContext();
+
     var st = SpawnManyTool{ .manager = &manager };
     const t = st.tool();
 
@@ -275,6 +301,73 @@ test "spawn_many fanout succeeds and returns batch_id + task_ids" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "note") != null);
 }
 
+// ── Phase 5 T3 — Superpowers self-gate (SAFETY INVARIANT) ────────────────────
+
+test "spawn_many refuses on a non-Superpowers turn (no spawn)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    var cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    // Default turn context: superpowers_mode = false → a normal turn.
+    root.setTurnContext(.{ .superpowers_mode = false });
+    defer root.clearTurnContext();
+
+    var st = SpawnManyTool{ .manager = &manager };
+    const t = st.tool();
+
+    // Well-formed args + a connected manager: the ONLY reason this must fail
+    // is the Superpowers gate. Proves a non-superpowers turn cannot fan out.
+    const parsed = try root.parseTestArgs(
+        \\{"tasks":[{"task":"research A"},{"task":"research B"}]}
+    );
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    // The refusal uses ToolResult.fail — a static error_msg (do NOT free).
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Superpowers mode") != null);
+    // No batch was created — the refusal carries no batch_id (the gate runs
+    // before manager.spawnMany is ever reached). output is empty on failure.
+    try std.testing.expectEqualStrings("", result.output);
+}
+
+test "spawn_many proceeds on a Superpowers turn" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    var cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    root.setTurnContext(.{ .superpowers_mode = true });
+    defer root.clearTurnContext();
+
+    var st = SpawnManyTool{ .manager = &manager };
+    const t = st.tool();
+    const parsed = try root.parseTestArgs(
+        \\{"tasks":[{"task":"research A"}]}
+    );
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.success) std.testing.allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "batch_id") != null);
+}
+
 test "spawn_many surfaces TooManyConcurrentSubagents" {
     var cfg = config_mod.Config{
         .workspace_dir = "/tmp/yc",
@@ -285,6 +378,9 @@ test "spawn_many surfaces TooManyConcurrentSubagents" {
         .max_concurrent = 0,
     });
     defer manager.deinit();
+
+    root.setTurnContext(.{ .superpowers_mode = true });
+    defer root.clearTurnContext();
 
     var st = SpawnManyTool{ .manager = &manager };
     const t = st.tool();
