@@ -36,6 +36,10 @@ pub const MemoryStoreTool = struct {
     /// threaded from tool binding so memory_store's JudgeContext
     /// honors operator config. Default true preserves M2 behavior.
     cardinality_fastpath_enabled: bool = true,
+    /// P3 (memory-phase-0.5) — semantic type-routing flag, threaded from
+    /// tool binding so memory_store's JudgeContext routes memory_type by
+    /// fact meaning per operator config. Default true.
+    semantic_type_routing_enabled: bool = true,
     coref_embed: ?@import("../memory/vector/embeddings.zig").EmbeddingProvider = null,
 
     pub const tool_name = "memory_store";
@@ -285,7 +289,7 @@ pub const MemoryStoreTool = struct {
         const judge_ctx: ?extraction_persist.JudgeContext = blk: {
             if (self.judge_provider) |jp| {
                 if (self.judge_model_name) |jmn| {
-                    break :blk extraction_persist.JudgeContext{ .provider = jp, .model_name = jmn, .cardinality_fastpath_enabled = self.cardinality_fastpath_enabled };
+                    break :blk extraction_persist.JudgeContext{ .provider = jp, .model_name = jmn, .cardinality_fastpath_enabled = self.cardinality_fastpath_enabled, .semantic_type_routing_enabled = self.semantic_type_routing_enabled };
                 }
             }
             break :blk null;

@@ -543,6 +543,11 @@ pub const Agent = struct {
     /// threaded through to JudgeContext so persistExtracted honors
     /// the operator-set value. Default true preserves M2 behavior.
     extraction_cardinality_fastpath: bool = true,
+    /// P3 (memory-phase-0.5) — semantic type-routing gate, threaded to
+    /// JudgeContext so persistExtracted routes memory_type by fact meaning
+    /// (custom: open_loop/decision/preference/person) instead of by
+    /// attribution. Default true. See config_types.semantic_type_routing_enabled.
+    semantic_type_routing_enabled: bool = true,
     /// V1.14.7 — extraction trigger gates (per-turn enqueue, memory nudge,
     /// skills nudge). Defaults preserve V1.14.6 behavior. C2 wires structured
     /// extraction into compaction; C3 flips defaults to disabled and deletes
@@ -1455,6 +1460,9 @@ pub const Agent = struct {
             // V1.14.12 (M2 review CRITICAL) — propagate the cardinality
             // fast-path flag so Pass C judge_ctx honors operator config.
             .extraction_cardinality_fastpath = self.extraction_cardinality_fastpath,
+            // P3 — propagate the semantic type-routing flag so Pass C
+            // judge_ctx routes memory_type by fact meaning per operator config.
+            .semantic_type_routing_enabled = self.semantic_type_routing_enabled,
         };
     }
 

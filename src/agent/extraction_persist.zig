@@ -225,6 +225,23 @@ pub const JudgeContext = struct {
     /// (persistExtracted ignored it). Operators couldn't disable M2 via
     /// config — only via code revert. This restores the contract.
     cardinality_fastpath_enabled: bool = true,
+    /// P3 (memory-phase-0.5) — semantic type-routing gate. When TRUE
+    /// (default), the durable `memory_type` of each extracted fact is
+    /// routed by what the fact MEANS (open_loop / decision / preference /
+    /// person custom: types, derived from `classifyPredicate`) rather than
+    /// by WHO said it. When FALSE, the persist site falls back to the
+    /// legacy `categoryForAttribution(attributed_to)` (user→core, else→
+    /// daily) — the EXACT pre-P3 behavior.
+    ///
+    /// Wired from `agent.semantic_type_routing_enabled` config through the
+    /// same caller chain as `cardinality_fastpath_enabled`. Default true.
+    ///
+    /// Null-judge note: when no JudgeContext is configured the gate reads
+    /// as `true` at the persist site (`if (judge) |j| j.… else true`), so
+    /// semantic routing is on-by-default even on no-judge tenants. An
+    /// operator who sets the config flag false gets it threaded through
+    /// every JudgeContext construction site.
+    semantic_type_routing_enabled: bool = true,
 };
 
 /// V1.6 commit 8 — optional embedding provider for entity coreference.
@@ -411,6 +428,48 @@ pub fn parseExtractedJson(
 fn categoryForAttribution(attributed_to: []const u8) memory_root.MemoryCategory {
     if (std.mem.eql(u8, attributed_to, "user")) return .core;
     return .daily;
+}
+
+/// P3 (memory-phase-0.5) — route a memory's durable `memory_type` by what
+/// the fact MEANS (its predicate semantics), not by WHO said it.
+///
+/// Uses the signals `classifyPredicate` already computes for the
+/// predicate:
+///   - slot_type == "open_loop"          → custom:"open_loop"
+///   - slot_type == "decision"           → custom:"decision"
+///   - link_type == .preference          → custom:"preference"
+///   - link_type == .relationship        → custom:"person"
+///   - otherwise → legacy categoryForAttribution(attributed_to)
+///     (user→core, else→daily)
+///
+/// The custom strings are `memory_root.MemoryCategory.custom` free-text
+/// values — `toString` passes them straight to the `memory_type` column,
+/// and the read path (`memoryTypeToCategory` / `MemoryCategory.fromString`)
+/// maps any unknown string back to `.custom`, so this needs no enum change
+/// and no DB migration. The strings are static literals (no alloc/free).
+///
+/// Priority note: slot_type checks come before link_type. The only
+/// predicates carrying BOTH a slot_type and a non-attribute link_type are
+/// none in the current maps (slot-type predicates all default to
+/// .attribute link), so order is not load-bearing today, but slot signals
+/// (open_loop/decision) are the more specific intent and win by design.
+///
+/// `attributed_to` is NOT consulted for the semantic types — it remains
+/// recorded as provenance in the row metadata (buildExtractionMetadata
+/// emits `metadata.attributed_to`) and is still the fallback router for
+/// facts with no distinctive semantic signal.
+fn categoryForSemantics(class: PredicateClass, attributed_to: []const u8) memory_root.MemoryCategory {
+    if (class.slot_type) |st| {
+        if (std.mem.eql(u8, st, working_memory.SlotType.open_loop)) return .{ .custom = "open_loop" };
+        if (std.mem.eql(u8, st, working_memory.SlotType.decision)) return .{ .custom = "decision" };
+    }
+    switch (class.link_type) {
+        .preference => return .{ .custom = "preference" },
+        .relationship => return .{ .custom = "person" },
+        else => {},
+    }
+    // No distinctive semantic signal — fall back to attribution routing.
+    return categoryForAttribution(attributed_to);
 }
 
 /// V1.6 commit 7 (Gap 2 from memory pipeline handoff): deterministic key
@@ -912,6 +971,55 @@ test "P9 parity: classifyPredicate matches both legacy maps for every branch" {
     }
 }
 
+// ── P3: semantic memory_type routing ──────────────────────────────────
+//
+// categoryForSemantics routes the durable memory_type by the predicate's
+// meaning (via classifyPredicate), falling back to attribution only when
+// the fact carries no distinctive semantic signal. Asserts each of the
+// four custom: types fires for a representative predicate, the fallback
+// preserves the legacy user→core / else→daily behavior, and the routing is
+// independent of `attributed_to` for the semantic cases.
+test "P3 categoryForSemantics routes by predicate meaning, not attribution" {
+    const expectCustom = struct {
+        fn f(cat: memory_root.MemoryCategory, want: []const u8) !void {
+            try std.testing.expect(cat == .custom);
+            try std.testing.expectEqualStrings(want, cat.custom);
+        }
+    }.f;
+
+    // open_loop slot → custom:"open_loop" (regardless of speaker).
+    try expectCustom(categoryForSemantics(classifyPredicate("TODO"), "user"), "open_loop");
+    try expectCustom(categoryForSemantics(classifyPredicate("PROMISED"), "assistant"), "open_loop");
+    // decision slot → custom:"decision".
+    try expectCustom(categoryForSemantics(classifyPredicate("DECIDED"), "assistant"), "decision");
+    try expectCustom(categoryForSemantics(classifyPredicate("CHOSE"), "user"), "decision");
+    // preference link → custom:"preference".
+    try expectCustom(categoryForSemantics(classifyPredicate("PREFERS"), "assistant"), "preference");
+    try expectCustom(categoryForSemantics(classifyPredicate("LIKES"), "user"), "preference");
+    // relationship link → custom:"person".
+    try expectCustom(categoryForSemantics(classifyPredicate("KNOWS"), "user"), "person");
+    try expectCustom(categoryForSemantics(classifyPredicate("MARRIED_TO"), "assistant"), "person");
+
+    // No distinctive signal → fall back to attribution routing
+    // (user→core, else→daily) — the exact legacy behavior.
+    try std.testing.expect(categoryForSemantics(classifyPredicate("WORKS_AT"), "user").eql(.core));
+    try std.testing.expect(categoryForSemantics(classifyPredicate("WORKS_AT"), "assistant").eql(.daily));
+    try std.testing.expect(categoryForSemantics(classifyPredicate("LIVES_IN"), "undecided").eql(.daily));
+    // Unknown predicate, user-attributed → core (fallback path).
+    try std.testing.expect(categoryForSemantics(classifyPredicate("UNKNOWN_VERB"), "user").eql(.core));
+}
+
+// P3: with the flag OFF (the `else` branch at the persist site), routing
+// reduces to the legacy categoryForAttribution. This pins that the
+// fallback function itself is unchanged.
+test "P3 categoryForAttribution unchanged (flag-off path)" {
+    try std.testing.expect(categoryForAttribution("user").eql(.core));
+    try std.testing.expect(categoryForAttribution("assistant").eql(.daily));
+    try std.testing.expect(categoryForAttribution("assistant_offer").eql(.daily));
+    try std.testing.expect(categoryForAttribution("undecided").eql(.daily));
+    try std.testing.expect(categoryForAttribution("anything_else").eql(.daily));
+}
+
 fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
     for (s) |c| {
         switch (c) {
@@ -1246,7 +1354,18 @@ pub fn persistExtracted(
         };
         defer allocator.free(metadata_json);
 
-        const category = categoryForAttribution(m.attributed_to);
+        // P3 (memory-phase-0.5) — route the durable memory_type by what
+        // the fact MEANS, not by who said it. Gated by the
+        // semantic_type_routing_enabled flag (default ON; threaded via
+        // JudgeContext). Flag OFF (or — defensively — no JudgeContext that
+        // sets it) → exact legacy categoryForAttribution behavior.
+        // `attributed_to` stays recorded as provenance in the metadata
+        // (buildExtractionMetadata above), it just no longer routes the type.
+        const semantic_routing_enabled = if (judge) |j| j.semantic_type_routing_enabled else true;
+        const category = if (semantic_routing_enabled)
+            categoryForSemantics(classifyPredicate(m.predicate), m.attributed_to)
+        else
+            categoryForAttribution(m.attributed_to);
 
         // V1.14.12 (Memory audit Finding 6 fix, 2026-05-19) — route
         // through the event-typed variant so memory_events.event_type

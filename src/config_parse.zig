@@ -998,6 +998,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("extraction_coverage_filter_enabled")) |v| {
                 if (v == .bool) self.agent.extraction_coverage_filter_enabled = v.bool;
             }
+            // P3 (memory-phase-0.5) — wire the semantic type-routing gate so
+            // operators can disable it via config.json (default ON).
+            if (ag.object.get("semantic_type_routing_enabled")) |v| {
+                if (v == .bool) self.agent.semantic_type_routing_enabled = v.bool;
+            }
             // C4 (brain-graph activation) — wire the nested [agent.extraction]
             // ExtractionConfig block. Previously this struct had NO parser, so
             // its "flip via TOML" docstring silently no-op'd. The session-end

@@ -14096,6 +14096,43 @@ fn memoryTypeToCategory(allocator: std.mem.Allocator, mem_type: []const u8) !mem
     return .{ .custom = try allocator.dupe(u8, mem_type) };
 }
 
+// ── P3 round-trip: custom: memory types survive the DB string column ──
+//
+// The durable `memory_type` is stored as a string and read back. P3 routes
+// extracted facts to `MemoryCategory{ .custom = "preference"|"decision"|
+// "open_loop"|"person" }`. This test pins the CRITICAL invariant flagged in
+// the P3 spec: a custom category written via `categoryToMemoryType` (the
+// write side) must read back IDENTICALLY via `memoryTypeToCategory` (the
+// read side) — NOT crash, NOT collapse to `.core`. Both helpers handle
+// arbitrary strings (write passes through; read maps unknown → `.custom`),
+// so the round-trip is the identity for any string that is not a builtin
+// category name.
+test "P3 round-trip: memoryTypeToCategory(categoryToMemoryType(custom)) == custom" {
+    const allocator = std.testing.allocator;
+    const customs = [_][]const u8{ "preference", "decision", "open_loop", "person" };
+    for (customs) |name| {
+        const want = memory_root.MemoryCategory{ .custom = name };
+        // write side: custom string passes straight through to the column.
+        const mem_type = categoryToMemoryType(want);
+        try std.testing.expectEqualStrings(name, mem_type);
+        // read side: unknown string must come back as .custom (NOT .core).
+        const got = try memoryTypeToCategory(allocator, mem_type);
+        defer if (got == .custom) allocator.free(got.custom);
+        try std.testing.expect(got == .custom);
+        try std.testing.expect(want.eql(got));
+        try std.testing.expectEqualStrings(name, got.custom);
+    }
+    // Builtins must NOT regress to .custom.
+    const builtins = [_]memory_root.MemoryCategory{ .core, .daily, .conversation };
+    const builtin_names = [_][]const u8{ "core", "daily", "conversation" };
+    for (builtins, builtin_names) |cat, name| {
+        try std.testing.expectEqualStrings(name, categoryToMemoryType(cat));
+        const rt = try memoryTypeToCategory(allocator, categoryToMemoryType(cat));
+        defer if (rt == .custom) allocator.free(rt.custom);
+        try std.testing.expect(cat.eql(rt));
+    }
+}
+
 fn computeContentHash(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(content, &digest, .{});

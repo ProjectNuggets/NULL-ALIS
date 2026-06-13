@@ -455,6 +455,22 @@ pub const AgentConfig = struct {
     /// Set to FALSE to restore pre-M3 behavior (every fact re-extracted
     /// at boundary). Debug/migration use only.
     extraction_coverage_filter_enabled: bool = true,
+    /// P3 (memory-phase-0.5) — semantic type-routing gate.
+    ///
+    /// When TRUE (default), an extracted fact's durable `memory_type` is
+    /// routed by what the fact MEANS — derived from the predicate's
+    /// classification (open_loop / decision / preference / person, written
+    /// as `custom:` free-text memory types) — rather than by WHO said it.
+    ///
+    /// When FALSE, the persist site falls back to the legacy
+    /// attribution router (`attributed_to == "user"` → core, else → daily)
+    /// — the exact pre-P3 behavior. `attributed_to` is recorded as row
+    /// provenance metadata in BOTH modes; this flag only controls whether
+    /// it also drives the type.
+    ///
+    /// Threaded to extraction_persist via JudgeContext through the same
+    /// caller chain as `extraction_cardinality_fastpath`.
+    semantic_type_routing_enabled: bool = true,
     // V1.14.12 (Path A) — extraction_legacy_direct_writes FIELD REMOVED.
     // M5 sprint flag-gated two redundant direct write paths during a
     // soak window. Path A closes the M5 sprint by:

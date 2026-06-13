@@ -179,6 +179,10 @@ pub const ExtractionContext = struct {
     /// operator config actually controls M2 behavior. Default true
     /// preserves M2 fast-path effects.
     cardinality_fastpath_enabled: bool = true,
+    /// P3 (memory-phase-0.5) — semantic type-routing flag, passed through
+    /// to JudgeContext so persistExtracted routes memory_type by fact
+    /// meaning per operator config. Default true.
+    semantic_type_routing_enabled: bool = true,
 };
 
 /// V1.14.9 — Episode-based boundary extraction. Replaces the V1.14.8
@@ -795,6 +799,14 @@ fn persistExtraction(
     // object map directly. attributed_to defaults to "user" (boundary
     // extraction is implicitly user-attributed; the agent's own writes go
     // through memory_store, not this path).
+    //
+    // P3 (memory-phase-0.5): attributed_to is now PROVENANCE-ONLY metadata,
+    // not a type router — the durable memory_type is routed by the fact's
+    // meaning (predicate semantics) at the persist site, gated by
+    // semantic_type_routing_enabled. The schema.Edge here carries no real
+    // observed-speaker field (only source_name, the subject entity), so
+    // there is nothing more accurate to substitute; "user" stays as the
+    // recorded provenance default for boundary extraction.
     const mems = try allocator.alloc(extraction_persist.ExtractedMemory, kept_edges.len);
     defer {
         for (mems) |m| m.deinit(allocator);
@@ -835,6 +847,7 @@ fn persistExtraction(
                 .provider = ctx.judge_provider.?,
                 .model_name = ctx.judge_model,
                 .cardinality_fastpath_enabled = ctx.cardinality_fastpath_enabled,
+                .semantic_type_routing_enabled = ctx.semantic_type_routing_enabled, // P3
             }
         else
             null;

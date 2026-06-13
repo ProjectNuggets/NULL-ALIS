@@ -123,6 +123,11 @@ pub const CompactionConfig = struct {
     /// threaded into JudgeContext at the Pass A + Pass C direct sites
     /// so persistExtracted honors operator config.
     extraction_cardinality_fastpath: bool = true,
+    /// P3 (memory-phase-0.5) — semantic type-routing flag, threaded into
+    /// the ExtractionContext (and thence JudgeContext) at the Pass A +
+    /// Pass C sites so persistExtracted routes memory_type by fact meaning
+    /// per operator config. Default true.
+    semantic_type_routing_enabled: bool = true,
     // V1.6 commit 8: optional embedding provider for entity coreference.
     // When set, extracted-fact object strings get cosine-resolved against
     // existing memory_entities rows (≥0.95 = same entity, reuse id; new
@@ -478,6 +483,7 @@ fn dropOldestPairsFromMiddle(
                 .boundary_kind = .pass_a, // V1.14.9 L-01: explicit telemetry tag
                 .write_origin = .pass_a_drop, // V1.14.12 (M1) — per-path telemetry tag
                 .cardinality_fastpath_enabled = config.extraction_cardinality_fastpath, // V1.14.12 (M2 review CRITICAL)
+                .semantic_type_routing_enabled = config.semantic_type_routing_enabled, // P3
             };
             const br = extraction_runner.extractAtBoundary(allocator, buf.items, ctx);
             defer br.deinit(allocator);
@@ -715,6 +721,7 @@ fn compactHistoryKeepingRecent(
                 .boundary_kind = .pass_c, // V1.14.9 L-01: explicit telemetry tag
                 .write_origin = .pass_c_compaction_extract, // V1.14.12 (M1) — per-path telemetry tag
                 .cardinality_fastpath_enabled = config.extraction_cardinality_fastpath, // V1.14.12 (M2 review CRITICAL)
+                .semantic_type_routing_enabled = config.semantic_type_routing_enabled, // P3
             };
             const br = extraction_runner.extractAtBoundary(allocator, buf.items, ctx);
             defer br.deinit(allocator);

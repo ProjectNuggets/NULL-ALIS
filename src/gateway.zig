@@ -2158,6 +2158,7 @@ const TenantRuntime = struct {
             extract_model_i, // Finding #2: matched extraction-sidecar pair
             cmt96_coref_embed,
             runtime.config.agent.extraction_cardinality_fastpath, // V1.14.12 (M2 review CRITICAL)
+            runtime.config.agent.semantic_type_routing_enabled, // P3 (memory-phase-0.5)
         );
 
         // V1.12 — wire wiki_link tool with the same provider+model+embedder
@@ -2250,11 +2251,16 @@ const TenantRuntime = struct {
                     // from config to session_mgr so each per-session Agent
                     // inherits it and propagates to JudgeContext.
                     runtime.session_mgr.extraction_cardinality_fastpath = runtime.config.agent.extraction_cardinality_fastpath;
-                    log.info("extraction.enabled user_id={d} coref={s} judge={s} cardinality_fastpath={s}", .{
+                    // P3 — wire semantic type-routing flag from config to
+                    // session_mgr so each per-session Agent inherits it and
+                    // propagates to JudgeContext.
+                    runtime.session_mgr.semantic_type_routing_enabled = runtime.config.agent.semantic_type_routing_enabled;
+                    log.info("extraction.enabled user_id={d} coref={s} judge={s} cardinality_fastpath={s} semantic_type_routing={s}", .{
                         numeric_user_id,
                         if (coref_on) "on" else "off-no-embed",
                         "wired-session-end-v1.9-6",
                         if (runtime.config.agent.extraction_cardinality_fastpath) "on" else "off",
+                        if (runtime.config.agent.semantic_type_routing_enabled) "on" else "off",
                     });
                 }
             } else |_| {

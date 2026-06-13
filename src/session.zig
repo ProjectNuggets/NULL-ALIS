@@ -248,6 +248,10 @@ pub const SessionManager = struct {
     /// Default true preserves M2 behavior (set-valued additive writes
     /// skip the judge LLM call).
     extraction_cardinality_fastpath: bool = true,
+    /// P3 (memory-phase-0.5) — semantic type-routing gate, threaded from
+    /// gateway config to per-session Agent → JudgeContext. Same INIT-ONLY
+    /// concurrency contract as the sibling fields. Default true.
+    semantic_type_routing_enabled: bool = true,
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
@@ -728,6 +732,8 @@ pub const SessionManager = struct {
         // V1.14.12 (M2 review CRITICAL) — cardinality fast-path gate,
         // same plumbing pattern.
         agent.extraction_cardinality_fastpath = self.extraction_cardinality_fastpath;
+        // P3 — semantic type-routing gate, same plumbing pattern.
+        agent.semantic_type_routing_enabled = self.semantic_type_routing_enabled;
         return agent;
     }
 
