@@ -605,6 +605,11 @@ pub const Agent = struct {
     max_tokens: u32 = max_tokens_resolver.DEFAULT_MODEL_MAX_TOKENS,
     max_tokens_override: ?u32 = null,
     reasoning_effort: ?[]const u8 = null,
+    /// Phase 5 (Superpowers mode) — true for the duration of a turn where the
+    /// FE sent reasoning_effort="superpowers". Cleared on turn defer so it does
+    /// NOT persist across turns. Tasks 2–3 (coordinator mode + tool gate) read
+    /// this flag; this is its only storage location.
+    superpowers_mode: bool = false,
     compact_context_enabled: bool = false,
     verbose_level: VerboseLevel = .off,
     reasoning_mode: ReasoningMode = .off,

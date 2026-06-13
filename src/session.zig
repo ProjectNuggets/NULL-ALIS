@@ -280,6 +280,11 @@ pub const SessionManager = struct {
         turn_execution_mode: ?ExecutionMode = null,
         turn_autonomy: ?AutonomyLevel = null,
         turn_reasoning_effort: ?[]const u8 = null,
+        /// Phase 5 (Superpowers mode) — true when the FE sent
+        /// reasoning_effort="superpowers". Activates coordinator mode on the
+        /// agent for this turn; restored to false on defer (same pattern as
+        /// turn_reasoning_effort / turn_execution_mode).
+        turn_superpowers_mode: bool = false,
     };
 
     pub const OriginSnapshot = struct {
@@ -1129,6 +1134,7 @@ pub const SessionManager = struct {
 
         const previous_execution_mode = session.agent.execution_mode;
         const previous_reasoning_effort = session.agent.reasoning_effort;
+        const previous_superpowers_mode = session.agent.superpowers_mode;
         const previous_policy = session.agent.policy;
         var turn_policy = if (session.agent.policy) |policy| policy.* else SecurityPolicy{};
         var turn_policy_applied = false;
@@ -1137,6 +1143,12 @@ pub const SessionManager = struct {
         }
         if (options.turn_reasoning_effort) |effort| {
             session.agent.reasoning_effort = effort;
+        }
+        // Phase 5 (Superpowers mode): activate coordinator mode for this turn
+        // when the FE sent reasoning_effort="superpowers". Restored on defer so
+        // the session reverts to the previous value after the turn completes.
+        if (options.turn_superpowers_mode) {
+            session.agent.superpowers_mode = true;
         }
         if (options.turn_autonomy) |autonomy| {
             turn_policy.autonomy = autonomy;
@@ -1149,6 +1161,9 @@ pub const SessionManager = struct {
             }
             if (options.turn_reasoning_effort != null) {
                 session.agent.reasoning_effort = previous_reasoning_effort;
+            }
+            if (options.turn_superpowers_mode) {
+                session.agent.superpowers_mode = previous_superpowers_mode;
             }
             if (turn_policy_applied) {
                 session.agent.policy = previous_policy;

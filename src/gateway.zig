@@ -86,6 +86,10 @@ const ChatStreamTurnOptions = struct {
     execution_mode: ?execution_mode_mod.ExecutionMode = null,
     autonomy: ?security.AutonomyLevel = null,
     reasoning_effort: ?[]const u8 = null,
+    /// Phase 5 (Superpowers mode) — set when reasoning_effort=="superpowers".
+    /// Tells the session layer to activate coordinator mode. The provider
+    /// NEVER sees "superpowers" raw (mapReasoningEffort converts it to "high").
+    superpowers_mode: bool = false,
 };
 const extension_ws_auth = @import("extension_ws/auth.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
@@ -2467,6 +2471,7 @@ const TenantRuntime = struct {
             .turn_execution_mode = turn_options.execution_mode,
             .turn_autonomy = turn_options.autonomy,
             .turn_reasoning_effort = turn_options.reasoning_effort,
+            .turn_superpowers_mode = turn_options.superpowers_mode,
         });
         return response;
     }
@@ -5909,12 +5914,30 @@ fn parseChatStreamAutonomy(body: []const u8) ?security.AutonomyLevel {
     return security.AutonomyLevel.fromString(raw);
 }
 
+/// Phase 5 (Superpowers mode) — map the raw reasoning_effort wire value to
+/// the effective provider-safe effort string and the superpowers_mode flag.
+/// The provider NEVER sees "superpowers" raw (D5 requirement); we convert it
+/// to "high" here so every consumer downstream is protected.
+///
+///   "superpowers" (case-insensitive) → { .superpowers = true,  .effort = "high" }
+///   "low" / "medium" / "high" / "none"               → { .superpowers = false, .effort = <that> }
+///   anything else / null                              → { .superpowers = false, .effort = null  }
+const MapReasoningEffortResult = struct { superpowers: bool, effort: ?[]const u8 };
+fn mapReasoningEffort(raw: ?[]const u8) MapReasoningEffortResult {
+    const r = raw orelse return .{ .superpowers = false, .effort = null };
+    if (std.ascii.eqlIgnoreCase(r, "superpowers")) return .{ .superpowers = true, .effort = "high" };
+    if (std.ascii.eqlIgnoreCase(r, "low")) return .{ .superpowers = false, .effort = "low" };
+    if (std.ascii.eqlIgnoreCase(r, "medium")) return .{ .superpowers = false, .effort = "medium" };
+    if (std.ascii.eqlIgnoreCase(r, "high")) return .{ .superpowers = false, .effort = "high" };
+    if (std.ascii.eqlIgnoreCase(r, "none")) return .{ .superpowers = false, .effort = "none" };
+    return .{ .superpowers = false, .effort = null };
+}
+
 fn parseChatStreamReasoningEffort(body: []const u8) ?[]const u8 {
     if (cleanJsonStringField(body, "reasoning_effort")) |raw| {
-        if (std.ascii.eqlIgnoreCase(raw, "low")) return "low";
-        if (std.ascii.eqlIgnoreCase(raw, "medium")) return "medium";
-        if (std.ascii.eqlIgnoreCase(raw, "high")) return "high";
-        if (std.ascii.eqlIgnoreCase(raw, "none")) return "none";
+        // Route through mapReasoningEffort so "superpowers" → "high" here too
+        // (used by legacy callers that only need the effort string).
+        return mapReasoningEffort(raw).effort;
     }
     if (cleanJsonStringField(body, "assistant_mode")) |raw| {
         if (std.ascii.eqlIgnoreCase(raw, "fast")) return "low";
@@ -5925,11 +5948,47 @@ fn parseChatStreamReasoningEffort(body: []const u8) ?[]const u8 {
 }
 
 fn parseChatStreamTurnOptions(body: []const u8) ChatStreamTurnOptions {
+    // Parse reasoning_effort via mapReasoningEffort so "superpowers" is split
+    // into its two concerns: the effective effort for the provider ("high") and
+    // the superpowers_mode activation flag for the coordinator path.
+    const effort_raw = cleanJsonStringField(body, "reasoning_effort");
+    const mapped = mapReasoningEffort(effort_raw);
+    // assistant_mode fallback (legacy — only applies when reasoning_effort absent)
+    const effort_final: ?[]const u8 = if (mapped.effort != null) mapped.effort else blk: {
+        if (cleanJsonStringField(body, "assistant_mode")) |raw| {
+            if (std.ascii.eqlIgnoreCase(raw, "fast")) break :blk "low";
+            if (std.ascii.eqlIgnoreCase(raw, "balanced")) break :blk "medium";
+            if (std.ascii.eqlIgnoreCase(raw, "deep")) break :blk "high";
+        }
+        break :blk null;
+    };
     return .{
         .execution_mode = parseChatStreamExecutionMode(body),
         .autonomy = parseChatStreamAutonomy(body),
-        .reasoning_effort = parseChatStreamReasoningEffort(body),
+        .reasoning_effort = effort_final,
+        .superpowers_mode = mapped.superpowers,
     };
+}
+
+test "mapReasoningEffort superpowers reasoning maps to coordinator + high effort" {
+    const a = mapReasoningEffort("superpowers");
+    try std.testing.expect(a.superpowers);
+    try std.testing.expectEqualStrings("high", a.effort.?);
+    const b = mapReasoningEffort("high");
+    try std.testing.expect(!b.superpowers);
+    try std.testing.expectEqualStrings("high", b.effort.?);
+    const c = mapReasoningEffort("low");
+    try std.testing.expect(!c.superpowers);
+    try std.testing.expectEqualStrings("low", c.effort.?);
+    const d = mapReasoningEffort("SUPERPOWERS"); // case-insensitive
+    try std.testing.expect(d.superpowers);
+    try std.testing.expectEqualStrings("high", d.effort.?);
+    const e = mapReasoningEffort("garbage");
+    try std.testing.expect(!e.superpowers);
+    try std.testing.expect(e.effort == null);
+    const f = mapReasoningEffort(null);
+    try std.testing.expect(!f.superpowers);
+    try std.testing.expect(f.effort == null);
 }
 
 test "chat stream turn options map zaki composer controls" {
@@ -10883,6 +10942,7 @@ fn handleApiChatStreamSseConnection(
                 .turn_execution_mode = turn_options.execution_mode,
                 .turn_autonomy = turn_options.autonomy,
                 .turn_reasoning_effort = turn_options.reasoning_effort,
+                .turn_superpowers_mode = turn_options.superpowers_mode,
             }) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                 break :blk .{ .err = .{ .code = "chat_failed", .msg = "chat failed" } };
