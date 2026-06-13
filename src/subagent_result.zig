@@ -298,11 +298,6 @@ pub const ArtifactCollector = struct {
         return .{ .allocator = allocator };
     }
 
-    /// Chain-aware constructor: capture, then forward to `next`.
-    pub fn initChained(allocator: std.mem.Allocator, next: ?observability.Observer) ArtifactCollector {
-        return .{ .allocator = allocator, .next = next };
-    }
-
     pub fn deinit(self: *ArtifactCollector) void {
         for (self.list.items) |r| {
             self.allocator.free(r.id);
