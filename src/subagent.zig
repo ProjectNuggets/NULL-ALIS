@@ -31,6 +31,8 @@ const heartbeat_wake = @import("heartbeat_wake.zig");
 const build_options = @import("build_options");
 const env_rebrand = @import("env_rebrand.zig");
 const config_types = @import("config_types.zig");
+const subagent_batch = @import("subagent_batch.zig");
+pub const BatchTracker = subagent_batch.BatchTracker;
 
 const log = std.log.scoped(.subagent);
 const TASK_LEDGER_FILE_NAME = "subagent_tasks.jsonl";
@@ -66,6 +68,10 @@ pub const TaskState = struct {
     started_at: i64,
     completed_at: ?i64 = null,
     thread: ?std.Thread = null,
+    /// Phase 4 — batch membership tag. Non-null iff this task was spawned as
+    /// part of a multi-subagent fan-out batch. Manager-allocator-owned; freed
+    /// by freeTaskState / clearTasksLocked alongside `label` and `session_key`.
+    batch_id: ?[]const u8 = null,
 };
 
 pub const SubagentConfig = struct {
@@ -151,6 +157,11 @@ pub const SubagentManager = struct {
     ledger_state_mgr: ?*zaki_state.Manager = null,
     ledger_user_id: ?i64 = null,
     ledger_recovery_pending: bool,
+    /// Phase 4 — in-memory fan-out batch registry. Tracks which task_ids belong
+    /// to each batch, their terminal status, the parent session_key, and the
+    /// deadline. All access is under `mutex` (the tracker is NOT self-locked —
+    /// see subagent_batch.zig LOCK INVARIANT).
+    batches: subagent_batch.BatchTracker = undefined,
 
     completion_runner: ?CompletionRunnerFn = null,
     completion_runner_ctx: ?*anyopaque = null,
@@ -207,6 +218,7 @@ pub const SubagentManager = struct {
             .ledger_recovery_pending = cfg.tenant.enabled and std.mem.eql(u8, cfg.state.backend, "postgres"),
             .task_delivery = if (owned) |o| o.delivery else null,
             ._owned_fallback = owned,
+            .batches = subagent_batch.BatchTracker.init(allocator),
         };
         if (!manager.ledger_recovery_pending) {
             manager.recoverDurableState() catch |err| {
@@ -230,6 +242,7 @@ pub const SubagentManager = struct {
             if (state.runtime_session_key) |sk| self.allocator.free(sk);
             if (state.origin_channel) |channel| self.allocator.free(channel);
             if (state.origin_chat_id) |chat| self.allocator.free(chat);
+            if (state.batch_id) |bid| self.allocator.free(bid); // Phase 4
             self.allocator.free(state.label);
             self.allocator.free(state.task_summary);
             self.allocator.free(state.task_prompt);
@@ -245,6 +258,8 @@ pub const SubagentManager = struct {
             owned.deinit();
             self._owned_fallback = null;
         }
+        // Phase 4 — free all batch state.
+        self.batches.deinit();
     }
 
     pub fn attachPostgresLedger(self: *SubagentManager, state_mgr: *zaki_state.Manager, user_id: i64) void {
@@ -524,6 +539,7 @@ pub const SubagentManager = struct {
             if (state.runtime_session_key) |value| self.allocator.free(value);
             if (state.origin_channel) |value| self.allocator.free(value);
             if (state.origin_chat_id) |value| self.allocator.free(value);
+            if (state.batch_id) |value| self.allocator.free(value); // Phase 4
             self.allocator.free(state.label);
             self.allocator.free(state.task_summary);
             self.allocator.free(state.task_prompt);
@@ -1349,6 +1365,7 @@ fn freeTaskState(allocator: Allocator, state: *TaskState) void {
     if (state.runtime_session_key) |value| allocator.free(value);
     if (state.origin_channel) |value| allocator.free(value);
     if (state.origin_chat_id) |value| allocator.free(value);
+    if (state.batch_id) |value| allocator.free(value); // Phase 4
     allocator.free(state.label);
     allocator.free(state.task_summary);
     allocator.free(state.task_prompt);
