@@ -661,98 +661,98 @@ pub const SubagentManager = struct {
         // mark-after-deliver (markSubagentResultDelivered).
         var result_id_buf: [40]u8 = undefined;
         var result_id_slice: ?[]const u8 = null;
-        // ── Layer A: in-memory idempotency gate ──────────────────────────
-        // If the task is already in a terminal state, do not re-deliver or
-        // re-wake. This covers the common same-process duplicate path; the
-        // durable subagentResultStatusIsDelivered gate covers cross-restart.
-        var already_terminal = false;
+        // ── In-memory idempotency gate + first-completion (single lock) ─────
+        // Layer A (terminal check) and the first-completion mutation are now
+        // combined into ONE lock acquisition to eliminate the TOCTOU gap that
+        // existed when they were two separate acquisitions (review I-B1).
+        // On the already-terminal path `transferred` stays false, so the
+        // `defer if (!transferred)` above frees owned_result/owned_err exactly
+        // once — no leak, no double-free.
+        var should_deliver = false;
         {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.tasks.get(task_id)) |state| {
                 if (state.status == .completed or state.status == .failed or state.status == .cancelled) {
-                    already_terminal = true;
-                }
-            }
-        }
-        if (already_terminal) {
-            log.info("subagent: idempotent completion skipped task_id={d} (already terminal in-memory)", .{task_id});
-            return;
-        }
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            if (self.tasks.get(task_id)) |state| {
-                if (state.result) |value| self.allocator.free(value);
-                if (state.error_msg) |value| self.allocator.free(value);
-                state.status = if (owned_err != null) .failed else .completed;
-                state.result = owned_result;
-                state.error_msg = owned_err;
-                transferred = true;
-                state.completed_at = std.time.milliTimestamp();
-                self.persistTaskSnapshotLocked(task_id, state);
-                label = state.label;
-                origin_channel = state.origin_channel orelse "system";
-                origin_chat_id = state.origin_chat_id orelse "agent";
-                request_session_key = state.session_key orelse origin_chat_id;
+                    // Already terminal — idempotent skip.
+                    // owned_result/owned_err are freed by the `defer if (!transferred)` above.
+                } else {
+                    if (state.result) |value| self.allocator.free(value);
+                    if (state.error_msg) |value| self.allocator.free(value);
+                    state.status = if (owned_err != null) .failed else .completed;
+                    state.result = owned_result;
+                    state.error_msg = owned_err;
+                    transferred = true;
+                    state.completed_at = std.time.milliTimestamp();
+                    self.persistTaskSnapshotLocked(task_id, state);
+                    label = state.label;
+                    origin_channel = state.origin_channel orelse "system";
+                    origin_chat_id = state.origin_chat_id orelse "agent";
+                    request_session_key = state.session_key orelse origin_chat_id;
 
-                // ── Durable outbox persist (Phase 1) ─────────────────────
-                // Write the completion BEFORE we deliver/wake so a crash
-                // between persist and deliver is recovered by
-                // loadPendingSubagentResults on boot (Task 1.6).
-                // Best-effort: PG failure is warned but does NOT block delivery.
-                // Fill result_id_slice using the hoisted buffer; available
-                // after the lock for the durable gate and mark-delivered.
-                result_id_slice = formatSubagentResultId(&result_id_buf, task_id) catch null;
+                    // ── Durable outbox persist (Phase 1) ─────────────────────
+                    // Write the completion BEFORE we deliver/wake so a crash
+                    // between persist and deliver is recovered by
+                    // loadPendingSubagentResults on boot (Task 1.6).
+                    // Best-effort: PG failure is warned but does NOT block delivery.
+                    // Fill result_id_slice using the hoisted buffer; available
+                    // after the lock for the durable gate and mark-delivered.
+                    result_id_slice = formatSubagentResultId(&result_id_buf, task_id) catch null;
 
-                if (self.ledger_state_mgr) |sm| {
-                    if (state.session_key) |skey| {
-                        if (zaki_session.parseUserIdFromSessionKey(skey)) |uid_str| {
-                            const uid_num = std.fmt.parseInt(i64, uid_str, 10) catch null;
-                            if (uid_num) |user_id| {
-                                if (result_id_slice) |result_id| {
-                                    // Phase 1 payload: minimal {status,text}. Phase 2 swaps to full SubagentResult JSON.
-                                    const status_str: []const u8 = if (state.status == .failed) "failed" else "completed";
-                                    const text_src: []const u8 = state.result orelse (state.error_msg orelse "");
-                                    const payload = std.json.Stringify.valueAlloc(self.allocator, .{
-                                        .status = status_str,
-                                        .text = text_src,
-                                    }, .{}) catch null;
-                                    if (payload) |pj| {
-                                        defer self.allocator.free(pj);
-                                        sm.upsertSubagentResult(.{
-                                            .result_id = result_id,
-                                            .user_id = user_id,
-                                            .session_key = skey,
-                                            .task_id = @intCast(task_id),
-                                            .result_json = pj,
-                                        }) catch |err| log.warn("subagent: durable persist failed task_id={d}: {}", .{ task_id, err });
+                    if (self.ledger_state_mgr) |sm| {
+                        if (state.session_key) |skey| {
+                            if (zaki_session.parseUserIdFromSessionKey(skey)) |uid_str| {
+                                const uid_num = std.fmt.parseInt(i64, uid_str, 10) catch null;
+                                if (uid_num) |user_id| {
+                                    if (result_id_slice) |result_id| {
+                                        // Phase 1 payload: minimal {status,text}. Phase 2 swaps to full SubagentResult JSON.
+                                        const status_str: []const u8 = if (state.status == .failed) "failed" else "completed";
+                                        const text_src: []const u8 = state.result orelse (state.error_msg orelse "");
+                                        const payload = std.json.Stringify.valueAlloc(self.allocator, .{
+                                            .status = status_str,
+                                            .text = text_src,
+                                        }, .{}) catch null;
+                                        if (payload) |pj| {
+                                            defer self.allocator.free(pj);
+                                            sm.upsertSubagentResult(.{
+                                                .result_id = result_id,
+                                                .user_id = user_id,
+                                                .session_key = skey,
+                                                .task_id = @intCast(task_id),
+                                                .result_json = pj,
+                                            }) catch |err| log.warn("subagent: durable persist failed task_id={d}: {}", .{ task_id, err });
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
 
-                // Mirror terminal transition into the canonical ledger
-                // (WP2.1). Result/error strings are owned by the subagent
-                // state; we pass null here to avoid cross-owning a pointer
-                // into the ledger, which does not manage string lifetimes.
-                if (self.task_delivery) |td| {
-                    var id_buf: [tasks_mod.ledger.TASK_ID_LEN]u8 = undefined;
-                    if (formatCanonicalTaskId(&id_buf, task_id)) |id_slice| {
-                        if (state.status == .failed) {
-                            td.markFailed(id_slice, null) catch |err| {
-                                log.warn("subagent: failed to mirror failed status for task #{d}: {}", .{ task_id, err });
-                            };
-                        } else {
-                            td.markSucceeded(id_slice, null) catch |err| {
-                                log.warn("subagent: failed to mirror succeeded status for task #{d}: {}", .{ task_id, err });
-                            };
+                    // Mirror terminal transition into the canonical ledger
+                    // (WP2.1). Result/error strings are owned by the subagent
+                    // state; we pass null here to avoid cross-owning a pointer
+                    // into the ledger, which does not manage string lifetimes.
+                    if (self.task_delivery) |td| {
+                        var id_buf: [tasks_mod.ledger.TASK_ID_LEN]u8 = undefined;
+                        if (formatCanonicalTaskId(&id_buf, task_id)) |id_slice| {
+                            if (state.status == .failed) {
+                                td.markFailed(id_slice, null) catch |err| {
+                                    log.warn("subagent: failed to mirror failed status for task #{d}: {}", .{ task_id, err });
+                                };
+                            } else {
+                                td.markSucceeded(id_slice, null) catch |err| {
+                                    log.warn("subagent: failed to mirror succeeded status for task #{d}: {}", .{ task_id, err });
+                                };
+                            }
                         }
                     }
-                }
+                    should_deliver = true;
+                } // end else (not already terminal)
             }
+        }
+        if (!should_deliver) {
+            log.info("subagent: idempotent completion skipped task_id={d} (already terminal)", .{task_id});
+            return;
         }
 
         // ── Layer B: durable idempotency gate (cross-restart) ────────────
