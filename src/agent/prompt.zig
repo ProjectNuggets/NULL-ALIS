@@ -478,7 +478,6 @@ fn buildCoordinatorSection(w: anytype) !void {
         "## ⚡ Superpowers — Coordinator mode\n\n" ++
         "You are the **coordinator** for this turn: orchestrate, don't grind. " ++
         "Decompose the goal, briefly plan, dispatch the independent sub-tasks to subagents (use `spawn_many` to fan out in one batch), review every result, then **synthesize** them into a single coherent deliverable in your own voice — never dump raw subagent output. " ++
-        "See the `coordinator` skill for the full plan→dispatch→review→synthesize→deliver playbook. " ++
         "Fanning out burns credits (N subagents ≈ N× cost), so only parallelize when the work is genuinely independent.\n\n",
     );
 }

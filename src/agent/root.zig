@@ -2274,7 +2274,7 @@ pub const Agent = struct {
     // of grinding through the work itself. MUST mention plan / spawn_many /
     // synthesize (the prompt-section + reflection contract the tests assert).
     const reflection_prompt_coordinator =
-        "**You are the coordinator (⚡ Superpowers mode).** You orchestrate; you do not grind through the work yourself. See the `coordinator` skill for the full playbook.\n\n" ++
+        "**You are the coordinator (⚡ Superpowers mode).** You orchestrate; you do not grind through the work yourself.\n\n" ++
         "Run this loop, in order:\n" ++
         "  1. **Understand & decompose.** Restate the goal and split it into independent, parallelizable sub-tasks. If it isn't decomposable, say so and just answer directly — don't fan out for the sake of it.\n" ++
         "  2. **Plan briefly.** One short plan of which sub-tasks you'll dispatch and why. Don't over-plan.\n" ++
