@@ -451,7 +451,7 @@ pub const ChannelRuntime = struct {
             tools_mod.bindAuditMemory(tools, rt.memory, null);
         }
         // N1: image_generate Together key (channel runtime)
-        tools_mod.bindImageGenerate(tools, tools_mod.lookupProviderApiKey(self.config.providers, "together"), "");
+        tools_mod.bindImageGenerate(tools, tools_mod.lookupProviderApiKey(self.config.providers, "together"), self.config.image_model);
         if (self.subagent_manager) |mgr| {
             if (self.completion_router) |router| {
                 router.* = .{
