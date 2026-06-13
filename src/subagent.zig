@@ -867,6 +867,20 @@ pub const SubagentManager = struct {
             }
             self.allocator.free(content);
         }
+
+        // ── Wake parent turn (push, not poll) ──────────────────────────────
+        // Enqueue a heartbeat wake for the parent's user so the daemon's
+        // heartbeat thread drains it and fires a forced turn via
+        // processMessageWithContext. This replaces any polling job.
+        // Safe to call from the subagent thread: heartbeat_wake.enqueue()
+        // is mutex-guarded and uses c_allocator internally.
+        // Do NOT call processMessageWithContext directly from this thread.
+        if (zaki_session.parseUserIdFromSessionKey(request_session_key)) |uid_str| {
+            var rbuf: [64]u8 = undefined;
+            const reason = std.fmt.bufPrint(&rbuf, "subagent_completion:{d}", .{task_id}) catch "subagent_completion";
+            heartbeat_wake.enqueue(uid_str, reason) catch |err|
+                log.warn("subagent: wake enqueue failed task_id={d}: {}", .{ task_id, err });
+        }
     }
 
     /// Transition a queued task to running. Returns true if the
@@ -1850,6 +1864,50 @@ const BlockingCompletionRunner = struct {
         self.mutex.unlock();
     }
 };
+
+// ── Task 1.4 test: completeTask enqueues a heartbeat wake ─────────────
+
+test "completeTask enqueues a heartbeat wake for the parent user" {
+    heartbeat_wake.clearForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "wake-test-task"),
+        .task_summary = try std.testing.allocator.dupe(u8, "test wake enqueue"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "test wake enqueue"),
+        .session_key = try std.testing.allocator.dupe(u8, "agent:zaki-bot:user:42:main"),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 7, state);
+
+    _ = mgr.markTaskRunning(7);
+    mgr.completeTask(7, "wake result", null);
+
+    const req = heartbeat_wake.dequeue();
+    try std.testing.expect(req != null);
+    var mutable_req = req.?;
+    defer mutable_req.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, mutable_req.reason, "subagent_completion") != null);
+    // user_id "42" must be present so the daemon wakes the right user
+    try std.testing.expectEqualStrings("42", mutable_req.user_id.?);
+}
 
 // ── Task 1.3 test: formatSubagentResultId ─────────────────────────────
 
