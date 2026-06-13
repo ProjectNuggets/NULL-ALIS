@@ -130,6 +130,9 @@ pub const web_search = @import("web_search.zig");
 pub const web_fetch = @import("web_fetch.zig");
 pub const file_append = @import("file_append.zig");
 pub const spawn = @import("spawn.zig");
+/// Phase 4 G3 — fan-out tools (gated off by default; see fanout_enabled in allTools opts).
+pub const spawn_many = @import("spawn_many.zig");
+pub const subagent_batch_result = @import("subagent_batch_result.zig");
 pub const task_list = @import("task_list.zig");
 pub const task_get = @import("task_get.zig");
 pub const task_stop = @import("task_stop.zig");
@@ -617,6 +620,21 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .flags = .{ .mutating = true },
         .risk_level = .high,
         .cost_class = .c,
+    },
+    .{
+        // Phase 4 G3 — fan-out N subagents under one batch. High cost (N× credits).
+        // Gated off by default; Phase 5 enables via fanout_enabled.
+        .name = spawn_many.SpawnManyTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .high,
+        .cost_class = .c,
+    },
+    .{
+        // Phase 4 G3 — read-only batch result query. Low cost.
+        .name = subagent_batch_result.SubagentBatchResultTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+        .cost_class = .a,
     },
     .{
         // External channel send — medium (Telegram/Slack/WhatsApp APIs).
@@ -1200,6 +1218,15 @@ pub fn allTools(
         /// gateway always creates one) leave this null; the tool
         /// surfaces a "not configured" error rather than crashing.
         run_trace_store: ?*@import("../run_trace_store.zig").RunTraceStore = null,
+        /// Phase 4 G3 — fan-out tools gate. OFF by default.
+        ///
+        /// When true AND tool_profile == .main, registers `spawn_many` and
+        /// `subagent_batch_result`. Phase 5 will set this from the Superpowers
+        /// signal. Regular turns (fanout_enabled=false) never see these tools —
+        /// fan-out is a coordinator-only capability that burns N× credits.
+        ///
+        /// NEVER set to true in subagentTools() — the depth guard must hold.
+        fanout_enabled: bool = false,
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -1535,6 +1562,19 @@ pub fn allTools(
         const sp = try allocator.create(spawn.SpawnTool);
         sp.* = .{ .manager = opts.subagent_manager };
         try list.append(allocator, sp.tool());
+    }
+
+    // Phase 4 G3 — fan-out tools: spawn_many + subagent_batch_result.
+    // OFF by default (fanout_enabled=false). Phase 5 will set fanout_enabled
+    // from the Superpowers signal. EXCLUDED from subagentTools() — depth guard.
+    if (opts.tool_profile == .main and opts.fanout_enabled) {
+        const smt = try allocator.create(spawn_many.SpawnManyTool);
+        smt.* = .{ .manager = opts.subagent_manager };
+        try list.append(allocator, smt.tool());
+
+        const sbrt = try allocator.create(subagent_batch_result.SubagentBatchResultTool);
+        sbrt.* = .{ .manager = opts.subagent_manager };
+        try list.append(allocator, sbrt.tool());
     }
 
     // Always publish the message tool in the main profile; the tool itself
@@ -3510,6 +3550,10 @@ test "defaultMetadataRegistry only whitelists expected background_safe tools" {
         // store. Both are safe to run from a scheduled lane.
           "memory_doctor",
         "trace_query",
+        // Phase 4 fan-out — subagent_batch_result reads a batch's task results
+        // (read_only against the in-memory batch tracker); safe in a background/
+        // cron lane. spawn_many is NOT here (it mutates — spawns subagents).
+        "subagent_batch_result",
     };
 
     // Everything in the whitelist must be background_safe.
@@ -3813,6 +3857,77 @@ test "subagentTools includes the artifact tools" {
     }
     try std.testing.expect(has_artifact);
     try std.testing.expect(has_doc);
+}
+
+// ── Phase 4 G3 — fanout gating tests ─────────────────────────────────────────
+
+test "allTools fanout gating OFF by default — spawn_many and subagent_batch_result absent" {
+    const Config = @import("../config.zig").Config;
+    const subagent_mod = @import("../subagent.zig");
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    // Default: fanout_enabled = false
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .config = &cfg,
+        .tool_profile = .main,
+        .subagent_manager = &manager,
+        // fanout_enabled defaults to false — omit to test the default
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    for (tools) |t| {
+        try std.testing.expect(!std.mem.eql(u8, t.name(), "spawn_many"));
+        try std.testing.expect(!std.mem.eql(u8, t.name(), "subagent_batch_result"));
+    }
+}
+
+test "allTools fanout gating ON — spawn_many and subagent_batch_result present" {
+    const Config = @import("../config.zig").Config;
+    const subagent_mod = @import("../subagent.zig");
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .config = &cfg,
+        .tool_profile = .main,
+        .subagent_manager = &manager,
+        .fanout_enabled = true,
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var found_spawn_many = false;
+    var found_sbr = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "spawn_many")) found_spawn_many = true;
+        if (std.mem.eql(u8, t.name(), "subagent_batch_result")) found_sbr = true;
+    }
+    try std.testing.expect(found_spawn_many);
+    try std.testing.expect(found_sbr);
+}
+
+test "subagentTools never includes spawn_many or subagent_batch_result (depth guard)" {
+    const tools = try subagentTools(std.testing.allocator, ".", .{});
+    defer {
+        for (tools) |t| t.deinit(std.testing.allocator);
+        std.testing.allocator.free(tools);
+    }
+    for (tools) |t| {
+        try std.testing.expect(!std.mem.eql(u8, t.name(), "spawn_many"));
+        try std.testing.expect(!std.mem.eql(u8, t.name(), "subagent_batch_result"));
+    }
 }
 
 test {

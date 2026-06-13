@@ -2285,6 +2285,13 @@ const TenantRuntime = struct {
                 };
                 mgr.attachCompletionDelivery(@ptrCast(router), appendSubagentCompletionToGatewaySession);
             }
+            // Phase 4 G5 — start the per-manager batch-deadline reaper ticker.
+            // Called here (after full init: ledger, delivery, task_delivery all
+            // wired) so the first reap tick has access to the complete manager
+            // state. The ticker holds no gateway lock; it calls reapBatchDeadlines
+            // which acquires SubagentManager.mutex internally. deinit() signals
+            // shutdown and joins the thread before freeing any manager state.
+            mgr.startReaperTicker();
         }
 
         log.info("tenant.runtime.config user={s} source={s} hash={x}", .{
@@ -24589,6 +24596,9 @@ pub fn runWithRole(
                             mgr.attachCompletionDelivery(@ptrCast(router), appendSubagentCompletionToGatewaySession);
                         }
                     }
+                    // Phase 4 G5 — start the reaper ticker for the standalone
+                    // (non-tenant) manager. Same contract as the tenant path above.
+                    mgr.startReaperTicker();
                 }
             }
         }
