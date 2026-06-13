@@ -243,6 +243,38 @@ pub const BatchTracker = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    /// H4 — Return batch_ids of batches that are eligible for expiry.
+    ///
+    /// A batch is expirable when ALL of the following hold:
+    ///   - wake_claimed == true  (the barrier already fired; the parent was woken)
+    ///   - allTerminal() == true (every task reached a terminal state)
+    ///   - created_at_ms + ttl_ms <= now_ms  (the batch is old enough)
+    ///
+    /// Returns a slice of duped batch_id strings (into `allocator`). Caller
+    /// must free each string and the outer slice. Used by the reaper Phase B
+    /// sweep to evict stale batches and prevent unbounded memory growth.
+    pub fn expirableBatchIds(
+        self: *BatchTracker,
+        allocator: Allocator,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) ![][]const u8 {
+        var out: std.ArrayListUnmanaged([]const u8) = .{};
+        errdefer {
+            for (out.items) |item| allocator.free(item);
+            out.deinit(allocator);
+        }
+        var it = self.batches.iterator();
+        while (it.next()) |e| {
+            const bs = e.value_ptr.*;
+            if (!bs.wake_claimed) continue;
+            if (!bs.allTerminal()) continue;
+            if (bs.created_at_ms + ttl_ms > now_ms) continue;
+            try out.append(allocator, try allocator.dupe(u8, e.key_ptr.*));
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
     /// Compatibility alias: returns only the batch_ids of overdue batches,
     /// duped into `allocator`. Used where task_ids are not needed. Caller
     /// frees each string and the outer slice.

@@ -192,6 +192,39 @@ pub const SubagentManager = struct {
     /// delivery still leaves this allocated (its destructor runs anyway).
     _owned_fallback: ?tasks_mod.delivery.OwnedFallback = null,
 
+    // ── Phase 4 G5 — batch-deadline reaper ticker ──────────────────────────
+    //
+    // WHY a per-manager thread rather than hooking tenantRuntimeMaintenanceMain:
+    // `runTenantRuntimeMaintenance` holds `tenant_runtime_mutex` across the
+    // entire sweep (including evictIdleShutdownAware per session). Calling
+    // `reapBatchDeadlines` there would execute `completeTask` (PG I/O, bus
+    // publish, delivery callbacks) while holding that lock — blocking all
+    // incoming request processing during persistence. A per-manager ticker
+    // avoids this hazard: it runs independently of the request pipeline and
+    // holds NO gateway lock while the reaper does its work.
+    //
+    // Tick granularity: ~10 s (REAPER_TICK_INTERVAL_MS). Deadline enforcement
+    // is coarse to the tick — acceptable for v1 staging. A 60-second batch
+    // budget may fire up to 10 s late; this is documented and acceptable.
+    //
+    // Shutdown: the ticker checks `_reaper_shutdown` at loop top and every
+    // sleep increment (50 ms steps) — same pattern as tenantRuntimeMaintenanceMain.
+    // `deinit` signals shutdown and joins the thread before freeing any state the
+    // reaper touches.
+    //
+    // Tests: tests call `reapBatchDeadlines(now_ms)` directly and do NOT start
+    // the ticker thread, so there is no per-test overhead and no shutdown race.
+    // The ticker is only started by `startReaperTicker()`, called from gateway
+    // when the tenant runtime is fully initialized.
+
+    /// Atomic shutdown flag for the reaper ticker. Set true by `deinit`
+    /// before joining the thread.
+    _reaper_shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// Optional background ticker thread. Null until `startReaperTicker` is
+    /// called (production path); left null in tests.
+    _reaper_thread: ?std.Thread = null,
+
     pub fn init(
         allocator: Allocator,
         cfg: *const config_mod.Config,
@@ -229,6 +262,16 @@ pub const SubagentManager = struct {
     }
 
     pub fn deinit(self: *SubagentManager) void {
+        // Phase 4 G5 — signal the reaper ticker and join it BEFORE freeing
+        // any state it may be touching (batches, tasks). The ticker only
+        // accesses state via reapBatchDeadlines which holds the manager mutex;
+        // once the thread exits, no further access can occur.
+        self._reaper_shutdown.store(true, .release);
+        if (self._reaper_thread) |thread| {
+            thread.join();
+            self._reaper_thread = null;
+        }
+
         // Join all running threads and free task states
         var it = self.tasks.iterator();
         while (it.next()) |entry| {
@@ -1437,7 +1480,136 @@ pub const SubagentManager = struct {
         }
         return outcome;
     }
+
+    // ── Phase 4 G5 — batch-deadline reaper ──────────────────────────────────
+
+    /// TTL for delivered batches (H4). After a batch is all-terminal AND
+    /// wake_claimed AND older than this duration, the reaper removes it from
+    /// the tracker to prevent unbounded memory growth. 30 minutes gives the
+    /// parent agent ample time to collect results via subagent_batch_result.
+    pub const BATCH_EXPIRY_TTL_MS: i64 = 30 * 60 * 1000;
+
+    /// Tick interval for the background reaper ticker thread (10 seconds).
+    /// Deadline enforcement is coarse to this granularity — a batch may fire
+    /// up to ~10 s after its wall-clock deadline. Acceptable for v1 staging.
+    const REAPER_TICK_INTERVAL_MS: u64 = 10_000;
+
+    /// H2 — Reap overdue batches and expire old delivered batches.
+    ///
+    /// Phase A — TIMEOUT OVERDUE:
+    ///   Capture overdue batches (with task_ids) UNDER the lock, then RELEASE
+    ///   before calling completeTask (which re-locks). This is the H2 lock
+    ///   discipline: the reaper holds NO lock while completeTask runs.
+    ///   completeTask marks each task terminal; the LAST timeout in a batch
+    ///   claims the batch wake via the Group-4 barrier. Already-terminal
+    ///   tasks are idempotent-skipped by completeTask's Layer-A gate.
+    ///
+    ///   v1 limitation: the reaper marks the task `.timeout` for the barrier
+    ///   but does NOT forcibly kill the runaway OS thread (unsafe in Zig).
+    ///   The thread finishes on its own; its completion is idempotent-skipped
+    ///   (first-terminal-wins via Layer A). The concurrency slot frees when
+    ///   the thread exits naturally.
+    ///
+    /// Phase B — EXPIRE OLD DELIVERED BATCHES (H4):
+    ///   Collect batch_ids eligible for expiry UNDER the lock, then call
+    ///   expireBatch for each — also under the lock (expireBatch is a tracker
+    ///   method and must be called under mutex per the LOCK INVARIANT). This
+    ///   is safe: expireBatch only frees tracker-owned memory, it does not
+    ///   call any re-entrant manager methods.
+    ///
+    /// `now_ms` is the caller's view of wall-clock time (injected for testability).
+    pub fn reapBatchDeadlines(self: *SubagentManager, now_ms: i64) void {
+        // ── Phase A: capture overdue under lock, then release before completeTask ──
+        const overdue = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            break :blk self.batches.overdueBatchesWithTaskIds(self.allocator, now_ms) catch &.{};
+        };
+        defer {
+            for (overdue) |o| {
+                self.allocator.free(o.batch_id);
+                self.allocator.free(o.task_ids);
+            }
+            self.allocator.free(overdue);
+        }
+
+        for (overdue) |o| {
+            log.info("subagent: reaper timing out batch_id={s} ({d} tasks)", .{ o.batch_id, o.task_ids.len });
+            for (o.task_ids) |tid| {
+                // Lock is NOT held here — completeTask acquires it internally.
+                // Already-terminal tasks are idempotent-skipped via Layer A.
+                self.completeTask(tid, .{
+                    .status = .timeout,
+                    .text = "subagent exceeded batch deadline",
+                    .err = "batch_deadline_exceeded",
+                }, null);
+            }
+        }
+
+        // ── Phase B: expire old delivered batches (H4) ──
+        // This section DOES hold the lock because expireBatch is a tracker
+        // method (LOCK INVARIANT). It is safe: expireBatch only manipulates
+        // the tracker's own maps and does not call any manager method that
+        // would re-acquire the mutex.
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const expirable = self.batches.expirableBatchIds(self.allocator, now_ms, BATCH_EXPIRY_TTL_MS) catch &.{};
+            defer {
+                for (expirable) |id| self.allocator.free(id);
+                self.allocator.free(expirable);
+            }
+            for (expirable) |id| {
+                log.info("subagent: reaper expiring delivered batch_id={s} (TTL elapsed)", .{id});
+                self.batches.expireBatch(id);
+            }
+        }
+    }
+
+    /// Start the per-manager background reaper ticker. The ticker calls
+    /// `reapBatchDeadlines(now)` every REAPER_TICK_INTERVAL_MS and exits
+    /// promptly when `_reaper_shutdown` is set (by `deinit`).
+    ///
+    /// Must NOT be called in tests — tests drive reapBatchDeadlines directly
+    /// with controlled `now_ms` values. The gateway calls this once after the
+    /// tenant runtime is fully initialized.
+    ///
+    /// If the thread fails to spawn (rare, OOM or system limit), a warning is
+    /// logged and the reaper degrades gracefully — batch timeouts simply won't
+    /// fire automatically. Manual calls to `reapBatchDeadlines` still work.
+    pub fn startReaperTicker(self: *SubagentManager) void {
+        const thread = std.Thread.spawn(
+            .{ .stack_size = 256 * 1024 },
+            reaperTickerMain,
+            .{self},
+        ) catch |err| {
+            log.warn("subagent: failed to start reaper ticker: {} — batch deadlines will NOT be reaped automatically", .{err});
+            return;
+        };
+        self._reaper_thread = thread;
+        log.info("subagent: batch-deadline reaper ticker started (tick={}ms, ttl={}ms)", .{
+            REAPER_TICK_INTERVAL_MS,
+            BATCH_EXPIRY_TTL_MS,
+        });
+    }
 };
+
+/// Background thread function for the per-manager batch-deadline reaper.
+/// Ticks every REAPER_TICK_INTERVAL_MS; sleeps in 50ms increments to stay
+/// shutdown-responsive (matching the maintenance-thread pattern in gateway.zig).
+fn reaperTickerMain(mgr: *SubagentManager) void {
+    var last_run_ms: i64 = 0;
+    while (!mgr._reaper_shutdown.load(.acquire)) {
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms - last_run_ms >= SubagentManager.REAPER_TICK_INTERVAL_MS) {
+            mgr.reapBatchDeadlines(now_ms);
+            last_run_ms = now_ms;
+        }
+        // Sleep in short increments so shutdown is observed promptly.
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+    log.info("subagent: reaper ticker exiting", .{});
+}
 
 // ── Thread function ─────────────────────────────────────────────
 
@@ -3700,6 +3872,224 @@ test "batch barrier: per-task wakes suppressed; one batch wake when all terminal
 
     // Queue must be empty — no stray per-task wake was emitted.
     try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount());
+}
+
+// ── Phase 4 G5 tests: batch-deadline reaper (TDD — written before implementation) ──
+
+// Test 1: reaper marks still-running task .timeout (via completeTask) past the deadline,
+// and fires the batch barrier wake (the last timeout claims the batch wake).
+test "reaper marks still-running batch tasks timeout past deadline + fires the barrier" {
+    heartbeat_wake.clearForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    const batch_id = "batch:reaper:1";
+    const session_key = "agent:zaki-bot:user:55:main";
+
+    // Task 1: will be completed naturally (terminal before reaper runs).
+    const state1 = try std.testing.allocator.create(TaskState);
+    state1.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "reaper-task-1"),
+        .task_summary = try std.testing.allocator.dupe(u8, "reaper test 1"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "reaper test 1"),
+        .session_key = try std.testing.allocator.dupe(u8, session_key),
+        .batch_id = try std.testing.allocator.dupe(u8, batch_id),
+        .started_at = std.time.milliTimestamp(),
+    };
+    // Task 2: still running when reaper fires.
+    const state2 = try std.testing.allocator.create(TaskState);
+    state2.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "reaper-task-2"),
+        .task_summary = try std.testing.allocator.dupe(u8, "reaper test 2"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "reaper test 2"),
+        .session_key = try std.testing.allocator.dupe(u8, session_key),
+        .batch_id = try std.testing.allocator.dupe(u8, batch_id),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 301, state1);
+    try mgr.tasks.put(std.testing.allocator, 302, state2);
+
+    // Register the batch with a deadline in the past (1 ms ago).
+    const past_deadline: i64 = std.time.milliTimestamp() - 1;
+    {
+        mgr.mutex.lock();
+        defer mgr.mutex.unlock();
+        try mgr.batches.register(batch_id, &[_]u64{ 301, 302 }, session_key, past_deadline - 60_000, past_deadline);
+    }
+
+    _ = mgr.markTaskRunning(301);
+    _ = mgr.markTaskRunning(302);
+
+    // Task 1 completes naturally: barrier suppresses per-task wake (batch not all-terminal yet).
+    heartbeat_wake.clearForTest();
+    mgr.completeTask(301, .{ .status = .completed, .text = "done early" }, null);
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount()); // suppressed
+
+    // Reaper fires at `now_ms` past the deadline. Task 2 is still running.
+    const now_past = std.time.milliTimestamp() + 1;
+    mgr.reapBatchDeadlines(now_past);
+
+    // Task 2 must now be terminal (.completed status with result.status=.timeout).
+    const s2_status = mgr.getTaskStatus(302);
+    try std.testing.expect(s2_status != null);
+    try std.testing.expect(s2_status.? == .completed); // completeTask marks non-err as .completed
+
+    // The batch barrier must have fired exactly ONE batch wake.
+    try std.testing.expectEqual(@as(usize, 1), heartbeat_wake.pendingCount());
+    const req = heartbeat_wake.dequeue();
+    try std.testing.expect(req != null);
+    var mutable_req = req.?;
+    defer mutable_req.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, mutable_req.reason, "subagent_batch_complete") != null);
+    try std.testing.expectEqualStrings("55", mutable_req.user_id.?);
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount()); // no extra wakes
+}
+
+// Test 2: reaper expires old delivered batches (H4) — batchOf → null after expiry.
+// std.testing.allocator catches leaks if expiry fails to free memory.
+test "reaper expires old delivered batches (no leak, batchOf returns null after expiry)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    const batch_id = "batch:expiry:1";
+    const session_key = "agent:zaki-bot:user:66:main";
+
+    // Two tasks in a batch. Created far in the past (older than TTL).
+    const ancient_created: i64 = 1_000; // epoch ms 1000 — very old
+    const ancient_deadline: i64 = 2_000; // deadline also ancient
+
+    const state1 = try std.testing.allocator.create(TaskState);
+    state1.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "expire-task-1"),
+        .task_summary = try std.testing.allocator.dupe(u8, "expiry test 1"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "expiry test 1"),
+        .session_key = try std.testing.allocator.dupe(u8, session_key),
+        .batch_id = try std.testing.allocator.dupe(u8, batch_id),
+        .started_at = ancient_created,
+    };
+    const state2 = try std.testing.allocator.create(TaskState);
+    state2.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "expire-task-2"),
+        .task_summary = try std.testing.allocator.dupe(u8, "expiry test 2"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "expiry test 2"),
+        .session_key = try std.testing.allocator.dupe(u8, session_key),
+        .batch_id = try std.testing.allocator.dupe(u8, batch_id),
+        .started_at = ancient_created,
+    };
+    try mgr.tasks.put(std.testing.allocator, 401, state1);
+    try mgr.tasks.put(std.testing.allocator, 402, state2);
+
+    {
+        mgr.mutex.lock();
+        defer mgr.mutex.unlock();
+        try mgr.batches.register(batch_id, &[_]u64{ 401, 402 }, session_key, ancient_created, ancient_deadline);
+    }
+
+    _ = mgr.markTaskRunning(401);
+    _ = mgr.markTaskRunning(402);
+
+    // Both tasks complete — barrier fires, wake_claimed becomes true.
+    heartbeat_wake.clearForTest();
+    mgr.completeTask(401, .{ .status = .completed, .text = "r1" }, null);
+    mgr.completeTask(402, .{ .status = .completed, .text = "r2" }, null);
+    heartbeat_wake.clearForTest(); // consume the batch wake
+
+    // Now call reaper with now_ms far in the future (beyond TTL).
+    // The batch is all-terminal + wake_claimed + ancient → should be expired.
+    const far_future_ms: i64 = ancient_created + SubagentManager.BATCH_EXPIRY_TTL_MS + 1;
+    mgr.reapBatchDeadlines(far_future_ms);
+
+    // After expiry, batchOf returns null for both tasks.
+    mgr.mutex.lock();
+    defer mgr.mutex.unlock();
+    try std.testing.expect(mgr.batches.batchOf(401) == null);
+    try std.testing.expect(mgr.batches.batchOf(402) == null);
+    try std.testing.expect(mgr.batches.sessionKey(batch_id) == null);
+}
+
+// Test 3: reaper does not deadlock (no lock held across completeTask).
+// This is a smoke test: reapBatchDeadlines must return within a short timeout.
+// If there were a deadlock (lock held across completeTask which re-locks), this
+// would hang forever and the test timeout would catch it.
+test "reaper does not deadlock (no lock held across completeTask)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    const batch_id = "batch:nodeadlock:1";
+    const session_key = "agent:zaki-bot:user:77:main";
+
+    const state1 = try std.testing.allocator.create(TaskState);
+    state1.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "dl-task-1"),
+        .task_summary = try std.testing.allocator.dupe(u8, "deadlock test 1"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "deadlock test 1"),
+        .session_key = try std.testing.allocator.dupe(u8, session_key),
+        .batch_id = try std.testing.allocator.dupe(u8, batch_id),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 501, state1);
+    const past: i64 = std.time.milliTimestamp() - 1;
+    {
+        mgr.mutex.lock();
+        defer mgr.mutex.unlock();
+        try mgr.batches.register(batch_id, &[_]u64{501}, session_key, past - 1, past);
+    }
+    _ = mgr.markTaskRunning(501);
+    heartbeat_wake.clearForTest();
+
+    // This must complete without deadlock. The test runner will time out if it
+    // hangs. If the lock were held across completeTask (which re-locks), this
+    // would deadlock immediately (Zig's Mutex is non-reentrant).
+    mgr.reapBatchDeadlines(std.time.milliTimestamp() + 1);
+
+    // Verify the task became terminal (confirming reapBatchDeadlines ran).
+    try std.testing.expect(mgr.getTaskStatus(501) != null);
+    heartbeat_wake.clearForTest();
 }
 
 // Regression: non-batched single completion still wakes per-task (UNCHANGED PATH).
