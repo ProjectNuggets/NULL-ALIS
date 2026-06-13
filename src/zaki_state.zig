@@ -1817,7 +1817,10 @@ const ManagerImpl = struct {
         };
     }
 
-    fn schemaRaw(self: *const Self) []const u8 {
+    /// Raw (unquoted) tenant schema name. `pub` so cross-module tests (e.g. the
+    /// subagent_results PG recovery tests in subagent.zig) can build the
+    /// DROP SCHEMA cleanup query under the postgres engine.
+    pub fn schemaRaw(self: *const Self) []const u8 {
         return self.schema_raw_buf[0..self.schema_raw_len];
     }
 
@@ -1994,7 +1997,11 @@ const ManagerImpl = struct {
         self.pool_entries.clearRetainingCapacity();
     }
 
-    fn migrate(self: *Self) !void {
+    /// Apply the embedded schema migrations for this tenant. Called internally
+    /// by `init`; also `pub` so cross-module PG tests (subagent_results
+    /// recovery in subagent.zig) can re-create the schema after a DROP in
+    /// setup/teardown under the postgres engine.
+    pub fn migrate(self: *Self) !void {
         const statements = [_][]const u8{
             "CREATE SCHEMA IF NOT EXISTS {schema}",
             "CREATE EXTENSION IF NOT EXISTS pgcrypto",
@@ -11838,7 +11845,11 @@ const ManagerImpl = struct {
         return allocator.dupe(u8, out[0..]);
     }
 
-    fn exec(self: *Self, query: []const u8) !*c.PGresult {
+    /// Execute a raw SQL statement on a pooled connection. `pub` so
+    /// cross-module PG tests (e.g. the subagent_results recovery tests in
+    /// subagent.zig) can run DROP SCHEMA setup/teardown under the postgres
+    /// engine. Caller owns the returned *PGresult (PQclear it).
+    pub fn exec(self: *Self, query: []const u8) !*c.PGresult {
         var lease = self.acquireConn(self.lock_timeout_ms) catch |err| switch (err) {
             error.ConnectionPoolBusy => return error.ConnectionFailed,
             else => return err,

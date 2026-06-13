@@ -284,8 +284,13 @@ pub const SubagentManager = struct {
     /// before a restart. Idempotent: each row is marked delivered after waking
     /// so a second restart won't re-fire the same completion. Best-effort:
     /// logs and continues on any error. Frees every row (deinit + free slice).
-    /// Phase-1 recovery content is a minimal marker; Phase 2 will re-hydrate
-    /// the full result text from result_json — do NOT parse result_json here.
+    ///
+    /// Phase 2 (Task 2.3): the durable row's `result_json` now holds a full
+    /// `SubagentResult`. We parse it and re-deliver the REAL answer text (with
+    /// the task_id in the header for parent-side correlation), so a recovered
+    /// turn carries the actual answer — not just a marker. If parsing fails
+    /// (legacy/minimal row, corrupt JSON), we fall back to the marker-only
+    /// content so recovery still wakes the parent.
     pub fn recoverPendingSubagentResults(self: *SubagentManager, user_id: i64) void {
         const sm = self.ledger_state_mgr orelse return;
         const rows = sm.loadPendingSubagentResults(self.allocator, user_id) catch |err| {
@@ -297,16 +302,33 @@ pub const SubagentManager = struct {
             self.allocator.free(rows);
         }
         for (rows) |row| {
-            // Re-deliver a minimal Phase-1 marker to the parent session history.
-            // Phase 2 (Task 2.3) will parse result_json and deliver the real text.
+            // Re-deliver to the parent session history. Rehydrate the full text
+            // from result_json; the parsed arena is freed by `defer` before the
+            // next iteration.
             if (self.completion_delivery) |delivery| {
-                const content = std.fmt.allocPrint(
-                    self.allocator,
-                    "[Subagent task_id={d} completed — recovered after restart]",
-                    .{row.task_id},
-                ) catch continue;
-                defer self.allocator.free(content);
-                delivery(self.completion_delivery_ctx, row.session_key, content) catch {};
+                const content: ?[]u8 = blk: {
+                    if (SubagentResult.fromJsonAlloc(self.allocator, row.result_json)) |parsed_const| {
+                        var parsed = parsed_const;
+                        defer parsed.deinit(self.allocator);
+                        break :blk std.fmt.allocPrint(
+                            self.allocator,
+                            "[Subagent task_id={d} completed — recovered after restart]\n{s}",
+                            .{ row.task_id, parsed.value.text },
+                        ) catch null;
+                    } else |err| {
+                        // Parse failure — fall back to the marker-only content.
+                        log.warn("subagent: recovery result_json parse failed task_id={d}: {} — delivering marker", .{ row.task_id, err });
+                        break :blk std.fmt.allocPrint(
+                            self.allocator,
+                            "[Subagent task_id={d} completed — recovered after restart]",
+                            .{row.task_id},
+                        ) catch null;
+                    }
+                };
+                if (content) |c| {
+                    defer self.allocator.free(c);
+                    delivery(self.completion_delivery_ctx, row.session_key, c) catch {};
+                }
             }
             // Wake the parent's heartbeat turn so the recovery is processed.
             var ubuf: [32]u8 = undefined;
@@ -2305,9 +2327,11 @@ test "recoverPendingSubagentResults re-delivers and wakes for pending rows" {
     try std.testing.expectEqualStrings("42", mutable_req.user_id.?);
     try std.testing.expect(std.mem.indexOf(u8, mutable_req.reason, "subagent_completion:recovered") != null);
 
-    // The delivery callback must have been called.
+    // The delivery callback must have been called — with the task_id in the
+    // header AND (Phase 2, Task 2.3) the rehydrated result text from the row.
     try std.testing.expect(recorder.content != null);
     try std.testing.expect(std.mem.indexOf(u8, recorder.content.?, "77") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.content.?, "recovered answer") != null);
 
     // The row must now be marked delivered (not pending).
     const rows = try state_mgr.loadPendingSubagentResults(allocator, 42);
@@ -2326,6 +2350,110 @@ test "recoverPendingSubagentResults re-delivers and wakes for pending rows" {
         defer allocator.free(drop_q);
         const res = try state_mgr.exec(drop_q);
         _ = res;
+    }
+}
+
+// ── Task 2.3 test: recovery re-hydrates the FULL result text ──────────
+// Seed a pending row whose result_json is a complete SubagentResult (status,
+// text, metadata) — exactly what Phase-2 completeTask now writes — and assert
+// recovery delivers the actual ANSWER TEXT (not a bare marker). PG-guarded;
+// skips cleanly without a test Postgres.
+test "recoverPendingSubagentResults re-hydrates full result text from durable row" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(
+        allocator,
+        "NULLALIS_POSTGRES_TEST_URL",
+        "NULLCLAW_POSTGRES_TEST_URL",
+    ) catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    heartbeat_wake.clearForTest();
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_rehydrate", .{std.time.microTimestamp()});
+    const state_cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var state_mgr = try zaki_state.Manager.init(allocator, state_cfg);
+    defer state_mgr.deinit();
+
+    {
+        const pg_helpers = @import("memory/engines/postgres.zig");
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, state_mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        _ = try state_mgr.exec(drop_q);
+    }
+    try state_mgr.migrate();
+
+    // Build the durable payload exactly the way Phase-2 completeTask does:
+    // serialize a full SubagentResult via toJsonAlloc.
+    const seeded = SubagentResult{
+        .status = .completed,
+        .text = "the fully rehydrated answer body",
+        .tokens = 2048,
+        .turns = 4,
+        .duration_ms = 1234,
+    };
+    const seeded_json = try seeded.toJsonAlloc(allocator);
+    defer allocator.free(seeded_json);
+
+    try state_mgr.upsertSubagentResult(.{
+        .result_id = "subagent:91",
+        .user_id = 42,
+        .session_key = "agent:zaki-bot:user:42:main",
+        .task_id = 91,
+        .result_json = seeded_json,
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(allocator, &cfg, null, .{});
+    defer mgr.deinit();
+    mgr.attachPostgresLedger(&state_mgr, 42);
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+
+    // Wake enqueued for the user.
+    const req = heartbeat_wake.dequeue();
+    try std.testing.expect(req != null);
+    var mutable_req = req.?;
+    defer mutable_req.deinit();
+    try std.testing.expectEqualStrings("42", mutable_req.user_id.?);
+
+    // The delivered content must carry the ACTUAL answer text (rehydrated from
+    // the full SubagentResult JSON), plus the task_id for correlation.
+    try std.testing.expect(recorder.content != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.content.?, "the fully rehydrated answer body") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.content.?, "91") != null);
+
+    // Row marked delivered.
+    const rows = try state_mgr.loadPendingSubagentResults(allocator, 42);
+    defer {
+        for (rows) |r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 0), rows.len);
+
+    {
+        const pg_helpers = @import("memory/engines/postgres.zig");
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, state_mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        _ = try state_mgr.exec(drop_q);
     }
 }
 
