@@ -367,7 +367,7 @@ pub fn spawnMany(self: *SubagentManager, specs: []const SpawnSpec, request_sessi
 
 Provide the full Zig in implementation (mirror `spawn.zig` exactly for the manager-wiring, turn-context resolution, and ToolResult construction; cap `maxItems` at 8 to bound fan-out width).
 
-- [ ] **Step 4: Register** in `src/agent/commands.zig` next to the `spawn` tool registration (default-on, main profile). DO NOT add to `subagentTools()` — subagents must not fan-out (depth guard). Mirror the `spawn_tool` wiring (`var spawn_many_tool = spawn_many_mod.SpawnManyTool{ .manager = &manager };`).
+- [ ] **Step 4: Register** in `src/agent/commands.zig` next to the `spawn` tool registration, but **GATED — power-user-only, OFF by default**: `spawn_many` (and `subagent_batch_result`, Task 6) are registered behind a `superpowers`/coordinator gate (a per-turn flag wired in **Phase 5 — Superpowers mode**). Until Phase 5 lands the gate, register them behind a feature flag that **defaults OFF**, so **regular turns never see `spawn_many`** — fan-out is power-user-only by design (it burns N× credits). Still EXCLUDED from `subagentTools()` — subagents must not fan-out (depth guard). Mirror the `spawn_tool` wiring (`var spawn_many_tool = spawn_many_mod.SpawnManyTool{ .manager = &manager };`).
 
 - [ ] **Step 5: Run tests + build** → PASS / clean.
 
