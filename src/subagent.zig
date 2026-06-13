@@ -18,6 +18,7 @@ const observability = @import("observability.zig");
 const tasks_mod = @import("tasks/root.zig");
 const zaki_session = @import("session/root.zig");
 const zaki_state = @import("zaki_state.zig");
+const heartbeat_wake = @import("heartbeat_wake.zig");
 
 const log = std.log.scoped(.subagent);
 const TASK_LEDGER_FILE_NAME = "subagent_tasks.jsonl";
@@ -268,6 +269,7 @@ pub const SubagentManager = struct {
         if (formatted.len != tasks_mod.ledger.TASK_ID_LEN) return null;
         return formatted;
     }
+
 
     /// Spawn a background subagent. Returns task_id immediately.
     pub fn spawn(
@@ -670,6 +672,41 @@ pub const SubagentManager = struct {
                 origin_channel = state.origin_channel orelse "system";
                 origin_chat_id = state.origin_chat_id orelse "agent";
                 request_session_key = state.session_key orelse origin_chat_id;
+
+                // ── Durable outbox persist (Phase 1) ─────────────────────
+                // Write the completion BEFORE we deliver/wake so a crash
+                // between persist and deliver is recovered by
+                // loadPendingSubagentResults on boot (Task 1.6).
+                // Best-effort: PG failure is warned but does NOT block delivery.
+                if (self.ledger_state_mgr) |sm| {
+                    if (state.session_key) |skey| {
+                        if (zaki_session.parseUserIdFromSessionKey(skey)) |uid_str| {
+                            const uid_num = std.fmt.parseInt(i64, uid_str, 10) catch null;
+                            if (uid_num) |user_id| {
+                                var idbuf: [40]u8 = undefined;
+                                if (formatSubagentResultId(&idbuf, task_id)) |result_id| {
+                                    // Phase 1 payload: minimal {status,text}. Phase 2 swaps to full SubagentResult JSON.
+                                    const status_str: []const u8 = if (state.status == .failed) "failed" else "completed";
+                                    const text_src: []const u8 = state.result orelse (state.error_msg orelse "");
+                                    const payload = std.json.Stringify.valueAlloc(self.allocator, .{
+                                        .status = status_str,
+                                        .text = text_src,
+                                    }, .{}) catch null;
+                                    if (payload) |pj| {
+                                        defer self.allocator.free(pj);
+                                        sm.upsertSubagentResult(.{
+                                            .result_id = result_id,
+                                            .user_id = user_id,
+                                            .session_key = skey,
+                                            .task_id = @intCast(task_id),
+                                            .result_json = pj,
+                                        }) catch |err| log.warn("subagent: durable persist failed task_id={d}: {}", .{ task_id, err });
+                                    }
+                                } else |_| {}
+                            }
+                        }
+                    }
+                }
 
                 // Mirror terminal transition into the canonical ledger
                 // (WP2.1). Result/error strings are owned by the subagent
@@ -1074,6 +1111,12 @@ pub fn parseTaskStatus(raw: []const u8) TaskStatus {
     if (std.mem.eql(u8, raw, "completed")) return .completed;
     if (std.mem.eql(u8, raw, "cancelled")) return .cancelled;
     return .failed;
+}
+
+/// Format the durable outbox result_id for a given task_id.
+/// Result is always "subagent:<task_id>" — stable, human-readable, unique per manager.
+fn formatSubagentResultId(buf: []u8, task_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "subagent:{d}", .{task_id});
 }
 
 fn isTaskSessionKey(session_key: []const u8) bool {
@@ -1807,6 +1850,20 @@ const BlockingCompletionRunner = struct {
         self.mutex.unlock();
     }
 };
+
+// ── Task 1.3 test: formatSubagentResultId ─────────────────────────────
+
+test "formatSubagentResultId formats stable id" {
+    var buf: [40]u8 = undefined;
+    const id = try formatSubagentResultId(&buf, 7);
+    try std.testing.expectEqualStrings("subagent:7", id);
+}
+
+test "formatSubagentResultId handles large task_id" {
+    var buf: [40]u8 = undefined;
+    const id = try formatSubagentResultId(&buf, 123456789);
+    try std.testing.expectEqualStrings("subagent:123456789", id);
+}
 
 const RecordingCompletionDelivery = struct {
     session_key: ?[]const u8 = null,
