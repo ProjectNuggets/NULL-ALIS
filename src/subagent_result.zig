@@ -69,6 +69,67 @@ test "ArtifactCollector ignores non-create/update ops and other events" {
     try std.testing.expectEqual(@as(u64, 2), collector.refs()[0].version);
 }
 
+/// Test-only observer that counts artifact_events and remembers the last id.
+const CountingArtifactObserver = struct {
+    count: usize = 0,
+    last_id_buf: [64]u8 = undefined,
+    last_id_len: usize = 0,
+
+    const vt = observability.Observer.VTable{
+        .record_event = rec,
+        .record_metric = noMetric,
+        .flush = noFlush,
+        .name = nm,
+    };
+    fn observer(self: *CountingArtifactObserver) observability.Observer {
+        return .{ .ptr = @ptrCast(self), .vtable = &vt };
+    }
+    fn rec(ptr: *anyopaque, event: *const observability.ObserverEvent) void {
+        const self: *CountingArtifactObserver = @ptrCast(@alignCast(ptr));
+        switch (event.*) {
+            .artifact_event => |ae| {
+                self.count += 1;
+                const n = @min(ae.artifact_id.len, self.last_id_buf.len);
+                @memcpy(self.last_id_buf[0..n], ae.artifact_id[0..n]);
+                self.last_id_len = n;
+            },
+            else => {},
+        }
+    }
+    fn noMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+    fn noFlush(_: *anyopaque) void {}
+    fn nm(_: *anyopaque) []const u8 {
+        return "counting-artifact";
+    }
+    fn lastId(self: *CountingArtifactObserver) []const u8 {
+        return self.last_id_buf[0..self.last_id_len];
+    }
+};
+
+test "resurfaceArtifacts re-emits one artifact_event per ArtifactRef" {
+    var counter = CountingArtifactObserver{};
+    const obs = counter.observer();
+    const result = SubagentResult{
+        .status = .completed,
+        .text = "done",
+        .artifacts = &.{
+            .{ .id = "art_1", .kind = "markdown", .title = "Report", .url = "/api/v1/artifacts/art_1", .version = 1 },
+            .{ .id = "art_2", .kind = "html", .title = "Page", .url = "/api/v1/artifacts/art_2", .version = 2 },
+        },
+    };
+    resurfaceArtifacts(obs, result);
+    try std.testing.expectEqual(@as(usize, 2), counter.count);
+    try std.testing.expectEqualStrings("art_2", counter.lastId());
+}
+
+test "resurfaceArtifacts on an empty artifacts slice emits nothing" {
+    var counter = CountingArtifactObserver{};
+    const obs = counter.observer();
+    const result = SubagentResult{ .status = .completed, .text = "no artifacts" };
+    resurfaceArtifacts(obs, result);
+    try std.testing.expectEqual(@as(usize, 0), counter.count);
+}
+
 test "SubagentResult round-trips through JSON" {
     const a = std.testing.allocator;
     const original = SubagentResult{
@@ -333,3 +394,26 @@ pub const ArtifactCollector = struct {
         return "subagent-artifact-collector";
     }
 };
+
+/// Re-emit each `ArtifactRef` from a completed `SubagentResult` as an
+/// `artifact_event` (op "created") on the parent's LIVE observer, so the FE
+/// side panel surfaces the subagent's deliverables when the completion reaches
+/// the parent (Phase 3, Subagent Pass). The artifacts were already persisted by
+/// the subagent's `artifact_create` under the SAME tenant schema/user, so this
+/// re-emits only the EVENT — no content re-upload. Read-only over `result`; the
+/// borrowed slices live for the duration of each `recordEvent` call (mirrors
+/// the artifact_event payload lifetime), which is exactly the producer
+/// contract `RunEventObserver` and the FE SSE bridge already honor.
+pub fn resurfaceArtifacts(obs: observability.Observer, result: SubagentResult) void {
+    for (result.artifacts) |ref| {
+        const evt = observability.ObserverEvent{ .artifact_event = .{
+            .op = "created",
+            .artifact_id = ref.id,
+            .title = ref.title,
+            .kind = ref.kind,
+            .version = ref.version,
+            .url = ref.url,
+        } };
+        obs.recordEvent(&evt);
+    }
+}
