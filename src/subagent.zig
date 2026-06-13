@@ -1029,12 +1029,25 @@ pub const SubagentManager = struct {
         // `defer if (!transferred)` above frees owned_result/owned_err exactly
         // once — no leak, no double-free.
         var should_deliver = false;
+        // ── Batch barrier variables (H1: declared before the lock, set inside) ────
+        // For batched tasks the per-task wake is suppressed; the LAST task to go
+        // terminal claims a single batch wake. `batch_id_to_wake` is a manager-
+        // allocator-owned DUPE taken inside the lock (H1) so it cannot dangle after
+        // the lock is released — the reaper may free BatchState concurrently.
+        // Freed with `defer` outside the lock immediately after the wake is emitted.
+        var emit_per_task_wake = true;
+        var batch_id_to_wake: ?[]const u8 = null;
         {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.tasks.get(task_id)) |state| {
                 if (state.status == .completed or state.status == .failed or state.status == .cancelled) {
                     // Already terminal — idempotent skip.
+                    // H6: first-terminal-wins — whether it's a real completion or the
+                    // batch-deadline reaper that marks the task, whichever acquires
+                    // the lock first wins. A reaper timeout vs a simultaneous real
+                    // completion: `.timeout` if the reaper arrived first, `.completed`
+                    // if the thread arrived first. Both are correct; document only.
                     // owned_result/owned_err are freed by the `defer if (!transferred)` above.
                 } else {
                     if (state.result) |*value| freeSubagentResult(self.allocator, value);
@@ -1110,6 +1123,22 @@ pub const SubagentManager = struct {
                                     log.warn("subagent: failed to mirror succeeded status for task #{d}: {}", .{ task_id, err });
                                 };
                             }
+                        }
+                    }
+                    // ── Batch barrier wake decision (inside the lock — H1) ────────
+                    // Batched tasks suppress the per-task wake; only the LAST task to
+                    // go terminal in the batch claims the single batch wake.
+                    // Non-batched tasks (batch_id == null) keep the per-task wake.
+                    // batch_id_to_wake is a DUPE taken here (H1: inside the lock)
+                    // so it cannot dangle after the lock releases (the reaper may
+                    // free the BatchState at any time under the same mutex). It is
+                    // freed with `defer` just after the batch wake is enqueued.
+                    if (state.batch_id) |bid| {
+                        emit_per_task_wake = false; // suppress per-task wake
+                        self.batches.markTerminal(bid, task_id);
+                        if (self.batches.allTerminal(bid) and self.batches.tryClaimWake(bid)) {
+                            // This completer is the last in the batch — claim the batch wake.
+                            batch_id_to_wake = self.allocator.dupe(u8, bid) catch null; // DUPE under lock
                         }
                     }
                     should_deliver = true;
@@ -1297,18 +1326,43 @@ pub const SubagentManager = struct {
         }
 
         // ── Wake parent turn (push, not poll) ──────────────────────────────
-        // Enqueue a heartbeat wake for the parent's user so the daemon's
-        // heartbeat thread drains it and fires a forced turn via
-        // processMessageWithContext. This replaces any polling job.
-        // Safe to call from the subagent thread: heartbeat_wake.enqueue()
-        // is mutex-guarded and uses c_allocator internally.
+        // BATCH-AWARE (Phase 4 G4, H1/H6):
+        //   • Non-batched task (emit_per_task_wake=true): the EXISTING per-task
+        //     wake fires unchanged — subagent_completion:{task_id}.
+        //   • Batched task NOT the last terminal (emit_per_task_wake=false,
+        //     batch_id_to_wake=null): wake is suppressed; the parent stays asleep
+        //     until the barrier fires.
+        //   • Batched task IS the last terminal (emit_per_task_wake=false,
+        //     batch_id_to_wake set): ONE batch wake fires — subagent_batch_complete:{batch_id}.
+        //     batch_id_to_wake is a manager-allocator-owned dupe (freed below, H1).
+        //
+        // The DURABLE per-task persist + delivery (Layer A/B, completion_delivery/bus,
+        // markSubagentResultDelivered) is UNCHANGED — every task still durably records
+        // its own result; only the wake is batched. The parent, woken once, collects
+        // all N results via subagent_batch_result (Group 3).
+        //
+        // Safe to call from the subagent thread: heartbeat_wake.enqueue() is
+        // mutex-guarded and uses c_allocator internally.
         // Do NOT call processMessageWithContext directly from this thread.
-        if (zaki_session.parseUserIdFromSessionKey(request_session_key)) |uid_str| {
-            var rbuf: [64]u8 = undefined;
-            const reason = std.fmt.bufPrint(&rbuf, "subagent_completion:{d}", .{task_id}) catch "subagent_completion";
-            heartbeat_wake.enqueue(uid_str, reason) catch |err|
-                log.warn("subagent: wake enqueue failed task_id={d}: {}", .{ task_id, err });
+        if (emit_per_task_wake) {
+            // Non-batched path — UNCHANGED from Phase 1.
+            if (zaki_session.parseUserIdFromSessionKey(request_session_key)) |uid_str| {
+                var rbuf: [64]u8 = undefined;
+                const reason = std.fmt.bufPrint(&rbuf, "subagent_completion:{d}", .{task_id}) catch "subagent_completion";
+                heartbeat_wake.enqueue(uid_str, reason) catch |err|
+                    log.warn("subagent: wake enqueue failed task_id={d}: {}", .{ task_id, err });
+            }
+        } else if (batch_id_to_wake) |bid| {
+            // Last task in the batch — emit ONE batch wake and free the H1 dupe.
+            defer self.allocator.free(bid);
+            if (zaki_session.parseUserIdFromSessionKey(request_session_key)) |uid_str| {
+                var rbuf: [96]u8 = undefined;
+                const reason = std.fmt.bufPrint(&rbuf, "subagent_batch_complete:{s}", .{bid}) catch "subagent_batch_complete";
+                heartbeat_wake.enqueue(uid_str, reason) catch |err|
+                    log.warn("subagent: batch wake enqueue failed batch_id={s}: {}", .{ bid, err });
+            }
         }
+        // else: batched task, not the last terminal — wake suppressed (batch barrier).
     }
 
     /// Transition a queued task to running. Returns true if the
@@ -3559,4 +3613,137 @@ test "getBatchResults H7 — unknown batch_id returns error.UnknownBatch" {
 
     const result = mgr.getBatchResults(std.testing.allocator, "batch:9999:0");
     try std.testing.expectError(error.UnknownBatch, result);
+}
+
+// ── Phase 4 G4 tests: batch barrier ───────────────────────────────────────────
+
+// TDD: write BEFORE the barrier implementation. Must FAIL until the barrier
+// suppresses per-task wakes for batched tasks and emits ONE batch wake.
+test "batch barrier: per-task wakes suppressed; one batch wake when all terminal" {
+    heartbeat_wake.clearForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    // Insert two TaskState entries manually — both tagged with the same batch_id.
+    // Mirrors the Phase-1 idempotency test pattern (no real threads needed here).
+    const batch_id = "batch:99:111111";
+    const session_key = "agent:zaki-bot:user:42:main";
+
+    const state1 = try std.testing.allocator.create(TaskState);
+    state1.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "barrier-task-1"),
+        .task_summary = try std.testing.allocator.dupe(u8, "barrier test 1"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "barrier test 1"),
+        .session_key = try std.testing.allocator.dupe(u8, session_key),
+        .batch_id = try std.testing.allocator.dupe(u8, batch_id),
+        .started_at = std.time.milliTimestamp(),
+    };
+    const state2 = try std.testing.allocator.create(TaskState);
+    state2.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "barrier-task-2"),
+        .task_summary = try std.testing.allocator.dupe(u8, "barrier test 2"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "barrier test 2"),
+        .session_key = try std.testing.allocator.dupe(u8, session_key),
+        .batch_id = try std.testing.allocator.dupe(u8, batch_id),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 101, state1);
+    try mgr.tasks.put(std.testing.allocator, 102, state2);
+
+    // Register the batch in the tracker under the manager lock.
+    {
+        mgr.mutex.lock();
+        defer mgr.mutex.unlock();
+        const now = std.time.milliTimestamp();
+        try mgr.batches.register(batch_id, &[_]u64{ 101, 102 }, session_key, now, now + 60_000);
+    }
+
+    // Drain any wakes that may be present from setup.
+    heartbeat_wake.clearForTest();
+
+    _ = mgr.markTaskRunning(101);
+    _ = mgr.markTaskRunning(102);
+
+    // Complete task 101 (batch not yet all-terminal: task 102 still running).
+    // The barrier MUST suppress the per-task wake.
+    mgr.completeTask(101, .{ .status = .completed, .text = "result A" }, null);
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount()); // SUPPRESSED
+
+    // Complete task 102 (last task → barrier fires ONE batch wake).
+    mgr.completeTask(102, .{ .status = .completed, .text = "result B" }, null);
+    try std.testing.expectEqual(@as(usize, 1), heartbeat_wake.pendingCount()); // EXACTLY ONE
+
+    const req = heartbeat_wake.dequeue();
+    try std.testing.expect(req != null);
+    var mutable_req = req.?;
+    defer mutable_req.deinit();
+    // Wake reason must carry the batch id.
+    try std.testing.expect(std.mem.indexOf(u8, mutable_req.reason, "subagent_batch_complete") != null);
+    // User id must be "42" so the daemon wakes the right user.
+    try std.testing.expectEqualStrings("42", mutable_req.user_id.?);
+
+    // Queue must be empty — no stray per-task wake was emitted.
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount());
+}
+
+// Regression: non-batched single completion still wakes per-task (UNCHANGED PATH).
+test "non-batched single completion still wakes per-task (barrier regression guard)" {
+    heartbeat_wake.clearForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    // Non-batched task (batch_id = null — the standard single-spawn path).
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "single-task"),
+        .task_summary = try std.testing.allocator.dupe(u8, "single spawn test"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "single spawn test"),
+        .session_key = try std.testing.allocator.dupe(u8, "agent:zaki-bot:user:7:main"),
+        // batch_id explicitly left as null (default)
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 200, state);
+
+    _ = mgr.markTaskRunning(200);
+    mgr.completeTask(200, .{ .status = .completed, .text = "single result" }, null);
+
+    // The original per-task wake MUST still fire for non-batched tasks.
+    try std.testing.expectEqual(@as(usize, 1), heartbeat_wake.pendingCount());
+    const req = heartbeat_wake.dequeue();
+    try std.testing.expect(req != null);
+    var mutable_req = req.?;
+    defer mutable_req.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, mutable_req.reason, "subagent_completion") != null);
+    try std.testing.expectEqualStrings("7", mutable_req.user_id.?);
 }
