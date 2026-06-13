@@ -13,6 +13,7 @@ const Allocator = std.mem.Allocator;
 const bus_mod = @import("bus.zig");
 const config_mod = @import("config.zig");
 const channel_loop = @import("channel_loop.zig");
+const tools_mod = @import("tools/root.zig");
 const json_util = @import("json_util.zig");
 const observability = @import("observability.zig");
 const tasks_mod = @import("tasks/root.zig");
@@ -1209,6 +1210,33 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
     };
     defer runtime.deinit();
 
+    // Phase 3 (Subagent Pass) — make the subagent's artifact_create functional
+    // and capture what it produces.
+    //
+    // (1) The subagent runtime is built via allTools(.subagent), which registers
+    //     artifact_create but leaves its state_mgr/user_id UNBOUND (the parent
+    //     gateway binds those via bindStateMgrTenant; this isolated runtime never
+    //     was). Bind them from the manager's ledger handles so the subagent
+    //     persists artifacts to the SAME tenant schema/user as the parent —
+    //     otherwise artifact_create returns "state manager not bound".
+    if (ctx.manager.ledger_state_mgr) |sm| {
+        if (ctx.manager.ledger_user_id) |uid| {
+            tools_mod.bindStateMgrTenant(runtime.tools, sm, uid);
+        }
+    }
+
+    // (2) Install an ArtifactCollector for this turn. We pass it as the
+    //     `progress_observer` to processMessageWithContext (NOT via the
+    //     thread-local setToolObserver, which the inner agent loop overwrites
+    //     and then clears). The session combines base+progress into the turn's
+    //     agent.observer, which the loop installs as the tool observer — so the
+    //     artifact_create tool's emitted `artifact_event`s reach the collector.
+    //     The collector owns its duped refs until deinit; completeTask
+    //     deep-copies them into the manager allocator (dupeSubagentResult), so
+    //     deinit after the handoff is UAF-free.
+    var artifact_collector = subagent_result.ArtifactCollector.init(ctx.manager.allocator);
+    defer artifact_collector.deinit();
+
     var session_buf: [128]u8 = undefined;
     const session_key = deriveTaskRuntimeSessionKey(&session_buf, ctx.request_session_key, ctx.task_id);
 
@@ -1252,7 +1280,12 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         session_key,
         framed_task,
         null,
-        .{ .turn_origin = .proactive },
+        .{
+            .turn_origin = .proactive,
+            // Phase 3: capture artifact_event emissions from the subagent's
+            // tools into artifact_collector for the SubagentResult.
+            .progress_observer = artifact_collector.observer(),
+        },
     ) catch |err| {
         ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
         return;
@@ -1260,10 +1293,16 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
     defer ctx.manager.allocator.free(result);
 
     const dur_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - run_started_at));
+    // Phase 3: hand the captured artifacts to completeTask, which deep-copies
+    // them into the manager allocator (dupeSubagentResult) so they ride back to
+    // the parent in the durable result_json + delivery. refs() is a borrowed
+    // view valid until artifact_collector.deinit() (deferred above) — safe
+    // because completeTask copies before this function returns.
     ctx.manager.completeTask(ctx.task_id, .{
         .status = .completed,
         .text = result,
         .duration_ms = dur_ms,
+        .artifacts = artifact_collector.refs(),
     }, null);
 }
 

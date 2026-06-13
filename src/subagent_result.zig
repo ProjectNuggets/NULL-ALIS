@@ -14,6 +14,60 @@
 //! `fromJsonAlloc` owns its memory via an arena — call `deinit` to free it.
 
 const std = @import("std");
+const observability = @import("observability.zig");
+
+test "ArtifactCollector captures artifact_event into ArtifactRef" {
+    const a = std.testing.allocator;
+    var collector = ArtifactCollector.init(a);
+    defer collector.deinit();
+    const obs = collector.observer();
+    const evt = observability.ObserverEvent{ .artifact_event = .{
+        .op = "created",
+        .artifact_id = "art_9",
+        .title = "Doc",
+        .kind = "markdown",
+        .version = 1,
+        .url = "/api/v1/artifacts/art_9",
+    } };
+    obs.recordEvent(&evt);
+    const refs = collector.refs();
+    try std.testing.expectEqual(@as(usize, 1), refs.len);
+    try std.testing.expectEqualStrings("art_9", refs[0].id);
+    try std.testing.expectEqualStrings("markdown", refs[0].kind);
+    try std.testing.expectEqualStrings("Doc", refs[0].title);
+    try std.testing.expectEqualStrings("/api/v1/artifacts/art_9", refs[0].url);
+    try std.testing.expectEqual(@as(u64, 1), refs[0].version);
+}
+
+test "ArtifactCollector ignores non-create/update ops and other events" {
+    const a = std.testing.allocator;
+    var collector = ArtifactCollector.init(a);
+    defer collector.deinit();
+    const obs = collector.observer();
+    // A delete op must NOT be captured (only created/updated surface artifacts).
+    const del = observability.ObserverEvent{ .artifact_event = .{
+        .op = "deleted",
+        .artifact_id = "art_x",
+        .title = "Gone",
+        .kind = "markdown",
+        .version = 2,
+        .url = "/api/v1/artifacts/art_x",
+    } };
+    obs.recordEvent(&del);
+    try std.testing.expectEqual(@as(usize, 0), collector.refs().len);
+    // An updated op IS captured.
+    const upd = observability.ObserverEvent{ .artifact_event = .{
+        .op = "updated",
+        .artifact_id = "art_y",
+        .title = "V2",
+        .kind = "html",
+        .version = 2,
+        .url = "/api/v1/artifacts/art_y",
+    } };
+    obs.recordEvent(&upd);
+    try std.testing.expectEqual(@as(usize, 1), collector.refs().len);
+    try std.testing.expectEqual(@as(u64, 2), collector.refs()[0].version);
+}
 
 test "SubagentResult round-trips through JSON" {
     const a = std.testing.allocator;
@@ -140,5 +194,142 @@ pub const SubagentResult = struct {
             .{ .ignore_unknown_fields = true },
         );
         return .{ .value = value, .arena = arena };
+    }
+};
+
+/// ArtifactCollector — thread-local observer installed for a subagent's agent
+/// loop (Phase 3, Subagent Pass). It captures every `artifact_event` the
+/// subagent's `artifact_create`/`artifact_update` tools emit and accumulates
+/// them as owned `ArtifactRef`s. At completion, `refs()` is handed to the
+/// `SubagentResult` built for `completeTask`, which deep-copies the slice into
+/// the manager allocator (`dupeSubagentResult`) — so the collector can `deinit`
+/// safely after the handoff with no use-after-free across the thread→manager
+/// boundary.
+///
+/// Observer contract: this implements the real four-function `Observer.VTable`
+/// from observability.zig (`record_event` / `record_metric` / `flush` /
+/// `name`), exposed through the `.vtable` pointer form (NOT the simplified
+/// `{ ptr, record_event }` the plan sketched). `recordEvent` must be safe to
+/// call from multiple threads per the Observer contract — the internal
+/// `mutex` guards the list (the subagent agent loop can fan out to parallel
+/// workers that share this observer).
+///
+/// Chaining: if a previous tool observer is already installed when the
+/// collector goes in, pass it as `next` so each event is forwarded after
+/// capture and nothing that already worked (e.g. an SSE forwarder) breaks. In
+/// the common subagent case the previous observer is the runtime's noop, so
+/// `next` is typically null.
+pub const ArtifactCollector = struct {
+    allocator: std.mem.Allocator,
+    list: std.ArrayListUnmanaged(ArtifactRef) = .{},
+    mutex: std.Thread.Mutex = .{},
+    /// Optional downstream observer to forward events to after capturing.
+    next: ?observability.Observer = null,
+
+    const vtable = observability.Observer.VTable{
+        .record_event = recordEventThunk,
+        .record_metric = recordMetricThunk,
+        .flush = flushThunk,
+        .name = nameThunk,
+    };
+
+    pub fn init(allocator: std.mem.Allocator) ArtifactCollector {
+        return .{ .allocator = allocator };
+    }
+
+    /// Chain-aware constructor: capture, then forward to `next`.
+    pub fn initChained(allocator: std.mem.Allocator, next: ?observability.Observer) ArtifactCollector {
+        return .{ .allocator = allocator, .next = next };
+    }
+
+    pub fn deinit(self: *ArtifactCollector) void {
+        for (self.list.items) |r| {
+            self.allocator.free(r.id);
+            self.allocator.free(r.kind);
+            self.allocator.free(r.title);
+            self.allocator.free(r.url);
+        }
+        self.list.deinit(self.allocator);
+        self.list = .{};
+    }
+
+    pub fn observer(self: *ArtifactCollector) observability.Observer {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    /// Borrowed view of the captured refs. Valid until `deinit`. The caller
+    /// (completeTask) deep-copies these into the manager allocator.
+    pub fn refs(self: *ArtifactCollector) []const ArtifactRef {
+        return self.list.items;
+    }
+
+    fn recordEventThunk(ptr: *anyopaque, event: *const observability.ObserverEvent) void {
+        const self: *ArtifactCollector = @ptrCast(@alignCast(ptr));
+        switch (event.*) {
+            .artifact_event => |ae| {
+                // Only created/updated surface a user-visible artifact; ignore
+                // any other op (e.g. delete) so the parent never re-surfaces a
+                // removed artifact.
+                if (std.mem.eql(u8, ae.op, "created") or std.mem.eql(u8, ae.op, "updated")) {
+                    self.captureLocked(ae);
+                }
+            },
+            else => {},
+        }
+        // Chain: forward the untouched event downstream after capture so an
+        // already-installed observer keeps working.
+        if (self.next) |n| n.recordEvent(event);
+    }
+
+    fn captureLocked(self: *ArtifactCollector, ae: anytype) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        // Dupe every borrowed slice — the ObserverEvent payload is only valid
+        // for the duration of recordEvent (mirrors artifact_event lifetime).
+        const id = self.allocator.dupe(u8, ae.artifact_id) catch return;
+        errdefer self.allocator.free(id);
+        const kind = self.allocator.dupe(u8, ae.kind) catch {
+            self.allocator.free(id);
+            return;
+        };
+        errdefer self.allocator.free(kind);
+        const title = self.allocator.dupe(u8, ae.title) catch {
+            self.allocator.free(id);
+            self.allocator.free(kind);
+            return;
+        };
+        errdefer self.allocator.free(title);
+        const url = self.allocator.dupe(u8, ae.url) catch {
+            self.allocator.free(id);
+            self.allocator.free(kind);
+            self.allocator.free(title);
+            return;
+        };
+        self.list.append(self.allocator, .{
+            .id = id,
+            .kind = kind,
+            .title = title,
+            .url = url,
+            .version = ae.version,
+        }) catch {
+            self.allocator.free(id);
+            self.allocator.free(kind);
+            self.allocator.free(title);
+            self.allocator.free(url);
+        };
+    }
+
+    fn recordMetricThunk(ptr: *anyopaque, metric: *const observability.ObserverMetric) void {
+        const self: *ArtifactCollector = @ptrCast(@alignCast(ptr));
+        if (self.next) |n| n.recordMetric(metric);
+    }
+
+    fn flushThunk(ptr: *anyopaque) void {
+        const self: *ArtifactCollector = @ptrCast(@alignCast(ptr));
+        if (self.next) |n| n.flush();
+    }
+
+    fn nameThunk(_: *anyopaque) []const u8 {
+        return "subagent-artifact-collector";
     }
 };
