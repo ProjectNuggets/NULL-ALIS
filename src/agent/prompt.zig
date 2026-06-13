@@ -283,8 +283,7 @@ pub const PromptContext = struct {
     task_plan_block: ?[]const u8 = null,
     /// Phase 5 (Superpowers mode) — when true, the volatile prompt emits the
     /// coordinator section (see `buildCoordinatorSection`): you are the
-    /// coordinator, see the `coordinator` skill, run
-    /// plan→dispatch→review→synthesize→deliver. Set from
+    /// coordinator, run plan→dispatch→review→synthesize→deliver. Set from
     /// `agent.superpowers_mode` where this context is built
     /// (`context_engine.assemble`). Volatile (per-turn) because superpowers is
     /// a per-turn signal — a normal turn never emits it.
@@ -468,7 +467,7 @@ pub fn buildStableSystemPrompt(
 /// largest contributor and comes from memory_loader.loadTurnMemorySlot.
 /// Phase 5 (Superpowers mode) — the coordinator framing section. Emitted in
 /// the volatile block when `ctx.coordinator_mode` is set. One concise
-/// paragraph: you are the coordinator, see the `coordinator` skill, run
+/// paragraph: you are the coordinator, run
 /// plan→dispatch→review→synthesize→deliver. The detailed step-by-step
 /// playbook lives in the per-turn reflection prompt
 /// (`reflection_prompt_coordinator` in agent/root.zig); this section just
@@ -2030,8 +2029,8 @@ test "buildVolatileSystemPrompt emits coordinator section when coordinator_mode 
     });
     defer allocator.free(volatile_out);
 
-    // One concise paragraph: you are the coordinator, see the `coordinator`
-    // skill, run plan→dispatch→review→synthesize→deliver.
+    // One concise paragraph: you are the coordinator, run
+    // plan→dispatch→review→synthesize→deliver.
     try std.testing.expect(std.mem.indexOf(u8, volatile_out, "coordinator") != null);
     try std.testing.expect(std.mem.indexOf(u8, volatile_out, "Superpowers") != null);
     try std.testing.expect(std.mem.indexOf(u8, volatile_out, "synthesize") != null);
