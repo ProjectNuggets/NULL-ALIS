@@ -3550,6 +3550,10 @@ test "defaultMetadataRegistry only whitelists expected background_safe tools" {
         // store. Both are safe to run from a scheduled lane.
           "memory_doctor",
         "trace_query",
+        // Phase 4 fan-out — subagent_batch_result reads a batch's task results
+        // (read_only against the in-memory batch tracker); safe in a background/
+        // cron lane. spawn_many is NOT here (it mutates — spawns subagents).
+        "subagent_batch_result",
     };
 
     // Everything in the whitelist must be background_safe.
