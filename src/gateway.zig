@@ -32823,7 +32823,12 @@ const StopTestFixture = struct {
                 std.time.milliTimestamp()
             else
                 null,
-            .result = if (status == .completed) try alloc.dupe(u8, "done") else null,
+            // Phase 2: TaskState.result is a structured SubagentResult; only
+            // `text` is heap-owned (default empty slices are comptime &.{}).
+            .result = if (status == .completed)
+                subagent_mod.SubagentResultType{ .status = .completed, .text = try alloc.dupe(u8, "done") }
+            else
+                null,
         };
         try fx.mgr.tasks.put(alloc, numeric_id, state);
         // Mirror into the canonical ledger so getTaskSnapshot sees it.
