@@ -370,21 +370,44 @@ pub const SubagentManager = struct {
     }
 
 
-    /// Spawn a background subagent. Returns task_id immediately.
-    pub fn spawn(
+    // ── Phase 4 G2 types ────────────────────────────────────────────────────────
+
+    /// A single spec passed to spawnMany. The task and label slices are borrowed
+    /// from the caller and must remain valid until spawnMany returns.
+    pub const SpawnSpec = struct {
+        task: []const u8,
+        label: []const u8,
+    };
+
+    /// Return value of spawnMany. The caller owns batch_id and task_ids (both
+    /// allocator-owned) and must free them via the manager's allocator.
+    /// `requested` = len(specs) supplied; `task_ids.len` = how many actually
+    /// spawned (H8: may be < requested if a mid-loop failure occurred).
+    pub const BatchHandle = struct {
+        batch_id: []const u8,
+        task_ids: []u64,
+        requested: usize,
+    };
+
+    // ── Spawn implementation ─────────────────────────────────────────────────
+
+    /// H3 — Inner locked spawn. Assumes `self.mutex` is ALREADY HELD by the
+    /// caller; does NOT lock and does NOT check capacity (capacity must be
+    /// pre-checked before entering the batch loop). Sets `state.batch_id` to
+    /// a dupe of `batch_id` if non-null.
+    ///
+    /// `std.Thread.spawn` is safe to call under the lock: it does not touch
+    /// `self.mutex`; the spawned thread blocks in `markTaskRunning` trying to
+    /// acquire the same mutex, so it is parked until the caller releases it.
+    fn spawnInBatchLocked(
         self: *SubagentManager,
         task: []const u8,
         label: []const u8,
         request_session_key: []const u8,
         origin_channel: []const u8,
         origin_chat_id: []const u8,
+        batch_id: ?[]const u8,
     ) !u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.getRunningCountLocked() >= self.config.max_concurrent)
-            return error.TooManyConcurrentSubagents;
-
         const task_id = self.next_id;
         self.next_id += 1;
 
@@ -406,6 +429,10 @@ pub const SubagentManager = struct {
         errdefer self.allocator.free(state_channel);
         const state_chat = try self.allocator.dupe(u8, origin_chat_id);
         errdefer self.allocator.free(state_chat);
+        // Phase 4 — tag with batch membership if this is a fan-out task.
+        const state_batch_id: ?[]const u8 = if (batch_id) |b| try self.allocator.dupe(u8, b) else null;
+        errdefer if (state_batch_id) |b| self.allocator.free(b);
+
         const created_at = std.time.milliTimestamp();
         state.* = .{
             .status = .queued,
@@ -417,6 +444,7 @@ pub const SubagentManager = struct {
             .origin_channel = state_channel,
             .origin_chat_id = state_chat,
             .started_at = created_at,
+            .batch_id = state_batch_id,
         };
 
         try self.tasks.put(self.allocator, task_id, state);
@@ -438,7 +466,6 @@ pub const SubagentManager = struct {
         const origin_chat_copy = try self.allocator.dupe(u8, origin_chat_id);
         errdefer self.allocator.free(origin_chat_copy);
 
-        // Build thread context
         const ctx = try self.allocator.create(ThreadContext);
         errdefer self.allocator.destroy(ctx);
         ctx.* = .{
@@ -477,6 +504,119 @@ pub const SubagentManager = struct {
         }
 
         return task_id;
+    }
+
+    /// Return remaining subagent capacity for this manager (max_concurrent minus
+    /// currently queued/running). Clamped to 0 — never wraps. Caller must hold
+    /// `self.mutex`.
+    fn remainingCapacityLocked(self: *SubagentManager) u32 {
+        const running = self.getRunningCountLocked();
+        if (running >= self.config.max_concurrent) return 0;
+        return self.config.max_concurrent - running;
+    }
+
+    /// Spawn a background subagent. Returns task_id immediately.
+    /// Single-spawn public API — unchanged signature; delegates to
+    /// spawnInBatchLocked with null batch_id under a single lock acquisition.
+    pub fn spawn(
+        self: *SubagentManager,
+        task: []const u8,
+        label: []const u8,
+        request_session_key: []const u8,
+        origin_channel: []const u8,
+        origin_chat_id: []const u8,
+    ) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.getRunningCountLocked() >= self.config.max_concurrent)
+            return error.TooManyConcurrentSubagents;
+        return self.spawnInBatchLocked(task, label, request_session_key, origin_channel, origin_chat_id, null);
+    }
+
+    /// H3 — Fan out N subagents under a single batch.
+    ///
+    /// All-or-nothing capacity check: if specs.len > remainingCapacityLocked()
+    /// at the moment we enter the lock, we return error.TooManyConcurrentSubagents
+    /// and spawn NOTHING. The capacity check, the entire spawn loop, AND the
+    /// batch registration all run under ONE continuous mutex hold so no concurrent
+    /// spawnMany or spawn call can slip tasks in between the check and the spawns.
+    ///
+    /// H8 — partial-spawn note: if a mid-loop spawnInBatchLocked fails (OOM,
+    /// thread limit), we break and register the batch with however many tasks DID
+    /// spawn; BatchHandle.requested vs task_ids.len tells the caller how many were
+    /// actually created. On zero spawned we return error.SpawnFailed.
+    ///
+    /// Caller owns handle.batch_id and handle.task_ids; free both via the manager
+    /// allocator.
+    pub fn spawnMany(
+        self: *SubagentManager,
+        specs: []const SpawnSpec,
+        request_session_key: []const u8,
+        origin_channel: []const u8,
+        origin_chat_id: []const u8,
+        budget_ms: i64,
+    ) !BatchHandle {
+        if (specs.len == 0) return error.EmptyBatch;
+
+        const now = std.time.milliTimestamp();
+        var ids = std.ArrayListUnmanaged(u64){};
+        errdefer ids.deinit(self.allocator);
+
+        // batch_id is formatted into a stack buffer then duped into the allocator
+        // after the lock section to avoid holding a pointer into stack memory past
+        // the lock scope.
+        var idbuf: [64]u8 = undefined;
+        var batch_id_len: usize = 0;
+
+        {
+            // H3 — single lock: capacity check + spawn loop + batch register.
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            if (specs.len > self.remainingCapacityLocked())
+                return error.TooManyConcurrentSubagents;
+
+            // Use next_id (the monotonic spawn counter) as the sequence component
+            // so the batch_id is stable and unique within this manager's lifetime.
+            const seq = self.next_id;
+            const batch_id_local = try std.fmt.bufPrint(&idbuf, "batch:{d}:{d}", .{ seq, now });
+            batch_id_len = batch_id_local.len;
+
+            for (specs) |spec| {
+                const tid = self.spawnInBatchLocked(
+                    spec.task,
+                    spec.label,
+                    request_session_key,
+                    origin_channel,
+                    origin_chat_id,
+                    batch_id_local,
+                ) catch break; // H8: partial failure — register what did spawn
+                ids.append(self.allocator, tid) catch break;
+            }
+
+            if (ids.items.len > 0) {
+                // Register the batch in the tracker while still under the lock.
+                // On failure (OOM), log and continue — the tasks are spawned and
+                // will complete; the barrier just won't fire.
+                self.batches.register(
+                    batch_id_local,
+                    ids.items,
+                    request_session_key,
+                    now,
+                    now + budget_ms,
+                ) catch |err| log.warn("subagent: batch register failed: {}", .{err});
+            }
+        }
+
+        if (ids.items.len == 0) return error.SpawnFailed;
+
+        // Dupe the batch_id out of the stack buffer now that the lock is released.
+        const owned_batch_id = try self.allocator.dupe(u8, idbuf[0..batch_id_len]);
+        return BatchHandle{
+            .batch_id = owned_batch_id,
+            .task_ids = try ids.toOwnedSlice(self.allocator),
+            .requested = specs.len,
+        };
     }
 
     pub fn getTaskStatus(self: *SubagentManager, task_id: u64) ?TaskStatus {
@@ -3166,4 +3306,117 @@ fn spawnWhileLocked(
 
     state.thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, subagentThreadFn, .{ctx});
     return task_id;
+}
+
+// ── Phase 4 Group 2 tests (TDD — written before implementation) ───────────────
+
+test "spawnInBatch tags task with batch_id and registers" {
+    // spawnMany 1 spec → the task's TaskState.batch_id == the returned batch_id
+    // AND mgr.batches.batchOf(tid) == batch_id.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.completion_runner = immediateCompletionRunner;
+    defer mgr.deinit();
+
+    const specs = [_]SubagentManager.SpawnSpec{.{ .task = "research topic A", .label = "la" }};
+    const handle = try mgr.spawnMany(&specs, "agent:zaki-bot:user:1:main", "agent", "chat:1", 60_000);
+    defer {
+        std.testing.allocator.free(handle.batch_id);
+        std.testing.allocator.free(handle.task_ids);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), handle.task_ids.len);
+    try std.testing.expectEqual(@as(usize, 1), handle.requested);
+    const tid = handle.task_ids[0];
+
+    // task's batch_id field matches
+    mgr.mutex.lock();
+    const state = mgr.tasks.get(tid) orelse {
+        mgr.mutex.unlock();
+        return error.TestUnexpectedResult;
+    };
+    const task_bid = state.batch_id orelse {
+        mgr.mutex.unlock();
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqualStrings(handle.batch_id, task_bid);
+
+    // tracker index also maps tid → batch_id
+    const tracker_bid = mgr.batches.batchOf(tid) orelse {
+        mgr.mutex.unlock();
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqualStrings(handle.batch_id, tracker_bid);
+    mgr.mutex.unlock();
+}
+
+test "spawnMany fans out N under one batch within capacity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{ .max_concurrent = 8 });
+    mgr.completion_runner = immediateCompletionRunner;
+    defer mgr.deinit();
+
+    const specs = [_]SubagentManager.SpawnSpec{
+        .{ .task = "research A", .label = "la" },
+        .{ .task = "research B", .label = "lb" },
+        .{ .task = "research C", .label = "lc" },
+    };
+    const handle = try mgr.spawnMany(&specs, "agent:zaki-bot:user:2:main", "agent", "chat:2", 60_000);
+    defer {
+        std.testing.allocator.free(handle.batch_id);
+        std.testing.allocator.free(handle.task_ids);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), handle.task_ids.len);
+    try std.testing.expectEqual(@as(usize, 3), handle.requested);
+
+    // All task_ids share the same batch_id; tracker knows all 3
+    mgr.mutex.lock();
+    defer mgr.mutex.unlock();
+    const tracker_tids = mgr.batches.taskIds(handle.batch_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 3), tracker_tids.len);
+
+    for (handle.task_ids) |tid| {
+        const st = mgr.tasks.get(tid) orelse return error.TestUnexpectedResult;
+        const bid = st.batch_id orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(handle.batch_id, bid);
+    }
+}
+
+test "spawnMany rejects when N > remaining capacity (all-or-nothing, no partial)" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{ .max_concurrent = 2 });
+    mgr.completion_runner = immediateCompletionRunner;
+    defer mgr.deinit();
+
+    const specs = [_]SubagentManager.SpawnSpec{
+        .{ .task = "A", .label = "la" },
+        .{ .task = "B", .label = "lb" },
+        .{ .task = "C", .label = "lc" }, // exceeds max_concurrent=2
+    };
+    const result = mgr.spawnMany(&specs, "agent:zaki-bot:user:3:main", "agent", "chat:3", 60_000);
+    try std.testing.expectError(error.TooManyConcurrentSubagents, result);
+
+    // No tasks should have been spawned (running count unchanged = 0)
+    try std.testing.expectEqual(@as(u32, 0), mgr.getRunningCount());
 }
