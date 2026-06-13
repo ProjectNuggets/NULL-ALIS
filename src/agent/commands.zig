@@ -180,42 +180,30 @@ fn deriveSessionEndEntityKey(allocator: std.mem.Allocator, object: []const u8) !
 /// P2 (memory-phase-0.5) — derive a stable, content-addressed key for a
 /// session-end durable fact.
 ///
-/// Keying strategy:
-///   - Structured triple (subject/predicate/object all present): delegate to
-///     `extraction_persist.deriveExtractionKey` which SHA-256-hashes
-///     `lower(subject)|UPPER(predicate)|lower(object)`.  This produces the
-///     same `extracted_<hex>` key that Pass-C extraction uses, so repeat
-///     sessions stating the same triple collapse to ONE row.
-///   - Prose-only fact (any triple field absent): key as
-///     `durable_fact/<sha256_hex(content)[0..16]>` — a 64-bit content hash
-///     that deduplicates identical prose across sessions without requiring
-///     structured parsing.
+/// ALL facts (triple or prose) produce `durable_fact/<sha256_hex(content)[0..32]>`.
+/// Using the first 16 bytes (128-bit) of SHA-256 as a 32 hex-char suffix,
+/// matching the `deriveSessionEndEntityKey` pattern above.
 ///
-/// Both paths replace the old `durable_fact/{now_s}/{idx}` scheme, which
-/// minted a fresh row per session regardless of content (the root cause of
-/// the "3× SaaS product" duplication symptom).
+/// This preserves byte-for-byte identical classification vs the original
+/// timestamp-keyed scheme: `durable_fact/` is listed in
+/// `isSystemManagedMemoryKey` and matched by `propagateCorrection`, so
+/// edit-protection and correction propagation are unchanged.
+///
+/// Cross-writer dedup with Pass-C `extracted_` keys is intentionally deferred
+/// to the Phase-1 semantic-merge work — we keep one canonical `durable_fact/`
+/// row here.
 fn deriveDurableFactKey(
     allocator: std.mem.Allocator,
-    fact: anytype,
+    fact: *const memory_mod.summarizer.ExtractedFact,
 ) ![]u8 {
-    if (fact.hasTriple()) {
-        // Triple path: reuse extraction_persist canonical key so this row
-        // collides with (and upserts) any extracted_<hash> row from Pass-C.
-        return extraction_persist.deriveExtractionKey(
-            allocator,
-            fact.subject.?,
-            fact.predicate.?,
-            fact.object.?,
-        );
-    }
-    // Prose path: SHA-256 of raw content, first 8 bytes as hex (16 hex chars).
+    // SHA-256 of raw content; first 16 bytes → 32 hex chars (128-bit dedup).
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(fact.content);
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
-    var hex_buf: [16]u8 = undefined;
+    var hex_buf: [32]u8 = undefined;
     const hex_chars = "0123456789abcdef";
-    for (digest[0..8], 0..) |b, i| {
+    for (digest[0..16], 0..) |b, i| {
         hex_buf[i * 2] = hex_chars[b >> 4];
         hex_buf[i * 2 + 1] = hex_chars[b & 0x0f];
     }
@@ -5646,30 +5634,19 @@ test "P1-6 audit: ttl_recycle is non-interactive — inline boundary extraction 
 
 // P2 (memory-phase-0.5) — content-keyed durable_fact derivation tests.
 //
-// Verifies three invariants:
-//   1. Two prose facts with IDENTICAL content → same key (dedup fires).
-//   2. Two prose facts with DIFFERENT content → different keys.
-//   3. A structured triple fact → key is `extracted_<hex>` (triple path).
-//
-// Uses a minimal anonymous struct that satisfies the `anytype` duck type
-// expected by deriveDurableFactKey (hasTriple / content / subject /
-// predicate / object).
-test "P2: prose facts with identical content produce the same durable_fact key" {
+// Verifies three invariants using real ExtractedFact values (no duck-typing):
+//   1. Two facts with IDENTICAL content → same key (dedup fires).
+//   2. Two facts with DIFFERENT content → different keys.
+//   3. A structured triple fact ALSO gets a `durable_fact/` key — classification
+//      is preserved; cross-writer dedup with extracted_ is Phase-1 work.
+
+test "P2: identical content produces the same durable_fact key" {
     const allocator = std.testing.allocator;
+    const EF = memory_mod.summarizer.ExtractedFact;
 
-    const FakeFact = struct {
-        content: []const u8,
-        subject: ?[]const u8 = null,
-        predicate: ?[]const u8 = null,
-        object: ?[]const u8 = null,
-        pub fn hasTriple(self: *const @This()) bool {
-            return self.subject != null and self.predicate != null and self.object != null;
-        }
-    };
-
-    const fact_a = FakeFact{ .content = "User prefers dark mode" };
-    const fact_b = FakeFact{ .content = "User prefers dark mode" };
-    const fact_c = FakeFact{ .content = "User dislikes Comic Sans" };
+    const fact_a = EF{ .key = "", .content = "User prefers dark mode", .category = .core };
+    const fact_b = EF{ .key = "", .content = "User prefers dark mode", .category = .core };
+    const fact_c = EF{ .key = "", .content = "User dislikes Comic Sans", .category = .core };
 
     const key_a = try deriveDurableFactKey(allocator, &fact_a);
     defer allocator.free(key_a);
@@ -5682,25 +5659,19 @@ test "P2: prose facts with identical content produce the same durable_fact key" 
     try std.testing.expectEqualStrings(key_a, key_b);
     // Different content → different keys.
     try std.testing.expect(!std.mem.eql(u8, key_a, key_c));
-    // Prose path produces `durable_fact/<hex>` prefix.
+    // Always produces `durable_fact/<hex>` prefix — classification preserved.
     try std.testing.expect(std.mem.startsWith(u8, key_a, "durable_fact/"));
 }
 
-test "P2: triple fact uses extraction_persist canonical key (extracted_ prefix)" {
+test "P2: triple fact also gets a durable_fact/ key (no classification change)" {
     const allocator = std.testing.allocator;
+    const EF = memory_mod.summarizer.ExtractedFact;
 
-    const FakeFact = struct {
-        content: []const u8,
-        subject: ?[]const u8 = null,
-        predicate: ?[]const u8 = null,
-        object: ?[]const u8 = null,
-        pub fn hasTriple(self: *const @This()) bool {
-            return self.subject != null and self.predicate != null and self.object != null;
-        }
-    };
-
-    const triple_fact = FakeFact{
+    // A structured triple — all three triple fields present.
+    const triple_fact = EF{
+        .key = "",
         .content = "User likes Zig",
+        .category = .core,
         .subject = "user",
         .predicate = "LIKES",
         .object = "Zig",
@@ -5709,11 +5680,7 @@ test "P2: triple fact uses extraction_persist canonical key (extracted_ prefix)"
     const key = try deriveDurableFactKey(allocator, &triple_fact);
     defer allocator.free(key);
 
-    // Triple path must produce the extracted_<hex> shape.
-    try std.testing.expect(std.mem.startsWith(u8, key, "extracted_"));
-
-    // Must match extraction_persist.deriveExtractionKey directly.
-    const canonical = try extraction_persist.deriveExtractionKey(allocator, "user", "LIKES", "Zig");
-    defer allocator.free(canonical);
-    try std.testing.expectEqualStrings(canonical, key);
+    // Triple facts must ALSO produce the durable_fact/ prefix — not extracted_.
+    // Cross-writer dedup with Pass-C extracted_ keys is deferred to Phase-1.
+    try std.testing.expect(std.mem.startsWith(u8, key, "durable_fact/"));
 }
