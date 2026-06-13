@@ -113,6 +113,8 @@ test "superpowers reasoning maps to coordinator + high effort" {
 
 ## Task 4 — The `coordinator` SKILL (teach the orchestration discipline)
 
+> **⏸️ DEFERRED (2026-06-13) → its own work package: `CARRY-FORWARD-loadable-skills-and-skill-author.md`.** Superpowers v1 ships without a skill *file*: the coordinator behavior is compiled-in (Task 2's prompt section + reflection + `.coordinator` mode). Shipping a *loadable* shared skill file needs entrypoint PVC-seeding (HOME=/data is a PVC mount → image-bake is shadowed) — a boot-path/cross-repo change. The "See the coordinator skill" pointer was removed from the Task 2 prompts in v1 to avoid a dangling reference; restore it when the file ships.
+
 **Files:** Create the skill in the engine's shared skills location so every tenant gets it: `~/.nullalis/skills/coordinator/skill.json` + `SKILL.md`, OR (preferred for GitOps) embed it as an operator-provisioned skill the chart/image ships. Verify how shared skills are provisioned (image bake vs `~/.nullalis/skills`); pick the one that deploys via the existing pipeline. Test: a skills-loading test that the `coordinator` skill is discoverable.
 
 - [ ] **Step 1: Failing test** — `listSkillsMerged` (or the prompt skills section) includes a skill named `coordinator` when the skill dir is present (mirror an existing skills test).
@@ -174,6 +176,8 @@ subagents, not to do the grunt work yourself.
 ---
 
 ## Task 5 (stretch) — `skill_author` tool: let the agent create skills
+
+> **⏸️ DEFERRED (2026-06-13) → `CARRY-FORWARD-loadable-skills-and-skill-author.md`** (bundled with Task 4's loadable-skill work package).
 
 **Files:** Create `src/tools/skill_author.zig`; register (main profile; available in coordinator mode). Test: inline.
 

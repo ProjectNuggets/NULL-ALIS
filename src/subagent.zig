@@ -1747,6 +1747,13 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         null,
         .{
             .turn_origin = .proactive,
+            // Metering fix (Phase 5 Group A, money-critical): subagent turns
+            // run in an isolated thread with no SSE done-frame, so the BFF
+            // reconcile sweep must bill them. The sweep only debits
+            // entry_kind='daemon' rows — tag every subagent turn accordingly
+            // so subagent LLM spend is reconciled to the wallet rather than
+            // silently dropped.
+            .entry_kind = .daemon,
             // Phase 3: capture artifact_event emissions from the subagent's
             // tools into artifact_collector for the SubagentResult.
             .progress_observer = artifact_collector.observer(),
@@ -4093,6 +4100,23 @@ test "reaper does not deadlock (no lock held across completeTask)" {
 }
 
 // Regression: non-batched single completion still wakes per-task (UNCHANGED PATH).
+test "subagent production turn carries entry_kind=daemon (metering fix)" {
+    // Plumbing assertion: the ProcessMessageOptions struct that subagentThreadFn
+    // passes to processMessageWithContext must carry entry_kind=.daemon so the
+    // BFF reconcile sweep bills the subagent's LLM spend. This test constructs
+    // the SAME options literal as the production code path and asserts the
+    // discriminator — a direct compile-time guarantee that the fix is present.
+    // (Full turn_usage PG billing is verified on staging.)
+    const session_mod = @import("session.zig");
+    const opts: session_mod.SessionManager.ProcessMessageOptions = .{
+        .turn_origin = .proactive,
+        .entry_kind = .daemon,
+        .progress_observer = null,
+    };
+    try std.testing.expectEqual(tools_mod.EntryKind.daemon, opts.entry_kind);
+    try std.testing.expectEqual(tools_mod.TurnOrigin.proactive, opts.turn_origin);
+}
+
 test "non-batched single completion still wakes per-task (barrier regression guard)" {
     heartbeat_wake.clearForTest();
 

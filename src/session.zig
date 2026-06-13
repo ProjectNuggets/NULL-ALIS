@@ -48,6 +48,30 @@ const SESSION_IDLE_CONTEXT_THRESHOLD_SECS: u64 = 5 * 60;
 /// protection; this constant is a hard runtime ceiling.
 const MAX_SESSIONS_PER_USER: usize = 200;
 
+/// Phase 5 (Superpowers mode) — resolve the effective per-turn execution mode
+/// override.
+///
+/// Returns the mode to APPLY to the session for this turn, or `null` to leave
+/// the session's current mode untouched.
+///
+///   - An explicit `turn_execution_mode` from the FE always wins (we never
+///     silently override a user-chosen mode like /plan or /review).
+///   - Otherwise, a Superpowers turn (`turn_superpowers_mode == true`) runs as
+///     the `.coordinator` — this is the heart of Superpowers mode.
+///   - Otherwise, no override (`null`).
+///
+/// This is intentionally a pure function so the safety-critical
+/// "superpowers ⇒ coordinator, unless overridden" decision is unit-testable
+/// without standing up a full turn.
+fn resolveTurnExecutionMode(
+    turn_execution_mode: ?ExecutionMode,
+    turn_superpowers_mode: bool,
+) ?ExecutionMode {
+    if (turn_execution_mode) |mode| return mode;
+    if (turn_superpowers_mode) return .coordinator;
+    return null;
+}
+
 const DEFAULT_QUEUE_DROP_MESSAGE = "Queue policy dropped this queued turn.";
 const QUEUE_NEWEST_DROP_MESSAGE = "Queue overflow: dropped newest queued turn.";
 const QUEUE_SUMMARIZE_DROP_MESSAGE = "Queue overflow: dropped and coalesced queued turns. Please resend your latest request.";
@@ -280,6 +304,11 @@ pub const SessionManager = struct {
         turn_execution_mode: ?ExecutionMode = null,
         turn_autonomy: ?AutonomyLevel = null,
         turn_reasoning_effort: ?[]const u8 = null,
+        /// Phase 5 (Superpowers mode) — true when the FE sent
+        /// reasoning_effort="superpowers". Activates coordinator mode on the
+        /// agent for this turn; restored to false on defer (same pattern as
+        /// turn_reasoning_effort / turn_execution_mode).
+        turn_superpowers_mode: bool = false,
     };
 
     pub const OriginSnapshot = struct {
@@ -1071,6 +1100,10 @@ pub const SessionManager = struct {
             .session_key = session_key,
             .provider = session.agent.default_provider,
             .model = session.agent.model_name,
+            // Phase 5 T3 — propagate the per-turn Superpowers flag to tools.
+            // The fan-out tools (spawn_many / subagent_batch_result) self-gate
+            // on this; a non-Superpowers turn cannot fan out.
+            .superpowers_mode = options.turn_superpowers_mode,
         });
         defer tools_mod.clearTurnContext();
 
@@ -1129,14 +1162,31 @@ pub const SessionManager = struct {
 
         const previous_execution_mode = session.agent.execution_mode;
         const previous_reasoning_effort = session.agent.reasoning_effort;
+        const previous_superpowers_mode = session.agent.superpowers_mode;
         const previous_policy = session.agent.policy;
         var turn_policy = if (session.agent.policy) |policy| policy.* else SecurityPolicy{};
         var turn_policy_applied = false;
-        if (options.turn_execution_mode) |mode| {
+        // Phase 5 (Superpowers mode): resolve the effective execution mode for
+        // this turn. An explicit FE override wins; otherwise a Superpowers turn
+        // runs as `.coordinator`. `null` means "leave the session's mode as-is".
+        // Restored on defer so the session reverts after the turn completes.
+        const effective_execution_mode = resolveTurnExecutionMode(
+            options.turn_execution_mode,
+            options.turn_superpowers_mode,
+        );
+        if (effective_execution_mode) |mode| {
             session.agent.execution_mode = mode;
         }
         if (options.turn_reasoning_effort) |effort| {
             session.agent.reasoning_effort = effort;
+        }
+        // Phase 5 (Superpowers mode): activate coordinator mode for this turn
+        // when the FE sent reasoning_effort="superpowers". Restored on defer so
+        // the session reverts to the previous value after the turn completes.
+        // The fan-out tools (spawn_many / subagent_batch_result) self-gate on
+        // this flag — a non-superpowers turn cannot fan out (Phase 5 T3).
+        if (options.turn_superpowers_mode) {
+            session.agent.superpowers_mode = true;
         }
         if (options.turn_autonomy) |autonomy| {
             turn_policy.autonomy = autonomy;
@@ -1144,11 +1194,14 @@ pub const SessionManager = struct {
             turn_policy_applied = true;
         }
         defer {
-            if (options.turn_execution_mode != null) {
+            if (effective_execution_mode != null) {
                 session.agent.execution_mode = previous_execution_mode;
             }
             if (options.turn_reasoning_effort != null) {
                 session.agent.reasoning_effort = previous_reasoning_effort;
+            }
+            if (options.turn_superpowers_mode) {
+                session.agent.superpowers_mode = previous_superpowers_mode;
             }
             if (turn_policy_applied) {
                 session.agent.policy = previous_policy;
@@ -1745,6 +1798,45 @@ fn testConfig() Config {
         .default_model = "test/mock-model",
         .allocator = testing.allocator,
     };
+}
+
+// ---------------------------------------------------------------------------
+// 0. Phase 5 (Superpowers mode) — per-turn coordinator mode resolution
+// ---------------------------------------------------------------------------
+
+test "resolveTurnExecutionMode: superpowers with no override → coordinator" {
+    // The heart of Superpowers mode: a superpowers turn that gave no explicit
+    // mode runs as the coordinator.
+    try testing.expectEqual(
+        @as(?ExecutionMode, .coordinator),
+        resolveTurnExecutionMode(null, true),
+    );
+}
+
+test "resolveTurnExecutionMode: explicit override wins over superpowers" {
+    // An explicit execution_mode from the FE always takes precedence — we
+    // never silently override a user-chosen mode.
+    try testing.expectEqual(
+        @as(?ExecutionMode, .review),
+        resolveTurnExecutionMode(.review, true),
+    );
+    try testing.expectEqual(
+        @as(?ExecutionMode, .plan),
+        resolveTurnExecutionMode(.plan, true),
+    );
+}
+
+test "resolveTurnExecutionMode: no superpowers → respects override or leaves unchanged" {
+    // Not a superpowers turn: forward the explicit override (or null to leave
+    // the session's current mode untouched). NEVER coordinator.
+    try testing.expectEqual(
+        @as(?ExecutionMode, null),
+        resolveTurnExecutionMode(null, false),
+    );
+    try testing.expectEqual(
+        @as(?ExecutionMode, .execute),
+        resolveTurnExecutionMode(.execute, false),
+    );
 }
 
 // ---------------------------------------------------------------------------

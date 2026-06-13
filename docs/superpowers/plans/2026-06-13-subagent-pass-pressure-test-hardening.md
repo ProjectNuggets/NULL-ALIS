@@ -97,13 +97,15 @@ Remove the "flat 5× on the parent" tier. Superpowers cost = the parent turn (me
 ### D2 — Toggle-only (no entitlement gate)
 Do NOT add a paid-tier entitlement check. Any user can send `reasoning_effort="superpowers"`. The financial safety is the reserve gate (D3), not a tier gate.
 
-### D3 — Fan-out RESERVE gate (the hard cut) [Critical]
-Before `spawn_many` actually spawns, **reserve** estimated credits on the wallet:
-- estimate = N × (typical subagent turn cost) — use a configurable per-subagent estimate (or a recent-average). 
-- Call the existing wallet **reserve gate** (the one parent turns use — T13 "wallet reserve gate") for the batch reserve. If balance < reserve → `spawn_many` REFUSES with a 402-style result → the agent surfaces the **#51 paywall card** ("top up / upgrade to run Superpowers").
-- On batch completion, **settle** the actual subagent cost against the reserve (release unused / debit actual). 
-- This is the hard cut: no spawn without an upfront reserve; bounded overage = at most one in-flight fan-out; the next turn's gate catches a depleted balance.
-- TDD: insufficient balance → spawn_many refused (no subagents spawned) + a paywall-card signal; sufficient → reserve held, subagents run, settle on completion.
+### D3 — Fan-out cost gate = BOUNDED-OVERAGE (LOCKED 2026-06-12)
+**Decision (owner):** Bounded-overage, NOT a pre-spawn reserve. Recon finding: the **engine has zero wallet access** — the reserve gate is entirely BFF-side, *before* the turn. A true pre-spawn reserve would need a new engine↔BFF reserve round-trip (a real architecture change / own workstream). Rejected for v1.
+
+**How bounded-overage delivers the hard cut with NO new engine code** (all three pieces already exist):
+1. **Subagents are billed** — the metering fix (this doc, above) tags subagent turns `entry_kind=.daemon`, so the BFF reconcile sweep debits them.
+2. **Force-debit even into negative** — the reconcile sweep already uses `reserveUnits(allowOverdraw=true)` (agent-usage-reconcile.js), so a fan-out that overruns the balance still settles (the cost is never leaked).
+3. **Hard cut at the NEXT turn** — the existing per-turn reserve gate (T13, BFF) refuses the next turn with 429 → the **#51 paywall card** once the balance is depleted.
+
+**Net:** cost is always captured; max overspend = **one in-flight fan-out**; the cut lands at the next turn. The only gap vs a strict pre-spawn cut is that one bounded fan-out. A true pre-spawn reserve is a documented future hardening (needs engine↔BFF reserve). **No `spawn_many` reserve-gate task in the Phase 5 build** — D3 is satisfied by Group A's metering fix + existing BFF infra. The coordinator SKILL (D4) must be transparent that Superpowers burns real credits and can hit the paywall.
 
 ### D4 — Coordinator skill: add the polling-fallback (H5)
 The `coordinator` SKILL.md (Phase 5 Task 4) must include: "Results normally arrive together as one batch wake. If they don't arrive promptly (e.g. after a restart), call `subagent_batch_result(batch_id)` to collect — never block indefinitely." (Resolves the restart-hang risk.)

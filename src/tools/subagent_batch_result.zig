@@ -1,7 +1,9 @@
 //! subagent_batch_result tool — collect results for a fan-out batch by id.
 //!
-//! Gated off-by-default: registered only when `opts.fanout_enabled = true`
-//! AND `opts.tool_profile == .main`. Excluded from subagentTools() — depth guard.
+//! Registered in the MAIN profile when multiagent is enabled, then SELF-GATED
+//! at execute() to ⚡ Superpowers turns (paired with spawn_many — a batch only
+//! exists if it was spawned on a Superpowers turn). Excluded from
+//! subagentTools() — depth guard.
 //!
 //! H7: returns a clear error when the batch is unknown or expired.
 
@@ -22,7 +24,7 @@ pub const SubagentBatchResultTool = struct {
     pub const tool_name = "subagent_batch_result";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Collect all task results for a fan-out batch by batch_id; returns survivors, failures, and timeouts.",
+        .what = "Superpowers-only: collect all results for a fan-out batch (survivors, failures, timeouts).",
         .use_when = &.{
             "after spawn_many when you want to poll for results rather than waiting for the system-message delivery",
             "after a restart when the batch wake may have been missed and you need to recover results",
@@ -38,7 +40,7 @@ pub const SubagentBatchResultTool = struct {
     }
 
     pub const tool_description =
-        "Collect all results for a batch spawned by spawn_many. " ++
+        "⚡ Superpowers mode only. Collect all results for a batch spawned by spawn_many. " ++
         "Returns a JSON array with one entry per task: {task_id, status, text, error}. " ++
         "Includes tasks in any state (completed, failed, timeout, still running). " ++
         "H7: if the batch_id is unknown or expired, returns a clear error.";
@@ -57,6 +59,14 @@ pub const SubagentBatchResultTool = struct {
     }
 
     pub fn execute(self: *SubagentBatchResultTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+        // Phase 5 T3 — Superpowers self-gate (SAFETY INVARIANT). Paired with
+        // spawn_many: a batch only exists if it was spawned on a Superpowers
+        // turn, so collecting one is a Superpowers-only capability too. Runs
+        // FIRST — a non-Superpowers turn can never reach the batch tracker.
+        if (!root.getTurnContext().superpowers_mode) {
+            return ToolResult.fail("subagent_batch_result is only available in ⚡ Superpowers mode — enable it from the reasoning toggle.");
+        }
+
         // Parse batch_id before manager check so parameter errors are clear.
         const batch_id = root.getString(args, "batch_id") orelse
             return ToolResult.fail("Missing 'batch_id' parameter");
@@ -136,6 +146,9 @@ test "subagent_batch_result schema contains batch_id" {
 }
 
 test "subagent_batch_result missing batch_id" {
+    // Run as a Superpowers turn so we exercise arg validation past the T3 gate.
+    root.setTurnContext(.{ .superpowers_mode = true });
+    defer root.clearTurnContext();
     var sbt = SubagentBatchResultTool{};
     const t = sbt.tool();
     const parsed = try root.parseTestArgs("{}");
@@ -146,6 +159,8 @@ test "subagent_batch_result missing batch_id" {
 }
 
 test "subagent_batch_result without manager fails" {
+    root.setTurnContext(.{ .superpowers_mode = true });
+    defer root.clearTurnContext();
     var sbt = SubagentBatchResultTool{};
     const t = sbt.tool();
     const parsed = try root.parseTestArgs("{\"batch_id\":\"batch:1:0\"}");
@@ -165,6 +180,9 @@ test "subagent_batch_result H7 — unknown batch_id returns clear error" {
     };
     var manager = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
     defer manager.deinit();
+
+    root.setTurnContext(.{ .superpowers_mode = true });
+    defer root.clearTurnContext();
 
     var sbt = SubagentBatchResultTool{ .manager = &manager };
     const t = sbt.tool();
@@ -203,6 +221,10 @@ test "subagent_batch_result returns JSON array for known batch" {
         std.testing.allocator.free(handle.task_ids);
     }
 
+    // Phase 5 T3 — collecting a fan-out batch is a Superpowers-only capability.
+    root.setTurnContext(.{ .superpowers_mode = true });
+    defer root.clearTurnContext();
+
     var sbt = SubagentBatchResultTool{ .manager = &manager };
     const t = sbt.tool();
 
@@ -220,4 +242,57 @@ test "subagent_batch_result returns JSON array for known batch" {
     try std.testing.expect(result.output[0] == '[');
     try std.testing.expect(std.mem.indexOf(u8, result.output, "task_id") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "status") != null);
+}
+
+// ── Phase 5 T3 — Superpowers self-gate (SAFETY INVARIANT) ────────────────────
+
+test "subagent_batch_result refuses on a non-Superpowers turn" {
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    // Default turn context: superpowers_mode = false → a normal turn.
+    root.setTurnContext(.{ .superpowers_mode = false });
+    defer root.clearTurnContext();
+
+    var sbt = SubagentBatchResultTool{ .manager = &manager };
+    const t = sbt.tool();
+    const parsed = try root.parseTestArgs("{\"batch_id\":\"batch:1:0\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    // The refusal uses ToolResult.fail — a static error_msg (do NOT free).
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Superpowers mode") != null);
+}
+
+test "subagent_batch_result proceeds on a Superpowers turn" {
+    // Superpowers turn + unknown batch → it gets PAST the gate and reaches the
+    // H7 unknown-batch path (proves the gate let it through).
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    root.setTurnContext(.{ .superpowers_mode = true });
+    defer root.clearTurnContext();
+
+    var sbt = SubagentBatchResultTool{ .manager = &manager };
+    const t = sbt.tool();
+    const parsed = try root.parseTestArgs("{\"batch_id\":\"batch:9999:never\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |em| std.testing.allocator.free(em);
+
+    try std.testing.expect(!result.success);
+    // Past the gate: the failure is the H7 unknown-batch error, NOT the gate.
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Superpowers mode") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "batch:9999:never") != null);
 }
