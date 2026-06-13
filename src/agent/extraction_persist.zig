@@ -577,28 +577,101 @@ fn buildExtractionMetadata(
     return buf.toOwnedSlice(allocator);
 }
 
-/// V1.7a-5 (spec seam 3) — map an extraction-time `predicate` (the SVO
-/// triple verb, e.g. PREFERS, REPLACES, USED_FOR) to its high-level
-/// `LinkType` category for FE rendering + agent-side reasoning.
+/// P9 (memory-phase-0.5) — UNIFIED predicate classification.
 ///
-/// The mapping is OPINIONATED but conservative: predicates we recognize
-/// route to specific categories; unrecognized predicates default to
-/// `.attribute` (the broadest category) AND log an info so production
-/// telemetry surfaces gaps in our vocabulary. Adding a new predicate
-/// to a category is a one-line patch in this function.
+/// Historically two disjoint allowlists classified the same `predicate`:
+///   - `predicateToSlotType` → working-memory `SlotType` string (or null)
+///   - `linkTypeForPredicate` → high-level `LinkType` category
+/// They were separate functions that could silently disagree (e.g. a
+/// predicate gaining a slot_type but never a matching link_type, or vice
+/// versa). `classifyPredicate` is the single source of truth that returns
+/// BOTH signals from ONE pass; the two legacy functions now delegate here
+/// so the maps can never drift apart again.
 ///
-/// Single source of truth — every extraction write routes through here.
-/// Comparison is case-INsensitive on ASCII so `"PREFERS"`, `"prefers"`,
-/// and `"Prefers"` all map identically.
-pub fn linkTypeForPredicate(predicate: []const u8) memory_root.LinkType {
-    // Normalize to uppercase for compare. Bounded buffer matches longest
-    // expected predicate (~32 chars; predicates with COMPLEX_NAMES_LIKE_THIS
-    // top out around 24 chars in practice). Longer → fall through to default.
+/// NOTE — name disambiguation: this is DISTINCT from
+/// `edge_resolution.classifyPredicate`, which returns a
+/// `PredicateCardinality` (set-valued vs single-valued) for the judge
+/// fast-path. Different concern, different return type; both names are
+/// qualified at every call site.
+///
+/// Behavior contract (must remain byte-for-byte identical to the two
+/// legacy maps):
+///   - `slot_type` is matched case-INsensitively with NO length cap
+///     (mirrors the old `predicateToSlotType`, which used
+///     `std.ascii.eqlIgnoreCase` directly). null = no WM-slot promotion.
+///   - `link_type` is matched case-INsensitively via an uppercase
+///     normalize into a bounded 64-byte buffer; predicates longer than
+///     the buffer fall through to `.attribute` (mirrors the old
+///     `linkTypeForPredicate`). Default for any unrecognized predicate is
+///     `.attribute`.
+///
+/// This function does NOT log — logging (the `extraction.linktype_map_default`
+/// info on oversize / default) is preserved by the `linkTypeForPredicate`
+/// wrapper so production telemetry is unchanged.
+pub const PredicateClass = struct {
+    /// Working-memory slot type (a `working_memory.SlotType.*` string), or
+    /// null when the predicate does not warrant WM promotion.
+    slot_type: ?[]const u8,
+    /// High-level relationship category for the memory's entity edge.
+    link_type: memory_root.LinkType,
+};
+
+pub fn classifyPredicate(predicate: []const u8) PredicateClass {
+    return .{
+        .slot_type = slotTypeForPredicate(predicate),
+        .link_type = linkTypeForPredicateInner(predicate),
+    };
+}
+
+/// Pure slot-type lookup — no length cap, case-insensitive. Extracted from
+/// the legacy `predicateToSlotType` body so `classifyPredicate` and the
+/// `predicateToSlotType` wrapper share ONE allowlist.
+fn slotTypeForPredicate(predicate: []const u8) ?[]const u8 {
+    // Open loops — pending actions the user mentioned.
+    if (std.ascii.eqlIgnoreCase(predicate, "TODO")) return working_memory.SlotType.open_loop;
+    if (std.ascii.eqlIgnoreCase(predicate, "WILL_DO")) return working_memory.SlotType.open_loop;
+    if (std.ascii.eqlIgnoreCase(predicate, "REMINDS_ME_TO")) return working_memory.SlotType.open_loop;
+    if (std.ascii.eqlIgnoreCase(predicate, "NEEDS_TO")) return working_memory.SlotType.open_loop;
+    if (std.ascii.eqlIgnoreCase(predicate, "PROMISED")) return working_memory.SlotType.open_loop;
+    if (std.ascii.eqlIgnoreCase(predicate, "OPEN_LOOP")) return working_memory.SlotType.open_loop;
+
+    // Active goals — current projects / objectives.
+    if (std.ascii.eqlIgnoreCase(predicate, "WORKING_ON")) return working_memory.SlotType.active_goal;
+    if (std.ascii.eqlIgnoreCase(predicate, "BUILDING")) return working_memory.SlotType.active_goal;
+    if (std.ascii.eqlIgnoreCase(predicate, "GOAL")) return working_memory.SlotType.active_goal;
+    if (std.ascii.eqlIgnoreCase(predicate, "FOCUSING_ON")) return working_memory.SlotType.active_goal;
+    if (std.ascii.eqlIgnoreCase(predicate, "WANTS_TO_FINISH")) return working_memory.SlotType.active_goal;
+
+    // Decisions — committed choices.
+    if (std.ascii.eqlIgnoreCase(predicate, "DECIDED")) return working_memory.SlotType.decision;
+    if (std.ascii.eqlIgnoreCase(predicate, "CHOSE")) return working_memory.SlotType.decision;
+    if (std.ascii.eqlIgnoreCase(predicate, "PICKED")) return working_memory.SlotType.decision;
+
+    // Emotional state.
+    if (std.ascii.eqlIgnoreCase(predicate, "FEELS")) return working_memory.SlotType.emotional;
+    if (std.ascii.eqlIgnoreCase(predicate, "MENTAL_STATE")) return working_memory.SlotType.emotional;
+    if (std.ascii.eqlIgnoreCase(predicate, "STRESSED_ABOUT")) return working_memory.SlotType.emotional;
+
+    // Open questions.
+    if (std.ascii.eqlIgnoreCase(predicate, "ASKING")) return working_memory.SlotType.open_question;
+    if (std.ascii.eqlIgnoreCase(predicate, "WONDERING")) return working_memory.SlotType.open_question;
+
+    // Temporal events.
+    if (std.ascii.eqlIgnoreCase(predicate, "HAPPENS_ON")) return working_memory.SlotType.temporal;
+    if (std.ascii.eqlIgnoreCase(predicate, "SCHEDULED_FOR")) return working_memory.SlotType.temporal;
+    if (std.ascii.eqlIgnoreCase(predicate, "BIRTHDAY")) return working_memory.SlotType.temporal;
+
+    return null;
+}
+
+/// Pure link-type lookup — NO logging. The oversize/default `log.info`
+/// telemetry lives in the public `linkTypeForPredicate` wrapper so this
+/// inner function stays side-effect-free and shareable by
+/// `classifyPredicate`. Behavior (buffer size, default) matches the legacy
+/// `linkTypeForPredicate` exactly.
+fn linkTypeForPredicateInner(predicate: []const u8) memory_root.LinkType {
     var buf: [64]u8 = undefined;
-    if (predicate.len > buf.len) {
-        log.info("extraction.linktype_map_default predicate_len={d} fallback=attribute", .{predicate.len});
-        return .attribute;
-    }
+    if (predicate.len > buf.len) return .attribute;
     for (predicate, 0..) |ch, i| buf[i] = std.ascii.toUpper(ch);
     const norm = buf[0..predicate.len];
 
@@ -645,11 +718,47 @@ pub fn linkTypeForPredicate(predicate: []const u8) memory_root.LinkType {
     if (std.mem.eql(u8, norm, "JOINED")) return .episode;
     if (std.mem.eql(u8, norm, "VISITED")) return .episode;
 
-    // Default: .attribute (descriptive properties — BIRTHDAY, LIVES_IN,
-    // WORKS_AT, IS, HAS, etc.). Log so we can grow the mapping when
-    // production reveals new predicate surface forms.
-    log.info("extraction.linktype_map_default predicate={s} fallback=attribute", .{predicate});
     return .attribute;
+}
+
+/// V1.7a-5 (spec seam 3) — map an extraction-time `predicate` (the SVO
+/// triple verb, e.g. PREFERS, REPLACES, USED_FOR) to its high-level
+/// `LinkType` category for FE rendering + agent-side reasoning.
+///
+/// The mapping is OPINIONATED but conservative: predicates we recognize
+/// route to specific categories; unrecognized predicates default to
+/// `.attribute` (the broadest category) AND log an info so production
+/// telemetry surfaces gaps in our vocabulary. Adding a new predicate
+/// to a category is a one-line patch in `linkTypeForPredicateInner`.
+///
+/// P9: this is now a thin LOGGING wrapper around the shared
+/// `classifyPredicate`/`linkTypeForPredicateInner` lookup. The mapping
+/// table moved into `linkTypeForPredicateInner` (single source of truth);
+/// this wrapper preserves the legacy `extraction.linktype_map_default`
+/// telemetry on the oversize + default branches so production behavior is
+/// unchanged.
+///
+/// Single source of truth — every extraction write routes through here.
+/// Comparison is case-INsensitive on ASCII so `"PREFERS"`, `"prefers"`,
+/// and `"Prefers"` all map identically.
+pub fn linkTypeForPredicate(predicate: []const u8) memory_root.LinkType {
+    // Oversize predicates exceed the inner lookup's 64-byte normalize
+    // buffer and fall through to .attribute. Preserve the legacy
+    // oversize telemetry (logs predicate_len, not the raw string) before
+    // delegating.
+    if (predicate.len > 64) {
+        log.info("extraction.linktype_map_default predicate_len={d} fallback=attribute", .{predicate.len});
+        return .attribute;
+    }
+    const lt = linkTypeForPredicateInner(predicate);
+    // `linkTypeForPredicateInner` returns .attribute ONLY on its default
+    // branch (there are no explicit .attribute mappings), so a non-oversize
+    // input landing on .attribute is exactly the legacy default branch —
+    // emit the same telemetry the inlined map used to.
+    if (lt == .attribute) {
+        log.info("extraction.linktype_map_default predicate={s} fallback=attribute", .{predicate});
+    }
+    return lt;
 }
 
 test "linkTypeForPredicate maps known predicates correctly" {
@@ -672,6 +781,135 @@ test "linkTypeForPredicate handles oversize input without panic" {
     // 65 chars — exceeds 64-byte normalize buffer; falls through to default.
     const huge = "A" ** 65;
     try std.testing.expectEqual(memory_root.LinkType.attribute, linkTypeForPredicate(huge));
+}
+
+// ── P9 parity: classifyPredicate is the single source of truth ────────
+//
+// This test pins the behavior-preserving contract for the P9 refactor.
+// `Case` enumerates a representative predicate for EVERY branch of BOTH
+// legacy maps (gathered by reading the pre-refactor bodies of
+// `predicateToSlotType` and `linkTypeForPredicate` in full), plus the
+// case-insensitivity, empty, and oversize edge cases. For each:
+//   - `classifyPredicate(p).slot_type` MUST equal the EXPECTED legacy
+//     `predicateToSlotType(p)` value, and
+//   - `classifyPredicate(p).link_type` MUST equal the EXPECTED legacy
+//     `linkTypeForPredicate(p)` value, and
+//   - the two delegating wrappers MUST agree with `classifyPredicate`.
+const ParityCase = struct {
+    predicate: []const u8,
+    want_slot: ?[]const u8,
+    want_link: memory_root.LinkType,
+};
+
+test "P9 parity: classifyPredicate matches both legacy maps for every branch" {
+    const WM = working_memory.SlotType;
+    const cases = [_]ParityCase{
+        // ── link_type: preference branch ──
+        .{ .predicate = "PREFERS", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "LIKES", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "HATES", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "AVOIDS", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "FAVORS", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "DISLIKES", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "ENJOYS", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "VALUES", .want_slot = null, .want_link = .preference },
+        // ── link_type: supersession branch ──
+        .{ .predicate = "REPLACES", .want_slot = null, .want_link = .supersession },
+        .{ .predicate = "USED_TO_BE", .want_slot = null, .want_link = .supersession },
+        .{ .predicate = "FORMERLY", .want_slot = null, .want_link = .supersession },
+        .{ .predicate = "PREVIOUSLY", .want_slot = null, .want_link = .supersession },
+        .{ .predicate = "USED_TO_PREFER", .want_slot = null, .want_link = .supersession },
+        .{ .predicate = "USED_TO_USE", .want_slot = null, .want_link = .supersession },
+        // ── link_type: relationship branch ──
+        .{ .predicate = "KNOWS", .want_slot = null, .want_link = .relationship },
+        .{ .predicate = "WORKS_WITH", .want_slot = null, .want_link = .relationship },
+        .{ .predicate = "MARRIED_TO", .want_slot = null, .want_link = .relationship },
+        .{ .predicate = "FRIENDS_WITH", .want_slot = null, .want_link = .relationship },
+        .{ .predicate = "MANAGES", .want_slot = null, .want_link = .relationship },
+        .{ .predicate = "REPORTS_TO", .want_slot = null, .want_link = .relationship },
+        .{ .predicate = "COLLABORATES_WITH", .want_slot = null, .want_link = .relationship },
+        .{ .predicate = "RELATED_TO", .want_slot = null, .want_link = .relationship },
+        // ── link_type: usage branch ──
+        .{ .predicate = "USED_FOR", .want_slot = null, .want_link = .usage },
+        .{ .predicate = "USES", .want_slot = null, .want_link = .usage },
+        .{ .predicate = "OWNS", .want_slot = null, .want_link = .usage },
+        .{ .predicate = "DEPENDS_ON", .want_slot = null, .want_link = .usage },
+        .{ .predicate = "BUILDS_WITH", .want_slot = null, .want_link = .usage },
+        .{ .predicate = "DEPLOYS_TO", .want_slot = null, .want_link = .usage },
+        // ── link_type: episode branch ──
+        .{ .predicate = "HAPPENED_ON", .want_slot = null, .want_link = .episode },
+        .{ .predicate = "ATTENDED", .want_slot = null, .want_link = .episode },
+        .{ .predicate = "OCCURRED_AT", .want_slot = null, .want_link = .episode },
+        .{ .predicate = "JOINED", .want_slot = null, .want_link = .episode },
+        .{ .predicate = "VISITED", .want_slot = null, .want_link = .episode },
+        // ── slot_type: open_loop branch (all unmapped link → .attribute) ──
+        .{ .predicate = "TODO", .want_slot = WM.open_loop, .want_link = .attribute },
+        .{ .predicate = "WILL_DO", .want_slot = WM.open_loop, .want_link = .attribute },
+        .{ .predicate = "REMINDS_ME_TO", .want_slot = WM.open_loop, .want_link = .attribute },
+        .{ .predicate = "NEEDS_TO", .want_slot = WM.open_loop, .want_link = .attribute },
+        .{ .predicate = "PROMISED", .want_slot = WM.open_loop, .want_link = .attribute },
+        .{ .predicate = "OPEN_LOOP", .want_slot = WM.open_loop, .want_link = .attribute },
+        // ── slot_type: active_goal branch ──
+        .{ .predicate = "WORKING_ON", .want_slot = WM.active_goal, .want_link = .attribute },
+        .{ .predicate = "BUILDING", .want_slot = WM.active_goal, .want_link = .attribute },
+        .{ .predicate = "GOAL", .want_slot = WM.active_goal, .want_link = .attribute },
+        .{ .predicate = "FOCUSING_ON", .want_slot = WM.active_goal, .want_link = .attribute },
+        .{ .predicate = "WANTS_TO_FINISH", .want_slot = WM.active_goal, .want_link = .attribute },
+        // ── slot_type: decision branch ──
+        .{ .predicate = "DECIDED", .want_slot = WM.decision, .want_link = .attribute },
+        .{ .predicate = "CHOSE", .want_slot = WM.decision, .want_link = .attribute },
+        .{ .predicate = "PICKED", .want_slot = WM.decision, .want_link = .attribute },
+        // ── slot_type: emotional branch ──
+        .{ .predicate = "FEELS", .want_slot = WM.emotional, .want_link = .attribute },
+        .{ .predicate = "MENTAL_STATE", .want_slot = WM.emotional, .want_link = .attribute },
+        .{ .predicate = "STRESSED_ABOUT", .want_slot = WM.emotional, .want_link = .attribute },
+        // ── slot_type: open_question branch ──
+        .{ .predicate = "ASKING", .want_slot = WM.open_question, .want_link = .attribute },
+        .{ .predicate = "WONDERING", .want_slot = WM.open_question, .want_link = .attribute },
+        // ── slot_type: temporal branch ──
+        .{ .predicate = "HAPPENS_ON", .want_slot = WM.temporal, .want_link = .attribute },
+        .{ .predicate = "SCHEDULED_FOR", .want_slot = WM.temporal, .want_link = .attribute },
+        // BIRTHDAY: temporal slot AND .attribute link — the canonical
+        // example of a predicate the two legacy maps classified
+        // DIFFERENTLY (slot ≠ null, link = default). Pins the cross-map
+        // independence the unified function must preserve.
+        .{ .predicate = "BIRTHDAY", .want_slot = WM.temporal, .want_link = .attribute },
+        // ── case-insensitivity (both maps are case-insensitive) ──
+        .{ .predicate = "prefers", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "Prefers", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "todo", .want_slot = WM.open_loop, .want_link = .attribute },
+        .{ .predicate = "birthday", .want_slot = WM.temporal, .want_link = .attribute },
+        // ── unknown + empty → slot null, link .attribute ──
+        .{ .predicate = "UNKNOWN_VERB", .want_slot = null, .want_link = .attribute },
+        .{ .predicate = "WORKS_AT", .want_slot = null, .want_link = .attribute },
+        .{ .predicate = "", .want_slot = null, .want_link = .attribute },
+        // ── oversize (65 chars) → slot null, link .attribute ──
+        .{ .predicate = "A" ** 65, .want_slot = null, .want_link = .attribute },
+    };
+
+    for (cases) |tc| {
+        const got = classifyPredicate(tc.predicate);
+        // slot_type parity (optional []const u8 — compare via expectEqualSlices)
+        if (tc.want_slot) |ws| {
+            try std.testing.expect(got.slot_type != null);
+            try std.testing.expectEqualSlices(u8, ws, got.slot_type.?);
+        } else {
+            try std.testing.expect(got.slot_type == null);
+        }
+        // link_type parity
+        try std.testing.expectEqual(tc.want_link, got.link_type);
+
+        // The two delegating wrappers MUST return EXACTLY what
+        // classifyPredicate computed (behavior-preserving contract).
+        const wrapper_slot = predicateToSlotType(tc.predicate);
+        if (got.slot_type) |gs| {
+            try std.testing.expect(wrapper_slot != null);
+            try std.testing.expectEqualSlices(u8, gs, wrapper_slot.?);
+        } else {
+            try std.testing.expect(wrapper_slot == null);
+        }
+        try std.testing.expectEqual(got.link_type, linkTypeForPredicate(tc.predicate));
+    }
 }
 
 fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
@@ -1191,42 +1429,13 @@ pub fn persistExtracted(
 /// round-trip. Docstring corrected at v1.14.13 Step 5 (BIRTHDAY-DOC) —
 /// previous docstring claimed BIRTHDAY did not promote; the code has
 /// always promoted it. The code is correct; the doc lied.
+///
+/// P9: now a thin delegate to the shared `classifyPredicate` (via
+/// `slotTypeForPredicate`). The allowlist moved into
+/// `slotTypeForPredicate` (single source of truth shared with the
+/// link_type map) so the two maps can never drift apart.
 fn predicateToSlotType(predicate: []const u8) ?[]const u8 {
-    // Open loops — pending actions the user mentioned.
-    if (std.ascii.eqlIgnoreCase(predicate, "TODO")) return working_memory.SlotType.open_loop;
-    if (std.ascii.eqlIgnoreCase(predicate, "WILL_DO")) return working_memory.SlotType.open_loop;
-    if (std.ascii.eqlIgnoreCase(predicate, "REMINDS_ME_TO")) return working_memory.SlotType.open_loop;
-    if (std.ascii.eqlIgnoreCase(predicate, "NEEDS_TO")) return working_memory.SlotType.open_loop;
-    if (std.ascii.eqlIgnoreCase(predicate, "PROMISED")) return working_memory.SlotType.open_loop;
-    if (std.ascii.eqlIgnoreCase(predicate, "OPEN_LOOP")) return working_memory.SlotType.open_loop;
-
-    // Active goals — current projects / objectives.
-    if (std.ascii.eqlIgnoreCase(predicate, "WORKING_ON")) return working_memory.SlotType.active_goal;
-    if (std.ascii.eqlIgnoreCase(predicate, "BUILDING")) return working_memory.SlotType.active_goal;
-    if (std.ascii.eqlIgnoreCase(predicate, "GOAL")) return working_memory.SlotType.active_goal;
-    if (std.ascii.eqlIgnoreCase(predicate, "FOCUSING_ON")) return working_memory.SlotType.active_goal;
-    if (std.ascii.eqlIgnoreCase(predicate, "WANTS_TO_FINISH")) return working_memory.SlotType.active_goal;
-
-    // Decisions — committed choices.
-    if (std.ascii.eqlIgnoreCase(predicate, "DECIDED")) return working_memory.SlotType.decision;
-    if (std.ascii.eqlIgnoreCase(predicate, "CHOSE")) return working_memory.SlotType.decision;
-    if (std.ascii.eqlIgnoreCase(predicate, "PICKED")) return working_memory.SlotType.decision;
-
-    // Emotional state.
-    if (std.ascii.eqlIgnoreCase(predicate, "FEELS")) return working_memory.SlotType.emotional;
-    if (std.ascii.eqlIgnoreCase(predicate, "MENTAL_STATE")) return working_memory.SlotType.emotional;
-    if (std.ascii.eqlIgnoreCase(predicate, "STRESSED_ABOUT")) return working_memory.SlotType.emotional;
-
-    // Open questions.
-    if (std.ascii.eqlIgnoreCase(predicate, "ASKING")) return working_memory.SlotType.open_question;
-    if (std.ascii.eqlIgnoreCase(predicate, "WONDERING")) return working_memory.SlotType.open_question;
-
-    // Temporal events.
-    if (std.ascii.eqlIgnoreCase(predicate, "HAPPENS_ON")) return working_memory.SlotType.temporal;
-    if (std.ascii.eqlIgnoreCase(predicate, "SCHEDULED_FOR")) return working_memory.SlotType.temporal;
-    if (std.ascii.eqlIgnoreCase(predicate, "BIRTHDAY")) return working_memory.SlotType.temporal;
-
-    return null;
+    return classifyPredicate(predicate).slot_type;
 }
 
 /// V1.6 commit 7 — derive a stable entity-side target key from an object
