@@ -554,6 +554,15 @@ pub const Agent = struct {
     /// over the P3-typed memories. Default true. See
     /// config_types.typed_views_enabled.
     typed_views_enabled: bool = true,
+    /// P4 (memory-phase-0.5) — canonical-continuity-summary gate, threaded to
+    /// the commands gating predicate (`shouldUseDeterministicSessionSummary`)
+    /// so the two LIVE in-conversation boundary triggers
+    /// (`summary_seed:auto`/`compaction:auto`) take the REAL LLM-summarizer
+    /// path instead of the deterministic template. These triggers run
+    /// off-thread (persistSessionCheckpointAsync), so the LLM call does not
+    /// block the user turn. Default true. See
+    /// config_types.canonical_continuity_summary_enabled.
+    canonical_continuity_summary_enabled: bool = true,
     /// V1.14.7 — extraction trigger gates (per-turn enqueue, memory nudge,
     /// skills nudge). Defaults preserve V1.14.6 behavior. C2 wires structured
     /// extraction into compaction; C3 flips defaults to disabled and deletes
@@ -8978,11 +8987,15 @@ test "persistSessionCheckpoint fallback prefers compaction carrier from actual h
     try std.testing.expect(found_timeline_summary);
 }
 
-test "persistSessionCheckpoint summary_seed auto uses deterministic summary without provider call" {
+test "persistSessionCheckpoint summary_seed auto uses deterministic summary without provider call (P4 flag OFF)" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
 
+    // P4: with the canonical-continuity flag OFF, summary_seed:auto must use
+    // the deterministic template and NEVER reach summary_provider.chat — the
+    // failing provider proves no provider call happens on this path.
+    agent.canonical_continuity_summary_enabled = false;
     agent.provider = .{ .ptr = @ptrCast(&test_failing_summary_provider_state), .vtable = &test_failing_summary_provider_vtable };
 
     var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
@@ -9018,6 +9031,10 @@ test "persistSessionCheckpoint blocks fallback overwrite of existing canonical s
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
 
+    // P4: pin the deterministic (fallback-quality) path so the promotion-block
+    // invariant is exercised directly. Flag OFF → summary_seed:auto writes a
+    // fallback-tier summary which must NOT overwrite the existing canonical.
+    agent.canonical_continuity_summary_enabled = false;
     agent.provider = .{ .ptr = @ptrCast(&test_failing_summary_provider_state), .vtable = &test_failing_summary_provider_vtable };
 
     var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");

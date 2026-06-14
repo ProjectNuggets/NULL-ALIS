@@ -256,6 +256,10 @@ pub const SessionManager = struct {
     /// gateway config to per-session Agent → memory_loader. Same INIT-ONLY
     /// concurrency contract as the sibling fields. Default true.
     typed_views_enabled: bool = true,
+    /// P4 (memory-phase-0.5) — canonical-continuity-summary gate, threaded
+    /// from gateway config to per-session Agent → commands gating predicate.
+    /// Same INIT-ONLY concurrency contract as the sibling fields. Default true.
+    canonical_continuity_summary_enabled: bool = true,
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
@@ -740,6 +744,8 @@ pub const SessionManager = struct {
         agent.semantic_type_routing_enabled = self.semantic_type_routing_enabled;
         // Phase 0.5 — typed-views READ gate, same plumbing pattern.
         agent.typed_views_enabled = self.typed_views_enabled;
+        // P4 — canonical-continuity-summary gate, same plumbing pattern.
+        agent.canonical_continuity_summary_enabled = self.canonical_continuity_summary_enabled;
         return agent;
     }
 

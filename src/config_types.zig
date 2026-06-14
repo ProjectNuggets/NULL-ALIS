@@ -487,6 +487,30 @@ pub const AgentConfig = struct {
     /// Threaded to memory_loader via LoadTurnMemoryOptions through the agent
     /// (same plumbing pattern as `semantic_type_routing_enabled`).
     typed_views_enabled: bool = true,
+    /// P4 (memory-phase-0.5) — canonical-continuity-summary gate.
+    ///
+    /// When TRUE (default), the two LIVE in-conversation boundary triggers
+    /// (`summary_seed:auto`, `compaction:auto`) take the REAL LLM-summarizer
+    /// path (`summary_provider.chat`) instead of the deterministic
+    /// `buildStructuredFallbackSummary` template. These triggers run
+    /// OFF-THREAD via `persistSessionCheckpointAsync` (commands.zig — a
+    /// `std.Thread.spawn` worker that runs `persistSessionCheckpointDetailed`),
+    /// so the LLM call does NOT block the user's turn. The deterministic
+    /// template is preserved as the error/fallback path when the LLM
+    /// summarizer fails (provider error / parse error), so the summary is
+    /// never lost.
+    ///
+    /// When FALSE, the live triggers fall back to the EXACT prior
+    /// (deterministic-template) behavior — a safe rollback for the
+    /// LLM-cost / latency tradeoff this introduces (one summarizer call per
+    /// in-conversation boundary). Genuinely non-interactive checkpoint
+    /// reasons (shutdown / idle_evict / ttl_evict / ttl_recycle) ALWAYS use
+    /// the deterministic fallback regardless of this flag — they can't block
+    /// on an LLM call.
+    ///
+    /// Threaded to the commands gating predicate via the agent the same way
+    /// as `semantic_type_routing_enabled` / `typed_views_enabled`.
+    canonical_continuity_summary_enabled: bool = true,
     // V1.14.12 (Path A) — extraction_legacy_direct_writes FIELD REMOVED.
     // M5 sprint flag-gated two redundant direct write paths during a
     // soak window. Path A closes the M5 sprint by:

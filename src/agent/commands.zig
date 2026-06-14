@@ -1200,13 +1200,46 @@ fn isNonInteractiveCheckpointReason(reason: []const u8) bool {
         std.mem.eql(u8, reason, "ttl_recycle");
 }
 
-fn shouldUseDeterministicSessionSummary(reason: []const u8) bool {
-    return std.mem.eql(u8, reason, "compaction:auto") or
-        std.mem.eql(u8, reason, "summary_seed:auto") or
-        // P0-2: shutdown + idle/TTL eviction must skip the blocking LLM
-        // summarizer (summary_provider.chat) and use the deterministic
-        // structured fallback summary — see isNonInteractiveCheckpointReason.
-        isNonInteractiveCheckpointReason(reason);
+/// Pure gating predicate for the deterministic vs. LLM session-summary path.
+///
+/// `reason` — the checkpoint reason tag.
+/// `canonical_continuity_summary_enabled` — the P4 flag (default ON).
+///
+/// Returns TRUE when the deterministic `buildStructuredFallbackSummary`
+/// template must be used (and `summary_provider.chat` is NOT reached);
+/// FALSE when the real LLM summarizer path runs.
+///
+/// Three classes of reason:
+///   - Genuinely non-interactive (shutdown / idle_evict / ttl_evict /
+///     ttl_recycle): ALWAYS deterministic regardless of the flag. They run
+///     on maintenance/shutdown lanes that cannot block on a 30-75s LLM call
+///     (P0-2 / P1-6).
+///   - LIVE in-conversation triggers (compaction:auto / summary_seed:auto):
+///     deterministic ONLY when the P4 flag is OFF. When ON (default), they
+///     take the real LLM-summarizer path. CRITICAL safety invariant: both
+///     run OFF-THREAD via `persistSessionCheckpointAsync` (a std.Thread.spawn
+///     worker → persistSessionCheckpointDetailed → persistSessionSemanticSummary),
+///     so the LLM call never blocks the user's turn. If that ever changes,
+///     this gate must NOT route them to the LLM path.
+///   - Interactive operator reasons (compaction:manual / reset:manual / …):
+///     never deterministic — they always took the LLM path and still do.
+fn shouldUseDeterministicSessionSummary(reason: []const u8, canonical_continuity_summary_enabled: bool) bool {
+    // P0-2 / P1-6: shutdown + idle/TTL eviction + ttl_recycle must skip the
+    // blocking LLM summarizer (summary_provider.chat) and use the
+    // deterministic structured fallback — see isNonInteractiveCheckpointReason.
+    // This holds regardless of the P4 flag.
+    if (isNonInteractiveCheckpointReason(reason)) return true;
+
+    // P4: the two LIVE in-conversation triggers. When the canonical-continuity
+    // flag is OFF, restore the exact prior behavior (deterministic template).
+    // When ON (default), fall through to the LLM summarizer path. They run
+    // off-thread, so the LLM call does not block the user turn.
+    if (!canonical_continuity_summary_enabled) {
+        if (std.mem.eql(u8, reason, "compaction:auto") or
+            std.mem.eql(u8, reason, "summary_seed:auto")) return true;
+    }
+
+    return false;
 }
 
 /// True when the inline session-end boundary extraction (extractAtBoundary)
@@ -1238,7 +1271,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
     defer if (parsed_summary) |*result| result.deinit(self.allocator);
     var summary_quality: SummaryQuality = .fallback;
     const content = blk: {
-        if (shouldUseDeterministicSessionSummary(reason)) {
+        if (shouldUseDeterministicSessionSummary(reason, self.canonical_continuity_summary_enabled)) {
             summary_text_owned = buildStructuredFallbackSummary(self, entries, checkpoint_content);
             if (summary_text_owned) |owned| {
                 log.info("memory.timeline_summary status=deterministic session={s} reason={s} entries={d}", .{
@@ -5576,25 +5609,45 @@ test "HELP_TEXT covers additional implemented commands" {
 // Together they assert ZERO inline provider.chat for the three evict reasons.
 
 test "P0-2: shutdown/idle_evict/ttl_evict use deterministic summary (no inline provider.chat)" {
-    try std.testing.expect(shouldUseDeterministicSessionSummary("shutdown"));
-    try std.testing.expect(shouldUseDeterministicSessionSummary("idle_evict"));
-    try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_evict"));
+    // Non-interactive reasons are deterministic regardless of the P4 flag —
+    // assert with the flag ON (default) to prove the flag does NOT route them
+    // to the blocking LLM path.
+    try std.testing.expect(shouldUseDeterministicSessionSummary("shutdown", true));
+    try std.testing.expect(shouldUseDeterministicSessionSummary("idle_evict", true));
+    try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_evict", true));
     // P1-6 (audit, part a): ttl_recycle joins the deterministic set.
-    try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_recycle"));
+    try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_recycle", true));
+    // ...and still deterministic with the flag OFF.
+    try std.testing.expect(shouldUseDeterministicSessionSummary("shutdown", false));
+    try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_recycle", false));
 }
 
-test "P0-2: existing deterministic reasons still hold" {
-    // Regression guard — the pre-existing deterministic reasons must remain.
-    try std.testing.expect(shouldUseDeterministicSessionSummary("compaction:auto"));
-    try std.testing.expect(shouldUseDeterministicSessionSummary("summary_seed:auto"));
+test "P4: live triggers take the LLM-summarizer path when the canonical flag is ON" {
+    // Flag ON (default): the two LIVE in-conversation triggers route to the
+    // real LLM summarizer (NOT deterministic). They run off-thread via
+    // persistSessionCheckpointAsync, so the LLM call never blocks the turn.
+    try std.testing.expect(!shouldUseDeterministicSessionSummary("compaction:auto", true));
+    try std.testing.expect(!shouldUseDeterministicSessionSummary("summary_seed:auto", true));
+}
+
+test "P4: live triggers fall back to deterministic template when the canonical flag is OFF" {
+    // Flag OFF: exact prior behavior — the live triggers use the deterministic
+    // template (safe cost/latency rollback).
+    try std.testing.expect(shouldUseDeterministicSessionSummary("compaction:auto", false));
+    try std.testing.expect(shouldUseDeterministicSessionSummary("summary_seed:auto", false));
+    // Non-interactive reasons remain deterministic in both flag states.
+    try std.testing.expect(shouldUseDeterministicSessionSummary("shutdown", false));
 }
 
 test "P0-2: interactive reasons still take the LLM summary path" {
     // Manual / interactive checkpoints keep the inline LLM summarizer — only
     // the non-interactive lifecycle reasons are diverted off the blocking path.
-    try std.testing.expect(!shouldUseDeterministicSessionSummary("compaction:manual"));
-    try std.testing.expect(!shouldUseDeterministicSessionSummary("reset:manual"));
-    try std.testing.expect(!shouldUseDeterministicSessionSummary(""));
+    // Independent of the P4 flag (assert in both states).
+    try std.testing.expect(!shouldUseDeterministicSessionSummary("compaction:manual", true));
+    try std.testing.expect(!shouldUseDeterministicSessionSummary("reset:manual", true));
+    try std.testing.expect(!shouldUseDeterministicSessionSummary("", true));
+    try std.testing.expect(!shouldUseDeterministicSessionSummary("compaction:manual", false));
+    try std.testing.expect(!shouldUseDeterministicSessionSummary("reset:manual", false));
 }
 
 test "P0-2: inline boundary extraction is skipped exactly for the evict reasons" {

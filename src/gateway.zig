@@ -2259,6 +2259,11 @@ const TenantRuntime = struct {
                     // session_mgr so each per-session Agent inherits it and
                     // propagates to memory_loader (LoadTurnMemoryOptions).
                     runtime.session_mgr.typed_views_enabled = runtime.config.agent.typed_views_enabled;
+                    // P4 — wire canonical-continuity-summary flag from config
+                    // to session_mgr so each per-session Agent inherits it and
+                    // propagates to the commands gating predicate. Default ON;
+                    // OFF restores the deterministic-template behavior.
+                    runtime.session_mgr.canonical_continuity_summary_enabled = runtime.config.agent.canonical_continuity_summary_enabled;
                     log.info("extraction.enabled user_id={d} coref={s} judge={s} cardinality_fastpath={s} semantic_type_routing={s}", .{
                         numeric_user_id,
                         if (coref_on) "on" else "off-no-embed",

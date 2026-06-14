@@ -1009,6 +1009,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("typed_views_enabled")) |v| {
                 if (v == .bool) self.agent.typed_views_enabled = v.bool;
             }
+            // P4 (memory-phase-0.5) — wire the canonical-continuity-summary
+            // gate so operators can disable the per-boundary LLM summarizer
+            // (cost/latency rollback) via config.json (default ON).
+            if (ag.object.get("canonical_continuity_summary_enabled")) |v| {
+                if (v == .bool) self.agent.canonical_continuity_summary_enabled = v.bool;
+            }
             // C4 (brain-graph activation) — wire the nested [agent.extraction]
             // ExtractionConfig block. Previously this struct had NO parser, so
             // its "flip via TOML" docstring silently no-op'd. The session-end
