@@ -548,6 +548,12 @@ pub const Agent = struct {
     /// (custom: open_loop/decision/preference/person) instead of by
     /// attribution. Default true. See config_types.semantic_type_routing_enabled.
     semantic_type_routing_enabled: bool = true,
+    /// Phase 0.5 (memory-phase-0.5) — typed-views READ gate, threaded to
+    /// memory_loader via LoadTurnMemoryOptions so the four typed context
+    /// blocks (<preferences>/<open_loops>/<decisions>/<people>) are assembled
+    /// over the P3-typed memories. Default true. See
+    /// config_types.typed_views_enabled.
+    typed_views_enabled: bool = true,
     /// V1.14.7 — extraction trigger gates (per-turn enqueue, memory nudge,
     /// skills nudge). Defaults preserve V1.14.6 behavior. C2 wires structured
     /// extraction into compaction; C3 flips defaults to disabled and deletes

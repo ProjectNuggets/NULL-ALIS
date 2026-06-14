@@ -252,6 +252,10 @@ pub const SessionManager = struct {
     /// gateway config to per-session Agent → JudgeContext. Same INIT-ONLY
     /// concurrency contract as the sibling fields. Default true.
     semantic_type_routing_enabled: bool = true,
+    /// Phase 0.5 (memory-phase-0.5) — typed-views READ gate, threaded from
+    /// gateway config to per-session Agent → memory_loader. Same INIT-ONLY
+    /// concurrency contract as the sibling fields. Default true.
+    typed_views_enabled: bool = true,
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
@@ -734,6 +738,8 @@ pub const SessionManager = struct {
         agent.extraction_cardinality_fastpath = self.extraction_cardinality_fastpath;
         // P3 — semantic type-routing gate, same plumbing pattern.
         agent.semantic_type_routing_enabled = self.semantic_type_routing_enabled;
+        // Phase 0.5 — typed-views READ gate, same plumbing pattern.
+        agent.typed_views_enabled = self.typed_views_enabled;
         return agent;
     }
 

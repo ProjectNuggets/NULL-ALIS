@@ -471,6 +471,22 @@ pub const AgentConfig = struct {
     /// Threaded to extraction_persist via JudgeContext through the same
     /// caller chain as `extraction_cardinality_fastpath`.
     semantic_type_routing_enabled: bool = true,
+    /// Phase 0.5 (memory-phase-0.5) — typed views READ gate.
+    ///
+    /// When TRUE (default), the memory loader assembles four deterministic
+    /// always-on context blocks over the P3-typed memories and injects them
+    /// into the agent's per-turn volatile system block:
+    ///   <preferences> / <open_loops> / <decisions> / <people>
+    /// These are VIEWS over the existing store (filter by memory_type) — the
+    /// reader side of the P3 `semantic_type_routing_enabled` writer.
+    ///
+    /// When FALSE, no new blocks are emitted — the agent sees the exact
+    /// prior (pre-Phase-0.5) context. Read-side only; does not affect what
+    /// is written.
+    ///
+    /// Threaded to memory_loader via LoadTurnMemoryOptions through the agent
+    /// (same plumbing pattern as `semantic_type_routing_enabled`).
+    typed_views_enabled: bool = true,
     // V1.14.12 (Path A) — extraction_legacy_direct_writes FIELD REMOVED.
     // M5 sprint flag-gated two redundant direct write paths during a
     // soak window. Path A closes the M5 sprint by:

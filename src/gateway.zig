@@ -2255,6 +2255,10 @@ const TenantRuntime = struct {
                     // session_mgr so each per-session Agent inherits it and
                     // propagates to JudgeContext.
                     runtime.session_mgr.semantic_type_routing_enabled = runtime.config.agent.semantic_type_routing_enabled;
+                    // Phase 0.5 — wire typed-views READ flag from config to
+                    // session_mgr so each per-session Agent inherits it and
+                    // propagates to memory_loader (LoadTurnMemoryOptions).
+                    runtime.session_mgr.typed_views_enabled = runtime.config.agent.typed_views_enabled;
                     log.info("extraction.enabled user_id={d} coref={s} judge={s} cardinality_fastpath={s} semantic_type_routing={s}", .{
                         numeric_user_id,
                         if (coref_on) "on" else "off-no-embed",
