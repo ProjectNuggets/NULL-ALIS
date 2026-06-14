@@ -27,6 +27,10 @@ const platform = @import("../platform.zig");
 const voice_mod = @import("../voice.zig");
 const voice_mode = @import("../voice_mode.zig");
 const observability = @import("../observability.zig");
+// Brain-leak Fix B — capture recurrence of scaffold output leaks. Fire-and-
+// forget global; no-op when Sentry/GlitchTip isn't configured (same path the
+// W1.4 Manager error-capture uses).
+const sentry_runtime = @import("../sentry_runtime.zig");
 const json_util = @import("../json_util.zig");
 const tool_dispatcher = @import("../tool_mode.zig");
 const Observer = observability.Observer;
@@ -2188,6 +2192,126 @@ pub const Agent = struct {
         };
         out.deinit(allocator);
         return collapsed;
+    }
+
+    /// Brain-leak Fix B — strip the system-prompt scaffold from user-bound
+    /// output.
+    ///
+    /// The #48 leak: the agent's system-prompt scaffold (`## Brain
+    /// Architecture` + body, `## Memory Link Types`, "Layer 0/1", etc.)
+    /// surfaced into a visible assistant turn because no output-boundary strip
+    /// existed. That turn then entered thread history and got persisted as
+    /// brain entities (the loop Fix A also guards). This is the source-side
+    /// kill: it removes any scaffold section from the assistant text BEFORE it
+    /// reaches the user (it feeds both the live `final_reply` SSE tokens and
+    /// the buffered reply, since `final_text` derives from `display_text`,
+    /// which is scrubbed here — the SAME belt-and-suspenders boundary as
+    /// `stripToolCallMarkup`).
+    ///
+    /// Precision: a section is stripped ONLY when a line is EXACTLY a scaffold
+    /// header — `## <Title>` (or `### <Title>` for the XML-tool sections) whose
+    /// `<Title>` is one of the keystone `context_builder.stable_prompt_markers`
+    /// titles. The strip runs from that header line up to (but excluding) the
+    /// next markdown heading (`## ` / `### `) or end-of-text. A user's own
+    /// `## My Heading` never matches the keystone titles, and inline lowercase
+    /// mentions ("...about brain architecture...") are not headers, so
+    /// legitimate content is untouched. Allocation contract mirrors
+    /// `stripToolCallMarkup`: returns a dupe of the input when nothing is
+    /// stripped, or a fresh slice when it is; caller frees only when the
+    /// returned pointer differs from the input.
+    ///
+    /// `fired` is set TRUE iff at least one scaffold section was removed, so
+    /// the call site can capture recurrence (log.err + Sentry/GlitchTip).
+    fn stripScaffoldSections(allocator: std.mem.Allocator, text: []const u8, fired: *bool) []u8 {
+        fired.* = false;
+        // Fast path: no level-2/3 ATX heading → no scaffold section possible.
+        if (std.mem.indexOf(u8, text, "## ") == null) {
+            return allocator.dupe(u8, text) catch return @constCast(text);
+        }
+
+        var out: std.ArrayListUnmanaged(u8) = .{};
+        errdefer out.deinit(allocator);
+
+        var i: usize = 0;
+        // Track whether the current position is at the start of a line so we
+        // only treat `## ` as a heading when it leads a line (ATX rule).
+        var at_line_start = true;
+        while (i < text.len) {
+            if (at_line_start and isScaffoldHeaderAt(text, i)) {
+                // Drop from here to the next heading line or EOF.
+                fired.* = true;
+                i = nextHeadingOrEnd(text, i);
+                at_line_start = true;
+                continue;
+            }
+            const ch = text[i];
+            out.append(allocator, ch) catch return @constCast(text);
+            at_line_start = (ch == '\n');
+            i += 1;
+        }
+
+        if (!fired.*) {
+            // No change — return a dupe matching the no-strip contract.
+            out.deinit(allocator);
+            return allocator.dupe(u8, text) catch return @constCast(text);
+        }
+
+        // Collapse the blank-line runs the strip may have left behind, and
+        // trim leading whitespace (reuses the tool-call scrub helper).
+        const collapsed = collapseBlankLineRuns(allocator, out.items) catch {
+            return out.toOwnedSlice(allocator) catch return @constCast(text);
+        };
+        out.deinit(allocator);
+        return collapsed;
+    }
+
+    /// True when `text[pos..]` begins with an EXACT scaffold section header
+    /// line. Matches the keystone `stable_prompt_markers` titles: the marker
+    /// strings carry a `## <Title>\n\n` shape, so the header token is the
+    /// marker up to and including the first newline (e.g. `## Brain
+    /// Architecture\n`). We accept the header when the marker's text (minus
+    /// its trailing blank line) is present at `pos` AND the title is followed
+    /// by a line break or end-of-text — so `## Brain Architecture course`
+    /// (a longer user heading) does NOT match.
+    fn isScaffoldHeaderAt(text: []const u8, pos: usize) bool {
+        const rest = text[pos..];
+        inline for (context_builder.stable_prompt_markers) |marker| {
+            // marker.marker == "## <Title>\n\n"; the header token is the part
+            // up to the first '\n'.
+            const m = marker.marker;
+            const nl = std.mem.indexOfScalar(u8, m, '\n') orelse m.len;
+            const header = m[0..nl]; // "## <Title>"
+            if (rest.len >= header.len and std.mem.eql(u8, rest[0..header.len], header)) {
+                // Must be the WHOLE heading line: next byte is a newline or EOF.
+                if (rest.len == header.len or rest[header.len] == '\n' or rest[header.len] == '\r') {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Starting at a scaffold header position, return the index of the next
+    /// markdown heading line (`## ` or `### ` at a line start) or text.len if
+    /// none — i.e. the exclusive end of the section body to drop.
+    fn nextHeadingOrEnd(text: []const u8, header_pos: usize) usize {
+        // Advance past the header line first.
+        var j = header_pos;
+        while (j < text.len and text[j] != '\n') : (j += 1) {}
+        if (j < text.len) j += 1; // consume the newline after the header
+        // Now scan line-by-line for the next ATX heading.
+        while (j < text.len) {
+            // j is at a line start here.
+            if (std.mem.startsWith(u8, text[j..], "## ") or
+                std.mem.startsWith(u8, text[j..], "### "))
+            {
+                return j;
+            }
+            // Skip to the next line start.
+            while (j < text.len and text[j] != '\n') : (j += 1) {}
+            if (j < text.len) j += 1;
+        }
+        return text.len;
     }
 
     /// Helper for `stripToolCallMarkup`. Collapses runs of consecutive empty
@@ -5053,10 +5177,41 @@ pub const Agent = struct {
                 const scrubbed_display_text: []u8 = stripToolCallMarkup(self.allocator, display_text);
                 defer if (scrubbed_display_text.ptr != display_text.ptr) self.allocator.free(scrubbed_display_text);
 
+                // Brain-leak Fix B — strip any system-prompt scaffold section
+                // (## Brain Architecture, ## Memory Link Types, …) from the
+                // user-bound text BEFORE composeFinalReply. This is the source
+                // kill for the #48 leak: `final_text` derives from
+                // `display_text`, so scrubbing here covers both the live
+                // `final_reply` SSE tokens and the buffered reply. When a strip
+                // fires we capture it (log.err + Sentry/GlitchTip) so recurrence
+                // is visible — a strip firing in prod means the scaffold reached
+                // the output boundary and the upstream cause needs attention.
+                var scaffold_strip_fired = false;
+                const deleaked_display_text: []u8 = stripScaffoldSections(self.allocator, scrubbed_display_text, &scaffold_strip_fired);
+                defer if (deleaked_display_text.ptr != scrubbed_display_text.ptr) self.allocator.free(deleaked_display_text);
+                if (scaffold_strip_fired) {
+                    log.err(
+                        "output.scaffold_leak_stripped run_id={s} iteration={d} bytes_before={d} bytes_after={d}",
+                        .{ self.current_run_id orelse "-", iteration, scrubbed_display_text.len, deleaked_display_text.len },
+                    );
+                    sentry_runtime.globalOrFallback().captureError(
+                        "agent.output_scaffold_leak",
+                        "system-prompt scaffold reached the user-bound output boundary and was stripped (brain-leak #48 recurrence)",
+                    );
+                    const leak_notice = ObserverEvent{ .system_notice = .{
+                        .kind = "generic",
+                        .severity = "error",
+                        .message = "Internal formatting was removed from the reply.",
+                        .detail = "scaffold_leak_stripped",
+                        .run_id = self.current_run_id,
+                    } };
+                    self.observer.recordEvent(&leak_notice);
+                }
+
                 const safe_display_text = if (malformed_tool_markup)
                     "I hit an internal tool-call formatting error before execution. Please retry."
                 else
-                    scrubbed_display_text;
+                    deleaked_display_text;
                 const finalize_start_ms = std.time.milliTimestamp();
                 const base_text = if (self.context_was_compacted) blk: {
                     const was_force = self.context_force_compressed;
@@ -12542,6 +12697,67 @@ test "Agent streaming follow-through retries false in-progress claims" {
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
     try std.testing.expect(std.mem.indexOf(u8, recorder.chunks.items, "Executing the next step now:") == null);
     try std.testing.expect(std.mem.indexOf(u8, recorder.chunks.items, "done") != null);
+}
+
+// ── Brain-leak Fix B — strip system-prompt scaffold from user-bound output ─
+// The #48 leak: the agent's system-prompt scaffold (## Brain Architecture
+// + body, etc.) surfaced in a visible assistant turn. No output-boundary
+// strip existed. stripScaffoldSections removes any scaffold `## <marker>`
+// section (header + body up to the next heading/end), matched conservatively
+// against the keystone context_builder.stable_prompt_markers list so it can't
+// drift and never touches legitimate markdown headings.
+
+test "brain-leak B: strip removes a scaffold section, sets fired" {
+    const allocator = std.testing.allocator;
+    const input =
+        "Here is my answer.\n\n" ++
+        "## Brain Architecture\n\n" ++
+        "Layer 0 is working memory. Layer 1 is durable. Distillation extraction runs at session end.\n\n" ++
+        "## My Real Heading\n\n" ++
+        "This is legitimate content the user asked for.\n";
+    var fired = false;
+    const out = Agent.stripScaffoldSections(allocator, input, &fired);
+    defer if (out.ptr != input.ptr) allocator.free(out);
+
+    try std.testing.expect(fired); // capture must fire on a real strip
+    // Scaffold section + its header are gone.
+    try std.testing.expect(std.mem.indexOf(u8, out, "## Brain Architecture") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Distillation extraction runs") == null);
+    // Legitimate content + the user's own heading survive intact.
+    try std.testing.expect(std.mem.indexOf(u8, out, "Here is my answer.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "## My Real Heading") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "legitimate content the user asked for") != null);
+}
+
+test "brain-leak B: normal markdown is untouched, fired stays false" {
+    const allocator = std.testing.allocator;
+    const input =
+        "## My Heading\n\n" ++
+        "Some prose about brain architecture in general (lowercase, inline — not a section).\n\n" ++
+        "## Another Section\n\n" ++
+        "More content.\n";
+    var fired = false;
+    const out = Agent.stripScaffoldSections(allocator, input, &fired);
+    defer if (out.ptr != input.ptr) allocator.free(out);
+
+    try std.testing.expect(!fired); // no scaffold section → no capture
+    try std.testing.expectEqualStrings(input, out); // byte-identical passthrough
+}
+
+test "brain-leak B: scaffold section at end-of-text is stripped to the end" {
+    const allocator = std.testing.allocator;
+    const input =
+        "Real reply body.\n\n" ++
+        "## Memory Link Types\n\n" ++
+        "relationship, preference, usage, supersession ...";
+    var fired = false;
+    const out = Agent.stripScaffoldSections(allocator, input, &fired);
+    defer if (out.ptr != input.ptr) allocator.free(out);
+
+    try std.testing.expect(fired);
+    try std.testing.expect(std.mem.indexOf(u8, out, "## Memory Link Types") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "supersession") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Real reply body.") != null);
 }
 
 test "Agent streaming holds partial XML residue before final scrub" {
