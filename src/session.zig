@@ -3956,3 +3956,73 @@ test "getOrCreate enforces MAX_SESSIONS_PER_USER per user" {
     // Other users are unaffected
     _ = try sm.getOrCreate("agent:zaki-bot:user:other-user:main");
 }
+
+// ---------------------------------------------------------------------------
+// W1.3 regression: memory-write failure must NOT abort the turn
+// ---------------------------------------------------------------------------
+//
+// W1.3 ("turn-path memory-write robustness") made processMessageWithContext
+// resilient to session-store write failures. The two write sites
+// (saveMessage for the user turn, saveMessage/saveMessageRich for the
+// assistant turn) both use `catch |err| log.warn(...)` so the error is
+// swallowed and the turn still completes. This test locks that invariant
+// permanently: inject a SessionStore whose saveMessage always returns an
+// error, run a full turn, and assert the reply is produced and no error
+// propagates to the caller.
+test "W1.3: memory-write failure during turn does not abort the turn" {
+    // A SessionStore stub whose saveMessage always fails. Every other
+    // required vtable slot is a no-op / minimal stub so the store is valid.
+    const FailingStore = struct {
+        fn implSaveMessage(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) anyerror!void {
+            return error.OutOfMemory; // always fail
+        }
+        fn implLoadMessages(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror![]memory_mod.MessageEntry {
+            return allocator.alloc(memory_mod.MessageEntry, 0);
+        }
+        fn implClearMessages(_: *anyopaque, _: []const u8) anyerror!void {}
+        fn implClearAutoSaved(_: *anyopaque, _: ?[]const u8) anyerror!void {}
+        fn implSaveCompletionEvent(_: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, _: ?[]const u8, _: ?[]const u8, _: ?[]const u8, _: []const u8) anyerror![]u8 {
+            return allocator.dupe(u8, session_id);
+        }
+        fn implLoadCompletionEvents(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror![]memory_mod.CompletionEvent {
+            return allocator.alloc(memory_mod.CompletionEvent, 0);
+        }
+        fn implDeleteCompletionEvent(_: *anyopaque, _: []const u8) anyerror!void {}
+
+        const vtable = memory_mod.SessionStore.VTable{
+            .saveMessage = &implSaveMessage,
+            .loadMessages = &implLoadMessages,
+            .clearMessages = &implClearMessages,
+            .clearAutoSaved = &implClearAutoSaved,
+            .saveCompletionEvent = &implSaveCompletionEvent,
+            .loadCompletionEvents = &implLoadCompletionEvents,
+            .deleteCompletionEvent = &implDeleteCompletionEvent,
+        };
+    };
+
+    // A dummy pointer for the vtable — the impls above ignore `ptr`.
+    var dummy: u8 = 0;
+    const failing_store = memory_mod.SessionStore{
+        .ptr = @ptrCast(&dummy),
+        .vtable = &FailingStore.vtable,
+    };
+
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    // Wire the failing store in — this is the seam W1.3 hardened.
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, null, failing_store);
+    defer sm.deinit();
+
+    // The turn must complete and return the provider's reply even though
+    // every saveMessage call inside processMessageWithContext will error.
+    const resp = try sm.processMessage("w1.3:robustness", "hello", null);
+    defer testing.allocator.free(resp);
+
+    // Core invariant: turn completed, reply returned, no error propagated.
+    try testing.expectEqualStrings("ok", resp);
+
+    // Secondary: the session advanced (turn_count incremented) despite the
+    // write failures, confirming the full turn path ran to completion.
+    const session = try sm.getOrCreate("w1.3:robustness");
+    try testing.expectEqual(@as(u64, 1), session.turn_count);
+}
