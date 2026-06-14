@@ -1483,6 +1483,18 @@ pub fn isEditableMemoryEntry(key: []const u8, category: MemoryCategory) bool {
     // structural checks below.
     _ = category;
     if (isTombstoneKey(key) or isMarkdownLineKey(key) or isAppendOnlyMemoryKey(key)) return false;
+    // 0.5b H1 — curability is a PROVENANCE question ("is this user/agent
+    // content?"), not key-bookkeeping. `durable_fact/*` is brain-visible,
+    // recallable USER KNOWLEDGE (content-addressed facts, promoted goals,
+    // learning corrections) — so it must be curable (archive/forget/edit).
+    // It is classified system-managed ONLY because that predicate also
+    // drives the forget/markdown-mirror discipline in
+    // zaki_dual.zig::implForget; mutating the shared predicate would change
+    // that unrelated role. Instead, special-case the curability gate here:
+    // durable_fact/ passes provenance, every other system-managed prefix
+    // (summary_latest/, timeline_summary/, agent_plan/, context_anchor,
+    // append-only families) stays protected via isSystemManagedMemoryKey.
+    if (std.mem.startsWith(u8, key, "durable_fact/")) return true;
     if (isInternalMemoryKey(key) or isSystemManagedMemoryKey(key)) return false;
     return true;
 }
@@ -3209,10 +3221,11 @@ test "V1.14.12 (Memory audit Finding 1): durable_fact/* is brain-visible" {
     // Now visible.
     try std.testing.expect(isBrainVisibleKey("durable_fact/1700000000/0"));
     try std.testing.expect(isBrainVisibleKey("durable_fact/1700000000/42"));
-    // Edit-protection still holds via isSystemManagedMemoryKey at line ~1171
-    // — the hidden-vs-visible status is independent of the edit-protection
-    // status, by design.
-    try std.testing.expect(!isEditableMemoryEntry("durable_fact/1700000000/0", .core));
+    // 0.5b H1 — durable_fact/* is user KNOWLEDGE, so it is now curable
+    // (archive/forget/edit). isEditableMemoryEntry special-cases this prefix
+    // without mutating the shared isSystemManagedMemoryKey predicate (whose
+    // forget/mirror-discipline role in zaki_dual.zig stays intact).
+    try std.testing.expect(isEditableMemoryEntry("durable_fact/1700000000/0", .core));
 }
 
 test "V1.14.12 (Memory audit Finding 1): existing hidden continuity stays hidden" {
@@ -4424,7 +4437,9 @@ test "editable memory classification keeps user state editable" {
     try std.testing.expect(isEditableMemoryEntry("user_name", .core));
     try std.testing.expect(!isEditableMemoryEntry("summary_latest/agent:zaki-bot:user:1:main", .core));
     try std.testing.expect(!isEditableMemoryEntry("timeline_summary/agent:zaki-bot:user:1:main/1", .daily));
-    try std.testing.expect(!isEditableMemoryEntry("durable_fact/1/0", .core));
+    // 0.5b H1 — durable_fact/* is user knowledge → curable in every category.
+    try std.testing.expect(isEditableMemoryEntry("durable_fact/1/0", .core));
+    try std.testing.expect(isEditableMemoryEntry("durable_fact/1/0", .{ .custom = "preference" }));
 }
 
 test "V1.10 Gap B — daily-type user-namespace keys are editable" {
@@ -4443,10 +4458,15 @@ test "V1.10 Gap B — daily-type user-namespace keys are editable" {
     try std.testing.expect(isEditableMemoryEntry("any_user_key", .daily));
     // Internal / system-managed keys still refused regardless of category.
     try std.testing.expect(!isEditableMemoryEntry("autosave_user_123", .conversation));
-    try std.testing.expect(!isEditableMemoryEntry("durable_fact/1/0", .daily));
+    // 0.5b H1 — durable_fact/* is the exception: user knowledge, so curable.
+    try std.testing.expect(isEditableMemoryEntry("durable_fact/1/0", .daily));
+    // Genuinely-protected continuity/append-only/anchor keys stay refused.
     try std.testing.expect(!isEditableMemoryEntry("summary_latest/x", .core));
     try std.testing.expect(!isEditableMemoryEntry("timeline_summary/x/1", .core));
     try std.testing.expect(!isEditableMemoryEntry("context_anchor_current", .core));
+    try std.testing.expect(!isEditableMemoryEntry("agent_plan/current/x", .core));
+    try std.testing.expect(!isEditableMemoryEntry("session_summary/x/1", .core));
+    try std.testing.expect(!isEditableMemoryEntry("__tombstone__/x", .core));
 }
 
 test "tombstone target key extracts target" {
