@@ -79,12 +79,16 @@ pub fn analyzeQuery(query: []const u8, config: AdaptiveConfig) QueryAnalysis {
     const is_question = isQuestionQuery(query);
 
     // Strategy rules (ordered by priority):
-    // 1. Special chars (underscores, dots, slashes) → keyword_only (key lookup)
+    // 1. SINGLE-token query with special chars (underscores, dots, slashes) →
+    //    keyword_only (key/path lookup like "user_id" or "a.b/c"). A *multi-token*
+    //    natural-language query that merely contains punctuation (e.g.
+    //    "Hariat-negotiation with Big Eric") must NOT collapse to keyword-only —
+    //    it still needs vector/hybrid recall. Hence the `token_count <= 1` guard.
     // 2. Very short (<=keyword_max_tokens) → keyword_only
     // 3. Question + long (>=vector_min_tokens) → vector_only
     // 4. Long (>=vector_min_tokens) → hybrid
     // 5. Otherwise → hybrid
-    const strategy: RetrievalStrategy = if (has_special_chars)
+    const strategy: RetrievalStrategy = if (has_special_chars and token_count <= 1)
         .keyword_only
     else if (token_count <= config.keyword_max_tokens)
         .keyword_only
@@ -203,11 +207,36 @@ test "question detection is case-insensitive" {
     try testing.expect(result.is_question);
 }
 
-test "special chars take priority over token count" {
-    // 7 tokens but has underscores → keyword_only
-    const result = analyzeQuery("my_key some_other thing here and more stuff", enabled_config);
-    try testing.expectEqual(RetrievalStrategy.keyword_only, result.recommended_strategy);
+test "multi-token query with punctuation is NOT keyword_only (P6)" {
+    // 6 tokens but contains underscores → must still go hybrid/vector, not
+    // collapse to keyword-only. Special chars only force keyword_only for
+    // single-token key/path lookups.
+    const result = analyzeQuery("my_key some_other thing here and more", enabled_config);
+    try testing.expect(result.recommended_strategy != .keyword_only);
     try testing.expect(result.has_special_chars);
+    try testing.expectEqual(@as(u32, 6), result.token_count);
+}
+
+test "multi-token natural query with hyphen routes hybrid not keyword (P6)" {
+    // "Hariat-negotiation with Big Eric" — a real natural-language query whose
+    // single hyphen previously collapsed it to keyword_only, skipping vector.
+    const result = analyzeQuery("Hariat-negotiation with Big Eric", enabled_config);
+    try testing.expect(result.recommended_strategy != .keyword_only);
+    try testing.expect(result.has_special_chars);
+    try testing.expectEqual(@as(u32, 4), result.token_count);
+}
+
+test "single special-char token still routes keyword_only (P6)" {
+    // A single key-like token is correctly keyword_only.
+    const id_result = analyzeQuery("user_id", enabled_config);
+    try testing.expectEqual(RetrievalStrategy.keyword_only, id_result.recommended_strategy);
+    try testing.expect(id_result.has_special_chars);
+    try testing.expectEqual(@as(u32, 1), id_result.token_count);
+
+    const dotted_result = analyzeQuery("a.b", enabled_config);
+    try testing.expectEqual(RetrievalStrategy.keyword_only, dotted_result.recommended_strategy);
+    try testing.expect(dotted_result.has_special_chars);
+    try testing.expectEqual(@as(u32, 1), dotted_result.token_count);
 }
 
 test "avg_token_length computed correctly" {
