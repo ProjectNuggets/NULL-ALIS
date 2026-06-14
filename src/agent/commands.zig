@@ -1588,7 +1588,9 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             var msgs_buf = std.ArrayListUnmanaged(providers.ChatMessage).initCapacity(self.allocator, self.history.items.len) catch null;
             if (msgs_buf) |*buf| {
                 defer buf.deinit(self.allocator);
-                for (self.history.items) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
+                // Preserve tool identity (.name) so the extraction filter can
+                // drop internal-tool dumps — see OwnedMessage.toExtractionMessage.
+                for (self.history.items) |m| buf.appendAssumeCapacity(m.toExtractionMessage());
                 const ctx = extraction_runner.ExtractionContext{
                     .judge_provider = self.extraction_judge_provider,
                     .judge_model = self.extraction_judge_model_name,
