@@ -279,6 +279,29 @@ pub fn pickSlotForWrite(
 ///   1. Pick slot via pickSlotForWrite (eviction logic)
 ///   2. upsertWorkingMemorySlot at that slot_id
 ///   3. Log structured event for observability
+/// Find the slot_id of an existing slot whose `source_key` matches
+/// `source_key`, or null if none. A non-null match means the referent
+/// being promoted is ALREADY in working memory — the current promotion is
+/// a re-mention / re-extraction of the same underlying fact, not a new one.
+/// Returns null when `source_key` is null (un-keyed writes never dedup).
+/// Failure-soft: load failure → null (caller falls back to a fresh slot).
+fn findSlotBySourceKey(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state.Manager,
+    user_id: i64,
+    session_id: []const u8,
+    source_key: ?[]const u8,
+) ?i32 {
+    const sk = source_key orelse return null;
+    const slots = state_mgr.listWorkingMemorySlots(allocator, user_id, session_id) catch return null;
+    defer memory_root.freeWorkingMemorySlots(allocator, slots);
+    for (slots) |*s| {
+        const existing = s.source_key orelse continue;
+        if (std.mem.eql(u8, existing, sk)) return s.slot_id;
+    }
+    return null;
+}
+
 pub fn promoteSlot(
     allocator: std.mem.Allocator,
     state_mgr: *zaki_state.Manager,
@@ -290,7 +313,24 @@ pub fn promoteSlot(
     importance: f64,
     pinned: bool,
 ) !?i32 {
-    const slot_id = (try pickSlotForWrite(allocator, state_mgr, user_id, session_id, slot_type)) orelse {
+    // WM (memory-phase-0.5) — recency-on-recall. If a slot already exists
+    // for this `source_key`, the referent is being re-mentioned / re-
+    // extracted this turn: bump its recency via `touchSlot` and reuse its
+    // slot_id for the upsert below, instead of allocating a fresh slot and
+    // leaving a stale duplicate to decay. This is the natural call site the
+    // `touchSlot` docstring describes; without it `touchSlot` was dead code
+    // and re-mentions churned a new slot each time. The subsequent upsert on
+    // the same slot_id also stamps `last_touched_at = NOW()`, so the touch
+    // is belt-and-suspenders for the (rare) case the upsert is skipped — but
+    // it also makes the recency advance observable independently of content
+    // changes, which is what the recency-decay eviction relies on.
+    const existing_slot_id = findSlotBySourceKey(allocator, state_mgr, user_id, session_id, source_key);
+    if (existing_slot_id) |sid| {
+        touchSlot(state_mgr, user_id, session_id, sid);
+    }
+
+    const slot_id = existing_slot_id orelse
+        (try pickSlotForWrite(allocator, state_mgr, user_id, session_id, slot_type)) orelse {
         log.info(
             "working_memory.promote.skipped reason=all_pinned user={d} session={s} type={s}",
             .{ user_id, session_id, slot_type },
@@ -318,6 +358,31 @@ pub fn promoteSlot(
         .{ user_id, session_id, slot_id, slot_type, importance, pinned },
     );
     return slot_id;
+}
+
+/// WM (memory-phase-0.5) — bounded reaper threshold logic, factored out
+/// as a pure function so it's unit-testable without a database.
+///
+/// Returns true iff a slot last touched at `last_touched_unix` is stale
+/// relative to `now_unix` given a retention window of `retention_days`,
+/// i.e. it has been untouched for STRICTLY MORE than the window and is
+/// therefore a reap candidate. `retention_days == 0` disables reaping
+/// (always returns false) — matches the config "0 = disabled" contract.
+///
+/// The DB reaper (`zaki_state.reapStaleWorkingMemory`) applies the
+/// equivalent predicate server-side (`last_touched_at < NOW() - interval`);
+/// this function exists so the boundary logic — the off-by-one at the
+/// window edge and the disabled-sentinel — is verified in a fast, hermetic
+/// unit test rather than only behind the postgres gate.
+pub fn isWorkingMemoryStale(
+    last_touched_unix: i64,
+    now_unix: i64,
+    retention_days: u32,
+) bool {
+    if (retention_days == 0) return false; // reaper disabled
+    const window_secs: i64 = @as(i64, retention_days) * 24 * 60 * 60;
+    const age_secs: i64 = now_unix - last_touched_unix;
+    return age_secs > window_secs;
 }
 
 /// Bump `last_touched_at` on a slot — called when the slot's content
@@ -570,4 +635,28 @@ test "RESERVED_SLOT_IDENTITY and RESERVED_SLOT_PERSONA are 0 and 1" {
 
 test "RENDER_TOP_N is 10" {
     try std.testing.expectEqual(@as(usize, 10), RENDER_TOP_N);
+}
+
+test "isWorkingMemoryStale — reaper threshold logic (WM)" {
+    const now: i64 = 1_700_000_000;
+    const day: i64 = 24 * 60 * 60;
+
+    // Fresh slot (touched now) is never stale under any positive window.
+    try std.testing.expect(!isWorkingMemoryStale(now, now, 30));
+    // Touched 1 day ago, 30-day window → not stale.
+    try std.testing.expect(!isWorkingMemoryStale(now - day, now, 30));
+    // Touched exactly at the window edge (30 days) → NOT stale (strict >).
+    try std.testing.expect(!isWorkingMemoryStale(now - 30 * day, now, 30));
+    // One second past the window edge → stale.
+    try std.testing.expect(isWorkingMemoryStale(now - 30 * day - 1, now, 30));
+    // Touched 60 days ago, 30-day window → stale.
+    try std.testing.expect(isWorkingMemoryStale(now - 60 * day, now, 30));
+
+    // retention_days == 0 disables the reaper: even an ancient slot is
+    // never reaped.
+    try std.testing.expect(!isWorkingMemoryStale(now - 365 * day, now, 0));
+
+    // Tighter window (1 day): a 2-day-old slot is stale, a 12-hour-old isn't.
+    try std.testing.expect(isWorkingMemoryStale(now - 2 * day, now, 1));
+    try std.testing.expect(!isWorkingMemoryStale(now - day / 2, now, 1));
 }

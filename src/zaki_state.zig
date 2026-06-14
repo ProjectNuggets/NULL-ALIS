@@ -1156,6 +1156,11 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn clearWorkingMemorySession(_: *@This(), _: i64, _: []const u8) !void {
         return;
     }
+    /// WM (memory-phase-0.5) — reaper stub for non-postgres builds. No WM
+    /// rows exist without Postgres, so nothing to reap.
+    pub fn reapStaleWorkingMemory(_: *@This(), _: u32) !u64 {
+        return 0;
+    }
     /// V1.13 Day 2 — extraction queue stubs for non-postgres builds.
     /// Non-postgres builds run extraction synchronously inline (V1.12
     /// behavior) — the queue is a postgres-only background-lane primitive.
@@ -9909,6 +9914,52 @@ const ManagerImpl = struct {
         const lengths = [_]c_int{ @intCast(user_s.len), @intCast(session_id.len) };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
+    }
+
+    /// WM (memory-phase-0.5) — bounded working-memory reaper. Deletes every
+    /// `working_memory` row whose `last_touched_at` is older than
+    /// `retention_days` days. The `working_memory` table otherwise accretes
+    /// dead rows forever for sessions that ended WITHOUT a clean /reset
+    /// (eviction/TTL drops the in-RAM Session but leaves the Postgres rows).
+    ///
+    /// Hooked into the tenant-maintenance sweep (same cadence as session
+    /// idle/TTL eviction) — see gateway.runTenantRuntimeMaintenance. NOT a
+    /// new timer.
+    ///
+    /// Predicate matches the pure `working_memory.isWorkingMemoryStale`
+    /// boundary logic (untouched STRICTLY MORE than the window). Identity
+    /// slots are pinned but are NOT exempt here: a session idle past the
+    /// retention window is wholly stale — when the user returns, a fresh
+    /// session re-pins identity from the canonical identity store. Reaping
+    /// per-row (not per-session) keeps the statement a single bounded DELETE.
+    ///
+    /// `retention_days == 0` disables the reaper (returns 0 without touching
+    /// the DB), matching the config contract. Returns the number of rows
+    /// deleted.
+    pub fn reapStaleWorkingMemory(
+        self: *Self,
+        retention_days: u32,
+    ) !u64 {
+        if (retention_days == 0) return 0; // reaper disabled
+        const q = try self.buildQuery(
+            "DELETE FROM {schema}.working_memory " ++
+                "WHERE last_touched_at < NOW() - ($1::int * INTERVAL '1 day')",
+        );
+        defer self.allocator.free(q);
+        var days_buf: [16]u8 = undefined;
+        const days_s = try std.fmt.bufPrintZ(&days_buf, "{d}", .{retention_days});
+        const params = [_]?[*:0]const u8{days_s.ptr};
+        const lengths = [_]c_int{@intCast(days_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const affected = c.PQcmdTuples(result);
+        if (affected == null) return 0;
+        const affected_slice = std.mem.span(affected);
+        const deleted = std.fmt.parseInt(u64, affected_slice, 10) catch 0;
+        if (deleted > 0) {
+            log.info("working_memory.reaped rows={d} retention_days={d}", .{ deleted, retention_days });
+        }
+        return deleted;
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -18962,6 +19013,179 @@ test "P1-3 extraction-queue backpressure — coalesce dupes + depth cap keeps qu
     {
         const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
         defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// WM (memory-phase-0.5) — bounded working memory: clear-on-reset,
+// reaper, recency-touch. Postgres-gated (skip without a DB URL).
+// ─────────────────────────────────────────────────────────────────
+
+test "WM clearWorkingMemorySession wipes the session's slots (clear-on-reset)" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    const sid = "wm-reset-session";
+
+    // Pin identity at the reserved slot 0, plus a couple of stale
+    // open_loop / active_goal slots that a /reset should wipe.
+    _ = try mgr.upsertWorkingMemorySlot(2, sid, 0, "identity", "user is Nova", null, 1.0, true);
+    _ = try mgr.upsertWorkingMemorySlot(2, sid, 2, "open_loop", "call Alfred about MNDA", "k_loop", 0.9, false);
+    _ = try mgr.upsertWorkingMemorySlot(2, sid, 3, "active_goal", "ship P8", "k_goal", 0.95, false);
+
+    {
+        const before = try mgr.listWorkingMemorySlots(allocator, 2, sid);
+        defer memory_root.freeWorkingMemorySlots(allocator, before);
+        try std.testing.expectEqual(@as(usize, 3), before.len);
+    }
+
+    // The clear-on-reset primitive: wipes ALL slots for the session
+    // (the session.zig reset path re-pins identity afterwards).
+    try mgr.clearWorkingMemorySession(2, sid);
+
+    {
+        const after = try mgr.listWorkingMemorySlots(allocator, 2, sid);
+        defer memory_root.freeWorkingMemorySlots(allocator, after);
+        try std.testing.expectEqual(@as(usize, 0), after.len);
+    }
+
+    // Identity is re-pinnable after the clear (mirrors the session-reset
+    // re-pin): a fresh identity slot 0 lands cleanly with no leftover slots.
+    _ = try mgr.upsertWorkingMemorySlot(2, sid, 0, "identity", "user is Nova", null, 1.0, true);
+    {
+        const repinned = try mgr.listWorkingMemorySlots(allocator, 2, sid);
+        defer memory_root.freeWorkingMemorySlots(allocator, repinned);
+        try std.testing.expectEqual(@as(usize, 1), repinned.len);
+        try std.testing.expectEqualStrings("identity", repinned[0].slot_type);
+        try std.testing.expect(repinned[0].pinned);
+    }
+
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+}
+
+test "WM reapStaleWorkingMemory deletes only rows past the retention window" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    const fresh_sid = "wm-fresh-session";
+    const stale_sid = "wm-stale-session";
+
+    // A fresh slot (last_touched_at = NOW() via upsert).
+    _ = try mgr.upsertWorkingMemorySlot(2, fresh_sid, 2, "open_loop", "recent loop", "k_fresh", 0.9, false);
+    // A slot we'll age into staleness.
+    _ = try mgr.upsertWorkingMemorySlot(2, stale_sid, 2, "open_loop", "ancient loop", "k_stale", 0.9, false);
+
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+
+    // Backdate the stale session's slot to 40 days ago — past the 30-day
+    // retention window.
+    {
+        const age_q = try std.fmt.allocPrint(
+            allocator,
+            "UPDATE {s}.working_memory SET last_touched_at = NOW() - INTERVAL '40 days' WHERE session_id = '{s}'",
+            .{ schema_q, stale_sid },
+        );
+        defer allocator.free(age_q);
+        const r = try mgr.exec(age_q);
+        c.PQclear(r);
+    }
+
+    // Reaper with a 30-day window: the 40-day-old row goes, the fresh stays.
+    const deleted = try mgr.reapStaleWorkingMemory(30);
+    try std.testing.expectEqual(@as(u64, 1), deleted);
+
+    {
+        const fresh_after = try mgr.listWorkingMemorySlots(allocator, 2, fresh_sid);
+        defer memory_root.freeWorkingMemorySlots(allocator, fresh_after);
+        try std.testing.expectEqual(@as(usize, 1), fresh_after.len);
+
+        const stale_after = try mgr.listWorkingMemorySlots(allocator, 2, stale_sid);
+        defer memory_root.freeWorkingMemorySlots(allocator, stale_after);
+        try std.testing.expectEqual(@as(usize, 0), stale_after.len);
+    }
+
+    // retention_days == 0 disables the reaper: even the now-only fresh row
+    // is left untouched and nothing is deleted.
+    const deleted_disabled = try mgr.reapStaleWorkingMemory(0);
+    try std.testing.expectEqual(@as(u64, 0), deleted_disabled);
+
+    {
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+}
+
+test "WM touchWorkingMemorySlot advances a slot's recency (recency-on-recall)" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    const sid = "wm-touch-session";
+    _ = try mgr.upsertWorkingMemorySlot(2, sid, 2, "open_loop", "loop to recall", "k_touch", 0.9, false);
+
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+
+    // Backdate the slot so its recency is clearly stale.
+    {
+        const age_q = try std.fmt.allocPrint(
+            allocator,
+            "UPDATE {s}.working_memory SET last_touched_at = NOW() - INTERVAL '5 days' WHERE session_id = '{s}'",
+            .{ schema_q, sid },
+        );
+        defer allocator.free(age_q);
+        const r = try mgr.exec(age_q);
+        c.PQclear(r);
+    }
+
+    const before_touch: i64 = blk: {
+        const slots = try mgr.listWorkingMemorySlots(allocator, 2, sid);
+        defer memory_root.freeWorkingMemorySlots(allocator, slots);
+        try std.testing.expectEqual(@as(usize, 1), slots.len);
+        break :blk slots[0].last_touched_at_unix;
+    };
+
+    // Recall / re-mention → touch bumps last_touched_at to NOW().
+    try mgr.touchWorkingMemorySlot(2, sid, 2);
+
+    const after_touch: i64 = blk: {
+        const slots = try mgr.listWorkingMemorySlots(allocator, 2, sid);
+        defer memory_root.freeWorkingMemorySlots(allocator, slots);
+        try std.testing.expectEqual(@as(usize, 1), slots.len);
+        break :blk slots[0].last_touched_at_unix;
+    };
+
+    // Recency advanced: the touched timestamp is strictly newer (the slot
+    // was 5 days stale; touch moves it to ~now, gaining several days).
+    try std.testing.expect(after_touch > before_touch);
+    try std.testing.expect(after_touch - before_touch > 4 * 24 * 60 * 60);
+
+    {
         const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
         defer allocator.free(drop_q);
         const result = try mgr.exec(drop_q);

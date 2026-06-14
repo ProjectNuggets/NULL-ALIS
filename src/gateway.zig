@@ -2684,6 +2684,20 @@ fn runTenantRuntimeMaintenance(state: *GatewayState, now_s: i64) void {
                 &state.shutdown_requested,
             );
         }
+        // WM (memory-phase-0.5) — bounded working-memory reaper. Piggybacks on
+        // this same maintenance cadence (NOT a new timer) so dead
+        // `working_memory` rows from sessions that ended without a clean
+        // /reset don't accrete forever. Evicting the in-RAM Session above does
+        // NOT touch the Postgres WM rows; this DELETE does. Failure-soft:
+        // reap errors are logged inside reapStaleWorkingMemory's caller-side
+        // catch and never abort the sweep. `retention_days == 0` disables it.
+        if (runtime.state_mgr) |state_mgr| {
+            const retention_days = runtime.config.memory.lifecycle.working_memory_retention_days;
+            if (retention_days > 0) {
+                _ = state_mgr.reapStaleWorkingMemory(retention_days) catch |err|
+                    log.warn("gateway.wm_reap_failed err={s}", .{@errorName(err)});
+            }
+        }
     }
     if (state.shutdown_requested.load(.acquire)) return;
     pruneTenantRuntimeCache(state, now_s);

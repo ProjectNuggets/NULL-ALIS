@@ -1145,6 +1145,15 @@ pub const MemoryLifecycleConfig = struct {
     snapshot_enabled: bool = false,
     snapshot_on_hygiene: bool = false,
     auto_hydrate: bool = true,
+    /// WM (memory-phase-0.5) — bounded working-memory reaper threshold.
+    /// `working_memory` rows for a (user, session) whose newest slot has
+    /// been untouched for more than this many days are deleted by the
+    /// reaper that piggybacks on the tenant-maintenance sweep (same cadence
+    /// as session idle/TTL eviction). Without this the table accretes dead
+    /// rows forever for sessions that ended without a clean /reset. Set to
+    /// 0 to disable the reaper entirely. Default 30 days mirrors
+    /// `purge_after_days` — a session idle a month is safely stale.
+    working_memory_retention_days: u32 = 30,
 };
 
 pub const MemoryResponseCacheConfig = struct {
