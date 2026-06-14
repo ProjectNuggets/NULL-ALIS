@@ -619,7 +619,14 @@ fn addPromptBlocksByMarkers(
     }
 }
 
-const stable_prompt_markers = [_]PromptBlockMarker{
+/// KEYSTONE — the single source of truth for the system-prompt scaffold
+/// section titles. This list IS the brain-leak denylist seed: Fixes A/B/C of
+/// the brain-leak series (extraction_persist write-boundary denylist, the
+/// root.zig user-bound output strip, and the zaki_state C0 purge) all derive
+/// from `stable_prompt_markers` + `scaffold_internal_tokens` below so the
+/// guardrails can NEVER drift from the prompt that produces the scaffold.
+/// If you add/rename a stable section here, the leak defenses update for free.
+pub const stable_prompt_markers = [_]PromptBlockMarker{
     .{ .marker = "## Memory Link Types\n\n", .name = "memory_link_types", .bucket = "stable:tier1" },
     .{ .marker = "## Brain Architecture\n\n", .name = "brain_architecture", .bucket = "stable:tier1" },
     .{ .marker = "## Response Protocol\n\n", .name = "response_protocol", .bucket = "stable:tier1" },
@@ -637,6 +644,146 @@ const stable_prompt_markers = [_]PromptBlockMarker{
     .{ .marker = "## Tool Use Protocol\n\n", .name = "xml_tool_protocol", .bucket = "stable:xml_tools" },
     .{ .marker = "### Available Tools\n\n", .name = "xml_tool_catalog", .bucket = "stable:xml_tools" },
 };
+
+/// Scaffold-body terms — the distinctive multi-word phrases that appear
+/// INSIDE the stable sections above (chiefly `## Brain Architecture` and
+/// `## Memory Link Types`). The #48 leak persisted these as brain ENTITIES,
+/// so they belong on the entity-name denylist alongside the section titles.
+///
+/// Curated, NOT auto-derived: section BODIES are prose that changes; pinning
+/// the load-bearing terms here keeps the denylist precise (full-name match,
+/// see `scaffold_entity_names`) without sweeping in generic vocabulary.
+pub const scaffold_internal_tokens = [_][]const u8{
+    "Working memory",
+    "Working Memory",
+    "Distillation extraction",
+    "Distillation Extraction",
+    "Layer 0",
+    "Layer 1",
+    "Layer 2",
+    "Auto-promoted",
+    "Auto-promotion",
+    "Semantic memory",
+    "Episodic memory",
+    "Procedural memory",
+    "Memory link",
+    "Memory Link",
+    "Link type",
+    "Link Type",
+};
+
+/// Brain-leak denylist of scaffold section TITLES (the bare `## <Title>` text,
+/// header markup stripped). Built from `stable_prompt_markers` so it can't
+/// drift. Excludes the generic single-word titles (Safety / Tools / Runtime /
+/// Workspace / Skills) that legitimately occur as user-supplied entity names —
+/// the leak only ever produced the scaffold-SPECIFIC multi-word phrases, and
+/// matching is exact-full-name (not substring), so omitting them avoids
+/// over-filtering real facts. The XML tool-protocol titles are kept (they are
+/// never plausible user entities). See `scaffold_entity_names` for the
+/// combined, deduped denylist Fixes A/C consume.
+pub const scaffold_title_names = [_][]const u8{
+    "Memory Link Types",
+    "Brain Architecture",
+    "Response Protocol",
+    "Channel Attachments",
+    "Task Decomposition",
+    "Runtime Capabilities",
+    "Persona Calibration",
+    "Project Context",
+    "Available Skills",
+    "Tool Use Protocol",
+    "Available Tools",
+};
+
+/// Combined entity-name denylist for the brain-leak fixes: scaffold section
+/// titles + scaffold-body terms. Compared case-insensitively and after
+/// whitespace-normalization by `isScaffoldEntityName`. This is the single
+/// list Fix A (extraction write boundary) and Fix C (C0 purge) consume.
+pub const scaffold_entity_names = scaffold_title_names ++ scaffold_internal_tokens;
+
+/// Whitespace-normalize `s` in place into `buf` (collapse internal runs of
+/// ASCII whitespace to a single space, trim ends, lowercase ASCII). Returns
+/// the normalized slice (a prefix of `buf`). Used by `isScaffoldEntityName`
+/// so "  brain   architecture " matches "Brain Architecture". `buf` must be
+/// at least `s.len` bytes. Non-ASCII bytes pass through unchanged (the
+/// scaffold terms are all ASCII, so this is sufficient + allocation-free).
+fn normalizeScaffoldName(s: []const u8, buf: []u8) []u8 {
+    var out_len: usize = 0;
+    var i: usize = 0;
+    var pending_space = false;
+    var seen_nonspace = false;
+    while (i < s.len) : (i += 1) {
+        const ch = s[i];
+        if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') {
+            if (seen_nonspace) pending_space = true;
+            continue;
+        }
+        if (pending_space) {
+            buf[out_len] = ' ';
+            out_len += 1;
+            pending_space = false;
+        }
+        buf[out_len] = std.ascii.toLower(ch);
+        out_len += 1;
+        seen_nonspace = true;
+    }
+    return buf[0..out_len];
+}
+
+/// True when `name` is a system-prompt scaffold artifact (section title or
+/// scaffold-body term) that must never be persisted as a brain entity or
+/// recalled into a reply. Case-insensitive, whitespace-normalized, EXACT
+/// full-name match (not substring) so legitimate facts that merely contain a
+/// scaffold word ("Safety team", "uses Layer 0 of the stack") are untouched.
+/// Stack-buffered + allocation-free; safe to call per fact on the write path.
+pub fn isScaffoldEntityName(name: []const u8) bool {
+    // Bound the work: the longest denylist entry is ~20 chars; any candidate
+    // far longer than the longest entry cannot be an exact match. 128 is a
+    // generous cap that covers every entry with headroom and keeps the
+    // stack buffer small. Longer names are definitionally not a match.
+    if (name.len == 0 or name.len > 128) return false;
+    var buf: [128]u8 = undefined;
+    const norm = normalizeScaffoldName(name, &buf);
+    if (norm.len == 0) return false;
+    inline for (scaffold_entity_names) |entry| {
+        var ebuf: [128]u8 = undefined;
+        const enorm = normalizeScaffoldName(entry, &ebuf);
+        if (std.mem.eql(u8, norm, enorm)) return true;
+    }
+    return false;
+}
+
+test "isScaffoldEntityName: scaffold titles + body terms match (case/whitespace-insensitive)" {
+    try std.testing.expect(isScaffoldEntityName("Brain Architecture"));
+    try std.testing.expect(isScaffoldEntityName("brain architecture")); // case
+    try std.testing.expect(isScaffoldEntityName("  Brain   Architecture  ")); // whitespace
+    try std.testing.expect(isScaffoldEntityName("Memory Link Types"));
+    try std.testing.expect(isScaffoldEntityName("Response Protocol"));
+    try std.testing.expect(isScaffoldEntityName("Channel Attachments"));
+    try std.testing.expect(isScaffoldEntityName("Task Decomposition"));
+    try std.testing.expect(isScaffoldEntityName("Working memory"));
+    try std.testing.expect(isScaffoldEntityName("Distillation extraction"));
+    try std.testing.expect(isScaffoldEntityName("Layer 0"));
+    try std.testing.expect(isScaffoldEntityName("Auto-promoted"));
+}
+
+test "isScaffoldEntityName: legitimate facts are NOT over-filtered" {
+    // Real user entities — must pass through.
+    try std.testing.expect(!isScaffoldEntityName("Helix"));
+    try std.testing.expect(!isScaffoldEntityName("dark mode"));
+    try std.testing.expect(!isScaffoldEntityName("Acme"));
+    try std.testing.expect(!isScaffoldEntityName("Cairo"));
+    // Generic single words deliberately excluded from the denylist so a real
+    // fact using them survives.
+    try std.testing.expect(!isScaffoldEntityName("Safety"));
+    try std.testing.expect(!isScaffoldEntityName("Tools"));
+    try std.testing.expect(!isScaffoldEntityName("Skills"));
+    // Exact-match, not substring: a scaffold word embedded in a real phrase
+    // must NOT trip the filter.
+    try std.testing.expect(!isScaffoldEntityName("Safety team"));
+    try std.testing.expect(!isScaffoldEntityName("Brain Architecture course")); // longer than the entry
+    try std.testing.expect(!isScaffoldEntityName("")); // empty
+}
 
 const volatile_prompt_markers = [_]PromptBlockMarker{
     .{ .marker = "## Conversation Context\n\n", .name = "conversation_context", .bucket = "volatile:turn" },

@@ -18213,6 +18213,121 @@ test "P7 person-as-subject — extracted edge makes the subject a resolvable nod
     }
 }
 
+test "brain-leak A: scaffold triples rejected at persist write boundary; real fact persists" {
+    // End-to-end proof of Fix A: feed an extraction triple set that mixes
+    // system-prompt scaffold artifacts (the #48 leak shape — section titles +
+    // body terms as subject/object) with one genuine fact. After persist:
+    //   - NO scaffold entity row exists in memory_entities,
+    //   - NO scaffold edge row exists in memory_edges,
+    //   - the genuine fact IS persisted (no over-filtering),
+    //   - PersistResult.skipped_scaffold counts exactly the rejected facts.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-brainleak-a/workspace");
+
+    // Real deterministic embedder so coref WOULD mint entity rows for any
+    // surviving subject/object — making the "no scaffold entity" assertion
+    // meaningful (if the gate failed, the scaffold names would become nodes).
+    const embeddings = @import("memory/vector/embeddings.zig");
+    const local = try embeddings.LocalHashEmbedding.init(allocator, 1024);
+    const embed_provider = local.provider();
+    defer embed_provider.deinit();
+    const coref = extraction_persist.EntityResolution{ .embed_provider = embed_provider, .threshold = 0.95 };
+
+    // The triple set: 3 scaffold-poisoned facts + 1 genuine fact. The scaffold
+    // facts mirror the live-confirmed leak (section title as object, section
+    // title as subject, body term as object).
+    const triples = [_]extraction_persist.ExtractedMemory{
+        .{ .text = "The brain has a Brain Architecture", .subject = "user", .predicate = "USES", .object = "Brain Architecture", .attributed_to = "user", .confidence = 0.9 },
+        .{ .text = "Memory Link Types describe edges", .subject = "Memory Link Types", .predicate = "RELATED_TO", .object = "edges", .attributed_to = "user", .confidence = 0.9 },
+        .{ .text = "Working memory holds slots", .subject = "user", .predicate = "USES", .object = "Working memory", .attributed_to = "user", .confidence = 0.9 },
+        // Genuine fact — must survive.
+        .{ .text = "User prefers Helix editor", .subject = "user", .predicate = "PREFERS", .object = "Helix", .attributed_to = "user", .confidence = 0.95 },
+    };
+    const r = try extraction_persist.persistExtracted(
+        allocator, &mgr, 2, "brainleak-a-session", &triples,
+        null, // judge
+        coref, // coref present → any survivor resolves to an entity row
+        null, // mem_rt
+        .test_wire, 0, true,
+    );
+
+    // Exactly the 3 scaffold facts rejected; exactly the 1 genuine fact written.
+    try std.testing.expectEqual(@as(usize, 3), r.skipped_scaffold);
+    try std.testing.expectEqual(@as(usize, 1), r.written_count);
+
+    // No scaffold entity rows minted (case-insensitive name_lower match on any
+    // denylisted surface form). This is the core anti-poison assertion.
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT COUNT(*) FROM {s}.memory_entities WHERE user_id = 2 " ++
+                "AND name_lower IN ('brain architecture','memory link types','working memory')",
+            .{schema_q},
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const cnt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(cnt);
+        try std.testing.expectEqualStrings("0", cnt);
+    }
+
+    // No edges reference a scaffold fact (the genuine PREFERS Helix edge is the
+    // only edge family allowed). Assert zero edges carry the scaffold predicates
+    // we fed for the rejected triples.
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT COUNT(*) FROM {s}.memory_edges e " ++
+                "WHERE e.user_id = 2 AND e.fact IN " ++
+                "('The brain has a Brain Architecture','Memory Link Types describe edges','Working memory holds slots')",
+            .{schema_q},
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const cnt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(cnt);
+        try std.testing.expectEqualStrings("0", cnt);
+    }
+
+    // The genuine "Helix" entity DID get minted (proves no over-filtering).
+    {
+        const emb = try embed_provider.embed(allocator, "Helix");
+        defer allocator.free(emb);
+        const found = try mgr.findEntityByCosine(allocator, 2, emb, 0.95);
+        try std.testing.expect(found != null);
+        const row = found.?;
+        defer row.deinit(allocator);
+        try std.testing.expectEqualStrings("Helix", row.name);
+    }
+}
+
 // V1.6 commit 9 — edge mutation events.
 //
 // Acceptance: every upsertMemoryEdge call emits one edge_added event;
