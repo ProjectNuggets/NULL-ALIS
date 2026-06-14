@@ -4611,6 +4611,13 @@ const ManagerImpl = struct {
                 // categories; without this they would resurrect/demote on a
                 // benign re-upsert. open_loop is durable here (close-out
                 // preserved) even though it still decays in ranking.
+                // NOTE: the close-out (valid_to/is_latest/memory_type) is
+                // preserved for a durable row, but `content`/`metadata` below
+                // still refresh to EXCLUDED — so re-mentioning an ARCHIVED
+                // durable fact keeps it archived (no resurrection) while
+                // updating its stored phrasing. Intended: latest wording wins;
+                // the archival STATE is what's protected, not the text bytes.
+                // (Same semantics at the `upsertMemory` sibling path.)
                 "ON CONFLICT (user_id, key) DO UPDATE SET " ++
                 "session_id = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN NULL ELSE EXCLUDED.session_id END, " ++
                 "content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, " ++

@@ -673,9 +673,12 @@ pub const scaffold_internal_tokens = [_][]const u8{
 };
 
 /// Brain-leak denylist of scaffold section TITLES (the bare `## <Title>` text,
-/// header markup stripped). Built from `stable_prompt_markers` so it can't
-/// drift. Excludes the generic single-word titles (Safety / Tools / Runtime /
-/// Workspace / Skills) that legitimately occur as user-supplied entity names —
+/// header markup stripped). A CURATED SUBSET of the `stable_prompt_markers`
+/// titles, guarded by the comptime drift-check below (every entry must still
+/// match a real marker, so renaming a section there is a COMPILE error — not
+/// silent denylist staleness). Excludes the generic single-word titles
+/// (Safety / Tools / Runtime / Workspace / Skills) that legitimately occur as
+/// user-supplied entity names —
 /// the leak only ever produced the scaffold-SPECIFIC multi-word phrases, and
 /// matching is exact-full-name (not substring), so omitting them avoids
 /// over-filtering real facts. The XML tool-protocol titles are kept (they are
@@ -694,6 +697,31 @@ pub const scaffold_title_names = [_][]const u8{
     "Tool Use Protocol",
     "Available Tools",
 };
+
+// Comptime drift guard for `scaffold_title_names`: every denylisted title
+// MUST still exist as a real `## <Title>` (or `### <Title>`) section in
+// `stable_prompt_markers`. If a section is renamed there without updating the
+// list, the stale entry would match nothing and the Fix A (write-boundary)
+// and Fix C (C0 purge) denylists would silently go stale — re-opening the
+// poisoning vector for the renamed section. Make that a COMPILE error. (The
+// reverse — a new marker not mirrored here — is intentionally allowed: the
+// list is a curated subset that omits generic single-word titles.)
+comptime {
+    for (scaffold_title_names) |title| {
+        var found = false;
+        for (stable_prompt_markers) |marker| {
+            if (std.mem.eql(u8, marker.marker, "## " ++ title ++ "\n\n") or
+                std.mem.eql(u8, marker.marker, "### " ++ title ++ "\n\n"))
+            {
+                found = true;
+            }
+        }
+        if (!found) @compileError(
+            "scaffold_title_names entry '" ++ title ++
+                "' matches no stable_prompt_markers section (rename drift) — update the denylist",
+        );
+    }
+}
 
 /// Combined entity-name denylist for the brain-leak fixes: scaffold section
 /// titles + scaffold-body terms. Compared case-insensitively and after

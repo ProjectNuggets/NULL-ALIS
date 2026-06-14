@@ -442,15 +442,16 @@ fn sqlInListFromSet(comptime set: []const []const u8) []const u8 {
     return s ++ ")";
 }
 
-test "EVERGREEN/DURABLE SQL fragments are comptime-consistent with the sets" {
-    // The SQL `IN (...)` strings must equal the lists derived from the sets,
-    // so a future edit to one without the other is a compile-time error.
-    // Force comptime evaluation of the builder (it concatenates with `++`,
-    // which is a comptime-only op).
-    const evergreen_expected = comptime sqlInListFromSet(&EVERGREEN_MEMORY_TYPES);
-    const durable_expected = comptime sqlInListFromSet(&DURABLE_MEMORY_TYPES);
-    try std.testing.expectEqualStrings(evergreen_expected, EVERGREEN_TYPES_SQL);
-    try std.testing.expectEqualStrings(durable_expected, DURABLE_TYPES_SQL);
+// Drift guard: the hand-written `*_TYPES_SQL` constants must equal the
+// `IN (...)` lists derived from the `*_MEMORY_TYPES` sets. Editing one set
+// without the other is now a COMPILE error (not a silent divergence, nor a
+// merely test-time failure) — the `comptime` block forces evaluation of the
+// `++`-built builder and `@compileError`s on any mismatch.
+comptime {
+    if (!std.mem.eql(u8, sqlInListFromSet(&EVERGREEN_MEMORY_TYPES), EVERGREEN_TYPES_SQL))
+        @compileError("EVERGREEN_TYPES_SQL drifted from EVERGREEN_MEMORY_TYPES — regenerate the IN-list");
+    if (!std.mem.eql(u8, sqlInListFromSet(&DURABLE_MEMORY_TYPES), DURABLE_TYPES_SQL))
+        @compileError("DURABLE_TYPES_SQL drifted from DURABLE_MEMORY_TYPES — regenerate the IN-list");
 }
 
 // ── Link types ─────────────────────────────────────────────────────
