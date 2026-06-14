@@ -1329,7 +1329,7 @@ pub const WriteOrigin = enum {
 /// LLM (today's primary path), agent tool writes, or the classifier
 /// when those land. Each fact passes through:
 ///   1. predicate blacklist (defense-in-depth against meta-narrative)
-///   2. MD5 content_hash dedup pre-filter (V1.6 5b.3 — exact-byte match)
+///   2. SHA-256 content_hash dedup pre-filter (V1.6 5b.3 — exact-byte match)
 ///   3. **V1.6 commit 6**: contradiction LLM judge when `judge` provided
 ///      a. duplicate detected → skip (treat as semantic-dup of existing row)
 ///      b. contradicted older facts → close out via setMemoryInvalidation

@@ -1500,6 +1500,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (lc.get("auto_hydrate")) |v| if (v == .bool) {
                         self.memory.lifecycle.auto_hydrate = v.bool;
                     };
+                    if (lc.get("working_memory_retention_days")) |v| if (v == .integer) {
+                        self.memory.lifecycle.working_memory_retention_days = @intCast(v.integer);
+                    };
                 }
             }
 

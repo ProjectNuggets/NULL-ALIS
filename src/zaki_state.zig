@@ -5395,7 +5395,7 @@ const ManagerImpl = struct {
         return try decodeMemoryEntry(allocator, result, 0);
     }
 
-    /// V1.6 commit 5b.3 (WR-1): MD5 content_hash dedup pre-filter for
+    /// V1.6 commit 5b.3 (WR-1): SHA-256 content_hash dedup pre-filter for
     /// extraction-derived writes. Returns the existing memory row if
     /// the user already has a memory with identical normalized content,
     /// or null otherwise.
