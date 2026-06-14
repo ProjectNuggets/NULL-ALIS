@@ -466,7 +466,7 @@ fn categoryForAttribution(attributed_to: []const u8) memory_root.MemoryCategory 
 /// recorded as provenance in the row metadata (buildExtractionMetadata
 /// emits `metadata.attributed_to`) and is still the fallback router for
 /// facts with no distinctive semantic signal.
-fn categoryForSemantics(class: PredicateClass, attributed_to: []const u8) memory_root.MemoryCategory {
+pub fn categoryForSemantics(class: PredicateClass, attributed_to: []const u8) memory_root.MemoryCategory {
     if (class.slot_type) |st| {
         if (std.mem.eql(u8, st, working_memory.SlotType.open_loop)) return .{ .custom = "open_loop" };
         if (std.mem.eql(u8, st, working_memory.SlotType.decision)) return .{ .custom = "decision" };
@@ -502,6 +502,150 @@ pub fn categoryForSessionEndFact(
     if (semantic_type_routing_enabled)
         return categoryForSemantics(classifyPredicate(predicate), attributed_to);
     return categoryForAttribution(attributed_to);
+}
+
+// ── C0 (memory-phase-0.5) — one-time backfill decision helpers ───────────
+//
+// The prior patches (P1/P3/P4/P7) fix NEW writes. C0 is the operator-triggered
+// backfill that repairs EXISTING rows for ALL users. These two pure functions
+// are the testable core of the re-type and re-entity-type decisions; the
+// Manager-side SQL loop (`zaki_state.phase05Backfill`) calls them per row.
+// Keeping the decision logic here — beside the write-path helpers it mirrors —
+// means the backfill can NEVER drift from how new writes are typed.
+
+/// C0 op 1 — should an EXISTING memory row be re-typed?
+///
+/// Only rows still carrying the legacy untyped defaults (`core`/`daily`) are
+/// candidates: a row already routed to a semantic type (preference/decision/
+/// person/open_loop/…) by P3 must be left exactly as-is so a second backfill
+/// run is a no-op (idempotence). The new type is computed with the SAME logic
+/// as new writes — `categoryForSemantics(classifyPredicate(predicate),
+/// attributed_to)` — so re-typing converges on the write path's answer.
+///
+/// Returns the new `memory_type` string (a static literal owned by the
+/// MemoryCategory union — never allocated) ONLY when ALL hold:
+///   - `current_type` is `core` or `daily` (untyped legacy default), AND
+///   - a non-empty `predicate` is available, AND
+///   - the predicate routes to a type that DIFFERS from `current_type`.
+///
+/// Returns null (leave the row untouched) otherwise — including the
+/// already-typed case, the no-predicate case, and the "predicate routes back
+/// to the same core/daily" case (no churn). Idempotent by construction:
+/// re-running on an already-backfilled row finds `current_type` is now the
+/// semantic type → not core/daily → returns null.
+pub fn backfillMemoryType(
+    current_type: []const u8,
+    predicate: []const u8,
+    attributed_to: []const u8,
+) ?[]const u8 {
+    // Gate: only legacy untyped rows are candidates. A row already at a
+    // semantic type is left alone (idempotence + don't fight P3).
+    const is_legacy_default = std.mem.eql(u8, current_type, "core") or
+        std.mem.eql(u8, current_type, "daily");
+    if (!is_legacy_default) return null;
+    // No predicate → no semantic signal → leave untyped (spec: only re-type
+    // where a predicate is genuinely available).
+    if (predicate.len == 0) return null;
+
+    const new_type = categoryForSemantics(classifyPredicate(predicate), attributed_to).toString();
+    // No-op when the predicate routes back to the same legacy default
+    // (e.g. an `.attribute` predicate with attributed_to="user" → "core"):
+    // re-typing core→core is churn with no benefit, so report nothing.
+    if (std.mem.eql(u8, new_type, current_type)) return null;
+    return new_type;
+}
+
+/// C0 op 2 — can an EXISTING `'PROPER'` entity be upgraded to a known class
+/// from the predicate context of an edge pointing at it?
+///
+/// The only DETERMINISTIC predicate→entity-class signal in the system is the
+/// relationship family (KNOWS, MARRIED_TO, WORKS_WITH, MANAGES, …): a triple
+/// `subject <relationship-pred> object` makes the OBJECT a PERSON. This is the
+/// SAME `.relationship` signal P3 uses to route the memory to `custom:"person"`
+/// (`categoryForSemantics`), so the two stay consistent. Reuses
+/// `classifyPredicate(...).link_type` — no new vocabulary.
+///
+/// All other predicates yield null: we do NOT guess ORG/PRODUCT/PLACE/etc. from
+/// a predicate (there is no deterministic mapping; that typing is the LLM
+/// entity-pipeline's job). Returns the static "PERSON" literal or null. The
+/// caller stamps it via `upsertEntity`, whose no-clobber CASE means a stamp of
+/// "PERSON" on a row already typed PERSON is a no-op (idempotence) and a stamp
+/// can only UPGRADE — never demote a known type.
+pub fn backfillEntityTypeFromPredicate(predicate: []const u8) ?[]const u8 {
+    if (predicate.len == 0) return null;
+    return switch (classifyPredicate(predicate).link_type) {
+        .relationship => "PERSON",
+        else => null,
+    };
+}
+
+test "backfillMemoryType: legacy core/daily re-typed by semantic predicate" {
+    // PREFERS → preference (differs from core) → re-type.
+    try std.testing.expectEqualStrings(
+        "preference",
+        backfillMemoryType("core", "PREFERS", "user").?,
+    );
+    // KNOWS → person (relationship) — re-type a daily row.
+    try std.testing.expectEqualStrings(
+        "person",
+        backfillMemoryType("daily", "KNOWS", "user").?,
+    );
+    // DECIDED → decision (slot_type) — re-type.
+    try std.testing.expectEqualStrings(
+        "decision",
+        backfillMemoryType("core", "DECIDED", "user").?,
+    );
+    // TODO → open_loop (slot_type) — re-type.
+    try std.testing.expectEqualStrings(
+        "open_loop",
+        backfillMemoryType("daily", "TODO", "user").?,
+    );
+}
+
+test "backfillMemoryType: already-typed rows are left alone (idempotence)" {
+    // A row already at a semantic type is never a candidate — the second
+    // backfill run finds these and returns null.
+    try std.testing.expect(backfillMemoryType("preference", "PREFERS", "user") == null);
+    try std.testing.expect(backfillMemoryType("person", "KNOWS", "user") == null);
+    try std.testing.expect(backfillMemoryType("decision", "DECIDED", "user") == null);
+    try std.testing.expect(backfillMemoryType("open_loop", "TODO", "user") == null);
+    // conversation is also not a legacy untyped default.
+    try std.testing.expect(backfillMemoryType("conversation", "PREFERS", "user") == null);
+}
+
+test "backfillMemoryType: no predicate or same-type route → no-op" {
+    // No predicate → leave untyped.
+    try std.testing.expect(backfillMemoryType("core", "", "user") == null);
+    // An .attribute predicate with attributed_to="user" routes back to core
+    // → core==core → no churn.
+    try std.testing.expect(backfillMemoryType("core", "LIVES_IN", "user") == null);
+    // .attribute predicate with non-user attribution routes to daily → and a
+    // daily row stays daily → no churn.
+    try std.testing.expect(backfillMemoryType("daily", "LIVES_IN", "assistant") == null);
+}
+
+test "backfillMemoryType: attribute predicate can still move daily→core for user facts" {
+    // A user-attributed .attribute fact that was mis-stored as daily routes to
+    // core under the write-path logic; backfill corrects it.
+    try std.testing.expectEqualStrings(
+        "core",
+        backfillMemoryType("daily", "LIVES_IN", "user").?,
+    );
+}
+
+test "backfillEntityTypeFromPredicate: relationship predicates imply PERSON" {
+    try std.testing.expectEqualStrings("PERSON", backfillEntityTypeFromPredicate("KNOWS").?);
+    try std.testing.expectEqualStrings("PERSON", backfillEntityTypeFromPredicate("MARRIED_TO").?);
+    try std.testing.expectEqualStrings("PERSON", backfillEntityTypeFromPredicate("WORKS_WITH").?);
+    try std.testing.expectEqualStrings("PERSON", backfillEntityTypeFromPredicate("manages").?); // case-insensitive
+}
+
+test "backfillEntityTypeFromPredicate: non-relationship predicates yield null (no guessing)" {
+    try std.testing.expect(backfillEntityTypeFromPredicate("PREFERS") == null); // preference
+    try std.testing.expect(backfillEntityTypeFromPredicate("USES") == null); // usage
+    try std.testing.expect(backfillEntityTypeFromPredicate("LIVES_IN") == null); // attribute
+    try std.testing.expect(backfillEntityTypeFromPredicate("ATTENDED") == null); // episode
+    try std.testing.expect(backfillEntityTypeFromPredicate("") == null);
 }
 
 /// V1.6 commit 7 (Gap 2 from memory pipeline handoff): deterministic key

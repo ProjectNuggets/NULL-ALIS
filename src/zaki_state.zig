@@ -14,6 +14,12 @@ const config_types = @import("config_types.zig");
 const env_rebrand = @import("env_rebrand.zig");
 const memory_root = @import("memory/root.zig");
 const text_norm = @import("memory/text_norm.zig");
+// C0 (memory-phase-0.5) — the Phase-0.5 backfill (`phase05Backfill`) reuses
+// the P3 re-type decision helpers (`backfillMemoryType`,
+// `backfillEntityTypeFromPredicate`) so the backfill can never drift from how
+// new writes are typed. Module-level circular import (extraction_persist
+// imports zaki_state) is fine — only runtime calls, no comptime cycle.
+const extraction_persist = @import("agent/extraction_persist.zig");
 const cron_mod = @import("cron.zig");
 const security_secrets = @import("security/secrets.zig");
 
@@ -1030,6 +1036,17 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
         _: []const u8,
     ) !bool {
         return false;
+    }
+    /// C0 (memory-phase-0.5) — stub for non-postgres builds; the one-time
+    /// Phase-0.5 backfill no-ops, returning an all-zero report so the
+    /// `memory_maintain` `phase05_backfill` action degrades cleanly.
+    pub fn phase05Backfill(
+        _: *@This(),
+        _: std.mem.Allocator,
+        _: ?i64,
+        dry_run: bool,
+    ) !memory_root.Phase05BackfillReport {
+        return .{ .dry_run = dry_run };
     }
     /// V1.6 commit 6 — stub for non-postgres builds. Returns empty
     /// candidate list so `edge_resolution.resolveOne` short-circuits to
@@ -8226,6 +8243,430 @@ const ManagerImpl = struct {
         return true;
     }
 
+    // ── C0 (memory-phase-0.5) — one-time, idempotent backfill ─────────────
+    //
+    // The prior patches (P1 dedup, P3 semantic typing, P4 continuity un-embed,
+    // P7 entity typing) fix NEW writes. Every EXISTING user's corpus is still
+    // mistyped (core/daily), carries exact-duplicate rows, untyped 'PROPER'
+    // entities, and embedded continuity. `phase05Backfill` is the operator-
+    // triggered repair for ALL users.
+    //
+    // SAFETY (see the `memory_maintain` `phase05_backfill` action):
+    //   - DRY-RUN is the default at the tool layer. When `dry_run=true` this
+    //     COMPUTES + COUNTS what would change and writes NOTHING.
+    //   - IDEMPOTENT. A second run is a no-op: re-typing gates on the legacy
+    //     core/daily default (already-typed rows are skipped); entity re-typing
+    //     only touches 'PROPER'; exact-dedup gates on live (valid_to IS NULL)
+    //     rows so superseded dups aren't re-processed; un-embed only deletes
+    //     continuity rows that exist.
+    //   - BATCHED per user (iterate users; bounded fetches within a user) so a
+    //     huge user can't lock the table or OOM the process.
+    //   - CONSERVATIVE. Exact `content_hash` dedup only (NEVER hard-delete —
+    //     supersede via `setMemoryInvalidation`). Near-duplicate / semantic
+    //     merge is DEFERRED to Phase 1's write-time MERGE and only REPORTED
+    //     here (cluster count).
+    //
+    // `user_id_opt`: a specific user, or null = ALL users (the general fix).
+    pub fn phase05Backfill(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id_opt: ?i64,
+        dry_run: bool,
+    ) !memory_root.Phase05BackfillReport {
+        var report: memory_root.Phase05BackfillReport = .{ .dry_run = dry_run };
+
+        // 1. Enumerate the user set. Either the one requested user or every
+        //    user that owns at least one memory row (the corpus we repair).
+        var user_ids: std.ArrayListUnmanaged(i64) = .empty;
+        defer user_ids.deinit(allocator);
+        if (user_id_opt) |uid| {
+            try user_ids.append(allocator, uid);
+        } else {
+            const users_q = try self.buildQuery(
+                "SELECT DISTINCT user_id FROM {schema}.memories ORDER BY user_id",
+            );
+            defer self.allocator.free(users_q);
+            const users_result = try self.exec(users_q);
+            defer c.PQclear(users_result);
+            const un: usize = @intCast(c.PQntuples(users_result));
+            try user_ids.ensureTotalCapacity(allocator, un);
+            for (0..un) |i| {
+                const row_idx: c_int = @intCast(i);
+                const uid_str = try dupeResultValue(allocator, users_result, row_idx, 0);
+                defer allocator.free(uid_str);
+                const uid = std.fmt.parseInt(i64, uid_str, 10) catch continue;
+                try user_ids.append(allocator, uid);
+            }
+        }
+
+        for (user_ids.items) |uid| {
+            report.users_scanned += 1;
+            try self.phase05BackfillRetypeRows(allocator, uid, dry_run, &report);
+            try self.phase05BackfillRetypeEntities(uid, dry_run, &report);
+            try self.phase05BackfillUnembedContinuity(allocator, uid, dry_run, &report);
+            try self.phase05BackfillExactDedup(allocator, uid, dry_run, &report);
+            try self.phase05BackfillCountNearDups(uid, &report);
+        }
+
+        log.info(
+            "phase05_backfill dry_run={} users={d} retyped={d} entities={d} continuity_embeds_removed={d} exact_dups={d} near_dup_clusters={d}",
+            .{
+                dry_run,
+                report.users_scanned,
+                report.rows_retyped,
+                report.entities_retyped,
+                report.continuity_embeddings_removed,
+                report.exact_dups_collapsed,
+                report.near_dup_clusters,
+            },
+        );
+        return report;
+    }
+
+    /// C0 op 1 — re-type memory rows still on the legacy core/daily default
+    /// whose predicate maps to a semantic type. The predicate is read from
+    /// `metadata->>'predicate'` — the SAME field the live edge-backfill relies
+    /// on (it is the reliable predicate source for extracted rows). The new
+    /// type is decided by `extraction_persist.backfillMemoryType`, which reuses
+    /// the P3 write-path logic, so the backfill cannot drift from new writes.
+    fn phase05BackfillRetypeRows(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        dry_run: bool,
+        report: *memory_root.Phase05BackfillReport,
+    ) !void {
+        // Candidate fetch: legacy-default rows that genuinely carry a
+        // predicate. Bounded read (predicate present + still core/daily). We
+        // batch by re-querying after each UPDATE pass would change the set, but
+        // since UPDATEs move rows OFF core/daily, a single pass suffices and
+        // re-running the whole backfill is a clean no-op.
+        const q = try self.buildQuery(
+            "SELECT key, memory_type, metadata->>'predicate', " ++
+                "COALESCE(metadata->>'attributed_to', '') " ++
+                "FROM {schema}.memories " ++
+                "WHERE user_id = $1 " ++
+                "AND memory_type IN ('core','daily') " ++
+                "AND metadata ? 'predicate' " ++
+                "AND length(metadata->>'predicate') > 0",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const n: usize = @intCast(c.PQntuples(result));
+        for (0..n) |i| {
+            const row_idx: c_int = @intCast(i);
+            const key = try dupeResultValue(allocator, result, row_idx, 0);
+            defer allocator.free(key);
+            const cur_type = try dupeResultValue(allocator, result, row_idx, 1);
+            defer allocator.free(cur_type);
+            const predicate = try dupeResultValue(allocator, result, row_idx, 2);
+            defer allocator.free(predicate);
+            const attributed_to = try dupeResultValue(allocator, result, row_idx, 3);
+            defer allocator.free(attributed_to);
+
+            // Decision delegated to the shared P3-aligned helper. null = leave
+            // as-is (already-typed / no-predicate / same-type → idempotent).
+            const new_type = extraction_persist.backfillMemoryType(cur_type, predicate, attributed_to) orelse continue;
+
+            report.rows_retyped += 1;
+            if (dry_run) continue;
+
+            // Live UPDATE — touch ONLY memory_type (+ link_type, which P3 also
+            // derives from the predicate, kept consistent here). Guard the
+            // WHERE on the still-legacy type so a concurrent write that already
+            // re-typed the row makes this a no-op (idempotent under races).
+            const link_type = extraction_persist.linkTypeForPredicate(predicate).toString();
+            const upd_q = try self.buildQuery(
+                "UPDATE {schema}.memories SET memory_type = $3, link_type = $4, updated_at = updated_at " ++
+                    "WHERE user_id = $1 AND key = $2 AND memory_type IN ('core','daily')",
+            );
+            defer self.allocator.free(upd_q);
+            const key_z = try self.allocator.dupeZ(u8, key);
+            defer self.allocator.free(key_z);
+            const type_z = try self.allocator.dupeZ(u8, new_type);
+            defer self.allocator.free(type_z);
+            const lt_z = try self.allocator.dupeZ(u8, link_type);
+            defer self.allocator.free(lt_z);
+            const upd_params = [_]?[*:0]const u8{ user_s.ptr, key_z, type_z, lt_z };
+            const upd_lengths = [_]c_int{
+                @intCast(user_s.len),
+                @intCast(key.len),
+                @intCast(new_type.len),
+                @intCast(link_type.len),
+            };
+            const upd_result = try self.execParams(upd_q, &upd_params, &upd_lengths);
+            c.PQclear(upd_result);
+        }
+    }
+
+    /// C0 op 2 — upgrade `'PROPER'` entities to a known class where a
+    /// DETERMINISTIC predicate signal exists. The only such signal is the
+    /// relationship family (KNOWS/MARRIED_TO/…): the OBJECT of a relationship
+    /// triple is a PERSON (`extraction_persist.backfillEntityTypeFromPredicate`,
+    /// the same `.relationship` signal P3 routes to `custom:"person"`). We find
+    /// each PROPER entity's incoming edge predicates, ask the helper, and stamp
+    /// the upgrade with the P7 no-clobber semantics: ONLY rows still at 'PROPER'
+    /// are touched, so a re-run (or a row already typed) is a no-op, and a stamp
+    /// can only UPGRADE, never demote. Type-only UPDATE preserves the existing
+    /// name_embedding (we deliberately do NOT call upsertEntity, which would
+    /// require — and clobber with — a fresh embedding).
+    fn phase05BackfillRetypeEntities(
+        self: *Self,
+        user_id: i64,
+        dry_run: bool,
+        report: *memory_root.Phase05BackfillReport,
+    ) !void {
+        // Distinct incoming predicates per PROPER entity. An entity is an edge
+        // target_key; the edge predicate is the typing signal. is_latest only
+        // (closed edges are stale). We aggregate predicates per entity so one
+        // entity with several incoming predicates is decided once.
+        const q = try self.buildQuery(
+            "SELECT e.id, ARRAY_AGG(DISTINCT ed.predicate) " ++
+                "FROM {schema}.memory_entities e " ++
+                "JOIN {schema}.memory_edges ed " ++
+                "  ON ed.user_id = e.user_id AND ed.target_key = e.id AND ed.is_latest " ++
+                "WHERE e.user_id = $1 AND e.entity_type = 'PROPER' " ++
+                "GROUP BY e.id",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const n: usize = @intCast(c.PQntuples(result));
+        for (0..n) |i| {
+            const row_idx: c_int = @intCast(i);
+            const id_ptr = c.PQgetvalue(result, row_idx, 0);
+            const id_slice: []const u8 = if (id_ptr == null) "" else std.mem.span(id_ptr);
+            const preds_ptr = c.PQgetvalue(result, row_idx, 1);
+            const preds_arr: []const u8 = if (preds_ptr == null) "" else std.mem.span(preds_ptr);
+
+            // Decide a single upgraded type for this entity. We scan the
+            // aggregated predicate array text for any relationship predicate;
+            // the FIRST that yields PERSON wins (we only ever produce PERSON,
+            // so no conflicting-class ambiguity is possible). The array text is
+            // a Postgres array literal `{KNOWS,LIKES}` — we split on the
+            // delimiters and ask the helper per token.
+            var new_type: ?[]const u8 = null;
+            var it = std.mem.tokenizeAny(u8, preds_arr, "{},\"");
+            while (it.next()) |tok| {
+                if (extraction_persist.backfillEntityTypeFromPredicate(tok)) |t| {
+                    new_type = t;
+                    break;
+                }
+            }
+            const upgraded = new_type orelse continue;
+
+            report.entities_retyped += 1;
+            if (dry_run) continue;
+
+            // No-clobber UPDATE: only flip rows still at 'PROPER'. Idempotent +
+            // upgrade-only by construction.
+            const upd_q = try self.buildQuery(
+                "UPDATE {schema}.memory_entities SET entity_type = $3, updated_at = NOW() " ++
+                    "WHERE user_id = $1 AND id = $2 AND entity_type = 'PROPER'",
+            );
+            defer self.allocator.free(upd_q);
+            const id_z = try self.allocator.dupeZ(u8, id_slice);
+            defer self.allocator.free(id_z);
+            const type_z = try self.allocator.dupeZ(u8, upgraded);
+            defer self.allocator.free(type_z);
+            const upd_params = [_]?[*:0]const u8{ user_s.ptr, id_z, type_z };
+            const upd_lengths = [_]c_int{
+                @intCast(user_s.len),
+                @intCast(id_slice.len),
+                @intCast(upgraded.len),
+            };
+            const upd_result = try self.execParams(upd_q, &upd_params, &upd_lengths);
+            c.PQclear(upd_result);
+        }
+    }
+
+    /// C0 op 3 — delete EXISTING embedded continuity-summary rows from the
+    /// pgvector `memory_embeddings` table. New continuity is already un-embedded
+    /// by P4; this removes the pre-P4 pollution. The authoritative gate is P4's
+    /// `memory_root.isContinuitySummaryKey` (reused, NOT re-listed): we fetch
+    /// candidate keys via the four prefixes, then re-filter every key through
+    /// the predicate before deleting, so the prefix list can never drift.
+    /// `durable_fact/` and real fact embeddings are NEVER matched. Tolerates a
+    /// missing embeddings table (deployments without the vector plane).
+    fn phase05BackfillUnembedContinuity(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        dry_run: bool,
+        report: *memory_root.Phase05BackfillReport,
+    ) !void {
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+
+        // Candidate keys: anything under the continuity prefixes. The LIKE
+        // set is a pre-filter only; isContinuitySummaryKey is the gate.
+        const q = try self.buildQuery(
+            "SELECT key FROM {schema}.memory_embeddings " ++
+                "WHERE user_id = $1 AND (" ++
+                "  key LIKE 'summary_latest/%' OR " ++
+                "  key LIKE 'timeline_summary/%' OR " ++
+                "  key LIKE 'session_summary/%' OR " ++
+                "  key LIKE 'summary_fallback/%')",
+        );
+        defer self.allocator.free(q);
+        const result = self.execParams(q, &params, &lengths) catch |err| {
+            // Missing embeddings table (no vector plane) → nothing to un-embed.
+            log.info("phase05_backfill.unembed skip user={d} err={s}", .{ user_id, @errorName(err) });
+            return;
+        };
+        defer c.PQclear(result);
+
+        const n: usize = @intCast(c.PQntuples(result));
+        for (0..n) |i| {
+            const row_idx: c_int = @intCast(i);
+            const key = try dupeResultValue(allocator, result, row_idx, 0);
+            defer allocator.free(key);
+
+            // Authoritative gate — reuse P4's predicate (single source of the
+            // four continuity prefixes). A key that slips through the LIKE but
+            // isn't continuity is skipped.
+            if (!memory_root.isContinuitySummaryKey(key)) continue;
+
+            report.continuity_embeddings_removed += 1;
+            if (dry_run) continue;
+
+            const del_q = try self.buildQuery(
+                "DELETE FROM {schema}.memory_embeddings WHERE user_id = $1 AND key = $2",
+            );
+            defer self.allocator.free(del_q);
+            const key_z = try self.allocator.dupeZ(u8, key);
+            defer self.allocator.free(key_z);
+            const del_params = [_]?[*:0]const u8{ user_s.ptr, key_z };
+            const del_lengths = [_]c_int{ @intCast(user_s.len), @intCast(key.len) };
+            const del_result = try self.execParams(del_q, &del_params, &del_lengths);
+            c.PQclear(del_result);
+        }
+    }
+
+    /// C0 op 4 — CONSERVATIVE exact-duplicate dedup. Collapse ONLY rows that
+    /// are byte-identical by `content_hash` (same user). Keep the canonical
+    /// (oldest by created_at) row; supersede the rest via the EXISTING
+    /// bitemporal invalidation path (`setMemoryInvalidation`) — NEVER
+    /// hard-delete. Gating on `valid_to IS NULL` (live rows only) makes a
+    /// re-run a no-op: already-superseded dups have a non-null valid_to and
+    /// drop out of the group. Near-duplicate / semantic merge is DEFERRED to
+    /// Phase 1 (see `phase05BackfillCountNearDups`).
+    fn phase05BackfillExactDedup(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        dry_run: bool,
+        report: *memory_root.Phase05BackfillReport,
+    ) !void {
+        // Groups of live rows sharing one content_hash, >1 member. We aggregate
+        // keys ordered by created_at so element [0] is the canonical keeper.
+        const q = try self.buildQuery(
+            "SELECT ARRAY_AGG(key ORDER BY created_at ASC, key ASC) " ++
+                "FROM {schema}.memories " ++
+                "WHERE user_id = $1 AND content_hash IS NOT NULL " ++
+                "AND (valid_to IS NULL OR valid_to > EXTRACT(EPOCH FROM NOW())::bigint) " ++
+                "GROUP BY content_hash HAVING COUNT(*) > 1",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const now_unix = std.time.timestamp();
+        const n: usize = @intCast(c.PQntuples(result));
+        for (0..n) |i| {
+            const row_idx: c_int = @intCast(i);
+            const arr_ptr = c.PQgetvalue(result, row_idx, 0);
+            const arr_text: []const u8 = if (arr_ptr == null) "" else std.mem.span(arr_ptr);
+
+            // Parse the Postgres text-array literal `{k1,k2,...}` into keys.
+            // Memory keys are snake_case / colon / slash — never contain the
+            // array delimiters `{},` — so tokenizing on those is exact. (Quoted
+            // forms are tolerated by stripping the quote char.)
+            var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer keys.deinit(allocator);
+            var it = std.mem.tokenizeAny(u8, arr_text, "{},\"");
+            while (it.next()) |tok| try keys.append(allocator, tok);
+            if (keys.items.len < 2) continue;
+
+            // keys[0] is the oldest → canonical keeper. Supersede the rest.
+            for (keys.items[1..]) |loser_key| {
+                report.exact_dups_collapsed += 1;
+                if (dry_run) continue;
+                // Reuse the bitemporal close-out path (sets valid_to/invalid_at/
+                // expired_at/is_latest=false + cascades edges). Idempotent — a
+                // second close is harmless, and the live-only group filter means
+                // a second RUN never reaches an already-closed loser.
+                self.setMemoryInvalidation(user_id, loser_key, now_unix, now_unix) catch |err| {
+                    log.warn("phase05_backfill.dedup_supersede_failed user={d} key={s} err={s}", .{
+                        user_id, loser_key, @errorName(err),
+                    });
+                };
+            }
+        }
+    }
+
+    /// C0 — REPORT-ONLY near-duplicate cluster count. Phase 1's write-time
+    /// MERGE will handle near-dup / semantic collapse ("SaaS" vs "SaaS app");
+    /// merging here is data-loss risk, so C0 only COUNTS the remaining work so
+    /// operators see it. Heuristic (conservative, no writes): live rows sharing
+    /// the SAME (subject, predicate) from metadata but DIFFERENT content_hash —
+    /// the canonical near-dup shape (one logical fact stated two ways). Counts
+    /// such clusters; never touches a row.
+    fn phase05BackfillCountNearDups(
+        self: *Self,
+        user_id: i64,
+        report: *memory_root.Phase05BackfillReport,
+    ) !void {
+        const q = try self.buildQuery(
+            "SELECT COUNT(*) FROM (" ++
+                "  SELECT metadata->>'subject' AS s, metadata->>'predicate' AS p " ++
+                "  FROM {schema}.memories " ++
+                "  WHERE user_id = $1 " ++
+                "  AND metadata ? 'subject' AND metadata ? 'predicate' " ++
+                "  AND length(metadata->>'subject') > 0 AND length(metadata->>'predicate') > 0 " ++
+                "  AND content_hash IS NOT NULL " ++
+                "  AND (valid_to IS NULL OR valid_to > EXTRACT(EPOCH FROM NOW())::bigint) " ++
+                "  GROUP BY metadata->>'subject', metadata->>'predicate' " ++
+                "  HAVING COUNT(DISTINCT content_hash) > 1" ++
+                ") clusters",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        if (c.PQntuples(result) == 0) return;
+        const count_ptr = c.PQgetvalue(result, 0, 0);
+        if (count_ptr == null) return;
+        const count_slice = std.mem.span(count_ptr);
+        const count = std.fmt.parseInt(usize, count_slice, 10) catch 0;
+        report.near_dup_clusters += count;
+    }
+
     /// Today the `subject` column is unpopulated by upsertMemoryWithMetadata
     /// (V1.6 5b.3 wrote subject only into JSONB metadata). This query
     /// reads the JSONB path directly so it works without a forward
@@ -14429,6 +14870,279 @@ fn initPostgresTestManagerWithPool(allocator: std.mem.Allocator, pool_max: u32, 
     return mgr;
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// C0 (memory-phase-0.5) — phase05Backfill postgres-gated integration.
+//
+// Pure-logic decision tests live in agent/extraction_persist.zig
+// (backfillMemoryType / backfillEntityTypeFromPredicate). These exercise the
+// actual UPDATE/DELETE/supersede SQL + the two SAFETY contracts:
+//   - dry_run (the tool default) writes NOTHING, and
+//   - a second live run is a clean no-op (idempotence).
+// Skipped locally (require NULLALIS_POSTGRES_TEST_URL).
+// ─────────────────────────────────────────────────────────────────────
+
+/// Helper: read a memory row's raw memory_type by key (incl. superseded rows;
+/// no validity filter). Returns owned string; caller frees.
+fn c0ReadMemoryType(allocator: std.mem.Allocator, mgr: *ManagerImpl, user_id: i64, key: []const u8) ![]u8 {
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+    const q = try std.fmt.allocPrint(
+        allocator,
+        "SELECT memory_type FROM {s}.memories WHERE user_id = {d} AND key = '{s}'",
+        .{ schema_q, user_id, key },
+    );
+    defer allocator.free(q);
+    const result = try mgr.exec(q);
+    defer c.PQclear(result);
+    return try dupeResultValue(allocator, result, 0, 0);
+}
+
+test "C0 phase05Backfill: dry-run writes NOTHING but reports counts" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-c0-dry/workspace");
+
+    // A legacy `daily` row whose predicate PREFERS routes to `preference`.
+    try mgr.upsertMemoryWithMetadata(
+        2,
+        "c0_dry_pref",
+        "User prefers dark mode",
+        .daily,
+        "sess-c0",
+        \\{"subject":"user","predicate":"PREFERS","object":"dark mode","attributed_to":"user"}
+        ,
+    );
+
+    const report = try mgr.phase05Backfill(allocator, 2, true); // dry_run=true
+    try std.testing.expect(report.dry_run);
+    try std.testing.expectEqual(@as(usize, 1), report.users_scanned);
+    // Reports the would-be re-type...
+    try std.testing.expectEqual(@as(usize, 1), report.rows_retyped);
+    // ...but the row's memory_type is UNCHANGED on disk.
+    const mt = try c0ReadMemoryType(allocator, &mgr, 2, "c0_dry_pref");
+    defer allocator.free(mt);
+    try std.testing.expectEqualStrings("daily", mt);
+}
+
+test "C0 phase05Backfill: live re-type + idempotent second run" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-c0-retype/workspace");
+
+    try mgr.upsertMemoryWithMetadata(
+        2,
+        "c0_pref",
+        "User prefers dark mode",
+        .daily,
+        "sess-c0",
+        \\{"subject":"user","predicate":"PREFERS","object":"dark mode","attributed_to":"user"}
+        ,
+    );
+    // A KNOWS row → person; and a no-predicate row that must stay untouched.
+    try mgr.upsertMemoryWithMetadata(
+        2,
+        "c0_person",
+        "User knows Alice",
+        .daily,
+        "sess-c0",
+        \\{"subject":"user","predicate":"KNOWS","object":"Alice","attributed_to":"user"}
+        ,
+    );
+    try mgr.upsertMemoryWithMetadata(2, "c0_nopred", "freeform note", .daily, "sess-c0", "{}");
+
+    // Live run #1.
+    const r1 = try mgr.phase05Backfill(allocator, 2, false);
+    try std.testing.expect(!r1.dry_run);
+    try std.testing.expectEqual(@as(usize, 2), r1.rows_retyped);
+
+    const pref_t = try c0ReadMemoryType(allocator, &mgr, 2, "c0_pref");
+    defer allocator.free(pref_t);
+    try std.testing.expectEqualStrings("preference", pref_t);
+    const person_t = try c0ReadMemoryType(allocator, &mgr, 2, "c0_person");
+    defer allocator.free(person_t);
+    try std.testing.expectEqualStrings("person", person_t);
+    const nopred_t = try c0ReadMemoryType(allocator, &mgr, 2, "c0_nopred");
+    defer allocator.free(nopred_t);
+    try std.testing.expectEqualStrings("daily", nopred_t); // untouched — no predicate
+
+    // Live run #2 — IDEMPOTENT: already-typed rows are no longer candidates.
+    const r2 = try mgr.phase05Backfill(allocator, 2, false);
+    try std.testing.expectEqual(@as(usize, 0), r2.rows_retyped);
+    const pref_t2 = try c0ReadMemoryType(allocator, &mgr, 2, "c0_pref");
+    defer allocator.free(pref_t2);
+    try std.testing.expectEqualStrings("preference", pref_t2);
+}
+
+test "C0 phase05Backfill: exact content_hash dedup supersedes (never hard-deletes), idempotent" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-c0-dedup/workspace");
+
+    // Two rows with byte-identical content → identical content_hash. Distinct
+    // keys (the duplicate-write shape C0 repairs). Both start live.
+    const dup_content = "User lives in Cairo";
+    try mgr.upsertMemoryWithMetadata(2, "c0_dup_old", dup_content, .core, "sess-c0", "{}");
+    try mgr.upsertMemoryWithMetadata(2, "c0_dup_new", dup_content, .core, "sess-c0", "{}");
+
+    const r1 = try mgr.phase05Backfill(allocator, 2, false);
+    try std.testing.expectEqual(@as(usize, 1), r1.exact_dups_collapsed); // 1 loser
+
+    // The keeper (oldest by created_at) is still live; exactly one of the two
+    // remains visible via the validity-filtered getMemory.
+    var live_count: usize = 0;
+    if (try mgr.getMemory(allocator, 2, "c0_dup_old")) |m| {
+        m.deinit(allocator);
+        live_count += 1;
+    }
+    if (try mgr.getMemory(allocator, 2, "c0_dup_new")) |m| {
+        m.deinit(allocator);
+        live_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), live_count);
+
+    // NEVER hard-deleted — both rows still exist in the table (one superseded).
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const q = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}.memories WHERE user_id = 2 AND content_hash IS NOT NULL", .{schema_q});
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const cnt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(cnt);
+        try std.testing.expectEqualStrings("2", cnt);
+    }
+
+    // Idempotent: second run finds no LIVE duplicate group (loser has valid_to).
+    const r2 = try mgr.phase05Backfill(allocator, 2, false);
+    try std.testing.expectEqual(@as(usize, 0), r2.exact_dups_collapsed);
+}
+
+test "C0 phase05Backfill: un-embed deletes continuity embeddings, keeps durable_fact" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-c0-unembed/workspace");
+
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+
+    // Stand up a minimal pgvector-shaped embeddings table in the tenant schema
+    // (the vector plane creates it at runtime; the test recreates its shape).
+    {
+        const ddl = try std.fmt.allocPrint(allocator,
+            \\CREATE TABLE IF NOT EXISTS {s}.memory_embeddings (
+            \\  user_id BIGINT NOT NULL, key TEXT NOT NULL,
+            \\  embedding vector(3), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            \\  PRIMARY KEY (user_id, key))
+        , .{schema_q});
+        defer allocator.free(ddl);
+        const r = mgr.exec(ddl) catch return error.SkipZigTest; // skip if no pgvector ext
+        c.PQclear(r);
+    }
+    // Insert continuity rows (must be deleted) + a durable_fact row (must stay).
+    {
+        const ins = try std.fmt.allocPrint(allocator,
+            \\INSERT INTO {s}.memory_embeddings (user_id, key, embedding) VALUES
+            \\  (2, 'summary_latest/sess-x/0', '[0,0,0]'),
+            \\  (2, 'timeline_summary/sess-x/1', '[0,0,0]'),
+            \\  (2, 'session_summary/sess-x/2', '[0,0,0]'),
+            \\  (2, 'summary_fallback/sess-x/3', '[0,0,0]'),
+            \\  (2, 'durable_fact/1778049787/0', '[0,0,0]')
+        , .{schema_q});
+        defer allocator.free(ins);
+        const r = try mgr.exec(ins);
+        c.PQclear(r);
+    }
+
+    const r1 = try mgr.phase05Backfill(allocator, 2, false);
+    try std.testing.expectEqual(@as(usize, 4), r1.continuity_embeddings_removed);
+
+    // durable_fact survived; continuity gone.
+    {
+        const q = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}.memory_embeddings WHERE user_id = 2", .{schema_q});
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const cnt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(cnt);
+        try std.testing.expectEqualStrings("1", cnt); // only durable_fact remains
+    }
+
+    // Idempotent — nothing left to remove.
+    const r2 = try mgr.phase05Backfill(allocator, 2, false);
+    try std.testing.expectEqual(@as(usize, 0), r2.continuity_embeddings_removed);
+}
+
+test "C0 phase05Backfill: PROPER entity with relationship edge upgrades to PERSON, idempotent + no-clobber" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-c0-entity/workspace");
+
+    const zero_emb = [_]f32{0.0} ** 1024;
+
+    // (a) Alice: PROPER entity with an incoming KNOWS (relationship) edge →
+    //     must upgrade to PERSON.
+    const alice_id = try mgr.upsertEntity(allocator, 2, "Alice", "PROPER", &zero_emb);
+    defer allocator.free(alice_id);
+    try mgr.upsertMemory(2, "m_knows_alice", "User knows Alice", .core, null);
+    try mgr.upsertMemoryEdge(2, "m_knows_alice", alice_id, "KNOWS", "extraction_classifier", 1.0);
+
+    // (b) Helix: PROPER entity with an incoming USES (usage, NOT relationship)
+    //     edge → must stay PROPER (no guessing ORG/PRODUCT from non-relationship
+    //     predicates).
+    const helix_id = try mgr.upsertEntity(allocator, 2, "Helix", "PROPER", &zero_emb);
+    defer allocator.free(helix_id);
+    try mgr.upsertMemory(2, "m_uses_helix", "User uses Helix", .core, null);
+    try mgr.upsertMemoryEdge(2, "m_uses_helix", helix_id, "USES", "extraction_classifier", 1.0);
+
+    // (c) Bob: already typed PERSON (no-clobber sanity — never demoted, never
+    //     re-counted).
+    const bob_id = try mgr.upsertEntity(allocator, 2, "Bob", "PERSON", &zero_emb);
+    defer allocator.free(bob_id);
+    try mgr.upsertMemory(2, "m_knows_bob", "User knows Bob", .core, null);
+    try mgr.upsertMemoryEdge(2, "m_knows_bob", bob_id, "MARRIED_TO", "extraction_classifier", 1.0);
+
+    const readType = struct {
+        fn run(a: std.mem.Allocator, m: *ManagerImpl, id: []const u8) ![]u8 {
+            const schema_q = try pg_helpers.quoteIdentifier(a, m.schemaRaw());
+            defer a.free(schema_q);
+            const q = try std.fmt.allocPrint(a, "SELECT entity_type FROM {s}.memory_entities WHERE user_id = 2 AND id = '{s}'", .{ schema_q, id });
+            defer a.free(q);
+            const result = try m.exec(q);
+            defer c.PQclear(result);
+            return try dupeResultValue(a, result, 0, 0);
+        }
+    };
+
+    const r1 = try mgr.phase05Backfill(allocator, 2, false);
+    // Only Alice flips (Helix non-relationship, Bob already PERSON).
+    try std.testing.expectEqual(@as(usize, 1), r1.entities_retyped);
+
+    const alice_t = try readType.run(allocator, &mgr, alice_id);
+    defer allocator.free(alice_t);
+    try std.testing.expectEqualStrings("PERSON", alice_t);
+    const helix_t = try readType.run(allocator, &mgr, helix_id);
+    defer allocator.free(helix_t);
+    try std.testing.expectEqualStrings("PROPER", helix_t); // unchanged — no guessing
+    const bob_t = try readType.run(allocator, &mgr, bob_id);
+    defer allocator.free(bob_t);
+    try std.testing.expectEqualStrings("PERSON", bob_t); // unchanged — not demoted
+
+    // Idempotent: Alice is now PERSON, no longer a 'PROPER' candidate.
+    const r2 = try mgr.phase05Backfill(allocator, 2, false);
+    try std.testing.expectEqual(@as(usize, 0), r2.entities_retyped);
+}
+
 test "setMemorySource preserves updated_at for attribution-only enrichment" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -17144,8 +17858,6 @@ test "P7 person-as-subject — extracted edge makes the subject a resolvable nod
     try mgr.migrate();
     try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-p7-subject/workspace");
 
-    const extraction_persist = @import("agent/extraction_persist.zig");
-
     // Real deterministic 1024-d embedder so coref actually mints entity rows
     // (Tarek and Acme get distinct vectors; cosine won't false-merge them).
     const embeddings = @import("memory/vector/embeddings.zig");
@@ -17808,8 +18520,6 @@ test "V1.7a-4 entity-key Zig/SQL convergence — backfill target_key == deriveEn
     try mgr.migrate();
     try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
 
-    const extraction_persist = @import("agent/extraction_persist.zig");
-
     // Seed memories with metadata covering each lowering range. Use distinct
     // source keys so we can read each edge back individually.
     const Case = struct {
@@ -18056,7 +18766,6 @@ test "V1.7a-5 link_type rich wiring — column populated from metadata + backfil
 
     // ── (8) End-to-end via extraction_persist: predicate maps to category,
     //       metadata gets it, column reflects it.
-    const extraction_persist = @import("agent/extraction_persist.zig");
     const mems = [_]extraction_persist.ExtractedMemory{.{
         .text = "User uses Helix as primary editor",
         .subject = "user",

@@ -920,6 +920,43 @@ pub fn freeProseFacts(allocator: std.mem.Allocator, facts: []ProseFact) void {
     allocator.free(facts);
 }
 
+/// C0 (memory-phase-0.5) — aggregate report of a single Phase-0.5 backfill run.
+///
+/// Returned by `state_mgr.phase05Backfill(allocator, user_id_opt, dry_run)`.
+/// One struct per run (aggregated across however many users the run touched).
+/// In dry_run mode every counter reflects what WOULD change — nothing is
+/// written. In a live run the counters reflect what DID change.
+///
+/// The five operation counters mirror the five conservative operations:
+///   1. `rows_retyped`            — memory rows whose `memory_type` moved off
+///                                  the legacy core/daily default to a semantic
+///                                  type (op 1).
+///   2. `entities_retyped`        — `'PROPER'` entities upgraded to a known
+///                                  class (op 2; PERSON-from-relationship only).
+///   3. `continuity_embeddings_removed` — embedded continuity-summary rows
+///                                  deleted from `memory_embeddings` (op 3).
+///   4. `exact_dups_collapsed`    — exact `content_hash` duplicate rows
+///                                  superseded via the bitemporal invalidation
+///                                  path, NEVER hard-deleted (op 4).
+///   5. `near_dup_clusters`       — REPORT-ONLY count of near-duplicate
+///                                  candidate clusters (same user, similar but
+///                                  not byte-identical content). DEFERRED to
+///                                  Phase 1's write-time MERGE; never merged
+///                                  here (data-loss risk).
+///
+/// `users_scanned` is how many users the run iterated. `dry_run` echoes the
+/// mode so the report is self-describing.
+pub const Phase05BackfillReport = struct {
+    dry_run: bool,
+    users_scanned: usize = 0,
+    rows_retyped: usize = 0,
+    entities_retyped: usize = 0,
+    continuity_embeddings_removed: usize = 0,
+    exact_dups_collapsed: usize = 0,
+    /// Report-only — near-duplicate candidate clusters left for Phase 1.
+    near_dup_clusters: usize = 0,
+};
+
 /// V1.7a-9a — owned community-name lookup row.
 pub const CommunityName = struct {
     name: []u8,

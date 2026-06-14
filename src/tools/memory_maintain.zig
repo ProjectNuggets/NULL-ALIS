@@ -125,10 +125,13 @@ pub const MemoryMaintainTool = struct {
         "(7) prose_survey — V1.10-B LLM-judge surveyor: scan durable_fact / timeline_summary rows mentioning entity_pattern, " ++
         "use the cheap sidecar judge to find prose-level contradictions, mark losers as superseded with bidirectional pointers. " ++
         "Use when stale prose facts (e.g. \"X is the codename\" + \"X is the OLD codename\") need cleanup that edge-graph survey can't see. " ++
+        "(8) phase05_backfill — OPERATOR one-time corpus repair (DRY-RUN by default): re-type legacy core/daily rows by predicate semantics, " ++
+        "upgrade 'PROPER' entities to PERSON where a relationship predicate proves it, delete pre-P4 embedded continuity summaries, and collapse " ++
+        "EXACT content_hash duplicates (supersede, never delete). Idempotent. Pass apply=true for a live run; all_users=true to repair every user. " ++
         "Use when you notice stale facts, contradictory states, renamed entities, or unresolved corrections. " ++
         "After each call, check `next_consideration` in the response for suggested follow-up actions.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["cascade_update","invalidate_when","resolve_contradiction","propagate_correction","temporal_decay","survey","prose_survey"],"description":"Which truth-maintenance operation to perform."},"old_name":{"type":"string","description":"For cascade_update: the entity name being renamed FROM."},"new_name":{"type":"string","description":"For cascade_update: the entity name being renamed TO."},"predicate":{"type":"string","description":"For invalidate_when: predicate to match (e.g. STATUS, PREFERS, WORKS_AT)."},"object_name":{"type":"string","description":"For invalidate_when: target entity name to match."},"subject_name":{"type":"string","description":"For invalidate_when: optional subject entity name to narrow further."},"loser_key":{"type":"string","description":"For resolve_contradiction: the memory key being closed."},"winner_key":{"type":"string","description":"For resolve_contradiction: the memory key that stays alive."},"correction_key":{"type":"string","description":"For propagate_correction: the memory key holding the correction."},"entity_pattern":{"type":"string","description":"For propagate_correction OR prose_survey: substring to match in target memory content (e.g. \"MNDA\", \"Mia\", \"Neptune\")."},"threshold_days":{"type":"integer","description":"For temporal_decay: only decay memories untouched for this many days. Default 30."},"half_life_days":{"type":"integer","description":"For temporal_decay: confidence half-life in days. Default 30."},"max_facts":{"type":"integer","description":"For prose_survey: cap on number of rows the LLM judge sees per call. Default 50, max 200. The result includes `more_available=true` if matching rows exceeded the cap so you can re-run with a tighter pattern."},"dry_run":{"type":"boolean","description":"For prose_survey: if true, returns judge verdicts without writing any metadata (preview mode). Default false."}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["cascade_update","invalidate_when","resolve_contradiction","propagate_correction","temporal_decay","survey","prose_survey","phase05_backfill"],"description":"Which truth-maintenance operation to perform."},"old_name":{"type":"string","description":"For cascade_update: the entity name being renamed FROM."},"new_name":{"type":"string","description":"For cascade_update: the entity name being renamed TO."},"predicate":{"type":"string","description":"For invalidate_when: predicate to match (e.g. STATUS, PREFERS, WORKS_AT)."},"object_name":{"type":"string","description":"For invalidate_when: target entity name to match."},"subject_name":{"type":"string","description":"For invalidate_when: optional subject entity name to narrow further."},"loser_key":{"type":"string","description":"For resolve_contradiction: the memory key being closed."},"winner_key":{"type":"string","description":"For resolve_contradiction: the memory key that stays alive."},"correction_key":{"type":"string","description":"For propagate_correction: the memory key holding the correction."},"entity_pattern":{"type":"string","description":"For propagate_correction OR prose_survey: substring to match in target memory content (e.g. \"MNDA\", \"Mia\", \"Neptune\")."},"threshold_days":{"type":"integer","description":"For temporal_decay: only decay memories untouched for this many days. Default 30."},"half_life_days":{"type":"integer","description":"For temporal_decay: confidence half-life in days. Default 30."},"max_facts":{"type":"integer","description":"For prose_survey: cap on number of rows the LLM judge sees per call. Default 50, max 200. The result includes `more_available=true` if matching rows exceeded the cap so you can re-run with a tighter pattern."},"dry_run":{"type":"boolean","description":"For prose_survey: if true, returns judge verdicts without writing any metadata (preview mode). Default false."},"apply":{"type":"boolean","description":"For phase05_backfill ONLY: the one-time corpus repair is DRY-RUN by default (reports what WOULD change, writes nothing). Set apply=true to perform a LIVE run that modifies data. Idempotent + safe to re-run."},"all_users":{"type":"boolean","description":"For phase05_backfill ONLY: if true, repair EVERY user's corpus (the general fix). Default false = only the calling tenant's user_id."}},"required":["action"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -142,7 +145,7 @@ pub const MemoryMaintainTool = struct {
 
     pub fn execute(self: *MemoryMaintainTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const action = root.getString(args, "action") orelse
-            return ToolResult.fail("Missing 'action' parameter. One of: cascade_update, invalidate_when, resolve_contradiction, propagate_correction, temporal_decay, survey, prose_survey.");
+            return ToolResult.fail("Missing 'action' parameter. One of: cascade_update, invalidate_when, resolve_contradiction, propagate_correction, temporal_decay, survey, prose_survey, phase05_backfill.");
 
         const smgr = self.state_mgr orelse
             return ToolResult.fail("memory_maintain requires postgres state manager (tenant context not wired).");
@@ -163,8 +166,10 @@ pub const MemoryMaintainTool = struct {
             return executeSurvey(allocator, smgr, uid);
         } else if (std.mem.eql(u8, action, "prose_survey")) {
             return executeProseSurvey(allocator, smgr, uid, self.judge_provider, self.judge_model, args);
+        } else if (std.mem.eql(u8, action, "phase05_backfill")) {
+            return executePhase05Backfill(allocator, smgr, uid, args);
         } else {
-            const msg = try std.fmt.allocPrint(allocator, "Unknown action '{s}'. Valid: cascade_update, invalidate_when, resolve_contradiction, propagate_correction, temporal_decay, survey, prose_survey.", .{action});
+            const msg = try std.fmt.allocPrint(allocator, "Unknown action '{s}'. Valid: cascade_update, invalidate_when, resolve_contradiction, propagate_correction, temporal_decay, survey, prose_survey, phase05_backfill.", .{action});
             return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         }
     }
@@ -645,6 +650,64 @@ pub const MemoryMaintainTool = struct {
                 verdicts_json.items,
                 skipped,
                 if (dry_run) "true" else "false",
+                nc_esc,
+            },
+        );
+        return ToolResult{ .success = true, .output = output };
+    }
+
+    /// C0 (memory-phase-0.5) — operator-triggered one-time corpus backfill.
+    ///
+    /// SAFETY: DRY-RUN is the DEFAULT. With no `apply` arg (or `apply=false`)
+    /// this COMPUTES + REPORTS what would change and writes NOTHING. A live run
+    /// requires the explicit `apply=true` flag. `all_users=true` repairs every
+    /// user's corpus (the general fix); default is the calling tenant only.
+    ///
+    /// Idempotent: re-running (dry or live) on already-backfilled data is a
+    /// no-op — already-typed rows are skipped, entity re-typing only touches
+    /// 'PROPER', exact-dedup gates on live rows, un-embed only removes existing
+    /// continuity embeddings. The five operation counters are the whole output.
+    fn executePhase05Backfill(
+        allocator: std.mem.Allocator,
+        smgr: *zaki_state.Manager,
+        uid: i64,
+        args: JsonObjectMap,
+    ) !ToolResult {
+        // DRY-RUN DEFAULT. `apply=true` is the ONLY way to write. Anything
+        // else (absent, false) → dry_run.
+        const apply = root.getBool(args, "apply") orelse false;
+        const dry_run = !apply;
+        const all_users = root.getBool(args, "all_users") orelse false;
+        const user_scope: ?i64 = if (all_users) null else uid;
+
+        const report = smgr.phase05Backfill(allocator, user_scope, dry_run) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "phase05_backfill failed: {s}", .{@errorName(err)});
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
+        };
+
+        const next_consideration = if (dry_run)
+            "Dry-run complete — nothing was written. Review the counters, then re-run with apply=true to perform the live repair. The operation is idempotent and safe to re-run."
+        else if (report.near_dup_clusters > 0)
+            "Live backfill applied. Note `near_dup_clusters` > 0: those are near-duplicate candidates (same subject+predicate, different content) DEFERRED to Phase 1's write-time MERGE — they were reported, not merged (merging here is data-loss risk)."
+        else
+            "Live backfill applied. Corpus re-typed, entities upgraded where determinable, embedded continuity removed, and exact duplicates superseded. Idempotent — a second run is a clean no-op.";
+
+        const nc_esc = try jsonEscape(allocator, next_consideration);
+        defer allocator.free(nc_esc);
+        const output = try std.fmt.allocPrint(
+            allocator,
+            "{{\"action\":\"phase05_backfill\",\"dry_run\":{s},\"all_users\":{s},\"users_scanned\":{d}," ++
+                "\"rows_retyped\":{d},\"entities_retyped\":{d},\"continuity_embeddings_removed\":{d}," ++
+                "\"exact_dups_collapsed\":{d},\"near_dup_clusters\":{d},\"next_consideration\":\"{s}\"}}",
+            .{
+                if (report.dry_run) "true" else "false",
+                if (all_users) "true" else "false",
+                report.users_scanned,
+                report.rows_retyped,
+                report.entities_retyped,
+                report.continuity_embeddings_removed,
+                report.exact_dups_collapsed,
+                report.near_dup_clusters,
                 nc_esc,
             },
         );
