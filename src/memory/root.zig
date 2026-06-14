@@ -322,6 +322,48 @@ pub const MemoryCategory = union(enum) {
     }
 };
 
+/// Phase-0.5b — the SINGLE SOURCE OF TRUTH for "which memory_type strings are
+/// durable / evergreen". A prior patch (P3) routed durable user facts off
+/// `memory_type='core'` onto `custom:"preference"/"decision"/"person"/
+/// "open_loop"`, but ~6 sites kept equating "durable/protected" with the
+/// literal string `'core'`, so the typed durables silently lost protection.
+/// These two type-sets (+ their SQL fragments + predicates) thread the same
+/// definition through every site so they can never drift again.
+///
+///   EVERGREEN = types that NEVER age out under confidence/temporal decay.
+///   DURABLE   = EVERGREEN + open_loop = types that get the resurrect +
+///               anti-demotion + no-clobber protections that `core` had.
+///
+/// open_loop is DURABLE (protected from resurrection/demotion/clobber) but
+/// NOT EVERGREEN (it still decays — open loops resolve over time).
+pub const EVERGREEN_MEMORY_TYPES = [_][]const u8{ "core", "preference", "decision", "person" };
+pub const DURABLE_MEMORY_TYPES = [_][]const u8{ "core", "preference", "decision", "person", "open_loop" };
+
+/// SQL `IN (...)` fragments, single-sourced from the sets above. SELECT/UPDATE
+/// sites reference these constants instead of hand-writing the lists so the
+/// SQL can never drift from `isEvergreenMemoryType` / `isDurableMemoryType`.
+/// The comptime test below asserts the strings match the sets exactly.
+pub const EVERGREEN_TYPES_SQL = "('core','preference','decision','person')";
+pub const DURABLE_TYPES_SQL = "('core','preference','decision','person','open_loop')";
+
+/// True for the EVERGREEN type strings (never decay). Mirror of
+/// `isEvergreenCategory` over the raw `memory_type` column value.
+pub fn isEvergreenMemoryType(t: []const u8) bool {
+    for (EVERGREEN_MEMORY_TYPES) |et| {
+        if (std.mem.eql(u8, t, et)) return true;
+    }
+    return false;
+}
+
+/// True for the DURABLE type strings (get the `core`-grade resurrect /
+/// anti-demotion / no-clobber protections). EVERGREEN ∪ {open_loop}.
+pub fn isDurableMemoryType(t: []const u8) bool {
+    for (DURABLE_MEMORY_TYPES) |dt| {
+        if (std.mem.eql(u8, t, dt)) return true;
+    }
+    return false;
+}
+
 /// P3 review (memory-phase-0.5) — durable semantic types are evergreen and
 /// must NOT age out under temporal decay in recall ranking.
 ///
@@ -341,12 +383,13 @@ pub const MemoryCategory = union(enum) {
 /// over time and stay recency-weighted (they decay), matching design intent.
 /// All other categories (`.daily`, `.conversation`, other custom strings)
 /// decay normally.
+///
+/// Phase-0.5b: delegates to `isEvergreenMemoryType` (the shared set) so the
+/// category predicate and the raw-string predicate can never diverge.
 pub fn isEvergreenCategory(category: MemoryCategory) bool {
     return switch (category) {
         .core => true,
-        .custom => |name| std.mem.eql(u8, name, "preference") or
-            std.mem.eql(u8, name, "decision") or
-            std.mem.eql(u8, name, "person"),
+        .custom => |name| isEvergreenMemoryType(name),
         else => false,
     };
 }
@@ -364,6 +407,50 @@ test "isEvergreenCategory: open_loop and recency types are NOT evergreen" {
     try std.testing.expect(!isEvergreenCategory(.daily));
     try std.testing.expect(!isEvergreenCategory(.conversation));
     try std.testing.expect(!isEvergreenCategory(.{ .custom = "other" }));
+}
+
+test "isEvergreenMemoryType / isDurableMemoryType cover the right sets" {
+    // EVERGREEN ⊂ DURABLE; open_loop is durable-but-not-evergreen.
+    try std.testing.expect(isEvergreenMemoryType("core"));
+    try std.testing.expect(isEvergreenMemoryType("preference"));
+    try std.testing.expect(isEvergreenMemoryType("decision"));
+    try std.testing.expect(isEvergreenMemoryType("person"));
+    try std.testing.expect(!isEvergreenMemoryType("open_loop"));
+    try std.testing.expect(!isEvergreenMemoryType("daily"));
+
+    try std.testing.expect(isDurableMemoryType("core"));
+    try std.testing.expect(isDurableMemoryType("preference"));
+    try std.testing.expect(isDurableMemoryType("decision"));
+    try std.testing.expect(isDurableMemoryType("person"));
+    try std.testing.expect(isDurableMemoryType("open_loop"));
+    try std.testing.expect(!isDurableMemoryType("daily"));
+    try std.testing.expect(!isDurableMemoryType("conversation"));
+
+    // Every EVERGREEN type is also DURABLE (set containment).
+    for (EVERGREEN_MEMORY_TYPES) |t| try std.testing.expect(isDurableMemoryType(t));
+}
+
+/// Build a `('a','b',...)` SQL `IN`-list from a comptime string set, so the
+/// hand-written `*_TYPES_SQL` constants can be asserted byte-for-byte against
+/// the `*_MEMORY_TYPES` sets — drift becomes a comptime test failure.
+fn sqlInListFromSet(comptime set: []const []const u8) []const u8 {
+    var s: []const u8 = "(";
+    for (set, 0..) |t, i| {
+        if (i > 0) s = s ++ ",";
+        s = s ++ "'" ++ t ++ "'";
+    }
+    return s ++ ")";
+}
+
+test "EVERGREEN/DURABLE SQL fragments are comptime-consistent with the sets" {
+    // The SQL `IN (...)` strings must equal the lists derived from the sets,
+    // so a future edit to one without the other is a compile-time error.
+    // Force comptime evaluation of the builder (it concatenates with `++`,
+    // which is a comptime-only op).
+    const evergreen_expected = comptime sqlInListFromSet(&EVERGREEN_MEMORY_TYPES);
+    const durable_expected = comptime sqlInListFromSet(&DURABLE_MEMORY_TYPES);
+    try std.testing.expectEqualStrings(evergreen_expected, EVERGREEN_TYPES_SQL);
+    try std.testing.expectEqualStrings(durable_expected, DURABLE_TYPES_SQL);
 }
 
 // ── Link types ─────────────────────────────────────────────────────
