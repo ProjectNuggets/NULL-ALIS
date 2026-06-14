@@ -293,7 +293,14 @@ pub const RetrievalEngine = struct {
     sources: std.ArrayListUnmanaged(RetrievalSourceAdapter),
     merge_k: u32,
     top_k: u32,
+    /// Floor on the FINAL fused (RRF) score. See note in applyMinRelevance and
+    /// MemoryQueryConfig.min_score: RRF puts rank-1 at 1/(1+k) ≈ 0.0164 (k=60),
+    /// so this is a no-op floor in the wrong metric space. The real relevance
+    /// floor is `min_cosine`, applied to vector candidates before fusion.
     min_score: f64,
+    /// Real relevance floor in COSINE space, applied to vector-lane candidates
+    /// BEFORE RRF fusion. 0.0 = disabled (default). See MemoryQueryConfig.min_cosine.
+    min_cosine: f64 = 0.0,
     owns_self: bool = false,
 
     // Vector search components (all optional, null = keyword-only)
@@ -331,6 +338,7 @@ pub const RetrievalEngine = struct {
             .merge_k = query_cfg.rrf_k,
             .top_k = query_cfg.max_results,
             .min_score = query_cfg.min_score,
+            .min_cosine = query_cfg.min_cosine,
             .temporal_decay_cfg = query_cfg.hybrid.temporal_decay,
             .mmr_cfg = query_cfg.hybrid.mmr,
         };
@@ -490,6 +498,22 @@ pub const RetrievalEngine = struct {
                 log.warn("vector result conversion failed: {}", .{err});
                 break :hybrid_blk;
             };
+
+            // ── Cosine relevance floor (P5) ──
+            // Drop vector candidates whose cosine similarity (carried in
+            // vector_score, [0,1]) is below min_cosine, BEFORE RRF fusion. This
+            // is the *real* relevance floor: at this stage the candidates carry a
+            // genuine cosine, whereas the post-fusion final_score is RRF
+            // (1/(rank+1+k) ≈ 0.0164 at rank-1, k=60) and is NOT a similarity.
+            // Default min_cosine=0.0 disables this → no behavior change.
+            vector_candidates = applyMinCosine(allocator, vector_candidates.?, self.min_cosine);
+
+            // If the floor removed everything, treat the vector lane as absent.
+            if (vector_candidates.?.len == 0) {
+                freeCandidates(allocator, vector_candidates.?);
+                vector_candidates = null;
+                break :hybrid_blk;
+            }
 
             valid_count += 1;
         }
@@ -740,9 +764,55 @@ pub const RetrievalEngine = struct {
     }
 };
 
+/// P5 — cosine relevance floor for VECTOR-lane candidates, applied BEFORE RRF.
+///
+/// At this stage each candidate carries a genuine cosine similarity in
+/// vector_score (in [0,1]); this is the only point in the pipeline where a real
+/// similarity floor is meaningful. (Post-fusion, final_score is RRF
+/// 1/(rank+1+k) ≈ 0.0164 at rank-1 with k=60 — NOT a similarity — so the
+/// separate min_score floor in applyMinRelevance operates in the wrong metric
+/// space and is effectively a no-op.)
+///
+/// Drops candidates whose vector_score < min_cosine. A null or NaN vector_score
+/// is treated as failing the floor (it carries no usable cosine), but only when
+/// the floor is active. With min_cosine <= 0.0 the floor is DISABLED and the
+/// slice is returned unchanged (no behavior change by default).
+/// Returns the (possibly shrunk) slice; filtered entries are deinited.
+fn applyMinCosine(allocator: Allocator, candidates: []RetrievalCandidate, min_cosine: f64) []RetrievalCandidate {
+    // Disabled (default): no filtering, no allocation churn.
+    if (min_cosine <= 0.0) return candidates;
+
+    // Compare in the cosine's native f32 space. vector_score is f32, so we
+    // narrow the f64 floor once rather than widening every score to f64 —
+    // widening f32→f64 introduces a rounding artifact (e.g. f32 0.7 becomes
+    // 0.6999998 in f64, which would spuriously fail a 0.7 floor).
+    const floor: f32 = @floatCast(min_cosine);
+
+    var keep: usize = 0;
+    for (candidates, 0..) |*ca, idx| {
+        const cosine: f32 = ca.vector_score orelse std.math.nan(f32);
+        if (!std.math.isNan(cosine) and cosine >= floor) {
+            if (keep != idx) {
+                candidates[keep] = ca.*;
+            }
+            keep += 1;
+        } else {
+            ca.deinit(allocator);
+        }
+    }
+    return shrinkAlloc(allocator, candidates, keep);
+}
+
 /// Filter candidates below min_score threshold.
 /// Returns the (possibly shrunk) slice. Filtered entries are deinited.
 /// NaN scores are always filtered out regardless of min_score.
+///
+/// NOTE: This operates on the FINAL fused score (final_score), which is RRF —
+/// 1/(rank+1+k) ≈ 0.0164 at rank-1 (k=60) — NOT a cosine similarity. As such it
+/// is a no-op floor in the wrong metric space (any positive min_score deletes
+/// everything). The real relevance floor is applyMinCosine (P5), applied to the
+/// vector lane before fusion. This is kept for backward compatibility and its
+/// NaN-scrubbing behavior; do not rely on min_score as a similarity threshold.
 fn applyMinRelevance(allocator: Allocator, candidates: []RetrievalCandidate, min_score: f64) []RetrievalCandidate {
     // Even with min_score <= 0, scan for NaN scores to prevent propagation
     var has_nan = false;
@@ -1248,6 +1318,68 @@ test "vectorResultsToCandidates converts correctly" {
     try std.testing.expect(candidates[0].vector_score != null);
     try std.testing.expect(@abs(candidates[0].vector_score.? - 0.9) < 0.001);
     try std.testing.expect(candidates[0].keyword_rank == null);
+}
+
+test "applyMinCosine drops vector candidates below the cosine floor (P5)" {
+    const allocator = std.testing.allocator;
+    const k_hi = try allocator.dupe(u8, "hi");
+    defer allocator.free(k_hi);
+    const k_mid = try allocator.dupe(u8, "mid");
+    defer allocator.free(k_mid);
+    const k_lo = try allocator.dupe(u8, "lo");
+    defer allocator.free(k_lo);
+
+    // Cosines: 0.9 (keep), 0.5 (drop), 0.1 (drop) with floor 0.6
+    const vec_results = [_]vector_store_mod.VectorResult{
+        .{ .key = k_hi, .score = 0.9 },
+        .{ .key = k_mid, .score = 0.5 },
+        .{ .key = k_lo, .score = 0.1 },
+    };
+    const candidates = try vectorResultsToCandidates(allocator, &vec_results);
+
+    const filtered = applyMinCosine(allocator, candidates, 0.6);
+    defer freeCandidates(allocator, filtered);
+
+    // Only the 0.9 candidate survives the 0.6 floor.
+    try std.testing.expectEqual(@as(usize, 1), filtered.len);
+    try std.testing.expectEqualStrings("hi", filtered[0].key);
+    try std.testing.expect(filtered[0].vector_score.? >= 0.6);
+}
+
+test "applyMinCosine with floor 0.0 keeps all candidates — no behavior change (P5)" {
+    const allocator = std.testing.allocator;
+    const k_a = try allocator.dupe(u8, "a");
+    defer allocator.free(k_a);
+    const k_b = try allocator.dupe(u8, "b");
+    defer allocator.free(k_b);
+
+    const vec_results = [_]vector_store_mod.VectorResult{
+        .{ .key = k_a, .score = 0.9 },
+        .{ .key = k_b, .score = 0.01 }, // very low cosine, but floor disabled
+    };
+    const candidates = try vectorResultsToCandidates(allocator, &vec_results);
+
+    // floor 0.0 = disabled → slice returned unchanged (same ptr, all kept)
+    const filtered = applyMinCosine(allocator, candidates, 0.0);
+    defer freeCandidates(allocator, filtered);
+
+    try std.testing.expectEqual(@as(usize, 2), filtered.len);
+    try std.testing.expectEqual(candidates.ptr, filtered.ptr);
+}
+
+test "applyMinCosine on exact-boundary cosine keeps it (>= floor) (P5)" {
+    const allocator = std.testing.allocator;
+    const k = try allocator.dupe(u8, "edge");
+    defer allocator.free(k);
+    const vec_results = [_]vector_store_mod.VectorResult{
+        .{ .key = k, .score = 0.7 },
+    };
+    const candidates = try vectorResultsToCandidates(allocator, &vec_results);
+    const filtered = applyMinCosine(allocator, candidates, 0.7);
+    defer freeCandidates(allocator, filtered);
+
+    // cosine == floor → kept (inclusive lower bound)
+    try std.testing.expectEqual(@as(usize, 1), filtered.len);
 }
 
 test "Engine with circuit breaker open skips vector search" {

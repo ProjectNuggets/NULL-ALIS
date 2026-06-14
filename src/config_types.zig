@@ -1092,7 +1092,22 @@ pub const MemorySyncConfig = struct {
 
 pub const MemoryQueryConfig = struct {
     max_results: u32 = 6,
+    /// Floor applied to the FINAL fused score (Reciprocal Rank Fusion), NOT a
+    /// cosine similarity. RRF assigns 1/(rank+1+k); with the default k=60 the
+    /// rank-1 hit always scores 1/61 ≈ 0.0164 — even for a perfect match. So
+    /// any min_score > ~0.0164 would silently delete every result. This is a
+    /// no-op floor in the wrong metric space; prefer `min_cosine` below for a
+    /// real relevance floor. Kept (default 0.0) for backward compatibility.
     min_score: f64 = 0.0,
+    /// Real relevance floor in COSINE space, applied to vector-lane candidates
+    /// BEFORE RRF fusion (vector candidates carry a genuine cosine similarity in
+    /// [0,1] at that stage; fused RRF scores do not). Vector candidates with
+    /// cosine < min_cosine are dropped so genuine noise never enters fusion.
+    /// Default 0.0 = DISABLED (no behavior change). Do NOT set aggressively: the
+    /// correct threshold can only be established empirically via the Phase-1 eval
+    /// harness — recall is not actually broken (the "0.01" reading was the RRF
+    /// 1/61 math, not a similarity).
+    min_cosine: f64 = 0.0,
     merge_strategy: []const u8 = "rrf",
     rrf_k: u32 = 60,
     hybrid: MemoryHybridConfig = .{},

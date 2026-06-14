@@ -1266,6 +1266,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                                 if (v == .float) self.memory.search.query.min_score = v.float;
                                 if (v == .integer) self.memory.search.query.min_score = @floatFromInt(v.integer);
                             }
+                            if (query.get("min_cosine")) |v| {
+                                if (v == .float) self.memory.search.query.min_cosine = v.float;
+                                if (v == .integer) self.memory.search.query.min_cosine = @floatFromInt(v.integer);
+                            }
                             if (query.get("merge_strategy")) |v| if (v == .string) {
                                 self.memory.search.query.merge_strategy = try self.allocator.dupe(u8, v.string);
                             };
