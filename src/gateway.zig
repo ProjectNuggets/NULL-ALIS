@@ -15634,6 +15634,13 @@ fn isRejectedExtractionPredicate(predicate: []const u8) bool {
         "GREETED",      "SAID",         "ASKED",               "MENTIONED",           "REPLIED",
         "ACKNOWLEDGED", "EXPRESSED",    "INDICATED_READINESS", "IS_GETTING_STARTED",  "OFFERED_TO_WAIT",
         "PRIORITIZED",  "ADDRESSED_AS", "IS_UNKNOWN",          "EXPRESSED_READINESS", "INITIATED_CONVERSATION",
+        // P7 — the entity_pipeline speaker hub (user:<id> → entity). RENAMED
+        // from "MENTIONED" so it no longer collides with the meta-narrative
+        // ban above; it gets its OWN entry here to stay render/PPR-excluded
+        // (graph-density: every user→person mention would otherwise flood the
+        // graph). Genuine relationships (KNOWS/WORKS_AT/…) are NOT listed and
+        // keep flowing.
+        "USER_MENTIONED",
     };
     for (rejected) |p| if (std.mem.eql(u8, p, predicate)) return true;
     return false;
@@ -35149,6 +35156,19 @@ test "brain: buildBrainTypedEdges (V1.7a-3) returns empty for user with no edges
 // (source, target) pair (uniqueness key is the full SVO triple). The
 // sort comparator must use predicate as third tiebreaker so JSON output
 // is byte-stable across requests with the same underlying edge set.
+test "P7: isRejectedExtractionPredicate rejects renamed speaker hub, keeps relationships" {
+    // Defense-in-depth mirror of extraction_persist.REJECTED_PREDICATES.
+    // The renamed speaker-hub predicate (USER_MENTIONED) must be rejected here
+    // too so the dense user→entity hub never renders on /brain/graph, while
+    // genuine relationship predicates flow into the graph.
+    try std.testing.expect(isRejectedExtractionPredicate("USER_MENTIONED"));
+    try std.testing.expect(isRejectedExtractionPredicate("MENTIONED")); // meta-narrative ban intact
+    try std.testing.expect(isRejectedExtractionPredicate("SAID"));
+    try std.testing.expect(!isRejectedExtractionPredicate("KNOWS"));
+    try std.testing.expect(!isRejectedExtractionPredicate("WORKS_AT"));
+    try std.testing.expect(!isRejectedExtractionPredicate("REPORTS_TO"));
+}
+
 test "brain: buildBrainTypedEdges (V1.7a-3) sorts by predicate when source+target match" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;

@@ -633,11 +633,18 @@ pub fn freeTypedEdges(allocator: std.mem.Allocator, edges: []TypedEdge) void {
 pub const EntityRow = struct {
     id: []const u8,
     name: []const u8,
+    /// P7 (CRM substrate) — the parsed entity class (PERSON / ORG / PROJECT /
+    /// PRODUCT / PLACE / EVENT / CONCEPT, or the generic `'PROPER'` default).
+    /// Round-trips from `memory_entities.entity_type` so typed-person nodes
+    /// survive the upsert→read cycle. Defaults to the schema default so
+    /// older read paths and stubs that don't populate it stay valid.
+    entity_type: []const u8 = "PROPER",
     similarity: f64 = 0.0,
 
     pub fn deinit(self: *const EntityRow, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.name);
+        allocator.free(self.entity_type);
     }
 };
 

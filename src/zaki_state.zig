@@ -1132,7 +1132,10 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn findEntityByCosine(_: *@This(), _: std.mem.Allocator, _: i64, _: []const f32, _: f64) !?memory_root.EntityRow {
         return null;
     }
-    pub fn upsertEntity(_: *@This(), allocator: std.mem.Allocator, _: i64, name: []const u8, _: []const f32) ![]u8 {
+    pub fn upsertEntity(_: *@This(), allocator: std.mem.Allocator, _: i64, name: []const u8, _: []const u8, _: []const f32) ![]u8 {
+        // P7 — `entity_type` (the 5th param) is ignored on non-postgres
+        // builds: entity coreference + typing is a postgres-pgvector feature;
+        // non-postgres callers fall back to the hash-based stable key.
         return allocator.dupe(u8, name);
     }
     /// V1.13 Day 1 — working memory stubs for non-postgres builds.
@@ -9474,7 +9477,7 @@ const ManagerImpl = struct {
         try arr_buf.appendSlice(allocator, "}");
 
         const q = try self.buildQuery(
-            "SELECT id, name FROM {schema}.memory_entities " ++
+            "SELECT id, name, entity_type FROM {schema}.memory_entities " ++
                 "WHERE user_id = $1 AND id = ANY($2::text[])",
         );
         defer self.allocator.free(q);
@@ -9497,7 +9500,10 @@ const ManagerImpl = struct {
             const id = try dupeResultValue(allocator, result, i, 0);
             errdefer allocator.free(id);
             const name = try dupeResultValue(allocator, result, i, 1);
-            try out.append(allocator, .{ .id = id, .name = name });
+            errdefer allocator.free(name);
+            // P7 — round-trip the entity class (NOT NULL, defaults 'PROPER').
+            const entity_type = try dupeResultValue(allocator, result, i, 2);
+            try out.append(allocator, .{ .id = id, .name = name, .entity_type = entity_type });
         }
         return out.toOwnedSlice(allocator);
     }
@@ -9532,7 +9538,7 @@ const ManagerImpl = struct {
         try emb_buf.append(allocator, ']');
 
         const q = try self.buildQuery(
-            "SELECT id, name, 1 - (name_embedding <=> $2::vector) AS sim " ++
+            "SELECT id, name, 1 - (name_embedding <=> $2::vector) AS sim, entity_type " ++
                 "FROM {schema}.memory_entities " ++
                 "WHERE user_id = $1 AND name_embedding IS NOT NULL " ++
                 "ORDER BY name_embedding <=> $2::vector " ++
@@ -9556,7 +9562,10 @@ const ManagerImpl = struct {
         errdefer allocator.free(id);
         const name = try dupeResultValue(allocator, result, 0, 1);
         errdefer allocator.free(name);
-        return memory_root.EntityRow{ .id = id, .name = name, .similarity = sim };
+        // P7 — column 3 is entity_type (NOT NULL, defaults 'PROPER'); round-trip it.
+        const entity_type = try dupeResultValue(allocator, result, 0, 3);
+        errdefer allocator.free(entity_type);
+        return memory_root.EntityRow{ .id = id, .name = name, .entity_type = entity_type, .similarity = sim };
     }
 
     /// V1.6 commit 8 — write a new entity row to memory_entities with its
@@ -9568,11 +9577,22 @@ const ManagerImpl = struct {
     ///
     /// Caller has already determined no cosine ≥ threshold neighbor exists
     /// (via findEntityByCosine returning null) — this is the create branch.
+    ///
+    /// P7 (CRM substrate) — `entity_type` is the parsed entity class (PERSON,
+    /// ORG, PROJECT, …, or the generic `'PROPER'`). It is persisted on INSERT
+    /// and round-trips via `findEntityByCosine` / `findEntitiesByKeys`. On
+    /// CONFLICT the type is *upgraded only away from* `'PROPER'`: an incoming
+    /// real type promotes an existing generic row, but an incoming `'PROPER'`
+    /// never clobbers an already-known type (so re-mentioning "Tarek" with no
+    /// type in a later pass cannot demote him from PERSON back to PROPER).
+    /// Callers with no type information pass `"PROPER"` to preserve the
+    /// pre-P7 default behavior.
     pub fn upsertEntity(
         self: *Self,
         allocator: std.mem.Allocator,
         user_id: i64,
         name: []const u8,
+        entity_type: []const u8,
         embedding: []const f32,
     ) ![]u8 {
         // W1.1 (Fix 4) — fail-closed on a bogus tenant id before the row
@@ -9593,10 +9613,18 @@ const ManagerImpl = struct {
         const id = try self.randomHexId(self.allocator, 16);
         errdefer self.allocator.free(id);
 
+        // P7 — `entity_type` is $5. On CONFLICT, upgrade the stored type only
+        // when the incoming type is a real (non-'PROPER') class: the CASE
+        // keeps the existing type whenever the new value is 'PROPER', so a
+        // typeless re-mention never demotes a known PERSON/ORG/… back to the
+        // generic default. EXCLUDED.entity_type is the value we tried to
+        // insert (i.e. the `entity_type` arg).
         const q = try self.buildQuery(
-            "INSERT INTO {schema}.memory_entities (id, user_id, name, name_lower, name_embedding) " ++
-                "VALUES ($1, $2, $3, LOWER($3), $4::vector) " ++
+            "INSERT INTO {schema}.memory_entities (id, user_id, name, name_lower, entity_type, name_embedding) " ++
+                "VALUES ($1, $2, $3, LOWER($3), $5, $4::vector) " ++
                 "ON CONFLICT (user_id, name_lower) DO UPDATE SET " ++
+                "entity_type = CASE WHEN EXCLUDED.entity_type = 'PROPER' " ++
+                "THEN {schema}.memory_entities.entity_type ELSE EXCLUDED.entity_type END, " ++
                 "name_embedding = EXCLUDED.name_embedding, updated_at = NOW() " ++
                 "RETURNING id",
         );
@@ -9609,12 +9637,15 @@ const ManagerImpl = struct {
         defer self.allocator.free(name_z);
         const emb_z = try self.allocator.dupeZ(u8, emb_buf.items);
         defer self.allocator.free(emb_z);
-        const params = [_]?[*:0]const u8{ id_z, user_s.ptr, name_z, emb_z };
+        const type_z = try self.allocator.dupeZ(u8, entity_type);
+        defer self.allocator.free(type_z);
+        const params = [_]?[*:0]const u8{ id_z, user_s.ptr, name_z, emb_z, type_z };
         const lengths = [_]c_int{
             @intCast(id.len),
             @intCast(user_s.len),
             @intCast(name.len),
             @intCast(emb_buf.items.len),
+            @intCast(entity_type.len),
         };
         const result = try self.execParams(q, &params, &lengths);
         defer c.PQclear(result);
@@ -16511,7 +16542,7 @@ test "V1.6 commit 7 memory_edges insert + dedup + cascade-on-close" {
 }
 
 // Brain-graph activation hardening (C1) — PPR must not be flooded by the
-// per-user speaker hub (`user:<id>` MENTIONED edges minted by the entity
+// per-user speaker hub (`user:<id>` USER_MENTIONED edges minted by the entity
 // pipeline). The hub is non-discriminative ("user mentioned everything"), and
 // findEdgesPPR has no degree normalization, so before activating the entity
 // pipeline the recursive traversal must exclude `user:%` endpoints. Otherwise
@@ -16553,7 +16584,7 @@ test "C1 PPR hub-exclusion — speaker hub does not flood traversal" {
     // Per-user speaker/self hub touches the seed AND 30 unrelated junk nodes.
     // Without hub-exclusion, PPR from mem_seed walks the hub edge and floods
     // every junk_* node with score.
-    try mgr.upsertMemoryEdge(2, "user:2", "mem_seed", "MENTIONED", "wiki_link", 0.9);
+    try mgr.upsertMemoryEdge(2, "user:2", "mem_seed", "USER_MENTIONED", "wiki_link", 0.9);
     // Per-session source hub (structural orphan-killer) touches the seed AND a
     // separate swarm of session-junk nodes — same flood risk via a different
     // structural hub.
@@ -16562,7 +16593,7 @@ test "C1 PPR hub-exclusion — speaker hub does not flood traversal" {
     while (k < 30) : (k += 1) {
         var jkey_buf: [32]u8 = undefined;
         const jkey = try std.fmt.bufPrint(&jkey_buf, "junk_{d}", .{k});
-        try mgr.upsertMemoryEdge(2, "user:2", jkey, "MENTIONED", "wiki_link", 0.9);
+        try mgr.upsertMemoryEdge(2, "user:2", jkey, "USER_MENTIONED", "wiki_link", 0.9);
         var sjkey_buf: [32]u8 = undefined;
         const sjkey = try std.fmt.bufPrint(&sjkey_buf, "sjunk_{d}", .{k});
         try mgr.upsertMemoryEdge(2, "session:s1", sjkey, "IN_SESSION", "structural", 1.0);
@@ -16752,9 +16783,9 @@ test "VALIDATION cohort — keystone de-orphans with meaning (before/after)" {
     for (seeds) |s| try mgr.upsertMemory(2, s.k, s.c, .core, null);
 
     const zero_emb = [_]f32{0.0} ** 1024;
-    const helix_id = try mgr.upsertEntity(allocator, 2, "Helix", &zero_emb);
+    const helix_id = try mgr.upsertEntity(allocator, 2, "Helix", "PROPER", &zero_emb);
     defer allocator.free(helix_id);
-    const mia_id = try mgr.upsertEntity(allocator, 2, "Mia", &zero_emb);
+    const mia_id = try mgr.upsertEntity(allocator, 2, "Mia", "PROPER", &zero_emb);
     defer allocator.free(mia_id);
 
     const measure = struct {
@@ -16899,7 +16930,7 @@ test "V1.6 commit 8 entity coreference — cosine match + miss" {
     neovim_emb[100] = 1.0;
 
     // ── Step 1: insert "Helix" entity. Returns new id.
-    const helix_id = try mgr.upsertEntity(allocator, 2, "Helix", &helix_emb);
+    const helix_id = try mgr.upsertEntity(allocator, 2, "Helix", "PROPER", &helix_emb);
     defer allocator.free(helix_id);
     try std.testing.expect(helix_id.len > 0);
 
@@ -16922,7 +16953,7 @@ test "V1.6 commit 8 entity coreference — cosine match + miss" {
     }
 
     // ── Step 4: insert NeoVim entity, verify two distinct rows now exist.
-    const neovim_id = try mgr.upsertEntity(allocator, 2, "NeoVim", &neovim_emb);
+    const neovim_id = try mgr.upsertEntity(allocator, 2, "NeoVim", "PROPER", &neovim_emb);
     defer allocator.free(neovim_id);
     try std.testing.expect(!std.mem.eql(u8, helix_id, neovim_id));
 
@@ -16933,6 +16964,235 @@ test "V1.6 commit 8 entity coreference — cosine match + miss" {
         const row = found.?;
         defer row.deinit(allocator);
         try std.testing.expectEqualStrings("NeoVim", row.name);
+    }
+}
+
+// P7 (CRM substrate) — entity_type persists + round-trips through
+// upsertEntity → findEntityByCosine, and the ON CONFLICT upgrade never
+// demotes a known type back to 'PROPER'.
+//
+// Acceptance:
+//   1. upsertEntity(uid,"Tarek","person",emb) → findEntityByCosine returns
+//      entity_type == "person" (round-trip).
+//   2. Re-upserting the SAME entity with type "PROPER" does NOT clobber the
+//      known "person" type (no-clobber-PROPER rule).
+//   3. Upserting a 'PROPER' entity then re-upserting with a real type
+//      UPGRADES it away from 'PROPER'.
+test "P7 entity typing — round-trip + no-clobber-PROPER + upgrade" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-p7-typing/workspace");
+
+    // Distinct synthetic embeddings so cosine finds each entity back exactly.
+    var tarek_emb: [1024]f32 = [_]f32{0.0} ** 1024;
+    tarek_emb[7] = 1.0;
+    var helix_emb: [1024]f32 = [_]f32{0.0} ** 1024;
+    helix_emb[42] = 1.0;
+
+    // ── 1. Round-trip: type "person" survives upsert → cosine read.
+    {
+        const id = try mgr.upsertEntity(allocator, 2, "Tarek", "person", &tarek_emb);
+        defer allocator.free(id);
+        const found = try mgr.findEntityByCosine(allocator, 2, &tarek_emb, 0.95);
+        try std.testing.expect(found != null);
+        const row = found.?;
+        defer row.deinit(allocator);
+        try std.testing.expectEqualStrings("Tarek", row.name);
+        try std.testing.expectEqualStrings("person", row.entity_type);
+    }
+
+    // ── 2. No-clobber: re-upsert Tarek with type 'PROPER' must NOT demote
+    //    him from "person".
+    {
+        const id = try mgr.upsertEntity(allocator, 2, "Tarek", "PROPER", &tarek_emb);
+        defer allocator.free(id);
+        const found = try mgr.findEntityByCosine(allocator, 2, &tarek_emb, 0.95);
+        try std.testing.expect(found != null);
+        const row = found.?;
+        defer row.deinit(allocator);
+        try std.testing.expectEqualStrings("person", row.entity_type); // unchanged
+    }
+
+    // ── 3. Upgrade away from 'PROPER': insert a generic entity, then re-upsert
+    //    with a real type → the real type wins.
+    {
+        const id0 = try mgr.upsertEntity(allocator, 2, "Helix", "PROPER", &helix_emb);
+        allocator.free(id0);
+        {
+            const found = try mgr.findEntityByCosine(allocator, 2, &helix_emb, 0.95);
+            try std.testing.expect(found != null);
+            const row = found.?;
+            defer row.deinit(allocator);
+            try std.testing.expectEqualStrings("PROPER", row.entity_type);
+        }
+        const id1 = try mgr.upsertEntity(allocator, 2, "Helix", "product", &helix_emb);
+        allocator.free(id1);
+        {
+            const found = try mgr.findEntityByCosine(allocator, 2, &helix_emb, 0.95);
+            try std.testing.expect(found != null);
+            const row = found.?;
+            defer row.deinit(allocator);
+            try std.testing.expectEqualStrings("product", row.entity_type); // upgraded
+        }
+    }
+}
+
+// P7 (CRM substrate) — an extracted edge with a person SUBJECT creates a
+// subject entity node. Pre-P7 the edge path resolved ONLY the object, so
+// "Tarek WORKS_AT Acme" made Acme a node but Tarek vanished. Now the subject
+// is resolved too (unless it's the self/speaker pseudo-subject).
+//
+// Acceptance:
+//   1. After persisting "Tarek WORKS_AT Acme", BOTH Tarek and Acme are
+//      resolvable entity rows (subject becomes a node, not just the object),
+//      and a Tarek→Acme typed edge connects them.
+//   2. A self-subject fact ("user PREFERS Helix") does NOT mint a "user"
+//      entity node — the speaker maps to the user:<id> hub, not a graph node.
+test "P7 person-as-subject — extracted edge makes the subject a resolvable node" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-p7-subject/workspace");
+
+    const extraction_persist = @import("agent/extraction_persist.zig");
+
+    // Real deterministic 1024-d embedder so coref actually mints entity rows
+    // (Tarek and Acme get distinct vectors; cosine won't false-merge them).
+    const embeddings = @import("memory/vector/embeddings.zig");
+    const local = try embeddings.LocalHashEmbedding.init(allocator, 1024);
+    const embed_provider = local.provider();
+    defer embed_provider.deinit();
+    const coref = extraction_persist.EntityResolution{ .embed_provider = embed_provider, .threshold = 0.95 };
+
+    // ── Fact 1: person SUBJECT — "Tarek WORKS_AT Acme".
+    const person_fact = [_]extraction_persist.ExtractedMemory{.{
+        .text = "Tarek works at Acme",
+        .subject = "Tarek",
+        .predicate = "WORKS_AT",
+        .object = "Acme",
+        .attributed_to = "user",
+        .confidence = 0.9,
+    }};
+    const r1 = try extraction_persist.persistExtracted(
+        allocator, &mgr, 2, "p7-subject-session", &person_fact,
+        null, // judge
+        coref, // P7: coref present → subject + object resolve to entity rows
+        null, // mem_rt
+        .test_wire, 0, true,
+    );
+    try std.testing.expect(r1.written_count == 1);
+
+    // Subject "Tarek" must now be a resolvable entity node (cosine search with
+    // its own embedding finds it back).
+    {
+        const emb = try embed_provider.embed(allocator, "Tarek");
+        defer allocator.free(emb);
+        const found = try mgr.findEntityByCosine(allocator, 2, emb, 0.95);
+        try std.testing.expect(found != null); // subject became a node — the P7 fix
+        const row = found.?;
+        defer row.deinit(allocator);
+        try std.testing.expectEqualStrings("Tarek", row.name);
+    }
+    // Object "Acme" is a node too (pre-P7 behavior, still holds).
+    {
+        const emb = try embed_provider.embed(allocator, "Acme");
+        defer allocator.free(emb);
+        const found = try mgr.findEntityByCosine(allocator, 2, emb, 0.95);
+        try std.testing.expect(found != null);
+        const row = found.?;
+        defer row.deinit(allocator);
+        try std.testing.expectEqualStrings("Acme", row.name);
+    }
+    // A Tarek→Acme WORKS_AT edge connects the two entity nodes (count the
+    // entity-to-entity edges with that predicate via the materialized graph).
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT COUNT(*) FROM {s}.memory_edges " ++
+                "WHERE user_id = 2 AND predicate = 'WORKS_AT' " ++
+                "AND source_key LIKE '%' AND target_key LIKE '%' " ++
+                "AND source_key NOT LIKE 'extracted_%' AND source_key NOT LIKE 'user:%'",
+            .{schema_q},
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const cnt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(cnt);
+        const n = try std.fmt.parseInt(i64, cnt, 10);
+        try std.testing.expect(n >= 1); // subject→object entity edge exists
+    }
+
+    // ── Fact 2: self SUBJECT — "user PREFERS Helix" must NOT mint a "user"
+    //    entity node (the speaker is the user:<id> hub, not a graph entity).
+    const self_fact = [_]extraction_persist.ExtractedMemory{.{
+        .text = "user prefers Helix",
+        .subject = "user",
+        .predicate = "PREFERS",
+        .object = "Helix",
+        .attributed_to = "user",
+        .confidence = 0.9,
+    }};
+    const r2 = try extraction_persist.persistExtracted(
+        allocator, &mgr, 2, "p7-subject-session", &self_fact,
+        null, coref, null, .test_wire, 0, true,
+    );
+    try std.testing.expect(r2.written_count == 1);
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT COUNT(*) FROM {s}.memory_entities WHERE user_id = 2 AND name_lower = 'user'",
+            .{schema_q},
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const cnt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(cnt);
+        try std.testing.expectEqualStrings("0", cnt); // no "user" entity node minted
     }
 }
 

@@ -290,6 +290,11 @@ const REJECTED_PREDICATES = [_][]const u8{
     "IS_UNKNOWN",
     "EXPRESSED_READINESS",
     "INITIATED_CONVERSATION",
+    // P7 — entity_pipeline speaker hub predicate (RENAMED from "MENTIONED").
+    // Keep it rejected at this write-time defense-in-depth filter too, so the
+    // gateway blacklist (gateway.isRejectedExtractionPredicate) and this list
+    // stay in sync — the dense user→entity hub must not render or feed PPR.
+    "USER_MENTIONED",
 };
 
 inline fn isRejectedPredicate(predicate: []const u8) bool {
@@ -1486,13 +1491,59 @@ pub fn persistExtracted(
         // Either way: every fact about the same object lands on the same
         // graph node — the difference is whether "Helix" and "Helix editor"
         // collapse to ONE node (cosine yes, hash no).
-        const target_key = resolveEntityKey(allocator, state_mgr, user_id, m.object, coref) catch |err| blk: {
+        const target_key = resolveEntityKey(allocator, state_mgr, user_id, m.object, "PROPER", coref) catch |err| blk: {
             log.warn("extraction.entity_resolve_failed err={s} object={s}", .{ @errorName(err), m.object });
             // Final fallback: hash-only key so the edge still writes
             break :blk deriveEntityKey(allocator, m.object) catch null;
         };
+
+        // P7 (CRM substrate) — resolve the SUBJECT to an entity node too, when
+        // it is a named entity (e.g. a person), so "Tarek WORKS_AT Acme" makes
+        // Tarek a first-class graph node — not just Acme. The pre-P7 path only
+        // ever resolved the object, so a person-as-subject produced 0 typed
+        // nodes. We skip the self/speaker pseudo-subjects ("user", "I", …):
+        // those denote the conversation participants (the `user:<id>` speaker
+        // hub), not entities. Best-effort: subject-resolution failure never
+        // aborts the object edge below. `'PROPER'` here can only UPGRADE the
+        // row (the no-clobber rule in upsertEntity protects a known type).
+        const subject_key: ?[]u8 = if (isSelfPseudoSubject(m.subject))
+            null
+        else
+            resolveEntityKey(allocator, state_mgr, user_id, m.subject, "PROPER", coref) catch |err| blk: {
+                log.warn("extraction.subject_resolve_failed err={s} subject={s}", .{ @errorName(err), m.subject });
+                break :blk null;
+            };
+        defer if (subject_key) |sk| allocator.free(sk);
+
         if (target_key) |tk| {
             defer allocator.free(tk);
+
+            // P7 — emit the relationship edge between the two resolved
+            // entities so the subject node is connected, not orphaned:
+            //   subject_entity --predicate--> object_entity
+            // (e.g. Tarek --WORKS_AT--> Acme). Keeps the same predicate +
+            // provenance as the memory→object edge below. Best-effort.
+            if (subject_key) |sk| {
+                if (!std.mem.eql(u8, sk, tk)) {
+                    state_mgr.upsertMemoryEdgeRich(
+                        user_id,
+                        sk,
+                        tk,
+                        m.predicate,
+                        "extraction_classifier",
+                        m.confidence,
+                        m.text,
+                        m.temporal_anchor_unix,
+                        key,
+                        originToExtractionPass(origin),
+                        if (session_boundary_id == 0) null else session_boundary_id,
+                    ) catch |err| {
+                        log.warn("extraction.subject_edge_write_failed subject={s} target={s} predicate={s} err={s}", .{
+                            sk, tk, m.predicate, @errorName(err),
+                        });
+                    };
+                }
+            }
             // V1.14 — call the rich variant. Pass:
             //   - fact = m.text (the full sentence the LLM produced)
             //   - temporal_anchor_unix = m.temporal_anchor_unix
@@ -1639,11 +1690,18 @@ fn predicateToSlotType(predicate: []const u8) ?[]const u8 {
 /// Caller frees the returned slice. The returned key is the value the
 /// edge writer uses as `target_key`, so a coreference match means existing
 /// edges to that entity gain weight via the UNIQUE INDEX.
+/// P7 — `entity_type` is the class to stamp on a freshly-minted entity
+/// (`'PROPER'` for the object/subject endpoints of an extracted triple, which
+/// carry no per-endpoint type in the triple JSON). Threaded into `upsertEntity`
+/// so the no-clobber-PROPER rule applies: if the entity already exists with a
+/// real type (from the entity_pipeline path), passing `'PROPER'` here will NOT
+/// demote it.
 fn resolveEntityKey(
     allocator: std.mem.Allocator,
     state_mgr: *zaki_state.Manager,
     user_id: i64,
     object: []const u8,
+    entity_type: []const u8,
     coref: ?EntityResolution,
 ) ![]u8 {
     const c = coref orelse return deriveEntityKey(allocator, object);
@@ -1671,7 +1729,7 @@ fn resolveEntityKey(
     }
 
     // No match → create new entity.
-    const new_id = state_mgr.upsertEntity(allocator, user_id, object, embedding) catch |err| {
+    const new_id = state_mgr.upsertEntity(allocator, user_id, object, entity_type, embedding) catch |err| {
         log.warn("extraction.entity_upsert_failed err={s} object={s} — using hash fallback", .{
             @errorName(err), object,
         });
@@ -1679,6 +1737,20 @@ fn resolveEntityKey(
     };
     log.info("extraction.entity_created object={s} entity_id={s}", .{ object, new_id });
     return new_id;
+}
+
+/// P7 — is this triple subject the speaker/self pseudo-subject rather than a
+/// named graph entity? "user" / "assistant" / "I" / "me" / "you" denote the
+/// conversation participants (the speaker hub `user:<id>`), NOT first-class
+/// entity nodes. Everything else (a person's name like "Tarek", an org, …) is
+/// a named entity that SHOULD become its own resolvable node so
+/// "Tarek WORKS_AT Acme" makes Tarek a node — not just Acme. Case-insensitive.
+fn isSelfPseudoSubject(subject: []const u8) bool {
+    const self_terms = [_][]const u8{ "user", "assistant", "i", "me", "you", "we", "self" };
+    for (self_terms) |t| {
+        if (std.ascii.eqlIgnoreCase(t, subject)) return true;
+    }
+    return false;
 }
 
 /// Hash-fallback entity key for an `object` surface form.
@@ -1914,6 +1986,33 @@ test "isRejectedPredicate covers known meta-narrative predicates" {
     try std.testing.expect(!isRejectedPredicate("PREFERS"));
     try std.testing.expect(!isRejectedPredicate("DEPLOYS_TO"));
     try std.testing.expect(!isRejectedPredicate("BIRTHDAY"));
+}
+
+test "P7 predicate fix: renamed speaker hub (USER_MENTIONED) rejected; relationships still flow" {
+    // The renamed speaker-hub predicate gets its OWN dedicated blacklist entry
+    // so the dense user→entity hub stays out of the graph (no mention-flood),
+    // while the meta-narrative "MENTIONED" ban remains independent.
+    try std.testing.expect(isRejectedPredicate("USER_MENTIONED"));
+    try std.testing.expect(isRejectedPredicate("MENTIONED")); // meta-narrative ban intact
+    // Genuine relationship predicates are NOT blacklisted — they must flow so
+    // person nodes connect (Tarek WORKS_AT Acme, Jack REPORTS_TO Tarek, …).
+    try std.testing.expect(!isRejectedPredicate("KNOWS"));
+    try std.testing.expect(!isRejectedPredicate("WORKS_AT"));
+    try std.testing.expect(!isRejectedPredicate("REPORTS_TO"));
+}
+
+test "P7 isSelfPseudoSubject: speaker/self terms vs named entities" {
+    // Self/speaker pseudo-subjects map to the user:<id> hub, NOT a graph node.
+    try std.testing.expect(isSelfPseudoSubject("user"));
+    try std.testing.expect(isSelfPseudoSubject("User")); // case-insensitive
+    try std.testing.expect(isSelfPseudoSubject("I"));
+    try std.testing.expect(isSelfPseudoSubject("me"));
+    try std.testing.expect(isSelfPseudoSubject("assistant"));
+    // Named entities (people, orgs) are NOT self — they SHOULD become nodes.
+    try std.testing.expect(!isSelfPseudoSubject("Tarek"));
+    try std.testing.expect(!isSelfPseudoSubject("Jack"));
+    try std.testing.expect(!isSelfPseudoSubject("Acme"));
+    try std.testing.expect(!isSelfPseudoSubject("")); // empty is not self
 }
 
 test "parseExtractedJson handles confidence as integer" {
