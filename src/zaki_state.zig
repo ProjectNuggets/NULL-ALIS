@@ -5212,8 +5212,12 @@ const ManagerImpl = struct {
             "";
 
         if (!isSystemMemoryKey(key)) {
-            // Tier-3 promotion: fact seen across >= 2 sessions and not yet core.
-            if (seen_count >= 2 and !std.mem.eql(u8, returned_type, "core")) {
+            // Tier-3 promotion: fact seen across >= 2 sessions and not yet a
+            // durable type. Phase-0.5b C2: gate on `!isDurableMemoryType` (not
+            // just `!= "core"`) so a corroborated preference/decision/person/
+            // open_loop is NOT promoted — promotion to core would irreversibly
+            // erase its semantic type and vanish it from its typed view.
+            if (seen_count >= 2 and !memory_root.isDurableMemoryType(returned_type)) {
                 self.promoteMemoryToCore(user_id, key) catch |err| {
                     log.warn("upsertMemory: tier-3 promotion failed key={s}: {}", .{ key, err });
                 };
@@ -5257,9 +5261,15 @@ const ManagerImpl = struct {
         // upsertMemory + upsertMemoryWithMetadata, this branch is normally
         // unreachable (the upsert clears valid_to before promote runs), but
         // defense-in-depth — promote should never lift an invalid row.
+        // Phase-0.5b C2: never overwrite a DURABLE type's memory_type. The
+        // WHERE excludes core/preference/decision/person/open_loop so a
+        // corroborated typed durable is never clobbered to 'core' (which
+        // would erase the type irreversibly + drop it from its typed view).
+        // Non-durable rows (daily/conversation/episodic/...) still promote
+        // normally — memory_type='core', session_id NULL, confidence raised.
         const q = try self.buildQuery(
             "UPDATE {schema}.memories SET memory_type = 'core', session_id = NULL, confidence_score = 0.9, updated_at = NOW() " ++
-                "WHERE user_id = $1 AND key = $2 AND memory_type != 'core' AND " ++ MEMORIES_VALIDITY_FILTER,
+                "WHERE user_id = $1 AND key = $2 AND memory_type NOT IN " ++ memory_root.DURABLE_TYPES_SQL ++ " AND " ++ MEMORIES_VALIDITY_FILTER,
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
@@ -8420,12 +8430,16 @@ const ManagerImpl = struct {
         // batch by re-querying after each UPDATE pass would change the set, but
         // since UPDATEs move rows OFF core/daily, a single pass suffices and
         // re-running the whole backfill is a clean no-op.
+        // Phase-0.5b H7: only consider LIVE rows for retype. A CLOSED row
+        // (valid_to in the past) must stay closed — retyping it would move it
+        // from protected (closed-stays-closed under C1) to resurrectable.
         const q = try self.buildQuery(
             "SELECT key, memory_type, metadata->>'predicate', " ++
                 "COALESCE(metadata->>'attributed_to', '') " ++
                 "FROM {schema}.memories " ++
                 "WHERE user_id = $1 " ++
                 "AND memory_type IN ('core','daily') " ++
+                "AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
                 "AND metadata ? 'predicate' " ++
                 "AND length(metadata->>'predicate') > 0",
         );
@@ -8462,9 +8476,13 @@ const ManagerImpl = struct {
             // WHERE on the still-legacy type so a concurrent write that already
             // re-typed the row makes this a no-op (idempotent under races).
             const link_type = extraction_persist.linkTypeForPredicate(predicate).toString();
+            // Phase-0.5b H7: re-assert the validity guard on the live UPDATE
+            // (defense-in-depth vs. a concurrent close-out between the SELECT
+            // and this write) so a row closed mid-backfill is never retyped.
             const upd_q = try self.buildQuery(
                 "UPDATE {schema}.memories SET memory_type = $3, link_type = $4, updated_at = updated_at " ++
-                    "WHERE user_id = $1 AND key = $2 AND memory_type IN ('core','daily')",
+                    "WHERE user_id = $1 AND key = $2 AND memory_type IN ('core','daily') " ++
+                    "AND " ++ MEMORIES_VALIDITY_FILTER,
             );
             defer self.allocator.free(upd_q);
             const key_z = try self.allocator.dupeZ(u8, key);
@@ -9156,9 +9174,17 @@ const ManagerImpl = struct {
         // Defensive: never accept "core" as the target — would be a no-op
         // that masks the caller's confusion.
         if (std.mem.eql(u8, target_category_str, "core")) return false;
+        // Phase-0.5b H2: demote reaches ALL durable types, not just 'core'.
+        // C1 now protects preference/decision/person/open_loop with the same
+        // immortality guard core had, so the release-valve must be able to
+        // demote them too — otherwise a wrongly-typed durable would be stuck.
+        // Phase-0.5b H7: validity guard — only demote a LIVE row. Without it,
+        // demote could retype a CLOSED row, moving it from protected (closed
+        // stays closed) to resurrectable (a fresh upsert would revive it).
         const q = try self.buildQuery(
             "UPDATE {schema}.memories SET memory_type = $3, updated_at = NOW() " ++
-                "WHERE user_id = $1 AND key = $2 AND memory_type = 'core' " ++
+                "WHERE user_id = $1 AND key = $2 AND memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " " ++
+                "AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
                 "RETURNING id",
         );
         defer self.allocator.free(q);
