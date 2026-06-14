@@ -95,6 +95,8 @@ pub const ALL_TOOLS = [_][]const u8{
     "shell",
     "skill_registry",
     "spawn",
+    "spawn_many",
+    "subagent_batch_result",
     "task_get",
     "task_list",
     "task_stop",

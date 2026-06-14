@@ -220,7 +220,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     // iter27: transcript_read SessionStore binding
     tools_mod.bindSessionStore(tools, if (mem_rt) |rt| rt.session_store else null);
     // N1: image_generate Together key (CLI path)
-    tools_mod.bindImageGenerate(tools, tools_mod.lookupProviderApiKey(cfg.providers, "together"), "");
+    tools_mod.bindImageGenerate(tools, tools_mod.lookupProviderApiKey(cfg.providers, "together"), cfg.image_model);
 
     // Provider interface from runtime bundle (includes retries/fallbacks).
     const provider_i: Provider = runtime_provider.provider();

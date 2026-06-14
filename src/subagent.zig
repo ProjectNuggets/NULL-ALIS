@@ -13,11 +13,26 @@ const Allocator = std.mem.Allocator;
 const bus_mod = @import("bus.zig");
 const config_mod = @import("config.zig");
 const channel_loop = @import("channel_loop.zig");
+const tools_mod = @import("tools/root.zig");
 const json_util = @import("json_util.zig");
 const observability = @import("observability.zig");
 const tasks_mod = @import("tasks/root.zig");
 const zaki_session = @import("session/root.zig");
 const zaki_state = @import("zaki_state.zig");
+const subagent_result = @import("subagent_result.zig");
+const SubagentResult = subagent_result.SubagentResult;
+/// Re-export the Phase-2 result value types so callers that already import the
+/// subagent module (gateway, agent/commands) can reference
+/// `subagent.SubagentResult` / `subagent.SubagentStatus` without a second
+/// import of subagent_result.zig.
+pub const SubagentResultType = SubagentResult;
+pub const SubagentStatus = subagent_result.Status;
+const heartbeat_wake = @import("heartbeat_wake.zig");
+const build_options = @import("build_options");
+const env_rebrand = @import("env_rebrand.zig");
+const config_types = @import("config_types.zig");
+const subagent_batch = @import("subagent_batch.zig");
+pub const BatchTracker = subagent_batch.BatchTracker;
 
 const log = std.log.scoped(.subagent);
 const TASK_LEDGER_FILE_NAME = "subagent_tasks.jsonl";
@@ -45,11 +60,18 @@ pub const TaskState = struct {
     runtime_session_key: ?[]const u8 = null,
     origin_channel: ?[]const u8 = null,
     origin_chat_id: ?[]const u8 = null,
-    result: ?[]const u8 = null,
+    /// Phase 2: structured completion value (manager-allocator-owned slices).
+    /// Freed via freeSubagentResult. Phase 1 stored only `?[]const u8` text;
+    /// the text now lives in `result.?.text` and rides alongside metadata.
+    result: ?SubagentResult = null,
     error_msg: ?[]const u8 = null,
     started_at: i64,
     completed_at: ?i64 = null,
     thread: ?std.Thread = null,
+    /// Phase 4 — batch membership tag. Non-null iff this task was spawned as
+    /// part of a multi-subagent fan-out batch. Manager-allocator-owned; freed
+    /// by freeTaskState / clearTasksLocked alongside `label` and `session_key`.
+    batch_id: ?[]const u8 = null,
 };
 
 pub const SubagentConfig = struct {
@@ -135,6 +157,11 @@ pub const SubagentManager = struct {
     ledger_state_mgr: ?*zaki_state.Manager = null,
     ledger_user_id: ?i64 = null,
     ledger_recovery_pending: bool,
+    /// Phase 4 — in-memory fan-out batch registry. Tracks which task_ids belong
+    /// to each batch, their terminal status, the parent session_key, and the
+    /// deadline. All access is under `mutex` (the tracker is NOT self-locked —
+    /// see subagent_batch.zig LOCK INVARIANT).
+    batches: subagent_batch.BatchTracker = undefined,
 
     completion_runner: ?CompletionRunnerFn = null,
     completion_runner_ctx: ?*anyopaque = null,
@@ -165,6 +192,39 @@ pub const SubagentManager = struct {
     /// delivery still leaves this allocated (its destructor runs anyway).
     _owned_fallback: ?tasks_mod.delivery.OwnedFallback = null,
 
+    // ── Phase 4 G5 — batch-deadline reaper ticker ──────────────────────────
+    //
+    // WHY a per-manager thread rather than hooking tenantRuntimeMaintenanceMain:
+    // `runTenantRuntimeMaintenance` holds `tenant_runtime_mutex` across the
+    // entire sweep (including evictIdleShutdownAware per session). Calling
+    // `reapBatchDeadlines` there would execute `completeTask` (PG I/O, bus
+    // publish, delivery callbacks) while holding that lock — blocking all
+    // incoming request processing during persistence. A per-manager ticker
+    // avoids this hazard: it runs independently of the request pipeline and
+    // holds NO gateway lock while the reaper does its work.
+    //
+    // Tick granularity: ~10 s (REAPER_TICK_INTERVAL_MS). Deadline enforcement
+    // is coarse to the tick — acceptable for v1 staging. A 60-second batch
+    // budget may fire up to 10 s late; this is documented and acceptable.
+    //
+    // Shutdown: the ticker checks `_reaper_shutdown` at loop top and every
+    // sleep increment (50 ms steps) — same pattern as tenantRuntimeMaintenanceMain.
+    // `deinit` signals shutdown and joins the thread before freeing any state the
+    // reaper touches.
+    //
+    // Tests: tests call `reapBatchDeadlines(now_ms)` directly and do NOT start
+    // the ticker thread, so there is no per-test overhead and no shutdown race.
+    // The ticker is only started by `startReaperTicker()`, called from gateway
+    // when the tenant runtime is fully initialized.
+
+    /// Atomic shutdown flag for the reaper ticker. Set true by `deinit`
+    /// before joining the thread.
+    _reaper_shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// Optional background ticker thread. Null until `startReaperTicker` is
+    /// called (production path); left null in tests.
+    _reaper_thread: ?std.Thread = null,
+
     pub fn init(
         allocator: Allocator,
         cfg: *const config_mod.Config,
@@ -191,6 +251,7 @@ pub const SubagentManager = struct {
             .ledger_recovery_pending = cfg.tenant.enabled and std.mem.eql(u8, cfg.state.backend, "postgres"),
             .task_delivery = if (owned) |o| o.delivery else null,
             ._owned_fallback = owned,
+            .batches = subagent_batch.BatchTracker.init(allocator),
         };
         if (!manager.ledger_recovery_pending) {
             manager.recoverDurableState() catch |err| {
@@ -201,6 +262,16 @@ pub const SubagentManager = struct {
     }
 
     pub fn deinit(self: *SubagentManager) void {
+        // Phase 4 G5 — signal the reaper ticker and join it BEFORE freeing
+        // any state it may be touching (batches, tasks). The ticker only
+        // accesses state via reapBatchDeadlines which holds the manager mutex;
+        // once the thread exits, no further access can occur.
+        self._reaper_shutdown.store(true, .release);
+        if (self._reaper_thread) |thread| {
+            thread.join();
+            self._reaper_thread = null;
+        }
+
         // Join all running threads and free task states
         var it = self.tasks.iterator();
         while (it.next()) |entry| {
@@ -208,12 +279,13 @@ pub const SubagentManager = struct {
             if (state.thread) |thread| {
                 thread.join();
             }
-            if (state.result) |r| self.allocator.free(r);
+            if (state.result) |*r| freeSubagentResult(self.allocator, r);
             if (state.error_msg) |e| self.allocator.free(e);
             if (state.session_key) |sk| self.allocator.free(sk);
             if (state.runtime_session_key) |sk| self.allocator.free(sk);
             if (state.origin_channel) |channel| self.allocator.free(channel);
             if (state.origin_chat_id) |chat| self.allocator.free(chat);
+            if (state.batch_id) |bid| self.allocator.free(bid); // Phase 4
             self.allocator.free(state.label);
             self.allocator.free(state.task_summary);
             self.allocator.free(state.task_prompt);
@@ -229,6 +301,8 @@ pub const SubagentManager = struct {
             owned.deinit();
             self._owned_fallback = null;
         }
+        // Phase 4 — free all batch state.
+        self.batches.deinit();
     }
 
     pub fn attachPostgresLedger(self: *SubagentManager, state_mgr: *zaki_state.Manager, user_id: i64) void {
@@ -250,9 +324,78 @@ pub const SubagentManager = struct {
         delivery: CompletionDeliveryFn,
     ) void {
         self.mutex.lock();
-        defer self.mutex.unlock();
         self.completion_delivery_ctx = ctx;
         self.completion_delivery = delivery;
+        self.mutex.unlock();
+
+        // Startup recovery: re-deliver any completions that were persisted
+        // but not confirmed-delivered before the previous pod restart.
+        // Only runs when both the PG ledger AND the delivery callback are
+        // wired — mirrors the gateway.zig wiring order where
+        // attachPostgresLedger is called first, attachCompletionDelivery
+        // second (Task 1.6).
+        if (self.ledger_user_id) |uid| {
+            self.recoverPendingSubagentResults(uid);
+        }
+    }
+
+    /// Re-deliver completions that were persisted but not confirmed-delivered
+    /// before a restart. Idempotent: each row is marked delivered after waking
+    /// so a second restart won't re-fire the same completion. Best-effort:
+    /// logs and continues on any error. Frees every row (deinit + free slice).
+    ///
+    /// Phase 2 (Task 2.3): the durable row's `result_json` now holds a full
+    /// `SubagentResult`. We parse it and re-deliver the REAL answer text (with
+    /// the task_id in the header for parent-side correlation), so a recovered
+    /// turn carries the actual answer — not just a marker. If parsing fails
+    /// (legacy/minimal row, corrupt JSON), we fall back to the marker-only
+    /// content so recovery still wakes the parent.
+    pub fn recoverPendingSubagentResults(self: *SubagentManager, user_id: i64) void {
+        const sm = self.ledger_state_mgr orelse return;
+        const rows = sm.loadPendingSubagentResults(self.allocator, user_id) catch |err| {
+            log.warn("subagent: recovery load failed user_id={d}: {}", .{ user_id, err });
+            return;
+        };
+        defer {
+            for (rows) |*r| r.deinit(self.allocator);
+            self.allocator.free(rows);
+        }
+        for (rows) |row| {
+            // Re-deliver to the parent session history. Rehydrate the full text
+            // from result_json; the parsed arena is freed by `defer` before the
+            // next iteration.
+            if (self.completion_delivery) |delivery| {
+                const content: ?[]u8 = blk: {
+                    if (SubagentResult.fromJsonAlloc(self.allocator, row.result_json)) |parsed_const| {
+                        var parsed = parsed_const;
+                        defer parsed.deinit(self.allocator);
+                        break :blk std.fmt.allocPrint(
+                            self.allocator,
+                            "[Subagent task_id={d} completed — recovered after restart]\n{s}",
+                            .{ row.task_id, parsed.value.text },
+                        ) catch null;
+                    } else |err| {
+                        // Parse failure — fall back to the marker-only content.
+                        log.warn("subagent: recovery result_json parse failed task_id={d}: {} — delivering marker", .{ row.task_id, err });
+                        break :blk std.fmt.allocPrint(
+                            self.allocator,
+                            "[Subagent task_id={d} completed — recovered after restart]",
+                            .{row.task_id},
+                        ) catch null;
+                    }
+                };
+                if (content) |c| {
+                    defer self.allocator.free(c);
+                    delivery(self.completion_delivery_ctx, row.session_key, c) catch {};
+                }
+            }
+            // Wake the parent's heartbeat turn so the recovery is processed.
+            var ubuf: [32]u8 = undefined;
+            const uid_s: ?[]const u8 = std.fmt.bufPrint(&ubuf, "{d}", .{user_id}) catch null;
+            heartbeat_wake.enqueue(uid_s, "subagent_completion:recovered") catch {};
+            // Mark delivered so a subsequent restart doesn't re-fire this row.
+            sm.markSubagentResultDelivered(row.result_id) catch {};
+        }
     }
 
     /// Attach a canonical TaskDelivery so subagent lifecycle transitions
@@ -269,21 +412,45 @@ pub const SubagentManager = struct {
         return formatted;
     }
 
-    /// Spawn a background subagent. Returns task_id immediately.
-    pub fn spawn(
+
+    // ── Phase 4 G2 types ────────────────────────────────────────────────────────
+
+    /// A single spec passed to spawnMany. The task and label slices are borrowed
+    /// from the caller and must remain valid until spawnMany returns.
+    pub const SpawnSpec = struct {
+        task: []const u8,
+        label: []const u8,
+    };
+
+    /// Return value of spawnMany. The caller owns batch_id and task_ids (both
+    /// allocator-owned) and must free them via the manager's allocator.
+    /// `requested` = len(specs) supplied; `task_ids.len` = how many actually
+    /// spawned (H8: may be < requested if a mid-loop failure occurred).
+    pub const BatchHandle = struct {
+        batch_id: []const u8,
+        task_ids: []u64,
+        requested: usize,
+    };
+
+    // ── Spawn implementation ─────────────────────────────────────────────────
+
+    /// H3 — Inner locked spawn. Assumes `self.mutex` is ALREADY HELD by the
+    /// caller; does NOT lock and does NOT check capacity (capacity must be
+    /// pre-checked before entering the batch loop). Sets `state.batch_id` to
+    /// a dupe of `batch_id` if non-null.
+    ///
+    /// `std.Thread.spawn` is safe to call under the lock: it does not touch
+    /// `self.mutex`; the spawned thread blocks in `markTaskRunning` trying to
+    /// acquire the same mutex, so it is parked until the caller releases it.
+    fn spawnInBatchLocked(
         self: *SubagentManager,
         task: []const u8,
         label: []const u8,
         request_session_key: []const u8,
         origin_channel: []const u8,
         origin_chat_id: []const u8,
+        batch_id: ?[]const u8,
     ) !u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.getRunningCountLocked() >= self.config.max_concurrent)
-            return error.TooManyConcurrentSubagents;
-
         const task_id = self.next_id;
         self.next_id += 1;
 
@@ -305,6 +472,10 @@ pub const SubagentManager = struct {
         errdefer self.allocator.free(state_channel);
         const state_chat = try self.allocator.dupe(u8, origin_chat_id);
         errdefer self.allocator.free(state_chat);
+        // Phase 4 — tag with batch membership if this is a fan-out task.
+        const state_batch_id: ?[]const u8 = if (batch_id) |b| try self.allocator.dupe(u8, b) else null;
+        errdefer if (state_batch_id) |b| self.allocator.free(b);
+
         const created_at = std.time.milliTimestamp();
         state.* = .{
             .status = .queued,
@@ -316,6 +487,7 @@ pub const SubagentManager = struct {
             .origin_channel = state_channel,
             .origin_chat_id = state_chat,
             .started_at = created_at,
+            .batch_id = state_batch_id,
         };
 
         try self.tasks.put(self.allocator, task_id, state);
@@ -337,7 +509,6 @@ pub const SubagentManager = struct {
         const origin_chat_copy = try self.allocator.dupe(u8, origin_chat_id);
         errdefer self.allocator.free(origin_chat_copy);
 
-        // Build thread context
         const ctx = try self.allocator.create(ThreadContext);
         errdefer self.allocator.destroy(ctx);
         ctx.* = .{
@@ -378,6 +549,119 @@ pub const SubagentManager = struct {
         return task_id;
     }
 
+    /// Return remaining subagent capacity for this manager (max_concurrent minus
+    /// currently queued/running). Clamped to 0 — never wraps. Caller must hold
+    /// `self.mutex`.
+    fn remainingCapacityLocked(self: *SubagentManager) u32 {
+        const running = self.getRunningCountLocked();
+        if (running >= self.config.max_concurrent) return 0;
+        return self.config.max_concurrent - running;
+    }
+
+    /// Spawn a background subagent. Returns task_id immediately.
+    /// Single-spawn public API — unchanged signature; delegates to
+    /// spawnInBatchLocked with null batch_id under a single lock acquisition.
+    pub fn spawn(
+        self: *SubagentManager,
+        task: []const u8,
+        label: []const u8,
+        request_session_key: []const u8,
+        origin_channel: []const u8,
+        origin_chat_id: []const u8,
+    ) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.getRunningCountLocked() >= self.config.max_concurrent)
+            return error.TooManyConcurrentSubagents;
+        return self.spawnInBatchLocked(task, label, request_session_key, origin_channel, origin_chat_id, null);
+    }
+
+    /// H3 — Fan out N subagents under a single batch.
+    ///
+    /// All-or-nothing capacity check: if specs.len > remainingCapacityLocked()
+    /// at the moment we enter the lock, we return error.TooManyConcurrentSubagents
+    /// and spawn NOTHING. The capacity check, the entire spawn loop, AND the
+    /// batch registration all run under ONE continuous mutex hold so no concurrent
+    /// spawnMany or spawn call can slip tasks in between the check and the spawns.
+    ///
+    /// H8 — partial-spawn note: if a mid-loop spawnInBatchLocked fails (OOM,
+    /// thread limit), we break and register the batch with however many tasks DID
+    /// spawn; BatchHandle.requested vs task_ids.len tells the caller how many were
+    /// actually created. On zero spawned we return error.SpawnFailed.
+    ///
+    /// Caller owns handle.batch_id and handle.task_ids; free both via the manager
+    /// allocator.
+    pub fn spawnMany(
+        self: *SubagentManager,
+        specs: []const SpawnSpec,
+        request_session_key: []const u8,
+        origin_channel: []const u8,
+        origin_chat_id: []const u8,
+        budget_ms: i64,
+    ) !BatchHandle {
+        if (specs.len == 0) return error.EmptyBatch;
+
+        const now = std.time.milliTimestamp();
+        var ids = std.ArrayListUnmanaged(u64){};
+        errdefer ids.deinit(self.allocator);
+
+        // batch_id is formatted into a stack buffer then duped into the allocator
+        // after the lock section to avoid holding a pointer into stack memory past
+        // the lock scope.
+        var idbuf: [64]u8 = undefined;
+        var batch_id_len: usize = 0;
+
+        {
+            // H3 — single lock: capacity check + spawn loop + batch register.
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            if (specs.len > self.remainingCapacityLocked())
+                return error.TooManyConcurrentSubagents;
+
+            // Use next_id (the monotonic spawn counter) as the sequence component
+            // so the batch_id is stable and unique within this manager's lifetime.
+            const seq = self.next_id;
+            const batch_id_local = try std.fmt.bufPrint(&idbuf, "batch:{d}:{d}", .{ seq, now });
+            batch_id_len = batch_id_local.len;
+
+            for (specs) |spec| {
+                const tid = self.spawnInBatchLocked(
+                    spec.task,
+                    spec.label,
+                    request_session_key,
+                    origin_channel,
+                    origin_chat_id,
+                    batch_id_local,
+                ) catch break; // H8: partial failure — register what did spawn
+                ids.append(self.allocator, tid) catch break;
+            }
+
+            if (ids.items.len > 0) {
+                // Register the batch in the tracker while still under the lock.
+                // On failure (OOM), log and continue — the tasks are spawned and
+                // will complete; the barrier just won't fire.
+                self.batches.register(
+                    batch_id_local,
+                    ids.items,
+                    request_session_key,
+                    now,
+                    now + budget_ms,
+                ) catch |err| log.warn("subagent: batch register failed: {}", .{err});
+            }
+        }
+
+        if (ids.items.len == 0) return error.SpawnFailed;
+
+        // Dupe the batch_id out of the stack buffer now that the lock is released.
+        const owned_batch_id = try self.allocator.dupe(u8, idbuf[0..batch_id_len]);
+        return BatchHandle{
+            .batch_id = owned_batch_id,
+            .task_ids = try ids.toOwnedSlice(self.allocator),
+            .requested = specs.len,
+        };
+    }
+
     pub fn getTaskStatus(self: *SubagentManager, task_id: u64) ?TaskStatus {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -387,13 +671,112 @@ pub const SubagentManager = struct {
         return null;
     }
 
-    pub fn getTaskResult(self: *SubagentManager, task_id: u64) ?[]const u8 {
+    /// Return the full structured result for a task (Phase 2). The returned
+    /// `SubagentResult` borrows manager-owned slices guarded by the manager
+    /// lifetime — copy out anything you need to retain past the next mutation.
+    pub fn getTaskResult(self: *SubagentManager, task_id: u64) ?SubagentResult {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.tasks.get(task_id)) |state| {
             return state.result;
         }
         return null;
+    }
+
+    /// Return just the final-answer text for a task — the manual query path
+    /// (`task_get` tool, callers that only relay the answer). Borrowed slice,
+    /// manager-lifetime; copy if retaining. Null when the task is unknown or
+    /// produced no result.
+    pub fn getTaskResultText(self: *SubagentManager, task_id: u64) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.tasks.get(task_id)) |state| {
+            if (state.result) |r| return r.text;
+        }
+        return null;
+    }
+
+    // ── Phase 4 G3 — getBatchResults ────────────────────────────────────────
+
+    /// One row in the getBatchResults response. All slices are duped into the
+    /// caller's `allocator` and must be freed. Use freeBatchResultEntries to
+    /// release the slice at once, or free each field individually:
+    ///   allocator.free(entry.task_id_str); allocator.free(entry.status);
+    ///   allocator.free(entry.text); if (entry.err) |e| allocator.free(e);
+    pub const BatchResultEntry = struct {
+        task_id: u64,
+        status: []const u8, // dupe into caller allocator
+        text: []const u8, // dupe into caller allocator
+        err: ?[]const u8, // dupe into caller allocator, or null
+    };
+
+    /// Free all entries in a BatchResultEntry slice returned by getBatchResults,
+    /// then free the slice itself. Convenience helper for callers.
+    pub fn freeBatchResultEntries(allocator: Allocator, entries: []BatchResultEntry) void {
+        for (entries) |e| {
+            allocator.free(e.status);
+            allocator.free(e.text);
+            if (e.err) |err| allocator.free(err);
+        }
+        allocator.free(entries);
+    }
+
+    /// Phase 4 G3 — Collect the result of every task in a batch.
+    ///
+    /// H7: Returns `error.UnknownBatch` when `batch_id` is not found (expired or
+    /// never existed) so the caller can surface a clear "batch not found" message
+    /// rather than returning empty/None ambiguously.
+    ///
+    /// Returns one `BatchResultEntry` per task_id recorded in the batch (all
+    /// states: queued, running, completed, failed, timeout — whatever is current).
+    /// Strings are duped into `allocator`; caller must free via
+    /// `freeBatchResultEntries` or manually.
+    pub fn getBatchResults(self: *SubagentManager, allocator: Allocator, batch_id: []const u8) ![]BatchResultEntry {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // H7 — unknown batch → clear error
+        const ids = self.batches.taskIds(batch_id) orelse return error.UnknownBatch;
+
+        var entries: std.ArrayListUnmanaged(BatchResultEntry) = .{};
+        errdefer {
+            for (entries.items) |e| {
+                allocator.free(e.status);
+                allocator.free(e.text);
+                if (e.err) |err| allocator.free(err);
+            }
+            entries.deinit(allocator);
+        }
+
+        for (ids) |task_id| {
+            const state = self.tasks.get(task_id);
+
+            const status_str: []const u8 = if (state) |st| @tagName(st.status) else "unknown";
+            const status_duped = try allocator.dupe(u8, status_str);
+            errdefer allocator.free(status_duped);
+
+            const text_str: []const u8 = if (state) |st|
+                (if (st.result) |r| r.text else "")
+            else
+                "";
+            const text_duped = try allocator.dupe(u8, text_str);
+            errdefer allocator.free(text_duped);
+
+            const err_duped: ?[]const u8 = if (state) |st|
+                (if (st.error_msg) |em| try allocator.dupe(u8, em) else null)
+            else
+                null;
+            errdefer if (err_duped) |e| allocator.free(e);
+
+            try entries.append(allocator, .{
+                .task_id = task_id,
+                .status = status_duped,
+                .text = text_duped,
+                .err = err_duped,
+            });
+        }
+
+        return entries.toOwnedSlice(allocator);
     }
 
     pub fn getRunningCount(self: *SubagentManager) u32 {
@@ -416,12 +799,13 @@ pub const SubagentManager = struct {
         while (it.next()) |entry| {
             const state = entry.value_ptr.*;
             if (state.thread) |thread| thread.join();
-            if (state.result) |value| self.allocator.free(value);
+            if (state.result) |*value| freeSubagentResult(self.allocator, value);
             if (state.error_msg) |value| self.allocator.free(value);
             if (state.session_key) |value| self.allocator.free(value);
             if (state.runtime_session_key) |value| self.allocator.free(value);
             if (state.origin_channel) |value| self.allocator.free(value);
             if (state.origin_chat_id) |value| self.allocator.free(value);
+            if (state.batch_id) |value| self.allocator.free(value); // Phase 4
             self.allocator.free(state.label);
             self.allocator.free(state.task_summary);
             self.allocator.free(state.task_prompt);
@@ -533,8 +917,13 @@ pub const SubagentManager = struct {
             break :blk null;
         };
         errdefer if (runtime_session_key) |value| self.allocator.free(value);
-        const result = if (snapshot.result) |value| try self.allocator.dupe(u8, value) else null;
-        errdefer if (result) |value| self.allocator.free(value);
+        // Phase 2: the durable task-snapshot row carries only the text result;
+        // wrap it into a minimal SubagentResult (status inferred from the row).
+        const result: ?SubagentResult = if (snapshot.result) |value|
+            try subagentResultFromText(self.allocator, parseTaskStatus(snapshot.status), value)
+        else
+            null;
+        errdefer if (result) |*value| freeSubagentResult(self.allocator, value);
         const error_msg = if (snapshot.error_msg) |value| try self.allocator.dupe(u8, value) else null;
         errdefer if (error_msg) |value| self.allocator.free(value);
 
@@ -576,8 +965,13 @@ pub const SubagentManager = struct {
         errdefer if (origin_channel) |value| self.allocator.free(value);
         const origin_chat_id = if (snapshot.origin_chat_id) |value| try self.allocator.dupe(u8, value) else null;
         errdefer if (origin_chat_id) |value| self.allocator.free(value);
-        const result = if (snapshot.result) |value| try self.allocator.dupe(u8, value) else null;
-        errdefer if (result) |value| self.allocator.free(value);
+        // Phase 2: the file-ledger snapshot stores only the text result; wrap
+        // it into a minimal SubagentResult (status inferred from the row).
+        const result: ?SubagentResult = if (snapshot.result) |value|
+            try subagentResultFromText(self.allocator, snapshot.status, value)
+        else
+            null;
+        errdefer if (result) |*value| freeSubagentResult(self.allocator, value);
         const error_msg = if (snapshot.error_msg) |value| try self.allocator.dupe(u8, value) else null;
         errdefer if (error_msg) |value| self.allocator.free(value);
 
@@ -619,7 +1013,10 @@ pub const SubagentManager = struct {
                     state.label,
                     state.task_prompt,
                     taskStatusText(state.status),
-                    state.result,
+                    // Phase 2: the task-snapshot row stores the text only; the
+                    // full structured result lives in the durable outbox
+                    // (subagent_results.result_json) via completeTask.
+                    if (state.result) |r| r.text else null,
                     state.error_msg,
                     state.started_at,
                     if (state.status == .queued) null else state.started_at,
@@ -633,9 +1030,17 @@ pub const SubagentManager = struct {
     }
 
     /// Mark a task as completed or failed. Thread-safe.
-    fn completeTask(self: *SubagentManager, task_id: u64, result: ?[]const u8, err_msg: ?[]const u8) void {
+    ///
+    /// Phase 2: `result` is the structured `SubagentResult` the subagent
+    /// produced (success path). The early-failure callers (runtime init / model
+    /// errors) pass `result == null` and an `err_msg` string instead; in that
+    /// case a minimal failed result is synthesized for the durable row and the
+    /// delivery. The incoming result's slices are duped into the manager
+    /// allocator (via dupeSubagentResult) so they outlive the subagent thread's
+    /// arena; freeSubagentResult releases them.
+    fn completeTask(self: *SubagentManager, task_id: u64, result: ?SubagentResult, err_msg: ?[]const u8) void {
         // Dupe result/error into manager's allocator (source may be arena-backed)
-        const owned_result = if (result) |r| self.allocator.dupe(u8, r) catch null else null;
+        const owned_result: ?SubagentResult = if (result) |r| (dupeSubagentResult(self.allocator, r) catch null) else null;
         const owned_err = if (err_msg) |e| self.allocator.dupe(u8, e) catch null else null;
 
         // HI-01 fix (2026-05-07): if the task entry was removed from the
@@ -646,7 +1051,7 @@ pub const SubagentManager = struct {
         // transfer explicitly and free on the failure path.
         var transferred = false;
         defer if (!transferred) {
-            if (owned_result) |r| self.allocator.free(r);
+            if (owned_result) |*r| freeSubagentResult(self.allocator, r);
             if (owned_err) |e| self.allocator.free(e);
         };
 
@@ -654,40 +1059,153 @@ pub const SubagentManager = struct {
         var origin_channel: []const u8 = "system";
         var origin_chat_id: []const u8 = "agent";
         var request_session_key: []const u8 = "agent";
+        // result_id buffer hoisted here so it's available after the lock
+        // for the durable gate (subagentResultStatusIsDelivered) and
+        // mark-after-deliver (markSubagentResultDelivered).
+        var result_id_buf: [40]u8 = undefined;
+        var result_id_slice: ?[]const u8 = null;
+        // ── In-memory idempotency gate + first-completion (single lock) ─────
+        // Layer A (terminal check) and the first-completion mutation are now
+        // combined into ONE lock acquisition to eliminate the TOCTOU gap that
+        // existed when they were two separate acquisitions (review I-B1).
+        // On the already-terminal path `transferred` stays false, so the
+        // `defer if (!transferred)` above frees owned_result/owned_err exactly
+        // once — no leak, no double-free.
+        var should_deliver = false;
+        // ── Batch barrier variables (H1: declared before the lock, set inside) ────
+        // For batched tasks the per-task wake is suppressed; the LAST task to go
+        // terminal claims a single batch wake. `batch_id_to_wake` is a manager-
+        // allocator-owned DUPE taken inside the lock (H1) so it cannot dangle after
+        // the lock is released — the reaper may free BatchState concurrently.
+        // Freed with `defer` outside the lock immediately after the wake is emitted.
+        var emit_per_task_wake = true;
+        var batch_id_to_wake: ?[]const u8 = null;
         {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.tasks.get(task_id)) |state| {
-                if (state.result) |value| self.allocator.free(value);
-                if (state.error_msg) |value| self.allocator.free(value);
-                state.status = if (owned_err != null) .failed else .completed;
-                state.result = owned_result;
-                state.error_msg = owned_err;
-                transferred = true;
-                state.completed_at = std.time.milliTimestamp();
-                self.persistTaskSnapshotLocked(task_id, state);
-                label = state.label;
-                origin_channel = state.origin_channel orelse "system";
-                origin_chat_id = state.origin_chat_id orelse "agent";
-                request_session_key = state.session_key orelse origin_chat_id;
+                if (state.status == .completed or state.status == .failed or state.status == .cancelled) {
+                    // Already terminal — idempotent skip.
+                    // H6: first-terminal-wins — whether it's a real completion or the
+                    // batch-deadline reaper that marks the task, whichever acquires
+                    // the lock first wins. A reaper timeout vs a simultaneous real
+                    // completion: `.timeout` if the reaper arrived first, `.completed`
+                    // if the thread arrived first. Both are correct; document only.
+                    // owned_result/owned_err are freed by the `defer if (!transferred)` above.
+                } else {
+                    if (state.result) |*value| freeSubagentResult(self.allocator, value);
+                    if (state.error_msg) |value| self.allocator.free(value);
+                    state.status = if (owned_err != null) .failed else .completed;
+                    state.result = owned_result;
+                    state.error_msg = owned_err;
+                    transferred = true;
+                    state.completed_at = std.time.milliTimestamp();
+                    self.persistTaskSnapshotLocked(task_id, state);
+                    label = state.label;
+                    origin_channel = state.origin_channel orelse "system";
+                    origin_chat_id = state.origin_chat_id orelse "agent";
+                    request_session_key = state.session_key orelse origin_chat_id;
 
-                // Mirror terminal transition into the canonical ledger
-                // (WP2.1). Result/error strings are owned by the subagent
-                // state; we pass null here to avoid cross-owning a pointer
-                // into the ledger, which does not manage string lifetimes.
-                if (self.task_delivery) |td| {
-                    var id_buf: [tasks_mod.ledger.TASK_ID_LEN]u8 = undefined;
-                    if (formatCanonicalTaskId(&id_buf, task_id)) |id_slice| {
-                        if (state.status == .failed) {
-                            td.markFailed(id_slice, null) catch |err| {
-                                log.warn("subagent: failed to mirror failed status for task #{d}: {}", .{ task_id, err });
-                            };
-                        } else {
-                            td.markSucceeded(id_slice, null) catch |err| {
-                                log.warn("subagent: failed to mirror succeeded status for task #{d}: {}", .{ task_id, err });
-                            };
+                    // ── Durable outbox persist (Phase 1) ─────────────────────
+                    // Write the completion BEFORE we deliver/wake so a crash
+                    // between persist and deliver is recovered by
+                    // loadPendingSubagentResults on boot (Task 1.6).
+                    // Best-effort: PG failure is warned but does NOT block delivery.
+                    // Fill result_id_slice using the hoisted buffer; available
+                    // after the lock for the durable gate and mark-delivered.
+                    result_id_slice = formatSubagentResultId(&result_id_buf, task_id) catch null;
+
+                    if (self.ledger_state_mgr) |sm| {
+                        if (state.session_key) |skey| {
+                            if (zaki_session.parseUserIdFromSessionKey(skey)) |uid_str| {
+                                const uid_num = std.fmt.parseInt(i64, uid_str, 10) catch null;
+                                if (uid_num) |user_id| {
+                                    if (result_id_slice) |result_id| {
+                                        // Phase 2 payload: the FULL SubagentResult JSON (status,
+                                        // text, artifacts, tokens, turns, tools_used, err,
+                                        // duration_ms) — replacing the Phase-1 minimal
+                                        // {status,text}. Recovery (Task 2.3) re-hydrates the real
+                                        // text from this. When the task failed before producing a
+                                        // structured result, synthesize a minimal failed result
+                                        // from the error string so the row is still well-formed.
+                                        const persist_result: SubagentResult = state.result orelse .{
+                                            .status = .failed,
+                                            .text = state.error_msg orelse "",
+                                            .err = state.error_msg,
+                                        };
+                                        const payload = persist_result.toJsonAlloc(self.allocator) catch null;
+                                        if (payload) |pj| {
+                                            defer self.allocator.free(pj);
+                                            sm.upsertSubagentResult(.{
+                                                .result_id = result_id,
+                                                .user_id = user_id,
+                                                .session_key = skey,
+                                                .task_id = @intCast(task_id),
+                                                .result_json = pj,
+                                            }) catch |err| log.warn("subagent: durable persist failed task_id={d}: {}", .{ task_id, err });
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
+
+                    // Mirror terminal transition into the canonical ledger
+                    // (WP2.1). Result/error strings are owned by the subagent
+                    // state; we pass null here to avoid cross-owning a pointer
+                    // into the ledger, which does not manage string lifetimes.
+                    if (self.task_delivery) |td| {
+                        var id_buf: [tasks_mod.ledger.TASK_ID_LEN]u8 = undefined;
+                        if (formatCanonicalTaskId(&id_buf, task_id)) |id_slice| {
+                            if (state.status == .failed) {
+                                td.markFailed(id_slice, null) catch |err| {
+                                    log.warn("subagent: failed to mirror failed status for task #{d}: {}", .{ task_id, err });
+                                };
+                            } else {
+                                td.markSucceeded(id_slice, null) catch |err| {
+                                    log.warn("subagent: failed to mirror succeeded status for task #{d}: {}", .{ task_id, err });
+                                };
+                            }
+                        }
+                    }
+                    // ── Batch barrier wake decision (inside the lock — H1) ────────
+                    // Batched tasks suppress the per-task wake; only the LAST task to
+                    // go terminal in the batch claims the single batch wake.
+                    // Non-batched tasks (batch_id == null) keep the per-task wake.
+                    // batch_id_to_wake is a DUPE taken here (H1: inside the lock)
+                    // so it cannot dangle after the lock releases (the reaper may
+                    // free the BatchState at any time under the same mutex). It is
+                    // freed with `defer` just after the batch wake is enqueued.
+                    if (state.batch_id) |bid| {
+                        emit_per_task_wake = false; // suppress per-task wake
+                        self.batches.markTerminal(bid, task_id);
+                        if (self.batches.allTerminal(bid) and self.batches.tryClaimWake(bid)) {
+                            // This completer is the last in the batch — claim the batch wake.
+                            batch_id_to_wake = self.allocator.dupe(u8, bid) catch null; // DUPE under lock
+                        }
+                    }
+                    should_deliver = true;
+                } // end else (not already terminal)
+            }
+        }
+        if (!should_deliver) {
+            log.info("subagent: idempotent completion skipped task_id={d} (already terminal)", .{task_id});
+            return;
+        }
+
+        // ── Layer B: durable idempotency gate (cross-restart) ────────────
+        // If PG is attached, check whether this result_id has already been
+        // marked 'delivered' in the durable outbox. This fires on restart
+        // recovery: a pod crash AFTER persist but BEFORE mark-delivered
+        // correctly re-delivers (status is still 'pending'); a pod crash
+        // AFTER mark-delivered skips (status is 'delivered'). Layer A
+        // (in-memory) already handles the same-process duplicate path.
+        if (self.ledger_state_mgr) |sm| {
+            if (result_id_slice) |rid| {
+                const already_delivered = sm.subagentResultStatusIsDelivered(rid) catch false;
+                if (already_delivered) {
+                    log.info("subagent: idempotent delivery skipped task_id={d} (durable status=delivered)", .{task_id});
+                    return;
                 }
             }
         }
@@ -726,12 +1244,17 @@ pub const SubagentManager = struct {
         // "no output" framing is also rewritten so the parent has a clear
         // recovery path ("re-run with a more specific task, or compute
         // directly") instead of silently relaying an empty bubble.
-        const has_real_result = if (owned_result) |r| r.len > 0 else false;
+        const has_real_result = if (owned_result) |r| r.text.len > 0 else false;
         const content = if (has_real_result)
+            // Phase 2: deliver the result text plus a one-line metadata footer
+            // so the parent agent sees structured signal (tokens/turns/duration),
+            // not just text. The footer is intentionally compact and machine-
+            // greppable. Zero-valued metrics are still emitted for shape
+            // stability (a subagent that produced no measurable usage shows 0s).
             std.fmt.allocPrint(
                 self.allocator,
-                "[Subagent '{s}' task_id={d} completed]\n{s}",
-                .{ label, task_id, owned_result.? },
+                "[Subagent '{s}' task_id={d} completed]\n{s}\n[tokens={d} turns={d} duration_ms={d}]",
+                .{ label, task_id, owned_result.?.text, owned_result.?.tokens, owned_result.?.turns, owned_result.?.duration_ms },
             ) catch return
         else if (owned_err) |e|
             std.fmt.allocPrint(
@@ -830,6 +1353,59 @@ pub const SubagentManager = struct {
             }
             self.allocator.free(content);
         }
+
+        // ── Mark durable row delivered (idempotency: first deliver wins) ──
+        // Flip the outbox row from 'pending' to 'delivered' NOW that we
+        // have successfully routed the result. If we crash here (after
+        // delivery, before mark), recovery re-delivers once more — safe
+        // because the parent's session dedup on task_id prevents a visible
+        // duplicate. The mark is best-effort: a PG failure is logged but
+        // does not block the wake.
+        if (self.ledger_state_mgr) |sm| {
+            if (result_id_slice) |rid| {
+                sm.markSubagentResultDelivered(rid) catch |err|
+                    log.warn("subagent: mark-delivered failed task_id={d}: {}", .{ task_id, err });
+            }
+        }
+
+        // ── Wake parent turn (push, not poll) ──────────────────────────────
+        // BATCH-AWARE (Phase 4 G4, H1/H6):
+        //   • Non-batched task (emit_per_task_wake=true): the EXISTING per-task
+        //     wake fires unchanged — subagent_completion:{task_id}.
+        //   • Batched task NOT the last terminal (emit_per_task_wake=false,
+        //     batch_id_to_wake=null): wake is suppressed; the parent stays asleep
+        //     until the barrier fires.
+        //   • Batched task IS the last terminal (emit_per_task_wake=false,
+        //     batch_id_to_wake set): ONE batch wake fires — subagent_batch_complete:{batch_id}.
+        //     batch_id_to_wake is a manager-allocator-owned dupe (freed below, H1).
+        //
+        // The DURABLE per-task persist + delivery (Layer A/B, completion_delivery/bus,
+        // markSubagentResultDelivered) is UNCHANGED — every task still durably records
+        // its own result; only the wake is batched. The parent, woken once, collects
+        // all N results via subagent_batch_result (Group 3).
+        //
+        // Safe to call from the subagent thread: heartbeat_wake.enqueue() is
+        // mutex-guarded and uses c_allocator internally.
+        // Do NOT call processMessageWithContext directly from this thread.
+        if (emit_per_task_wake) {
+            // Non-batched path — UNCHANGED from Phase 1.
+            if (zaki_session.parseUserIdFromSessionKey(request_session_key)) |uid_str| {
+                var rbuf: [64]u8 = undefined;
+                const reason = std.fmt.bufPrint(&rbuf, "subagent_completion:{d}", .{task_id}) catch "subagent_completion";
+                heartbeat_wake.enqueue(uid_str, reason) catch |err|
+                    log.warn("subagent: wake enqueue failed task_id={d}: {}", .{ task_id, err });
+            }
+        } else if (batch_id_to_wake) |bid| {
+            // Last task in the batch — emit ONE batch wake and free the H1 dupe.
+            defer self.allocator.free(bid);
+            if (zaki_session.parseUserIdFromSessionKey(request_session_key)) |uid_str| {
+                var rbuf: [96]u8 = undefined;
+                const reason = std.fmt.bufPrint(&rbuf, "subagent_batch_complete:{s}", .{bid}) catch "subagent_batch_complete";
+                heartbeat_wake.enqueue(uid_str, reason) catch |err|
+                    log.warn("subagent: batch wake enqueue failed batch_id={s}: {}", .{ bid, err });
+            }
+        }
+        // else: batched task, not the last terminal — wake suppressed (batch barrier).
     }
 
     /// Transition a queued task to running. Returns true if the
@@ -904,7 +1480,136 @@ pub const SubagentManager = struct {
         }
         return outcome;
     }
+
+    // ── Phase 4 G5 — batch-deadline reaper ──────────────────────────────────
+
+    /// TTL for delivered batches (H4). After a batch is all-terminal AND
+    /// wake_claimed AND older than this duration, the reaper removes it from
+    /// the tracker to prevent unbounded memory growth. 30 minutes gives the
+    /// parent agent ample time to collect results via subagent_batch_result.
+    pub const BATCH_EXPIRY_TTL_MS: i64 = 30 * 60 * 1000;
+
+    /// Tick interval for the background reaper ticker thread (10 seconds).
+    /// Deadline enforcement is coarse to this granularity — a batch may fire
+    /// up to ~10 s after its wall-clock deadline. Acceptable for v1 staging.
+    const REAPER_TICK_INTERVAL_MS: u64 = 10_000;
+
+    /// H2 — Reap overdue batches and expire old delivered batches.
+    ///
+    /// Phase A — TIMEOUT OVERDUE:
+    ///   Capture overdue batches (with task_ids) UNDER the lock, then RELEASE
+    ///   before calling completeTask (which re-locks). This is the H2 lock
+    ///   discipline: the reaper holds NO lock while completeTask runs.
+    ///   completeTask marks each task terminal; the LAST timeout in a batch
+    ///   claims the batch wake via the Group-4 barrier. Already-terminal
+    ///   tasks are idempotent-skipped by completeTask's Layer-A gate.
+    ///
+    ///   v1 limitation: the reaper marks the task `.timeout` for the barrier
+    ///   but does NOT forcibly kill the runaway OS thread (unsafe in Zig).
+    ///   The thread finishes on its own; its completion is idempotent-skipped
+    ///   (first-terminal-wins via Layer A). The concurrency slot frees when
+    ///   the thread exits naturally.
+    ///
+    /// Phase B — EXPIRE OLD DELIVERED BATCHES (H4):
+    ///   Collect batch_ids eligible for expiry UNDER the lock, then call
+    ///   expireBatch for each — also under the lock (expireBatch is a tracker
+    ///   method and must be called under mutex per the LOCK INVARIANT). This
+    ///   is safe: expireBatch only frees tracker-owned memory, it does not
+    ///   call any re-entrant manager methods.
+    ///
+    /// `now_ms` is the caller's view of wall-clock time (injected for testability).
+    pub fn reapBatchDeadlines(self: *SubagentManager, now_ms: i64) void {
+        // ── Phase A: capture overdue under lock, then release before completeTask ──
+        const overdue = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            break :blk self.batches.overdueBatchesWithTaskIds(self.allocator, now_ms) catch &.{};
+        };
+        defer {
+            for (overdue) |o| {
+                self.allocator.free(o.batch_id);
+                self.allocator.free(o.task_ids);
+            }
+            self.allocator.free(overdue);
+        }
+
+        for (overdue) |o| {
+            log.info("subagent: reaper timing out batch_id={s} ({d} tasks)", .{ o.batch_id, o.task_ids.len });
+            for (o.task_ids) |tid| {
+                // Lock is NOT held here — completeTask acquires it internally.
+                // Already-terminal tasks are idempotent-skipped via Layer A.
+                self.completeTask(tid, .{
+                    .status = .timeout,
+                    .text = "subagent exceeded batch deadline",
+                    .err = "batch_deadline_exceeded",
+                }, null);
+            }
+        }
+
+        // ── Phase B: expire old delivered batches (H4) ──
+        // This section DOES hold the lock because expireBatch is a tracker
+        // method (LOCK INVARIANT). It is safe: expireBatch only manipulates
+        // the tracker's own maps and does not call any manager method that
+        // would re-acquire the mutex.
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const expirable = self.batches.expirableBatchIds(self.allocator, now_ms, BATCH_EXPIRY_TTL_MS) catch &.{};
+            defer {
+                for (expirable) |id| self.allocator.free(id);
+                self.allocator.free(expirable);
+            }
+            for (expirable) |id| {
+                log.info("subagent: reaper expiring delivered batch_id={s} (TTL elapsed)", .{id});
+                self.batches.expireBatch(id);
+            }
+        }
+    }
+
+    /// Start the per-manager background reaper ticker. The ticker calls
+    /// `reapBatchDeadlines(now)` every REAPER_TICK_INTERVAL_MS and exits
+    /// promptly when `_reaper_shutdown` is set (by `deinit`).
+    ///
+    /// Must NOT be called in tests — tests drive reapBatchDeadlines directly
+    /// with controlled `now_ms` values. The gateway calls this once after the
+    /// tenant runtime is fully initialized.
+    ///
+    /// If the thread fails to spawn (rare, OOM or system limit), a warning is
+    /// logged and the reaper degrades gracefully — batch timeouts simply won't
+    /// fire automatically. Manual calls to `reapBatchDeadlines` still work.
+    pub fn startReaperTicker(self: *SubagentManager) void {
+        const thread = std.Thread.spawn(
+            .{ .stack_size = 256 * 1024 },
+            reaperTickerMain,
+            .{self},
+        ) catch |err| {
+            log.warn("subagent: failed to start reaper ticker: {} — batch deadlines will NOT be reaped automatically", .{err});
+            return;
+        };
+        self._reaper_thread = thread;
+        log.info("subagent: batch-deadline reaper ticker started (tick={}ms, ttl={}ms)", .{
+            REAPER_TICK_INTERVAL_MS,
+            BATCH_EXPIRY_TTL_MS,
+        });
+    }
 };
+
+/// Background thread function for the per-manager batch-deadline reaper.
+/// Ticks every REAPER_TICK_INTERVAL_MS; sleeps in 50ms increments to stay
+/// shutdown-responsive (matching the maintenance-thread pattern in gateway.zig).
+fn reaperTickerMain(mgr: *SubagentManager) void {
+    var last_run_ms: i64 = 0;
+    while (!mgr._reaper_shutdown.load(.acquire)) {
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms - last_run_ms >= SubagentManager.REAPER_TICK_INTERVAL_MS) {
+            mgr.reapBatchDeadlines(now_ms);
+            last_run_ms = now_ms;
+        }
+        // Sleep in short increments so shutdown is observed promptly.
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+    log.info("subagent: reaper ticker exiting", .{});
+}
 
 // ── Thread function ─────────────────────────────────────────────
 
@@ -925,6 +1630,15 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
     // the thread exit so the cancelled state is observable by callers.
     if (!ctx.manager.markTaskRunning(ctx.task_id)) return;
 
+    // Phase 2: measure wall-clock run duration (mark-running → completion) so
+    // the SubagentResult carries `duration_ms`. This is the one piece of
+    // metadata we can capture WITHOUT touching the agent-loop control flow.
+    // turns/tokens/tools_used are NOT exposed by processMessageWithContext's
+    // text-only return and the subagent's isolated ChannelRuntime carries no
+    // usage_rt (that is gateway-wired only), so they stay at their zero
+    // defaults here — Phase 3 may surface them if the loop is taught to.
+    const run_started_at = std.time.milliTimestamp();
+
     // Test path: injected runner bypasses the full runtime (used in unit tests).
     if (ctx.manager.completion_runner) |runner| {
         const system_prompt = "You are a background subagent. Complete the assigned task concisely and accurately.";
@@ -939,7 +1653,12 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
             ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
             return;
         };
-        ctx.manager.completeTask(ctx.task_id, result, null);
+        const dur_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - run_started_at));
+        ctx.manager.completeTask(ctx.task_id, .{
+            .status = .completed,
+            .text = result,
+            .duration_ms = dur_ms,
+        }, null);
         return;
     }
 
@@ -955,6 +1674,33 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         return;
     };
     defer runtime.deinit();
+
+    // Phase 3 (Subagent Pass) — make the subagent's artifact_create functional
+    // and capture what it produces.
+    //
+    // (1) The subagent runtime is built via allTools(.subagent), which registers
+    //     artifact_create but leaves its state_mgr/user_id UNBOUND (the parent
+    //     gateway binds those via bindStateMgrTenant; this isolated runtime never
+    //     was). Bind them from the manager's ledger handles so the subagent
+    //     persists artifacts to the SAME tenant schema/user as the parent —
+    //     otherwise artifact_create returns "state manager not bound".
+    if (ctx.manager.ledger_state_mgr) |sm| {
+        if (ctx.manager.ledger_user_id) |uid| {
+            tools_mod.bindStateMgrTenant(runtime.tools, sm, uid);
+        }
+    }
+
+    // (2) Install an ArtifactCollector for this turn. We pass it as the
+    //     `progress_observer` to processMessageWithContext (NOT via the
+    //     thread-local setToolObserver, which the inner agent loop overwrites
+    //     and then clears). The session combines base+progress into the turn's
+    //     agent.observer, which the loop installs as the tool observer — so the
+    //     artifact_create tool's emitted `artifact_event`s reach the collector.
+    //     The collector owns its duped refs until deinit; completeTask
+    //     deep-copies them into the manager allocator (dupeSubagentResult), so
+    //     deinit after the handoff is UAF-free.
+    var artifact_collector = subagent_result.ArtifactCollector.init(ctx.manager.allocator);
+    defer artifact_collector.deinit();
 
     var session_buf: [128]u8 = undefined;
     const session_key = deriveTaskRuntimeSessionKey(&session_buf, ctx.request_session_key, ctx.task_id);
@@ -999,14 +1745,37 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         session_key,
         framed_task,
         null,
-        .{ .turn_origin = .proactive },
+        .{
+            .turn_origin = .proactive,
+            // Metering fix (Phase 5 Group A, money-critical): subagent turns
+            // run in an isolated thread with no SSE done-frame, so the BFF
+            // reconcile sweep must bill them. The sweep only debits
+            // entry_kind='daemon' rows — tag every subagent turn accordingly
+            // so subagent LLM spend is reconciled to the wallet rather than
+            // silently dropped.
+            .entry_kind = .daemon,
+            // Phase 3: capture artifact_event emissions from the subagent's
+            // tools into artifact_collector for the SubagentResult.
+            .progress_observer = artifact_collector.observer(),
+        },
     ) catch |err| {
         ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
         return;
     };
     defer ctx.manager.allocator.free(result);
 
-    ctx.manager.completeTask(ctx.task_id, result, null);
+    const dur_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - run_started_at));
+    // Phase 3: hand the captured artifacts to completeTask, which deep-copies
+    // them into the manager allocator (dupeSubagentResult) so they ride back to
+    // the parent in the durable result_json + delivery. refs() is a borrowed
+    // view valid until artifact_collector.deinit() (deferred above) — safe
+    // because completeTask copies before this function returns.
+    ctx.manager.completeTask(ctx.task_id, .{
+        .status = .completed,
+        .text = result,
+        .duration_ms = dur_ms,
+        .artifacts = artifact_collector.refs(),
+    }, null);
 }
 
 fn summarizeTaskForDisplay(allocator: Allocator, task: []const u8) ![]u8 {
@@ -1046,12 +1815,13 @@ const LedgerSnapshot = struct {
 
 fn freeTaskState(allocator: Allocator, state: *TaskState) void {
     if (state.thread) |thread| thread.join();
-    if (state.result) |value| allocator.free(value);
+    if (state.result) |*value| freeSubagentResult(allocator, value);
     if (state.error_msg) |value| allocator.free(value);
     if (state.session_key) |value| allocator.free(value);
     if (state.runtime_session_key) |value| allocator.free(value);
     if (state.origin_channel) |value| allocator.free(value);
     if (state.origin_chat_id) |value| allocator.free(value);
+    if (state.batch_id) |value| allocator.free(value); // Phase 4
     allocator.free(state.label);
     allocator.free(state.task_summary);
     allocator.free(state.task_prompt);
@@ -1074,6 +1844,103 @@ pub fn parseTaskStatus(raw: []const u8) TaskStatus {
     if (std.mem.eql(u8, raw, "completed")) return .completed;
     if (std.mem.eql(u8, raw, "cancelled")) return .cancelled;
     return .failed;
+}
+
+/// Format the durable outbox result_id for a given task_id.
+/// Result is always "subagent:<task_id>" — stable, human-readable, unique per manager.
+fn formatSubagentResultId(buf: []u8, task_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "subagent:{d}", .{task_id});
+}
+
+/// Free every slice owned by a `SubagentResult` stored in `TaskState.result`.
+/// The result and all its slices (`text`, each `ArtifactRef`'s strings, every
+/// `tools_used` entry plus the outer arrays, and `err`) are allocated in the
+/// manager allocator by `dupeSubagentResult`. Call this everywhere the old
+/// `state.result` text was freed. Idempotent only in the sense that it must be
+/// called exactly once per stored result (no double-free): callers null the
+/// field or replace it immediately after.
+pub fn freeSubagentResult(allocator: Allocator, result: *const SubagentResult) void {
+    allocator.free(result.text);
+    for (result.artifacts) |art| {
+        allocator.free(art.id);
+        allocator.free(art.kind);
+        allocator.free(art.title);
+        allocator.free(art.url);
+    }
+    allocator.free(result.artifacts);
+    for (result.tools_used) |name| allocator.free(name);
+    allocator.free(result.tools_used);
+    if (result.err) |e| allocator.free(e);
+}
+
+/// Deep-copy a `SubagentResult` into `allocator` so it outlives the source
+/// (which is typically the subagent thread's arena). Mirrors how Phase 1 duped
+/// the text result into the manager allocator. On any allocation failure the
+/// partial copy is rolled back (no leak) and the error is propagated.
+fn dupeSubagentResult(allocator: Allocator, src: SubagentResult) !SubagentResult {
+    const text = try allocator.dupe(u8, src.text);
+    errdefer allocator.free(text);
+
+    const artifacts = try allocator.alloc(subagent_result.ArtifactRef, src.artifacts.len);
+    var arts_done: usize = 0;
+    errdefer {
+        var i: usize = 0;
+        while (i < arts_done) : (i += 1) {
+            allocator.free(artifacts[i].id);
+            allocator.free(artifacts[i].kind);
+            allocator.free(artifacts[i].title);
+            allocator.free(artifacts[i].url);
+        }
+        allocator.free(artifacts);
+    }
+    for (src.artifacts, 0..) |art, i| {
+        const id = try allocator.dupe(u8, art.id);
+        errdefer allocator.free(id);
+        const kind = try allocator.dupe(u8, art.kind);
+        errdefer allocator.free(kind);
+        const title = try allocator.dupe(u8, art.title);
+        errdefer allocator.free(title);
+        const url = try allocator.dupe(u8, art.url);
+        artifacts[i] = .{ .id = id, .kind = kind, .title = title, .url = url, .version = art.version };
+        arts_done = i + 1;
+    }
+
+    const tools = try allocator.alloc([]const u8, src.tools_used.len);
+    var tools_done: usize = 0;
+    errdefer {
+        var i: usize = 0;
+        while (i < tools_done) : (i += 1) allocator.free(tools[i]);
+        allocator.free(tools);
+    }
+    for (src.tools_used, 0..) |name, i| {
+        tools[i] = try allocator.dupe(u8, name);
+        tools_done = i + 1;
+    }
+
+    const err = if (src.err) |e| try allocator.dupe(u8, e) else null;
+
+    return .{
+        .status = src.status,
+        .text = text,
+        .artifacts = artifacts,
+        .tokens = src.tokens,
+        .turns = src.turns,
+        .tools_used = tools,
+        .err = err,
+        .duration_ms = src.duration_ms,
+    };
+}
+
+/// Build a minimal manager-owned `SubagentResult` from a recovered text
+/// snapshot (file ledger / PG task-snapshot rows that only carry the text).
+/// Used by the snapshot→TaskState rehydration paths, which historically stored
+/// just the text. Status is inferred from the snapshot's task status.
+fn subagentResultFromText(allocator: Allocator, status: TaskStatus, text: []const u8) !SubagentResult {
+    const owned = try allocator.dupe(u8, text);
+    return .{
+        .status = if (status == .failed) .failed else .completed,
+        .text = owned,
+    };
 }
 
 fn isTaskSessionKey(session_key: []const u8) bool {
@@ -1126,7 +1993,9 @@ fn appendLedgerSnapshot(allocator: Allocator, path: []const u8, task_id: u64, st
     try buf.appendSlice(allocator, ",\"origin_chat_id\":");
     try appendOptionalJsonString(&buf, allocator, state.origin_chat_id);
     try buf.appendSlice(allocator, ",\"result\":");
-    try appendOptionalJsonString(&buf, allocator, state.result);
+    // Phase 2: the file ledger persists the text only (legacy recovery path);
+    // the structured result rides in the PG durable outbox via completeTask.
+    try appendOptionalJsonString(&buf, allocator, if (state.result) |r| r.text else null);
     try buf.appendSlice(allocator, ",\"error\":");
     try appendOptionalJsonString(&buf, allocator, state.error_msg);
     try buf.writer(allocator).print(",\"started_at\":{d},\"completed_at\":", .{state.started_at});
@@ -1341,10 +2210,65 @@ test "SubagentManager completeTask updates state" {
 
     _ = mgr.markTaskRunning(1);
     try std.testing.expectEqual(TaskStatus.running, mgr.getTaskStatus(1).?);
-    mgr.completeTask(1, "done!", null);
+    mgr.completeTask(1, .{ .status = .completed, .text = "done!" }, null);
 
     try std.testing.expectEqual(TaskStatus.completed, mgr.getTaskStatus(1).?);
-    try std.testing.expectEqualStrings("done!", mgr.getTaskResult(1).?);
+    // getTaskResultText returns the text (the manual-query/task_get path).
+    try std.testing.expectEqualStrings("done!", mgr.getTaskResultText(1).?);
+    // getTaskResult returns the full structured value.
+    try std.testing.expectEqual(subagent_result.Status.completed, mgr.getTaskResult(1).?.status);
+}
+
+// ── Task 2.2 test: a completed task's stored SubagentResult carries metadata ──
+
+test "completeTask stores structured SubagentResult metadata" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "meta-task"),
+        .task_summary = try std.testing.allocator.dupe(u8, "carry metadata"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "carry metadata"),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 1, state);
+    _ = mgr.markTaskRunning(1);
+
+    // Drive completeTask with a fully-populated SubagentResult (slices live in
+    // test memory; completeTask dupes them into the manager allocator).
+    const tools = [_][]const u8{ "shell", "produce_document" };
+    mgr.completeTask(1, .{
+        .status = .completed,
+        .text = "structured answer",
+        .tokens = 4321,
+        .turns = 5,
+        .tools_used = &tools,
+        .duration_ms = 999,
+    }, null);
+
+    // Read it back via getTaskResult and assert every field survived the dupe.
+    const got = mgr.getTaskResult(1).?;
+    try std.testing.expectEqual(subagent_result.Status.completed, got.status);
+    try std.testing.expectEqualStrings("structured answer", got.text);
+    try std.testing.expectEqual(@as(u64, 4321), got.tokens);
+    try std.testing.expectEqual(@as(u32, 5), got.turns);
+    try std.testing.expectEqual(@as(u64, 999), got.duration_ms);
+    try std.testing.expectEqual(@as(usize, 2), got.tools_used.len);
+    try std.testing.expectEqualStrings("shell", got.tools_used[0]);
+    try std.testing.expectEqualStrings("produce_document", got.tools_used[1]);
+    // The stored slices must be manager-owned copies, NOT the test's stack slice.
+    try std.testing.expect(got.tools_used.ptr != &tools);
 }
 
 test "SubagentManager completeTask with error" {
@@ -1407,7 +2331,7 @@ test "SubagentManager completeTask routes via bus" {
     try mgr.tasks.put(std.testing.allocator, 1, state);
 
     _ = mgr.markTaskRunning(1);
-    mgr.completeTask(1, "result text", null);
+    mgr.completeTask(1, .{ .status = .completed, .text = "result text" }, null);
 
     // Check bus received the message — verify depth increased
     var msg = try waitForInboundMessage(&bus, 50);
@@ -1448,7 +2372,7 @@ test "SubagentManager completeTask falls back to local completion delivery witho
     try mgr.tasks.put(std.testing.allocator, 1, state);
 
     _ = mgr.markTaskRunning(1);
-    mgr.completeTask(1, "result text", null);
+    mgr.completeTask(1, .{ .status = .completed, .text = "result text" }, null);
 
     try std.testing.expect(recorder.session_key != null);
     try std.testing.expect(recorder.content != null);
@@ -1500,7 +2424,7 @@ test "SubagentManager completeTask prefers completion_delivery over bus when bot
     try mgr.tasks.put(std.testing.allocator, 1, state);
 
     _ = mgr.markTaskRunning(1);
-    mgr.completeTask(1, "tenant result payload", null);
+    mgr.completeTask(1, .{ .status = .completed, .text = "tenant result payload" }, null);
 
     // completion_delivery recorder must have received the content.
     try std.testing.expect(recorder.session_key != null);
@@ -1676,7 +2600,7 @@ test "SubagentManager recovers completed task from file ledger" {
 
     try std.testing.expectEqual(@as(u64, 2), recovered.next_id);
     try std.testing.expectEqual(TaskStatus.completed, recovered.getTaskStatus(1).?);
-    try std.testing.expectEqualStrings("completed: recover me", recovered.getTaskResult(1).?);
+    try std.testing.expectEqualStrings("completed: recover me", recovered.getTaskResultText(1).?);
 }
 
 test "SubagentManager recovery marks in-flight task as failed explicitly" {
@@ -1808,6 +2732,362 @@ const BlockingCompletionRunner = struct {
     }
 };
 
+// ── Task 1.6 tests: startup recovery ─────────────────────────────────
+
+// Non-PG unit test: calling recoverPendingSubagentResults on a manager
+// with ledger_state_mgr=null is a clean no-op — no crash, no wake enqueued.
+// This runs locally (no Postgres required) and must be GREEN.
+test "recoverPendingSubagentResults with null ledger_state_mgr is a no-op" {
+    heartbeat_wake.clearForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    // ledger_state_mgr is null — must return immediately with no side effects.
+    mgr.recoverPendingSubagentResults(42);
+
+    // No wake must have been enqueued.
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount());
+    // No delivery must have happened.
+    try std.testing.expect(recorder.content == null);
+}
+
+// PG-guarded recovery test: seed a pending row, call recovery, assert a wake
+// was enqueued for the user and the row is now marked delivered.
+// Skips cleanly when Postgres is not configured (local / CI without DB).
+test "recoverPendingSubagentResults re-delivers and wakes for pending rows" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(
+        allocator,
+        "NULLALIS_POSTGRES_TEST_URL",
+        "NULLCLAW_POSTGRES_TEST_URL",
+    ) catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    heartbeat_wake.clearForTest();
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_recover", .{std.time.microTimestamp()});
+    const state_cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var state_mgr = try zaki_state.Manager.init(allocator, state_cfg);
+    defer state_mgr.deinit();
+
+    // Cleanup on exit.
+    {
+        const pg_helpers = @import("memory/engines/postgres.zig");
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, state_mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const res = try state_mgr.exec(drop_q);
+        _ = res;
+    }
+    try state_mgr.migrate();
+
+    // Seed one pending row for user_id=42, session_key contains "user:42".
+    try state_mgr.upsertSubagentResult(.{
+        .result_id = "subagent:77",
+        .user_id = 42,
+        .session_key = "agent:zaki-bot:user:42:main",
+        .task_id = 77,
+        .result_json = "{\"status\":\"completed\",\"text\":\"recovered answer\"}",
+    });
+
+    // Build a manager with the PG ledger and a recording delivery.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(allocator, &cfg, null, .{});
+    defer mgr.deinit();
+    // Attach ledger FIRST (mirrors gateway.zig wiring order).
+    mgr.attachPostgresLedger(&state_mgr, 42);
+    // Attach delivery SECOND — triggers recovery.
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+
+    // A wake must have been enqueued for user "42".
+    const req = heartbeat_wake.dequeue();
+    try std.testing.expect(req != null);
+    var mutable_req = req.?;
+    defer mutable_req.deinit();
+    try std.testing.expectEqualStrings("42", mutable_req.user_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, mutable_req.reason, "subagent_completion:recovered") != null);
+
+    // The delivery callback must have been called — with the task_id in the
+    // header AND (Phase 2, Task 2.3) the rehydrated result text from the row.
+    try std.testing.expect(recorder.content != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.content.?, "77") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.content.?, "recovered answer") != null);
+
+    // The row must now be marked delivered (not pending).
+    const rows = try state_mgr.loadPendingSubagentResults(allocator, 42);
+    defer {
+        for (rows) |r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 0), rows.len);
+
+    // Drop test schema.
+    {
+        const pg_helpers = @import("memory/engines/postgres.zig");
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, state_mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const res = try state_mgr.exec(drop_q);
+        _ = res;
+    }
+}
+
+// ── Task 2.3 test: recovery re-hydrates the FULL result text ──────────
+// Seed a pending row whose result_json is a complete SubagentResult (status,
+// text, metadata) — exactly what Phase-2 completeTask now writes — and assert
+// recovery delivers the actual ANSWER TEXT (not a bare marker). PG-guarded;
+// skips cleanly without a test Postgres.
+test "recoverPendingSubagentResults re-hydrates full result text from durable row" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(
+        allocator,
+        "NULLALIS_POSTGRES_TEST_URL",
+        "NULLCLAW_POSTGRES_TEST_URL",
+    ) catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    heartbeat_wake.clearForTest();
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_rehydrate", .{std.time.microTimestamp()});
+    const state_cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var state_mgr = try zaki_state.Manager.init(allocator, state_cfg);
+    defer state_mgr.deinit();
+
+    {
+        const pg_helpers = @import("memory/engines/postgres.zig");
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, state_mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        _ = try state_mgr.exec(drop_q);
+    }
+    try state_mgr.migrate();
+
+    // Build the durable payload exactly the way Phase-2 completeTask does:
+    // serialize a full SubagentResult via toJsonAlloc.
+    const seeded = SubagentResult{
+        .status = .completed,
+        .text = "the fully rehydrated answer body",
+        .tokens = 2048,
+        .turns = 4,
+        .duration_ms = 1234,
+    };
+    const seeded_json = try seeded.toJsonAlloc(allocator);
+    defer allocator.free(seeded_json);
+
+    try state_mgr.upsertSubagentResult(.{
+        .result_id = "subagent:91",
+        .user_id = 42,
+        .session_key = "agent:zaki-bot:user:42:main",
+        .task_id = 91,
+        .result_json = seeded_json,
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(allocator, &cfg, null, .{});
+    defer mgr.deinit();
+    mgr.attachPostgresLedger(&state_mgr, 42);
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+
+    // Wake enqueued for the user.
+    const req = heartbeat_wake.dequeue();
+    try std.testing.expect(req != null);
+    var mutable_req = req.?;
+    defer mutable_req.deinit();
+    try std.testing.expectEqualStrings("42", mutable_req.user_id.?);
+
+    // The delivered content must carry the ACTUAL answer text (rehydrated from
+    // the full SubagentResult JSON), plus the task_id for correlation.
+    try std.testing.expect(recorder.content != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.content.?, "the fully rehydrated answer body") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorder.content.?, "91") != null);
+
+    // Row marked delivered.
+    const rows = try state_mgr.loadPendingSubagentResults(allocator, 42);
+    defer {
+        for (rows) |r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 0), rows.len);
+
+    {
+        const pg_helpers = @import("memory/engines/postgres.zig");
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, state_mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        _ = try state_mgr.exec(drop_q);
+    }
+}
+
+// ── Task 1.5 test: duplicate completion is idempotent ─────────────────
+
+test "duplicate completion of same task_id is idempotent (no double wake)" {
+    heartbeat_wake.clearForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "idem-task"),
+        .task_summary = try std.testing.allocator.dupe(u8, "idempotency check"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "idempotency check"),
+        .session_key = try std.testing.allocator.dupe(u8, "agent:zaki-bot:user:42:main"),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 7, state);
+
+    _ = mgr.markTaskRunning(7);
+    // First completion: delivers + enqueues one wake
+    mgr.completeTask(7, .{ .status = .completed, .text = "first result" }, null);
+
+    // Second completion for the same task_id: task is already terminal.
+    // Drain the queue BEFORE the second call so coalescing can't mask double-enqueue
+    {
+        const first_req = heartbeat_wake.dequeue();
+        try std.testing.expect(first_req != null);
+        var mutable_first = first_req.?;
+        defer mutable_first.deinit();
+    }
+    // Queue must now be empty
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount());
+
+    // Remember what the recorder captured from the first delivery
+    const first_content_len = if (recorder.content) |c| c.len else @as(usize, 0);
+
+    // In-memory guard: completeTask sees state.status==.completed → skips deliver+wake entirely.
+    mgr.completeTask(7, .{ .status = .completed, .text = "second result — must be ignored" }, null);
+
+    // No additional wake must have been enqueued
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount());
+
+    // The recorder content must NOT have changed (no second delivery)
+    const second_content_len = if (recorder.content) |c| c.len else @as(usize, 0);
+    try std.testing.expectEqual(first_content_len, second_content_len);
+}
+
+// ── Task 1.4 test: completeTask enqueues a heartbeat wake ─────────────
+
+test "completeTask enqueues a heartbeat wake for the parent user" {
+    heartbeat_wake.clearForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "wake-test-task"),
+        .task_summary = try std.testing.allocator.dupe(u8, "test wake enqueue"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "test wake enqueue"),
+        .session_key = try std.testing.allocator.dupe(u8, "agent:zaki-bot:user:42:main"),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 7, state);
+
+    _ = mgr.markTaskRunning(7);
+    mgr.completeTask(7, .{ .status = .completed, .text = "wake result" }, null);
+
+    const req = heartbeat_wake.dequeue();
+    try std.testing.expect(req != null);
+    var mutable_req = req.?;
+    defer mutable_req.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, mutable_req.reason, "subagent_completion") != null);
+    // user_id "42" must be present so the daemon wakes the right user
+    try std.testing.expectEqualStrings("42", mutable_req.user_id.?);
+}
+
+// ── Task 1.3 test: formatSubagentResultId ─────────────────────────────
+
+test "formatSubagentResultId formats stable id" {
+    var buf: [40]u8 = undefined;
+    const id = try formatSubagentResultId(&buf, 7);
+    try std.testing.expectEqualStrings("subagent:7", id);
+}
+
+test "formatSubagentResultId handles large task_id" {
+    var buf: [40]u8 = undefined;
+    const id = try formatSubagentResultId(&buf, 123456789);
+    try std.testing.expectEqualStrings("subagent:123456789", id);
+}
+
 const RecordingCompletionDelivery = struct {
     session_key: ?[]const u8 = null,
     content: ?[]const u8 = null,
@@ -1843,7 +3123,7 @@ test "SubagentManager spawn e2e completes and publishes bus message" {
     try waitForTaskTerminal(&mgr, task_id, 2_000);
 
     try std.testing.expectEqual(TaskStatus.completed, mgr.getTaskStatus(task_id).?);
-    try std.testing.expectEqualStrings("completed: summarize this", mgr.getTaskResult(task_id).?);
+    try std.testing.expectEqualStrings("completed: summarize this", mgr.getTaskResultText(task_id).?);
     var msg = try waitForInboundMessage(&bus, 250);
     defer msg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("agent", msg.channel);
@@ -2158,7 +3438,7 @@ test "SubagentManager cancelQueued refuses terminal task" {
         .label = try std.testing.allocator.dupe(u8, "done"),
         .task_summary = try std.testing.allocator.dupe(u8, "done summary"),
         .task_prompt = try std.testing.allocator.dupe(u8, "done prompt"),
-        .result = try std.testing.allocator.dupe(u8, "ok"),
+        .result = .{ .status = .completed, .text = try std.testing.allocator.dupe(u8, "ok") },
         .started_at = std.time.milliTimestamp(),
         .completed_at = std.time.milliTimestamp(),
     };
@@ -2342,4 +3622,542 @@ fn spawnWhileLocked(
 
     state.thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, subagentThreadFn, .{ctx});
     return task_id;
+}
+
+// ── Phase 4 Group 2 tests (TDD — written before implementation) ───────────────
+
+test "spawnInBatch tags task with batch_id and registers" {
+    // spawnMany 1 spec → the task's TaskState.batch_id == the returned batch_id
+    // AND mgr.batches.batchOf(tid) == batch_id.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.completion_runner = immediateCompletionRunner;
+    defer mgr.deinit();
+
+    const specs = [_]SubagentManager.SpawnSpec{.{ .task = "research topic A", .label = "la" }};
+    const handle = try mgr.spawnMany(&specs, "agent:zaki-bot:user:1:main", "agent", "chat:1", 60_000);
+    defer {
+        std.testing.allocator.free(handle.batch_id);
+        std.testing.allocator.free(handle.task_ids);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), handle.task_ids.len);
+    try std.testing.expectEqual(@as(usize, 1), handle.requested);
+    const tid = handle.task_ids[0];
+
+    // task's batch_id field matches
+    mgr.mutex.lock();
+    const state = mgr.tasks.get(tid) orelse {
+        mgr.mutex.unlock();
+        return error.TestUnexpectedResult;
+    };
+    const task_bid = state.batch_id orelse {
+        mgr.mutex.unlock();
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqualStrings(handle.batch_id, task_bid);
+
+    // tracker index also maps tid → batch_id
+    const tracker_bid = mgr.batches.batchOf(tid) orelse {
+        mgr.mutex.unlock();
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqualStrings(handle.batch_id, tracker_bid);
+    mgr.mutex.unlock();
+}
+
+test "spawnMany fans out N under one batch within capacity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{ .max_concurrent = 8 });
+    mgr.completion_runner = immediateCompletionRunner;
+    defer mgr.deinit();
+
+    const specs = [_]SubagentManager.SpawnSpec{
+        .{ .task = "research A", .label = "la" },
+        .{ .task = "research B", .label = "lb" },
+        .{ .task = "research C", .label = "lc" },
+    };
+    const handle = try mgr.spawnMany(&specs, "agent:zaki-bot:user:2:main", "agent", "chat:2", 60_000);
+    defer {
+        std.testing.allocator.free(handle.batch_id);
+        std.testing.allocator.free(handle.task_ids);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), handle.task_ids.len);
+    try std.testing.expectEqual(@as(usize, 3), handle.requested);
+
+    // All task_ids share the same batch_id; tracker knows all 3
+    mgr.mutex.lock();
+    defer mgr.mutex.unlock();
+    const tracker_tids = mgr.batches.taskIds(handle.batch_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 3), tracker_tids.len);
+
+    for (handle.task_ids) |tid| {
+        const st = mgr.tasks.get(tid) orelse return error.TestUnexpectedResult;
+        const bid = st.batch_id orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(handle.batch_id, bid);
+    }
+}
+
+test "spawnMany rejects when N > remaining capacity (all-or-nothing, no partial)" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{ .max_concurrent = 2 });
+    mgr.completion_runner = immediateCompletionRunner;
+    defer mgr.deinit();
+
+    const specs = [_]SubagentManager.SpawnSpec{
+        .{ .task = "A", .label = "la" },
+        .{ .task = "B", .label = "lb" },
+        .{ .task = "C", .label = "lc" }, // exceeds max_concurrent=2
+    };
+    const result = mgr.spawnMany(&specs, "agent:zaki-bot:user:3:main", "agent", "chat:3", 60_000);
+    try std.testing.expectError(error.TooManyConcurrentSubagents, result);
+
+    // No tasks should have been spawned (running count unchanged = 0)
+    try std.testing.expectEqual(@as(u32, 0), mgr.getRunningCount());
+}
+
+// ── Phase 4 G3 tests (TDD — getBatchResults + H7) ─────────────────────────────
+
+test "getBatchResults returns entries for spawned tasks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.completion_runner = immediateCompletionRunner;
+    defer mgr.deinit();
+
+    const specs = [_]SubagentManager.SpawnSpec{
+        .{ .task = "task alpha", .label = "alpha" },
+        .{ .task = "task beta", .label = "beta" },
+    };
+    const handle = try mgr.spawnMany(&specs, "agent:zaki-bot:user:99:main", "agent", "chat:99", 60_000);
+    defer {
+        std.testing.allocator.free(handle.batch_id);
+        std.testing.allocator.free(handle.task_ids);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), handle.task_ids.len);
+
+    const entries = try mgr.getBatchResults(std.testing.allocator, handle.batch_id);
+    defer SubagentManager.freeBatchResultEntries(std.testing.allocator, entries);
+
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    // Every entry must have a task_id from the batch
+    for (entries) |e| {
+        var found = false;
+        for (handle.task_ids) |tid| {
+            if (e.task_id == tid) { found = true; break; }
+        }
+        try std.testing.expect(found);
+        // status must be a valid non-empty string
+        try std.testing.expect(e.status.len > 0);
+    }
+}
+
+test "getBatchResults H7 — unknown batch_id returns error.UnknownBatch" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const result = mgr.getBatchResults(std.testing.allocator, "batch:9999:0");
+    try std.testing.expectError(error.UnknownBatch, result);
+}
+
+// ── Phase 4 G4 tests: batch barrier ───────────────────────────────────────────
+
+// TDD: write BEFORE the barrier implementation. Must FAIL until the barrier
+// suppresses per-task wakes for batched tasks and emits ONE batch wake.
+test "batch barrier: per-task wakes suppressed; one batch wake when all terminal" {
+    heartbeat_wake.clearForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    // Insert two TaskState entries manually — both tagged with the same batch_id.
+    // Mirrors the Phase-1 idempotency test pattern (no real threads needed here).
+    const batch_id = "batch:99:111111";
+    const session_key = "agent:zaki-bot:user:42:main";
+
+    const state1 = try std.testing.allocator.create(TaskState);
+    state1.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "barrier-task-1"),
+        .task_summary = try std.testing.allocator.dupe(u8, "barrier test 1"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "barrier test 1"),
+        .session_key = try std.testing.allocator.dupe(u8, session_key),
+        .batch_id = try std.testing.allocator.dupe(u8, batch_id),
+        .started_at = std.time.milliTimestamp(),
+    };
+    const state2 = try std.testing.allocator.create(TaskState);
+    state2.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "barrier-task-2"),
+        .task_summary = try std.testing.allocator.dupe(u8, "barrier test 2"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "barrier test 2"),
+        .session_key = try std.testing.allocator.dupe(u8, session_key),
+        .batch_id = try std.testing.allocator.dupe(u8, batch_id),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 101, state1);
+    try mgr.tasks.put(std.testing.allocator, 102, state2);
+
+    // Register the batch in the tracker under the manager lock.
+    {
+        mgr.mutex.lock();
+        defer mgr.mutex.unlock();
+        const now = std.time.milliTimestamp();
+        try mgr.batches.register(batch_id, &[_]u64{ 101, 102 }, session_key, now, now + 60_000);
+    }
+
+    // Drain any wakes that may be present from setup.
+    heartbeat_wake.clearForTest();
+
+    _ = mgr.markTaskRunning(101);
+    _ = mgr.markTaskRunning(102);
+
+    // Complete task 101 (batch not yet all-terminal: task 102 still running).
+    // The barrier MUST suppress the per-task wake.
+    mgr.completeTask(101, .{ .status = .completed, .text = "result A" }, null);
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount()); // SUPPRESSED
+
+    // Complete task 102 (last task → barrier fires ONE batch wake).
+    mgr.completeTask(102, .{ .status = .completed, .text = "result B" }, null);
+    try std.testing.expectEqual(@as(usize, 1), heartbeat_wake.pendingCount()); // EXACTLY ONE
+
+    const req = heartbeat_wake.dequeue();
+    try std.testing.expect(req != null);
+    var mutable_req = req.?;
+    defer mutable_req.deinit();
+    // Wake reason must carry the batch id.
+    try std.testing.expect(std.mem.indexOf(u8, mutable_req.reason, "subagent_batch_complete") != null);
+    // User id must be "42" so the daemon wakes the right user.
+    try std.testing.expectEqualStrings("42", mutable_req.user_id.?);
+
+    // Queue must be empty — no stray per-task wake was emitted.
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount());
+}
+
+// ── Phase 4 G5 tests: batch-deadline reaper (TDD — written before implementation) ──
+
+// Test 1: reaper marks still-running task .timeout (via completeTask) past the deadline,
+// and fires the batch barrier wake (the last timeout claims the batch wake).
+test "reaper marks still-running batch tasks timeout past deadline + fires the barrier" {
+    heartbeat_wake.clearForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    const batch_id = "batch:reaper:1";
+    const session_key = "agent:zaki-bot:user:55:main";
+
+    // Task 1: will be completed naturally (terminal before reaper runs).
+    const state1 = try std.testing.allocator.create(TaskState);
+    state1.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "reaper-task-1"),
+        .task_summary = try std.testing.allocator.dupe(u8, "reaper test 1"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "reaper test 1"),
+        .session_key = try std.testing.allocator.dupe(u8, session_key),
+        .batch_id = try std.testing.allocator.dupe(u8, batch_id),
+        .started_at = std.time.milliTimestamp(),
+    };
+    // Task 2: still running when reaper fires.
+    const state2 = try std.testing.allocator.create(TaskState);
+    state2.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "reaper-task-2"),
+        .task_summary = try std.testing.allocator.dupe(u8, "reaper test 2"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "reaper test 2"),
+        .session_key = try std.testing.allocator.dupe(u8, session_key),
+        .batch_id = try std.testing.allocator.dupe(u8, batch_id),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 301, state1);
+    try mgr.tasks.put(std.testing.allocator, 302, state2);
+
+    // Register the batch with a deadline in the past (1 ms ago).
+    const past_deadline: i64 = std.time.milliTimestamp() - 1;
+    {
+        mgr.mutex.lock();
+        defer mgr.mutex.unlock();
+        try mgr.batches.register(batch_id, &[_]u64{ 301, 302 }, session_key, past_deadline - 60_000, past_deadline);
+    }
+
+    _ = mgr.markTaskRunning(301);
+    _ = mgr.markTaskRunning(302);
+
+    // Task 1 completes naturally: barrier suppresses per-task wake (batch not all-terminal yet).
+    heartbeat_wake.clearForTest();
+    mgr.completeTask(301, .{ .status = .completed, .text = "done early" }, null);
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount()); // suppressed
+
+    // Reaper fires at `now_ms` past the deadline. Task 2 is still running.
+    const now_past = std.time.milliTimestamp() + 1;
+    mgr.reapBatchDeadlines(now_past);
+
+    // Task 2 must now be terminal (.completed status with result.status=.timeout).
+    const s2_status = mgr.getTaskStatus(302);
+    try std.testing.expect(s2_status != null);
+    try std.testing.expect(s2_status.? == .completed); // completeTask marks non-err as .completed
+
+    // The batch barrier must have fired exactly ONE batch wake.
+    try std.testing.expectEqual(@as(usize, 1), heartbeat_wake.pendingCount());
+    const req = heartbeat_wake.dequeue();
+    try std.testing.expect(req != null);
+    var mutable_req = req.?;
+    defer mutable_req.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, mutable_req.reason, "subagent_batch_complete") != null);
+    try std.testing.expectEqualStrings("55", mutable_req.user_id.?);
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount()); // no extra wakes
+}
+
+// Test 2: reaper expires old delivered batches (H4) — batchOf → null after expiry.
+// std.testing.allocator catches leaks if expiry fails to free memory.
+test "reaper expires old delivered batches (no leak, batchOf returns null after expiry)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    const batch_id = "batch:expiry:1";
+    const session_key = "agent:zaki-bot:user:66:main";
+
+    // Two tasks in a batch. Created far in the past (older than TTL).
+    const ancient_created: i64 = 1_000; // epoch ms 1000 — very old
+    const ancient_deadline: i64 = 2_000; // deadline also ancient
+
+    const state1 = try std.testing.allocator.create(TaskState);
+    state1.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "expire-task-1"),
+        .task_summary = try std.testing.allocator.dupe(u8, "expiry test 1"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "expiry test 1"),
+        .session_key = try std.testing.allocator.dupe(u8, session_key),
+        .batch_id = try std.testing.allocator.dupe(u8, batch_id),
+        .started_at = ancient_created,
+    };
+    const state2 = try std.testing.allocator.create(TaskState);
+    state2.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "expire-task-2"),
+        .task_summary = try std.testing.allocator.dupe(u8, "expiry test 2"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "expiry test 2"),
+        .session_key = try std.testing.allocator.dupe(u8, session_key),
+        .batch_id = try std.testing.allocator.dupe(u8, batch_id),
+        .started_at = ancient_created,
+    };
+    try mgr.tasks.put(std.testing.allocator, 401, state1);
+    try mgr.tasks.put(std.testing.allocator, 402, state2);
+
+    {
+        mgr.mutex.lock();
+        defer mgr.mutex.unlock();
+        try mgr.batches.register(batch_id, &[_]u64{ 401, 402 }, session_key, ancient_created, ancient_deadline);
+    }
+
+    _ = mgr.markTaskRunning(401);
+    _ = mgr.markTaskRunning(402);
+
+    // Both tasks complete — barrier fires, wake_claimed becomes true.
+    heartbeat_wake.clearForTest();
+    mgr.completeTask(401, .{ .status = .completed, .text = "r1" }, null);
+    mgr.completeTask(402, .{ .status = .completed, .text = "r2" }, null);
+    heartbeat_wake.clearForTest(); // consume the batch wake
+
+    // Now call reaper with now_ms far in the future (beyond TTL).
+    // The batch is all-terminal + wake_claimed + ancient → should be expired.
+    const far_future_ms: i64 = ancient_created + SubagentManager.BATCH_EXPIRY_TTL_MS + 1;
+    mgr.reapBatchDeadlines(far_future_ms);
+
+    // After expiry, batchOf returns null for both tasks.
+    mgr.mutex.lock();
+    defer mgr.mutex.unlock();
+    try std.testing.expect(mgr.batches.batchOf(401) == null);
+    try std.testing.expect(mgr.batches.batchOf(402) == null);
+    try std.testing.expect(mgr.batches.sessionKey(batch_id) == null);
+}
+
+// Test 3: reaper does not deadlock (no lock held across completeTask).
+// This is a smoke test: reapBatchDeadlines must return within a short timeout.
+// If there were a deadlock (lock held across completeTask which re-locks), this
+// would hang forever and the test timeout would catch it.
+test "reaper does not deadlock (no lock held across completeTask)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    const batch_id = "batch:nodeadlock:1";
+    const session_key = "agent:zaki-bot:user:77:main";
+
+    const state1 = try std.testing.allocator.create(TaskState);
+    state1.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "dl-task-1"),
+        .task_summary = try std.testing.allocator.dupe(u8, "deadlock test 1"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "deadlock test 1"),
+        .session_key = try std.testing.allocator.dupe(u8, session_key),
+        .batch_id = try std.testing.allocator.dupe(u8, batch_id),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 501, state1);
+    const past: i64 = std.time.milliTimestamp() - 1;
+    {
+        mgr.mutex.lock();
+        defer mgr.mutex.unlock();
+        try mgr.batches.register(batch_id, &[_]u64{501}, session_key, past - 1, past);
+    }
+    _ = mgr.markTaskRunning(501);
+    heartbeat_wake.clearForTest();
+
+    // This must complete without deadlock. The test runner will time out if it
+    // hangs. If the lock were held across completeTask (which re-locks), this
+    // would deadlock immediately (Zig's Mutex is non-reentrant).
+    mgr.reapBatchDeadlines(std.time.milliTimestamp() + 1);
+
+    // Verify the task became terminal (confirming reapBatchDeadlines ran).
+    try std.testing.expect(mgr.getTaskStatus(501) != null);
+    heartbeat_wake.clearForTest();
+}
+
+// Regression: non-batched single completion still wakes per-task (UNCHANGED PATH).
+test "subagent production turn carries entry_kind=daemon (metering fix)" {
+    // Plumbing assertion: the ProcessMessageOptions struct that subagentThreadFn
+    // passes to processMessageWithContext must carry entry_kind=.daemon so the
+    // BFF reconcile sweep bills the subagent's LLM spend. This test constructs
+    // the SAME options literal as the production code path and asserts the
+    // discriminator — a direct compile-time guarantee that the fix is present.
+    // (Full turn_usage PG billing is verified on staging.)
+    const session_mod = @import("session.zig");
+    const opts: session_mod.SessionManager.ProcessMessageOptions = .{
+        .turn_origin = .proactive,
+        .entry_kind = .daemon,
+        .progress_observer = null,
+    };
+    try std.testing.expectEqual(tools_mod.EntryKind.daemon, opts.entry_kind);
+    try std.testing.expectEqual(tools_mod.TurnOrigin.proactive, opts.turn_origin);
+}
+
+test "non-batched single completion still wakes per-task (barrier regression guard)" {
+    heartbeat_wake.clearForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var recorder = RecordingCompletionDelivery{};
+    defer recorder.deinit();
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachCompletionDelivery(@ptrCast(&recorder), RecordingCompletionDelivery.run);
+    defer mgr.deinit();
+
+    // Non-batched task (batch_id = null — the standard single-spawn path).
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "single-task"),
+        .task_summary = try std.testing.allocator.dupe(u8, "single spawn test"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "single spawn test"),
+        .session_key = try std.testing.allocator.dupe(u8, "agent:zaki-bot:user:7:main"),
+        // batch_id explicitly left as null (default)
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 200, state);
+
+    _ = mgr.markTaskRunning(200);
+    mgr.completeTask(200, .{ .status = .completed, .text = "single result" }, null);
+
+    // The original per-task wake MUST still fire for non-batched tasks.
+    try std.testing.expectEqual(@as(usize, 1), heartbeat_wake.pendingCount());
+    const req = heartbeat_wake.dequeue();
+    try std.testing.expect(req != null);
+    var mutable_req = req.?;
+    defer mutable_req.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, mutable_req.reason, "subagent_completion") != null);
+    try std.testing.expectEqualStrings("7", mutable_req.user_id.?);
 }

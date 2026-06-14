@@ -795,6 +795,10 @@ pub const ContextEngine = struct {
             .known_weakness_block = if (known_weakness_block) |b| (if (b.len > 0) b else null) else null,
             .task_plan_block = if (task_plan_block) |b| (if (b.len > 0) b else null) else null,
             .skill_traces_block = if (skill_traces_block) |b| (if (b.len > 0) b else null) else null,
+            // Phase 5 (Superpowers mode) — emit the coordinator framing section
+            // when this turn runs in Superpowers mode. Per-turn signal; the
+            // session restores agent.superpowers_mode on the turn's defer.
+            .coordinator_mode = agent.superpowers_mode,
         };
 
         const stable_prompt = try prompt.buildStableSystemPrompt(allocator, prompt_ctx);

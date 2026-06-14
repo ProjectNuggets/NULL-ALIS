@@ -11,6 +11,12 @@ pub const ExecutionMode = enum {
     execute,
     review,
     background,
+    /// Phase 5 (Superpowers mode) — the in-turn coordinator. Plans, fans out
+    /// to subagents, reviews their results, and synthesizes a single
+    /// deliverable. It does NOT do direct mutating grunt work; that is
+    /// delegated. Activated per-turn when the FE sends
+    /// reasoning_effort="superpowers" (and no explicit mode override).
+    coordinator,
 
     pub fn toSlice(self: ExecutionMode) []const u8 {
         return switch (self) {
@@ -18,6 +24,7 @@ pub const ExecutionMode = enum {
             .execute => "execute",
             .review => "review",
             .background => "background",
+            .coordinator => "coordinator",
         };
     }
 
@@ -26,24 +33,29 @@ pub const ExecutionMode = enum {
         if (std.mem.eql(u8, s, "execute")) return .execute;
         if (std.mem.eql(u8, s, "review")) return .review;
         if (std.mem.eql(u8, s, "background")) return .background;
+        if (std.mem.eql(u8, s, "coordinator")) return .coordinator;
         return null;
     }
 
     /// Whether a tool is allowed in this execution mode based on its metadata.
     /// Execute mode allows all tools. Plan/review only allow read_only tools.
-    /// Background only allows background_safe tools.
+    /// Background only allows background_safe tools. Coordinator allows
+    /// read_only OR coordinator_dispatch tools — it plans, dispatches, and
+    /// reads, but delegates direct mutating grunt work to subagents.
     pub fn allowsTool(self: ExecutionMode, meta: metadata.ToolMetadata) bool {
         return switch (self) {
             .execute => true,
             .plan, .review => meta.flags.read_only,
             .background => meta.flags.background_safe,
+            .coordinator => meta.flags.read_only or meta.flags.coordinator_dispatch,
         };
     }
 
     pub fn isReadOnly(self: ExecutionMode) bool {
         return switch (self) {
             .plan, .review => true,
-            .execute, .background => false,
+            // Coordinator dispatches (spawn_many mutates) → not read-only.
+            .execute, .background, .coordinator => false,
         };
     }
 };
@@ -99,4 +111,36 @@ test "isReadOnly" {
     try std.testing.expect(ExecutionMode.review.isReadOnly());
     try std.testing.expect(!ExecutionMode.execute.isReadOnly());
     try std.testing.expect(!ExecutionMode.background.isReadOnly());
+}
+
+// ── Phase 5 (Superpowers mode) — .coordinator execution mode ─────────
+
+test "coordinator mode exists and round-trips" {
+    const m = ExecutionMode.coordinator;
+    try std.testing.expectEqualStrings("coordinator", m.toSlice());
+    const back = ExecutionMode.fromString("coordinator") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(ExecutionMode.coordinator, back);
+}
+
+test "coordinator mode allows read_only tools" {
+    const meta = metadata.ToolMetadata{ .name = "file_read", .flags = .{ .read_only = true } };
+    try std.testing.expect(ExecutionMode.coordinator.allowsTool(meta));
+}
+
+test "coordinator mode allows coordinator_dispatch tools" {
+    // spawn_many mutates, but it's a dispatch tool — coordinator must be able
+    // to plan + dispatch + read, just not do direct mutating grunt work.
+    const dispatch = metadata.ToolMetadata{ .name = "spawn_many", .flags = .{ .mutating = true, .coordinator_dispatch = true } };
+    try std.testing.expect(ExecutionMode.coordinator.allowsTool(dispatch));
+}
+
+test "coordinator mode blocks pure-mutating non-dispatch tools" {
+    // file_write is mutating grunt work with no dispatch flag — coordinator
+    // delegates that to subagents rather than doing it directly.
+    const grunt = metadata.ToolMetadata{ .name = "file_write", .flags = .{ .mutating = true } };
+    try std.testing.expect(!ExecutionMode.coordinator.allowsTool(grunt));
+}
+
+test "coordinator mode is not flagged read-only (it dispatches)" {
+    try std.testing.expect(!ExecutionMode.coordinator.isReadOnly());
 }

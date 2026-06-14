@@ -130,6 +130,9 @@ pub const web_search = @import("web_search.zig");
 pub const web_fetch = @import("web_fetch.zig");
 pub const file_append = @import("file_append.zig");
 pub const spawn = @import("spawn.zig");
+/// Phase 4 G3 — fan-out tools (gated off by default; see fanout_enabled in allTools opts).
+pub const spawn_many = @import("spawn_many.zig");
+pub const subagent_batch_result = @import("subagent_batch_result.zig");
 pub const task_list = @import("task_list.zig");
 pub const task_get = @import("task_get.zig");
 pub const task_stop = @import("task_stop.zig");
@@ -397,14 +400,16 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .cost_class = .b,
     },
     .{
+        // coordinator_dispatch: the coordinator reads spawned-task status.
         .name = task_list.TaskListTool.tool_name,
-        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true, .coordinator_dispatch = true },
         .risk_level = .low,
         .cost_class = .a,
     },
     .{
+        // coordinator_dispatch: the coordinator reads a spawned task's result.
         .name = task_get.TaskGetTool.tool_name,
-        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true, .coordinator_dispatch = true },
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -606,17 +611,37 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     },
     .{
         // Spawns a full subagent turn — potentially many LLM calls + tools.
+        // coordinator_dispatch: the coordinator delegates work through it.
         .name = delegate.DelegateTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .coordinator_dispatch = true },
         .risk_level = .high,
         .cost_class = .c,
     },
     .{
         // Spawns a long-running task — same reasoning as delegate.
+        // coordinator_dispatch: the coordinator dispatches a single subagent.
         .name = spawn.SpawnTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .coordinator_dispatch = true },
         .risk_level = .high,
         .cost_class = .c,
+    },
+    .{
+        // Phase 4 G3 — fan-out N subagents under one batch. High cost (N× credits).
+        // Registered when multiagent is enabled (Phase 5 T3); self-gated to
+        // Superpowers turns. coordinator_dispatch: the coordinator's primary
+        // fan-out primitive.
+        .name = spawn_many.SpawnManyTool.tool_name,
+        .flags = .{ .mutating = true, .coordinator_dispatch = true },
+        .risk_level = .high,
+        .cost_class = .c,
+    },
+    .{
+        // Phase 4 G3 — read-only batch result query. Low cost.
+        // coordinator_dispatch: the coordinator collects fan-out results.
+        .name = subagent_batch_result.SubagentBatchResultTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true, .coordinator_dispatch = true },
+        .risk_level = .low,
+        .cost_class = .a,
     },
     .{
         // External channel send — medium (Telegram/Slack/WhatsApp APIs).
@@ -1537,6 +1562,25 @@ pub fn allTools(
         try list.append(allocator, sp.tool());
     }
 
+    // Phase 4 G3 / Phase 5 T3 — fan-out tools: spawn_many + subagent_batch_result.
+    // Registered in the MAIN profile whenever multiagent is enabled (same gate
+    // as spawn/delegate above), so the coordinator has them available. They are
+    // then SELF-GATED at execute() to ⚡ Superpowers turns: a non-Superpowers
+    // turn REFUSES before any spawn (each execute() reads
+    // getTurnContext().superpowers_mode first). Their tool descriptions are
+    // tagged "⚡ Superpowers mode only" so the model does not call them on a
+    // normal turn. EXCLUDED from subagentTools() — depth guard: subagents must
+    // never fan out.
+    if (opts.tool_profile == .main and multiagent_enabled) {
+        const smt = try allocator.create(spawn_many.SpawnManyTool);
+        smt.* = .{ .manager = opts.subagent_manager };
+        try list.append(allocator, smt.tool());
+
+        const sbrt = try allocator.create(subagent_batch_result.SubagentBatchResultTool);
+        sbrt.* = .{ .manager = opts.subagent_manager };
+        try list.append(allocator, sbrt.tool());
+    }
+
     // Always publish the message tool in the main profile; the tool itself
     // handles bus-less runtimes by falling back to direct-send paths (e.g.
     // file-mode Telegram via user_root) and reports a clear error when no
@@ -1840,6 +1884,16 @@ pub const RuntimeTurnContext = struct {
     /// webhook can swap it mid-session. S2.3-S2.6 enforcement sites read
     /// this field in preflight. See `src/entitlement.zig` for the type.
     entitlement: Entitlement = .{},
+    /// **Phase 5 T3 (Superpowers mode)** — per-turn flag, set from
+    /// `ProcessMessageOptions.turn_superpowers_mode` where the session
+    /// installs the turn context (`session.processMessageWithContext`).
+    /// Mirrors how `entitlement` / `entry_kind` flow per-turn session state to
+    /// tools. The fan-out tools (`spawn_many`, `subagent_batch_result`) read
+    /// this in `execute()` and REFUSE when false — defense-in-depth so a
+    /// non-Superpowers turn can never fan out, even if the tool somehow reaches
+    /// the model. Default false (a normal turn). Propagates to parallel tool
+    /// workers because the agent copies the turn context onto each worker.
+    superpowers_mode: bool = false,
 };
 
 pub const ToolTenantContext = struct {
@@ -2596,6 +2650,17 @@ pub fn subagentTools(
         http_enabled: bool = false,
         allowed_paths: []const []const u8 = &.{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
+        // Phase 3 (Subagent Pass): tenant handles so the subagent's
+        // artifact_create persists to the SAME schema/user as the parent and
+        // emits the artifact_event the ArtifactCollector captures. Optional —
+        // when null the tool is still registered but degrades to a clear
+        // "state manager not bound" error (matches allTools' bind-later shape).
+        state_mgr: ?*zaki_state.Manager = null,
+        user_id: ?i64 = null,
+        // produce_document branding (operator typography). Empty/default ⇒
+        // system fonts. produce_document writes a downloadable file to the
+        // workspace; its output is NOT surfaced via the artifact_event path.
+        branding: produce_document.BrandingConfig = .{},
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -2631,6 +2696,26 @@ pub fn subagentTools(
         ht.* = .{};
         try list.append(allocator, ht.tool());
     }
+
+    // Phase 3 (Subagent Pass) — artifact handoff. The subagent can now produce
+    // user-visible deliverables the parent re-surfaces.
+    //
+    // artifact_create is the keystone: it persists a versioned side-panel
+    // artifact to {schema}.artifacts (same tenant as the parent — state_mgr +
+    // user_id bound here) AND emits an `artifact_event` ObserverEvent that the
+    // ArtifactCollector (installed as the subagent thread's tool observer)
+    // captures into SubagentResult.artifacts. Constructed exactly like
+    // allTools() does (fields state_mgr + user_id; see artifact_create.zig).
+    const act = try allocator.create(artifact_create.ArtifactCreateTool);
+    act.* = .{ .state_mgr = opts.state_mgr, .user_id = opts.user_id };
+    try list.append(allocator, act.tool());
+
+    // produce_document — a one-shot rendered file (pdf/docx/xlsx/pptx/html) in
+    // the subagent workspace. It emits NO observer event, so its output is a
+    // downloadable-file capability, not an auto-surfaced canvas artifact.
+    const pdt = try allocator.create(produce_document.ProduceDocumentTool);
+    pdt.* = .{ .workspace_dir = workspace_dir, .branding = opts.branding };
+    try list.append(allocator, pdt.tool());
 
     return list.toOwnedSlice(allocator);
 }
@@ -3026,7 +3111,10 @@ test "all tools includes extras when enabled" {
     // (legacy `browser` tool removed — agent_browser backend's browser_*
     //  family registers only when an OrchestratorClient is passed, which
     //  this test does not do, so the count stays at 57.)
-    try std.testing.expectEqual(@as(usize, 57), tools.len);
+    // + spawn_many + subagent_batch_result (Phase 5 T3: fan-out tools register
+    //   in the MAIN profile when multiagent is on — Superpowers-gated at
+    //   execute(), not at registration) = 59.
+    try std.testing.expectEqual(@as(usize, 59), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -3061,7 +3149,9 @@ test "all tools excludes extras when disabled" {
     //   (2026-05-25 surface-audit close) = 53.
     // + memory_purge_pii (D52 Pillar 4, prod-readiness Sprint 1,
     //   2026-05-28) = 54.
-    try std.testing.expectEqual(@as(usize, 54), tools.len);
+    // + spawn_many + subagent_batch_result (Phase 5 T3: fan-out tools register
+    //   with multiagent, Superpowers-gated at execute()) = 56.
+    try std.testing.expectEqual(@as(usize, 56), tools.len);
 }
 
 test "all tools includes cron and pushover tools" {
@@ -3202,7 +3292,9 @@ test "all tools includes message when event bus is available" {
     // 2026-05-25 surface-audit close: +4 artifact_share/revoke/diff/history
     // + 2 memory_doctor/trace_query → 53.
     // D52 Pillar 4 (prod-readiness Sprint 1, 2026-05-28): +memory_purge_pii → 54.
-    try std.testing.expectEqual(@as(usize, 54), tools.len);
+    // Phase 5 T3: +spawn_many +subagent_batch_result (fan-out tools register
+    // with multiagent, Superpowers-gated at execute()) → 56.
+    try std.testing.expectEqual(@as(usize, 56), tools.len);
 
     var found_message = false;
     for (tools) |t| {
@@ -3481,6 +3573,10 @@ test "defaultMetadataRegistry only whitelists expected background_safe tools" {
         // store. Both are safe to run from a scheduled lane.
           "memory_doctor",
         "trace_query",
+        // Phase 4 fan-out — subagent_batch_result reads a batch's task results
+        // (read_only against the in-memory batch tracker); safe in a background/
+        // cron lane. spawn_many is NOT here (it mutates — spawns subagents).
+        "subagent_batch_result",
     };
 
     // Everything in the whitelist must be background_safe.
@@ -3768,6 +3864,69 @@ test "canonicalMetadataForCall falls back to base metadata on invalid JSON" {
     const bad = canonicalMetadataForCall(allocator, "shell", "not-json");
     try std.testing.expect(bad.flags.mutating);
     try std.testing.expect(!bad.flags.read_only);
+}
+
+test "subagentTools includes the artifact tools" {
+    const tools = try subagentTools(std.testing.allocator, ".", .{});
+    defer {
+        for (tools) |t| t.deinit(std.testing.allocator);
+        std.testing.allocator.free(tools);
+    }
+    var has_artifact = false;
+    var has_doc = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "artifact_create")) has_artifact = true;
+        if (std.mem.eql(u8, t.name(), "produce_document")) has_doc = true;
+    }
+    try std.testing.expect(has_artifact);
+    try std.testing.expect(has_doc);
+}
+
+// ── Phase 4 G3 / Phase 5 T3 — fan-out tool registration ──────────────────────
+// Registration is by multiagent_enabled (default ON), the same gate as
+// spawn/delegate. The ⚡ Superpowers gate moved to execute() — see the self-gate
+// tests in spawn_many.zig / subagent_batch_result.zig (a non-Superpowers turn
+// refuses). The depth guard (subagent profile excludes them) is the next test.
+
+test "allTools registers spawn_many + subagent_batch_result in main profile (multiagent on)" {
+    const Config = @import("../config.zig").Config;
+    const subagent_mod = @import("../subagent.zig");
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .config = &cfg,
+        .tool_profile = .main,
+        .subagent_manager = &manager,
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var found_spawn_many = false;
+    var found_sbr = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "spawn_many")) found_spawn_many = true;
+        if (std.mem.eql(u8, t.name(), "subagent_batch_result")) found_sbr = true;
+    }
+    try std.testing.expect(found_spawn_many);
+    try std.testing.expect(found_sbr);
+}
+
+test "subagentTools never includes spawn_many or subagent_batch_result (depth guard)" {
+    const tools = try subagentTools(std.testing.allocator, ".", .{});
+    defer {
+        for (tools) |t| t.deinit(std.testing.allocator);
+        std.testing.allocator.free(tools);
+    }
+    for (tools) |t| {
+        try std.testing.expect(!std.mem.eql(u8, t.name(), "spawn_many"));
+        try std.testing.expect(!std.mem.eql(u8, t.name(), "subagent_batch_result"));
+    }
 }
 
 test {

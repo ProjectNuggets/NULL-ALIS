@@ -86,6 +86,10 @@ const ChatStreamTurnOptions = struct {
     execution_mode: ?execution_mode_mod.ExecutionMode = null,
     autonomy: ?security.AutonomyLevel = null,
     reasoning_effort: ?[]const u8 = null,
+    /// Phase 5 (Superpowers mode) — set when reasoning_effort=="superpowers".
+    /// Tells the session layer to activate coordinator mode. The provider
+    /// NEVER sees "superpowers" raw (mapReasoningEffort converts it to "high").
+    superpowers_mode: bool = false,
 };
 const extension_ws_auth = @import("extension_ws/auth.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
@@ -2287,7 +2291,7 @@ const TenantRuntime = struct {
         tools_mod.bindImageGenerate(
             runtime.tools,
             tools_mod.lookupProviderApiKey(runtime.config.providers, "together"),
-            "",
+            runtime.config.image_model,
         );
         if (runtime.subagent_manager) |mgr| {
             mgr.attachTaskDelivery(runtime.task_delivery);
@@ -2300,6 +2304,13 @@ const TenantRuntime = struct {
                 };
                 mgr.attachCompletionDelivery(@ptrCast(router), appendSubagentCompletionToGatewaySession);
             }
+            // Phase 4 G5 — start the per-manager batch-deadline reaper ticker.
+            // Called here (after full init: ledger, delivery, task_delivery all
+            // wired) so the first reap tick has access to the complete manager
+            // state. The ticker holds no gateway lock; it calls reapBatchDeadlines
+            // which acquires SubagentManager.mutex internally. deinit() signals
+            // shutdown and joins the thread before freeing any manager state.
+            mgr.startReaperTicker();
         }
 
         log.info("tenant.runtime.config user={s} source={s} hash={x}", .{
@@ -2475,6 +2486,7 @@ const TenantRuntime = struct {
             .turn_execution_mode = turn_options.execution_mode,
             .turn_autonomy = turn_options.autonomy,
             .turn_reasoning_effort = turn_options.reasoning_effort,
+            .turn_superpowers_mode = turn_options.superpowers_mode,
         });
         return response;
     }
@@ -5931,12 +5943,30 @@ fn parseChatStreamAutonomy(body: []const u8) ?security.AutonomyLevel {
     return security.AutonomyLevel.fromString(raw);
 }
 
+/// Phase 5 (Superpowers mode) — map the raw reasoning_effort wire value to
+/// the effective provider-safe effort string and the superpowers_mode flag.
+/// The provider NEVER sees "superpowers" raw (D5 requirement); we convert it
+/// to "high" here so every consumer downstream is protected.
+///
+///   "superpowers" (case-insensitive) → { .superpowers = true,  .effort = "high" }
+///   "low" / "medium" / "high" / "none"               → { .superpowers = false, .effort = <that> }
+///   anything else / null                              → { .superpowers = false, .effort = null  }
+const MapReasoningEffortResult = struct { superpowers: bool, effort: ?[]const u8 };
+fn mapReasoningEffort(raw: ?[]const u8) MapReasoningEffortResult {
+    const r = raw orelse return .{ .superpowers = false, .effort = null };
+    if (std.ascii.eqlIgnoreCase(r, "superpowers")) return .{ .superpowers = true, .effort = "high" };
+    if (std.ascii.eqlIgnoreCase(r, "low")) return .{ .superpowers = false, .effort = "low" };
+    if (std.ascii.eqlIgnoreCase(r, "medium")) return .{ .superpowers = false, .effort = "medium" };
+    if (std.ascii.eqlIgnoreCase(r, "high")) return .{ .superpowers = false, .effort = "high" };
+    if (std.ascii.eqlIgnoreCase(r, "none")) return .{ .superpowers = false, .effort = "none" };
+    return .{ .superpowers = false, .effort = null };
+}
+
 fn parseChatStreamReasoningEffort(body: []const u8) ?[]const u8 {
     if (cleanJsonStringField(body, "reasoning_effort")) |raw| {
-        if (std.ascii.eqlIgnoreCase(raw, "low")) return "low";
-        if (std.ascii.eqlIgnoreCase(raw, "medium")) return "medium";
-        if (std.ascii.eqlIgnoreCase(raw, "high")) return "high";
-        if (std.ascii.eqlIgnoreCase(raw, "none")) return "none";
+        // Route through mapReasoningEffort so "superpowers" → "high" here too
+        // (used by legacy callers that only need the effort string).
+        return mapReasoningEffort(raw).effort;
     }
     if (cleanJsonStringField(body, "assistant_mode")) |raw| {
         if (std.ascii.eqlIgnoreCase(raw, "fast")) return "low";
@@ -5947,11 +5977,47 @@ fn parseChatStreamReasoningEffort(body: []const u8) ?[]const u8 {
 }
 
 fn parseChatStreamTurnOptions(body: []const u8) ChatStreamTurnOptions {
+    // Parse reasoning_effort via mapReasoningEffort so "superpowers" is split
+    // into its two concerns: the effective effort for the provider ("high") and
+    // the superpowers_mode activation flag for the coordinator path.
+    const effort_raw = cleanJsonStringField(body, "reasoning_effort");
+    const mapped = mapReasoningEffort(effort_raw);
+    // assistant_mode fallback (legacy — only applies when reasoning_effort absent)
+    const effort_final: ?[]const u8 = if (mapped.effort != null) mapped.effort else blk: {
+        if (cleanJsonStringField(body, "assistant_mode")) |raw| {
+            if (std.ascii.eqlIgnoreCase(raw, "fast")) break :blk "low";
+            if (std.ascii.eqlIgnoreCase(raw, "balanced")) break :blk "medium";
+            if (std.ascii.eqlIgnoreCase(raw, "deep")) break :blk "high";
+        }
+        break :blk null;
+    };
     return .{
         .execution_mode = parseChatStreamExecutionMode(body),
         .autonomy = parseChatStreamAutonomy(body),
-        .reasoning_effort = parseChatStreamReasoningEffort(body),
+        .reasoning_effort = effort_final,
+        .superpowers_mode = mapped.superpowers,
     };
+}
+
+test "mapReasoningEffort superpowers reasoning maps to coordinator + high effort" {
+    const a = mapReasoningEffort("superpowers");
+    try std.testing.expect(a.superpowers);
+    try std.testing.expectEqualStrings("high", a.effort.?);
+    const b = mapReasoningEffort("high");
+    try std.testing.expect(!b.superpowers);
+    try std.testing.expectEqualStrings("high", b.effort.?);
+    const c = mapReasoningEffort("low");
+    try std.testing.expect(!c.superpowers);
+    try std.testing.expectEqualStrings("low", c.effort.?);
+    const d = mapReasoningEffort("SUPERPOWERS"); // case-insensitive
+    try std.testing.expect(d.superpowers);
+    try std.testing.expectEqualStrings("high", d.effort.?);
+    const e = mapReasoningEffort("garbage");
+    try std.testing.expect(!e.superpowers);
+    try std.testing.expect(e.effort == null);
+    const f = mapReasoningEffort(null);
+    try std.testing.expect(!f.superpowers);
+    try std.testing.expect(f.effort == null);
 }
 
 test "chat stream turn options map zaki composer controls" {
@@ -10905,6 +10971,7 @@ fn handleApiChatStreamSseConnection(
                 .turn_execution_mode = turn_options.execution_mode,
                 .turn_autonomy = turn_options.autonomy,
                 .turn_reasoning_effort = turn_options.reasoning_effort,
+                .turn_superpowers_mode = turn_options.superpowers_mode,
             }) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                 break :blk .{ .err = .{ .code = "chat_failed", .msg = "chat failed" } };
@@ -24607,7 +24674,7 @@ pub fn runWithRole(
                 tools_mod.bindImageGenerate(
                     tools_slice,
                     tools_mod.lookupProviderApiKey(cfg.providers, "together"),
-                    "",
+                    cfg.image_model,
                 );
                 session_mgr_opt = sm;
                 if (subagent_manager_opt) |mgr| {
@@ -24625,6 +24692,9 @@ pub fn runWithRole(
                             mgr.attachCompletionDelivery(@ptrCast(router), appendSubagentCompletionToGatewaySession);
                         }
                     }
+                    // Phase 4 G5 — start the reaper ticker for the standalone
+                    // (non-tenant) manager. Same contract as the tenant path above.
+                    mgr.startReaperTicker();
                 }
             }
         }
@@ -30587,8 +30657,18 @@ test "W1.2: getTenantRuntime refuses a key-value-skewed cached runtime and serve
     // must evict the skewed entry and create a fresh runtime correctly bound to
     // "2" so the request still succeeds.
     const fetched = try getTenantRuntime(&state, &cfg, &user_ctx_2);
-    try std.testing.expect(fetched != runtime_1); // never the wrong-tenant runtime
-    try std.testing.expectEqualStrings("2", fetched.user_id); // correct binding
+    // NOTE: do NOT assert `fetched != runtime_1` by pointer. The guard evicts
+    // (deinit + free) the skewed runtime_1 and then allocates a FRESH runtime,
+    // which the allocator may legitimately place at runtime_1's just-freed
+    // address — so `runtime_1` is now a dangling pointer and a pointer-identity
+    // check is unsound and allocator/platform-dependent (it held on macOS but
+    // the freed slot is reused on linux-x86_64 → false pointer-equality → the
+    // test failed on Linux only). The "never serve the wrong-tenant runtime"
+    // guarantee is expressed SOUNDLY by the binding assertion below: a runtime
+    // bound to "2" is by definition not runtime_1's wrong-tenant ("1") binding,
+    // and a truly broken guard that returned the un-evicted runtime_1 would read
+    // user_id "1" here and still fail the test.
+    try std.testing.expectEqualStrings("2", fetched.user_id); // correct binding — the real guarantee
     try std.testing.expect(!fetched.pending_destroy.load(.acquire));
 
     // And the cache is repaired: key "2" now maps to the fresh, correct runtime.
@@ -32859,7 +32939,12 @@ const StopTestFixture = struct {
                 std.time.milliTimestamp()
             else
                 null,
-            .result = if (status == .completed) try alloc.dupe(u8, "done") else null,
+            // Phase 2: TaskState.result is a structured SubagentResult; only
+            // `text` is heap-owned (default empty slices are comptime &.{}).
+            .result = if (status == .completed)
+                subagent_mod.SubagentResultType{ .status = .completed, .text = try alloc.dupe(u8, "done") }
+            else
+                null,
         };
         try fx.mgr.tasks.put(alloc, numeric_id, state);
         // Mirror into the canonical ledger so getTaskSnapshot sees it.

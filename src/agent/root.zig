@@ -625,6 +625,11 @@ pub const Agent = struct {
     max_tokens: u32 = max_tokens_resolver.DEFAULT_MODEL_MAX_TOKENS,
     max_tokens_override: ?u32 = null,
     reasoning_effort: ?[]const u8 = null,
+    /// Phase 5 (Superpowers mode) — true for the duration of a turn where the
+    /// FE sent reasoning_effort="superpowers". Cleared on turn defer so it does
+    /// NOT persist across turns. Tasks 2–3 (coordinator mode + tool gate) read
+    /// this flag; this is its only storage location.
+    superpowers_mode: bool = false,
     compact_context_enabled: bool = false,
     verbose_level: VerboseLevel = .off,
     reasoning_mode: ReasoningMode = .off,
@@ -2287,6 +2292,21 @@ pub const Agent = struct {
         "You are in review mode. Analyze the read-only tool results above and provide a structured review with findings and recommendations.";
     const reflection_prompt_background =
         "Process the tool results. Do not attempt user interaction tools.";
+    // Phase 5 (Superpowers mode) — the in-turn coordinator playbook. This is
+    // the heart of Superpowers mode: the model orchestrates subagents instead
+    // of grinding through the work itself. MUST mention plan / spawn_many /
+    // synthesize (the prompt-section + reflection contract the tests assert).
+    const reflection_prompt_coordinator =
+        "**You are the coordinator (⚡ Superpowers mode).** You orchestrate; you do not grind through the work yourself.\n\n" ++
+        "Run this loop, in order:\n" ++
+        "  1. **Understand & decompose.** Restate the goal and split it into independent, parallelizable sub-tasks. If it isn't decomposable, say so and just answer directly — don't fan out for the sake of it.\n" ++
+        "  2. **Plan briefly.** One short plan of which sub-tasks you'll dispatch and why. Don't over-plan.\n" ++
+        "  3. **Dispatch with `spawn_many`.** Fan out the independent sub-tasks in a single batch. Each brief MUST be focused and self-contained — subagents inherit NO conversation context, so spell out everything they need.\n" ++
+        "  4. **Review each result.** When the batch returns (or via `subagent_batch_result`), read every result critically. Do not trust blindly; note gaps.\n" ++
+        "  5. **Synthesize into ONE deliverable.** Merge the subagent outputs into a single coherent answer in YOUR voice. NEVER dump raw subagent transcripts at the user.\n" ++
+        "  6. **Deliver.** Present the synthesized result.\n\n" ++
+        "Partial success is fine: synthesize the survivors and name which sub-tasks failed and why — never silently drop a failure.\n" ++
+        "Be transparent that fanning out burns credits (N parallel subagents ≈ N× the cost): only fan out when the parallelism is real.";
 
     fn getReflectionPrompt(mode: ExecutionMode) []const u8 {
         return switch (mode) {
@@ -2294,6 +2314,7 @@ pub const Agent = struct {
             .execute => reflection_prompt_execute,
             .review => reflection_prompt_review,
             .background => reflection_prompt_background,
+            .coordinator => reflection_prompt_coordinator,
         };
     }
 
@@ -2948,11 +2969,13 @@ pub const Agent = struct {
                     .plan => "Tool blocked: not allowed in plan mode (read-only tools only)",
                     .review => "Tool blocked: not allowed in review mode (read-only tools only)",
                     .background => "Tool blocked: not allowed in background mode (background-safe tools only)",
+                    .coordinator => "Tool blocked: not allowed in coordinator mode (delegate mutating work to a subagent via spawn / spawn_many)",
                     .execute => unreachable, // execute allows all tools
                 };
                 const reason: []const u8 = switch (self.execution_mode) {
                     .plan, .review => "mode_requires_read_only",
                     .background => "mode_requires_background_safe",
+                    .coordinator => "mode_requires_dispatch_or_read_only",
                     .execute => unreachable,
                 };
                 return .{ .blocked = .{
@@ -10969,6 +10992,50 @@ test "preflight blocks mutating tools in review mode" {
     const result = agent.preflightToolPolicy(call);
     try std.testing.expect(result == .blocked);
     try std.testing.expect(std.mem.indexOf(u8, result.blocked.output, "review mode") != null);
+}
+
+// ── Phase 5 (Superpowers mode) — coordinator reflection + preflight ──────
+
+test "getReflectionPrompt coordinator mentions plan, spawn_many, synthesize" {
+    const p = Agent.getReflectionPrompt(.coordinator);
+    try std.testing.expect(std.mem.indexOf(u8, p, "plan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "spawn_many") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "synthesize") != null);
+}
+
+test "preflight allows read-only + dispatch tools in coordinator mode" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.execution_mode = .coordinator;
+    // read_only tools + coordinator_dispatch tools are allowed.
+    const allowed_tools = [_][]const u8{
+        "file_read", "web_search", "task_list", "task_get", // read-only
+        "spawn",     "delegate", // dispatch (mutating but coordinator_dispatch)
+    };
+    for (allowed_tools) |name| {
+        const call = ParsedToolCall{ .name = name, .arguments_json = "{}", .tool_call_id = null };
+        const result = agent.preflightToolPolicy(call);
+        try std.testing.expect(result == .allowed);
+    }
+}
+
+test "preflight blocks pure-mutating non-dispatch tools in coordinator mode" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.execution_mode = .coordinator;
+    // file_write / shell mutate and are NOT dispatch tools — coordinator
+    // delegates that grunt work to a subagent rather than doing it directly.
+    const blocked_tools = [_][]const u8{ "file_write", "shell", "memory_store" };
+    for (blocked_tools) |name| {
+        const call = ParsedToolCall{ .name = name, .arguments_json = "{}", .tool_call_id = null };
+        const result = agent.preflightToolPolicy(call);
+        try std.testing.expect(result == .blocked);
+        try std.testing.expect(std.mem.indexOf(u8, result.blocked.output, "coordinator mode") != null);
+    }
 }
 
 test "preflight allows read-only tools in review mode" {

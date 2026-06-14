@@ -392,6 +392,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     if (root.get("profile")) |v| {
         if (v == .string) self.profile = try self.allocator.dupe(u8, v.string);
     }
+    if (root.get("image_model")) |v| {
+        if (v == .string) self.image_model = try self.allocator.dupe(u8, v.string);
+    }
     if (root.get("default_provider")) |v| {
         if (v == .string) self.legacy_default_provider_detected = true;
     }
