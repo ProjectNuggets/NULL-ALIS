@@ -1705,12 +1705,17 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             const procedural_memory = @import("procedural_memory.zig");
 
             // G16 (WM-CROSS-SESSION) — promote high-importance WM slots
-            // (active_goal + decision, composite ≥ threshold) to
-            // durable_facts BEFORE the procedural-memory capture below.
-            // Ordering invariant: promotion-before-capture ensures the
-            // transient_goal durable_facts exist before the reflection
-            // trail references them. Failure-soft: returns count 0 on any
-            // setup error; per-slot failures log without aborting.
+            // (active_goal / decision / open_loop, composite ≥ threshold)
+            // to durable_facts BEFORE the procedural-memory capture below.
+            // P8: keys are branched by slot_type —
+            // `durable_fact/{slot_type}/{session_id}/{slot_id}` — so each
+            // promoted kind lands in a distinct, queryable namespace; the
+            // old flat `transient_goal` segment is gone. open_loop is now
+            // also promotable (P8 addition). Ordering invariant:
+            // promotion-before-capture ensures the durable_fact rows exist
+            // before the reflection trail references them. Failure-soft:
+            // returns count 0 on any setup error; per-slot failures log
+            // without aborting.
             {
                 const promotion = @import("promotion.zig");
                 var prom_result = promotion.promoteWMToDurableAtSessionEnd(

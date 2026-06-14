@@ -8414,9 +8414,10 @@ const ManagerImpl = struct {
     /// each PROPER entity's incoming edge predicates, ask the helper, and stamp
     /// the upgrade with the P7 no-clobber semantics: ONLY rows still at 'PROPER'
     /// are touched, so a re-run (or a row already typed) is a no-op, and a stamp
-    /// can only UPGRADE, never demote. Type-only UPDATE preserves the existing
-    /// name_embedding (we deliberately do NOT call upsertEntity, which would
-    /// require — and clobber with — a fresh embedding).
+    /// can only UPGRADE, never demote. Type-only UPDATE (entity_type column only,
+    /// no embedding re-generation) preserves the existing name_embedding — we
+    /// deliberately do NOT call upsertEntity here because that path requires a
+    /// fresh embedding vector and would clobber the existing one unnecessarily.
     fn phase05BackfillRetypeEntities(
         self: *Self,
         user_id: i64,

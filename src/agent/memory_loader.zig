@@ -109,6 +109,14 @@ pub const SelectionStats = struct {
     identity_pin_active: bool = false,
     identity_pin_fact_count: usize = 0,
     identity_pin_appended_bytes: usize = 0,
+    // Phase 0.5 typed-view injection telemetry. True when at least one
+    // of the four typed-view blocks (preferences / open_loops / decisions
+    // / people) produced a non-empty fenced block. item_count and
+    // appended_bytes are the aggregate across all four builders so
+    // operators can measure typed-view coverage per turn in turn_audit.
+    typed_views_active: bool = false,
+    typed_views_item_count: usize = 0,
+    typed_views_appended_bytes: usize = 0,
 };
 
 pub const ContextResult = struct {
@@ -581,6 +589,20 @@ fn loadContextDetailed(
         }
     }
 
+    // P4 / C0 note: this secondary timeline-fallback bucket searches
+    // global_entries (vector recall results, session_id=null) for
+    // timeline_summary/ keys. Post-P4, `shouldEmbedMemoryEntry` returns
+    // false for timeline_summary/ — new continuity rows are not embedded
+    // and therefore do not appear in vector recall. C0 op-3 deletes
+    // pre-P4 embedded continuity rows. Together these make this path
+    // unreachable for fresh data on a fully-migrated instance.
+    //
+    // The loop is deliberately KEPT (not pruned) as a safety net for:
+    //   (a) instances where C0 has not yet run (pre-migration rows),
+    //   (b) any future embed-policy relaxation that re-embeds continuity.
+    // On a post-C0 production instance the loop iterates over entries
+    // but finds no timeline_summary/ matches — it is effectively a no-op
+    // at negligible cost (~µs over an already-fetched slice).
     if (appended < DEFAULT_RECALL_LIMIT and buf.items.len < MAX_CONTEXT_BYTES and global_entries != null) {
         if (global_entries) |entries| {
             for (entries) |entry| {
@@ -787,6 +809,10 @@ fn loadContextWithRuntimeDetailed(
         }
     }
 
+    // P4 / C0 note: see the matching comment in loadContextFromMemory.
+    // Post-P4 + post-C0, timeline_summary/ rows are not embedded so vector
+    // recall never returns them; this loop is a no-op on fully-migrated
+    // instances but is retained as a safety net for pre-C0 legacy rows.
     if (buf.items.len < MAX_CONTEXT_BYTES and global_entries != null) {
         if (global_entries) |entries| {
             for (entries) |entry| {
@@ -1128,6 +1154,10 @@ pub fn loadTurnMemorySlotOpts(
     var loop_block: ?[]u8 = null;
     var decision_block: ?[]u8 = null;
     var people_block: ?[]u8 = null;
+    // Aggregate typed-view telemetry across all four builders so it can be
+    // wired into result.stats after the block (mirrors graph_stats /
+    // identity_stats pattern).
+    var typed_views_stats: TypedViewAppendResult = .{};
     if (opts.typed_views_enabled) {
         if (state_mgr_for_graph) |sm| if (user_id_for_graph) |uid| {
             var s: TypedViewAppendResult = .{};
@@ -1135,23 +1165,38 @@ pub fn loadTurnMemorySlotOpts(
                 log.warn("typed_views.preferences_failed err={s} — skipping block", .{@errorName(err)});
                 break :blk null;
             };
+            typed_views_stats.appended = typed_views_stats.appended or s.appended;
+            typed_views_stats.item_count += s.item_count;
+            typed_views_stats.appended_bytes += s.appended_bytes;
             s = .{};
             loop_block = buildTypedViewBlock(allocator, sm, uid, "open_loop", "open_loops", "Unfinished threads — proactively follow up; these are time-sensitive (most recent first).", &s) catch |err| blk: {
                 log.warn("typed_views.open_loops_failed err={s} — skipping block", .{@errorName(err)});
                 break :blk null;
             };
+            typed_views_stats.appended = typed_views_stats.appended or s.appended;
+            typed_views_stats.item_count += s.item_count;
+            typed_views_stats.appended_bytes += s.appended_bytes;
             s = .{};
             decision_block = buildTypedViewBlock(allocator, sm, uid, "decision", "decisions", "Decisions already made — do not relitigate; treat as settled (most recent first).", &s) catch |err| blk: {
                 log.warn("typed_views.decisions_failed err={s} — skipping block", .{@errorName(err)});
                 break :blk null;
             };
+            typed_views_stats.appended = typed_views_stats.appended or s.appended;
+            typed_views_stats.item_count += s.item_count;
+            typed_views_stats.appended_bytes += s.appended_bytes;
             s = .{};
             people_block = buildTypedViewBlock(allocator, sm, uid, "person", "people", "People in the user's life — relationships and CRM facts.", &s) catch |err| blk: {
                 log.warn("typed_views.people_failed err={s} — skipping block", .{@errorName(err)});
                 break :blk null;
             };
+            typed_views_stats.appended = typed_views_stats.appended or s.appended;
+            typed_views_stats.item_count += s.item_count;
+            typed_views_stats.appended_bytes += s.appended_bytes;
         };
     }
+    result.stats.typed_views_active = typed_views_stats.appended;
+    result.stats.typed_views_item_count = typed_views_stats.item_count;
+    result.stats.typed_views_appended_bytes = typed_views_stats.appended_bytes;
     defer if (pref_block) |b| allocator.free(b);
     defer if (loop_block) |b| allocator.free(b);
     defer if (decision_block) |b| allocator.free(b);
