@@ -694,23 +694,72 @@ pub const MemoryMaintainTool = struct {
 
         const nc_esc = try jsonEscape(allocator, next_consideration);
         defer allocator.free(nc_esc);
-        const output = try std.fmt.allocPrint(
-            allocator,
-            "{{\"action\":\"phase05_backfill\",\"dry_run\":{s},\"all_users\":{s},\"users_scanned\":{d}," ++
-                "\"rows_retyped\":{d},\"entities_retyped\":{d},\"continuity_embeddings_removed\":{d}," ++
-                "\"exact_dups_collapsed\":{d},\"near_dup_clusters\":{d},\"next_consideration\":\"{s}\"}}",
-            .{
-                if (report.dry_run) "true" else "false",
-                if (all_users) "true" else "false",
-                report.users_scanned,
-                report.rows_retyped,
-                report.entities_retyped,
-                report.continuity_embeddings_removed,
-                report.exact_dups_collapsed,
-                report.near_dup_clusters,
-                nc_esc,
-            },
-        );
+        // Brain-leak Fix C (polish) — render via the pure helper so the
+        // result JSON includes the scaffold_entities_purged /
+        // scaffold_edges_purged counters an operator needs to see.
+        const output = try formatPhase05Result(allocator, report, all_users, nc_esc);
         return ToolResult{ .success = true, .output = output };
     }
 };
+
+/// Brain-leak Fix C (polish) — render the phase05_backfill report as the
+/// tool's JSON result string. Extracted as a pure helper so the output
+/// shape (incl. the scaffold-purge counters) is unit-testable without a
+/// live Postgres Manager. `next_consideration` must already be
+/// JSON-escaped by the caller. Caller owns the returned slice.
+fn formatPhase05Result(
+    allocator: std.mem.Allocator,
+    report: mem_root.Phase05BackfillReport,
+    all_users: bool,
+    next_consideration_escaped: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"action\":\"phase05_backfill\",\"dry_run\":{s},\"all_users\":{s},\"users_scanned\":{d}," ++
+            "\"rows_retyped\":{d},\"entities_retyped\":{d},\"continuity_embeddings_removed\":{d}," ++
+            "\"exact_dups_collapsed\":{d},\"near_dup_clusters\":{d}," ++
+            // Brain-leak Fix C — surface the scaffold-purge blast radius so an
+            // operator running the tool sees the purge counts in the result,
+            // not just in log.info.
+            "\"scaffold_entities_purged\":{d},\"scaffold_edges_purged\":{d}," ++
+            "\"next_consideration\":\"{s}\"}}",
+        .{
+            if (report.dry_run) "true" else "false",
+            if (all_users) "true" else "false",
+            report.users_scanned,
+            report.rows_retyped,
+            report.entities_retyped,
+            report.continuity_embeddings_removed,
+            report.exact_dups_collapsed,
+            report.near_dup_clusters,
+            report.scaffold_entities_purged,
+            report.scaffold_edges_purged,
+            next_consideration_escaped,
+        },
+    );
+}
+
+test "brain-leak C polish: phase05_backfill output surfaces scaffold-purge counts" {
+    const allocator = std.testing.allocator;
+    const report = mem_root.Phase05BackfillReport{
+        .dry_run = true,
+        .users_scanned = 1,
+        .rows_retyped = 5,
+        .entities_retyped = 2,
+        .continuity_embeddings_removed = 0,
+        .exact_dups_collapsed = 1,
+        .near_dup_clusters = 0,
+        .scaffold_entities_purged = 3,
+        .scaffold_edges_purged = 7,
+    };
+    const out = try formatPhase05Result(allocator, report, false, "ok");
+    defer allocator.free(out);
+
+    // The two scaffold counters are present with their values.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"scaffold_entities_purged\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"scaffold_edges_purged\":7") != null);
+    // Existing counters still present (no regression in the result shape).
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"rows_retyped\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"near_dup_clusters\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"dry_run\":true") != null);
+}
