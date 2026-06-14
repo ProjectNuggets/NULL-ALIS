@@ -20,6 +20,12 @@ const text_norm = @import("memory/text_norm.zig");
 // new writes are typed. Module-level circular import (extraction_persist
 // imports zaki_state) is fine — only runtime calls, no comptime cycle.
 const extraction_persist = @import("agent/extraction_persist.zig");
+// Brain-leak Fix C — keystone reuse for the C0 scaffold purge. Same
+// `context_builder.isScaffoldEntityName` predicate Fix A uses at the write
+// boundary, so purge (existing poison) and reject (new poison) share ONE
+// matching definition derived from `stable_prompt_markers` — no drift.
+// context_builder imports only leaf modules; runtime-only call, no comptime cycle.
+const context_builder = @import("agent/context_builder.zig");
 const cron_mod = @import("cron.zig");
 const security_secrets = @import("security/secrets.zig");
 
@@ -8356,10 +8362,13 @@ const ManagerImpl = struct {
             try self.phase05BackfillUnembedContinuity(allocator, uid, dry_run, &report);
             try self.phase05BackfillExactDedup(allocator, uid, dry_run, &report);
             try self.phase05BackfillCountNearDups(uid, &report);
+            // Brain-leak Fix C — purge system-prompt scaffold entities/edges that
+            // the #48 leak persisted before Fixes A/B closed the source.
+            try self.phase05BackfillPurgeScaffold(uid, dry_run, &report);
         }
 
         log.info(
-            "phase05_backfill dry_run={} users={d} retyped={d} entities={d} continuity_embeds_removed={d} exact_dups={d} near_dup_clusters={d}",
+            "phase05_backfill dry_run={} users={d} retyped={d} entities={d} continuity_embeds_removed={d} exact_dups={d} near_dup_clusters={d} scaffold_entities_purged={d} scaffold_edges_purged={d}",
             .{
                 dry_run,
                 report.users_scanned,
@@ -8368,6 +8377,8 @@ const ManagerImpl = struct {
                 report.continuity_embeddings_removed,
                 report.exact_dups_collapsed,
                 report.near_dup_clusters,
+                report.scaffold_entities_purged,
+                report.scaffold_edges_purged,
             },
         );
         return report;
@@ -8716,6 +8727,128 @@ const ManagerImpl = struct {
         const count_slice = std.mem.span(count_ptr);
         const count = std.fmt.parseInt(usize, count_slice, 10) catch 0;
         report.near_dup_clusters += count;
+    }
+
+    /// C0 op 5 (brain-leak Fix C) — purge system-prompt scaffold entities and
+    /// their edges. The #48 leak persisted scaffold section titles / body terms
+    /// (## Brain Architecture, Memory Link Types, "Working memory", …) as brain
+    /// ENTITIES; this removes that pre-fix pollution for the scoped user.
+    ///
+    /// Matching authority: `context_builder.isScaffoldEntityName` — the SAME
+    /// keystone predicate Fix A enforces at the write boundary. We fetch the
+    /// user's entities and re-filter every `name` through it (rather than
+    /// hard-coding a SQL `IN (...)` of denylist strings) so purge (existing
+    /// poison) and reject (new poison) can NEVER diverge: one definition,
+    /// derived from `stable_prompt_markers`. Entities are sparse (proper nouns),
+    /// so the full fetch is cheap.
+    ///
+    /// SAFETY: dry_run (the tool default) COUNTS but writes nothing. On apply,
+    /// for each matched entity we delete the edges that reference it (source OR
+    /// target) and then the entity row. Idempotent: a second run finds nothing
+    /// (the rows are gone). Best-effort per entity — a delete failure logs and
+    /// continues so one bad row can't strand the rest of the purge.
+    fn phase05BackfillPurgeScaffold(
+        self: *Self,
+        user_id: i64,
+        dry_run: bool,
+        report: *memory_root.Phase05BackfillReport,
+    ) !void {
+        // Fetch all entities for the user (id, name). Entities are sparse, so
+        // an unbounded read is acceptable (same assumption as the retype pass).
+        const q = try self.buildQuery(
+            "SELECT id, name FROM {schema}.memory_entities WHERE user_id = $1",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const n: usize = @intCast(c.PQntuples(result));
+        for (0..n) |i| {
+            const row_idx: c_int = @intCast(i);
+            const id_ptr = c.PQgetvalue(result, row_idx, 0);
+            const id_slice: []const u8 = if (id_ptr == null) "" else std.mem.span(id_ptr);
+            const name_ptr = c.PQgetvalue(result, row_idx, 1);
+            const name_slice: []const u8 = if (name_ptr == null) "" else std.mem.span(name_ptr);
+
+            // Keystone gate — identical matching to the Fix A write boundary.
+            if (!context_builder.isScaffoldEntityName(name_slice)) continue;
+
+            report.scaffold_entities_purged += 1;
+
+            // Count this entity's referencing edges (source OR target) for the
+            // report — done on BOTH dry-run and apply so the operator sees the
+            // blast radius before committing.
+            const edge_count = self.phase05CountScaffoldEdges(user_id, id_slice) catch |err| blk: {
+                log.warn("phase05_backfill.scaffold_edge_count_failed id={s} err={s}", .{ id_slice, @errorName(err) });
+                break :blk 0;
+            };
+            report.scaffold_edges_purged += edge_count;
+
+            if (dry_run) continue;
+
+            // Apply — delete the referencing edges first, then the entity row.
+            const id_z = try self.allocator.dupeZ(u8, id_slice);
+            defer self.allocator.free(id_z);
+
+            {
+                const del_edges_q = try self.buildQuery(
+                    "DELETE FROM {schema}.memory_edges " ++
+                        "WHERE user_id = $1 AND (source_key = $2 OR target_key = $2)",
+                );
+                defer self.allocator.free(del_edges_q);
+                const del_params = [_]?[*:0]const u8{ user_s.ptr, id_z };
+                const del_lengths = [_]c_int{ @intCast(user_s.len), @intCast(id_slice.len) };
+                const del_result = self.execParams(del_edges_q, &del_params, &del_lengths) catch |err| {
+                    log.warn("phase05_backfill.scaffold_edge_delete_failed id={s} err={s}", .{ id_slice, @errorName(err) });
+                    continue;
+                };
+                c.PQclear(del_result);
+            }
+            {
+                const del_entity_q = try self.buildQuery(
+                    "DELETE FROM {schema}.memory_entities WHERE user_id = $1 AND id = $2",
+                );
+                defer self.allocator.free(del_entity_q);
+                const del_params = [_]?[*:0]const u8{ user_s.ptr, id_z };
+                const del_lengths = [_]c_int{ @intCast(user_s.len), @intCast(id_slice.len) };
+                const del_result = self.execParams(del_entity_q, &del_params, &del_lengths) catch |err| {
+                    log.warn("phase05_backfill.scaffold_entity_delete_failed id={s} err={s}", .{ id_slice, @errorName(err) });
+                    continue;
+                };
+                c.PQclear(del_result);
+            }
+            log.warn("phase05_backfill.scaffold_entity_purged id={s} name={s} edges={d}", .{ id_slice, name_slice, edge_count });
+        }
+    }
+
+    /// Helper for `phase05BackfillPurgeScaffold` — count edges that reference
+    /// `entity_id` as source OR target for the given user. Used for the
+    /// report's `scaffold_edges_purged` blast-radius count (dry-run + apply).
+    fn phase05CountScaffoldEdges(self: *Self, user_id: i64, entity_id: []const u8) !usize {
+        const q = try self.buildQuery(
+            "SELECT COUNT(*) FROM {schema}.memory_edges " ++
+                "WHERE user_id = $1 AND (source_key = $2 OR target_key = $2)",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const id_z = try self.allocator.dupeZ(u8, entity_id);
+        defer self.allocator.free(id_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, id_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(entity_id.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        if (c.PQntuples(result) == 0) return 0;
+        const count_ptr = c.PQgetvalue(result, 0, 0);
+        if (count_ptr == null) return 0;
+        return std.fmt.parseInt(usize, std.mem.span(count_ptr), 10) catch 0;
     }
 
     /// Today the `subject` column is unpopulated by upsertMemoryWithMetadata
@@ -15395,6 +15528,122 @@ test "C0 phase05Backfill: PROPER entity with relationship edge upgrades to PERSO
     // Idempotent: Alice is now PERSON, no longer a 'PROPER' candidate.
     const r2 = try mgr.phase05Backfill(allocator, 2, false);
     try std.testing.expectEqual(@as(usize, 0), r2.entities_retyped);
+}
+
+test "brain-leak C: phase05Backfill purges scaffold entities + their edges (dry-run safe, idempotent)" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-c0-scaffold/workspace");
+
+    const zero_emb = [_]f32{0.0} ** 1024;
+
+    // (a) A poisoned scaffold entity — the #48 leak shape: a section title that
+    //     got persisted as a brain entity, with an incoming edge.
+    const scaffold_id = try mgr.upsertEntity(allocator, 2, "Brain Architecture", "PROPER", &zero_emb);
+    defer allocator.free(scaffold_id);
+    try mgr.upsertMemory(2, "m_scaffold", "User uses Brain Architecture", .core, null);
+    try mgr.upsertMemoryEdge(2, "m_scaffold", scaffold_id, "USES", "extraction_classifier", 1.0);
+
+    // (b) A scaffold entity as an edge SOURCE too (e.g. "Memory Link Types" →
+    //     edges) — purge must clear edges on both sides.
+    const scaffold2_id = try mgr.upsertEntity(allocator, 2, "Memory Link Types", "PROPER", &zero_emb);
+    defer allocator.free(scaffold2_id);
+    const real_target = try mgr.upsertEntity(allocator, 2, "edges", "PROPER", &zero_emb);
+    defer allocator.free(real_target);
+    try mgr.upsertMemoryEdge(2, scaffold2_id, real_target, "RELATED_TO", "extraction_classifier", 1.0);
+
+    // (c) A genuine entity + edge — must survive untouched.
+    const helix_id = try mgr.upsertEntity(allocator, 2, "Helix", "PROPER", &zero_emb);
+    defer allocator.free(helix_id);
+    try mgr.upsertMemory(2, "m_helix", "User uses Helix", .core, null);
+    try mgr.upsertMemoryEdge(2, "m_helix", helix_id, "USES", "extraction_classifier", 1.0);
+
+    const countEntities = struct {
+        fn run(a: std.mem.Allocator, m: *ManagerImpl) !i64 {
+            const schema_q = try pg_helpers.quoteIdentifier(a, m.schemaRaw());
+            defer a.free(schema_q);
+            const q = try std.fmt.allocPrint(a, "SELECT COUNT(*) FROM {s}.memory_entities WHERE user_id = 2", .{schema_q});
+            defer a.free(q);
+            const result = try m.exec(q);
+            defer c.PQclear(result);
+            const s = try dupeResultValue(a, result, 0, 0);
+            defer a.free(s);
+            return try std.fmt.parseInt(i64, s, 10);
+        }
+    };
+    const entityExists = struct {
+        fn run(a: std.mem.Allocator, m: *ManagerImpl, id: []const u8) !bool {
+            const schema_q = try pg_helpers.quoteIdentifier(a, m.schemaRaw());
+            defer a.free(schema_q);
+            const q = try std.fmt.allocPrint(a, "SELECT COUNT(*) FROM {s}.memory_entities WHERE user_id = 2 AND id = '{s}'", .{ schema_q, id });
+            defer a.free(q);
+            const result = try m.exec(q);
+            defer c.PQclear(result);
+            const s = try dupeResultValue(a, result, 0, 0);
+            defer a.free(s);
+            return !std.mem.eql(u8, s, "0");
+        }
+    };
+    const edgesTouchingScaffold = struct {
+        fn run(a: std.mem.Allocator, m: *ManagerImpl, sid1: []const u8, sid2: []const u8) !i64 {
+            const schema_q = try pg_helpers.quoteIdentifier(a, m.schemaRaw());
+            defer a.free(schema_q);
+            const q = try std.fmt.allocPrint(
+                a,
+                "SELECT COUNT(*) FROM {s}.memory_edges WHERE user_id = 2 AND " ++
+                    "(source_key IN ('{s}','{s}') OR target_key IN ('{s}','{s}'))",
+                .{ schema_q, sid1, sid2, sid1, sid2 },
+            );
+            defer a.free(q);
+            const result = try m.exec(q);
+            defer c.PQclear(result);
+            const s = try dupeResultValue(a, result, 0, 0);
+            defer a.free(s);
+            return try std.fmt.parseInt(i64, s, 10);
+        }
+    };
+
+    const entities_before = try countEntities.run(allocator, &mgr);
+    try std.testing.expectEqual(@as(i64, 4), entities_before); // 2 scaffold + edges + Helix
+
+    // ── Dry-run: reports the would-be purge, deletes NOTHING.
+    const dry = try mgr.phase05Backfill(allocator, 2, true);
+    try std.testing.expect(dry.dry_run);
+    try std.testing.expectEqual(@as(usize, 2), dry.scaffold_entities_purged); // Brain Architecture + Memory Link Types
+    try std.testing.expect(dry.scaffold_edges_purged >= 2); // both scaffold edges counted
+    try std.testing.expectEqual(@as(i64, 4), try countEntities.run(allocator, &mgr)); // untouched on disk
+    try std.testing.expect(try entityExists.run(allocator, &mgr, scaffold_id));
+
+    // ── Apply: scaffold entities + their edges deleted; genuine survive.
+    const r1 = try mgr.phase05Backfill(allocator, 2, false);
+    try std.testing.expect(!r1.dry_run);
+    try std.testing.expectEqual(@as(usize, 2), r1.scaffold_entities_purged);
+    try std.testing.expect(r1.scaffold_edges_purged >= 2);
+
+    try std.testing.expect(!(try entityExists.run(allocator, &mgr, scaffold_id))); // gone
+    try std.testing.expect(!(try entityExists.run(allocator, &mgr, scaffold2_id))); // gone
+    try std.testing.expectEqual(@as(i64, 0), try edgesTouchingScaffold.run(allocator, &mgr, scaffold_id, scaffold2_id)); // edges gone
+
+    // Genuine entity + its edge survive (no over-purge).
+    try std.testing.expect(try entityExists.run(allocator, &mgr, helix_id));
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const q = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}.memory_edges WHERE user_id = 2 AND target_key = '{s}'", .{ schema_q, helix_id });
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const s = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(s);
+        try std.testing.expectEqualStrings("1", s); // Helix's USES edge intact
+    }
+
+    // ── Idempotent: second apply finds nothing left to purge.
+    const r2 = try mgr.phase05Backfill(allocator, 2, false);
+    try std.testing.expectEqual(@as(usize, 0), r2.scaffold_entities_purged);
+    try std.testing.expectEqual(@as(usize, 0), r2.scaffold_edges_purged);
 }
 
 test "setMemorySource preserves updated_at for attribution-only enrichment" {

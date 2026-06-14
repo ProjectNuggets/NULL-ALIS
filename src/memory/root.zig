@@ -955,6 +955,14 @@ pub const Phase05BackfillReport = struct {
     exact_dups_collapsed: usize = 0,
     /// Report-only — near-duplicate candidate clusters left for Phase 1.
     near_dup_clusters: usize = 0,
+    /// Brain-leak Fix C — count of system-prompt scaffold entities purged
+    /// (memory_entities rows whose name matches the scaffold denylist). On
+    /// dry-run this is the would-be deletion count; on apply it is the rows
+    /// deleted. Idempotent: a second run finds 0.
+    scaffold_entities_purged: usize = 0,
+    /// Brain-leak Fix C — count of memory_edges rows deleted because they
+    /// referenced a purged scaffold entity (source_key or target_key).
+    scaffold_edges_purged: usize = 0,
 };
 
 /// V1.7a-9a — owned community-name lookup row.
