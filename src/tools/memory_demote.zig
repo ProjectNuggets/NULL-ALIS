@@ -17,9 +17,13 @@
 //! Safety:
 //!   - target_category MUST be one of "daily" / "conversation" /
 //!     "episodic". Defending against "core" prevents a no-op that would
-//!     mask agent confusion.
-//!   - Only acts on rows that are currently `core`. Returns success-with-
-//!     null-effect when key doesn't exist or is already non-core.
+//!     mask agent confusion. (The target enum is unchanged by 0.5b.)
+//!   - Phase-0.5b H2: acts on rows that are currently a DURABLE type
+//!     (core / preference / decision / person / open_loop), not just
+//!     `core` — the release-valve must reach the typed durables now that
+//!     C1 protects them with the same immortality guard core had. Returns
+//!     success-with-null-effect when the key doesn't exist, is already a
+//!     non-durable type, or is closed-out (the LIVE-row validity guard).
 //!   - Emits a memory_events row with event_type='demote' carrying the
 //!     from/to types so the demotion is auditable.
 //!

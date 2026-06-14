@@ -9157,16 +9157,22 @@ const ManagerImpl = struct {
         }
     }
 
-    /// V1.6 commit 11 — flip a `core` memory back to a non-core type.
+    /// V1.6 commit 11 — flip a DURABLE memory back to a non-durable type.
     /// Required because V1.7's CASE-guard in upsertMemory + the W-INT-01
-    /// fix make core rows immortal against subsequent upserts (preserving
+    /// fix make durable rows immortal against subsequent upserts (preserving
     /// promotion + close-out state). The only escape hatch is this
     /// explicit demotion.
     ///
+    /// Phase-0.5b H2: the WHERE now matches `memory_type IN <DURABLE_TYPES_SQL>`
+    /// (core/preference/decision/person/open_loop), not just `core`, because
+    /// C1 extended the immortality guard to all durable types — the release-
+    /// valve has to reach them too. Phase-0.5b H7: only LIVE rows are touched
+    /// (validity guard) so a closed row is never moved protected→resurrectable.
+    ///
     /// `target_category_str` must be one of "daily" / "conversation" /
     /// "episodic" — i.e. anything but "core". Returns true when a row was
-    /// actually demoted (false when key didn't exist or was already
-    /// non-core).
+    /// actually demoted (false when the key didn't exist, was already a
+    /// non-durable type, or was closed-out).
     ///
     /// Emits a memory_events row with event_type='demote' carrying the
     /// `from`/`to` types so audit can reconstruct demotion history.
