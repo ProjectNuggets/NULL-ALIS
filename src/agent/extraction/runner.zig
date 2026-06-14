@@ -474,8 +474,16 @@ fn buildEpisodeTranscript(
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     for (episode.messages) |*msg| {
+        // Brain-leak KEYSTONE — never serialize `.system` messages into the
+        // extraction input. history[0] on the session-end path is the LIVE
+        // system prompt (## Brain Architecture / ## Memory Link Types
+        // scaffold); injected mid-turn `.system` reflection prompts are the
+        // same hazard. Filtering by ROLE (not content) kills ALL scaffold —
+        // named or not, present or future — at the origin, while leaving
+        // assistant/user/tool turns (which carry genuine user facts) intact.
+        if (msg.role == .system) continue;
         const role_str: []const u8 = switch (msg.role) {
-            .system => "SYSTEM",
+            .system => unreachable, // filtered above
             .user => "USER",
             .assistant => "ASSISTANT",
             .tool => "TOOL",
@@ -520,8 +528,16 @@ fn buildTranscript(
     errdefer buf.deinit(allocator);
 
     for (window) |*msg| {
+        // Brain-leak KEYSTONE — exclude `.system` messages from the
+        // extraction input. See buildEpisodeTranscript for the full
+        // rationale: the session-end path passes the whole history
+        // (incl. history[0], the live system prompt scaffold) here; any
+        // injected mid-turn `.system` reflection prompt is the same
+        // hazard. Filter by ROLE so genuine user/assistant/tool content
+        // is preserved.
+        if (msg.role == .system) continue;
         const role_str: []const u8 = switch (msg.role) {
-            .system => "SYSTEM",
+            .system => unreachable, // filtered above
             .user => "USER",
             .assistant => "ASSISTANT",
             .tool => "TOOL",
@@ -986,6 +1002,183 @@ test "buildTranscript respects per-message + total caps" {
     // Per-message 2KB cap applied
     try std.testing.expect(transcript.len < 5000 + 100);
     try std.testing.expect(transcript.len < 3000); // ~2KB + headers
+}
+
+// ── Brain-leak KEYSTONE — exclude `.system` messages from extraction input ─
+// Root cause of the #48 leak: the session-end extraction path
+// (commands.zig builds `msgs_buf` from the WHOLE `self.history.items`,
+// including history[0] — the LIVE system prompt carrying the
+// `## Brain Architecture` / `## Memory Link Types` scaffold) hands that
+// whole window to extractAtBoundary. The transcript builders serialized
+// `.system` verbatim, so the scaffold became brain entities. The mid-
+// session Pass A slices `first_user_idx + 1` and so never had the
+// system prefix; the session-end path had no such guard. The keystone
+// is to filter by ROLE (`.system`) at the transcript builders — the one
+// layer every boundary path flows through — killing ALL scaffold (named
+// or not, present or future) at the origin while preserving genuine
+// `.assistant` / `.user` / `.tool` facts.
+//
+// Note: the `.system` instruction prompt handed to the extractor LLM in
+// runExtractionCall / runHydrationCall is a SEPARATE message array (the
+// extraction/hydration system prompt) and is unaffected — only the
+// conversation-window transcript is filtered.
+
+test "brain-leak keystone: buildTranscript excludes .system scaffold but keeps real facts" {
+    const allocator = std.testing.allocator;
+    // history[0] mirrors the live system prompt: scaffold section headers
+    // + body terms that the #48 leak persisted as brain entities.
+    const scaffold_system =
+        \\You are an assistant.
+        \\## Brain Architecture
+        \\Layer 0 is working memory. Layer 1 is durable. Distillation extraction runs at session end.
+        \\## Memory Link Types
+        \\relationship, preference, usage, supersession
+    ;
+    const msgs = [_]ChatMessage{
+        .{ .role = .system, .content = scaffold_system },
+        .{ .role = .user, .content = "I work at Acme Corp." },
+        .{ .role = .assistant, .content = "Noted — you work at Acme Corp." },
+    };
+    const transcript = try buildTranscript(allocator, &msgs, 80_000);
+    defer allocator.free(transcript);
+
+    // ZERO scaffold content reaches the extractor.
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "Brain Architecture") == null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "Memory Link Types") == null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "Layer 0 is working memory") == null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "supersession") == null);
+    // The SYSTEM role label itself is gone (no .system line serialized).
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "SYSTEM:") == null);
+    // Genuine user + assistant facts in the SAME window survive.
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "USER: I work at Acme Corp.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "ASSISTANT: Noted — you work at Acme Corp.") != null);
+}
+
+test "brain-leak keystone: buildEpisodeTranscript excludes .system scaffold but keeps real facts" {
+    const allocator = std.testing.allocator;
+    const scaffold_system =
+        \\## Brain Architecture
+        \\Layer 0 is working memory.
+        \\## Memory Link Types
+        \\relationship, preference
+    ;
+    const msgs = [_]ChatMessage{
+        .{ .role = .system, .content = scaffold_system },
+        .{ .role = .user, .content = "My dog is named Rex." },
+        .{ .role = .assistant, .content = "Got it, Rex." },
+    };
+    const episode = chunker.Episode{
+        .messages = &msgs,
+        .estimated_tokens = 0,
+        .boundary_signal = .window_start,
+        .start_idx = 0,
+        .end_idx = @intCast(msgs.len),
+    };
+    const transcript = try buildEpisodeTranscript(allocator, episode);
+    defer allocator.free(transcript);
+
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "Brain Architecture") == null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "Memory Link Types") == null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "Layer 0 is working memory") == null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "SYSTEM:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "USER: My dog is named Rex.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "ASSISTANT: Got it, Rex.") != null);
+}
+
+/// Captures the transcript actually fed to the extraction LLM so the
+/// keystone end-to-end test can assert what crossed the extractor
+/// boundary. The extraction transcript is `request.messages[1].content`
+/// (messages[0] is the extraction *instruction* system prompt, which is
+/// unrelated to the conversation window).
+const TranscriptCapturingProvider = struct {
+    last_extraction_input: ?[]u8 = null,
+    alloc: std.mem.Allocator,
+
+    fn chatWithSystem(_: *anyopaque, _: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return "";
+    }
+
+    fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        const self: *TranscriptCapturingProvider = @ptrCast(@alignCast(ptr));
+        // The conversation transcript is the user message (index 1).
+        if (request.messages.len >= 2) {
+            if (self.last_extraction_input) |old| self.alloc.free(old);
+            self.last_extraction_input = self.alloc.dupe(u8, request.messages[1].content) catch null;
+        }
+        // Return a benign empty extraction so persist short-circuits
+        // (zero edges) — this test asserts on the INPUT, not the output.
+        return .{
+            .content = try allocator.dupe(u8, "{\"entities\":[],\"edges\":[]}"),
+        };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+    fn getName(_: *anyopaque) []const u8 {
+        return "transcript-capturing";
+    }
+    fn deinit(_: *anyopaque) void {}
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinit,
+    };
+
+    fn provider(self: *TranscriptCapturingProvider) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+};
+
+test "brain-leak keystone (e2e): session-end window with scaffold history[0] never reaches the extractor" {
+    // The actual #48 root cause shape: extractAtBoundary is handed the
+    // WHOLE session-end history whose history[0] is the live system
+    // prompt scaffold. This drives the full pipeline (chunk → episode
+    // transcript → extraction LLM call) and asserts the scaffold never
+    // crosses the extractor boundary, while a genuine user/assistant
+    // fact in the same window does.
+    const allocator = std.testing.allocator;
+    var prov = TranscriptCapturingProvider{ .alloc = allocator };
+    defer if (prov.last_extraction_input) |s| allocator.free(s);
+
+    const scaffold_system =
+        \\You are Zaki.
+        \\## Brain Architecture
+        \\Layer 0 is working memory. Layer 1 is durable. Distillation extraction runs at session end.
+        \\## Memory Link Types
+        \\relationship, preference, usage, supersession
+    ;
+    const window = [_]ChatMessage{
+        .{ .role = .system, .content = scaffold_system }, // history[0] — the leak source
+        .{ .role = .user, .content = "I just adopted a cat named Mochi." },
+        .{ .role = .assistant, .content = "Congrats on adopting Mochi!" },
+    };
+
+    const ctx = ExtractionContext{
+        .extract_provider = prov.provider(),
+        .extract_model = "extract-model",
+        .judge_model = "",
+        .enable_hydration = false, // extraction-only; isolates the keystone
+    };
+    const result = extractAtBoundary(allocator, &window, ctx);
+    defer result.deinit(allocator);
+
+    // The extractor WAS called and we captured exactly what it saw.
+    try std.testing.expect(prov.last_extraction_input != null);
+    const seen = prov.last_extraction_input.?;
+
+    // ZERO scaffold content crossed the extractor boundary.
+    try std.testing.expect(std.mem.indexOf(u8, seen, "Brain Architecture") == null);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "Memory Link Types") == null);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "Layer 0 is working memory") == null);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "supersession") == null);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "SYSTEM:") == null);
+    // The genuine fact in the SAME window IS present for extraction.
+    try std.testing.expect(std.mem.indexOf(u8, seen, "I just adopted a cat named Mochi.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "Mochi") != null);
 }
 
 test "extractAtBoundary skip path: empty window" {
