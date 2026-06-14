@@ -6,8 +6,9 @@
 //! session-end memory-lifecycle round-trip against a real postgres.
 //!
 //!   1. G16 (WM-CROSS-SESSION) — a high-importance `active_goal` working-
-//!      memory slot is promoted to a `durable_fact/transient_goal/...` row
-//!      by `promotion.promoteWMToDurableAtSessionEnd`, and that row is
+//!      memory slot is promoted to a `durable_fact/active_goal/...` row
+//!      (P8 slot-type-branched key) by
+//!      `promotion.promoteWMToDurableAtSessionEnd`, and that row is
 //!      verified to actually exist in postgres by reading it back.
 //!
 //!   2. G5 (REFLECTION-STORE) — a `reflection.ReflectionTrail` carrying
@@ -121,9 +122,16 @@ test "v1.14.18-B G5+G16: WM-slot promotion + reflection capture round-trip to po
     // Exactly one promotable slot was seeded → exactly one promotion.
     try std.testing.expectEqual(@as(u32, 1), prom_result.count());
 
+    // P8 (memory-phase-0.5): the promotion key is branched by slot_type —
+    // `durable_fact/{slot_type}/{session_id}/{slot_id}` — so each promotable
+    // kind lands in its own queryable namespace. The seeded slot above is an
+    // `active_goal`, so its durable key carries the `active_goal` segment.
+    // (Pre-P8 this was the flat constant `transient_goal`, which discarded
+    // the discriminator; see promotion.zig `promotionKey` + the commands.zig
+    // session-end wire-site comment.)
     const expected_key = try std.fmt.allocPrint(
         allocator,
-        "durable_fact/transient_goal/{s}/{d}",
+        "durable_fact/active_goal/{s}/{d}",
         .{ session_id, slot_id },
     );
     defer allocator.free(expected_key);
