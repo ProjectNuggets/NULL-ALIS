@@ -984,6 +984,21 @@ pub const MemorySearchConfig = struct {
     enabled: bool = true,
     provider: []const u8 = "none",
     model: []const u8 = "text-embedding-3-small",
+    /// SOURCE DEFAULT — fallback only. MUST be overridden by deployed config to
+    /// match the pgvector column dimension of the target schema. Production uses
+    /// e5-large (dimensions: 1024); the OpenAI text-embedding-3-small default
+    /// here (1536) is for dev/local setups and is the wrong value for a
+    /// pgvector deployment that was initialized with dim=1024.
+    ///
+    /// A dimension mismatch is caught fail-closed at boot by
+    /// store_pgvector.PgvectorVectorStore.ensureSchema (error.PgVectorDimensionMismatch)
+    /// — the server refuses to start rather than silently writing zero-recall
+    /// vectors. Override with NULLALIS_PGVECTOR_ALLOW_DESTRUCTIVE_REBUILD=1
+    /// only if you accept full embedding data loss.
+    ///
+    /// Do NOT change this default to 1024: that would mask misconfiguration for
+    /// OpenAI/local setups while adding nothing — the fail-closed guard already
+    /// catches mismatches safely.
     dimensions: u32 = 1536,
     fallback_provider: []const u8 = "none",
     store: MemoryVectorStoreConfig = .{},

@@ -2905,6 +2905,18 @@ pub fn initRuntimeWithOptions(
 
     const embed_name: []const u8 = if (embed_provider) |ep_| ep_.getName() else "none";
 
+    // T1 boot-time visibility: log the resolved embedding config so operators
+    // can immediately verify the live embedder is the intended model/dimension,
+    // not an accidental fallback. Dimension mismatch against pgvector is already
+    // caught fail-closed by store_pgvector.PgVectorDimensionMismatch — this log
+    // is observability-only (no duplicate guard).
+    log.info("embedding config: provider={s} model={s} dimensions={d} pgvector_table={s}", .{
+        config.search.provider,
+        config.search.model,
+        config.search.dimensions,
+        config.search.store.pgvector_table,
+    });
+
     return .{
         .memory = instance.memory,
         .session_store = instance.session_store,
