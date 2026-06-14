@@ -543,6 +543,26 @@ pub const Agent = struct {
     /// threaded through to JudgeContext so persistExtracted honors
     /// the operator-set value. Default true preserves M2 behavior.
     extraction_cardinality_fastpath: bool = true,
+    /// P3 (memory-phase-0.5) — semantic type-routing gate, threaded to
+    /// JudgeContext so persistExtracted routes memory_type by fact meaning
+    /// (custom: open_loop/decision/preference/person) instead of by
+    /// attribution. Default true. See config_types.semantic_type_routing_enabled.
+    semantic_type_routing_enabled: bool = true,
+    /// Phase 0.5 (memory-phase-0.5) — typed-views READ gate, threaded to
+    /// memory_loader via LoadTurnMemoryOptions so the four typed context
+    /// blocks (<preferences>/<open_loops>/<decisions>/<people>) are assembled
+    /// over the P3-typed memories. Default true. See
+    /// config_types.typed_views_enabled.
+    typed_views_enabled: bool = true,
+    /// P4 (memory-phase-0.5) — canonical-continuity-summary gate, threaded to
+    /// the commands gating predicate (`shouldUseDeterministicSessionSummary`)
+    /// so the two LIVE in-conversation boundary triggers
+    /// (`summary_seed:auto`/`compaction:auto`) take the REAL LLM-summarizer
+    /// path instead of the deterministic template. These triggers run
+    /// off-thread (persistSessionCheckpointAsync), so the LLM call does not
+    /// block the user turn. Default true. See
+    /// config_types.canonical_continuity_summary_enabled.
+    canonical_continuity_summary_enabled: bool = true,
     /// V1.14.7 — extraction trigger gates (per-turn enqueue, memory nudge,
     /// skills nudge). Defaults preserve V1.14.6 behavior. C2 wires structured
     /// extraction into compaction; C3 flips defaults to disabled and deletes
@@ -1460,6 +1480,9 @@ pub const Agent = struct {
             // V1.14.12 (M2 review CRITICAL) — propagate the cardinality
             // fast-path flag so Pass C judge_ctx honors operator config.
             .extraction_cardinality_fastpath = self.extraction_cardinality_fastpath,
+            // P3 — propagate the semantic type-routing flag so Pass C
+            // judge_ctx routes memory_type by fact meaning per operator config.
+            .semantic_type_routing_enabled = self.semantic_type_routing_enabled,
         };
     }
 
@@ -6774,8 +6797,17 @@ pub const Agent = struct {
         const latest = mem.get(self.allocator, latest_key) catch return;
         if (latest) |entry| {
             var owned_entry = entry;
-            owned_entry.deinit(self.allocator);
-            return;
+            defer owned_entry.deinit(self.allocator);
+            // P4c: self-heal. If the existing summary_latest is the shallow
+            // deterministic-fallback skeleton (turn-1 thin summary), DON'T
+            // treat it as final — re-fire summary_seed so a richer session
+            // upgrades it to a canonical LLM summary. A canonical existing
+            // summary is left untouched (the early return below). The
+            // promotion guard (shouldPromoteSummaryLatest) still prevents a
+            // fresh fallback from overwriting an existing canonical, so this
+            // re-fire only ever upgrades, never downgrades.
+            if (!commands.summaryLatestIsFallback(owned_entry.content)) return;
+            // fall through to re-summarize
         }
 
         // V1.14.10 A — async (see refreshDurableContinuityAfterCompaction
@@ -6784,6 +6816,9 @@ pub const Agent = struct {
         // contention on a path that didn't need to block. No truth-
         // flag to update on this path (caller doesn't read a return
         // value), so we just discard the spawn success bool.
+        //
+        // P4c: ALSO fires when the existing summary_latest is fallback-quality
+        // (re-summarize to upgrade it as the session gets richer).
         _ = commands.persistSessionCheckpointAsync(self, "summary_seed:auto");
     }
 
@@ -8987,11 +9022,15 @@ test "persistSessionCheckpoint fallback prefers compaction carrier from actual h
     try std.testing.expect(found_timeline_summary);
 }
 
-test "persistSessionCheckpoint summary_seed auto uses deterministic summary without provider call" {
+test "persistSessionCheckpoint summary_seed auto uses deterministic summary without provider call (P4 flag OFF)" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
 
+    // P4: with the canonical-continuity flag OFF, summary_seed:auto must use
+    // the deterministic template and NEVER reach summary_provider.chat — the
+    // failing provider proves no provider call happens on this path.
+    agent.canonical_continuity_summary_enabled = false;
     agent.provider = .{ .ptr = @ptrCast(&test_failing_summary_provider_state), .vtable = &test_failing_summary_provider_vtable };
 
     var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
@@ -9027,6 +9066,10 @@ test "persistSessionCheckpoint blocks fallback overwrite of existing canonical s
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
 
+    // P4: pin the deterministic (fallback-quality) path so the promotion-block
+    // invariant is exercised directly. Flag OFF → summary_seed:auto writes a
+    // fallback-tier summary which must NOT overwrite the existing canonical.
+    agent.canonical_continuity_summary_enabled = false;
     agent.provider = .{ .ptr = @ptrCast(&test_failing_summary_provider_state), .vtable = &test_failing_summary_provider_vtable };
 
     var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");

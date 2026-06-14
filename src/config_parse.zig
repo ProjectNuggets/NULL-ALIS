@@ -1001,6 +1001,23 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("extraction_coverage_filter_enabled")) |v| {
                 if (v == .bool) self.agent.extraction_coverage_filter_enabled = v.bool;
             }
+            // P3 (memory-phase-0.5) — wire the semantic type-routing gate so
+            // operators can disable it via config.json (default ON).
+            if (ag.object.get("semantic_type_routing_enabled")) |v| {
+                if (v == .bool) self.agent.semantic_type_routing_enabled = v.bool;
+            }
+            // Phase 0.5 (memory-phase-0.5) — wire the typed-views READ gate so
+            // operators can disable the four typed context blocks via
+            // config.json (default ON).
+            if (ag.object.get("typed_views_enabled")) |v| {
+                if (v == .bool) self.agent.typed_views_enabled = v.bool;
+            }
+            // P4 (memory-phase-0.5) — wire the canonical-continuity-summary
+            // gate so operators can disable the per-boundary LLM summarizer
+            // (cost/latency rollback) via config.json (default ON).
+            if (ag.object.get("canonical_continuity_summary_enabled")) |v| {
+                if (v == .bool) self.agent.canonical_continuity_summary_enabled = v.bool;
+            }
             // C4 (brain-graph activation) — wire the nested [agent.extraction]
             // ExtractionConfig block. Previously this struct had NO parser, so
             // its "flip via TOML" docstring silently no-op'd. The session-end
@@ -1258,6 +1275,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                                 if (v == .float) self.memory.search.query.min_score = v.float;
                                 if (v == .integer) self.memory.search.query.min_score = @floatFromInt(v.integer);
                             }
+                            if (query.get("min_cosine")) |v| {
+                                if (v == .float) self.memory.search.query.min_cosine = v.float;
+                                if (v == .integer) self.memory.search.query.min_cosine = @floatFromInt(v.integer);
+                            }
                             if (query.get("merge_strategy")) |v| if (v == .string) {
                                 self.memory.search.query.merge_strategy = try self.allocator.dupe(u8, v.string);
                             };
@@ -1481,6 +1502,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     };
                     if (lc.get("auto_hydrate")) |v| if (v == .bool) {
                         self.memory.lifecycle.auto_hydrate = v.bool;
+                    };
+                    if (lc.get("working_memory_retention_days")) |v| if (v == .integer) {
+                        self.memory.lifecycle.working_memory_retention_days = @intCast(v.integer);
                     };
                 }
             }

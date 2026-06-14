@@ -19,9 +19,10 @@
 //! 1. **Reject heuristics** — drop facts whose `predicate` is in the
 //!    rejected-predicate blacklist (covers cases where the LLM emitted
 //!    meta-narrative despite the prompt's anti-meta rules).
-//! 2. **MD5 content_hash dedup** — if a memory with identical
+//! 2. **SHA-256 content_hash dedup** — if a memory with identical
 //!    normalized content already exists for this user, skip silently
-//!    (Mem0-style pre-filter, gap #13 from audit).
+//!    (Mem0-style pre-filter, gap #13 from audit). Previously used MD5
+//!    (dead layer — 32-char hex can never match a 64-char SHA-256 column).
 //! 3. **Cosine similarity dedup** — if cosine vs recent rows in same
 //!    session > 0.92 (D4 mitigation), skip.
 //! 4. **Key derivation** — `extracted_<unix_ns>_<hex8>` shape so
@@ -224,6 +225,26 @@ pub const JudgeContext = struct {
     /// (persistExtracted ignored it). Operators couldn't disable M2 via
     /// config — only via code revert. This restores the contract.
     cardinality_fastpath_enabled: bool = true,
+    /// P3 (memory-phase-0.5) — semantic type-routing gate. When TRUE
+    /// (default), the durable `memory_type` of each extracted fact is
+    /// routed by what the fact MEANS (open_loop / decision / preference /
+    /// person custom: types, derived from `classifyPredicate`) rather than
+    /// by WHO said it. When FALSE, the persist site falls back to the
+    /// legacy `categoryForAttribution(attributed_to)` (user→core, else→
+    /// daily) — the EXACT pre-P3 behavior.
+    ///
+    /// Wired from `agent.semantic_type_routing_enabled` config through the
+    /// same caller chain as `cardinality_fastpath_enabled`. Default true.
+    ///
+    /// NOTE (P3 review): the persist-site gate no longer reads this field.
+    /// The off-switch is honored via an explicit `semantic_type_routing_enabled`
+    /// parameter on `persistExtracted`, which is ALWAYS present — so the flag
+    /// works even on no-judge tenants (where there is no JudgeContext to read).
+    /// This field is retained for symmetry with `cardinality_fastpath_enabled`
+    /// and so construction sites that build a JudgeContext from the same config
+    /// stay uniform; callers forward the same configured value into the
+    /// explicit persist parameter.
+    semantic_type_routing_enabled: bool = true,
 };
 
 /// V1.6 commit 8 — optional embedding provider for entity coreference.
@@ -269,6 +290,11 @@ const REJECTED_PREDICATES = [_][]const u8{
     "IS_UNKNOWN",
     "EXPRESSED_READINESS",
     "INITIATED_CONVERSATION",
+    // P7 — entity_pipeline speaker hub predicate (RENAMED from "MENTIONED").
+    // Keep it rejected at this write-time defense-in-depth filter too, so the
+    // gateway blacklist (gateway.isRejectedExtractionPredicate) and this list
+    // stay in sync — the dense user→entity hub must not render or feed PPR.
+    "USER_MENTIONED",
 };
 
 inline fn isRejectedPredicate(predicate: []const u8) bool {
@@ -278,12 +304,15 @@ inline fn isRejectedPredicate(predicate: []const u8) bool {
     return false;
 }
 
-/// Compute MD5 hex of normalized content for V1.6 5b.3 dedup pre-filter.
-/// Mirrors `zaki_state.computeContentHash` semantics so the hash matches
-/// what the upsert path stores in the `content_hash` column.
-fn computeMd5Hex(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
-    var digest: [16]u8 = undefined;
-    std.crypto.hash.Md5.hash(content, &digest, .{});
+/// Compute SHA-256 hex of content for the V1.6 5b.3 dedup pre-filter.
+/// Produces a 64-char hex string that matches the `content_hash` column,
+/// which is populated by `zaki_state.computeContentHash` (also SHA-256).
+/// Previous implementation used MD5 (32-char hex), making it impossible
+/// for the dedup query to ever match a stored hash — the layer was
+/// silently dead. Fixed in P1 of the memory-phase-0.5 patch series.
+fn computeContentHashHex(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(content, &digest, .{});
     const out = try allocator.alloc(u8, digest.len * 2);
     _ = security_secrets.hexEncode(&digest, out);
     return out;
@@ -407,6 +436,216 @@ pub fn parseExtractedJson(
 fn categoryForAttribution(attributed_to: []const u8) memory_root.MemoryCategory {
     if (std.mem.eql(u8, attributed_to, "user")) return .core;
     return .daily;
+}
+
+/// P3 (memory-phase-0.5) — route a memory's durable `memory_type` by what
+/// the fact MEANS (its predicate semantics), not by WHO said it.
+///
+/// Uses the signals `classifyPredicate` already computes for the
+/// predicate:
+///   - slot_type == "open_loop"          → custom:"open_loop"
+///   - slot_type == "decision"           → custom:"decision"
+///   - link_type == .preference          → custom:"preference"
+///   - link_type == .relationship        → custom:"person"
+///   - otherwise → legacy categoryForAttribution(attributed_to)
+///     (user→core, else→daily)
+///
+/// The custom strings are `memory_root.MemoryCategory.custom` free-text
+/// values — `toString` passes them straight to the `memory_type` column,
+/// and the read path (`memoryTypeToCategory` / `MemoryCategory.fromString`)
+/// maps any unknown string back to `.custom`, so this needs no enum change
+/// and no DB migration. The strings are static literals (no alloc/free).
+///
+/// Priority note: slot_type checks come before link_type. The only
+/// predicates carrying BOTH a slot_type and a non-attribute link_type are
+/// none in the current maps (slot-type predicates all default to
+/// .attribute link), so order is not load-bearing today, but slot signals
+/// (open_loop/decision) are the more specific intent and win by design.
+///
+/// `attributed_to` is NOT consulted for the semantic types — it remains
+/// recorded as provenance in the row metadata (buildExtractionMetadata
+/// emits `metadata.attributed_to`) and is still the fallback router for
+/// facts with no distinctive semantic signal.
+pub fn categoryForSemantics(class: PredicateClass, attributed_to: []const u8) memory_root.MemoryCategory {
+    if (class.slot_type) |st| {
+        if (std.mem.eql(u8, st, working_memory.SlotType.open_loop)) return .{ .custom = "open_loop" };
+        if (std.mem.eql(u8, st, working_memory.SlotType.decision)) return .{ .custom = "decision" };
+    }
+    switch (class.link_type) {
+        .preference => return .{ .custom = "preference" },
+        .relationship => return .{ .custom = "person" },
+        else => {},
+    }
+    // No distinctive semantic signal — fall back to attribution routing.
+    return categoryForAttribution(attributed_to);
+}
+
+/// P4d (memory-phase-0.5) — public routing entry for the legacy session-end
+/// `durable_fact` loop (commands.zig). That loop hardcoded `.core` for every
+/// fact, so a preference/decision/person learned ONLY at session end never
+/// got a semantic `memory_type` and never surfaced in the typed
+/// <preferences>/<people>/etc. views.
+///
+/// Mirrors the P3 persistExtracted routing (line ~1428): when
+/// `semantic_type_routing_enabled` is ON (default), route by what the fact
+/// MEANS via `categoryForSemantics(classifyPredicate(predicate), …)`; OFF →
+/// legacy `categoryForAttribution`. `attributed_to` may be empty (session-end
+/// facts often lack it) — categoryForAttribution treats non-"user" as the
+/// daily fallback, so an empty attribution with no semantic signal lands the
+/// same `.daily`/`.core` shape the loop relied on. Prose-only facts (no
+/// predicate) should NOT call this — the caller keeps `.core` for them.
+pub fn categoryForSessionEndFact(
+    predicate: []const u8,
+    attributed_to: []const u8,
+    semantic_type_routing_enabled: bool,
+) memory_root.MemoryCategory {
+    if (semantic_type_routing_enabled)
+        return categoryForSemantics(classifyPredicate(predicate), attributed_to);
+    return categoryForAttribution(attributed_to);
+}
+
+// ── C0 (memory-phase-0.5) — one-time backfill decision helpers ───────────
+//
+// The prior patches (P1/P3/P4/P7) fix NEW writes. C0 is the operator-triggered
+// backfill that repairs EXISTING rows for ALL users. These two pure functions
+// are the testable core of the re-type and re-entity-type decisions; the
+// Manager-side SQL loop (`zaki_state.phase05Backfill`) calls them per row.
+// Keeping the decision logic here — beside the write-path helpers it mirrors —
+// means the backfill can NEVER drift from how new writes are typed.
+
+/// C0 op 1 — should an EXISTING memory row be re-typed?
+///
+/// Only rows still carrying the legacy untyped defaults (`core`/`daily`) are
+/// candidates: a row already routed to a semantic type (preference/decision/
+/// person/open_loop/…) by P3 must be left exactly as-is so a second backfill
+/// run is a no-op (idempotence). The new type is computed with the SAME logic
+/// as new writes — `categoryForSemantics(classifyPredicate(predicate),
+/// attributed_to)` — so re-typing converges on the write path's answer.
+///
+/// Returns the new `memory_type` string (a static literal owned by the
+/// MemoryCategory union — never allocated) ONLY when ALL hold:
+///   - `current_type` is `core` or `daily` (untyped legacy default), AND
+///   - a non-empty `predicate` is available, AND
+///   - the predicate routes to a type that DIFFERS from `current_type`.
+///
+/// Returns null (leave the row untouched) otherwise — including the
+/// already-typed case, the no-predicate case, and the "predicate routes back
+/// to the same core/daily" case (no churn). Idempotent by construction:
+/// re-running on an already-backfilled row finds `current_type` is now the
+/// semantic type → not core/daily → returns null.
+pub fn backfillMemoryType(
+    current_type: []const u8,
+    predicate: []const u8,
+    attributed_to: []const u8,
+) ?[]const u8 {
+    // Gate: only legacy untyped rows are candidates. A row already at a
+    // semantic type is left alone (idempotence + don't fight P3).
+    const is_legacy_default = std.mem.eql(u8, current_type, "core") or
+        std.mem.eql(u8, current_type, "daily");
+    if (!is_legacy_default) return null;
+    // No predicate → no semantic signal → leave untyped (spec: only re-type
+    // where a predicate is genuinely available).
+    if (predicate.len == 0) return null;
+
+    const new_type = categoryForSemantics(classifyPredicate(predicate), attributed_to).toString();
+    // No-op when the predicate routes back to the same legacy default
+    // (e.g. an `.attribute` predicate with attributed_to="user" → "core"):
+    // re-typing core→core is churn with no benefit, so report nothing.
+    if (std.mem.eql(u8, new_type, current_type)) return null;
+    return new_type;
+}
+
+/// C0 op 2 — can an EXISTING `'PROPER'` entity be upgraded to a known class
+/// from the predicate context of an edge pointing at it?
+///
+/// The only DETERMINISTIC predicate→entity-class signal in the system is the
+/// relationship family (KNOWS, MARRIED_TO, WORKS_WITH, MANAGES, …): a triple
+/// `subject <relationship-pred> object` makes the OBJECT a PERSON. This is the
+/// SAME `.relationship` signal P3 uses to route the memory to `custom:"person"`
+/// (`categoryForSemantics`), so the two stay consistent. Reuses
+/// `classifyPredicate(...).link_type` — no new vocabulary.
+///
+/// All other predicates yield null: we do NOT guess ORG/PRODUCT/PLACE/etc. from
+/// a predicate (there is no deterministic mapping; that typing is the LLM
+/// entity-pipeline's job). Returns the static "PERSON" literal or null. The
+/// caller stamps it via `upsertEntity`, whose no-clobber CASE means a stamp of
+/// "PERSON" on a row already typed PERSON is a no-op (idempotence) and a stamp
+/// can only UPGRADE — never demote a known type.
+pub fn backfillEntityTypeFromPredicate(predicate: []const u8) ?[]const u8 {
+    if (predicate.len == 0) return null;
+    return switch (classifyPredicate(predicate).link_type) {
+        .relationship => "PERSON",
+        else => null,
+    };
+}
+
+test "backfillMemoryType: legacy core/daily re-typed by semantic predicate" {
+    // PREFERS → preference (differs from core) → re-type.
+    try std.testing.expectEqualStrings(
+        "preference",
+        backfillMemoryType("core", "PREFERS", "user").?,
+    );
+    // KNOWS → person (relationship) — re-type a daily row.
+    try std.testing.expectEqualStrings(
+        "person",
+        backfillMemoryType("daily", "KNOWS", "user").?,
+    );
+    // DECIDED → decision (slot_type) — re-type.
+    try std.testing.expectEqualStrings(
+        "decision",
+        backfillMemoryType("core", "DECIDED", "user").?,
+    );
+    // TODO → open_loop (slot_type) — re-type.
+    try std.testing.expectEqualStrings(
+        "open_loop",
+        backfillMemoryType("daily", "TODO", "user").?,
+    );
+}
+
+test "backfillMemoryType: already-typed rows are left alone (idempotence)" {
+    // A row already at a semantic type is never a candidate — the second
+    // backfill run finds these and returns null.
+    try std.testing.expect(backfillMemoryType("preference", "PREFERS", "user") == null);
+    try std.testing.expect(backfillMemoryType("person", "KNOWS", "user") == null);
+    try std.testing.expect(backfillMemoryType("decision", "DECIDED", "user") == null);
+    try std.testing.expect(backfillMemoryType("open_loop", "TODO", "user") == null);
+    // conversation is also not a legacy untyped default.
+    try std.testing.expect(backfillMemoryType("conversation", "PREFERS", "user") == null);
+}
+
+test "backfillMemoryType: no predicate or same-type route → no-op" {
+    // No predicate → leave untyped.
+    try std.testing.expect(backfillMemoryType("core", "", "user") == null);
+    // An .attribute predicate with attributed_to="user" routes back to core
+    // → core==core → no churn.
+    try std.testing.expect(backfillMemoryType("core", "LIVES_IN", "user") == null);
+    // .attribute predicate with non-user attribution routes to daily → and a
+    // daily row stays daily → no churn.
+    try std.testing.expect(backfillMemoryType("daily", "LIVES_IN", "assistant") == null);
+}
+
+test "backfillMemoryType: attribute predicate can still move daily→core for user facts" {
+    // A user-attributed .attribute fact that was mis-stored as daily routes to
+    // core under the write-path logic; backfill corrects it.
+    try std.testing.expectEqualStrings(
+        "core",
+        backfillMemoryType("daily", "LIVES_IN", "user").?,
+    );
+}
+
+test "backfillEntityTypeFromPredicate: relationship predicates imply PERSON" {
+    try std.testing.expectEqualStrings("PERSON", backfillEntityTypeFromPredicate("KNOWS").?);
+    try std.testing.expectEqualStrings("PERSON", backfillEntityTypeFromPredicate("MARRIED_TO").?);
+    try std.testing.expectEqualStrings("PERSON", backfillEntityTypeFromPredicate("WORKS_WITH").?);
+    try std.testing.expectEqualStrings("PERSON", backfillEntityTypeFromPredicate("manages").?); // case-insensitive
+}
+
+test "backfillEntityTypeFromPredicate: non-relationship predicates yield null (no guessing)" {
+    try std.testing.expect(backfillEntityTypeFromPredicate("PREFERS") == null); // preference
+    try std.testing.expect(backfillEntityTypeFromPredicate("USES") == null); // usage
+    try std.testing.expect(backfillEntityTypeFromPredicate("LIVES_IN") == null); // attribute
+    try std.testing.expect(backfillEntityTypeFromPredicate("ATTENDED") == null); // episode
+    try std.testing.expect(backfillEntityTypeFromPredicate("") == null);
 }
 
 /// V1.6 commit 7 (Gap 2 from memory pipeline handoff): deterministic key
@@ -573,28 +812,101 @@ fn buildExtractionMetadata(
     return buf.toOwnedSlice(allocator);
 }
 
-/// V1.7a-5 (spec seam 3) — map an extraction-time `predicate` (the SVO
-/// triple verb, e.g. PREFERS, REPLACES, USED_FOR) to its high-level
-/// `LinkType` category for FE rendering + agent-side reasoning.
+/// P9 (memory-phase-0.5) — UNIFIED predicate classification.
 ///
-/// The mapping is OPINIONATED but conservative: predicates we recognize
-/// route to specific categories; unrecognized predicates default to
-/// `.attribute` (the broadest category) AND log an info so production
-/// telemetry surfaces gaps in our vocabulary. Adding a new predicate
-/// to a category is a one-line patch in this function.
+/// Historically two disjoint allowlists classified the same `predicate`:
+///   - `predicateToSlotType` → working-memory `SlotType` string (or null)
+///   - `linkTypeForPredicate` → high-level `LinkType` category
+/// They were separate functions that could silently disagree (e.g. a
+/// predicate gaining a slot_type but never a matching link_type, or vice
+/// versa). `classifyPredicate` is the single source of truth that returns
+/// BOTH signals from ONE pass; the two legacy functions now delegate here
+/// so the maps can never drift apart again.
 ///
-/// Single source of truth — every extraction write routes through here.
-/// Comparison is case-INsensitive on ASCII so `"PREFERS"`, `"prefers"`,
-/// and `"Prefers"` all map identically.
-pub fn linkTypeForPredicate(predicate: []const u8) memory_root.LinkType {
-    // Normalize to uppercase for compare. Bounded buffer matches longest
-    // expected predicate (~32 chars; predicates with COMPLEX_NAMES_LIKE_THIS
-    // top out around 24 chars in practice). Longer → fall through to default.
+/// NOTE — name disambiguation: this is DISTINCT from
+/// `edge_resolution.classifyPredicate`, which returns a
+/// `PredicateCardinality` (set-valued vs single-valued) for the judge
+/// fast-path. Different concern, different return type; both names are
+/// qualified at every call site.
+///
+/// Behavior contract (must remain byte-for-byte identical to the two
+/// legacy maps):
+///   - `slot_type` is matched case-INsensitively with NO length cap
+///     (mirrors the old `predicateToSlotType`, which used
+///     `std.ascii.eqlIgnoreCase` directly). null = no WM-slot promotion.
+///   - `link_type` is matched case-INsensitively via an uppercase
+///     normalize into a bounded 64-byte buffer; predicates longer than
+///     the buffer fall through to `.attribute` (mirrors the old
+///     `linkTypeForPredicate`). Default for any unrecognized predicate is
+///     `.attribute`.
+///
+/// This function does NOT log — logging (the `extraction.linktype_map_default`
+/// info on oversize / default) is preserved by the `linkTypeForPredicate`
+/// wrapper so production telemetry is unchanged.
+pub const PredicateClass = struct {
+    /// Working-memory slot type (a `working_memory.SlotType.*` string), or
+    /// null when the predicate does not warrant WM promotion.
+    slot_type: ?[]const u8,
+    /// High-level relationship category for the memory's entity edge.
+    link_type: memory_root.LinkType,
+};
+
+pub fn classifyPredicate(predicate: []const u8) PredicateClass {
+    return .{
+        .slot_type = slotTypeForPredicate(predicate),
+        .link_type = linkTypeForPredicateInner(predicate),
+    };
+}
+
+/// Pure slot-type lookup — no length cap, case-insensitive. Extracted from
+/// the legacy `predicateToSlotType` body so `classifyPredicate` and the
+/// `predicateToSlotType` wrapper share ONE allowlist.
+fn slotTypeForPredicate(predicate: []const u8) ?[]const u8 {
+    // Open loops — pending actions the user mentioned.
+    if (std.ascii.eqlIgnoreCase(predicate, "TODO")) return working_memory.SlotType.open_loop;
+    if (std.ascii.eqlIgnoreCase(predicate, "WILL_DO")) return working_memory.SlotType.open_loop;
+    if (std.ascii.eqlIgnoreCase(predicate, "REMINDS_ME_TO")) return working_memory.SlotType.open_loop;
+    if (std.ascii.eqlIgnoreCase(predicate, "NEEDS_TO")) return working_memory.SlotType.open_loop;
+    if (std.ascii.eqlIgnoreCase(predicate, "PROMISED")) return working_memory.SlotType.open_loop;
+    if (std.ascii.eqlIgnoreCase(predicate, "OPEN_LOOP")) return working_memory.SlotType.open_loop;
+
+    // Active goals — current projects / objectives.
+    if (std.ascii.eqlIgnoreCase(predicate, "WORKING_ON")) return working_memory.SlotType.active_goal;
+    if (std.ascii.eqlIgnoreCase(predicate, "BUILDING")) return working_memory.SlotType.active_goal;
+    if (std.ascii.eqlIgnoreCase(predicate, "GOAL")) return working_memory.SlotType.active_goal;
+    if (std.ascii.eqlIgnoreCase(predicate, "FOCUSING_ON")) return working_memory.SlotType.active_goal;
+    if (std.ascii.eqlIgnoreCase(predicate, "WANTS_TO_FINISH")) return working_memory.SlotType.active_goal;
+
+    // Decisions — committed choices.
+    if (std.ascii.eqlIgnoreCase(predicate, "DECIDED")) return working_memory.SlotType.decision;
+    if (std.ascii.eqlIgnoreCase(predicate, "CHOSE")) return working_memory.SlotType.decision;
+    if (std.ascii.eqlIgnoreCase(predicate, "PICKED")) return working_memory.SlotType.decision;
+
+    // Emotional state.
+    if (std.ascii.eqlIgnoreCase(predicate, "FEELS")) return working_memory.SlotType.emotional;
+    if (std.ascii.eqlIgnoreCase(predicate, "MENTAL_STATE")) return working_memory.SlotType.emotional;
+    if (std.ascii.eqlIgnoreCase(predicate, "STRESSED_ABOUT")) return working_memory.SlotType.emotional;
+
+    // Open questions.
+    if (std.ascii.eqlIgnoreCase(predicate, "ASKING")) return working_memory.SlotType.open_question;
+    if (std.ascii.eqlIgnoreCase(predicate, "WONDERING")) return working_memory.SlotType.open_question;
+
+    // Temporal events.
+    if (std.ascii.eqlIgnoreCase(predicate, "HAPPENS_ON")) return working_memory.SlotType.temporal;
+    if (std.ascii.eqlIgnoreCase(predicate, "SCHEDULED_FOR")) return working_memory.SlotType.temporal;
+    if (std.ascii.eqlIgnoreCase(predicate, "BIRTHDAY")) return working_memory.SlotType.temporal;
+
+    return null;
+}
+
+/// Pure link-type lookup — NO logging. The oversize/default `log.info`
+/// telemetry lives in the public `linkTypeForPredicate` wrapper so this
+/// inner function stays side-effect-free and shareable by
+/// `classifyPredicate`. Behavior (buffer size, default) matches the legacy
+/// `linkTypeForPredicate` exactly.
+fn linkTypeForPredicateInner(predicate: []const u8) memory_root.LinkType {
     var buf: [64]u8 = undefined;
-    if (predicate.len > buf.len) {
-        log.info("extraction.linktype_map_default predicate_len={d} fallback=attribute", .{predicate.len});
-        return .attribute;
-    }
+    if (predicate.len > buf.len) return .attribute;
     for (predicate, 0..) |ch, i| buf[i] = std.ascii.toUpper(ch);
     const norm = buf[0..predicate.len];
 
@@ -641,11 +953,47 @@ pub fn linkTypeForPredicate(predicate: []const u8) memory_root.LinkType {
     if (std.mem.eql(u8, norm, "JOINED")) return .episode;
     if (std.mem.eql(u8, norm, "VISITED")) return .episode;
 
-    // Default: .attribute (descriptive properties — BIRTHDAY, LIVES_IN,
-    // WORKS_AT, IS, HAS, etc.). Log so we can grow the mapping when
-    // production reveals new predicate surface forms.
-    log.info("extraction.linktype_map_default predicate={s} fallback=attribute", .{predicate});
     return .attribute;
+}
+
+/// V1.7a-5 (spec seam 3) — map an extraction-time `predicate` (the SVO
+/// triple verb, e.g. PREFERS, REPLACES, USED_FOR) to its high-level
+/// `LinkType` category for FE rendering + agent-side reasoning.
+///
+/// The mapping is OPINIONATED but conservative: predicates we recognize
+/// route to specific categories; unrecognized predicates default to
+/// `.attribute` (the broadest category) AND log an info so production
+/// telemetry surfaces gaps in our vocabulary. Adding a new predicate
+/// to a category is a one-line patch in `linkTypeForPredicateInner`.
+///
+/// P9: this is now a thin LOGGING wrapper around the shared
+/// `classifyPredicate`/`linkTypeForPredicateInner` lookup. The mapping
+/// table moved into `linkTypeForPredicateInner` (single source of truth);
+/// this wrapper preserves the legacy `extraction.linktype_map_default`
+/// telemetry on the oversize + default branches so production behavior is
+/// unchanged.
+///
+/// Single source of truth — every extraction write routes through here.
+/// Comparison is case-INsensitive on ASCII so `"PREFERS"`, `"prefers"`,
+/// and `"Prefers"` all map identically.
+pub fn linkTypeForPredicate(predicate: []const u8) memory_root.LinkType {
+    // Oversize predicates exceed the inner lookup's 64-byte normalize
+    // buffer and fall through to .attribute. Preserve the legacy
+    // oversize telemetry (logs predicate_len, not the raw string) before
+    // delegating.
+    if (predicate.len > 64) {
+        log.info("extraction.linktype_map_default predicate_len={d} fallback=attribute", .{predicate.len});
+        return .attribute;
+    }
+    const lt = linkTypeForPredicateInner(predicate);
+    // `linkTypeForPredicateInner` returns .attribute ONLY on its default
+    // branch (there are no explicit .attribute mappings), so a non-oversize
+    // input landing on .attribute is exactly the legacy default branch —
+    // emit the same telemetry the inlined map used to.
+    if (lt == .attribute) {
+        log.info("extraction.linktype_map_default predicate={s} fallback=attribute", .{predicate});
+    }
+    return lt;
 }
 
 test "linkTypeForPredicate maps known predicates correctly" {
@@ -668,6 +1016,263 @@ test "linkTypeForPredicate handles oversize input without panic" {
     // 65 chars — exceeds 64-byte normalize buffer; falls through to default.
     const huge = "A" ** 65;
     try std.testing.expectEqual(memory_root.LinkType.attribute, linkTypeForPredicate(huge));
+}
+
+// ── P9 parity: classifyPredicate is the single source of truth ────────
+//
+// This test pins the behavior-preserving contract for the P9 refactor.
+// `Case` enumerates a representative predicate for EVERY branch of BOTH
+// legacy maps (gathered by reading the pre-refactor bodies of
+// `predicateToSlotType` and `linkTypeForPredicate` in full), plus the
+// case-insensitivity, empty, and oversize edge cases. For each:
+//   - `classifyPredicate(p).slot_type` MUST equal the EXPECTED legacy
+//     `predicateToSlotType(p)` value, and
+//   - `classifyPredicate(p).link_type` MUST equal the EXPECTED legacy
+//     `linkTypeForPredicate(p)` value, and
+//   - the two delegating wrappers MUST agree with `classifyPredicate`.
+const ParityCase = struct {
+    predicate: []const u8,
+    want_slot: ?[]const u8,
+    want_link: memory_root.LinkType,
+};
+
+test "P9 parity: classifyPredicate matches both legacy maps for every branch" {
+    const WM = working_memory.SlotType;
+    const cases = [_]ParityCase{
+        // ── link_type: preference branch ──
+        .{ .predicate = "PREFERS", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "LIKES", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "HATES", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "AVOIDS", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "FAVORS", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "DISLIKES", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "ENJOYS", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "VALUES", .want_slot = null, .want_link = .preference },
+        // ── link_type: supersession branch ──
+        .{ .predicate = "REPLACES", .want_slot = null, .want_link = .supersession },
+        .{ .predicate = "USED_TO_BE", .want_slot = null, .want_link = .supersession },
+        .{ .predicate = "FORMERLY", .want_slot = null, .want_link = .supersession },
+        .{ .predicate = "PREVIOUSLY", .want_slot = null, .want_link = .supersession },
+        .{ .predicate = "USED_TO_PREFER", .want_slot = null, .want_link = .supersession },
+        .{ .predicate = "USED_TO_USE", .want_slot = null, .want_link = .supersession },
+        // ── link_type: relationship branch ──
+        .{ .predicate = "KNOWS", .want_slot = null, .want_link = .relationship },
+        .{ .predicate = "WORKS_WITH", .want_slot = null, .want_link = .relationship },
+        .{ .predicate = "MARRIED_TO", .want_slot = null, .want_link = .relationship },
+        .{ .predicate = "FRIENDS_WITH", .want_slot = null, .want_link = .relationship },
+        .{ .predicate = "MANAGES", .want_slot = null, .want_link = .relationship },
+        .{ .predicate = "REPORTS_TO", .want_slot = null, .want_link = .relationship },
+        .{ .predicate = "COLLABORATES_WITH", .want_slot = null, .want_link = .relationship },
+        .{ .predicate = "RELATED_TO", .want_slot = null, .want_link = .relationship },
+        // ── link_type: usage branch ──
+        .{ .predicate = "USED_FOR", .want_slot = null, .want_link = .usage },
+        .{ .predicate = "USES", .want_slot = null, .want_link = .usage },
+        .{ .predicate = "OWNS", .want_slot = null, .want_link = .usage },
+        .{ .predicate = "DEPENDS_ON", .want_slot = null, .want_link = .usage },
+        .{ .predicate = "BUILDS_WITH", .want_slot = null, .want_link = .usage },
+        .{ .predicate = "DEPLOYS_TO", .want_slot = null, .want_link = .usage },
+        // ── link_type: episode branch ──
+        .{ .predicate = "HAPPENED_ON", .want_slot = null, .want_link = .episode },
+        .{ .predicate = "ATTENDED", .want_slot = null, .want_link = .episode },
+        .{ .predicate = "OCCURRED_AT", .want_slot = null, .want_link = .episode },
+        .{ .predicate = "JOINED", .want_slot = null, .want_link = .episode },
+        .{ .predicate = "VISITED", .want_slot = null, .want_link = .episode },
+        // ── slot_type: open_loop branch (all unmapped link → .attribute) ──
+        .{ .predicate = "TODO", .want_slot = WM.open_loop, .want_link = .attribute },
+        .{ .predicate = "WILL_DO", .want_slot = WM.open_loop, .want_link = .attribute },
+        .{ .predicate = "REMINDS_ME_TO", .want_slot = WM.open_loop, .want_link = .attribute },
+        .{ .predicate = "NEEDS_TO", .want_slot = WM.open_loop, .want_link = .attribute },
+        .{ .predicate = "PROMISED", .want_slot = WM.open_loop, .want_link = .attribute },
+        .{ .predicate = "OPEN_LOOP", .want_slot = WM.open_loop, .want_link = .attribute },
+        // ── slot_type: active_goal branch ──
+        .{ .predicate = "WORKING_ON", .want_slot = WM.active_goal, .want_link = .attribute },
+        .{ .predicate = "BUILDING", .want_slot = WM.active_goal, .want_link = .attribute },
+        .{ .predicate = "GOAL", .want_slot = WM.active_goal, .want_link = .attribute },
+        .{ .predicate = "FOCUSING_ON", .want_slot = WM.active_goal, .want_link = .attribute },
+        .{ .predicate = "WANTS_TO_FINISH", .want_slot = WM.active_goal, .want_link = .attribute },
+        // ── slot_type: decision branch ──
+        .{ .predicate = "DECIDED", .want_slot = WM.decision, .want_link = .attribute },
+        .{ .predicate = "CHOSE", .want_slot = WM.decision, .want_link = .attribute },
+        .{ .predicate = "PICKED", .want_slot = WM.decision, .want_link = .attribute },
+        // ── slot_type: emotional branch ──
+        .{ .predicate = "FEELS", .want_slot = WM.emotional, .want_link = .attribute },
+        .{ .predicate = "MENTAL_STATE", .want_slot = WM.emotional, .want_link = .attribute },
+        .{ .predicate = "STRESSED_ABOUT", .want_slot = WM.emotional, .want_link = .attribute },
+        // ── slot_type: open_question branch ──
+        .{ .predicate = "ASKING", .want_slot = WM.open_question, .want_link = .attribute },
+        .{ .predicate = "WONDERING", .want_slot = WM.open_question, .want_link = .attribute },
+        // ── slot_type: temporal branch ──
+        .{ .predicate = "HAPPENS_ON", .want_slot = WM.temporal, .want_link = .attribute },
+        .{ .predicate = "SCHEDULED_FOR", .want_slot = WM.temporal, .want_link = .attribute },
+        // BIRTHDAY: temporal slot AND .attribute link — the canonical
+        // example of a predicate the two legacy maps classified
+        // DIFFERENTLY (slot ≠ null, link = default). Pins the cross-map
+        // independence the unified function must preserve.
+        .{ .predicate = "BIRTHDAY", .want_slot = WM.temporal, .want_link = .attribute },
+        // ── case-insensitivity (both maps are case-insensitive) ──
+        .{ .predicate = "prefers", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "Prefers", .want_slot = null, .want_link = .preference },
+        .{ .predicate = "todo", .want_slot = WM.open_loop, .want_link = .attribute },
+        .{ .predicate = "birthday", .want_slot = WM.temporal, .want_link = .attribute },
+        // ── unknown + empty → slot null, link .attribute ──
+        .{ .predicate = "UNKNOWN_VERB", .want_slot = null, .want_link = .attribute },
+        .{ .predicate = "WORKS_AT", .want_slot = null, .want_link = .attribute },
+        .{ .predicate = "", .want_slot = null, .want_link = .attribute },
+        // ── oversize (65 chars) → slot null, link .attribute ──
+        .{ .predicate = "A" ** 65, .want_slot = null, .want_link = .attribute },
+    };
+
+    for (cases) |tc| {
+        const got = classifyPredicate(tc.predicate);
+        // slot_type parity (optional []const u8 — compare via expectEqualSlices)
+        if (tc.want_slot) |ws| {
+            try std.testing.expect(got.slot_type != null);
+            try std.testing.expectEqualSlices(u8, ws, got.slot_type.?);
+        } else {
+            try std.testing.expect(got.slot_type == null);
+        }
+        // link_type parity
+        try std.testing.expectEqual(tc.want_link, got.link_type);
+
+        // The two delegating wrappers MUST return EXACTLY what
+        // classifyPredicate computed (behavior-preserving contract).
+        const wrapper_slot = predicateToSlotType(tc.predicate);
+        if (got.slot_type) |gs| {
+            try std.testing.expect(wrapper_slot != null);
+            try std.testing.expectEqualSlices(u8, gs, wrapper_slot.?);
+        } else {
+            try std.testing.expect(wrapper_slot == null);
+        }
+        try std.testing.expectEqual(got.link_type, linkTypeForPredicate(tc.predicate));
+    }
+}
+
+// ── P3: semantic memory_type routing ──────────────────────────────────
+//
+// categoryForSemantics routes the durable memory_type by the predicate's
+// meaning (via classifyPredicate), falling back to attribution only when
+// the fact carries no distinctive semantic signal. Asserts each of the
+// four custom: types fires for a representative predicate, the fallback
+// preserves the legacy user→core / else→daily behavior, and the routing is
+// independent of `attributed_to` for the semantic cases.
+test "P3 categoryForSemantics routes by predicate meaning, not attribution" {
+    const expectCustom = struct {
+        fn f(cat: memory_root.MemoryCategory, want: []const u8) !void {
+            try std.testing.expect(cat == .custom);
+            try std.testing.expectEqualStrings(want, cat.custom);
+        }
+    }.f;
+
+    // open_loop slot → custom:"open_loop" (regardless of speaker).
+    try expectCustom(categoryForSemantics(classifyPredicate("TODO"), "user"), "open_loop");
+    try expectCustom(categoryForSemantics(classifyPredicate("PROMISED"), "assistant"), "open_loop");
+    // decision slot → custom:"decision".
+    try expectCustom(categoryForSemantics(classifyPredicate("DECIDED"), "assistant"), "decision");
+    try expectCustom(categoryForSemantics(classifyPredicate("CHOSE"), "user"), "decision");
+    // preference link → custom:"preference".
+    try expectCustom(categoryForSemantics(classifyPredicate("PREFERS"), "assistant"), "preference");
+    try expectCustom(categoryForSemantics(classifyPredicate("LIKES"), "user"), "preference");
+    // relationship link → custom:"person".
+    try expectCustom(categoryForSemantics(classifyPredicate("KNOWS"), "user"), "person");
+    try expectCustom(categoryForSemantics(classifyPredicate("MARRIED_TO"), "assistant"), "person");
+
+    // No distinctive signal → fall back to attribution routing
+    // (user→core, else→daily) — the exact legacy behavior.
+    try std.testing.expect(categoryForSemantics(classifyPredicate("WORKS_AT"), "user").eql(.core));
+    try std.testing.expect(categoryForSemantics(classifyPredicate("WORKS_AT"), "assistant").eql(.daily));
+    try std.testing.expect(categoryForSemantics(classifyPredicate("LIVES_IN"), "undecided").eql(.daily));
+    // Unknown predicate, user-attributed → core (fallback path).
+    try std.testing.expect(categoryForSemantics(classifyPredicate("UNKNOWN_VERB"), "user").eql(.core));
+}
+
+// P4d: the public session-end routing entry used by commands.zig's legacy
+// durable_fact loop. With the flag ON it mirrors categoryForSemantics; with
+// the flag OFF it reduces to categoryForAttribution. The headline case: a
+// triple-bearing session-end PREFERS fact gets memory_type="preference"
+// (previously it was hardcoded `.core` and never surfaced in <preferences>).
+test "P4d categoryForSessionEndFact routes triple-bearing session-end facts by meaning" {
+    const expectCustom = struct {
+        fn f(cat: memory_root.MemoryCategory, want: []const u8) !void {
+            try std.testing.expect(cat == .custom);
+            try std.testing.expectEqualStrings(want, cat.custom);
+        }
+    }.f;
+
+    // Headline TDD case: triple-bearing PREFERS fact → "preference".
+    try expectCustom(categoryForSessionEndFact("PREFERS", "user", true), "preference");
+    // Other semantic types route too.
+    try expectCustom(categoryForSessionEndFact("DECIDED", "assistant", true), "decision");
+    try expectCustom(categoryForSessionEndFact("TODO", "user", true), "open_loop");
+    try expectCustom(categoryForSessionEndFact("MARRIED_TO", "user", true), "person");
+
+    // Empty attribution (common at session end) with no semantic signal → the
+    // legacy `.daily` fallback shape (else→daily). Confirms an empty string is
+    // safe.
+    try std.testing.expect(categoryForSessionEndFact("WORKS_AT", "", true).eql(.daily));
+    // Semantic signal wins even with empty attribution.
+    try expectCustom(categoryForSessionEndFact("PREFERS", "", true), "preference");
+
+    // Flag OFF → exact legacy categoryForAttribution behavior (no semantic
+    // routing). A PREFERS fact attributed to the user lands `.core`, NOT
+    // "preference" — this is the cost/latency-free rollback contract.
+    try std.testing.expect(categoryForSessionEndFact("PREFERS", "user", false).eql(.core));
+    try std.testing.expect(categoryForSessionEndFact("PREFERS", "assistant", false).eql(.daily));
+}
+
+// P3: with the flag OFF (the `else` branch at the persist site), routing
+// reduces to the legacy categoryForAttribution. This pins that the
+// fallback function itself is unchanged.
+test "P3 categoryForAttribution unchanged (flag-off path)" {
+    try std.testing.expect(categoryForAttribution("user").eql(.core));
+    try std.testing.expect(categoryForAttribution("assistant").eql(.daily));
+    try std.testing.expect(categoryForAttribution("assistant_offer").eql(.daily));
+    try std.testing.expect(categoryForAttribution("undecided").eql(.daily));
+    try std.testing.expect(categoryForAttribution("anything_else").eql(.daily));
+}
+
+// P3 review (memory-phase-0.5) — the persist-site gate's category decision,
+// extracted as a pure helper so the off-switch is testable WITHOUT a live DB
+// or a JudgeContext. This mirrors the exact expression at the persist site:
+//   category = if (enabled) categoryForSemantics(...) else categoryForAttribution(...)
+// The point being pinned: the result depends ONLY on the explicit flag, never
+// on whether a judge is present.
+fn gateCategory(
+    semantic_type_routing_enabled: bool,
+    predicate: []const u8,
+    attributed_to: []const u8,
+) memory_root.MemoryCategory {
+    return if (semantic_type_routing_enabled)
+        categoryForSemantics(classifyPredicate(predicate), attributed_to)
+    else
+        categoryForAttribution(attributed_to);
+}
+
+test "P3 review: off-switch honored on no-judge tenants (flag false → legacy routing)" {
+    // A user-attributed PREFERS fact. With routing ON it becomes
+    // custom:"preference" (semantic). With routing OFF it must reproduce
+    // the EXACT legacy categoryForAttribution result: user → .core.
+    //
+    // The gate value passed to persistExtracted is now an explicit param
+    // that is ALWAYS present (no JudgeContext required) — so an operator's
+    // flag=false takes effect even when judge == null. These assertions pin
+    // that the category is a pure function of the flag, independent of judge.
+
+    // Flag ON → semantic type (regression baseline: must be preference).
+    try std.testing.expect(gateCategory(true, "PREFERS", "user").eql(.{ .custom = "preference" }));
+
+    // Flag OFF → legacy attribution routing, identical to the pre-P3 path.
+    // This is the no-judge off-switch: the value below is what the persist
+    // site computes when judge == null AND the operator set the flag false.
+    try std.testing.expect(gateCategory(false, "PREFERS", "user").eql(.core));
+    try std.testing.expect(gateCategory(false, "PREFERS", "assistant").eql(.daily));
+    // Open-loop predicate, user-attributed: ON → custom:"open_loop";
+    // OFF → legacy (user → core), proving the override is total.
+    try std.testing.expect(gateCategory(true, "NEEDS_TO", "user").eql(.{ .custom = "open_loop" }));
+    try std.testing.expect(gateCategory(false, "NEEDS_TO", "user").eql(.core));
+    // Flag OFF must EXACTLY equal categoryForAttribution for every input,
+    // with no dependence on predicate semantics.
+    try std.testing.expect(gateCategory(false, "PREFERS", "user").eql(categoryForAttribution("user")));
+    try std.testing.expect(gateCategory(false, "NEEDS_TO", "assistant").eql(categoryForAttribution("assistant")));
 }
 
 fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
@@ -724,7 +1329,7 @@ pub const WriteOrigin = enum {
 /// LLM (today's primary path), agent tool writes, or the classifier
 /// when those land. Each fact passes through:
 ///   1. predicate blacklist (defense-in-depth against meta-narrative)
-///   2. MD5 content_hash dedup pre-filter (V1.6 5b.3 — exact-byte match)
+///   2. SHA-256 content_hash dedup pre-filter (V1.6 5b.3 — exact-byte match)
 ///   3. **V1.6 commit 6**: contradiction LLM judge when `judge` provided
 ///      a. duplicate detected → skip (treat as semantic-dup of existing row)
 ///      b. contradicted older facts → close out via setMemoryInvalidation
@@ -782,6 +1387,15 @@ pub fn persistExtracted(
     mem_rt: ?*memory_root.MemoryRuntime,
     origin: WriteOrigin,
     session_boundary_id: i64, // P3: milliTimestamp at boundary fire; 0 for non-boundary callers
+    // P3 review (memory-phase-0.5) — semantic type-routing off-switch.
+    // Threaded ALWAYS (independent of `judge`) so the config flag is honored
+    // even on no-judge tenants (graceful-degradation path). Default-ON is the
+    // caller's responsibility; every call site forwards the configured value
+    // (memory_store `self.`, runner `ctx.`) or `true` for test fixtures.
+    // Previously this was read off `JudgeContext` and defaulted to `true`
+    // whenever `judge == null`, which silently ignored an operator's
+    // flag=false on tenants with no extraction judge.
+    semantic_type_routing_enabled: bool,
 ) !PersistResult {
     var result = PersistResult{
         .written_count = 0,
@@ -821,12 +1435,12 @@ pub fn persistExtracted(
             continue;
         }
 
-        // Step 2 (V1.6 5b.3 WR-1): MD5 content_hash dedup. Compaction
+        // Step 2 (V1.6 5b.3 WR-1): SHA-256 content_hash dedup. Compaction
         // Pass C re-summarizes prior prose summaries on each trigger,
         // causing the LLM to re-emit the same atomic facts. Skip if a
         // memory with identical normalized content already exists for
         // this user. Cheap — uses idx_memories_hash directly.
-        const content_hash = computeMd5Hex(allocator, m.text) catch |err| {
+        const content_hash = computeContentHashHex(allocator, m.text) catch |err| {
             log.warn("extraction.hash_failed err={s}", .{@errorName(err)});
             result.failed_count += 1;
             continue;
@@ -1004,7 +1618,19 @@ pub fn persistExtracted(
         };
         defer allocator.free(metadata_json);
 
-        const category = categoryForAttribution(m.attributed_to);
+        // P3 (memory-phase-0.5) — route the durable memory_type by what
+        // the fact MEANS, not by who said it. Gated by the
+        // semantic_type_routing_enabled flag (default ON), now threaded as an
+        // explicit parameter that is ALWAYS present — independent of whether a
+        // JudgeContext exists. Flag OFF → exact legacy categoryForAttribution
+        // behavior on ALL tenants, including no-judge ones (P3 review fix:
+        // the off-switch previously hardcoded `true` when judge == null).
+        // `attributed_to` stays recorded as provenance in the metadata
+        // (buildExtractionMetadata above), it just no longer routes the type.
+        const category = if (semantic_type_routing_enabled)
+            categoryForSemantics(classifyPredicate(m.predicate), m.attributed_to)
+        else
+            categoryForAttribution(m.attributed_to);
 
         // V1.14.12 (Memory audit Finding 6 fix, 2026-05-19) — route
         // through the event-typed variant so memory_events.event_type
@@ -1067,13 +1693,59 @@ pub fn persistExtracted(
         // Either way: every fact about the same object lands on the same
         // graph node — the difference is whether "Helix" and "Helix editor"
         // collapse to ONE node (cosine yes, hash no).
-        const target_key = resolveEntityKey(allocator, state_mgr, user_id, m.object, coref) catch |err| blk: {
+        const target_key = resolveEntityKey(allocator, state_mgr, user_id, m.object, "PROPER", coref) catch |err| blk: {
             log.warn("extraction.entity_resolve_failed err={s} object={s}", .{ @errorName(err), m.object });
             // Final fallback: hash-only key so the edge still writes
             break :blk deriveEntityKey(allocator, m.object) catch null;
         };
+
+        // P7 (CRM substrate) — resolve the SUBJECT to an entity node too, when
+        // it is a named entity (e.g. a person), so "Tarek WORKS_AT Acme" makes
+        // Tarek a first-class graph node — not just Acme. The pre-P7 path only
+        // ever resolved the object, so a person-as-subject produced 0 typed
+        // nodes. We skip the self/speaker pseudo-subjects ("user", "I", …):
+        // those denote the conversation participants (the `user:<id>` speaker
+        // hub), not entities. Best-effort: subject-resolution failure never
+        // aborts the object edge below. `'PROPER'` here can only UPGRADE the
+        // row (the no-clobber rule in upsertEntity protects a known type).
+        const subject_key: ?[]u8 = if (isSelfPseudoSubject(m.subject))
+            null
+        else
+            resolveEntityKey(allocator, state_mgr, user_id, m.subject, "PROPER", coref) catch |err| blk: {
+                log.warn("extraction.subject_resolve_failed err={s} subject={s}", .{ @errorName(err), m.subject });
+                break :blk null;
+            };
+        defer if (subject_key) |sk| allocator.free(sk);
+
         if (target_key) |tk| {
             defer allocator.free(tk);
+
+            // P7 — emit the relationship edge between the two resolved
+            // entities so the subject node is connected, not orphaned:
+            //   subject_entity --predicate--> object_entity
+            // (e.g. Tarek --WORKS_AT--> Acme). Keeps the same predicate +
+            // provenance as the memory→object edge below. Best-effort.
+            if (subject_key) |sk| {
+                if (!std.mem.eql(u8, sk, tk)) {
+                    state_mgr.upsertMemoryEdgeRich(
+                        user_id,
+                        sk,
+                        tk,
+                        m.predicate,
+                        "extraction_classifier",
+                        m.confidence,
+                        m.text,
+                        m.temporal_anchor_unix,
+                        key,
+                        originToExtractionPass(origin),
+                        if (session_boundary_id == 0) null else session_boundary_id,
+                    ) catch |err| {
+                        log.warn("extraction.subject_edge_write_failed subject={s} target={s} predicate={s} err={s}", .{
+                            sk, tk, m.predicate, @errorName(err),
+                        });
+                    };
+                }
+            }
             // V1.14 — call the rich variant. Pass:
             //   - fact = m.text (the full sentence the LLM produced)
             //   - temporal_anchor_unix = m.temporal_anchor_unix
@@ -1187,42 +1859,13 @@ pub fn persistExtracted(
 /// round-trip. Docstring corrected at v1.14.13 Step 5 (BIRTHDAY-DOC) —
 /// previous docstring claimed BIRTHDAY did not promote; the code has
 /// always promoted it. The code is correct; the doc lied.
+///
+/// P9: now a thin delegate to the shared `classifyPredicate` (via
+/// `slotTypeForPredicate`). The allowlist moved into
+/// `slotTypeForPredicate` (single source of truth shared with the
+/// link_type map) so the two maps can never drift apart.
 fn predicateToSlotType(predicate: []const u8) ?[]const u8 {
-    // Open loops — pending actions the user mentioned.
-    if (std.ascii.eqlIgnoreCase(predicate, "TODO")) return working_memory.SlotType.open_loop;
-    if (std.ascii.eqlIgnoreCase(predicate, "WILL_DO")) return working_memory.SlotType.open_loop;
-    if (std.ascii.eqlIgnoreCase(predicate, "REMINDS_ME_TO")) return working_memory.SlotType.open_loop;
-    if (std.ascii.eqlIgnoreCase(predicate, "NEEDS_TO")) return working_memory.SlotType.open_loop;
-    if (std.ascii.eqlIgnoreCase(predicate, "PROMISED")) return working_memory.SlotType.open_loop;
-    if (std.ascii.eqlIgnoreCase(predicate, "OPEN_LOOP")) return working_memory.SlotType.open_loop;
-
-    // Active goals — current projects / objectives.
-    if (std.ascii.eqlIgnoreCase(predicate, "WORKING_ON")) return working_memory.SlotType.active_goal;
-    if (std.ascii.eqlIgnoreCase(predicate, "BUILDING")) return working_memory.SlotType.active_goal;
-    if (std.ascii.eqlIgnoreCase(predicate, "GOAL")) return working_memory.SlotType.active_goal;
-    if (std.ascii.eqlIgnoreCase(predicate, "FOCUSING_ON")) return working_memory.SlotType.active_goal;
-    if (std.ascii.eqlIgnoreCase(predicate, "WANTS_TO_FINISH")) return working_memory.SlotType.active_goal;
-
-    // Decisions — committed choices.
-    if (std.ascii.eqlIgnoreCase(predicate, "DECIDED")) return working_memory.SlotType.decision;
-    if (std.ascii.eqlIgnoreCase(predicate, "CHOSE")) return working_memory.SlotType.decision;
-    if (std.ascii.eqlIgnoreCase(predicate, "PICKED")) return working_memory.SlotType.decision;
-
-    // Emotional state.
-    if (std.ascii.eqlIgnoreCase(predicate, "FEELS")) return working_memory.SlotType.emotional;
-    if (std.ascii.eqlIgnoreCase(predicate, "MENTAL_STATE")) return working_memory.SlotType.emotional;
-    if (std.ascii.eqlIgnoreCase(predicate, "STRESSED_ABOUT")) return working_memory.SlotType.emotional;
-
-    // Open questions.
-    if (std.ascii.eqlIgnoreCase(predicate, "ASKING")) return working_memory.SlotType.open_question;
-    if (std.ascii.eqlIgnoreCase(predicate, "WONDERING")) return working_memory.SlotType.open_question;
-
-    // Temporal events.
-    if (std.ascii.eqlIgnoreCase(predicate, "HAPPENS_ON")) return working_memory.SlotType.temporal;
-    if (std.ascii.eqlIgnoreCase(predicate, "SCHEDULED_FOR")) return working_memory.SlotType.temporal;
-    if (std.ascii.eqlIgnoreCase(predicate, "BIRTHDAY")) return working_memory.SlotType.temporal;
-
-    return null;
+    return classifyPredicate(predicate).slot_type;
 }
 
 /// V1.6 commit 7 — derive a stable entity-side target key from an object
@@ -1249,11 +1892,18 @@ fn predicateToSlotType(predicate: []const u8) ?[]const u8 {
 /// Caller frees the returned slice. The returned key is the value the
 /// edge writer uses as `target_key`, so a coreference match means existing
 /// edges to that entity gain weight via the UNIQUE INDEX.
+/// P7 — `entity_type` is the class to stamp on a freshly-minted entity
+/// (`'PROPER'` for the object/subject endpoints of an extracted triple, which
+/// carry no per-endpoint type in the triple JSON). Threaded into `upsertEntity`
+/// so the no-clobber-PROPER rule applies: if the entity already exists with a
+/// real type (from the entity_pipeline path), passing `'PROPER'` here will NOT
+/// demote it.
 fn resolveEntityKey(
     allocator: std.mem.Allocator,
     state_mgr: *zaki_state.Manager,
     user_id: i64,
     object: []const u8,
+    entity_type: []const u8,
     coref: ?EntityResolution,
 ) ![]u8 {
     const c = coref orelse return deriveEntityKey(allocator, object);
@@ -1281,7 +1931,7 @@ fn resolveEntityKey(
     }
 
     // No match → create new entity.
-    const new_id = state_mgr.upsertEntity(allocator, user_id, object, embedding) catch |err| {
+    const new_id = state_mgr.upsertEntity(allocator, user_id, object, entity_type, embedding) catch |err| {
         log.warn("extraction.entity_upsert_failed err={s} object={s} — using hash fallback", .{
             @errorName(err), object,
         });
@@ -1289,6 +1939,20 @@ fn resolveEntityKey(
     };
     log.info("extraction.entity_created object={s} entity_id={s}", .{ object, new_id });
     return new_id;
+}
+
+/// P7 — is this triple subject the speaker/self pseudo-subject rather than a
+/// named graph entity? "user" / "assistant" / "I" / "me" / "you" denote the
+/// conversation participants (the speaker hub `user:<id>`), NOT first-class
+/// entity nodes. Everything else (a person's name like "Tarek", an org, …) is
+/// a named entity that SHOULD become its own resolvable node so
+/// "Tarek WORKS_AT Acme" makes Tarek a node — not just Acme. Case-insensitive.
+fn isSelfPseudoSubject(subject: []const u8) bool {
+    const self_terms = [_][]const u8{ "user", "assistant", "i", "me", "you", "we", "self" };
+    for (self_terms) |t| {
+        if (std.ascii.eqlIgnoreCase(t, subject)) return true;
+    }
+    return false;
 }
 
 /// Hash-fallback entity key for an `object` surface form.
@@ -1524,6 +2188,33 @@ test "isRejectedPredicate covers known meta-narrative predicates" {
     try std.testing.expect(!isRejectedPredicate("PREFERS"));
     try std.testing.expect(!isRejectedPredicate("DEPLOYS_TO"));
     try std.testing.expect(!isRejectedPredicate("BIRTHDAY"));
+}
+
+test "P7 predicate fix: renamed speaker hub (USER_MENTIONED) rejected; relationships still flow" {
+    // The renamed speaker-hub predicate gets its OWN dedicated blacklist entry
+    // so the dense user→entity hub stays out of the graph (no mention-flood),
+    // while the meta-narrative "MENTIONED" ban remains independent.
+    try std.testing.expect(isRejectedPredicate("USER_MENTIONED"));
+    try std.testing.expect(isRejectedPredicate("MENTIONED")); // meta-narrative ban intact
+    // Genuine relationship predicates are NOT blacklisted — they must flow so
+    // person nodes connect (Tarek WORKS_AT Acme, Jack REPORTS_TO Tarek, …).
+    try std.testing.expect(!isRejectedPredicate("KNOWS"));
+    try std.testing.expect(!isRejectedPredicate("WORKS_AT"));
+    try std.testing.expect(!isRejectedPredicate("REPORTS_TO"));
+}
+
+test "P7 isSelfPseudoSubject: speaker/self terms vs named entities" {
+    // Self/speaker pseudo-subjects map to the user:<id> hub, NOT a graph node.
+    try std.testing.expect(isSelfPseudoSubject("user"));
+    try std.testing.expect(isSelfPseudoSubject("User")); // case-insensitive
+    try std.testing.expect(isSelfPseudoSubject("I"));
+    try std.testing.expect(isSelfPseudoSubject("me"));
+    try std.testing.expect(isSelfPseudoSubject("assistant"));
+    // Named entities (people, orgs) are NOT self — they SHOULD become nodes.
+    try std.testing.expect(!isSelfPseudoSubject("Tarek"));
+    try std.testing.expect(!isSelfPseudoSubject("Jack"));
+    try std.testing.expect(!isSelfPseudoSubject("Acme"));
+    try std.testing.expect(!isSelfPseudoSubject("")); // empty is not self
 }
 
 test "parseExtractedJson handles confidence as integer" {
@@ -1779,4 +2470,20 @@ test "V1.14.12 (M1 + Path A): WriteOrigin enum count guards against silent addit
     // (attribution="extraction_classifier") by metadata alone. Not a
     // hygiene gap — different schema layer (memory_edges, not memories).
     try std.testing.expectEqual(@as(usize, 6), @typeInfo(WriteOrigin).@"enum".fields.len);
+}
+
+test "content-hash helper matches the stored content_hash algorithm (SHA-256, 64 hex)" {
+    const a = std.testing.allocator;
+    const h = try computeContentHashHex(a, "user lives in Hamburg");
+    defer a.free(h);
+    // SHA-256 produces a 32-byte digest → 64 hex chars.
+    try std.testing.expectEqual(@as(usize, 64), h.len);
+    // Must match what zaki_state stores in the content_hash column.
+    // zaki_state.computeContentHash is private, so replicate it here.
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("user lives in Hamburg", &digest, .{});
+    const want = try a.alloc(u8, 64);
+    defer a.free(want);
+    _ = security_secrets.hexEncode(&digest, want);
+    try std.testing.expectEqualStrings(want, h);
 }

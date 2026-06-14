@@ -446,7 +446,12 @@ pub const ContextEngine = struct {
                 agent.memory_session_id,
                 agent.extraction_state_mgr,
                 agent.extraction_user_id,
-                .{ .skip_legacy_identity = wm_owns_identity },
+                .{
+                    .skip_legacy_identity = wm_owns_identity,
+                    // Phase 0.5 — typed views READ gate, threaded from agent
+                    // config so operators can disable the four typed blocks.
+                    .typed_views_enabled = agent.typed_views_enabled,
+                },
             ) catch |err| blk: {
                 log.warn("memory.enrichment_failed error={s} — proceeding without memory slot", .{@errorName(err)});
                 break :blk memory_loader.MemorySlot{
@@ -1156,6 +1161,9 @@ fn FakeIngestAgent(comptime ObserverT: type) type {
         memory_session_id: ?[]const u8 = null,
         extraction_state_mgr: ?*zaki_state.Manager = null,
         extraction_user_id: ?i64 = null,
+        // Phase 0.5 — typed-views READ gate, reached through the agent:
+        // anytype in ContextEngine.ingest at the loadTurnMemorySlotOpts call.
+        typed_views_enabled: bool = true,
         observer: ObserverT,
         current_run_id: ?[]const u8 = null,
     };

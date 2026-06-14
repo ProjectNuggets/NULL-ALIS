@@ -90,7 +90,19 @@ pub const COOCCURS_PREDICATE: []const u8 = "MENTIONS";
 /// Speaker-mention predicate. Connects user_id → entity for every entity
 /// the user surfaced in a turn. By construction, the user node is the
 /// densest hub in the graph (touched by every turn the user authors).
-pub const SPEAKER_PREDICATE: []const u8 = "MENTIONED";
+///
+/// P7 — RENAMED `"MENTIONED"` → `"USER_MENTIONED"` to end a name collision.
+/// The old name collided with the meta-narrative predicate `"MENTIONED"` that
+/// the extraction blacklist (gateway + extraction_persist `REJECTED_PREDICATES`)
+/// rejects alongside SAID/ASKED/GREETED. That shared name meant the *only*
+/// thing keeping this dense speaker hub out of `/brain/graph` was an entry
+/// that semantically targets LLM meta-narrative, not the speaker hub — fragile
+/// and self-conflating. Now the speaker hub has its OWN dedicated blacklist
+/// entry (`"USER_MENTIONED"`), so it stays render-excluded + PPR-excluded
+/// (graph-density protection: every user→person mention would otherwise
+/// flood the graph) while the genuine relationship predicates
+/// (KNOWS / WORKS_AT / REPORTS_TO — never blacklisted) keep flowing.
+pub const SPEAKER_PREDICATE: []const u8 = "USER_MENTIONED";
 
 /// Attribution tag stamped on every edge written by this pipeline. Lets
 /// the hygiene job + brain page distinguish wiki-link edges from
@@ -573,7 +585,9 @@ pub fn resolveEntity(
     }
 
     // Mint new (or reuse an exact-name match via ON CONFLICT name_lower).
-    const new_id = try state_mgr.upsertEntity(allocator, user_id, mention.canonical, emb);
+    // P7 — thread the LLM-parsed entity class (PERSON / ORG / …) through so
+    // the row is typed; this is the parsed type that was previously dropped.
+    const new_id = try state_mgr.upsertEntity(allocator, user_id, mention.canonical, mention.entity_type, emb);
     return .{
         .entity_id = new_id,
         .canonical_name = mention.canonical,
@@ -773,8 +787,9 @@ fn mentionsEntity(content: []const u8, name: []const u8) bool {
 /// (source) to the ENTITY (target).
 ///
 /// Why this edge and not the others the pipeline already emits: the
-/// user->entity speaker hub (MENTIONED) is blacklisted from /brain/graph
-/// render AND PPR-excluded; entity<->entity co-occurrence has an entity
+/// user->entity speaker hub (USER_MENTIONED — P7 rename of MENTIONED) is
+/// blacklisted from /brain/graph render AND PPR-excluded; entity<->entity
+/// co-occurrence has an entity
 /// source, which the render rule (source must be a visible memory) drops.
 /// A memory->entity edge BOTH renders (source=memory, target=entity) AND
 /// feeds Personalized-PageRank recall (entity nodes aren't hub-excluded;

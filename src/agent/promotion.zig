@@ -10,30 +10,49 @@
 //!
 //! At session-end (called from `commands.zig` session-end checkpoint path),
 //! `promoteWMToDurableAtSessionEnd` walks the session's WM slots, filters
-//! down to (slot_type ∈ {active_goal, decision}) AND
+//! down to (slot_type ∈ {active_goal, decision, open_loop}) AND
 //! (composite_priority ≥ PROMOTION_THRESHOLD), and writes each to
-//! `durable_fact/transient_goal/<session_id>/<slot_id>` via `mem.store`.
+//! `durable_fact/<slot_type>/<session_id>/<slot_id>` via `mem.store`.
 //!
-//! ## Why the `durable_fact/transient_goal/` key shape
+//! ## Why the `durable_fact/<slot_type>/` key shape (P8)
 //!
 //! - `durable_fact/` prefix → `memory_loader.isDurableFactKey` already
 //!   classifies this row as semantic-continuity. At session-start, the
 //!   existing memory_loader path pulls it into the volatile prompt slot
 //!   naturally; no new continuity-classifier code needed.
-//! - `transient_goal/` segment → discriminator from extraction-classifier
-//!   `durable_fact/<ts>/<idx>` rows so the agent + brain UI can
-//!   distinguish "user-stated goal that survived the session boundary"
-//!   from "extracted long-lived fact".
+//! - `<slot_type>/` segment → P8 discriminator. Each promotable type
+//!   (`active_goal` / `decision` / `open_loop`) gets its OWN namespace so
+//!   the durable rows stay queryable by kind, and so they're still
+//!   distinguishable from extraction-classifier `durable_fact/<ts>/<idx>`
+//!   rows. (Pre-P8 this segment was the constant `transient_goal`, which
+//!   discarded the type discriminator.)
 //! - `<session_id>/<slot_id>` segments → idempotent. Re-running promotion
 //!   for the same session+slot upserts (no duplicate rows).
 //!
-//! ## Why slot_type ∈ {active_goal, decision} only
+//! ## Why slot_type ∈ {active_goal, decision, open_loop}
 //!
 //! Per the dispatch: these are the slots whose loss most-clearly breaks
-//! multi-session continuity. `open_loop` is intentionally excluded for
-//! v1.14.18-B because open loops often resolve naturally between sessions
-//! (the user comes back having handled the loop already); promoting them
-//! adds clutter without behavioral lift. v1.14.19 sleep-cycle may revisit.
+//! multi-session continuity. P8 (memory-phase-0.5) ADDS `open_loop` to the
+//! promotion vocabulary: an open loop ("call Alfred about the MNDA") is a
+//! trackable item that should survive a session boundary so the agent can
+//! follow up next session instead of forgetting the user ever owed an
+//! action. The original v1.14.18-B exclusion rationale ("loops often
+//! resolve naturally between sessions") proved wrong in practice — losing
+//! the loop entirely is strictly worse than carrying a stale one the agent
+//! can ask about and close.
+//!
+//! ## Why the key is branched by slot_type (P8)
+//!
+//! The pre-P8 key folded `active_goal` AND `decision` into one namespace
+//! (`durable_fact/transient_goal/{sid}/{slot}`), discarding the slot_type
+//! discriminator — every promoted slot looked like a "transient_goal"
+//! regardless of whether it was a goal, a decision, or (now) an open loop.
+//! That made the durable rows un-queryable by kind. P8 branches the key on
+//! slot_type — `durable_fact/{slot_type}/{sid}/{slot}` — so each type lands
+//! in a distinct, queryable namespace (`durable_fact/decision/...`,
+//! `durable_fact/open_loop/...`, `durable_fact/active_goal/...`). The
+//! `durable_fact/` prefix is preserved so `memory_loader.isDurableFactKey`
+//! still classifies these as semantic-continuity rows (no loader change).
 //!
 //! ## Why composite_priority ≥ 0.5
 //!
@@ -88,10 +107,40 @@ pub const PromotionResult = struct {
     }
 };
 
-/// True iff the slot_type is in the promotion vocabulary for v1.14.18-B.
+/// True iff the slot_type is in the promotion vocabulary.
+///
+/// P8 (memory-phase-0.5): `open_loop` joined `active_goal` + `decision`.
+/// Open loops are trackable items the agent should follow up on across
+/// session boundaries — losing them entirely is worse than carrying a
+/// stale one the agent can ask about and close.
 pub fn isPromotableSlotType(slot_type: []const u8) bool {
     return std.mem.eql(u8, slot_type, working_memory.SlotType.active_goal) or
-        std.mem.eql(u8, slot_type, working_memory.SlotType.decision);
+        std.mem.eql(u8, slot_type, working_memory.SlotType.decision) or
+        std.mem.eql(u8, slot_type, working_memory.SlotType.open_loop);
+}
+
+/// Build the durable promotion key for a slot. P8: branched by `slot_type`
+/// so each promotable kind lands in a distinct, queryable namespace —
+/// `durable_fact/<slot_type>/<session_id>/<slot_id>`. The `durable_fact/`
+/// prefix is preserved so `memory_loader.isDurableFactKey` still classifies
+/// the row as semantic-continuity (no loader change). Caller owns the
+/// returned slice.
+///
+/// `slot_type` is expected to be one of the promotable `SlotType.*` static
+/// strings; the function does not validate (callers gate on
+/// `isPromotableSlotType` first), it just folds whatever it's given into
+/// the key so the namespace always carries the discriminator verbatim.
+pub fn promotionKey(
+    allocator: std.mem.Allocator,
+    slot_type: []const u8,
+    session_id: []const u8,
+    slot_id: i32,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "durable_fact/{s}/{s}/{d}",
+        .{ slot_type, session_id, slot_id },
+    );
 }
 
 /// Promote high-importance non-identity slots to durable_facts at
@@ -160,11 +209,9 @@ pub fn promoteWMToDurableAtSessionEnd(
         }
 
         // Build the durable key. See module doc for the key-shape rationale.
-        const key = std.fmt.allocPrint(
-            allocator,
-            "durable_fact/transient_goal/{s}/{d}",
-            .{ session_id, s.slot_id },
-        ) catch |err| {
+        // P8: branched by slot_type via `promotionKey` so each promotable
+        // kind (active_goal / decision / open_loop) is distinct + queryable.
+        const key = promotionKey(allocator, s.slot_type, session_id, s.slot_id) catch |err| {
             log.warn("promotion.key_alloc_failed err={s} slot_id={d}", .{ @errorName(err), s.slot_id });
             continue;
         };
@@ -226,11 +273,13 @@ inline fn emptyResult(allocator: std.mem.Allocator) PromotionResult {
 // Tests
 // ─────────────────────────────────────────────────────────────────
 
-test "isPromotableSlotType matches active_goal and decision only" {
+test "isPromotableSlotType matches active_goal, decision, and open_loop (P8)" {
     try std.testing.expect(isPromotableSlotType(working_memory.SlotType.active_goal));
     try std.testing.expect(isPromotableSlotType(working_memory.SlotType.decision));
+    // P8: open_loop is now promotable — open loops survive across sessions
+    // as trackable items.
+    try std.testing.expect(isPromotableSlotType(working_memory.SlotType.open_loop));
     try std.testing.expect(!isPromotableSlotType(working_memory.SlotType.identity));
-    try std.testing.expect(!isPromotableSlotType(working_memory.SlotType.open_loop));
     try std.testing.expect(!isPromotableSlotType(working_memory.SlotType.emotional));
     try std.testing.expect(!isPromotableSlotType(working_memory.SlotType.relationship));
     try std.testing.expect(!isPromotableSlotType(working_memory.SlotType.recent_entity));
@@ -238,6 +287,39 @@ test "isPromotableSlotType matches active_goal and decision only" {
     try std.testing.expect(!isPromotableSlotType(working_memory.SlotType.temporal));
     try std.testing.expect(!isPromotableSlotType(working_memory.SlotType.open_question));
     try std.testing.expect(!isPromotableSlotType("unknown_type"));
+}
+
+test "promotionKey is branched by slot_type — distinct, queryable namespaces (P8)" {
+    const allocator = std.testing.allocator;
+
+    const goal_key = try promotionKey(allocator, working_memory.SlotType.active_goal, "sess_abc", 3);
+    defer allocator.free(goal_key);
+    const decision_key = try promotionKey(allocator, working_memory.SlotType.decision, "sess_abc", 3);
+    defer allocator.free(decision_key);
+    const loop_key = try promotionKey(allocator, working_memory.SlotType.open_loop, "sess_abc", 3);
+    defer allocator.free(loop_key);
+
+    // Each carries the durable_fact/ prefix (classification stays consistent
+    // with the rest of Phase 0.5 — memory_loader.isDurableFactKey).
+    try std.testing.expect(std.mem.startsWith(u8, goal_key, "durable_fact/"));
+    try std.testing.expect(std.mem.startsWith(u8, decision_key, "durable_fact/"));
+    try std.testing.expect(std.mem.startsWith(u8, loop_key, "durable_fact/"));
+
+    // Each carries its OWN slot_type discriminator as the second segment.
+    try std.testing.expectEqualStrings("durable_fact/active_goal/sess_abc/3", goal_key);
+    try std.testing.expectEqualStrings("durable_fact/decision/sess_abc/3", decision_key);
+    try std.testing.expectEqualStrings("durable_fact/open_loop/sess_abc/3", loop_key);
+
+    // The whole point of P8: decision and open_loop keys for the SAME
+    // (session, slot) are DISTINCT — the slot_type is no longer folded away.
+    try std.testing.expect(!std.mem.eql(u8, decision_key, loop_key));
+    try std.testing.expect(!std.mem.eql(u8, decision_key, goal_key));
+    try std.testing.expect(!std.mem.eql(u8, goal_key, loop_key));
+
+    // And each key actually contains its slot_type token (queryable by kind).
+    try std.testing.expect(std.mem.indexOf(u8, decision_key, "/decision/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loop_key, "/open_loop/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, goal_key, "/active_goal/") != null);
 }
 
 test "PROMOTION_THRESHOLD is 0.5" {
@@ -253,7 +335,7 @@ test "promoteWMToDurableAtSessionEnd with null state_mgr returns empty" {
 
 test "PromotedSlot zero-init lifecycle" {
     const allocator = std.testing.allocator;
-    const key = try allocator.dupe(u8, "durable_fact/transient_goal/s1/2");
+    const key = try allocator.dupe(u8, "durable_fact/decision/s1/2");
     var slot = PromotedSlot{
         .original_slot_id = 2,
         .durable_key = key,
@@ -261,7 +343,7 @@ test "PromotedSlot zero-init lifecycle" {
     };
     defer slot.deinit(allocator);
     try std.testing.expectEqual(@as(i32, 2), slot.original_slot_id);
-    try std.testing.expectEqualStrings("durable_fact/transient_goal/s1/2", slot.durable_key);
+    try std.testing.expectEqualStrings("durable_fact/decision/s1/2", slot.durable_key);
 }
 
 test "compositePriority gate (sanity-check of the threshold against working_memory formula)" {

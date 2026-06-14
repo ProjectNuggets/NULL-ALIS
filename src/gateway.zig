@@ -2162,6 +2162,7 @@ const TenantRuntime = struct {
             extract_model_i, // Finding #2: matched extraction-sidecar pair
             cmt96_coref_embed,
             runtime.config.agent.extraction_cardinality_fastpath, // V1.14.12 (M2 review CRITICAL)
+            runtime.config.agent.semantic_type_routing_enabled, // P3 (memory-phase-0.5)
         );
 
         // V1.12 — wire wiki_link tool with the same provider+model+embedder
@@ -2254,11 +2255,25 @@ const TenantRuntime = struct {
                     // from config to session_mgr so each per-session Agent
                     // inherits it and propagates to JudgeContext.
                     runtime.session_mgr.extraction_cardinality_fastpath = runtime.config.agent.extraction_cardinality_fastpath;
-                    log.info("extraction.enabled user_id={d} coref={s} judge={s} cardinality_fastpath={s}", .{
+                    // P3 — wire semantic type-routing flag from config to
+                    // session_mgr so each per-session Agent inherits it and
+                    // propagates to JudgeContext.
+                    runtime.session_mgr.semantic_type_routing_enabled = runtime.config.agent.semantic_type_routing_enabled;
+                    // Phase 0.5 — wire typed-views READ flag from config to
+                    // session_mgr so each per-session Agent inherits it and
+                    // propagates to memory_loader (LoadTurnMemoryOptions).
+                    runtime.session_mgr.typed_views_enabled = runtime.config.agent.typed_views_enabled;
+                    // P4 — wire canonical-continuity-summary flag from config
+                    // to session_mgr so each per-session Agent inherits it and
+                    // propagates to the commands gating predicate. Default ON;
+                    // OFF restores the deterministic-template behavior.
+                    runtime.session_mgr.canonical_continuity_summary_enabled = runtime.config.agent.canonical_continuity_summary_enabled;
+                    log.info("extraction.enabled user_id={d} coref={s} judge={s} cardinality_fastpath={s} semantic_type_routing={s}", .{
                         numeric_user_id,
                         if (coref_on) "on" else "off-no-embed",
                         "wired-session-end-v1.9-6",
                         if (runtime.config.agent.extraction_cardinality_fastpath) "on" else "off",
+                        if (runtime.config.agent.semantic_type_routing_enabled) "on" else "off",
                     });
                 }
             } else |_| {
@@ -2685,6 +2700,20 @@ fn runTenantRuntimeMaintenance(state: *GatewayState, now_s: i64) void {
                 runtime.config.agent.session_idle_timeout_secs,
                 &state.shutdown_requested,
             );
+        }
+        // WM (memory-phase-0.5) — bounded working-memory reaper. Piggybacks on
+        // this same maintenance cadence (NOT a new timer) so dead
+        // `working_memory` rows from sessions that ended without a clean
+        // /reset don't accrete forever. Evicting the in-RAM Session above does
+        // NOT touch the Postgres WM rows; this DELETE does. Failure-soft:
+        // reap errors are logged inside reapStaleWorkingMemory's caller-side
+        // catch and never abort the sweep. `retention_days == 0` disables it.
+        if (runtime.state_mgr) |state_mgr| {
+            const retention_days = runtime.config.memory.lifecycle.working_memory_retention_days;
+            if (retention_days > 0) {
+                _ = state_mgr.reapStaleWorkingMemory(retention_days) catch |err|
+                    log.warn("gateway.wm_reap_failed err={s}", .{@errorName(err)});
+            }
         }
     }
     if (state.shutdown_requested.load(.acquire)) return;
@@ -15691,6 +15720,13 @@ fn isRejectedExtractionPredicate(predicate: []const u8) bool {
         "GREETED",      "SAID",         "ASKED",               "MENTIONED",           "REPLIED",
         "ACKNOWLEDGED", "EXPRESSED",    "INDICATED_READINESS", "IS_GETTING_STARTED",  "OFFERED_TO_WAIT",
         "PRIORITIZED",  "ADDRESSED_AS", "IS_UNKNOWN",          "EXPRESSED_READINESS", "INITIATED_CONVERSATION",
+        // P7 — the entity_pipeline speaker hub (user:<id> → entity). RENAMED
+        // from "MENTIONED" so it no longer collides with the meta-narrative
+        // ban above; it gets its OWN entry here to stay render/PPR-excluded
+        // (graph-density: every user→person mention would otherwise flood the
+        // graph). Genuine relationships (KNOWS/WORKS_AT/…) are NOT listed and
+        // keep flowing.
+        "USER_MENTIONED",
     };
     for (rejected) |p| if (std.mem.eql(u8, p, predicate)) return true;
     return false;
@@ -35224,6 +35260,19 @@ test "brain: buildBrainTypedEdges (V1.7a-3) returns empty for user with no edges
 // (source, target) pair (uniqueness key is the full SVO triple). The
 // sort comparator must use predicate as third tiebreaker so JSON output
 // is byte-stable across requests with the same underlying edge set.
+test "P7: isRejectedExtractionPredicate rejects renamed speaker hub, keeps relationships" {
+    // Defense-in-depth mirror of extraction_persist.REJECTED_PREDICATES.
+    // The renamed speaker-hub predicate (USER_MENTIONED) must be rejected here
+    // too so the dense user→entity hub never renders on /brain/graph, while
+    // genuine relationship predicates flow into the graph.
+    try std.testing.expect(isRejectedExtractionPredicate("USER_MENTIONED"));
+    try std.testing.expect(isRejectedExtractionPredicate("MENTIONED")); // meta-narrative ban intact
+    try std.testing.expect(isRejectedExtractionPredicate("SAID"));
+    try std.testing.expect(!isRejectedExtractionPredicate("KNOWS"));
+    try std.testing.expect(!isRejectedExtractionPredicate("WORKS_AT"));
+    try std.testing.expect(!isRejectedExtractionPredicate("REPORTS_TO"));
+}
+
 test "brain: buildBrainTypedEdges (V1.7a-3) sorts by predicate when source+target match" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;

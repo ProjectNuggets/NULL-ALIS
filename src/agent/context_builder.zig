@@ -283,6 +283,11 @@ pub const MemorySelection = struct {
     identity_pin_active: bool = false,
     identity_pin_fact_count: usize = 0,
     identity_pin_appended_bytes: usize = 0,
+    // Typed-view telemetry (prefs/open-loops/decisions/people builders).
+    // Mirrors graph_recall_* / identity_pin_* shape for turn_audit coverage.
+    typed_views_active: bool = false,
+    typed_views_item_count: usize = 0,
+    typed_views_appended_bytes: usize = 0,
 };
 
 pub const PromptRefreshPlan = struct {
@@ -1198,6 +1203,10 @@ pub fn selectionFromStats(stats: anytype) MemorySelection {
         .identity_pin_active = stats.identity_pin_active,
         .identity_pin_fact_count = stats.identity_pin_fact_count,
         .identity_pin_appended_bytes = stats.identity_pin_appended_bytes,
+        // Typed-view fields — mirrors identity_pin projection above.
+        .typed_views_active = stats.typed_views_active,
+        .typed_views_item_count = stats.typed_views_item_count,
+        .typed_views_appended_bytes = stats.typed_views_appended_bytes,
     };
 }
 
@@ -1742,6 +1751,9 @@ test "buildLastTurnContext captures injected memory bytes" {
         identity_pin_active: bool,
         identity_pin_fact_count: usize,
         identity_pin_appended_bytes: usize,
+        typed_views_active: bool,
+        typed_views_item_count: usize,
+        typed_views_appended_bytes: usize,
     }{
         .available = true,
         .candidate_count = 5,
@@ -1768,6 +1780,10 @@ test "buildLastTurnContext captures injected memory bytes" {
         .identity_pin_active = false,
         .identity_pin_fact_count = 0,
         .identity_pin_appended_bytes = 0,
+        // V1.8-14 contract: zeroed defaults for the test fixture.
+        .typed_views_active = false,
+        .typed_views_item_count = 0,
+        .typed_views_appended_bytes = 0,
     };
     const last_turn = buildLastTurnContext(
         plan,

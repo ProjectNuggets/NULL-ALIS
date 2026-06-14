@@ -322,6 +322,50 @@ pub const MemoryCategory = union(enum) {
     }
 };
 
+/// P3 review (memory-phase-0.5) — durable semantic types are evergreen and
+/// must NOT age out under temporal decay in recall ranking.
+///
+/// Before P3, user-attributed facts became `.core` and were evergreen.
+/// P3 routes those same facts to `custom:"preference"/"decision"/"person"`
+/// (by meaning, not attribution). Without this predicate they would suddenly
+/// `!= .core` and start decaying — a regression, since preferences, people,
+/// and decisions are durable.
+///
+/// Returns true for:
+///   - `.core` (legacy evergreen tier — unchanged)
+///   - `custom:"preference"` (durable user preferences)
+///   - `custom:"decision"`   (durable commitments/choices)
+///   - `custom:"person"`     (durable relationship facts)
+///
+/// `custom:"open_loop"` is deliberately NOT evergreen — open loops resolve
+/// over time and stay recency-weighted (they decay), matching design intent.
+/// All other categories (`.daily`, `.conversation`, other custom strings)
+/// decay normally.
+pub fn isEvergreenCategory(category: MemoryCategory) bool {
+    return switch (category) {
+        .core => true,
+        .custom => |name| std.mem.eql(u8, name, "preference") or
+            std.mem.eql(u8, name, "decision") or
+            std.mem.eql(u8, name, "person"),
+        else => false,
+    };
+}
+
+test "isEvergreenCategory: core and durable semantic types are evergreen" {
+    try std.testing.expect(isEvergreenCategory(.core));
+    try std.testing.expect(isEvergreenCategory(.{ .custom = "preference" }));
+    try std.testing.expect(isEvergreenCategory(.{ .custom = "decision" }));
+    try std.testing.expect(isEvergreenCategory(.{ .custom = "person" }));
+}
+
+test "isEvergreenCategory: open_loop and recency types are NOT evergreen" {
+    // open_loop deliberately decays — open loops resolve over time.
+    try std.testing.expect(!isEvergreenCategory(.{ .custom = "open_loop" }));
+    try std.testing.expect(!isEvergreenCategory(.daily));
+    try std.testing.expect(!isEvergreenCategory(.conversation));
+    try std.testing.expect(!isEvergreenCategory(.{ .custom = "other" }));
+}
+
 // ── Link types ─────────────────────────────────────────────────────
 //
 // V1.7a-5 (spec seam 3) — high-level RELATIONSHIP CATEGORY for a memory's
@@ -589,11 +633,18 @@ pub fn freeTypedEdges(allocator: std.mem.Allocator, edges: []TypedEdge) void {
 pub const EntityRow = struct {
     id: []const u8,
     name: []const u8,
+    /// P7 (CRM substrate) — the parsed entity class (PERSON / ORG / PROJECT /
+    /// PRODUCT / PLACE / EVENT / CONCEPT, or the generic `'PROPER'` default).
+    /// Round-trips from `memory_entities.entity_type` so typed-person nodes
+    /// survive the upsert→read cycle. Defaults to the schema default so
+    /// older read paths and stubs that don't populate it stay valid.
+    entity_type: []const u8 = "PROPER",
     similarity: f64 = 0.0,
 
     pub fn deinit(self: *const EntityRow, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.name);
+        allocator.free(self.entity_type);
     }
 };
 
@@ -869,6 +920,43 @@ pub fn freeProseFacts(allocator: std.mem.Allocator, facts: []ProseFact) void {
     allocator.free(facts);
 }
 
+/// C0 (memory-phase-0.5) — aggregate report of a single Phase-0.5 backfill run.
+///
+/// Returned by `state_mgr.phase05Backfill(allocator, user_id_opt, dry_run)`.
+/// One struct per run (aggregated across however many users the run touched).
+/// In dry_run mode every counter reflects what WOULD change — nothing is
+/// written. In a live run the counters reflect what DID change.
+///
+/// The five operation counters mirror the five conservative operations:
+///   1. `rows_retyped`            — memory rows whose `memory_type` moved off
+///                                  the legacy core/daily default to a semantic
+///                                  type (op 1).
+///   2. `entities_retyped`        — `'PROPER'` entities upgraded to a known
+///                                  class (op 2; PERSON-from-relationship only).
+///   3. `continuity_embeddings_removed` — embedded continuity-summary rows
+///                                  deleted from `memory_embeddings` (op 3).
+///   4. `exact_dups_collapsed`    — exact `content_hash` duplicate rows
+///                                  superseded via the bitemporal invalidation
+///                                  path, NEVER hard-deleted (op 4).
+///   5. `near_dup_clusters`       — REPORT-ONLY count of near-duplicate
+///                                  candidate clusters (same user, similar but
+///                                  not byte-identical content). DEFERRED to
+///                                  Phase 1's write-time MERGE; never merged
+///                                  here (data-loss risk).
+///
+/// `users_scanned` is how many users the run iterated. `dry_run` echoes the
+/// mode so the report is self-describing.
+pub const Phase05BackfillReport = struct {
+    dry_run: bool,
+    users_scanned: usize = 0,
+    rows_retyped: usize = 0,
+    entities_retyped: usize = 0,
+    continuity_embeddings_removed: usize = 0,
+    exact_dups_collapsed: usize = 0,
+    /// Report-only — near-duplicate candidate clusters left for Phase 1.
+    near_dup_clusters: usize = 0,
+};
+
 /// V1.7a-9a — owned community-name lookup row.
 pub const CommunityName = struct {
     name: []u8,
@@ -1100,6 +1188,40 @@ pub fn isIndexArtifactKey(key: []const u8) bool {
     return classifyArtifactKey(key) == .index;
 }
 
+/// P4b (memory-phase-0.5) — continuity-SUMMARY key prefixes.
+///
+/// These four prefixes carry the agent's "where were we" warm-start briefs.
+/// They are injected into the next session by EXPLICIT key (memory_loader
+/// reads `summary_latest/{sid}` directly via appendDirectEntry), NOT via
+/// semantic/vector recall — so they must NOT be embedded into the pgvector
+/// fact space, where shallow continuity rows
+/// ("focus: ... / decisions: none / open_loops: none") pollute recall of
+/// real user facts.
+///
+/// This predicate gates EMBEDDING ONLY (via `isSemanticBookkeepingKey` →
+/// `shouldEmbedMemoryEntry`). It deliberately does NOT feed
+/// `isDefaultHiddenMemoryKey`, because that predicate also drives the
+/// recall/loader skip path (`isInternalMemoryEntryKeyOrContent` →
+/// `appendDirectEntry`/`shouldSkipLowSignalEntry`): folding continuity in
+/// there would make `memory_loader` skip its own explicit-key injection of
+/// `summary_latest/{sid}` and DESTROY warm-start continuity. Embedding and
+/// recall-skip are intentionally decoupled here.
+///
+/// CRITICAL: `durable_fact/` is deliberately EXCLUDED. It is classified as a
+/// continuity ARTIFACT (classifyArtifactKey) but its CONTENT is user-authored
+/// fact text (session-end extraction), so it must stay recallable/embedded.
+/// Only the summary-skeleton prefixes are un-embedded here.
+///
+/// These four prefixes are also present in `BRAIN_HIDDEN_PREFIXES` below —
+/// the two surfaces are intentionally consistent: continuity summaries are
+/// hidden from BOTH brain-visibility AND embedding.
+pub fn isContinuitySummaryKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "summary_latest/") or
+        std.mem.startsWith(u8, key, "timeline_summary/") or
+        std.mem.startsWith(u8, key, "session_summary/") or
+        std.mem.startsWith(u8, key, "summary_fallback/");
+}
+
 pub fn isDefaultHiddenMemoryKey(key: []const u8) bool {
     return isInternalMemoryKey(key) or
         isAuditArtifactKey(key) or
@@ -1181,7 +1303,14 @@ pub fn isBrainVisibleKey(key: []const u8) bool {
 
 pub fn isSemanticBookkeepingKey(key: []const u8) bool {
     return isDefaultHiddenMemoryKey(key) or
-        std.mem.eql(u8, key, "context_anchor_current");
+        std.mem.eql(u8, key, "context_anchor_current") or
+        // P4b: continuity summaries are warm-start briefs injected by explicit
+        // key, not recallable facts — keep them OUT of the pgvector fact space.
+        // This is the ONLY consumer of isSemanticBookkeepingKey
+        // (shouldEmbedMemoryEntry), so this hides them from embedding WITHOUT
+        // touching the recall/loader skip path that injects summary_latest.
+        // durable_fact/ stays embeddable (isContinuitySummaryKey excludes it).
+        isContinuitySummaryKey(key);
 }
 
 pub fn shouldEmbedMemoryEntry(key: []const u8, content: []const u8) bool {
@@ -2854,6 +2983,18 @@ pub fn initRuntimeWithOptions(
 
     const embed_name: []const u8 = if (embed_provider) |ep_| ep_.getName() else "none";
 
+    // T1 boot-time visibility: log the resolved embedding config so operators
+    // can immediately verify the live embedder is the intended model/dimension,
+    // not an accidental fallback. Dimension mismatch against pgvector is already
+    // caught fail-closed by store_pgvector.PgVectorDimensionMismatch — this log
+    // is observability-only (no duplicate guard).
+    log.info("embedding config: provider={s} model={s} dimensions={d} pgvector_table={s}", .{
+        config.search.provider,
+        config.search.model,
+        config.search.dimensions,
+        config.search.store.pgvector_table,
+    });
+
     return .{
         .memory = instance.memory,
         .session_store = instance.session_store,
@@ -3873,17 +4014,51 @@ test "shouldEmbedMemoryEntry skips bookkeeping artifacts and oversize content" {
     try std.testing.expect(!shouldEmbedMemoryEntry("context_anchor_current", "anchor blob"));
     try std.testing.expect(!shouldEmbedMemoryEntry("session_checkpoint_1", "checkpoint blob"));
     try std.testing.expect(!shouldEmbedMemoryEntry("autosave_user_1", "hello"));
-    try std.testing.expect(shouldEmbedMemoryEntry("summary_latest/agent:test:user:1:main", "focus: ship"));
 
-    // max_tokens=512, CHARS_PER_TOKEN=4 → gate is 2048 bytes
-    var medium: [1400]u8 = undefined;
-    @memset(&medium, 'a');
-    try std.testing.expect(shouldEmbedMemoryEntry("timeline_summary/agent:test:user:1:main/1", medium[0..]));
+    // P4b: continuity summaries are NO LONGER embedded — they're warm-start
+    // briefs injected by explicit key, not recallable facts. Embedding them
+    // polluted the pgvector fact space with shallow "decisions: none" rows.
+    try std.testing.expect(!shouldEmbedMemoryEntry("summary_latest/agent:test:user:1:main", "focus: ship"));
+    try std.testing.expect(!shouldEmbedMemoryEntry("timeline_summary/agent:test:user:1:main/1", "focus: ship"));
+    try std.testing.expect(!shouldEmbedMemoryEntry("session_summary/agent:test:user:1:main/1", "focus: ship"));
+    try std.testing.expect(!shouldEmbedMemoryEntry("summary_fallback/agent:test:user:1:main/1", "focus: ship"));
 
-    // 2049 bytes exceeds the 2048-byte gate
+    // P4b: durable_fact/ stays RECALLABLE (user-authored content, not
+    // bookkeeping) — small payloads must still embed (key is NOT hidden).
+    try std.testing.expect(shouldEmbedMemoryEntry("durable_fact/x", "user prefers dark mode"));
+
+    // 2049 bytes exceeds the 2048-byte gate (size gate, not key gate)
     var big: [2049]u8 = undefined;
     @memset(&big, 'a');
     try std.testing.expect(!shouldEmbedMemoryEntry("durable_fact/x", big[0..]));
+}
+
+test "P4b: continuity summaries are hidden from embedding but durable_fact stays recallable" {
+    // The four continuity-summary prefixes are hidden from embedding.
+    try std.testing.expect(isContinuitySummaryKey("summary_latest/agent:test:user:1:main"));
+    try std.testing.expect(isContinuitySummaryKey("timeline_summary/agent:test:user:1:main/1700000000"));
+    try std.testing.expect(isContinuitySummaryKey("session_summary/agent:test:user:1:main/1700000000"));
+    try std.testing.expect(isContinuitySummaryKey("summary_fallback/agent:test:user:1:main/1700000000"));
+    // The embedding gate (isSemanticBookkeepingKey) reflects this.
+    try std.testing.expect(isSemanticBookkeepingKey("summary_latest/x"));
+    try std.testing.expect(isSemanticBookkeepingKey("timeline_summary/x"));
+
+    // CRITICAL: durable_fact/ is user-authored content — it must NOT be hidden
+    // (stays recallable / embeddable). It is a continuity ARTIFACT by key
+    // classification, but its content is real facts.
+    try std.testing.expect(!isContinuitySummaryKey("durable_fact/x"));
+    try std.testing.expect(!isSemanticBookkeepingKey("durable_fact/x"));
+    try std.testing.expectEqual(ArtifactRole.continuity, classifyArtifactKey("durable_fact/x"));
+
+    // Consistency with BRAIN_HIDDEN_PREFIXES: every continuity-summary prefix
+    // hidden from embedding must ALSO be hidden from /brain visibility (and
+    // vice-versa for these four). The two surfaces cannot drift.
+    try std.testing.expect(!isBrainVisibleKey("summary_latest/x"));
+    try std.testing.expect(!isBrainVisibleKey("timeline_summary/x"));
+    try std.testing.expect(!isBrainVisibleKey("session_summary/x"));
+    try std.testing.expect(!isBrainVisibleKey("summary_fallback/x"));
+    // durable_fact/ stays brain-visible too (user-authored content).
+    try std.testing.expect(isBrainVisibleKey("durable_fact/x"));
 }
 
 test "MemoryRuntime.drainOutbox with no outbox returns 0" {

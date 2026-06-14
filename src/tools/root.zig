@@ -2445,6 +2445,7 @@ pub fn bindMemoryStoreUnifiedContext(
     judge_model_name: ?[]const u8,
     coref_embed: ?@import("../memory/vector/embeddings.zig").EmbeddingProvider,
     cardinality_fastpath_enabled: bool, // V1.14.12 (M2 review CRITICAL)
+    semantic_type_routing_enabled: bool, // P3 (memory-phase-0.5)
 ) void {
     for (tools) |t| {
         if (t.vtable == &memory_store.MemoryStoreTool.vtable) {
@@ -2453,6 +2454,7 @@ pub fn bindMemoryStoreUnifiedContext(
             mt.judge_model_name = judge_model_name;
             mt.coref_embed = coref_embed;
             mt.cardinality_fastpath_enabled = cardinality_fastpath_enabled;
+            mt.semantic_type_routing_enabled = semantic_type_routing_enabled;
         }
     }
 }

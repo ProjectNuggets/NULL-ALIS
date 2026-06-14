@@ -455,6 +455,62 @@ pub const AgentConfig = struct {
     /// Set to FALSE to restore pre-M3 behavior (every fact re-extracted
     /// at boundary). Debug/migration use only.
     extraction_coverage_filter_enabled: bool = true,
+    /// P3 (memory-phase-0.5) — semantic type-routing gate.
+    ///
+    /// When TRUE (default), an extracted fact's durable `memory_type` is
+    /// routed by what the fact MEANS — derived from the predicate's
+    /// classification (open_loop / decision / preference / person, written
+    /// as `custom:` free-text memory types) — rather than by WHO said it.
+    ///
+    /// When FALSE, the persist site falls back to the legacy
+    /// attribution router (`attributed_to == "user"` → core, else → daily)
+    /// — the exact pre-P3 behavior. `attributed_to` is recorded as row
+    /// provenance metadata in BOTH modes; this flag only controls whether
+    /// it also drives the type.
+    ///
+    /// Threaded to extraction_persist via JudgeContext through the same
+    /// caller chain as `extraction_cardinality_fastpath`.
+    semantic_type_routing_enabled: bool = true,
+    /// Phase 0.5 (memory-phase-0.5) — typed views READ gate.
+    ///
+    /// When TRUE (default), the memory loader assembles four deterministic
+    /// always-on context blocks over the P3-typed memories and injects them
+    /// into the agent's per-turn volatile system block:
+    ///   <preferences> / <open_loops> / <decisions> / <people>
+    /// These are VIEWS over the existing store (filter by memory_type) — the
+    /// reader side of the P3 `semantic_type_routing_enabled` writer.
+    ///
+    /// When FALSE, no new blocks are emitted — the agent sees the exact
+    /// prior (pre-Phase-0.5) context. Read-side only; does not affect what
+    /// is written.
+    ///
+    /// Threaded to memory_loader via LoadTurnMemoryOptions through the agent
+    /// (same plumbing pattern as `semantic_type_routing_enabled`).
+    typed_views_enabled: bool = true,
+    /// P4 (memory-phase-0.5) — canonical-continuity-summary gate.
+    ///
+    /// When TRUE (default), the two LIVE in-conversation boundary triggers
+    /// (`summary_seed:auto`, `compaction:auto`) take the REAL LLM-summarizer
+    /// path (`summary_provider.chat`) instead of the deterministic
+    /// `buildStructuredFallbackSummary` template. These triggers run
+    /// OFF-THREAD via `persistSessionCheckpointAsync` (commands.zig — a
+    /// `std.Thread.spawn` worker that runs `persistSessionCheckpointDetailed`),
+    /// so the LLM call does NOT block the user's turn. The deterministic
+    /// template is preserved as the error/fallback path when the LLM
+    /// summarizer fails (provider error / parse error), so the summary is
+    /// never lost.
+    ///
+    /// When FALSE, the live triggers fall back to the EXACT prior
+    /// (deterministic-template) behavior — a safe rollback for the
+    /// LLM-cost / latency tradeoff this introduces (one summarizer call per
+    /// in-conversation boundary). Genuinely non-interactive checkpoint
+    /// reasons (shutdown / idle_evict / ttl_evict / ttl_recycle) ALWAYS use
+    /// the deterministic fallback regardless of this flag — they can't block
+    /// on an LLM call.
+    ///
+    /// Threaded to the commands gating predicate via the agent the same way
+    /// as `semantic_type_routing_enabled` / `typed_views_enabled`.
+    canonical_continuity_summary_enabled: bool = true,
     // V1.14.12 (Path A) — extraction_legacy_direct_writes FIELD REMOVED.
     // M5 sprint flag-gated two redundant direct write paths during a
     // soak window. Path A closes the M5 sprint by:
@@ -952,6 +1008,21 @@ pub const MemorySearchConfig = struct {
     enabled: bool = true,
     provider: []const u8 = "none",
     model: []const u8 = "text-embedding-3-small",
+    /// SOURCE DEFAULT — fallback only. MUST be overridden by deployed config to
+    /// match the pgvector column dimension of the target schema. Production uses
+    /// e5-large (dimensions: 1024); the OpenAI text-embedding-3-small default
+    /// here (1536) is for dev/local setups and is the wrong value for a
+    /// pgvector deployment that was initialized with dim=1024.
+    ///
+    /// A dimension mismatch is caught fail-closed at boot by
+    /// store_pgvector.PgvectorVectorStore.ensureSchema (error.PgVectorDimensionMismatch)
+    /// — the server refuses to start rather than silently writing zero-recall
+    /// vectors. Override with NULLALIS_PGVECTOR_ALLOW_DESTRUCTIVE_REBUILD=1
+    /// only if you accept full embedding data loss.
+    ///
+    /// Do NOT change this default to 1024: that would mask misconfiguration for
+    /// OpenAI/local setups while adding nothing — the fail-closed guard already
+    /// catches mismatches safely.
     dimensions: u32 = 1536,
     fallback_provider: []const u8 = "none",
     store: MemoryVectorStoreConfig = .{},
@@ -1060,7 +1131,22 @@ pub const MemorySyncConfig = struct {
 
 pub const MemoryQueryConfig = struct {
     max_results: u32 = 6,
+    /// Floor applied to the FINAL fused score (Reciprocal Rank Fusion), NOT a
+    /// cosine similarity. RRF assigns 1/(rank+1+k); with the default k=60 the
+    /// rank-1 hit always scores 1/61 ≈ 0.0164 — even for a perfect match. So
+    /// any min_score > ~0.0164 would silently delete every result. This is a
+    /// no-op floor in the wrong metric space; prefer `min_cosine` below for a
+    /// real relevance floor. Kept (default 0.0) for backward compatibility.
     min_score: f64 = 0.0,
+    /// Real relevance floor in COSINE space, applied to vector-lane candidates
+    /// BEFORE RRF fusion (vector candidates carry a genuine cosine similarity in
+    /// [0,1] at that stage; fused RRF scores do not). Vector candidates with
+    /// cosine < min_cosine are dropped so genuine noise never enters fusion.
+    /// Default 0.0 = DISABLED (no behavior change). Do NOT set aggressively: the
+    /// correct threshold can only be established empirically via the Phase-1 eval
+    /// harness — recall is not actually broken (the "0.01" reading was the RRF
+    /// 1/61 math, not a similarity).
+    min_cosine: f64 = 0.0,
     merge_strategy: []const u8 = "rrf",
     rrf_k: u32 = 60,
     hybrid: MemoryHybridConfig = .{},
@@ -1098,6 +1184,15 @@ pub const MemoryLifecycleConfig = struct {
     snapshot_enabled: bool = false,
     snapshot_on_hygiene: bool = false,
     auto_hydrate: bool = true,
+    /// WM (memory-phase-0.5) — bounded working-memory reaper threshold.
+    /// `working_memory` rows for a (user, session) whose newest slot has
+    /// been untouched for more than this many days are deleted by the
+    /// reaper that piggybacks on the tenant-maintenance sweep (same cadence
+    /// as session idle/TTL eviction). Without this the table accretes dead
+    /// rows forever for sessions that ended without a clean /reset. Set to
+    /// 0 to disable the reaper entirely. Default 30 days mirrors
+    /// `purge_after_days` — a session idle a month is safely stale.
+    working_memory_retention_days: u32 = 30,
 };
 
 pub const MemoryResponseCacheConfig = struct {

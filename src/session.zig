@@ -272,6 +272,18 @@ pub const SessionManager = struct {
     /// Default true preserves M2 behavior (set-valued additive writes
     /// skip the judge LLM call).
     extraction_cardinality_fastpath: bool = true,
+    /// P3 (memory-phase-0.5) — semantic type-routing gate, threaded from
+    /// gateway config to per-session Agent → JudgeContext. Same INIT-ONLY
+    /// concurrency contract as the sibling fields. Default true.
+    semantic_type_routing_enabled: bool = true,
+    /// Phase 0.5 (memory-phase-0.5) — typed-views READ gate, threaded from
+    /// gateway config to per-session Agent → memory_loader. Same INIT-ONLY
+    /// concurrency contract as the sibling fields. Default true.
+    typed_views_enabled: bool = true,
+    /// P4 (memory-phase-0.5) — canonical-continuity-summary gate, threaded
+    /// from gateway config to per-session Agent → commands gating predicate.
+    /// Same INIT-ONLY concurrency contract as the sibling fields. Default true.
+    canonical_continuity_summary_enabled: bool = true,
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
@@ -757,6 +769,12 @@ pub const SessionManager = struct {
         // V1.14.12 (M2 review CRITICAL) — cardinality fast-path gate,
         // same plumbing pattern.
         agent.extraction_cardinality_fastpath = self.extraction_cardinality_fastpath;
+        // P3 — semantic type-routing gate, same plumbing pattern.
+        agent.semantic_type_routing_enabled = self.semantic_type_routing_enabled;
+        // Phase 0.5 — typed-views READ gate, same plumbing pattern.
+        agent.typed_views_enabled = self.typed_views_enabled;
+        // P4 — canonical-continuity-summary gate, same plumbing pattern.
+        agent.canonical_continuity_summary_enabled = self.canonical_continuity_summary_enabled;
         return agent;
     }
 
@@ -998,6 +1016,40 @@ pub const SessionManager = struct {
             std.ascii.eqlIgnoreCase(cmd, "restart");
     }
 
+    /// WM (memory-phase-0.5) — clear the session's working-memory slots on
+    /// /new|/reset|/restart, then RE-PIN identity so the agent still knows
+    /// who the user is after the reset. A /reset should wipe stale
+    /// open_loops / active_goals / decisions but MUST NOT forget the user's
+    /// identity.
+    ///
+    /// Why clear-then-re-pin (vs. preserving slot 0 in place): identity is
+    /// pinned at `RESERVED_SLOT_IDENTITY` (slot 0) and is reconstructed from
+    /// the canonical `listIdentityFacts` store — exactly what
+    /// `pinIdentityFromUserState` does at session creation. So a full clear
+    /// followed by the same re-pin call is the simplest correct path: it
+    /// can't drift from the creation-time pin, and it picks up any identity
+    /// facts learned during the just-ended session. The working_memory
+    /// session_id is the session_key (see getOrCreateInternal's pin site).
+    ///
+    /// Failure-soft: no state_mgr / no user_id / postgres unavailable → no-op.
+    /// A WM reset failure must never block the user's /reset from completing.
+    fn clearSessionWorkingMemory(self: *SessionManager, session_key: []const u8) void {
+        const smgr = self.extraction_state_mgr orelse return;
+        const uid = self.extraction_user_id orelse return;
+        smgr.clearWorkingMemorySession(uid, session_key) catch |err| {
+            log.warn("session.wm_clear_failed session={s} err={s}", .{ session_key, @errorName(err) });
+            return;
+        };
+        // Re-pin identity from the canonical identity store so who-the-user-is
+        // survives the reset. Best-effort: if there are no identity facts yet
+        // this is a no-op (returns 0), which is correct — nothing to preserve.
+        _ = working_memory.pinIdentityFromUserState(self.allocator, smgr, uid, session_key) catch |err| {
+            log.warn("session.wm_clear_repin_failed session={s} err={s}", .{ session_key, @errorName(err) });
+            return;
+        };
+        log.info("session.wm_cleared_on_reset session={s} user={d}", .{ session_key, uid });
+    }
+
     /// Process a message within a session context.
     /// Finds or creates the session, locks it, runs agent.turn(), returns owned response.
     pub fn processMessage(self: *SessionManager, session_key: []const u8, content: []const u8, conversation_context: ?ConversationContext) ![]const u8 {
@@ -1229,6 +1281,18 @@ pub const SessionManager = struct {
         // Track consolidation timestamp
         if (session.agent.last_turn_compacted) {
             session.last_consolidated = @intCast(@max(0, std.time.timestamp()));
+        }
+
+        // WM (memory-phase-0.5) — clear working memory on /new|/reset|/restart.
+        // Done OUTSIDE the `session_store` guard below because working memory
+        // lives in Postgres via `extraction_state_mgr`, not in `session_store`;
+        // a tenant with WM but no session_store backend must still clear on
+        // reset. Identity is re-pinned inside the helper.
+        {
+            const reset_trimmed = std.mem.trim(u8, content, " \t\r\n");
+            if (slashClearsSession(reset_trimmed)) {
+                self.clearSessionWorkingMemory(session_key);
+            }
         }
 
         // Persist messages via session store

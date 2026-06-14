@@ -109,6 +109,14 @@ pub const SelectionStats = struct {
     identity_pin_active: bool = false,
     identity_pin_fact_count: usize = 0,
     identity_pin_appended_bytes: usize = 0,
+    // Phase 0.5 typed-view injection telemetry. True when at least one
+    // of the four typed-view blocks (preferences / open_loops / decisions
+    // / people) produced a non-empty fenced block. item_count and
+    // appended_bytes are the aggregate across all four builders so
+    // operators can measure typed-view coverage per turn in turn_audit.
+    typed_views_active: bool = false,
+    typed_views_item_count: usize = 0,
+    typed_views_appended_bytes: usize = 0,
 };
 
 pub const ContextResult = struct {
@@ -581,6 +589,20 @@ fn loadContextDetailed(
         }
     }
 
+    // P4 / C0 note: this secondary timeline-fallback bucket searches
+    // global_entries (vector recall results, session_id=null) for
+    // timeline_summary/ keys. Post-P4, `shouldEmbedMemoryEntry` returns
+    // false for timeline_summary/ — new continuity rows are not embedded
+    // and therefore do not appear in vector recall. C0 op-3 deletes
+    // pre-P4 embedded continuity rows. Together these make this path
+    // unreachable for fresh data on a fully-migrated instance.
+    //
+    // The loop is deliberately KEPT (not pruned) as a safety net for:
+    //   (a) instances where C0 has not yet run (pre-migration rows),
+    //   (b) any future embed-policy relaxation that re-embeds continuity.
+    // On a post-C0 production instance the loop iterates over entries
+    // but finds no timeline_summary/ matches — it is effectively a no-op
+    // at negligible cost (~µs over an already-fetched slice).
     if (appended < DEFAULT_RECALL_LIMIT and buf.items.len < MAX_CONTEXT_BYTES and global_entries != null) {
         if (global_entries) |entries| {
             for (entries) |entry| {
@@ -787,6 +809,10 @@ fn loadContextWithRuntimeDetailed(
         }
     }
 
+    // P4 / C0 note: see the matching comment in loadContextFromMemory.
+    // Post-P4 + post-C0, timeline_summary/ rows are not embedded so vector
+    // recall never returns them; this loop is a no-op on fully-migrated
+    // instances but is retained as a safety net for pre-C0 legacy rows.
     if (buf.items.len < MAX_CONTEXT_BYTES and global_entries != null) {
         if (global_entries) |entries| {
             for (entries) |entry| {
@@ -981,6 +1007,14 @@ pub const LoadTurnMemoryOptions = struct {
     /// fresh session before any slots), the legacy path stays active
     /// as a fallback so identity is never lost.
     skip_legacy_identity: bool = false,
+
+    /// Phase 0.5 — typed views gate (default ON). When true AND
+    /// state_mgr + user_id are bound, four deterministic blocks
+    /// (<preferences> / <open_loops> / <decisions> / <people>) are
+    /// appended inside the <memory_for_turn> fence, reading the P3-typed
+    /// memory signals. When false → no new blocks (exact prior context).
+    /// Threaded from `agent.typed_views_enabled` (config_types.AgentConfig).
+    typed_views_enabled: bool = true,
 };
 
 pub fn loadTurnMemorySlot(
@@ -1107,12 +1141,79 @@ pub fn loadTurnMemorySlotOpts(
     result.stats.identity_pin_appended_bytes = identity_stats.appended_bytes;
     defer if (identity_block) |b| allocator.free(b);
 
+    // ── Phase 0.5: typed views ─────────────────────────────────────────
+    // Read the P3-typed memory signals as four deterministic, always-on
+    // blocks. Gated behind opts.typed_views_enabled (default ON, threaded
+    // from agent config). Requires state_mgr + user_id (these are
+    // user-global, cross-session views). Each builder queries one
+    // memory_type via listMemories(.{ .custom = … }, session_id=null) and
+    // falls back silently on any error so it can never make injection
+    // WORSE than legacy. 4 filtered queries/turn — acceptable per Phase
+    // 0.5 perf note (small, user_id-indexed sets).
+    var pref_block: ?[]u8 = null;
+    var loop_block: ?[]u8 = null;
+    var decision_block: ?[]u8 = null;
+    var people_block: ?[]u8 = null;
+    // Aggregate typed-view telemetry across all four builders so it can be
+    // wired into result.stats after the block (mirrors graph_stats /
+    // identity_stats pattern).
+    var typed_views_stats: TypedViewAppendResult = .{};
+    if (opts.typed_views_enabled) {
+        if (state_mgr_for_graph) |sm| if (user_id_for_graph) |uid| {
+            var s: TypedViewAppendResult = .{};
+            pref_block = buildTypedViewBlock(allocator, sm, uid, "preference", "preferences", "User preferences — honor these by default when relevant.", &s) catch |err| blk: {
+                log.warn("typed_views.preferences_failed err={s} — skipping block", .{@errorName(err)});
+                break :blk null;
+            };
+            typed_views_stats.appended = typed_views_stats.appended or s.appended;
+            typed_views_stats.item_count += s.item_count;
+            typed_views_stats.appended_bytes += s.appended_bytes;
+            s = .{};
+            loop_block = buildTypedViewBlock(allocator, sm, uid, "open_loop", "open_loops", "Unfinished threads — proactively follow up; these are time-sensitive (most recent first).", &s) catch |err| blk: {
+                log.warn("typed_views.open_loops_failed err={s} — skipping block", .{@errorName(err)});
+                break :blk null;
+            };
+            typed_views_stats.appended = typed_views_stats.appended or s.appended;
+            typed_views_stats.item_count += s.item_count;
+            typed_views_stats.appended_bytes += s.appended_bytes;
+            s = .{};
+            decision_block = buildTypedViewBlock(allocator, sm, uid, "decision", "decisions", "Decisions already made — do not relitigate; treat as settled (most recent first).", &s) catch |err| blk: {
+                log.warn("typed_views.decisions_failed err={s} — skipping block", .{@errorName(err)});
+                break :blk null;
+            };
+            typed_views_stats.appended = typed_views_stats.appended or s.appended;
+            typed_views_stats.item_count += s.item_count;
+            typed_views_stats.appended_bytes += s.appended_bytes;
+            s = .{};
+            people_block = buildTypedViewBlock(allocator, sm, uid, "person", "people", "People in the user's life — relationships and CRM facts.", &s) catch |err| blk: {
+                log.warn("typed_views.people_failed err={s} — skipping block", .{@errorName(err)});
+                break :blk null;
+            };
+            typed_views_stats.appended = typed_views_stats.appended or s.appended;
+            typed_views_stats.item_count += s.item_count;
+            typed_views_stats.appended_bytes += s.appended_bytes;
+        };
+    }
+    result.stats.typed_views_active = typed_views_stats.appended;
+    result.stats.typed_views_item_count = typed_views_stats.item_count;
+    result.stats.typed_views_appended_bytes = typed_views_stats.appended_bytes;
+    defer if (pref_block) |b| allocator.free(b);
+    defer if (loop_block) |b| allocator.free(b);
+    defer if (decision_block) |b| allocator.free(b);
+    defer if (people_block) |b| allocator.free(b);
+
     // If everything is empty, return empty slot (no fence).
     const has_legacy = result.context.len > 0;
     const has_graph = if (graph_block) |g| g.len > 0 else false;
     const has_community = if (community_block) |c| c.len > 0 else false;
     const has_identity = if (identity_block) |b| b.len > 0 else false;
-    if (!has_legacy and !has_graph and !has_community and !has_identity) {
+    const has_pref = if (pref_block) |b| b.len > 0 else false;
+    const has_loop = if (loop_block) |b| b.len > 0 else false;
+    const has_decision = if (decision_block) |b| b.len > 0 else false;
+    const has_people = if (people_block) |b| b.len > 0 else false;
+    if (!has_legacy and !has_graph and !has_community and !has_identity and
+        !has_pref and !has_loop and !has_decision and !has_people)
+    {
         allocator.free(result.context);
         return .{
             .fenced_content = try allocator.dupe(u8, ""),
@@ -1124,17 +1225,26 @@ pub fn loadTurnMemorySlotOpts(
     const graph_payload: []const u8 = if (graph_block) |g| g else "";
     const community_payload: []const u8 = if (community_block) |c| c else "";
     const identity_payload: []const u8 = if (identity_block) |b| b else "";
+    const pref_payload: []const u8 = if (pref_block) |b| b else "";
+    const loop_payload: []const u8 = if (loop_block) |b| b else "";
+    const decision_payload: []const u8 = if (decision_block) |b| b else "";
+    const people_payload: []const u8 = if (people_block) |b| b else "";
     // V1.8-9: identity block goes FIRST inside the fence — context-invariant
     // facts are read before turn-specific retrieval. Order: identity →
-    // legacy retrieval → graph neighbors → communities.
+    // typed views → legacy retrieval → graph neighbors → communities.
     //
     // Priority cascade rationale:
     //   1. <active_identity>     — who the user IS (foundation, every turn)
-    //   2. result.context        — starts with `pending_conflicts` (V1.7
+    //   2. typed views           — <preferences>/<open_loops>/<decisions>/
+    //                              <people>: context-invariant standing facts
+    //                              (Phase 0.5). Like identity, these are
+    //                              always-on (not cosine-gated), so they sit
+    //                              with identity ahead of turn-specific recall.
+    //   3. result.context        — starts with `pending_conflicts` (V1.7
     //                              Item 3) then summary_latest, semantic
     //                              bucket, fallback bucket
-    //   3. <graph_neighbors>     — 1-hop graph expansion of recall seeds
-    //   4. <active_communities>  — top-3 community labels for orientation
+    //   4. <graph_neighbors>     — 1-hop graph expansion of recall seeds
+    //   5. <active_communities>  — top-3 community labels for orientation
     //
     // Why identity beats pending_conflicts: without knowing who you're
     // talking to, you can't usefully process their stated confusion.
@@ -1143,8 +1253,8 @@ pub fn loadTurnMemorySlotOpts(
     // "first across all warm context."
     const fenced = try std.fmt.allocPrint(
         allocator,
-        "<memory_for_turn>\n{s}{s}{s}{s}</memory_for_turn>\n",
-        .{ identity_payload, result.context, graph_payload, community_payload },
+        "<memory_for_turn>\n{s}{s}{s}{s}{s}{s}{s}{s}</memory_for_turn>\n",
+        .{ identity_payload, pref_payload, loop_payload, decision_payload, people_payload, result.context, graph_payload, community_payload },
     );
     return .{
         .fenced_content = fenced,
@@ -1379,6 +1489,147 @@ fn identityDedupKey(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
         try buf.append(allocator, lower);
     }
     return buf.toOwnedSlice(allocator);
+}
+
+// ── Phase 0.5 typed views — read the P3-typed memory signals ───────────────
+//
+// P3 routes a fact's durable `memory_type` by meaning into
+// `MemoryCategory{ .custom = "preference" | "open_loop" | "decision" |
+// "person" }`. Those signals were WRITTEN but nothing READ them. These four
+// views are deterministic, always-on context blocks over the existing store
+// (filter by type — NOT a new store) so the agent always sees the user's
+// preferences, open loops, decisions, and people on every memory-touching
+// turn, regardless of this turn's cosine relevance.
+//
+// Each block mirrors the <active_identity> shape exactly: a one-line header
+// (so the model knows how to use it), compact bullet items, a hard per-block
+// byte cap, and a per-item byte cap with UTF-8-safe truncation + XML-strip
+// defense-in-depth. Empty type → block omitted entirely (no empty fence).
+//
+// Queried via state_mgr.listMemories(allocator, user_id, .{ .custom = … },
+// null) — session_id null because these are user-global, cross-session.
+// listMemories already ORDER BY updated_at DESC, so open_loops are
+// recency-sorted and decisions are most-recent-N for free. 4 filtered
+// queries/turn is acceptable for Phase 0.5 (small, user_id-indexed sets);
+// each is bounded by a fetch limit below.
+
+/// Hard per-block byte cap. Holds ~6-10 short facts each — same envelope as
+/// IDENTITY_BLOCK_MAX_BYTES (1500). Keeps the four blocks combined well under
+/// the warm-context budget (worst case ~4*1500 = 6KB, but in practice most
+/// users have 0-2 populated types).
+const TYPED_VIEW_BLOCK_MAX_BYTES: usize = 1200;
+/// Per-item content cap (UTF-8 safe). Same shape as IDENTITY_FACT_MAX_BYTES.
+const TYPED_VIEW_ITEM_MAX_BYTES: usize = 220;
+/// Max rows fetched per typed query. Loader trims further by byte budget.
+/// open_loops/decisions are recency-sorted (updated_at DESC) so the most
+/// recent N survive the byte cap; preferences/people likewise.
+const TYPED_VIEW_FETCH_LIMIT: i64 = 12;
+
+/// Telemetry for a single typed-view block. Mirrors IdentityAppendResult.
+const TypedViewAppendResult = struct {
+    appended: bool = false,
+    item_count: usize = 0,
+    appended_bytes: usize = 0,
+};
+
+/// PURE renderer for a typed-view block. Takes an already-fetched slice of
+/// MemoryEntry (does NOT own/free them — caller's responsibility) and renders
+/// the fenced block. Returns null when no items survive trimming → caller
+/// omits the block (no empty `<tag></tag>`).
+///
+/// Pure-function shape (slice in, optional bytes out) so the builders' core
+/// logic is testable without a live DB. `tag` is the fence name
+/// ("preferences" etc.); `header` is the one-line description the model reads.
+fn renderTypedViewBlock(
+    allocator: std.mem.Allocator,
+    tag: []const u8,
+    header: []const u8,
+    entries: []const MemoryEntry,
+    stats: *TypedViewAppendResult,
+) !?[]u8 {
+    if (entries.len == 0) return null;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.print("<{s}>\n", .{tag});
+    try w.writeAll(header);
+    try w.writeByte('\n');
+    // Header bytes are not counted against the item budget — they are a
+    // fixed small cost. The cap governs how many ITEMS we admit.
+    const header_bytes = buf.items.len;
+
+    var emitted: usize = 0;
+    var bytes_used: usize = 0;
+    for (entries) |entry| {
+        const trimmed = std.mem.trim(u8, entry.content, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const truncated = truncateUtf8(trimmed, TYPED_VIEW_ITEM_MAX_BYTES);
+        const line_overhead: usize = 3; // "- " + "\n"
+        if (bytes_used + truncated.len + line_overhead > TYPED_VIEW_BLOCK_MAX_BYTES) break;
+        try w.writeAll("- ");
+        // Defense-in-depth: strip XML structural chars so a future
+        // extraction-classifier regression can't inject system-prompt markup
+        // (mirrors buildActiveIdentityBlock / buildActiveCommunitiesBlock).
+        for (truncated) |ch| {
+            if (ch == '<' or ch == '>' or ch == '\r') continue;
+            if (ch == '\n') {
+                try w.writeByte(' ');
+                continue;
+            }
+            try w.writeByte(ch);
+        }
+        try w.writeByte('\n');
+        bytes_used += truncated.len + line_overhead;
+        emitted += 1;
+    }
+
+    if (emitted == 0) {
+        // Every candidate was blank/oversized after trimming. Drop the block
+        // rather than emit an empty header.
+        buf.deinit(allocator);
+        return null;
+    }
+    try w.print("</{s}>\n", .{tag});
+    stats.appended = true;
+    stats.item_count = emitted;
+    stats.appended_bytes = header_bytes + bytes_used + tag.len + 4; // "</…>\n"
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Query one typed view by P3 custom memory_type, then render it.
+/// `mem_type` is the durable `memory_type` string ("preference" etc.).
+/// session_id is null: these are user-global, cross-session.
+///
+/// Returns null when state_mgr errors (caller logs + skips — graceful
+/// degrade, legacy retrieval unaffected) or when no rows of this type exist.
+/// Follows the file's free discipline: `defer memory_mod.freeEntries(...)`
+/// on the listMemories result.
+fn buildTypedViewBlock(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state.Manager,
+    user_id: i64,
+    mem_type: []const u8,
+    tag: []const u8,
+    header: []const u8,
+    stats: *TypedViewAppendResult,
+) !?[]u8 {
+    const entries = try state_mgr.listMemories(
+        allocator,
+        user_id,
+        .{ .custom = mem_type },
+        null,
+    );
+    defer memory_mod.freeEntries(allocator, entries);
+    if (entries.len == 0) return null;
+
+    // Bound the rendered set to the most-recent N (listMemories already
+    // ORDER BY updated_at DESC — recency-sorted for open_loops/decisions;
+    // preferences/people likewise). The byte cap inside the renderer trims
+    // further; this just caps the slice we hand it.
+    const limit: usize = @intCast(TYPED_VIEW_FETCH_LIMIT);
+    const bounded = entries[0..@min(entries.len, limit)];
+    return renderTypedViewBlock(allocator, tag, header, bounded, stats);
 }
 
 // ── V1.7a-2 graph-expand recall consumer helpers ──────────────────────────
@@ -2625,4 +2876,152 @@ test "tier gate: score-range arithmetic at rrf_k=60 top_k=25" {
         break :blk if (parsed >= 0.0 and parsed <= 1.0) parsed else @as(f64, 0.0);
     };
     try std.testing.expectEqual(@as(f64, 0.0), clamped);
+}
+
+// ── Phase 0.5 typed views — pure-function builder tests ────────────────────
+//
+// renderTypedViewBlock is the testable core of the four typed-view builders:
+// it takes an already-fetched []const MemoryEntry (so no live DB needed) and
+// renders the fenced block. buildTypedViewBlock wraps it with a listMemories
+// query; that query path needs Postgres (Manager is PG-only), so the pure
+// renderer is where the byte cap / inclusion / omission / empty-handling logic
+// is asserted. MemoryEntry literals below use static string fields (the
+// renderer only READS entry.content — it never owns or frees the slice).
+
+/// Test helper: a static-string MemoryEntry for the pure renderer. The
+/// renderer borrows `content`; nothing is allocated or freed.
+fn testEntry(content: []const u8) MemoryEntry {
+    return .{
+        .id = "id",
+        .key = "k",
+        .content = content,
+        .category = .{ .custom = "preference" },
+        .timestamp = "0",
+    };
+}
+
+test "typed views: renderTypedViewBlock includes the typed items + header + fence" {
+    const allocator = std.testing.allocator;
+    const entries = [_]MemoryEntry{
+        testEntry("user prefers dark mode"),
+        testEntry("user prefers concise replies"),
+    };
+    var stats: TypedViewAppendResult = .{};
+    const out = (try renderTypedViewBlock(allocator, "preferences", "User preferences — honor these.", &entries, &stats)).?;
+    defer allocator.free(out);
+
+    // (a) typed items are present, one bullet each.
+    try std.testing.expect(std.mem.indexOf(u8, out, "- user prefers dark mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "- user prefers concise replies") != null);
+    // header + open/close fence present.
+    try std.testing.expect(std.mem.startsWith(u8, out, "<preferences>\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "User preferences — honor these.\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out, "</preferences>\n"));
+    try std.testing.expect(stats.appended);
+    try std.testing.expectEqual(@as(usize, 2), stats.item_count);
+}
+
+test "typed views: renderTypedViewBlock renders ONLY the items it is handed (type isolation)" {
+    const allocator = std.testing.allocator;
+    // Caller (buildTypedViewBlock) pre-filters by memory_type via listMemories,
+    // so the renderer only ever sees the matching type. Verify it never invents
+    // content not in its input slice — the omission guarantee at the render layer.
+    const entries = [_]MemoryEntry{testEntry("open_loop: reply to Dana about the lease")};
+    var stats: TypedViewAppendResult = .{};
+    const out = (try renderTypedViewBlock(allocator, "open_loops", "Unfinished threads.", &entries, &stats)).?;
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "reply to Dana about the lease") != null);
+    // No leakage of unrelated typed markup — the only fence is <open_loops>.
+    try std.testing.expect(std.mem.indexOf(u8, out, "<preferences>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<decisions>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<people>") == null);
+}
+
+test "typed views: renderTypedViewBlock respects the hard per-block byte cap" {
+    const allocator = std.testing.allocator;
+    // Each item is ~100 bytes; with TYPED_VIEW_BLOCK_MAX_BYTES = 1200 and a
+    // 3-byte line overhead, far fewer than 40 items can fit. The renderer must
+    // stop admitting items once the cap would be exceeded — the block never
+    // grows unbounded.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var list: std.ArrayListUnmanaged(MemoryEntry) = .empty;
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        const c = try std.fmt.allocPrint(aa, "preference item number {d} padded out to about a hundred bytes so the cap is exercised", .{i});
+        try list.append(aa, testEntry(c));
+    }
+    var stats: TypedViewAppendResult = .{};
+    const out = (try renderTypedViewBlock(allocator, "preferences", "Prefs.", list.items, &stats)).?;
+    defer allocator.free(out);
+
+    // (c) total bytes bounded: header + items + fence stays within the cap
+    // plus a small fixed overhead for the header/fence lines.
+    try std.testing.expect(out.len <= TYPED_VIEW_BLOCK_MAX_BYTES + 64);
+    // And NOT all 40 items were admitted (the cap actually bit).
+    try std.testing.expect(stats.item_count < 40);
+    try std.testing.expect(stats.item_count > 0);
+}
+
+test "typed views: renderTypedViewBlock truncates an oversized single item to the per-item cap" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const huge = try aa.alloc(u8, TYPED_VIEW_ITEM_MAX_BYTES * 3);
+    @memset(huge, 'x');
+    const entries = [_]MemoryEntry{testEntry(huge)};
+    var stats: TypedViewAppendResult = .{};
+    const out = (try renderTypedViewBlock(allocator, "people", "People.", &entries, &stats)).?;
+    defer allocator.free(out);
+
+    // The rendered item is capped at the per-item byte budget (UTF-8 safe).
+    // Count only the 'x' run so header/fence bytes don't inflate the figure.
+    var x_run: usize = 0;
+    for (out) |ch| {
+        if (ch == 'x') x_run += 1;
+    }
+    try std.testing.expect(x_run <= TYPED_VIEW_ITEM_MAX_BYTES);
+    try std.testing.expectEqual(@as(usize, 1), stats.item_count);
+}
+
+test "typed views: renderTypedViewBlock returns null for empty input (no empty fence)" {
+    const allocator = std.testing.allocator;
+    const empty: []const MemoryEntry = &[_]MemoryEntry{};
+    var stats: TypedViewAppendResult = .{};
+    const out = try renderTypedViewBlock(allocator, "decisions", "Decisions.", empty, &stats);
+    try std.testing.expect(out == null);
+    try std.testing.expect(!stats.appended);
+}
+
+test "typed views: renderTypedViewBlock returns null when every item is blank (no empty fence)" {
+    const allocator = std.testing.allocator;
+    const entries = [_]MemoryEntry{ testEntry("   "), testEntry("\n\t ") };
+    var stats: TypedViewAppendResult = .{};
+    const out = try renderTypedViewBlock(allocator, "decisions", "Decisions.", &entries, &stats);
+    try std.testing.expect(out == null);
+    try std.testing.expect(!stats.appended);
+}
+
+test "typed views: renderTypedViewBlock strips XML structural chars (defense-in-depth)" {
+    const allocator = std.testing.allocator;
+    const entries = [_]MemoryEntry{testEntry("decided to <inject>markup</inject>")};
+    var stats: TypedViewAppendResult = .{};
+    const out = (try renderTypedViewBlock(allocator, "decisions", "Decisions.", &entries, &stats)).?;
+    defer allocator.free(out);
+
+    // The only '<' / '>' allowed are the block's own fence tags. The item's
+    // angle brackets are stripped so a classifier regression can't inject
+    // system-prompt markup.
+    try std.testing.expect(std.mem.indexOf(u8, out, "<inject>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "</inject>") == null);
+    // Inner text survives (sans brackets).
+    try std.testing.expect(std.mem.indexOf(u8, out, "injectmarkup/inject") != null);
+}
+
+test "typed views: LoadTurnMemoryOptions.typed_views_enabled defaults to true" {
+    const opts = LoadTurnMemoryOptions{};
+    try std.testing.expect(opts.typed_views_enabled);
 }

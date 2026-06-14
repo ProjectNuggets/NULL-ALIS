@@ -36,6 +36,10 @@ pub const MemoryStoreTool = struct {
     /// threaded from tool binding so memory_store's JudgeContext
     /// honors operator config. Default true preserves M2 behavior.
     cardinality_fastpath_enabled: bool = true,
+    /// P3 (memory-phase-0.5) — semantic type-routing flag, threaded from
+    /// tool binding so memory_store's JudgeContext routes memory_type by
+    /// fact meaning per operator config. Default true.
+    semantic_type_routing_enabled: bool = true,
     coref_embed: ?@import("../memory/vector/embeddings.zig").EmbeddingProvider = null,
 
     pub const tool_name = "memory_store";
@@ -285,7 +289,7 @@ pub const MemoryStoreTool = struct {
         const judge_ctx: ?extraction_persist.JudgeContext = blk: {
             if (self.judge_provider) |jp| {
                 if (self.judge_model_name) |jmn| {
-                    break :blk extraction_persist.JudgeContext{ .provider = jp, .model_name = jmn, .cardinality_fastpath_enabled = self.cardinality_fastpath_enabled };
+                    break :blk extraction_persist.JudgeContext{ .provider = jp, .model_name = jmn, .cardinality_fastpath_enabled = self.cardinality_fastpath_enabled, .semantic_type_routing_enabled = self.semantic_type_routing_enabled };
                 }
             }
             break :blk null;
@@ -309,6 +313,7 @@ pub const MemoryStoreTool = struct {
             self.mem_rt, // V1.8-2: vector coverage on agent memory_store tool
             .memory_store_tool, // V1.14.12 (M1) — per-path telemetry tag
             0, // P3: not a boundary caller — no boundary ID
+            self.semantic_type_routing_enabled, // P3 review: off-switch honored even with no judge
         ) catch |err| {
             std.log.scoped(.memory_store).warn("memory_store unified pipeline failed subject='{s}' predicate='{s}' err={s}", .{ subject, predicate, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "Failed to store memory via unified pipeline: {s}", .{@errorName(err)});

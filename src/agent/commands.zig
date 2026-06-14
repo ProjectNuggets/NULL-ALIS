@@ -177,6 +177,39 @@ fn deriveSessionEndEntityKey(allocator: std.mem.Allocator, object: []const u8) !
     return std.fmt.allocPrint(allocator, "entity_{s}", .{hex_buf});
 }
 
+/// P2 (memory-phase-0.5) — derive a stable, content-addressed key for a
+/// session-end durable fact.
+///
+/// ALL facts (triple or prose) produce `durable_fact/<sha256_hex(content)[0..32]>`.
+/// Using the first 16 bytes (128-bit) of SHA-256 as a 32 hex-char suffix,
+/// matching the `deriveSessionEndEntityKey` pattern above.
+///
+/// This preserves byte-for-byte identical classification vs the original
+/// timestamp-keyed scheme: `durable_fact/` is listed in
+/// `isSystemManagedMemoryKey` and matched by `propagateCorrection`, so
+/// edit-protection and correction propagation are unchanged.
+///
+/// Cross-writer dedup with Pass-C `extracted_` keys is intentionally deferred
+/// to the Phase-1 semantic-merge work — we keep one canonical `durable_fact/`
+/// row here.
+fn deriveDurableFactKey(
+    allocator: std.mem.Allocator,
+    fact: *const memory_mod.summarizer.ExtractedFact,
+) ![]u8 {
+    // SHA-256 of raw content; first 16 bytes → 32 hex chars (128-bit dedup).
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(fact.content);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    var hex_buf: [32]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (digest[0..16], 0..) |b, i| {
+        hex_buf[i * 2] = hex_chars[b >> 4];
+        hex_buf[i * 2 + 1] = hex_chars[b & 0x0f];
+    }
+    return std.fmt.allocPrint(allocator, "durable_fact/{s}", .{hex_buf});
+}
+
 /// V1.12 — build a compact transcript text from MessageEntries for the
 /// session-end entity_pipeline pass. Walks the entries in order
 /// (oldest-first), filters to user/assistant content, caps at ~3KB.
@@ -1079,6 +1112,27 @@ fn summaryLatestQuality(content: []const u8) SummaryQuality {
     return .canonical;
 }
 
+/// P4c (memory-phase-0.5) — true when an existing `summary_latest` body is the
+/// shallow deterministic-fallback skeleton rather than a canonical LLM
+/// summary. `ensureDurableContinuitySeed` uses this to RE-fire (re-summarize)
+/// a turn-1 fallback as the session gets richer, instead of treating any
+/// existing summary_latest as final.
+///
+/// Primary signal: the `quality_tier=fallback` metadata flag written by
+/// buildSummaryLatestContent. Secondary (belt-and-suspenders) signal for
+/// legacy rows written before the tier flag existed: the hardcoded
+/// `decisions: none` + `open_loops: none` skeleton that
+/// buildStructuredFallbackSummary emits on an empty/thin turn.
+pub fn summaryLatestIsFallback(content: []const u8) bool {
+    if (summaryLatestQuality(content) == .fallback) return true;
+    // Legacy rows had no quality_tier; detect the skeleton template directly.
+    if (metadataValue(content, "quality_tier") == null) {
+        if (std.mem.indexOf(u8, content, "decisions: none") != null and
+            std.mem.indexOf(u8, content, "open_loops: none") != null) return true;
+    }
+    return false;
+}
+
 fn shouldPromoteSummaryLatest(
     allocator: std.mem.Allocator,
     mem: memory_mod.Memory,
@@ -1167,13 +1221,46 @@ fn isNonInteractiveCheckpointReason(reason: []const u8) bool {
         std.mem.eql(u8, reason, "ttl_recycle");
 }
 
-fn shouldUseDeterministicSessionSummary(reason: []const u8) bool {
-    return std.mem.eql(u8, reason, "compaction:auto") or
-        std.mem.eql(u8, reason, "summary_seed:auto") or
-        // P0-2: shutdown + idle/TTL eviction must skip the blocking LLM
-        // summarizer (summary_provider.chat) and use the deterministic
-        // structured fallback summary — see isNonInteractiveCheckpointReason.
-        isNonInteractiveCheckpointReason(reason);
+/// Pure gating predicate for the deterministic vs. LLM session-summary path.
+///
+/// `reason` — the checkpoint reason tag.
+/// `canonical_continuity_summary_enabled` — the P4 flag (default ON).
+///
+/// Returns TRUE when the deterministic `buildStructuredFallbackSummary`
+/// template must be used (and `summary_provider.chat` is NOT reached);
+/// FALSE when the real LLM summarizer path runs.
+///
+/// Three classes of reason:
+///   - Genuinely non-interactive (shutdown / idle_evict / ttl_evict /
+///     ttl_recycle): ALWAYS deterministic regardless of the flag. They run
+///     on maintenance/shutdown lanes that cannot block on a 30-75s LLM call
+///     (P0-2 / P1-6).
+///   - LIVE in-conversation triggers (compaction:auto / summary_seed:auto):
+///     deterministic ONLY when the P4 flag is OFF. When ON (default), they
+///     take the real LLM-summarizer path. CRITICAL safety invariant: both
+///     run OFF-THREAD via `persistSessionCheckpointAsync` (a std.Thread.spawn
+///     worker → persistSessionCheckpointDetailed → persistSessionSemanticSummary),
+///     so the LLM call never blocks the user's turn. If that ever changes,
+///     this gate must NOT route them to the LLM path.
+///   - Interactive operator reasons (compaction:manual / reset:manual / …):
+///     never deterministic — they always took the LLM path and still do.
+fn shouldUseDeterministicSessionSummary(reason: []const u8, canonical_continuity_summary_enabled: bool) bool {
+    // P0-2 / P1-6: shutdown + idle/TTL eviction + ttl_recycle must skip the
+    // blocking LLM summarizer (summary_provider.chat) and use the
+    // deterministic structured fallback — see isNonInteractiveCheckpointReason.
+    // This holds regardless of the P4 flag.
+    if (isNonInteractiveCheckpointReason(reason)) return true;
+
+    // P4: the two LIVE in-conversation triggers. When the canonical-continuity
+    // flag is OFF, restore the exact prior behavior (deterministic template).
+    // When ON (default), fall through to the LLM summarizer path. They run
+    // off-thread, so the LLM call does not block the user turn.
+    if (!canonical_continuity_summary_enabled) {
+        if (std.mem.eql(u8, reason, "compaction:auto") or
+            std.mem.eql(u8, reason, "summary_seed:auto")) return true;
+    }
+
+    return false;
 }
 
 /// True when the inline session-end boundary extraction (extractAtBoundary)
@@ -1205,7 +1292,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
     defer if (parsed_summary) |*result| result.deinit(self.allocator);
     var summary_quality: SummaryQuality = .fallback;
     const content = blk: {
-        if (shouldUseDeterministicSessionSummary(reason)) {
+        if (shouldUseDeterministicSessionSummary(reason, self.canonical_continuity_summary_enabled)) {
             summary_text_owned = buildStructuredFallbackSummary(self, entries, checkpoint_content);
             if (summary_text_owned) |owned| {
                 log.info("memory.timeline_summary status=deterministic session={s} reason={s} entries={d}", .{
@@ -1376,13 +1463,27 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
     if (parsed_summary) |parsed| {
         var triple_edges_written: usize = 0;
         for (parsed.extracted_facts, 0..) |fact, idx| {
-            const fact_key = std.fmt.allocPrint(
-                self.allocator,
-                "durable_fact/{d}/{d}",
-                .{ now_s, idx },
-            ) catch continue;
+            _ = idx; // P2: index no longer used in key — content-addressed below
+            const fact_key = deriveDurableFactKey(self.allocator, &fact) catch continue;
             defer self.allocator.free(fact_key);
-            if (mem.store(fact_key, fact.content, .core, null)) |_| {
+            // P4d (memory-phase-0.5): route the stored memory_type by what a
+            // triple-bearing fact MEANS instead of hardcoding `.core`, so a
+            // preference/decision/person learned ONLY at session end gets a
+            // semantic type and surfaces in the typed <preferences>/<people>/
+            // <decisions>/<open_loops> views. Gated by
+            // semantic_type_routing_enabled (default ON, same gate as the P3
+            // persistExtracted path). Prose-only facts (no predicate / no
+            // triple) keep `.core` — classification stays consistent and the
+            // durable_fact/ KEY prefix is unchanged either way.
+            const fact_category: memory_mod.MemoryCategory = if (fact.hasTriple())
+                extraction_persist.categoryForSessionEndFact(
+                    fact.predicate.?,
+                    fact.attributed_to orelse "",
+                    self.semantic_type_routing_enabled,
+                )
+            else
+                .core;
+            if (mem.store(fact_key, fact.content, fact_category, null)) |_| {
                 if (rt) |mem_rt| _ = mem_rt.syncVectorAfterStore(self.allocator, fact_key, fact.content);
             } else |_| {
                 continue;
@@ -1604,12 +1705,17 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             const procedural_memory = @import("procedural_memory.zig");
 
             // G16 (WM-CROSS-SESSION) — promote high-importance WM slots
-            // (active_goal + decision, composite ≥ threshold) to
-            // durable_facts BEFORE the procedural-memory capture below.
-            // Ordering invariant: promotion-before-capture ensures the
-            // transient_goal durable_facts exist before the reflection
-            // trail references them. Failure-soft: returns count 0 on any
-            // setup error; per-slot failures log without aborting.
+            // (active_goal / decision / open_loop, composite ≥ threshold)
+            // to durable_facts BEFORE the procedural-memory capture below.
+            // P8: keys are branched by slot_type —
+            // `durable_fact/{slot_type}/{session_id}/{slot_id}` — so each
+            // promoted kind lands in a distinct, queryable namespace; the
+            // old flat `transient_goal` segment is gone. open_loop is now
+            // also promotable (P8 addition). Ordering invariant:
+            // promotion-before-capture ensures the durable_fact rows exist
+            // before the reflection trail references them. Failure-soft:
+            // returns count 0 on any setup error; per-slot failures log
+            // without aborting.
             {
                 const promotion = @import("promotion.zig");
                 var prom_result = promotion.promoteWMToDurableAtSessionEnd(
@@ -5550,25 +5656,72 @@ test "HELP_TEXT covers additional implemented commands" {
 // Together they assert ZERO inline provider.chat for the three evict reasons.
 
 test "P0-2: shutdown/idle_evict/ttl_evict use deterministic summary (no inline provider.chat)" {
-    try std.testing.expect(shouldUseDeterministicSessionSummary("shutdown"));
-    try std.testing.expect(shouldUseDeterministicSessionSummary("idle_evict"));
-    try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_evict"));
+    // Non-interactive reasons are deterministic regardless of the P4 flag —
+    // assert with the flag ON (default) to prove the flag does NOT route them
+    // to the blocking LLM path.
+    try std.testing.expect(shouldUseDeterministicSessionSummary("shutdown", true));
+    try std.testing.expect(shouldUseDeterministicSessionSummary("idle_evict", true));
+    try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_evict", true));
     // P1-6 (audit, part a): ttl_recycle joins the deterministic set.
-    try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_recycle"));
+    try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_recycle", true));
+    // ...and still deterministic with the flag OFF.
+    try std.testing.expect(shouldUseDeterministicSessionSummary("shutdown", false));
+    try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_recycle", false));
 }
 
-test "P0-2: existing deterministic reasons still hold" {
-    // Regression guard — the pre-existing deterministic reasons must remain.
-    try std.testing.expect(shouldUseDeterministicSessionSummary("compaction:auto"));
-    try std.testing.expect(shouldUseDeterministicSessionSummary("summary_seed:auto"));
+test "P4: live triggers take the LLM-summarizer path when the canonical flag is ON" {
+    // Flag ON (default): the two LIVE in-conversation triggers route to the
+    // real LLM summarizer (NOT deterministic). They run off-thread via
+    // persistSessionCheckpointAsync, so the LLM call never blocks the turn.
+    try std.testing.expect(!shouldUseDeterministicSessionSummary("compaction:auto", true));
+    try std.testing.expect(!shouldUseDeterministicSessionSummary("summary_seed:auto", true));
+}
+
+test "P4: live triggers fall back to deterministic template when the canonical flag is OFF" {
+    // Flag OFF: exact prior behavior — the live triggers use the deterministic
+    // template (safe cost/latency rollback).
+    try std.testing.expect(shouldUseDeterministicSessionSummary("compaction:auto", false));
+    try std.testing.expect(shouldUseDeterministicSessionSummary("summary_seed:auto", false));
+    // Non-interactive reasons remain deterministic in both flag states.
+    try std.testing.expect(shouldUseDeterministicSessionSummary("shutdown", false));
+}
+
+test "P4c: summaryLatestIsFallback detects fallback-quality summaries for re-fire" {
+    // quality_tier=fallback metadata → fallback (the primary signal).
+    const fallback_tier =
+        "type=summary_latest\nsession=agent:test:user:1:main\n" ++
+        "quality_tier=fallback\nfocus: thin turn-1\ndecisions:\n- shipping\n";
+    try std.testing.expect(summaryLatestIsFallback(fallback_tier));
+
+    // quality_tier=canonical → NOT fallback (ensureDurableContinuitySeed leaves
+    // it untouched, does NOT re-fire).
+    const canonical_tier =
+        "type=summary_latest\nsession=agent:test:user:1:main\n" ++
+        "quality_tier=canonical\nfocus: rich session\ndecisions:\n- ship the patch\n";
+    try std.testing.expect(!summaryLatestIsFallback(canonical_tier));
+
+    // Legacy row (no quality_tier) carrying the hardcoded skeleton → fallback.
+    const legacy_skeleton =
+        "type=summary_latest\nsession=agent:test:user:1:main\n" ++
+        "focus: \ndecisions: none\nopen_loops: none\nnext: \n";
+    try std.testing.expect(summaryLatestIsFallback(legacy_skeleton));
+
+    // Legacy row (no quality_tier) with real content → NOT fallback.
+    const legacy_real =
+        "type=summary_latest\nsession=agent:test:user:1:main\n" ++
+        "focus: ship\ndecisions:\n- keep rollout blocked\nopen_loops:\n- fix token truth\n";
+    try std.testing.expect(!summaryLatestIsFallback(legacy_real));
 }
 
 test "P0-2: interactive reasons still take the LLM summary path" {
     // Manual / interactive checkpoints keep the inline LLM summarizer — only
     // the non-interactive lifecycle reasons are diverted off the blocking path.
-    try std.testing.expect(!shouldUseDeterministicSessionSummary("compaction:manual"));
-    try std.testing.expect(!shouldUseDeterministicSessionSummary("reset:manual"));
-    try std.testing.expect(!shouldUseDeterministicSessionSummary(""));
+    // Independent of the P4 flag (assert in both states).
+    try std.testing.expect(!shouldUseDeterministicSessionSummary("compaction:manual", true));
+    try std.testing.expect(!shouldUseDeterministicSessionSummary("reset:manual", true));
+    try std.testing.expect(!shouldUseDeterministicSessionSummary("", true));
+    try std.testing.expect(!shouldUseDeterministicSessionSummary("compaction:manual", false));
+    try std.testing.expect(!shouldUseDeterministicSessionSummary("reset:manual", false));
 }
 
 test "P0-2: inline boundary extraction is skipped exactly for the evict reasons" {
@@ -5599,9 +5752,63 @@ test "P1-6 audit: ttl_recycle is non-interactive — inline boundary extraction 
     // enqueueExtractionJob lane). Pin all three gates together.
     try std.testing.expect(isNonInteractiveCheckpointReason("ttl_recycle"));
     try std.testing.expect(shouldSkipInlineBoundaryExtraction("ttl_recycle"));
-    try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_recycle"));
+    // Non-interactive → deterministic regardless of the P4 flag (assert ON).
+    try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_recycle", true));
     // Interactive reasons remain unaffected — the gate widened by exactly one.
     try std.testing.expect(!isNonInteractiveCheckpointReason("reset:manual"));
     try std.testing.expect(!isNonInteractiveCheckpointReason("api_compact"));
     try std.testing.expect(!isNonInteractiveCheckpointReason("compaction:manual"));
+}
+
+// P2 (memory-phase-0.5) — content-keyed durable_fact derivation tests.
+//
+// Verifies three invariants using real ExtractedFact values (no duck-typing):
+//   1. Two facts with IDENTICAL content → same key (dedup fires).
+//   2. Two facts with DIFFERENT content → different keys.
+//   3. A structured triple fact ALSO gets a `durable_fact/` key — classification
+//      is preserved; cross-writer dedup with extracted_ is Phase-1 work.
+
+test "P2: identical content produces the same durable_fact key" {
+    const allocator = std.testing.allocator;
+    const EF = memory_mod.summarizer.ExtractedFact;
+
+    const fact_a = EF{ .key = "", .content = "User prefers dark mode", .category = .core };
+    const fact_b = EF{ .key = "", .content = "User prefers dark mode", .category = .core };
+    const fact_c = EF{ .key = "", .content = "User dislikes Comic Sans", .category = .core };
+
+    const key_a = try deriveDurableFactKey(allocator, &fact_a);
+    defer allocator.free(key_a);
+    const key_b = try deriveDurableFactKey(allocator, &fact_b);
+    defer allocator.free(key_b);
+    const key_c = try deriveDurableFactKey(allocator, &fact_c);
+    defer allocator.free(key_c);
+
+    // Same content → same key (dedup).
+    try std.testing.expectEqualStrings(key_a, key_b);
+    // Different content → different keys.
+    try std.testing.expect(!std.mem.eql(u8, key_a, key_c));
+    // Always produces `durable_fact/<hex>` prefix — classification preserved.
+    try std.testing.expect(std.mem.startsWith(u8, key_a, "durable_fact/"));
+}
+
+test "P2: triple fact also gets a durable_fact/ key (no classification change)" {
+    const allocator = std.testing.allocator;
+    const EF = memory_mod.summarizer.ExtractedFact;
+
+    // A structured triple — all three triple fields present.
+    const triple_fact = EF{
+        .key = "",
+        .content = "User likes Zig",
+        .category = .core,
+        .subject = "user",
+        .predicate = "LIKES",
+        .object = "Zig",
+    };
+
+    const key = try deriveDurableFactKey(allocator, &triple_fact);
+    defer allocator.free(key);
+
+    // Triple facts must ALSO produce the durable_fact/ prefix — not extracted_.
+    // Cross-writer dedup with Pass-C extracted_ keys is deferred to Phase-1.
+    try std.testing.expect(std.mem.startsWith(u8, key, "durable_fact/"));
 }
