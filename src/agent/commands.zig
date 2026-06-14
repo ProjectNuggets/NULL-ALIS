@@ -1112,6 +1112,27 @@ fn summaryLatestQuality(content: []const u8) SummaryQuality {
     return .canonical;
 }
 
+/// P4c (memory-phase-0.5) — true when an existing `summary_latest` body is the
+/// shallow deterministic-fallback skeleton rather than a canonical LLM
+/// summary. `ensureDurableContinuitySeed` uses this to RE-fire (re-summarize)
+/// a turn-1 fallback as the session gets richer, instead of treating any
+/// existing summary_latest as final.
+///
+/// Primary signal: the `quality_tier=fallback` metadata flag written by
+/// buildSummaryLatestContent. Secondary (belt-and-suspenders) signal for
+/// legacy rows written before the tier flag existed: the hardcoded
+/// `decisions: none` + `open_loops: none` skeleton that
+/// buildStructuredFallbackSummary emits on an empty/thin turn.
+pub fn summaryLatestIsFallback(content: []const u8) bool {
+    if (summaryLatestQuality(content) == .fallback) return true;
+    // Legacy rows had no quality_tier; detect the skeleton template directly.
+    if (metadataValue(content, "quality_tier") == null) {
+        if (std.mem.indexOf(u8, content, "decisions: none") != null and
+            std.mem.indexOf(u8, content, "open_loops: none") != null) return true;
+    }
+    return false;
+}
+
 fn shouldPromoteSummaryLatest(
     allocator: std.mem.Allocator,
     mem: memory_mod.Memory,
@@ -5637,6 +5658,33 @@ test "P4: live triggers fall back to deterministic template when the canonical f
     try std.testing.expect(shouldUseDeterministicSessionSummary("summary_seed:auto", false));
     // Non-interactive reasons remain deterministic in both flag states.
     try std.testing.expect(shouldUseDeterministicSessionSummary("shutdown", false));
+}
+
+test "P4c: summaryLatestIsFallback detects fallback-quality summaries for re-fire" {
+    // quality_tier=fallback metadata → fallback (the primary signal).
+    const fallback_tier =
+        "type=summary_latest\nsession=agent:test:user:1:main\n" ++
+        "quality_tier=fallback\nfocus: thin turn-1\ndecisions:\n- shipping\n";
+    try std.testing.expect(summaryLatestIsFallback(fallback_tier));
+
+    // quality_tier=canonical → NOT fallback (ensureDurableContinuitySeed leaves
+    // it untouched, does NOT re-fire).
+    const canonical_tier =
+        "type=summary_latest\nsession=agent:test:user:1:main\n" ++
+        "quality_tier=canonical\nfocus: rich session\ndecisions:\n- ship the patch\n";
+    try std.testing.expect(!summaryLatestIsFallback(canonical_tier));
+
+    // Legacy row (no quality_tier) carrying the hardcoded skeleton → fallback.
+    const legacy_skeleton =
+        "type=summary_latest\nsession=agent:test:user:1:main\n" ++
+        "focus: \ndecisions: none\nopen_loops: none\nnext: \n";
+    try std.testing.expect(summaryLatestIsFallback(legacy_skeleton));
+
+    // Legacy row (no quality_tier) with real content → NOT fallback.
+    const legacy_real =
+        "type=summary_latest\nsession=agent:test:user:1:main\n" ++
+        "focus: ship\ndecisions:\n- keep rollout blocked\nopen_loops:\n- fix token truth\n";
+    try std.testing.expect(!summaryLatestIsFallback(legacy_real));
 }
 
 test "P0-2: interactive reasons still take the LLM summary path" {

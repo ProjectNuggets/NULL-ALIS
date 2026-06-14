@@ -6774,8 +6774,17 @@ pub const Agent = struct {
         const latest = mem.get(self.allocator, latest_key) catch return;
         if (latest) |entry| {
             var owned_entry = entry;
-            owned_entry.deinit(self.allocator);
-            return;
+            defer owned_entry.deinit(self.allocator);
+            // P4c: self-heal. If the existing summary_latest is the shallow
+            // deterministic-fallback skeleton (turn-1 thin summary), DON'T
+            // treat it as final — re-fire summary_seed so a richer session
+            // upgrades it to a canonical LLM summary. A canonical existing
+            // summary is left untouched (the early return below). The
+            // promotion guard (shouldPromoteSummaryLatest) still prevents a
+            // fresh fallback from overwriting an existing canonical, so this
+            // re-fire only ever upgrades, never downgrades.
+            if (!commands.summaryLatestIsFallback(owned_entry.content)) return;
+            // fall through to re-summarize
         }
 
         // V1.14.10 A — async (see refreshDurableContinuityAfterCompaction
@@ -6784,6 +6793,9 @@ pub const Agent = struct {
         // contention on a path that didn't need to block. No truth-
         // flag to update on this path (caller doesn't read a return
         // value), so we just discard the spawn success bool.
+        //
+        // P4c: ALSO fires when the existing summary_latest is fallback-quality
+        // (re-summarize to upgrade it as the session gets richer).
         _ = commands.persistSessionCheckpointAsync(self, "summary_seed:auto");
     }
 
