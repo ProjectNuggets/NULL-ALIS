@@ -480,6 +480,30 @@ fn categoryForSemantics(class: PredicateClass, attributed_to: []const u8) memory
     return categoryForAttribution(attributed_to);
 }
 
+/// P4d (memory-phase-0.5) — public routing entry for the legacy session-end
+/// `durable_fact` loop (commands.zig). That loop hardcoded `.core` for every
+/// fact, so a preference/decision/person learned ONLY at session end never
+/// got a semantic `memory_type` and never surfaced in the typed
+/// <preferences>/<people>/etc. views.
+///
+/// Mirrors the P3 persistExtracted routing (line ~1428): when
+/// `semantic_type_routing_enabled` is ON (default), route by what the fact
+/// MEANS via `categoryForSemantics(classifyPredicate(predicate), …)`; OFF →
+/// legacy `categoryForAttribution`. `attributed_to` may be empty (session-end
+/// facts often lack it) — categoryForAttribution treats non-"user" as the
+/// daily fallback, so an empty attribution with no semantic signal lands the
+/// same `.daily`/`.core` shape the loop relied on. Prose-only facts (no
+/// predicate) should NOT call this — the caller keeps `.core` for them.
+pub fn categoryForSessionEndFact(
+    predicate: []const u8,
+    attributed_to: []const u8,
+    semantic_type_routing_enabled: bool,
+) memory_root.MemoryCategory {
+    if (semantic_type_routing_enabled)
+        return categoryForSemantics(classifyPredicate(predicate), attributed_to);
+    return categoryForAttribution(attributed_to);
+}
+
 /// V1.6 commit 7 (Gap 2 from memory pipeline handoff): deterministic key
 /// derivation via SHA-256 of `subject|predicate|object`. Same fact extracted
 /// across different sessions / different times maps to the SAME key.
@@ -1015,6 +1039,40 @@ test "P3 categoryForSemantics routes by predicate meaning, not attribution" {
     try std.testing.expect(categoryForSemantics(classifyPredicate("LIVES_IN"), "undecided").eql(.daily));
     // Unknown predicate, user-attributed → core (fallback path).
     try std.testing.expect(categoryForSemantics(classifyPredicate("UNKNOWN_VERB"), "user").eql(.core));
+}
+
+// P4d: the public session-end routing entry used by commands.zig's legacy
+// durable_fact loop. With the flag ON it mirrors categoryForSemantics; with
+// the flag OFF it reduces to categoryForAttribution. The headline case: a
+// triple-bearing session-end PREFERS fact gets memory_type="preference"
+// (previously it was hardcoded `.core` and never surfaced in <preferences>).
+test "P4d categoryForSessionEndFact routes triple-bearing session-end facts by meaning" {
+    const expectCustom = struct {
+        fn f(cat: memory_root.MemoryCategory, want: []const u8) !void {
+            try std.testing.expect(cat == .custom);
+            try std.testing.expectEqualStrings(want, cat.custom);
+        }
+    }.f;
+
+    // Headline TDD case: triple-bearing PREFERS fact → "preference".
+    try expectCustom(categoryForSessionEndFact("PREFERS", "user", true), "preference");
+    // Other semantic types route too.
+    try expectCustom(categoryForSessionEndFact("DECIDED", "assistant", true), "decision");
+    try expectCustom(categoryForSessionEndFact("TODO", "user", true), "open_loop");
+    try expectCustom(categoryForSessionEndFact("MARRIED_TO", "user", true), "person");
+
+    // Empty attribution (common at session end) with no semantic signal → the
+    // legacy `.daily` fallback shape (else→daily). Confirms an empty string is
+    // safe.
+    try std.testing.expect(categoryForSessionEndFact("WORKS_AT", "", true).eql(.daily));
+    // Semantic signal wins even with empty attribution.
+    try expectCustom(categoryForSessionEndFact("PREFERS", "", true), "preference");
+
+    // Flag OFF → exact legacy categoryForAttribution behavior (no semantic
+    // routing). A PREFERS fact attributed to the user lands `.core`, NOT
+    // "preference" — this is the cost/latency-free rollback contract.
+    try std.testing.expect(categoryForSessionEndFact("PREFERS", "user", false).eql(.core));
+    try std.testing.expect(categoryForSessionEndFact("PREFERS", "assistant", false).eql(.daily));
 }
 
 // P3: with the flag OFF (the `else` branch at the persist site), routing

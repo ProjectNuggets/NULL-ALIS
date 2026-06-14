@@ -1466,7 +1466,24 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             _ = idx; // P2: index no longer used in key — content-addressed below
             const fact_key = deriveDurableFactKey(self.allocator, &fact) catch continue;
             defer self.allocator.free(fact_key);
-            if (mem.store(fact_key, fact.content, .core, null)) |_| {
+            // P4d (memory-phase-0.5): route the stored memory_type by what a
+            // triple-bearing fact MEANS instead of hardcoding `.core`, so a
+            // preference/decision/person learned ONLY at session end gets a
+            // semantic type and surfaces in the typed <preferences>/<people>/
+            // <decisions>/<open_loops> views. Gated by
+            // semantic_type_routing_enabled (default ON, same gate as the P3
+            // persistExtracted path). Prose-only facts (no predicate / no
+            // triple) keep `.core` — classification stays consistent and the
+            // durable_fact/ KEY prefix is unchanged either way.
+            const fact_category: memory_mod.MemoryCategory = if (fact.hasTriple())
+                extraction_persist.categoryForSessionEndFact(
+                    fact.predicate.?,
+                    fact.attributed_to orelse "",
+                    self.semantic_type_routing_enabled,
+                )
+            else
+                .core;
+            if (mem.store(fact_key, fact.content, fact_category, null)) |_| {
                 if (rt) |mem_rt| _ = mem_rt.syncVectorAfterStore(self.allocator, fact_key, fact.content);
             } else |_| {
                 continue;
