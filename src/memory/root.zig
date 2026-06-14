@@ -322,6 +322,50 @@ pub const MemoryCategory = union(enum) {
     }
 };
 
+/// P3 review (memory-phase-0.5) — durable semantic types are evergreen and
+/// must NOT age out under temporal decay in recall ranking.
+///
+/// Before P3, user-attributed facts became `.core` and were evergreen.
+/// P3 routes those same facts to `custom:"preference"/"decision"/"person"`
+/// (by meaning, not attribution). Without this predicate they would suddenly
+/// `!= .core` and start decaying — a regression, since preferences, people,
+/// and decisions are durable.
+///
+/// Returns true for:
+///   - `.core` (legacy evergreen tier — unchanged)
+///   - `custom:"preference"` (durable user preferences)
+///   - `custom:"decision"`   (durable commitments/choices)
+///   - `custom:"person"`     (durable relationship facts)
+///
+/// `custom:"open_loop"` is deliberately NOT evergreen — open loops resolve
+/// over time and stay recency-weighted (they decay), matching design intent.
+/// All other categories (`.daily`, `.conversation`, other custom strings)
+/// decay normally.
+pub fn isEvergreenCategory(category: MemoryCategory) bool {
+    return switch (category) {
+        .core => true,
+        .custom => |name| std.mem.eql(u8, name, "preference") or
+            std.mem.eql(u8, name, "decision") or
+            std.mem.eql(u8, name, "person"),
+        else => false,
+    };
+}
+
+test "isEvergreenCategory: core and durable semantic types are evergreen" {
+    try std.testing.expect(isEvergreenCategory(.core));
+    try std.testing.expect(isEvergreenCategory(.{ .custom = "preference" }));
+    try std.testing.expect(isEvergreenCategory(.{ .custom = "decision" }));
+    try std.testing.expect(isEvergreenCategory(.{ .custom = "person" }));
+}
+
+test "isEvergreenCategory: open_loop and recency types are NOT evergreen" {
+    // open_loop deliberately decays — open loops resolve over time.
+    try std.testing.expect(!isEvergreenCategory(.{ .custom = "open_loop" }));
+    try std.testing.expect(!isEvergreenCategory(.daily));
+    try std.testing.expect(!isEvergreenCategory(.conversation));
+    try std.testing.expect(!isEvergreenCategory(.{ .custom = "other" }));
+}
+
 // ── Link types ─────────────────────────────────────────────────────
 //
 // V1.7a-5 (spec seam 3) — high-level RELATIONSHIP CATEGORY for a memory's

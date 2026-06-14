@@ -7,12 +7,15 @@
 //!   where   lambda = ln(2) / half_life_days
 //!
 //! At age == half_life_days the multiplier is exactly 0.5.
-//! Evergreen entries (category == .core) are never decayed.
+//! Evergreen entries are never decayed — `.core` plus the durable semantic
+//! types (custom:"preference"/"decision"/"person"); see
+//! `memory_root.isEvergreenCategory`. `open_loop` is NOT evergreen.
 
 const std = @import("std");
 const retrieval = @import("engine.zig");
 const RetrievalCandidate = retrieval.RetrievalCandidate;
-const MemoryCategory = @import("../root.zig").MemoryCategory;
+const memory_root = @import("../root.zig");
+const MemoryCategory = memory_root.MemoryCategory;
 const config_types = @import("../../config_types.zig");
 
 pub const TemporalDecayConfig = config_types.MemoryTemporalDecayConfig;
@@ -50,7 +53,8 @@ pub fn isEvergreen(path: []const u8) bool {
 const secs_per_day: f64 = 86400.0;
 
 /// Apply temporal decay to candidate scores in-place.
-/// Evergreen candidates (category == .core) are not decayed.
+/// Evergreen candidates (see `memory_root.isEvergreenCategory` — `.core`
+/// plus durable custom: types preference/decision/person) are not decayed.
 /// Candidates with created_at == 0 (unknown timestamp) are not decayed.
 pub fn applyTemporalDecay(
     candidates: []RetrievalCandidate,
@@ -63,8 +67,12 @@ pub fn applyTemporalDecay(
     const lambda = decayLambda(config.half_life_days);
 
     for (candidates) |*c| {
-        // Skip evergreen (core) entries
-        if (c.category == .core) continue;
+        // Skip evergreen entries. P3 review: this covers `.core` AND the
+        // durable semantic types (custom:"preference"/"decision"/"person").
+        // Before P3, user facts were `.core` and never decayed; semantic
+        // routing now sends them to custom: types, so the exemption must
+        // follow. `open_loop` is intentionally excluded (it decays).
+        if (memory_root.isEvergreenCategory(c.category)) continue;
 
         // Skip entries with no known timestamp
         if (c.created_at == 0) continue;
@@ -187,6 +195,35 @@ test "applyTemporalDecay core category never decayed" {
     };
     applyTemporalDecay(&candidates, .{ .enabled = true, .half_life_days = 30 }, now);
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), candidates[0].final_score, 1e-10);
+}
+
+// P3 review (memory-phase-0.5) — semantic routing sends durable user facts
+// to custom: types instead of `.core`. Those durable types must STAY
+// evergreen (regression guard); `open_loop` must still decay (design intent).
+test "applyTemporalDecay durable semantic types stay evergreen like core; open_loop decays" {
+    const created = 1000000;
+    const now = created + 365 * 86400; // 1 year old → would decay heavily
+
+    var candidates = [_]RetrievalCandidate{
+        makeCandidate(.core, 1.0, created), // (c) core still exempt
+        makeCandidate(.{ .custom = "preference" }, 1.0, created), // (a) exempt
+        makeCandidate(.{ .custom = "decision" }, 1.0, created), // exempt
+        makeCandidate(.{ .custom = "person" }, 1.0, created), // exempt
+        makeCandidate(.{ .custom = "open_loop" }, 1.0, created), // (b) DECAYS
+        makeCandidate(.daily, 1.0, created), // (c) daily still decays
+    };
+    applyTemporalDecay(&candidates, .{ .enabled = true, .half_life_days = 30 }, now);
+
+    // (a)+(c) preference matches core exactly — both unchanged at 1.0.
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), candidates[0].final_score, 1e-10); // core
+    try std.testing.expectApproxEqAbs(candidates[0].final_score, candidates[1].final_score, 1e-12); // preference == core
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), candidates[2].final_score, 1e-10); // decision
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), candidates[3].final_score, 1e-10); // person
+
+    // (b) open_loop is recency-weighted → score reduced for an old timestamp.
+    try std.testing.expect(candidates[4].final_score < 0.001); // open_loop decayed
+    // (c) daily still decays.
+    try std.testing.expect(candidates[5].final_score < 0.001);
 }
 
 test "applyTemporalDecay disabled config no changes" {
