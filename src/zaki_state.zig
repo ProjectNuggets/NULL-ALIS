@@ -4727,7 +4727,16 @@ const ManagerImpl = struct {
                 std.mem.span(c.PQgetvalue(result, 0, 2))
             else
                 "";
-            if (seen_count > 1 and !std.mem.eql(u8, returned_type, "core")) {
+            // 0.5b M3 (sibling completion): gate on `!isDurableMemoryType` (not
+            // the literal `!= "core"`) so re-corroborating a durable type
+            // (preference/decision/person/open_loop) across sessions does NOT
+            // spuriously fire pending_conflicts — those are evergreen and
+            // expected to be re-seen. P3 routes durable facts onto these typed
+            // categories, and this function's own CASE-guards (DURABLE_TYPES_SQL)
+            // keep the type, so the literal `!= "core"` was always true here.
+            // A `daily` re-corroboration still fires (unchanged). Mirrors the
+            // upsertMemory twin gate.
+            if (seen_count > 1 and !memory_root.isDurableMemoryType(returned_type)) {
                 if (session_text.len > 0) {
                     self.writePendingConflictMarker(user_id, key, session_text) catch |err| {
                         log.warn("upsertMemoryWithMetadata: conflict marker failed key={s}: {}", .{ key, err });
