@@ -5227,7 +5227,12 @@ const ManagerImpl = struct {
             // LR-03: suppress for already-promoted (core) rows — they have
             // been deliberately elevated to global truth; further cross-session
             // writes are expected and should not generate false-positive alerts.
-            if (seen_count > 1 and !std.mem.eql(u8, returned_type, "core")) {
+            // 0.5b M3: gate on `!isDurableMemoryType` (not just `!= "core"`) so
+            // re-corroborating a durable type (preference/decision/person/
+            // open_loop) does NOT spuriously fire pending_conflicts — those are
+            // evergreen and expected to be re-seen across sessions. A `daily`
+            // re-corroboration still fires (unchanged).
+            if (seen_count > 1 and !memory_root.isDurableMemoryType(returned_type)) {
                 // NF-01: replace assert with a logged guard — std.debug.assert
                 // is elided in ReleaseFast, making the safety net vanish in
                 // production. The session_text.len == 0 case can arise from
