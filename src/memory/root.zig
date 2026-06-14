@@ -322,6 +322,48 @@ pub const MemoryCategory = union(enum) {
     }
 };
 
+/// Phase-0.5b — the SINGLE SOURCE OF TRUTH for "which memory_type strings are
+/// durable / evergreen". A prior patch (P3) routed durable user facts off
+/// `memory_type='core'` onto `custom:"preference"/"decision"/"person"/
+/// "open_loop"`, but ~6 sites kept equating "durable/protected" with the
+/// literal string `'core'`, so the typed durables silently lost protection.
+/// These two type-sets (+ their SQL fragments + predicates) thread the same
+/// definition through every site so they can never drift again.
+///
+///   EVERGREEN = types that NEVER age out under confidence/temporal decay.
+///   DURABLE   = EVERGREEN + open_loop = types that get the resurrect +
+///               anti-demotion + no-clobber protections that `core` had.
+///
+/// open_loop is DURABLE (protected from resurrection/demotion/clobber) but
+/// NOT EVERGREEN (it still decays — open loops resolve over time).
+pub const EVERGREEN_MEMORY_TYPES = [_][]const u8{ "core", "preference", "decision", "person" };
+pub const DURABLE_MEMORY_TYPES = [_][]const u8{ "core", "preference", "decision", "person", "open_loop" };
+
+/// SQL `IN (...)` fragments, single-sourced from the sets above. SELECT/UPDATE
+/// sites reference these constants instead of hand-writing the lists so the
+/// SQL can never drift from `isEvergreenMemoryType` / `isDurableMemoryType`.
+/// The comptime test below asserts the strings match the sets exactly.
+pub const EVERGREEN_TYPES_SQL = "('core','preference','decision','person')";
+pub const DURABLE_TYPES_SQL = "('core','preference','decision','person','open_loop')";
+
+/// True for the EVERGREEN type strings (never decay). Mirror of
+/// `isEvergreenCategory` over the raw `memory_type` column value.
+pub fn isEvergreenMemoryType(t: []const u8) bool {
+    for (EVERGREEN_MEMORY_TYPES) |et| {
+        if (std.mem.eql(u8, t, et)) return true;
+    }
+    return false;
+}
+
+/// True for the DURABLE type strings (get the `core`-grade resurrect /
+/// anti-demotion / no-clobber protections). EVERGREEN ∪ {open_loop}.
+pub fn isDurableMemoryType(t: []const u8) bool {
+    for (DURABLE_MEMORY_TYPES) |dt| {
+        if (std.mem.eql(u8, t, dt)) return true;
+    }
+    return false;
+}
+
 /// P3 review (memory-phase-0.5) — durable semantic types are evergreen and
 /// must NOT age out under temporal decay in recall ranking.
 ///
@@ -341,12 +383,13 @@ pub const MemoryCategory = union(enum) {
 /// over time and stay recency-weighted (they decay), matching design intent.
 /// All other categories (`.daily`, `.conversation`, other custom strings)
 /// decay normally.
+///
+/// Phase-0.5b: delegates to `isEvergreenMemoryType` (the shared set) so the
+/// category predicate and the raw-string predicate can never diverge.
 pub fn isEvergreenCategory(category: MemoryCategory) bool {
     return switch (category) {
         .core => true,
-        .custom => |name| std.mem.eql(u8, name, "preference") or
-            std.mem.eql(u8, name, "decision") or
-            std.mem.eql(u8, name, "person"),
+        .custom => |name| isEvergreenMemoryType(name),
         else => false,
     };
 }
@@ -364,6 +407,51 @@ test "isEvergreenCategory: open_loop and recency types are NOT evergreen" {
     try std.testing.expect(!isEvergreenCategory(.daily));
     try std.testing.expect(!isEvergreenCategory(.conversation));
     try std.testing.expect(!isEvergreenCategory(.{ .custom = "other" }));
+}
+
+test "isEvergreenMemoryType / isDurableMemoryType cover the right sets" {
+    // EVERGREEN ⊂ DURABLE; open_loop is durable-but-not-evergreen.
+    try std.testing.expect(isEvergreenMemoryType("core"));
+    try std.testing.expect(isEvergreenMemoryType("preference"));
+    try std.testing.expect(isEvergreenMemoryType("decision"));
+    try std.testing.expect(isEvergreenMemoryType("person"));
+    try std.testing.expect(!isEvergreenMemoryType("open_loop"));
+    try std.testing.expect(!isEvergreenMemoryType("daily"));
+
+    try std.testing.expect(isDurableMemoryType("core"));
+    try std.testing.expect(isDurableMemoryType("preference"));
+    try std.testing.expect(isDurableMemoryType("decision"));
+    try std.testing.expect(isDurableMemoryType("person"));
+    try std.testing.expect(isDurableMemoryType("open_loop"));
+    try std.testing.expect(!isDurableMemoryType("daily"));
+    try std.testing.expect(!isDurableMemoryType("conversation"));
+
+    // Every EVERGREEN type is also DURABLE (set containment).
+    for (EVERGREEN_MEMORY_TYPES) |t| try std.testing.expect(isDurableMemoryType(t));
+}
+
+/// Build a `('a','b',...)` SQL `IN`-list from a comptime string set, so the
+/// hand-written `*_TYPES_SQL` constants can be asserted byte-for-byte against
+/// the `*_MEMORY_TYPES` sets — drift becomes a comptime test failure.
+fn sqlInListFromSet(comptime set: []const []const u8) []const u8 {
+    var s: []const u8 = "(";
+    for (set, 0..) |t, i| {
+        if (i > 0) s = s ++ ",";
+        s = s ++ "'" ++ t ++ "'";
+    }
+    return s ++ ")";
+}
+
+// Drift guard: the hand-written `*_TYPES_SQL` constants must equal the
+// `IN (...)` lists derived from the `*_MEMORY_TYPES` sets. Editing one set
+// without the other is now a COMPILE error (not a silent divergence, nor a
+// merely test-time failure) — the `comptime` block forces evaluation of the
+// `++`-built builder and `@compileError`s on any mismatch.
+comptime {
+    if (!std.mem.eql(u8, sqlInListFromSet(&EVERGREEN_MEMORY_TYPES), EVERGREEN_TYPES_SQL))
+        @compileError("EVERGREEN_TYPES_SQL drifted from EVERGREEN_MEMORY_TYPES — regenerate the IN-list");
+    if (!std.mem.eql(u8, sqlInListFromSet(&DURABLE_MEMORY_TYPES), DURABLE_TYPES_SQL))
+        @compileError("DURABLE_TYPES_SQL drifted from DURABLE_MEMORY_TYPES — regenerate the IN-list");
 }
 
 // ── Link types ─────────────────────────────────────────────────────
@@ -955,6 +1043,14 @@ pub const Phase05BackfillReport = struct {
     exact_dups_collapsed: usize = 0,
     /// Report-only — near-duplicate candidate clusters left for Phase 1.
     near_dup_clusters: usize = 0,
+    /// Brain-leak Fix C — count of system-prompt scaffold entities purged
+    /// (memory_entities rows whose name matches the scaffold denylist). On
+    /// dry-run this is the would-be deletion count; on apply it is the rows
+    /// deleted. Idempotent: a second run finds 0.
+    scaffold_entities_purged: usize = 0,
+    /// Brain-leak Fix C — count of memory_edges rows deleted because they
+    /// referenced a purged scaffold entity (source_key or target_key).
+    scaffold_edges_purged: usize = 0,
 };
 
 /// V1.7a-9a — owned community-name lookup row.
@@ -1388,6 +1484,18 @@ pub fn isEditableMemoryEntry(key: []const u8, category: MemoryCategory) bool {
     // structural checks below.
     _ = category;
     if (isTombstoneKey(key) or isMarkdownLineKey(key) or isAppendOnlyMemoryKey(key)) return false;
+    // 0.5b H1 — curability is a PROVENANCE question ("is this user/agent
+    // content?"), not key-bookkeeping. `durable_fact/*` is brain-visible,
+    // recallable USER KNOWLEDGE (content-addressed facts, promoted goals,
+    // learning corrections) — so it must be curable (archive/forget/edit).
+    // It is classified system-managed ONLY because that predicate also
+    // drives the forget/markdown-mirror discipline in
+    // zaki_dual.zig::implForget; mutating the shared predicate would change
+    // that unrelated role. Instead, special-case the curability gate here:
+    // durable_fact/ passes provenance, every other system-managed prefix
+    // (summary_latest/, timeline_summary/, agent_plan/, context_anchor,
+    // append-only families) stays protected via isSystemManagedMemoryKey.
+    if (std.mem.startsWith(u8, key, "durable_fact/")) return true;
     if (isInternalMemoryKey(key) or isSystemManagedMemoryKey(key)) return false;
     return true;
 }
@@ -3114,10 +3222,11 @@ test "V1.14.12 (Memory audit Finding 1): durable_fact/* is brain-visible" {
     // Now visible.
     try std.testing.expect(isBrainVisibleKey("durable_fact/1700000000/0"));
     try std.testing.expect(isBrainVisibleKey("durable_fact/1700000000/42"));
-    // Edit-protection still holds via isSystemManagedMemoryKey at line ~1171
-    // — the hidden-vs-visible status is independent of the edit-protection
-    // status, by design.
-    try std.testing.expect(!isEditableMemoryEntry("durable_fact/1700000000/0", .core));
+    // 0.5b H1 — durable_fact/* is user KNOWLEDGE, so it is now curable
+    // (archive/forget/edit). isEditableMemoryEntry special-cases this prefix
+    // without mutating the shared isSystemManagedMemoryKey predicate (whose
+    // forget/mirror-discipline role in zaki_dual.zig stays intact).
+    try std.testing.expect(isEditableMemoryEntry("durable_fact/1700000000/0", .core));
 }
 
 test "V1.14.12 (Memory audit Finding 1): existing hidden continuity stays hidden" {
@@ -4329,7 +4438,9 @@ test "editable memory classification keeps user state editable" {
     try std.testing.expect(isEditableMemoryEntry("user_name", .core));
     try std.testing.expect(!isEditableMemoryEntry("summary_latest/agent:zaki-bot:user:1:main", .core));
     try std.testing.expect(!isEditableMemoryEntry("timeline_summary/agent:zaki-bot:user:1:main/1", .daily));
-    try std.testing.expect(!isEditableMemoryEntry("durable_fact/1/0", .core));
+    // 0.5b H1 — durable_fact/* is user knowledge → curable in every category.
+    try std.testing.expect(isEditableMemoryEntry("durable_fact/1/0", .core));
+    try std.testing.expect(isEditableMemoryEntry("durable_fact/1/0", .{ .custom = "preference" }));
 }
 
 test "V1.10 Gap B — daily-type user-namespace keys are editable" {
@@ -4348,10 +4459,15 @@ test "V1.10 Gap B — daily-type user-namespace keys are editable" {
     try std.testing.expect(isEditableMemoryEntry("any_user_key", .daily));
     // Internal / system-managed keys still refused regardless of category.
     try std.testing.expect(!isEditableMemoryEntry("autosave_user_123", .conversation));
-    try std.testing.expect(!isEditableMemoryEntry("durable_fact/1/0", .daily));
+    // 0.5b H1 — durable_fact/* is the exception: user knowledge, so curable.
+    try std.testing.expect(isEditableMemoryEntry("durable_fact/1/0", .daily));
+    // Genuinely-protected continuity/append-only/anchor keys stay refused.
     try std.testing.expect(!isEditableMemoryEntry("summary_latest/x", .core));
     try std.testing.expect(!isEditableMemoryEntry("timeline_summary/x/1", .core));
     try std.testing.expect(!isEditableMemoryEntry("context_anchor_current", .core));
+    try std.testing.expect(!isEditableMemoryEntry("agent_plan/current/x", .core));
+    try std.testing.expect(!isEditableMemoryEntry("session_summary/x/1", .core));
+    try std.testing.expect(!isEditableMemoryEntry("__tombstone__/x", .core));
 }
 
 test "tombstone target key extracts target" {

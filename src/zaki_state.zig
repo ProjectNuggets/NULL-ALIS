@@ -20,6 +20,12 @@ const text_norm = @import("memory/text_norm.zig");
 // new writes are typed. Module-level circular import (extraction_persist
 // imports zaki_state) is fine — only runtime calls, no comptime cycle.
 const extraction_persist = @import("agent/extraction_persist.zig");
+// Brain-leak Fix C — keystone reuse for the C0 scaffold purge. Same
+// `context_builder.isScaffoldEntityName` predicate Fix A uses at the write
+// boundary, so purge (existing poison) and reject (new poison) share ONE
+// matching definition derived from `stable_prompt_markers` — no drift.
+// context_builder imports only leaf modules; runtime-only call, no comptime cycle.
+const context_builder = @import("agent/context_builder.zig");
 const cron_mod = @import("cron.zig");
 const security_secrets = @import("security/secrets.zig");
 
@@ -4598,10 +4604,24 @@ const ManagerImpl = struct {
         const q = try self.buildQuery(
             "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, metadata, lemmatized, link_type, updated_at) " ++
                 "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, ($8::jsonb)->>'link_type', NOW()) " ++
+                // Phase-0.5b C1: the resurrect-on-upsert + anti-demotion
+                // CASE-guards now key on `memory_type IN <DURABLE_TYPES_SQL>`
+                // (core/preference/decision/person/open_loop) instead of just
+                // `= 'core'`. P3 routed durable user facts onto the typed
+                // categories; without this they would resurrect/demote on a
+                // benign re-upsert. open_loop is durable here (close-out
+                // preserved) even though it still decays in ranking.
+                // NOTE: the close-out (valid_to/is_latest/memory_type) is
+                // preserved for a durable row, but `content`/`metadata` below
+                // still refresh to EXCLUDED — so re-mentioning an ARCHIVED
+                // durable fact keeps it archived (no resurrection) while
+                // updating its stored phrasing. Intended: latest wording wins;
+                // the archival STATE is what's protected, not the text bytes.
+                // (Same semantics at the `upsertMemory` sibling path.)
                 "ON CONFLICT (user_id, key) DO UPDATE SET " ++
-                "session_id = CASE WHEN {schema}.memories.memory_type = 'core' THEN NULL ELSE EXCLUDED.session_id END, " ++
+                "session_id = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN NULL ELSE EXCLUDED.session_id END, " ++
                 "content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, " ++
-                "memory_type = CASE WHEN {schema}.memories.memory_type = 'core' THEN 'core' ELSE EXCLUDED.memory_type END, " ++
+                "memory_type = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.memory_type ELSE EXCLUDED.memory_type END, " ++
                 "metadata = EXCLUDED.metadata, lemmatized = EXCLUDED.lemmatized, " ++
                 // V1.7a-5: refresh link_type from the new metadata's value.
                 // COALESCE with the existing value so omitting link_type in
@@ -4609,10 +4629,10 @@ const ManagerImpl = struct {
                 // category (defensive — current callers always emit it).
                 "link_type = COALESCE((EXCLUDED.metadata)->>'link_type', {schema}.memories.link_type), " ++
                 "updated_at = NOW(), " ++
-                "valid_to    = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.valid_to    ELSE NULL END, " ++
-                "invalid_at  = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.invalid_at  ELSE NULL END, " ++
-                "expired_at  = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.expired_at  ELSE NULL END, " ++
-                "is_latest   = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.is_latest   ELSE TRUE END, " ++
+                "valid_to    = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.valid_to    ELSE NULL END, " ++
+                "invalid_at  = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.invalid_at  ELSE NULL END, " ++
+                "expired_at  = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.expired_at  ELSE NULL END, " ++
+                "is_latest   = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.is_latest   ELSE TRUE END, " ++
                 "seen_in_session_count = CASE " ++
                 "  WHEN {schema}.memories.session_id IS DISTINCT FROM EXCLUDED.session_id " ++
                 "       AND EXCLUDED.session_id IS NOT NULL " ++
@@ -4714,7 +4734,16 @@ const ManagerImpl = struct {
                 std.mem.span(c.PQgetvalue(result, 0, 2))
             else
                 "";
-            if (seen_count > 1 and !std.mem.eql(u8, returned_type, "core")) {
+            // 0.5b M3 (sibling completion): gate on `!isDurableMemoryType` (not
+            // the literal `!= "core"`) so re-corroborating a durable type
+            // (preference/decision/person/open_loop) across sessions does NOT
+            // spuriously fire pending_conflicts — those are evergreen and
+            // expected to be re-seen. P3 routes durable facts onto these typed
+            // categories, and this function's own CASE-guards (DURABLE_TYPES_SQL)
+            // keep the type, so the literal `!= "core"` was always true here.
+            // A `daily` re-corroboration still fires (unchanged). Mirrors the
+            // upsertMemory twin gate.
+            if (seen_count > 1 and !memory_root.isDurableMemoryType(returned_type)) {
                 if (session_text.len > 0) {
                     self.writePendingConflictMarker(user_id, key, session_text) catch |err| {
                         log.warn("upsertMemoryWithMetadata: conflict marker failed key={s}: {}", .{ key, err });
@@ -5103,15 +5132,20 @@ const ManagerImpl = struct {
         const q = try self.buildQuery(
             "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, lemmatized, updated_at) " ++
                 "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) " ++
+                // Phase-0.5b C1: resurrect-on-upsert + anti-demotion guards
+                // now key on `memory_type IN <DURABLE_TYPES_SQL>` (see the
+                // upsertMemoryWithMetadata sibling above). A superseded
+                // preference/decision/person/open_loop keeps its close-out
+                // (no resurrection) and can't be demoted by a benign re-upsert.
                 "ON CONFLICT (user_id, key) DO UPDATE SET " ++
-                "session_id = CASE WHEN {schema}.memories.memory_type = 'core' THEN NULL ELSE EXCLUDED.session_id END, " ++
+                "session_id = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN NULL ELSE EXCLUDED.session_id END, " ++
                 "content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, " ++
-                "memory_type = CASE WHEN {schema}.memories.memory_type = 'core' THEN 'core' ELSE EXCLUDED.memory_type END, " ++
+                "memory_type = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.memory_type ELSE EXCLUDED.memory_type END, " ++
                 "lemmatized = EXCLUDED.lemmatized, updated_at = NOW(), " ++
-                "valid_to    = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.valid_to    ELSE NULL END, " ++
-                "invalid_at  = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.invalid_at  ELSE NULL END, " ++
-                "expired_at  = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.expired_at  ELSE NULL END, " ++
-                "is_latest   = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.is_latest   ELSE TRUE END, " ++
+                "valid_to    = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.valid_to    ELSE NULL END, " ++
+                "invalid_at  = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.invalid_at  ELSE NULL END, " ++
+                "expired_at  = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.expired_at  ELSE NULL END, " ++
+                "is_latest   = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.is_latest   ELSE TRUE END, " ++
                 "seen_in_session_count = CASE " ++
                 "  WHEN {schema}.memories.session_id IS DISTINCT FROM EXCLUDED.session_id " ++
                 "       AND EXCLUDED.session_id IS NOT NULL " ++
@@ -5194,8 +5228,12 @@ const ManagerImpl = struct {
             "";
 
         if (!isSystemMemoryKey(key)) {
-            // Tier-3 promotion: fact seen across >= 2 sessions and not yet core.
-            if (seen_count >= 2 and !std.mem.eql(u8, returned_type, "core")) {
+            // Tier-3 promotion: fact seen across >= 2 sessions and not yet a
+            // durable type. Phase-0.5b C2: gate on `!isDurableMemoryType` (not
+            // just `!= "core"`) so a corroborated preference/decision/person/
+            // open_loop is NOT promoted — promotion to core would irreversibly
+            // erase its semantic type and vanish it from its typed view.
+            if (seen_count >= 2 and !memory_root.isDurableMemoryType(returned_type)) {
                 self.promoteMemoryToCore(user_id, key) catch |err| {
                     log.warn("upsertMemory: tier-3 promotion failed key={s}: {}", .{ key, err });
                 };
@@ -5205,7 +5243,12 @@ const ManagerImpl = struct {
             // LR-03: suppress for already-promoted (core) rows — they have
             // been deliberately elevated to global truth; further cross-session
             // writes are expected and should not generate false-positive alerts.
-            if (seen_count > 1 and !std.mem.eql(u8, returned_type, "core")) {
+            // 0.5b M3: gate on `!isDurableMemoryType` (not just `!= "core"`) so
+            // re-corroborating a durable type (preference/decision/person/
+            // open_loop) does NOT spuriously fire pending_conflicts — those are
+            // evergreen and expected to be re-seen across sessions. A `daily`
+            // re-corroboration still fires (unchanged).
+            if (seen_count > 1 and !memory_root.isDurableMemoryType(returned_type)) {
                 // NF-01: replace assert with a logged guard — std.debug.assert
                 // is elided in ReleaseFast, making the safety net vanish in
                 // production. The session_text.len == 0 case can arise from
@@ -5239,9 +5282,15 @@ const ManagerImpl = struct {
         // upsertMemory + upsertMemoryWithMetadata, this branch is normally
         // unreachable (the upsert clears valid_to before promote runs), but
         // defense-in-depth — promote should never lift an invalid row.
+        // Phase-0.5b C2: never overwrite a DURABLE type's memory_type. The
+        // WHERE excludes core/preference/decision/person/open_loop so a
+        // corroborated typed durable is never clobbered to 'core' (which
+        // would erase the type irreversibly + drop it from its typed view).
+        // Non-durable rows (daily/conversation/episodic/...) still promote
+        // normally — memory_type='core', session_id NULL, confidence raised.
         const q = try self.buildQuery(
             "UPDATE {schema}.memories SET memory_type = 'core', session_id = NULL, confidence_score = 0.9, updated_at = NOW() " ++
-                "WHERE user_id = $1 AND key = $2 AND memory_type != 'core' AND " ++ MEMORIES_VALIDITY_FILTER,
+                "WHERE user_id = $1 AND key = $2 AND memory_type NOT IN " ++ memory_root.DURABLE_TYPES_SQL ++ " AND " ++ MEMORIES_VALIDITY_FILTER,
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
@@ -7902,6 +7951,12 @@ const ManagerImpl = struct {
                 "  AND m.key NOT LIKE 'autosave_%' " ++
                 "  AND m.key NOT LIKE 'session_checkpoint_%' " ++
                 "  AND m.key NOT LIKE 'pending_conflicts%' " ++
+                // Phase-0.5b H3: persistent confidence decay now EXEMPTS the
+                // evergreen types (core/preference/decision/person), matching
+                // the in-memory isEvergreenCategory predicate. open_loop is
+                // deliberately NOT in the evergreen set — open loops still
+                // decay so they age out as they resolve.
+                "  AND m.memory_type NOT IN " ++ memory_root.EVERGREEN_TYPES_SQL ++ " " ++
                 "  RETURNING m.id, COALESCE(m.confidence_score, 0.8) AS new_conf" ++
                 ") " ++
                 "SELECT COUNT(*)::bigint AS n, COALESCE(AVG(new_conf), 0.0)::double precision AS avg_new " ++
@@ -8356,10 +8411,13 @@ const ManagerImpl = struct {
             try self.phase05BackfillUnembedContinuity(allocator, uid, dry_run, &report);
             try self.phase05BackfillExactDedup(allocator, uid, dry_run, &report);
             try self.phase05BackfillCountNearDups(uid, &report);
+            // Brain-leak Fix C — purge system-prompt scaffold entities/edges that
+            // the #48 leak persisted before Fixes A/B closed the source.
+            try self.phase05BackfillPurgeScaffold(uid, dry_run, &report);
         }
 
         log.info(
-            "phase05_backfill dry_run={} users={d} retyped={d} entities={d} continuity_embeds_removed={d} exact_dups={d} near_dup_clusters={d}",
+            "phase05_backfill dry_run={} users={d} retyped={d} entities={d} continuity_embeds_removed={d} exact_dups={d} near_dup_clusters={d} scaffold_entities_purged={d} scaffold_edges_purged={d}",
             .{
                 dry_run,
                 report.users_scanned,
@@ -8368,6 +8426,8 @@ const ManagerImpl = struct {
                 report.continuity_embeddings_removed,
                 report.exact_dups_collapsed,
                 report.near_dup_clusters,
+                report.scaffold_entities_purged,
+                report.scaffold_edges_purged,
             },
         );
         return report;
@@ -8391,12 +8451,16 @@ const ManagerImpl = struct {
         // batch by re-querying after each UPDATE pass would change the set, but
         // since UPDATEs move rows OFF core/daily, a single pass suffices and
         // re-running the whole backfill is a clean no-op.
+        // Phase-0.5b H7: only consider LIVE rows for retype. A CLOSED row
+        // (valid_to in the past) must stay closed — retyping it would move it
+        // from protected (closed-stays-closed under C1) to resurrectable.
         const q = try self.buildQuery(
             "SELECT key, memory_type, metadata->>'predicate', " ++
                 "COALESCE(metadata->>'attributed_to', '') " ++
                 "FROM {schema}.memories " ++
                 "WHERE user_id = $1 " ++
                 "AND memory_type IN ('core','daily') " ++
+                "AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
                 "AND metadata ? 'predicate' " ++
                 "AND length(metadata->>'predicate') > 0",
         );
@@ -8433,9 +8497,13 @@ const ManagerImpl = struct {
             // WHERE on the still-legacy type so a concurrent write that already
             // re-typed the row makes this a no-op (idempotent under races).
             const link_type = extraction_persist.linkTypeForPredicate(predicate).toString();
+            // Phase-0.5b H7: re-assert the validity guard on the live UPDATE
+            // (defense-in-depth vs. a concurrent close-out between the SELECT
+            // and this write) so a row closed mid-backfill is never retyped.
             const upd_q = try self.buildQuery(
                 "UPDATE {schema}.memories SET memory_type = $3, link_type = $4, updated_at = updated_at " ++
-                    "WHERE user_id = $1 AND key = $2 AND memory_type IN ('core','daily')",
+                    "WHERE user_id = $1 AND key = $2 AND memory_type IN ('core','daily') " ++
+                    "AND " ++ MEMORIES_VALIDITY_FILTER,
             );
             defer self.allocator.free(upd_q);
             const key_z = try self.allocator.dupeZ(u8, key);
@@ -8718,6 +8786,128 @@ const ManagerImpl = struct {
         report.near_dup_clusters += count;
     }
 
+    /// C0 op 5 (brain-leak Fix C) — purge system-prompt scaffold entities and
+    /// their edges. The #48 leak persisted scaffold section titles / body terms
+    /// (## Brain Architecture, Memory Link Types, "Working memory", …) as brain
+    /// ENTITIES; this removes that pre-fix pollution for the scoped user.
+    ///
+    /// Matching authority: `context_builder.isScaffoldEntityName` — the SAME
+    /// keystone predicate Fix A enforces at the write boundary. We fetch the
+    /// user's entities and re-filter every `name` through it (rather than
+    /// hard-coding a SQL `IN (...)` of denylist strings) so purge (existing
+    /// poison) and reject (new poison) can NEVER diverge: one definition,
+    /// derived from `stable_prompt_markers`. Entities are sparse (proper nouns),
+    /// so the full fetch is cheap.
+    ///
+    /// SAFETY: dry_run (the tool default) COUNTS but writes nothing. On apply,
+    /// for each matched entity we delete the edges that reference it (source OR
+    /// target) and then the entity row. Idempotent: a second run finds nothing
+    /// (the rows are gone). Best-effort per entity — a delete failure logs and
+    /// continues so one bad row can't strand the rest of the purge.
+    fn phase05BackfillPurgeScaffold(
+        self: *Self,
+        user_id: i64,
+        dry_run: bool,
+        report: *memory_root.Phase05BackfillReport,
+    ) !void {
+        // Fetch all entities for the user (id, name). Entities are sparse, so
+        // an unbounded read is acceptable (same assumption as the retype pass).
+        const q = try self.buildQuery(
+            "SELECT id, name FROM {schema}.memory_entities WHERE user_id = $1",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        const n: usize = @intCast(c.PQntuples(result));
+        for (0..n) |i| {
+            const row_idx: c_int = @intCast(i);
+            const id_ptr = c.PQgetvalue(result, row_idx, 0);
+            const id_slice: []const u8 = if (id_ptr == null) "" else std.mem.span(id_ptr);
+            const name_ptr = c.PQgetvalue(result, row_idx, 1);
+            const name_slice: []const u8 = if (name_ptr == null) "" else std.mem.span(name_ptr);
+
+            // Keystone gate — identical matching to the Fix A write boundary.
+            if (!context_builder.isScaffoldEntityName(name_slice)) continue;
+
+            report.scaffold_entities_purged += 1;
+
+            // Count this entity's referencing edges (source OR target) for the
+            // report — done on BOTH dry-run and apply so the operator sees the
+            // blast radius before committing.
+            const edge_count = self.phase05CountScaffoldEdges(user_id, id_slice) catch |err| blk: {
+                log.warn("phase05_backfill.scaffold_edge_count_failed id={s} err={s}", .{ id_slice, @errorName(err) });
+                break :blk 0;
+            };
+            report.scaffold_edges_purged += edge_count;
+
+            if (dry_run) continue;
+
+            // Apply — delete the referencing edges first, then the entity row.
+            const id_z = try self.allocator.dupeZ(u8, id_slice);
+            defer self.allocator.free(id_z);
+
+            {
+                const del_edges_q = try self.buildQuery(
+                    "DELETE FROM {schema}.memory_edges " ++
+                        "WHERE user_id = $1 AND (source_key = $2 OR target_key = $2)",
+                );
+                defer self.allocator.free(del_edges_q);
+                const del_params = [_]?[*:0]const u8{ user_s.ptr, id_z };
+                const del_lengths = [_]c_int{ @intCast(user_s.len), @intCast(id_slice.len) };
+                const del_result = self.execParams(del_edges_q, &del_params, &del_lengths) catch |err| {
+                    log.warn("phase05_backfill.scaffold_edge_delete_failed id={s} err={s}", .{ id_slice, @errorName(err) });
+                    continue;
+                };
+                c.PQclear(del_result);
+            }
+            {
+                const del_entity_q = try self.buildQuery(
+                    "DELETE FROM {schema}.memory_entities WHERE user_id = $1 AND id = $2",
+                );
+                defer self.allocator.free(del_entity_q);
+                const del_params = [_]?[*:0]const u8{ user_s.ptr, id_z };
+                const del_lengths = [_]c_int{ @intCast(user_s.len), @intCast(id_slice.len) };
+                const del_result = self.execParams(del_entity_q, &del_params, &del_lengths) catch |err| {
+                    log.warn("phase05_backfill.scaffold_entity_delete_failed id={s} err={s}", .{ id_slice, @errorName(err) });
+                    continue;
+                };
+                c.PQclear(del_result);
+            }
+            log.warn("phase05_backfill.scaffold_entity_purged id={s} name={s} edges={d}", .{ id_slice, name_slice, edge_count });
+        }
+    }
+
+    /// Helper for `phase05BackfillPurgeScaffold` — count edges that reference
+    /// `entity_id` as source OR target for the given user. Used for the
+    /// report's `scaffold_edges_purged` blast-radius count (dry-run + apply).
+    fn phase05CountScaffoldEdges(self: *Self, user_id: i64, entity_id: []const u8) !usize {
+        const q = try self.buildQuery(
+            "SELECT COUNT(*) FROM {schema}.memory_edges " ++
+                "WHERE user_id = $1 AND (source_key = $2 OR target_key = $2)",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const id_z = try self.allocator.dupeZ(u8, entity_id);
+        defer self.allocator.free(id_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, id_z };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(entity_id.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        if (c.PQntuples(result) == 0) return 0;
+        const count_ptr = c.PQgetvalue(result, 0, 0);
+        if (count_ptr == null) return 0;
+        return std.fmt.parseInt(usize, std.mem.span(count_ptr), 10) catch 0;
+    }
+
     /// Today the `subject` column is unpopulated by upsertMemoryWithMetadata
     /// (V1.6 5b.3 wrote subject only into JSONB metadata). This query
     /// reads the JSONB path directly so it works without a forward
@@ -8988,16 +9178,22 @@ const ManagerImpl = struct {
         }
     }
 
-    /// V1.6 commit 11 — flip a `core` memory back to a non-core type.
+    /// V1.6 commit 11 — flip a DURABLE memory back to a non-durable type.
     /// Required because V1.7's CASE-guard in upsertMemory + the W-INT-01
-    /// fix make core rows immortal against subsequent upserts (preserving
+    /// fix make durable rows immortal against subsequent upserts (preserving
     /// promotion + close-out state). The only escape hatch is this
     /// explicit demotion.
     ///
+    /// Phase-0.5b H2: the WHERE now matches `memory_type IN <DURABLE_TYPES_SQL>`
+    /// (core/preference/decision/person/open_loop), not just `core`, because
+    /// C1 extended the immortality guard to all durable types — the release-
+    /// valve has to reach them too. Phase-0.5b H7: only LIVE rows are touched
+    /// (validity guard) so a closed row is never moved protected→resurrectable.
+    ///
     /// `target_category_str` must be one of "daily" / "conversation" /
     /// "episodic" — i.e. anything but "core". Returns true when a row was
-    /// actually demoted (false when key didn't exist or was already
-    /// non-core).
+    /// actually demoted (false when the key didn't exist, was already a
+    /// non-durable type, or was closed-out).
     ///
     /// Emits a memory_events row with event_type='demote' carrying the
     /// `from`/`to` types so audit can reconstruct demotion history.
@@ -9005,9 +9201,17 @@ const ManagerImpl = struct {
         // Defensive: never accept "core" as the target — would be a no-op
         // that masks the caller's confusion.
         if (std.mem.eql(u8, target_category_str, "core")) return false;
+        // Phase-0.5b H2: demote reaches ALL durable types, not just 'core'.
+        // C1 now protects preference/decision/person/open_loop with the same
+        // immortality guard core had, so the release-valve must be able to
+        // demote them too — otherwise a wrongly-typed durable would be stuck.
+        // Phase-0.5b H7: validity guard — only demote a LIVE row. Without it,
+        // demote could retype a CLOSED row, moving it from protected (closed
+        // stays closed) to resurrectable (a fresh upsert would revive it).
         const q = try self.buildQuery(
             "UPDATE {schema}.memories SET memory_type = $3, updated_at = NOW() " ++
-                "WHERE user_id = $1 AND key = $2 AND memory_type = 'core' " ++
+                "WHERE user_id = $1 AND key = $2 AND memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " " ++
+                "AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
                 "RETURNING id",
         );
         defer self.allocator.free(q);
@@ -15397,6 +15601,122 @@ test "C0 phase05Backfill: PROPER entity with relationship edge upgrades to PERSO
     try std.testing.expectEqual(@as(usize, 0), r2.entities_retyped);
 }
 
+test "brain-leak C: phase05Backfill purges scaffold entities + their edges (dry-run safe, idempotent)" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-c0-scaffold/workspace");
+
+    const zero_emb = [_]f32{0.0} ** 1024;
+
+    // (a) A poisoned scaffold entity — the #48 leak shape: a section title that
+    //     got persisted as a brain entity, with an incoming edge.
+    const scaffold_id = try mgr.upsertEntity(allocator, 2, "Brain Architecture", "PROPER", &zero_emb);
+    defer allocator.free(scaffold_id);
+    try mgr.upsertMemory(2, "m_scaffold", "User uses Brain Architecture", .core, null);
+    try mgr.upsertMemoryEdge(2, "m_scaffold", scaffold_id, "USES", "extraction_classifier", 1.0);
+
+    // (b) A scaffold entity as an edge SOURCE too (e.g. "Memory Link Types" →
+    //     edges) — purge must clear edges on both sides.
+    const scaffold2_id = try mgr.upsertEntity(allocator, 2, "Memory Link Types", "PROPER", &zero_emb);
+    defer allocator.free(scaffold2_id);
+    const real_target = try mgr.upsertEntity(allocator, 2, "edges", "PROPER", &zero_emb);
+    defer allocator.free(real_target);
+    try mgr.upsertMemoryEdge(2, scaffold2_id, real_target, "RELATED_TO", "extraction_classifier", 1.0);
+
+    // (c) A genuine entity + edge — must survive untouched.
+    const helix_id = try mgr.upsertEntity(allocator, 2, "Helix", "PROPER", &zero_emb);
+    defer allocator.free(helix_id);
+    try mgr.upsertMemory(2, "m_helix", "User uses Helix", .core, null);
+    try mgr.upsertMemoryEdge(2, "m_helix", helix_id, "USES", "extraction_classifier", 1.0);
+
+    const countEntities = struct {
+        fn run(a: std.mem.Allocator, m: *ManagerImpl) !i64 {
+            const schema_q = try pg_helpers.quoteIdentifier(a, m.schemaRaw());
+            defer a.free(schema_q);
+            const q = try std.fmt.allocPrint(a, "SELECT COUNT(*) FROM {s}.memory_entities WHERE user_id = 2", .{schema_q});
+            defer a.free(q);
+            const result = try m.exec(q);
+            defer c.PQclear(result);
+            const s = try dupeResultValue(a, result, 0, 0);
+            defer a.free(s);
+            return try std.fmt.parseInt(i64, s, 10);
+        }
+    };
+    const entityExists = struct {
+        fn run(a: std.mem.Allocator, m: *ManagerImpl, id: []const u8) !bool {
+            const schema_q = try pg_helpers.quoteIdentifier(a, m.schemaRaw());
+            defer a.free(schema_q);
+            const q = try std.fmt.allocPrint(a, "SELECT COUNT(*) FROM {s}.memory_entities WHERE user_id = 2 AND id = '{s}'", .{ schema_q, id });
+            defer a.free(q);
+            const result = try m.exec(q);
+            defer c.PQclear(result);
+            const s = try dupeResultValue(a, result, 0, 0);
+            defer a.free(s);
+            return !std.mem.eql(u8, s, "0");
+        }
+    };
+    const edgesTouchingScaffold = struct {
+        fn run(a: std.mem.Allocator, m: *ManagerImpl, sid1: []const u8, sid2: []const u8) !i64 {
+            const schema_q = try pg_helpers.quoteIdentifier(a, m.schemaRaw());
+            defer a.free(schema_q);
+            const q = try std.fmt.allocPrint(
+                a,
+                "SELECT COUNT(*) FROM {s}.memory_edges WHERE user_id = 2 AND " ++
+                    "(source_key IN ('{s}','{s}') OR target_key IN ('{s}','{s}'))",
+                .{ schema_q, sid1, sid2, sid1, sid2 },
+            );
+            defer a.free(q);
+            const result = try m.exec(q);
+            defer c.PQclear(result);
+            const s = try dupeResultValue(a, result, 0, 0);
+            defer a.free(s);
+            return try std.fmt.parseInt(i64, s, 10);
+        }
+    };
+
+    const entities_before = try countEntities.run(allocator, &mgr);
+    try std.testing.expectEqual(@as(i64, 4), entities_before); // 2 scaffold + edges + Helix
+
+    // ── Dry-run: reports the would-be purge, deletes NOTHING.
+    const dry = try mgr.phase05Backfill(allocator, 2, true);
+    try std.testing.expect(dry.dry_run);
+    try std.testing.expectEqual(@as(usize, 2), dry.scaffold_entities_purged); // Brain Architecture + Memory Link Types
+    try std.testing.expect(dry.scaffold_edges_purged >= 2); // both scaffold edges counted
+    try std.testing.expectEqual(@as(i64, 4), try countEntities.run(allocator, &mgr)); // untouched on disk
+    try std.testing.expect(try entityExists.run(allocator, &mgr, scaffold_id));
+
+    // ── Apply: scaffold entities + their edges deleted; genuine survive.
+    const r1 = try mgr.phase05Backfill(allocator, 2, false);
+    try std.testing.expect(!r1.dry_run);
+    try std.testing.expectEqual(@as(usize, 2), r1.scaffold_entities_purged);
+    try std.testing.expect(r1.scaffold_edges_purged >= 2);
+
+    try std.testing.expect(!(try entityExists.run(allocator, &mgr, scaffold_id))); // gone
+    try std.testing.expect(!(try entityExists.run(allocator, &mgr, scaffold2_id))); // gone
+    try std.testing.expectEqual(@as(i64, 0), try edgesTouchingScaffold.run(allocator, &mgr, scaffold_id, scaffold2_id)); // edges gone
+
+    // Genuine entity + its edge survive (no over-purge).
+    try std.testing.expect(try entityExists.run(allocator, &mgr, helix_id));
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const q = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}.memory_edges WHERE user_id = 2 AND target_key = '{s}'", .{ schema_q, helix_id });
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const s = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(s);
+        try std.testing.expectEqualStrings("1", s); // Helix's USES edge intact
+    }
+
+    // ── Idempotent: second apply finds nothing left to purge.
+    const r2 = try mgr.phase05Backfill(allocator, 2, false);
+    try std.testing.expectEqual(@as(usize, 0), r2.scaffold_entities_purged);
+    try std.testing.expectEqual(@as(usize, 0), r2.scaffold_edges_purged);
+}
+
 test "setMemorySource preserves updated_at for attribution-only enrichment" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -17395,6 +17715,14 @@ test "V1.6 commit 6 × V1.7 W-INT-01 resurrect-on-upsert clears close-out cols" 
     // Use `.daily` (non-core) to exercise the resurrect-on-upsert path —
     // a `.core`-seeded row would hit the core-preserve branch instead,
     // which is the OTHER axis tested in step 6 below.
+    //
+    // Phase-0.5b note: `.daily` STILL resurrects under the type-based C1 fix
+    // (daily is ephemeral — not in DURABLE_MEMORY_TYPES), so this test's
+    // behavior is UNCHANGED. The durable types (preference/decision/person/
+    // open_loop) now do NOT resurrect — see the dedicated C1 tests
+    // "Phase-0.5b C1: durable types do NOT resurrect ...". The universal
+    // state-based rule "closed-stays-closed for daily too" is the Phase-1
+    // unified-classifier item, intentionally NOT changed here.
     try mgr.upsertMemoryWithMetadata(2, "extracted_resurrect_test", "User prefers NeoVim editor", .daily, "session-A",
         \\{"subject":"user","predicate":"PREFERS","object_key":"NeoVim","attributed_to":"user","attribution":"extraction_classifier","confidence":1.0}
     );
@@ -17463,6 +17791,261 @@ test "V1.6 commit 6 × V1.7 W-INT-01 resurrect-on-upsert clears close-out cols" 
         const closed_core = try mgr.getMemory(allocator, 2, "core_stays_closed");
         try std.testing.expect(closed_core == null); // still hidden — core close-out preserved
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase-0.5b — durable-type protection (C1/C2/H2/H3/H7) postgres-gated.
+//
+// A prior patch (P3) routed durable user facts off `memory_type='core'`
+// onto `custom:"preference"/"decision"/"person"/"open_loop"`, but the
+// protection guards still keyed on the literal `'core'`. These tests pin
+// the type-based fixes from `memory_root.{DURABLE,EVERGREEN}_*`:
+//   C1 — durable types do NOT resurrect on a benign re-upsert.
+//   C2 — a corroborated durable type is NOT promoted (clobbered) to core.
+//   H2 — demote reaches the durable types (not just core).
+//   H3 — persistent decay exempts the evergreen types (open_loop still decays).
+//   H7 — retype/demote only touch LIVE rows (a closed row is skipped).
+// Skipped locally (require NULLALIS_POSTGRES_TEST_URL).
+// ─────────────────────────────────────────────────────────────────────
+
+/// Helper: read (valid_to_is_null, is_latest) for a key, bypassing the
+/// validity filter so superseded rows are visible. Returns booleans.
+fn p05bReadCloseOut(mgr: *ManagerImpl, allocator: std.mem.Allocator, user_id: i64, key: []const u8) !struct { valid_to_null: bool, is_latest: bool } {
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+    const q = try std.fmt.allocPrint(
+        allocator,
+        "SELECT valid_to, is_latest FROM {s}.memories WHERE user_id = {d} AND key = '{s}'",
+        .{ schema_q, user_id, key },
+    );
+    defer allocator.free(q);
+    const result = try mgr.exec(q);
+    defer c.PQclear(result);
+    try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+    const valid_to_null = c.PQgetisnull(result, 0, 0) != 0;
+    const is_latest_str = try dupeResultValue(allocator, result, 0, 1);
+    defer allocator.free(is_latest_str);
+    return .{ .valid_to_null = valid_to_null, .is_latest = std.mem.eql(u8, is_latest_str, "t") };
+}
+
+// C1 — a superseded DURABLE typed row (preference / open_loop) keeps its
+// close-out across a benign re-upsert: valid_to stays NON-NULL, is_latest
+// stays FALSE. Contrast the `.daily` resurrect test above (daily DOES revive).
+test "Phase-0.5b C1: durable types (preference, open_loop) do NOT resurrect on re-upsert" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-p05b-c1/workspace");
+
+    const close_ts: i64 = std.time.timestamp();
+
+    // ── preference: seed → supersede → re-upsert → must STAY closed.
+    try mgr.upsertMemoryWithMetadata(2, "p05b_pref", "User prefers dark mode", .{ .custom = "preference" }, "sess-A",
+        \\{"subject":"user","predicate":"PREFERS","object":"dark mode","attributed_to":"user"}
+    );
+    try mgr.setMemoryInvalidation(2, "p05b_pref", close_ts, close_ts);
+    // Benign re-upsert, same key, fresh content from a new session.
+    try mgr.upsertMemoryWithMetadata(2, "p05b_pref", "User prefers a dark theme", .{ .custom = "preference" }, "sess-B",
+        \\{"subject":"user","predicate":"PREFERS","object":"dark theme","attributed_to":"user"}
+    );
+    {
+        const co = try p05bReadCloseOut(&mgr, allocator, 2, "p05b_pref");
+        try std.testing.expect(!co.valid_to_null); // valid_to stays NON-NULL — NOT resurrected
+        try std.testing.expect(!co.is_latest); // is_latest stays FALSE
+        // memory_type preserved (anti-demotion): still a preference.
+        const t = try c0ReadMemoryType(allocator, &mgr, 2, "p05b_pref");
+        defer allocator.free(t);
+        try std.testing.expectEqualStrings("preference", t);
+        // And it stays hidden from retrieval (closed-out).
+        const got = try mgr.getMemory(allocator, 2, "p05b_pref");
+        try std.testing.expect(got == null);
+    }
+
+    // ── open_loop: durable too — same closed-stays-closed behavior.
+    try mgr.upsertMemoryWithMetadata(2, "p05b_loop", "Waiting on the contract review", .{ .custom = "open_loop" }, "sess-A",
+        \\{"subject":"user","predicate":"AWAITING","object":"contract review","attributed_to":"user"}
+    );
+    try mgr.setMemoryInvalidation(2, "p05b_loop", close_ts, close_ts);
+    try mgr.upsertMemoryWithMetadata(2, "p05b_loop", "Still waiting on contract review", .{ .custom = "open_loop" }, "sess-B",
+        \\{"subject":"user","predicate":"AWAITING","object":"contract review","attributed_to":"user"}
+    );
+    {
+        const co = try p05bReadCloseOut(&mgr, allocator, 2, "p05b_loop");
+        try std.testing.expect(!co.valid_to_null); // open_loop is DURABLE → NOT resurrected
+        try std.testing.expect(!co.is_latest);
+        const t = try c0ReadMemoryType(allocator, &mgr, 2, "p05b_loop");
+        defer allocator.free(t);
+        try std.testing.expectEqualStrings("open_loop", t);
+    }
+}
+
+// C2 — a `preference` written from ≥2 distinct sessions (which would trip
+// Tier-3 auto-promotion for a generic row) is NOT promoted to core. Its
+// memory_type stays `preference` (promotion would erase the type + drop it
+// from its <preferences> view).
+test "Phase-0.5b C2: corroborated preference is NOT promoted/clobbered to core" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-p05b-c2/workspace");
+
+    // Two cross-session writes of the SAME preference key → seen_in_session
+    // count reaches the promotion trigger. The fix gates promotion on
+    // `!isDurableMemoryType`, so a preference is left alone.
+    try mgr.upsertMemoryWithMetadata(2, "p05b_promo_pref", "User prefers tabs over spaces", .{ .custom = "preference" }, "sess-A",
+        \\{"subject":"user","predicate":"PREFERS","object":"tabs","attributed_to":"user"}
+    );
+    try mgr.upsertMemoryWithMetadata(2, "p05b_promo_pref", "User prefers tabs not spaces", .{ .custom = "preference" }, "sess-B",
+        \\{"subject":"user","predicate":"PREFERS","object":"tabs","attributed_to":"user"}
+    );
+
+    const t = try c0ReadMemoryType(allocator, &mgr, 2, "p05b_promo_pref");
+    defer allocator.free(t);
+    try std.testing.expectEqualStrings("preference", t); // NOT "core"
+
+    // Sanity: the comparison case — a generic `.daily` corroborated row DOES
+    // still promote to core (promotion path itself is intact).
+    try mgr.upsertMemory(2, "p05b_promo_daily", "some fact", .daily, "sess-A");
+    try mgr.upsertMemory(2, "p05b_promo_daily", "some fact restated", .daily, "sess-B");
+    const dt = try c0ReadMemoryType(allocator, &mgr, 2, "p05b_promo_daily");
+    defer allocator.free(dt);
+    try std.testing.expectEqualStrings("core", dt); // generic row still promotes
+}
+
+// H2 + H7 — demote reaches the durable types AND only touches LIVE rows.
+//   (a) demoting a `preference` updates exactly 1 row (returns true).
+//   (b) demote skips a CLOSED durable row (validity guard) → returns false.
+test "Phase-0.5b H2/H7: demote reaches durable types, skips closed rows" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-p05b-h2/workspace");
+
+    // ── (a) H2: demote a LIVE preference → 1 row updated, type becomes daily.
+    try mgr.upsertMemoryWithMetadata(2, "p05b_demote_pref", "User prefers dark mode", .{ .custom = "preference" }, "sess-A",
+        \\{"subject":"user","predicate":"PREFERS","object":"dark mode","attributed_to":"user"}
+    );
+    const demoted = try mgr.demoteMemoryFromCore(2, "p05b_demote_pref", "daily");
+    try std.testing.expect(demoted); // before the fix this was false (only matched 'core')
+    {
+        const t = try c0ReadMemoryType(allocator, &mgr, 2, "p05b_demote_pref");
+        defer allocator.free(t);
+        try std.testing.expectEqualStrings("daily", t);
+    }
+
+    // ── (b) H7: demote a CLOSED preference → skipped (validity guard).
+    const close_ts: i64 = std.time.timestamp();
+    try mgr.upsertMemoryWithMetadata(2, "p05b_demote_closed", "User prefers light mode", .{ .custom = "preference" }, "sess-A",
+        \\{"subject":"user","predicate":"PREFERS","object":"light mode","attributed_to":"user"}
+    );
+    try mgr.setMemoryInvalidation(2, "p05b_demote_closed", close_ts, close_ts);
+    const demoted_closed = try mgr.demoteMemoryFromCore(2, "p05b_demote_closed", "daily");
+    try std.testing.expect(!demoted_closed); // closed row is LIVE-guarded → not touched
+    {
+        // type unchanged — still preference (was NOT retyped to daily).
+        const t = try c0ReadMemoryType(allocator, &mgr, 2, "p05b_demote_closed");
+        defer allocator.free(t);
+        try std.testing.expectEqualStrings("preference", t);
+    }
+}
+
+// H3 — the persistent confidence-decay sweep (temporalDecay) EXEMPTS the
+// evergreen types. A `preference` row is NOT decayed; a `daily` row IS, and
+// an `open_loop` row IS (open_loop is durable but NOT evergreen).
+test "Phase-0.5b H3: persistent decay exempts evergreen, still decays daily + open_loop" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-p05b-h3/workspace");
+
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+
+    // Seed three rows with a high starting confidence + an OLD last_accessed_at
+    // so the age-based decay window (threshold_days) is satisfied.
+    inline for (.{
+        .{ "p05b_decay_pref", "preference" },
+        .{ "p05b_decay_daily", "daily" },
+        .{ "p05b_decay_loop", "open_loop" },
+    }) |row| {
+        try mgr.upsertMemory(2, row[0], "content for " ++ row[0], .daily, "sess-A");
+        const seed_q = try std.fmt.allocPrint(
+            allocator,
+            "UPDATE {s}.memories SET memory_type = '{s}', confidence_score = 0.8, " ++
+                "last_accessed_at = NOW() - INTERVAL '90 days', created_at = NOW() - INTERVAL '90 days' " ++
+                "WHERE user_id = 2 AND key = '{s}'",
+            .{ schema_q, row[1], row[0] },
+        );
+        defer allocator.free(seed_q);
+        const r = try mgr.exec(seed_q);
+        c.PQclear(r);
+    }
+
+    // Run the persistent decay sweep: threshold 30d, half-life 30d.
+    _ = try mgr.temporalDecay(2, 30, 30);
+
+    // Read back confidence_score per row.
+    const Reader = struct {
+        fn conf(m: *ManagerImpl, a: std.mem.Allocator, sq: []const u8, key: []const u8) !f64 {
+            const q = try std.fmt.allocPrint(a, "SELECT confidence_score FROM {s}.memories WHERE user_id = 2 AND key = '{s}'", .{ sq, key });
+            defer a.free(q);
+            const res = try m.exec(q);
+            defer c.PQclear(res);
+            const s = try dupeResultValue(a, res, 0, 0);
+            defer a.free(s);
+            return std.fmt.parseFloat(f64, s);
+        }
+    };
+
+    const pref_conf = try Reader.conf(&mgr, allocator, schema_q, "p05b_decay_pref");
+    const daily_conf = try Reader.conf(&mgr, allocator, schema_q, "p05b_decay_daily");
+    const loop_conf = try Reader.conf(&mgr, allocator, schema_q, "p05b_decay_loop");
+
+    // preference is EVERGREEN → untouched, stays at the seeded 0.8.
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8), pref_conf, 1e-9);
+    // daily decays below the seed.
+    try std.testing.expect(daily_conf < 0.8);
+    // open_loop is durable but NOT evergreen → it still decays.
+    try std.testing.expect(loop_conf < 0.8);
+}
+
+// H7 (backfill) — phase05BackfillRetypeRows only retypes LIVE rows. A CLOSED
+// row carrying a predicate is skipped (its memory_type is left untouched),
+// so a closed row is never moved from protected → resurrectable.
+test "Phase-0.5b H7: phase05Backfill skips a closed row" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-p05b-h7/workspace");
+
+    const close_ts: i64 = std.time.timestamp();
+
+    // A LIVE daily row with a PREFERS predicate (a retype candidate) and a
+    // CLOSED daily row with the same shape. Only the live one should retype.
+    try mgr.upsertMemoryWithMetadata(2, "p05b_bf_live", "User prefers dark mode", .daily, "sess-A",
+        \\{"subject":"user","predicate":"PREFERS","object":"dark mode","attributed_to":"user"}
+    );
+    try mgr.upsertMemoryWithMetadata(2, "p05b_bf_closed", "User prefers light mode", .daily, "sess-A",
+        \\{"subject":"user","predicate":"PREFERS","object":"light mode","attributed_to":"user"}
+    );
+    try mgr.setMemoryInvalidation(2, "p05b_bf_closed", close_ts, close_ts);
+
+    const report = try mgr.phase05Backfill(allocator, 2, false);
+    // Exactly the LIVE row is retyped; the closed row is skipped.
+    try std.testing.expectEqual(@as(usize, 1), report.rows_retyped);
+
+    const live_t = try c0ReadMemoryType(allocator, &mgr, 2, "p05b_bf_live");
+    defer allocator.free(live_t);
+    try std.testing.expectEqualStrings("preference", live_t); // retyped
+
+    const closed_t = try c0ReadMemoryType(allocator, &mgr, 2, "p05b_bf_closed");
+    defer allocator.free(closed_t);
+    try std.testing.expectEqualStrings("daily", closed_t); // untouched — still daily, still closed
 }
 
 // V1.6 commit 7 — memory_edges round-trip + dedup + cascade-close-out.
@@ -18210,6 +18793,121 @@ test "P7 person-as-subject — extracted edge makes the subject a resolvable nod
         const cnt = try dupeResultValue(allocator, result, 0, 0);
         defer allocator.free(cnt);
         try std.testing.expectEqualStrings("0", cnt); // no "user" entity node minted
+    }
+}
+
+test "brain-leak A: scaffold triples rejected at persist write boundary; real fact persists" {
+    // End-to-end proof of Fix A: feed an extraction triple set that mixes
+    // system-prompt scaffold artifacts (the #48 leak shape — section titles +
+    // body terms as subject/object) with one genuine fact. After persist:
+    //   - NO scaffold entity row exists in memory_entities,
+    //   - NO scaffold edge row exists in memory_edges,
+    //   - the genuine fact IS persisted (no over-filtering),
+    //   - PersistResult.skipped_scaffold counts exactly the rejected facts.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-brainleak-a/workspace");
+
+    // Real deterministic embedder so coref WOULD mint entity rows for any
+    // surviving subject/object — making the "no scaffold entity" assertion
+    // meaningful (if the gate failed, the scaffold names would become nodes).
+    const embeddings = @import("memory/vector/embeddings.zig");
+    const local = try embeddings.LocalHashEmbedding.init(allocator, 1024);
+    const embed_provider = local.provider();
+    defer embed_provider.deinit();
+    const coref = extraction_persist.EntityResolution{ .embed_provider = embed_provider, .threshold = 0.95 };
+
+    // The triple set: 3 scaffold-poisoned facts + 1 genuine fact. The scaffold
+    // facts mirror the live-confirmed leak (section title as object, section
+    // title as subject, body term as object).
+    const triples = [_]extraction_persist.ExtractedMemory{
+        .{ .text = "The brain has a Brain Architecture", .subject = "user", .predicate = "USES", .object = "Brain Architecture", .attributed_to = "user", .confidence = 0.9 },
+        .{ .text = "Memory Link Types describe edges", .subject = "Memory Link Types", .predicate = "RELATED_TO", .object = "edges", .attributed_to = "user", .confidence = 0.9 },
+        .{ .text = "Working memory holds slots", .subject = "user", .predicate = "USES", .object = "Working memory", .attributed_to = "user", .confidence = 0.9 },
+        // Genuine fact — must survive.
+        .{ .text = "User prefers Helix editor", .subject = "user", .predicate = "PREFERS", .object = "Helix", .attributed_to = "user", .confidence = 0.95 },
+    };
+    const r = try extraction_persist.persistExtracted(
+        allocator, &mgr, 2, "brainleak-a-session", &triples,
+        null, // judge
+        coref, // coref present → any survivor resolves to an entity row
+        null, // mem_rt
+        .test_wire, 0, true,
+    );
+
+    // Exactly the 3 scaffold facts rejected; exactly the 1 genuine fact written.
+    try std.testing.expectEqual(@as(usize, 3), r.skipped_scaffold);
+    try std.testing.expectEqual(@as(usize, 1), r.written_count);
+
+    // No scaffold entity rows minted (case-insensitive name_lower match on any
+    // denylisted surface form). This is the core anti-poison assertion.
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT COUNT(*) FROM {s}.memory_entities WHERE user_id = 2 " ++
+                "AND name_lower IN ('brain architecture','memory link types','working memory')",
+            .{schema_q},
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const cnt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(cnt);
+        try std.testing.expectEqualStrings("0", cnt);
+    }
+
+    // No edges reference a scaffold fact (the genuine PREFERS Helix edge is the
+    // only edge family allowed). Assert zero edges carry the scaffold predicates
+    // we fed for the rejected triples.
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT COUNT(*) FROM {s}.memory_edges e " ++
+                "WHERE e.user_id = 2 AND e.fact IN " ++
+                "('The brain has a Brain Architecture','Memory Link Types describe edges','Working memory holds slots')",
+            .{schema_q},
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        const cnt = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(cnt);
+        try std.testing.expectEqualStrings("0", cnt);
+    }
+
+    // The genuine "Helix" entity DID get minted (proves no over-filtering).
+    {
+        const emb = try embed_provider.embed(allocator, "Helix");
+        defer allocator.free(emb);
+        const found = try mgr.findEntityByCosine(allocator, 2, emb, 0.95);
+        try std.testing.expect(found != null);
+        const row = found.?;
+        defer row.deinit(allocator);
+        try std.testing.expectEqualStrings("Helix", row.name);
     }
 }
 

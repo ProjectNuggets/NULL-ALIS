@@ -19,11 +19,18 @@ pub const SNAPSHOT_FILENAME = "MEMORY_SNAPSHOT.json";
 
 // ── Export ─────────────────────────────────────────────────────────
 
-/// Export all core memories to a JSON snapshot file.
+/// Export ALL user-facing memories to a JSON snapshot file.
 /// Returns the number of entries exported.
+///
+/// Phase-0.5b H4: a backup must be COMPLETE. Previously this listed only
+/// `.core`, so after P3 routed durable user facts onto the typed categories
+/// (preference/decision/person/open_loop) plus all `.daily` facts, those were
+/// silently dropped from every backup. Passing `null` category exports every
+/// category (the engine's list with no category filter returns all rows),
+/// so the snapshot captures the full user fact set, not just legacy core.
 pub fn exportSnapshot(allocator: std.mem.Allocator, mem: Memory, workspace_dir: []const u8) !usize {
-    // List all core memories
-    const entries = try mem.list(allocator, .core, null);
+    // List ALL memories (no category filter) — backup completeness.
+    const entries = try mem.list(allocator, null, null);
     defer root.freeEntries(allocator, entries);
 
     if (entries.len == 0) return 0;
@@ -255,6 +262,55 @@ test "R3: snapshot export then import roundtrip preserves all entries" {
     try std.testing.expect(e3 != null);
     defer e3.?.deinit(allocator);
     try std.testing.expectEqualStrings("Igor", e3.?.content);
+}
+
+// Phase-0.5b H4 — backup completeness: exportSnapshot must capture ALL user
+// facts, not just `.core`. Before the fix it listed only `.core`, so a
+// `preference` (a P3 typed durable) and a `.daily` fact were silently dropped
+// from every backup. This asserts both are exported and round-trip back.
+test "H4: snapshot exports non-core facts (preference + daily), not just core" {
+    if (!build_options.enable_sqlite) return;
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_dir);
+
+    var src_impl = try sqlite_mod.SqliteMemory.init(allocator, ":memory:");
+    defer src_impl.deinit();
+    const src_mem = src_impl.memory();
+
+    // One of each: legacy core, a P3 typed durable, and an ephemeral daily.
+    try src_mem.store("core_name", "Igor", .core, null);
+    try src_mem.store("pref_editor", "NeoVim forever", .{ .custom = "preference" }, null);
+    try src_mem.store("daily_note", "stood up at 9am", .daily, null);
+
+    // Export → all 3 categories must be captured (not just the 1 core).
+    const exported = try exportSnapshot(allocator, src_mem, workspace_dir);
+    try std.testing.expectEqual(@as(usize, 3), exported);
+
+    // Round-trip into a fresh store and confirm every fact survived.
+    var dst_impl = try sqlite_mod.SqliteMemory.init(allocator, ":memory:");
+    defer dst_impl.deinit();
+    const dst_mem = dst_impl.memory();
+
+    const hydrated = try hydrateFromSnapshot(allocator, dst_mem, workspace_dir);
+    try std.testing.expectEqual(@as(usize, 3), hydrated);
+
+    const pref = try dst_mem.get(allocator, "pref_editor");
+    try std.testing.expect(pref != null);
+    defer pref.?.deinit(allocator);
+    try std.testing.expectEqualStrings("NeoVim forever", pref.?.content);
+    // category preserved across the snapshot round-trip
+    try std.testing.expect(pref.?.category.eql(.{ .custom = "preference" }));
+
+    const daily = try dst_mem.get(allocator, "daily_note");
+    try std.testing.expect(daily != null);
+    defer daily.?.deinit(allocator);
+    try std.testing.expectEqualStrings("stood up at 9am", daily.?.content);
+    try std.testing.expect(daily.?.category.eql(.daily));
 }
 
 test "R3: shouldHydrate returns true when memory is empty and snapshot exists" {

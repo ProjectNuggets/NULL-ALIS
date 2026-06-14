@@ -54,6 +54,12 @@ const memory_embeddings = @import("../memory/vector/embeddings.zig");
 const text_norm = @import("../memory/text_norm.zig");
 const pii_detect = @import("../memory/pii_detect.zig");
 const working_memory = @import("working_memory.zig");
+// Brain-leak Fix A — keystone reuse. `context_builder.isScaffoldEntityName`
+// is derived from the `stable_prompt_markers` list (the system-prompt scaffold
+// section titles), so the entity-name denylist here can never drift from the
+// prompt that produces the leak. context_builder imports only leaf modules
+// (no extraction_persist / zaki_state), so this introduces no import cycle.
+const context_builder = @import("context_builder.zig");
 
 /// One atomic fact extracted from a conversation. Mirrors the JSON
 /// schema specified in compaction.zig::summarizer_system. Produced by
@@ -193,6 +199,11 @@ pub const PersistResult = struct {
     /// via `setMemoryInvalidation`. One contradicting NEW fact may close
     /// multiple older rows (e.g. correcting a chain of stale prefs).
     contradictions_resolved: usize = 0,
+    /// Brain-leak Fix A — facts rejected because their subject OR object is a
+    /// system-prompt scaffold artifact (`isRejectedEntityName`). Distinct from
+    /// `skipped_blacklist` (predicate denylist) so observability can tell the
+    /// two write-boundary defenses apart.
+    skipped_scaffold: usize = 0,
     failed_count: usize,
 };
 
@@ -302,6 +313,30 @@ inline fn isRejectedPredicate(predicate: []const u8) bool {
         if (std.mem.eql(u8, p, predicate)) return true;
     }
     return false;
+}
+
+/// Brain-leak Fix A — entity-name denylist at the write boundary.
+///
+/// The #48 leak surfaced the agent's system-prompt scaffold (section titles
+/// like `## Brain Architecture`, body terms like "Working memory" / "Layer 0")
+/// into a visible assistant turn, which then entered thread history and got
+/// persisted as brain ENTITIES at session-end extraction. There was a
+/// predicate denylist (`REJECTED_PREDICATES`) but NO entity-name denylist —
+/// so any fact whose SUBJECT or OBJECT *is* a scaffold artifact wrote straight
+/// to `memory_entities`/`memory_edges` and then rendered in `/brain` + got
+/// recalled into replies (the feedback loop).
+///
+/// This is the keystone gate that stops new poison: it delegates to
+/// `context_builder.isScaffoldEntityName`, which is built from the
+/// `stable_prompt_markers` list (the single source of truth for the scaffold
+/// section titles) plus the curated scaffold-body terms. Reusing that list
+/// means this denylist can never drift from the prompt that produces the leak.
+///
+/// Match is case-insensitive, whitespace-normalized, EXACT-full-name (not
+/// substring) so legitimate facts that merely *contain* a scaffold word
+/// ("Safety team", "uses Layer 0 of the stack") are not over-filtered.
+inline fn isRejectedEntityName(name: []const u8) bool {
+    return context_builder.isScaffoldEntityName(name);
 }
 
 /// Compute SHA-256 hex of content for the V1.6 5b.3 dedup pre-filter.
@@ -1435,6 +1470,21 @@ pub fn persistExtracted(
             continue;
         }
 
+        // Step 1b (brain-leak Fix A): entity-name denylist. Reject the WHOLE
+        // fact if its SUBJECT or OBJECT is a system-prompt scaffold artifact
+        // (## Brain Architecture, Memory Link Types, "Working memory", …)
+        // BEFORE any memory row / entity / edge is written. This is the
+        // keystone gate that stops the #48 feedback loop at the write boundary.
+        // Logged at warn for observability so recurrence is visible.
+        if (isRejectedEntityName(m.subject) or isRejectedEntityName(m.object)) {
+            log.warn(
+                "extraction.rejected_scaffold_entity subject={s} predicate={s} object={s}",
+                .{ m.subject, m.predicate, m.object },
+            );
+            result.skipped_scaffold += 1;
+            continue;
+        }
+
         // Step 2 (V1.6 5b.3 WR-1): SHA-256 content_hash dedup. Compaction
         // Pass C re-summarizes prior prose summaries on each trigger,
         // causing the LLM to re-emit the same atomic facts. Skip if a
@@ -1830,7 +1880,7 @@ pub fn persistExtracted(
     // WRITTEN counts (not attempted) to decide whether direct paths
     // are subsumed by extract paths.
     log.info(
-        "memory.write.batch_done origin={s} attempted={d} written={d} skipped_md5={d} skipped_semantic={d} skipped_blacklist={d} contradictions={d} failed={d}",
+        "memory.write.batch_done origin={s} attempted={d} written={d} skipped_md5={d} skipped_semantic={d} skipped_blacklist={d} skipped_scaffold={d} contradictions={d} failed={d}",
         .{
             origin.toSlice(),
             memories.len,
@@ -1838,6 +1888,7 @@ pub fn persistExtracted(
             result.skipped_md5_dup,
             result.skipped_semantic_dup,
             result.skipped_blacklist,
+            result.skipped_scaffold,
             result.contradictions_resolved,
             result.failed_count,
         },
@@ -2188,6 +2239,44 @@ test "isRejectedPredicate covers known meta-narrative predicates" {
     try std.testing.expect(!isRejectedPredicate("PREFERS"));
     try std.testing.expect(!isRejectedPredicate("DEPLOYS_TO"));
     try std.testing.expect(!isRejectedPredicate("BIRTHDAY"));
+}
+
+// ── Brain-leak Fix A — entity-name denylist at the write boundary ──────
+// The #48 leak persisted system-prompt scaffold section titles + body terms
+// (## Brain Architecture, ## Memory Link Types, "Working memory", "Layer 0",
+// …) as brain ENTITIES. There is a predicate denylist (REJECTED_PREDICATES)
+// but no entity-name denylist. `isRejectedEntityName` is the write-time gate;
+// it delegates to the KEYSTONE `context_builder.isScaffoldEntityName` so the
+// list cannot drift from the prompt scaffold that produces the leak.
+
+test "brain-leak A: isRejectedEntityName rejects scaffold names (subject OR object surface forms)" {
+    // Section titles (the leaked entities Confirmed in zaki_bot.memory_entities).
+    try std.testing.expect(isRejectedEntityName("Brain Architecture"));
+    try std.testing.expect(isRejectedEntityName("Memory Link Types"));
+    try std.testing.expect(isRejectedEntityName("Response Protocol"));
+    try std.testing.expect(isRejectedEntityName("Channel Attachments"));
+    try std.testing.expect(isRejectedEntityName("Task Decomposition"));
+    // Case-insensitive + whitespace-normalized (the leak arrives in varied casings).
+    try std.testing.expect(isRejectedEntityName("brain architecture"));
+    try std.testing.expect(isRejectedEntityName("  Memory   Link   Types "));
+    // Scaffold-body terms.
+    try std.testing.expect(isRejectedEntityName("Working memory"));
+    try std.testing.expect(isRejectedEntityName("Distillation extraction"));
+    try std.testing.expect(isRejectedEntityName("Layer 0"));
+    try std.testing.expect(isRejectedEntityName("Auto-promoted"));
+}
+
+test "brain-leak A: isRejectedEntityName does NOT over-filter real entities" {
+    // Genuine user facts must survive — don't poison recall by rejecting them.
+    try std.testing.expect(!isRejectedEntityName("Helix"));
+    try std.testing.expect(!isRejectedEntityName("dark mode"));
+    try std.testing.expect(!isRejectedEntityName("Acme"));
+    try std.testing.expect(!isRejectedEntityName("Cairo"));
+    // Generic words deliberately NOT on the denylist (exact-match only).
+    try std.testing.expect(!isRejectedEntityName("Safety"));
+    try std.testing.expect(!isRejectedEntityName("Tools"));
+    try std.testing.expect(!isRejectedEntityName("Safety team"));
+    try std.testing.expect(!isRejectedEntityName(""));
 }
 
 test "P7 predicate fix: renamed speaker hub (USER_MENTIONED) rejected; relationships still flow" {
