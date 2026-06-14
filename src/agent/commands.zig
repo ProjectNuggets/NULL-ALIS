@@ -5743,7 +5743,8 @@ test "P1-6 audit: ttl_recycle is non-interactive — inline boundary extraction 
     // enqueueExtractionJob lane). Pin all three gates together.
     try std.testing.expect(isNonInteractiveCheckpointReason("ttl_recycle"));
     try std.testing.expect(shouldSkipInlineBoundaryExtraction("ttl_recycle"));
-    try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_recycle"));
+    // Non-interactive → deterministic regardless of the P4 flag (assert ON).
+    try std.testing.expect(shouldUseDeterministicSessionSummary("ttl_recycle", true));
     // Interactive reasons remain unaffected — the gate widened by exactly one.
     try std.testing.expect(!isNonInteractiveCheckpointReason("reset:manual"));
     try std.testing.expect(!isNonInteractiveCheckpointReason("api_compact"));
