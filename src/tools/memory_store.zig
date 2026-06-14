@@ -313,6 +313,7 @@ pub const MemoryStoreTool = struct {
             self.mem_rt, // V1.8-2: vector coverage on agent memory_store tool
             .memory_store_tool, // V1.14.12 (M1) — per-path telemetry tag
             0, // P3: not a boundary caller — no boundary ID
+            self.semantic_type_routing_enabled, // P3 review: off-switch honored even with no judge
         ) catch |err| {
             std.log.scoped(.memory_store).warn("memory_store unified pipeline failed subject='{s}' predicate='{s}' err={s}", .{ subject, predicate, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "Failed to store memory via unified pipeline: {s}", .{@errorName(err)});

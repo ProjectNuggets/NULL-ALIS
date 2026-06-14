@@ -17765,6 +17765,7 @@ test "V1.7a-5 link_type rich wiring — column populated from metadata + backfil
         null, // V1.8-2: mem_rt — test fixture, no runtime
         .test_wire, // V1.14.12 (M1) — per-path telemetry tag
         0, // P3: test wire — no boundary ID
+        true, // P3 review: semantic_type_routing_enabled — default ON (this test asserts PREFERS → preference)
     );
     try std.testing.expect(persist_result.written_count == 1);
     {

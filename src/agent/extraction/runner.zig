@@ -873,6 +873,7 @@ fn persistExtraction(
         ctx.archive_mem_rt,
         ctx.write_origin, // V1.14.12 (M1) — per-path telemetry tag from caller
         boundary_id,      // P3: milliTimestamp at boundary fire
+        ctx.semantic_type_routing_enabled, // P3 review: off-switch honored even with no judge
     ) catch |err| {
         log.warn("boundary.extraction.persistExtracted_failed err={s} edges={d}", .{ @errorName(err), result.edges.len });
         return;

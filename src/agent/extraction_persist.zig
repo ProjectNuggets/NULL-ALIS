@@ -236,11 +236,14 @@ pub const JudgeContext = struct {
     /// Wired from `agent.semantic_type_routing_enabled` config through the
     /// same caller chain as `cardinality_fastpath_enabled`. Default true.
     ///
-    /// Null-judge note: when no JudgeContext is configured the gate reads
-    /// as `true` at the persist site (`if (judge) |j| j.… else true`), so
-    /// semantic routing is on-by-default even on no-judge tenants. An
-    /// operator who sets the config flag false gets it threaded through
-    /// every JudgeContext construction site.
+    /// NOTE (P3 review): the persist-site gate no longer reads this field.
+    /// The off-switch is honored via an explicit `semantic_type_routing_enabled`
+    /// parameter on `persistExtracted`, which is ALWAYS present — so the flag
+    /// works even on no-judge tenants (where there is no JudgeContext to read).
+    /// This field is retained for symmetry with `cardinality_fastpath_enabled`
+    /// and so construction sites that build a JudgeContext from the same config
+    /// stay uniform; callers forward the same configured value into the
+    /// explicit persist parameter.
     semantic_type_routing_enabled: bool = true,
 };
 
@@ -1020,6 +1023,51 @@ test "P3 categoryForAttribution unchanged (flag-off path)" {
     try std.testing.expect(categoryForAttribution("anything_else").eql(.daily));
 }
 
+// P3 review (memory-phase-0.5) — the persist-site gate's category decision,
+// extracted as a pure helper so the off-switch is testable WITHOUT a live DB
+// or a JudgeContext. This mirrors the exact expression at the persist site:
+//   category = if (enabled) categoryForSemantics(...) else categoryForAttribution(...)
+// The point being pinned: the result depends ONLY on the explicit flag, never
+// on whether a judge is present.
+fn gateCategory(
+    semantic_type_routing_enabled: bool,
+    predicate: []const u8,
+    attributed_to: []const u8,
+) memory_root.MemoryCategory {
+    return if (semantic_type_routing_enabled)
+        categoryForSemantics(classifyPredicate(predicate), attributed_to)
+    else
+        categoryForAttribution(attributed_to);
+}
+
+test "P3 review: off-switch honored on no-judge tenants (flag false → legacy routing)" {
+    // A user-attributed PREFERS fact. With routing ON it becomes
+    // custom:"preference" (semantic). With routing OFF it must reproduce
+    // the EXACT legacy categoryForAttribution result: user → .core.
+    //
+    // The gate value passed to persistExtracted is now an explicit param
+    // that is ALWAYS present (no JudgeContext required) — so an operator's
+    // flag=false takes effect even when judge == null. These assertions pin
+    // that the category is a pure function of the flag, independent of judge.
+
+    // Flag ON → semantic type (regression baseline: must be preference).
+    try std.testing.expect(gateCategory(true, "PREFERS", "user").eql(.{ .custom = "preference" }));
+
+    // Flag OFF → legacy attribution routing, identical to the pre-P3 path.
+    // This is the no-judge off-switch: the value below is what the persist
+    // site computes when judge == null AND the operator set the flag false.
+    try std.testing.expect(gateCategory(false, "PREFERS", "user").eql(.core));
+    try std.testing.expect(gateCategory(false, "PREFERS", "assistant").eql(.daily));
+    // Open-loop predicate, user-attributed: ON → custom:"open_loop";
+    // OFF → legacy (user → core), proving the override is total.
+    try std.testing.expect(gateCategory(true, "NEEDS_TO", "user").eql(.{ .custom = "open_loop" }));
+    try std.testing.expect(gateCategory(false, "NEEDS_TO", "user").eql(.core));
+    // Flag OFF must EXACTLY equal categoryForAttribution for every input,
+    // with no dependence on predicate semantics.
+    try std.testing.expect(gateCategory(false, "PREFERS", "user").eql(categoryForAttribution("user")));
+    try std.testing.expect(gateCategory(false, "NEEDS_TO", "assistant").eql(categoryForAttribution("assistant")));
+}
+
 fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
     for (s) |c| {
         switch (c) {
@@ -1132,6 +1180,15 @@ pub fn persistExtracted(
     mem_rt: ?*memory_root.MemoryRuntime,
     origin: WriteOrigin,
     session_boundary_id: i64, // P3: milliTimestamp at boundary fire; 0 for non-boundary callers
+    // P3 review (memory-phase-0.5) — semantic type-routing off-switch.
+    // Threaded ALWAYS (independent of `judge`) so the config flag is honored
+    // even on no-judge tenants (graceful-degradation path). Default-ON is the
+    // caller's responsibility; every call site forwards the configured value
+    // (memory_store `self.`, runner `ctx.`) or `true` for test fixtures.
+    // Previously this was read off `JudgeContext` and defaulted to `true`
+    // whenever `judge == null`, which silently ignored an operator's
+    // flag=false on tenants with no extraction judge.
+    semantic_type_routing_enabled: bool,
 ) !PersistResult {
     var result = PersistResult{
         .written_count = 0,
@@ -1356,13 +1413,14 @@ pub fn persistExtracted(
 
         // P3 (memory-phase-0.5) — route the durable memory_type by what
         // the fact MEANS, not by who said it. Gated by the
-        // semantic_type_routing_enabled flag (default ON; threaded via
-        // JudgeContext). Flag OFF (or — defensively — no JudgeContext that
-        // sets it) → exact legacy categoryForAttribution behavior.
+        // semantic_type_routing_enabled flag (default ON), now threaded as an
+        // explicit parameter that is ALWAYS present — independent of whether a
+        // JudgeContext exists. Flag OFF → exact legacy categoryForAttribution
+        // behavior on ALL tenants, including no-judge ones (P3 review fix:
+        // the off-switch previously hardcoded `true` when judge == null).
         // `attributed_to` stays recorded as provenance in the metadata
         // (buildExtractionMetadata above), it just no longer routes the type.
-        const semantic_routing_enabled = if (judge) |j| j.semantic_type_routing_enabled else true;
-        const category = if (semantic_routing_enabled)
+        const category = if (semantic_type_routing_enabled)
             categoryForSemantics(classifyPredicate(m.predicate), m.attributed_to)
         else
             categoryForAttribution(m.attributed_to);
