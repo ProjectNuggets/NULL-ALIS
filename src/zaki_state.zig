@@ -4604,10 +4604,17 @@ const ManagerImpl = struct {
         const q = try self.buildQuery(
             "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, metadata, lemmatized, link_type, updated_at) " ++
                 "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, ($8::jsonb)->>'link_type', NOW()) " ++
+                // Phase-0.5b C1: the resurrect-on-upsert + anti-demotion
+                // CASE-guards now key on `memory_type IN <DURABLE_TYPES_SQL>`
+                // (core/preference/decision/person/open_loop) instead of just
+                // `= 'core'`. P3 routed durable user facts onto the typed
+                // categories; without this they would resurrect/demote on a
+                // benign re-upsert. open_loop is durable here (close-out
+                // preserved) even though it still decays in ranking.
                 "ON CONFLICT (user_id, key) DO UPDATE SET " ++
-                "session_id = CASE WHEN {schema}.memories.memory_type = 'core' THEN NULL ELSE EXCLUDED.session_id END, " ++
+                "session_id = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN NULL ELSE EXCLUDED.session_id END, " ++
                 "content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, " ++
-                "memory_type = CASE WHEN {schema}.memories.memory_type = 'core' THEN 'core' ELSE EXCLUDED.memory_type END, " ++
+                "memory_type = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.memory_type ELSE EXCLUDED.memory_type END, " ++
                 "metadata = EXCLUDED.metadata, lemmatized = EXCLUDED.lemmatized, " ++
                 // V1.7a-5: refresh link_type from the new metadata's value.
                 // COALESCE with the existing value so omitting link_type in
@@ -4615,10 +4622,10 @@ const ManagerImpl = struct {
                 // category (defensive — current callers always emit it).
                 "link_type = COALESCE((EXCLUDED.metadata)->>'link_type', {schema}.memories.link_type), " ++
                 "updated_at = NOW(), " ++
-                "valid_to    = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.valid_to    ELSE NULL END, " ++
-                "invalid_at  = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.invalid_at  ELSE NULL END, " ++
-                "expired_at  = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.expired_at  ELSE NULL END, " ++
-                "is_latest   = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.is_latest   ELSE TRUE END, " ++
+                "valid_to    = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.valid_to    ELSE NULL END, " ++
+                "invalid_at  = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.invalid_at  ELSE NULL END, " ++
+                "expired_at  = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.expired_at  ELSE NULL END, " ++
+                "is_latest   = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.is_latest   ELSE TRUE END, " ++
                 "seen_in_session_count = CASE " ++
                 "  WHEN {schema}.memories.session_id IS DISTINCT FROM EXCLUDED.session_id " ++
                 "       AND EXCLUDED.session_id IS NOT NULL " ++
@@ -5109,15 +5116,20 @@ const ManagerImpl = struct {
         const q = try self.buildQuery(
             "INSERT INTO {schema}.memories (id, user_id, session_id, key, content, content_hash, memory_type, lemmatized, updated_at) " ++
                 "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) " ++
+                // Phase-0.5b C1: resurrect-on-upsert + anti-demotion guards
+                // now key on `memory_type IN <DURABLE_TYPES_SQL>` (see the
+                // upsertMemoryWithMetadata sibling above). A superseded
+                // preference/decision/person/open_loop keeps its close-out
+                // (no resurrection) and can't be demoted by a benign re-upsert.
                 "ON CONFLICT (user_id, key) DO UPDATE SET " ++
-                "session_id = CASE WHEN {schema}.memories.memory_type = 'core' THEN NULL ELSE EXCLUDED.session_id END, " ++
+                "session_id = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN NULL ELSE EXCLUDED.session_id END, " ++
                 "content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, " ++
-                "memory_type = CASE WHEN {schema}.memories.memory_type = 'core' THEN 'core' ELSE EXCLUDED.memory_type END, " ++
+                "memory_type = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.memory_type ELSE EXCLUDED.memory_type END, " ++
                 "lemmatized = EXCLUDED.lemmatized, updated_at = NOW(), " ++
-                "valid_to    = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.valid_to    ELSE NULL END, " ++
-                "invalid_at  = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.invalid_at  ELSE NULL END, " ++
-                "expired_at  = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.expired_at  ELSE NULL END, " ++
-                "is_latest   = CASE WHEN {schema}.memories.memory_type = 'core' THEN {schema}.memories.is_latest   ELSE TRUE END, " ++
+                "valid_to    = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.valid_to    ELSE NULL END, " ++
+                "invalid_at  = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.invalid_at  ELSE NULL END, " ++
+                "expired_at  = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.expired_at  ELSE NULL END, " ++
+                "is_latest   = CASE WHEN {schema}.memories.memory_type IN " ++ memory_root.DURABLE_TYPES_SQL ++ " THEN {schema}.memories.is_latest   ELSE TRUE END, " ++
                 "seen_in_session_count = CASE " ++
                 "  WHEN {schema}.memories.session_id IS DISTINCT FROM EXCLUDED.session_id " ++
                 "       AND EXCLUDED.session_id IS NOT NULL " ++
@@ -7908,6 +7920,12 @@ const ManagerImpl = struct {
                 "  AND m.key NOT LIKE 'autosave_%' " ++
                 "  AND m.key NOT LIKE 'session_checkpoint_%' " ++
                 "  AND m.key NOT LIKE 'pending_conflicts%' " ++
+                // Phase-0.5b H3: persistent confidence decay now EXEMPTS the
+                // evergreen types (core/preference/decision/person), matching
+                // the in-memory isEvergreenCategory predicate. open_loop is
+                // deliberately NOT in the evergreen set — open loops still
+                // decay so they age out as they resolve.
+                "  AND m.memory_type NOT IN " ++ memory_root.EVERGREEN_TYPES_SQL ++ " " ++
                 "  RETURNING m.id, COALESCE(m.confidence_score, 0.8) AS new_conf" ++
                 ") " ++
                 "SELECT COUNT(*)::bigint AS n, COALESCE(AVG(new_conf), 0.0)::double precision AS avg_new " ++
@@ -17644,6 +17662,14 @@ test "V1.6 commit 6 × V1.7 W-INT-01 resurrect-on-upsert clears close-out cols" 
     // Use `.daily` (non-core) to exercise the resurrect-on-upsert path —
     // a `.core`-seeded row would hit the core-preserve branch instead,
     // which is the OTHER axis tested in step 6 below.
+    //
+    // Phase-0.5b note: `.daily` STILL resurrects under the type-based C1 fix
+    // (daily is ephemeral — not in DURABLE_MEMORY_TYPES), so this test's
+    // behavior is UNCHANGED. The durable types (preference/decision/person/
+    // open_loop) now do NOT resurrect — see the dedicated C1 tests
+    // "Phase-0.5b C1: durable types do NOT resurrect ...". The universal
+    // state-based rule "closed-stays-closed for daily too" is the Phase-1
+    // unified-classifier item, intentionally NOT changed here.
     try mgr.upsertMemoryWithMetadata(2, "extracted_resurrect_test", "User prefers NeoVim editor", .daily, "session-A",
         \\{"subject":"user","predicate":"PREFERS","object_key":"NeoVim","attributed_to":"user","attribution":"extraction_classifier","confidence":1.0}
     );
@@ -17712,6 +17738,261 @@ test "V1.6 commit 6 × V1.7 W-INT-01 resurrect-on-upsert clears close-out cols" 
         const closed_core = try mgr.getMemory(allocator, 2, "core_stays_closed");
         try std.testing.expect(closed_core == null); // still hidden — core close-out preserved
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase-0.5b — durable-type protection (C1/C2/H2/H3/H7) postgres-gated.
+//
+// A prior patch (P3) routed durable user facts off `memory_type='core'`
+// onto `custom:"preference"/"decision"/"person"/"open_loop"`, but the
+// protection guards still keyed on the literal `'core'`. These tests pin
+// the type-based fixes from `memory_root.{DURABLE,EVERGREEN}_*`:
+//   C1 — durable types do NOT resurrect on a benign re-upsert.
+//   C2 — a corroborated durable type is NOT promoted (clobbered) to core.
+//   H2 — demote reaches the durable types (not just core).
+//   H3 — persistent decay exempts the evergreen types (open_loop still decays).
+//   H7 — retype/demote only touch LIVE rows (a closed row is skipped).
+// Skipped locally (require NULLALIS_POSTGRES_TEST_URL).
+// ─────────────────────────────────────────────────────────────────────
+
+/// Helper: read (valid_to_is_null, is_latest) for a key, bypassing the
+/// validity filter so superseded rows are visible. Returns booleans.
+fn p05bReadCloseOut(mgr: *ManagerImpl, allocator: std.mem.Allocator, user_id: i64, key: []const u8) !struct { valid_to_null: bool, is_latest: bool } {
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+    const q = try std.fmt.allocPrint(
+        allocator,
+        "SELECT valid_to, is_latest FROM {s}.memories WHERE user_id = {d} AND key = '{s}'",
+        .{ schema_q, user_id, key },
+    );
+    defer allocator.free(q);
+    const result = try mgr.exec(q);
+    defer c.PQclear(result);
+    try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+    const valid_to_null = c.PQgetisnull(result, 0, 0) != 0;
+    const is_latest_str = try dupeResultValue(allocator, result, 0, 1);
+    defer allocator.free(is_latest_str);
+    return .{ .valid_to_null = valid_to_null, .is_latest = std.mem.eql(u8, is_latest_str, "t") };
+}
+
+// C1 — a superseded DURABLE typed row (preference / open_loop) keeps its
+// close-out across a benign re-upsert: valid_to stays NON-NULL, is_latest
+// stays FALSE. Contrast the `.daily` resurrect test above (daily DOES revive).
+test "Phase-0.5b C1: durable types (preference, open_loop) do NOT resurrect on re-upsert" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-p05b-c1/workspace");
+
+    const close_ts: i64 = std.time.timestamp();
+
+    // ── preference: seed → supersede → re-upsert → must STAY closed.
+    try mgr.upsertMemoryWithMetadata(2, "p05b_pref", "User prefers dark mode", .{ .custom = "preference" }, "sess-A",
+        \\{"subject":"user","predicate":"PREFERS","object":"dark mode","attributed_to":"user"}
+    );
+    try mgr.setMemoryInvalidation(2, "p05b_pref", close_ts, close_ts);
+    // Benign re-upsert, same key, fresh content from a new session.
+    try mgr.upsertMemoryWithMetadata(2, "p05b_pref", "User prefers a dark theme", .{ .custom = "preference" }, "sess-B",
+        \\{"subject":"user","predicate":"PREFERS","object":"dark theme","attributed_to":"user"}
+    );
+    {
+        const co = try p05bReadCloseOut(&mgr, allocator, 2, "p05b_pref");
+        try std.testing.expect(!co.valid_to_null); // valid_to stays NON-NULL — NOT resurrected
+        try std.testing.expect(!co.is_latest); // is_latest stays FALSE
+        // memory_type preserved (anti-demotion): still a preference.
+        const t = try c0ReadMemoryType(allocator, &mgr, 2, "p05b_pref");
+        defer allocator.free(t);
+        try std.testing.expectEqualStrings("preference", t);
+        // And it stays hidden from retrieval (closed-out).
+        const got = try mgr.getMemory(allocator, 2, "p05b_pref");
+        try std.testing.expect(got == null);
+    }
+
+    // ── open_loop: durable too — same closed-stays-closed behavior.
+    try mgr.upsertMemoryWithMetadata(2, "p05b_loop", "Waiting on the contract review", .{ .custom = "open_loop" }, "sess-A",
+        \\{"subject":"user","predicate":"AWAITING","object":"contract review","attributed_to":"user"}
+    );
+    try mgr.setMemoryInvalidation(2, "p05b_loop", close_ts, close_ts);
+    try mgr.upsertMemoryWithMetadata(2, "p05b_loop", "Still waiting on contract review", .{ .custom = "open_loop" }, "sess-B",
+        \\{"subject":"user","predicate":"AWAITING","object":"contract review","attributed_to":"user"}
+    );
+    {
+        const co = try p05bReadCloseOut(&mgr, allocator, 2, "p05b_loop");
+        try std.testing.expect(!co.valid_to_null); // open_loop is DURABLE → NOT resurrected
+        try std.testing.expect(!co.is_latest);
+        const t = try c0ReadMemoryType(allocator, &mgr, 2, "p05b_loop");
+        defer allocator.free(t);
+        try std.testing.expectEqualStrings("open_loop", t);
+    }
+}
+
+// C2 — a `preference` written from ≥2 distinct sessions (which would trip
+// Tier-3 auto-promotion for a generic row) is NOT promoted to core. Its
+// memory_type stays `preference` (promotion would erase the type + drop it
+// from its <preferences> view).
+test "Phase-0.5b C2: corroborated preference is NOT promoted/clobbered to core" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-p05b-c2/workspace");
+
+    // Two cross-session writes of the SAME preference key → seen_in_session
+    // count reaches the promotion trigger. The fix gates promotion on
+    // `!isDurableMemoryType`, so a preference is left alone.
+    try mgr.upsertMemoryWithMetadata(2, "p05b_promo_pref", "User prefers tabs over spaces", .{ .custom = "preference" }, "sess-A",
+        \\{"subject":"user","predicate":"PREFERS","object":"tabs","attributed_to":"user"}
+    );
+    try mgr.upsertMemoryWithMetadata(2, "p05b_promo_pref", "User prefers tabs not spaces", .{ .custom = "preference" }, "sess-B",
+        \\{"subject":"user","predicate":"PREFERS","object":"tabs","attributed_to":"user"}
+    );
+
+    const t = try c0ReadMemoryType(allocator, &mgr, 2, "p05b_promo_pref");
+    defer allocator.free(t);
+    try std.testing.expectEqualStrings("preference", t); // NOT "core"
+
+    // Sanity: the comparison case — a generic `.daily` corroborated row DOES
+    // still promote to core (promotion path itself is intact).
+    try mgr.upsertMemory(2, "p05b_promo_daily", "some fact", .daily, "sess-A");
+    try mgr.upsertMemory(2, "p05b_promo_daily", "some fact restated", .daily, "sess-B");
+    const dt = try c0ReadMemoryType(allocator, &mgr, 2, "p05b_promo_daily");
+    defer allocator.free(dt);
+    try std.testing.expectEqualStrings("core", dt); // generic row still promotes
+}
+
+// H2 + H7 — demote reaches the durable types AND only touches LIVE rows.
+//   (a) demoting a `preference` updates exactly 1 row (returns true).
+//   (b) demote skips a CLOSED durable row (validity guard) → returns false.
+test "Phase-0.5b H2/H7: demote reaches durable types, skips closed rows" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-p05b-h2/workspace");
+
+    // ── (a) H2: demote a LIVE preference → 1 row updated, type becomes daily.
+    try mgr.upsertMemoryWithMetadata(2, "p05b_demote_pref", "User prefers dark mode", .{ .custom = "preference" }, "sess-A",
+        \\{"subject":"user","predicate":"PREFERS","object":"dark mode","attributed_to":"user"}
+    );
+    const demoted = try mgr.demoteMemoryFromCore(2, "p05b_demote_pref", "daily");
+    try std.testing.expect(demoted); // before the fix this was false (only matched 'core')
+    {
+        const t = try c0ReadMemoryType(allocator, &mgr, 2, "p05b_demote_pref");
+        defer allocator.free(t);
+        try std.testing.expectEqualStrings("daily", t);
+    }
+
+    // ── (b) H7: demote a CLOSED preference → skipped (validity guard).
+    const close_ts: i64 = std.time.timestamp();
+    try mgr.upsertMemoryWithMetadata(2, "p05b_demote_closed", "User prefers light mode", .{ .custom = "preference" }, "sess-A",
+        \\{"subject":"user","predicate":"PREFERS","object":"light mode","attributed_to":"user"}
+    );
+    try mgr.setMemoryInvalidation(2, "p05b_demote_closed", close_ts, close_ts);
+    const demoted_closed = try mgr.demoteMemoryFromCore(2, "p05b_demote_closed", "daily");
+    try std.testing.expect(!demoted_closed); // closed row is LIVE-guarded → not touched
+    {
+        // type unchanged — still preference (was NOT retyped to daily).
+        const t = try c0ReadMemoryType(allocator, &mgr, 2, "p05b_demote_closed");
+        defer allocator.free(t);
+        try std.testing.expectEqualStrings("preference", t);
+    }
+}
+
+// H3 — the persistent confidence-decay sweep (temporalDecay) EXEMPTS the
+// evergreen types. A `preference` row is NOT decayed; a `daily` row IS, and
+// an `open_loop` row IS (open_loop is durable but NOT evergreen).
+test "Phase-0.5b H3: persistent decay exempts evergreen, still decays daily + open_loop" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-p05b-h3/workspace");
+
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+
+    // Seed three rows with a high starting confidence + an OLD last_accessed_at
+    // so the age-based decay window (threshold_days) is satisfied.
+    inline for (.{
+        .{ "p05b_decay_pref", "preference" },
+        .{ "p05b_decay_daily", "daily" },
+        .{ "p05b_decay_loop", "open_loop" },
+    }) |row| {
+        try mgr.upsertMemory(2, row[0], "content for " ++ row[0], .daily, "sess-A");
+        const seed_q = try std.fmt.allocPrint(
+            allocator,
+            "UPDATE {s}.memories SET memory_type = '{s}', confidence_score = 0.8, " ++
+                "last_accessed_at = NOW() - INTERVAL '90 days', created_at = NOW() - INTERVAL '90 days' " ++
+                "WHERE user_id = 2 AND key = '{s}'",
+            .{ schema_q, row[1], row[0] },
+        );
+        defer allocator.free(seed_q);
+        const r = try mgr.exec(seed_q);
+        c.PQclear(r);
+    }
+
+    // Run the persistent decay sweep: threshold 30d, half-life 30d.
+    _ = try mgr.temporalDecay(2, 30, 30);
+
+    // Read back confidence_score per row.
+    const Reader = struct {
+        fn conf(m: *ManagerImpl, a: std.mem.Allocator, sq: []const u8, key: []const u8) !f64 {
+            const q = try std.fmt.allocPrint(a, "SELECT confidence_score FROM {s}.memories WHERE user_id = 2 AND key = '{s}'", .{ sq, key });
+            defer a.free(q);
+            const res = try m.exec(q);
+            defer c.PQclear(res);
+            const s = try dupeResultValue(a, res, 0, 0);
+            defer a.free(s);
+            return std.fmt.parseFloat(f64, s);
+        }
+    };
+
+    const pref_conf = try Reader.conf(&mgr, allocator, schema_q, "p05b_decay_pref");
+    const daily_conf = try Reader.conf(&mgr, allocator, schema_q, "p05b_decay_daily");
+    const loop_conf = try Reader.conf(&mgr, allocator, schema_q, "p05b_decay_loop");
+
+    // preference is EVERGREEN → untouched, stays at the seeded 0.8.
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8), pref_conf, 1e-9);
+    // daily decays below the seed.
+    try std.testing.expect(daily_conf < 0.8);
+    // open_loop is durable but NOT evergreen → it still decays.
+    try std.testing.expect(loop_conf < 0.8);
+}
+
+// H7 (backfill) — phase05BackfillRetypeRows only retypes LIVE rows. A CLOSED
+// row carrying a predicate is skipped (its memory_type is left untouched),
+// so a closed row is never moved from protected → resurrectable.
+test "Phase-0.5b H7: phase05Backfill skips a closed row" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-p05b-h7/workspace");
+
+    const close_ts: i64 = std.time.timestamp();
+
+    // A LIVE daily row with a PREFERS predicate (a retype candidate) and a
+    // CLOSED daily row with the same shape. Only the live one should retype.
+    try mgr.upsertMemoryWithMetadata(2, "p05b_bf_live", "User prefers dark mode", .daily, "sess-A",
+        \\{"subject":"user","predicate":"PREFERS","object":"dark mode","attributed_to":"user"}
+    );
+    try mgr.upsertMemoryWithMetadata(2, "p05b_bf_closed", "User prefers light mode", .daily, "sess-A",
+        \\{"subject":"user","predicate":"PREFERS","object":"light mode","attributed_to":"user"}
+    );
+    try mgr.setMemoryInvalidation(2, "p05b_bf_closed", close_ts, close_ts);
+
+    const report = try mgr.phase05Backfill(allocator, 2, false);
+    // Exactly the LIVE row is retyped; the closed row is skipped.
+    try std.testing.expectEqual(@as(usize, 1), report.rows_retyped);
+
+    const live_t = try c0ReadMemoryType(allocator, &mgr, 2, "p05b_bf_live");
+    defer allocator.free(live_t);
+    try std.testing.expectEqualStrings("preference", live_t); // retyped
+
+    const closed_t = try c0ReadMemoryType(allocator, &mgr, 2, "p05b_bf_closed");
+    defer allocator.free(closed_t);
+    try std.testing.expectEqualStrings("daily", closed_t); // untouched — still daily, still closed
 }
 
 // V1.6 commit 7 — memory_edges round-trip + dedup + cascade-close-out.
