@@ -992,6 +992,11 @@ pub const MemoryConfig = struct {
                 if (!self.search.query.hybrid.enabled) self.search.query.hybrid.enabled = true;
                 if (std.mem.eql(u8, self.search.store.kind, "auto")) self.search.store.kind = "pgvector";
                 if (std.mem.eql(u8, self.reliability.rollout_mode, "off")) self.reliability.rollout_mode = "on";
+                // H1 (boot hardening): the commercial/postgres_hybrid profile
+                // runs on pgvector — a silently-degraded vector plane = silent
+                // memory loss on a green pod. Default the boot requirement on
+                // here; an operator can still pin it false in config.json.
+                self.search.require_vector_store_on_boot = true;
             },
             .minimal_none => {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "none";
@@ -1025,6 +1030,15 @@ pub const MemorySearchConfig = struct {
     /// catches mismatches safely.
     dimensions: u32 = 1536,
     fallback_provider: []const u8 = "none",
+    /// H1 (boot hardening): when true, a production-like boot FAILS if the
+    /// vector store cannot initialize (pgvector extension missing, DB
+    /// unreachable, or embedding-dimension mismatch) instead of silently
+    /// degrading to keyword-only memory on a "green" pod. Enforced in
+    /// gateway.applyStartupSelfCheck (ProductionVectorStoreRequired), gated
+    /// additionally by isProductionLikeGateway so dev/loopback keeps the
+    /// warn-and-continue path. Default false (dev-safe); the zaki_bot /
+    /// postgres_hybrid profile flips it true (see applyProfileDefaults).
+    require_vector_store_on_boot: bool = false,
     store: MemoryVectorStoreConfig = .{},
     chunking: MemoryChunkingConfig = .{},
     sync: MemorySyncConfig = .{},

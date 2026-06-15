@@ -1160,6 +1160,12 @@ pub const GatewayState = struct {
     state_degraded: bool = false,
     state_degraded_reason_buf: [64]u8 = [_]u8{0} ** 64,
     state_degraded_reason_len: usize = 0,
+    // H1 (boot hardening): records WHY the vector-store boot probe failed
+    // (e.g. "PgVectorDimensionMismatch") so the call-site fail-loud log is
+    // actionable. Populated by applyStartupSelfCheck before it returns
+    // error.ProductionVectorStoreRequired.
+    vector_store_probe_reason_buf: [64]u8 = [_]u8{0} ** 64,
+    vector_store_probe_reason_len: usize = 0,
     chat_provider_effective: []const u8 = "unknown",
     embedding_provider_effective: []const u8 = "none",
     provider_data_source: []const u8 = "config",
@@ -5617,7 +5623,7 @@ fn buildFallbackChainIntoBuf(buf: []u8, fallback_providers: []const []const u8) 
     return used;
 }
 
-const StartupSelfCheckError = error{ProductionPostgresRequired};
+const StartupSelfCheckError = error{ ProductionPostgresRequired, ProductionVectorStoreRequired };
 
 /// True when `err` is a member of `StartupSelfCheckError` — a fatal
 /// production-readiness gate failure that must fail the process loud
@@ -5689,6 +5695,39 @@ fn applyStartupSelfCheck(
         isProductionLikeGateway(cfg, effective_host))
     {
         return error.ProductionPostgresRequired;
+    }
+
+    // H1 (2026-06-15, prod-readiness): fail-loud when a production-like
+    // gateway requires a working vector store (memory.search
+    // .require_vector_store_on_boot — default true for the postgres_hybrid
+    // / zaki_bot profile) but the store cannot initialize (pgvector
+    // extension missing, DB unreachable, or embedding-dimension mismatch).
+    // Pre-H1 the vec_plane swallowed these (break :vec_plane) → silent
+    // keyword-only memory on a green pod, surfacing only at the first
+    // tenant turn. Probe the store at boot instead.
+    //
+    // Ordering: runs AFTER the Postgres keystone above and ONLY when the
+    // gateway is NOT already state-degraded — so a dead Postgres is
+    // reported as ProductionPostgresRequired (not conflated here), and the
+    // pgvector probe is never run against a DB we already know is down.
+    // Like the Postgres guard, the error is returned SILENTLY; the
+    // matching log.err is emitted at the runWithRole call site (Zig 0.15's
+    // test runner counts log.err as a failure).
+    //
+    // Dev/loopback (require flag still false there by default, AND
+    // isProductionLikeGateway false) keeps the vec_plane warn-and-continue
+    // path untouched.
+    if (cfg.memory.search.require_vector_store_on_boot and
+        !state.state_degraded and
+        isProductionLikeGateway(cfg, effective_host) and
+        memory_mod.vectorPlaneRequested(&cfg.memory))
+    {
+        if (memory_mod.probeVectorStoreForBoot(cfg.allocator, &cfg.memory)) |_| {
+            // vector store reachable — nothing to do.
+        } else |err| {
+            state.vector_store_probe_reason_len = copyIntoBuf(&state.vector_store_probe_reason_buf, @errorName(err));
+            return error.ProductionVectorStoreRequired;
+        }
     }
 
     const dispatch_mode = tool_dispatcher.parseMode(cfg.agent.tool_dispatcher);
@@ -24233,13 +24272,48 @@ const MaintenanceContext = struct {
     state: *GatewayState,
 };
 
+// H6 (boot hardening): steady-state DB readiness ping cadence. The
+// maintenance thread runs `SELECT 1` against Postgres this often and feeds
+// health.markComponentOk/Error("db", …). /ready aggregates the registry so
+// a pod whose Postgres went away post-boot is shed from the Service. This
+// is deliberately NOT wired into /health (liveness) — a transient DB blip
+// must not trigger a restart storm (mirrors the C3 health/ready split).
+const DB_READINESS_PING_INTERVAL_SECS: i64 = 10;
+const DB_HEALTH_COMPONENT = "db";
+
+fn pingDbReadiness(state: *GatewayState) void {
+    // Only meaningful for a Postgres-backed gateway. File-backed dev
+    // gateways have no DB to ping; registering a perpetually-erroring "db"
+    // component would wrongly make /ready not-ready.
+    if (comptime !build_options.enable_postgres) return;
+    const mgr = state.zaki_state orelse return;
+    mgr.pingHealth() catch |err| {
+        health.markComponentError(DB_HEALTH_COMPONENT, @errorName(err));
+        return;
+    };
+    health.markComponentOk(DB_HEALTH_COMPONENT);
+}
+
 fn tenantRuntimeMaintenanceMain(ctx: *MaintenanceContext) void {
     var last_run_s: i64 = 0;
+    var last_db_ping_s: i64 = 0;
+    // H6: seed the "db" component to ok at startup for a Postgres-backed
+    // gateway so /ready does not flap not-ready in the first ping interval
+    // (boot already proved Postgres reachable via migrate()/zaki_state init;
+    // applyStartupSelfCheck fails loud if it didn't). The periodic ping
+    // below takes over from here.
+    if (build_options.enable_postgres and ctx.state.zaki_state != null) {
+        health.markComponentOk(DB_HEALTH_COMPONENT);
+    }
     while (!ctx.state.shutdown_requested.load(.acquire)) {
         const now_s = std.time.timestamp();
         if (now_s - last_run_s >= TENANT_RUNTIME_MAINTENANCE_INTERVAL_SECS) {
             runTenantRuntimeMaintenance(ctx.state, now_s);
             last_run_s = now_s;
+        }
+        if (now_s - last_db_ping_s >= DB_READINESS_PING_INTERVAL_SECS) {
+            pingDbReadiness(ctx.state);
+            last_db_ping_s = now_s;
         }
         // Sleep in short increments so shutdown is observed promptly (the
         // accept loop tears down within ~50ms; match that responsiveness).
@@ -24718,6 +24792,22 @@ pub fn runWithRole(
                     log.err(
                         "startup.production_postgres_required configured={s} effective={s} reason={s} host={s} — refusing to run degraded in production",
                         .{ state.state_backend_configured, state.state_backend_effective, reason, host },
+                    );
+                },
+                error.ProductionVectorStoreRequired => {
+                    // H1 (2026-06-15): same fail-loud contract as the Postgres
+                    // keystone. The vector store could not initialize and the
+                    // profile requires it — refuse to boot rather than serve a
+                    // silently keyword-only memory plane. Banner first for
+                    // full config context, then the actionable one-liner.
+                    logStartupSelfCheck(&state);
+                    const reason = if (state.vector_store_probe_reason_len > 0)
+                        state.vector_store_probe_reason_buf[0..state.vector_store_probe_reason_len]
+                    else
+                        "vector_store_init_failed";
+                    log.err(
+                        "startup.production_vector_store_required store_kind={s} embedding_provider={s} reason={s} host={s} — refusing to run with a degraded vector plane in production (set memory.search.require_vector_store_on_boot=false to override)",
+                        .{ cfg.memory.search.store.kind, state.embedding_provider_effective, reason, host },
                     );
                 },
             }
@@ -30389,6 +30479,49 @@ test "handleReady multiple unhealthy components returns 503" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"not_ready\"") != null);
 }
 
+// ── H6 (boot hardening): the "db" component gates /ready, not /health ──
+
+test "H6: db component error sheds the pod via /ready (503)" {
+    health.reset();
+    health.markComponentOk("gateway");
+    health.markComponentError(DB_HEALTH_COMPONENT, "connection refused");
+    const resp = handleReady(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"name\":\"db\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"healthy\":false") != null);
+    health.reset();
+}
+
+test "H6: db component ok keeps /ready ready (200)" {
+    health.reset();
+    health.markComponentOk("gateway");
+    health.markComponentOk(DB_HEALTH_COMPONENT);
+    const resp = handleReady(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("200 OK", resp.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"ready\"") != null);
+    health.reset();
+}
+
+test "H6: db component error does NOT fail /health liveness (stays 200)" {
+    // The C3 split: a DB blip is a readiness signal, never a liveness kill —
+    // otherwise a transient Postgres hiccup restart-storms every pod. Cheap
+    // /health stays 200 "degraded" while /ready (above) sheds the pod.
+    health.reset();
+    health.markComponentError(DB_HEALTH_COMPONENT, "connection refused");
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.liveness_deadlock_threshold_ms = 180_000;
+    state.queued_requests.store(0, .release); // not wedged
+
+    const resp = healthFastPathResponse(&state);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expectEqualStrings("{\"status\":\"degraded\"}", resp.body);
+    health.reset();
+}
+
 test "handleReady response body is valid JSON structure" {
     health.reset();
     health.markComponentOk("test-svc");
@@ -31508,11 +31641,93 @@ test "isFatalStartupError: recognizes the StartupSelfCheckError set, rejects oth
     // is the unit-testable core of the fail-loud decision — the
     // std.process.exit(1) itself cannot be exercised in-process.
     try std.testing.expect(isFatalStartupError(error.ProductionPostgresRequired));
+    // H1: the new vector-store variant is also a fatal startup error —
+    // covered automatically by the comptime set walk.
+    try std.testing.expect(isFatalStartupError(error.ProductionVectorStoreRequired));
     // Unrelated errors must NOT be treated as fatal startup errors —
     // those fall through to markError + continue, not process exit.
     try std.testing.expect(!isFatalStartupError(error.ConnectionRefused));
     try std.testing.expect(!isFatalStartupError(error.OutOfMemory));
     try std.testing.expect(!isFatalStartupError(error.FileNotFound));
+}
+
+// ── H1 (2026-06-15, prod-readiness) vector-store boot-requirement gate ──
+//
+// applyStartupSelfCheck must return error.ProductionVectorStoreRequired
+// when running production-like AND memory.search.require_vector_store_on_boot
+// is set AND the configured vector store cannot initialize. Dev/loopback
+// (and the flag-off path) keep the warn-and-continue behavior. These tests
+// use the pgvector "url missing" failure so no live DB is needed — the
+// probe returns error.PgvectorUrlMissing deterministically.
+
+fn h1ConfigWithPgvectorRequire(allocator: std.mem.Allocator) Config {
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullalis",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = allocator,
+    };
+    cfg.state.backend = "file"; // keep state non-degraded so the PG keystone is a no-op
+    cfg.memory.search.enabled = true;
+    cfg.memory.search.provider = "openai";
+    cfg.memory.search.query.hybrid.enabled = true;
+    cfg.memory.search.store.kind = "pgvector";
+    cfg.memory.postgres.url = ""; // pgvector configured but no URL → probe fails
+    cfg.memory.search.require_vector_store_on_boot = true;
+    return cfg;
+}
+
+test "applyStartupSelfCheck: production + require_vector_store + unconfigured store = ProductionVectorStoreRequired" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+
+    var cfg = h1ConfigWithPgvectorRequire(allocator);
+    cfg.gateway.allow_public_bind = true; // production-like
+
+    const result = applyStartupSelfCheck(&gs, &cfg, null, "0.0.0.0");
+    try std.testing.expectError(error.ProductionVectorStoreRequired, result);
+    try std.testing.expect(gs.vector_store_probe_reason_len > 0);
+}
+
+test "applyStartupSelfCheck: loopback + require_vector_store = no error (dev warn-and-continue)" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+
+    var cfg = h1ConfigWithPgvectorRequire(allocator);
+    cfg.gateway.allow_public_bind = false; // dev / loopback
+
+    // Even though the flag is set and the store is unconfigured, a non-
+    // production-like host must NOT fail-close — dev keeps booting.
+    try applyStartupSelfCheck(&gs, &cfg, null, "127.0.0.1");
+}
+
+test "applyStartupSelfCheck: production + require_vector_store=false = no error" {
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+
+    var cfg = h1ConfigWithPgvectorRequire(allocator);
+    cfg.gateway.allow_public_bind = true;
+    cfg.memory.search.require_vector_store_on_boot = false; // opt-out
+
+    try applyStartupSelfCheck(&gs, &cfg, null, "0.0.0.0");
+}
+
+test "applyStartupSelfCheck: degraded postgres takes precedence over vector probe" {
+    // When Postgres itself is down, the keystone ProductionPostgresRequired
+    // must fire FIRST — the vector probe (which would hit the same dead DB)
+    // must not run, so the operator sees the right root cause.
+    const allocator = std.testing.allocator;
+    var gs = GatewayState.init(allocator);
+    defer gs.deinit();
+
+    var cfg = h1ConfigWithPgvectorRequire(allocator);
+    cfg.state.backend = "postgres"; // configured for PG...
+    cfg.gateway.allow_public_bind = true;
+    // ...but zaki_state stays null + we pass an init error → state_degraded.
+    const result = applyStartupSelfCheck(&gs, &cfg, error.ConnectionRefused, "0.0.0.0");
+    try std.testing.expectError(error.ProductionPostgresRequired, result);
 }
 
 // ── S5 (2026-05-29, prod-readiness) emit-site round-trip tests ──

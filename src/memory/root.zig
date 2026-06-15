@@ -3141,6 +3141,74 @@ pub fn initRuntimeWithOptions(
     };
 }
 
+// ── H1 (boot hardening): vector-store boot probe ─────────────────────
+
+/// Whether the given memory config would attempt to bring up a vector
+/// plane at runtime — same gate as the `vec_plane` block in
+/// initRuntimeWithOptions. When false, there is nothing to fail-close on.
+pub fn vectorPlaneRequested(config: *const config_types.MemoryConfig) bool {
+    return config.search.enabled and
+        !std.mem.eql(u8, config.search.provider, "none") and
+        config.search.query.hybrid.enabled;
+}
+
+/// H1: probe whether the configured vector store can actually initialize,
+/// WITHOUT building a full MemoryRuntime. Returns the SPECIFIC init error
+/// (PgConnectionFailed / PgSchemaFailed / PgVectorDimensionMismatch / …)
+/// so a production-like boot can fail loud at startup instead of silently
+/// degrading to keyword-only memory on the first tenant turn (the
+/// vec_plane `break :vec_plane` swallow). The gateway self-check calls this
+/// only when production-like AND require_vector_store_on_boot is set.
+///
+/// Scope: the pgvector store (the commercial/postgres_hybrid path) and
+/// qdrant are probed for real. sqlite/auto/none stores are LOCAL/dev paths
+/// — there is no remote dependency that can be "missing/unreachable" at
+/// boot in the way the audit targets, so they are treated as a no-op (the
+/// existing in-line sqlite creation still runs per-runtime and degrades).
+pub fn probeVectorStoreForBoot(
+    allocator: std.mem.Allocator,
+    config: *const config_types.MemoryConfig,
+) !void {
+    if (!vectorPlaneRequested(config)) return;
+
+    const store_kind = config.search.store.kind;
+
+    if (std.mem.eql(u8, store_kind, "pgvector")) {
+        if (!build_options.enable_postgres) return error.PgNotEnabled;
+        if (config.postgres.url.len == 0) return error.PgvectorUrlMissing;
+        const schema = if (config.search.store.pgvector_schema.len > 0)
+            config.search.store.pgvector_schema
+        else
+            config.postgres.schema;
+        const pgvs = try store_pgvector.PgvectorVectorStore.init(allocator, .{
+            .connection_url = config.postgres.url,
+            .schema_name = schema,
+            .table_name = config.search.store.pgvector_table,
+            .dimensions = config.search.dimensions,
+            .pool_max = config.postgres.pool_max,
+            .acquire_timeout_ms = config.postgres.acquire_timeout_ms,
+        });
+        pgvs.deinit();
+        return;
+    }
+
+    if (std.mem.eql(u8, store_kind, "qdrant")) {
+        if (config.search.store.qdrant_url.len == 0) return error.QdrantUrlMissing;
+        const qdrant = try store_qdrant.QdrantVectorStore.init(allocator, .{
+            .url = config.search.store.qdrant_url,
+            .api_key = if (config.search.store.qdrant_api_key.len > 0) config.search.store.qdrant_api_key else null,
+            .collection_name = config.search.store.qdrant_collection,
+            .dimensions = config.search.dimensions,
+        });
+        qdrant.deinit();
+        return;
+    }
+
+    // sqlite_shared / sqlite_sidecar / auto — local, no boot-time remote
+    // dependency to fail-close on.
+    return;
+}
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 const c = sqlite.c;
@@ -4570,4 +4638,120 @@ test {
     _ = migrate;
     _ = diagnostics;
     _ = summarizer;
+}
+
+// ── H1 (boot hardening): vector-store boot probe tests ───────────────
+
+test "H1: vectorPlaneRequested gate" {
+    var cfg = config_types.MemoryConfig{};
+    // Defaults: search.enabled=true, provider="none", hybrid.enabled=false.
+    try std.testing.expect(!vectorPlaneRequested(&cfg));
+    cfg.search.provider = "openai";
+    cfg.search.query.hybrid.enabled = true;
+    try std.testing.expect(vectorPlaneRequested(&cfg));
+    cfg.search.enabled = false;
+    try std.testing.expect(!vectorPlaneRequested(&cfg));
+}
+
+test "H1: probe is a no-op when vector plane not requested" {
+    var cfg = config_types.MemoryConfig{};
+    cfg.search.provider = "none"; // not requested
+    try probeVectorStoreForBoot(std.testing.allocator, &cfg);
+}
+
+test "H1: probe is a no-op for sqlite/auto stores" {
+    var cfg = config_types.MemoryConfig{};
+    cfg.search.provider = "openai";
+    cfg.search.query.hybrid.enabled = true;
+    cfg.search.store.kind = "auto"; // local — no remote dependency
+    try probeVectorStoreForBoot(std.testing.allocator, &cfg);
+}
+
+test "H1: probe fails when pgvector configured without a url" {
+    var cfg = config_types.MemoryConfig{};
+    cfg.search.provider = "openai";
+    cfg.search.query.hybrid.enabled = true;
+    cfg.search.store.kind = "pgvector";
+    cfg.postgres.url = ""; // configured for pgvector but unreachable-by-config
+    if (build_options.enable_postgres) {
+        try std.testing.expectError(error.PgvectorUrlMissing, probeVectorStoreForBoot(std.testing.allocator, &cfg));
+    } else {
+        try std.testing.expectError(error.PgNotEnabled, probeVectorStoreForBoot(std.testing.allocator, &cfg));
+    }
+}
+
+test "H1: probe succeeds against a live pgvector DB" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (std.process.getEnvVarOwned(allocator, "NULLALIS_POSTGRES_TEST_URL") catch return error.SkipZigTest);
+    defer allocator.free(test_url);
+
+    var table_buf: [64]u8 = undefined;
+    const table = try std.fmt.bufPrint(&table_buf, "h1_probe_ok_{d}", .{std.time.microTimestamp()});
+
+    var cfg = config_types.MemoryConfig{};
+    cfg.search.provider = "openai";
+    cfg.search.query.hybrid.enabled = true;
+    cfg.search.store.kind = "pgvector";
+    cfg.search.store.pgvector_schema = "public";
+    cfg.search.store.pgvector_table = table;
+    cfg.search.dimensions = 8;
+    cfg.postgres.url = test_url;
+    cfg.postgres.schema = "public";
+
+    // First probe creates the table at dim=8 and succeeds.
+    try probeVectorStoreForBoot(allocator, &cfg);
+    // Idempotent: a second probe at the SAME dim is clean.
+    try probeVectorStoreForBoot(allocator, &cfg);
+
+    // Cleanup the probe table.
+    const drop = store_pgvector.PgvectorVectorStore.init(allocator, .{
+        .connection_url = test_url,
+        .schema_name = "public",
+        .table_name = table,
+        .dimensions = 8,
+        .pool_max = 1,
+        .acquire_timeout_ms = 500,
+    }) catch null;
+    if (drop) |store| store.deinit();
+}
+
+test "H1: probe fails closed on embedding-dimension mismatch" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (std.process.getEnvVarOwned(allocator, "NULLALIS_POSTGRES_TEST_URL") catch return error.SkipZigTest);
+    defer allocator.free(test_url);
+
+    var table_buf: [64]u8 = undefined;
+    const table = try std.fmt.bufPrint(&table_buf, "h1_probe_dim_{d}", .{std.time.microTimestamp()});
+
+    var cfg = config_types.MemoryConfig{};
+    cfg.search.provider = "openai";
+    cfg.search.query.hybrid.enabled = true;
+    cfg.search.store.kind = "pgvector";
+    cfg.search.store.pgvector_schema = "public";
+    cfg.search.store.pgvector_table = table;
+    cfg.search.dimensions = 8;
+    cfg.postgres.url = test_url;
+    cfg.postgres.schema = "public";
+
+    // Create the table at dim=8.
+    try probeVectorStoreForBoot(allocator, &cfg);
+
+    // Now probe at a DIFFERENT dimension — must fail closed (the exact
+    // silent-recall-zero footgun the audit targets).
+    cfg.search.dimensions = 16;
+    try std.testing.expectError(error.PgVectorDimensionMismatch, probeVectorStoreForBoot(allocator, &cfg));
+
+    // Cleanup at the original dim.
+    cfg.search.dimensions = 8;
+    const drop = store_pgvector.PgvectorVectorStore.init(allocator, .{
+        .connection_url = test_url,
+        .schema_name = "public",
+        .table_name = table,
+        .dimensions = 8,
+        .pool_max = 1,
+        .acquire_timeout_ms = 500,
+    }) catch null;
+    if (drop) |store| store.deinit();
 }

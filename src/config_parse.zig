@@ -386,6 +386,13 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
     defer parsed.deinit();
 
+    // H5 (boot hardening): a syntactically valid but non-object top-level
+    // (e.g. `[...]` or a bare scalar) is malformed config — guard it
+    // instead of hitting `parsed.value.object` (unchecked union access →
+    // safety panic). Surfacing a catchable error lets load() classify this
+    // as ConfigParseFailed and refuse to boot rather than crash or silently
+    // default.
+    if (parsed.value != .object) return error.ConfigNotObject;
     const root = parsed.value.object;
 
     // Top-level fields
@@ -1199,6 +1206,15 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     };
                     if (search.get("fallback_provider")) |v| if (v == .string) {
                         self.memory.search.fallback_provider = try self.allocator.dupe(u8, v.string);
+                    };
+                    // H1 (boot hardening): explicit opt-in/out of the
+                    // fail-closed vector-store boot requirement. NOTE: the
+                    // postgres_hybrid/zaki_bot profile forces this true in
+                    // applyProfileDefaults (which runs AFTER parse), so a
+                    // config that sets it false there is overridden to true —
+                    // a deliberate safe default for the commercial profile.
+                    if (search.get("require_vector_store_on_boot")) |v| if (v == .bool) {
+                        self.memory.search.require_vector_store_on_boot = v.bool;
                     };
 
                     // search.store
