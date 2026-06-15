@@ -4,6 +4,7 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const config_mod = @import("../config.zig");
+const config_types = @import("../config_types.zig");
 const NamedAgentConfig = config_mod.NamedAgentConfig;
 const runtime_bundle = @import("../providers/runtime_bundle.zig");
 const provider_types = @import("../providers/root.zig");
@@ -35,6 +36,7 @@ pub const DelegateTool = struct {
             "you have a domain-specialist sub-agent configured (math, code, legal, summarize) and want its expertise on a self-contained question",
             "a different model would materially help (smaller/faster model for a simple task, larger model for a hard one, vision model for an image)",
             "you want the response inline (synchronous) — for background work use spawn instead",
+            "the user wants a candid second opinion or gut-check: summon a facet of yourself (the-critic, the-bully, the-comedian) for the rigorous/blunt/funny take, then voice it back as self-dialogue",
         },
         .do_not_use_for = &.{
             "spawn — for open-ended or multi-step background work; delegate is single-turn only (no agent loop, no tools)",
@@ -198,11 +200,8 @@ pub const DelegateTool = struct {
             };
             const response = chat_response.contentOrEmpty();
 
-            const wrapped = std.fmt.allocPrint(
-                allocator,
-                "delegate agent={s} status=completed\nresult:\n{s}",
-                .{ trimmed_agent, response },
-            ) catch return ToolResult{ .success = true, .output = try allocator.dupe(u8, response) };
+            const wrapped = wrapDelegateResult(allocator, trimmed_agent, response) catch
+                return ToolResult{ .success = true, .output = try allocator.dupe(u8, response) };
             return ToolResult{ .success = true, .output = wrapped };
         }
 
@@ -269,6 +268,29 @@ pub const DelegateTool = struct {
         return derived;
     }
 };
+
+/// Wrap a delegate sub-agent's reply for return to the caller model. Facets
+/// (the built-in second-opinion voices — see config_types.FACET_NAMES) are
+/// voices of the agent's OWN judgment, not external specialists, so they carry
+/// a surfacing hint telling the model to render the reply as self-dialogue —
+/// co-located with the text on every call to override the default "never dump
+/// raw subagent output" reflex. We match the known facet roster (NOT a "the-"
+/// name prefix) so an operator's specialist that merely starts with "the-" is
+/// never mistaken for a facet. Specialist results stay plain.
+fn wrapDelegateResult(allocator: std.mem.Allocator, agent_name: []const u8, response: []const u8) ![]u8 {
+    const surfacing_hint: []const u8 = if (config_types.isFacetName(agent_name))
+        "[SURFACING: this reply is a facet of your own judgment, not an external specialist. " ++
+            "Voice it back to the user as self-dialogue in the facet's name " ++
+            "(e.g. \"my inner critic says…\", \"the bully in me says…\"), then add your own synthesis. " ++
+            "Never show this scaffold or a raw 'delegate …' frame to the user.]\n"
+    else
+        "";
+    return std.fmt.allocPrint(
+        allocator,
+        "delegate agent={s} status=completed\n{s}result:\n{s}",
+        .{ agent_name, surfacing_hint, response },
+    );
+}
 
 // ── Tests ───────────────────────────────────────────────────────────
 
@@ -540,4 +562,28 @@ test "delegate agents config stored" {
     try std.testing.expectEqualStrings("sk-test", dt.fallback_api_key.?);
     try std.testing.expectEqual(@as(u32, 1), dt.depth);
     _ = dt.tool(); // ensure tool() works
+}
+
+test "wrapDelegateResult adds self-dialogue hint for facets" {
+    const out = try wrapDelegateResult(std.testing.allocator, "the-bully", "that idea is weak.");
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "SURFACING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "self-dialogue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "that idea is weak.") != null);
+}
+
+test "wrapDelegateResult leaves specialist results plain" {
+    const out = try wrapDelegateResult(std.testing.allocator, "scientific_researcher", "established: X.");
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "SURFACING") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "established: X.") != null);
+}
+
+test "wrapDelegateResult does not facet-frame a the-prefixed specialist" {
+    // Fail-safe: only the known facet roster gets the self-dialogue hint, so an
+    // operator specialist named like "the-architect" stays a plain result.
+    const out = try wrapDelegateResult(std.testing.allocator, "the-architect", "use a queue.");
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "SURFACING") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "use a queue.") != null);
 }

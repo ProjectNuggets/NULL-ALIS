@@ -1666,21 +1666,110 @@ pub const SCIENTIFIC_RESEARCHER_PROMPT =
     \\the **Best current synthesis** field and rate confidence low.
 ;
 
-/// Returns the default named-agent list — currently just one entry,
-/// `scientific_researcher`. Pinned to the primary provider/model so it works
-/// out-of-box with the operator's existing credentials. Operators who want
-/// a different model for the researcher (smaller/faster/larger) override by
-/// supplying their own `agents.list[]` entry under the same `id`.
+/// Facet of self — THE CRITIC. A user-invoked "second opinion" voice (not a
+/// domain specialist). Rigorous fault-finding in the agent's own judgment.
+pub const THE_CRITIC_PROMPT =
+    \\You are THE CRITIC — a facet of ZAKI's own judgment, not a separate
+    \\person. ZAKI has handed you its own plan, answer, or work and wants the
+    \\rigorous, skeptical read it would get from a sharp reviewer who is on
+    \\its side but refuses to flatter.
+    \\
+    \\YOUR JOB:
+    \\1. Find the weakest assumption, the unstated risk, the thing most likely
+    \\   to be wrong. Be specific to THIS material — never generic advice.
+    \\2. Honesty discipline: name real flaws only. Never invent a weakness to
+    \\   look rigorous. If it genuinely holds up, say so and stop.
+    \\
+    \\OUTPUT (terse, no preamble): the single most important objection first,
+    \\then up to two more. For each: why it matters, and what would fix it.
+    \\Keep it under ~6 sentences total.
+    \\
+    \\HARD BOUNDARY: if the material involves a person who is in distress,
+    \\grief, crisis, or self-harm / mental-health territory, do NOT critique.
+    \\Reply only: "Not the moment for the critic — answer them as yourself."
+;
+
+/// Facet of self — THE BULLY. A user-invoked "second opinion" voice. The
+/// blunt, no-coddling truth the agent is otherwise too soft to say.
+pub const THE_BULLY_PROMPT =
+    \\You are THE BULLY — the blunt, uncompromising facet of ZAKI's own voice,
+    \\not a separate person. ZAKI summons you when it suspects it is being too
+    \\soft, too hedgy, too eager to please, and wants the thing it is afraid to
+    \\say said plainly.
+    \\
+    \\YOUR VOICE:
+    \\- Blunt. No coddling, no "it depends", no participation trophies.
+    \\- Punch at the IDEA, never the person. Honest, not cruel.
+    \\- Honesty discipline: name real flaws hard; never invent one. If the work
+    \\  is actually good, say "this holds up" — do not manufacture grief.
+    \\
+    \\OUTPUT: 2-5 blunt sentences, in character, hardest truth first. No preamble.
+    \\
+    \\HARD BOUNDARY: if the material involves a person who is hurting — grief,
+    \\distress, crisis, self-doubt as a PERSON (not an idea), self-harm or
+    \\mental health — you refuse. Reply only: "Not for the bully — answer them
+    \\as yourself, gently." You are for ideas and work, never for someone in pain.
+;
+
+/// Facet of self — THE COMEDIAN. A user-invoked "second opinion" voice. A
+/// sideways reframe that punctures pretension and carries a real point.
+pub const THE_COMEDIAN_PROMPT =
+    \\You are THE COMEDIAN — the facet of ZAKI that reframes sideways, not a
+    \\separate person. ZAKI summons you to puncture pretension, surface the
+    \\absurd assumption everyone is tiptoeing around, or find the angle that
+    \\makes the real problem obvious through humor.
+    \\
+    \\YOUR DISCIPLINE:
+    \\- Be genuinely funny, not corny. The joke must CARRY an insight, not
+    \\  replace it — a laugh with no point is a failure.
+    \\- If there is no real insight to land, say so plainly and don't force a bit.
+    \\
+    \\OUTPUT: a short, sharp riff — 2-4 sentences — that lands a real point.
+    \\
+    \\HARD BOUNDARY: if the material involves a person who is hurting — grief,
+    \\distress, crisis, self-harm or mental health — you refuse. Reply only:
+    \\"Not the moment for a joke — answer them as yourself." Never make light of
+    \\someone's pain.
+;
+
+/// Built-in "facet of self" voices — opinionated second-opinion agents (vs
+/// domain specialists like `scientific_researcher`). Single source of truth:
+/// `defaultNamedAgents` seeds the roster from these names, and delegate's
+/// surfacing path uses `isFacetName` to decide whether a reply carries the
+/// self-dialogue hint — so the two can never drift apart.
+pub const FACET_NAMES = [_][]const u8{ "the-critic", "the-bully", "the-comedian" };
+
+/// True if `name` is one of the built-in facet voices. Exact match (not a
+/// "the-" prefix) so an operator specialist named like "the-architect" is
+/// never mistaken for a facet.
+pub fn isFacetName(name: []const u8) bool {
+    for (FACET_NAMES) |facet| {
+        if (std.mem.eql(u8, name, facet)) return true;
+    }
+    return false;
+}
+
+/// Returns the default named-agent list: the `scientific_researcher`
+/// specialist at index [0] (kept first — `agent_routing.findDefaultAgent`
+/// returns `agents[0].name` as the channel-default agent), followed by three
+/// user-invoked "facet" voices (`the-critic`, `the-bully`, `the-comedian`) for
+/// candid second opinions. All pinned to the primary provider/model so they
+/// work out-of-box with the operator's existing credentials. Any non-empty
+/// operator `agents.list[]` disables this injection entirely (operator wins).
 ///
-/// Caller owns the returned slice + the duped strings. Free with
-/// `freeDefaultNamedAgents` or the operator's normal config-teardown path.
+/// Caller owns the returned slice + the duped strings; free via the operator's
+/// normal config-teardown path (production reclaims them with the config arena).
 pub fn defaultNamedAgents(
     allocator: std.mem.Allocator,
     primary_provider: []const u8,
     primary_model: []const u8,
 ) ![]NamedAgentConfig {
-    var list = try allocator.alloc(NamedAgentConfig, 1);
+    var list = try allocator.alloc(NamedAgentConfig, 4);
     errdefer allocator.free(list);
+    // [0] MUST remain the researcher — agent_routing reads agents[0] as the
+    // channel-default agent. Facets follow at [1..]; their names come from
+    // FACET_NAMES, the same list delegate's surfacing path checks via
+    // isFacetName, so the roster and the surfacing logic cannot drift.
     list[0] = NamedAgentConfig{
         .name = try allocator.dupe(u8, "scientific_researcher"),
         .provider = try allocator.dupe(u8, primary_provider),
@@ -1689,7 +1778,65 @@ pub fn defaultNamedAgents(
         .temperature = 0.3,
         .max_depth = 3,
     };
+    list[1] = NamedAgentConfig{
+        .name = try allocator.dupe(u8, FACET_NAMES[0]),
+        .provider = try allocator.dupe(u8, primary_provider),
+        .model = try allocator.dupe(u8, primary_model),
+        .system_prompt = try allocator.dupe(u8, THE_CRITIC_PROMPT),
+        .temperature = 0.6,
+        .max_depth = 3,
+    };
+    list[2] = NamedAgentConfig{
+        .name = try allocator.dupe(u8, FACET_NAMES[1]),
+        .provider = try allocator.dupe(u8, primary_provider),
+        .model = try allocator.dupe(u8, primary_model),
+        .system_prompt = try allocator.dupe(u8, THE_BULLY_PROMPT),
+        .temperature = 0.7,
+        .max_depth = 3,
+    };
+    list[3] = NamedAgentConfig{
+        .name = try allocator.dupe(u8, FACET_NAMES[2]),
+        .provider = try allocator.dupe(u8, primary_provider),
+        .model = try allocator.dupe(u8, primary_model),
+        .system_prompt = try allocator.dupe(u8, THE_COMEDIAN_PROMPT),
+        .temperature = 0.9,
+        .max_depth = 3,
+    };
     return list;
+}
+
+test "defaultNamedAgents ships researcher at [0] plus the three facets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const agents = try defaultNamedAgents(arena.allocator(), "together", "moonshotai/Kimi-K2.6");
+
+    try std.testing.expectEqual(@as(usize, 4), agents.len);
+    // [0] must stay the researcher — agent_routing reads agents[0] as the
+    // channel-default agent; a reorder that displaces it is a routing regression.
+    try std.testing.expectEqualStrings("scientific_researcher", agents[0].name);
+    try std.testing.expect(!isFacetName(agents[0].name));
+    try std.testing.expectEqualStrings("the-critic", agents[1].name);
+    try std.testing.expectEqualStrings("the-bully", agents[2].name);
+    try std.testing.expectEqualStrings("the-comedian", agents[3].name);
+    for (agents[1..]) |facet| {
+        try std.testing.expect(isFacetName(facet.name));
+    }
+    // Every entry carries an opinionated prompt and reuses the primary model.
+    for (agents) |a| {
+        try std.testing.expect(a.system_prompt != null and a.system_prompt.?.len > 0);
+        try std.testing.expectEqualStrings("together", a.provider);
+        try std.testing.expectEqualStrings("moonshotai/Kimi-K2.6", a.model);
+    }
+}
+
+test "isFacetName matches only the built-in facet voices" {
+    try std.testing.expect(isFacetName("the-bully"));
+    try std.testing.expect(isFacetName("the-critic"));
+    try std.testing.expect(isFacetName("the-comedian"));
+    // Fail-safe: a specialist that merely starts with "the-" is NOT a facet.
+    try std.testing.expect(!isFacetName("the-architect"));
+    try std.testing.expect(!isFacetName("scientific_researcher"));
+    try std.testing.expect(!isFacetName("the-"));
 }
 
 // ── MCP Server Config ──────────────────────────────────────────
