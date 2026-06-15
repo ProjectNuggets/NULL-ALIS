@@ -674,6 +674,10 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = build_options_module },
             },
         }),
+        // Honor -Dtest-filter for the postgres suite too, so a single test can
+        // be run in isolation (e.g. the migration-lock test through a local
+        // pgBouncer in transaction mode for verification).
+        .filters = if (test_filter) |tf| &.{tf} else &.{},
     });
     if (sqlite3) |lib| {
         verification_tests.linkLibrary(lib);
