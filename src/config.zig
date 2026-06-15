@@ -2,6 +2,7 @@ const std = @import("std");
 const platform = @import("platform.zig");
 pub const config_types = @import("config_types.zig");
 pub const config_parse = @import("config_parse.zig");
+const provider_api_key = @import("providers/api_key.zig");
 
 // ── Re-export all types so downstream `@import("config.zig").Foo` still works ──
 
@@ -218,6 +219,28 @@ pub const Config = struct {
             defer self.allocator.free(key);
             return !isPlaceholderSecretValue(key);
         } else |_| {}
+        return false;
+    }
+
+    /// H3 (boot hardening): does the active primary provider have a usable
+    /// API key? Resolved EXACTLY the way the runtime resolves it at request
+    /// time (providers[].api_key → provider-specific env var like
+    /// MOONSHOT_API_KEY → generic NULLALIS_API_KEY/API_KEY fallback — see
+    /// providers/api_key.zig), so a key supplied only via env (the Helm
+    /// injection path) is honored and does NOT trip a false boot failure.
+    /// A present-but-placeholder value (e.g. REPLACE_WITH_PROVIDER_KEY) is
+    /// treated as missing. `provider_name` is the RESOLVED active primary
+    /// (`self.default_provider` after applyProfileDefaults).
+    fn hasUsablePrimaryProviderApiKey(self: *const Config, provider_name: []const u8) bool {
+        const resolved = provider_api_key.resolveApiKeyFromConfig(
+            self.allocator,
+            provider_name,
+            self.providers,
+        ) catch return false;
+        if (resolved) |key| {
+            defer self.allocator.free(key);
+            return !isPlaceholderSecretValue(key);
+        }
         return false;
     }
 
@@ -1061,6 +1084,7 @@ pub const Config = struct {
         InvalidBackoffMs,
         MissingDefaultProviderConfig,
         MissingTogetherApiKey,
+        MissingPrimaryProviderApiKey,
         MissingInternalServiceToken,
         InvalidInternalServiceToken,
         InvalidZakiBotStateBackend,
@@ -1099,6 +1123,20 @@ pub const Config = struct {
             }
             if ((std.mem.eql(u8, self.default_provider, "together") or std.mem.eql(u8, self.default_provider, "together-ai")) and !self.hasUsableTogetherApiKey()) {
                 return ValidationError.MissingTogetherApiKey;
+            }
+            // H3 (boot hardening, #1 cutover risk): the ACTIVE PRIMARY
+            // provider MUST have a usable key, not just a base_url. Pre-H3
+            // only together/together-ai was key-checked here; primary=moonshot
+            // with an empty MOONSHOT_API_KEY booted a green pod that then
+            // failed 100% of turns. Together is already covered by the
+            // specific check above (with its own TOGETHER_API_KEY env
+            // fallback + dedicated error), so skip it here to keep that
+            // error precise; assert every OTHER primary's key.
+            if (!std.mem.eql(u8, self.default_provider, "together") and
+                !std.mem.eql(u8, self.default_provider, "together-ai") and
+                !self.hasUsablePrimaryProviderApiKey(self.default_provider))
+            {
+                return ValidationError.MissingPrimaryProviderApiKey;
             }
             if (self.gateway.internal_service_tokens.len == 0) {
                 return ValidationError.MissingInternalServiceToken;
@@ -1149,6 +1187,12 @@ pub const Config = struct {
             ),
             ValidationError.MissingTogetherApiKey => std.debug.print(
                 "Config error: zaki_bot profile requires a valid TOGETHER_API_KEY for together-ai.\n",
+                .{},
+            ),
+            ValidationError.MissingPrimaryProviderApiKey => std.debug.print(
+                "Config error: zaki_bot profile requires a valid API key for the active primary provider " ++
+                    "(set providers[].api_key or the provider's env var, e.g. MOONSHOT_API_KEY). " ++
+                    "Refusing to boot a pod that would fail every turn.\n",
                 .{},
             ),
             ValidationError.MissingInternalServiceToken => std.debug.print(
@@ -4221,6 +4265,124 @@ test "zaki_bot validation rejects placeholder postgres connection string" {
     );
 
     try std.testing.expectError(Config.ValidationError.InvalidPostgresConnectionString, cfg.validate());
+}
+
+// ── H3 (boot hardening): require the ACTIVE PRIMARY provider key ──────
+//
+// Pre-H3, zaki_bot validation only asserted a key for together/together-ai
+// (MissingTogetherApiKey) and otherwise only checked the primary had a
+// base_url. So primary=moonshot with an EMPTY MOONSHOT_API_KEY booted
+// "healthy" and then failed EVERY turn (100% turn-failure on a green pod).
+// validate() runs AFTER applyProfileDefaults, so self.default_provider is
+// the resolved active primary; assert its key is present + non-placeholder
+// (resolved the same way the runtime resolves it: providers[].api_key →
+// provider-specific env → generic fallback).
+
+test "zaki_bot validation rejects missing primary provider api key (moonshot)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .profile = "zaki_bot",
+        .default_provider = "moonshot",
+        .default_model = "kimi-k2.6",
+    };
+
+    // Provider entry exists with a base_url (so MissingDefaultProviderConfig
+    // does NOT fire) but NO api_key — the exact pre-H3 silent-boot footgun.
+    cfg.providers = &.{
+        .{ .name = "moonshot", .base_url = "https://api.moonshot.ai/v1" },
+    };
+    cfg.state.backend = "postgres";
+    cfg.applySecretRuntimeOverrides(
+        try allocator.dupe(u8, "prod-internal-token-1234"),
+        try allocator.dupe(u8, "postgresql://zaki:zaki@127.0.0.1:5432/zaki"),
+    );
+
+    // NOTE: relies on MOONSHOT_API_KEY being unset in the test env. The
+    // resolver falls back to generic NULLALIS_API_KEY/API_KEY too; CI runs
+    // without those. If a developer has them exported the test would see a
+    // key — acceptable (it asserts the absence path), and the prod pod env
+    // is hermetic.
+    try std.testing.expectError(Config.ValidationError.MissingPrimaryProviderApiKey, cfg.validate());
+}
+
+test "zaki_bot validation rejects placeholder primary provider api key (moonshot)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .profile = "zaki_bot",
+        .default_provider = "moonshot",
+        .default_model = "kimi-k2.6",
+    };
+
+    cfg.providers = &.{
+        .{ .name = "moonshot", .api_key = "REPLACE_WITH_PROVIDER_KEY", .base_url = "https://api.moonshot.ai/v1" },
+    };
+    cfg.state.backend = "postgres";
+    cfg.applySecretRuntimeOverrides(
+        try allocator.dupe(u8, "prod-internal-token-1234"),
+        try allocator.dupe(u8, "postgresql://zaki:zaki@127.0.0.1:5432/zaki"),
+    );
+
+    try std.testing.expectError(Config.ValidationError.MissingPrimaryProviderApiKey, cfg.validate());
+}
+
+test "zaki_bot validation accepts present primary provider api key (moonshot)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .profile = "zaki_bot",
+        .default_provider = "moonshot",
+        .default_model = "kimi-k2.6",
+    };
+
+    cfg.providers = &.{
+        .{ .name = "moonshot", .api_key = "sk-moonshot-valid-key", .base_url = "https://api.moonshot.ai/v1" },
+    };
+    cfg.state.backend = "postgres";
+    cfg.applySecretRuntimeOverrides(
+        try allocator.dupe(u8, "prod-internal-token-1234"),
+        try allocator.dupe(u8, "postgresql://zaki:zaki@127.0.0.1:5432/zaki"),
+    );
+
+    try cfg.validate();
+}
+
+test "standard profile does not require primary provider api key" {
+    // Fail-closed is zaki_bot/production-only. A standard (dev) profile must
+    // keep booting with no provider key configured — operator ergonomics.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .profile = "standard",
+        .default_provider = "moonshot",
+        .default_model = "kimi-k2.6",
+    };
+    cfg.providers = &.{
+        .{ .name = "moonshot", .base_url = "https://api.moonshot.ai/v1" },
+    };
+
+    try cfg.validate();
 }
 
 test "tools config parses web_search_provider" {
