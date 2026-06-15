@@ -469,12 +469,23 @@ pub const Config = struct {
         if (std.fs.openFileAbsolute(resolved_paths.config_path, .{})) |file| {
             defer file.close();
             const content = try file.readToEndAlloc(allocator, 1024 * 64);
+            // H5 (boot hardening): the file is PRESENT. A parse failure here
+            // is real corruption (the pod always ships a config.json), NOT a
+            // "use defaults" situation. Pre-H5 this swallowed every non-OOM
+            // error → struct defaults → profile silently fell back to
+            // "standard" (skipping ALL zaki_bot fail-closed validation) and
+            // an unparseable `profile` never reached markdown_only-vs-prod
+            // logic. Propagate as ConfigParseFailed so runGateway exits
+            // non-zero instead of booting a wrong/degraded pod.
+            //
+            // "file ABSENT" (the else branch below) still keeps defaults —
+            // that is a legitimate fresh install.
             cfg.parseJson(content) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => {}, // malformed JSON — use defaults for unparsed fields
+                else => return error.ConfigParseFailed,
             };
         } else |_| {
-            // Config file doesn't exist yet — use defaults
+            // Config file doesn't exist yet — use defaults (fresh install).
         }
 
         // Environment variable overrides
@@ -2573,6 +2584,81 @@ test "json parse empty object uses defaults" {
     try std.testing.expectEqualStrings("openrouter", cfg.default_provider);
     try std.testing.expectEqual(@as(f64, 0.7), cfg.default_temperature);
     try std.testing.expect(cfg.secrets.encrypt);
+}
+
+// ── H5 (boot hardening): malformed config must fail, not silently default ──
+//
+// Pre-H5, load() swallowed every non-OOM parseJson error → struct
+// defaults. In production the pod ALWAYS has a config.json, so a parse
+// failure = real corruption; defaulting silently meant profile fell back
+// to "standard" (skipping ALL zaki_bot fail-closed validation) and the
+// pod booted wrong. parseJson must surface the failure so load() can
+// propagate it and runGateway exits non-zero.
+
+test "parseJson propagates malformed JSON (syntax error)" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try std.testing.expectError(error.SyntaxError, cfg.parseJson("{ this is not valid json"));
+}
+
+test "parseJson rejects non-object top-level (array) without panicking" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    // Valid JSON, but root is an array — pre-H5 this hit `parsed.value.object`
+    // (unchecked union access → safety panic). Must be a catchable error.
+    try std.testing.expectError(error.ConfigNotObject, cfg.parseJson("[1, 2, 3]"));
+}
+
+test "parseJson rejects non-object top-level (scalar) without panicking" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try std.testing.expectError(error.ConfigNotObject, cfg.parseJson("42"));
+}
+
+// POSIX env mutators for the load() integration tests below. Mirrors the
+// idiom already used in tools/openapi.zig tests. setenv()/unsetenv() are
+// POSIX-only; these tests are gated to non-Windows.
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "H5: load propagates ConfigParseFailed when present config is malformed" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // Drives the real load() path: a config.json that EXISTS but is corrupt
+    // must propagate (so runGateway exits non-zero), NOT silently default.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    const cfg_path = try std.fs.path.joinZ(std.testing.allocator, &.{ dir_path, "config.json" });
+    defer std.testing.allocator.free(cfg_path);
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = "{ corrupt: " });
+
+    // NULLALIS_CONFIG_PATH points load() at the corrupt file. Zig's test
+    // runner executes tests sequentially in one process; restore after.
+    _ = setenv("NULLALIS_CONFIG_PATH", cfg_path.ptr, 1);
+    defer _ = unsetenv("NULLALIS_CONFIG_PATH");
+
+    try std.testing.expectError(error.ConfigParseFailed, Config.load(std.testing.allocator));
+}
+
+test "H5: load keeps defaults when config file is absent (fresh install)" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+    // Point at a path that does NOT exist — fresh install must still load.
+    const cfg_path = try std.fs.path.joinZ(std.testing.allocator, &.{ dir_path, "config.json" });
+    defer std.testing.allocator.free(cfg_path);
+
+    _ = setenv("NULLALIS_CONFIG_PATH", cfg_path.ptr, 1);
+    defer _ = unsetenv("NULLALIS_CONFIG_PATH");
+
+    var cfg = try Config.load(std.testing.allocator);
+    cfg.deinit();
 }
 
 test "json parse integer temperature coerced to float" {

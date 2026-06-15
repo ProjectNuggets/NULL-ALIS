@@ -568,9 +568,24 @@ fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const
 // ── Gateway ──────────────────────────────────────────────────────
 
 fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
-    var cfg = yc.config.Config.load(allocator) catch {
-        std.debug.print("No config found -- run `nullalis onboard` first\n", .{});
-        std.process.exit(1);
+    var cfg = yc.config.Config.load(allocator) catch |err| switch (err) {
+        // H5 (boot hardening): a PRESENT-but-unparseable config.json is real
+        // corruption — fail loud with an actionable message and a non-zero
+        // exit, rather than the misleading "No config found" (which it is
+        // NOT) or silently booting on struct defaults. The production pod
+        // always ships a config.json, so this path = operator must fix the
+        // file, not run onboard.
+        error.ConfigParseFailed => {
+            std.debug.print(
+                "Config error: config.json is present but could not be parsed (malformed JSON or non-object top-level). Refusing to boot on defaults. Fix the file and retry.\n",
+                .{},
+            );
+            std.process.exit(1);
+        },
+        else => {
+            std.debug.print("No config found -- run `nullalis onboard` first\n", .{});
+            std.process.exit(1);
+        },
     };
     defer cfg.deinit();
 
