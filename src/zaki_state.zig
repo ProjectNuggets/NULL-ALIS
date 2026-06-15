@@ -2028,11 +2028,110 @@ const ManagerImpl = struct {
         self.pool_entries.clearRetainingCapacity();
     }
 
+    /// H4 (boot hardening): a process-wide constant key for the migration
+    /// advisory lock. Stable, arbitrary 64-bit value (chosen once; must NOT
+    /// change across releases or two versions would not serialize against
+    /// each other). pg_advisory_lock keys are per-database, so all tenant
+    /// schemas in one DB share this single migration lock — exactly the
+    /// intent: serialize EVERY migrate() across every pod for a given DB.
+    pub const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x7A41_4B49_4D49_4752; // "zAKIMIGR" mnemonic
+
+    /// H4: total bounded wait for the migration lock before giving up. A pod
+    /// that cannot acquire the lock within this window FAILS its migrate()
+    /// (error.MigrationLockTimeout) rather than proceeding unlocked — we
+    /// never run migrations without the lock. Session-level advisory locks
+    /// auto-release if the holder's connection drops (pod crash), so a stuck
+    /// lock self-heals; this bound just prevents an unbounded boot hang.
+    const MIGRATION_LOCK_MAX_WAIT_MS: i64 = 60_000;
+    const MIGRATION_LOCK_RETRY_SLEEP_MS: u64 = 100;
+
+    /// H4: run `SELECT pg_try_advisory_lock($key)` on a specific connection
+    /// and return whether the lock was granted. Non-blocking (returns
+    /// immediately), so the connection's statement_timeout never bites.
+    fn tryAdvisoryLockOnConn(self: *Self, conn: *c.PGconn, key: i64) !bool {
+        _ = self;
+        var buf: [96]u8 = undefined;
+        const q = try std.fmt.bufPrintZ(&buf, "SELECT pg_try_advisory_lock({d})", .{key});
+        const result = c.PQexec(conn, q.ptr) orelse return error.ExecFailed;
+        defer c.PQclear(result);
+        if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) return error.ExecFailed;
+        if (c.PQntuples(result) < 1) return error.ExecFailed;
+        const val = c.PQgetvalue(result, 0, 0);
+        // libpq renders bool as "t"/"f".
+        return val[0] == 't';
+    }
+
+    /// H4: best-effort `SELECT pg_advisory_unlock($key)` on a specific
+    /// connection. Best-effort because the lock also auto-releases on
+    /// connection close; a failed unlock here is logged (test-gated) but
+    /// must not mask the migration outcome.
+    fn advisoryUnlockOnConn(self: *Self, conn: *c.PGconn, key: i64) void {
+        var buf: [96]u8 = undefined;
+        const q = std.fmt.bufPrintZ(&buf, "SELECT pg_advisory_unlock({d})", .{key}) catch return;
+        const result = c.PQexec(conn, q.ptr) orelse {
+            if (!builtin.is_test) log.warn("migration advisory unlock failed to execute", .{});
+            return;
+        };
+        c.PQclear(result);
+        _ = self;
+    }
+
+    /// H4: pin a dedicated connection and acquire the migration advisory
+    /// lock on it, retrying with a bounded total wait. Returns the pinned
+    /// `ConnLease` (the caller HOLDS the lock on `lease.conn` until it calls
+    /// `advisoryUnlockOnConn` + `releaseConn`). On timeout the conn is
+    /// released and `error.MigrationLockTimeout` is returned — the caller
+    /// MUST NOT proceed to migrate without the lock.
+    fn acquireMigrationLock(self: *Self) !ConnLease {
+        var lease = self.acquireConn(self.lock_timeout_ms) catch |err| switch (err) {
+            error.ConnectionPoolBusy => return error.ConnectionFailed,
+            else => return err,
+        };
+        errdefer self.releaseConn(&lease, false);
+
+        const start_ms = std.time.milliTimestamp();
+        while (true) {
+            const granted = self.tryAdvisoryLockOnConn(lease.conn, MIGRATION_ADVISORY_LOCK_KEY) catch |err| {
+                return err;
+            };
+            if (granted) return lease;
+
+            const elapsed_ms = std.time.milliTimestamp() - start_ms;
+            if (elapsed_ms >= MIGRATION_LOCK_MAX_WAIT_MS) {
+                if (!builtin.is_test) log.err(
+                    "migration advisory lock not acquired within {d}ms — another pod may be mid-migration; refusing to migrate unlocked",
+                    .{MIGRATION_LOCK_MAX_WAIT_MS},
+                );
+                return error.MigrationLockTimeout;
+            }
+            std.Thread.sleep(MIGRATION_LOCK_RETRY_SLEEP_MS * std.time.ns_per_ms);
+        }
+    }
+
     /// Apply the embedded schema migrations for this tenant. Called internally
     /// by `init`; also `pub` so cross-module PG tests (subagent_results
     /// recovery in subagent.zig) can re-create the schema after a DROP in
     /// setup/teardown under the postgres engine.
+    ///
+    /// H4 (boot hardening): the whole migration run is serialized by a
+    /// session-level pg_advisory_lock on a dedicated pinned connection.
+    /// Without it, a rolling-update / HPA scale-out runs two pods' migrate()
+    /// concurrently — deadlock risk today, and outright corruption once a
+    /// non-idempotent 0002+ migration ships. The lock is released (and the
+    /// pinned conn returned to the pool) on every exit path.
     pub fn migrate(self: *Self) !void {
+        var lock_lease = try self.acquireMigrationLock();
+        defer {
+            self.advisoryUnlockOnConn(lock_lease.conn, MIGRATION_ADVISORY_LOCK_KEY);
+            self.releaseConn(&lock_lease, true);
+        }
+        return self.migrateLocked();
+    }
+
+    /// H4: the actual migration body, run while the caller holds the
+    /// migration advisory lock (see `migrate`). Never call directly except
+    /// from `migrate` — it assumes the lock is held.
+    fn migrateLocked(self: *Self) !void {
         const statements = [_][]const u8{
             "CREATE SCHEMA IF NOT EXISTS {schema}",
             "CREATE EXTENSION IF NOT EXISTS pgcrypto",
@@ -17426,6 +17525,110 @@ test "postgres_pool_releases_on_exec_error" {
     const after_recovery = mgr.debugPoolSnapshot();
     try std.testing.expectEqual(@as(u32, 0), after_recovery.in_use);
     try std.testing.expect(after_recovery.open_conns <= after_recovery.pool_max);
+}
+
+// ── H4 (boot hardening): migrations serialized by a PG advisory lock ──
+//
+// migrate() had NO lock; a rolling-update / HPA scale-out can run two
+// pods' migrations concurrently (deadlock risk, worse once non-idempotent
+// 0002+ ships). The fix wraps the migration run in a session-level
+// pg_advisory_lock on a dedicated pinned connection.
+
+test "H4: advisory lock is mutually exclusive then re-grantable after unlock" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = try initPostgresTestManagerWithPool(allocator, 4, 500);
+    defer mgr.deinit();
+
+    const KEY = ManagerImpl.MIGRATION_ADVISORY_LOCK_KEY;
+    // Hold the migration lock on connection A.
+    var lease_a = try mgr.acquireConn(0);
+    defer mgr.releaseConn(&lease_a, true);
+    try std.testing.expect(try mgr.tryAdvisoryLockOnConn(lease_a.conn, KEY));
+
+    // A different session (connection B) must NOT be able to take it.
+    var lease_b = try mgr.acquireConn(0);
+    defer mgr.releaseConn(&lease_b, true);
+    try std.testing.expect(!(try mgr.tryAdvisoryLockOnConn(lease_b.conn, KEY)));
+
+    // Release on A; now B can take it.
+    mgr.advisoryUnlockOnConn(lease_a.conn, KEY);
+    try std.testing.expect(try mgr.tryAdvisoryLockOnConn(lease_b.conn, KEY));
+    mgr.advisoryUnlockOnConn(lease_b.conn, KEY);
+}
+
+test "H4: migrate acquires and releases the advisory lock (no lock left held)" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    // initPostgresTestManagerWithPool already ran migrate() once during init.
+    var mgr = try initPostgresTestManagerWithPool(allocator, 4, 500);
+    defer mgr.deinit();
+
+    const KEY = ManagerImpl.MIGRATION_ADVISORY_LOCK_KEY;
+    // After init's migrate() returned, the advisory lock MUST be free —
+    // otherwise a follow-up migrate (or another pod) would block forever.
+    // A fresh session taking pg_try_advisory_lock proves migrate() unlocked.
+    var probe = try mgr.acquireConn(0);
+    defer mgr.releaseConn(&probe, true);
+    try std.testing.expect(try mgr.tryAdvisoryLockOnConn(probe.conn, KEY));
+    mgr.advisoryUnlockOnConn(probe.conn, KEY);
+
+    // And migrate() is still idempotent under the lock (re-run is clean).
+    try mgr.migrate();
+    // Lock is free again after the second migrate().
+    try std.testing.expect(try mgr.tryAdvisoryLockOnConn(probe.conn, KEY));
+    mgr.advisoryUnlockOnConn(probe.conn, KEY);
+}
+
+test "H4: concurrent migrate() from two managers on one schema does not error" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // Two managers pointed at the SAME schema = two pods racing migrate()
+    // during a rolling update. initPostgresTestManagerWithPool makes a unique
+    // schema + migrates once; build a second manager on that same schema.
+    var mgr_a = try initPostgresTestManagerWithPool(allocator, 4, 2000);
+    defer mgr_a.deinit();
+
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+    const cfg_b = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = mgr_a.schemaRaw(),
+            .pool_max = 4,
+            .lock_timeout_ms = 2000,
+        },
+    };
+    var mgr_b = try ManagerImpl.init(allocator, cfg_b);
+    defer mgr_b.deinit();
+
+    const Runner = struct {
+        fn run(m: *ManagerImpl, out: *?anyerror) void {
+            m.migrate() catch |e| {
+                out.* = e;
+            };
+        }
+    };
+
+    var err_a: ?anyerror = null;
+    var err_b: ?anyerror = null;
+    const t_a = try std.Thread.spawn(.{}, Runner.run, .{ &mgr_a, &err_a });
+    const t_b = try std.Thread.spawn(.{}, Runner.run, .{ &mgr_b, &err_b });
+    t_a.join();
+    t_b.join();
+
+    // The advisory lock serializes them; both complete without a deadlock
+    // or duplicate-DDL error (the legacy loop is idempotent + now serial).
+    if (err_a) |e| {
+        std.debug.print("concurrent migrate A failed: {any}\n", .{e});
+        return e;
+    }
+    if (err_b) |e| {
+        std.debug.print("concurrent migrate B failed: {any}\n", .{e});
+        return e;
+    }
 }
 
 test "postgres deleteSession removes thread durable state and preserves non-autosave memories" {
