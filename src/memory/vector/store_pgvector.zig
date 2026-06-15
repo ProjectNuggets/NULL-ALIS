@@ -17,6 +17,7 @@
 //!   CREATE INDEX ON memory_vectors USING ivfflat (embedding vector_cosine_ops);
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const build_options = @import("build_options");
 const env_rebrand = @import("../../env_rebrand.zig");
@@ -140,7 +141,16 @@ pub const PgvectorVectorStore = struct {
         };
 
         if (build_options.enable_postgres) {
-            errdefer self.closeAllPoolConns();
+            // On ensureSchema failure (e.g. PgVectorDimensionMismatch /
+            // PgSchemaFailed after a pool conn was opened) we must release
+            // BOTH the libpq conns AND the pool_entries ArrayList backing
+            // store — deinit() (which frees the ArrayList) never runs on this
+            // error path, so closeAllPoolConns alone (which only
+            // clearRetainingCapacity's) would leak the ArrayList capacity.
+            errdefer {
+                self.closeAllPoolConns();
+                self.pool_entries.deinit(self.allocator);
+            }
             try self.ensureSchema();
         }
         return self;
@@ -394,7 +404,12 @@ pub const PgvectorVectorStore = struct {
                 // accepting data loss.
                 const allow_destructive = allowDestructiveRebuild(self.allocator);
                 if (!allow_destructive) {
-                    log.err(
+                    // Gate err-level on !builtin.is_test: Zig 0.15's test
+                    // runner counts a log.err as a test failure, and H1's
+                    // boot-probe test deliberately exercises this fail-closed
+                    // path. Operators outside tests still get the err-level
+                    // diagnostic. (Same idiom as zaki_state.zig / gateway.zig.)
+                    if (!builtin.is_test) log.err(
                         "pgvector dimension mismatch for table '{s}': existing={d} expected={d}. " ++
                             "Refusing to drop the table (all embeddings would be lost). " ++
                             "To continue: either (a) change the embedding provider back to a model " ++

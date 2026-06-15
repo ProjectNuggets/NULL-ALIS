@@ -1207,6 +1207,15 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (search.get("fallback_provider")) |v| if (v == .string) {
                         self.memory.search.fallback_provider = try self.allocator.dupe(u8, v.string);
                     };
+                    // H1 (boot hardening): explicit opt-in/out of the
+                    // fail-closed vector-store boot requirement. NOTE: the
+                    // postgres_hybrid/zaki_bot profile forces this true in
+                    // applyProfileDefaults (which runs AFTER parse), so a
+                    // config that sets it false there is overridden to true —
+                    // a deliberate safe default for the commercial profile.
+                    if (search.get("require_vector_store_on_boot")) |v| if (v == .bool) {
+                        self.memory.search.require_vector_store_on_boot = v.bool;
+                    };
 
                     // search.store
                     if (search.get("store")) |store_val| {
