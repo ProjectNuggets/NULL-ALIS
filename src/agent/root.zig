@@ -929,6 +929,17 @@ pub const Agent = struct {
                 .tool_call_id = self.tool_call_id,
             };
         }
+
+        /// Project into the extraction-input ChatMessage: role + content + the
+        /// tool `.name` (identity). The extraction transcript builders read only
+        /// these three fields, and `.name` lets them drop internal-tool dumps by
+        /// tool identity (see runner.isInternalExtractionToolName). Deliberately
+        /// omits reasoning/tool_calls so chunk-token estimation on the extraction
+        /// window is unchanged from the prior role+content-only projection — this
+        /// adds the tool name and nothing else.
+        pub fn toExtractionMessage(self: *const OwnedMessage) ChatMessage {
+            return .{ .role = self.role, .content = self.content, .name = self.name };
+        }
     };
 
     /// Result of a single agent turn. Returned by `turn()` to give
@@ -7319,6 +7330,22 @@ test "Agent.OwnedMessage toChatMessage" {
     try std.testing.expectEqualStrings("hello", chat.content);
     // User messages carry no reasoning.
     try std.testing.expect(chat.reasoning_content == null);
+}
+
+test "Agent.OwnedMessage toExtractionMessage preserves tool name for extraction-hygiene filtering" {
+    // The extraction window builders filter internal-tool dumps by tool IDENTITY
+    // (msg.name). The history→window projection MUST carry .name through, or the
+    // session-end / compaction paths would fail open. This is the contract.
+    const msg = Agent.OwnedMessage{
+        .role = .tool,
+        .content = "Layer 0-7 dump",
+        .name = "memory_doctor",
+    };
+    const chat = msg.toExtractionMessage();
+    try std.testing.expect(chat.role == .tool);
+    try std.testing.expectEqualStrings("Layer 0-7 dump", chat.content);
+    try std.testing.expect(chat.name != null);
+    try std.testing.expectEqualStrings("memory_doctor", chat.name.?);
 }
 
 test "Agent.OwnedMessage carries reasoning through toChatMessage" {

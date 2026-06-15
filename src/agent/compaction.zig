@@ -467,7 +467,9 @@ fn dropOldestPairsFromMiddle(
         var msgs_buf = std.ArrayListUnmanaged(ChatMessage).initCapacity(allocator, window.len) catch null;
         if (msgs_buf) |*buf| {
             defer buf.deinit(allocator);
-            for (window) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
+            // Preserve tool identity (.name) so the extraction filter can drop
+            // internal-tool dumps — see OwnedMessage.toExtractionMessage.
+            for (window) |m| buf.appendAssumeCapacity(m.toExtractionMessage());
             const judge_model_resolved = config.extraction_judge_model_name orelse "";
             const ctx = extraction_runner.ExtractionContext{
                 .judge_provider = config.extraction_judge_provider,
@@ -706,7 +708,9 @@ fn compactHistoryKeepingRecent(
         var msgs_buf = std.ArrayListUnmanaged(ChatMessage).initCapacity(allocator, window.len) catch null;
         if (msgs_buf) |*buf| {
             defer buf.deinit(allocator);
-            for (window) |m| buf.appendAssumeCapacity(.{ .role = m.role, .content = m.content });
+            // Preserve tool identity (.name) so the extraction filter can drop
+            // internal-tool dumps — see OwnedMessage.toExtractionMessage.
+            for (window) |m| buf.appendAssumeCapacity(m.toExtractionMessage());
             const judge_model_resolved = config.extraction_judge_model_name orelse "";
             const ctx = extraction_runner.ExtractionContext{
                 .judge_provider = config.extraction_judge_provider,

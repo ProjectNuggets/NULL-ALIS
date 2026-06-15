@@ -459,6 +459,62 @@ fn countNonNull(results: []const ?schema.ExtractionResult) usize {
 /// Review fix M-03.
 const PER_MESSAGE_EPISODE_CAP: usize = 8_000;
 
+/// Brain-leak follow-up — internal/introspection tools whose OUTPUT is the
+/// agent reading its OWN brain back to itself (memory layers, the brain graph,
+/// context/runtime self-state, traces) or re-surfacing already-stored memory /
+/// raw history verbatim — NOT new world knowledge. Their `.tool` results must
+/// never reach the extractor: `memory_doctor`'s "Layer 0-7" dump would be
+/// persisted as brain entities, and `transcript_read` can re-inject the very
+/// `.system` scaffold the keystone suppresses. This is the `.tool` sibling of
+/// the `.system` keystone.
+///
+/// Data tools (web_search, fetch, file reads, …) are deliberately ABSENT: they
+/// bring in genuine facts and still extract. A `.tool` message with no recorded
+/// `name` fails OPEN (kept). Match is EXACT on the canonical `tool_name`.
+///
+/// Deliberately NOT excluded (kept), and why — these need the per-tool judgment
+/// of the Phase-1 unified classifier, not a blunt name match:
+///   • `memory_recall` — its recalled facts give the extractor coref/disambig
+///     context for the surrounding user turns; re-extraction of the facts
+///     themselves is deduped anyway.
+///   • `task_list`/`task_get`/`cron_runs`/`skill_registry` — operational state
+///     that may carry user-created open-loops (genuine knowledge), so a blanket
+///     exclude would drop real facts.
+/// The drift-proof long-term home is an `introspection` tool-metadata flag each
+/// tool declares for itself — tracked to Phase-1, not built here.
+const internal_extraction_tool_names = [_][]const u8{
+    // Diagnostic / structural self-state — pure bookkeeping, never world knowledge.
+    "memory_doctor", // read-only memory diagnostic ("Layer 0-7" report)
+    "memory_maintain", // maintenance/compaction JSON output
+    "brain_graph", // dumps the brain's own entity/edge graph
+    "context_snapshot", // agent self-state introspection
+    "trace_query", // internal execution/telemetry traces
+    "runtime_info", // runtime/model self-info
+    // Verbatim re-surfacing of the agent's OWN stored memory / raw history.
+    "memory_list", // enumerates stored memory entries verbatim
+    "memory_timeline", // dumps the agent's own session summaries
+    "transcript_read", // raw verbatim transcript (scaffold re-injection vector)
+};
+
+comptime {
+    // Well-formedness guard: no empty entries, no duplicates (typo backstop).
+    for (internal_extraction_tool_names, 0..) |a, i| {
+        if (a.len == 0) @compileError("internal_extraction_tool_names has an empty entry");
+        for (internal_extraction_tool_names[0..i]) |b| {
+            if (std.mem.eql(u8, a, b)) @compileError("internal_extraction_tool_names duplicate: " ++ a);
+        }
+    }
+}
+
+/// True when `name` is an internal/introspection tool whose output is the
+/// agent's own state, not world knowledge — see `internal_extraction_tool_names`.
+fn isInternalExtractionToolName(name: []const u8) bool {
+    for (internal_extraction_tool_names) |t| {
+        if (std.mem.eql(u8, name, t)) return true;
+    }
+    return false;
+}
+
 /// V1.14.9 — Build a transcript for ONE episode. Episodes are
 /// bounded by `target_episode_tokens` at the chunker level, but
 /// `buildEpisodeTranscript` still caps each individual message at
@@ -482,6 +538,15 @@ fn buildEpisodeTranscript(
         // named or not, present or future — at the origin, while leaving
         // assistant/user/tool turns (which carry genuine user facts) intact.
         if (msg.role == .system) continue;
+        // Brain-leak follow-up — drop internal/introspection tool dumps by tool
+        // IDENTITY (the `.tool` sibling of the `.system` keystone). Their output
+        // is the agent's own memory/diagnostic state, not user knowledge; data
+        // tools and null-name results pass through. See isInternalExtractionToolName.
+        if (msg.role == .tool) {
+            if (msg.name) |tool_name| {
+                if (isInternalExtractionToolName(tool_name)) continue;
+            }
+        }
         const role_str: []const u8 = switch (msg.role) {
             .system => unreachable, // filtered above
             .user => "USER",
@@ -536,6 +601,14 @@ fn buildTranscript(
         // hazard. Filter by ROLE so genuine user/assistant/tool content
         // is preserved.
         if (msg.role == .system) continue;
+        // Brain-leak follow-up — drop internal/introspection tool dumps by tool
+        // IDENTITY (the `.tool` sibling of the `.system` keystone). Data tools
+        // and null-name results pass through. See isInternalExtractionToolName.
+        if (msg.role == .tool) {
+            if (msg.name) |tool_name| {
+                if (isInternalExtractionToolName(tool_name)) continue;
+            }
+        }
         const role_str: []const u8 = switch (msg.role) {
             .system => unreachable, // filtered above
             .user => "USER",
@@ -1083,6 +1156,76 @@ test "brain-leak keystone: buildEpisodeTranscript excludes .system scaffold but 
     try std.testing.expect(std.mem.indexOf(u8, transcript, "SYSTEM:") == null);
     try std.testing.expect(std.mem.indexOf(u8, transcript, "USER: My dog is named Rex.") != null);
     try std.testing.expect(std.mem.indexOf(u8, transcript, "ASSISTANT: Got it, Rex.") != null);
+}
+
+test "extraction tool-identity filter: buildTranscript drops internal-tool dumps but keeps data-tool + null-name results" {
+    const allocator = std.testing.allocator;
+    // memory_doctor emits the agent's OWN internal state ("Layer 0-7"), which
+    // the #48-class leak would persist as brain entities. A genuine data tool
+    // (web_search) carries world knowledge that SHOULD still extract. A tool
+    // message with no recorded name fails OPEN (legacy/persisted path) — kept.
+    const msgs = [_]ChatMessage{
+        .{ .role = .user, .content = "What's the capital of France?" },
+        .{ .role = .tool, .content = "Paris is the capital of France.", .name = "web_search" },
+        .{ .role = .tool, .content = "Layer 0 working_memory=3; Layer 1 durable=42; pending=0", .name = "memory_doctor" },
+        .{ .role = .tool, .content = "legacy unnamed tool result", .name = null },
+        .{ .role = .assistant, .content = "It's Paris." },
+    };
+    const transcript = try buildTranscript(allocator, &msgs, 80_000);
+    defer allocator.free(transcript);
+
+    // Internal-tool dump never reaches the extractor.
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "Layer 0 working_memory") == null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "durable=42") == null);
+    // Genuine data-tool knowledge survives.
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "Paris is the capital of France.") != null);
+    // Null-name tool result fails OPEN (kept — no identity to filter on).
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "legacy unnamed tool result") != null);
+    // Surrounding user/assistant content intact.
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "USER: What's the capital of France?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "ASSISTANT: It's Paris.") != null);
+}
+
+test "extraction tool-identity filter: buildEpisodeTranscript drops internal-tool dumps but keeps data-tool results" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]ChatMessage{
+        .{ .role = .user, .content = "Remember my flight is UA 123." },
+        .{ .role = .tool, .content = "brain graph: 12 entities, 30 edges, center=user", .name = "brain_graph" },
+        .{ .role = .tool, .content = "Flight UA 123 departs 9:00am from SFO.", .name = "web_search" },
+        .{ .role = .assistant, .content = "Noted, UA 123." },
+    };
+    const episode = chunker.Episode{
+        .messages = &msgs,
+        .estimated_tokens = 0,
+        .boundary_signal = .window_start,
+        .start_idx = 0,
+        .end_idx = @intCast(msgs.len),
+    };
+    const transcript = try buildEpisodeTranscript(allocator, episode);
+    defer allocator.free(transcript);
+
+    // Internal brain-graph dump excluded; genuine flight fact survives.
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "brain graph: 12 entities") == null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "Flight UA 123 departs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "USER: Remember my flight is UA 123.") != null);
+}
+
+test "extraction tool-identity filter: null name fails OPEN; match is EXACT (no prefix/substring)" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]ChatMessage{
+        // Internal-LOOKING content but NO recorded name → cannot be filtered by
+        // identity, so it fails OPEN (kept). The filter keys on identity, never content.
+        .{ .role = .tool, .content = "Layer 0-7 dump with no name", .name = null },
+        // Near-collision names that CONTAIN an internal name as a prefix/substring
+        // must NOT be excluded — the match is exact on the canonical tool_name.
+        .{ .role = .tool, .content = "data from memory_doctor_v2 plugin", .name = "memory_doctor_v2" },
+        .{ .role = .tool, .content = "kept brain_graph_export payload", .name = "brain_graph_export" },
+    };
+    const transcript = try buildTranscript(allocator, &msgs, 80_000);
+    defer allocator.free(transcript);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "Layer 0-7 dump with no name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "data from memory_doctor_v2 plugin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "kept brain_graph_export payload") != null);
 }
 
 /// Captures the transcript actually fed to the extraction LLM so the
