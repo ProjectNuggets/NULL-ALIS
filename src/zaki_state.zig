@@ -2052,11 +2052,21 @@ const ManagerImpl = struct {
     /// H4: total bounded wait for the migration lock before giving up. A pod
     /// that cannot acquire the lock within this window FAILS its migrate()
     /// (error.MigrationLockTimeout) rather than proceeding unlocked — we
-    /// never run migrations without the lock. Session-level advisory locks
-    /// auto-release if the holder's connection drops (pod crash), so a stuck
-    /// lock self-heals; this bound just prevents an unbounded boot hang.
+    /// never run migrations without the lock. Transaction-scoped advisory
+    /// locks auto-release when the holder's txn ends or its connection drops
+    /// (pod crash), so a stuck lock self-heals; this bound just prevents an
+    /// unbounded boot hang.
     const MIGRATION_LOCK_MAX_WAIT_MS: i64 = 60_000;
     const MIGRATION_LOCK_RETRY_SLEEP_MS: u64 = 100;
+
+    /// pgBouncer-transaction fix: process-wide serialization of migrate()
+    /// across ALL Manager instances in this process. Each tenant runtime scope
+    /// builds its OWN Manager with its own pool (see tenant_runtime_scope.zig),
+    /// so a per-Manager lock would not serialize them — this container-level
+    /// (static) mutex does. It prevents an intra-pod thundering herd of
+    /// advisory-lock probes against pgBouncer's small backend budget; the
+    /// cross-pod serialization is the advisory xact lock (acquireMigrationXactLock).
+    var g_migration_mutex: std.Thread.Mutex = .{};
 
     /// H4: run `SELECT pg_try_advisory_lock($key)` on a specific connection
     /// and return whether the lock was granted. Non-blocking (returns
@@ -2089,25 +2099,25 @@ const ManagerImpl = struct {
         _ = self;
     }
 
-    /// H4: pin a dedicated connection and acquire the migration advisory
-    /// lock on it, retrying with a bounded total wait. Returns the pinned
-    /// `ConnLease` (the caller HOLDS the lock on `lease.conn` until it calls
-    /// `advisoryUnlockOnConn` + `releaseConn`). On timeout the conn is
-    /// released and `error.MigrationLockTimeout` is returned — the caller
-    /// MUST NOT proceed to migrate without the lock.
-    fn acquireMigrationLock(self: *Self) !ConnLease {
-        var lease = self.acquireConn(self.lock_timeout_ms) catch |err| switch (err) {
-            error.ConnectionPoolBusy => return error.ConnectionFailed,
-            else => return err,
-        };
-        errdefer self.releaseConn(&lease, false);
-
+    /// pgBouncer-transaction fix: take the migration advisory lock as a
+    /// TRANSACTION-scoped lock on the pinned `txn` connection, retrying with a
+    /// bounded total wait. The NON-blocking pg_try_advisory_xact_lock is used so
+    /// the per-connection lock_timeout (2s) never aborts the wait — the bounded
+    /// retry loop owns the timeout. The lock is held until the caller
+    /// COMMITs/ROLLBACKs the txn (auto-release: NO manual pg_advisory_unlock,
+    /// which is what made the unlock land on a different pooled backend and emit
+    /// "you don't own a lock of type ExclusiveLock"). On timeout returns
+    /// error.MigrationLockTimeout WITHOUT migrating — we never migrate unlocked.
+    fn acquireMigrationXactLock(self: *Self, txn: *TxnLease) !void {
+        _ = self;
+        var buf: [96]u8 = undefined;
+        const q = try std.fmt.bufPrint(&buf, "SELECT pg_try_advisory_xact_lock({d})", .{MIGRATION_ADVISORY_LOCK_KEY});
         const start_ms = std.time.milliTimestamp();
         while (true) {
-            const granted = self.tryAdvisoryLockOnConn(lease.conn, MIGRATION_ADVISORY_LOCK_KEY) catch |err| {
-                return err;
-            };
-            if (granted) return lease;
+            const result = try txn.exec(q);
+            const granted = c.PQntuples(result) >= 1 and c.PQgetvalue(result, 0, 0)[0] == 't';
+            c.PQclear(result);
+            if (granted) return;
 
             const elapsed_ms = std.time.milliTimestamp() - start_ms;
             if (elapsed_ms >= MIGRATION_LOCK_MAX_WAIT_MS) {
@@ -2126,19 +2136,41 @@ const ManagerImpl = struct {
     /// recovery in subagent.zig) can re-create the schema after a DROP in
     /// setup/teardown under the postgres engine.
     ///
-    /// H4 (boot hardening): the whole migration run is serialized by a
-    /// session-level pg_advisory_lock on a dedicated pinned connection.
-    /// Without it, a rolling-update / HPA scale-out runs two pods' migrate()
-    /// concurrently — deadlock risk today, and outright corruption once a
-    /// non-idempotent 0002+ migration ships. The lock is released (and the
-    /// pinned conn returned to the pool) on every exit path.
+    /// Serialization (boot hardening, pgBouncer-transaction safe):
+    ///   1. A process-global mutex serializes migrate() across the many
+    ///      per-tenant Manager instances in THIS pod (no intra-pod herd).
+    ///   2. The migration advisory lock is held as a pg_try_advisory_xact_lock
+    ///      inside an OPEN transaction on one pinned connection. The open txn
+    ///      pins that backend through pgBouncer (pool_mode=transaction), so the
+    ///      lock survives the whole migration; COMMIT auto-releases it. The
+    ///      former session-level pg_advisory_lock did NOT survive: pgBouncer
+    ///      returned the backend to the pool after the bare acquire statement,
+    ///      so it never serialized across pods and the manual unlock landed on a
+    ///      different backend ("you don't own a lock of type ExclusiveLock").
+    /// Without this, a rolling-update / HPA scale-out runs two pods' migrate()
+    /// concurrently — deadlock risk today, outright corruption once a
+    /// non-idempotent 0002+ migration ships.
     pub fn migrate(self: *Self) !void {
-        var lock_lease = try self.acquireMigrationLock();
-        defer {
-            self.advisoryUnlockOnConn(lock_lease.conn, MIGRATION_ADVISORY_LOCK_KEY);
-            self.releaseConn(&lock_lease, true);
+        // (1) Serialize migrate() within this process (across Manager instances).
+        g_migration_mutex.lock();
+        defer g_migration_mutex.unlock();
+
+        // (2) Hold the migration advisory lock as a transaction-scoped lock on a
+        // single pinned connection. beginTransaction() runs BEGIN and keeps the
+        // conn — the open txn pins the backend through pgBouncer.
+        var txn = try self.beginTransaction();
+        defer txn.deinit(); // rollback + release if we don't reach commit()
+
+        // The lock conn is idle-in-transaction while migrateLocked() runs DDL on
+        // OTHER pooled conns — make sure it is never reaped mid-migration.
+        {
+            const r = try txn.exec("SET LOCAL idle_in_transaction_session_timeout = 0");
+            c.PQclear(r);
         }
-        return self.migrateLocked();
+
+        try self.acquireMigrationXactLock(&txn);
+        try self.migrateLocked();
+        try txn.commit(); // releases the advisory xact lock + returns the conn
     }
 
     /// H4: the actual migration body, run while the caller holds the
@@ -17560,8 +17592,10 @@ test "H6: pingHealth succeeds against a live database" {
 //
 // migrate() had NO lock; a rolling-update / HPA scale-out can run two
 // pods' migrations concurrently (deadlock risk, worse once non-idempotent
-// 0002+ ships). The fix wraps the migration run in a session-level
-// pg_advisory_lock on a dedicated pinned connection.
+// 0002+ ships). The fix holds a transaction-scoped pg_try_advisory_xact_lock
+// inside an open BEGIN..COMMIT on a pinned connection (the open txn pins the
+// backend through pgBouncer pool_mode=transaction; COMMIT auto-releases it),
+// plus a process-global mutex serializing migrate() within a pod.
 
 test "H4: advisory lock is mutually exclusive then re-grantable after unlock" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
@@ -17607,6 +17641,34 @@ test "H4: migrate acquires and releases the advisory lock (no lock left held)" {
     // Lock is free again after the second migrate().
     try std.testing.expect(try mgr.tryAdvisoryLockOnConn(probe.conn, KEY));
     mgr.advisoryUnlockOnConn(probe.conn, KEY);
+}
+
+test "pgBouncer-fix: migration xact lock is exclusive while the holder's txn is open" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = try initPostgresTestManagerWithPool(allocator, 4, 2000);
+    defer mgr.deinit();
+
+    const KEY = ManagerImpl.MIGRATION_ADVISORY_LOCK_KEY;
+
+    // Hold the migration lock exactly as migrate() does now: a transaction-
+    // scoped pg_try_advisory_xact_lock inside an OPEN transaction on a pinned
+    // connection (the open txn is what pins the backend through pgBouncer).
+    var txn = try mgr.beginTransaction();
+    defer txn.deinit(); // ROLLBACK-on-not-committed releases the xact lock
+    try mgr.acquireMigrationXactLock(&txn);
+
+    // A different session must NOT be able to take the same advisory lock:
+    // advisory locks are database-global, and xact- and session-scoped
+    // requests on the same key conflict.
+    var other = try mgr.acquireConn(0);
+    defer mgr.releaseConn(&other, true);
+    try std.testing.expect(!(try mgr.tryAdvisoryLockOnConn(other.conn, KEY)));
+
+    // Ending the holder's transaction releases it; now it is grantable.
+    txn.rollback();
+    try std.testing.expect(try mgr.tryAdvisoryLockOnConn(other.conn, KEY));
+    mgr.advisoryUnlockOnConn(other.conn, KEY);
 }
 
 test "H4: concurrent migrate() from two managers on one schema does not error" {
