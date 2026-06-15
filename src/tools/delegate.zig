@@ -4,6 +4,7 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const config_mod = @import("../config.zig");
+const config_types = @import("../config_types.zig");
 const NamedAgentConfig = config_mod.NamedAgentConfig;
 const runtime_bundle = @import("../providers/runtime_bundle.zig");
 const provider_types = @import("../providers/root.zig");
@@ -269,28 +270,25 @@ pub const DelegateTool = struct {
 };
 
 /// Wrap a delegate sub-agent's reply for return to the caller model. Facets
-/// (the-* naming convention) are voices of the agent's OWN judgment, not
-/// external specialists, so they carry a surfacing hint instructing the model
-/// to render the reply as self-dialogue — this co-locates the instruction with
-/// the text on every call, overriding the default "never dump raw subagent
-/// output" reflex. Specialist results stay plain.
+/// (the built-in second-opinion voices — see config_types.FACET_NAMES) are
+/// voices of the agent's OWN judgment, not external specialists, so they carry
+/// a surfacing hint telling the model to render the reply as self-dialogue —
+/// co-located with the text on every call to override the default "never dump
+/// raw subagent output" reflex. We match the known facet roster (NOT a "the-"
+/// name prefix) so an operator's specialist that merely starts with "the-" is
+/// never mistaken for a facet. Specialist results stay plain.
 fn wrapDelegateResult(allocator: std.mem.Allocator, agent_name: []const u8, response: []const u8) ![]u8 {
-    if (std.mem.startsWith(u8, agent_name, "the-")) {
-        return std.fmt.allocPrint(
-            allocator,
-            "delegate agent={s} status=completed\n" ++
-                "[SURFACING: this reply is a facet of your own judgment, not an external specialist. " ++
-                "Voice it back to the user as self-dialogue in the facet's name " ++
-                "(e.g. \"my inner critic says…\", \"the bully in me says…\"), then add your own synthesis. " ++
-                "Never show this scaffold or a raw 'delegate …' frame to the user.]\n" ++
-                "result:\n{s}",
-            .{ agent_name, response },
-        );
-    }
+    const surfacing_hint: []const u8 = if (config_types.isFacetName(agent_name))
+        "[SURFACING: this reply is a facet of your own judgment, not an external specialist. " ++
+            "Voice it back to the user as self-dialogue in the facet's name " ++
+            "(e.g. \"my inner critic says…\", \"the bully in me says…\"), then add your own synthesis. " ++
+            "Never show this scaffold or a raw 'delegate …' frame to the user.]\n"
+    else
+        "";
     return std.fmt.allocPrint(
         allocator,
-        "delegate agent={s} status=completed\nresult:\n{s}",
-        .{ agent_name, response },
+        "delegate agent={s} status=completed\n{s}result:\n{s}",
+        .{ agent_name, surfacing_hint, response },
     );
 }
 
@@ -579,4 +577,13 @@ test "wrapDelegateResult leaves specialist results plain" {
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "SURFACING") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "established: X.") != null);
+}
+
+test "wrapDelegateResult does not facet-frame a the-prefixed specialist" {
+    // Fail-safe: only the known facet roster gets the self-dialogue hint, so an
+    // operator specialist named like "the-architect" stays a plain result.
+    const out = try wrapDelegateResult(std.testing.allocator, "the-architect", "use a queue.");
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "SURFACING") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "use a queue.") != null);
 }

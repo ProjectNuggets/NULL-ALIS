@@ -206,10 +206,20 @@ fix was word/config-level (plus one tiny helper), consistent with the lean remit
    offer is the primary discovery path**; the chip is additive (consistent with "if the agent
    can't suggest it in flow").
 
-**Verification:** `zig build` clean (comptime lint passed); `zig build test` →
-**7248/7366 passed, 118 skipped (env-gated), 0 failed.** New tests: `wrapDelegateResult`
-(facet hint present / specialist plain) and `defaultNamedAgents ships researcher + 3 facets`.
+**Post-review hardening (high-recall diff review, 3 finder angles):** two fixes folded in
+before merge — (a) **fail-safe facet detection**: `delegate` now recognizes facets by exact
+match against the `FACET_NAMES` roster (single source of truth in `config_types.zig`), not a
+`"the-"` name prefix, so an operator specialist named e.g. `the-architect` is never
+mis-framed as ZAKI's inner voice; (b) the roster regression test that pins
+`agents[0] == scientific_researcher` (the routing-default invariant) was actually added —
+an earlier filtered run had passed vacuously because the test did not yet exist.
 
-**Files touched:** `src/config_types.zig` (3 facet prompts + 4-entry roster),
-`src/tools/delegate.zig` (use_when bullet + `wrapDelegateResult`), `src/agent/prompt.zig`
-(`buildFacetsSection`).
+**Verification:** `zig build` clean (comptime lint passed); `zig build test` →
+**7251/7369 passed, 118 skipped (env-gated), 0 failed.** New tests: `wrapDelegateResult`
+(facet hint present / specialist plain / `the-`-prefixed specialist stays plain),
+`defaultNamedAgents ships researcher at [0] plus the three facets`, and `isFacetName matches
+only the built-in facet voices`.
+
+**Files touched:** `src/config_types.zig` (3 facet prompts + `FACET_NAMES`/`isFacetName` +
+4-entry roster), `src/tools/delegate.zig` (use_when bullet + `wrapDelegateResult`),
+`src/agent/prompt.zig` (`buildFacetsSection`).

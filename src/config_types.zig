@@ -1718,6 +1718,23 @@ pub const THE_COMEDIAN_PROMPT =
     \\someone's pain.
 ;
 
+/// Built-in "facet of self" voices — opinionated second-opinion agents (vs
+/// domain specialists like `scientific_researcher`). Single source of truth:
+/// `defaultNamedAgents` seeds the roster from these names, and delegate's
+/// surfacing path uses `isFacetName` to decide whether a reply carries the
+/// self-dialogue hint — so the two can never drift apart.
+pub const FACET_NAMES = [_][]const u8{ "the-critic", "the-bully", "the-comedian" };
+
+/// True if `name` is one of the built-in facet voices. Exact match (not a
+/// "the-" prefix) so an operator specialist named like "the-architect" is
+/// never mistaken for a facet.
+pub fn isFacetName(name: []const u8) bool {
+    for (FACET_NAMES) |facet| {
+        if (std.mem.eql(u8, name, facet)) return true;
+    }
+    return false;
+}
+
 /// Returns the default named-agent list: the `scientific_researcher`
 /// specialist at index [0] (kept first — `agent_routing.findDefaultAgent`
 /// returns `agents[0].name` as the channel-default agent), followed by three
@@ -1736,9 +1753,9 @@ pub fn defaultNamedAgents(
     var list = try allocator.alloc(NamedAgentConfig, 4);
     errdefer allocator.free(list);
     // [0] MUST remain the researcher — agent_routing reads agents[0] as the
-    // channel-default agent. Facets follow at [1..]; the `the-*` naming
-    // convention is what delegate's surfacing path + the FACETS prompt block
-    // use to recognize a facet (vs a specialist) without a schema field.
+    // channel-default agent. Facets follow at [1..]; their names come from
+    // FACET_NAMES, the same list delegate's surfacing path checks via
+    // isFacetName, so the roster and the surfacing logic cannot drift.
     list[0] = NamedAgentConfig{
         .name = try allocator.dupe(u8, "scientific_researcher"),
         .provider = try allocator.dupe(u8, primary_provider),
@@ -1748,7 +1765,7 @@ pub fn defaultNamedAgents(
         .max_depth = 3,
     };
     list[1] = NamedAgentConfig{
-        .name = try allocator.dupe(u8, "the-critic"),
+        .name = try allocator.dupe(u8, FACET_NAMES[0]),
         .provider = try allocator.dupe(u8, primary_provider),
         .model = try allocator.dupe(u8, primary_model),
         .system_prompt = try allocator.dupe(u8, THE_CRITIC_PROMPT),
@@ -1756,7 +1773,7 @@ pub fn defaultNamedAgents(
         .max_depth = 3,
     };
     list[2] = NamedAgentConfig{
-        .name = try allocator.dupe(u8, "the-bully"),
+        .name = try allocator.dupe(u8, FACET_NAMES[1]),
         .provider = try allocator.dupe(u8, primary_provider),
         .model = try allocator.dupe(u8, primary_model),
         .system_prompt = try allocator.dupe(u8, THE_BULLY_PROMPT),
@@ -1764,7 +1781,7 @@ pub fn defaultNamedAgents(
         .max_depth = 3,
     };
     list[3] = NamedAgentConfig{
-        .name = try allocator.dupe(u8, "the-comedian"),
+        .name = try allocator.dupe(u8, FACET_NAMES[2]),
         .provider = try allocator.dupe(u8, primary_provider),
         .model = try allocator.dupe(u8, primary_model),
         .system_prompt = try allocator.dupe(u8, THE_COMEDIAN_PROMPT),
@@ -1772,6 +1789,40 @@ pub fn defaultNamedAgents(
         .max_depth = 3,
     };
     return list;
+}
+
+test "defaultNamedAgents ships researcher at [0] plus the three facets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const agents = try defaultNamedAgents(arena.allocator(), "together", "moonshotai/Kimi-K2.6");
+
+    try std.testing.expectEqual(@as(usize, 4), agents.len);
+    // [0] must stay the researcher — agent_routing reads agents[0] as the
+    // channel-default agent; a reorder that displaces it is a routing regression.
+    try std.testing.expectEqualStrings("scientific_researcher", agents[0].name);
+    try std.testing.expect(!isFacetName(agents[0].name));
+    try std.testing.expectEqualStrings("the-critic", agents[1].name);
+    try std.testing.expectEqualStrings("the-bully", agents[2].name);
+    try std.testing.expectEqualStrings("the-comedian", agents[3].name);
+    for (agents[1..]) |facet| {
+        try std.testing.expect(isFacetName(facet.name));
+    }
+    // Every entry carries an opinionated prompt and reuses the primary model.
+    for (agents) |a| {
+        try std.testing.expect(a.system_prompt != null and a.system_prompt.?.len > 0);
+        try std.testing.expectEqualStrings("together", a.provider);
+        try std.testing.expectEqualStrings("moonshotai/Kimi-K2.6", a.model);
+    }
+}
+
+test "isFacetName matches only the built-in facet voices" {
+    try std.testing.expect(isFacetName("the-bully"));
+    try std.testing.expect(isFacetName("the-critic"));
+    try std.testing.expect(isFacetName("the-comedian"));
+    // Fail-safe: a specialist that merely starts with "the-" is NOT a facet.
+    try std.testing.expect(!isFacetName("the-architect"));
+    try std.testing.expect(!isFacetName("scientific_researcher"));
+    try std.testing.expect(!isFacetName("the-"));
 }
 
 // ── MCP Server Config ──────────────────────────────────────────
