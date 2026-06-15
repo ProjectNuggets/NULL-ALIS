@@ -2028,6 +2028,19 @@ const ManagerImpl = struct {
         self.pool_entries.clearRetainingCapacity();
     }
 
+    /// H6 (boot hardening): a lightweight liveness ping for the DB —
+    /// `SELECT 1` on a pooled connection. Returns an error if the query
+    /// fails (DB unreachable, conn dead, pool exhausted). The gateway
+    /// maintenance thread runs this on a steady-state cadence and maps the
+    /// result to health.markComponentOk/Error("db", …); /ready aggregates
+    /// the registry and sheds a pod whose Postgres went away post-boot.
+    /// Deliberately trivial (no schema, no params) so it measures only
+    /// "can we round-trip a query to Postgres right now".
+    pub fn pingHealth(self: *Self) !void {
+        const result = try self.exec("SELECT 1");
+        c.PQclear(result);
+    }
+
     /// H4 (boot hardening): a process-wide constant key for the migration
     /// advisory lock. Stable, arbitrary 64-bit value (chosen once; must NOT
     /// change across releases or two versions would not serialize against
@@ -17525,6 +17538,22 @@ test "postgres_pool_releases_on_exec_error" {
     const after_recovery = mgr.debugPoolSnapshot();
     try std.testing.expectEqual(@as(u32, 0), after_recovery.in_use);
     try std.testing.expect(after_recovery.open_conns <= after_recovery.pool_max);
+}
+
+// ── H6 (boot hardening): DB steady-state readiness ping ──────────────
+//
+// pingHealth() is a lightweight `SELECT 1` the gateway maintenance thread
+// runs periodically to feed health.markComponentOk/Error("db", …) so
+// /ready (which aggregates the registry) sheds a pod whose Postgres went
+// away AFTER boot. Kept out of /health (liveness) to avoid restart storms.
+
+test "H6: pingHealth succeeds against a live database" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = try initPostgresTestManagerWithPool(allocator, 2, 500);
+    defer mgr.deinit();
+
+    try mgr.pingHealth();
 }
 
 // ── H4 (boot hardening): migrations serialized by a PG advisory lock ──

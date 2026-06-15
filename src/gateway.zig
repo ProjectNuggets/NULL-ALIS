@@ -24233,13 +24233,48 @@ const MaintenanceContext = struct {
     state: *GatewayState,
 };
 
+// H6 (boot hardening): steady-state DB readiness ping cadence. The
+// maintenance thread runs `SELECT 1` against Postgres this often and feeds
+// health.markComponentOk/Error("db", …). /ready aggregates the registry so
+// a pod whose Postgres went away post-boot is shed from the Service. This
+// is deliberately NOT wired into /health (liveness) — a transient DB blip
+// must not trigger a restart storm (mirrors the C3 health/ready split).
+const DB_READINESS_PING_INTERVAL_SECS: i64 = 10;
+const DB_HEALTH_COMPONENT = "db";
+
+fn pingDbReadiness(state: *GatewayState) void {
+    // Only meaningful for a Postgres-backed gateway. File-backed dev
+    // gateways have no DB to ping; registering a perpetually-erroring "db"
+    // component would wrongly make /ready not-ready.
+    if (comptime !build_options.enable_postgres) return;
+    const mgr = state.zaki_state orelse return;
+    mgr.pingHealth() catch |err| {
+        health.markComponentError(DB_HEALTH_COMPONENT, @errorName(err));
+        return;
+    };
+    health.markComponentOk(DB_HEALTH_COMPONENT);
+}
+
 fn tenantRuntimeMaintenanceMain(ctx: *MaintenanceContext) void {
     var last_run_s: i64 = 0;
+    var last_db_ping_s: i64 = 0;
+    // H6: seed the "db" component to ok at startup for a Postgres-backed
+    // gateway so /ready does not flap not-ready in the first ping interval
+    // (boot already proved Postgres reachable via migrate()/zaki_state init;
+    // applyStartupSelfCheck fails loud if it didn't). The periodic ping
+    // below takes over from here.
+    if (build_options.enable_postgres and ctx.state.zaki_state != null) {
+        health.markComponentOk(DB_HEALTH_COMPONENT);
+    }
     while (!ctx.state.shutdown_requested.load(.acquire)) {
         const now_s = std.time.timestamp();
         if (now_s - last_run_s >= TENANT_RUNTIME_MAINTENANCE_INTERVAL_SECS) {
             runTenantRuntimeMaintenance(ctx.state, now_s);
             last_run_s = now_s;
+        }
+        if (now_s - last_db_ping_s >= DB_READINESS_PING_INTERVAL_SECS) {
+            pingDbReadiness(ctx.state);
+            last_db_ping_s = now_s;
         }
         // Sleep in short increments so shutdown is observed promptly (the
         // accept loop tears down within ~50ms; match that responsiveness).
@@ -30387,6 +30422,49 @@ test "handleReady multiple unhealthy components returns 503" {
     defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
     try std.testing.expectEqualStrings("503 Service Unavailable", resp.http_status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"not_ready\"") != null);
+}
+
+// ── H6 (boot hardening): the "db" component gates /ready, not /health ──
+
+test "H6: db component error sheds the pod via /ready (503)" {
+    health.reset();
+    health.markComponentOk("gateway");
+    health.markComponentError(DB_HEALTH_COMPONENT, "connection refused");
+    const resp = handleReady(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("503 Service Unavailable", resp.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"name\":\"db\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"healthy\":false") != null);
+    health.reset();
+}
+
+test "H6: db component ok keeps /ready ready (200)" {
+    health.reset();
+    health.markComponentOk("gateway");
+    health.markComponentOk(DB_HEALTH_COMPONENT);
+    const resp = handleReady(std.testing.allocator);
+    defer if (resp.allocated) std.testing.allocator.free(@constCast(resp.body));
+    try std.testing.expectEqualStrings("200 OK", resp.http_status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"ready\"") != null);
+    health.reset();
+}
+
+test "H6: db component error does NOT fail /health liveness (stays 200)" {
+    // The C3 split: a DB blip is a readiness signal, never a liveness kill —
+    // otherwise a transient Postgres hiccup restart-storms every pod. Cheap
+    // /health stays 200 "degraded" while /ready (above) sheds the pod.
+    health.reset();
+    health.markComponentError(DB_HEALTH_COMPONENT, "connection refused");
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.liveness_deadlock_threshold_ms = 180_000;
+    state.queued_requests.store(0, .release); // not wedged
+
+    const resp = healthFastPathResponse(&state);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expectEqualStrings("{\"status\":\"degraded\"}", resp.body);
+    health.reset();
 }
 
 test "handleReady response body is valid JSON structure" {
