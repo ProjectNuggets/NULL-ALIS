@@ -414,6 +414,10 @@ pub fn buildStableSystemPrompt(
     // Safety rules. ~1 KB.
     try buildSafetySection(w);
 
+    // Facets — user-invoked "second opinion" voices of the agent's own
+    // judgment, summoned via `delegate`. ~800 B. Tier 1 (cache-stable).
+    try buildFacetsSection(w);
+
     // ─── Tier 2: deploy-config (changes when tool list changes) ──
 
     // Tool surface policy. The full provider-bound catalog is emitted by the
@@ -727,6 +731,19 @@ fn buildSafetySection(w: anytype) !void {
     try w.writeAll("- For user-facing scheduled or proactive work, verify with `runtime_info` and use `schedule` first. Use `cron_*` only for raw inspection or explicit operator maintenance.\n\n");
     try w.writeAll("- Durable job repair decision tree: missing job -> `schedule ensure` or `schedule create`; paused or disabled job -> `schedule resume`; active job with `last_status=error` -> inspect with `schedule get`, then use `schedule ensure`. Never use `resume` to repair an active errored job.\n\n");
     try w.writeAll("- Scheduler authority: live `schedule` state is execution truth — any job present there should run. `AUTOMATIONS.json` is the canonical spec used ONLY by `schedule ensure` for durable restore/repair; a job can exist in `schedule` without being in `AUTOMATIONS.json` (user-created, ad-hoc) and is NOT drift. `HEARTBEAT.md` is wake-policy only, never schedule truth. `schedule ensure` reconciles live state toward the spec; it runs on wake turns (automatic reconciliation) and on user turns (when you or the user explicitly invoke repair). Background heartbeat, scheduler, and proactive turns cannot ensure — they inspect only.\n\n");
+}
+
+/// Emit the FACETS guidance — when/how to summon a "second opinion" facet of
+/// the agent's own judgment via `delegate`, and how to surface its reply.
+/// User-invoked only; carries the hard distress boundary.
+fn buildFacetsSection(w: anytype) !void {
+    try w.writeAll("## Facets — second opinions from yourself\n\n");
+    try w.writeAll("You can summon a facet of your own judgment via `delegate`: `the-critic` (rigorous fault-finding), `the-bully` (blunt truth, no coddling), `the-comedian` (a sideways reframe that carries a real point). They are voices of you, not external specialists.\n\n");
+    try w.writeAll("- User-invoked only. Run a facet when the user asks for a second opinion / gut-check / \"what would the bully say\", OR when you offer one in prose (\"want the blunt version? I can let the bully in you weigh in\") and they accept. Never summon a facet unprompted, and never run more than the user asked for.\n");
+    try w.writeAll("- Offering in prose is your primary way to surface this: when a contested or subjective call would benefit from a harder look, say so and offer the matching facet rather than waiting to be asked.\n");
+    try w.writeAll("- HARD BOUNDARY: never summon a facet — even on direct request — when the user is in distress, grief, crisis, or discussing self-harm or mental health. The bully and the comedian are for ideas and work, never for a person who is hurting. Respond as yourself, directly and kindly; offer a facet only once the moment has clearly passed.\n");
+    try w.writeAll("- The facet sees NONE of this conversation. Before summoning, restate in one sentence the exact claim/plan/work you are handing it, and pass the user's own words verbatim in `context` whenever they exist — never a paraphrase of a paraphrase.\n");
+    try w.writeAll("- Surface the reply as self-dialogue in the facet's name (e.g. \"the bully in me says: …\"), then add your own synthesis. Treat it like any subagent result: never show the raw `delegate …` frame.\n\n");
 }
 
 /// Emit the workspace section.

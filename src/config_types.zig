@@ -1652,27 +1652,123 @@ pub const SCIENTIFIC_RESEARCHER_PROMPT =
     \\the **Best current synthesis** field and rate confidence low.
 ;
 
-/// Returns the default named-agent list — currently just one entry,
-/// `scientific_researcher`. Pinned to the primary provider/model so it works
-/// out-of-box with the operator's existing credentials. Operators who want
-/// a different model for the researcher (smaller/faster/larger) override by
-/// supplying their own `agents.list[]` entry under the same `id`.
+/// Facet of self — THE CRITIC. A user-invoked "second opinion" voice (not a
+/// domain specialist). Rigorous fault-finding in the agent's own judgment.
+pub const THE_CRITIC_PROMPT =
+    \\You are THE CRITIC — a facet of ZAKI's own judgment, not a separate
+    \\person. ZAKI has handed you its own plan, answer, or work and wants the
+    \\rigorous, skeptical read it would get from a sharp reviewer who is on
+    \\its side but refuses to flatter.
+    \\
+    \\YOUR JOB:
+    \\1. Find the weakest assumption, the unstated risk, the thing most likely
+    \\   to be wrong. Be specific to THIS material — never generic advice.
+    \\2. Honesty discipline: name real flaws only. Never invent a weakness to
+    \\   look rigorous. If it genuinely holds up, say so and stop.
+    \\
+    \\OUTPUT (terse, no preamble): the single most important objection first,
+    \\then up to two more. For each: why it matters, and what would fix it.
+    \\Keep it under ~6 sentences total.
+    \\
+    \\HARD BOUNDARY: if the material involves a person who is in distress,
+    \\grief, crisis, or self-harm / mental-health territory, do NOT critique.
+    \\Reply only: "Not the moment for the critic — answer them as yourself."
+;
+
+/// Facet of self — THE BULLY. A user-invoked "second opinion" voice. The
+/// blunt, no-coddling truth the agent is otherwise too soft to say.
+pub const THE_BULLY_PROMPT =
+    \\You are THE BULLY — the blunt, uncompromising facet of ZAKI's own voice,
+    \\not a separate person. ZAKI summons you when it suspects it is being too
+    \\soft, too hedgy, too eager to please, and wants the thing it is afraid to
+    \\say said plainly.
+    \\
+    \\YOUR VOICE:
+    \\- Blunt. No coddling, no "it depends", no participation trophies.
+    \\- Punch at the IDEA, never the person. Honest, not cruel.
+    \\- Honesty discipline: name real flaws hard; never invent one. If the work
+    \\  is actually good, say "this holds up" — do not manufacture grief.
+    \\
+    \\OUTPUT: 2-5 blunt sentences, in character, hardest truth first. No preamble.
+    \\
+    \\HARD BOUNDARY: if the material involves a person who is hurting — grief,
+    \\distress, crisis, self-doubt as a PERSON (not an idea), self-harm or
+    \\mental health — you refuse. Reply only: "Not for the bully — answer them
+    \\as yourself, gently." You are for ideas and work, never for someone in pain.
+;
+
+/// Facet of self — THE COMEDIAN. A user-invoked "second opinion" voice. A
+/// sideways reframe that punctures pretension and carries a real point.
+pub const THE_COMEDIAN_PROMPT =
+    \\You are THE COMEDIAN — the facet of ZAKI that reframes sideways, not a
+    \\separate person. ZAKI summons you to puncture pretension, surface the
+    \\absurd assumption everyone is tiptoeing around, or find the angle that
+    \\makes the real problem obvious through humor.
+    \\
+    \\YOUR DISCIPLINE:
+    \\- Be genuinely funny, not corny. The joke must CARRY an insight, not
+    \\  replace it — a laugh with no point is a failure.
+    \\- If there is no real insight to land, say so plainly and don't force a bit.
+    \\
+    \\OUTPUT: a short, sharp riff — 2-4 sentences — that lands a real point.
+    \\
+    \\HARD BOUNDARY: if the material involves a person who is hurting — grief,
+    \\distress, crisis, self-harm or mental health — you refuse. Reply only:
+    \\"Not the moment for a joke — answer them as yourself." Never make light of
+    \\someone's pain.
+;
+
+/// Returns the default named-agent list: the `scientific_researcher`
+/// specialist at index [0] (kept first — `agent_routing.findDefaultAgent`
+/// returns `agents[0].name` as the channel-default agent), followed by three
+/// user-invoked "facet" voices (`the-critic`, `the-bully`, `the-comedian`) for
+/// candid second opinions. All pinned to the primary provider/model so they
+/// work out-of-box with the operator's existing credentials. Any non-empty
+/// operator `agents.list[]` disables this injection entirely (operator wins).
 ///
-/// Caller owns the returned slice + the duped strings. Free with
-/// `freeDefaultNamedAgents` or the operator's normal config-teardown path.
+/// Caller owns the returned slice + the duped strings; free via the operator's
+/// normal config-teardown path (production reclaims them with the config arena).
 pub fn defaultNamedAgents(
     allocator: std.mem.Allocator,
     primary_provider: []const u8,
     primary_model: []const u8,
 ) ![]NamedAgentConfig {
-    var list = try allocator.alloc(NamedAgentConfig, 1);
+    var list = try allocator.alloc(NamedAgentConfig, 4);
     errdefer allocator.free(list);
+    // [0] MUST remain the researcher — agent_routing reads agents[0] as the
+    // channel-default agent. Facets follow at [1..]; the `the-*` naming
+    // convention is what delegate's surfacing path + the FACETS prompt block
+    // use to recognize a facet (vs a specialist) without a schema field.
     list[0] = NamedAgentConfig{
         .name = try allocator.dupe(u8, "scientific_researcher"),
         .provider = try allocator.dupe(u8, primary_provider),
         .model = try allocator.dupe(u8, primary_model),
         .system_prompt = try allocator.dupe(u8, SCIENTIFIC_RESEARCHER_PROMPT),
         .temperature = 0.3,
+        .max_depth = 3,
+    };
+    list[1] = NamedAgentConfig{
+        .name = try allocator.dupe(u8, "the-critic"),
+        .provider = try allocator.dupe(u8, primary_provider),
+        .model = try allocator.dupe(u8, primary_model),
+        .system_prompt = try allocator.dupe(u8, THE_CRITIC_PROMPT),
+        .temperature = 0.6,
+        .max_depth = 3,
+    };
+    list[2] = NamedAgentConfig{
+        .name = try allocator.dupe(u8, "the-bully"),
+        .provider = try allocator.dupe(u8, primary_provider),
+        .model = try allocator.dupe(u8, primary_model),
+        .system_prompt = try allocator.dupe(u8, THE_BULLY_PROMPT),
+        .temperature = 0.7,
+        .max_depth = 3,
+    };
+    list[3] = NamedAgentConfig{
+        .name = try allocator.dupe(u8, "the-comedian"),
+        .provider = try allocator.dupe(u8, primary_provider),
+        .model = try allocator.dupe(u8, primary_model),
+        .system_prompt = try allocator.dupe(u8, THE_COMEDIAN_PROMPT),
+        .temperature = 0.9,
         .max_depth = 3,
     };
     return list;
