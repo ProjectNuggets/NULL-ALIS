@@ -6059,7 +6059,7 @@ test "mapReasoningEffort superpowers reasoning maps to coordinator + high effort
     try std.testing.expect(f.effort == null);
 }
 
-test "chat stream turn options map zaki composer controls" {
+test "chat stream turn options still parse explicit mode overrides" {
     const body =
         \\{"message":"run it","mode":"review","autonomy":"read_only","reasoning_effort":"high"}
     ;
@@ -15756,9 +15756,9 @@ fn buildBrainTypedEdges(
 /// (would create a cycle: agent → memory → gateway → agent).
 fn isRejectedExtractionPredicate(predicate: []const u8) bool {
     const rejected = [_][]const u8{
-        "GREETED",      "SAID",         "ASKED",               "MENTIONED",           "REPLIED",
-        "ACKNOWLEDGED", "EXPRESSED",    "INDICATED_READINESS", "IS_GETTING_STARTED",  "OFFERED_TO_WAIT",
-        "PRIORITIZED",  "ADDRESSED_AS", "IS_UNKNOWN",          "EXPRESSED_READINESS", "INITIATED_CONVERSATION",
+        "GREETED",        "SAID",         "ASKED",               "MENTIONED",           "REPLIED",
+        "ACKNOWLEDGED",   "EXPRESSED",    "INDICATED_READINESS", "IS_GETTING_STARTED",  "OFFERED_TO_WAIT",
+        "PRIORITIZED",    "ADDRESSED_AS", "IS_UNKNOWN",          "EXPRESSED_READINESS", "INITIATED_CONVERSATION",
         // P7 — the entity_pipeline speaker hub (user:<id> → entity). RENAMED
         // from "MENTIONED" so it no longer collides with the meta-narrative
         // ban above; it gets its OWN entry here to stay render/PPR-excluded

@@ -479,9 +479,9 @@ pub fn buildStableSystemPrompt(
 fn buildCoordinatorSection(w: anytype) !void {
     try w.writeAll(
         "## ⚡ Superpowers — Coordinator mode\n\n" ++
-        "You are the **coordinator** for this turn: orchestrate, don't grind. " ++
-        "Decompose the goal, briefly plan, dispatch the independent sub-tasks to subagents (use `spawn_many` to fan out in one batch), review every result, then **synthesize** them into a single coherent deliverable in your own voice — never dump raw subagent output. " ++
-        "Fanning out burns credits (N subagents ≈ N× cost), so only parallelize when the work is genuinely independent.\n\n",
+            "You are the **coordinator** for this turn: orchestrate, don't grind. " ++
+            "Decompose the goal, briefly plan, dispatch the independent sub-tasks to subagents (use `spawn_many` to fan out in one batch), review every result, then **synthesize** them into a single coherent deliverable in your own voice — never dump raw subagent output. " ++
+            "Fanning out burns credits (N subagents ≈ N× cost), so only parallelize when the work is genuinely independent.\n\n",
     );
 }
 
@@ -686,7 +686,8 @@ fn buildTaskDecompositionSection(w: anytype) !void {
     try w.writeAll("- Simple questions or single-tool operations do not need a plan.\n");
     try w.writeAll("- `todo` is not the internal planner; use it only when the user explicitly asks to create/manage a visible todo, checklist, or task list, or asks you to track a durable session checklist.\n");
     try w.writeAll("- If the user says \"plan this\" or asks for an implementation plan, write the plan in prose or `<task_plan>`; do not persist it via `todo` unless asked.\n");
-    try w.writeAll("- After emitting the plan, execute step 1 immediately in the same turn.\n");
+    try w.writeAll("- In execute mode, after emitting an internal plan, execute step 1 immediately in the same turn.\n");
+    try w.writeAll("- In plan or review mode, do not execute the plan. Stop after the plan/review and suggest switching to execute mode when the user wants implementation.\n");
     try w.writeAll("- Do not re-emit the plan on subsequent iterations — execute the next pending step.\n\n");
 }
 
@@ -713,7 +714,7 @@ fn buildSafetySection(w: anytype) !void {
         "- Slash commands: you may mention `/help` if the user asks what commands exist, `/reset` if they want to start over, `/new` if they ask for a fresh session, `/approve allow-once|deny` if a tool approval is pending. For everything else, prefer concrete actions via your tools over suggesting slash commands. Do not fabricate commands; the short list above is what you may surface by name.\n\n",
     );
     try w.writeAll(
-        "- Self-control tools: use `set_execution_mode` to switch your own mode proactively — `plan` before a non-trivial implementation (multiple approaches, >2-3 files, architectural choice), back to `execute` once the approach is clear; `review` for read-only verification after changes; `background` only for automated/heartbeat turns. Always include a short `reason` so the user sees why you switched. Use `context_snapshot` to self-inspect (current mode, pending approvals, session key) before deciding on an approach. Both tools are read-only and safe to call.\n\n",
+        "- Mode control is user-owned: the user stays in `plan`, `review`, or `execute` until they explicitly change it through the UI or `/mode`. Do not silently switch modes. If a different mode would be better, say so briefly and suggest the exact mode. Use `context_snapshot` to self-inspect the current mode, pending approvals, and session key before deciding on an approach.\n\n",
     );
     try w.writeAll("- Never claim that an action has started or is in progress unless you emit the tool call in the same response. If no tool call is emitted, describe only verified results, limitations, or the next question.\n\n");
     try w.writeAll("- Never fabricate tool evidence. You only have search results from `web_search`/`web_fetch` calls you emit THIS turn, file contents from `file_read`/`shell` calls you emit this turn, snapshot data from `context_snapshot` calls you emit this turn, and memory hits from `memory_recall`/`memory_list`/`memory_timeline` calls you emit this turn. Phrasings like \"From my search:\", \"Based on the file:\", \"My snapshot shows:\", \"I checked memory and found:\" are prohibited unless the matching tool call appears in the same response. When the user asks about a product, service, framework, library, company, or any specific external term you have not verifiably encountered through a tool call in this session, `web_search` is not optional — it is your first action before answering, and you do not answer from guesses or training-data recall.\n\n");
@@ -2266,6 +2267,30 @@ test "buildSafetySection does not contain turn classification text" {
     try std.testing.expect(std.mem.indexOf(u8, output, "Precedence: verified runtime state") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Preferred tool paths") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Never claim that an action has started or is in progress") != null);
+}
+
+test "task decomposition keeps plan and review modes read-only" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+    try buildTaskDecompositionSection(w);
+
+    const output = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, output, "After emitting the plan, execute step 1 immediately") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "execute step 1 immediately") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "In plan or review mode, do not execute the plan") != null);
+}
+
+test "safety section makes execution mode user-owned" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+    try buildSafetySection(w);
+
+    const output = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, output, "Mode control is user-owned") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Do not silently switch modes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "use `set_execution_mode` to switch your own mode proactively") == null);
 }
 
 test "task planning prompt keeps internal plans separate from todo" {
