@@ -1,7 +1,9 @@
-//! set_execution_mode tool — lets the agent switch its own execution mode
-//! (plan / execute / review / background) mid-turn without forcing the user
-//! to type `/mode`. Mirrors Claude Code's EnterPlanModeTool / ExitPlanModeTool
-//! pattern but unified since nullalis already has a 4-mode enum.
+//! set_execution_mode tool — legacy self-control surface.
+//!
+//! V1 user-owned modes make normal mode changes explicit user actions via
+//! `/mode` or the session mode API. The tool is kept so older prompts/tool
+//! lists fail closed with a useful suggestion instead of silently mutating the
+//! live session mode.
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -14,11 +16,10 @@ pub const SetExecutionModeTool = struct {
     pub const tool_name = "set_execution_mode";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Switch your own execution mode: plan, execute, review, or background.",
+        .what = "Suggest an execution-mode change without mutating the user's current mode.",
         .use_when = &.{
-            "Switching to plan before a non-trivial implementation (read-only exploration)",
-            "Switching back to execute once the approach is clear",
-            "Switching to review for read-only verification after a change has landed",
+            "You believe plan, review, or execute mode would be better for the next step",
+            "You need to tell the user which mode to choose explicitly",
         },
         .do_not_use_for = &.{
             "runtime_info — for inspecting current runtime/mode rather than changing it",
@@ -31,13 +32,13 @@ pub const SetExecutionModeTool = struct {
         @import("lint.zig").lintToolDescription("set_execution_mode", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
     }
     pub const tool_description =
-        "Switch your own execution mode. " ++
+        "Suggest an execution-mode change without changing it. " ++
         "`plan` = read-only exploration before committing to an approach (mutating tools blocked). " ++
         "`execute` = default; all tools available. " ++
         "`review` = read-only verification after changes. " ++
         "`background` = only background-safe tools (for automated/heartbeat turns). " ++
-        "Use proactively: switch to plan before a non-trivial implementation, back to execute when the approach is clear. " ++
-        "Always include a short `reason` so the user sees why you switched.";
+        "Mode changes are user-owned in V1: ask the user to switch modes through the UI or `/mode`; do not silently flip modes. " ++
+        "Always include a short `reason` so the user sees why you are suggesting the change.";
     pub const tool_params =
         \\{"type":"object","properties":{"mode":{"type":"string","enum":["plan","execute","review","background"],"description":"Target execution mode"},"reason":{"type":"string","description":"One-line rationale shown back to the user"}},"required":["mode","reason"]}
     ;
@@ -62,29 +63,29 @@ pub const SetExecutionModeTool = struct {
             return ToolResult.fail("Missing 'reason'. Give a one-line rationale so the user sees why you switched.");
         if (reason.len == 0) return ToolResult.fail("'reason' must not be empty.");
 
-        if (root.getAgentController()) |ctrl| {
-            // Dupe `before` because `getExecutionMode` may return a slice into
-            // controller-owned storage that becomes stale once `setExecutionMode`
-            // mutates the mode. The real Agent controller returns static strings
-            // so this is defensive rather than load-bearing — but we don't want
-            // to depend on implementation details of the vtable.
-            const before_slice = ctrl.getExecutionMode();
-            const before = try allocator.dupe(u8, before_slice);
-            defer allocator.free(before);
+        if (!std.mem.eql(u8, mode, "plan") and
+            !std.mem.eql(u8, mode, "execute") and
+            !std.mem.eql(u8, mode, "review") and
+            !std.mem.eql(u8, mode, "background"))
+        {
+            return ToolResult.fail("Unknown mode. Use one of: plan, execute, review, background.");
+        }
 
-            const ok = ctrl.setExecutionMode(mode);
-            if (!ok) {
-                return ToolResult.fail("Unknown mode. Use one of: plan, execute, review, background.");
-            }
-            const after = ctrl.getExecutionMode();
+        if (root.getAgentController()) |ctrl| {
+            const current = ctrl.getExecutionMode();
             const msg = try std.fmt.allocPrint(
                 allocator,
-                "Switched execution mode: {s} → {s}. Reason: {s}",
-                .{ before, after, reason },
+                "Mode unchanged ({s}). Mode changes are user-owned; suggest that the user switch to {s} mode via the UI or `/mode {s}`. Reason: {s}",
+                .{ current, mode, mode, reason },
             );
             return ToolResult{ .success = true, .output = msg };
         }
-        return ToolResult.fail("Agent controller unavailable; cannot switch mode from this context.");
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "Mode unchanged. Mode changes are user-owned; suggest that the user switch to {s} mode via the UI or `/mode {s}`. Reason: {s}",
+            .{ mode, mode, reason },
+        );
+        return ToolResult{ .success = true, .output = msg };
     }
 };
 
@@ -115,7 +116,7 @@ const TestController = struct {
     }
 };
 
-test "set_execution_mode flips mode via controller" {
+test "set_execution_mode suggests mode via controller without mutating" {
     var tc = TestController{};
     @memcpy(tc.mode[0..7], "execute");
     tc.mode_len = 7;
@@ -136,8 +137,9 @@ test "set_execution_mode flips mode via controller" {
     const res = try t.execute(std.testing.allocator, args_parsed.value.object);
     defer std.testing.allocator.free(res.output);
     try std.testing.expect(res.success);
-    try std.testing.expectEqualStrings("plan", tc.mode[0..tc.mode_len]);
-    try std.testing.expect(std.mem.indexOf(u8, res.output, "execute → plan") != null);
+    try std.testing.expectEqualStrings("execute", tc.mode[0..tc.mode_len]);
+    try std.testing.expect(std.mem.indexOf(u8, res.output, "Mode unchanged (execute)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.output, "/mode plan") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.output, "exploring before editing") != null);
 }
 
@@ -172,11 +174,13 @@ test "set_execution_mode requires reason" {
     try std.testing.expect(!res.success);
 }
 
-test "set_execution_mode fails when no controller is bound" {
+test "set_execution_mode returns suggestion when no controller is bound" {
     root.clearAgentController();
     var t = SetExecutionModeTool{};
     var args_parsed = try root.parseTestArgs("{\"mode\":\"plan\",\"reason\":\"testing\"}");
     defer args_parsed.deinit();
     const res = try t.execute(std.testing.allocator, args_parsed.value.object);
-    try std.testing.expect(!res.success);
+    defer std.testing.allocator.free(res.output);
+    try std.testing.expect(res.success);
+    try std.testing.expect(std.mem.indexOf(u8, res.output, "/mode plan") != null);
 }

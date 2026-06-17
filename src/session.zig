@@ -1989,6 +1989,31 @@ test "processMessage returns mock response" {
     try testing.expectEqualStrings("Hello from mock", resp);
 }
 
+test "session mode persists across normal turns and survives turn override" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "mode:persist";
+    const mode_reply = try sm.processMessage(session_key, "/mode plan", null);
+    defer testing.allocator.free(mode_reply);
+    try testing.expect(std.mem.indexOf(u8, mode_reply, "Switched to plan mode") != null);
+
+    const session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(ExecutionMode.plan, session.agent.execution_mode);
+
+    const normal_reply = try sm.processMessage(session_key, "normal turn", null);
+    defer testing.allocator.free(normal_reply);
+    try testing.expectEqual(ExecutionMode.plan, session.agent.execution_mode);
+
+    const override_reply = try sm.processMessageWithContext(session_key, "temporary review", null, .{
+        .turn_execution_mode = .review,
+    });
+    defer testing.allocator.free(override_reply);
+    try testing.expectEqual(ExecutionMode.plan, session.agent.execution_mode);
+}
+
 test "processMessage refreshes system prompt when conversation context is cleared" {
     var mock = MockProvider{ .response = "ok" };
     const cfg = testConfig();

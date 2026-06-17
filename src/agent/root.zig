@@ -2364,9 +2364,11 @@ pub const Agent = struct {
         "If a tool failed due to a transient issue (timeout/network/rate-limit), proactively retry up to 2 times with adjusted parameters before giving up. " ++
         "If a tool reports queued/async delivery, state it as queued (not confirmed delivered) unless a later tool confirms delivery.";
     const reflection_prompt_plan =
-        "You are in plan mode. Analyze the read-only tool results above and provide a structured plan. Do not attempt to use mutating tools.";
+        "You are in plan mode. Analyze the read-only tool results above, gather enough context for a decision-complete implementation plan, then stop. " ++
+        "Do not use mutating tools and do not begin implementation. If implementation is the next step, tell the user to switch to execute mode.";
     const reflection_prompt_review =
-        "You are in review mode. Analyze the read-only tool results above and provide a structured review with findings and recommendations.";
+        "You are in review mode. Analyze the read-only tool results above and provide findings first, ordered by severity, with concrete evidence, risk, and missing tests. " ++
+        "Do not use mutating tools and do not implement fixes. If fixes are needed, tell the user to switch to execute mode.";
     const reflection_prompt_background =
         "Process the tool results. Do not attempt user interaction tools.";
     // Phase 5 (Superpowers mode) — the in-turn coordinator playbook. This is
@@ -11120,6 +11122,20 @@ test "getReflectionPrompt coordinator mentions plan, spawn_many, synthesize" {
     try std.testing.expect(std.mem.indexOf(u8, p, "synthesize") != null);
 }
 
+test "getReflectionPrompt plan stops before implementation" {
+    const p = Agent.getReflectionPrompt(.plan);
+    try std.testing.expect(std.mem.indexOf(u8, p, "plan mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "do not begin implementation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "switch to execute mode") != null);
+}
+
+test "getReflectionPrompt review is findings first and read-only" {
+    const p = Agent.getReflectionPrompt(.review);
+    try std.testing.expect(std.mem.indexOf(u8, p, "findings first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "ordered by severity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "do not implement fixes") != null);
+}
+
 test "preflight allows read-only + dispatch tools in coordinator mode" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
@@ -11129,7 +11145,7 @@ test "preflight allows read-only + dispatch tools in coordinator mode" {
     // read_only tools + coordinator_dispatch tools are allowed.
     const allowed_tools = [_][]const u8{
         "file_read", "web_search", "task_list", "task_get", // read-only
-        "spawn",     "delegate", // dispatch (mutating but coordinator_dispatch)
+        "spawn", "delegate", // dispatch (mutating but coordinator_dispatch)
     };
     for (allowed_tools) |name| {
         const call = ParsedToolCall{ .name = name, .arguments_json = "{}", .tool_call_id = null };
