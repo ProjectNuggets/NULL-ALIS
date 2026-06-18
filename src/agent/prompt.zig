@@ -1044,6 +1044,7 @@ fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("3. User asks to share → call `artifact_share(artifact_id, expires_in_hours?)` — mints an opaque public URL with a default 7-day TTL (max 30 days). Returns `{share_code, share_url, expires_at}`. Surface the URL inline so the user can copy it. To unpublish: `artifact_revoke_share(artifact_id)`. The UI also exposes a Share button on the artifact card; both paths land on the same backend.\n");
     try w.writeAll("4. User asks 'what changed since v3?' or to inspect history → use `artifact_history(artifact_id)` for the version list or `artifact_diff(artifact_id, from_version, to_version)` for a specific revision comparison.\n");
     try w.writeAll("5. User asks to export → call `produce_document(format=pdf|docx|pptx|xlsx|html, content=<artifact content>, title=<artifact title>)`. The user gets a downloadable file alongside the live canvas.\n\n");
+    try w.writeAll("6. When discussing or revising an existing long artifact/document, never treat a partial `artifact_get` page as the full body. If the tool returns `partial=true` or a `next_offset`, keep paging with `artifact_get(offset=<next_offset>, max_chars=200000)` until you have the sections needed for the user's request. Do not repeat truncation markers to the user as if they were document content.\n\n");
     // v1.14.23 WARN 4.A — Introspection tools narration.
     // The schema-level tool catalog already advertises these (via
     // `buildToolInstructions` in dispatcher.zig), but the prompt's
@@ -1871,6 +1872,8 @@ test "buildStableSystemPrompt includes S-tier artifact blueprints" {
     try std.testing.expect(std.mem.indexOf(u8, stable, "report/brief = one-page brief") != null);
     try std.testing.expect(std.mem.indexOf(u8, stable, "spreadsheet = clean CSV") != null);
     try std.testing.expect(std.mem.indexOf(u8, stable, "HTML artifact = complete semantic HTML") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stable, "never treat a partial `artifact_get` page as the full body") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stable, "Do not repeat truncation markers to the user") != null);
 }
 
 test "buildToolsSection emits tools sorted by name regardless of input order [S5.4]" {

@@ -401,7 +401,7 @@ pub fn parseXmlToolCalls(
 /// Net effect: typical real-world tool returns (logs, code files,
 /// memory queries, search results) NEVER hit this cap now. Only
 /// pathological cases trigger truncation.
-pub const MAX_TOOL_RESULT_CONTEXT_CHARS: usize = 24_000;
+pub const MAX_TOOL_RESULT_CONTEXT_CHARS: usize = 200_000;
 
 /// Truncate tool output to fit within the context budget.
 /// Keeps the first and last portions so the LLM sees both the beginning
