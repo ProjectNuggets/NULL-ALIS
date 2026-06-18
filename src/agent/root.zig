@@ -8364,6 +8364,51 @@ const test_failing_summary_provider_vtable = providers.Provider.VTable{
     .deinit = TestFailingSummaryProvider.deinitFn,
 };
 
+const TestKeyFactSummaryProvider = struct {
+    fn chatWithSystem(_: *anyopaque, alloc: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return alloc.dupe(
+            u8,
+            "focus: test summary\n" ++
+                "decisions:\n- none\n" ++
+                "open_loops:\n- none\n" ++
+                "next:\n- none\n" ++
+                "Key fact: The user is building a staging V2 agent memory pipeline.\n",
+        );
+    }
+
+    fn chat(_: *anyopaque, alloc: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        return .{
+            .content = try alloc.dupe(
+                u8,
+                "focus: test summary\n" ++
+                    "decisions:\n- none\n" ++
+                    "open_loops:\n- none\n" ++
+                    "next:\n- none\n" ++
+                    "Key fact: The user is building a staging V2 agent memory pipeline.\n",
+            ),
+        };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "test-key-fact-summary-provider";
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
+};
+
+var test_key_fact_summary_provider_state: u8 = 0;
+const test_key_fact_summary_provider_vtable = providers.Provider.VTable{
+    .chatWithSystem = TestKeyFactSummaryProvider.chatWithSystem,
+    .chat = TestKeyFactSummaryProvider.chat,
+    .supportsNativeTools = TestKeyFactSummaryProvider.supportsNativeTools,
+    .getName = TestKeyFactSummaryProvider.getName,
+    .deinit = TestKeyFactSummaryProvider.deinitFn,
+};
+
 fn makeTestAgent(allocator: std.mem.Allocator) !Agent {
     var noop = observability.NoopObserver{};
     return Agent{
@@ -8992,7 +9037,7 @@ test "persistSessionCheckpoint caps timeline index to 32 descriptors" {
     try std.testing.expectEqual(@as(usize, 32), count);
 }
 
-test "persistSessionCheckpoint omits last_summary_key when summarizer is disabled" {
+test "persistSessionCheckpoint writes continuity summaries when legacy summarizer is disabled" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
@@ -9053,12 +9098,47 @@ test "persistSessionCheckpoint omits last_summary_key when summarizer is disable
     const anchor = (try mem.get(allocator, "context_anchor_current")) orelse return error.TestUnexpectedResult;
     defer anchor.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_checkpoint_key=session_checkpoint_") != null);
-    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_summary_key=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_summary_key=timeline_summary/agent:zaki-bot:user:1:main/") != null);
 
-    const latest = try mem.get(allocator, "summary_latest/agent:zaki-bot:user:1:main");
-    if (latest) |entry| {
-        defer entry.deinit(allocator);
-        return error.TestUnexpectedResult;
+    const latest = (try mem.get(allocator, "summary_latest/agent:zaki-bot:user:1:main")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "type=summary_latest") != null);
+
+    const timeline_index = (try mem.get(allocator, "timeline_index/current")) orelse return error.TestUnexpectedResult;
+    defer timeline_index.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, timeline_index.content, "\"key\":\"timeline_summary/agent:zaki-bot:user:1:main/") != null);
+}
+
+test "persistSessionCheckpoint does not promote parsed summary facts to durable_fact" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.provider = .{ .ptr = @ptrCast(&test_key_fact_summary_provider_state), .vtable = &test_key_fact_summary_provider_vtable };
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    agent.mem = mem;
+    agent.memory_session_id = "agent:zaki-bot:user:1:main";
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "review the staging V2 memory pipeline"),
+    });
+
+    agent.persistSessionCheckpoint("new");
+
+    const latest = (try mem.get(allocator, "summary_latest/agent:zaki-bot:user:1:main")) orelse return error.TestUnexpectedResult;
+    defer latest.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "type=summary_latest") != null);
+
+    const core_entries = try mem.list(allocator, .core, null);
+    defer memory_mod.freeEntries(allocator, core_entries);
+    for (core_entries) |entry| {
+        if (std.mem.startsWith(u8, entry.key, "durable_fact/")) {
+            return error.TestUnexpectedResult;
+        }
     }
 }
 

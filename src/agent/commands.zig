@@ -4,7 +4,6 @@ const learning = @import("learning.zig");
 const goal_loop = @import("goal_loop.zig");
 const prompt_mod = @import("prompt.zig");
 const providers = @import("../providers/root.zig");
-const extraction_persist = @import("extraction_persist.zig");
 const extraction_runner = @import("extraction/runner.zig");
 const text_norm = @import("../memory/text_norm.zig");
 const tools_mod = @import("../tools/root.zig");
@@ -148,66 +147,6 @@ fn parsePositiveUsize(raw: []const u8) ?usize {
 
 fn memoryRuntimePtr(self: anytype) ?*memory_mod.MemoryRuntime {
     return if (@hasField(@TypeOf(self.*), "mem_rt")) self.mem_rt else null;
-}
-
-/// V1.6 cmt9.5 — derive a hash-stable entity key from an `object` string,
-/// mirroring extraction_persist.deriveEntityKey shape so session-end edges
-/// land on the SAME entity nodes that compaction Pass C extraction creates.
-/// `entity_<sha256(lower(object))[0..16]>`. Lowercase normalizes capitalization
-/// variance ("Helix" vs "helix"). V1.7a-4 (closes ship-review WR-02): the
-/// canonicalization helper is now `extraction_persist.lowerForEntityKey`
-/// (Unicode-aware over ASCII + Latin-1 Supplement) — single source of truth
-/// for both Zig sites and matched server-side by PG `lower(...)` in the
-/// cmt16 backfill SQL. Cmt8 entity coreference (cosine ≥0.95) is not
-/// plumbed here — commands.zig has no embedding provider in scope; full
-/// coref requires routing through extraction_persist (cmt9.6 follow-up).
-fn deriveSessionEndEntityKey(allocator: std.mem.Allocator, object: []const u8) ![]u8 {
-    const lower = try extraction_persist.lowerForEntityKey(allocator, object);
-    defer allocator.free(lower);
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(lower);
-    var digest: [32]u8 = undefined;
-    hasher.final(&digest);
-    var hex_buf: [16]u8 = undefined;
-    const hex_chars = "0123456789abcdef";
-    for (digest[0..8], 0..) |b, i| {
-        hex_buf[i * 2] = hex_chars[b >> 4];
-        hex_buf[i * 2 + 1] = hex_chars[b & 0x0f];
-    }
-    return std.fmt.allocPrint(allocator, "entity_{s}", .{hex_buf});
-}
-
-/// P2 (memory-phase-0.5) — derive a stable, content-addressed key for a
-/// session-end durable fact.
-///
-/// ALL facts (triple or prose) produce `durable_fact/<sha256_hex(content)[0..32]>`.
-/// Using the first 16 bytes (128-bit) of SHA-256 as a 32 hex-char suffix,
-/// matching the `deriveSessionEndEntityKey` pattern above.
-///
-/// This preserves byte-for-byte identical classification vs the original
-/// timestamp-keyed scheme: `durable_fact/` is listed in
-/// `isSystemManagedMemoryKey` and matched by `propagateCorrection`, so
-/// edit-protection and correction propagation are unchanged.
-///
-/// Cross-writer dedup with Pass-C `extracted_` keys is intentionally deferred
-/// to the Phase-1 semantic-merge work — we keep one canonical `durable_fact/`
-/// row here.
-fn deriveDurableFactKey(
-    allocator: std.mem.Allocator,
-    fact: *const memory_mod.summarizer.ExtractedFact,
-) ![]u8 {
-    // SHA-256 of raw content; first 16 bytes → 32 hex chars (128-bit dedup).
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(fact.content);
-    var digest: [32]u8 = undefined;
-    hasher.final(&digest);
-    var hex_buf: [32]u8 = undefined;
-    const hex_chars = "0123456789abcdef";
-    for (digest[0..16], 0..) |b, i| {
-        hex_buf[i * 2] = hex_chars[b >> 4];
-        hex_buf[i * 2 + 1] = hex_chars[b & 0x0f];
-    }
-    return std.fmt.allocPrint(allocator, "durable_fact/{s}", .{hex_buf});
 }
 
 /// V1.12 — build a compact transcript text from MessageEntries for the
@@ -790,13 +729,18 @@ fn lifecycleSummaryTimeoutSecs(self: anytype) u64 {
 }
 
 fn effectiveSummarizerConfig(self: anytype) memory_mod.SummarizerConfig {
-    if (self.mem_rt) |rt| return rt.summarizerConfig();
-    return .{
+    var cfg = if (self.mem_rt) |rt| rt.summarizerConfig() else memory_mod.SummarizerConfig{
         .enabled = true,
         .window_size_tokens = 4000,
         .summary_max_tokens = 500,
         .auto_extract_semantic = true,
     };
+    // `memory.summarizer.enabled` controls the legacy sliding-window
+    // summarizer. Session-continuity summaries are the modern lifecycle path
+    // and must still write timeline_summary/summary_latest artifacts when a
+    // MemoryRuntime is present.
+    cfg.enabled = true;
+    return cfg;
 }
 
 fn firstCheckpointBullet(checkpoint_content: []const u8, section: []const u8) ?[]const u8 {
@@ -1265,8 +1209,8 @@ fn shouldUseDeterministicSessionSummary(reason: []const u8, canonical_continuity
 
 /// True when the inline session-end boundary extraction (extractAtBoundary)
 /// must be skipped because the checkpoint is non-interactive (P0-2). The
-/// entity pipeline is still enqueued to the daemon lane downstream, so the
-/// extraction is not dropped — only moved off the blocking path.
+/// session-end queue job still runs the entity pipeline and unified boundary
+/// extraction downstream, so extraction is moved off the blocking path.
 fn shouldSkipInlineBoundaryExtraction(reason: []const u8) bool {
     return isNonInteractiveCheckpointReason(reason);
 }
@@ -1275,7 +1219,6 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
     const mem = self.mem orelse return false;
     const rt = self.mem_rt;
     const summarizer_cfg = effectiveSummarizerConfig(self);
-    if (!summarizer_cfg.enabled) return false;
 
     const entries = buildSessionEndSummaryEntries(self, self.allocator, checkpoint_content, summarizer_cfg) catch return false;
     defer self.allocator.free(entries);
@@ -1460,119 +1403,22 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
 
     updateTimelineIndex(self.allocator, mem, rt, session_id, now_iso, focus, timeline_key, summary_origin);
 
-    if (parsed_summary) |parsed| {
-        var triple_edges_written: usize = 0;
-        for (parsed.extracted_facts, 0..) |fact, idx| {
-            _ = idx; // P2: index no longer used in key — content-addressed below
-            const fact_key = deriveDurableFactKey(self.allocator, &fact) catch continue;
-            defer self.allocator.free(fact_key);
-            // P4d (memory-phase-0.5): route the stored memory_type by what a
-            // triple-bearing fact MEANS instead of hardcoding `.core`, so a
-            // preference/decision/person learned ONLY at session end gets a
-            // semantic type and surfaces in the typed <preferences>/<people>/
-            // <decisions>/<open_loops> views. Gated by
-            // semantic_type_routing_enabled (default ON, same gate as the P3
-            // persistExtracted path). Prose-only facts (no predicate / no
-            // triple) keep `.core` — classification stays consistent and the
-            // durable_fact/ KEY prefix is unchanged either way.
-            const fact_category: memory_mod.MemoryCategory = if (fact.hasTriple())
-                extraction_persist.categoryForSessionEndFact(
-                    fact.predicate.?,
-                    fact.attributed_to orelse "",
-                    self.semantic_type_routing_enabled,
-                )
-            else
-                .core;
-            if (mem.store(fact_key, fact.content, fact_category, null)) |_| {
-                if (rt) |mem_rt| _ = mem_rt.syncVectorAfterStore(self.allocator, fact_key, fact.content);
-            } else |_| {
-                continue;
-            }
-
-            // V1.6 cmt9.5 (Gap 3): when the LLM emitted a structured triple
-            // alongside the prose Key fact (===EXTRACTED=== JSON tail), also
-            // write an edge to memory_edges so the session-end fact joins
-            // the materialized graph. Source is the durable_fact row we
-            // just wrote (continuity-bucket; agent context preserved);
-            // target is a hash-derived entity key (V1.6 cmt7 shape — cmt8
-            // entity coreference is intentionally NOT plumbed here, since
-            // commands.zig doesn't have an embedding provider in scope and
-            // adding one through the agent surface is a separate refactor).
-            //
-            // V1.7 cmt9.6 (full Gap 3 closure): when fact carries a triple
-            // AND tenant has extraction context, ALSO route through
-            // extraction_persist.persistExtracted — this gets us coref +
-            // edge insert + source attribution, AND the resulting
-            // extracted_<hash> row is now first-class continuity (added
-            // to memory_loader.isSemanticContinuityKey in cmt9.6). The
-            // inline durable_fact write above is preserved as a legacy
-            // dual-write for backwards compat with /learn list/forget
-            // commands; future commit may collapse to single-write once
-            // those tools migrate to extracted_* keys.
-            //
-            // V1.14.12 (Memory audit Finding 1 fix, 2026-05-19) — the
-            // durable_fact/* prefix is now brain-VISIBLE (was previously
-            // hidden via BRAIN_HIDDEN_PREFIXES, which combined with the
-            // MD5 dedup below to make session-end facts invisible
-            // everywhere). The dedup below is now intentional, not a
-            // bug: durable_fact is THE visible user-facing row; the
-            // extracted_<hash> path is the (no-op'd) coref+judge enrich
-            // path. The edge write further below ALWAYS fires regardless
-            // of MD5 dedup — covers the graph half of unification.
-            //
-            // MD5 dedup in persistExtracted will see the durable_fact row's
-            // identical content_hash and silently skip the extracted_<hash>
-            // write. This is the intended behavior post-Finding-1: one
-            // visible row per session-end fact, not two.
-            if (fact.hasTriple()) {
-                if (self.extraction_state_mgr) |smgr| {
-                    if (self.extraction_user_id) |uid| {
-                        const target_key = deriveSessionEndEntityKey(self.allocator, fact.object.?) catch null;
-                        if (target_key) |tk| {
-                            defer self.allocator.free(tk);
-                            smgr.upsertMemoryEdge(
-                                uid,
-                                fact_key,
-                                tk,
-                                fact.predicate.?,
-                                "session_end_loop",
-                                fact.confidence,
-                            ) catch |err| {
-                                log.warn("session_end edge write failed key={s} predicate={s} err={s}", .{
-                                    fact_key, fact.predicate.?, @errorName(err),
-                                });
-                                continue;
-                            };
-                            triple_edges_written += 1;
-                        }
-
-                        // V1.14.12 (Path A) — legacy direct write deleted.
-                        // Session-end durable_fact promotion flows entirely
-                        // through extractAtBoundary at the block below
-                        // (write_origin = .session_end_extract). The
-                        // extractAtBoundary path now handles null-judge
-                        // gracefully so this deletion doesn't regress
-                        // no-judge tenants.
-                    }
-                }
-            }
-        }
+    {
+        const parsed_fact_count: usize = if (parsed_summary) |parsed| parsed.extracted_facts.len else 0;
         log.info("memory.timeline_summary status=ok session={s} reason={s} entries={d} facts={d} edges={d} next={s}", .{
             session_id,
             reason,
             entries.len,
-            parsed.extracted_facts.len,
-            triple_edges_written,
+            parsed_fact_count,
+            0,
             next,
         });
 
-        // V1.14.8 C3 — unified boundary extraction at session end (additive
-        // to the legacy `parsed.extracted_facts` persist loop above). Routes
-        // through the same extraction_runner used by Pass C, ensuring a
-        // single extractor shape across all distillation moments. Failure-
-        // soft per layer; existing per-fact persist remains the legacy
-        // primary writer until C5 cleanup. Dedup at persistExtracted handles
-        // overlap between the two paths.
+        // V1.14.8 C3 — unified boundary extraction at session end. Parsed
+        // session-summary facts are intentionally NOT written directly to
+        // durable_fact/*; canonical facts flow through extractAtBoundary or
+        // explicit memory-store/tool writes so summary prose cannot pollute
+        // user-visible canonical memory.
         // The runner can use a dedicated extraction provider/model without
         // a contradiction judge, but this legacy session-end path only has
         // judge-backed extraction config available. Avoid routing arbitrary
@@ -1581,9 +1427,8 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         // P0-2: on non-interactive checkpoints (shutdown / idle_evict /
         // ttl_evict) this inline pass is SKIPPED — extractAtBoundary is a
         // blocking LLM-backed extraction that would stall the maintenance /
-        // shutdown path. The entity pipeline is still enqueued to the daemon
-        // lane below (enqueueExtractionJob), so the extraction is moved
-        // off-thread, not dropped.
+        // shutdown path. The session-end queue job below runs unified boundary
+        // extraction out-of-band, so canonical extraction is moved off-thread.
         if (self.history.items.len > 0 and !shouldSkipInlineBoundaryExtraction(reason)) {
             var msgs_buf = std.ArrayListUnmanaged(providers.ChatMessage).initCapacity(self.allocator, self.history.items.len) catch null;
             if (msgs_buf) |*buf| {
@@ -1630,9 +1475,9 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         // V1.14.7, leaving this path gated behind the misnamed legacy
         // `per_turn_enqueue_enabled` (default false), which left the whole
         // pipeline dormant. It now keys off the dedicated, default-ON
-        // `session_end_entity_pipeline_enabled` flag. Inline structured
-        // extraction above (persistExtracted on parsed.extracted_facts) is a
-        // separate, always-on path that writes facts/edges synchronously.
+        // `session_end_entity_pipeline_enabled` flag. The worker also runs
+        // unified boundary extraction for canonical facts, so non-interactive
+        // session-end paths do not need to block here.
         if (self.extraction_cfg.session_end_entity_pipeline_enabled and self.extraction_state_mgr != null and self.extraction_user_id != null) {
             const smgr_ep = self.extraction_state_mgr.?;
             const uid_ep = self.extraction_user_id.?;
@@ -1791,11 +1636,10 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
             }
         }
     }
-    // When parsed_summary is null, we arrived here via one of three paths that
-    // each already logged their own status event above (deterministic /
-    // fallback=structured reason=provider_error / fallback=structured
-    // reason=parse_error). Emitting another `status=fallback` here is redundant
-    // and previously caused double-logging in every non-LLM turn.
+    // The session-end side effects above intentionally run for parsed,
+    // deterministic, and structured-fallback summaries. Boundary continuity
+    // must not disappear just because the LLM summary parser did not produce
+    // a structured result.
     return true;
 }
 
@@ -1890,7 +1734,10 @@ pub fn persistSessionCheckpointAsync(self: anytype, reason: []const u8) bool {
             const allocator = c.allocator;
             const reason_local = c.reason_owned;
             const agent = c.agent;
-            _ = persistSessionCheckpointDetailed(agent, reason_local);
+            // Async lifecycle workers can outlive the per-turn narration
+            // observer wrapper stored in agent.observer; keep telemetry to
+            // logs here and let sync/manual paths emit observer events.
+            _ = persistSessionCheckpointDetailedWithObserver(agent, reason_local, false);
             allocator.free(reason_local);
             allocator.destroy(c);
             // Release happens-before any subsequent acquire-load — the
@@ -1920,6 +1767,10 @@ pub fn persistSessionCheckpointAsync(self: anytype, reason: []const u8) bool {
 }
 
 pub fn persistSessionCheckpointDetailed(self: anytype, reason: []const u8) bool {
+    return persistSessionCheckpointDetailedWithObserver(self, reason, true);
+}
+
+fn persistSessionCheckpointDetailedWithObserver(self: anytype, reason: []const u8, emit_observer_event: bool) bool {
     const start_ms = std.time.milliTimestamp();
     defer {
         const duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - start_ms));
@@ -1927,11 +1778,13 @@ pub fn persistSessionCheckpointDetailed(self: anytype, reason: []const u8) bool 
             duration_ms,
             reason,
         });
-        const refresh_event = observability.ObserverEvent{ .turn_stage = .{
-            .stage = "continuity_refresh",
-            .duration_ms = duration_ms,
-        } };
-        self.observer.recordEvent(&refresh_event);
+        if (emit_observer_event) {
+            const refresh_event = observability.ObserverEvent{ .turn_stage = .{
+                .stage = "continuity_refresh",
+                .duration_ms = duration_ms,
+            } };
+            self.observer.recordEvent(&refresh_event);
+        }
     }
 
     const mem = self.mem orelse return false;
@@ -5760,57 +5613,4 @@ test "P1-6 audit: ttl_recycle is non-interactive — inline boundary extraction 
     try std.testing.expect(!isNonInteractiveCheckpointReason("reset:manual"));
     try std.testing.expect(!isNonInteractiveCheckpointReason("api_compact"));
     try std.testing.expect(!isNonInteractiveCheckpointReason("compaction:manual"));
-}
-
-// P2 (memory-phase-0.5) — content-keyed durable_fact derivation tests.
-//
-// Verifies three invariants using real ExtractedFact values (no duck-typing):
-//   1. Two facts with IDENTICAL content → same key (dedup fires).
-//   2. Two facts with DIFFERENT content → different keys.
-//   3. A structured triple fact ALSO gets a `durable_fact/` key — classification
-//      is preserved; cross-writer dedup with extracted_ is Phase-1 work.
-
-test "P2: identical content produces the same durable_fact key" {
-    const allocator = std.testing.allocator;
-    const EF = memory_mod.summarizer.ExtractedFact;
-
-    const fact_a = EF{ .key = "", .content = "User prefers dark mode", .category = .core };
-    const fact_b = EF{ .key = "", .content = "User prefers dark mode", .category = .core };
-    const fact_c = EF{ .key = "", .content = "User dislikes Comic Sans", .category = .core };
-
-    const key_a = try deriveDurableFactKey(allocator, &fact_a);
-    defer allocator.free(key_a);
-    const key_b = try deriveDurableFactKey(allocator, &fact_b);
-    defer allocator.free(key_b);
-    const key_c = try deriveDurableFactKey(allocator, &fact_c);
-    defer allocator.free(key_c);
-
-    // Same content → same key (dedup).
-    try std.testing.expectEqualStrings(key_a, key_b);
-    // Different content → different keys.
-    try std.testing.expect(!std.mem.eql(u8, key_a, key_c));
-    // Always produces `durable_fact/<hex>` prefix — classification preserved.
-    try std.testing.expect(std.mem.startsWith(u8, key_a, "durable_fact/"));
-}
-
-test "P2: triple fact also gets a durable_fact/ key (no classification change)" {
-    const allocator = std.testing.allocator;
-    const EF = memory_mod.summarizer.ExtractedFact;
-
-    // A structured triple — all three triple fields present.
-    const triple_fact = EF{
-        .key = "",
-        .content = "User likes Zig",
-        .category = .core,
-        .subject = "user",
-        .predicate = "LIKES",
-        .object = "Zig",
-    };
-
-    const key = try deriveDurableFactKey(allocator, &triple_fact);
-    defer allocator.free(key);
-
-    // Triple facts must ALSO produce the durable_fact/ prefix — not extracted_.
-    // Cross-writer dedup with Pass-C extracted_ keys is deferred to Phase-1.
-    try std.testing.expect(std.mem.startsWith(u8, key, "durable_fact/"));
 }

@@ -34,6 +34,7 @@ const providers = @import("providers/root.zig");
 const embeddings = @import("memory/vector/embeddings.zig");
 const circuit_breaker = @import("memory/vector/circuit_breaker.zig");
 const entity_pipeline = @import("agent/entity_pipeline.zig");
+const extraction_runner = @import("agent/extraction/runner.zig");
 const tools_mod = @import("tools/root.zig");
 const tool_sandbox_v1 = @import("tools/tool_sandbox_v1.zig");
 const entitlement_mod = @import("entitlement.zig");
@@ -1196,13 +1197,25 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
 
         // V1.13 Day 2.2 — Extraction queue worker tick.
         //
-        // Drains pending jobs (max 5 per tick = max 5 LLM calls/sec
-        // worst-case) into entity_pipeline.runOnTurn out-of-band. Agent
-        // turn loop already returned in <5ms (enqueue-only on producer
-        // side once the trigger sites are cut over).
+        // Drains pending jobs into entity_pipeline.runOnTurn out-of-band.
+        // For session_end jobs the same worker also runs unified boundary
+        // extraction, producing canonical extracted memory without blocking
+        // idle/TTL/shutdown checkpoint paths. The queued transcript is capped
+        // at 12KB by buildSessionEndTranscriptText; keep the boundary runner
+        // capped to one sequential episode so this heartbeat lane stays a
+        // bounded worker, not a general boundary fan-out executor.
         if (pg_mgr) |worker_mgr| {
             if (worker_provider_bundle) |bundle| {
                 if (worker_embedder) |embedder| {
+                    const boundary_provider = if (bundle.sidecarProvider()) |sp| sp else bundle.provider();
+                    const boundary_model: []const u8 = blk: {
+                        if (bundle.sidecarProvider() != null) {
+                            const sm = bundle.sidecarModelName();
+                            if (sm.len > 0) break :blk sm;
+                        }
+                        if (config.agent.extraction_judge_model.len > 0) break :blk config.agent.extraction_judge_model;
+                        break :blk config.default_model orelse "moonshotai/Kimi-K2.6";
+                    };
                     var jobs_processed: usize = 0;
                     // HI-04 fix: dropped 5 → 2. Worst-case worker tick
                     // = MAX_JOBS_PER_TICK × per-job-timeout. With 5 × 10s
@@ -1224,6 +1237,8 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
                             config,
                             worker_mgr,
                             bundle.provider(),
+                            boundary_provider,
+                            boundary_model,
                             embedder,
                             &extraction_breaker,
                         ) catch |err| blk: {
@@ -1313,6 +1328,32 @@ const ExtractionBreaker = struct {
     }
 };
 
+const SessionEndBoundaryStatus = enum {
+    not_applicable,
+    skipped_entity_llm_failed,
+    extracted,
+    failed,
+};
+
+const ExtractionJobCompletion = struct {
+    outcome: entity_pipeline.RunOutcome,
+    error_text: []const u8,
+};
+
+fn queuedSessionEndBoundaryStatus(job_type: []const u8, entity_outcome: entity_pipeline.RunOutcome, extraction_present: ?bool) SessionEndBoundaryStatus {
+    if (!std.mem.eql(u8, job_type, "session_end")) return .not_applicable;
+    if (entity_outcome == .llm_failed) return .skipped_entity_llm_failed;
+    if (extraction_present orelse false) return .extracted;
+    return .failed;
+}
+
+fn extractionJobCompletion(entity_outcome: entity_pipeline.RunOutcome, boundary_status: SessionEndBoundaryStatus) ExtractionJobCompletion {
+    if (entity_outcome == .ok and boundary_status == .failed) {
+        return .{ .outcome = .llm_failed, .error_text = "boundary_failed" };
+    }
+    return .{ .outcome = entity_outcome, .error_text = @tagName(entity_outcome) };
+}
+
 /// V1.13 Day 2.2 — process one extraction job from the queue. Returns
 /// true when a job was processed (drain loop continues), false when
 /// queue empty (drain loop stops). All errors are failure-soft.
@@ -1349,6 +1390,8 @@ fn processOneExtractionJob(
     config: *const Config,
     state_mgr: *zaki_state.Manager,
     provider: providers.Provider,
+    boundary_provider: providers.Provider,
+    boundary_model: []const u8,
     embedder: embeddings.EmbeddingProvider,
     breaker: ?*ExtractionBreaker,
 ) !bool {
@@ -1496,18 +1539,67 @@ fn processOneExtractionJob(
         30, // per-job timeout — matches Together's typical latency floor
         episode_key_for_run, // V1.14.3 (G-03): edge provenance anchor
     );
+    var boundary_extraction_present: ?bool = null;
+    var boundary_status = queuedSessionEndBoundaryStatus(job.job_type, stats.outcome, boundary_extraction_present);
+    if (boundary_status == .skipped_entity_llm_failed) {
+        log.warn("extraction_queue.session_end_boundary_skipped job_id={d} reason=entity_llm_failed", .{job.id});
+    } else if (std.mem.eql(u8, job.job_type, "session_end")) {
+        var window = [_]providers.ChatMessage{
+            .{
+                .role = .user,
+                .content = text_field,
+            },
+        };
+        const boundary_ctx = extraction_runner.ExtractionContext{
+            .extract_provider = boundary_provider,
+            .extract_model = boundary_model,
+            .judge_provider = boundary_provider,
+            .judge_model = boundary_model,
+            .state_mgr = state_mgr,
+            .user_id = job.user_id,
+            .session_id = if (job.session_id.len == 0) null else job.session_id,
+            .coref_embed = embedder,
+            .archive_mem = null,
+            .archive_mem_rt = null,
+            .timeout_secs = 30,
+            .enable_hydration = false,
+            .max_episodes_per_boundary = 1,
+            .extraction_concurrency = 1,
+            .boundary_kind = .session_end,
+            .write_origin = .session_end_extract,
+            .coverage_filter_enabled = config.agent.extraction_coverage_filter_enabled,
+            .cardinality_fastpath_enabled = config.agent.extraction_cardinality_fastpath,
+            .semantic_type_routing_enabled = config.agent.semantic_type_routing_enabled,
+        };
+        const boundary_result = extraction_runner.extractAtBoundary(allocator, &window, boundary_ctx);
+        defer boundary_result.deinit(allocator);
+        boundary_extraction_present = boundary_result.extraction != null;
+        boundary_status = queuedSessionEndBoundaryStatus(job.job_type, stats.outcome, boundary_extraction_present);
+        log.info(
+            "extraction_queue.session_end_boundary job_id={d} status={s} entities={d} edges={d} hydration_present={}",
+            .{
+                job.id,
+                @tagName(boundary_status),
+                if (boundary_result.extraction) |e| e.entities.len else 0,
+                if (boundary_result.extraction) |e| e.edges.len else 0,
+                boundary_result.hydration != null,
+            },
+        );
+    }
+    const completion = extractionJobCompletion(stats.outcome, boundary_status);
     const elapsed = std.time.milliTimestamp() - t_start;
     log.info(
         "extraction_queue.processed job_id={d} type={s} outcome={s} mentions={d} edges={d} elapsed_ms={d}",
-        .{ job.id, job.job_type, @tagName(stats.outcome), stats.mentions_extracted, stats.edges_emitted, elapsed },
+        .{ job.id, job.job_type, @tagName(completion.outcome), stats.mentions_extracted, stats.edges_emitted, elapsed },
     );
-    // P1-6: feed the real extractor-call outcome to the breaker. An llm_failed
-    // (timeout / brownout) increments toward open; an ok / parse_failed closes
-    // it (parse_failed means the endpoint responded — not an availability
-    // problem). This is the recovery edge: the half-open probe's success here
-    // closes the breaker and resumes normal draining.
+    // P1-6: feed the completed queued job outcome to the breaker. For
+    // session_end this includes the canonical boundary pass; a missing boundary
+    // extraction is retried instead of marking the job done with only entity
+    // edges written. An llm_failed increments toward open; ok / parse_failed
+    // closes it (parse_failed means the endpoint responded — not an
+    // availability problem).
     if (breaker) |b| {
-        b.recordOutcome(stats.outcome);
+        b.recordOutcome(completion.outcome);
         if (b.isOpen()) {
             log.warn(
                 "extraction_queue.breaker_opened — {d} consecutive extractor failures; deferring extraction for cooldown",
@@ -1515,10 +1607,10 @@ fn processOneExtractionJob(
             );
         }
     }
-    if (stats.outcome == .ok) {
+    if (completion.outcome == .ok) {
         state_mgr.markExtractionJobDone(job.id) catch {};
     } else {
-        state_mgr.markExtractionJobFailed(job.id, @tagName(stats.outcome)) catch {};
+        state_mgr.markExtractionJobFailed(job.id, completion.error_text) catch {};
     }
     return true;
 }
@@ -4699,9 +4791,9 @@ test "C2 half-open wedge — every post-probe early-return records an outcome (b
     {
         var b = ExtractionBreaker.init(2, 0);
         const cycle = [_]Path{
-            .normal_ok,        .parse_failure, .claim_race_null,
-            .short_text,       .thrown_error,  .normal_llm_failed,
-            .normal_ok,        .empty_queue,   .normal_ok,
+            .normal_ok,  .parse_failure, .claim_race_null,
+            .short_text, .thrown_error,  .normal_llm_failed,
+            .normal_ok,  .empty_queue,   .normal_ok,
         };
         var iter: usize = 0;
         while (iter < 50) : (iter += 1) {
@@ -4725,5 +4817,47 @@ test "C2 half-open wedge — every post-probe early-return records an outcome (b
             try std.testing.expect(ok); // never wedged
         }
         try std.testing.expect(!b.isOpen());
+    }
+}
+
+test "session_end worker completion requires queued boundary extraction success" {
+    {
+        const status = queuedSessionEndBoundaryStatus("wiki_link", .ok, null);
+        try std.testing.expectEqual(SessionEndBoundaryStatus.not_applicable, status);
+        const completion = extractionJobCompletion(.ok, status);
+        try std.testing.expectEqual(entity_pipeline.RunOutcome.ok, completion.outcome);
+        try std.testing.expectEqualStrings("ok", completion.error_text);
+    }
+
+    {
+        const status = queuedSessionEndBoundaryStatus("session_end", .ok, true);
+        try std.testing.expectEqual(SessionEndBoundaryStatus.extracted, status);
+        const completion = extractionJobCompletion(.ok, status);
+        try std.testing.expectEqual(entity_pipeline.RunOutcome.ok, completion.outcome);
+        try std.testing.expectEqualStrings("ok", completion.error_text);
+    }
+
+    {
+        const status = queuedSessionEndBoundaryStatus("session_end", .ok, false);
+        try std.testing.expectEqual(SessionEndBoundaryStatus.failed, status);
+        const completion = extractionJobCompletion(.ok, status);
+        try std.testing.expectEqual(entity_pipeline.RunOutcome.llm_failed, completion.outcome);
+        try std.testing.expectEqualStrings("boundary_failed", completion.error_text);
+    }
+
+    {
+        const status = queuedSessionEndBoundaryStatus("session_end", .llm_failed, null);
+        try std.testing.expectEqual(SessionEndBoundaryStatus.skipped_entity_llm_failed, status);
+        const completion = extractionJobCompletion(.llm_failed, status);
+        try std.testing.expectEqual(entity_pipeline.RunOutcome.llm_failed, completion.outcome);
+        try std.testing.expectEqualStrings("llm_failed", completion.error_text);
+    }
+
+    {
+        const status = queuedSessionEndBoundaryStatus("session_end", .parse_failed, true);
+        try std.testing.expectEqual(SessionEndBoundaryStatus.extracted, status);
+        const completion = extractionJobCompletion(.parse_failed, status);
+        try std.testing.expectEqual(entity_pipeline.RunOutcome.parse_failed, completion.outcome);
+        try std.testing.expectEqualStrings("parse_failed", completion.error_text);
     }
 }
