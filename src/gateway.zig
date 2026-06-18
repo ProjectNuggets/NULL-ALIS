@@ -4441,6 +4441,61 @@ fn buildV1CutoverResponse(
     return out.toOwnedSlice(allocator);
 }
 
+// TEMP DIAG [V1CUTOVER-DIAG] — remove after CI root-cause pinned.
+fn v1cutoverDiagSnapshot(allocator: std.mem.Allocator, tag: []const u8, user_ctx: *const UserContext) void {
+    const ws = user_ctx.workspace_path;
+    const bootstrap_path = std.fmt.allocPrint(allocator, "{s}/BOOTSTRAP.md", .{ws}) catch return;
+    defer allocator.free(bootstrap_path);
+    const state_path = std.fmt.allocPrint(allocator, "{s}/.nullalis/workspace-state.json", .{ws}) catch return;
+    defer allocator.free(state_path);
+    const onboarding_path = std.fmt.allocPrint(allocator, "{s}/onboarding.json", .{user_ctx.user_root}) catch return;
+    defer allocator.free(onboarding_path);
+
+    const bootstrap_exists = blk: {
+        std.fs.accessAbsolute(bootstrap_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    const state_exists = blk: {
+        std.fs.accessAbsolute(state_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    const onboarding_exists = blk: {
+        std.fs.accessAbsolute(onboarding_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+
+    // Read workspace-state.json content (markers) if present.
+    var state_preview_buf: [256]u8 = undefined;
+    var state_preview: []const u8 = "<absent>";
+    if (state_exists) {
+        if (std.fs.openFileAbsolute(state_path, .{})) |f| {
+            defer f.close();
+            const n = f.readAll(&state_preview_buf) catch 0;
+            state_preview = state_preview_buf[0..n];
+        } else |_| {
+            state_preview = "<openerr>";
+        }
+    }
+    // Read first ~80 chars of BOOTSTRAP.md if present.
+    var bootstrap_preview_buf: [120]u8 = undefined;
+    var bootstrap_preview: []const u8 = "<absent>";
+    if (bootstrap_exists) {
+        if (std.fs.openFileAbsolute(bootstrap_path, .{})) |f| {
+            defer f.close();
+            const n = f.readAll(&bootstrap_preview_buf) catch 0;
+            const lim = @min(n, 80);
+            bootstrap_preview = bootstrap_preview_buf[0..lim];
+        } else |_| {
+            bootstrap_preview = "<openerr>";
+        }
+    }
+
+    std.log.scoped(.gateway).warn(
+        "[V1CUTOVER-DIAG] tag={s} ws={s} bootstrap_exists={} state_exists={} onboarding_exists={} state_json='{s}' bootstrap_head='{s}'",
+        .{ tag, ws, bootstrap_exists, state_exists, onboarding_exists, state_preview, bootstrap_preview },
+    );
+}
+
 fn archiveWorkspaceForV1Cutover(
     allocator: std.mem.Allocator,
     state: *GatewayState,
@@ -4453,6 +4508,8 @@ fn archiveWorkspaceForV1Cutover(
     defer allocator.free(marker_path);
     const archive_workspace_path = try v1CutoverArchiveWorkspacePath(allocator, user_ctx, safe_version);
     errdefer allocator.free(archive_workspace_path);
+
+    v1cutoverDiagSnapshot(allocator, "BEFORE-archive", user_ctx); // [V1CUTOVER-DIAG]
 
     if (fileExistsAbsolute(marker_path)) {
         try ensureUserDirectories(user_ctx);
@@ -4499,10 +4556,15 @@ fn archiveWorkspaceForV1Cutover(
         else => return err,
     };
 
+    v1cutoverDiagSnapshot(allocator, "AFTER-archive+delete", user_ctx); // [V1CUTOVER-DIAG]
+
     try ensureUserDirectories(user_ctx);
     try ensureUserProvisioned(state, user_ctx);
     const project_ctx = onboard.zakiBotProjectContext();
     try onboard.scaffoldWorkspace(allocator, user_ctx.workspace_path, &project_ctx);
+
+    v1cutoverDiagSnapshot(allocator, "AFTER-rescaffold", user_ctx); // [V1CUTOVER-DIAG]
+
     try writeV1CutoverOnboardingState(allocator, state, user_ctx, version, archive_workspace_path);
 
     const marker_body = try buildV1CutoverResponse(allocator, "applied", user_ctx.user_id, version, archive_workspace_path);
