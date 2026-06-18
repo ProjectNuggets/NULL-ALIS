@@ -1762,14 +1762,6 @@ fn ensureBootstrapLifecycle(
     var state_dirty = false;
     var bootstrap_exists = fileExistsAbsolute(bootstrap_path);
 
-    // [V1CUTOVER-DIAG] entry snapshot — remove after CI root-cause pinned.
-    // Gate on the cutover test's tenant workspace to keep CI logs focused.
-    const diag_on = std.mem.endsWith(u8, workspace_dir, "/42/workspace");
-    if (diag_on) std.log.scoped(.onboard_diag).warn(
-        "[V1CUTOVER-DIAG] ensureBootstrapLifecycle ws={s} profile={s} bootstrap_exists={} seeded_at={?s} completed_at={?s}",
-        .{ workspace_dir, @tagName(ctx.workspace_profile), bootstrap_exists, state.bootstrap_seeded_at, state.onboarding_completed_at },
-    );
-
     if (state.bootstrap_seeded_at == null and bootstrap_exists) {
         try markBootstrapSeededAt(allocator, &state);
         state_dirty = true;
@@ -1787,10 +1779,6 @@ fn ensureBootstrapLifecycle(
             identity_template,
             user_template,
         );
-        if (diag_on) std.log.scoped(.onboard_diag).warn(
-            "[V1CUTOVER-DIAG] ensureBootstrapLifecycle seed-branch entered ws={s} legacy_completed={}",
-            .{ workspace_dir, legacy_completed },
-        ); // [V1CUTOVER-DIAG]
         if (legacy_completed) {
             try markOnboardingCompletedAt(allocator, &state);
             state_dirty = true;
@@ -1799,20 +1787,11 @@ fn ensureBootstrapLifecycle(
             defer allocator.free(bootstrap_tmpl);
             try writeIfMissing(allocator, workspace_dir, "BOOTSTRAP.md", bootstrap_tmpl);
             bootstrap_exists = fileExistsAbsolute(bootstrap_path);
-            if (diag_on) std.log.scoped(.onboard_diag).warn(
-                "[V1CUTOVER-DIAG] ensureBootstrapLifecycle seeded-birthday ws={s} tmpl_has_marker={} bootstrap_exists_after={}",
-                .{ workspace_dir, std.mem.indexOf(u8, bootstrap_tmpl, "pick up right where they left off") != null, bootstrap_exists },
-            ); // [V1CUTOVER-DIAG]
             if (bootstrap_exists and state.bootstrap_seeded_at == null) {
                 try markBootstrapSeededAt(allocator, &state);
                 state_dirty = true;
             }
         }
-    } else {
-        if (diag_on) std.log.scoped(.onboard_diag).warn(
-            "[V1CUTOVER-DIAG] ensureBootstrapLifecycle SEED-SKIPPED ws={s} seeded_at={?s} completed_at={?s} bootstrap_exists={}",
-            .{ workspace_dir, state.bootstrap_seeded_at, state.onboarding_completed_at, bootstrap_exists },
-        ); // [V1CUTOVER-DIAG]
     }
 
     if (state_dirty) {

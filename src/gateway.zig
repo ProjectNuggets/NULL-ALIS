@@ -4441,61 +4441,6 @@ fn buildV1CutoverResponse(
     return out.toOwnedSlice(allocator);
 }
 
-// TEMP DIAG [V1CUTOVER-DIAG] — remove after CI root-cause pinned.
-fn v1cutoverDiagSnapshot(allocator: std.mem.Allocator, tag: []const u8, user_ctx: *const UserContext) void {
-    const ws = user_ctx.workspace_path;
-    const bootstrap_path = std.fmt.allocPrint(allocator, "{s}/BOOTSTRAP.md", .{ws}) catch return;
-    defer allocator.free(bootstrap_path);
-    const state_path = std.fmt.allocPrint(allocator, "{s}/.nullalis/workspace-state.json", .{ws}) catch return;
-    defer allocator.free(state_path);
-    const onboarding_path = std.fmt.allocPrint(allocator, "{s}/onboarding.json", .{user_ctx.user_root}) catch return;
-    defer allocator.free(onboarding_path);
-
-    const bootstrap_exists = blk: {
-        std.fs.accessAbsolute(bootstrap_path, .{}) catch break :blk false;
-        break :blk true;
-    };
-    const state_exists = blk: {
-        std.fs.accessAbsolute(state_path, .{}) catch break :blk false;
-        break :blk true;
-    };
-    const onboarding_exists = blk: {
-        std.fs.accessAbsolute(onboarding_path, .{}) catch break :blk false;
-        break :blk true;
-    };
-
-    // Read workspace-state.json content (markers) if present.
-    var state_preview_buf: [256]u8 = undefined;
-    var state_preview: []const u8 = "<absent>";
-    if (state_exists) {
-        if (std.fs.openFileAbsolute(state_path, .{})) |f| {
-            defer f.close();
-            const n = f.readAll(&state_preview_buf) catch 0;
-            state_preview = state_preview_buf[0..n];
-        } else |_| {
-            state_preview = "<openerr>";
-        }
-    }
-    // Read first ~80 chars of BOOTSTRAP.md if present.
-    var bootstrap_preview_buf: [120]u8 = undefined;
-    var bootstrap_preview: []const u8 = "<absent>";
-    if (bootstrap_exists) {
-        if (std.fs.openFileAbsolute(bootstrap_path, .{})) |f| {
-            defer f.close();
-            const n = f.readAll(&bootstrap_preview_buf) catch 0;
-            const lim = @min(n, 80);
-            bootstrap_preview = bootstrap_preview_buf[0..lim];
-        } else |_| {
-            bootstrap_preview = "<openerr>";
-        }
-    }
-
-    std.log.scoped(.gateway).warn(
-        "[V1CUTOVER-DIAG] tag={s} ws={s} bootstrap_exists={} state_exists={} onboarding_exists={} state_json='{s}' bootstrap_head='{s}'",
-        .{ tag, ws, bootstrap_exists, state_exists, onboarding_exists, state_preview, bootstrap_preview },
-    );
-}
-
 fn archiveWorkspaceForV1Cutover(
     allocator: std.mem.Allocator,
     state: *GatewayState,
@@ -4508,8 +4453,6 @@ fn archiveWorkspaceForV1Cutover(
     defer allocator.free(marker_path);
     const archive_workspace_path = try v1CutoverArchiveWorkspacePath(allocator, user_ctx, safe_version);
     errdefer allocator.free(archive_workspace_path);
-
-    v1cutoverDiagSnapshot(allocator, "BEFORE-archive", user_ctx); // [V1CUTOVER-DIAG]
 
     if (fileExistsAbsolute(marker_path)) {
         try ensureUserDirectories(user_ctx);
@@ -4534,36 +4477,30 @@ fn archiveWorkspaceForV1Cutover(
         };
     }
 
-    // Re-scaffold a genuinely clean workspace. The route already scaffolds
-    // the user workspace on every `/users/{id}/*` request (see the
+    // Re-scaffold a genuinely clean workspace. The route already scaffolds the
+    // user workspace on every `/users/{id}/*` request (see the
     // `scaffoldUserWorkspace` call in `handleApiRoute` before this dispatch),
     // which — because the beta workspace still has a `BOOTSTRAP.md` at that
     // point — persists a `bootstrap_seeded_at` marker into
-    // `<workspace>/.nullalis/workspace-state.json`. The archive step above is
-    // expected to carry that marker (and the legacy `BOOTSTRAP.md`) away with
-    // the rest of the workspace, but it is best-effort: `renameAbsolute`
-    // swallows `error.FileNotFound`, and a rename is not guaranteed to leave
-    // an empty source directory on every host filesystem. If ANY stale file
-    // survives, the re-scaffold below is write-if-missing and
-    // `ensureBootstrapLifecycle` treats the surviving marker / BOOTSTRAP.md as
-    // "onboarding already done" — so it skips seeding the fresh V1 first-run
-    // BOOTSTRAP.md and the user lands in their new workspace with no first-run
-    // experience. Force-clearing here makes the fresh-workspace contract
-    // deterministic regardless of host rename semantics; the user's old data
-    // is already preserved in the archive.
+    // `<workspace>/.nullalis/workspace-state.json`. The archive step above moves
+    // that marker (and the legacy `BOOTSTRAP.md`) away, but it is best-effort:
+    // `renameAbsolute` swallows `error.FileNotFound`, and a rename is not
+    // guaranteed to leave an empty source directory on every host filesystem. If
+    // any stale file survived, the write-if-missing re-scaffold below would let
+    // `ensureBootstrapLifecycle` treat the surviving marker / BOOTSTRAP.md as
+    // "onboarding already done" and skip seeding the fresh V1 first-run
+    // BOOTSTRAP.md. Force-clearing here makes the fresh-workspace contract
+    // deterministic regardless of host rename semantics; the user's old data is
+    // already preserved in the archive.
     std.fs.deleteTreeAbsolute(user_ctx.workspace_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
 
-    v1cutoverDiagSnapshot(allocator, "AFTER-archive+delete", user_ctx); // [V1CUTOVER-DIAG]
-
     try ensureUserDirectories(user_ctx);
     try ensureUserProvisioned(state, user_ctx);
     const project_ctx = onboard.zakiBotProjectContext();
     try onboard.scaffoldWorkspace(allocator, user_ctx.workspace_path, &project_ctx);
-
-    v1cutoverDiagSnapshot(allocator, "AFTER-rescaffold", user_ctx); // [V1CUTOVER-DIAG]
 
     try writeV1CutoverOnboardingState(allocator, state, user_ctx, version, archive_workspace_path);
 
