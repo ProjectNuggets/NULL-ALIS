@@ -4477,6 +4477,28 @@ fn archiveWorkspaceForV1Cutover(
         };
     }
 
+    // Re-scaffold a genuinely clean workspace. The route already scaffolds
+    // the user workspace on every `/users/{id}/*` request (see the
+    // `scaffoldUserWorkspace` call in `handleApiRoute` before this dispatch),
+    // which — because the beta workspace still has a `BOOTSTRAP.md` at that
+    // point — persists a `bootstrap_seeded_at` marker into
+    // `<workspace>/.nullalis/workspace-state.json`. The archive step above is
+    // expected to carry that marker (and the legacy `BOOTSTRAP.md`) away with
+    // the rest of the workspace, but it is best-effort: `renameAbsolute`
+    // swallows `error.FileNotFound`, and a rename is not guaranteed to leave
+    // an empty source directory on every host filesystem. If ANY stale file
+    // survives, the re-scaffold below is write-if-missing and
+    // `ensureBootstrapLifecycle` treats the surviving marker / BOOTSTRAP.md as
+    // "onboarding already done" — so it skips seeding the fresh V1 first-run
+    // BOOTSTRAP.md and the user lands in their new workspace with no first-run
+    // experience. Force-clearing here makes the fresh-workspace contract
+    // deterministic regardless of host rename semantics; the user's old data
+    // is already preserved in the archive.
+    std.fs.deleteTreeAbsolute(user_ctx.workspace_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+
     try ensureUserDirectories(user_ctx);
     try ensureUserProvisioned(state, user_ctx);
     const project_ctx = onboard.zakiBotProjectContext();
