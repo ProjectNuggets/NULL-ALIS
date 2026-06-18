@@ -4351,6 +4351,144 @@ fn workspaceFilePath(allocator: std.mem.Allocator, workspace_path: []const u8, n
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace_path, name });
 }
 
+fn fileExistsAbsolute(path: []const u8) bool {
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
+}
+
+fn sanitizeV1CutoverVersionForPath(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (version) |c| {
+        const allowed = (c >= 'a' and c <= 'z') or
+            (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or
+            c == '-' or
+            c == '_' or
+            c == '.';
+        try out.append(allocator, if (allowed) c else '-');
+    }
+    if (out.items.len == 0) {
+        try out.appendSlice(allocator, "v1");
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn v1CutoverMarkerPath(allocator: std.mem.Allocator, user_root: []const u8, safe_version: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/v1_cutover_{s}.json", .{ user_root, safe_version });
+}
+
+fn v1CutoverArchiveRoot(allocator: std.mem.Allocator, user_ctx: *const UserContext, safe_version: []const u8) ![]u8 {
+    if (std.mem.startsWith(u8, user_ctx.user_root, user_ctx.workspace_path)) {
+        const parent = std.fs.path.dirname(user_ctx.workspace_path) orelse user_ctx.user_root;
+        return std.fmt.allocPrint(allocator, "{s}/.nullalis-archives/v1-cutover-{s}", .{ parent, safe_version });
+    }
+    return std.fmt.allocPrint(allocator, "{s}/archives/v1-cutover-{s}", .{ user_ctx.user_root, safe_version });
+}
+
+fn v1CutoverArchiveWorkspacePath(allocator: std.mem.Allocator, user_ctx: *const UserContext, safe_version: []const u8) ![]u8 {
+    const archive_root = try v1CutoverArchiveRoot(allocator, user_ctx, safe_version);
+    defer allocator.free(archive_root);
+    return std.fmt.allocPrint(allocator, "{s}/workspace", .{archive_root});
+}
+
+fn writeV1CutoverOnboardingState(
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    user_ctx: *const UserContext,
+    version: []const u8,
+    archive_workspace_path: []const u8,
+) !void {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    try w.writeAll("{\"completed\":false,\"completed_at_s\":null,\"v1_cutover\":{\"version\":\"");
+    try jsonEscapeInto(w, version);
+    try w.writeAll("\",\"status\":\"applied\",\"birthday_first_run\":\"queued\",\"memory_import_bridge\":\"offered\",\"workspace_archive_path\":\"");
+    try jsonEscapeInto(w, archive_workspace_path);
+    try w.print("\",\"applied_at_s\":{d}}}", .{std.time.timestamp()});
+    try w.writeAll("}");
+
+    if (state.zaki_state) |mgr| {
+        const user_id = try parseNumericUserId(user_ctx.user_id);
+        try mgr.putOnboardingJson(user_id, out.items);
+    } else {
+        const onboarding_path = try onboardingStatePath(allocator, user_ctx.user_root);
+        defer allocator.free(onboarding_path);
+        try writeFile(onboarding_path, out.items);
+    }
+}
+
+fn buildV1CutoverResponse(
+    allocator: std.mem.Allocator,
+    status: []const u8,
+    user_id: []const u8,
+    version: []const u8,
+    archive_workspace_path: []const u8,
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+    try w.writeAll("{\"status\":\"");
+    try jsonEscapeInto(w, status);
+    try w.writeAll("\",\"user_id\":\"");
+    try jsonEscapeInto(w, user_id);
+    try w.writeAll("\",\"cutover_version\":\"");
+    try jsonEscapeInto(w, version);
+    try w.writeAll("\",\"birthday_first_run\":\"queued\",\"memory_import_bridge\":\"offered\",\"archive_reversible\":true,\"workspace_archive_path\":\"");
+    try jsonEscapeInto(w, archive_workspace_path);
+    try w.writeAll("\"}");
+    return out.toOwnedSlice(allocator);
+}
+
+fn archiveWorkspaceForV1Cutover(
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    user_ctx: *const UserContext,
+    version: []const u8,
+) !struct { status: []const u8, archive_workspace_path: []u8 } {
+    const safe_version = try sanitizeV1CutoverVersionForPath(allocator, version);
+    defer allocator.free(safe_version);
+    const marker_path = try v1CutoverMarkerPath(allocator, user_ctx.user_root, safe_version);
+    defer allocator.free(marker_path);
+    const archive_workspace_path = try v1CutoverArchiveWorkspacePath(allocator, user_ctx, safe_version);
+    errdefer allocator.free(archive_workspace_path);
+
+    if (fileExistsAbsolute(marker_path)) {
+        try ensureUserDirectories(user_ctx);
+        try ensureUserProvisioned(state, user_ctx);
+        const project_ctx = onboard.zakiBotProjectContext();
+        try onboard.scaffoldWorkspace(allocator, user_ctx.workspace_path, &project_ctx);
+        return .{ .status = "already_applied", .archive_workspace_path = archive_workspace_path };
+    }
+
+    if (!fileExistsAbsolute(archive_workspace_path)) {
+        if (std.fs.path.dirname(archive_workspace_path)) |parent| {
+            try makeAbsolutePath(parent);
+        }
+        std.fs.renameAbsolute(user_ctx.workspace_path, archive_workspace_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    } else {
+        std.fs.deleteTreeAbsolute(user_ctx.workspace_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+
+    try ensureUserDirectories(user_ctx);
+    try ensureUserProvisioned(state, user_ctx);
+    const project_ctx = onboard.zakiBotProjectContext();
+    try onboard.scaffoldWorkspace(allocator, user_ctx.workspace_path, &project_ctx);
+    try writeV1CutoverOnboardingState(allocator, state, user_ctx, version, archive_workspace_path);
+
+    const marker_body = try buildV1CutoverResponse(allocator, "applied", user_ctx.user_id, version, archive_workspace_path);
+    defer allocator.free(marker_body);
+    try writeFile(marker_path, marker_body);
+    return .{ .status = "applied", .archive_workspace_path = archive_workspace_path };
+}
+
 fn writeTelegramChannelState(
     allocator: std.mem.Allocator,
     channel_state_path: []const u8,
@@ -15756,9 +15894,9 @@ fn buildBrainTypedEdges(
 /// (would create a cycle: agent → memory → gateway → agent).
 fn isRejectedExtractionPredicate(predicate: []const u8) bool {
     const rejected = [_][]const u8{
-        "GREETED",      "SAID",         "ASKED",               "MENTIONED",           "REPLIED",
-        "ACKNOWLEDGED", "EXPRESSED",    "INDICATED_READINESS", "IS_GETTING_STARTED",  "OFFERED_TO_WAIT",
-        "PRIORITIZED",  "ADDRESSED_AS", "IS_UNKNOWN",          "EXPRESSED_READINESS", "INITIATED_CONVERSATION",
+        "GREETED",        "SAID",         "ASKED",               "MENTIONED",           "REPLIED",
+        "ACKNOWLEDGED",   "EXPRESSED",    "INDICATED_READINESS", "IS_GETTING_STARTED",  "OFFERED_TO_WAIT",
+        "PRIORITIZED",    "ADDRESSED_AS", "IS_UNKNOWN",          "EXPRESSED_READINESS", "INITIATED_CONVERSATION",
         // P7 — the entity_pipeline speaker hub (user:<id> → entity). RENAMED
         // from "MENTIONED" so it no longer collides with the meta-narrative
         // ban above; it gets its OWN entry here to stay render/PPR-excluded
@@ -19851,6 +19989,30 @@ fn handleApiRoute(
         user_write_lock = acquired;
     }
     defer if (user_write_lock) |*lock| lock.deinit();
+
+    if (std.mem.eql(u8, parsed.subpath, "v1-cutover")) {
+        if (!std.mem.eql(u8, method, "POST")) {
+            return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
+        }
+        const body = extractBody(raw_request) orelse "{}";
+        const version = jsonStringField(body, "cutover_version") orelse "2026-06-v1";
+        if (version.len == 0 or version.len > 128) {
+            return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_cutover_version\"}" };
+        }
+        const cutover = archiveWorkspaceForV1Cutover(req_allocator, state, &user_ctx, version) catch |err| {
+            log.warn("v1_cutover.failed user_id={s} err={s}", .{ scoped_user_id, @errorName(err) });
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"v1_cutover_failed\"}" };
+        };
+        defer req_allocator.free(cutover.archive_workspace_path);
+        const response_body = buildV1CutoverResponse(
+            req_allocator,
+            cutover.status,
+            scoped_user_id,
+            version,
+            cutover.archive_workspace_path,
+        ) catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+        return .{ .body = response_body };
+    }
 
     if (std.mem.eql(u8, parsed.subpath, "onboarding")) {
         if (std.mem.eql(u8, method, "GET")) {
@@ -27220,6 +27382,86 @@ test "users provision route succeeds even when ownership lock is held in file mo
 
     try std.testing.expectEqualStrings("200 OK", response.status);
     try std.testing.expectEqualStrings("{\"status\":\"provisioned\"}", response.body);
+}
+
+test "handleApiRoute POST v1-cutover archives workspace and queues V1 first-run idempotently" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+    const workspace_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/42/workspace", .{tenant_root});
+    defer std.testing.allocator.free(workspace_path);
+    try makeAbsolutePath(workspace_path);
+
+    const beta_file_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/beta-state.txt", .{workspace_path});
+    defer std.testing.allocator.free(beta_file_path);
+    try writeFile(beta_file_path, "legacy beta workspace state\n");
+    const beta_bootstrap_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/BOOTSTRAP.md", .{workspace_path});
+    defer std.testing.allocator.free(beta_bootstrap_path);
+    try writeFile(beta_bootstrap_path, "legacy beta bootstrap\n");
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_enabled = true;
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{\"cutover_version\":\"2026-06-v1\"}";
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /api/v1/users/42/v1-cutover HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nIdempotency-Key: v1-cutover:2026-06-v1:user:42\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "POST",
+        "/api/v1/users/42/v1-cutover",
+        &state,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqualStrings("200 OK", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"status\":\"applied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"birthday_first_run\":\"queued\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"memory_import_bridge\":\"offered\"") != null);
+
+    const archive_file_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/42/archives/v1-cutover-2026-06-v1/workspace/beta-state.txt", .{tenant_root});
+    defer std.testing.allocator.free(archive_file_path);
+    try std.fs.accessAbsolute(archive_file_path, .{});
+
+    const fresh_bootstrap = try readFileOrDefault(std.testing.allocator, beta_bootstrap_path, "");
+    defer std.testing.allocator.free(fresh_bootstrap);
+    try std.testing.expect(std.mem.indexOf(u8, fresh_bootstrap, "pick up right where they left off") != null);
+
+    const onboarding_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/42/onboarding.json", .{tenant_root});
+    defer std.testing.allocator.free(onboarding_path);
+    const onboarding_json = try readFileOrDefault(std.testing.allocator, onboarding_path, "");
+    defer std.testing.allocator.free(onboarding_json);
+    try std.testing.expect(std.mem.indexOf(u8, onboarding_json, "\"completed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, onboarding_json, "\"memory_import_bridge\":\"offered\"") != null);
+
+    const replay_response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "POST",
+        "/api/v1/users/42/v1-cutover",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("200 OK", replay_response.status);
+    try std.testing.expect(std.mem.indexOf(u8, replay_response.body, "\"status\":\"already_applied\"") != null);
+    try std.fs.accessAbsolute(archive_file_path, .{});
 }
 
 test "prepareBrokerUserForRouting bootstraps broker file-mode user state" {
