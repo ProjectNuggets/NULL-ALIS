@@ -93,6 +93,22 @@ Client-side `fetch().abort()` alone does NOT count as a cancel — bind
 the Stop button to the cancel route so server-side work, meter
 receipts, and tool side-effects honor the user's intent.
 
+#### 2.1.1 V1 beta cutover first-run reset *(operator/BFF only)*
+
+`POST /api/v1/users/{id}/v1-cutover` is an internal cutover route for
+the ZAKI BFF, not a visible user setting. It archives the beta
+workspace, regenerates the V1 `BOOTSTRAP.md`, marks onboarding
+incomplete, and returns:
+
+- `birthday_first_run: "queued"`
+- `memory_import_bridge: "offered"`
+- `archive_reversible: true`
+
+The endpoint is idempotent per `cutover_version`: a re-run returns
+`status: "already_applied"` without moving the workspace again. UI
+should surface only the result of this state: the next Agent first-run
+should feel fresh and should invite memory import from ChatGPT/Claude.
+
 ### 2.2 Persistent memory — the differentiator
 
 | Tool | Purpose | UX surface |

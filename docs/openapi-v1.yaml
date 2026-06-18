@@ -658,6 +658,51 @@ paths:
               schema:
                 $ref: "#/components/schemas/OwnershipLockConflictResponse"
 
+  /api/v1/users/{user_id}/v1-cutover:
+    post:
+      tags: [user]
+      summary: Reset beta workspace to V1 first-run state
+      description: >
+        Internal BFF/operator route used during commercial V1 cutover. The
+        gateway archives the current workspace, regenerates the V1 bootstrap,
+        marks onboarding incomplete, queues the birthday first-run, and records
+        that the memory-import bridge should be offered. Safe to re-run for the
+        same cutover_version; a completed marker returns already_applied without
+        archiving a second time.
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/UserIdPath"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cutover_version:
+                  type: string
+                  default: 2026-06-v1
+                request_id:
+                  type: string
+      responses:
+        "200":
+          description: V1 first-run queued or already applied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1CutoverResponse"
+        "400":
+          description: Invalid cutover_version or user_id
+        "405":
+          description: Method not allowed
+        "409":
+          description: Tenant ownership lock conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnershipLockConflictResponse"
+
   /api/v1/users/{user_id}/config:
     get:
       tags: [user]
@@ -4015,6 +4060,35 @@ components:
         status:
           type: string
       additionalProperties: true
+    V1CutoverResponse:
+      type: object
+      required:
+        - status
+        - user_id
+        - cutover_version
+        - birthday_first_run
+        - memory_import_bridge
+        - archive_reversible
+        - workspace_archive_path
+      properties:
+        status:
+          type: string
+          enum: [applied, already_applied]
+        user_id:
+          type: string
+        cutover_version:
+          type: string
+        birthday_first_run:
+          type: string
+          enum: [queued]
+        memory_import_bridge:
+          type: string
+          enum: [offered]
+        archive_reversible:
+          type: boolean
+        workspace_archive_path:
+          type: string
+      additionalProperties: false
     ChannelControlStatus:
       type: object
       description: |
