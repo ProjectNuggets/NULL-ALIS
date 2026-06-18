@@ -27524,7 +27524,14 @@ test "handleApiRoute POST v1-cutover archives workspace and queues V1 first-run 
 
     const fresh_bootstrap = try readFileOrDefault(std.testing.allocator, beta_bootstrap_path, "");
     defer std.testing.allocator.free(fresh_bootstrap);
-    try std.testing.expect(std.mem.indexOf(u8, fresh_bootstrap, "pick up right where they left off") != null);
+    // The cutover re-scaffolds a fresh V1 first-run BOOTSTRAP.md via
+    // onboard.scaffoldWorkspace -> bootstrapTemplate(zaki_bot). Assert on the
+    // memory-bridge line that is stable across the template's wording (the
+    // exact "they left off"/"it left off" tail has changed over time); this
+    // confirms the freshly seeded birthday bootstrap replaced the legacy beta
+    // bootstrap rather than the legacy content surviving.
+    try std.testing.expect(std.mem.indexOf(u8, fresh_bootstrap, "pick up right where ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fresh_bootstrap, "legacy beta bootstrap") == null);
 
     const onboarding_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/42/onboarding.json", .{tenant_root});
     defer std.testing.allocator.free(onboarding_path);
