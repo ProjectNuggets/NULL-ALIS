@@ -8848,6 +8848,11 @@ test "slash /new writes checkpoint, summary objects, and context anchor" {
         if (!std.mem.startsWith(u8, entry.key, "session_checkpoint_")) continue;
         checkpoint_found = true;
         try std.testing.expect(std.mem.indexOf(u8, entry.content, "reason=new") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "created_at_unix=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "created_at_utc=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "date_utc=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "boundary_reason=new") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "session_id=agent:zaki-bot:user:1:main") != null);
         try std.testing.expect(std.mem.indexOf(u8, entry.content, "actual user request") != null);
         try std.testing.expect(std.mem.indexOf(u8, entry.content, "[Memory context]") == null);
         try std.testing.expect(std.mem.indexOf(u8, entry.content, "Working on it.") != null);
@@ -8864,6 +8869,11 @@ test "slash /new writes checkpoint, summary objects, and context anchor" {
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "origin_channel=app") != null);
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "origin_lane=main") != null);
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_summary_key=timeline_summary/agent:zaki-bot:user:1:main/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "created_at_unix=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "created_at_utc=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "date_utc=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "boundary_reason=new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "session_id=agent:zaki-bot:user:1:main") != null);
 
     const session_entries = try mem.list(allocator, .conversation, "agent:zaki-bot:user:1:main");
     defer memory_mod.freeEntries(allocator, session_entries);
@@ -8877,6 +8887,11 @@ test "slash /new writes checkpoint, summary objects, and context anchor" {
     for (daily_entries) |entry| {
         if (!std.mem.startsWith(u8, entry.key, "timeline_summary/agent:zaki-bot:user:1:main/")) continue;
         found_timeline_summary = true;
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "created_at_unix=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "created_at_utc=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "date_utc=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "boundary_reason=new") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "session_id=agent:zaki-bot:user:1:main") != null);
         try std.testing.expect(std.mem.indexOf(u8, entry.content, "focus:") != null);
         break;
     }
@@ -8891,6 +8906,11 @@ test "slash /new writes checkpoint, summary objects, and context anchor" {
     try std.testing.expect(std.mem.indexOf(u8, latest.content, "origin_channel=app") != null);
     try std.testing.expect(std.mem.indexOf(u8, latest.content, "origin_lane=main") != null);
     try std.testing.expect(std.mem.indexOf(u8, latest.content, "source_key=timeline_summary/agent:zaki-bot:user:1:main/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "created_at_unix=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "created_at_utc=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "date_utc=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "boundary_reason=new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "session_id=agent:zaki-bot:user:1:main") != null);
     try std.testing.expect(std.mem.indexOf(u8, latest.content, "focus:") != null);
 
     const timeline_index = (try mem.get(allocator, "timeline_index/current")) orelse return error.TestUnexpectedResult;
@@ -9099,10 +9119,16 @@ test "persistSessionCheckpoint writes continuity summaries when legacy summarize
     defer anchor.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_checkpoint_key=session_checkpoint_") != null);
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_summary_key=timeline_summary/agent:zaki-bot:user:1:main/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "created_at_utc=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "date_utc=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "boundary_reason=new") != null);
 
     const latest = (try mem.get(allocator, "summary_latest/agent:zaki-bot:user:1:main")) orelse return error.TestUnexpectedResult;
     defer latest.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, latest.content, "type=summary_latest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "created_at_utc=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "date_utc=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "boundary_reason=new") != null);
 
     const timeline_index = (try mem.get(allocator, "timeline_index/current")) orelse return error.TestUnexpectedResult;
     defer timeline_index.deinit(allocator);
@@ -9311,12 +9337,25 @@ test "persistSessionCheckpoint blocks fallback overwrite of existing canonical s
     const daily_entries = try mem.list(allocator, .daily, null);
     defer memory_mod.freeEntries(allocator, daily_entries);
     var found_timeline_summary = false;
+    var found_summary_fallback = false;
     for (daily_entries) |entry| {
-        if (!std.mem.startsWith(u8, entry.key, "timeline_summary/agent:zaki-bot:user:1:main/")) continue;
-        found_timeline_summary = true;
-        break;
+        if (std.mem.startsWith(u8, entry.key, "timeline_summary/agent:zaki-bot:user:1:main/")) {
+            found_timeline_summary = true;
+            try std.testing.expect(std.mem.indexOf(u8, entry.content, "created_at_utc=") != null);
+            try std.testing.expect(std.mem.indexOf(u8, entry.content, "date_utc=") != null);
+            try std.testing.expect(std.mem.indexOf(u8, entry.content, "boundary_reason=summary_seed:auto") != null);
+        }
+        if (std.mem.startsWith(u8, entry.key, "summary_fallback/agent:zaki-bot:user:1:main/")) {
+            found_summary_fallback = true;
+            try std.testing.expect(std.mem.indexOf(u8, entry.content, "quality_tier=fallback") != null);
+            try std.testing.expect(std.mem.indexOf(u8, entry.content, "created_at_utc=") != null);
+            try std.testing.expect(std.mem.indexOf(u8, entry.content, "date_utc=") != null);
+            try std.testing.expect(std.mem.indexOf(u8, entry.content, "boundary_reason=summary_seed:auto") != null);
+            try std.testing.expect(std.mem.indexOf(u8, entry.content, "session_id=agent:zaki-bot:user:1:main") != null);
+        }
     }
     try std.testing.expect(found_timeline_summary);
+    try std.testing.expect(found_summary_fallback);
 }
 
 test "persistSessionCheckpoint upgrades fallback summary_latest to canonical" {

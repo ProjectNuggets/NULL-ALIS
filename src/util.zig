@@ -11,10 +11,10 @@ pub fn formatBytes(bytes: u64) struct { value: f64, unit: []const u8 } {
     return .{ .value = size, .unit = units[idx] };
 }
 
-/// Get current timestamp as ISO 8601 string
-pub fn timestamp(buf: []u8) []const u8 {
-    const epoch = std.time.timestamp();
-    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(epoch) };
+/// Format a Unix timestamp, in seconds, as UTC ISO 8601 (`YYYY-MM-DDTHH:MM:SSZ`).
+pub fn timestamp_from_unix(timestamp_s: i64, buf: []u8) []const u8 {
+    if (timestamp_s < 0) return "0000-00-00T00:00:00Z";
+    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(timestamp_s) };
     const day = epoch_seconds.getEpochDay();
     const year_day = day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
@@ -32,6 +32,28 @@ pub fn timestamp(buf: []u8) []const u8 {
     return result;
 }
 
+/// Format a Unix timestamp, in seconds, as UTC date (`YYYY-MM-DD`).
+pub fn date_utc_from_unix(timestamp_s: i64, buf: []u8) []const u8 {
+    if (timestamp_s < 0) return "0000-00-00";
+    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(timestamp_s) };
+    const day = epoch_seconds.getEpochDay();
+    const year_day = day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    const result = std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+    }) catch "0000-00-00";
+
+    return result;
+}
+
+/// Get current timestamp as ISO 8601 string.
+pub fn timestamp(buf: []u8) []const u8 {
+    return timestamp_from_unix(std.time.timestamp(), buf);
+}
+
 test "formatBytes" {
     const result = formatBytes(3_500_000);
     try std.testing.expect(result.value > 3.3 and result.value < 3.4);
@@ -42,6 +64,16 @@ test "timestamp produces valid length" {
     var buf: [32]u8 = undefined;
     const ts = timestamp(&buf);
     try std.testing.expectEqual(@as(usize, 20), ts.len);
+}
+
+test "timestamp_from_unix formats fixed UTC instant" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", timestamp_from_unix(0, &buf));
+}
+
+test "date_utc_from_unix formats fixed UTC date" {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("1970-01-02", date_utc_from_unix(86_400, &buf));
 }
 
 // ── JSON helpers ────────────────────────────────────────────────

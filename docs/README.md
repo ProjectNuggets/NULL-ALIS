@@ -48,6 +48,7 @@ isn't listed below, it's been archived or doesn't exist.
 | Doc | Purpose |
 |---|---|
 | [`agent-lifecycle-spec.md`](agent-lifecycle-spec.md) | Agent turn lifecycle reference |
+| [`canonical-memory-design-contract.md`](canonical-memory-design-contract.md) | Canonical memory planes, timestamp contract, and continuity action items |
 | [`slash-commands-spec.md`](slash-commands-spec.md) | Slash command catalog |
 | [`execution-cell-contract.md`](execution-cell-contract.md) | Runtime cell contract |
 | [`zaki-runtime-contract.md`](zaki-runtime-contract.md) | zaki-prod runtime contract |
