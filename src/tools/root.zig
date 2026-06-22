@@ -1375,7 +1375,8 @@ pub fn allTools(
     igt.* = .{ .workspace_dir = workspace_dir };
     try list.append(allocator, igt.tool());
 
-    // produce_document: first-class PDF/DOCX/XLSX/PPTX/HTML generation.
+    // produce_document: first-class PDF generation. Legacy office/HTML
+    // renderers stay parked inside the tool until their quality passes ship.
     // workspace_dir bound so produced files land under attachments/produced/
     // inside the agent's workspace. `branding` is pulled from operator
     // config — empty/missing dir = disabled, system fonts. When set,
@@ -2710,7 +2711,7 @@ pub fn subagentTools(
     act.* = .{ .state_mgr = opts.state_mgr, .user_id = opts.user_id };
     try list.append(allocator, act.tool());
 
-    // produce_document — a one-shot rendered file (pdf/docx/xlsx/pptx/html) in
+    // produce_document — a one-shot rendered PDF in
     // the subagent workspace. It emits NO observer event, so its output is a
     // downloadable-file capability, not an auto-surfaced canvas artifact.
     const pdt = try allocator.create(produce_document.ProduceDocumentTool);
@@ -3102,7 +3103,7 @@ test "all tools includes extras when enabled" {
     // + memory_maintain (V1.9-5 truth-maintenance toolkit)
     // + time_now (V1.9-DX1 wall-clock tool)
     // + wiki_link (V1.12 entity-mention extractor) = 45.
-    // + produce_document (Wave 2A: first-class PDF/DOCX/XLSX/PPTX/HTML) = 46.
+    // + produce_document (Wave 2A: first-class PDF export; legacy renderers parked) = 46.
     // + 4 artifact_* (Wave 2C: canvas/artifacts backend) = 50.
     // + 4 artifact_share/revoke/diff/history + 2 memory_doctor/trace_query
     //   (2026-05-25 surface-audit close) = 56.
@@ -3287,7 +3288,7 @@ test "all tools includes message when event bus is available" {
     // V1.9-DX1 added time_now (wall-clock awareness) → 39.
     // V1.12 added wiki_link (entity-mention extractor) → 40.
     // 2026-05-23 B1: delegate + spawn flipped on by default → 42.
-    // Wave 2A: produce_document added (first-class PDF/DOCX/XLSX/PPTX/HTML) → 43.
+    // Wave 2A: produce_document added (first-class PDF export; legacy renderers parked) → 43.
     // Wave 2C: 4 artifact_* tools → 47.
     // 2026-05-25 surface-audit close: +4 artifact_share/revoke/diff/history
     // + 2 memory_doctor/trace_query → 53.
@@ -3548,10 +3549,10 @@ test "multiagent-gated tools (delegate, spawn) still classify as mutating + non-
 test "defaultMetadataRegistry only whitelists expected background_safe tools" {
     const registry = defaultMetadataRegistry();
     const background_safe_names = [_][]const u8{
-        "runtime_info",     "file_read",          "memory_recall",
-        "memory_list",      "memory_timeline",    "transcript_read",
-        "web_fetch",        "web_search",         "task_list",
-        "task_get",         "set_execution_mode", "context_snapshot",
+        "runtime_info",     "file_read",             "memory_recall",
+        "memory_list",      "memory_timeline",       "transcript_read",
+        "web_fetch",        "web_search",            "task_list",
+        "task_get",         "set_execution_mode",    "context_snapshot",
         // produce_document: writes ONLY to <workspace>/attachments/produced/
         // with timestamped filenames (no overwrite, no cross-invocation
         // state). Safe to run from a scheduled job / cron lane. Wave 2A.
@@ -3561,7 +3562,7 @@ test "defaultMetadataRegistry only whitelists expected background_safe tools" {
         // that needs to summarize "last week's artifacts" etc). The
         // create + update variants are explicitly NOT background-safe
         // (mutating; require an authenticated turn context).
-        "artifact_get",       "artifact_list",
+        "artifact_get",          "artifact_list",
         // 2026-05-25 surface-audit close — read-only artifact diff +
         // history tools. Same posture as get + list: safe to run from
         // a cron summary job. The mutating share + revoke_share
@@ -3571,12 +3572,12 @@ test "defaultMetadataRegistry only whitelists expected background_safe tools" {
         // are pure in-process diagnostics. Memory doctor inspects RAM
         // counters + capabilities; trace_query reads a bounded RAM
         // store. Both are safe to run from a scheduled lane.
-          "memory_doctor",
+             "memory_doctor",
         "trace_query",
         // Phase 4 fan-out — subagent_batch_result reads a batch's task results
         // (read_only against the in-memory batch tracker); safe in a background/
         // cron lane. spawn_many is NOT here (it mutates — spawns subagents).
-        "subagent_batch_result",
+             "subagent_batch_result",
     };
 
     // Everything in the whitelist must be background_safe.

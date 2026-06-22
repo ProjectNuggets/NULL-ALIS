@@ -139,9 +139,9 @@ pub const Config = struct {
     state: StateConfig = .{},
     composio: ComposioConfig = .{},
     /// Operator-deployed brand typography (Thmanyah by default). Empty
-    /// font_dir disables; otherwise produce_document applies @font-face /
-    /// pandoc --variable mainfont so PDF/DOCX/PPTX/HTML output matches the
-    /// operator's house font. See `BrandingConfig` for details.
+    /// font_dir disables; otherwise produce_document applies direct
+    /// @font-face/font-file paths so PDF output matches the operator's
+    /// house font. See `BrandingConfig` for details.
     branding: BrandingConfig = .{},
     secrets: SecretsConfig = .{},
     browser: BrowserConfig = .{},

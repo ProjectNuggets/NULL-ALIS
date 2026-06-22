@@ -275,8 +275,9 @@ pub const ObserverMetric = union(enum) {
     /// misconfigured allowlist surfaces fast.
     extension_ws_ssrf_block_total: u64,
 
-    /// produce_document tool. `format` is "pdf|docx|pptx|xlsx|html|
-    /// md". `result` is "ok|tool_missing|render_failed|invalid_input".
+    /// produce_document tool. Public success format is "pdf"; parked legacy
+    /// renderer requests may still appear as invalid_input until re-enabled.
+    /// `result` is "ok|tool_missing|render_failed|invalid_input".
     produce_document_total: struct {
         format: []const u8,
         result: []const u8,
@@ -303,8 +304,9 @@ pub const ObserverMetric = union(enum) {
     /// "blocked" | "expired".
     approval_decision_total: struct { result: []const u8 },
 
-    /// Artifact-export operation. `format` is "pdf|docx|pptx|xlsx|html",
-    /// `result` is "ok|invalid_format|missing_artifact|state_unavailable|
+    /// Artifact-export operation. `format` is "pdf" plus "invalid" before
+    /// validation. Parked legacy formats reject before render. `result` is
+    /// "ok|invalid_format|missing_artifact|state_unavailable|
     /// renderer_unavailable|cross_user_denied".
     artifact_export_total: struct { format: []const u8, result: []const u8 },
     artifact_export_latency_ms: struct { format: []const u8, value: u64 },

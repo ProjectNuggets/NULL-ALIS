@@ -1425,15 +1425,15 @@ pub const ComposioConfig = struct {
 // ── Branding config (operator-deployed brand typography) ────────
 //
 // Operator-only config — NOT user-settable. Lets a deployment apply a
-// licensed font family (e.g. Thmanyah) to every document produced via
-// `produce_document` (PDF / DOCX / PPTX / HTML / landing pages). The
+// licensed font family (e.g. Thmanyah) to PDFs produced via
+// `produce_document`. The
 // font files themselves are NEVER committed to this repo (license forbids
 // redistribution); the operator places them on their own infrastructure
 // and points us at the directory via `font_dir`.
 //
 // Honesty (§14.5): when `font_dir` is empty or the directory is missing,
 // `produce_document` falls back to system defaults silently and does NOT
-// advertise the branded `theme: thmanyah` Marp variant to the agent.
+// advertise branded output to the agent.
 pub const BrandingConfig = struct {
     /// Absolute path to a directory containing font subfolders. Expected
     /// structure (compatible with Thmanyah's distribution shape):

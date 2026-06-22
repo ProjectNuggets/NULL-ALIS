@@ -37,8 +37,9 @@ info:
     - Canvas/artifact CRUD, share, export, attachment upload (with
       `Idempotency-Key` dedupe), trace sharing, and the authenticated
       export download route are documented below. The artifact export
-      bridge resolves through `produce_document` and supports pdf, docx,
-      pptx, xlsx, and html; unknown formats return 400.
+      bridge resolves through `produce_document` and currently exposes
+      only PDF as the polished public export; DOCX/PPTX/XLSX/HTML are
+      parked legacy renderers and return 400 if requested.
     - TODO: Task lifecycle extensions are documented in docs/agent-lifecycle-spec.md.
 servers:
   - url: http://127.0.0.1:3000
@@ -3026,8 +3027,9 @@ paths:
         cannot pick `thmanyah` via this endpoint.
 
         Renderer-missing failures surface as `502 renderer_unavailable`
-        with the install hint embedded in `detail`. Format must be one
-        of `pdf|docx|pptx|xlsx|html`; anything else returns 400.
+        with the install hint embedded in `detail`. Format must be `pdf`;
+        DOCX/PPTX/XLSX/HTML are parked until their S-tier quality passes
+        are complete, and anything else returns 400.
 
         Response shape includes both `url` and `download_url`, both
         pointing at `GET /api/v1/users/{user_id}/exports/{filename}`
@@ -3044,7 +3046,7 @@ paths:
           required: false
           schema:
             type: string
-            enum: [pdf, docx, pptx, xlsx, html]
+            enum: [pdf]
             default: pdf
       responses:
         '200':
@@ -4482,7 +4484,7 @@ components:
           type: string
         format:
           type: string
-          enum: [pdf, docx, pptx, xlsx, html]
+          enum: [pdf]
         filename:
           type: string
           description: Generated filename inside attachments/produced/.

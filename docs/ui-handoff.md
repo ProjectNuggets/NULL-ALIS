@@ -54,7 +54,7 @@ explicitly scoped out of V1 by product.
 > **nullalis is a persistent personal-AI agent** that remembers you
 > across sessions, runs goal-oriented multi-step work autonomously,
 > drives both server-side and user-browser automation, produces
-> document-grade deliverables (PDF / DOCX / XLSX / PPTX / HTML), and
+> document-grade PDF deliverables, markdown source artifacts, and
 > exposes a Canvas/Artifacts side-panel for iterative authoring.
 
 The UI must communicate this story in the first 5 seconds of landing.
@@ -227,18 +227,15 @@ last_error_at_s}`. `connection_state` is derived from `last_seen_at` vs a
 
 | Format | Engine | Notes |
 |---|---|---|
-| PDF | pandoc + weasyprint | Resume / report style |
-| DOCX | pandoc | Word-compatible |
-| XLSX | pandas + openpyxl | Spreadsheet from structured data |
-| PPTX | marp-cli | Themes: `default`, `gaia`, `uncover`, `thmanyah` (brand) |
-| HTML | pandoc + tailored CSS | Standalone landing page |
+| PDF | pandoc + WeasyPrint | Public polished export; markdown source in, styled PDF out |
+| DOCX / XLSX / PPTX / HTML | parked legacy renderers | Hidden until each format gets its own S-tier pass |
 
 **UX surface**:
 - "**Deliverables**" tray at the top of the artifacts panel — separates
   real files from inline content.
-- Each deliverable is downloadable + previewable in a side panel.
-- Theme picker (PPTX only) defaults to `thmanyah` for brand
-  consistency; user can pick `default`/`gaia`/`uncover`.
+- Each PDF deliverable is downloadable + previewable in a side panel.
+- Hide DOCX/XLSX/PPTX/HTML export choices until the backend re-enables
+  them with explicit quality gates.
 - See `src/agent/prompt.zig` §"Deliverables — produce_document vs
   artifact vs inline" for when the agent should reach for which.
 
@@ -254,7 +251,7 @@ last_error_at_s}`. `connection_state` is derived from `last_seen_at` vs a
 | `artifact_revoke_share` *(v1.14.21)* | Unpublish a shared artifact | "Stop sharing" on share modal |
 | `artifact_diff` *(v1.14.21)* | Compute diff between two versions | "What changed since v3?" inline answer |
 | `artifact_history` *(v1.14.21)* | List all versions with timestamps + change summaries | "Version history" panel |
-| `POST /api/v1/users/:id/artifacts/:artifact_id/export?format=pdf|docx|pptx|xlsx|html` | Export an artifact through `produce_document` | Download / Open file action on artifact card |
+| `POST /api/v1/users/:id/artifacts/:artifact_id/export?format=pdf` | Export an artifact through `produce_document` | Download / Open PDF action on artifact card |
 | `artifact_event` SSE | Real-time refresh notification | Panel updates without polling |
 
 **UX rule**: artifacts are the "you're co-authoring with the agent"
@@ -534,8 +531,8 @@ config control plane.
 | Setting | Default | Description |
 |---|---|---|
 | `branding.font_dir` | unset → bundled Thmanyah at `/usr/local/share/nullalis/branding/fonts/` | v1.14.22 CR-04 — bundled fonts now ship IN the container. Operators don't need to deploy anything; tenants get branded output out of the box. Override with a custom dir only for non-Thmanyah brand. |
-| `branding.primary_color` | brand teal | Used in PDF/HTML/PPTX themes |
-| Default PPTX theme | `thmanyah` | User-overridable per call |
+| `branding.primary_color` | brand teal | Used in the PDF document theme |
+| Parked legacy themes | DOCX/PPTX/HTML | Hidden until S-tier passes ship |
 
 ### 3.4 Notifications
 
@@ -580,7 +577,7 @@ These are the "wow" surfaces — design them to feel premium.
 | First successful long-horizon delegate | Background-task completion toast | Proof of autonomy |
 | First user-browser automation | Permission card with screenshot of target page | Proof of trust + capability |
 | First model swap to 1M-context | Chip "Now using Claude Opus 4.7 — 1M token window" | Proof the picker actually changes the agent |
-| First Thmanyah-branded PDF/PPTX delivery | Brand-styled preview thumbnail | Proof of premium typography differentiator |
+| First Thmanyah-branded PDF delivery | Brand-styled preview thumbnail | Proof of premium typography differentiator |
 
 ### 4.6 Model picker UX *(v1.14.22)*
 
@@ -737,7 +734,7 @@ before public scale unless product explicitly hides the surface.
 - **P0 — Memory user scope + privacy (D60 / Hybrid Pillar 1)**: per-user memory write/read/delete/export verified end-to-end via the GDPR purge cascade tests, PII consent gate is opt-in by default, and the in-prompt "STORE if user shares own personal info" directive landed at `74ddd469` (live-verified 3/3 personal-fact prompts now store cleanly). Memory_doctor returns actionable readiness. `memory_store(valid_at)` shipped at `3d5ef37b`.
 
 **Closed in v1.14.21 / v1.14.22** (no longer deferred):
-- Artifact export bridge — `POST /api/v1/users/:id/artifacts/:id/export?format=pdf|docx|pptx|xlsx|html` resolves ownership via `getArtifactById`, calls `ProduceDocumentTool.execute()` with the safe `default` theme, and returns JSON `{status, artifact_id, format, filename, path, url, download_url}`. Companion route `GET /api/v1/users/:id/exports/:filename` streams the produced file with the right binary Content-Type and is filename-traversal guarded. Renderer-missing failures surface as `502 renderer_unavailable`. Covered by handler-level unit tests + live-PG cross-user isolation test.
+- Artifact export bridge — `POST /api/v1/users/:id/artifacts/:id/export?format=pdf` resolves ownership via `getArtifactById`, calls `ProduceDocumentTool.execute()`, and returns JSON `{status, artifact_id, format, filename, path, url, download_url}`. Companion route `GET /api/v1/users/:id/exports/:filename` streams the produced file with the right binary Content-Type and is filename-traversal guarded. Renderer-missing failures surface as `502 renderer_unavailable`; DOCX/PPTX/XLSX/HTML requests return `400 unsupported_format` while parked. Covered by handler-level unit tests + live-PG cross-user isolation test.
 - D63 — Renderer chain bundled in Dockerfile (texlive-xetex + pandoc + marp-cli + pandas + openpyxl + weasyprint + chromium); build-time probe runs a real PDF render
 - D64 — Per-user share-spam cap shipped (100 live shares; 429 surface)
 - D62 — `migrations.run()` wired into `zaki_state.migrate`
@@ -784,7 +781,7 @@ Before shipping any UI surface, confirm:
 **Canvas + artifacts**
 - [ ] You've subscribed to `artifact_event` SSE for live canvas refresh (no polling).
 - [ ] You've wired the artifact card's `Share` / `Stop sharing` / `Version history` / `Diff` actions — backend tools are `artifact_share` / `artifact_revoke_share` / `artifact_history` / `artifact_diff`.
-- [ ] You've smoke-tested artifact export for PDF and one office format against a live tenant; disabled UI if the backend gate is not closed.
+- [ ] You've smoke-tested PDF artifact export against a live tenant; DOCX/PPTX/XLSX/HTML buttons stay hidden until their backend gates are reopened.
 
 **Approval + autonomy**
 - [ ] You've wired the `approval_required` card with a 60s timeout + three actions (Approve / Modify-args / Deny).
@@ -823,7 +820,7 @@ Before shipping any UI surface, confirm:
 | Display font | Thmanyah Serif Display |
 | Body serif | Thmanyah Serif Text |
 | Theme tokens | (TODO — UI agent defines + writes back to `assets/branding/tokens.json`) |
-| PPTX brand theme | `thmanyah` in `produce_document` |
+| PDF brand typography | Thmanyah fonts resolved by `produce_document` |
 
 The Thmanyah font family is bundled in-repo (commit `49ad4618`),
 shipped IN the runtime container at `/usr/local/share/nullalis/branding/fonts/`

@@ -12124,7 +12124,7 @@ fn handleTraceGet(
 //   PUT    /api/v1/users/:user_id/artifacts/:id
 //   POST   /api/v1/users/:user_id/artifacts/:id/share
 //   DELETE /api/v1/users/:user_id/artifacts/:id/share
-//   POST   /api/v1/users/:user_id/artifacts/:id/export?format=pdf|docx|...
+//   POST   /api/v1/users/:user_id/artifacts/:id/export?format=pdf
 //
 // Public (no auth, CORS-open):
 //   GET    /api/v1/share/artifact/:share_code
@@ -12760,19 +12760,15 @@ fn handleArtifactExport(
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
     };
 
-    // Allowlist matches `produce_document`'s `Format` enum and applies the
-    // SAME case-insensitivity (produce_document.zig:492-500 trims + lowers
-    // via std.ascii.eqlIgnoreCase). We canonicalize to lowercase HERE so a
+    // Public export intentionally exposes only PDF. Legacy DOCX/PPTX/XLSX/HTML
+    // renderers are parked in produce_document until each gets its own quality
+    // pass. We canonicalize to lowercase HERE so a
     // caller passing `?format=PDF` still succeeds AND the response's
     // `format` field echoes the canonical lowercase form — easier for FE
     // contract validation.
     const format_raw = parseQueryParam(target, "format") orelse "pdf";
     const format: []const u8 = blk: {
         if (std.ascii.eqlIgnoreCase(format_raw, "pdf")) break :blk "pdf";
-        if (std.ascii.eqlIgnoreCase(format_raw, "docx")) break :blk "docx";
-        if (std.ascii.eqlIgnoreCase(format_raw, "pptx")) break :blk "pptx";
-        if (std.ascii.eqlIgnoreCase(format_raw, "xlsx")) break :blk "xlsx";
-        if (std.ascii.eqlIgnoreCase(format_raw, "html")) break :blk "html";
         // Format-allowlist failure: upgrade the result_label to
         // "invalid_format" so the SLO signal correctly attributes THIS
         // 400 to a bad format param (vs. bad method/artifact_id/user_id,
@@ -12780,7 +12776,7 @@ fn handleArtifactExport(
         result_label = "invalid_format";
         return .{
             .status = "400 Bad Request",
-            .body = "{\"error\":\"invalid_format\",\"detail\":\"format must be one of: pdf, docx, pptx, xlsx, html\"}",
+            .body = "{\"error\":\"unsupported_format\",\"detail\":\"PDF is the only public export format right now; DOCX, PPTX, XLSX, and HTML are parked until their S-tier renderers ship\"}",
         };
     };
     // Format validated — upgrade the metric label so the histogram and
@@ -12971,7 +12967,7 @@ fn handleArtifactExport(
 /// uses, so the caller does NOT free them. Heap-allocated error strings (via
 /// allocPrint) are everything else and MUST be freed.
 fn isProduceDocumentLiteralError(em: []const u8) bool {
-    return std.mem.eql(u8, em, "Missing 'format' parameter (one of: pdf, docx, xlsx, pptx, html)") or
+    return std.mem.eql(u8, em, "Missing 'format' parameter (only supported: pdf)") or
         std.mem.eql(u8, em, "Missing 'content' parameter") or
         std.mem.eql(u8, em, "'content' must not be empty") or
         std.mem.eql(u8, em, "Workspace not configured — tool has no place to write the produced document");
@@ -21310,7 +21306,7 @@ fn handleApiRoute(
     //   PUT    /artifacts/:id                          → user edit
     //   POST   /artifacts/:id/share                    → mint share code
     //   DELETE /artifacts/:id/share                    → revoke share
-    //   POST   /artifacts/:id/export?format=pdf|docx|pptx|xlsx|html → produce_document bridge
+    //   POST   /artifacts/:id/export?format=pdf → produce_document bridge
     if (std.mem.eql(u8, parsed.subpath, "artifacts")) {
         const target = extractRequestTarget(raw_request) orelse base_path;
         return handleArtifactList(req_allocator, method, scoped_user_id, state, target);
@@ -37158,7 +37154,28 @@ test "Wave 2A: export endpoint rejects unknown format with 400" {
         &state,
     );
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid_format") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "unsupported_format") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "PDF") != null);
+}
+
+test "Wave 2A: export endpoint rejects parked legacy format with 400" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    var ctx = try makeExportTestUserCtx(std.testing.allocator, "/tmp/nullalis-export-test-fake");
+    defer ctx.deinit(std.testing.allocator);
+    const resp = handleArtifactExport(
+        std.testing.allocator,
+        "POST",
+        "1",
+        "00000000-0000-0000-0000-000000000000",
+        "/api/v1/users/1/artifacts/00000000-0000-0000-0000-000000000000/export?format=html",
+        &ctx,
+        null,
+        &state,
+    );
+    try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "unsupported_format") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "parked") != null);
 }
 
 test "Wave 2A: export endpoint rejects malformed artifact id with 400" {
@@ -37366,9 +37383,9 @@ test "Wave 2A live: export bridge writes produced file + returns download URL" {
     var ctx = try makeExportTestUserCtx(allocator, ws);
     defer ctx.deinit(allocator);
 
-    // Pick HTML — pandoc-only path; if pandoc isn't installed we still
-    // exercise the renderer_unavailable code path (asserted below).
-    const target = try std.fmt.allocPrint(allocator, "/api/v1/users/601/artifacts/{s}/export?format=html", .{artifact.id});
+    // Pick PDF — if the renderer chain isn't installed we still exercise
+    // the renderer_unavailable code path (asserted below).
+    const target = try std.fmt.allocPrint(allocator, "/api/v1/users/601/artifacts/{s}/export?format=pdf", .{artifact.id});
     defer allocator.free(target);
 
     const resp = handleArtifactExport(
@@ -37390,10 +37407,10 @@ test "Wave 2A live: export bridge writes produced file + returns download URL" {
         return;
     }
 
-    // pandoc IS installed — full success path.
+    // PDF renderer chain IS installed — full success path.
     try std.testing.expectEqualStrings("200 OK", resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"status\":\"exported\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"format\":\"html\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"format\":\"pdf\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "attachments/produced/") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "/api/v1/users/601/exports/") != null);
     if (resp.body.len > 0) allocator.free(resp.body);

@@ -1031,19 +1031,19 @@ fn buildResponseProtocolSection(w: anytype) !void {
     try w.writeAll("## Deliverables — produce_document vs artifact vs inline\n\n");
     try w.writeAll("Pick the right output shape for the user's request:\n\n");
     try w.writeAll("- **Short reply (1-3 paragraphs, conversational, one-off):** answer INLINE in chat. No tool needed. Most turns end here.\n");
-    try w.writeAll("- **Substantial deliverable the user will save / send / share, finished in one shot** (PDF report, slide deck, spreadsheet, Word doc): call **`produce_document`**. Output file lands in `attachments/produced/`, returned as a markdown link. Best for: market research PDFs, expense XLSX, kickoff PPTX, formal docx letters, standalone HTML reports.\n");
+    try w.writeAll("- **Substantial deliverable the user will save / send / share, finished in one shot** (PDF report, executive brief, proposal, plan, memo, research report): call **`produce_document(format=pdf)`**. Output file lands in `attachments/produced/`, returned as a markdown link. Markdown remains the editable/source artifact; PDF is the polished public export.\n");
     try w.writeAll("- **Iterative document the user will REFINE over multiple turns** (\"make the intro shorter\", \"add a section on pricing\"): call **`artifact_create`** first → side-panel canvas the user sees + edits + you update via `artifact_update`. Each update versions automatically; user can revert. On the user's explicit export request → bridge to `produce_document` for the final file.\n");
     try w.writeAll("- **Raw markdown / code / config the user wants in workspace** (a CLAUDE.md template, a config.json, a Python script): use **`file_write`**. No rendering, no versioning, no canvas. The file is the thing.\n");
     try w.writeAll("- **A chart, logo, diagram, or illustration:** **`image_generate`** — Together-hosted FLUX/SD models, image lands in workspace as markdown the FE renders inline.\n\n");
-    try w.writeAll("**Honesty rule:** if `produce_document` returns an install-hint error (pandoc / marp-cli / pandas missing), surface that to the user VERBATIM and offer an alternative (HTML if PDF fails, CSV if XLSX fails, plain markdown via `file_write` as a last resort). Do NOT try to install binaries via `shell` — the sandbox blocks it.\n\n");
+    try w.writeAll("**Honesty rule:** if `produce_document` returns an install-hint error (pandoc / WeasyPrint / XeLaTeX missing), surface that to the user VERBATIM and offer plain markdown via `artifact_create` or `file_write` as the fallback. Do NOT try to install binaries via `shell` — the sandbox blocks it. DOCX/PPTX/XLSX/HTML exports are parked until their own quality passes; do not offer them as substitutes.\n\n");
     try w.writeAll("**Artifact lifecycle pattern (the canvas play):**\n");
     try w.writeAll("0. Artifact quality bar: make the canvas share-ready on first creation — clear title, strong opening answer, useful headings, concise sections, tables where they help, explicit assumptions when inputs are sparse, no placeholders, no lorem ipsum, no meta commentary about how you made it.\n");
-    try w.writeAll("0a. Artifact blueprints: report/brief = one-page brief → what matters → options/analysis → recommendation → risks/assumptions; deck = title slide → current gap → decision options → recommendation → next steps, one idea per slide; spreadsheet = clean CSV with headers, owner/status/priority/date/risk columns when relevant, summary rows when useful; HTML artifact = complete semantic HTML with inline CSS, responsive layout, real copy, and no external scripts.\n");
+    try w.writeAll("0a. Artifact blueprints: report/brief = one-page brief → what matters → options/analysis → recommendation → risks/assumptions; proposal = objective → scope → approach → timeline → investment → risks; plan = goal → phases → owners → dates → dependencies → success criteria; memo = context → decision → rationale → implications → next steps.\n");
     try w.writeAll("1. User asks for something substantial → `artifact_create(title, kind=markdown, content=<v1 draft>)`. Tell the user the canvas is open.\n");
     try w.writeAll("2. User requests changes → `artifact_update(id, new_content, change_summary=<one line>)`. The version bumps; the user sees the diff.\n");
     try w.writeAll("3. User asks to share → call `artifact_share(artifact_id, expires_in_hours?)` — mints an opaque public URL with a default 7-day TTL (max 30 days). Returns `{share_code, share_url, expires_at}`. Surface the URL inline so the user can copy it. To unpublish: `artifact_revoke_share(artifact_id)`. The UI also exposes a Share button on the artifact card; both paths land on the same backend.\n");
     try w.writeAll("4. User asks 'what changed since v3?' or to inspect history → use `artifact_history(artifact_id)` for the version list or `artifact_diff(artifact_id, from_version, to_version)` for a specific revision comparison.\n");
-    try w.writeAll("5. User asks to export → call `produce_document(format=pdf|docx|pptx|xlsx|html, content=<artifact content>, title=<artifact title>)`. The user gets a downloadable file alongside the live canvas.\n\n");
+    try w.writeAll("5. User asks to export → call `produce_document(format=pdf, content=<artifact content>, title=<artifact title>)`. The user gets a downloadable PDF alongside the live canvas.\n\n");
     try w.writeAll("6. When discussing or revising an existing long artifact/document, never treat a partial `artifact_get` page as the full body. If the tool returns `partial=true` or a `next_offset`, keep paging with `artifact_get(offset=<next_offset>, max_chars=200000)` until you have the sections needed for the user's request. Do not repeat truncation markers to the user as if they were document content.\n\n");
     // v1.14.23 WARN 4.A — Introspection tools narration.
     // The schema-level tool catalog already advertises these (via
@@ -1870,8 +1870,8 @@ test "buildStableSystemPrompt includes S-tier artifact blueprints" {
     try std.testing.expect(std.mem.indexOf(u8, stable, "Artifact quality bar") != null);
     try std.testing.expect(std.mem.indexOf(u8, stable, "Artifact blueprints") != null);
     try std.testing.expect(std.mem.indexOf(u8, stable, "report/brief = one-page brief") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stable, "spreadsheet = clean CSV") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stable, "HTML artifact = complete semantic HTML") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stable, "produce_document(format=pdf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stable, "DOCX/PPTX/XLSX/HTML exports are parked") != null);
     try std.testing.expect(std.mem.indexOf(u8, stable, "never treat a partial `artifact_get` page as the full body") != null);
     try std.testing.expect(std.mem.indexOf(u8, stable, "Do not repeat truncation markers to the user") != null);
 }

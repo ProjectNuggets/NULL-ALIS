@@ -1,22 +1,16 @@
 //! produce_document — first-class document generation for the agent.
 //!
-//! Before this tool, the agent had to discover the right pandoc / wkhtmltopdf /
-//! python-pptx / openpyxl incantation every time a user asked for a deliverable
-//! PDF, DOCX, XLSX, or PPTX. The shell tool can do it, but the agent kept
-//! re-inventing the recipe (and frequently producing fragile shell strings).
+//! Before this tool, the agent had to discover the right pandoc / WeasyPrint /
+//! XeLaTeX incantation every time a user asked for a deliverable PDF. The
+//! shell tool can do it, but the agent kept re-inventing the recipe (and
+//! frequently producing fragile shell strings).
 //! This tool exposes a stable schema: pick a format, supply source content,
 //! get a file in `<workspace>/attachments/produced/` plus a markdown reference
 //! the FE renders inline.
 //!
 //! Runtime dependencies (NOT bundled — must be installed in the runtime image):
-//!   - PDF:  pandoc (preferred) OR wkhtmltopdf OR weasyprint
-//!           install: brew install pandoc  /  apt install pandoc
-//!   - DOCX: pandoc
-//!   - XLSX: python3 + pandas + openpyxl (preferred) OR pure-python fallback
-//!           install: pip install pandas openpyxl
-//!   - PPTX: marp-cli (CommonMark + slide separators → pptx)
-//!           install: npm install -g @marp-team/marp-cli
-//!   - HTML: pandoc
+//!   - PDF: pandoc + weasyprint preferred; pandoc/xelatex kept as fallback.
+//!          install: brew install pandoc  /  apt install pandoc  /  pip install weasyprint
 //!
 //! Honesty: if the required binary is missing the tool returns a clear error
 //! that names BOTH the failure point AND the install hint. Per §14.5, we never
@@ -193,6 +187,61 @@ const HTML_DOCUMENT_STYLE =
     \\}
 ;
 
+const PDF_PRINT_STYLE =
+    \\@page {
+    \\  size: Letter;
+    \\  margin: 22mm 18mm 24mm;
+    \\  @bottom-left {
+    \\    content: "nullALIS";
+    \\    color: #777b76;
+    \\    font-size: 9px;
+    \\  }
+    \\  @bottom-right {
+    \\    content: counter(page);
+    \\    color: #777b76;
+    \\    font-size: 9px;
+    \\  }
+    \\}
+    \\@media print {
+    \\  body {
+    \\    font-size: 11.2pt;
+    \\    line-height: 1.58;
+    \\  }
+    \\  body > h1:first-of-type {
+    \\    margin: 0 0 18mm;
+    \\    padding: 0 0 9mm;
+    \\    border-bottom: 2px solid var(--artifact-accent);
+    \\    font-size: 31pt;
+    \\    line-height: 1.04;
+    \\  }
+    \\  h1, h2, h3, h4 {
+    \\    break-after: avoid;
+    \\    page-break-after: avoid;
+    \\  }
+    \\  h2 {
+    \\    margin-top: 12mm;
+    \\  }
+    \\  p, li {
+    \\    orphans: 3;
+    \\    widows: 3;
+    \\  }
+    \\  table {
+    \\    page-break-inside: avoid;
+    \\    break-inside: avoid;
+    \\  }
+    \\  thead {
+    \\    display: table-header-group;
+    \\  }
+    \\  tr, img, blockquote, pre {
+    \\    page-break-inside: avoid;
+    \\    break-inside: avoid;
+    \\  }
+    \\  pre {
+    \\    white-space: pre-wrap;
+    \\  }
+    \\}
+;
+
 const MARP_DEFAULT_THEME_CSS =
     \\/* @theme zaki-default */
     \\
@@ -290,10 +339,10 @@ pub const ProduceDocumentTool = struct {
     pub const tool_name = "produce_document";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Render markdown or CSV input to PDF, DOCX, XLSX, PPTX, or HTML deliverable.",
+        .what = "Render markdown input to a polished PDF deliverable.",
         .use_when = &.{
-            "User asks for a deliverable in pdf/docx/xlsx/pptx/html format",
-            "Producing a report, memo, slide deck, or spreadsheet from drafted content",
+            "User asks for a saveable, sendable, or shareable PDF deliverable",
+            "Producing a report, memo, brief, proposal, plan, or research document from drafted markdown",
             "Converting agent-authored markdown into a polished downloadable file",
         },
         .do_not_use_for = &.{
@@ -301,7 +350,7 @@ pub const ProduceDocumentTool = struct {
             "file_write — for plain markdown / code / text where no rendering needed",
             "web_fetch — for downloading existing documents rather than producing new ones",
         },
-        .cost_note = "Invokes a local renderer (pandoc / marp / python). Requires those binaries installed in the runtime.",
+        .cost_note = "Invokes local renderers (pandoc + WeasyPrint preferred, pandoc/XeLaTeX fallback). Requires those binaries installed in the runtime.",
         .completion_hint = "Writes <workspace>/attachments/produced/<title>_<ts>.<ext> and returns a markdown link for the FE to render inline.",
     };
 
@@ -310,17 +359,16 @@ pub const ProduceDocumentTool = struct {
     }
 
     pub const tool_description =
-        "Render a document (PDF, DOCX, XLSX, PPTX, or HTML) from source content. " ++
-        "Source format follows the output: markdown for pdf/docx/html, CSV for xlsx, " ++
-        "markdown with slide separators (`---`) for pptx. The rendered file lands in " ++
+        "Render a polished PDF from markdown source content. " ++
+        "The rendered file lands in " ++
         "<workspace>/attachments/produced/ and the tool returns a markdown link the FE " ++
-        "renders inline. Requires pandoc (pdf/docx/html), marp-cli (pptx), and " ++
-        "python3 + pandas + openpyxl (xlsx) in the runtime image. If a required binary " ++
+        "renders inline. Requires pandoc + WeasyPrint in the runtime image; pandoc/XeLaTeX " ++
+        "is kept as a compatibility fallback. If a required binary " ++
         "is missing the tool returns a clear error with the install hint — surface that " ++
         "to the user verbatim; do NOT try to install binaries via shell (sandbox blocks it).\n\n" ++
-        // ─── Format templates — the model copies these patterns, so
+        // ─── PDF blueprint — the model copies these patterns, so
         // they must encode document quality, not just syntax.
-        "## How to format `content` per `format`\n\n" ++
+        "## How to format `content`\n\n" ++
         "## Artifact quality gate\n" ++
         "Before calling this tool, make the source read like a final deliverable: a specific\n" ++
         "title, a useful opening answer, scannable sections, concrete numbers/names when\n" ++
@@ -328,10 +376,10 @@ pub const ProduceDocumentTool = struct {
         "Do not include process notes such as \"I created this\" or instructions about how to\n" ++
         "use the document. If the user gave sparse input, create a polished first draft with\n" ++
         "clearly labeled assumptions instead of an empty template.\n\n" ++
-        "### pdf / docx / html — markdown source\n" ++
+        "### pdf — markdown source\n" ++
         "Use standard markdown. Headings (`#`/`##`), bullet lists (`- `), numbered lists\n" ++
         "(`1. `), tables (pipe syntax), code blocks (triple backticks), blockquotes (`> `),\n" ++
-        "links (`[text](url)`), images (`![alt](path)`). pandoc handles the rest. Keep\n" ++
+        "links (`[text](url)`), images (`![alt](path)`). The renderer handles the rest. Keep\n" ++
         "headings shallow (2-3 levels) for readable PDFs.\n\n" ++
         "Default decision-doc blueprint:\n" ++
         "1. `# <specific title>`\n" ++
@@ -345,94 +393,46 @@ pub const ProduceDocumentTool = struct {
         "# Launch Readiness Brief — Agent Artifacts\n\n" ++
         "## One-page brief\n" ++
         "The artifact experience is close to launch, but the last-mile quality bar is the\n" ++
-        "document itself: every export should look share-ready before the user edits it.\n" ++
-        "The highest-leverage move is to standardize creation blueprints and improve the\n" ++
-        "default rendering path for HTML, PPTX, and spreadsheet exports.\n\n" ++
+        "document itself: every PDF export should look share-ready before the user edits it.\n" ++
+        "The highest-leverage move is to standardize creation blueprints and route PDF\n" ++
+        "through the styled HTML renderer before printing.\n\n" ++
         "## What matters\n" ++
         "- First impression: the opening page/slide must state a useful answer, not a template.\n" ++
         "- Editability: artifacts should preserve clean headings and tables so revisions are local.\n" ++
-        "- Export trust: PDF/DOCX/PPTX/XLSX/HTML should keep structure when downloaded.\n\n" ++
+        "- Export trust: PDF should preserve typography, tables, and section rhythm when downloaded.\n\n" ++
         "## Options\n" ++
         "| Option | Upside | Tradeoff |\n" ++
         "|---|---|---|\n" ++
         "| Prompt-only blueprints | Fastest quality lift | Depends on model compliance |\n" ++
-        "| Renderer themes | Improves every export | Does not fix weak source content |\n" ++
-        "| Structured workbook/deck specs | Best long-term control | Larger schema change |\n\n" ++
+        "| Styled HTML-to-PDF | Improves every export | Does not fix weak source content |\n" ++
+        "| Structured document specs | Best long-term control | Larger schema change |\n\n" ++
         "## Recommendation\n" ++
-        "Ship prompt blueprints and renderer themes now, then add structured workbook/deck\n" ++
-        "specs once the default surface is stable.\n\n" ++
+        "Ship prompt blueprints and the styled PDF renderer now, then add structured\n" ++
+        "document specs once the default surface is stable.\n\n" ++
         "## Risks and assumptions\n" ++
         "- Assumption: users prefer a strong editable draft over a blank form.\n" ++
         "- Risk: renderer dependencies may be missing in smaller deployments.\n" ++
         "```\n\n" ++
-        "### xlsx — CSV source\n" ++
-        "Plain CSV with a header row, then data rows. Use commas as separators; quote values\n" ++
-        "containing commas with `\"...\"`. Make the sheet useful, not just raw data: include\n" ++
-        "clear column names, units, status/owner fields when relevant, and summary rows when\n" ++
-        "the user asked for a model, budget, plan, or tracker. Avoid formulas from untrusted\n" ++
-        "input; use numeric values and explanatory columns instead.\n\n" ++
-        "EXAMPLE (XLSX / launch tracker):\n" ++
-        "```\n" ++
-        "Workstream,Owner,Status,Priority,Next Step,Due Date,Risk\n" ++
-        "Artifact templates,Product,In progress,High,Approve default document blueprint,2026-06-10,Medium\n" ++
-        "Renderer themes,Engineering,In progress,High,Verify PPTX and HTML export styling,2026-06-11,Low\n" ++
-        "Share page,Frontend,Ready,Medium,Run recipient smoke test,2026-06-12,Low\n" ++
-        "SUMMARY,,3 workstreams,2 high-priority,,,\n" ++
-        "```\n\n" ++
-        "### pptx — markdown with `---` slide separators (Marp convention)\n" ++
-        "Each `---` on its own line starts a new slide. First H1 on a slide is the title;\n" ++
-        "the rest is body. Write decks as executive narrative, not prose pasted onto slides:\n" ++
-        "one idea per slide, 3-5 bullets max, strong section titles, and a final decision or\n" ++
-        "next-step slide. Use tables only when comparison is the point.\n" ++
-        "The Marp `marp: true` frontmatter is AUTO-PREPENDED so you don't include it —\n" ++
-        "just write slide content. Pick a theme via the optional `theme` param:\n" ++
-        "  - `default` (ZAKI editorial theme, crisp white/ink/accent) — best general use\n" ++
-        "  - `gaia` (warm cream, serif accents, book-feel) — best for talks\n" ++
-        "  - `uncover` (bold black/white, big type) — best for keynote / lecture\n" ++
-        "  - `thmanyah` (brand typography) — AVAILABLE ONLY WHEN the operator has\n" ++
-        "    deployed a font dir + set `branding.font_dir` in config. If you pick\n" ++
-        "    `thmanyah` without branding enabled the tool returns a clear error so\n" ++
-        "    you can fall back to `default`. See your operator if you want branded\n" ++
-        "    output and it is not currently available.\n" ++
-        "If you DO want custom frontmatter, start `content` with `---` and yours wins\n" ++
-        "(operator escape hatch).\n\n" ++
         "### branding (operator-owned)\n" ++
         "When the operator has deployed a brand font (e.g. Thmanyah) and set\n" ++
-        "`branding.font_dir` in config, every PDF / DOCX / PPTX / HTML produced by\n" ++
+        "`branding.font_dir` in config, every PDF produced by\n" ++
         "this tool uses the brand typography automatically — you write the same\n" ++
-        "content, the deliverable carries the brand. For DOCX specifically, the\n" ++
-        "operator may also place a styled `<workspace>/branding/reference.docx` for\n" ++
-        "richer style application; if absent the tool logs a hint and produces a\n" ++
-        "plain DOCX. Branding is NOT a per-user preference — do not expose a\n" ++
+        "content, the deliverable carries the brand. Branding is NOT a per-user preference — do not expose a\n" ++
         "branding choice to users; it is an operator-level brand decision.\n\n" ++
-        "EXAMPLE (PPTX / product decision deck):\n" ++
-        "```\n" ++
-        "# Agent Artifacts Should Feel Finished\n" ++
-        "**Decision deck — June 2026**\n" ++
-        "---\n" ++
-        "# The Current Gap\n" ++
-        "- The canvas and share mechanics work\n" ++
-        "- The first draft still reads too generic\n" ++
-        "- Export quality depends on renderer defaults\n" ++
-        "---\n" ++
-        "# What Changes Now\n" ++
-        "- Strong blueprints for docs, sheets, decks, and HTML\n" ++
-        "- Styled HTML and PPTX defaults\n" ++
-        "- Versioned artifacts remain the authoring surface\n" ++
-        "---\n" ++
-        "# Decision\n" ++
-        "> Treat every artifact as a share-ready deliverable on the first pass.\n" ++
-        "```\n\n" ++
+        "### parked legacy renderers\n" ++
+        "DOCX, PPTX, XLSX, and HTML are intentionally hidden until each renderer gets\n" ++
+        "its own S-tier quality pass. Use markdown artifacts for iteration and PDF\n" ++
+        "for polished save/share/send requests.\n\n" ++
         "## When to use produce_document vs alternatives\n" ++
         "- For a quick 1-3 paragraph reply → answer INLINE, don't produce a doc.\n" ++
-        "- For a substantial deliverable the user will save or share → produce_document.\n" ++
+        "- For a substantial deliverable the user will save or share → produce_document(format=pdf).\n" ++
         "- For an iterative document the user will refine over many turns → artifact_create\n" ++
         "  (canvas) FIRST, then produce_document only on the user's explicit export request.\n" ++
         "- For a chart or image → image_generate.\n" ++
         "- For raw markdown / code the user will copy → file_write.";
 
     pub const tool_params =
-        \\{"type":"object","properties":{"format":{"type":"string","enum":["pdf","docx","xlsx","pptx","html"],"description":"Output format. pdf/docx/html accept markdown input; xlsx accepts CSV; pptx accepts markdown with --- slide separators."},"content":{"type":"string","description":"Source content. Markdown for pdf/docx/html/pptx, CSV for xlsx. Required."},"title":{"type":"string","description":"Document title — used for the output filename and (where supported) document metadata. Default 'untitled'. Will be sanitized to filesystem-safe characters."},"theme":{"type":"string","enum":["default","gaia","uncover","thmanyah"],"description":"Marp theme for PPTX slides. Ignored for non-pptx formats. 'default' = ZAKI editorial theme with crisp white/ink/accent styling. 'gaia' = warm cream background with serif accents, good for talks. 'uncover' = bold black-on-white, lecture/keynote style. 'thmanyah' = brand typography (AVAILABLE ONLY when operator has deployed branding fonts; otherwise returns a clear error). Default 'default'."}},"required":["format","content"]}
+        \\{"type":"object","properties":{"format":{"type":"string","enum":["pdf"],"description":"Output format. PDF is the only public polished export while DOCX/PPTX/XLSX/HTML are parked for later quality passes."},"content":{"type":"string","description":"Markdown source content. Required."},"title":{"type":"string","description":"Document title — used for the output filename and document metadata. Default 'untitled'. Will be sanitized to filesystem-safe characters."}},"required":["format","content"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -473,19 +473,28 @@ pub const ProduceDocumentTool = struct {
         // ── Validate args ────────────────────────────────────────────
         const format_raw = root.getString(args, "format") orelse {
             metric_result = "invalid_input";
-            return ToolResult.fail("Missing 'format' parameter (one of: pdf, docx, xlsx, pptx, html)");
+            return ToolResult.fail("Missing 'format' parameter (only supported: pdf)");
         };
         const format = parseFormat(format_raw) orelse {
             metric_result = "invalid_input";
             const msg = try std.fmt.allocPrint(
                 allocator,
-                "Invalid 'format' value: '{s}'. Must be one of: pdf, docx, xlsx, pptx, html",
+                "Invalid 'format' value: '{s}'. Only supported public format is: pdf",
                 .{format_raw},
             );
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
         const format_label = formatLabel(format);
         metric_format = format_label;
+        if (format != .pdf) {
+            metric_result = "invalid_input";
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "Format '{s}' is parked. PDF is the only public export format until this renderer gets its S-tier quality pass.",
+                .{format_raw},
+            );
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        }
 
         const content = root.getString(args, "content") orelse
             return ToolResult.fail("Missing 'content' parameter");
@@ -504,28 +513,6 @@ pub const ProduceDocumentTool = struct {
         const safe_title = try sanitizeTitle(allocator, raw_title);
         defer allocator.free(safe_title);
 
-        // 2026-05-25 (Wave 3 hardening) — Marp slide theme support.
-        // For PPTX, the renderer needs `marp: true` in the source's YAML
-        // frontmatter to actually treat the markdown as slides. We auto-
-        // prepend that frontmatter so the agent's `content` can be pure
-        // slide markdown (---separated H1 + body) without per-call ritual.
-        // Themes:
-        //   - default — generated ZAKI editorial theme (general use)
-        //   - gaia    — Marp built-in warm cream + serif accents
-        //   - uncover — Marp built-in bold black-on-white
-        //   - thmanyah — generated brand theme when operator fonts exist
-        // For non-pptx formats this param is ignored (with a hint in the
-        // tool schema).
-        const theme_raw = root.getString(args, "theme") orelse "default";
-        const theme = parseTheme(theme_raw) orelse {
-            const msg = try std.fmt.allocPrint(
-                allocator,
-                "Invalid 'theme' value: '{s}'. Must be one of: default, gaia, uncover, thmanyah",
-                .{theme_raw},
-            );
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-
         if (self.workspace_dir.len == 0) {
             return ToolResult.fail("Workspace not configured — tool has no place to write the produced document");
         }
@@ -542,20 +529,6 @@ pub const ProduceDocumentTool = struct {
             break :blk null;
         };
         defer if (resolved_branding_opt) |rb| rb.deinit(allocator);
-
-        // §14.5 honesty gate: if the agent picked `thmanyah` theme but
-        // branding is NOT enabled, refuse with a clear error rather than
-        // silently substituting `default`. The agent must surface this so
-        // the user knows their explicit branded request can't be honored.
-        if (theme == .thmanyah and resolved_branding_opt == null) {
-            const msg = try allocator.dupe(
-                u8,
-                "theme='thmanyah' requires operator branding to be enabled. " ++
-                    "Branding is not configured (operator hasn't set `branding.font_dir` in config). " ++
-                    "Fall back to theme='default'/'gaia'/'uncover' or ask your operator to deploy the brand font.",
-            );
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        }
 
         // ── Prepare directories ──────────────────────────────────────
         const sources_dir = try std.fs.path.join(allocator, &.{ self.workspace_dir, "attachments", "sources" });
@@ -618,13 +591,6 @@ pub const ProduceDocumentTool = struct {
 
         // ── Write source file ────────────────────────────────────────
         //
-        // For PPTX, prepend the Marp frontmatter so the agent's content can
-        // be pure slide markdown without per-call frontmatter ritual. The
-        // frontmatter selects the theme + sets sensible slide defaults
-        // (16:9 widescreen, paginate every slide). If the agent's content
-        // ALREADY starts with `---` (custom frontmatter), we skip our
-        // prepend so the agent's intent wins — operator escape hatch.
-        const should_prepend_marp = (format == .pptx) and !std.mem.startsWith(u8, content, "---");
         {
             const src_file = std.fs.createFileAbsolute(src_path, .{}) catch |err| {
                 const msg = try std.fmt.allocPrint(
@@ -635,22 +601,6 @@ pub const ProduceDocumentTool = struct {
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
             defer src_file.close();
-            if (should_prepend_marp) {
-                const fm = try std.fmt.allocPrint(
-                    allocator,
-                    "---\nmarp: true\ntheme: {s}\npaginate: true\nsize: 16:9\n---\n\n",
-                    .{marpThemeName(theme)},
-                );
-                defer allocator.free(fm);
-                src_file.writeAll(fm) catch |err| {
-                    const msg = try std.fmt.allocPrint(
-                        allocator,
-                        "Failed to write Marp frontmatter: {s}",
-                        .{@errorName(err)},
-                    );
-                    return ToolResult{ .success = false, .output = "", .error_msg = msg };
-                };
-            }
             src_file.writeAll(content) catch |err| {
                 const msg = try std.fmt.allocPrint(
                     allocator,
@@ -662,13 +612,9 @@ pub const ProduceDocumentTool = struct {
         }
 
         // ── Dispatch to renderer ─────────────────────────────────────
-        const render_result = switch (format) {
-            .pdf => try renderPdf(allocator, src_path, out_path, safe_title, resolved_branding_opt),
-            .docx => try renderDocx(allocator, src_path, out_path, safe_title, self.workspace_dir, resolved_branding_opt),
-            .xlsx => try renderXlsx(allocator, src_path, out_path),
-            .pptx => try renderPptx(allocator, src_path, out_path, theme, self.workspace_dir, resolved_branding_opt),
-            .html => try renderHtml(allocator, src_path, out_path, safe_title, resolved_branding_opt),
-        };
+        // ponytail: legacy DOCX/XLSX/PPTX/HTML renderers stay parked behind
+        // the public PDF-only gate until each format earns its own quality pass.
+        const render_result = try renderPdf(allocator, src_path, out_path, safe_title, resolved_branding_opt);
 
         // If renderer failed, return the error (and clean up the output if it
         // got partially created).
@@ -939,10 +885,13 @@ fn resolveBundledFontsPath(allocator: std.mem.Allocator) ?[]const u8 {
         if (directoryExists(p)) return p;
         allocator.free(p);
     }
-    // Candidate F: cwd + assets/branding/fonts (dev run from repo root)
-    const f = allocator.dupe(u8, "assets/branding/fonts") catch return null;
-    if (directoryExists(f)) return f;
-    allocator.free(f);
+    // Candidate F: cwd + assets/branding/fonts (dev run from repo root).
+    // Return an absolute path because CSS @font-face emits file:// URLs.
+    if (directoryExists("assets/branding/fonts")) {
+        return std.fs.cwd().realpathAlloc(allocator, "assets/branding/fonts") catch {
+            return allocator.dupe(u8, "assets/branding/fonts") catch null;
+        };
+    }
     return null;
 }
 
@@ -1089,6 +1038,7 @@ pub fn cssFontFaceBlock(
 fn buildHtmlHeaderContent(
     allocator: std.mem.Allocator,
     resolved_branding: ?ResolvedBranding,
+    include_pdf_style: bool,
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -1107,6 +1057,7 @@ fn buildHtmlHeaderContent(
         try w.writeAll(":root { --artifact-body-font: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; --artifact-display-font: Georgia, 'Times New Roman', serif; }\n");
     }
     try w.writeAll(HTML_DOCUMENT_STYLE);
+    if (include_pdf_style) try w.writeAll(PDF_PRINT_STYLE);
     try w.writeAll("</style>\n");
 
     return buf.toOwnedSlice(allocator);
@@ -1198,20 +1149,81 @@ fn sanitizeTitle(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 
 // ── Renderer dispatch ────────────────────────────────────────────────
 
-/// PDF: try pandoc+xelatex → pandoc default LaTeX → wkhtmltopdf → weasyprint.
-/// The xelatex path is first because pdflatex rejects common Unicode input
-/// (emoji, symbols, non-Latin text) that the UI artifact surface can produce.
-/// Fallbacks are attempted only for infrastructure gaps or the known pdflatex
-/// Unicode failure shape, not for arbitrary renderer/content failures.
+fn renderStyledHtml(
+    allocator: std.mem.Allocator,
+    src_path: []const u8,
+    out_path: []const u8,
+    title: []const u8,
+    resolved_branding: ?ResolvedBranding,
+    include_pdf_style: bool,
+) !RendererAttempt {
+    const meta = try metadataArg(allocator, "title", title);
+    defer allocator.free(meta);
+
+    var header_path_opt: ?[]u8 = null;
+    defer if (header_path_opt) |hp| {
+        std.fs.deleteFileAbsolute(hp) catch {};
+        allocator.free(hp);
+    };
+
+    const header_path = try std.fmt.allocPrint(allocator, "{s}.header.html", .{out_path});
+    errdefer allocator.free(header_path);
+
+    const header_content = try buildHtmlHeaderContent(allocator, resolved_branding, include_pdf_style);
+    defer allocator.free(header_content);
+
+    const f = std.fs.createFileAbsolute(header_path, .{}) catch |err| {
+        allocator.free(header_path);
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "Failed to create HTML document header '{s}': {s}",
+            .{ header_path, @errorName(err) },
+        );
+        return RendererAttempt{ .ran_but_failed = ToolResult{ .success = false, .output = "", .error_msg = msg } };
+    };
+    defer f.close();
+    f.writeAll(header_content) catch |err| {
+        allocator.free(header_path);
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "Failed to write HTML document header: {s}",
+            .{@errorName(err)},
+        );
+        return RendererAttempt{ .ran_but_failed = ToolResult{ .success = false, .output = "", .error_msg = msg } };
+    };
+    header_path_opt = header_path;
+
+    var argv_buf: [10][]const u8 = undefined;
+    var argv_len: usize = 0;
+    argv_buf[argv_len] = "pandoc";
+    argv_len += 1;
+    argv_buf[argv_len] = src_path;
+    argv_len += 1;
+    argv_buf[argv_len] = "-o";
+    argv_len += 1;
+    argv_buf[argv_len] = out_path;
+    argv_len += 1;
+    argv_buf[argv_len] = "--standalone";
+    argv_len += 1;
+    argv_buf[argv_len] = "--metadata";
+    argv_len += 1;
+    argv_buf[argv_len] = meta;
+    argv_len += 1;
+    if (header_path_opt) |hp| {
+        argv_buf[argv_len] = "-H";
+        argv_len += 1;
+        argv_buf[argv_len] = hp;
+        argv_len += 1;
+    }
+    return runRenderer(allocator, argv_buf[0..argv_len], "pandoc");
+}
+
+/// PDF: markdown → styled standalone HTML → WeasyPrint first. Legacy
+/// pandoc/XeLaTeX stays as fallback for hosts missing WeasyPrint.
 ///
-/// Branding: when `resolved_branding` is non-null we ask pandoc to use
-/// xelatex (the only pdflatex variant that handles OTF/TTF natively) and
-/// set `mainfont`/`sansfont` to the operator's body family. If xelatex
-/// isn't installed we re-attempt WITHOUT the branding args + log a warn
-/// so the PDF still renders unstyled. Pandoc looks up the family by name
-/// on the host font path (fc-cache / OSX FontBook) — so the operator
-/// must ensure the brand font is registered system-wide on the runtime
-/// host for the branded path to take effect.
+/// Branding: the primary path uses direct CSS @font-face file URLs. The
+/// LaTeX fallback passes direct OTF file paths via fontspec variables, so
+/// it does not depend on system font registration.
 fn renderPdf(
     allocator: std.mem.Allocator,
     src_path: []const u8,
@@ -1223,42 +1235,90 @@ fn renderPdf(
     defer allocator.free(meta);
     var pandoc_spawn_missing = false;
 
-    if (resolved_branding) |rb| {
-        const mainfont_arg = try std.fmt.allocPrint(allocator, "mainfont={s}", .{rb.body_font_family});
-        defer allocator.free(mainfont_arg);
-        const sansfont_arg = try std.fmt.allocPrint(allocator, "sansfont={s}", .{rb.body_font_family});
-        defer allocator.free(sansfont_arg);
+    const styled_html_path = try std.fmt.allocPrint(allocator, "{s}.html", .{out_path});
+    defer {
+        std.fs.deleteFileAbsolute(styled_html_path) catch {};
+        allocator.free(styled_html_path);
+    }
+    const html_attempt = try renderStyledHtml(allocator, src_path, styled_html_path, title, resolved_branding, true);
+    switch (html_attempt) {
+        .success => |s| {
+            freeRendererFailure(allocator, s);
+            const weasy_args = [_][]const u8{ "weasyprint", styled_html_path, out_path };
+            const weasy_attempt = runRenderer(allocator, &weasy_args, "weasyprint");
+            switch (weasy_attempt) {
+                .success => |ws| return ws,
+                .ran_but_failed => |r| {
+                    const stderr = if (r.error_msg) |em| em else "";
+                    std.log.scoped(.produce_document).warn(
+                        "WeasyPrint PDF render failed — retrying legacy pandoc PDF fallback. stderr: {s}",
+                        .{stderr},
+                    );
+                    freeRendererFailure(allocator, r);
+                },
+                .binary_missing => |bm| allocator.free(bm),
+                .binary_missing_static => {},
+            }
+        },
+        .ran_but_failed => |r| return r,
+        .binary_missing => |bm| {
+            allocator.free(bm);
+            pandoc_spawn_missing = true;
+        },
+        .binary_missing_static => pandoc_spawn_missing = true,
+    }
 
-        const branded_args = [_][]const u8{
-            "pandoc",       src_path,     "-o",         out_path,
-            "--pdf-engine", "xelatex",    "-V",         mainfont_arg,
-            "-V",           sansfont_arg, "--metadata", meta,
-        };
-        const branded_attempt = runRenderer(allocator, &branded_args, "pandoc");
-        switch (branded_attempt) {
-            .success => |s| return s,
-            .ran_but_failed => |r| {
-                // Most common failure: xelatex not installed. Detect via
-                // stderr contents and fall back to the plain pandoc path
-                // (which uses pdflatex internally) — branding loss is
-                // strictly better than no PDF.
-                const stderr = if (r.error_msg) |em| em else "";
-                if (!isBrandedPdfFallbackReason(stderr)) {
-                    return r;
-                }
-                std.log.scoped(.branding).warn(
-                    "PDF branded render failed — retrying without branding. Install/register xelatex + brand fonts for branded PDFs. stderr: {s}",
-                    .{stderr},
-                );
-                if (r.output.len > 0) allocator.free(r.output);
-                if (r.error_msg) |em| allocator.free(em);
-                // Fall through to plain pandoc path below.
-            },
-            .binary_missing => |bm| {
-                allocator.free(bm);
-                pandoc_spawn_missing = true;
-            },
-            .binary_missing_static => pandoc_spawn_missing = true,
+    if (!pandoc_spawn_missing) {
+        if (resolved_branding) |rb| {
+            const mainfont_arg = try std.fmt.allocPrint(allocator, "mainfont={s}-Regular.otf", .{rb.body_font_family});
+            defer allocator.free(mainfont_arg);
+            const mainfont_options_arg = try std.fmt.allocPrint(
+                allocator,
+                "mainfontoptions=Path={s}/,BoldFont={s}-Bold.otf",
+                .{ rb.body_otf_dir, rb.body_font_family },
+            );
+            defer allocator.free(mainfont_options_arg);
+            const sansfont_arg = try std.fmt.allocPrint(allocator, "sansfont={s}-Regular.otf", .{rb.body_font_family});
+            defer allocator.free(sansfont_arg);
+            const sansfont_options_arg = try std.fmt.allocPrint(
+                allocator,
+                "sansfontoptions=Path={s}/,BoldFont={s}-Bold.otf",
+                .{ rb.body_otf_dir, rb.body_font_family },
+            );
+            defer allocator.free(sansfont_options_arg);
+
+            const branded_args = [_][]const u8{
+                "pandoc",       src_path,             "-o",         out_path,
+                "--pdf-engine", "xelatex",            "-V",         mainfont_arg,
+                "-V",           mainfont_options_arg, "-V",         sansfont_arg,
+                "-V",           sansfont_options_arg, "--metadata", meta,
+            };
+            const branded_attempt = runRenderer(allocator, &branded_args, "pandoc");
+            switch (branded_attempt) {
+                .success => |s| return s,
+                .ran_but_failed => |r| {
+                    // Most common failure: xelatex not installed. Detect via
+                    // stderr contents and fall back to the plain pandoc path
+                    // (which uses pdflatex internally) — branding loss is
+                    // strictly better than no PDF.
+                    const stderr = if (r.error_msg) |em| em else "";
+                    if (!isBrandedPdfFallbackReason(stderr)) {
+                        return r;
+                    }
+                    std.log.scoped(.branding).warn(
+                        "PDF branded render failed — retrying without branding. Install/register xelatex + brand fonts for branded PDFs. stderr: {s}",
+                        .{stderr},
+                    );
+                    if (r.output.len > 0) allocator.free(r.output);
+                    if (r.error_msg) |em| allocator.free(em);
+                    // Fall through to plain pandoc path below.
+                },
+                .binary_missing => |bm| {
+                    allocator.free(bm);
+                    pandoc_spawn_missing = true;
+                },
+                .binary_missing_static => pandoc_spawn_missing = true,
+            }
         }
     }
 
@@ -1314,11 +1374,10 @@ fn renderPdf(
                 }
 
                 std.log.scoped(.produce_document).warn(
-                    "default pandoc PDF render failed due to LaTeX capability gap — falling through to wkhtmltopdf/weasyprint. Install texlive-xetex for Unicode-safe PDFs. stderr: {s}",
+                    "default pandoc PDF render failed due to LaTeX capability gap. Install WeasyPrint or texlive-xetex for PDFs. stderr: {s}",
                     .{stderr},
                 );
                 freeRendererFailure(allocator, r);
-                // Fall through to wkhtmltopdf / weasyprint below.
             },
             .binary_missing => |bm| allocator.free(bm),
             // Wave 2 review HIGH#1 — static message; do NOT free.
@@ -1326,39 +1385,10 @@ fn renderPdf(
         }
     }
 
-    // pandoc missing — try wkhtmltopdf.
-    const wkhtml_args = [_][]const u8{ "wkhtmltopdf", src_path, out_path };
-    const wk_attempt = runRenderer(allocator, &wkhtml_args, "wkhtmltopdf");
-    switch (wk_attempt) {
-        .success => |s| return s,
-        // HI-04: wkhtmltopdf is often missing too on minimal images.
-        // Surface the failure detail only if weasyprint also missing;
-        // otherwise prefer weasyprint's verdict.
-        .ran_but_failed => |r| {
-            // Best-effort: free wkhtmltopdf's stderr buf and fall
-            // through; weasyprint is the genuine workhorse on Alpine.
-            if (r.output.len > 0) allocator.free(r.output);
-            if (r.error_msg) |em| allocator.free(em);
-        },
-        .binary_missing => |bm| allocator.free(bm),
-        .binary_missing_static => {},
-    }
-
-    // wkhtmltopdf missing — last fallback: weasyprint.
-    const weasy_args = [_][]const u8{ "weasyprint", src_path, out_path };
-    const weasy_attempt = runRenderer(allocator, &weasy_args, "weasyprint");
-    switch (weasy_attempt) {
-        .success => |s| return s,
-        .ran_but_failed => |r| return r,
-        .binary_missing => |bm| allocator.free(bm),
-        .binary_missing_static => {},
-    }
-
-    // All three missing.
     const msg = try allocator.dupe(
         u8,
-        "PDF renderer not available — tried pandoc, wkhtmltopdf, weasyprint. " ++
-            "Install one of: brew install pandoc  /  apt install pandoc  /  pip install weasyprint",
+        "PDF renderer not available — styled PDF requires pandoc plus WeasyPrint, or pandoc plus XeLaTeX as fallback. " ++
+            "Install via: brew install pandoc  /  apt install pandoc  /  pip install weasyprint  /  install texlive-xetex",
     );
     return ToolResult{ .success = false, .output = "", .error_msg = msg };
 }
@@ -1766,9 +1796,9 @@ fn renderPptx(
     };
 }
 
-/// HTML: pandoc --standalone produces a full HTML document. We always
-/// pass a small document CSS header so HTML exports look share-ready by
-/// default; when branding is resolved, that header also includes
+/// Parked HTML renderer: pandoc --standalone produces a full HTML document.
+/// We pass the same document CSS header used by PDF; when branding is resolved,
+/// that header also includes
 /// @font-face declarations. Font URLs are absolute `file://` paths so
 /// local renders work; static deploys may rewrite them later.
 fn renderHtml(
@@ -1778,68 +1808,7 @@ fn renderHtml(
     title: []const u8,
     resolved_branding: ?ResolvedBranding,
 ) !ToolResult {
-    const meta = try metadataArg(allocator, "title", title);
-    defer allocator.free(meta);
-
-    var header_path_opt: ?[]u8 = null;
-    defer if (header_path_opt) |hp| {
-        // Best-effort cleanup; ignore failure.
-        std.fs.deleteFileAbsolute(hp) catch {};
-        allocator.free(hp);
-    };
-
-    const src_dir = std.fs.path.dirname(src_path) orelse "/tmp";
-    const header_path = try std.fs.path.join(allocator, &.{ src_dir, ".artifact_header.html" });
-    errdefer allocator.free(header_path);
-
-    const header_content = try buildHtmlHeaderContent(allocator, resolved_branding);
-    defer allocator.free(header_content);
-
-    const f = std.fs.createFileAbsolute(header_path, .{}) catch |err| {
-        allocator.free(header_path);
-        const msg = try std.fmt.allocPrint(
-            allocator,
-            "Failed to create HTML document header '{s}': {s}",
-            .{ header_path, @errorName(err) },
-        );
-        return ToolResult{ .success = false, .output = "", .error_msg = msg };
-    };
-    defer f.close();
-    f.writeAll(header_content) catch |err| {
-        allocator.free(header_path);
-        const msg = try std.fmt.allocPrint(
-            allocator,
-            "Failed to write HTML document header: {s}",
-            .{@errorName(err)},
-        );
-        return ToolResult{ .success = false, .output = "", .error_msg = msg };
-    };
-    header_path_opt = header_path;
-
-    var argv_buf: [10][]const u8 = undefined;
-    var argv_len: usize = 0;
-    argv_buf[argv_len] = "pandoc";
-    argv_len += 1;
-    argv_buf[argv_len] = src_path;
-    argv_len += 1;
-    argv_buf[argv_len] = "-o";
-    argv_len += 1;
-    argv_buf[argv_len] = out_path;
-    argv_len += 1;
-    argv_buf[argv_len] = "--standalone";
-    argv_len += 1;
-    argv_buf[argv_len] = "--metadata";
-    argv_len += 1;
-    argv_buf[argv_len] = meta;
-    argv_len += 1;
-    if (header_path_opt) |hp| {
-        argv_buf[argv_len] = "-H";
-        argv_len += 1;
-        argv_buf[argv_len] = hp;
-        argv_len += 1;
-    }
-    const argv = argv_buf[0..argv_len];
-    const attempt = runRenderer(allocator, argv, "pandoc");
+    const attempt = try renderStyledHtml(allocator, src_path, out_path, title, resolved_branding, false);
     return switch (attempt) {
         .success => |s| s,
         .ran_but_failed => |r| r,
@@ -1906,8 +1875,7 @@ fn runRenderer(
         // sandboxes, and on Zig stdlib revisions that may rename the variant,
         // the spawn-time "binary unavailable" condition surfaces under other
         // error names (`AccessDenied`, `ProcessNotFound`, etc.). Treating
-        // those as "binary missing" lets the renderer fallback chain
-        // (pandoc → wkhtmltopdf → weasyprint) keep walking instead of
+        // those as "binary missing" lets renderer fallback chains keep walking instead of
         // fail-fast on the FIRST renderer's spawn error. We classify any
         // listed spawn-time error as "missing"; everything else falls
         // through to the generic `ran_but_failed` arm with the actual
@@ -2017,16 +1985,17 @@ test "produce_document tool name + schema" {
     try std.testing.expect(std.mem.indexOf(u8, ProduceDocumentTool.tool_params, "content") != null);
     try std.testing.expect(std.mem.indexOf(u8, ProduceDocumentTool.tool_params, "title") != null);
     try std.testing.expect(std.mem.indexOf(u8, ProduceDocumentTool.tool_params, "pdf") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ProduceDocumentTool.tool_params, "xlsx") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ProduceDocumentTool.tool_params, "pptx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ProduceDocumentTool.tool_params, "xlsx") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ProduceDocumentTool.tool_params, "pptx") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ProduceDocumentTool.tool_params, "docx") == null);
 }
 
 test "produce_document description pins S-tier artifact blueprints" {
     const desc = ProduceDocumentTool.tool_description;
     try std.testing.expect(std.mem.indexOf(u8, desc, "Artifact quality gate") != null);
     try std.testing.expect(std.mem.indexOf(u8, desc, "Default decision-doc blueprint") != null);
-    try std.testing.expect(std.mem.indexOf(u8, desc, "EXAMPLE (XLSX / launch tracker)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, desc, "ZAKI editorial theme") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desc, "styled PDF renderer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desc, "parked legacy renderers") != null);
     try std.testing.expect(std.mem.indexOf(u8, desc, "no placeholders") != null);
 }
 
@@ -2086,6 +2055,24 @@ test "produce_document rejects invalid format string" {
     try std.testing.expect(std.mem.indexOf(u8, msg, "pdf") != null);
 }
 
+test "produce_document rejects parked non-PDF formats" {
+    var pd = ProduceDocumentTool{ .workspace_dir = "/tmp" };
+    const t = pd.tool();
+    const formats = [_][]const u8{ "docx", "xlsx", "pptx", "html" };
+    for (formats) |fmt| {
+        var args = std.json.ObjectMap.init(std.testing.allocator);
+        defer args.deinit();
+        try args.put("format", std.json.Value{ .string = fmt });
+        try args.put("content", std.json.Value{ .string = "# Hello" });
+        const result = try t.execute(std.testing.allocator, args);
+        defer if (result.error_msg) |m| std.testing.allocator.free(m);
+        try std.testing.expect(!result.success);
+        const msg = result.error_msg orelse result.output;
+        try std.testing.expect(std.mem.indexOf(u8, msg, "parked") != null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "PDF") != null);
+    }
+}
+
 test "produce_document rejects empty workspace" {
     var pd = ProduceDocumentTool{ .workspace_dir = "" };
     const t = pd.tool();
@@ -2102,10 +2089,8 @@ test "produce_document rejects empty workspace" {
 
 test "produce_document missing renderer surfaces install hint" {
     // Use a unique workspace under /tmp so we don't collide with concurrent
-    // test runs. The renderer chain (pandoc/wkhtmltopdf/weasyprint) may or
-    // may not be installed in the sandbox — we test the error path explicitly
-    // by invoking with a format whose renderer we deliberately point at a
-    // nonexistent binary by manipulating PATH. Simpler: just verify that
+    // test runs. The renderer chain may or may not be installed in the sandbox
+    // — just verify that
     // EITHER the call succeeds OR the error message mentions the install
     // hint (covering the CI-sandbox-without-binaries case AND the local-dev
     // case where pandoc IS installed).
@@ -2122,31 +2107,30 @@ test "produce_document missing renderer surfaces install hint" {
     const t = pd.tool();
     var args = std.json.ObjectMap.init(std.testing.allocator);
     defer args.deinit();
-    // PPTX requires marp-cli which is highly unlikely to be on a CI sandbox
-    // PATH; this maximizes the chance we hit the install-hint code path.
-    try args.put("format", std.json.Value{ .string = "pptx" });
-    try args.put("content", std.json.Value{ .string = "# Slide 1\n\n---\n\n# Slide 2" });
-    try args.put("title", std.json.Value{ .string = "test_deck" });
+    try args.put("format", std.json.Value{ .string = "pdf" });
+    try args.put("content", std.json.Value{ .string = "# PDF Smoke\n\nA short renderer check." });
+    try args.put("title", std.json.Value{ .string = "test_pdf" });
 
     const result = try t.execute(std.testing.allocator, args);
     defer {
         if (result.output.len > 0) std.testing.allocator.free(result.output);
         if (result.error_msg) |m| std.testing.allocator.free(m);
     }
-    // Two valid outcomes: (a) marp is installed AND succeeds; (b) marp is
-    // missing AND we get the install hint. The wrong outcome is a confusing
+    // Two valid outcomes: (a) a PDF renderer is installed AND succeeds; (b) no
+    // renderer is installed AND we get the install hint. The wrong outcome is a confusing
     // generic failure.
     if (result.success) {
         // The success path also exercises the file-write + markdown-link
         // formatting code; assert the link points into produced/.
         try std.testing.expect(std.mem.indexOf(u8, result.output, "attachments/produced/") != null);
-        try std.testing.expect(std.mem.indexOf(u8, result.output, ".pptx") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, ".pdf") != null);
     } else {
         const msg = if (result.error_msg) |m| m else result.output;
         // Per §14.5 honesty rule: the error must name the install hint.
         try std.testing.expect(
-            std.mem.indexOf(u8, msg, "marp") != null or
-                std.mem.indexOf(u8, msg, "npm install") != null,
+            std.mem.indexOf(u8, msg, "PDF renderer") != null or
+                std.mem.indexOf(u8, msg, "pandoc") != null or
+                std.mem.indexOf(u8, msg, "weasyprint") != null,
         );
     }
 }
@@ -2369,10 +2353,10 @@ test "PDF renderer classifiers distinguish pdflatex Unicode failure from arbitra
     try std.testing.expect(isPlainXelatexFallbackReason("xelatex: No such file or directory"));
 }
 
-test "produce_document PDF uses Unicode-safe renderer when pandoc and xelatex are installed" {
+test "produce_document PDF uses styled or Unicode-safe renderer when installed" {
     const allocator = std.testing.allocator;
     if (!rendererBinaryAvailable(allocator, "pandoc")) return error.SkipZigTest;
-    if (!rendererBinaryAvailable(allocator, "xelatex")) return error.SkipZigTest;
+    if (!rendererBinaryAvailable(allocator, "weasyprint") and !rendererBinaryAvailable(allocator, "xelatex")) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2394,6 +2378,65 @@ test "produce_document PDF uses Unicode-safe renderer when pandoc and xelatex ar
 
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, ".pdf") != null);
+}
+
+test "produce_document PDF embeds Thmanyah fonts when WeasyPrint is available" {
+    const allocator = std.testing.allocator;
+    if (!rendererBinaryAvailable(allocator, "pandoc")) return error.SkipZigTest;
+    if (!rendererBinaryAvailable(allocator, "weasyprint")) return error.SkipZigTest;
+    {
+        const probe_argv = [_][]const u8{ "pdffonts", "-v" };
+        const probe = process_util.run(allocator, &probe_argv, .{
+            .max_output_bytes = 16 * 1024,
+            .timeout_ns = 10 * std.time.ns_per_s,
+        }) catch return error.SkipZigTest;
+        defer allocator.free(probe.stdout);
+        defer allocator.free(probe.stderr);
+        if (!probe.success) return error.SkipZigTest;
+    }
+    const bundled_branding = (try resolveBranding(allocator, BrandingConfig{})) orelse return error.SkipZigTest;
+    defer bundled_branding.deinit(allocator);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(ws);
+
+    var pd = ProduceDocumentTool{ .workspace_dir = ws };
+    var args = std.json.ObjectMap.init(allocator);
+    defer args.deinit();
+    try args.put("format", std.json.Value{ .string = "pdf" });
+    try args.put("title", std.json.Value{ .string = "Thmanyah PDF Smoke" });
+    try args.put(
+        "content",
+        std.json.Value{ .string = "# Thmanyah PDF Smoke\n\n## Summary\n\n- One useful bullet.\n\n| Metric | Value |\n|---|---:|\n| Quality | High |\n\n> Branded quote.\n\n```zig\nconst ok = true;\n```" },
+    );
+
+    const result = try pd.execute(allocator, args);
+    defer {
+        if (result.output.len > 0) allocator.free(result.output);
+        if (result.error_msg) |em| allocator.free(em);
+    }
+    try std.testing.expect(result.success);
+
+    const marker = "attachments/produced/";
+    const start = std.mem.indexOf(u8, result.output, marker) orelse return error.MissingProducedPath;
+    const rest = result.output[start..];
+    const end = std.mem.indexOfScalar(u8, rest, ')') orelse rest.len;
+    const rel_path = rest[0..end];
+    const pdf_path = try std.fs.path.join(allocator, &.{ ws, rel_path });
+    defer allocator.free(pdf_path);
+
+    const fonts_argv = [_][]const u8{ "pdffonts", pdf_path };
+    const fonts = try process_util.run(allocator, &fonts_argv, .{
+        .max_output_bytes = 64 * 1024,
+        .timeout_ns = 10 * std.time.ns_per_s,
+    });
+    defer allocator.free(fonts.stdout);
+    defer allocator.free(fonts.stderr);
+    try std.testing.expect(fonts.success);
+    try std.testing.expect(std.mem.indexOf(u8, fonts.stdout, "thmanyah") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fonts.stdout, "LatinModern") == null);
 }
 
 fn rendererBinaryAvailable(allocator: std.mem.Allocator, binary_name: []const u8) bool {
@@ -2579,7 +2622,7 @@ test "cssFontFaceBlock emits valid @font-face declarations" {
 
 test "HTML header emits share-ready document CSS without branding" {
     const alloc = std.testing.allocator;
-    const header = try buildHtmlHeaderContent(alloc, null);
+    const header = try buildHtmlHeaderContent(alloc, null, false);
     defer alloc.free(header);
 
     try std.testing.expect(std.mem.indexOf(u8, header, "<style>") != null);
@@ -2588,6 +2631,35 @@ test "HTML header emits share-ready document CSS without branding" {
     try std.testing.expect(std.mem.indexOf(u8, header, "blockquote") != null);
     try std.testing.expect(std.mem.indexOf(u8, header, "table") != null);
     try std.testing.expect(std.mem.indexOf(u8, header, "@font-face") == null);
+}
+
+test "PDF header emits print CSS and branded font faces" {
+    const alloc = std.testing.allocator;
+    const built = try buildTestFontDir(alloc, "pdf_css");
+    defer {
+        std.fs.deleteTreeAbsolute(built.root) catch {};
+        alloc.free(built.font_dir);
+        alloc.free(built.root);
+    }
+    const br = BrandingConfig{
+        .font_dir = built.font_dir,
+        .body_font = "thmanyahsans",
+        .display_font = "thmanyahserifdisplay",
+    };
+    const rb = (try resolveBranding(alloc, br)).?;
+    defer rb.deinit(alloc);
+
+    const header = try buildHtmlHeaderContent(alloc, rb, true);
+    defer alloc.free(header);
+
+    try std.testing.expect(std.mem.indexOf(u8, header, "@font-face") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "@page") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "counter(page)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "thmanyahsans") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "thmanyahserifdisplay") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "table") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "blockquote") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "body > h1:first-of-type") != null);
 }
 
 test "parseTheme accepts thmanyah" {
@@ -2607,29 +2679,9 @@ test "marpThemeName maps default to generated ZAKI theme" {
     try std.testing.expectEqualStrings("thmanyah", marpThemeName(.thmanyah));
 }
 
-test "PPTX with theme=thmanyah but no branding returns clear error" {
+test "public execute rejects PPTX while renderer is parked" {
     const alloc = std.testing.allocator;
-    const ts = std.time.milliTimestamp();
-    const ws = try std.fmt.allocPrint(alloc, "/tmp/pd_thmanyah_unbranded_{d}", .{ts});
-    defer alloc.free(ws);
-    std.fs.makeDirAbsolute(ws) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-    defer std.fs.deleteTreeAbsolute(ws) catch {};
-
-    // Branding intentionally pointed at a missing dir so resolveBranding
-    // returns null (NOT empty — empty triggers the bundled-fonts fallback
-    // when the repo's `assets/branding/fonts/` is present, which would
-    // resolve a real ResolvedBranding and defeat this test's premise).
-    var pd = ProduceDocumentTool{
-        .workspace_dir = ws,
-        .branding = .{
-            .font_dir = "/tmp/pd_definitely_no_fonts_here_xyz_42",
-            .body_font = "x",
-            .display_font = "y",
-        },
-    };
+    var pd = ProduceDocumentTool{ .workspace_dir = "/tmp" };
     const t = pd.tool();
     var args = std.json.ObjectMap.init(alloc);
     defer args.deinit();
@@ -2644,11 +2696,8 @@ test "PPTX with theme=thmanyah but no branding returns clear error" {
     }
     try std.testing.expect(!result.success);
     const msg = if (result.error_msg) |m| m else result.output;
-    // Honesty: the error must name the missing operator config so the
-    // agent can surface it verbatim to the user.
-    try std.testing.expect(std.mem.indexOf(u8, msg, "thmanyah") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "branding") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "font_dir") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "parked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "PDF") != null);
 }
 
 test "PPTX default theme writes generated ZAKI theme CSS" {
@@ -2662,22 +2711,17 @@ test "PPTX default theme writes generated ZAKI theme CSS" {
     };
     defer std.fs.deleteTreeAbsolute(ws) catch {};
 
-    var pd = ProduceDocumentTool{
-        .workspace_dir = ws,
-        .branding = .{
-            .font_dir = "/tmp/pd_default_theme_no_fonts_here_xyz_42",
-            .body_font = "x",
-            .display_font = "y",
-        },
-    };
-    const t = pd.tool();
-    var args = std.json.ObjectMap.init(alloc);
-    defer args.deinit();
-    try args.put("format", std.json.Value{ .string = "pptx" });
-    try args.put("content", std.json.Value{ .string = "# Decision\n---\n# Next Steps" });
-    try args.put("theme", std.json.Value{ .string = "default" });
+    const src_path = try std.fs.path.join(alloc, &.{ ws, "deck.md" });
+    defer alloc.free(src_path);
+    const out_path = try std.fs.path.join(alloc, &.{ ws, "deck.pptx" });
+    defer alloc.free(out_path);
+    {
+        const f = try std.fs.createFileAbsolute(src_path, .{});
+        defer f.close();
+        try f.writeAll("# Decision\n---\n# Next Steps");
+    }
 
-    const result = try t.execute(alloc, args);
+    const result = try renderPptx(alloc, src_path, out_path, .default_theme, ws, null);
     defer {
         if (result.output.len > 0) alloc.free(result.output);
         if (result.error_msg) |m| alloc.free(m);
@@ -2713,22 +2757,25 @@ test "PPTX with theme=thmanyah + branding writes the marp theme CSS" {
     defer alloc.free(ws);
     try std.fs.makeDirAbsolute(ws);
 
-    var pd = ProduceDocumentTool{
-        .workspace_dir = ws,
-        .branding = .{
-            .font_dir = built.font_dir,
-            .body_font = "thmanyahsans",
-            .display_font = "thmanyahserifdisplay",
-        },
+    const br = BrandingConfig{
+        .font_dir = built.font_dir,
+        .body_font = "thmanyahsans",
+        .display_font = "thmanyahserifdisplay",
     };
-    const t = pd.tool();
-    var args = std.json.ObjectMap.init(alloc);
-    defer args.deinit();
-    try args.put("format", std.json.Value{ .string = "pptx" });
-    try args.put("content", std.json.Value{ .string = "# Slide 1\n---\n# Slide 2" });
-    try args.put("theme", std.json.Value{ .string = "thmanyah" });
+    const rb = (try resolveBranding(alloc, br)).?;
+    defer rb.deinit(alloc);
 
-    const result = try t.execute(alloc, args);
+    const src_path = try std.fs.path.join(alloc, &.{ ws, "deck.md" });
+    defer alloc.free(src_path);
+    const out_path = try std.fs.path.join(alloc, &.{ ws, "deck.pptx" });
+    defer alloc.free(out_path);
+    {
+        const f = try std.fs.createFileAbsolute(src_path, .{});
+        defer f.close();
+        try f.writeAll("# Slide 1\n---\n# Slide 2");
+    }
+
+    const result = try renderPptx(alloc, src_path, out_path, .thmanyah, ws, rb);
     defer {
         if (result.output.len > 0) alloc.free(result.output);
         if (result.error_msg) |m| alloc.free(m);
