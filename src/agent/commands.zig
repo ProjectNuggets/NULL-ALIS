@@ -1271,7 +1271,7 @@ fn shouldSkipInlineBoundaryExtraction(reason: []const u8) bool {
     return isNonInteractiveCheckpointReason(reason);
 }
 
-fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, session_id: []const u8, reason: []const u8, now_s: i64, now_iso: []const u8) bool {
+fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, session_id: []const u8, reason: []const u8, now_s: i64, now_iso: []const u8, emit_observer_events: bool) bool {
     const mem = self.mem orelse return false;
     const rt = self.mem_rt;
     const summarizer_cfg = effectiveSummarizerConfig(self);
@@ -1282,7 +1282,7 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
     const summarize_start_ms = std.time.milliTimestamp();
     defer {
         const duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - summarize_start_ms));
-        emitLifecycleSummarizerStage(self, duration_ms, entries.len);
+        if (emit_observer_events) emitLifecycleSummarizerStage(self, duration_ms, entries.len);
     }
 
     var summary_text_owned: ?[]u8 = null;
@@ -1676,10 +1676,12 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
                         "session_end.entity_pipeline_enqueued job_id={d} payload_bytes={d} session={s}",
                         .{ job_id, payload_str.len, session_id },
                     );
-                    const ep_event = observability.ObserverEvent{ .turn_stage = .{
-                        .stage = "session_end_entity_pipeline_enqueued",
-                    } };
-                    self.observer.recordEvent(&ep_event);
+                    if (emit_observer_events) {
+                        const ep_event = observability.ObserverEvent{ .turn_stage = .{
+                            .stage = "session_end_entity_pipeline_enqueued",
+                        } };
+                        self.observer.recordEvent(&ep_event);
+                    }
                 }
             }
         }
@@ -1890,7 +1892,9 @@ pub fn persistSessionCheckpointAsync(self: anytype, reason: []const u8) bool {
             const allocator = c.allocator;
             const reason_local = c.reason_owned;
             const agent = c.agent;
-            _ = persistSessionCheckpointDetailed(agent, reason_local);
+            // Async checkpoints can outlive the per-turn stack NarrationObserver.
+            // Keep durability work, but never emit narration/observer frames here.
+            _ = persistSessionCheckpointDetailedImpl(agent, reason_local, false);
             allocator.free(reason_local);
             allocator.destroy(c);
             // Release happens-before any subsequent acquire-load — the
@@ -1920,6 +1924,10 @@ pub fn persistSessionCheckpointAsync(self: anytype, reason: []const u8) bool {
 }
 
 pub fn persistSessionCheckpointDetailed(self: anytype, reason: []const u8) bool {
+    return persistSessionCheckpointDetailedImpl(self, reason, true);
+}
+
+fn persistSessionCheckpointDetailedImpl(self: anytype, reason: []const u8, emit_observer_events: bool) bool {
     const start_ms = std.time.milliTimestamp();
     defer {
         const duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - start_ms));
@@ -1927,11 +1935,13 @@ pub fn persistSessionCheckpointDetailed(self: anytype, reason: []const u8) bool 
             duration_ms,
             reason,
         });
-        const refresh_event = observability.ObserverEvent{ .turn_stage = .{
-            .stage = "continuity_refresh",
-            .duration_ms = duration_ms,
-        } };
-        self.observer.recordEvent(&refresh_event);
+        if (emit_observer_events) {
+            const refresh_event = observability.ObserverEvent{ .turn_stage = .{
+                .stage = "continuity_refresh",
+                .duration_ms = duration_ms,
+            } };
+            self.observer.recordEvent(&refresh_event);
+        }
     }
 
     const mem = self.mem orelse return false;
@@ -1973,7 +1983,7 @@ pub fn persistSessionCheckpointDetailed(self: anytype, reason: []const u8) bool 
         _ = rt.syncVectorAfterStore(self.allocator, checkpoint_key, checkpoint_content);
     }
 
-    const summary_written = persistSessionSemanticSummary(self, checkpoint_content, session_id, reason, now_s, now_iso);
+    const summary_written = persistSessionSemanticSummary(self, checkpoint_content, session_id, reason, now_s, now_iso, emit_observer_events);
     const anchor_origin = resolveSummaryOrigin(self, session_id, checkpoint_key);
     const summary_key = if (summary_written)
         std.fmt.allocPrint(self.allocator, "timeline_summary/{s}/{d}", .{ session_id, now_s }) catch null
