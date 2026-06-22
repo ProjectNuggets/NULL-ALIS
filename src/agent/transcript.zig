@@ -46,6 +46,18 @@ const QUEUE_DROP_MARKERS = [_][]const u8{
     "Queue mode latest: this older queued turn was superseded",
     "Queue overflow: this older queued turn was dropped.",
 };
+const INTERNAL_REFLECTION_MARKERS = [_][]const u8{
+    "This is your reply to the user. Not a planning document. Not a step-by-step outline. The actual reply.",
+    "STEP 1 (mandatory): Surface what the tool above just returned",
+    "The user CANNOT see the `<tool_result>` block above",
+};
+const INTERNAL_REFLECTION_PREFIXES = [_][]const u8{
+    "**This is your reply to the user. Not a planning document. Not a step-by-step outline. The actual reply.",
+    "This is your reply to the user. Not a planning document. Not a step-by-step outline. The actual reply.",
+    "**STEP 1 (mandatory): Surface what the tool above just returned",
+    "STEP 1 (mandatory): Surface what the tool above just returned",
+    "The user CANNOT see the `<tool_result>` block above",
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Hygiene functions
@@ -82,6 +94,46 @@ pub fn isInternalMessage(content: []const u8) bool {
         if (std.mem.startsWith(u8, content, marker)) return true;
     }
     return false;
+}
+
+pub fn containsInternalReflectionMarker(content: []const u8) bool {
+    for (&INTERNAL_REFLECTION_MARKERS) |marker| {
+        if (std.mem.indexOf(u8, content, marker) != null) return true;
+    }
+    return false;
+}
+
+pub fn looksLikeInternalReflectionPrefix(content: []const u8) bool {
+    const trimmed = std.mem.trimLeft(u8, content, " \t\r\n");
+    if (trimmed.len == 0) return true;
+    for (&INTERNAL_REFLECTION_PREFIXES) |prefix| {
+        const n = @min(trimmed.len, prefix.len);
+        if (std.mem.eql(u8, trimmed[0..n], prefix[0..n])) return true;
+    }
+    return false;
+}
+
+pub fn trailingInternalReflectionPrefixLen(content: []const u8) usize {
+    var best: usize = 0;
+    for (&INTERNAL_REFLECTION_PREFIXES) |prefix| {
+        var len = @min(content.len, prefix.len);
+        while (len > best) : (len -= 1) {
+            if (std.mem.eql(u8, content[content.len - len ..], prefix[0..len])) {
+                best = len;
+                break;
+            }
+        }
+    }
+    return best;
+}
+
+pub fn shouldExposeHistoryMessage(role: []const u8, content: []const u8) bool {
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    if (!std.mem.eql(u8, role, "user") and !std.mem.eql(u8, role, "assistant")) return false;
+    if (isInternalMessage(trimmed)) return false;
+    if (containsInternalReflectionMarker(content)) return false;
+    return true;
 }
 
 /// Full sanitization pipeline: detect internal-only messages (return ""),
@@ -192,6 +244,38 @@ test "sanitizeForExport strips markers and returns clean content for enriched me
     const input = "[Memory context]\nsome memory data\n\nUser's actual question";
     const result = sanitizeForExport(input);
     try std.testing.expectEqualStrings("User's actual question", result);
+}
+
+test "shouldExposeHistoryMessage allows normal user and assistant messages" {
+    try std.testing.expect(shouldExposeHistoryMessage("user", "Hello"));
+    try std.testing.expect(shouldExposeHistoryMessage("assistant", "Hi back"));
+}
+
+test "shouldExposeHistoryMessage rejects non-public roles and empty content" {
+    try std.testing.expect(!shouldExposeHistoryMessage("system", "sys"));
+    try std.testing.expect(!shouldExposeHistoryMessage("tool", "tool output"));
+    try std.testing.expect(!shouldExposeHistoryMessage("developer", "hidden"));
+    try std.testing.expect(!shouldExposeHistoryMessage("assistant", ""));
+    try std.testing.expect(!shouldExposeHistoryMessage("assistant", " \n\t "));
+}
+
+test "shouldExposeHistoryMessage rejects reflection prompt markers" {
+    try std.testing.expect(!shouldExposeHistoryMessage("user", "**This is your reply to the user. Not a planning document. Not a step-by-step outline. The actual reply.**"));
+    try std.testing.expect(!shouldExposeHistoryMessage("user", "<tool_result>ok</tool_result>\n\n**STEP 1 (mandatory): Surface what the tool above just returned.**"));
+    try std.testing.expect(!shouldExposeHistoryMessage("assistant", "The user CANNOT see the `<tool_result>` block above — they see only your text."));
+}
+
+test "looksLikeInternalReflectionPrefix holds streaming prompt prefixes" {
+    try std.testing.expect(looksLikeInternalReflectionPrefix("*"));
+    try std.testing.expect(looksLikeInternalReflectionPrefix("**This is your reply"));
+    try std.testing.expect(looksLikeInternalReflectionPrefix("STEP 1 (mandatory): Surface"));
+    try std.testing.expect(!looksLikeInternalReflectionPrefix("This is fine."));
+}
+
+test "trailingInternalReflectionPrefixLen holds split streaming suffixes" {
+    try std.testing.expectEqual(@as(usize, 6), trailingInternalReflectionPrefixLen("public **This"));
+    try std.testing.expectEqual(@as(usize, "STEP 1 (mandatory):".len), trailingInternalReflectionPrefixLen("public STEP 1 (mandatory):"));
+    try std.testing.expectEqual(@as(usize, 0), trailingInternalReflectionPrefixLen("public text"));
 }
 
 test "ProvenanceTag.isEmpty returns true for default-initialized tag" {

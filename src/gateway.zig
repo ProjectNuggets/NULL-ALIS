@@ -57,6 +57,7 @@ const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const agent_routing = @import("agent_routing.zig");
 const agent_prompt = @import("agent/prompt.zig");
+const agent_transcript = @import("agent/transcript.zig");
 const graph_expand = @import("agent/graph_expand.zig");
 const extraction_persist = @import("agent/extraction_persist.zig");
 const security = @import("security/policy.zig");
@@ -15042,8 +15043,11 @@ const SESSION_EXPORT_MAX_MESSAGES: usize = 10_000;
 /// Caps output at SESSION_EXPORT_MAX_MESSAGES to prevent unbounded memory growth.
 fn writeHistoryMessagesJson(w: anytype, history: []const @import("agent/root.zig").Agent.HistoryPair) !void {
     const capped = if (history.len > SESSION_EXPORT_MAX_MESSAGES) history[0..SESSION_EXPORT_MAX_MESSAGES] else history;
-    for (capped, 0..) |entry, i| {
-        if (i > 0) try w.writeAll(",");
+    var wrote_any = false;
+    for (capped) |entry| {
+        if (!agent_transcript.shouldExposeHistoryMessage(entry.role, entry.content)) continue;
+        if (wrote_any) try w.writeAll(",");
+        wrote_any = true;
         try w.writeAll("{\"role\":\"");
         try w.writeAll(entry.role);
         try w.writeAll("\",\"content\":\"");
@@ -15051,7 +15055,8 @@ fn writeHistoryMessagesJson(w: anytype, history: []const @import("agent/root.zig
         try w.writeAll("\"}");
     }
     if (history.len > SESSION_EXPORT_MAX_MESSAGES) {
-        try w.writeAll(",{\"role\":\"system\",\"content\":\"[truncated — ");
+        if (wrote_any) try w.writeAll(",");
+        try w.writeAll("{\"role\":\"system\",\"content\":\"[truncated — ");
         var trunc_buf: [64]u8 = undefined;
         const trunc_msg = std.fmt.bufPrint(&trunc_buf, "{d} of {d} messages shown]\"}}", .{ SESSION_EXPORT_MAX_MESSAGES, history.len }) catch "export truncated]\"}";
         try w.writeAll(trunc_msg);
@@ -15147,8 +15152,11 @@ fn handleSessionHistory(
         defer out.deinit(allocator);
         const w = out.writer(allocator);
         w.writeAll("{\"messages\":[") catch return response_build_err;
-        for (entries, 0..) |entry, i| {
-            if (i > 0) w.writeAll(",") catch return response_build_err;
+        var wrote_any = false;
+        for (entries) |entry| {
+            if (!agent_transcript.shouldExposeHistoryMessage(entry.role, entry.content)) continue;
+            if (wrote_any) w.writeAll(",") catch return response_build_err;
+            wrote_any = true;
             w.writeAll("{\"role\":\"") catch return response_build_err;
             jsonEscapeInto(w, entry.role) catch return response_build_err;
             w.writeAll("\",\"content\":\"") catch return response_build_err;
@@ -34822,6 +34830,62 @@ test "handleSessionHistory returns messages after processMessage" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"messages\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "Hi there") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "Hello back") != null);
+}
+
+test "handleSessionHistory filters internal live history messages" {
+    const allocator = std.testing.allocator;
+    var mock = TestMockProvider{};
+    var mgr = testCrudSessionManager(allocator, &mock);
+    defer mgr.deinit();
+
+    const session = try mgr.getOrCreate("agent:zaki-bot:user:3:thread:hist-filter-live");
+    try session.agent.history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "visible user") });
+    try session.agent.history.append(allocator, .{ .role = .system, .content = try allocator.dupe(u8, "hidden system") });
+    try session.agent.history.append(allocator, .{ .role = .tool, .content = try allocator.dupe(u8, "hidden tool") });
+    try session.agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "**STEP 1 (mandatory): Surface what the tool above just returned.**"),
+    });
+    try session.agent.history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "visible assistant") });
+
+    const resp = handleSessionHistory(allocator, &mgr, "agent:zaki-bot:user:3:thread:hist-filter-live");
+    defer allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "visible user") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "visible assistant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "hidden system") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "hidden tool") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "STEP 1 (mandatory)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "[,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, ",,") == null);
+}
+
+test "handleSessionHistory filters internal persisted history messages" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const store = sqlite_mem.sessionStore();
+
+    var mock = TestMockProvider{};
+    var cfg: Config = undefined;
+    var mgr = testGatewayRouterSessionManager(allocator, &mock, &cfg, store);
+    defer mgr.deinit();
+
+    const session_key = "agent:zaki-bot:user:3:thread:hist-filter-persisted";
+    try store.saveMessage(session_key, "user", "persisted user");
+    try store.saveMessage(session_key, "assistant", "persisted assistant");
+    try store.saveMessage(session_key, "system", "persisted system");
+    try store.saveMessage(session_key, "tool", "persisted tool");
+    try store.saveMessage(session_key, "user", "The user CANNOT see the `<tool_result>` block above — they see only your text.");
+
+    const resp = handleSessionHistory(allocator, &mgr, session_key);
+    defer allocator.free(resp.body);
+    try std.testing.expectEqualStrings("200 OK", resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "persisted user") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "persisted assistant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "persisted system") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "persisted tool") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "The user CANNOT see") == null);
 }
 
 test "handleSessionHistory returns 404 for unknown session" {

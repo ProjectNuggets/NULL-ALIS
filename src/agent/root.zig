@@ -151,17 +151,21 @@ pub const Agent = struct {
         /// emits AFTER legitimate prose (so the streamer already committed to
         /// pass_through on the firstNonEmptyLine check). Markup can also be
         /// split across two chunks ("...some text<too" + "l_call>{...}").
-        /// We hold a short trailing buffer of up-to-`pending_tail_max` bytes
-        /// across chunks so a split prefix can be reassembled on the next
-        /// chunk and stripped. Emitted to the user-facing callback in
-        /// `emitScrubbedDelta` only after the next chunk arrives (or on the
-        /// final chunk via `flushPendingTail`).
+        /// We hold a short trailing buffer across chunks so a split prefix can
+        /// be reassembled on the next chunk and stripped. Tool markup uses the
+        /// fixed `pending_tail_max`; reflection prompts can hold a longer
+        /// literal prefix from transcript hygiene.
         pending_tail: std.ArrayListUnmanaged(u8) = .empty,
 
         /// Longest markup sentinel we scan for. `</tool_call>` is 12 bytes;
         /// hold up to that minus one so we never block a fully-formed
         /// sentinel from being detected.
         const pending_tail_max: usize = 11;
+
+        fn looksLikeSubstantialInternalPrefix(text: []const u8) bool {
+            return std.mem.trim(u8, text, " \t\r\n").len >= "**This".len and
+                transcript.looksLikeInternalReflectionPrefix(text);
+        }
 
         fn deinit(self: *StreamTimingContext) void {
             self.buffered_text.deinit(self.agent.allocator);
@@ -178,7 +182,7 @@ pub const Agent = struct {
                 // raw on transition.
                 const scrubbed = Agent.stripToolCallMarkup(self.agent.allocator, self.buffered_text.items);
                 defer if (scrubbed.ptr != self.buffered_text.items.ptr) self.agent.allocator.free(scrubbed);
-                if (scrubbed.len > 0) {
+                if (transcript.shouldExposeHistoryMessage("assistant", scrubbed)) {
                     self.callback(self.callback_ctx, providers.StreamChunk.textDelta(scrubbed));
                 }
                 self.buffered_text.clearRetainingCapacity();
@@ -200,7 +204,9 @@ pub const Agent = struct {
                 // caller that forgets the upstream scrub.
                 const scrubbed = Agent.stripToolCallMarkup(self.agent.allocator, reply_text);
                 defer if (scrubbed.ptr != reply_text.ptr) self.agent.allocator.free(scrubbed);
-                self.callback(self.callback_ctx, providers.StreamChunk.textDelta(scrubbed));
+                if (transcript.shouldExposeHistoryMessage("assistant", scrubbed)) {
+                    self.callback(self.callback_ctx, providers.StreamChunk.textDelta(scrubbed));
+                }
             }
             self.callback(self.callback_ctx, providers.StreamChunk.finalChunk());
             self.final_pending = false;
@@ -224,8 +230,8 @@ pub const Agent = struct {
         ///      on the next chunk.
         ///
         /// `is_final == true` on the chunk means we should also flush the
-        /// held tail (whatever it is, the stream is ending, so any held
-        /// bytes are real content, not a future-markup prefix).
+        /// held tail unless it is still an ambiguous internal-reflection
+        /// prefix.
         fn emitScrubbedDelta(self: *StreamTimingContext, chunk: providers.StreamChunk) void {
             // Combine any held tail with the new delta so split markup
             // reassembles correctly.
@@ -233,16 +239,27 @@ pub const Agent = struct {
             var combined: std.ArrayListUnmanaged(u8) = .empty;
             defer combined.deinit(allocator);
             combined.appendSlice(allocator, self.pending_tail.items) catch {
-                // OOM — fall back to direct forward of the new delta (drop
-                // the held tail, accept the rare leak rather than fail the
-                // turn). Reset state so we don't double-emit later.
+                // OOM — fall back to the new delta unless it directly carries
+                // a complete internal marker. Keep ordinary whitespace chunks;
+                // stream deltas are not standalone history messages.
+                // Reset state so we don't double-emit later.
                 self.pending_tail.clearRetainingCapacity();
-                self.callback(self.callback_ctx, chunk);
+                if (chunk.delta.len > 0 and
+                    !transcript.containsInternalReflectionMarker(chunk.delta) and
+                    !looksLikeSubstantialInternalPrefix(chunk.delta))
+                {
+                    self.callback(self.callback_ctx, chunk);
+                }
                 return;
             };
             combined.appendSlice(allocator, chunk.delta) catch {
                 self.pending_tail.clearRetainingCapacity();
-                self.callback(self.callback_ctx, chunk);
+                if (chunk.delta.len > 0 and
+                    !transcript.containsInternalReflectionMarker(chunk.delta) and
+                    !looksLikeSubstantialInternalPrefix(chunk.delta))
+                {
+                    self.callback(self.callback_ctx, chunk);
+                }
                 return;
             };
             self.pending_tail.clearRetainingCapacity();
@@ -250,18 +267,32 @@ pub const Agent = struct {
             // Strip complete markup blocks.
             const scrubbed = Agent.stripToolCallMarkup(allocator, combined.items);
             defer if (scrubbed.ptr != combined.items.ptr) allocator.free(scrubbed);
+            if (scrubbed.len == 0 or
+                transcript.containsInternalReflectionMarker(scrubbed) or
+                (chunk.is_final and looksLikeSubstantialInternalPrefix(scrubbed)))
+            {
+                if (chunk.is_final) {
+                    self.callback(self.callback_ctx, providers.StreamChunk.finalChunk());
+                }
+                return;
+            }
 
             // Figure out how many trailing bytes look like a markup prefix
             // we should hold (only when more chunks may follow).
-            const hold_len: usize = if (chunk.is_final) 0 else Agent.trailingMarkupPrefixLen(scrubbed);
+            const hold_len: usize = if (chunk.is_final) 0 else @max(
+                Agent.trailingMarkupPrefixLen(scrubbed),
+                transcript.trailingInternalReflectionPrefixLen(scrubbed),
+            );
             const emit_len = scrubbed.len - hold_len;
             if (emit_len > 0) {
                 self.callback(self.callback_ctx, providers.StreamChunk.textDelta(scrubbed[0..emit_len]));
             }
             if (hold_len > 0) {
-                self.pending_tail.appendSlice(allocator, scrubbed[emit_len..]) catch {
-                    // Same OOM fallback: emit the rest directly.
-                    self.callback(self.callback_ctx, providers.StreamChunk.textDelta(scrubbed[emit_len..]));
+                const held = scrubbed[emit_len..];
+                self.pending_tail.appendSlice(allocator, held) catch {
+                    if (!looksLikeSubstantialInternalPrefix(held)) {
+                        self.callback(self.callback_ctx, providers.StreamChunk.textDelta(held));
+                    }
                 };
             }
             if (chunk.is_final) {
@@ -273,10 +304,14 @@ pub const Agent = struct {
         /// been routed through `emitScrubbedDelta` (defensive — both paths
         /// would otherwise lose the held tail).
         fn flushPendingTail(self: *StreamTimingContext) void {
-            if (self.pending_tail.items.len > 0) {
+            if (self.pending_tail.items.len > 0 and
+                !transcript.containsInternalReflectionMarker(self.pending_tail.items) and
+                !looksLikeSubstantialInternalPrefix(self.pending_tail.items))
+            {
                 self.callback(self.callback_ctx, providers.StreamChunk.textDelta(self.pending_tail.items));
                 self.pending_tail.clearRetainingCapacity();
             }
+            self.pending_tail.clearRetainingCapacity();
         }
     };
 
@@ -328,7 +363,8 @@ pub const Agent = struct {
         }
 
         const buffered_line = Agent.firstNonEmptyLine(ctx.buffered_text.items) orelse return;
-        if (Agent.looksLikeStreamingStatusPrefix(buffered_line) or
+        if (transcript.looksLikeInternalReflectionPrefix(ctx.buffered_text.items) or
+            Agent.looksLikeStreamingStatusPrefix(buffered_line) or
             Agent.looksLikeToolCallMarkupPrefix(buffered_line))
         {
             ctx.emission_mode = .hold_for_validation;
@@ -4310,6 +4346,10 @@ pub const Agent = struct {
             const rc = self.response_cache.?;
             if (rc.get(self.allocator, key_hex) catch null) |cached_response| {
                 errdefer self.allocator.free(cached_response);
+                if (!transcript.shouldExposeHistoryMessage("assistant", cached_response)) {
+                    self.allocator.free(cached_response);
+                    return TurnOutcome.justText(try self.allocator.dupe(u8, ""));
+                }
                 const history_copy = try self.allocator.dupe(u8, cached_response);
                 errdefer self.allocator.free(history_copy);
                 try self.history.append(self.allocator, .{
@@ -5160,11 +5200,20 @@ pub const Agent = struct {
                     "I hit an internal tool-call formatting error before execution. Please retry."
                 else
                     scrubbed_display_text;
+                const safe_display_internal = transcript.containsInternalReflectionMarker(safe_display_text);
+                const public_display_text = if (!safe_display_internal and transcript.shouldExposeHistoryMessage("assistant", safe_display_text))
+                    safe_display_text
+                else
+                    "";
                 const finalize_start_ms = std.time.milliTimestamp();
                 const base_text = if (self.context_was_compacted) blk: {
                     const was_force = self.context_force_compressed;
                     self.context_was_compacted = false;
                     self.context_force_compressed = false;
+
+                    if (public_display_text.len == 0) {
+                        break :blk try self.allocator.dupe(u8, "");
+                    }
 
                     // Emit a system_notice alongside the inline prefix so the
                     // frontend can render a distinct chrome notice (not buried
@@ -5186,12 +5235,19 @@ pub const Agent = struct {
                         "[Context recovery: older messages were dropped to fit within the context window. Some history may be inaccessible.]\n\n"
                     else
                         "[Context compacted]\n\n";
-                    break :blk try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ prefix, safe_display_text });
-                } else try self.allocator.dupe(u8, safe_display_text);
+                    break :blk try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ prefix, public_display_text });
+                } else try self.allocator.dupe(u8, public_display_text);
                 errdefer self.allocator.free(base_text);
 
                 const compose_start_ms = std.time.milliTimestamp();
-                const final_text = try self.composeFinalReply(base_text, response.reasoning_content, response.usage);
+                const final_reasoning = if (safe_display_internal) null else response.reasoning_content;
+                const composed_final_text = try self.composeFinalReply(base_text, final_reasoning, response.usage);
+                const final_text = if (transcript.shouldExposeHistoryMessage("assistant", composed_final_text))
+                    composed_final_text
+                else blk: {
+                    self.allocator.free(composed_final_text);
+                    break :blk try self.allocator.dupe(u8, "");
+                };
                 const compose_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compose_start_ms));
                 log.info("turn.stage stage=compose_final_reply iteration={d} duration_ms={d}", .{ iteration, compose_duration_ms });
                 const compose_stage_event = ObserverEvent{ .turn_stage = .{
@@ -5238,14 +5294,16 @@ pub const Agent = struct {
                     });
                 }
 
-                // Dupe from display_text directly (not from final_text) to avoid double-dupe.
-                // Carry the model's native reasoning_content so Moonshot's
-                // `thinking.keep:"all"` can replay it on the next turn.
-                {
-                    const hist_content = try self.allocator.dupe(u8, safe_display_text);
+                // Prefer the raw provider content for history so native reasoning
+                // can replay separately; when content was empty but reasoning
+                // became the visible reply, store that composed reply instead.
+                const history_uses_display = transcript.shouldExposeHistoryMessage("assistant", public_display_text);
+                const history_reply_text = if (history_uses_display) public_display_text else final_text;
+                if (transcript.shouldExposeHistoryMessage("assistant", history_reply_text)) {
+                    const hist_content = try self.allocator.dupe(u8, history_reply_text);
                     errdefer self.allocator.free(hist_content);
-                    const hist_reasoning: ?[]const u8 = if (response.reasoning_content) |rc|
-                        if (rc.len > 0) try self.allocator.dupe(u8, rc) else null
+                    const hist_reasoning: ?[]const u8 = if (history_uses_display and response.reasoning_content != null)
+                        if (response.reasoning_content.?.len > 0) try self.allocator.dupe(u8, response.reasoning_content.?) else null
                     else
                         null;
                     errdefer if (hist_reasoning) |r| self.allocator.free(r);
@@ -5311,23 +5369,25 @@ pub const Agent = struct {
                 if (self.auto_save) {
                     if (self.mem) |mem| {
                         const visible_reply = if (tts_audio_reply_text) |audio_reply| audio_reply else final_text;
-                        const ts: u128 = @bitCast(std.time.nanoTimestamp());
-                        const save_key = std.fmt.allocPrint(self.allocator, "autosave_assistant_{d}", .{ts}) catch null;
-                        if (save_key) |key| {
-                            defer self.allocator.free(key);
-                            if (mem.store(key, visible_reply, .conversation, self.memory_session_id)) |_| {
-                                // Vector sync after auto-save (fire-and-forget
-                                // — see user-message autosave above).
-                                if (self.mem_rt) |rt| {
-                                    _ = rt.syncVectorAfterStore(self.allocator, key, visible_reply);
+                        if (transcript.shouldExposeHistoryMessage("assistant", visible_reply)) {
+                            const ts: u128 = @bitCast(std.time.nanoTimestamp());
+                            const save_key = std.fmt.allocPrint(self.allocator, "autosave_assistant_{d}", .{ts}) catch null;
+                            if (save_key) |key| {
+                                defer self.allocator.free(key);
+                                if (mem.store(key, visible_reply, .conversation, self.memory_session_id)) |_| {
+                                    // Vector sync after auto-save (fire-and-forget
+                                    // — see user-message autosave above).
+                                    if (self.mem_rt) |rt| {
+                                        _ = rt.syncVectorAfterStore(self.allocator, key, visible_reply);
+                                    }
+                                } else |err| {
+                                    // S4.3 — durable-write silent catch closed. Assistant
+                                    // autosave is the cold-transcript tier for the agent's
+                                    // own replies. Losing one silently means the visible
+                                    // reply reached the user but was never recorded; /memory
+                                    // list would omit it without trace.
+                                    log.warn("autosave.assistant_failed key={s} err={s}", .{ key, @errorName(err) });
                                 }
-                            } else |err| {
-                                // S4.3 — durable-write silent catch closed. Assistant
-                                // autosave is the cold-transcript tier for the agent's
-                                // own replies. Losing one silently means the visible
-                                // reply reached the user but was never recorded; /memory
-                                // list would omit it without trace.
-                                log.warn("autosave.assistant_failed key={s} err={s}", .{ key, @errorName(err) });
                             }
                         }
                     }
@@ -5447,7 +5507,9 @@ pub const Agent = struct {
                 var cache_duration_ms: u64 = 0;
                 const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
 
-                if (allow_exact_response_cache and self.response_cache != null) {
+                if (allow_exact_response_cache and self.response_cache != null and
+                    transcript.shouldExposeHistoryMessage("assistant", final_text))
+                {
                     var store_key_buf: [16]u8 = undefined;
                     const sys_prompt = if (self.history.items.len > 0 and self.history.items[0].role == .system)
                         self.history.items[0].content
@@ -6043,17 +6105,23 @@ pub const Agent = struct {
         defer self.freeResponseFields(&summary_response);
 
         const summary_text = summary_response.contentOrEmpty();
-        const prefixed = if (loop_detected)
-            try std.fmt.allocPrint(self.allocator, "[Tool loop detected at {d}/{d}]\n\n{s}", .{ turn_tool_iterations, self.max_tool_iterations, summary_text })
+        const public_summary_text = if (transcript.shouldExposeHistoryMessage("assistant", summary_text))
+            summary_text
         else
-            try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}]\n\n{s}", .{ self.max_tool_iterations, self.max_tool_iterations, summary_text });
+            "";
+        const prefixed = if (loop_detected)
+            try std.fmt.allocPrint(self.allocator, "[Tool loop detected at {d}/{d}]\n\n{s}", .{ turn_tool_iterations, self.max_tool_iterations, public_summary_text })
+        else
+            try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}]\n\n{s}", .{ self.max_tool_iterations, self.max_tool_iterations, public_summary_text });
         errdefer self.allocator.free(prefixed);
 
         // Store in history (dupe the raw summary, not the prefixed version)
-        try self.history.append(self.allocator, .{
-            .role = .assistant,
-            .content = try self.allocator.dupe(u8, summary_text),
-        });
+        if (transcript.shouldExposeHistoryMessage("assistant", public_summary_text)) {
+            try self.history.append(self.allocator, .{
+                .role = .assistant,
+                .content = try self.allocator.dupe(u8, public_summary_text),
+            });
+        }
 
         // Compact history so the next turn can continue from a stable boundary.
         // v1.14.14 Phase 3 — route through ContextEngine.compact.
@@ -12852,6 +12920,240 @@ test "Agent streaming holds partial XML residue before final scrub" {
     try std.testing.expect(std.mem.indexOf(u8, recorder.chunks.items, "ool_call>") == null);
     try std.testing.expect(std.mem.indexOf(u8, recorder.chunks.items, "tool_call>") == null);
     try std.testing.expect(std.mem.indexOf(u8, recorder.chunks.items, "clean answer") != null);
+}
+
+test "Agent streaming and final output suppress internal reflection prompt" {
+    const ReflectionLeakProvider = struct {
+        const leaked_reply =
+            "**This is your reply to the user. Not a planning document. Not a step-by-step outline. The actual reply.**\n\n" ++
+            "The user CANNOT see the `<tool_result>` block above — they see only your text.";
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "unexpected chat path"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn streamChat(
+            _: *anyopaque,
+            allocator: std.mem.Allocator,
+            _: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            callback(callback_ctx, providers.StreamChunk.textDelta("**This"));
+            callback(callback_ctx, providers.StreamChunk.textDelta(leaked_reply["**This".len..]));
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = try allocator.dupe(u8, leaked_reply),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "reflection-leak-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const StreamRecorder = struct {
+        chunks: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            if (chunk.delta.len == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.chunks.appendSlice(std.testing.allocator, chunk.delta) catch {};
+        }
+
+        fn deinit(self: *@This()) void {
+            self.chunks.deinit(std.testing.allocator);
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = ReflectionLeakProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ReflectionLeakProvider.chatWithSystem,
+        .chat = ReflectionLeakProvider.chat,
+        .supportsNativeTools = ReflectionLeakProvider.supportsNativeTools,
+        .getName = ReflectionLeakProvider.getName,
+        .deinit = ReflectionLeakProvider.deinitFn,
+        .supports_streaming = ReflectionLeakProvider.supportsStreaming,
+        .stream_chat = ReflectionLeakProvider.streamChat,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var recorder = StreamRecorder{};
+    defer recorder.deinit();
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+        .stream_callback = StreamRecorder.onChunk,
+        .stream_ctx = @ptrCast(&recorder),
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("answer plainly");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("", response);
+    try std.testing.expectEqual(@as(usize, 0), recorder.chunks.items.len);
+    var assistant_messages: usize = 0;
+    for (agent.history.items) |msg| {
+        if (msg.role != .assistant) continue;
+        assistant_messages += 1;
+        try std.testing.expect(std.mem.indexOf(u8, msg.content, "This is your reply to the user") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), assistant_messages);
+}
+
+test "Agent streaming preserves whitespace-only deltas in public output" {
+    const SplitWhitespaceProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "unexpected chat path"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn streamChat(
+            _: *anyopaque,
+            allocator: std.mem.Allocator,
+            _: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            callback(callback_ctx, providers.StreamChunk.textDelta("Hello"));
+            callback(callback_ctx, providers.StreamChunk.textDelta(" "));
+            callback(callback_ctx, providers.StreamChunk.textDelta("world"));
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = try allocator.dupe(u8, "Hello world"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "split-whitespace-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const StreamRecorder = struct {
+        chunks: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            if (chunk.delta.len == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.chunks.appendSlice(std.testing.allocator, chunk.delta) catch {};
+        }
+
+        fn deinit(self: *@This()) void {
+            self.chunks.deinit(std.testing.allocator);
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = SplitWhitespaceProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = SplitWhitespaceProvider.chatWithSystem,
+        .chat = SplitWhitespaceProvider.chat,
+        .supportsNativeTools = SplitWhitespaceProvider.supportsNativeTools,
+        .getName = SplitWhitespaceProvider.getName,
+        .deinit = SplitWhitespaceProvider.deinitFn,
+        .supports_streaming = SplitWhitespaceProvider.supportsStreaming,
+        .stream_chat = SplitWhitespaceProvider.streamChat,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var recorder = StreamRecorder{};
+    defer recorder.deinit();
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+        .stream_callback = StreamRecorder.onChunk,
+        .stream_ctx = @ptrCast(&recorder),
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("answer plainly");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("Hello world", response);
+    try std.testing.expectEqualStrings("Hello world", recorder.chunks.items);
 }
 
 test "Agent shouldForceActionFollowThrough detects english deferred promise" {
