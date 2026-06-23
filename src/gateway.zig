@@ -34894,6 +34894,7 @@ test "handleSessionHistory filters internal persisted history messages" {
     try store.saveMessage(session_key, "system", "persisted system");
     try store.saveMessage(session_key, "tool", "persisted tool");
     try store.saveMessage(session_key, "user", "The user CANNOT see the `<tool_result>` block above — they see only your text.");
+    try store.saveMessage(session_key, "assistant", "**This is your reply");
 
     const resp = handleSessionHistory(allocator, &mgr, session_key);
     defer allocator.free(resp.body);
@@ -34903,6 +34904,7 @@ test "handleSessionHistory filters internal persisted history messages" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "persisted system") == null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "persisted tool") == null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "The user CANNOT see") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "**This is your reply") == null);
 }
 
 test "writeMessageEntriesJson filters state-manager persisted history entries" {

@@ -132,6 +132,7 @@ pub fn shouldExposeHistoryMessage(role: []const u8, content: []const u8) bool {
     if (trimmed.len == 0) return false;
     if (!std.mem.eql(u8, role, "user") and !std.mem.eql(u8, role, "assistant")) return false;
     if (isInternalMessage(trimmed)) return false;
+    if (trimmed.len >= "**This".len and looksLikeInternalReflectionPrefix(trimmed)) return false;
     if (containsInternalReflectionMarker(content)) return false;
     return true;
 }
@@ -263,6 +264,11 @@ test "shouldExposeHistoryMessage rejects reflection prompt markers" {
     try std.testing.expect(!shouldExposeHistoryMessage("user", "**This is your reply to the user. Not a planning document. Not a step-by-step outline. The actual reply.**"));
     try std.testing.expect(!shouldExposeHistoryMessage("user", "<tool_result>ok</tool_result>\n\n**STEP 1 (mandatory): Surface what the tool above just returned.**"));
     try std.testing.expect(!shouldExposeHistoryMessage("assistant", "The user CANNOT see the `<tool_result>` block above — they see only your text."));
+}
+
+test "shouldExposeHistoryMessage rejects truncated reflection prompt prefixes" {
+    try std.testing.expect(!shouldExposeHistoryMessage("assistant", "**This is your reply"));
+    try std.testing.expect(!shouldExposeHistoryMessage("assistant", "STEP 1 (mandatory): Surface"));
 }
 
 test "looksLikeInternalReflectionPrefix holds streaming prompt prefixes" {
