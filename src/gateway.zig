@@ -14371,8 +14371,11 @@ fn handlePersistedSessionDelete(
 }
 
 fn writeMessageEntriesJson(w: anytype, entries: []const memory_mod.MessageEntry) !void {
-    for (entries, 0..) |entry, i| {
-        if (i > 0) try w.writeAll(",");
+    var wrote_any = false;
+    for (entries) |entry| {
+        if (!agent_transcript.shouldExposeHistoryMessage(entry.role, entry.content)) continue;
+        if (wrote_any) try w.writeAll(",");
+        wrote_any = true;
         try w.writeAll("{\"role\":\"");
         try jsonEscapeInto(w, entry.role);
         try w.writeAll("\",\"content\":\"");
@@ -23445,18 +23448,20 @@ const ProbeClass = enum { health, ready, other };
 /// Classify a peeked request preview as a cheap liveness/readiness probe.
 ///
 /// Returns `.health` / `.ready` ONLY when `preview` contains a COMPLETE
-/// request line (CRLF-terminated) whose method is exactly `GET` and whose
+/// request header whose request line method is exactly `GET` and whose
 /// target base-path (the portion before any `?`) is exactly `/health` or
 /// `/ready`. Anything else — a different method, a different path, or a
-/// preview that has not yet received the full request line — returns
+/// preview that has not yet received the full request header — returns
 /// `.other`, so the connection falls through to the normal worker path
 /// unchanged. Parsing mirrors handleAcceptedConnection's own request-line
 /// split so the fast-path and slow-path agree on what these targets are.
 fn classifyProbeRequestLine(preview: []const u8) ProbeClass {
-    // Require the full request line so a truncated peek (e.g. "GET /healt")
-    // or a longer path peeked mid-flight (e.g. "GET /healthz" arriving as
-    // "GET /health") is never misclassified — we only act on a settled line.
+    // Require the full header so the fast path can consume the request before
+    // closing. Closing a socket with only MSG_PEEK'd bytes still unread can
+    // surface to clients as a reset after headers.
+    const header_end = std.mem.indexOf(u8, preview, "\r\n\r\n") orelse return .other;
     const line_end = std.mem.indexOf(u8, preview, "\r\n") orelse return .other;
+    if (line_end > header_end) return .other;
     const first_line = preview[0..line_end];
     var parts = std.mem.splitScalar(u8, first_line, ' ');
     const method = parts.next() orelse return .other;
@@ -23466,6 +23471,17 @@ fn classifyProbeRequestLine(preview: []const u8) ProbeClass {
     if (std.mem.eql(u8, base_path, "/health")) return .health;
     if (std.mem.eql(u8, base_path, "/ready")) return .ready;
     return .other;
+}
+
+fn consumePeekedProbeBytes(conn: std.net.Server.Connection, byte_count: usize) void {
+    var remaining = byte_count;
+    var discard: [512]u8 = undefined;
+    while (remaining > 0) {
+        const take = @min(remaining, discard.len);
+        const n = std.posix.recv(conn.stream.handle, discard[0..take], std.posix.MSG.DONTWAIT) catch return;
+        if (n == 0) return;
+        remaining -= n;
+    }
 }
 
 // ── C3: liveness deadlock watchdog ───────────────────────────────────
@@ -23580,27 +23596,30 @@ fn livenessDeadlockDetected(state: *const GatewayState, now_ms: i64) bool {
     return isWorkerPoolDeadlocked(queue_depth, in_flight, gap_ms, threshold_ms);
 }
 
-/// Peek (without consuming) the start of an accepted connection and, if it
-/// is a `GET /health` / `GET /ready` probe, serve it inline on the acceptor
-/// thread and return true (the caller must then close the connection). The
-/// response bytes are byte-for-byte identical to the worker path
-/// (handleAcceptedConnection's `.health` / `.ready` cases). Returns false
-/// for anything else — including a peek that would block or has not yet
-/// received the full request line — so the caller enqueues it normally;
-/// MSG_PEEK leaves the bytes in the socket buffer for the worker to re-read.
+/// Peek the start of an accepted connection and, if it is a complete
+/// `GET /health` / `GET /ready` probe, consume the peeked request bytes,
+/// serve it inline on the acceptor thread, and return true (the caller must
+/// then close the connection). The response bytes are byte-for-byte identical
+/// to the worker path (handleAcceptedConnection's `.health` / `.ready`
+/// cases). Returns false for anything else — including a peek that would block
+/// or has not yet received the full request header — so the caller enqueues it
+/// normally; MSG_PEEK leaves those non-probe bytes in the socket buffer for the
+/// worker to re-read.
 ///
 /// This MUST NOT block the acceptor thread: the peek is a single
 /// non-blocking recv(MSG_PEEK | MSG_DONTWAIT). Accepted sockets do NOT
 /// inherit the listener's O_NONBLOCK, so MSG_DONTWAIT is required to keep
 /// this one recv from blocking; on WouldBlock / short read / any error we
-/// bail to the slow path (enqueue) rather than wait. MSG_PEEK leaves the
-/// bytes in the socket buffer for the worker to re-read on the slow path.
+/// bail to the slow path (enqueue) rather than wait.
 fn tryServeProbeInline(state: *GatewayState, conn: std.net.Server.Connection) bool {
     var peek_buf: [256]u8 = undefined;
     const peek_flags: u32 = std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT;
     const n = std.posix.recv(conn.stream.handle, &peek_buf, peek_flags) catch return false;
     if (n == 0) return false;
     const class = classifyProbeRequestLine(peek_buf[0..n]);
+    if (class != .other) {
+        consumePeekedProbeBytes(conn, n);
+    }
     switch (class) {
         .other => return false,
         .health => {
@@ -30290,12 +30309,14 @@ test "P0-1 classifier: prefix paths are NOT misclassified" {
     try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("GET /readyz HTTP/1.1\r\n\r\n"));
 }
 
-test "P0-1 classifier: a partial request line (no CRLF) is not classified" {
-    // A peek that has not yet received the full request line must return
+test "P0-1 classifier: a partial request header is not classified" {
+    // A peek that has not yet received the full request header must return
     // .other so the connection falls through to the normal worker path —
     // never a guess on a truncated path like "GET /healt".
     try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("GET /healt"));
     try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("GET /health HTTP/1.1"));
+    try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("GET /health HTTP/1.1\r\n"));
+    try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("GET /ready HTTP/1.1\r\n"));
     try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine(""));
     try std.testing.expectEqual(ProbeClass.other, classifyProbeRequestLine("GE"));
 }
@@ -34882,6 +34903,26 @@ test "handleSessionHistory filters internal persisted history messages" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "persisted system") == null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "persisted tool") == null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "The user CANNOT see") == null);
+}
+
+test "writeMessageEntriesJson filters state-manager persisted history entries" {
+    const allocator = std.testing.allocator;
+    const entries = [_]memory_mod.MessageEntry{
+        .{ .role = "user", .content = "visible user" },
+        .{ .role = "system", .content = "hidden system" },
+        .{ .role = "tool", .content = "hidden tool" },
+        .{ .role = "user", .content = "**This is your reply to the user. Not a planning document. Not a step-by-step outline. The actual reply.**" },
+        .{ .role = "assistant", .content = "visible assistant" },
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    try writeMessageEntriesJson(out.writer(allocator), &entries);
+
+    try std.testing.expectEqualStrings(
+        "{\"role\":\"user\",\"content\":\"visible user\"},{\"role\":\"assistant\",\"content\":\"visible assistant\"}",
+        out.items,
+    );
 }
 
 test "handleSessionHistory returns 404 for unknown session" {
