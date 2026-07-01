@@ -259,6 +259,17 @@ fn maxStepsForModel(model: []const u8) u32 {
     return MAX_STEPS_DEFAULT;
 }
 
+/// Together's pro/max endpoint models (FLUX.1-pro, FLUX1.1-pro,
+/// FLUX.1-Kontext-pro, FLUX.1-Kontext-max) run a fixed internal pipeline and
+/// reject a `steps` field with HTTP 400. schnell/dev accept it. We omit the
+/// field for pro/max rather than downgrade the model, so image quality is
+/// preserved. Substring match covers bare + org-prefixed names.
+fn modelSupportsSteps(model: []const u8) bool {
+    if (std.ascii.indexOfIgnoreCase(model, "-pro") != null) return false;
+    if (std.ascii.indexOfIgnoreCase(model, "-max") != null) return false;
+    return true;
+}
+
 /// Round to nearest multiple of DIM_STRIDE, keeping within [MIN_DIM, MAX_DIM].
 fn roundToStride(v: u32) u32 {
     const half = DIM_STRIDE / 2;
@@ -309,8 +320,12 @@ fn buildRequestBody(
     try json_util.appendJsonInt(&body, allocator, "width", @intCast(width));
     try body.append(allocator, ',');
     try json_util.appendJsonInt(&body, allocator, "height", @intCast(height));
-    try body.append(allocator, ',');
-    try json_util.appendJsonInt(&body, allocator, "steps", @intCast(steps));
+    // ponytail: pro/Kontext-max models reject `steps`; only send it to models
+    // that accept it (schnell/dev). Preserves pro quality instead of downgrading.
+    if (modelSupportsSteps(model)) {
+        try body.append(allocator, ',');
+        try json_util.appendJsonInt(&body, allocator, "steps", @intCast(steps));
+    }
     try body.append(allocator, ',');
     try json_util.appendJsonInt(&body, allocator, "n", @intCast(n));
     if (reference_url) |url| {
@@ -580,6 +595,32 @@ test "buildRequestBody includes image_url when reference provided" {
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"image_url\":\"https://example.com/ref.png\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"black-forest-labs/FLUX.1-Kontext-pro\"") != null);
+    // Kontext-pro rejects `steps` — the field must be absent (the bug this fixes).
+    try std.testing.expect(std.mem.indexOf(u8, body, "steps") == null);
+}
+
+test "modelSupportsSteps: pro/max omit steps, schnell/dev keep them" {
+    try std.testing.expect(!modelSupportsSteps("black-forest-labs/FLUX.1-Kontext-pro"));
+    try std.testing.expect(!modelSupportsSteps("black-forest-labs/FLUX.1.1-pro"));
+    try std.testing.expect(!modelSupportsSteps("black-forest-labs/FLUX.1-pro"));
+    try std.testing.expect(!modelSupportsSteps("black-forest-labs/FLUX.1-Kontext-max"));
+    try std.testing.expect(modelSupportsSteps("black-forest-labs/FLUX.1-schnell"));
+    try std.testing.expect(modelSupportsSteps("black-forest-labs/FLUX.1-dev"));
+}
+
+test "buildRequestBody keeps steps for schnell/dev" {
+    const body = try buildRequestBody(
+        std.testing.allocator,
+        "black-forest-labs/FLUX.1-schnell",
+        "a sunset",
+        null,
+        1024,
+        1024,
+        4,
+        1,
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"steps\":4") != null);
 }
 
 test "buildRequestBody omits image_url when no reference" {
