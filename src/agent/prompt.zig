@@ -1139,7 +1139,7 @@ fn appendSkillsSection(
     // so the agent knows the Decision Hub exists and reaches for it when no
     // local skill fits. Static text → cache-stable in the Tier-3 prefix.
     try w.writeAll("## Skills\n\n");
-    try w.writeAll("Skills are reusable capability playbooks. Prefer an installed skill listed below when one fits the task. If none fits, call the `skill_registry` tool with action=\"search\" and a natural-language `query` to check the Decision Hub, then action=\"install\" the best match before proceeding — do not hand-roll a capability an existing skill already covers.\n\n");
+    try w.writeAll("Skills are reusable capability playbooks. Prefer an installed skill listed below when one fits the task. If none fits, call the `skill_registry` tool with action=\"search\" and a natural-language `query` to check the Decision Hub. If a Decision Hub skill looks useful, tell the user what you found and ask before installing it. Do not call action=\"install\" unless the user explicitly agrees. Do not hand-roll a capability an existing skill already covers.\n\n");
 
     if (skill_list.len == 0) return;
 
