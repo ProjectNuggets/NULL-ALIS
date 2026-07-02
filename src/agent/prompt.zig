@@ -1135,16 +1135,17 @@ fn appendSkillsSection(
         }
     }
 
+    // Skill-discovery nudge — ALWAYS emitted, even with zero installed skills,
+    // so the agent knows the Decision Hub exists and reaches for it when no
+    // local skill fits. Static text → cache-stable in the Tier-3 prefix.
+    try w.writeAll("## Skills\n\n");
+    try w.writeAll("Skills are reusable capability playbooks. Prefer an installed skill listed below when one fits the task. If none fits, call the `skill_registry` tool with action=\"search\" and a natural-language `query` to check the Decision Hub, then action=\"install\" the best match before proceeding — do not hand-roll a capability an existing skill already covers.\n\n");
+
     if (skill_list.len == 0) return;
 
     // Render always=true skills with full instructions first
-    var has_always = false;
     for (skill_list) |skill| {
         if (!skill.always or !skill.available) continue;
-        if (!has_always) {
-            try w.writeAll("## Skills\n\n");
-            has_always = true;
-        }
         try std.fmt.format(w, "### Skill: {s}\n\n", .{skill.name});
         if (skill.description.len > 0) {
             try std.fmt.format(w, "{s}\n\n", .{skill.description});
@@ -1625,14 +1626,19 @@ test "appendDateTimeSection outputs UTC timestamp" {
     try std.testing.expect(std.mem.indexOf(u8, output, "202") != null);
 }
 
-test "appendSkillsSection with no skills produces nothing" {
+test "appendSkillsSection with no skills still emits discovery nudge" {
     const allocator = std.testing.allocator;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
     try appendSkillsSection(allocator, w, "/tmp/nullalis-prompt-test-no-skills");
 
-    try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+    // Even with zero installed skills the agent must be told the Decision Hub
+    // exists and how to reach it — this is exactly when discovery matters most.
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "skill_registry") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "Decision Hub") != null);
+    // But no per-skill render block when nothing is installed.
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "### Skill:") == null);
 }
 
 test "appendSkillsSection renders summary XML for always=false skill" {
@@ -1666,8 +1672,9 @@ test "appendSkillsSection renders summary XML for always=false skill" {
     try std.testing.expect(std.mem.indexOf(u8, output, "description=\"Greets the user\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "SKILL.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "read_file") != null);
-    // Full instructions should NOT be in the output
-    try std.testing.expect(std.mem.indexOf(u8, output, "## Skills") == null);
+    // A summary-only skill must NOT get a full-instruction render block.
+    // (## Skills now always renders as the discovery-nudge header.)
+    try std.testing.expect(std.mem.indexOf(u8, output, "### Skill:") == null);
 }
 
 test "appendSkillsSection renders full instructions for always=true skill" {
@@ -1783,8 +1790,9 @@ test "appendSkillsSection renders unavailable skill with missing deps" {
     try std.testing.expect(std.mem.indexOf(u8, output, "name=\"docker-deploy\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "available=\"false\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "missing=") != null);
-    // Should NOT be in the full Skills section
-    try std.testing.expect(std.mem.indexOf(u8, output, "## Skills") == null);
+    // Should NOT get a full-instruction render block (## Skills is now the
+    // always-on discovery-nudge header).
+    try std.testing.expect(std.mem.indexOf(u8, output, "### Skill:") == null);
 }
 
 test "appendSkillsSection unavailable always=true skill renders in XML not full" {
