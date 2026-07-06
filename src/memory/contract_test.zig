@@ -79,3 +79,18 @@ test "memory contract: extraction tool denylist is exactly the contracted set" {
         try std.testing.expect(found);
     }
 }
+
+test "memory contract: extraction denylist entries are real registered tools (no typo drift)" {
+    const tools_root = @import("../tools/root.zig");
+    const registry = tools_root.defaultMetadataRegistry();
+    for (extraction_runner.internal_extraction_tool_names) |denied| {
+        var found = false;
+        for (registry) |meta| {
+            if (std.mem.eql(u8, meta.name, denied)) found = true;
+        }
+        if (!found) {
+            std.debug.print("denylist entry matches no registered tool: {s}\n", .{denied});
+            return error.DenylistDrift;
+        }
+    }
+}
