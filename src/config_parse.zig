@@ -1037,6 +1037,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("cost_vital_in_prompt")) |v| {
                 if (v == .bool) self.agent.cost_vital_in_prompt = v.bool;
             }
+            // Task 4 (package1-activations, "first dream consumer") — wire
+            // the dream_log warm-start gate so operators can disable the
+            // latest-reflection injection via config.json (default ON).
+            if (ag.object.get("dream_log_warmstart_enabled")) |v| {
+                if (v == .bool) self.agent.dream_log_warmstart_enabled = v.bool;
+            }
             // C4 (brain-graph activation) — wire the nested [agent.extraction]
             // ExtractionConfig block. Previously this struct had NO parser, so
             // its "flip via TOML" docstring silently no-op'd. The session-end

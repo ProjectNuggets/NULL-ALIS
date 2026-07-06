@@ -289,6 +289,11 @@ pub const SessionManager = struct {
     /// PromptContext.usage_runtime. Same INIT-ONLY concurrency contract as
     /// the sibling fields. Default true.
     cost_vital_in_prompt: bool = true,
+    /// Task 4 (package1-activations, "first dream consumer") — dream_log
+    /// warm-start gate, threaded from gateway config to per-session Agent →
+    /// memory_loader (LoadTurnMemoryOptions). Same INIT-ONLY concurrency
+    /// contract as the sibling fields. Default true.
+    dream_log_warmstart_enabled: bool = true,
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
@@ -783,6 +788,9 @@ pub const SessionManager = struct {
         // Task 3 (package1-activations) — cost-vital-in-prompt gate, same
         // plumbing pattern.
         agent.cost_vital_in_prompt = self.cost_vital_in_prompt;
+        // Task 4 (package1-activations) — dream_log warm-start gate, same
+        // plumbing pattern.
+        agent.dream_log_warmstart_enabled = self.dream_log_warmstart_enabled;
         return agent;
     }
 

@@ -600,6 +600,13 @@ pub const Agent = struct {
     /// INIT-ONLY concurrency contract as the sibling flags. Default true.
     /// See config_types.cost_vital_in_prompt.
     cost_vital_in_prompt: bool = true,
+    /// Task 4 (package1-activations, "first dream consumer") — dream_log
+    /// warm-start gate, threaded to memory_loader via LoadTurnMemoryOptions
+    /// so the latest `dream_log/<YYYY-MM-DD>` reflection is injected into
+    /// warm-start context. Same INIT-ONLY concurrency contract as the
+    /// sibling flags. Default true. See
+    /// config_types.dream_log_warmstart_enabled.
+    dream_log_warmstart_enabled: bool = true,
     /// P4 (memory-phase-0.5) — canonical-continuity-summary gate, threaded to
     /// the commands gating predicate (`shouldUseDeterministicSessionSummary`)
     /// so the two LIVE in-conversation boundary triggers

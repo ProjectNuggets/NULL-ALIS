@@ -2123,6 +2123,10 @@ const TenantRuntime = struct {
         // controls whether the per-session Agent's usage_rt reaches the
         // Runtime section of its own system prompt).
         runtime.session_mgr.cost_vital_in_prompt = runtime.config.agent.cost_vital_in_prompt;
+        // Task 4 (package1-activations, "first dream consumer") — wire the
+        // dream_log warm-start gate unconditionally, same plumbing pattern
+        // as cost_vital_in_prompt above.
+        runtime.session_mgr.dream_log_warmstart_enabled = runtime.config.agent.dream_log_warmstart_enabled;
 
         // Wire sidecar provider from bundle to session manager
         if (runtime.provider_bundle.sidecarProvider()) |sp| {
@@ -24981,6 +24985,11 @@ pub fn runWithRole(
                 // the standalone/local-agent path also surfaces the Cost
                 // line (or not) per config.
                 sm.cost_vital_in_prompt = cfg.agent.cost_vital_in_prompt;
+                // Task 4 (package1-activations) — mirror the tenant-runtime
+                // wiring: dream_log_warmstart_enabled travels the same way
+                // so the standalone/local-agent path also gets the latest
+                // overnight reflection injected (or not) per config.
+                sm.dream_log_warmstart_enabled = cfg.agent.dream_log_warmstart_enabled;
                 if (mem_rt) |*rt| {
                     sm.mem_rt = rt;
                     tools_mod.bindMemoryRuntime(tools_slice, rt);

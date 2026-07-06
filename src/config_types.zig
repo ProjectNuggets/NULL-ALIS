@@ -546,6 +546,27 @@ pub const AgentConfig = struct {
     /// the agent reads in its own system prompt; it never affects cost
     /// computation, billing, or the ledger itself.
     cost_vital_in_prompt: bool = true,
+    /// Task 4 (package1-activations, "first dream consumer") — dream_log
+    /// warm-start gate.
+    ///
+    /// When TRUE (default), the memory loader finds the latest
+    /// `dream_log/<YYYY-MM-DD>` key (the nightly dream cycle's most
+    /// recent reflection) and injects it into the agent's warm-start
+    /// context right after `pending_conflicts`, the same way
+    /// `summary_latest/{session}` is injected. Before this flag, the
+    /// nightly dream cycle wrote reflections that nothing ever read back
+    /// — a write-only organ. This makes the agent the first consumer of
+    /// its own overnight synthesis.
+    ///
+    /// When FALSE, no dream_log entry is injected — exact prior
+    /// (pre-Task-4) context. Read-only consumption either way: this
+    /// never marks dream_log/ keys hidden or reclassifies them (they
+    /// remain brain-visible derived synthesis).
+    ///
+    /// Threaded to memory_loader via LoadTurnMemoryOptions through the
+    /// agent, same plumbing pattern as `typed_views_enabled` /
+    /// `cost_vital_in_prompt`.
+    dream_log_warmstart_enabled: bool = true,
     // V1.14.12 (Path A) — extraction_legacy_direct_writes FIELD REMOVED.
     // M5 sprint flag-gated two redundant direct write paths during a
     // soak window. Path A closes the M5 sprint by:
