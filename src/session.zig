@@ -284,6 +284,11 @@ pub const SessionManager = struct {
     /// from gateway config to per-session Agent → commands gating predicate.
     /// Same INIT-ONLY concurrency contract as the sibling fields. Default true.
     canonical_continuity_summary_enabled: bool = true,
+    /// Task 3 (package1-activations, "cost interoception") — Runtime-prompt
+    /// cost-vital gate, threaded from gateway config to per-session Agent →
+    /// PromptContext.usage_runtime. Same INIT-ONLY concurrency contract as
+    /// the sibling fields. Default true.
+    cost_vital_in_prompt: bool = true,
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
@@ -775,6 +780,9 @@ pub const SessionManager = struct {
         agent.typed_views_enabled = self.typed_views_enabled;
         // P4 — canonical-continuity-summary gate, same plumbing pattern.
         agent.canonical_continuity_summary_enabled = self.canonical_continuity_summary_enabled;
+        // Task 3 (package1-activations) — cost-vital-in-prompt gate, same
+        // plumbing pattern.
+        agent.cost_vital_in_prompt = self.cost_vital_in_prompt;
         return agent;
     }
 

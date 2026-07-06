@@ -2117,6 +2117,12 @@ const TenantRuntime = struct {
         }
 
         runtime.session_mgr.usage_rt = runtime.usage_rt;
+        // Task 3 (package1-activations, "cost interoception") — wire the
+        // cost-vital-in-prompt gate unconditionally alongside usage_rt
+        // (independent of extraction/Postgres availability — this only
+        // controls whether the per-session Agent's usage_rt reaches the
+        // Runtime section of its own system prompt).
+        runtime.session_mgr.cost_vital_in_prompt = runtime.config.agent.cost_vital_in_prompt;
 
         // Wire sidecar provider from bundle to session manager
         if (runtime.provider_bundle.sidecarProvider()) |sp| {
@@ -24970,6 +24976,11 @@ pub fn runWithRole(
                 if (standalone_usage_rt) |*urt| {
                     sm.usage_rt = urt;
                 }
+                // Task 3 (package1-activations) — mirror the tenant-runtime
+                // wiring: cost_vital_in_prompt travels alongside usage_rt so
+                // the standalone/local-agent path also surfaces the Cost
+                // line (or not) per config.
+                sm.cost_vital_in_prompt = cfg.agent.cost_vital_in_prompt;
                 if (mem_rt) |*rt| {
                     sm.mem_rt = rt;
                     tools_mod.bindMemoryRuntime(tools_slice, rt);

@@ -799,6 +799,15 @@ pub const ContextEngine = struct {
             // when this turn runs in Superpowers mode. Per-turn signal; the
             // session restores agent.superpowers_mode on the turn's defer.
             .coordinator_mode = agent.superpowers_mode,
+            // Task 3 (package1-activations, "cost interoception") — surface
+            // the agent's own runtime spend in its Runtime prompt section.
+            // Gated on cost_vital_in_prompt (default true, threaded from
+            // config the same way as typed_views_enabled — see
+            // session.zig::buildSessionAgent); the flag OFF or usage_rt
+            // unset both resolve to null here, which is the exact
+            // byte-identical prior-prompt path (see prompt.zig's
+            // PromptContext.usage_runtime doc comment).
+            .usage_runtime = if (agent.cost_vital_in_prompt) agent.usage_rt else null,
         };
 
         const stable_prompt = try prompt.buildStableSystemPrompt(allocator, prompt_ctx);

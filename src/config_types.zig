@@ -530,6 +530,22 @@ pub const AgentConfig = struct {
     /// disabling it cannot lose events that would otherwise be dropped
     /// today, only skips the new durability path.
     trace_persistence_enabled: bool = true,
+    /// Task 3 (package1-activations, "cost interoception") — Runtime-prompt
+    /// cost-vital gate.
+    ///
+    /// When TRUE (default), the per-session Agent's `usage_rt` (already
+    /// wired end-to-end for structured per-turn accounting) is also passed
+    /// through to the system-prompt builder's Runtime section, which then
+    /// emits a "Cost: $X this month | $Y this session" line so the agent
+    /// can see its own spend, weigh expensive tools against it, and answer
+    /// cost questions truthfully.
+    ///
+    /// When FALSE, the Runtime section renders exactly as before this
+    /// feature (no Cost line) — same null-pointer off-path used when no
+    /// UsageRuntime is wired at all. Safe rollback: this only changes what
+    /// the agent reads in its own system prompt; it never affects cost
+    /// computation, billing, or the ledger itself.
+    cost_vital_in_prompt: bool = true,
     // V1.14.12 (Path A) — extraction_legacy_direct_writes FIELD REMOVED.
     // M5 sprint flag-gated two redundant direct write paths during a
     // soak window. Path A closes the M5 sprint by:

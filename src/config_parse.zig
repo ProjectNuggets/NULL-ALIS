@@ -1031,6 +1031,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("trace_persistence_enabled")) |v| {
                 if (v == .bool) self.agent.trace_persistence_enabled = v.bool;
             }
+            // Task 3 (package1-activations) — wire the cost-vital-in-prompt
+            // gate so operators can disable the Runtime section's Cost line
+            // via config.json (default ON).
+            if (ag.object.get("cost_vital_in_prompt")) |v| {
+                if (v == .bool) self.agent.cost_vital_in_prompt = v.bool;
+            }
             // C4 (brain-graph activation) — wire the nested [agent.extraction]
             // ExtractionConfig block. Previously this struct had NO parser, so
             // its "flip via TOML" docstring silently no-op'd. The session-end

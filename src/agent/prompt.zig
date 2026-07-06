@@ -9,6 +9,7 @@ const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
 const skills_mod = @import("../skills.zig");
 const tool_surface = @import("tool_surface.zig");
+const usage_runtime_mod = @import("../usage_runtime.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // System Prompt Builder
@@ -288,6 +289,19 @@ pub const PromptContext = struct {
     /// (`context_engine.assemble`). Volatile (per-turn) because superpowers is
     /// a per-turn signal — a normal turn never emits it.
     coordinator_mode: bool = false,
+    /// Task 3 (package1-activations, "cost interoception") — optional
+    /// pointer to the tenant's UsageRuntime, surfaced in the Runtime section
+    /// as a "Cost: $X this month | $Y this session" line so the agent can
+    /// weigh expensive tools against its own spend and answer cost
+    /// questions truthfully. Set from `agent.usage_rt` at
+    /// `context_engine.assemble` — null (default) reproduces the exact
+    /// prior Runtime section bytes (no Cost line), preserving byte-identical
+    /// prompts for callers that don't wire a UsageRuntime (or that have the
+    /// `cost_vital_in_prompt` flag off — see gating at the construction
+    /// site, mirroring `typed_views_enabled`). monthlyTotalUsd/sessionTotals
+    /// are infallible (return f64/struct, no error), so this can never fail
+    /// prompt build.
+    usage_runtime: ?*usage_runtime_mod.UsageRuntime = null,
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -455,7 +469,7 @@ pub fn buildStableSystemPrompt(
     // ─── Tier 4: runtime (per-session stable) ──
 
     // Runtime info — model name. ~200 B.
-    try buildRuntimeSection(w, ctx.model_name);
+    try buildRuntimeSection(w, ctx.model_name, ctx.usage_runtime);
 
     return try buf.toOwnedSlice(allocator);
 }
@@ -757,11 +771,25 @@ fn buildWorkspaceSection(w: anytype, workspace_dir: []const u8) !void {
 }
 
 /// Emit the runtime section.
-fn buildRuntimeSection(w: anytype, model_name: []const u8) !void {
+fn buildRuntimeSection(w: anytype, model_name: []const u8, usage_runtime: ?*usage_runtime_mod.UsageRuntime) !void {
     try std.fmt.format(w, "## Runtime\n\nOS: {s} | Model: {s}\n\n", .{
         @tagName(builtin.os.tag),
         model_name,
     });
+    // Task 3 (package1-activations, "cost interoception") — surface the
+    // tenant's own runtime spend so the agent can weigh expensive tools and
+    // answer cost questions truthfully. `usage_runtime` is null unless the
+    // caller wired an Agent's `usage_rt` AND the `cost_vital_in_prompt` flag
+    // is on (gating happens at the PromptContext construction site — see
+    // context_engine.zig — mirroring the typed_views_enabled pattern). null
+    // is byte-identical to prior behavior: no Cost line at all.
+    // monthlyTotalUsd/sessionTotals are infallible (f64 / plain struct), so
+    // this can never fail prompt build.
+    if (usage_runtime) |urt| {
+        const monthly = urt.monthlyTotalUsd(std.time.timestamp());
+        const sess = urt.sessionTotals();
+        try std.fmt.format(w, "Cost: ${d:.2} this month | ${d:.2} this session. This is your own runtime spend — weigh it when choosing expensive tools; it is safe to mention to the user when relevant.\n\n", .{ monthly, sess.cost });
+    }
     // R16 (2026-04-27) — disambiguate two orthogonal reasoning fields the
     // user may ask about. Without this, the model sees both in
     // context_snapshot output and infers (wrongly) that one disables the
@@ -1446,6 +1474,53 @@ test "buildSystemPrompt includes core sections" {
             return error.LinkTypeVocabularyDriftDetected;
         }
     }
+}
+
+// Task 3 (package1-activations, "cost interoception") — Runtime section
+// Cost line. Mirrors "buildSystemPrompt includes core sections" above but
+// isolates the Runtime section behavior for the new usage_runtime field.
+
+test "buildRuntimeSection emits Cost line when usage_runtime is set" {
+    const allocator = std.testing.allocator;
+    var urt = usage_runtime_mod.UsageRuntime.init(allocator);
+    defer urt.deinit();
+    urt.recordTurn("test-model", 100, 50, 1.23, 200);
+
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .usage_runtime = &urt,
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Runtime") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Cost: $") != null);
+    // This month's ledger is empty (no cost_jsonl_path configured), so
+    // monthlyTotalUsd is 0.00 — but the session total ($1.23 recorded above)
+    // must be present in the Cost line.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "$0.00 this month") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "$1.23 this session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "weigh it when choosing expensive tools") != null);
+}
+
+test "buildRuntimeSection omits Cost line and stays byte-identical when usage_runtime is null" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        // usage_runtime defaults to null — exact prior Runtime section bytes.
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Runtime") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "OS: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Model: test-model") != null);
+    // The prior Runtime section text must still be present verbatim.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Reasoning fields disambiguation") != null);
+    // No Cost line at all — null pointer is the off-path.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Cost:") == null);
 }
 
 // Dump-helper: writes the assembled prompt to /tmp/nullalis_prompt_full.txt
