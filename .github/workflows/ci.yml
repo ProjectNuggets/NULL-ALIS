@@ -19,7 +19,12 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux-x86_64
-          - os: macos-latest
+          # Pinned to macos-14: the current macos-latest (15.x) image's
+          # SDK/CLT combination fails to link libSystem with zig 0.15.2
+          # (undefined _abort/_malloc/__availability_version_check at link)
+          # — reproduced on fresh cache, so it's the image toolchain, not
+          # cache poisoning. Re-test macos-latest on the next zig bump.
+          - os: macos-14
             target: macos-aarch64
 
     steps:
