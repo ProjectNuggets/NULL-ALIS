@@ -2652,25 +2652,26 @@ fn testFlushClockNow() i64 {
 
 // Wave-E — park a lifecycle worker on `session` that blocks until `release`
 // is set, registering it as the session's in-flight lifecycle thread. An
-// UNBOUNDED join would deadlock on it. Returns the spawned thread; callers
-// MUST set release and reap (waitForLifecycleIdle) before the session is torn
-// down. Mirrors the P0-3 flush-test Blocker pattern.
+// UNBOUNDED join would deadlock on it. The helper first drains any real
+// processMessage lifecycle worker so the fake blocker does not overwrite a
+// live join handle and leave that worker running into test teardown.
 fn parkStuckLifecycleWorker(
     session: *Session,
     release: *std.atomic.Value(bool),
-) !std.Thread {
+) !void {
     const Blocker = struct {
         fn run(rel: *std.atomic.Value(bool), in_flight: *std.atomic.Value(bool)) void {
             while (!rel.load(.acquire)) std.Thread.sleep(1 * std.time.ns_per_ms);
             in_flight.store(false, .release);
         }
     };
+    try testing.expect(session.agent.waitForLifecycleIdle(30_000));
     session.agent.lifecycle_in_flight.store(true, .release);
+    errdefer session.agent.lifecycle_in_flight.store(false, .release);
     const blocker = try std.Thread.spawn(.{}, Blocker.run, .{ release, &session.agent.lifecycle_in_flight });
     session.agent.lifecycle_thread_mu.lock();
     session.agent.lifecycle_thread = blocker;
     session.agent.lifecycle_thread_mu.unlock();
-    return blocker;
 }
 
 test "Wave-E: evictIdle with a STUCK lifecycle worker returns within the bound and DEFERS the session (does not block)" {
@@ -2693,7 +2694,8 @@ test "Wave-E: evictIdle with a STUCK lifecycle worker returns within the bound a
 
     // Park a worker that never finishes within the bound.
     var release = std.atomic.Value(bool).init(false);
-    _ = try parkStuckLifecycleWorker(session, &release);
+    try parkStuckLifecycleWorker(session, &release);
+    defer release.store(true, .release);
 
     // evictIdle(0) makes the session idle-eligible. With the bounded join it
     // must return PROMPTLY (~evict_join_timeout_ms, NOT block on the parked
@@ -2711,7 +2713,7 @@ test "Wave-E: evictIdle with a STUCK lifecycle worker returns within the bound a
 
     // Release + reap so deinit doesn't see the worker in flight.
     release.store(true, .release);
-    _ = session.agent.waitForLifecycleIdle(5_000);
+    try testing.expect(session.agent.waitForLifecycleIdle(5_000));
 }
 
 test "Wave-E: evictIdleShutdownAware bails BETWEEN sessions when shutdown is set (maintenance thread exits promptly)" {
@@ -2735,7 +2737,8 @@ test "Wave-E: evictIdleShutdownAware bails BETWEEN sessions when shutdown is set
     const session_b = sm.getIfPresent("evict:b") orelse return error.TestUnexpectedResult;
 
     var release = std.atomic.Value(bool).init(false);
-    _ = try parkStuckLifecycleWorker(session_b, &release);
+    try parkStuckLifecycleWorker(session_b, &release);
+    defer release.store(true, .release);
 
     // Shutdown already requested → the sweep observes it BETWEEN sessions and
     // bails out, evicting nothing and (critically) returning promptly even
@@ -2753,7 +2756,7 @@ test "Wave-E: evictIdleShutdownAware bails BETWEEN sessions when shutdown is set
     try testing.expect(sm.getIfPresent("evict:b") != null);
 
     release.store(true, .release);
-    _ = session_b.agent.waitForLifecycleIdle(5_000);
+    try testing.expect(session_b.agent.waitForLifecycleIdle(5_000));
 }
 
 test "P0-3: flushSessionsForShutdownClocked skips heavy join past budget and returns promptly without racing the in-flight worker" {
@@ -2768,26 +2771,14 @@ test "P0-3: flushSessionsForShutdownClocked skips heavy join past budget and ret
     var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
     defer sm.deinit();
 
-    const first_reply = try sm.processMessage("shutdown:budget", "hello", null);
-    defer testing.allocator.free(first_reply);
-
-    const session = sm.getIfPresent("shutdown:budget") orelse return error.TestUnexpectedResult;
+    const session = try sm.getOrCreate("shutdown:budget");
 
     // Park a lifecycle worker that blocks until released, and register it
     // as the session's in-flight lifecycle thread. An UNBOUNDED join would
     // deadlock the flush here; the budget must skip it.
     var release = std.atomic.Value(bool).init(false);
-    const Blocker = struct {
-        fn run(rel: *std.atomic.Value(bool), in_flight: *std.atomic.Value(bool)) void {
-            while (!rel.load(.acquire)) std.Thread.sleep(1 * std.time.ns_per_ms);
-            in_flight.store(false, .release);
-        }
-    };
-    session.agent.lifecycle_in_flight.store(true, .release);
-    const blocker = try std.Thread.spawn(.{}, Blocker.run, .{ &release, &session.agent.lifecycle_in_flight });
-    session.agent.lifecycle_thread_mu.lock();
-    session.agent.lifecycle_thread = blocker;
-    session.agent.lifecycle_thread_mu.unlock();
+    try parkStuckLifecycleWorker(session, &release);
+    defer release.store(true, .release);
 
     // Fake clock already past a tiny budget on the FIRST budget check →
     // heavy join is skipped for the (only) session.
@@ -2821,7 +2812,7 @@ test "P0-3: flushSessionsForShutdownClocked skips heavy join past budget and ret
     // additionally have written the deterministic checkpoint via
     // persistSessionCheckpointDetailed — the path the flush deferred to.)
     release.store(true, .release);
-    _ = session.agent.waitForLifecycleIdle(5_000);
+    try testing.expect(session.agent.waitForLifecycleIdle(5_000));
 }
 
 test "P0-3: flushSessionsForShutdownClocked under budget still flushes every session" {
