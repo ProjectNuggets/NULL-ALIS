@@ -1,5 +1,3 @@
-BEGIN;
-
 -- Loop-2 substrate (three-loops spec §3.1): durable per-run tool-trace
 -- digests. One row per completed run; events carried as a JSONB array
 -- (kind, tool, success, duration_ms, error-ish fields — the observer's
@@ -20,5 +18,3 @@ CREATE UNIQUE INDEX IF NOT EXISTS tool_traces_run_uniq
 -- Miner access path: recent traces per user.
 CREATE INDEX IF NOT EXISTS tool_traces_user_recent
     ON {schema}.tool_traces (user_id, created_at DESC);
-
-COMMIT;
