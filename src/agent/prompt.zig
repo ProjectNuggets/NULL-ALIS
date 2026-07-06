@@ -290,17 +290,23 @@ pub const PromptContext = struct {
     /// a per-turn signal — a normal turn never emits it.
     coordinator_mode: bool = false,
     /// Task 3 (package1-activations, "cost interoception") — optional
-    /// pointer to the tenant's UsageRuntime, surfaced in the Runtime section
-    /// as a "Cost: $X this month | $Y this session" line so the agent can
+    /// pointer to the tenant's UsageRuntime, surfaced in the VOLATILE block
+    /// (see `buildCostSection`, called from `buildVolatileSystemPrompt`) as
+    /// a "Cost: $X this month | $Y this session" line so the agent can
     /// weigh expensive tools against its own spend and answer cost
     /// questions truthfully. Set from `agent.usage_rt` at
-    /// `context_engine.assemble` — null (default) reproduces the exact
-    /// prior Runtime section bytes (no Cost line), preserving byte-identical
-    /// prompts for callers that don't wire a UsageRuntime (or that have the
-    /// `cost_vital_in_prompt` flag off — see gating at the construction
-    /// site, mirroring `typed_views_enabled`). monthlyTotalUsd/sessionTotals
-    /// are infallible (return f64/struct, no error), so this can never fail
-    /// prompt build.
+    /// `context_engine.assemble` — null (default) omits the Cost line
+    /// entirely. Review fix (post-588b3776): originally emitted from the
+    /// STABLE block's Runtime section (Tier 4), which broke provider
+    /// byte-prefix / `cache_control` caching because the cost string
+    /// changes every turn. Moved to the volatile block, which is rebuilt
+    /// every turn and is NOT cache-targeted — `buildStableSystemPrompt`'s
+    /// output is now unaffected by this field entirely (byte-identical
+    /// regardless of whether it's null or points at an accruing
+    /// UsageRuntime). `cost_vital_in_prompt` flag off also resolves this to
+    /// null at the construction site (mirroring `typed_views_enabled`).
+    /// monthlyTotalUsd/sessionTotals are infallible (return f64/struct, no
+    /// error), so this can never fail prompt build.
     usage_runtime: ?*usage_runtime_mod.UsageRuntime = null,
 };
 
@@ -469,7 +475,7 @@ pub fn buildStableSystemPrompt(
     // ─── Tier 4: runtime (per-session stable) ──
 
     // Runtime info — model name. ~200 B.
-    try buildRuntimeSection(w, ctx.model_name, ctx.usage_runtime);
+    try buildRuntimeSection(w, ctx.model_name);
 
     return try buf.toOwnedSlice(allocator);
 }
@@ -499,6 +505,30 @@ fn buildCoordinatorSection(w: anytype) !void {
     );
 }
 
+/// Task 3 review fix (package1-activations, "cost interoception") — surface
+/// the tenant's own runtime spend so the agent can weigh expensive tools and
+/// answer cost questions truthfully. Originally emitted from
+/// `buildRuntimeSection` (Tier 4 of the STABLE block, see prompt.zig commit
+/// 588b3776) — moved here because a per-turn-changing cost string in the
+/// STABLE block defeats provider byte-prefix / `cache_control: ephemeral`
+/// caching (the whole stable block shares a single cache breakpoint; ANY
+/// byte change invalidates the cached tail on every turn). The VOLATILE
+/// block is rebuilt every turn and is NOT cache-targeted (see doc comment
+/// on `buildVolatileSystemPrompt`), which is exactly the freshness this
+/// content needs. `usage_runtime` is null unless the caller wired an
+/// Agent's `usage_rt` AND the `cost_vital_in_prompt` flag is on (gating
+/// happens at the PromptContext construction site — see
+/// context_engine.zig — mirroring the typed_views_enabled pattern). null
+/// means the section is omitted entirely. monthlyTotalUsd/sessionTotals are
+/// infallible (f64 / plain struct), so this can never fail prompt build.
+fn buildCostSection(w: anytype, usage_runtime: ?*usage_runtime_mod.UsageRuntime) !void {
+    if (usage_runtime) |urt| {
+        const monthly = urt.monthlyTotalUsd(std.time.timestamp());
+        const sess = urt.sessionTotals();
+        try std.fmt.format(w, "Cost: ${d:.2} this month | ${d:.2} this session. This is your own runtime spend — weigh it when choosing expensive tools; it is safe to mention to the user when relevant.\n\n", .{ monthly, sess.cost });
+    }
+}
+
 pub fn buildVolatileSystemPrompt(
     allocator: std.mem.Allocator,
     ctx: PromptContext,
@@ -514,6 +544,12 @@ pub fn buildVolatileSystemPrompt(
 
     // DateTime section — current UTC time. Always changes turn-to-turn.
     try appendDateTimeSection(allocator, w, ctx.workspace_dir);
+
+    // Task 3 review fix (package1-activations, "cost interoception") — the
+    // agent's own runtime spend. Per-turn-changing by nature (cost accrues
+    // every turn), so it belongs in the volatile tail, not the stable
+    // (cache-targeted) block. See buildCostSection doc comment.
+    try buildCostSection(w, ctx.usage_runtime);
 
     // Phase 5 (Superpowers mode) — coordinator framing. Emitted near the top
     // (after datetime, before recalled memory) so the coordinator role anchors
@@ -771,25 +807,11 @@ fn buildWorkspaceSection(w: anytype, workspace_dir: []const u8) !void {
 }
 
 /// Emit the runtime section.
-fn buildRuntimeSection(w: anytype, model_name: []const u8, usage_runtime: ?*usage_runtime_mod.UsageRuntime) !void {
+fn buildRuntimeSection(w: anytype, model_name: []const u8) !void {
     try std.fmt.format(w, "## Runtime\n\nOS: {s} | Model: {s}\n\n", .{
         @tagName(builtin.os.tag),
         model_name,
     });
-    // Task 3 (package1-activations, "cost interoception") — surface the
-    // tenant's own runtime spend so the agent can weigh expensive tools and
-    // answer cost questions truthfully. `usage_runtime` is null unless the
-    // caller wired an Agent's `usage_rt` AND the `cost_vital_in_prompt` flag
-    // is on (gating happens at the PromptContext construction site — see
-    // context_engine.zig — mirroring the typed_views_enabled pattern). null
-    // is byte-identical to prior behavior: no Cost line at all.
-    // monthlyTotalUsd/sessionTotals are infallible (f64 / plain struct), so
-    // this can never fail prompt build.
-    if (usage_runtime) |urt| {
-        const monthly = urt.monthlyTotalUsd(std.time.timestamp());
-        const sess = urt.sessionTotals();
-        try std.fmt.format(w, "Cost: ${d:.2} this month | ${d:.2} this session. This is your own runtime spend — weigh it when choosing expensive tools; it is safe to mention to the user when relevant.\n\n", .{ monthly, sess.cost });
-    }
     // R16 (2026-04-27) — disambiguate two orthogonal reasoning fields the
     // user may ask about. Without this, the model sees both in
     // context_snapshot output and infers (wrongly) that one disables the
@@ -1476,11 +1498,16 @@ test "buildSystemPrompt includes core sections" {
     }
 }
 
-// Task 3 (package1-activations, "cost interoception") — Runtime section
-// Cost line. Mirrors "buildSystemPrompt includes core sections" above but
-// isolates the Runtime section behavior for the new usage_runtime field.
+// Task 3 (package1-activations, "cost interoception") — Cost line, now
+// emitted by buildCostSection in the VOLATILE block (see review fix: a
+// per-turn-changing cost string in the STABLE block's Tier 4 Runtime
+// section defeated provider byte-prefix / cache_control caching). These
+// tests were adapted from the original "Runtime section" tests to assert
+// against the full-prompt assembly (the testable surface for the Cost
+// line's presence) AND to pin down that it is specifically the STABLE
+// Runtime section that must never contain it.
 
-test "buildRuntimeSection emits Cost line when usage_runtime is set" {
+test "buildVolatileSystemPrompt emits Cost line when usage_runtime is set" {
     const allocator = std.testing.allocator;
     var urt = usage_runtime_mod.UsageRuntime.init(allocator);
     defer urt.deinit();
@@ -1502,6 +1529,27 @@ test "buildRuntimeSection emits Cost line when usage_runtime is set" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "$0.00 this month") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "$1.23 this session") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "weigh it when choosing expensive tools") != null);
+
+    // The Cost line lives in the VOLATILE block now, not the stable
+    // Runtime section — assert it directly on the stable builder's output.
+    const stable = try buildStableSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .usage_runtime = &urt,
+    });
+    defer allocator.free(stable);
+    try std.testing.expect(std.mem.indexOf(u8, stable, "Cost:") == null);
+
+    // And it IS present in the volatile builder's own output.
+    const volatile_out = try buildVolatileSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .usage_runtime = &urt,
+    });
+    defer allocator.free(volatile_out);
+    try std.testing.expect(std.mem.indexOf(u8, volatile_out, "Cost: $") != null);
 }
 
 test "buildRuntimeSection omits Cost line and stays byte-identical when usage_runtime is null" {
@@ -1521,6 +1569,22 @@ test "buildRuntimeSection omits Cost line and stays byte-identical when usage_ru
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Reasoning fields disambiguation") != null);
     // No Cost line at all — null pointer is the off-path.
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Cost:") == null);
+
+    // Strengthened per review: buildRuntimeSection (via buildStableSystemPrompt)
+    // must contain NO "Cost:" ever now — even when usage_runtime IS set, since
+    // the Cost line no longer lives in the stable block at all.
+    var urt = usage_runtime_mod.UsageRuntime.init(allocator);
+    defer urt.deinit();
+    urt.recordTurn("test-model", 100, 50, 1.23, 200);
+
+    const stable_with_usage = try buildStableSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .usage_runtime = &urt,
+    });
+    defer allocator.free(stable_with_usage);
+    try std.testing.expect(std.mem.indexOf(u8, stable_with_usage, "Cost:") == null);
 }
 
 // Dump-helper: writes the assembled prompt to /tmp/nullalis_prompt_full.txt
@@ -2107,6 +2171,55 @@ test "buildStableSystemPrompt is byte-stable across back-to-back calls with iden
     defer allocator.free(third);
 
     try std.testing.expectEqualStrings(first, third);
+}
+
+// Task 3 review fix (package1-activations) — regression test for the
+// reviewer-identified gap: the STABLE prompt must stay byte-identical
+// across turns even when `usage_runtime` is set and cost accrues between
+// builds. Before the fix, the Cost line lived in `buildRuntimeSection`
+// (Tier 4 of the STABLE block), so a turn that recorded new cost would
+// change the stable prefix's bytes — silently defeating provider
+// byte-prefix / cache_control caching. This test builds the stable prompt
+// with a `usage_runtime` pointer, records a turn (changing session cost)
+// BETWEEN builds, and asserts the stable bytes are unaffected. Only the
+// volatile block may vary turn-to-turn.
+test "buildStableSystemPrompt is byte-stable across back-to-back calls even with usage_runtime set and cost accruing between calls" {
+    const allocator = std.testing.allocator;
+    var urt = usage_runtime_mod.UsageRuntime.init(allocator);
+    defer urt.deinit();
+
+    const ctx: PromptContext = .{
+        .workspace_dir = "/tmp/nonexistent-byte-eq-cost",
+        .model_name = "test-model",
+        .tools = &.{},
+        .usage_runtime = &urt,
+    };
+
+    const first = try buildStableSystemPrompt(allocator, ctx);
+    defer allocator.free(first);
+
+    // Accrue cost between builds — simulates a turn completing with real
+    // spend. If the Cost line were still in the stable block, this would
+    // change `second`'s bytes relative to `first`.
+    urt.recordTurn("test-model", 100, 50, 1.23, 200);
+
+    const second = try buildStableSystemPrompt(allocator, ctx);
+    defer allocator.free(second);
+
+    try std.testing.expectEqualStrings(first, second);
+
+    // Accrue MORE cost — paranoia pass, same as the sibling null-usage_runtime
+    // test's third call.
+    urt.recordTurn("test-model", 200, 80, 4.56, 300);
+
+    const third = try buildStableSystemPrompt(allocator, ctx);
+    defer allocator.free(third);
+
+    try std.testing.expectEqualStrings(first, third);
+
+    // The stable block must never contain a Cost line at all now — that
+    // content belongs exclusively to the volatile block.
+    try std.testing.expect(std.mem.indexOf(u8, first, "Cost:") == null);
 }
 
 test "buildVolatileSystemPrompt includes datetime and optional memory slot" {
