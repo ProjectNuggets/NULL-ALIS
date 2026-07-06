@@ -511,6 +511,25 @@ pub const AgentConfig = struct {
     /// Threaded to the commands gating predicate via the agent the same way
     /// as `semantic_type_routing_enabled` / `typed_views_enabled`.
     canonical_continuity_summary_enabled: bool = true,
+    /// Task 2 (Loop-2 prerequisite, package1-activations) — durable
+    /// tool-trace flush gate.
+    ///
+    /// When TRUE (default), the gateway wires each tenant's
+    /// `RunTraceStore` with a sink that calls
+    /// `zaki_state.Manager.insertToolTraceEvents` on every `agent_end`
+    /// event, persisting that run's sanitized event timeline to the
+    /// `tool_traces` table (migration 0008) so it survives process
+    /// restart. Requires both a Postgres `state_mgr` and a resolvable
+    /// numeric user_id to be in scope at tenant-runtime construction;
+    /// when either is missing the sink is simply never wired — same as
+    /// setting this flag to FALSE.
+    ///
+    /// When FALSE, no sink is wired — the RunTraceStore behaves exactly
+    /// as before this feature (in-memory-only, bounded, lost on
+    /// restart). Safe rollback: flushing is best-effort and additive:
+    /// disabling it cannot lose events that would otherwise be dropped
+    /// today, only skips the new durability path.
+    trace_persistence_enabled: bool = true,
     // V1.14.12 (Path A) — extraction_legacy_direct_writes FIELD REMOVED.
     // M5 sprint flag-gated two redundant direct write paths during a
     // soak window. Path A closes the M5 sprint by:

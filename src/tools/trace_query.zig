@@ -209,74 +209,13 @@ pub const TraceQueryTool = struct {
     }
 };
 
-/// Serialize one trace event — mirrors `serializeTraceEventJson` in
-/// gateway.zig so the agent's view of an event matches what the FE
-/// trace browser sees.
-fn serializeTraceEventJson(w: anytype, evt: *const run_trace_store_mod.TraceEvent) !void {
-    try w.writeAll("{\"kind\":\"");
-    try jsonEscapeInto(w, evt.kind.toSlice());
-    try w.print("\",\"ts_ms\":{d}", .{evt.ts_ms});
-    if (evt.phase) |v| {
-        try w.writeAll(",\"phase\":\"");
-        try jsonEscapeInto(w, v);
-        try w.writeAll("\"");
-    }
-    if (evt.tool) |v| {
-        try w.writeAll(",\"tool\":\"");
-        try jsonEscapeInto(w, v);
-        try w.writeAll("\"");
-    }
-    if (evt.tool_use_id) |v| {
-        try w.writeAll(",\"tool_use_id\":\"");
-        try jsonEscapeInto(w, v);
-        try w.writeAll("\"");
-    }
-    if (evt.label) |v| {
-        try w.writeAll(",\"label\":\"");
-        try jsonEscapeInto(w, v);
-        try w.writeAll("\"");
-    }
-    if (evt.risk_level) |v| {
-        try w.writeAll(",\"risk_level\":\"");
-        try jsonEscapeInto(w, v);
-        try w.writeAll("\"");
-    }
-    if (evt.status) |v| {
-        try w.writeAll(",\"status\":\"");
-        try jsonEscapeInto(w, v);
-        try w.writeAll("\"");
-    }
-    if (evt.task_id) |v| {
-        try w.writeAll(",\"task_id\":\"");
-        try jsonEscapeInto(w, v);
-        try w.writeAll("\"");
-    }
-    if (evt.success) |v| try w.print(",\"success\":{s}", .{if (v) "true" else "false"});
-    if (evt.duration_ms) |v| try w.print(",\"duration_ms\":{d}", .{v});
-    if (evt.iteration) |v| try w.print(",\"iteration\":{d}", .{v});
-    if (evt.exit_code) |v| try w.print(",\"exit_code\":{d}", .{v});
-    if (evt.usage_tokens) |v| try w.print(",\"usage_tokens\":{d}", .{v});
-    try w.writeAll("}");
-}
-
-fn jsonEscapeInto(writer: anytype, input: []const u8) !void {
-    for (input) |c| {
-        switch (c) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => {
-                if (c < 0x20) {
-                    try writer.print("\\u{x:0>4}", .{c});
-                } else {
-                    try writer.writeByte(c);
-                }
-            },
-        }
-    }
-}
+/// Serialize one trace event. Delegates to the single shared writer in
+/// `run_trace_store.zig` (Task 2, Loop-2 prerequisite) so the agent's
+/// view of an event, the FE trace browser's view, and the durable
+/// tool_traces flush all emit the exact same sanitized JSON schema —
+/// no forked/duplicated event serialization.
+const serializeTraceEventJson = run_trace_store_mod.serializeTraceEventJson;
+const jsonEscapeInto = run_trace_store_mod.jsonEscapeInto;
 
 // ── Tests ────────────────────────────────────────────────────────────
 

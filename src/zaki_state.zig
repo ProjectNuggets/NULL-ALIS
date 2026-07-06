@@ -974,6 +974,18 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn subagentResultStatusIsDelivered(_: *@This(), _: []const u8) !bool {
         return false;
     }
+    /// Task 2 (Loop-2 prerequisite, package1-activations) — stub for
+    /// non-postgres builds. The durable tool_traces digest table
+    /// requires Postgres; without it the RunTraceStore's flush sink is
+    /// never wired at construction time (gateway.zig only sets
+    /// flush_fn/flush_ctx when a live state_mgr is in scope, and
+    /// Manager.init itself fails in non-postgres builds), so this stub
+    /// is unreachable at runtime. It exists only so both build modes
+    /// compile against the same Manager surface, mirroring
+    /// upsertSubagentResult's no-op idiom above.
+    pub fn insertToolTraceEvents(_: *@This(), _: i64, _: []const u8, _: []const u8) !void {
+        return;
+    }
     pub fn forgetMemory(_: *@This(), _: i64, _: []const u8) !bool {
         return error.PostgresNotEnabled;
     }

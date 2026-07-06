@@ -1025,6 +1025,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("canonical_continuity_summary_enabled")) |v| {
                 if (v == .bool) self.agent.canonical_continuity_summary_enabled = v.bool;
             }
+            // Task 2 (Loop-2 prerequisite, package1-activations) — wire the
+            // durable tool-trace flush gate so operators can disable it via
+            // config.json (default ON).
+            if (ag.object.get("trace_persistence_enabled")) |v| {
+                if (v == .bool) self.agent.trace_persistence_enabled = v.bool;
+            }
             // C4 (brain-graph activation) — wire the nested [agent.extraction]
             // ExtractionConfig block. Previously this struct had NO parser, so
             // its "flip via TOML" docstring silently no-op'd. The session-end

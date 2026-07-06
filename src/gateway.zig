@@ -175,6 +175,18 @@ fn jsonSafeFloatF32(v: f32) f32 {
     return 0.0;
 }
 
+/// Task 2 (Loop-2 prerequisite, package1-activations) — thin adapter
+/// binding `RunTraceStore.flush_fn`'s function-pointer shape to
+/// `zaki_state.Manager.insertToolTraceEvents`. `ctx` is the tenant's
+/// `*zaki_state_mod.Manager`, bound as `flush_ctx` at construction
+/// time (see `TenantRuntime.init`). Kept as a free function (not a
+/// closure) so it can be taken as `&traceFlushAdapter` — a plain
+/// function pointer, matching the store's injectable-sink field type.
+fn traceFlushAdapter(ctx: ?*anyopaque, user_id: i64, run_id: []const u8, events_json: []const u8) anyerror!void {
+    const mgr: *zaki_state_mod.Manager = @ptrCast(@alignCast(ctx.?));
+    try mgr.insertToolTraceEvents(user_id, run_id, events_json);
+}
+
 /// Default per-user data root for tenant mode.
 const DEFAULT_TENANT_DATA_ROOT: []const u8 = "/data/users";
 
@@ -1941,6 +1953,20 @@ const TenantRuntime = struct {
             run_trace_store_mod.DEFAULT_MAX_RUNS,
             run_trace_store_mod.DEFAULT_MAX_EVENTS_PER_RUN,
         );
+        // Task 2 (Loop-2 prerequisite, package1-activations) — wire the
+        // durable per-run flush sink when persistence is enabled and a
+        // Postgres state_mgr + numeric user_id are both in scope. Flag
+        // off, or either dependency missing, leaves the sink null —
+        // exact prior (in-memory-only) behavior.
+        if (runtime.config.agent.trace_persistence_enabled) {
+            if (state_mgr) |smgr| {
+                if (std.fmt.parseInt(i64, user_ctx.user_id, 10) catch null) |trace_uid| {
+                    trace_store.flush_fn = &traceFlushAdapter;
+                    trace_store.flush_ctx = @ptrCast(smgr);
+                    trace_store.flush_user_id = trace_uid;
+                }
+            }
+        }
         runtime.trace_store = trace_store;
 
         if (observability.OtelObserver.fromEnv(allocator)) |otel_init| {
