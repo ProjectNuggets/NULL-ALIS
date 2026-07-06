@@ -43,8 +43,8 @@ enforced in extraction-builder tests inside `src/agent/extraction/runner.zig`.)
 | `.tool` result, `name == null` [E] | unknown | fail-open: extracted |
 | Entity named in `scaffold_entity_names` at persist boundary | bookkeeping | write rejected (denylist backstop) |
 | `memory_store` with a scaffold-entity key or system-managed-prefix key | bookkeeping | tool call rejected with redirect message |
-| Keys `summary_latest/ timeline_summary/ session_summary/ summary_fallback/` | derived | not embedded (`shouldEmbedMemoryEntry`=false), hidden by default, semantic-bookkeeping (excluded from fact recall) |
-| Keys `audit_shell/ __tombstone__/ compaction_* autosave_* session_checkpoint_*` | bookkeeping | hidden (`BRAIN_HIDDEN_PREFIXES`), append-only or system-managed |
+| Keys `summary_latest/ timeline_summary/ session_summary/ summary_fallback/` | derived | not embedded (`shouldEmbedMemoryEntry`=false), semantic-bookkeeping (excluded from fact recall), hidden from the /brain view (`isBrainVisibleKey`=false) but NOT default-hidden — stays injectable for warm-start (P4) |
+| Keys `audit_shell/ __tombstone__/ compaction_* autosave_* session_checkpoint_*` | bookkeeping | hidden from the /brain view (`BRAIN_HIDDEN_PREFIXES`); internal/audit families also default-hidden (`isDefaultHiddenMemoryKey`); append-only or system-managed |
 | `durable_fact/*` keys | knowledge | curable (archive/forget/edit — H1), system-write-disciplined |
 | `memory_type` in EVERGREEN set | knowledge (durable) | exempt from decay (in-memory + persistent SQL), resurrect-proof, promote-no-clobber |
 | `memory_type == open_loop` | knowledge (durable) | decays in ranking; still resurrect-proof/demotable-guard |
@@ -57,7 +57,7 @@ enforced in extraction-builder tests inside `src/agent/extraction/runner.zig`.)
 - Role filter (keystone): `src/agent/extraction/runner.zig` `buildEpisodeTranscript` (line 526) / `buildTranscript` (line 587)
 - Tool-identity filter: `runner.zig` `internal_extraction_tool_names` (line 485) + `isInternalExtractionToolName` (line 511)
 - Entity denylist: `src/agent/context_builder.zig` `scaffold_entity_names` (line 730) (comptime drift-guarded vs `stable_prompt_markers`)
-- Key predicates: `src/memory/root.zig` — `isInternalMemoryKey` (line 1193), `isContinuityArtifactKey` (line 1275), `isContinuitySummaryKey` (line 1314), `isDefaultHiddenMemoryKey` (line 1321) (`BRAIN_HIDDEN_PREFIXES` at line 1338), `isSemanticBookkeepingKey` (line 1400), `shouldEmbedMemoryEntry` (line 1412), `isTombstoneKey` (line 1423), `isAppendOnlyMemoryKey` (line 1433), `isSystemManagedMemoryKey` (line 1448), `isMutableMemoryEntry` (line 1465), `isEditableMemoryEntry` (line 1476)
+- Key predicates: `src/memory/root.zig` — `isInternalMemoryKey` (line 1193), `isContinuityArtifactKey` (line 1275), `isContinuitySummaryKey` (line 1314), `isDefaultHiddenMemoryKey` (line 1321), `isBrainVisibleKey` (line 1390), `BRAIN_HIDDEN_PREFIXES` (line 1338) / `BRAIN_HIDDEN_EXACT_KEYS` (line 1363), `isSemanticBookkeepingKey` (line 1400), `shouldEmbedMemoryEntry` (line 1412), `isTombstoneKey` (line 1423), `isAppendOnlyMemoryKey` (line 1433), `isSystemManagedMemoryKey` (line 1448), `isMutableMemoryEntry` (line 1465), `isEditableMemoryEntry` (line 1476)
 - Type sets: `src/memory/root.zig` `EVERGREEN_MEMORY_TYPES` (line 339) / `DURABLE_MEMORY_TYPES` (line 340) (+SQL fragments, comptime drift guard)
 - Store-boundary guard: `src/tools/memory_store.zig` (this contract, Task 3)
 - Registry cross-check: `src/memory/contract_test.zig` (Task 4)

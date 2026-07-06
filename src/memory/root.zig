@@ -4755,3 +4755,7 @@ test "H1: probe fails closed on embedding-dimension mismatch" {
     }) catch null;
     if (drop) |store| store.deinit();
 }
+
+test {
+    _ = @import("contract_test.zig");
+}

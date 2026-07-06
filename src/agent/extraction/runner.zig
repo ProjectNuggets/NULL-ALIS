@@ -482,7 +482,7 @@ const PER_MESSAGE_EPISODE_CAP: usize = 8_000;
 ///     exclude would drop real facts.
 /// The drift-proof long-term home is an `introspection` tool-metadata flag each
 /// tool declares for itself — tracked to Phase-1, not built here.
-const internal_extraction_tool_names = [_][]const u8{
+pub const internal_extraction_tool_names = [_][]const u8{
     // Diagnostic / structural self-state — pure bookkeeping, never world knowledge.
     "memory_doctor", // read-only memory diagnostic ("Layer 0-7" report)
     "memory_maintain", // maintenance/compaction JSON output
