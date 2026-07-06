@@ -764,6 +764,31 @@ fn normalizeScaffoldName(s: []const u8, buf: []u8) []u8 {
 /// full-name match (not substring) so legitimate facts that merely contain a
 /// scaffold word ("Safety team", "uses Layer 0 of the stack") are untouched.
 /// Stack-buffered + allocation-free; safe to call per fact on the write path.
+/// Comptime-normalize one denylist entry into static data, so the per-call
+/// cost of `isScaffoldEntityName` is ONE normalization of the input only —
+/// the constant entries are normalized once at compile time, not on every
+/// call (2026-07-06 review: the old inline-for re-normalized all ~27
+/// comptime-known literals per call).
+fn comptimeNormalizedEntry(comptime s: []const u8) []const u8 {
+    comptime {
+        @setEvalBranchQuota(10_000);
+        var buf: [s.len]u8 = undefined;
+        const n = normalizeScaffoldName(s, &buf);
+        const arr: [n.len]u8 = buf[0..n.len].*;
+        const final = arr;
+        return &final;
+    }
+}
+
+/// Pre-normalized forms of `scaffold_entity_names` (lowercased, whitespace-
+/// collapsed) — computed at comptime; compared directly at runtime.
+const normalized_scaffold_entity_names = blk: {
+    @setEvalBranchQuota(50_000);
+    var out: [scaffold_entity_names.len][]const u8 = undefined;
+    for (scaffold_entity_names, 0..) |entry, i| out[i] = comptimeNormalizedEntry(entry);
+    break :blk out;
+};
+
 pub fn isScaffoldEntityName(name: []const u8) bool {
     // Bound the work: the longest denylist entry is ~20 chars; any candidate
     // far longer than the longest entry cannot be an exact match. 128 is a
@@ -773,9 +798,7 @@ pub fn isScaffoldEntityName(name: []const u8) bool {
     var buf: [128]u8 = undefined;
     const norm = normalizeScaffoldName(name, &buf);
     if (norm.len == 0) return false;
-    inline for (scaffold_entity_names) |entry| {
-        var ebuf: [128]u8 = undefined;
-        const enorm = normalizeScaffoldName(entry, &ebuf);
+    for (normalized_scaffold_entity_names) |enorm| {
         if (std.mem.eql(u8, norm, enorm)) return true;
     }
     return false;

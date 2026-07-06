@@ -174,7 +174,7 @@ Apply these naming rules consistently:
 - Constants and comptime values: `SCREAMING_SNAKE_CASE` or `PascalCase` depending on context.
 - Vtable implementer naming: `<Name>Provider`, `<Name>Channel`, `<Name>Tool`, `<Name>Memory`, `<Name>Sandbox`.
 - Factory registration keys: stable, lowercase, user-facing (e.g., `"openai"`, `"telegram"`, `"shell"`).
-- Tests: named by behavior (`subject_expected_behavior`), fixtures use neutral names.
+- Tests: named by behavior, as descriptive prose; prefix with the subject/subsystem for group-filterability (e.g. `test "memory contract: ..."`, `test "brain-leak keystone: ..."`). Fixtures use neutral names. (2026-07-06: rule aligned with actual practice — 99% of the suite uses prose names; the old `subject_expected_behavior` form was aspirational, never practiced.)
 
 ### 6.2 Architecture Boundary Contract (Required)
 
