@@ -11436,6 +11436,45 @@ const ManagerImpl = struct {
         c.PQclear(result);
     }
 
+    // -----------------------------------------------------------------------
+    // Loop-2 substrate (three-loops spec §3.1, docs/memory-contract.md) —
+    // durable tool_traces digest table (migration 0008).
+    // -----------------------------------------------------------------------
+
+    /// Loop-2 substrate (three-loops spec §3.1): persist one run's tool-trace
+    /// digest. Best-effort caller contract — callers log.warn on error and
+    /// never fail the turn. Idempotent per (user_id, run_id): a second flush
+    /// for the same run is a no-op (ON CONFLICT DO NOTHING), matching the
+    /// "one digest row per run" contract even under at-least-once delivery.
+    /// Self-heals the parent users row via ensureUserRow so the FK can never
+    /// fault. `events_json` must be a JSON array; it is stored verbatim as
+    /// JSONB.
+    pub fn insertToolTraceEvents(self: *Self, user_id: i64, run_id: []const u8, events_json: []const u8) !void {
+        try self.ensureUserRow(user_id);
+        const q = try self.buildQuery(
+            "INSERT INTO {schema}.tool_traces (user_id, run_id, events) " ++
+                "VALUES ($1, $2, $3::jsonb) " ++
+                "ON CONFLICT (user_id, run_id) DO NOTHING",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const run_id_z = try self.allocator.dupeZ(u8, run_id);
+        defer self.allocator.free(run_id_z);
+        const events_z = try self.allocator.dupeZ(u8, events_json);
+        defer self.allocator.free(events_z);
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, run_id_z.ptr, events_z.ptr };
+        const lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(run_id.len),
+            @intCast(events_json.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        c.PQclear(result);
+    }
+
     /// Return all 'pending' subagent_results rows for a user, ordered by
     /// created_at ASC (oldest first, so recovery re-delivers in order).
     /// Caller owns the returned slice and each row; call row.deinit() then
@@ -14658,6 +14697,79 @@ test "subagent_results upsert is idempotent and loads pending" {
     const rows2 = try mgr.loadPendingSubagentResults(allocator, 42);
     defer allocator.free(rows2);
     try std.testing.expectEqual(@as(usize, 0), rows2.len);
+
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+}
+
+test "tool_traces: insertToolTraceEvents persists one digest per run, idempotent" {
+    // Loop-2 substrate keystone (PG). Proves migration 0008 + the new
+    // Manager method deliver the contract:
+    //   (1) insertToolTraceEvents persists FK-safely (funnels through ensureUserRow),
+    //   (2) ON CONFLICT (user_id, run_id) DO NOTHING makes a duplicate insert a no-op,
+    //   (3) exactly one row lands with the JSONB events intact.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_tooltraces", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    // Migrate: 0008 must apply cleanly (idempotent on re-migrate).
+    try mgr.migrate();
+    try mgr.migrate();
+
+    const events_json = "[{\"kind\":\"tool_call\",\"tool\":\"web_search\",\"success\":true,\"duration_ms\":420}]";
+
+    // (1) Persist WITHOUT a prior provisionUser call — must self-heal via ensureUserRow.
+    try mgr.insertToolTraceEvents(42, "run_abc", events_json);
+
+    // (2) Duplicate persist of the same (user_id, run_id) is a no-op.
+    try mgr.insertToolTraceEvents(42, "run_abc", events_json);
+
+    // (3) Read back: exactly one row with intact JSON.
+    {
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT run_id, events::text FROM {s}.tool_traces WHERE user_id = 42",
+            .{schema},
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        defer c.PQclear(result);
+        try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+
+        const run_id_val = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(run_id_val);
+        try std.testing.expectEqualStrings("run_abc", run_id_val);
+
+        const events_val = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(events_val);
+        try std.testing.expectEqualStrings(
+            "[{\"kind\": \"tool_call\", \"tool\": \"web_search\", \"success\": true, \"duration_ms\": 420}]",
+            events_val,
+        );
+    }
 
     {
         const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
