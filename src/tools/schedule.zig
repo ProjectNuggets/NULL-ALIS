@@ -137,7 +137,9 @@ fn buildAgentTaskPrompt(
             allocator,
             "Prepare the scheduled brief now. Brief specification: {s}. " ++
                 "Read HEARTBEAT.md in workspace only as wake policy if it is relevant. " ++
-                "Use runtime_info and schedule first for runtime truth. Then gather data using read-only integrations/tools as needed (calendar/email/news/weather). " ++
+                "Use runtime_info and schedule first for runtime truth. " ++
+                "If a recent dream_log/<date> memory exists (memory_recall or memory_timeline), let its themes inform tone and selection — the reflection is context, not content to quote verbatim. " ++
+                "Then gather data using read-only integrations/tools as needed (calendar/email/news/weather). " ++
                 "Deliver one concise Telegram-ready brief suitable for scheduler delivery. Do not call the message tool in this turn; scheduler delivery sends the final output. Do not create/update scheduler jobs in this turn." ++
                 PROACTIVE_USER_OUTPUT_GUARD,
             .{command},
@@ -1222,6 +1224,14 @@ test "buildAgentTaskPrompt report and follow_up carry the no-scaffold guard" {
         try std.testing.expect(std.mem.indexOf(u8, prompt, "system prompt") != null);
         try std.testing.expect(std.mem.indexOf(u8, prompt, "spec_text") != null);
     }
+}
+
+test "buildAgentTaskPrompt brief mentions dream_log for reflection context" {
+    const prompt = try buildAgentTaskPrompt(std.testing.allocator, .brief, "daily_morning_brief");
+    defer std.testing.allocator.free(prompt);
+
+    // The brief prompt should reference dream_log to consult overnight reflections.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "dream_log") != null);
 }
 
 test "schedule tool name" {
