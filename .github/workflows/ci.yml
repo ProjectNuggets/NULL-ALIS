@@ -34,8 +34,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .zig-cache
-          key: zig-${{ matrix.target }}-${{ hashFiles('src/**/*.zig', 'build.zig') }}
-          restore-keys: zig-${{ matrix.target }}-
+          # Keyed on runner IMAGE + zig version: a stale .zig-cache compiled
+          # against an older macOS SDK survives image rolls under a
+          # source-only key and produces undefined-libc-symbol link failures
+          # (the chronic macos-latest red). ImageOS/ImageVersion are set on
+          # all GitHub-hosted runners; v2 epoch busts the currently-poisoned
+          # entries.
+          key: zig-v2-${{ matrix.target }}-${{ env.ImageOS }}${{ env.ImageVersion }}-${{ hashFiles('.zigversion') }}-${{ hashFiles('src/**/*.zig', 'build.zig') }}
+          restore-keys: zig-v2-${{ matrix.target }}-${{ env.ImageOS }}${{ env.ImageVersion }}-${{ hashFiles('.zigversion') }}-
 
       - name: Run tests
         run: zig build test --summary all 2>&1 | tee test-output.txt
