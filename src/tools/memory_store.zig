@@ -8,6 +8,7 @@ const Memory = mem_root.Memory;
 const MemoryCategory = mem_root.MemoryCategory;
 const zaki_state = @import("../zaki_state.zig");
 const extraction_persist = @import("../agent/extraction_persist.zig");
+const context_builder = @import("../agent/context_builder.zig");
 const pii_detect = @import("../memory/pii_detect.zig");
 const observability = @import("../observability.zig");
 
@@ -117,6 +118,17 @@ pub const MemoryStoreTool = struct {
         const content = root.getString(args, "content") orelse
             return ToolResult.fail("Missing 'content' parameter");
         if (content.len == 0) return ToolResult.fail("'content' must not be empty");
+
+        // Memory contract (docs/memory-contract.md): the store boundary fails
+        // CLOSED on bookkeeping identities. Scaffold names can never become
+        // memory keys, and system-managed key namespaces are not writable
+        // via the tool surface. This guard runs before any memory/DB access.
+        if (context_builder.isScaffoldEntityName(key)) {
+            return ToolResult.fail("Key matches an internal scaffold name and cannot be stored. Pick a user-meaningful key.");
+        }
+        if (mem_root.isSystemManagedMemoryKey(key)) {
+            return ToolResult.fail("Key is in a system-managed namespace. These keys are written by the engine; store user facts under a plain key instead.");
+        }
 
         const session_id = resolveSessionId(args) catch |err| switch (err) {
             error.InvalidScope => return ToolResult.fail("Invalid 'scope' parameter. Expected 'session' or 'global'."),
@@ -561,4 +573,41 @@ test "memory_store rejects invalid scope value" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Invalid 'scope'") != null);
+}
+
+test "memory_store contract guard: scaffold entity name as key is rejected" {
+    // Guard fires BEFORE any memory access, so a tool with no backing memory
+    // is sufficient: reaching a memory call would itself be a failure.
+    var mt = MemoryStoreTool{ .memory = null };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"key\":\"Brain Architecture\",\"content\":\"layers and links\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "internal scaffold name") != null);
+}
+
+test "memory_store contract guard: system-managed key prefix is rejected" {
+    var mt = MemoryStoreTool{ .memory = null };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"key\":\"summary_latest/main\",\"content\":\"sneaky\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "system-managed") != null);
+}
+
+test "memory_store contract guard: normal key still passes the guard" {
+    const NoneMemory = mem_root.NoneMemory;
+    var backend = NoneMemory.init();
+    defer backend.deinit();
+
+    var mt = MemoryStoreTool{ .memory = backend.memory() };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"key\":\"favorite_editor\",\"content\":\"Helix\",\"scope\":\"global\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Stored memory: favorite_editor") != null);
 }
