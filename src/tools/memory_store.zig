@@ -8,6 +8,7 @@ const Memory = mem_root.Memory;
 const MemoryCategory = mem_root.MemoryCategory;
 const zaki_state = @import("../zaki_state.zig");
 const extraction_persist = @import("../agent/extraction_persist.zig");
+const context_builder = @import("../agent/context_builder.zig");
 const pii_detect = @import("../memory/pii_detect.zig");
 const observability = @import("../observability.zig");
 
@@ -118,6 +119,32 @@ pub const MemoryStoreTool = struct {
             return ToolResult.fail("Missing 'content' parameter");
         if (content.len == 0) return ToolResult.fail("'content' must not be empty");
 
+        // V1.7 cmt9.6 (full Gap 3): when caller supplied a structured triple
+        // AND tenant context is wired, route through the unified
+        // extraction_persist pipeline (judge + coref + edge insert + source
+        // attribution). Otherwise fall through to the inline path (backwards
+        // compat for prose-only stores). Detected HERE (before the key guard)
+        // because the unified path derives its own extracted_<hash> key and
+        // IGNORES the caller's `key` (which is only schema-required).
+        const subj = root.getString(args, "subject");
+        const pred = root.getString(args, "predicate");
+        const obj = root.getString(args, "object");
+        const has_triple = subj != null and pred != null and obj != null and
+            subj.?.len > 0 and pred.?.len > 0 and obj.?.len > 0;
+        const routes_unified = has_triple and self.state_mgr != null and self.user_id != null;
+
+        // Memory contract guard — see docs/memory-contract.md (Invariants §3/§6)
+        // and inlineKeyGuard for the families. Applied ONLY when the write will
+        // actually use the caller-supplied key (the inline path, including the
+        // triple-without-tenant fallthrough). The unified-triple path skips it:
+        // rejecting a valid structured fact because of an ignored placeholder
+        // key was review finding #1 (2026-07-06). Runs before any memory/DB access.
+        if (!routes_unified) {
+            if (inlineKeyGuard(key)) |rejection| {
+                return ToolResult.fail(rejection);
+            }
+        }
+
         const session_id = resolveSessionId(args) catch |err| switch (err) {
             error.InvalidScope => return ToolResult.fail("Invalid 'scope' parameter. Expected 'session' or 'global'."),
             error.InvalidSessionId => return ToolResult.fail("Invalid 'session_id' parameter. Must be non-empty when provided."),
@@ -125,17 +152,6 @@ pub const MemoryStoreTool = struct {
         const category_explicit = root.getString(args, "category") != null;
         const category_str = root.getString(args, "category") orelse if (session_id == null) "core" else "daily";
         var category = MemoryCategory.fromString(category_str);
-
-        // V1.7 cmt9.6 (full Gap 3): when caller supplied a structured triple
-        // AND tenant context is wired, route through the unified
-        // extraction_persist pipeline (judge + coref + edge insert + source
-        // attribution). Otherwise fall through to the inline path (backwards
-        // compat for prose-only stores).
-        const subj = root.getString(args, "subject");
-        const pred = root.getString(args, "predicate");
-        const obj = root.getString(args, "object");
-        const has_triple = subj != null and pred != null and obj != null and
-            subj.?.len > 0 and pred.?.len > 0 and obj.?.len > 0;
 
         // D55 (2026-05-24): optional ISO-8601 date for "when this fact
         // became true" — populates memory_edges.temporal_anchor_unix on
@@ -246,6 +262,22 @@ pub const MemoryStoreTool = struct {
         } else try std.fmt.allocPrint(allocator, "Stored memory: {s} ({s}, scope={s}{s}{s})", .{ effective_key, category.toString(), scope_label, session_suffix, key_note });
 
         return ToolResult{ .success = true, .output = msg };
+    }
+
+    /// Memory-contract store guard (docs/memory-contract.md): returns the
+    /// rejection message when `key` is a bookkeeping identity the INLINE write
+    /// path must never persist, null when the key is storable. Fail-closed
+    /// families: oversized keys (defense-in-depth bound), scaffold entity
+    /// names, system-managed namespaces, and default-hidden bookkeeping
+    /// (tombstones, audit artifacts, index artifacts). Pure function of the
+    /// key — callers decide WHERE it applies (executeInner skips it on the
+    /// unified-triple path, which ignores the caller key).
+    pub fn inlineKeyGuard(key: []const u8) ?[]const u8 {
+        if (key.len > 255) return "Key is too long (max 255 bytes). Use a short, stable key.";
+        if (context_builder.isScaffoldEntityName(key)) return "Key matches an internal scaffold name and cannot be stored. Pick a user-meaningful key.";
+        if (mem_root.isSystemManagedMemoryKey(key)) return "Key is in a system-managed namespace. These keys are written by the engine; store user facts under a plain key instead.";
+        if (mem_root.isDefaultHiddenMemoryKey(key)) return "Key is in an internal bookkeeping namespace (tombstone/audit/index) and cannot be stored.";
+        return null;
     }
 
     fn sessionScopedConflictKey(allocator: std.mem.Allocator, key: []const u8, session_id: []const u8) ![]u8 {
@@ -561,4 +593,111 @@ test "memory_store rejects invalid scope value" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Invalid 'scope'") != null);
+}
+
+test "memory_store contract guard: scaffold entity name as key is rejected" {
+    // Guard fires BEFORE any memory access, so a tool with no backing memory
+    // is sufficient: reaching a memory call would itself be a failure.
+    var mt = MemoryStoreTool{ .memory = null };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"key\":\"Brain Architecture\",\"content\":\"layers and links\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "internal scaffold name") != null);
+}
+
+test "memory_store contract guard: system-managed key prefix is rejected" {
+    var mt = MemoryStoreTool{ .memory = null };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"key\":\"summary_latest/main\",\"content\":\"sneaky\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "system-managed") != null);
+}
+
+test "memory_store contract guard: bookkeeping namespaces (tombstone/audit) are rejected" {
+    // Review finding #2 (2026-07-06): __tombstone__/ and audit_shell/ are
+    // bookkeeping per the contract but were NOT covered by the original guard
+    // (isSystemManagedMemoryKey lists neither). They must fail CLOSED too.
+    var mt = MemoryStoreTool{ .memory = null };
+    const t = mt.tool();
+    const cases = [_][]const u8{
+        "{\"key\":\"__tombstone__/x\",\"content\":\"fake reversal\"}",
+        "{\"key\":\"audit_shell/fake\",\"content\":\"forged audit row\"}",
+    };
+    for (cases) |case_json| {
+        const parsed = try root.parseTestArgs(case_json);
+        defer parsed.deinit();
+        const result = try t.execute(std.testing.allocator, parsed.value.object);
+        defer if (result.error_msg) |em| if (em.len > 0 and std.mem.indexOf(u8, em, "not configured") != null) std.testing.allocator.free(em);
+        try std.testing.expect(!result.success);
+        try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "bookkeeping") != null);
+    }
+}
+
+test "memory_store contract guard: oversized key is rejected before any work" {
+    // Defense-in-depth (review finding: no structural key-length bound at the
+    // tool boundary — predicate safety was per-predicate discipline only).
+    var mt = MemoryStoreTool{ .memory = null };
+    const t = mt.tool();
+    var big_key_json: std.ArrayListUnmanaged(u8) = .{};
+    defer big_key_json.deinit(std.testing.allocator);
+    try big_key_json.appendSlice(std.testing.allocator, "{\"key\":\"");
+    try big_key_json.appendNTimes(std.testing.allocator, 'k', 300);
+    try big_key_json.appendSlice(std.testing.allocator, "\",\"content\":\"v\"}");
+    const parsed = try root.parseTestArgs(big_key_json.items);
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "too long") != null);
+}
+
+test "memory_store contract guard: inlineKeyGuard families + storable keys" {
+    // Pure-helper contract (review finding #1 fix): the guard is a function of
+    // the key alone; executeInner applies it ONLY when the write will actually
+    // use the caller key (inline path), not on the unified-triple path which
+    // derives its own extracted_<hash> key.
+    try std.testing.expect(MemoryStoreTool.inlineKeyGuard("Brain Architecture") != null);
+    try std.testing.expect(MemoryStoreTool.inlineKeyGuard("summary_latest/x") != null);
+    try std.testing.expect(MemoryStoreTool.inlineKeyGuard("__tombstone__/x") != null);
+    try std.testing.expect(MemoryStoreTool.inlineKeyGuard("audit_shell/2026") != null);
+    // Storable: plain user keys AND the dream cycle's dream_log/ namespace.
+    try std.testing.expect(MemoryStoreTool.inlineKeyGuard("favorite_editor") == null);
+    try std.testing.expect(MemoryStoreTool.inlineKeyGuard("dream_log/2026-07-06") == null);
+    try std.testing.expect(MemoryStoreTool.inlineKeyGuard("project_codename") == null);
+}
+
+test "memory_store contract guard: triple WITHOUT tenant falls through to inline and IS guarded" {
+    // Finding #1 boundary: when a triple is supplied but no tenant context is
+    // wired, the write falls through to the inline path which REALLY uses the
+    // caller key — so the guard must still fire there. (The unified path with
+    // tenant context skips the guard because it ignores the caller key; that
+    // routing predicate is exercised via inlineKeyGuard + code placement — a
+    // live-Manager integration test is PG-gated territory.)
+    var mt = MemoryStoreTool{ .memory = null }; // no state_mgr/user_id → fallthrough
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs(
+        "{\"key\":\"Working memory\",\"content\":\"User prefers Helix\",\"subject\":\"user\",\"predicate\":\"PREFERS\",\"object\":\"Helix\"}",
+    );
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "internal scaffold name") != null);
+}
+
+test "memory_store contract guard: normal key still passes the guard" {
+    const NoneMemory = mem_root.NoneMemory;
+    var backend = NoneMemory.init();
+    defer backend.deinit();
+
+    var mt = MemoryStoreTool{ .memory = backend.memory() };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"key\":\"favorite_editor\",\"content\":\"Helix\",\"scope\":\"global\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Stored memory: favorite_editor") != null);
 }

@@ -482,7 +482,13 @@ const PER_MESSAGE_EPISODE_CAP: usize = 8_000;
 ///     exclude would drop real facts.
 /// The drift-proof long-term home is an `introspection` tool-metadata flag each
 /// tool declares for itself — tracked to Phase-1, not built here.
-const internal_extraction_tool_names = [_][]const u8{
+///
+/// `pub` is a TEST-ONLY surface (contract_test.zig cross-checks this list
+/// against the doc + tool registry). It is NOT a gate: the only gate is
+/// `isInternalExtractionToolName` via the transcript builders, whose
+/// fail-open-on-null-name semantics live in the CALLERS. Do not consume
+/// this list directly anywhere else.
+pub const internal_extraction_tool_names = [_][]const u8{
     // Diagnostic / structural self-state — pure bookkeeping, never world knowledge.
     "memory_doctor", // read-only memory diagnostic ("Layer 0-7" report)
     "memory_maintain", // maintenance/compaction JSON output
