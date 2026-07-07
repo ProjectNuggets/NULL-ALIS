@@ -22,6 +22,7 @@ const tool_surface = @import("tool_surface.zig");
 const procedural_memory = @import("procedural_memory.zig");
 const narration = @import("narration.zig");
 const bench_self = @import("bench_self.zig");
+const insights_block_mod = @import("insights_block.zig");
 const task_planner = @import("task_planner.zig");
 // v1.14.14 Phase 3 originally added `const compaction = @import("compaction.zig");`
 // here, but the new `compact`/`forceCompact` methods reach compaction via the
@@ -687,6 +688,46 @@ pub const ContextEngine = struct {
         };
         defer if (known_weakness_block) |b| allocator.free(b);
 
+        // Package 2a Task 4 (learning-contract behaviour §4 in-turn
+        // consultation) — recent mined-insights block. Reuses
+        // `trace_mining_enabled` (no new flag: consultation is part of
+        // mining being on) via @hasField, the same duck-typed guard used
+        // for provider/narration_ring_buffer/active_task_plan above — a
+        // minimal fixture without the field defaults to enabled, matching
+        // the field's own `= true` default on Agent/MemoryMaintainTool.
+        //
+        // KNOWN GAP (scoped deliberately): `Agent` itself does not yet
+        // carry a real `trace_mining_enabled` field — only
+        // `MemoryMaintainTool` does (bound from config at tool-construction
+        // time, tools/root.zig). Threading `config.agent.trace_mining_enabled`
+        // through session.zig/gateway.zig onto `Agent` (the
+        // `cost_vital_in_prompt`/`dream_log_warmstart_enabled` house
+        // pattern) is out of this task's file scope
+        // (context_engine.zig/prompt.zig/commands.zig/schedule.zig only).
+        // Until that follow-up lands, this branch always evaluates
+        // `enabled = true` against the real production Agent — matching
+        // the flag's own default, so an operator who has NOT touched the
+        // flag sees identical behavior either way. An operator who
+        // explicitly sets `trace_mining_enabled=false` will still see the
+        // mine_traces ACTION itself fully no-op (verified gate in
+        // memory_maintain.zig), but this READ-side consultation block
+        // will keep consulting any insights files already on disk from
+        // before the flag was flipped off, until that follow-up lands.
+        const insights_block: ?[]u8 = blk: {
+            const enabled = if (@hasField(@TypeOf(agent.*), "trace_mining_enabled"))
+                agent.trace_mining_enabled
+            else
+                true;
+            if (!enabled) break :blk null;
+            const insights_dir = try std.fs.path.join(allocator, &.{ agent.workspace_dir, "insights" });
+            defer allocator.free(insights_dir);
+            break :blk insights_block_mod.readInsightsBlock(allocator, insights_dir) catch |err| {
+                log.debug("insights_block.readInsightsBlock failed: {s}", .{@errorName(err)});
+                break :blk null;
+            };
+        };
+        defer if (insights_block) |b| allocator.free(b);
+
         defer if (skill_traces_block) |b| allocator.free(b);
 
         // v1.14.18-B G3 (NARRATION-AS-CONTEXT) — recent thoughts block.
@@ -776,10 +817,12 @@ pub const ContextEngine = struct {
         // v1.14.18-B coordination invariant — Recall-stack ordering:
         //   1. recent_thoughts (G3, Agent G)    ← FIRST in PromptContext
         //   2. known_weakness  (G7, Agent E)    ← SECOND (populated separately)
+        //   2b. insights_block (Package 2a T4) ← 2.5th (mined-insights, same
+        //       metacognitive register as known_weakness — populated separately)
         //   3. task_plan       (G4, v1.14.18-A) ← THIRD (agent's plan + progress)
         //   4. skill_traces    (G-07, existing) ← FOURTH
         //
-        // This four-block order is also baked into
+        // This block order is also baked into
         // `prompt.buildVolatileSystemPrompt`. Byte-stability across turns
         // assumes the upstream sources update at session boundaries.
         // Re-ordering these fields here without also updating the prompt
@@ -797,6 +840,7 @@ pub const ContextEngine = struct {
             .working_memory_block = wm_block,
             .recent_thoughts_block = if (recent_thoughts_block) |b| (if (b.len > 0) b else null) else null,
             .known_weakness_block = if (known_weakness_block) |b| (if (b.len > 0) b else null) else null,
+            .insights_block = if (insights_block) |b| (if (b.len > 0) b else null) else null,
             .task_plan_block = if (task_plan_block) |b| (if (b.len > 0) b else null) else null,
             .skill_traces_block = if (skill_traces_block) |b| (if (b.len > 0) b else null) else null,
             // Phase 5 (Superpowers mode) — emit the coordinator framing section

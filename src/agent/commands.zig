@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const learning = @import("learning.zig");
+const memory_loader = @import("memory_loader.zig");
 const goal_loop = @import("goal_loop.zig");
 const prompt_mod = @import("prompt.zig");
 const providers = @import("../providers/root.zig");
@@ -4929,6 +4930,98 @@ fn friendlyOriginLabel(origin: ?learning.LearnedOrigin) []const u8 {
     };
 }
 
+/// Resolves a `/learn <verb> <key>` argument to the full
+/// `durable_fact/behavior/...` key, accepting either the full key or the
+/// 16-char hex suffix — the exact resolution `/learn forget` already used;
+/// Task 4's `adopt`/`dismiss` share it rather than re-implementing the
+/// same shape check three times. Returns an allocator-owned key on
+/// success, or a friendly (SaaS-postured) error string the caller should
+/// return directly to the user.
+const ResolvedLearnKey = union(enum) {
+    key: []const u8,
+    err: []const u8,
+};
+
+fn resolveLearnKey(allocator: std.mem.Allocator, raw_key: []const u8) !ResolvedLearnKey {
+    if (std.mem.startsWith(u8, raw_key, "durable_fact/behavior/")) {
+        return .{ .key = try allocator.dupe(u8, raw_key) };
+    }
+    if (raw_key.len != 16) {
+        return .{ .err = try allocator.dupe(u8, "Key must be the full durable_fact/behavior/... key or a 16-char hex suffix. Use /learn list to see keys.") };
+    }
+    for (raw_key) |c| {
+        if (!std.ascii.isHex(c)) {
+            return .{ .err = try allocator.dupe(u8, "Key suffix must be hexadecimal. Use /learn list to see keys.") };
+        }
+    }
+    return .{ .key = try std.fmt.allocPrint(allocator, "durable_fact/behavior/{s}", .{raw_key}) };
+}
+
+/// Package 2a Task 4 — the shared transition body behind `/learn adopt`
+/// and `/learn dismiss`. Learning contract inv. 1 (no self-promotion): the
+/// ONLY way a shadow draft becomes active is a human calling
+/// `/learn adopt` (this function, called with new_state=.active); the
+/// ONLY way it becomes retired is `/learn dismiss` (new_state=.retired).
+/// Retired is NOT deleted (BINDING — see draftShadowFactsForFailures'
+/// dedup-by-key-existence in memory_maintain.zig: a hard delete would let
+/// the miner resurrect a dismissed suggestion on the next mining run).
+///
+/// Only a fact currently in `state=shadow` may transition. An already-
+/// active fact reports "already active"; an already-retired fact reports
+/// "already dismissed" — both idempotent no-ops, never an error. A
+/// legacy fact (no header at all) is grandfathered active per the
+/// injection gate, so it is treated the same as "already active" here
+/// (nothing to adopt/dismiss — it was never a shadow/retired draft).
+fn transitionLearnedFact(
+    self: anytype,
+    mem_rt: anytype,
+    raw_key: []const u8,
+    new_state: learning.LearnedState,
+    verb_past_tense: []const u8, // "adopted" / "dismissed" — for the success message
+) ![]const u8 {
+    const trimmed = std.mem.trim(u8, raw_key, " \t");
+    if (trimmed.len == 0) {
+        return try std.fmt.allocPrint(self.allocator, "Usage: /learn {s} <key>", .{if (new_state == .active) "adopt" else "dismiss"});
+    }
+
+    const resolved = try resolveLearnKey(self.allocator, trimmed);
+    switch (resolved) {
+        .err => |msg| return msg,
+        .key => {},
+    }
+    const full_key = resolved.key;
+    defer self.allocator.free(full_key);
+
+    const entry = (mem_rt.memory.get(self.allocator, full_key) catch |err| {
+        return try std.fmt.allocPrint(self.allocator, "Could not look up that suggestion: {s}", .{@errorName(err)});
+    }) orelse {
+        return try std.fmt.allocPrint(self.allocator, "No suggestion found with key: {s}", .{full_key});
+    };
+    defer entry.deinit(self.allocator);
+
+    const header = learning.parseLearnedMetadataHeader(entry.content);
+    if (header.state != .shadow) {
+        // Idempotent no-op: already on the ladder rung the caller wanted,
+        // or past it, or never a shadow draft at all (legacy/active).
+        return switch (header.state orelse .active) {
+            .shadow => unreachable, // excluded by the `!= .shadow` guard above
+            .active => try self.allocator.dupe(u8, "That fact is already active — nothing to do."),
+            .retired => try self.allocator.dupe(u8, "That suggestion was already dismissed — nothing to do."),
+        };
+    }
+
+    const rewritten = learning.rewriteLearnedFactState(self.allocator, entry.content, new_state) catch |err| {
+        return try std.fmt.allocPrint(self.allocator, "Could not update that suggestion: {s}", .{@errorName(err)});
+    };
+    defer self.allocator.free(rewritten);
+
+    mem_rt.memory.store(full_key, rewritten, .core, entry.session_id) catch |err| {
+        return try std.fmt.allocPrint(self.allocator, "Could not save that change: {s}", .{@errorName(err)});
+    };
+
+    return try std.fmt.allocPrint(self.allocator, "{s}: {s}", .{ verb_past_tense, full_key });
+}
+
 fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
     const parsed = splitFirstToken(arg);
     const sub = parsed.head;
@@ -4941,9 +5034,12 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
     // /learn  or  /learn list  — show the learning-contract trust ladder:
     // Active directives (influence behavior today) in one section,
     // Suggestions (shadow drafts awaiting /learn adopt — Task 4) in
-    // another. Package 2a Task 2 / inv. 3: origin is never conflated
-    // across sections. Legacy facts (no metadata header — the pre-Task-2
-    // shape) are grandfathered into Active, same rule as the injection gate.
+    // another, and dismissed suggestions (Task 4 retired hygiene) as a
+    // single collapsed line rather than a full section — a dismissed
+    // draft is a closed question, not something to keep re-reviewing.
+    // Package 2a Task 2 / inv. 3: origin is never conflated across
+    // sections. Legacy facts (no metadata header — the pre-Task-2 shape)
+    // are grandfathered into Active, same rule as the injection gate.
     if (sub.len == 0 or std.mem.eql(u8, sub, "list")) {
         const entries = mem_rt.memory.list(self.allocator, null, self.memory_session_id) catch |err| {
             return try std.fmt.allocPrint(self.allocator, "Memory list failed: {s}", .{@errorName(err)});
@@ -4952,17 +5048,20 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
 
         var active_count: usize = 0;
         var shadow_count: usize = 0;
+        var retired_count: usize = 0;
         for (entries) |e| {
             if (!std.mem.startsWith(u8, e.key, "durable_fact/behavior/")) continue;
             const header = learning.parseLearnedMetadataHeader(e.content);
             if (header.state == .shadow) {
                 shadow_count += 1;
+            } else if (header.state == .retired) {
+                retired_count += 1;
             } else {
                 active_count += 1;
             }
         }
 
-        if (active_count == 0 and shadow_count == 0) {
+        if (active_count == 0 and shadow_count == 0 and retired_count == 0) {
             return try self.allocator.dupe(u8, "No learned behavioral facts found.");
         }
 
@@ -4976,7 +5075,7 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
             for (entries) |e| {
                 if (!std.mem.startsWith(u8, e.key, "durable_fact/behavior/")) continue;
                 const header = learning.parseLearnedMetadataHeader(e.content);
-                if (header.state == .shadow) continue;
+                if (header.state == .shadow or header.state == .retired) continue;
                 idx += 1;
                 const body = learning.stripLearnedMetadataHeader(e.content);
                 const preview_len = @min(@as(usize, 200), body.len);
@@ -5000,7 +5099,28 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
             }
         }
 
+        if (retired_count > 0) {
+            const plural: []const u8 = if (retired_count == 1) "" else "s";
+            try w.print(
+                "{d} dismissed suggestion{s} — /learn forget <key> to delete permanently\n",
+                .{ retired_count, plural },
+            );
+        }
+
         return try out.toOwnedSlice(self.allocator);
+    }
+
+    // /learn adopt <key>  — the external gate (learning contract inv. 1):
+    // promote a shadow draft to active. Package 2a Task 4.
+    if (std.mem.eql(u8, sub, "adopt")) {
+        return try transitionLearnedFact(self, mem_rt, rest, .active, "Adopted");
+    }
+
+    // /learn dismiss <key>  — retire a shadow draft (NOT delete — see
+    // transitionLearnedFact's doc comment on why retired != deleted).
+    // Package 2a Task 4.
+    if (std.mem.eql(u8, sub, "dismiss")) {
+        return try transitionLearnedFact(self, mem_rt, rest, .retired, "Dismissed");
     }
 
     // /learn forget <key>  — remove a specific learned fact by key suffix or full key
@@ -5010,19 +5130,10 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
             return try self.allocator.dupe(u8, "Usage: /learn forget <key>");
         }
 
-        // Accept either the full key or the 16-char hex suffix
-        const full_key = if (std.mem.startsWith(u8, raw_key, "durable_fact/behavior/"))
-            try self.allocator.dupe(u8, raw_key)
-        else blk: {
-            if (raw_key.len != 16) {
-                return try self.allocator.dupe(u8, "Key must be the full durable_fact/behavior/... key or a 16-char hex suffix. Use /learn list to see keys.");
-            }
-            for (raw_key) |c| {
-                if (!std.ascii.isHex(c)) {
-                    return try self.allocator.dupe(u8, "Key suffix must be hexadecimal. Use /learn list to see keys.");
-                }
-            }
-            break :blk try std.fmt.allocPrint(self.allocator, "durable_fact/behavior/{s}", .{raw_key});
+        const resolved = try resolveLearnKey(self.allocator, raw_key);
+        const full_key = switch (resolved) {
+            .err => |msg| return msg,
+            .key => |k| k,
         };
         defer self.allocator.free(full_key);
 
@@ -5035,7 +5146,7 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
         return try std.fmt.allocPrint(self.allocator, "No learned fact found with key: {s}", .{full_key});
     }
 
-    return try self.allocator.dupe(u8, "Usage: /learn [list|forget <key>]");
+    return try self.allocator.dupe(u8, "Usage: /learn [list|adopt <key>|dismiss <key>|forget <key>]");
 }
 
 fn handlePersonaCommand(self: anytype, _arg: []const u8) ![]const u8 {
@@ -6018,4 +6129,376 @@ test "/learn list: no learned facts still reports cleanly (no empty sections)" {
     defer allocator.free(out);
 
     try std.testing.expect(std.mem.indexOf(u8, out, "No learned") != null);
+}
+
+// ── Package 2a Task 4: /learn adopt <key> and /learn dismiss <key> ─────────
+// The external gate made real (learning contract inv. 1): a shadow draft
+// only ever becomes active because a human explicitly adopted it via THIS
+// command. dismiss retires (never deletes — /learn forget still owns hard
+// delete) so the miner's dedup-by-existence (Task 3's draftShadowFactsForFailures)
+// can never resurrect a dismissed suggestion.
+
+fn storeShadowFixture(allocator: std.mem.Allocator, mem: memory_mod.Memory, content: []const u8) ![]const u8 {
+    const result = try learning.storeLearnedFact(allocator, mem, content, .mined_aggregate, &.{"r-1-1"}, null);
+    defer result.deinit(allocator);
+    return try allocator.dupe(u8, result.key);
+}
+
+test "/learn adopt <full key>: shadow -> active, origin + evidence preserved byte-exactly" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    const key = try storeShadowFixture(allocator, mem, "retry uploads with exponential backoff");
+    defer allocator.free(key);
+
+    const before = (try mem.get(allocator, key)) orelse return error.EntryNotFound;
+    const before_content_copy = try allocator.dupe(u8, before.content);
+    defer allocator.free(before_content_copy);
+    before.deinit(allocator);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+
+    const arg = try std.fmt.allocPrint(allocator, "adopt {s}", .{key});
+    defer allocator.free(arg);
+    const out = try handleLearnCommand(&fake_self, arg);
+    defer allocator.free(out);
+
+    const after = (try mem.get(allocator, key)) orelse return error.EntryNotFound;
+    defer after.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, after.content, "state=active") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after.content, "state=shadow") == null);
+    // origin + evidence byte-exactly preserved: swap state=shadow -> state=active
+    // in the ORIGINAL content and the result must match exactly.
+    const expected = try std.mem.replaceOwned(u8, allocator, before_content_copy, "state=shadow", "state=active");
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, after.content);
+}
+
+test "/learn adopt <16-hex suffix>: resolves the same way /learn forget does" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    const key = try storeShadowFixture(allocator, mem, "prefer terse commit messages");
+    defer allocator.free(key);
+    const suffix = key["durable_fact/behavior/".len..];
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+
+    const arg = try std.fmt.allocPrint(allocator, "adopt {s}", .{suffix});
+    defer allocator.free(arg);
+    const out = try handleLearnCommand(&fake_self, arg);
+    defer allocator.free(out);
+
+    const after = (try mem.get(allocator, key)) orelse return error.EntryNotFound;
+    defer after.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, after.content, "state=active") != null);
+}
+
+test "/learn adopt: injection flips ON after adopt (extends Task 2's loader gate test)" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    const key = try storeShadowFixture(allocator, mem, "shipping retries should back off exponentially");
+    defer allocator.free(key);
+
+    // BEFORE adopt: never injected (T2's gate).
+    const before_slot = try memory_loader.loadTurnMemorySlot(
+        allocator,
+        mem,
+        null,
+        "shipping",
+        "agent:zaki-bot:user:1:main",
+        null,
+        null,
+    );
+    defer allocator.free(before_slot.fenced_content);
+    try std.testing.expect(std.mem.indexOf(u8, before_slot.fenced_content, "shipping retries should back off exponentially") == null);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+    const arg = try std.fmt.allocPrint(allocator, "adopt {s}", .{key});
+    defer allocator.free(arg);
+    const out = try handleLearnCommand(&fake_self, arg);
+    defer allocator.free(out);
+
+    // AFTER adopt: injected (the external gate flipped it active).
+    const after_slot = try memory_loader.loadTurnMemorySlot(
+        allocator,
+        mem,
+        null,
+        "shipping",
+        "agent:zaki-bot:user:1:main",
+        null,
+        null,
+    );
+    defer allocator.free(after_slot.fenced_content);
+    try std.testing.expect(std.mem.indexOf(u8, after_slot.fenced_content, "shipping retries should back off exponentially") != null);
+}
+
+test "/learn adopt: idempotent re-adopt of an already-active fact reports 'already active'" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    const key = try storeShadowFixture(allocator, mem, "always back off on 429s");
+    defer allocator.free(key);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+    const arg = try std.fmt.allocPrint(allocator, "adopt {s}", .{key});
+    defer allocator.free(arg);
+
+    const first = try handleLearnCommand(&fake_self, arg);
+    defer allocator.free(first);
+    const second = try handleLearnCommand(&fake_self, arg);
+    defer allocator.free(second);
+
+    try std.testing.expect(std.mem.indexOf(u8, second, "already active") != null);
+
+    // Re-adopting must not corrupt the header — still exactly one state= line, active.
+    const entry = (try mem.get(allocator, key)) orelse return error.EntryNotFound;
+    defer entry.deinit(allocator);
+    var state_line_count: usize = 0;
+    var lines = std.mem.splitScalar(u8, entry.content, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "state=")) state_line_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), state_line_count);
+    try std.testing.expect(std.mem.indexOf(u8, entry.content, "state=active") != null);
+}
+
+test "/learn adopt: missing key gives a friendly error (SaaS posture)" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+
+    const out = try handleLearnCommand(&fake_self, "adopt durable_fact/behavior/0000000000000000");
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "No learned") != null or std.mem.indexOf(u8, out, "not found") != null or std.mem.indexOf(u8, out, "No suggestion") != null);
+    // No raw error-name jargon leaking to the user.
+    try std.testing.expect(std.mem.indexOf(u8, out, "EntryNotFound") == null);
+}
+
+test "/learn adopt: usage message when no key given" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+
+    const out = try handleLearnCommand(&fake_self, "adopt");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Usage") != null);
+}
+
+test "/learn dismiss <full key>: shadow -> retired (not deleted), still resolvable by key" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    const key = try storeShadowFixture(allocator, mem, "avoid parallel writes to the same file");
+    defer allocator.free(key);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+    const arg = try std.fmt.allocPrint(allocator, "dismiss {s}", .{key});
+    defer allocator.free(arg);
+    const out = try handleLearnCommand(&fake_self, arg);
+    defer allocator.free(out);
+
+    // Key still EXISTS (dismiss != delete — /learn forget still owns that).
+    const entry = (try mem.get(allocator, key)) orelse return error.KeyWasDeleted;
+    defer entry.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, entry.content, "state=retired") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.content, "state=shadow") == null);
+}
+
+test "/learn dismiss: retired fact is still never injected" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    const key = try storeShadowFixture(allocator, mem, "batch API calls instead of looping single calls");
+    defer allocator.free(key);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+    const arg = try std.fmt.allocPrint(allocator, "dismiss {s}", .{key});
+    defer allocator.free(arg);
+    const out = try handleLearnCommand(&fake_self, arg);
+    defer allocator.free(out);
+
+    const slot = try memory_loader.loadTurnMemorySlot(
+        allocator,
+        mem,
+        null,
+        "batch",
+        "agent:zaki-bot:user:1:main",
+        null,
+        null,
+    );
+    defer allocator.free(slot.fenced_content);
+    try std.testing.expect(std.mem.indexOf(u8, slot.fenced_content, "batch API calls instead of looping single calls") == null);
+}
+
+test "/learn dismiss: idempotent re-dismiss reports 'already dismissed'" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    const key = try storeShadowFixture(allocator, mem, "always page results over 100 items");
+    defer allocator.free(key);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+    const arg = try std.fmt.allocPrint(allocator, "dismiss {s}", .{key});
+    defer allocator.free(arg);
+
+    const first = try handleLearnCommand(&fake_self, arg);
+    defer allocator.free(first);
+    const second = try handleLearnCommand(&fake_self, arg);
+    defer allocator.free(second);
+
+    try std.testing.expect(std.mem.indexOf(u8, second, "already dismissed") != null);
+}
+
+test "/learn adopt on an already-retired (dismissed) key reports 'already dismissed', does not resurrect it" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    const key = try storeShadowFixture(allocator, mem, "confirm destructive ops before running them");
+    defer allocator.free(key);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+    const dismiss_arg = try std.fmt.allocPrint(allocator, "dismiss {s}", .{key});
+    defer allocator.free(dismiss_arg);
+    const dismiss_out = try handleLearnCommand(&fake_self, dismiss_arg);
+    defer allocator.free(dismiss_out);
+
+    const adopt_arg = try std.fmt.allocPrint(allocator, "adopt {s}", .{key});
+    defer allocator.free(adopt_arg);
+    const adopt_out = try handleLearnCommand(&fake_self, adopt_arg);
+    defer allocator.free(adopt_out);
+
+    try std.testing.expect(std.mem.indexOf(u8, adopt_out, "already dismissed") != null);
+
+    // Still retired — adopt must NOT have silently promoted it.
+    const entry = (try mem.get(allocator, key)) orelse return error.EntryNotFound;
+    defer entry.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, entry.content, "state=retired") != null);
+}
+
+test "/learn dismiss on an already-active fact reports 'already active', refuses (only shadow facts are adopted/dismissed)" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // origin=user_correction births active directly (birth-state law) — never a shadow draft.
+    const result = try learning.storeLearnedFact(allocator, mem, "always confirm before deleting files", .user_correction, &.{}, null);
+    defer result.deinit(allocator);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+    const arg = try std.fmt.allocPrint(allocator, "dismiss {s}", .{result.key});
+    defer allocator.free(arg);
+    const out = try handleLearnCommand(&fake_self, arg);
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "already active") != null);
+
+    // Still active — dismiss must not have retired a directive the user stated.
+    const entry = (try mem.get(allocator, result.key)) orelse return error.EntryNotFound;
+    defer entry.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, entry.content, "state=active") != null);
+}
+
+test "/learn dismiss: missing key gives a friendly error" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+
+    const out = try handleLearnCommand(&fake_self, "dismiss durable_fact/behavior/0000000000000000");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "EntryNotFound") == null);
+}
+
+test "/learn list: a dismissed suggestion shows as a collapsed 'N dismissed suggestions' line, not a full Suggestions entry" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    const key = try storeShadowFixture(allocator, mem, "prefer streaming responses for long outputs");
+    defer allocator.free(key);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+    const dismiss_arg = try std.fmt.allocPrint(allocator, "dismiss {s}", .{key});
+    defer allocator.free(dismiss_arg);
+    const dismiss_out = try handleLearnCommand(&fake_self, dismiss_arg);
+    defer allocator.free(dismiss_out);
+
+    const out = try handleLearnCommand(&fake_self, "list");
+    defer allocator.free(out);
+
+    // Collapsed hygiene line present, mentioning the forget escape hatch.
+    try std.testing.expect(std.mem.indexOf(u8, out, "1 dismissed suggestion") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "/learn forget") != null);
+    // The dismissed fact's own body text must NOT appear as a full Suggestions entry.
+    try std.testing.expect(std.mem.indexOf(u8, out, "prefer streaming responses for long outputs") == null);
+}
+
+test "/learn adopt on a legacy fact (no metadata header at all) reports 'already active', never corrupts it" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // Exactly what the pre-Task-2, unmodified user_correction fast path
+    // writes: plain content, mem.store, no metadata header at all.
+    try mem.store(
+        "durable_fact/behavior/legacynoheader01",
+        "onboarding reminders should be gentle",
+        .core,
+        null,
+    );
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+    const out = try handleLearnCommand(&fake_self, "adopt durable_fact/behavior/legacynoheader01");
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "already active") != null);
+
+    // Content must be byte-identical — a legacy fact is grandfathered
+    // active already; adopt must never attempt to inject a header into it.
+    const entry = (try mem.get(allocator, "durable_fact/behavior/legacynoheader01")) orelse return error.EntryNotFound;
+    defer entry.deinit(allocator);
+    try std.testing.expectEqualStrings("onboarding reminders should be gentle", entry.content);
 }

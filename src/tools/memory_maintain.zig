@@ -1065,6 +1065,66 @@ test "draftShadowFactsForFailures: skips drafting when factKey already exists (d
     try std.testing.expectEqual(@as(usize, 1), second.skipped_duplicate);
 }
 
+// ── BINDING (review-mandated) regression: dismiss != delete ─────────────
+//
+// This is the exact reason `/learn dismiss` retires (state=retired) rather
+// than hard-deleting (`/learn forget`'s job): draftShadowFactsForFailures'
+// dedup check is `mem.get(key) != null` — key EXISTENCE, regardless of
+// state (see its doc comment: "if factKey(content) already exists in
+// memory (ANY state — shadow OR active), the draft is skipped entirely").
+// If dismiss deleted the key instead of retiring it, the very next mining
+// run over the same recurring failure pattern would find the key gone and
+// redraft the EXACT suggestion the human just said no to — the
+// resurrection bug. This test drafts, dismisses (via the same
+// rewriteLearnedFactState + store primitive /learn dismiss uses), then
+// re-mines the identical pattern and asserts it is NOT redrafted.
+test "resurrection regression (BINDING): a dismissed (retired) shadow fact is never redrafted by a later mining run" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var report = try fixtureReportForFiles(allocator);
+    defer report.deinit(allocator);
+
+    // 1. The miner drafts a shadow suggestion for a qualifying failure pattern.
+    const first = try draftShadowFactsForFailures(allocator, mem, report, "session-1");
+    try std.testing.expectEqual(@as(usize, 1), first.drafted);
+
+    const key = try learning.factKey(allocator, "When using web_search, avoid timeout — failed 3x recently");
+    defer allocator.free(key);
+
+    // 2. The human dismisses it — /learn dismiss's actual mechanism:
+    // rewrite state=shadow -> state=retired, re-store under the SAME key
+    // (never a forget/delete).
+    const before = (try mem.get(allocator, key)) orelse return error.FactNotFound;
+    const rewritten = try learning.rewriteLearnedFactState(allocator, before.content, .retired);
+    defer allocator.free(rewritten);
+    before.deinit(allocator);
+    try mem.store(key, rewritten, .core, "session-1");
+
+    // Sanity: the key still exists and is retired (dismiss != delete).
+    const after_dismiss = (try mem.get(allocator, key)) orelse return error.KeyWasDeleted;
+    defer after_dismiss.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, after_dismiss.content, "state=retired") != null);
+
+    // 3. Re-mining the SAME recurring failure pattern (e.g. the nightly
+    // cron firing again next week) must NOT redraft the dismissed
+    // suggestion — dedup is by key existence, and the key still exists.
+    var report_2 = try fixtureReportForFiles(allocator);
+    defer report_2.deinit(allocator);
+    const second = try draftShadowFactsForFailures(allocator, mem, report_2, "session-1");
+    try std.testing.expectEqual(@as(usize, 0), second.drafted);
+    try std.testing.expectEqual(@as(usize, 1), second.skipped_duplicate);
+
+    // The fact must STILL be retired — not silently un-dismissed by the
+    // dedup skip, and not re-created as a fresh shadow row either.
+    const final = (try mem.get(allocator, key)) orelse return error.FactNotFound;
+    defer final.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, final.content, "state=retired") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final.content, "state=shadow") == null);
+}
+
 test "draftShadowFactsForFailures: drops a run_id containing a newline (closes T2's flagged residual)" {
     const allocator = std.testing.allocator;
     var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");

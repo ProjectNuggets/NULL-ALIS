@@ -290,6 +290,54 @@ pub fn stripLearnedMetadataHeader(content: []const u8) []const u8 {
     return content[header_end..];
 }
 
+/// rewriteLearnedFactState is the content surgery behind the external gate
+/// (Package 2a Task 4 — inv. 1): `/learn adopt` (shadow -> active) and
+/// `/learn dismiss` (shadow -> retired) both need to change ONLY the
+/// `state=` header line of a stored fact's content, leaving `origin=` and
+/// `evidence_run_ids=` byte-exactly as they were (the binding design's
+/// "preserve origin + evidence" requirement) and leaving the human-readable
+/// body untouched.
+///
+/// Requires a REAL leading header (see headerBlockEnd) — legacy content
+/// (no header at all) returns `error.NoHeader` rather than silently
+/// fabricating one; callers (handleLearnCommand) treat that as "nothing to
+/// adopt/dismiss" since a legacy fact is already grandfathered active and
+/// was never a shadow/retired draft to begin with. Caller frees the
+/// returned slice.
+pub fn rewriteLearnedFactState(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    new_state: LearnedState,
+) ![]u8 {
+    const header_end = headerBlockEnd(content) orelse return error.NoHeader;
+    const header_block = content[0..header_end];
+
+    // Find the state= line within the header block specifically (not a
+    // scan of the whole content — mirrors headerBlockEnd's own
+    // line-0-anchored discipline so a body line that merely looks like
+    // "state=..." can never be mistaken for the real header line).
+    var line_start: usize = 0;
+    var state_line_start: ?usize = null;
+    var state_line_end: usize = 0; // exclusive, i.e. the index of the line's trailing \n
+    var lines = std.mem.splitScalar(u8, header_block, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, LEARNED_STATE_PREFIX)) {
+            state_line_start = line_start;
+            state_line_end = line_start + line.len;
+            break;
+        }
+        line_start += line.len + 1; // +1 for the \n this split consumed
+    }
+    const s_start = state_line_start orelse return error.NoHeader;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, content[0..s_start]);
+    try buf.writer(allocator).print("{s}{s}", .{ LEARNED_STATE_PREFIX, new_state.toSlice() });
+    try buf.appendSlice(allocator, content[state_line_end..]);
+    return buf.toOwnedSlice(allocator);
+}
+
 /// buildLearnedMetadataHeader writes the `origin=`/`state=`/
 /// `evidence_run_ids=` header block (each line \n-terminated, followed by
 /// a blank line) for a fact birthed with the given origin/evidence.
@@ -812,6 +860,49 @@ test "stripLearnedMetadataHeader: strips header down to the human-readable body"
 test "stripLearnedMetadataHeader: legacy content with no header is returned unchanged (byte-identical)" {
     const legacy = "always respond in English";
     try std.testing.expectEqualStrings(legacy, stripLearnedMetadataHeader(legacy));
+}
+
+// ── rewriteLearnedFactState: the external gate's content surgery (Task 4) ──
+// /learn adopt (shadow->active) and /learn dismiss (shadow->retired) must
+// rewrite ONLY the state= line of a fact's stored content header, leaving
+// origin= and evidence_run_ids= byte-exactly preserved (binding design:
+// "preserve origin + evidence; re-store via the memory interface"). This is
+// pure string surgery — no Memory dependency — so it is unit-tested here in
+// isolation from the store/get round-trip.
+
+test "rewriteLearnedFactState: shadow -> active preserves origin and evidence_run_ids byte-exactly" {
+    const original = "origin=mined_aggregate\nstate=shadow\nevidence_run_ids=r-1-1,r-2-2\n\nretry uploads with exponential backoff";
+    const rewritten = try rewriteLearnedFactState(std.testing.allocator, original, .active);
+    defer std.testing.allocator.free(rewritten);
+
+    try std.testing.expectEqualStrings(
+        "origin=mined_aggregate\nstate=active\nevidence_run_ids=r-1-1,r-2-2\n\nretry uploads with exponential backoff",
+        rewritten,
+    );
+}
+
+test "rewriteLearnedFactState: shadow -> retired preserves origin (no evidence_run_ids line case)" {
+    const original = "origin=mined_aggregate\nstate=shadow\n\nretry uploads with exponential backoff";
+    const rewritten = try rewriteLearnedFactState(std.testing.allocator, original, .retired);
+    defer std.testing.allocator.free(rewritten);
+
+    try std.testing.expectEqualStrings(
+        "origin=mined_aggregate\nstate=retired\n\nretry uploads with exponential backoff",
+        rewritten,
+    );
+}
+
+test "rewriteLearnedFactState: the body text is untouched" {
+    const original = "origin=observed_failure\nstate=shadow\n\nmulti-line body\nwith several\nlines of text";
+    const rewritten = try rewriteLearnedFactState(std.testing.allocator, original, .active);
+    defer std.testing.allocator.free(rewritten);
+
+    try std.testing.expect(std.mem.endsWith(u8, rewritten, "multi-line body\nwith several\nlines of text"));
+}
+
+test "rewriteLearnedFactState: legacy content with no header returns error.NoHeader (adopt/dismiss must refuse, not corrupt)" {
+    const legacy = "always respond in English";
+    try std.testing.expectError(error.NoHeader, rewriteLearnedFactState(std.testing.allocator, legacy, .active));
 }
 
 // ── Hardening: a legacy fact whose BODY happens to contain a line that

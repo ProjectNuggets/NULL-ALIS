@@ -275,12 +275,25 @@ pub const PromptContext = struct {
     /// ordering invariant in `buildVolatileSystemPrompt`. Empty when no
     /// bench results are available (`.spike/results.tsv` absent).
     known_weakness_block: ?[]const u8 = null,
+    /// Package 2a Task 4 (learning-contract behaviour §4 — "in-turn
+    /// consultation") — recent mined-insights block, pre-formatted as
+    /// `<recent_insights>...</recent_insights>` by
+    /// `agent/insights_block.zig::readInsightsBlock`. Reads the latest
+    /// `workspace/insights/{ISO-week}.md` the miner (mine_traces) wrote
+    /// and surfaces its top 3 bullet lines — the agent's own recent
+    /// operational experience, alongside `known_weakness_block`'s
+    /// bench-derived self-knowledge. Renders between `known_weakness_block`
+    /// and `task_plan_block` per the recall-stack ordering invariant in
+    /// `buildVolatileSystemPrompt`. Empty/null when no insights file
+    /// exists yet, or `trace_mining_enabled` is off (consultation is part
+    /// of mining being on — no separate flag).
+    insights_block: ?[]const u8 = null,
     /// v1.14.18-A G4 (TASK-PLANNER READ-BACK) — the agent's retained task
     /// plan rendered as `<task_plan>...</task_plan>` by
     /// `agent/task_planner.zig::renderPlanBlock`. Surfaces the plan + live
     /// step progress in the volatile prompt. Renders after
-    /// `known_weakness_block` and before `skill_traces_block`. Empty until
-    /// the agent emits a `<task_plan>`.
+    /// `known_weakness_block` (and Task 4's `insights_block`) and before
+    /// `skill_traces_block`. Empty until the agent emits a `<task_plan>`.
     task_plan_block: ?[]const u8 = null,
     /// Phase 5 (Superpowers mode) — when true, the volatile prompt emits the
     /// coordinator section (see `buildCoordinatorSection`): you are the
@@ -602,6 +615,11 @@ pub fn buildVolatileSystemPrompt(
     //      skill traces because it's metacognitive ("here is what
     //      benchmarks say I'm bad at") and should anchor the
     //      procedural-recall reading underneath it.
+    //   2b. insights_block   (Package 2a Task 4) — recent mined-insights
+    //      (top 3 bullet lines from the latest workspace/insights/ file).
+    //      Right after known_weakness — same metacognitive register, this
+    //      time sourced from the agent's own operational trace history
+    //      rather than bench runs.
     //   3. recent_skill_traces (G-07, V1.14.3) — "what worked last
     //      time for this shape of task". The dominant procedural
     //      memory surface. Sits LAST so the agent reads identity →
@@ -625,9 +643,20 @@ pub fn buildVolatileSystemPrompt(
             try w.writeAll("\n");
         }
     }
+    // Package 2a Task 4 (learning-contract behaviour §4) — recent mined
+    // insights, right after known_weakness (both metacognitive: "here is
+    // what benchmarks say" next to "here is what my own recent experience
+    // taught me") and before task_plan.
+    if (ctx.insights_block) |ib| {
+        if (ib.len > 0) {
+            try w.writeAll(ib);
+            if (ib[ib.len - 1] != '\n') try w.writeAll("\n");
+            try w.writeAll("\n");
+        }
+    }
     // v1.14.18-A G4 (TASK-PLANNER READ-BACK) — the agent's plan + live step
-    // progress, after known_weakness and before skill traces (recall-stack
-    // ordering invariant; see context_engine.assemble).
+    // progress, after known_weakness/insights and before skill traces
+    // (recall-stack ordering invariant; see context_engine.assemble).
     if (ctx.task_plan_block) |tp| {
         if (tp.len > 0) {
             try w.writeAll(tp);
@@ -749,6 +778,7 @@ fn buildSafetySection(w: anytype) !void {
     try w.writeAll("- Browser tool decision tree (server-side vs extension-side). **Server-side** (`web_fetch`, `web_search`, `browser`, `http_request`): use these for public web research, scraping content behind no login, and automation against APIs that do not need the user's session. They run in the gateway, are fast, and never touch the user's real browser. **Extension-side** (`extension_navigate`, `extension_click`, `extension_type`, `extension_fill_form`, `extension_screenshot`, `extension_get_text`, `extension_get_dom`, `extension_wait_for`, `extension_scroll`, `extension_list_tabs`): use these ONLY when the task requires the user's logged-in session — Gmail or other inbox UIs not covered by `composio`, Slack/Teams web clients, banking, internal SaaS dashboards, social platforms with auth walls, paywalled content. Extension tools drive the user's REAL browser tab — actions are visible to them, require the nullalis browser extension to be connected, and are approval-gated under `.supervised` autonomy. When `composio` covers the integration (Gmail, GitHub, Notion, Slack, Calendar, Drive, etc.) prefer it over the extension because composio handles auth/refresh and runs without user-visible browser action.\n\n");
     try w.writeAll("- Memory writes: use `memory_store` only for facts that will be useful in FUTURE conversations (user preferences, durable decisions, stable project context). Use `memory_edit` to correct existing entries, `memory_archive` to close resolved ones, `memory_forget` to remove outdated ones (exact semantics in the next bullet). Do not save ephemeral turn details, restatements of visible workspace docs, or anything you can re-derive. Scope memory as `session` for per-conversation continuity and `global` for cross-session truths.\n\n");
     try w.writeAll("- Memory curation semantics: `memory_edit`/supersede CORRECTS a fact (history preserved); `memory_archive` CLOSES it (kept, excluded from recall); `memory_forget` DELETES it. Durable types (core/preference/decision/person/open_loop) never resurrect once corrected and are protected from accidental demotion. core/preference/decision/person are evergreen (never decay); open_loop decays in ranking but keeps that protection — when a loop is resolved, close it via archive or supersede, don't wait for decay. Never store the output of your own introspection tools (memory_doctor, brain_graph, memory_list, transcript_read, ...) — that is your machinery, not knowledge; `memory_store` rejects scaffold, system-managed, and internal bookkeeping keys.\n\n");
+    try w.writeAll("- Learning conduct: when you change approach because of a learned pattern, cite it — \"X failed 3 times this week, trying Y instead\" — and never claim uncited improvement. A shadow entry in `/learn list` is a suggestion you haven't adopted, not something you already do; adopt and dismiss are the user's verbs (`/learn adopt <key>` / `/learn dismiss <key>`), never yours to invoke on your own judgment.\n\n");
     // D52 Hybrid Pillar 1 (2026-05-24): override the LLM RLHF reflex that
     // refuses to persist user-volunteered PII into the user's OWN personal
     // memory. This is a personal-memory product — refusing the user's own
@@ -2345,6 +2375,77 @@ test "buildVolatileSystemPrompt v1.14.18-B recall-stack ordering invariant" {
     try std.testing.expect(kw < st);
 }
 
+// ── Package 2a Task 4: insights_block (behaviour §4 in-turn consultation) ──
+// Mirrors known_weakness_block exactly: pre-formatted by
+// agent/insights_block.zig::readInsightsBlock, sits in the volatile block
+// between known_weakness and task_plan (metacognitive neighbor — "here is
+// what benchmarks say I'm bad at" next to "here is what my own recent
+// experience taught me"). Missing/absent -> null -> byte-identical prompt
+// (no empty tag).
+
+test "buildVolatileSystemPrompt emits insights_block when present" {
+    const allocator = std.testing.allocator;
+    const insights_block = "<recent_insights source=\"mine_traces\">\n- `web_search` failed with \"timeout\" 4x\n</recent_insights>\n";
+
+    const volatile_out = try buildVolatileSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .insights_block = insights_block,
+    });
+    defer allocator.free(volatile_out);
+
+    try std.testing.expect(std.mem.indexOf(u8, volatile_out, "<recent_insights") != null);
+    try std.testing.expect(std.mem.indexOf(u8, volatile_out, "web_search") != null);
+}
+
+test "buildVolatileSystemPrompt omits insights_block when null (byte-identical to no field set)" {
+    const allocator = std.testing.allocator;
+
+    const with_null = try buildVolatileSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .insights_block = null,
+    });
+    defer allocator.free(with_null);
+
+    const without_field = try buildVolatileSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer allocator.free(without_field);
+
+    try std.testing.expect(std.mem.indexOf(u8, with_null, "<recent_insights") == null);
+    try std.testing.expectEqualStrings(without_field, with_null);
+}
+
+test "buildVolatileSystemPrompt: insights_block sits after known_weakness and before task_plan" {
+    const allocator = std.testing.allocator;
+
+    const kw_block = "<known_weakness>\nbench result placeholder\n</known_weakness>\n";
+    const insights_block = "<recent_insights source=\"mine_traces\">\n- a mined suggestion\n</recent_insights>\n";
+    const tp_block = "<task_plan>\n<summary>test plan</summary>\n</task_plan>\n";
+
+    const volatile_out = try buildVolatileSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .known_weakness_block = kw_block,
+        .insights_block = insights_block,
+        .task_plan_block = tp_block,
+    });
+    defer allocator.free(volatile_out);
+
+    const kw = std.mem.indexOf(u8, volatile_out, "<known_weakness") orelse return error.KnownWeaknessBlockMissing;
+    const ib = std.mem.indexOf(u8, volatile_out, "<recent_insights") orelse return error.InsightsBlockMissing;
+    const tp = std.mem.indexOf(u8, volatile_out, "<task_plan") orelse return error.TaskPlanBlockMissing;
+
+    try std.testing.expect(kw < ib);
+    try std.testing.expect(ib < tp);
+}
+
 test "buildVolatileSystemPrompt G-08: empty working_memory_block omits the <working_memory> tag" {
     // V1.14.3 (G-08 partial closure) — Rendering invariant test only.
     //
@@ -2491,6 +2592,31 @@ test "safety section makes execution mode user-owned" {
     try std.testing.expect(std.mem.indexOf(u8, output, "Mode control is user-owned") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Do not silently switch modes") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "use `set_execution_mode` to switch your own mode proactively") == null);
+}
+
+// Package 2a Task 4 — the conduct bullet (learning-contract behaviour §4,
+// inv. 6 "disclosure without theatre"): evidence-cited adaptation, never
+// claim uncited improvement, shadow = a suggestion not yet adopted,
+// adopt/dismiss are the USER's verbs.
+test "safety section teaches evidence-cited learning conduct (inv. 6 disclosure without theatre)" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+    try buildSafetySection(w);
+
+    const output = buf.items;
+    // Cite evidence when adapting due to a learned pattern.
+    try std.testing.expect(std.mem.indexOf(u8, output, "cite it") != null);
+    // Never claim uncited improvement.
+    try std.testing.expect(std.mem.indexOf(u8, output, "uncited improvement") != null);
+    // Shadow = a suggestion the agent hasn't adopted itself.
+    try std.testing.expect(std.mem.indexOf(u8, output, "suggestion") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "haven't adopted") != null);
+    // adopt/dismiss are the user's verbs, not the agent's.
+    try std.testing.expect(std.mem.indexOf(u8, output, "/learn adopt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/learn dismiss") != null);
+    // No new ## heading introduced by this bullet.
+    try std.testing.expect(std.mem.indexOf(u8, output, "## Learning") == null);
 }
 
 test "task planning prompt keeps internal plans separate from todo" {

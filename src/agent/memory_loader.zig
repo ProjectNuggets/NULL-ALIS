@@ -287,6 +287,20 @@ fn isShadowBehaviorFact(key: []const u8, content: []const u8) bool {
     return header.state == .shadow;
 }
 
+/// Package 2a Task 4 — "retired hygiene": a dismissed suggestion
+/// (`/learn dismiss`, state=retired) must NEVER be injected, exactly like
+/// a shadow draft. `isShadowBehaviorFact` above stays narrowly named/scoped
+/// (state == .shadow only — its own unit test pins that meaning), so every
+/// injection gate site uses THIS wider predicate instead: shadow OR
+/// retired, never active/legacy. Same key-prefix scoping and grandfather
+/// clause as isShadowBehaviorFact (legacy/non-behavior content passes
+/// through untouched).
+fn isRetiredOrShadowBehaviorFact(key: []const u8, content: []const u8) bool {
+    if (!std.mem.startsWith(u8, key, "durable_fact/behavior/")) return false;
+    const header = learning.parseLearnedMetadataHeader(content);
+    return header.state == .shadow or header.state == .retired;
+}
+
 // Legacy compatibility artifact: retained for audit/debug access only and
 // intentionally excluded from normal continuity injection.
 fn isSessionSummaryAuditKey(key: []const u8) bool {
@@ -640,8 +654,8 @@ fn loadContextDetailed(
             // continuity bucket. Both shapes feed agent bootstrap context.
             if (!isDurableFactKey(entry.key) and !isExtractedFactKey(entry.key)) continue;
             // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow
-            // behavior facts are never injected — see isShadowBehaviorFact.
-            if (isShadowBehaviorFact(entry.key, entry.content)) continue;
+            // behavior facts are never injected — see isRetiredOrShadowBehaviorFact.
+            if (isRetiredOrShadowBehaviorFact(entry.key, entry.content)) continue;
             if (containsKey(scoped_entries, entry.key)) continue;
             if (containsString(seen_keys.items, entry.key)) continue;
             const estimated_bytes = @min(entry.content.len, SEMANTIC_ENTRY_MAX_BYTES) + entry.key.len + 8;
@@ -697,8 +711,8 @@ fn loadContextDetailed(
     for (scoped_entries) |entry| {
         if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
         // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow behavior
-        // facts are never injected, through ANY bucket — see isShadowBehaviorFact.
-        if (isShadowBehaviorFact(entry.key, entry.content)) continue;
+        // facts are never injected, through ANY bucket — see isRetiredOrShadowBehaviorFact.
+        if (isRetiredOrShadowBehaviorFact(entry.key, entry.content)) continue;
         if (containsString(seen_keys.items, entry.key)) continue;
         if (isSemanticContinuityKey(entry.key)) {
             const estimated_bytes = @min(entry.content.len, SEMANTIC_ENTRY_MAX_BYTES) + entry.key.len + 8;
@@ -729,8 +743,8 @@ fn loadContextDetailed(
                 if (containsKey(scoped_entries, entry.key)) continue;
                 if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
                 // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow
-                // behavior facts are never injected — see isShadowBehaviorFact.
-                if (isShadowBehaviorFact(entry.key, entry.content)) continue;
+                // behavior facts are never injected — see isRetiredOrShadowBehaviorFact.
+                if (isRetiredOrShadowBehaviorFact(entry.key, entry.content)) continue;
                 if (containsString(seen_keys.items, entry.key)) continue;
                 const estimated_bytes = @min(entry.content.len, FALLBACK_ENTRY_MAX_BYTES) + entry.key.len + 8;
                 if (!canAppendToBucket(buf.items.len, fallback_bytes, stats.fallback_bucket_entries, FALLBACK_BUCKET_MAX_BYTES, FALLBACK_BUCKET_MAX_ENTRIES, estimated_bytes)) break;
@@ -884,8 +898,8 @@ fn loadContextWithRuntimeDetailed(
             // continuity bucket. Both shapes feed agent bootstrap context.
             if (!isDurableFactKey(entry.key) and !isExtractedFactKey(entry.key)) continue;
             // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow
-            // behavior facts are never injected — see isShadowBehaviorFact.
-            if (isShadowBehaviorFact(entry.key, entry.content)) continue;
+            // behavior facts are never injected — see isRetiredOrShadowBehaviorFact.
+            if (isRetiredOrShadowBehaviorFact(entry.key, entry.content)) continue;
             if (containsString(seen_keys.items, entry.key)) continue;
             const estimated_bytes = @min(entry.content.len, SEMANTIC_ENTRY_MAX_BYTES) + entry.key.len + 8;
             if (!canAppendToBucket(buf.items.len, semantic_bytes, stats.semantic_bucket_entries, SEMANTIC_BUCKET_MAX_BYTES, null, estimated_bytes)) break;
@@ -929,10 +943,10 @@ fn loadContextWithRuntimeDetailed(
         if (shouldSkipGenericEntry(cand.key, cand.snippet, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
         // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow behavior
         // facts are never injected, even via the vector/RRF candidate path
-        // — see isShadowBehaviorFact. cand.snippet is a full-content hydrate
+        // — see isRetiredOrShadowBehaviorFact. cand.snippet is a full-content hydrate
         // (memory/root.zig's hydrateSnippet dupes owned_entry.content), so
         // the metadata header (if any) survives into it intact.
-        if (isShadowBehaviorFact(cand.key, cand.snippet)) continue;
+        if (isRetiredOrShadowBehaviorFact(cand.key, cand.snippet)) continue;
         if (containsString(seen_keys.items, cand.key)) continue;
         if (isSemanticContinuityKey(cand.key)) {
             const estimated_bytes = @min(cand.snippet.len, SEMANTIC_ENTRY_MAX_BYTES) + cand.key.len + 8;
@@ -980,8 +994,8 @@ fn loadContextWithRuntimeDetailed(
                 if (containsCandidateKey(candidates, entry.key)) continue;
                 if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
                 // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow
-                // behavior facts are never injected — see isShadowBehaviorFact.
-                if (isShadowBehaviorFact(entry.key, entry.content)) continue;
+                // behavior facts are never injected — see isRetiredOrShadowBehaviorFact.
+                if (isRetiredOrShadowBehaviorFact(entry.key, entry.content)) continue;
                 if (containsString(seen_keys.items, entry.key)) continue;
                 if (isSemanticContinuityKey(entry.key) and (stats.semantic_bucket_entries < SEMANTIC_BUCKET_MIN_ENTRIES or semantic_bytes < 1600)) {
                     const semantic_estimated = @min(entry.content.len, SEMANTIC_ENTRY_MAX_BYTES) + entry.key.len + 8;
@@ -1015,8 +1029,8 @@ fn loadContextWithRuntimeDetailed(
                 }
                 if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
                 // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow
-                // behavior facts are never injected — see isShadowBehaviorFact.
-                if (isShadowBehaviorFact(entry.key, entry.content)) continue;
+                // behavior facts are never injected — see isRetiredOrShadowBehaviorFact.
+                if (isRetiredOrShadowBehaviorFact(entry.key, entry.content)) continue;
                 if (containsString(seen_keys.items, entry.key)) continue;
                 const estimated_bytes = @min(entry.content.len, FALLBACK_ENTRY_MAX_BYTES) + entry.key.len + 8;
                 if (!canAppendToBucket(buf.items.len, fallback_bytes, stats.fallback_bucket_entries, FALLBACK_BUCKET_MAX_BYTES, FALLBACK_BUCKET_MAX_ENTRIES, estimated_bytes)) break;
@@ -2502,6 +2516,72 @@ test "isShadowBehaviorFact: true only for durable_fact/behavior/ keys carrying s
 
     // Unrelated key entirely → false.
     try std.testing.expect(!isShadowBehaviorFact("summary_latest/agent:1:main", "state=shadow"));
+}
+
+// ── Task 4: retired facts are ALSO never injected ──────────────────────────
+// Learning contract inv. 1/3/7 extended by Task 4's "retired hygiene": a
+// dismissed suggestion (state=retired, via /learn dismiss) must never
+// influence behavior, exactly like a shadow draft. isShadowBehaviorFact's
+// name is shadow-specific (state == .shadow only) — a retired fact is NOT
+// shadow, so it must be excluded by a SEPARATE predicate/gate, not silently
+// rely on isShadowBehaviorFact widening.
+
+test "learning contract: a retired (dismissed) behavior fact is never injected" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // A dismissed suggestion: origin=mined_aggregate, state=retired (what
+    // /learn dismiss produces — see commands.zig's handleLearnCommand).
+    try mem.store(
+        "durable_fact/behavior/retiredfact0000",
+        "origin=mined_aggregate\nstate=retired\nevidence_run_ids=r-1-1\n\nretry uploads with exponential backoff",
+        .core,
+        null,
+    );
+
+    const slot = try loadTurnMemorySlot(
+        allocator,
+        mem,
+        null,
+        "uploads",
+        "agent:zaki-bot:user:3:main",
+        null,
+        null,
+    );
+    defer allocator.free(slot.fenced_content);
+
+    try std.testing.expect(std.mem.indexOf(u8, slot.fenced_content, "retry uploads with exponential backoff") == null);
+}
+
+test "isRetiredOrShadowBehaviorFact: true for both shadow and retired states, false for active/legacy" {
+    // Shadow → true.
+    try std.testing.expect(isRetiredOrShadowBehaviorFact(
+        "durable_fact/behavior/abc123",
+        "origin=mined_aggregate\nstate=shadow\n\nretry with backoff",
+    ));
+    // Retired (dismissed) → true.
+    try std.testing.expect(isRetiredOrShadowBehaviorFact(
+        "durable_fact/behavior/abc123",
+        "origin=mined_aggregate\nstate=retired\n\nretry with backoff",
+    ));
+    // Active → false.
+    try std.testing.expect(!isRetiredOrShadowBehaviorFact(
+        "durable_fact/behavior/abc123",
+        "origin=user_correction\nstate=active\n\nalways use snake_case",
+    ));
+    // Legacy (no header) → false (grandfathered active).
+    try std.testing.expect(!isRetiredOrShadowBehaviorFact(
+        "durable_fact/behavior/abc123",
+        "always use snake_case",
+    ));
+    // Non-behavior key → false regardless of shadow-shaped content.
+    try std.testing.expect(!isRetiredOrShadowBehaviorFact(
+        "durable_fact/shipping_pref",
+        "origin=mined_aggregate\nstate=retired\n\nirrelevant",
+    ));
 }
 
 test "global keyword fallback pulls cross-session entries when exact global recall misses punctuation variant" {
