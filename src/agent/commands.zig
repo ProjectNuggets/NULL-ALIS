@@ -5043,7 +5043,13 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
     // sections. Legacy facts (no metadata header — the pre-Task-2 shape)
     // are grandfathered into Active, same rule as the injection gate.
     if (sub.len == 0 or std.mem.eql(u8, sub, "list")) {
-        const entries = mem_rt.memory.list(self.allocator, null, self.memory_session_id) catch |err| {
+        // Live-drive finding (Package 2a): learned facts and wishes are
+        // GLOBAL artifacts (the miner and the capability-wall conduct store
+        // with session_id=null), but this list previously passed the lane
+        // key as an exact-match filter — structurally hiding every mined
+        // draft and wish from the user. List with NO session filter, like
+        // the injection reader (memory_loader) already does.
+        const entries = mem_rt.memory.list(self.allocator, null, null) catch |err| {
             return try std.fmt.allocPrint(self.allocator, "Memory list failed: {s}", .{@errorName(err)});
         };
         defer memory_mod.freeEntries(self.allocator, entries);
@@ -6107,6 +6113,53 @@ test "/learn list: renders Active and Suggestions (shadow) as separate sections"
     // SaaS posture: no raw enum jargon leaks into the user-visible string.
     try std.testing.expect(std.mem.indexOf(u8, out, "user_correction") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "mined_aggregate") == null);
+}
+
+test "/learn list: GLOBAL facts and wishes are visible from a lane-scoped session (live-drive regression)" {
+    // Package-2a live-drive finding: the miner writes learned facts and the
+    // agent files wishes GLOBALLY (session_id=null), but /learn list passed
+    // the lane key (memory_session_id) as an exact-match filter — making the
+    // list structurally blind to every mined draft and wish on the live
+    // gateway. The unit fixtures defaulted memory_session_id=null, so the
+    // suite never exercised the lane-scoped branch. This test pins the seam:
+    // a NON-NULL lane session must still see global learning artifacts.
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // Global shadow draft, exactly as the miner stores it.
+    const shadow_result = try learning.storeLearnedFact(
+        allocator,
+        mem,
+        "avoid fetching unreachable localhost URLs",
+        .mined_aggregate,
+        &.{},
+        null, // GLOBAL — the miner's scope
+    );
+    defer shadow_result.deinit(allocator);
+
+    // Global wish, exactly as the capability-wall conduct stores it.
+    try mem.store("wish/fax-support", "Needed: send a fax. evidence_run_id=r-1-1", .core, null);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{
+        .allocator = allocator,
+        .mem_rt = &rt,
+        // The live gateway shape: a lane-scoped session key.
+        .memory_session_id = "agent:zaki-bot:user:1:main",
+    };
+
+    const out = try handleLearnCommand(&fake_self, "list");
+    defer allocator.free(out);
+
+    // The global shadow draft MUST be visible despite the lane scope.
+    try std.testing.expect(std.mem.indexOf(u8, out, "avoid fetching unreachable localhost URLs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Suggestions") != null);
+    // The global wish MUST be visible too.
+    try std.testing.expect(std.mem.indexOf(u8, out, "Wishes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "wish/fax-support") != null);
 }
 
 test "/learn list: legacy fact (no metadata) renders in the Active section, not Suggestions" {

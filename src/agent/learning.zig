@@ -304,6 +304,14 @@ pub fn stripLearnedMetadataHeader(content: []const u8) []const u8 {
 /// adopt/dismiss" since a legacy fact is already grandfathered active and
 /// was never a shadow/retired draft to begin with. Caller frees the
 /// returned slice.
+///
+/// PROVENANCE NOTE (live-drive finding): the row's `metadata` JSONB is a
+/// BIRTH SNAPSHOT and is deliberately not rewritten on state transitions —
+/// the content header is the single authoritative provenance channel (it is
+/// the only one readable through the generic Memory interface; the JSONB is
+/// write-only and non-load-bearing). Auditors reading raw JSONB will see
+/// birth state, not current state. When the trust-governor receipts land,
+/// state transitions get their own hash-chained log — not a JSONB rewrite.
 pub fn rewriteLearnedFactState(
     allocator: std.mem.Allocator,
     content: []const u8,
