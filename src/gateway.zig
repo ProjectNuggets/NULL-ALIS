@@ -28257,6 +28257,319 @@ test "handleApiChatStreamSseConnection suppresses streamed tool-planning text an
     try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "event: done") != null);
 }
 
+test "handleApiChatStreamSseConnection tenant path flushes run trace once after turn" {
+    const EchoTool = struct {
+        const Self = @This();
+        pub const tool_name = "echo_tool";
+        pub const tool_description = "Returns a deterministic tool result";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) tools_mod.Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return .{
+                .success = true,
+                .output = try allocator.dupe(u8, "tool-ok"),
+            };
+        }
+    };
+
+    const ToolCallingProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-1"),
+                    .name = try allocator.dupe(u8, "echo_tool"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, ""),
+                    .tool_calls = tool_calls,
+                    .usage = .{ .prompt_tokens = 8, .completion_tokens = 4, .total_tokens = 12 },
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, "Final answer after trace flush"),
+                .tool_calls = &.{},
+                .usage = .{ .prompt_tokens = 6, .completion_tokens = 3, .total_tokens = 9 },
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "tool-calling-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const FakeTraceFlushSink = struct {
+        const Self = @This();
+        allocator: std.mem.Allocator,
+        calls: usize = 0,
+        user_id: i64 = 0,
+        run_ids: std.ArrayListUnmanaged([]u8) = .empty,
+        payloads: std.ArrayListUnmanaged([]u8) = .empty,
+
+        fn init(allocator: std.mem.Allocator) Self {
+            return .{ .allocator = allocator };
+        }
+
+        fn deinit(self: *Self) void {
+            for (self.run_ids.items) |run_id| self.allocator.free(run_id);
+            self.run_ids.deinit(self.allocator);
+            for (self.payloads.items) |payload| self.allocator.free(payload);
+            self.payloads.deinit(self.allocator);
+        }
+
+        fn flush(ctx: ?*anyopaque, user_id: i64, run_id: []const u8, events_json: []const u8) !void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            self.user_id = user_id;
+            const run_copy = try self.allocator.dupe(u8, run_id);
+            errdefer self.allocator.free(run_copy);
+            const payload_copy = try self.allocator.dupe(u8, events_json);
+            errdefer self.allocator.free(payload_copy);
+            try self.run_ids.append(self.allocator, run_copy);
+            errdefer _ = self.run_ids.pop();
+            try self.payloads.append(self.allocator, payload_copy);
+            errdefer _ = self.payloads.pop();
+        }
+    };
+
+    const FakeStream = struct {
+        buf: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn writeAll(self: *@This(), bytes: []const u8) !void {
+            try self.buf.appendSlice(std.testing.allocator, bytes);
+        }
+
+        fn deinit(self: *@This()) void {
+            self.buf.deinit(std.testing.allocator);
+        }
+    };
+
+    const TenantTestRuntime = struct {
+        fn create(
+            allocator: std.mem.Allocator,
+            state: *GatewayState,
+            cfg: *const Config,
+            user_ctx: *const UserContext,
+            provider: providers.Provider,
+            sink: *FakeTraceFlushSink,
+        ) !*TenantRuntime {
+            const echo_tool = try allocator.create(EchoTool);
+            echo_tool.* = .{};
+            errdefer allocator.destroy(echo_tool);
+
+            const tool_slice = try allocator.alloc(tools_mod.Tool, 1);
+            errdefer allocator.free(tool_slice);
+            tool_slice[0] = echo_tool.tool();
+
+            const owned_user_id = try allocator.dupe(u8, user_ctx.user_id);
+            errdefer allocator.free(owned_user_id);
+            const owned_workspace = try allocator.dupe(u8, user_ctx.workspace_path);
+            errdefer allocator.free(owned_workspace);
+
+            const usage_rt = try allocator.create(usage_runtime_mod.UsageRuntime);
+            errdefer allocator.destroy(usage_rt);
+            usage_rt.* = usage_runtime_mod.UsageRuntime.init(allocator);
+            errdefer usage_rt.deinit();
+
+            const trace_store = try allocator.create(run_trace_store_mod.RunTraceStore);
+            errdefer allocator.destroy(trace_store);
+            trace_store.* = run_trace_store_mod.RunTraceStore.init(
+                allocator,
+                run_trace_store_mod.DEFAULT_MAX_RUNS,
+                run_trace_store_mod.DEFAULT_MAX_EVENTS_PER_RUN,
+            );
+            errdefer trace_store.deinit();
+            trace_store.flush_fn = FakeTraceFlushSink.flush;
+            trace_store.flush_ctx = @ptrCast(sink);
+            trace_store.flush_user_id = 1;
+
+            const log_obs = try allocator.create(observability.LogObserver);
+            errdefer allocator.destroy(log_obs);
+            log_obs.* = .{};
+
+            const task_ledger = try allocator.create(tasks_mod.TaskLedger);
+            errdefer allocator.destroy(task_ledger);
+            task_ledger.* = tasks_mod.TaskLedger.init(allocator);
+            errdefer task_ledger.deinit();
+
+            const task_delivery = try allocator.create(tasks_mod.TaskDelivery);
+            errdefer allocator.destroy(task_delivery);
+            task_delivery.* = .{ .ledger = task_ledger, .observer = log_obs.observer() };
+
+            const runtime = try allocator.create(TenantRuntime);
+            errdefer allocator.destroy(runtime);
+            runtime.* = .{
+                .allocator = allocator,
+                .user_id = owned_user_id,
+                .workspace_path = owned_workspace,
+                .config = cfg.*,
+                .provider_bundle = .{ .allocator = allocator },
+                .tools = tool_slice,
+                .mem_rt = null,
+                .pg_session_store = null,
+                .state_mgr = null,
+                .subagent_manager = null,
+                .completion_router = null,
+                .sec_tracker = null,
+                .sec_policy = null,
+                .task_ledger = task_ledger,
+                .task_delivery = task_delivery,
+                .usage_rt = usage_rt,
+                .trace_store = trace_store,
+                .log_obs = log_obs,
+                .metrics_obs = .{ .metrics = &state.lifecycle_metrics },
+                .observer_slots = undefined,
+                .observer_multi = .{ .observers = &.{} },
+                .session_mgr = undefined,
+                .last_used_s = std.atomic.Value(i64).init(std.time.timestamp()),
+                .effective_config_source = "test_config",
+                .effective_config_hash = 0,
+                .resolved_settings = user_settings.defaults(),
+                .ignored_tenant_override_count = 0,
+            };
+            runtime.config.workspace_dir = runtime.workspace_path;
+            runtime.config.tenant.enabled = true;
+
+            runtime.observer_slots = .{
+                runtime.log_obs.observer(),
+                runtime.metrics_obs.observer(),
+                runtime.trace_store.observer(),
+                sentry_runtime.globalOrFallback().observer(),
+                runtime.noop_obs.observer(),
+            };
+            runtime.observer_multi = .{ .observers = runtime.observer_slots[0..] };
+            runtime.session_mgr = session_mod.SessionManager.init(
+                allocator,
+                &runtime.config,
+                provider,
+                runtime.tools,
+                null,
+                runtime.observer_multi.observer(),
+                null,
+                null,
+            );
+            runtime.session_mgr.usage_rt = runtime.usage_rt;
+            runtime.session_mgr.cost_vital_in_prompt = runtime.config.agent.cost_vital_in_prompt;
+            runtime.session_mgr.dream_log_warmstart_enabled = runtime.config.agent.dream_log_warmstart_enabled;
+
+            return runtime;
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+    const config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{tenant_root});
+    defer std.testing.allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = tenant_root,
+        .config_path = config_path,
+        .default_model = "test/mock-model",
+        .allocator = std.testing.allocator,
+        .tenant = .{ .enabled = true },
+    };
+
+    var provider_state = ToolCallingProvider{};
+    const provider_vtable = providers.Provider.VTable{
+        .chatWithSystem = ToolCallingProvider.chatWithSystem,
+        .chat = ToolCallingProvider.chat,
+        .supportsNativeTools = ToolCallingProvider.supportsNativeTools,
+        .getName = ToolCallingProvider.getName,
+        .deinit = ToolCallingProvider.deinitFn,
+    };
+    const provider = providers.Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var flush_sink = FakeTraceFlushSink.init(std.testing.allocator);
+    defer flush_sink.deinit();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_enabled = true;
+    state.tenant_data_root = tenant_root;
+    state.workspace_dir = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var user_ctx = try resolveUserContext(std.testing.allocator, &state, "1");
+    defer user_ctx.deinit(std.testing.allocator);
+    try ensureUserDirectories(&user_ctx);
+    const runtime = try TenantTestRuntime.create(
+        std.testing.allocator,
+        &state,
+        &cfg,
+        &user_ctx,
+        provider,
+        &flush_sink,
+    );
+    try state.tenant_runtimes.put(state.allocator, runtime.user_id, runtime);
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{\"message\":\"hello\",\"session_key\":\"agent:zaki-bot:user:1:main\"}";
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /api/v1/chat/stream HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    var fake_stream = FakeStream{};
+    defer fake_stream.deinit();
+
+    const handled = handleApiChatStreamSseConnection(
+        std.testing.allocator,
+        req_allocator,
+        &fake_stream,
+        raw_request,
+        "POST",
+        "/api/v1/chat/stream",
+        &state,
+        &cfg,
+        null,
+    );
+
+    try std.testing.expect(handled);
+    try std.testing.expectEqual(@as(usize, 1), flush_sink.calls);
+    try std.testing.expectEqual(@as(i64, 1), flush_sink.user_id);
+    try std.testing.expectEqual(@as(usize, 1), flush_sink.run_ids.items.len);
+    try std.testing.expect(flush_sink.run_ids.items[0].len > 0);
+    try std.testing.expectEqual(@as(usize, 1), flush_sink.payloads.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, flush_sink.payloads.items[0], "\"kind\":\"tool_call_start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flush_sink.payloads.items[0], "\"kind\":\"tool_call\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "Final answer after trace flush") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake_stream.buf.items, "event: done") != null);
+}
+
 test "tenant_lock_config_clamps_invalid_values" {
     const cfg = config_types.TenantConfig{
         .ownership_lock_lease_secs = 5,

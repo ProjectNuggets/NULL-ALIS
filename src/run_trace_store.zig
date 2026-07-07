@@ -296,6 +296,17 @@ pub const RunTraceStore = struct {
     /// which threads run_id through every forwarded event) call this
     /// directly instead of waiting for an `agent_end` event that never
     /// arrives on the real request path.
+    ///
+    /// Important durability semantics: today this is a first-successful-write
+    /// operation. `flushRun` does not mark a run as flushed, and the Postgres
+    /// sink (`Manager.insertToolTraceEvents`) inserts with
+    /// `ON CONFLICT (user_id, run_id) DO NOTHING`. A second flush after late
+    /// events will call the sink again, but the durable row will keep the
+    /// original event JSON and silently drop the late events. Call this at the
+    /// true turn-end seam exactly once per run. If callers ever need replace
+    /// semantics for late events, change the DB sink to
+    /// `DO UPDATE SET events = EXCLUDED.events` or add explicit flushed-run
+    /// tracking here before adding any second-flush path.
     pub fn flushRun(self: *RunTraceStore, run_id: []const u8) void {
         if (self.flush_fn == null) return;
 
