@@ -95,12 +95,49 @@ pub fn resolvePacingDelay(channel: []const u8) u32 {
 
 // ── RunEventObserver ─────────────────────────────────────────────────
 
+/// Extract the `run_id` field carried by an ObserverEvent, if that
+/// variant has one. `turn_complete` (the live agent runtime's actual
+/// terminal event) and a handful of other variants carry no run_id at
+/// all — those fall through to `null`.
+fn runIdOf(event: *const ObserverEvent) ?[]const u8 {
+    return switch (event.*) {
+        .llm_request => |e| e.run_id,
+        .llm_response => |e| e.run_id,
+        .agent_end => |e| e.run_id,
+        .tool_call_start => |e| e.run_id,
+        .tool_call => |e| e.run_id,
+        .turn_stage => |e| e.run_id,
+        .tool_only_turn => |e| e.run_id,
+        .task_update => |e| e.run_id,
+        .approval_required => |e| e.run_id,
+        .system_notice => |e| e.run_id,
+        .memory_retrieval => |e| e.run_id,
+        .artifact_event => |e| e.run_id,
+        .browser_frame => |e| e.run_id,
+        else => null,
+    };
+}
+
 pub const RunEventObserver = struct {
     inner: Observer,
     sink: FrameSink,
     allocator: std.mem.Allocator,
     last_reasoning_emit_ms: i64 = 0,
     last_reasoning_hash: u64 = 0,
+
+    // Integration-seam fix (PR #140 follow-up, T2): the durable trace
+    // flush (run_trace_store.zig) needs a run_id at the TRUE turn-end
+    // seam, which lives in the gateway stream handler AFTER
+    // processMessage[WithTurnOptions] returns — by which point the
+    // agent's own `current_run_id` has already been reset to null
+    // (it's a `defer`-scoped stack buffer valid only during the turn).
+    // This observer sees every forwarded ObserverEvent DURING the turn,
+    // each carrying that turn's run_id, so it captures the most recent
+    // one into an owned fixed buffer here. The gateway reads
+    // `lastRunId()` once the turn call returns and passes it to
+    // `trace_store.flushRun(...)`.
+    last_run_id_buf: [40]u8 = undefined,
+    last_run_id_len: usize = 0,
 
     const REASONING_DEDUPE_WINDOW_MS: i64 = 450;
 
@@ -118,10 +155,28 @@ pub const RunEventObserver = struct {
         };
     }
 
+    /// Most recent run_id seen across all forwarded events this turn, or
+    /// null if none carried one. Safe to call any time after the turn's
+    /// processMessage call returns — the returned slice is owned by this
+    /// observer's own buffer, not borrowed from the agent's (by-then
+    /// invalidated) per-turn buffer.
+    pub fn lastRunId(self: *const RunEventObserver) ?[]const u8 {
+        if (self.last_run_id_len == 0) return null;
+        return self.last_run_id_buf[0..self.last_run_id_len];
+    }
+
+    fn captureRunId(self: *RunEventObserver, run_id: ?[]const u8) void {
+        const rid = run_id orelse return;
+        const take = @min(rid.len, self.last_run_id_buf.len);
+        @memcpy(self.last_run_id_buf[0..take], rid[0..take]);
+        self.last_run_id_len = take;
+    }
+
     fn recordEvent(ptr: *anyopaque, event: *const ObserverEvent) void {
         const self: *RunEventObserver = @ptrCast(@alignCast(ptr));
         // Always forward to inner observer first
         self.inner.recordEvent(event);
+        self.captureRunId(runIdOf(event));
 
         // Translate applicable events to RunEvent SSE frames.
         switch (event.*) {

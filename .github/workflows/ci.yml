@@ -19,7 +19,12 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux-x86_64
-          - os: macos-latest
+          # Pinned to macos-14: the current macos-latest (15.x) image's
+          # SDK/CLT combination fails to link libSystem with zig 0.15.2
+          # (undefined _abort/_malloc/__availability_version_check at link)
+          # — reproduced on fresh cache, so it's the image toolchain, not
+          # cache poisoning. Re-test macos-latest on the next zig bump.
+          - os: macos-14
             target: macos-aarch64
 
     steps:
@@ -34,8 +39,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .zig-cache
-          key: zig-${{ matrix.target }}-${{ hashFiles('src/**/*.zig', 'build.zig') }}
-          restore-keys: zig-${{ matrix.target }}-
+          # Keyed on runner IMAGE + zig version: a stale .zig-cache compiled
+          # against an older macOS SDK survives image rolls under a
+          # source-only key and produces undefined-libc-symbol link failures
+          # (the chronic macos-latest red). ImageOS/ImageVersion are set on
+          # all GitHub-hosted runners; v2 epoch busts the currently-poisoned
+          # entries.
+          key: zig-v2-${{ matrix.target }}-${{ env.ImageOS }}${{ env.ImageVersion }}-${{ hashFiles('.zigversion') }}-${{ hashFiles('src/**/*.zig', 'build.zig') }}
+          restore-keys: zig-v2-${{ matrix.target }}-${{ env.ImageOS }}${{ env.ImageVersion }}-${{ hashFiles('.zigversion') }}-
 
       - name: Run tests
         run: zig build test --summary all 2>&1 | tee test-output.txt

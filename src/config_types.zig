@@ -511,6 +511,62 @@ pub const AgentConfig = struct {
     /// Threaded to the commands gating predicate via the agent the same way
     /// as `semantic_type_routing_enabled` / `typed_views_enabled`.
     canonical_continuity_summary_enabled: bool = true,
+    /// Task 2 (Loop-2 prerequisite, package1-activations) — durable
+    /// tool-trace flush gate.
+    ///
+    /// When TRUE (default), the gateway wires each tenant's
+    /// `RunTraceStore` with a sink that calls
+    /// `zaki_state.Manager.insertToolTraceEvents` on every `agent_end`
+    /// event, persisting that run's sanitized event timeline to the
+    /// `tool_traces` table (migration 0008) so it survives process
+    /// restart. Requires both a Postgres `state_mgr` and a resolvable
+    /// numeric user_id to be in scope at tenant-runtime construction;
+    /// when either is missing the sink is simply never wired — same as
+    /// setting this flag to FALSE.
+    ///
+    /// When FALSE, no sink is wired — the RunTraceStore behaves exactly
+    /// as before this feature (in-memory-only, bounded, lost on
+    /// restart). Safe rollback: flushing is best-effort and additive:
+    /// disabling it cannot lose events that would otherwise be dropped
+    /// today, only skips the new durability path.
+    trace_persistence_enabled: bool = true,
+    /// Task 3 (package1-activations, "cost interoception") — Runtime-prompt
+    /// cost-vital gate.
+    ///
+    /// When TRUE (default), the per-session Agent's `usage_rt` (already
+    /// wired end-to-end for structured per-turn accounting) is also passed
+    /// through to the system-prompt builder's Runtime section, which then
+    /// emits a "Cost: $X this month | $Y this session" line so the agent
+    /// can see its own spend, weigh expensive tools against it, and answer
+    /// cost questions truthfully.
+    ///
+    /// When FALSE, the Runtime section renders exactly as before this
+    /// feature (no Cost line) — same null-pointer off-path used when no
+    /// UsageRuntime is wired at all. Safe rollback: this only changes what
+    /// the agent reads in its own system prompt; it never affects cost
+    /// computation, billing, or the ledger itself.
+    cost_vital_in_prompt: bool = true,
+    /// Task 4 (package1-activations, "first dream consumer") — dream_log
+    /// warm-start gate.
+    ///
+    /// When TRUE (default), the memory loader finds the latest
+    /// `dream_log/<YYYY-MM-DD>` key (the nightly dream cycle's most
+    /// recent reflection) and injects it into the agent's warm-start
+    /// context right after `pending_conflicts`, the same way
+    /// `summary_latest/{session}` is injected. Before this flag, the
+    /// nightly dream cycle wrote reflections that nothing ever read back
+    /// — a write-only organ. This makes the agent the first consumer of
+    /// its own overnight synthesis.
+    ///
+    /// When FALSE, no dream_log entry is injected — exact prior
+    /// (pre-Task-4) context. Read-only consumption either way: this
+    /// never marks dream_log/ keys hidden or reclassifies them (they
+    /// remain brain-visible derived synthesis).
+    ///
+    /// Threaded to memory_loader via LoadTurnMemoryOptions through the
+    /// agent, same plumbing pattern as `typed_views_enabled` /
+    /// `cost_vital_in_prompt`.
+    dream_log_warmstart_enabled: bool = true,
     // V1.14.12 (Path A) — extraction_legacy_direct_writes FIELD REMOVED.
     // M5 sprint flag-gated two redundant direct write paths during a
     // soak window. Path A closes the M5 sprint by:

@@ -144,6 +144,17 @@ pub const MIGRATIONS = [_]Migration{
         .name = "0007_subagent_results",
         .sql = @embedFile("migrations/0007_subagent_results.sql"),
     },
+    .{
+        // Loop-2 substrate (three-loops spec §3.1, docs/memory-contract.md)
+        // — durable per-run tool-trace digests. Today's traces are
+        // in-memory only (RunTraceStore) and die with the process; this
+        // table gives the observer (Task 2: agent_end hook) a place to
+        // flush a JSONB digest of the run's tool events so the
+        // background-review miner can read them after a restart.
+        .version = 8,
+        .name = "0008_tool_traces",
+        .sql = @embedFile("migrations/0008_tool_traces.sql"),
+    },
 };
 
 /// Trait the runner's caller must satisfy: a method that takes a

@@ -451,6 +451,10 @@ pub const ContextEngine = struct {
                     // Phase 0.5 — typed views READ gate, threaded from agent
                     // config so operators can disable the four typed blocks.
                     .typed_views_enabled = agent.typed_views_enabled,
+                    // Task 4 (package1-activations) — dream_log warm-start
+                    // gate, threaded from agent config so operators can
+                    // disable the latest-reflection injection.
+                    .dream_log_warmstart_enabled = agent.dream_log_warmstart_enabled,
                 },
             ) catch |err| blk: {
                 log.warn("memory.enrichment_failed error={s} — proceeding without memory slot", .{@errorName(err)});
@@ -799,6 +803,15 @@ pub const ContextEngine = struct {
             // when this turn runs in Superpowers mode. Per-turn signal; the
             // session restores agent.superpowers_mode on the turn's defer.
             .coordinator_mode = agent.superpowers_mode,
+            // Task 3 (package1-activations, "cost interoception") — surface
+            // the agent's own runtime spend in its Runtime prompt section.
+            // Gated on cost_vital_in_prompt (default true, threaded from
+            // config the same way as typed_views_enabled — see
+            // session.zig::buildSessionAgent); the flag OFF or usage_rt
+            // unset both resolve to null here, which is the exact
+            // byte-identical prior-prompt path (see prompt.zig's
+            // PromptContext.usage_runtime doc comment).
+            .usage_runtime = if (agent.cost_vital_in_prompt) agent.usage_rt else null,
         };
 
         const stable_prompt = try prompt.buildStableSystemPrompt(allocator, prompt_ctx);
@@ -1164,6 +1177,9 @@ fn FakeIngestAgent(comptime ObserverT: type) type {
         // Phase 0.5 — typed-views READ gate, reached through the agent:
         // anytype in ContextEngine.ingest at the loadTurnMemorySlotOpts call.
         typed_views_enabled: bool = true,
+        // Task 4 (package1-activations) — dream_log warm-start gate, reached
+        // through the agent: anytype the same way as typed_views_enabled.
+        dream_log_warmstart_enabled: bool = true,
         observer: ObserverT,
         current_run_id: ?[]const u8 = null,
     };

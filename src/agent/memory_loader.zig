@@ -304,6 +304,34 @@ fn timelinePrefixForSession(allocator: std.mem.Allocator, session_id: ?[]const u
     return try std.fmt.allocPrint(allocator, "timeline_summary/{s}/", .{sid});
 }
 
+/// Task 4 (Loop-1 consumer, package1-activations) — find the most recent
+/// nightly dream-cycle reflection. The dream cycle writes to
+/// `dream_log/<YYYY-MM-DD>` (see the nightly job); nothing consumed those
+/// keys before this — a write-only organ. This is the first reader.
+///
+/// Dates sort lexicographically the same as chronologically (YYYY-MM-DD),
+/// so "lexicographic max across dream_log/ keys" == "latest date". Returns
+/// an allocator-owned copy of the winning key, or null if no dream_log/
+/// entries exist. Caller frees.
+///
+/// ponytail: full `mem.list(allocator, null, null)` scan + prefix filter.
+/// Fine at current corpus sizes (nightly cadence, one key/day). If this
+/// ever shows up in a profile, swap to a prefix-list API instead of
+/// optimizing this scan in place.
+fn latestDreamLogKey(allocator: std.mem.Allocator, mem: Memory) !?[]const u8 {
+    const entries = try mem.list(allocator, null, null);
+    defer memory_mod.freeEntries(allocator, entries);
+
+    var latest: ?[]const u8 = null;
+    for (entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, "dream_log/")) continue;
+        if (latest == null or std.mem.order(u8, entry.key, latest.?) == .gt) {
+            latest = entry.key;
+        }
+    }
+    return if (latest) |key| try allocator.dupe(u8, key) else null;
+}
+
 fn sanitizeMemoryText(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
     // Strip inline image markers from recalled snippets so stale
     // [IMAGE:...] references do not accidentally trigger multimodal mode.
@@ -474,6 +502,7 @@ fn loadContextDetailed(
     session_id: ?[]const u8,
     state_mgr_for_supersede: ?*zaki_state.Manager,
     user_id_for_supersede: ?i64,
+    dream_log_warmstart_enabled: bool,
 ) !ContextResult {
     var stats = SelectionStats{ .available = true };
     const scoped_entries = mem.recall(allocator, user_message, WARM_CANDIDATE_FETCH_LIMIT, session_id) catch {
@@ -551,11 +580,23 @@ fn loadContextDetailed(
     defer if (summary_latest_key) |key| allocator.free(key);
     const current_timeline_prefix = try timelinePrefixForSession(allocator, session_id);
     defer if (current_timeline_prefix) |prefix| allocator.free(prefix);
+    const dream_log_key = if (dream_log_warmstart_enabled) try latestDreamLogKey(allocator, mem) else null;
+    defer if (dream_log_key) |key| allocator.free(key);
 
     // V1.7 Item 3: surface any unresolved memory conflict at the top so
     // the agent sees it before any other context and can resolve it with
     // the user. Best-effort — failure must not block context loading.
     _ = appendDirectEntry(allocator, mem, w, &wrote_header, "pending_conflicts", 300) catch false;
+
+    // Task 4 (Loop-1 consumer, package1-activations): the agent's own
+    // latest overnight reflection joins warm-start — the dream stops
+    // being write-only. Read-only consumption: this does not hide or
+    // reclassify dream_log/ keys (still brain-visible derived synthesis).
+    if (dream_log_key) |dk| {
+        if (try appendDirectEntry(allocator, mem, w, &wrote_header, dk, CONTINUITY_ENTRY_MAX_BYTES)) {
+            try markSeenKey(allocator, &seen_keys, dk);
+        }
+    }
 
     if (summary_latest_key) |key| {
         if (try appendDirectEntry(allocator, mem, w, &wrote_header, key, CONTINUITY_ENTRY_MAX_BYTES)) {
@@ -691,6 +732,7 @@ fn loadContextWithRuntimeDetailed(
     session_id: ?[]const u8,
     state_mgr_for_supersede: ?*zaki_state.Manager,
     user_id_for_supersede: ?i64,
+    dream_log_warmstart_enabled: bool,
 ) !ContextResult {
     var stats = SelectionStats{ .available = true };
     // P4: tier gate — read once per call; 0.0 = disabled.
@@ -776,9 +818,21 @@ fn loadContextWithRuntimeDetailed(
     defer if (summary_latest_key) |key| allocator.free(key);
     const current_timeline_prefix = try timelinePrefixForSession(allocator, session_id);
     defer if (current_timeline_prefix) |prefix| allocator.free(prefix);
+    const dream_log_key = if (dream_log_warmstart_enabled) try latestDreamLogKey(allocator, mem) else null;
+    defer if (dream_log_key) |key| allocator.free(key);
 
     // V1.7 Item 3: surface any unresolved memory conflict first.
     _ = appendDirectEntry(allocator, mem, buf.writer(allocator), &wrote_header, "pending_conflicts", 300) catch false;
+
+    // Task 4 (Loop-1 consumer, package1-activations): the agent's own
+    // latest overnight reflection joins warm-start — the dream stops
+    // being write-only. Read-only consumption: this does not hide or
+    // reclassify dream_log/ keys (still brain-visible derived synthesis).
+    if (dream_log_key) |dk| {
+        if (try appendDirectEntry(allocator, mem, buf.writer(allocator), &wrote_header, dk, CONTINUITY_ENTRY_MAX_BYTES)) {
+            try markSeenKey(allocator, &seen_keys, dk);
+        }
+    }
 
     if (summary_latest_key) |key| {
         if (try appendDirectEntry(allocator, mem, buf.writer(allocator), &wrote_header, key, CONTINUITY_ENTRY_MAX_BYTES)) {
@@ -947,7 +1001,7 @@ pub fn loadContext(
     // need filtering should use loadTurnMemorySlot (which threads
     // state_mgr through). This shim preserves backwards-compat for
     // tests + non-tenant call paths.
-    const result = try loadContextDetailed(allocator, mem, user_message, session_id, null, null);
+    const result = try loadContextDetailed(allocator, mem, user_message, session_id, null, null, true);
     return result.context;
 }
 
@@ -959,7 +1013,7 @@ pub fn loadContextWithRuntime(
     session_id: ?[]const u8,
 ) ![]const u8 {
     // V1.10-A: same legacy-shim shape as loadContext above.
-    const result = try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id, null, null);
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id, null, null, true);
     return result.context;
 }
 
@@ -1015,6 +1069,22 @@ pub const LoadTurnMemoryOptions = struct {
     /// memory signals. When false → no new blocks (exact prior context).
     /// Threaded from `agent.typed_views_enabled` (config_types.AgentConfig).
     typed_views_enabled: bool = true,
+
+    /// Task 4 (Loop-1 consumer, package1-activations) — dream_log
+    /// warm-start gate (default ON). When true, the loader finds the
+    /// latest `dream_log/<YYYY-MM-DD>` key (the nightly dream cycle's
+    /// most recent reflection) and injects it via appendDirectEntry
+    /// right after pending_conflicts — the first consumer of an
+    /// otherwise write-only organ.
+    ///
+    /// When FALSE, no dream_log entry is injected — exact prior
+    /// (pre-Task-4) context. Read-only consumption either way: this
+    /// never marks dream_log/ keys hidden or reclassifies them.
+    ///
+    /// Threaded from `agent.dream_log_warmstart_enabled`
+    /// (config_types.AgentConfig), same plumbing pattern as
+    /// `typed_views_enabled`.
+    dream_log_warmstart_enabled: bool = true,
 };
 
 pub fn loadTurnMemorySlot(
@@ -1057,9 +1127,9 @@ pub fn loadTurnMemorySlotOpts(
     // the public surface. Callers that don't supply them get
     // graceful-degrade (no supersede filtering — same behavior as pre-V1.10).
     var result = if (mem_rt) |rt|
-        try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id, state_mgr_for_graph, user_id_for_graph)
+        try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id, state_mgr_for_graph, user_id_for_graph, opts.dream_log_warmstart_enabled)
     else
-        try loadContextDetailed(allocator, mem, user_message, session_id, state_mgr_for_graph, user_id_for_graph);
+        try loadContextDetailed(allocator, mem, user_message, session_id, state_mgr_for_graph, user_id_for_graph, opts.dream_log_warmstart_enabled);
 
     // ── V1.7a-2 graph-expand recall consumer ───────────────────────────
     // Append graph_neighbors block when state_mgr + user_id are both
@@ -1759,7 +1829,8 @@ fn entityOverlapImpl(
     for (rows, 0..) |row, i| {
         const score: f64 = if (max_count > 0.0)
             @as(f64, @floatFromInt(row.match_count)) / max_count
-        else 0.0;
+        else
+            0.0;
         // Heap-allocate every field that RetrievalCandidate.deinit() will free.
         // String literals must NOT be passed to allocator.free() — only the
         // zero-length "" is safe (free returns early on len==0), but "entity_overlap"
@@ -1781,20 +1852,20 @@ fn entityOverlapImpl(
         const source_path_dup = try allocator.dupe(u8, "");
         errdefer allocator.free(source_path_dup);
         out[i] = memory_mod.RetrievalCandidate{
-            .id           = id_dup,
-            .key          = key_dup,
-            .content      = content_dup,
-            .snippet      = snippet_dup,
-            .category     = .daily,
+            .id = id_dup,
+            .key = key_dup,
+            .content = content_dup,
+            .snippet = snippet_dup,
+            .category = .daily,
             .keyword_rank = null,
             .vector_score = null,
-            .final_score  = score,
-            .source       = source_dup,
-            .source_path  = source_path_dup,
-            .start_line   = 0,
-            .end_line     = 0,
-            .created_at   = 0,
-            .lane         = "",
+            .final_score = score,
+            .source = source_dup,
+            .source_path = source_path_dup,
+            .start_line = 0,
+            .end_line = 0,
+            .created_at = 0,
+            .lane = "",
         };
         out_len = i + 1;
     }
@@ -2380,7 +2451,7 @@ test "loadContext keeps non-runtime fallback on the small bucket" {
         try mem.store(key, content, .conversation, "agent:test:user:1:main");
     }
 
-    const result = try loadContextDetailed(allocator, mem, "shipping raw recall", "agent:test:user:1:main", null, null);
+    const result = try loadContextDetailed(allocator, mem, "shipping raw recall", "agent:test:user:1:main", null, null, true);
     defer allocator.free(result.context);
 
     try std.testing.expect(result.stats.fallback_bucket_entries <= FALLBACK_BUCKET_MAX_ENTRIES);
@@ -2622,7 +2693,7 @@ test "loadContextWithRuntime overfetches past internal candidate pollution" {
         ._allocator = allocator,
     };
 
-    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "alexsignal saturday", null, null, null);
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "alexsignal saturday", null, null, null, true);
     defer allocator.free(result.context);
 
     try std.testing.expect(result.stats.candidate_count > config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT);
@@ -2696,7 +2767,7 @@ test "loadContextWithRuntime keeps semantic continuity candidates when priority 
         ._allocator = allocator,
     };
 
-    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "Alex 30GB project", "agent:test:user:1:main", null, null);
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "Alex 30GB project", "agent:test:user:1:main", null, null, true);
     defer allocator.free(result.context);
 
     try std.testing.expect(result.stats.summary_latest_used);
@@ -2750,7 +2821,7 @@ test "loadContextWithRuntime keeps valid debug-key memories and filters known tr
         ._allocator = allocator,
     };
 
-    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "Alex 30GB debug checklist", null, null, null);
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "Alex 30GB debug checklist", null, null, null, true);
     defer allocator.free(result.context);
 
     try std.testing.expect(std.mem.indexOf(u8, result.context, "user_debug_note") != null);
@@ -2830,7 +2901,7 @@ test "loadContextWithRuntime caps fallback bucket and preserves semantic budget"
         ._allocator = allocator,
     };
 
-    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "30GB Alex project", "agent:test:user:1:main", null, null);
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "30GB Alex project", "agent:test:user:1:main", null, null, true);
     defer allocator.free(result.context);
 
     try std.testing.expect(result.stats.semantic_bucket_entries >= 2);
@@ -3024,4 +3095,126 @@ test "typed views: renderTypedViewBlock strips XML structural chars (defense-in-
 test "typed views: LoadTurnMemoryOptions.typed_views_enabled defaults to true" {
     const opts = LoadTurnMemoryOptions{};
     try std.testing.expect(opts.typed_views_enabled);
+}
+
+// ── dream_log warm-start injection (first dream consumer) ──────────────────
+
+test "loadContext injects the latest dream_log entry, not an older one" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // Deliberately share no keywords with the recall query below — this
+    // proves the older entry surfaces (if at all) only through the
+    // dream_log warm-start injection path, not through incidental
+    // keyword-recall matching, which would confound the assertion.
+    try mem.store(
+        "dream_log/2026-07-01",
+        "xqzplon vremtak zoblidge quixnar",
+        .core,
+        null,
+    );
+    try mem.store(
+        "dream_log/2026-07-05",
+        "reflection: latest overnight synthesis — ship the warm-start consumer",
+        .core,
+        null,
+    );
+    try mem.store("unrelated_key", "irrelevant content", .core, null);
+
+    const context = try loadContext(allocator, mem, "zznomatch_query_9928", null);
+    defer allocator.free(context);
+
+    try std.testing.expect(std.mem.indexOf(u8, context, "dream_log/2026-07-05") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "latest overnight synthesis") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "dream_log/2026-07-01") == null);
+    try std.testing.expect(std.mem.indexOf(u8, context, "xqzplon") == null);
+}
+
+test "loadContext is unchanged when no dream_log keys exist" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("unrelated_key", "irrelevant content", .core, null);
+
+    const context = try loadContext(allocator, mem, "anything", null);
+    defer allocator.free(context);
+
+    try std.testing.expect(std.mem.indexOf(u8, context, "dream_log") == null);
+}
+
+test "dream_log warm-start: flag off leaves output unchanged even with dream_log keys present" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "dream_log/2026-07-05",
+        "reflection: latest overnight synthesis — ship the warm-start consumer",
+        .core,
+        null,
+    );
+
+    const slot_on = try loadTurnMemorySlotOpts(
+        allocator,
+        mem,
+        null,
+        "zznomatch_query_9928",
+        null,
+        null,
+        null,
+        .{ .dream_log_warmstart_enabled = true },
+    );
+    defer allocator.free(slot_on.fenced_content);
+    try std.testing.expect(std.mem.indexOf(u8, slot_on.fenced_content, "dream_log/2026-07-05") != null);
+
+    const slot_off = try loadTurnMemorySlotOpts(
+        allocator,
+        mem,
+        null,
+        "zznomatch_query_9928",
+        null,
+        null,
+        null,
+        .{ .dream_log_warmstart_enabled = false },
+    );
+    defer allocator.free(slot_off.fenced_content);
+    try std.testing.expect(std.mem.indexOf(u8, slot_off.fenced_content, "dream_log") == null);
+}
+
+test "latestDreamLogKey returns the lexicographic max dream_log key" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("dream_log/2026-07-01", "old reflection", .core, null);
+    try mem.store("dream_log/2026-07-05", "latest reflection", .core, null);
+    try mem.store("dream_log/2026-06-30", "older reflection", .core, null);
+    try mem.store("unrelated_key", "irrelevant", .core, null);
+
+    const key = (try latestDreamLogKey(allocator, mem)).?;
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("dream_log/2026-07-05", key);
+}
+
+test "latestDreamLogKey returns null when no dream_log keys exist" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("unrelated_key", "irrelevant", .core, null);
+
+    const key = try latestDreamLogKey(allocator, mem);
+    try std.testing.expect(key == null);
 }

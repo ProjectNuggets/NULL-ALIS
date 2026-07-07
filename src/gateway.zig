@@ -175,6 +175,18 @@ fn jsonSafeFloatF32(v: f32) f32 {
     return 0.0;
 }
 
+/// Task 2 (Loop-2 prerequisite, package1-activations) — thin adapter
+/// binding `RunTraceStore.flush_fn`'s function-pointer shape to
+/// `zaki_state.Manager.insertToolTraceEvents`. `ctx` is the tenant's
+/// `*zaki_state_mod.Manager`, bound as `flush_ctx` at construction
+/// time (see `TenantRuntime.init`). Kept as a free function (not a
+/// closure) so it can be taken as `&traceFlushAdapter` — a plain
+/// function pointer, matching the store's injectable-sink field type.
+fn traceFlushAdapter(ctx: ?*anyopaque, user_id: i64, run_id: []const u8, events_json: []const u8) anyerror!void {
+    const mgr: *zaki_state_mod.Manager = @ptrCast(@alignCast(ctx.?));
+    try mgr.insertToolTraceEvents(user_id, run_id, events_json);
+}
+
 /// Default per-user data root for tenant mode.
 const DEFAULT_TENANT_DATA_ROOT: []const u8 = "/data/users";
 
@@ -1941,6 +1953,20 @@ const TenantRuntime = struct {
             run_trace_store_mod.DEFAULT_MAX_RUNS,
             run_trace_store_mod.DEFAULT_MAX_EVENTS_PER_RUN,
         );
+        // Task 2 (Loop-2 prerequisite, package1-activations) — wire the
+        // durable per-run flush sink when persistence is enabled and a
+        // Postgres state_mgr + numeric user_id are both in scope. Flag
+        // off, or either dependency missing, leaves the sink null —
+        // exact prior (in-memory-only) behavior.
+        if (runtime.config.agent.trace_persistence_enabled) {
+            if (state_mgr) |smgr| {
+                if (std.fmt.parseInt(i64, user_ctx.user_id, 10) catch null) |trace_uid| {
+                    trace_store.flush_fn = &traceFlushAdapter;
+                    trace_store.flush_ctx = @ptrCast(smgr);
+                    trace_store.flush_user_id = trace_uid;
+                }
+            }
+        }
         runtime.trace_store = trace_store;
 
         if (observability.OtelObserver.fromEnv(allocator)) |otel_init| {
@@ -2091,6 +2117,16 @@ const TenantRuntime = struct {
         }
 
         runtime.session_mgr.usage_rt = runtime.usage_rt;
+        // Task 3 (package1-activations, "cost interoception") — wire the
+        // cost-vital-in-prompt gate unconditionally alongside usage_rt
+        // (independent of extraction/Postgres availability — this only
+        // controls whether the per-session Agent's usage_rt reaches the
+        // Runtime section of its own system prompt).
+        runtime.session_mgr.cost_vital_in_prompt = runtime.config.agent.cost_vital_in_prompt;
+        // Task 4 (package1-activations, "first dream consumer") — wire the
+        // dream_log warm-start gate unconditionally, same plumbing pattern
+        // as cost_vital_in_prompt above.
+        runtime.session_mgr.dream_log_warmstart_enabled = runtime.config.agent.dream_log_warmstart_enabled;
 
         // Wire sidecar provider from bundle to session manager
         if (runtime.provider_bundle.sidecarProvider()) |sp| {
@@ -11111,6 +11147,12 @@ fn handleApiChatStreamSseConnection(
     // the same lock that updates the shared totals, and takeTurnDelta()
     // returns exactly THIS turn's own contribution after processMessage.
     var spend_usage_rt: ?*usage_runtime_mod.UsageRuntime = null;
+    // Integration-seam fix (PR #140 follow-up, T2): captured alongside
+    // spend_usage_rt so the durable trace flush can fire once the turn
+    // is fully done. Only the tenant-enabled path has a RunTraceStore
+    // (file-tenant / CLI fallback never durably persists traces) — see
+    // `trace_store` field on TenantRuntime.
+    var turn_trace_store: ?*run_trace_store_mod.RunTraceStore = null;
     const outcome: ReplyOutcome = blk: {
         if (state.tenant_enabled) {
             const cfg = config_opt orelse {
@@ -11126,6 +11168,7 @@ fn handleApiChatStreamSseConnection(
                 }
             };
             spend_usage_rt = tenant_runtime.usage_rt;
+            turn_trace_store = tenant_runtime.trace_store;
             // WO-03: arm the per-turn delta accumulator on THIS worker
             // thread. recordTurn/recordWeight calls during the agent loop
             // (which runs synchronously on this same thread) accumulate into
@@ -11184,6 +11227,25 @@ fn handleApiChatStreamSseConnection(
     keepalive.stop();
     if (keepalive_thread) |thread| thread.join();
     keepalive_joined = true;
+
+    // Integration-seam fix (PR #140 follow-up, T2): this is the TRUE
+    // turn-end seam on the live gateway path — processMessage[WithTurn-
+    // Options] has fully returned (success or error), so any tool events
+    // it emitted for this turn have already been buffered in
+    // turn_trace_store via run_event_observer_impl's forwarding. The
+    // durable flush used to wait for an `.agent_end` ObserverEvent that
+    // the agent runtime never emits in production (it emits
+    // `turn_complete`, which carries no run_id) — so the flush never
+    // fired. Firing it explicitly here, with the run_id captured by
+    // run_event_observer_impl across every forwarded event this turn,
+    // closes that gap. Best-effort: flushRun() is itself best-effort
+    // (logs + swallows failures), and a turn that never produced a
+    // run_id (no tenant runtime, or a pre-turn error) is a safe no-op.
+    if (turn_trace_store) |store| {
+        if (run_event_observer_impl.lastRunId()) |run_id| {
+            store.flushRun(run_id);
+        }
+    }
 
     const reply = switch (outcome) {
         .ok => |value| value,
@@ -24944,6 +25006,16 @@ pub fn runWithRole(
                 if (standalone_usage_rt) |*urt| {
                     sm.usage_rt = urt;
                 }
+                // Task 3 (package1-activations) — mirror the tenant-runtime
+                // wiring: cost_vital_in_prompt travels alongside usage_rt so
+                // the standalone/local-agent path also surfaces the Cost
+                // line (or not) per config.
+                sm.cost_vital_in_prompt = cfg.agent.cost_vital_in_prompt;
+                // Task 4 (package1-activations) — mirror the tenant-runtime
+                // wiring: dream_log_warmstart_enabled travels the same way
+                // so the standalone/local-agent path also gets the latest
+                // overnight reflection injected (or not) per config.
+                sm.dream_log_warmstart_enabled = cfg.agent.dream_log_warmstart_enabled;
                 if (mem_rt) |*rt| {
                     sm.mem_rt = rt;
                     tools_mod.bindMemoryRuntime(tools_slice, rt);

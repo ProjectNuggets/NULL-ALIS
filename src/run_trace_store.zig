@@ -157,6 +157,18 @@ pub const RunTraceStore = struct {
     max_events_per_run: usize,
     truncated_runs: std.StringArrayHashMapUnmanaged(void),
 
+    /// Task 2 (Loop-2 prerequisite) — optional durable-flush sink.
+    ///
+    /// All three default to null, which reproduces the exact prior
+    /// (in-memory-only) behavior. When all three are set, an
+    /// `.agent_end` event for a run triggers exactly one best-effort
+    /// call carrying that run's full sanitized event timeline as a
+    /// JSON array. Errors from the sink are logged and swallowed —
+    /// they must never propagate into the agent/observer path.
+    flush_fn: ?*const fn (ctx: ?*anyopaque, user_id: i64, run_id: []const u8, events_json: []const u8) anyerror!void = null,
+    flush_ctx: ?*anyopaque = null,
+    flush_user_id: ?i64 = null,
+
     pub fn init(
         allocator: std.mem.Allocator,
         max_runs: usize,
@@ -269,19 +281,93 @@ pub const RunTraceStore = struct {
         return self.runs.count();
     }
 
+    /// Explicit, caller-driven durable flush for a run (integration-seam
+    /// fix, PR #140 follow-up). Snapshots the run's currently-buffered
+    /// events under the mutex, releases the lock, then serializes and
+    /// hands the snapshot to the injected sink — identical lock
+    /// discipline and best-effort semantics as the `.agent_end`-triggered
+    /// path below (errors are logged and swallowed; unknown run_id or a
+    /// null sink are safe no-ops).
+    ///
+    /// Exists because the live agent runtime's terminal event is
+    /// `turn_complete` (no `run_id` — see observability.zig), never
+    /// `agent_end` (zero production emitters). Callers that know the
+    /// run_id at the true turn-end seam (e.g. the gateway stream handler,
+    /// which threads run_id through every forwarded event) call this
+    /// directly instead of waiting for an `agent_end` event that never
+    /// arrives on the real request path.
+    pub fn flushRun(self: *RunTraceStore, run_id: []const u8) void {
+        if (self.flush_fn == null) return;
+
+        self.mutex.lock();
+        var flush_snapshot: ?TraceSnapshot = null;
+        if (self.runs.get(run_id)) |b| {
+            flush_snapshot = self.copyBucket(self.allocator, b) catch |err| blk: {
+                std.log.scoped(.run_trace_store).warn("flush snapshot failed run_id='{s}' err={}", .{ run_id, err });
+                break :blk null;
+            };
+        }
+        self.mutex.unlock();
+
+        if (flush_snapshot) |*snap| {
+            defer snap.deinit();
+            self.tryFlush(snap);
+        }
+    }
+
     // ── Internals ───────────────────────────────────────────────────
 
     fn recordEvent(self: *RunTraceStore, event: *const ObserverEvent) void {
         // Extract run_id first — events without one are ignored; we do
         // not synthesize ids here (WP4.1 constraint).
         const derived = deriveTraceEvent(event) orelse return;
+        const is_agent_end = derived.kind == .agent_end;
+        const run_id = derived.run_id;
+
         self.mutex.lock();
-        defer self.mutex.unlock();
         self.appendLocked(derived) catch |err| {
             // Best-effort: failing to append must never propagate back
             // into the agent path. Drop silently; the caller cannot
             // observe this via the Observer vtable.
             std.log.scoped(.run_trace_store).debug("append failed: {}", .{err});
+        };
+        self.mutex.unlock();
+
+        // Task 2 (Loop-2 prerequisite): on agent_end, flush this run's
+        // buffered events. Kept for API/back-compat and existing test
+        // coverage — this arm is not reachable on the live gateway path
+        // (see flushRun doc comment above), but tests still construct
+        // synthetic agent_end events directly against this store.
+        if (is_agent_end) {
+            self.flushRun(run_id);
+        }
+    }
+
+    /// Best-effort durable flush — invoked with the store's mutex
+    /// already released. Serializes the given snapshot to the same
+    /// sanitized JSON schema `trace_query` exposes and hands it to the
+    /// injected sink. Any failure (serialization OOM or sink error) is
+    /// logged and swallowed; it must never propagate into the agent
+    /// path or the Observer vtable.
+    fn tryFlush(self: *RunTraceStore, snap: *const TraceSnapshot) void {
+        const flush_fn = self.flush_fn orelse return;
+        const user_id = self.flush_user_id orelse return;
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        serializeEventsJsonArray(self.allocator, &buf, snap.events) catch |err| {
+            std.log.scoped(.run_trace_store).warn(
+                "flush serialize failed run_id='{s}' err={}",
+                .{ snap.run_id, err },
+            );
+            return;
+        };
+
+        flush_fn(self.flush_ctx, user_id, snap.run_id, buf.items) catch |err| {
+            std.log.scoped(.run_trace_store).warn(
+                "flush sink failed run_id='{s}' err={}",
+                .{ snap.run_id, err },
+            );
         };
     }
 
@@ -411,6 +497,102 @@ pub const RunTraceStore = struct {
 fn dupeClamped(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     const take = @min(input.len, MAX_FIELD_LEN);
     return allocator.dupe(u8, input[0..take]);
+}
+
+// ── Shared sanitized-event JSON serialization ────────────────────────
+//
+// Single source of truth for the sanitized event JSON shape. Both the
+// `trace_query` agent tool and the Task 2 durable-flush sink must emit
+// the SAME fields (kind, tool, phase, label, status, success,
+// duration_ms, iteration, exit_code, usage_tokens, ts_ms) so a
+// persisted run's digest matches exactly what the agent/FE trace
+// browser already see. Do not fork this schema.
+
+/// Serialize one trace event as a JSON object. Exposed so callers
+/// outside this file (currently `tools/trace_query.zig`) can reuse the
+/// exact same field set rather than maintaining a parallel writer.
+pub fn serializeTraceEventJson(w: anytype, evt: *const TraceEvent) !void {
+    try w.writeAll("{\"kind\":\"");
+    try jsonEscapeInto(w, evt.kind.toSlice());
+    try w.print("\",\"ts_ms\":{d}", .{evt.ts_ms});
+    if (evt.phase) |v| {
+        try w.writeAll(",\"phase\":\"");
+        try jsonEscapeInto(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.tool) |v| {
+        try w.writeAll(",\"tool\":\"");
+        try jsonEscapeInto(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.tool_use_id) |v| {
+        try w.writeAll(",\"tool_use_id\":\"");
+        try jsonEscapeInto(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.label) |v| {
+        try w.writeAll(",\"label\":\"");
+        try jsonEscapeInto(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.risk_level) |v| {
+        try w.writeAll(",\"risk_level\":\"");
+        try jsonEscapeInto(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.status) |v| {
+        try w.writeAll(",\"status\":\"");
+        try jsonEscapeInto(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.task_id) |v| {
+        try w.writeAll(",\"task_id\":\"");
+        try jsonEscapeInto(w, v);
+        try w.writeAll("\"");
+    }
+    if (evt.success) |v| try w.print(",\"success\":{s}", .{if (v) "true" else "false"});
+    if (evt.duration_ms) |v| try w.print(",\"duration_ms\":{d}", .{v});
+    if (evt.iteration) |v| try w.print(",\"iteration\":{d}", .{v});
+    if (evt.exit_code) |v| try w.print(",\"exit_code\":{d}", .{v});
+    if (evt.usage_tokens) |v| try w.print(",\"usage_tokens\":{d}", .{v});
+    try w.writeAll("}");
+}
+
+/// Serialize a full slice of events as a JSON array using the same
+/// per-event writer as `serializeTraceEventJson`. Used by the Task 2
+/// durable-flush path to build the `events_json` payload handed to
+/// `Manager.insertToolTraceEvents`.
+pub fn serializeEventsJsonArray(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    events: []const TraceEvent,
+) !void {
+    const w = buf.writer(allocator);
+    try w.writeAll("[");
+    for (events, 0..) |*evt, i| {
+        if (i > 0) try w.writeAll(",");
+        try serializeTraceEventJson(w, evt);
+    }
+    try w.writeAll("]");
+}
+
+pub fn jsonEscapeInto(writer: anytype, input: []const u8) !void {
+    for (input) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (c < 0x20) {
+                    try writer.print("\\u{x:0>4}", .{c});
+                } else {
+                    try writer.writeByte(c);
+                }
+            },
+        }
+    }
 }
 
 // ── Internal translation layer ──────────────────────────────────────
@@ -748,4 +930,194 @@ test "RunTraceStore snapshot outlives subsequent mutations" {
 
     try std.testing.expectEqual(@as(usize, 1), snap.events.len);
     try std.testing.expectEqualStrings("keep-me", snap.events[0].tool.?);
+}
+
+// ── Durable flush on agent_end (Task 2, Loop-2 prerequisite) ────────
+
+const FlushCall = struct {
+    user_id: i64,
+    run_id: []u8,
+    events_json: []u8,
+};
+
+/// Recording fake sink — captures every invocation so tests can assert
+/// on call count, user_id, run_id, and serialized payload contents.
+const FakeFlushSink = struct {
+    allocator: std.mem.Allocator,
+    calls: std.ArrayListUnmanaged(FlushCall) = .empty,
+    fail: bool = false,
+
+    fn deinit(self: *FakeFlushSink) void {
+        for (self.calls.items) |c| {
+            self.allocator.free(c.run_id);
+            self.allocator.free(c.events_json);
+        }
+        self.calls.deinit(self.allocator);
+    }
+
+    fn flush(ctx: ?*anyopaque, user_id: i64, run_id: []const u8, events_json: []const u8) anyerror!void {
+        const self: *FakeFlushSink = @ptrCast(@alignCast(ctx.?));
+        if (self.fail) return error.Boom;
+        try self.calls.append(self.allocator, .{
+            .user_id = user_id,
+            .run_id = try self.allocator.dupe(u8, run_id),
+            .events_json = try self.allocator.dupe(u8, events_json),
+        });
+    }
+};
+
+test "durable flush: agent_end triggers exactly one flush call with both tool events" {
+    const allocator = std.testing.allocator;
+    var store = RunTraceStore.init(allocator, 4, 8);
+    defer store.deinit();
+
+    var sink = FakeFlushSink{ .allocator = allocator };
+    defer sink.deinit();
+    store.flush_fn = FakeFlushSink.flush;
+    store.flush_ctx = &sink;
+    store.flush_user_id = 99;
+
+    const obs = store.observer();
+    const e1 = ObserverEvent{ .tool_call_start = .{ .tool = "bash", .run_id = "r1" } };
+    const e2 = ObserverEvent{ .tool_call = .{ .tool = "file_read", .success = true, .duration_ms = 5, .run_id = "r1" } };
+    const e3 = ObserverEvent{ .agent_end = .{ .duration_ms = 100, .tokens_used = 50, .run_id = "r1" } };
+    obs.recordEvent(&e1);
+    obs.recordEvent(&e2);
+    obs.recordEvent(&e3);
+
+    // In-memory behavior is untouched: all 3 events still retained.
+    var snap = (try store.snapshotRun(allocator, "r1")).?;
+    defer snap.deinit();
+    try std.testing.expectEqual(@as(usize, 3), snap.events.len);
+
+    // Flush happened exactly once, on the agent_end event.
+    try std.testing.expectEqual(@as(usize, 1), sink.calls.items.len);
+    const call = sink.calls.items[0];
+    try std.testing.expectEqual(@as(i64, 99), call.user_id);
+    try std.testing.expectEqualStrings("r1", call.run_id);
+    try std.testing.expect(std.mem.indexOf(u8, call.events_json, "\"bash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call.events_json, "\"file_read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call.events_json, "\"success\":true") != null);
+}
+
+test "durable flush: null sink is a no-op, prior behavior unchanged" {
+    const allocator = std.testing.allocator;
+    var store = RunTraceStore.init(allocator, 4, 8);
+    defer store.deinit();
+    // flush_fn / flush_ctx / flush_user_id all left at their default null.
+
+    const obs = store.observer();
+    const e1 = ObserverEvent{ .tool_call_start = .{ .tool = "bash", .run_id = "r-null" } };
+    const e2 = ObserverEvent{ .agent_end = .{ .duration_ms = 10, .tokens_used = 1, .run_id = "r-null" } };
+    obs.recordEvent(&e1);
+    obs.recordEvent(&e2);
+
+    var snap = (try store.snapshotRun(allocator, "r-null")).?;
+    defer snap.deinit();
+    try std.testing.expectEqual(@as(usize, 2), snap.events.len);
+}
+
+test "durable flush: sink error does not propagate and later records still work" {
+    const allocator = std.testing.allocator;
+    var store = RunTraceStore.init(allocator, 4, 8);
+    defer store.deinit();
+
+    var sink = FakeFlushSink{ .allocator = allocator, .fail = true };
+    defer sink.deinit();
+    store.flush_fn = FakeFlushSink.flush;
+    store.flush_ctx = &sink;
+    store.flush_user_id = 7;
+
+    const obs = store.observer();
+    const e1 = ObserverEvent{ .tool_call_start = .{ .tool = "bash", .run_id = "r-err" } };
+    const e2 = ObserverEvent{ .agent_end = .{ .duration_ms = 10, .tokens_used = 1, .run_id = "r-err" } };
+    obs.recordEvent(&e1);
+    obs.recordEvent(&e2); // sink returns error.Boom — must not crash/propagate.
+
+    // No successful calls were recorded (sink always failed).
+    try std.testing.expectEqual(@as(usize, 0), sink.calls.items.len);
+
+    // Store keeps working after a failed flush.
+    const e3 = ObserverEvent{ .tool_call_start = .{ .tool = "bash", .run_id = "r-after" } };
+    obs.recordEvent(&e3);
+    var snap = (try store.snapshotRun(allocator, "r-after")).?;
+    defer snap.deinit();
+    try std.testing.expectEqual(@as(usize, 1), snap.events.len);
+}
+
+// ── flushRun: explicit, caller-driven flush (Task 2/T2 integration-seam fix) ──
+//
+// The live gateway's terminal event is `turn_complete` (no run_id — see
+// observability.zig), never `agent_end` (zero production emitters — see
+// gateway.zig's stream handler / agent/root.zig). The `.agent_end` arm in
+// `recordEvent` above is therefore dead on the real request path even
+// though it is exactly correct and well-tested in isolation. `flushRun`
+// gives callers who DO know the run_id at the true turn-end seam (e.g.
+// the gateway stream handler, which threads the run_id through every
+// forwarded ObserverEvent) a way to trigger the exact same best-effort
+// snapshot-and-flush behavior explicitly, without waiting for an event
+// that never arrives.
+test "flushRun: explicit call flushes a buffered run's events to the sink exactly once" {
+    const allocator = std.testing.allocator;
+    var store = RunTraceStore.init(allocator, 4, 8);
+    defer store.deinit();
+
+    var sink = FakeFlushSink{ .allocator = allocator };
+    defer sink.deinit();
+    store.flush_fn = FakeFlushSink.flush;
+    store.flush_ctx = &sink;
+    store.flush_user_id = 99;
+
+    const obs = store.observer();
+    const e1 = ObserverEvent{ .tool_call_start = .{ .tool = "bash", .run_id = "r1" } };
+    const e2 = ObserverEvent{ .tool_call = .{ .tool = "file_read", .success = true, .duration_ms = 5, .run_id = "r1" } };
+    obs.recordEvent(&e1);
+    obs.recordEvent(&e2);
+
+    // No agent_end was ever emitted — the old trigger never fires.
+    try std.testing.expectEqual(@as(usize, 0), sink.calls.items.len);
+
+    // Caller-driven flush at the real turn-end seam.
+    store.flushRun("r1");
+
+    try std.testing.expectEqual(@as(usize, 1), sink.calls.items.len);
+    const call = sink.calls.items[0];
+    try std.testing.expectEqual(@as(i64, 99), call.user_id);
+    try std.testing.expectEqualStrings("r1", call.run_id);
+    try std.testing.expect(std.mem.indexOf(u8, call.events_json, "\"bash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call.events_json, "\"file_read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call.events_json, "\"success\":true") != null);
+
+    // In-memory behavior is untouched: the run is still fully retained.
+    var snap = (try store.snapshotRun(allocator, "r1")).?;
+    defer snap.deinit();
+    try std.testing.expectEqual(@as(usize, 2), snap.events.len);
+}
+
+test "flushRun: unknown run_id is a safe no-op" {
+    const allocator = std.testing.allocator;
+    var store = RunTraceStore.init(allocator, 4, 8);
+    defer store.deinit();
+
+    var sink = FakeFlushSink{ .allocator = allocator };
+    defer sink.deinit();
+    store.flush_fn = FakeFlushSink.flush;
+    store.flush_ctx = &sink;
+    store.flush_user_id = 1;
+
+    store.flushRun("does-not-exist");
+    try std.testing.expectEqual(@as(usize, 0), sink.calls.items.len);
+}
+
+test "flushRun: null sink is a safe no-op" {
+    const allocator = std.testing.allocator;
+    var store = RunTraceStore.init(allocator, 4, 8);
+    defer store.deinit();
+    // flush_fn left null.
+
+    const obs = store.observer();
+    const e1 = ObserverEvent{ .tool_call_start = .{ .tool = "bash", .run_id = "r1" } };
+    obs.recordEvent(&e1);
+
+    store.flushRun("r1"); // must not crash
 }
