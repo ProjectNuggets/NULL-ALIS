@@ -151,6 +151,12 @@ pub const UsageRuntime = struct {
     /// detectable on read).
     cost_jsonl_path: ?[]const u8 = null,
     cost_jsonl_path_owned: bool = false,
+    /// Month-scoped cache for `monthlyTotalUsd`. Null means the ledger has
+    /// not been scanned for a month yet. Updated under `mutex`; successful
+    /// `recordTurn` ledger appends increment it only when the append lands in
+    /// the already-cached month.
+    cached_month_ordinal: ?i32 = null,
+    cached_month_total_usd: f64 = 0.0,
 
     pub fn init(allocator: std.mem.Allocator) UsageRuntime {
         return .{
@@ -261,7 +267,18 @@ pub const UsageRuntime = struct {
             self.persistTurnToJsonlLocked(model, input_tokens, output_tokens, cost_usd, ts) catch |err| {
                 const log = std.log.scoped(.usage);
                 log.warn("usage.cost_persist_failed err={s} model={s}", .{ @errorName(err), model });
+                return;
             };
+            self.addToCachedMonthLocked(ts, cost_usd);
+        }
+    }
+
+    fn addToCachedMonthLocked(self: *UsageRuntime, timestamp_secs: i64, cost_usd: f64) void {
+        const cached_month = self.cached_month_ordinal orelse return;
+        const turn_month = yearMonthOrdinal(timestamp_secs);
+        if (cached_month == turn_month) {
+            self.cached_month_total_usd += cost_usd;
+            return;
         }
     }
 
@@ -297,16 +314,25 @@ pub const UsageRuntime = struct {
     /// month boundaries (correct on Feb 28→Mar 1, leap years, etc.)
     /// unlike the day/30 approximation in cost.zig.
     pub fn monthlyTotalUsd(self: *UsageRuntime, now_secs: i64) f64 {
-        // Snapshot the path under lock to avoid race vs. deinit.
         self.mutex.lock();
-        const path_opt = self.cost_jsonl_path;
-        self.mutex.unlock();
-        const path = path_opt orelse return 0.0;
+        defer self.mutex.unlock();
 
+        const target_ym = yearMonthOrdinal(now_secs);
+        if (self.cached_month_ordinal) |cached_month| {
+            if (cached_month == target_ym) return self.cached_month_total_usd;
+        }
+
+        const path = self.cost_jsonl_path orelse return 0.0;
+        const total = scanMonthlyTotalFromLedger(path, target_ym);
+        self.cached_month_ordinal = target_ym;
+        self.cached_month_total_usd = total;
+        return total;
+    }
+
+    fn scanMonthlyTotalFromLedger(path: []const u8, target_ym: i32) f64 {
         const file = std.fs.cwd().openFile(path, .{}) catch return 0.0;
         defer file.close();
 
-        const target_ym = yearMonthOrdinal(now_secs);
         var total: f64 = 0.0;
 
         var read_buf: [4096]u8 = undefined;
@@ -846,6 +872,98 @@ test "D5 — monthlyTotalUsd excludes entries from other calendar months" {
     // Probe a month with no entries (April 2024 = 1712016000) — 0.
     const apr_total = rt.monthlyTotalUsd(1712016000);
     try std.testing.expect(apr_total == 0.0);
+}
+
+test "D5 — monthlyTotalUsd caches current month and recordTurn increments cached total" {
+    const allocator = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const tmp_dir = try std.fmt.bufPrint(&dir_buf, "/tmp/nullalis-d5-cache-{d}", .{std.time.microTimestamp()});
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    var rt = try UsageRuntime.initWithCostPersistence(allocator, tmp_dir);
+    defer rt.deinit();
+
+    const now = std.time.timestamp();
+    rt.recordTurn("m", 1, 1, 0.10, 1);
+    const first = rt.monthlyTotalUsd(now);
+    try std.testing.expect(@abs(first - 0.10) < 0.0001);
+
+    rt.recordTurn("m", 1, 1, 0.20, 1);
+    const second = rt.monthlyTotalUsd(now);
+    try std.testing.expect(@abs(second - 0.30) < 0.0001);
+}
+
+test "D5 — monthlyTotalUsd cache resets on calendar-month rollover" {
+    const allocator = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const tmp_dir = try std.fmt.bufPrint(&dir_buf, "/tmp/nullalis-d5-rollover-{d}", .{std.time.microTimestamp()});
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    var rt = try UsageRuntime.initWithCostPersistence(allocator, tmp_dir);
+    defer rt.deinit();
+
+    const path = rt.cost_jsonl_path.?;
+    if (std.fs.path.dirnamePosix(path)) |d| try std.fs.cwd().makePath(d);
+    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+
+    try file.writeAll("{\"model\":\"m\",\"input_tokens\":1,\"output_tokens\":1,\"cost_usd\":1.00000000,\"timestamp\":1705276800}\n");
+    try file.writeAll("{\"model\":\"m\",\"input_tokens\":1,\"output_tokens\":1,\"cost_usd\":2.00000000,\"timestamp\":1707955200}\n");
+
+    const jan_total = rt.monthlyTotalUsd(1705276800);
+    try std.testing.expect(@abs(jan_total - 1.00) < 0.001);
+
+    const feb_total = rt.monthlyTotalUsd(1707955200);
+    try std.testing.expect(@abs(feb_total - 2.00) < 0.001);
+}
+
+test "D5 — monthlyTotalUsd initializes cache from existing ledger scan" {
+    const allocator = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const tmp_dir = try std.fmt.bufPrint(&dir_buf, "/tmp/nullalis-d5-init-cache-{d}", .{std.time.microTimestamp()});
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    var rt = try UsageRuntime.initWithCostPersistence(allocator, tmp_dir);
+    defer rt.deinit();
+
+    const path = rt.cost_jsonl_path.?;
+    if (std.fs.path.dirnamePosix(path)) |d| try std.fs.cwd().makePath(d);
+    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+
+    try file.writeAll("{\"model\":\"m\",\"input_tokens\":1,\"output_tokens\":1,\"cost_usd\":1.25000000,\"timestamp\":1707955200}\n");
+    try file.writeAll("{\"model\":\"m\",\"input_tokens\":1,\"output_tokens\":1,\"cost_usd\":0.75000000,\"timestamp\":1707955200}\n");
+
+    const monthly = rt.monthlyTotalUsd(1707955200);
+    try std.testing.expect(@abs(monthly - 2.00) < 0.001);
+}
+
+test "D5 — recordTurn after querying another month does not undercount current month" {
+    const allocator = std.testing.allocator;
+    var dir_buf: [128]u8 = undefined;
+    const tmp_dir = try std.fmt.bufPrint(&dir_buf, "/tmp/nullalis-d5-cross-cache-{d}", .{std.time.microTimestamp()});
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    var rt = try UsageRuntime.initWithCostPersistence(allocator, tmp_dir);
+    defer rt.deinit();
+
+    const now = std.time.timestamp();
+    const path = rt.cost_jsonl_path.?;
+    if (std.fs.path.dirnamePosix(path)) |d| try std.fs.cwd().makePath(d);
+    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+
+    var current_line_buf: [160]u8 = undefined;
+    const current_line = try std.fmt.bufPrint(&current_line_buf, "{{\"model\":\"m\",\"input_tokens\":1,\"output_tokens\":1,\"cost_usd\":0.10000000,\"timestamp\":{d}}}\n", .{now});
+    try file.writeAll(current_line);
+    try file.writeAll("{\"model\":\"m\",\"input_tokens\":1,\"output_tokens\":1,\"cost_usd\":2.00000000,\"timestamp\":1707955200}\n");
+
+    const feb_total = rt.monthlyTotalUsd(1707955200);
+    try std.testing.expect(@abs(feb_total - 2.00) < 0.001);
+
+    rt.recordTurn("m", 1, 1, 0.20, 1);
+    const current_total = rt.monthlyTotalUsd(now);
+    try std.testing.expect(@abs(current_total - 0.30) < 0.001);
 }
 
 test "D5 — monthlyTotalUsd returns 0 when no path configured" {
