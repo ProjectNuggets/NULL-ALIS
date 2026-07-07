@@ -281,6 +281,40 @@ pub const RunTraceStore = struct {
         return self.runs.count();
     }
 
+    /// Explicit, caller-driven durable flush for a run (integration-seam
+    /// fix, PR #140 follow-up). Snapshots the run's currently-buffered
+    /// events under the mutex, releases the lock, then serializes and
+    /// hands the snapshot to the injected sink — identical lock
+    /// discipline and best-effort semantics as the `.agent_end`-triggered
+    /// path below (errors are logged and swallowed; unknown run_id or a
+    /// null sink are safe no-ops).
+    ///
+    /// Exists because the live agent runtime's terminal event is
+    /// `turn_complete` (no `run_id` — see observability.zig), never
+    /// `agent_end` (zero production emitters). Callers that know the
+    /// run_id at the true turn-end seam (e.g. the gateway stream handler,
+    /// which threads run_id through every forwarded event) call this
+    /// directly instead of waiting for an `agent_end` event that never
+    /// arrives on the real request path.
+    pub fn flushRun(self: *RunTraceStore, run_id: []const u8) void {
+        if (self.flush_fn == null) return;
+
+        self.mutex.lock();
+        var flush_snapshot: ?TraceSnapshot = null;
+        if (self.runs.get(run_id)) |b| {
+            flush_snapshot = self.copyBucket(self.allocator, b) catch |err| blk: {
+                std.log.scoped(.run_trace_store).warn("flush snapshot failed run_id='{s}' err={}", .{ run_id, err });
+                break :blk null;
+            };
+        }
+        self.mutex.unlock();
+
+        if (flush_snapshot) |*snap| {
+            defer snap.deinit();
+            self.tryFlush(snap);
+        }
+    }
+
     // ── Internals ───────────────────────────────────────────────────
 
     fn recordEvent(self: *RunTraceStore, event: *const ObserverEvent) void {
@@ -297,26 +331,15 @@ pub const RunTraceStore = struct {
             // observe this via the Observer vtable.
             std.log.scoped(.run_trace_store).debug("append failed: {}", .{err});
         };
-
-        // Task 2 (Loop-2 prerequisite): on agent_end, snapshot this
-        // run's buffered events under the mutex we already hold, then
-        // release the lock BEFORE serializing/flushing — JSON encoding
-        // and the sink call must never happen while holding the lock.
-        var flush_snapshot: ?TraceSnapshot = null;
-        if (is_agent_end and self.flush_fn != null) {
-            const bucket = self.runs.get(run_id);
-            if (bucket) |b| {
-                flush_snapshot = self.copyBucket(self.allocator, b) catch |err| blk: {
-                    std.log.scoped(.run_trace_store).warn("flush snapshot failed run_id='{s}' err={}", .{ run_id, err });
-                    break :blk null;
-                };
-            }
-        }
         self.mutex.unlock();
 
-        if (flush_snapshot) |*snap| {
-            defer snap.deinit();
-            self.tryFlush(snap);
+        // Task 2 (Loop-2 prerequisite): on agent_end, flush this run's
+        // buffered events. Kept for API/back-compat and existing test
+        // coverage — this arm is not reachable on the live gateway path
+        // (see flushRun doc comment above), but tests still construct
+        // synthetic agent_end events directly against this store.
+        if (is_agent_end) {
+            self.flushRun(run_id);
         }
     }
 
@@ -1020,4 +1043,81 @@ test "durable flush: sink error does not propagate and later records still work"
     var snap = (try store.snapshotRun(allocator, "r-after")).?;
     defer snap.deinit();
     try std.testing.expectEqual(@as(usize, 1), snap.events.len);
+}
+
+// ── flushRun: explicit, caller-driven flush (Task 2/T2 integration-seam fix) ──
+//
+// The live gateway's terminal event is `turn_complete` (no run_id — see
+// observability.zig), never `agent_end` (zero production emitters — see
+// gateway.zig's stream handler / agent/root.zig). The `.agent_end` arm in
+// `recordEvent` above is therefore dead on the real request path even
+// though it is exactly correct and well-tested in isolation. `flushRun`
+// gives callers who DO know the run_id at the true turn-end seam (e.g.
+// the gateway stream handler, which threads the run_id through every
+// forwarded ObserverEvent) a way to trigger the exact same best-effort
+// snapshot-and-flush behavior explicitly, without waiting for an event
+// that never arrives.
+test "flushRun: explicit call flushes a buffered run's events to the sink exactly once" {
+    const allocator = std.testing.allocator;
+    var store = RunTraceStore.init(allocator, 4, 8);
+    defer store.deinit();
+
+    var sink = FakeFlushSink{ .allocator = allocator };
+    defer sink.deinit();
+    store.flush_fn = FakeFlushSink.flush;
+    store.flush_ctx = &sink;
+    store.flush_user_id = 99;
+
+    const obs = store.observer();
+    const e1 = ObserverEvent{ .tool_call_start = .{ .tool = "bash", .run_id = "r1" } };
+    const e2 = ObserverEvent{ .tool_call = .{ .tool = "file_read", .success = true, .duration_ms = 5, .run_id = "r1" } };
+    obs.recordEvent(&e1);
+    obs.recordEvent(&e2);
+
+    // No agent_end was ever emitted — the old trigger never fires.
+    try std.testing.expectEqual(@as(usize, 0), sink.calls.items.len);
+
+    // Caller-driven flush at the real turn-end seam.
+    store.flushRun("r1");
+
+    try std.testing.expectEqual(@as(usize, 1), sink.calls.items.len);
+    const call = sink.calls.items[0];
+    try std.testing.expectEqual(@as(i64, 99), call.user_id);
+    try std.testing.expectEqualStrings("r1", call.run_id);
+    try std.testing.expect(std.mem.indexOf(u8, call.events_json, "\"bash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call.events_json, "\"file_read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call.events_json, "\"success\":true") != null);
+
+    // In-memory behavior is untouched: the run is still fully retained.
+    var snap = (try store.snapshotRun(allocator, "r1")).?;
+    defer snap.deinit();
+    try std.testing.expectEqual(@as(usize, 2), snap.events.len);
+}
+
+test "flushRun: unknown run_id is a safe no-op" {
+    const allocator = std.testing.allocator;
+    var store = RunTraceStore.init(allocator, 4, 8);
+    defer store.deinit();
+
+    var sink = FakeFlushSink{ .allocator = allocator };
+    defer sink.deinit();
+    store.flush_fn = FakeFlushSink.flush;
+    store.flush_ctx = &sink;
+    store.flush_user_id = 1;
+
+    store.flushRun("does-not-exist");
+    try std.testing.expectEqual(@as(usize, 0), sink.calls.items.len);
+}
+
+test "flushRun: null sink is a safe no-op" {
+    const allocator = std.testing.allocator;
+    var store = RunTraceStore.init(allocator, 4, 8);
+    defer store.deinit();
+    // flush_fn left null.
+
+    const obs = store.observer();
+    const e1 = ObserverEvent{ .tool_call_start = .{ .tool = "bash", .run_id = "r1" } };
+    obs.recordEvent(&e1);
+
+    store.flushRun("r1"); // must not crash
 }

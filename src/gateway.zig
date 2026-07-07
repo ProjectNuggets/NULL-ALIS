@@ -11147,6 +11147,12 @@ fn handleApiChatStreamSseConnection(
     // the same lock that updates the shared totals, and takeTurnDelta()
     // returns exactly THIS turn's own contribution after processMessage.
     var spend_usage_rt: ?*usage_runtime_mod.UsageRuntime = null;
+    // Integration-seam fix (PR #140 follow-up, T2): captured alongside
+    // spend_usage_rt so the durable trace flush can fire once the turn
+    // is fully done. Only the tenant-enabled path has a RunTraceStore
+    // (file-tenant / CLI fallback never durably persists traces) — see
+    // `trace_store` field on TenantRuntime.
+    var turn_trace_store: ?*run_trace_store_mod.RunTraceStore = null;
     const outcome: ReplyOutcome = blk: {
         if (state.tenant_enabled) {
             const cfg = config_opt orelse {
@@ -11162,6 +11168,7 @@ fn handleApiChatStreamSseConnection(
                 }
             };
             spend_usage_rt = tenant_runtime.usage_rt;
+            turn_trace_store = tenant_runtime.trace_store;
             // WO-03: arm the per-turn delta accumulator on THIS worker
             // thread. recordTurn/recordWeight calls during the agent loop
             // (which runs synchronously on this same thread) accumulate into
@@ -11220,6 +11227,25 @@ fn handleApiChatStreamSseConnection(
     keepalive.stop();
     if (keepalive_thread) |thread| thread.join();
     keepalive_joined = true;
+
+    // Integration-seam fix (PR #140 follow-up, T2): this is the TRUE
+    // turn-end seam on the live gateway path — processMessage[WithTurn-
+    // Options] has fully returned (success or error), so any tool events
+    // it emitted for this turn have already been buffered in
+    // turn_trace_store via run_event_observer_impl's forwarding. The
+    // durable flush used to wait for an `.agent_end` ObserverEvent that
+    // the agent runtime never emits in production (it emits
+    // `turn_complete`, which carries no run_id) — so the flush never
+    // fired. Firing it explicitly here, with the run_id captured by
+    // run_event_observer_impl across every forwarded event this turn,
+    // closes that gap. Best-effort: flushRun() is itself best-effort
+    // (logs + swallows failures), and a turn that never produced a
+    // run_id (no tenant runtime, or a pre-turn error) is a safe no-op.
+    if (turn_trace_store) |store| {
+        if (run_event_observer_impl.lastRunId()) |run_id| {
+            store.flushRun(run_id);
+        }
+    }
 
     const reply = switch (outcome) {
         .ok => |value| value,
