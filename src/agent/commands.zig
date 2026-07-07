@@ -5051,20 +5051,26 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
         var active_count: usize = 0;
         var shadow_count: usize = 0;
         var retired_count: usize = 0;
+        var wish_count: usize = 0;
         for (entries) |e| {
-            if (!std.mem.startsWith(u8, e.key, "durable_fact/behavior/")) continue;
-            const header = learning.parseLearnedMetadataHeader(e.content);
-            if (header.state == .shadow) {
-                shadow_count += 1;
-            } else if (header.state == .retired) {
-                retired_count += 1;
+            if (std.mem.startsWith(u8, e.key, "wish/")) {
+                wish_count += 1;
+            } else if (!std.mem.startsWith(u8, e.key, "durable_fact/behavior/")) {
+                continue;
             } else {
-                active_count += 1;
+                const header = learning.parseLearnedMetadataHeader(e.content);
+                if (header.state == .shadow) {
+                    shadow_count += 1;
+                } else if (header.state == .retired) {
+                    retired_count += 1;
+                } else {
+                    active_count += 1;
+                }
             }
         }
 
-        if (active_count == 0 and shadow_count == 0 and retired_count == 0) {
-            return try self.allocator.dupe(u8, "No learned behavioral facts found.");
+        if (active_count == 0 and shadow_count == 0 and retired_count == 0 and wish_count == 0) {
+            return try self.allocator.dupe(u8, "No learned behavioral facts or capability requests found.");
         }
 
         var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -5107,6 +5113,24 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
                 "{d} dismissed suggestion{s} — /learn forget <key> to delete permanently\n",
                 .{ retired_count, plural },
             );
+        }
+
+        // Package 2a Task 5: Wishes section (bucket 5 proposals)
+        // Learning contract: wishes are capability requests; brain-visible,
+        // user-facing, read-only.
+        if (wish_count > 0) {
+            if (active_count > 0 or shadow_count > 0 or retired_count > 0) {
+                try w.writeAll("\n");
+            }
+            try w.print("Wishes (capability requests) ({d}):\n", .{wish_count});
+            var idx: usize = 0;
+            for (entries) |e| {
+                if (!std.mem.startsWith(u8, e.key, "wish/")) continue;
+                idx += 1;
+                // Wishes have no metadata header — just the content
+                const preview_len = @min(@as(usize, 200), e.content.len);
+                try w.print("  {d}. {s}\n     key: {s}\n", .{ idx, e.content[0..preview_len], e.key });
+            }
         }
 
         return try out.toOwnedSlice(self.allocator);
@@ -6474,6 +6498,34 @@ test "/learn list: a dismissed suggestion shows as a collapsed 'N dismissed sugg
     try std.testing.expect(std.mem.indexOf(u8, out, "/learn forget") != null);
     // The dismissed fact's own body text must NOT appear as a full Suggestions entry.
     try std.testing.expect(std.mem.indexOf(u8, out, "prefer streaming responses for long outputs") == null);
+}
+
+// Package 2a Task 5: Wishes (capability-gap proposals, bucket 5)
+// Wishes are user-visible, read-only capability requests filed at capability walls.
+// They appear in their own /learn list section, brain-visible but excluded from embedding.
+
+test "/learn list: renders Wishes section when capability requests exist" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // Store two wishes directly via memory.store (no metadata headers).
+    try mem.store("wish/fix-npm-timeout", "Need better npm request timeout handling; current 30s limit fails on slow networks. evidence_run_id=r-1-2", .core, null);
+    try mem.store("wish/multipart-form-upload", "Support multipart form uploads (S3, file-based APIs). evidence_run_id=r-1-3", .core, null);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+
+    const out = try handleLearnCommand(&fake_self, "list");
+    defer allocator.free(out);
+
+    // Wishes section header and count present.
+    try std.testing.expect(std.mem.indexOf(u8, out, "Wishes (capability requests) (2)") != null);
+    // Both wishes rendered with their content (first 200 chars) and keys.
+    try std.testing.expect(std.mem.indexOf(u8, out, "fix-npm-timeout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "multipart-form-upload") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Better npm request timeout") != null or std.mem.indexOf(u8, out, "npm request timeout") != null);
 }
 
 test "/learn adopt on a legacy fact (no metadata header at all) reports 'already active', never corrupts it" {

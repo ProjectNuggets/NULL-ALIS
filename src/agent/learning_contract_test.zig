@@ -81,3 +81,28 @@ test "learning contract inv. 1: no origin births retired (retired is only reacha
         try std.testing.expect(birthState(origin) != .retired);
     }
 }
+
+// ── Bucket 5 (proposal): wish ledger ───────────────────────────────────────
+// Learning contract bucket 5 (docs/learning-contract.md line 24): "proposal"
+// = capability gap the agent wants; wish-ledger entry; never a behaviour,
+// never injected — it's a request to the roadmap. Wishes are brain-visible
+// (user may see them), excluded from embedding (semantic bookkeeping), never
+// injectable as directives.
+
+test "learning contract bucket 5: wish/ keys are brain-visible" {
+    const mem_root = @import("../memory/root.zig");
+    try std.testing.expect(mem_root.isBrainVisibleKey("wish/fix-npm-timeout"));
+    try std.testing.expect(mem_root.isBrainVisibleKey("wish/multipart-upload"));
+}
+
+test "learning contract bucket 5: wish/ keys excluded from embedding (semantic bookkeeping)" {
+    const mem_root = @import("../memory/root.zig");
+    try std.testing.expect(mem_root.isSemanticBookkeepingKey("wish/x"));
+    try std.testing.expect(mem_root.isSemanticBookkeepingKey("wish/some-feature"));
+}
+
+test "learning contract bucket 5: wish/ keys pass inlineKeyGuard (agent-authored, user-scoped)" {
+    const memory_store_tool = @import("../tools/memory_store.zig").MemoryStoreTool;
+    try std.testing.expectEqual(@as(?[]const u8, null), memory_store_tool.inlineKeyGuard("wish/calendar-tz-fix"));
+    try std.testing.expectEqual(@as(?[]const u8, null), memory_store_tool.inlineKeyGuard("wish/send-sms"));
+}

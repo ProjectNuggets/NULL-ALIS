@@ -779,6 +779,7 @@ fn buildSafetySection(w: anytype) !void {
     try w.writeAll("- Memory writes: use `memory_store` only for facts that will be useful in FUTURE conversations (user preferences, durable decisions, stable project context). Use `memory_edit` to correct existing entries, `memory_archive` to close resolved ones, `memory_forget` to remove outdated ones (exact semantics in the next bullet). Do not save ephemeral turn details, restatements of visible workspace docs, or anything you can re-derive. Scope memory as `session` for per-conversation continuity and `global` for cross-session truths.\n\n");
     try w.writeAll("- Memory curation semantics: `memory_edit`/supersede CORRECTS a fact (history preserved); `memory_archive` CLOSES it (kept, excluded from recall); `memory_forget` DELETES it. Durable types (core/preference/decision/person/open_loop) never resurrect once corrected and are protected from accidental demotion. core/preference/decision/person are evergreen (never decay); open_loop decays in ranking but keeps that protection — when a loop is resolved, close it via archive or supersede, don't wait for decay. Never store the output of your own introspection tools (memory_doctor, brain_graph, memory_list, transcript_read, ...) — that is your machinery, not knowledge; `memory_store` rejects scaffold, system-managed, and internal bookkeeping keys.\n\n");
     try w.writeAll("- Learning conduct: when you change approach because of a learned pattern, cite it — \"X failed 3 times this week, trying Y instead\" — and never claim uncited improvement. A shadow entry in `/learn list` is a suggestion you haven't adopted, not something you already do; adopt and dismiss are the user's verbs (`/learn adopt <key>` / `/learn dismiss <key>`), never yours to invoke on your own judgment.\n\n");
+    try w.writeAll("- Capability walls and wishes: when a needed tool, skill, or permission doesn't exist and blocks the user's request, file a wish via `memory_store` with key `wish/<short-slug>` and content describing what was needed; include `evidence_run_id=<run_id>` if known. Tell the user a wish was filed. Wishes are proposals to the roadmap — the team will review them, not auto-build them. Never claim the capability exists.\n\n");
     // D52 Hybrid Pillar 1 (2026-05-24): override the LLM RLHF reflex that
     // refuses to persist user-volunteered PII into the user's OWN personal
     // memory. This is a personal-memory product — refusing the user's own
@@ -2617,6 +2618,33 @@ test "safety section teaches evidence-cited learning conduct (inv. 6 disclosure 
     try std.testing.expect(std.mem.indexOf(u8, output, "/learn dismiss") != null);
     // No new ## heading introduced by this bullet.
     try std.testing.expect(std.mem.indexOf(u8, output, "## Learning") == null);
+}
+
+// Package 2a Task 5 — the wish ledger bullet (learning-contract behaviour §4,
+// capability walls): when a needed tool/skill/permission doesn't exist, file
+// a wish via memory_store with key wish/<slug> and content = what was needed
+// + evidence_run_id; tell the user; wishes are proposals to the roadmap.
+test "safety section teaches wish filing at capability walls (bucket 5 proposals)" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+    try buildSafetySection(w);
+
+    const output = buf.items;
+    // Capability walls trigger wish filing.
+    try std.testing.expect(std.mem.indexOf(u8, output, "Capability walls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "file a wish") != null);
+    // Key format: wish/<short-slug>
+    try std.testing.expect(std.mem.indexOf(u8, output, "wish/") != null);
+    // Content includes what was needed + evidence_run_id.
+    try std.testing.expect(std.mem.indexOf(u8, output, "evidence_run_id") != null);
+    // Tell the user a wish was filed.
+    try std.testing.expect(std.mem.indexOf(u8, output, "Tell the user") != null);
+    // Wishes are proposals, not auto-built.
+    try std.testing.expect(std.mem.indexOf(u8, output, "proposals") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "roadmap") != null);
+    // No new ## heading introduced by this bullet.
+    try std.testing.expect(std.mem.indexOf(u8, output, "## Wish") == null);
 }
 
 test "task planning prompt keeps internal plans separate from todo" {

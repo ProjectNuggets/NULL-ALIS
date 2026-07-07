@@ -1400,6 +1400,11 @@ pub fn isBrainVisibleKey(key: []const u8) bool {
 pub fn isSemanticBookkeepingKey(key: []const u8) bool {
     return isDefaultHiddenMemoryKey(key) or
         std.mem.eql(u8, key, "context_anchor_current") or
+        // Learning contract bucket 5 (docs/learning-contract.md line 24):
+        // wish/ keys are capability-gap proposals — brain-visible but excluded
+        // from embedding (they're not world knowledge, they're meta-requests to
+        // the roadmap). See docs/learning-contract.md § Behaviour design.
+        std.mem.startsWith(u8, key, "wish/") or
         // P4b: continuity summaries are warm-start briefs injected by explicit
         // key, not recallable facts — keep them OUT of the pgvector fact space.
         // This is the ONLY consumer of isSemanticBookkeepingKey
