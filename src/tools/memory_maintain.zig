@@ -9,6 +9,10 @@ const zaki_state = @import("../zaki_state.zig");
 const providers = @import("../providers/root.zig");
 const Provider = providers.Provider;
 const prose_judge = @import("prose_judge.zig");
+// Package 2a Task 3 (the miner) — pure analysis module + T2's
+// provenance-typed behavior-fact store.
+const trace_mining = @import("../agent/trace_mining.zig");
+const learning = @import("../agent/learning.zig");
 
 const log = std.log.scoped(.memory_maintain);
 
@@ -94,6 +98,20 @@ pub const MemoryMaintainTool = struct {
     /// configured. The action handler treats `judge_provider != null`
     /// AND `judge_model.len > 0` as the wired-up state.
     judge_model: []const u8 = "",
+    /// Package 2a Task 3 (the miner) — where `mine_traces` writes
+    /// `insights/{ISO-week}.md` + `.json`. Bound at tool-construction
+    /// time from the same `workspace_dir` every file_* tool receives
+    /// (see tools/root.zig::allTools). Empty when unset (non-test
+    /// construction always sets this); `mine_traces` fails cleanly if
+    /// empty rather than writing into cwd.
+    workspace_dir: []const u8 = "",
+    /// Package 2a Task 3 (the miner) — trace-mining gate. Bound from
+    /// config.agent.trace_mining_enabled at tenant-runtime construction
+    /// (mirrors the config-flag-to-tool-field plumbing pattern; see
+    /// config_types.zig's docstring on the flag itself). Defaults TRUE
+    /// so the struct's zero-value in ad-hoc test construction matches
+    /// the flag's own default.
+    trace_mining_enabled: bool = true,
 
     pub const tool_name = "memory_maintain";
 
@@ -115,7 +133,7 @@ pub const MemoryMaintainTool = struct {
         @import("lint.zig").lintToolDescription("memory_maintain", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
     }
     pub const tool_description =
-        "Maintain truth across your memory graph. Single tool, seven actions: " ++
+        "Maintain truth across your memory graph. Single tool, nine actions: " ++
         "(1) cascade_update — rename entity across all edges; " ++
         "(2) invalidate_when — close edges matching (predicate, object_name); " ++
         "(3) resolve_contradiction — explicitly pick loser/winner by memory key; " ++
@@ -129,9 +147,13 @@ pub const MemoryMaintainTool = struct {
         "upgrade 'PROPER' entities to PERSON where a relationship predicate proves it, delete pre-P4 embedded continuity summaries, and collapse " ++
         "EXACT content_hash duplicates (supersede, never delete). Idempotent. Pass apply=true for a live run; all_users=true to repair every user. " ++
         "Use when you notice stale facts, contradictory states, renamed entities, or unresolved corrections. " ++
+        "(9) mine_traces — Package 2a: mine recent tool_traces for failure patterns / recurring tool-sequences / tool-fluency stats " ++
+        "(deterministic, no LLM), write workspace/insights/{ISO-week}.md + .json, and draft shadow behavior-fact suggestions for " ++
+        "recurring failures (not active until you say 'learn adopt'). scope=user (default) mines YOUR OWN traces; " ++
+        "scope=fleet is an operator surface returning tool/count shapes ONLY (no run_ids, no content) with no file written. " ++
         "After each call, check `next_consideration` in the response for suggested follow-up actions.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["cascade_update","invalidate_when","resolve_contradiction","propagate_correction","temporal_decay","survey","prose_survey","phase05_backfill"],"description":"Which truth-maintenance operation to perform."},"old_name":{"type":"string","description":"For cascade_update: the entity name being renamed FROM."},"new_name":{"type":"string","description":"For cascade_update: the entity name being renamed TO."},"predicate":{"type":"string","description":"For invalidate_when: predicate to match (e.g. STATUS, PREFERS, WORKS_AT)."},"object_name":{"type":"string","description":"For invalidate_when: target entity name to match."},"subject_name":{"type":"string","description":"For invalidate_when: optional subject entity name to narrow further."},"loser_key":{"type":"string","description":"For resolve_contradiction: the memory key being closed."},"winner_key":{"type":"string","description":"For resolve_contradiction: the memory key that stays alive."},"correction_key":{"type":"string","description":"For propagate_correction: the memory key holding the correction."},"entity_pattern":{"type":"string","description":"For propagate_correction OR prose_survey: substring to match in target memory content (e.g. \"MNDA\", \"Mia\", \"Neptune\")."},"threshold_days":{"type":"integer","description":"For temporal_decay: only decay memories untouched for this many days. Default 30."},"half_life_days":{"type":"integer","description":"For temporal_decay: confidence half-life in days. Default 30."},"max_facts":{"type":"integer","description":"For prose_survey: cap on number of rows the LLM judge sees per call. Default 50, max 200. The result includes `more_available=true` if matching rows exceeded the cap so you can re-run with a tighter pattern."},"dry_run":{"type":"boolean","description":"For prose_survey: if true, returns judge verdicts without writing any metadata (preview mode). Default false."},"apply":{"type":"boolean","description":"For phase05_backfill ONLY: the one-time corpus repair is DRY-RUN by default (reports what WOULD change, writes nothing). Set apply=true to perform a LIVE run that modifies data. Idempotent + safe to re-run."},"all_users":{"type":"boolean","description":"For phase05_backfill ONLY: if true, repair EVERY user's corpus (the general fix). Default false = only the calling tenant's user_id."}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["cascade_update","invalidate_when","resolve_contradiction","propagate_correction","temporal_decay","survey","prose_survey","phase05_backfill","mine_traces"],"description":"Which truth-maintenance operation to perform."},"old_name":{"type":"string","description":"For cascade_update: the entity name being renamed FROM."},"new_name":{"type":"string","description":"For cascade_update: the entity name being renamed TO."},"predicate":{"type":"string","description":"For invalidate_when: predicate to match (e.g. STATUS, PREFERS, WORKS_AT)."},"object_name":{"type":"string","description":"For invalidate_when: target entity name to match."},"subject_name":{"type":"string","description":"For invalidate_when: optional subject entity name to narrow further."},"loser_key":{"type":"string","description":"For resolve_contradiction: the memory key being closed."},"winner_key":{"type":"string","description":"For resolve_contradiction: the memory key that stays alive."},"correction_key":{"type":"string","description":"For propagate_correction: the memory key holding the correction."},"entity_pattern":{"type":"string","description":"For propagate_correction OR prose_survey: substring to match in target memory content (e.g. \"MNDA\", \"Mia\", \"Neptune\")."},"threshold_days":{"type":"integer","description":"For temporal_decay: only decay memories untouched for this many days. Default 30."},"half_life_days":{"type":"integer","description":"For temporal_decay: confidence half-life in days. Default 30."},"max_facts":{"type":"integer","description":"For prose_survey: cap on number of rows the LLM judge sees per call. Default 50, max 200. The result includes `more_available=true` if matching rows exceeded the cap so you can re-run with a tighter pattern."},"dry_run":{"type":"boolean","description":"For prose_survey: if true, returns judge verdicts without writing any metadata (preview mode). Default false."},"apply":{"type":"boolean","description":"For phase05_backfill ONLY: the one-time corpus repair is DRY-RUN by default (reports what WOULD change, writes nothing). Set apply=true to perform a LIVE run that modifies data. Idempotent + safe to re-run."},"all_users":{"type":"boolean","description":"For phase05_backfill ONLY: if true, repair EVERY user's corpus (the general fix). Default false = only the calling tenant's user_id."},"since_days":{"type":"integer","description":"For mine_traces: how many days of tool_traces to mine. Default 7."},"scope":{"type":"string","enum":["user","fleet"],"description":"For mine_traces: 'user' (default) mines your own traces and writes insight files + shadow fact drafts. 'fleet' is an operator surface: cross-user tool/count shapes only, returned in this call's output, no file written."},"session_id":{"type":"string","description":"For mine_traces (scope=user only): optional session lane to scope drafted shadow facts to. Omit for workspace-global scope."}},"required":["action"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -145,7 +167,20 @@ pub const MemoryMaintainTool = struct {
 
     pub fn execute(self: *MemoryMaintainTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const action = root.getString(args, "action") orelse
-            return ToolResult.fail("Missing 'action' parameter. One of: cascade_update, invalidate_when, resolve_contradiction, propagate_correction, temporal_decay, survey, prose_survey, phase05_backfill.");
+            return ToolResult.fail("Missing 'action' parameter. One of: cascade_update, invalidate_when, resolve_contradiction, propagate_correction, temporal_decay, survey, prose_survey, phase05_backfill, mine_traces.");
+
+        // Package 2a Task 3 (the miner) — dispatched BEFORE the shared
+        // state_mgr/user_id unwrap below, because mine_traces owns its
+        // OWN tenant-context checks internally (executeMineTraces):
+        // the flag-off path must work with NEITHER bound (a disabled
+        // gate is not a "tenant not configured" error), and fleet scope
+        // needs state_mgr but explicitly NOT a numeric user_id. Folding
+        // it into the shared guard below would make every mine_traces
+        // call fail with a misleading "requires postgres state manager"
+        // message even when the real reason is simply the flag being off.
+        if (std.mem.eql(u8, action, "mine_traces")) {
+            return executeMineTraces(allocator, self, args);
+        }
 
         const smgr = self.state_mgr orelse
             return ToolResult.fail("memory_maintain requires postgres state manager (tenant context not wired).");
@@ -169,7 +204,7 @@ pub const MemoryMaintainTool = struct {
         } else if (std.mem.eql(u8, action, "phase05_backfill")) {
             return executePhase05Backfill(allocator, smgr, uid, args);
         } else {
-            const msg = try std.fmt.allocPrint(allocator, "Unknown action '{s}'. Valid: cascade_update, invalidate_when, resolve_contradiction, propagate_correction, temporal_decay, survey, prose_survey, phase05_backfill.", .{action});
+            const msg = try std.fmt.allocPrint(allocator, "Unknown action '{s}'. Valid: cascade_update, invalidate_when, resolve_contradiction, propagate_correction, temporal_decay, survey, prose_survey, phase05_backfill, mine_traces.", .{action});
             return ToolResult{ .success = false, .error_msg = msg, .output = "" };
         }
     }
@@ -762,4 +797,742 @@ test "brain-leak C polish: phase05_backfill output surfaces scaffold-purge count
     try std.testing.expect(std.mem.indexOf(u8, out, "\"rows_retyped\":5") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"near_dup_clusters\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"dry_run\":true") != null);
+}
+
+// ── mine_traces action (Package 2a Task 3 — the miner) ──────────────
+//
+// Governed by docs/learning-contract.md invariants 2, 4, 5. The pure
+// analyze()/render*() calls live in trace_mining.zig (inv. 2 —
+// observational, no LLM). This file orchestrates: flag check -> Manager
+// read (thin) -> analyze -> write files (inv. 4 — rebuildable, tested
+// for byte-identical idempotency below) -> draft shadow facts via T2's
+// storeLearnedFact (inv. 1 — birthed shadow, never self-promoted).
+
+/// Writes `{insights_dir}/{week_label}.md` + `.json` from a
+/// MiningReport. Overwrite semantics (not append): re-running the miner
+/// for the same window replaces both files, and because
+/// renderInsightsMarkdown/renderInsightsJson are pure deterministic
+/// functions of the report (trace_mining.zig), re-mining an
+/// EQUIVALENT set of trace rows produces byte-identical files (learning
+/// contract inv. 4 — insights are rebuildable). Creates insights_dir if
+/// it does not already exist.
+///
+/// Uses plain create+writeAll (not file_write.zig's temp+rename+
+/// symlink-defense machinery) deliberately: insights_dir/week_label are
+/// derived internally by this tool (never a user-supplied path), so the
+/// path-traversal/symlink-escape threat model file_write.zig defends
+/// against does not apply here — matching this project's stated
+/// preference for the simplest correct implementation over reused
+/// machinery built for a different threat model.
+fn writeInsightFiles(
+    allocator: std.mem.Allocator,
+    insights_dir: []const u8,
+    week_label: []const u8,
+    report: trace_mining.MiningReport,
+) !void {
+    std.fs.cwd().makePath(insights_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    var dir = try std.fs.cwd().openDir(insights_dir, .{});
+    defer dir.close();
+
+    const md = try trace_mining.renderInsightsMarkdown(allocator, report, week_label);
+    defer allocator.free(md);
+    const md_name = try std.fmt.allocPrint(allocator, "{s}.md", .{week_label});
+    defer allocator.free(md_name);
+    try dir.writeFile(.{ .sub_path = md_name, .data = md });
+
+    const json_str = try trace_mining.renderInsightsJson(allocator, report);
+    defer allocator.free(json_str);
+    const json_name = try std.fmt.allocPrint(allocator, "{s}.json", .{week_label});
+    defer allocator.free(json_name);
+    try dir.writeFile(.{ .sub_path = json_name, .data = json_str });
+}
+
+fn fixtureReportForFiles(allocator: std.mem.Allocator) !trace_mining.MiningReport {
+    var fp_evidence = try allocator.alloc([]const u8, 1);
+    fp_evidence[0] = try allocator.dupe(u8, "r-1-1");
+    var failure_patterns = try allocator.alloc(trace_mining.FailurePattern, 1);
+    failure_patterns[0] = .{
+        .tool = try allocator.dupe(u8, "web_search"),
+        .label = try allocator.dupe(u8, "timeout"),
+        .count = 3,
+        .evidence_run_ids = fp_evidence,
+    };
+    return .{
+        .failure_patterns = failure_patterns,
+        .recurrences = try allocator.alloc(trace_mining.RecurrenceCluster, 0),
+        .tool_stats = try allocator.alloc(trace_mining.ToolStat, 0),
+    };
+}
+
+test "writeInsightFiles: writes both .md and .json into the insights directory" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const allocator = std.testing.allocator;
+    const ws_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(ws_path);
+    const insights_dir = try std.fs.path.join(allocator, &.{ ws_path, "insights" });
+    defer allocator.free(insights_dir);
+
+    var report = try fixtureReportForFiles(allocator);
+    defer report.deinit(allocator);
+
+    try writeInsightFiles(allocator, insights_dir, "2026-W28", report);
+
+    const md_content = try tmp_dir.dir.readFileAlloc(allocator, "insights/2026-W28.md", 1 << 20);
+    defer allocator.free(md_content);
+    try std.testing.expect(std.mem.indexOf(u8, md_content, "web_search") != null);
+
+    const json_content = try tmp_dir.dir.readFileAlloc(allocator, "insights/2026-W28.json", 1 << 20);
+    defer allocator.free(json_content);
+    try std.testing.expect(std.mem.indexOf(u8, json_content, "web_search") != null);
+}
+
+test "writeInsightFiles: re-running for the same window overwrites idempotently (byte-identical, inv. 4)" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const allocator = std.testing.allocator;
+    const ws_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(ws_path);
+    const insights_dir = try std.fs.path.join(allocator, &.{ ws_path, "insights" });
+    defer allocator.free(insights_dir);
+
+    var report_1 = try fixtureReportForFiles(allocator);
+    defer report_1.deinit(allocator);
+    try writeInsightFiles(allocator, insights_dir, "2026-W28", report_1);
+
+    const md_1 = try tmp_dir.dir.readFileAlloc(allocator, "insights/2026-W28.md", 1 << 20);
+    defer allocator.free(md_1);
+    const json_1 = try tmp_dir.dir.readFileAlloc(allocator, "insights/2026-W28.json", 1 << 20);
+    defer allocator.free(json_1);
+
+    // Second mining run over an equivalent report (same content, freshly
+    // built) — the re-derived files must be byte-identical (rebuildability).
+    var report_2 = try fixtureReportForFiles(allocator);
+    defer report_2.deinit(allocator);
+    try writeInsightFiles(allocator, insights_dir, "2026-W28", report_2);
+
+    const md_2 = try tmp_dir.dir.readFileAlloc(allocator, "insights/2026-W28.md", 1 << 20);
+    defer allocator.free(md_2);
+    const json_2 = try tmp_dir.dir.readFileAlloc(allocator, "insights/2026-W28.json", 1 << 20);
+    defer allocator.free(json_2);
+
+    try std.testing.expectEqualStrings(md_1, md_2);
+    try std.testing.expectEqualStrings(json_1, json_2);
+}
+
+test "writeInsightFiles: creates the insights directory if it does not exist" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const allocator = std.testing.allocator;
+    const ws_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(ws_path);
+    const insights_dir = try std.fs.path.join(allocator, &.{ ws_path, "insights" });
+    defer allocator.free(insights_dir);
+
+    // Directory does not exist yet — writeInsightFiles must create it.
+    var report = try fixtureReportForFiles(allocator);
+    defer report.deinit(allocator);
+    try writeInsightFiles(allocator, insights_dir, "2026-W28", report);
+
+    var dir = try tmp_dir.dir.openDir("insights", .{});
+    dir.close();
+}
+
+// ── draftShadowFactsForFailures: shadow drafts from FailurePatterns ──
+//
+// Learning contract inv. 1 (no self-promotion): every drafted fact is
+// origin=mined_aggregate, which birthState() (learning.zig) always
+// starts at state=shadow — never active without an external
+// /learn adopt. This function only DRAFTS; it never promotes.
+
+/// Summary of one draftShadowFactsForFailures call, for the tool's
+/// JSON result / next_consideration text.
+const DraftSummary = struct {
+    drafted: usize = 0,
+    skipped_duplicate: usize = 0,
+    dropped_invalid_run_ids: usize = 0,
+};
+
+/// For each FailurePattern in `report`, drafts a one-line shadow
+/// behavior fact ("When using <tool>, avoid <label> — failed <n>x
+/// recently") via learning.storeLearnedFact(origin=.mined_aggregate,
+/// ...). BINDING (review-mandated): evidence_run_ids are
+/// format-validated via trace_mining.isValidRunId BEFORE they reach
+/// storeLearnedFact or any renderer — anything not shaped like
+/// `r-<digits>-<digits>` (including a run_id carrying a newline or
+/// comma, closing T2's flagged content-header injection residual) is
+/// dropped with a log.warn and excluded from the evidence passed to
+/// storeLearnedFact. Dedup: if factKey(content) already exists in
+/// memory (ANY state — shadow OR active), the draft is skipped
+/// entirely (no duplicate write, no re-drafting an already-adopted or
+/// already-shadow fact).
+fn draftShadowFactsForFailures(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    report: trace_mining.MiningReport,
+    session_id: ?[]const u8,
+) !DraftSummary {
+    var summary = DraftSummary{};
+
+    for (report.failure_patterns) |p| {
+        if (p.count < trace_mining.MIN_PATTERN_COUNT) continue; // defensive; analyze() already gates this
+
+        var valid_evidence: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer valid_evidence.deinit(allocator);
+        for (p.evidence_run_ids) |rid| {
+            if (trace_mining.isValidRunId(rid)) {
+                try valid_evidence.append(allocator, rid);
+            } else {
+                summary.dropped_invalid_run_ids += 1;
+                log.warn("mine_traces.invalid_run_id dropped tool={s} run_id_len={d}", .{ p.tool, rid.len });
+            }
+        }
+
+        const content = if (p.label.len == 0)
+            try std.fmt.allocPrint(allocator, "When using {s}, avoid recent failures — failed {d}x recently", .{ p.tool, p.count })
+        else
+            try std.fmt.allocPrint(allocator, "When using {s}, avoid {s} — failed {d}x recently", .{ p.tool, p.label, p.count });
+        defer allocator.free(content);
+
+        const key = try learning.factKey(allocator, content);
+        defer allocator.free(key);
+        if (try mem.get(allocator, key)) |existing| {
+            var e = existing;
+            e.deinit(allocator);
+            summary.skipped_duplicate += 1;
+            continue;
+        }
+
+        const result = try learning.storeLearnedFact(
+            allocator,
+            mem,
+            content,
+            .mined_aggregate,
+            valid_evidence.items,
+            session_id,
+        );
+        defer result.deinit(allocator);
+        if (result.stored) summary.drafted += 1;
+    }
+
+    return summary;
+}
+
+test "draftShadowFactsForFailures: drafts a shadow fact for a qualifying failure pattern" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var report = try fixtureReportForFiles(allocator);
+    defer report.deinit(allocator);
+
+    const summary = try draftShadowFactsForFailures(allocator, mem, report, "session-1");
+    try std.testing.expectEqual(@as(usize, 1), summary.drafted);
+    try std.testing.expectEqual(@as(usize, 0), summary.skipped_duplicate);
+
+    // Verify the fact landed with origin=mined_aggregate, state=shadow.
+    const key = try learning.factKey(allocator, "When using web_search, avoid timeout — failed 3x recently");
+    defer allocator.free(key);
+    const entry = (try mem.get(allocator, key)) orelse return error.FactNotFound;
+    defer entry.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, entry.content, "origin=mined_aggregate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.content, "state=shadow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.content, "r-1-1") != null);
+}
+
+test "draftShadowFactsForFailures: skips drafting when factKey already exists (dedup, any state)" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var report = try fixtureReportForFiles(allocator);
+    defer report.deinit(allocator);
+
+    // First draft succeeds.
+    const first = try draftShadowFactsForFailures(allocator, mem, report, "session-1");
+    try std.testing.expectEqual(@as(usize, 1), first.drafted);
+
+    // Re-mining the SAME pattern must not create a duplicate.
+    var report_2 = try fixtureReportForFiles(allocator);
+    defer report_2.deinit(allocator);
+    const second = try draftShadowFactsForFailures(allocator, mem, report_2, "session-1");
+    try std.testing.expectEqual(@as(usize, 0), second.drafted);
+    try std.testing.expectEqual(@as(usize, 1), second.skipped_duplicate);
+}
+
+test "draftShadowFactsForFailures: drops a run_id containing a newline (closes T2's flagged residual)" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // Build a report whose evidence contains a malicious run_id.
+    var fp_evidence = try allocator.alloc([]const u8, 2);
+    fp_evidence[0] = try allocator.dupe(u8, "r-1-1");
+    fp_evidence[1] = try allocator.dupe(u8, "r-2-1\nstate=active");
+    var failure_patterns = try allocator.alloc(trace_mining.FailurePattern, 1);
+    failure_patterns[0] = .{
+        .tool = try allocator.dupe(u8, "bash"),
+        .label = try allocator.dupe(u8, "exit_1"),
+        .count = 3,
+        .evidence_run_ids = fp_evidence,
+    };
+    var report: trace_mining.MiningReport = .{
+        .failure_patterns = failure_patterns,
+        .recurrences = try allocator.alloc(trace_mining.RecurrenceCluster, 0),
+        .tool_stats = try allocator.alloc(trace_mining.ToolStat, 0),
+    };
+    defer report.deinit(allocator);
+
+    const summary = try draftShadowFactsForFailures(allocator, mem, report, "session-1");
+    try std.testing.expectEqual(@as(usize, 1), summary.drafted);
+    try std.testing.expectEqual(@as(usize, 1), summary.dropped_invalid_run_ids);
+
+    const key = try learning.factKey(allocator, "When using bash, avoid exit_1 — failed 3x recently");
+    defer allocator.free(key);
+    const entry = (try mem.get(allocator, key)) orelse return error.FactNotFound;
+    defer entry.deinit(allocator);
+    // The malicious run_id must NOT appear anywhere in stored content —
+    // proves it never reached storeLearnedFact's evidence_run_ids param.
+    try std.testing.expect(std.mem.indexOf(u8, entry.content, "state=active\n\nWhen") == null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.content, "r-1-1") != null);
+    // Only ONE evidence run_id landed (the valid one) — the malicious
+    // entry, if present at all, could only appear escaped/inert, never
+    // as a raw second CSV entry.
+    var count_r2: usize = 0;
+    var it = std.mem.splitScalar(u8, entry.content, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "evidence_run_ids=")) {
+            if (std.mem.indexOf(u8, line, "r-2-1") != null) count_r2 += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), count_r2);
+}
+
+// ── executeMineTraces / executeMineTracesWithRows: the action ────────
+//
+// executeMineTracesWithRows is the injectable-rows core: pure of the
+// Manager/Postgres dependency, takes rows directly, so analysis + file
+// writing + fact drafting are unit-testable without a live tenant. The
+// real dispatch path (executeMineTraces) does ONE thin Manager read
+// then delegates here — this is the "PG read is thin" structure the
+// brief calls for.
+//
+// Default DAYS_DEFAULT=7 matches the brief's "since_days default 7".
+
+const MINE_TRACES_DEFAULT_SINCE_DAYS: u32 = 7;
+
+/// The injectable-rows core of `mine_traces`. Caller (executeMineTraces)
+/// has already read the rows from Postgres (or, for fleet scope, from
+/// ALL users); this function owns everything else: the flag check,
+/// analysis, file writing (user scope only), and fact drafting (user
+/// scope only — fleet is an operator surface with no per-tenant
+/// behavior to influence, see the fleet branch below).
+///
+/// `rows` ownership: caller-owned; this function does NOT free them
+/// (mirrors the analyze() borrowing contract — rows must outlive this
+/// call, but this function never takes ownership).
+fn executeMineTracesWithRows(
+    allocator: std.mem.Allocator,
+    self: *MemoryMaintainTool,
+    rows: []const trace_mining.ToolTraceDigestRow,
+    args: JsonObjectMap,
+) !ToolResult {
+    if (!self.trace_mining_enabled) {
+        // Heap-allocated (not ToolResult.ok(literal)) — every other
+        // branch of this action returns heap-allocated output, and
+        // callers uniformly free result.output. Keeping this branch's
+        // output on the same footing avoids a special-cased "this one
+        // literal must not be freed" contract for callers to remember.
+        const output = try allocator.dupe(u8, "{\"action\":\"mine_traces\",\"disabled\":true,\"message\":\"trace mining disabled via trace_mining_enabled=false\"}");
+        return ToolResult{ .success = true, .output = output };
+    }
+
+    const scope = root.getString(args, "scope") orelse "user";
+    const is_fleet = std.mem.eql(u8, scope, "fleet");
+
+    var report = try trace_mining.analyze(allocator, rows);
+    defer report.deinit(allocator);
+
+    const week_label = trace_mining.isoWeekLabel(std.time.timestamp());
+
+    if (is_fleet) {
+        // Fleet scope (learning contract inv. 5 — operator surface):
+        // NO file write (workspace/insights/ belongs to the invoking
+        // user's own tenant; a fleet aggregate written there would be
+        // an operator artifact leaking into a tenant's workspace — the
+        // brief's own binding call: "fleet mode returns the JSON in the
+        // ToolResult output ONLY"). NO fact drafting either — shadow
+        // behavior facts are per-tenant learning, meaningless at fleet
+        // aggregate scope. Labels are STRIPPED (fleet FailurePatterns
+        // carry tool+count only — see stripLabelsForFleet below).
+        const fleet_json = try renderFleetJson(allocator, report);
+        defer allocator.free(fleet_json);
+        const output = try allocator.dupe(u8, fleet_json);
+        return ToolResult{ .success = true, .output = output };
+    }
+
+    // User scope: write insight files + draft shadow facts.
+    if (self.workspace_dir.len == 0) {
+        return ToolResult.fail("mine_traces requires workspace_dir (tool not fully constructed).");
+    }
+    const insights_dir = try std.fs.path.join(allocator, &.{ self.workspace_dir, "insights" });
+    defer allocator.free(insights_dir);
+    try writeInsightFiles(allocator, insights_dir, &week_label, report);
+
+    var draft_summary = DraftSummary{};
+    if (self.memory) |mem| {
+        const session_id = root.getString(args, "session_id");
+        draft_summary = try draftShadowFactsForFailures(allocator, mem, report, session_id);
+    }
+
+    const output = try std.fmt.allocPrint(
+        allocator,
+        "{{\"action\":\"mine_traces\",\"scope\":\"user\",\"week\":\"{s}\",\"failure_patterns\":{d},\"recurrences\":{d}," ++
+            "\"tool_stats\":{d},\"facts_drafted\":{d},\"facts_skipped_duplicate\":{d},\"run_ids_dropped_invalid\":{d}}}",
+        .{
+            &week_label,
+            report.failure_patterns.len,
+            report.recurrences.len,
+            report.tool_stats.len,
+            draft_summary.drafted,
+            draft_summary.skipped_duplicate,
+            draft_summary.dropped_invalid_run_ids,
+        },
+    );
+    return ToolResult{ .success = true, .output = output };
+}
+
+/// Fleet-scope JSON: tool_stats carry the full shape (tool, uses,
+/// success_rate, p50_duration_ms — no user content), failure_patterns
+/// carry tool+count ONLY (label is DROPPED — labels can carry tenant
+/// content, e.g. an error message embedding a fragment of the failing
+/// argument; see the privacy sentinel test below), and evidence_run_ids
+/// / recurrences (which cite run_ids) are OMITTED ENTIRELY — no run_id,
+/// user_id, argument, or content string ever appears in fleet output
+/// (learning contract inv. 5).
+fn renderFleetJson(allocator: std.mem.Allocator, report: trace_mining.MiningReport) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\"scope\":\"fleet\",\"failure_patterns\":[");
+    for (report.failure_patterns, 0..) |p, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"tool\":\"");
+        try appendJsonEscapedFleet(allocator, &buf, p.tool);
+        try buf.writer(allocator).print("\",\"count\":{d}}}", .{p.count});
+    }
+    try buf.appendSlice(allocator, "],\"tool_stats\":[");
+    for (report.tool_stats, 0..) |t, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"tool\":\"");
+        try appendJsonEscapedFleet(allocator, &buf, t.tool);
+        try buf.writer(allocator).print(
+            "\",\"uses\":{d},\"success_rate\":{d:.4},\"p50_duration_ms\":{d}}}",
+            .{ t.uses, t.success_rate, t.p50_duration_ms },
+        );
+    }
+    try buf.appendSlice(allocator, "]}");
+
+    return buf.toOwnedSlice(allocator);
+}
+
+fn appendJsonEscapedFleet(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            else => {
+                if (c < 0x20) {
+                    try buf.writer(allocator).print("\\u{x:0>4}", .{c});
+                } else {
+                    try buf.append(allocator, c);
+                }
+            },
+        }
+    }
+}
+
+/// Real dispatch path: reads recent tool_traces rows from the tenant's
+/// Manager (user scope) or across all users (fleet scope), then
+/// delegates to executeMineTracesWithRows. "PG read is thin" — no
+/// analysis logic lives here.
+fn executeMineTraces(
+    allocator: std.mem.Allocator,
+    self: *MemoryMaintainTool,
+    args: JsonObjectMap,
+) !ToolResult {
+    if (!self.trace_mining_enabled) {
+        return executeMineTracesWithRows(allocator, self, &.{}, args);
+    }
+
+    const smgr = self.state_mgr orelse
+        return ToolResult.fail("mine_traces requires postgres state manager (tenant context not wired).");
+
+    const since_days_raw = root.getInt(args, "since_days") orelse @as(i64, MINE_TRACES_DEFAULT_SINCE_DAYS);
+    const since_days: u32 = if (since_days_raw <= 0) MINE_TRACES_DEFAULT_SINCE_DAYS else @intCast(since_days_raw);
+
+    const scope = root.getString(args, "scope") orelse "user";
+    const is_fleet = std.mem.eql(u8, scope, "fleet");
+
+    const rows = if (is_fleet)
+        smgr.listRecentToolTracesAllUsers(allocator, since_days) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "mine_traces fleet read failed: {s}", .{@errorName(err)});
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
+        }
+    else blk: {
+        const uid = self.user_id orelse
+            return ToolResult.fail("mine_traces requires user_id (tenant context not wired).");
+        break :blk smgr.listRecentToolTraces(allocator, uid, since_days) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "mine_traces read failed: {s}", .{@errorName(err)});
+            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
+        };
+    };
+    defer {
+        for (rows) |r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+
+    return executeMineTracesWithRows(allocator, self, rows, args);
+}
+
+test "mine_traces: flag off returns a disabled result and performs NO writes" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const allocator = std.testing.allocator;
+    const ws_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(ws_path);
+
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var tool = MemoryMaintainTool{
+        .workspace_dir = ws_path,
+        .trace_mining_enabled = false,
+        .memory = sqlite_mem.memory(),
+    };
+
+    const rows = try allocator.alloc(trace_mining.ToolTraceDigestRow, 0);
+    const parsed_args = try root.parseTestArgs("{}");
+    defer parsed_args.deinit();
+    const result = try executeMineTracesWithRows(allocator, &tool, rows, parsed_args.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+    // NOTE: error_msg is intentionally NOT freed here — every failure
+    // branch in executeMineTracesWithRows returns ToolResult.fail(literal)
+    // (see the "requires workspace_dir"/"requires postgres"/"requires
+    // user_id" guards), matching this codebase's established convention
+    // (see file_write.zig's tests) that literal error results must not be
+    // freed. These tests all assert result.success, so error_msg is null
+    // in the intended path regardless.
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "disabled") != null);
+
+    // No insights directory was created.
+    var dir_check = tmp_dir.dir.openDir("insights", .{});
+    try std.testing.expectError(error.FileNotFound, dir_check);
+    if (dir_check) |*d| d.close() else |_| {}
+}
+
+/// Builds a ToolTraceDigestRow whose events contain one failed
+/// tool_call for `tool`/`label`. Used to construct multi-row fixtures
+/// exercising the full mine_traces pipeline (read-rows -> analyze ->
+/// write -> draft).
+fn digestRow(allocator: std.mem.Allocator, run_id: []const u8, tool: []const u8, label: []const u8) !trace_mining.ToolTraceDigestRow {
+    const events_json = try std.fmt.allocPrint(
+        allocator,
+        "[{{\"kind\":\"tool_call\",\"tool\":\"{s}\",\"label\":\"{s}\",\"success\":false,\"duration_ms\":10}}]",
+        .{ tool, label },
+    );
+    return .{
+        .run_id = try allocator.dupe(u8, run_id),
+        .events_json = events_json,
+        .created_at_unix = 0,
+    };
+}
+
+test "mine_traces: user scope end-to-end — writes insight files AND drafts a shadow fact" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const allocator = std.testing.allocator;
+    const ws_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(ws_path);
+
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var tool = MemoryMaintainTool{
+        .workspace_dir = ws_path,
+        .trace_mining_enabled = true,
+        .memory = sqlite_mem.memory(),
+    };
+
+    var rows = [_]trace_mining.ToolTraceDigestRow{
+        try digestRow(allocator, "r-1-1", "web_search", "timeout"),
+        try digestRow(allocator, "r-2-1", "web_search", "timeout"),
+        try digestRow(allocator, "r-3-1", "web_search", "timeout"),
+    };
+    defer for (rows) |r| r.deinit(allocator);
+
+    const parsed_args = try root.parseTestArgs("{}");
+    defer parsed_args.deinit();
+    const result = try executeMineTracesWithRows(allocator, &tool, &rows, parsed_args.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+    // NOTE: error_msg is intentionally NOT freed here — every failure
+    // branch in executeMineTracesWithRows returns ToolResult.fail(literal)
+    // (see the "requires workspace_dir"/"requires postgres"/"requires
+    // user_id" guards), matching this codebase's established convention
+    // (see file_write.zig's tests) that literal error results must not be
+    // freed. These tests all assert result.success, so error_msg is null
+    // in the intended path regardless.
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"failure_patterns\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"facts_drafted\":1") != null);
+
+    // Insight files landed on disk with the current ISO week's name.
+    const week_label = trace_mining.isoWeekLabel(std.time.timestamp());
+    const md_path = try std.fmt.allocPrint(allocator, "insights/{s}.md", .{week_label});
+    defer allocator.free(md_path);
+    const md_content = try tmp_dir.dir.readFileAlloc(allocator, md_path, 1 << 20);
+    defer allocator.free(md_content);
+    try std.testing.expect(std.mem.indexOf(u8, md_content, "web_search") != null);
+
+    // The shadow fact landed with origin=mined_aggregate, state=shadow.
+    const mem = sqlite_mem.memory();
+    const key = try learning.factKey(allocator, "When using web_search, avoid timeout — failed 3x recently");
+    defer allocator.free(key);
+    const entry = (try mem.get(allocator, key)) orelse return error.FactNotFound;
+    defer entry.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, entry.content, "origin=mined_aggregate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.content, "state=shadow") != null);
+}
+
+test "mine_traces: fleet scope — privacy sentinel: a secret string in a label field never reaches fleet output" {
+    const allocator = std.testing.allocator;
+    var tool = MemoryMaintainTool{ .trace_mining_enabled = true };
+
+    const SENTINEL = "SUPER_SECRET_TENANT_ARGUMENT_XYZZY_42";
+    var rows = [_]trace_mining.ToolTraceDigestRow{
+        try digestRow(allocator, "r-1-1", "web_search", SENTINEL),
+        try digestRow(allocator, "r-2-1", "web_search", SENTINEL),
+        try digestRow(allocator, "r-3-1", "web_search", SENTINEL),
+    };
+    defer for (rows) |r| r.deinit(allocator);
+
+    const parsed_args = try root.parseTestArgs("{\"scope\":\"fleet\"}");
+    defer parsed_args.deinit();
+    const result = try executeMineTracesWithRows(allocator, &tool, &rows, parsed_args.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+    // NOTE: error_msg is intentionally NOT freed here — every failure
+    // branch in executeMineTracesWithRows returns ToolResult.fail(literal)
+    // (see the "requires workspace_dir"/"requires postgres"/"requires
+    // user_id" guards), matching this codebase's established convention
+    // (see file_write.zig's tests) that literal error results must not be
+    // freed. These tests all assert result.success, so error_msg is null
+    // in the intended path regardless.
+
+    try std.testing.expect(result.success);
+    // The sentinel (which only ever appears in the LABEL field) must
+    // NEVER appear in fleet output — labels are dropped entirely at
+    // fleet scope (learning contract inv. 5).
+    try std.testing.expect(std.mem.indexOf(u8, result.output, SENTINEL) == null);
+    // The tool NAME (a shape, not content) IS allowed to appear.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "web_search") != null);
+    // Run_ids must NEVER appear at fleet scope either.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "r-1-1") == null);
+}
+
+test "mine_traces: fleet scope writes NO files (returns JSON in ToolResult output only)" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const allocator = std.testing.allocator;
+    const ws_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(ws_path);
+
+    var tool = MemoryMaintainTool{ .workspace_dir = ws_path, .trace_mining_enabled = true };
+
+    var rows = [_]trace_mining.ToolTraceDigestRow{
+        try digestRow(allocator, "r-1-1", "bash", "exit_1"),
+        try digestRow(allocator, "r-2-1", "bash", "exit_1"),
+        try digestRow(allocator, "r-3-1", "bash", "exit_1"),
+    };
+    defer for (rows) |r| r.deinit(allocator);
+
+    const parsed_args = try root.parseTestArgs("{\"scope\":\"fleet\"}");
+    defer parsed_args.deinit();
+    const result = try executeMineTracesWithRows(allocator, &tool, &rows, parsed_args.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+    // NOTE: error_msg is intentionally NOT freed here — every failure
+    // branch in executeMineTracesWithRows returns ToolResult.fail(literal)
+    // (see the "requires workspace_dir"/"requires postgres"/"requires
+    // user_id" guards), matching this codebase's established convention
+    // (see file_write.zig's tests) that literal error results must not be
+    // freed. These tests all assert result.success, so error_msg is null
+    // in the intended path regardless.
+
+    try std.testing.expect(result.success);
+    var dir_check = tmp_dir.dir.openDir("insights", .{});
+    try std.testing.expectError(error.FileNotFound, dir_check);
+    if (dir_check) |*d| d.close() else |_| {}
+}
+
+test "mine_traces: dispatched correctly through the public Tool.execute() entry point (flag off, no tenant context needed)" {
+    // Closes the loop on the execute()-level routing: mine_traces must
+    // be reachable via the SAME dispatch path an agent actually calls
+    // (tool.execute(args)), not just the injectable-rows test seam
+    // above. Uses flag-off specifically because it needs NO state_mgr/
+    // user_id — proving mine_traces's dispatch doesn't fall through the
+    // top-level "requires postgres state manager" guard that gates
+    // every OTHER action (cascade_update, invalidate_when, ...).
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const allocator = std.testing.allocator;
+    const ws_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(ws_path);
+
+    var tool = MemoryMaintainTool{
+        .workspace_dir = ws_path,
+        .trace_mining_enabled = false,
+        // Deliberately state_mgr=null, user_id=null — proves mine_traces
+        // does not require tenant context when the flag is off.
+    };
+    const t = tool.tool();
+
+    const parsed_args = try root.parseTestArgs("{\"action\":\"mine_traces\"}");
+    defer parsed_args.deinit();
+    const result = try t.execute(allocator, parsed_args.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "disabled") != null);
+}
+
+test "mine_traces: missing 'action' error message lists mine_traces as a valid action" {
+    // Exercises the VERY FIRST guard in execute() (missing 'action'
+    // entirely), which fires before both the mine_traces early-dispatch
+    // and the shared state_mgr/user_id guard — so this reaches the
+    // literal error message unconditionally, without needing a
+    // constructed tenant context. error_msg here is a static literal
+    // (ToolResult.fail(...)) — matches this file's other tests'
+    // "do not free a literal error result" convention.
+    const allocator = std.testing.allocator;
+    var tool = MemoryMaintainTool{};
+    const t = tool.tool();
+
+    const parsed_args = try root.parseTestArgs("{}");
+    defer parsed_args.deinit();
+    const result = try t.execute(allocator, parsed_args.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "mine_traces") != null);
 }

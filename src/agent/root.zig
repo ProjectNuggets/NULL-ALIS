@@ -68,6 +68,7 @@ pub const prompt = @import("prompt.zig");
 pub const narration = @import("narration.zig");
 pub const task_planner = @import("task_planner.zig");
 pub const learning = @import("learning.zig");
+pub const trace_mining = @import("trace_mining.zig");
 pub const run_event_types = @import("run_event_types.zig");
 const usage_runtime_mod = @import("../usage_runtime.zig");
 // W1.2: memory_loader is now an internal stage of context_engine.

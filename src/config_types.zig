@@ -575,6 +575,25 @@ pub const AgentConfig = struct {
     /// agent, same plumbing pattern as `typed_views_enabled` /
     /// `cost_vital_in_prompt`.
     dream_log_warmstart_enabled: bool = true,
+    /// Package 2a Task 3 (the miner) — trace-mining gate.
+    ///
+    /// When TRUE (default), `memory_maintain action=mine_traces` reads
+    /// recent `tool_traces` rows (migration 0008), mines them for
+    /// failure patterns / recurring tool-sequences / tool-fluency stats
+    /// (src/agent/trace_mining.zig — deterministic, no LLM), writes
+    /// `workspace/insights/{ISO-week}.md` + `.json`, and drafts shadow
+    /// behavior facts (learning contract inv. 1: `origin=mined_aggregate`,
+    /// birthed `state=shadow` — never active without an external
+    /// `/learn adopt`) for failure patterns at or above
+    /// trace_mining.MIN_PATTERN_COUNT occurrences.
+    ///
+    /// When FALSE, the action returns a clean "trace mining disabled"
+    /// result and performs NO reads, NO file writes, and drafts NO
+    /// facts — a full no-op, matching the house pattern
+    /// (`trace_persistence_enabled` / `cost_vital_in_prompt` /
+    /// `dream_log_warmstart_enabled`) of flag-gated features degrading
+    /// to their exact pre-feature behavior when off.
+    trace_mining_enabled: bool = true,
     // V1.14.12 (Path A) — extraction_legacy_direct_writes FIELD REMOVED.
     // M5 sprint flag-gated two redundant direct write paths during a
     // soak window. Path A closes the M5 sprint by:
