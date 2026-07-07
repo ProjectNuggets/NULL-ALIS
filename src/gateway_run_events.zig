@@ -549,6 +549,55 @@ test "RunEventObserver forwards events to inner observer" {
     obs.recordEvent(&evt); // Should not panic
 }
 
+test "RunEventObserver lastRunId captures run ids and ignores events without one" {
+    var noop = observability.NoopObserver{};
+    const allocator = std.testing.allocator;
+    var test_sink = TestFrameSink.init(allocator);
+    defer test_sink.deinit();
+    var reo = RunEventObserver{ .inner = noop.observer(), .sink = test_sink.sink(), .allocator = allocator };
+    const obs = reo.observer();
+
+    try std.testing.expect(reo.lastRunId() == null);
+
+    const first = ObserverEvent{ .tool_call_start = .{ .tool = "shell", .run_id = "run-first" } };
+    obs.recordEvent(&first);
+    try std.testing.expectEqualStrings("run-first", reo.lastRunId().?);
+    try std.testing.expectEqualStrings("run-first", runIdOf(&first).?);
+
+    const complete = ObserverEvent{ .turn_complete = {} };
+    obs.recordEvent(&complete);
+    try std.testing.expect(runIdOf(&complete) == null);
+    try std.testing.expectEqualStrings("run-first", reo.lastRunId().?);
+
+    const later = ObserverEvent{ .tool_call = .{ .tool = "file_read", .success = true, .duration_ms = 7, .run_id = "run-second" } };
+    obs.recordEvent(&later);
+    try std.testing.expectEqualStrings("run-second", reo.lastRunId().?);
+    try std.testing.expectEqualStrings("run-second", runIdOf(&later).?);
+}
+
+test "RunEventObserver captureRunId preserves the 40 byte buffer boundary" {
+    var noop = observability.NoopObserver{};
+    const allocator = std.testing.allocator;
+    var test_sink = TestFrameSink.init(allocator);
+    defer test_sink.deinit();
+    var reo = RunEventObserver{ .inner = noop.observer(), .sink = test_sink.sink(), .allocator = allocator };
+
+    const exact_40 = "1234567890123456789012345678901234567890";
+    try std.testing.expectEqual(@as(usize, 40), exact_40.len);
+    reo.captureRunId(exact_40);
+    try std.testing.expectEqual(@as(usize, 40), reo.lastRunId().?.len);
+    try std.testing.expectEqualStrings(exact_40, reo.lastRunId().?);
+
+    const over_40 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO";
+    try std.testing.expect(over_40.len > 40);
+    reo.captureRunId(over_40);
+    try std.testing.expectEqual(@as(usize, 40), reo.lastRunId().?.len);
+    try std.testing.expectEqualStrings(over_40[0..40], reo.lastRunId().?);
+
+    reo.captureRunId(null);
+    try std.testing.expectEqualStrings(over_40[0..40], reo.lastRunId().?);
+}
+
 test "tool_call_start produces tool_start SSE frame" {
     var noop = observability.NoopObserver{};
     const allocator = std.testing.allocator;
