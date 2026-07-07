@@ -525,7 +525,7 @@ fn buildCostSection(w: anytype, usage_runtime: ?*usage_runtime_mod.UsageRuntime)
     if (usage_runtime) |urt| {
         const monthly = urt.monthlyTotalUsd(std.time.timestamp());
         const sess = urt.sessionTotals();
-        try std.fmt.format(w, "Cost: ${d:.2} this month | ${d:.2} this session. This is your own runtime spend — weigh it when choosing expensive tools; it is safe to mention to the user when relevant.\n\n", .{ monthly, sess.cost });
+        try std.fmt.format(w, "Cost: ${d:.2} this month | ${d:.2} this session. This is the OPERATOR'S runtime spend on you — weigh it when choosing expensive tools. Never volunteer these figures to end users; they are internal unit-cost data, not the user's bill.\n\n", .{ monthly, sess.cost });
     }
 }
 

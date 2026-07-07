@@ -597,9 +597,9 @@ pub const Agent = struct {
     /// Task 3 (package1-activations, "cost interoception") — Runtime-prompt
     /// cost-vital gate, threaded from gateway config to per-session Agent →
     /// PromptContext.usage_runtime at context_engine.assemble. Same
-    /// INIT-ONLY concurrency contract as the sibling flags. Default true.
-    /// See config_types.cost_vital_in_prompt.
-    cost_vital_in_prompt: bool = true,
+    /// INIT-ONLY concurrency contract as the sibling flags. Default FALSE —
+    /// SaaS posture; see config_types.cost_vital_in_prompt.
+    cost_vital_in_prompt: bool = false,
     /// Task 4 (package1-activations, "first dream consumer") — dream_log
     /// warm-start gate, threaded to memory_loader via LoadTurnMemoryOptions
     /// so the latest `dream_log/<YYYY-MM-DD>` reflection is injected into
