@@ -49,6 +49,7 @@ enforced in extraction-builder tests inside `src/agent/extraction/runner.zig`.)
 | `memory_type` in EVERGREEN set | knowledge (durable) | exempt from decay (in-memory + persistent SQL), resurrect-proof, promote-no-clobber |
 | `memory_type == open_loop` | knowledge (durable) | decays in ranking; still resurrect-proof/demotable-guard |
 | Working-memory slots | transient | ≤15 slots, reaper, cleared on reset |
+| `wish/*` keys | proposal (learning-contract bucket 5) | brain-VISIBLE (user may see the agent's wishes), NOT embedded (`isSemanticBookkeepingKey`), never injected as a directive, storable via `memory_store` (`inlineKeyGuard` allows) — a request to the roadmap, not behaviour |
 
 ## Enforcement map
 
