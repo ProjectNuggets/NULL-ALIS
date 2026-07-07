@@ -153,7 +153,7 @@ pub const MemoryMaintainTool = struct {
         "scope=fleet is an operator surface returning tool/count shapes ONLY (no run_ids, no content) with no file written. " ++
         "After each call, check `next_consideration` in the response for suggested follow-up actions.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["cascade_update","invalidate_when","resolve_contradiction","propagate_correction","temporal_decay","survey","prose_survey","phase05_backfill","mine_traces"],"description":"Which truth-maintenance operation to perform."},"old_name":{"type":"string","description":"For cascade_update: the entity name being renamed FROM."},"new_name":{"type":"string","description":"For cascade_update: the entity name being renamed TO."},"predicate":{"type":"string","description":"For invalidate_when: predicate to match (e.g. STATUS, PREFERS, WORKS_AT)."},"object_name":{"type":"string","description":"For invalidate_when: target entity name to match."},"subject_name":{"type":"string","description":"For invalidate_when: optional subject entity name to narrow further."},"loser_key":{"type":"string","description":"For resolve_contradiction: the memory key being closed."},"winner_key":{"type":"string","description":"For resolve_contradiction: the memory key that stays alive."},"correction_key":{"type":"string","description":"For propagate_correction: the memory key holding the correction."},"entity_pattern":{"type":"string","description":"For propagate_correction OR prose_survey: substring to match in target memory content (e.g. \"MNDA\", \"Mia\", \"Neptune\")."},"threshold_days":{"type":"integer","description":"For temporal_decay: only decay memories untouched for this many days. Default 30."},"half_life_days":{"type":"integer","description":"For temporal_decay: confidence half-life in days. Default 30."},"max_facts":{"type":"integer","description":"For prose_survey: cap on number of rows the LLM judge sees per call. Default 50, max 200. The result includes `more_available=true` if matching rows exceeded the cap so you can re-run with a tighter pattern."},"dry_run":{"type":"boolean","description":"For prose_survey: if true, returns judge verdicts without writing any metadata (preview mode). Default false."},"apply":{"type":"boolean","description":"For phase05_backfill ONLY: the one-time corpus repair is DRY-RUN by default (reports what WOULD change, writes nothing). Set apply=true to perform a LIVE run that modifies data. Idempotent + safe to re-run."},"all_users":{"type":"boolean","description":"For phase05_backfill ONLY: if true, repair EVERY user's corpus (the general fix). Default false = only the calling tenant's user_id."},"since_days":{"type":"integer","description":"For mine_traces: how many days of tool_traces to mine. Default 7."},"scope":{"type":"string","enum":["user","fleet"],"description":"For mine_traces: 'user' (default) mines your own traces and writes insight files + shadow fact drafts. 'fleet' is an operator surface: cross-user tool/count shapes only, returned in this call's output, no file written."},"session_id":{"type":"string","description":"For mine_traces (scope=user only): optional session lane to scope drafted shadow facts to. Omit for workspace-global scope."}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["cascade_update","invalidate_when","resolve_contradiction","propagate_correction","temporal_decay","survey","prose_survey","phase05_backfill","mine_traces"],"description":"Which truth-maintenance operation to perform."},"old_name":{"type":"string","description":"For cascade_update: the entity name being renamed FROM."},"new_name":{"type":"string","description":"For cascade_update: the entity name being renamed TO."},"predicate":{"type":"string","description":"For invalidate_when: predicate to match (e.g. STATUS, PREFERS, WORKS_AT)."},"object_name":{"type":"string","description":"For invalidate_when: target entity name to match."},"subject_name":{"type":"string","description":"For invalidate_when: optional subject entity name to narrow further."},"loser_key":{"type":"string","description":"For resolve_contradiction: the memory key being closed."},"winner_key":{"type":"string","description":"For resolve_contradiction: the memory key that stays alive."},"correction_key":{"type":"string","description":"For propagate_correction: the memory key holding the correction."},"entity_pattern":{"type":"string","description":"For propagate_correction OR prose_survey: substring to match in target memory content (e.g. \"MNDA\", \"Mia\", \"Neptune\")."},"threshold_days":{"type":"integer","description":"For temporal_decay: only decay memories untouched for this many days. Default 30."},"half_life_days":{"type":"integer","description":"For temporal_decay: confidence half-life in days. Default 30."},"max_facts":{"type":"integer","description":"For prose_survey: cap on number of rows the LLM judge sees per call. Default 50, max 200. The result includes `more_available=true` if matching rows exceeded the cap so you can re-run with a tighter pattern."},"dry_run":{"type":"boolean","description":"For prose_survey: if true, returns judge verdicts without writing any metadata (preview mode). Default false."},"apply":{"type":"boolean","description":"For phase05_backfill ONLY: the one-time corpus repair is DRY-RUN by default (reports what WOULD change, writes nothing). Set apply=true to perform a LIVE run that modifies data. Idempotent + safe to re-run."},"all_users":{"type":"boolean","description":"For phase05_backfill ONLY: if true, repair EVERY user's corpus (the general fix). Default false = only the calling tenant's user_id."},"since_days":{"type":"integer","description":"For mine_traces: how many days of tool_traces to mine. Default 7."},"scope":{"type":"string","enum":["user"],"description":"For mine_traces: 'user' (the only scope) mines your own traces and writes insight files + shadow fact drafts. Fleet-wide aggregation is an operator surface and is not available from this tool."},"session_id":{"type":"string","description":"For mine_traces (scope=user only): optional session lane to scope drafted shadow facts to. Omit for workspace-global scope."}},"required":["action"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -383,10 +383,11 @@ pub const MemoryMaintainTool = struct {
         uid: i64,
         args: JsonObjectMap,
     ) !ToolResult {
-        const threshold_days_raw = root.getInt(args, "threshold_days") orelse 30;
-        const half_life_days_raw = root.getInt(args, "half_life_days") orelse 30;
-        const threshold_days: u32 = if (threshold_days_raw <= 0) 30 else @intCast(threshold_days_raw);
-        const half_life_days: u32 = if (half_life_days_raw <= 0) 30 else @intCast(half_life_days_raw);
+        // Same P2 class as mine_traces since_days: the previous naked
+        // @intCast trapped on agent-supplied values > maxInt(u32).
+        // 3650 (10y) is an effectively-unbounded-but-safe ceiling.
+        const threshold_days = clampDays(root.getInt(args, "threshold_days"), 30, 3650);
+        const half_life_days = clampDays(root.getInt(args, "half_life_days"), 30, 3650);
 
         const result = smgr.temporalDecay(uid, threshold_days, half_life_days) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "temporal_decay failed: {s}", .{@errorName(err)});
@@ -1186,13 +1187,35 @@ test "draftShadowFactsForFailures: drops a run_id containing a newline (closes T
 // Default DAYS_DEFAULT=7 matches the brief's "since_days default 7".
 
 const MINE_TRACES_DEFAULT_SINCE_DAYS: u32 = 7;
+const MINE_TRACES_MAX_SINCE_DAYS: u32 = 365;
+const MINE_TRACES_FLEET_DENIED_MSG = "mine_traces scope=fleet is an operator surface and is not available from the agent tool (P1 fail-closed: no per-request operator identity exists at the tool layer). Use scope=user to mine your own traces.";
+
+/// Clamp an agent-supplied day-count argument into [1, max].
+/// Absent/zero/negative → `default`; oversized → `max`. The naked
+/// `@intCast(raw)` this replaces was a reachable panic: any agent-supplied
+/// value > maxInt(u32) trapped the whole tool call (P2 hardening).
+fn clampDays(raw: ?i64, default: u32, max: u32) u32 {
+    const v = raw orelse return default;
+    if (v <= 0) return default;
+    if (v > max) return max;
+    return @intCast(v);
+}
+
+test "clampDays: absent/zero/negative fall back to default; oversized clamps to max (P2)" {
+    try std.testing.expectEqual(@as(u32, 7), clampDays(null, 7, 365));
+    try std.testing.expectEqual(@as(u32, 7), clampDays(0, 7, 365));
+    try std.testing.expectEqual(@as(u32, 7), clampDays(-3, 7, 365));
+    try std.testing.expectEqual(@as(u32, 30), clampDays(30, 7, 365));
+    try std.testing.expectEqual(@as(u32, 365), clampDays(400, 7, 365));
+    // The exact P2 crash input: > maxInt(u32) used to trap in @intCast.
+    try std.testing.expectEqual(@as(u32, 365), clampDays(9_999_999_999, 7, 365));
+}
 
 /// The injectable-rows core of `mine_traces`. Caller (executeMineTraces)
-/// has already read the rows from Postgres (or, for fleet scope, from
-/// ALL users); this function owns everything else: the flag check,
-/// analysis, file writing (user scope only), and fact drafting (user
-/// scope only — fleet is an operator surface with no per-tenant
-/// behavior to influence, see the fleet branch below).
+/// has already read the rows from Postgres (user scope only — fleet is
+/// denied there before any read; see the P1 note below); this function
+/// owns everything else: the flag check, the fleet deny (defense in
+/// depth for direct callers), analysis, file writing, and fact drafting.
 ///
 /// `rows` ownership: caller-owned; this function does NOT free them
 /// (mirrors the analyze() borrowing contract — rows must outlive this
@@ -1213,29 +1236,27 @@ fn executeMineTracesWithRows(
         return ToolResult{ .success = true, .output = output };
     }
 
-    const scope = root.getString(args, "scope") orelse "user";
-    const is_fleet = std.mem.eql(u8, scope, "fleet");
+    // P1 (fail-closed): scope=fleet is DENIED from the agent tool,
+    // unconditionally. The only enforcement the tool layer has is
+    // `operator_only` — and that flag only denies under .supervised
+    // autonomy (approval_modes.zig), auto-approving under .full, so it
+    // cannot gate a single action's argument. There is no per-request
+    // operator identity inside tool execution, and any config/env
+    // marker would be pod-wide in staging (every tenant shares the
+    // binary) and agent-influenceable — an open gate pretending to be
+    // closed. Cross-tenant aggregation (learning contract inv. 5)
+    // therefore moves to a gateway internal-token operator endpoint
+    // (the PII/GDPR surface precedent); renderFleetJson +
+    // Manager.listRecentToolTracesAllUsers below are kept as its
+    // building blocks.
+    if (std.mem.eql(u8, root.getString(args, "scope") orelse "user", "fleet")) {
+        return ToolResult.fail(MINE_TRACES_FLEET_DENIED_MSG);
+    }
 
     var report = try trace_mining.analyze(allocator, rows);
     defer report.deinit(allocator);
 
     const week_label = trace_mining.isoWeekLabel(std.time.timestamp());
-
-    if (is_fleet) {
-        // Fleet scope (learning contract inv. 5 — operator surface):
-        // NO file write (workspace/insights/ belongs to the invoking
-        // user's own tenant; a fleet aggregate written there would be
-        // an operator artifact leaking into a tenant's workspace — the
-        // brief's own binding call: "fleet mode returns the JSON in the
-        // ToolResult output ONLY"). NO fact drafting either — shadow
-        // behavior facts are per-tenant learning, meaningless at fleet
-        // aggregate scope. Labels are STRIPPED (fleet FailurePatterns
-        // carry tool+count only — see stripLabelsForFleet below).
-        const fleet_json = try renderFleetJson(allocator, report);
-        defer allocator.free(fleet_json);
-        const output = try allocator.dupe(u8, fleet_json);
-        return ToolResult{ .success = true, .output = output };
-    }
 
     // User scope: write insight files + draft shadow facts.
     if (self.workspace_dir.len == 0) {
@@ -1334,21 +1355,25 @@ fn executeMineTraces(
         return executeMineTracesWithRows(allocator, self, &.{}, args);
     }
 
+    // P1 (fail-closed): fleet aggregation is an operator surface. The
+    // deny precedes EVERYTHING — the smgr requirement and above all the
+    // SQL read: the cross-tenant query itself is the leak, not just its
+    // rendering. See executeMineTracesWithRows for why no flag/config
+    // can substitute for this refusal.
+    if (std.mem.eql(u8, root.getString(args, "scope") orelse "user", "fleet")) {
+        return ToolResult.fail(MINE_TRACES_FLEET_DENIED_MSG);
+    }
+
     const smgr = self.state_mgr orelse
         return ToolResult.fail("mine_traces requires postgres state manager (tenant context not wired).");
 
-    const since_days_raw = root.getInt(args, "since_days") orelse @as(i64, MINE_TRACES_DEFAULT_SINCE_DAYS);
-    const since_days: u32 = if (since_days_raw <= 0) MINE_TRACES_DEFAULT_SINCE_DAYS else @intCast(since_days_raw);
+    const since_days = clampDays(
+        root.getInt(args, "since_days"),
+        MINE_TRACES_DEFAULT_SINCE_DAYS,
+        MINE_TRACES_MAX_SINCE_DAYS,
+    );
 
-    const scope = root.getString(args, "scope") orelse "user";
-    const is_fleet = std.mem.eql(u8, scope, "fleet");
-
-    const rows = if (is_fleet)
-        smgr.listRecentToolTracesAllUsers(allocator, since_days) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "mine_traces fleet read failed: {s}", .{@errorName(err)});
-            return ToolResult{ .success = false, .error_msg = msg, .output = "" };
-        }
-    else blk: {
+    const rows = blk: {
         const uid = self.user_id orelse
             return ToolResult.fail("mine_traces requires user_id (tenant context not wired).");
         break :blk smgr.listRecentToolTraces(allocator, uid, since_days) catch |err| {
@@ -1476,9 +1501,13 @@ test "mine_traces: user scope end-to-end — writes insight files AND drafts a s
     try std.testing.expect(std.mem.indexOf(u8, entry.content, "state=shadow") != null);
 }
 
-test "mine_traces: fleet scope — privacy sentinel: a secret string in a label field never reaches fleet output" {
+test "renderFleetJson — privacy sentinel: a secret string in a label field never reaches fleet output (inv. 5)" {
+    // renderFleetJson is no longer reachable from the agent tool (P1 —
+    // scope=fleet is denied fail-closed), but it is KEPT as the building
+    // block for the future gateway operator endpoint. This test pins its
+    // inv. 5 guarantee at the pure-function level so the endpoint
+    // inherits it already-verified.
     const allocator = std.testing.allocator;
-    var tool = MemoryMaintainTool{ .trace_mining_enabled = true };
 
     const SENTINEL = "SUPER_SECRET_TENANT_ARGUMENT_XYZZY_42";
     var rows = [_]trace_mining.ToolTraceDigestRow{
@@ -1488,30 +1517,22 @@ test "mine_traces: fleet scope — privacy sentinel: a secret string in a label 
     };
     defer for (rows) |r| r.deinit(allocator);
 
-    const parsed_args = try root.parseTestArgs("{\"scope\":\"fleet\"}");
-    defer parsed_args.deinit();
-    const result = try executeMineTracesWithRows(allocator, &tool, &rows, parsed_args.value.object);
-    defer if (result.output.len > 0) allocator.free(result.output);
-    // NOTE: error_msg is intentionally NOT freed here — every failure
-    // branch in executeMineTracesWithRows returns ToolResult.fail(literal)
-    // (see the "requires workspace_dir"/"requires postgres"/"requires
-    // user_id" guards), matching this codebase's established convention
-    // (see file_write.zig's tests) that literal error results must not be
-    // freed. These tests all assert result.success, so error_msg is null
-    // in the intended path regardless.
+    var report = try trace_mining.analyze(allocator, &rows);
+    defer report.deinit(allocator);
+    const fleet_json = try renderFleetJson(allocator, report);
+    defer allocator.free(fleet_json);
 
-    try std.testing.expect(result.success);
     // The sentinel (which only ever appears in the LABEL field) must
     // NEVER appear in fleet output — labels are dropped entirely at
     // fleet scope (learning contract inv. 5).
-    try std.testing.expect(std.mem.indexOf(u8, result.output, SENTINEL) == null);
+    try std.testing.expect(std.mem.indexOf(u8, fleet_json, SENTINEL) == null);
     // The tool NAME (a shape, not content) IS allowed to appear.
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "web_search") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fleet_json, "web_search") != null);
     // Run_ids must NEVER appear at fleet scope either.
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "r-1-1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fleet_json, "r-1-1") == null);
 }
 
-test "mine_traces: fleet scope writes NO files (returns JSON in ToolResult output only)" {
+test "mine_traces: scope=fleet is DENIED from the agent tool and writes nothing (P1 regression)" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
     const allocator = std.testing.allocator;
@@ -1531,18 +1552,34 @@ test "mine_traces: fleet scope writes NO files (returns JSON in ToolResult outpu
     defer parsed_args.deinit();
     const result = try executeMineTracesWithRows(allocator, &tool, &rows, parsed_args.value.object);
     defer if (result.output.len > 0) allocator.free(result.output);
-    // NOTE: error_msg is intentionally NOT freed here — every failure
-    // branch in executeMineTracesWithRows returns ToolResult.fail(literal)
-    // (see the "requires workspace_dir"/"requires postgres"/"requires
-    // user_id" guards), matching this codebase's established convention
-    // (see file_write.zig's tests) that literal error results must not be
-    // freed. These tests all assert result.success, so error_msg is null
-    // in the intended path regardless.
+    // error_msg not freed: the deny returns ToolResult.fail(literal)
+    // (file-level convention for literal error results).
 
-    try std.testing.expect(result.success);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "operator surface") != null);
+    // The deny produced NO tenant-visible artifacts.
     var dir_check = tmp_dir.dir.openDir("insights", .{});
     try std.testing.expectError(error.FileNotFound, dir_check);
     if (dir_check) |*d| d.close() else |_| {}
+}
+
+test "mine_traces: scope=fleet is denied through the public Tool.execute() path BEFORE any state requirement (P1 regression)" {
+    // No state_mgr is wired here: if the deny did not precede the
+    // postgres requirement in executeMineTraces, this would fail with
+    // "requires postgres state manager" instead of the operator deny —
+    // proving the cross-tenant read can never precede the refusal.
+    const allocator = std.testing.allocator;
+    var tool = MemoryMaintainTool{ .trace_mining_enabled = true };
+    const t = tool.tool();
+
+    const parsed_args = try root.parseTestArgs("{\"action\":\"mine_traces\",\"scope\":\"fleet\"}");
+    defer parsed_args.deinit();
+    const result = try t.execute(allocator, parsed_args.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "operator surface") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "postgres") == null);
 }
 
 test "mine_traces: dispatched correctly through the public Tool.execute() entry point (flag off, no tenant context needed)" {

@@ -61,7 +61,13 @@ The bucket is decided by these axes — never by content matching:
 5. **Privacy boundary.** Per-user trace CONTENT never leaves the tenant.
    Fleet-scope aggregation carries tool names, outcome counts, duration
    shapes — never arguments, keys, or text. Operator sees the fleet shape,
-   not the user's life.
+   not the user's life. Enforcement note (P1 hardening): fleet aggregation
+   is NOT reachable from any agent-facing tool — `mine_traces scope=fleet`
+   denies fail-closed (no per-request operator identity exists at the tool
+   layer; `operator_only` only bites under supervised autonomy). The fleet
+   surface is reserved for a gateway internal-token operator endpoint;
+   its building blocks (`listRecentToolTracesAllUsers`, `renderFleetJson`)
+   stay verified against this invariant.
 6. **Disclosure without theatre.** The agent may say "I've noticed X fails
    when Y — seen 4 times; adjusting" (citing real evidence) and must not
    claim improvement it cannot cite. Ties to AGENTS.md §14.7: no directive
