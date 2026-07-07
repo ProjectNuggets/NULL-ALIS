@@ -4915,6 +4915,20 @@ fn handleVoiceCommand(self: anytype, arg: []const u8) ![]const u8 {
     return try self.allocator.dupe(u8, "Usage: /voice [on|off]");
 }
 
+/// SaaS posture (Package 2a Task 2): /learn list is user-facing. Origin
+/// renders as a friendly label — never the raw LearnedOrigin enum tag
+/// (internal jargon like "user_correction"/"mined_aggregate" must not
+/// leak into a user-visible string). `null` origin covers the legacy
+/// shape (no metadata header at all — pre-Task-2 facts).
+fn friendlyOriginLabel(origin: ?learning.LearnedOrigin) []const u8 {
+    const o = origin orelse return "you told me";
+    return switch (o) {
+        .user_correction => "you told me",
+        .operator => "set by your workspace",
+        .observed_success, .observed_failure, .mined_aggregate => "learned from experience",
+    };
+}
+
 fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
     const parsed = splitFirstToken(arg);
     const sub = parsed.head;
@@ -4924,35 +4938,68 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
         return try self.allocator.dupe(u8, "Memory not available.");
     };
 
-    // /learn  or  /learn list  — show all behavioral facts
+    // /learn  or  /learn list  — show the learning-contract trust ladder:
+    // Active directives (influence behavior today) in one section,
+    // Suggestions (shadow drafts awaiting /learn adopt — Task 4) in
+    // another. Package 2a Task 2 / inv. 3: origin is never conflated
+    // across sections. Legacy facts (no metadata header — the pre-Task-2
+    // shape) are grandfathered into Active, same rule as the injection gate.
     if (sub.len == 0 or std.mem.eql(u8, sub, "list")) {
         const entries = mem_rt.memory.list(self.allocator, null, self.memory_session_id) catch |err| {
             return try std.fmt.allocPrint(self.allocator, "Memory list failed: {s}", .{@errorName(err)});
         };
         defer memory_mod.freeEntries(self.allocator, entries);
 
+        var active_count: usize = 0;
+        var shadow_count: usize = 0;
+        for (entries) |e| {
+            if (!std.mem.startsWith(u8, e.key, "durable_fact/behavior/")) continue;
+            const header = learning.parseLearnedMetadataHeader(e.content);
+            if (header.state == .shadow) {
+                shadow_count += 1;
+            } else {
+                active_count += 1;
+            }
+        }
+
+        if (active_count == 0 and shadow_count == 0) {
+            return try self.allocator.dupe(u8, "No learned behavioral facts found.");
+        }
+
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
         const w = out.writer(self.allocator);
 
-        var count: usize = 0;
-        for (entries) |e| {
-            if (!std.mem.startsWith(u8, e.key, "durable_fact/behavior/")) continue;
-            count += 1;
+        if (active_count > 0) {
+            try w.print("Active ({d}):\n", .{active_count});
+            var idx: usize = 0;
+            for (entries) |e| {
+                if (!std.mem.startsWith(u8, e.key, "durable_fact/behavior/")) continue;
+                const header = learning.parseLearnedMetadataHeader(e.content);
+                if (header.state == .shadow) continue;
+                idx += 1;
+                const body = learning.stripLearnedMetadataHeader(e.content);
+                const preview_len = @min(@as(usize, 200), body.len);
+                const origin_label = friendlyOriginLabel(header.origin);
+                try w.print("  {d}. {s} ({s})\n     key: {s}\n", .{ idx, body[0..preview_len], origin_label, e.key });
+            }
         }
 
-        if (count == 0) {
-            return try self.allocator.dupe(u8, "No learned behavioral facts found.");
+        if (shadow_count > 0) {
+            try w.print("Suggestions (shadow — adopt with /learn adopt <key>) ({d}):\n", .{shadow_count});
+            var idx: usize = 0;
+            for (entries) |e| {
+                if (!std.mem.startsWith(u8, e.key, "durable_fact/behavior/")) continue;
+                const header = learning.parseLearnedMetadataHeader(e.content);
+                if (header.state != .shadow) continue;
+                idx += 1;
+                const body = learning.stripLearnedMetadataHeader(e.content);
+                const preview_len = @min(@as(usize, 200), body.len);
+                const origin_label = friendlyOriginLabel(header.origin);
+                try w.print("  {d}. {s} ({s})\n     key: {s}\n", .{ idx, body[0..preview_len], origin_label, e.key });
+            }
         }
 
-        try w.print("Learned behavioral facts ({d}):\n", .{count});
-        var idx: usize = 0;
-        for (entries) |e| {
-            if (!std.mem.startsWith(u8, e.key, "durable_fact/behavior/")) continue;
-            idx += 1;
-            const preview_len = @min(@as(usize, 200), e.content.len);
-            try w.print("  {d}. {s}\n     key: {s}\n", .{ idx, e.content[0..preview_len], e.key });
-        }
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -5823,4 +5870,152 @@ test "P2: triple fact also gets a durable_fact/ key (no classification change)" 
     // Triple facts must ALSO produce the durable_fact/ prefix — not extracted_.
     // Cross-writer dedup with Pass-C extracted_ keys is deferred to Phase-1.
     try std.testing.expect(std.mem.startsWith(u8, key, "durable_fact/"));
+}
+
+// ── Package 2a Task 2: /learn list shows the trust ladder ──────────────────
+// Learning contract inv. 3: /learn list shows origin=user_correction and
+// origin=mined_aggregate SEPARATELY (never conflated). SaaS posture: no
+// internal jargon in user-visible strings — origin renders as a friendly
+// label ("you told me" / "learned from experience"), not the raw enum tag.
+
+const FakeLearnListSelf = struct {
+    allocator: std.mem.Allocator,
+    memory_session_id: ?[]const u8 = null,
+    mem_rt: ?*memory_mod.MemoryRuntime = null,
+};
+
+fn makeTestMemoryRuntime(allocator: std.mem.Allocator, mem: memory_mod.Memory) memory_mod.MemoryRuntime {
+    return memory_mod.MemoryRuntime{
+        .memory = mem,
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{
+            .supports_keyword_rank = false,
+            .supports_session_store = false,
+            .supports_transactions = false,
+            .supports_outbox = false,
+        },
+        .resolved = .{
+            .primary_backend = "test",
+            .retrieval_mode = "keyword",
+            .vector_mode = "none",
+            .embedding_provider = "none",
+            .rollout_mode = "off",
+            .vector_sync_mode = "best_effort",
+            .hygiene_enabled = false,
+            .conversation_retention_days = 0,
+            .snapshot_enabled = false,
+            .cache_enabled = false,
+            .semantic_cache_enabled = false,
+            .summarizer_enabled = false,
+            .source_count = 0,
+            .fallback_policy = "degrade",
+        },
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+    };
+}
+
+test "/learn list: renders Active and Suggestions (shadow) as separate sections" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    const active_result = try learning.storeLearnedFact(
+        allocator,
+        mem,
+        "always confirm before deleting files",
+        .user_correction,
+        &.{},
+        null,
+    );
+    defer active_result.deinit(allocator);
+
+    const shadow_result = try learning.storeLearnedFact(
+        allocator,
+        mem,
+        "retry uploads with exponential backoff",
+        .mined_aggregate,
+        &.{},
+        null,
+    );
+    defer shadow_result.deinit(allocator);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+
+    const out = try handleLearnCommand(&fake_self, "list");
+    defer allocator.free(out);
+
+    // Both sections present, correctly labeled.
+    try std.testing.expect(std.mem.indexOf(u8, out, "Active") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Suggestions") != null);
+
+    // The active fact's content appears in the output.
+    try std.testing.expect(std.mem.indexOf(u8, out, "always confirm before deleting files") != null);
+    // The shadow fact's content ALSO appears (rendered as a suggestion —
+    // /learn list is the one place shadow drafts are visible per the
+    // contract, they are just never INJECTED into the prompt).
+    try std.testing.expect(std.mem.indexOf(u8, out, "retry uploads with exponential backoff") != null);
+
+    // Active section comes before the Suggestions section (ladder order).
+    const active_idx = std.mem.indexOf(u8, out, "Active").?;
+    const suggestions_idx = std.mem.indexOf(u8, out, "Suggestions").?;
+    try std.testing.expect(active_idx < suggestions_idx);
+
+    // SaaS posture: no raw enum jargon leaks into the user-visible string.
+    try std.testing.expect(std.mem.indexOf(u8, out, "user_correction") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "mined_aggregate") == null);
+}
+
+test "/learn list: legacy fact (no metadata) renders in the Active section, not Suggestions" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "durable_fact/behavior/legacyonlyfact1",
+        "legacy preference with no provenance header",
+        .core,
+        null,
+    );
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+
+    const out = try handleLearnCommand(&fake_self, "list");
+    defer allocator.free(out);
+
+    const active_idx = std.mem.indexOf(u8, out, "Active") orelse return error.NoActiveSection;
+    const content_idx = std.mem.indexOf(u8, out, "legacy preference with no provenance header") orelse return error.ContentMissing;
+    const suggestions_idx = std.mem.indexOf(u8, out, "Suggestions");
+
+    // Content appears AFTER "Active" and (if a Suggestions section exists
+    // at all) BEFORE "Suggestions" — i.e. it lands in the Active section.
+    try std.testing.expect(content_idx > active_idx);
+    if (suggestions_idx) |si| {
+        try std.testing.expect(content_idx < si);
+    }
+}
+
+test "/learn list: no learned facts still reports cleanly (no empty sections)" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{ .allocator = allocator, .mem_rt = &rt };
+
+    const out = try handleLearnCommand(&fake_self, "list");
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "No learned") != null);
 }

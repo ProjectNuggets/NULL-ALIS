@@ -5,6 +5,7 @@ const multimodal = @import("../multimodal.zig");
 const zaki_state = @import("../zaki_state.zig");
 const graph_expand = @import("graph_expand.zig");
 const text_norm = @import("../memory/text_norm.zig");
+const learning = @import("learning.zig");
 const Memory = memory_mod.Memory;
 const MemoryEntry = memory_mod.MemoryEntry;
 const MemoryRuntime = memory_mod.MemoryRuntime;
@@ -261,6 +262,29 @@ fn isDurableFactKey(key: []const u8) bool {
 /// (this predicate). Two roles, no conflict.
 fn isExtractedFactKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "extracted_");
+}
+
+/// Package 2a Task 2 — the learning contract's trust ladder gate
+/// (inv. 1, 3, 7): SHADOW IS NEVER INJECTED. A durable_fact/behavior/
+/// entry is skipped from priority injection when its stored content
+/// carries an explicit `state=shadow` metadata header (learning.zig's
+/// storeLearnedFact writes this for every origin except
+/// user_correction/operator — the birth-state law).
+///
+/// Two other shapes both pass through (return false, i.e. "not shadow,
+/// inject normally"):
+///   - Non-behavior durable_fact/ keys (e.g. durable_fact/shipping_pref)
+///     — outside the learning contract's scope entirely; this gate must
+///     never touch facts that were never learning-contract artifacts.
+///   - durable_fact/behavior/ entries with NO metadata header at all
+///     (the legacy shape — exactly what the pre-Task-2 and still-
+///     unmodified user_correction fast path in root.zig writes today).
+///     Grandfathered as active per the brief: "facts without metadata =
+///     legacy = active."
+fn isShadowBehaviorFact(key: []const u8, content: []const u8) bool {
+    if (!std.mem.startsWith(u8, key, "durable_fact/behavior/")) return false;
+    const header = learning.parseLearnedMetadataHeader(content);
+    return header.state == .shadow;
 }
 
 // Legacy compatibility artifact: retained for audit/debug access only and
@@ -615,6 +639,9 @@ fn loadContextDetailed(
             // V1.7 cmt9.6: extracted_<hash> rows join durable_fact in the
             // continuity bucket. Both shapes feed agent bootstrap context.
             if (!isDurableFactKey(entry.key) and !isExtractedFactKey(entry.key)) continue;
+            // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow
+            // behavior facts are never injected — see isShadowBehaviorFact.
+            if (isShadowBehaviorFact(entry.key, entry.content)) continue;
             if (containsKey(scoped_entries, entry.key)) continue;
             if (containsString(seen_keys.items, entry.key)) continue;
             const estimated_bytes = @min(entry.content.len, SEMANTIC_ENTRY_MAX_BYTES) + entry.key.len + 8;
@@ -669,6 +696,9 @@ fn loadContextDetailed(
 
     for (scoped_entries) |entry| {
         if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
+        // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow behavior
+        // facts are never injected, through ANY bucket — see isShadowBehaviorFact.
+        if (isShadowBehaviorFact(entry.key, entry.content)) continue;
         if (containsString(seen_keys.items, entry.key)) continue;
         if (isSemanticContinuityKey(entry.key)) {
             const estimated_bytes = @min(entry.content.len, SEMANTIC_ENTRY_MAX_BYTES) + entry.key.len + 8;
@@ -698,6 +728,9 @@ fn loadContextDetailed(
                 if (entry.session_id != null) continue; // keep scoped isolation (no cross-session bleed)
                 if (containsKey(scoped_entries, entry.key)) continue;
                 if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
+                // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow
+                // behavior facts are never injected — see isShadowBehaviorFact.
+                if (isShadowBehaviorFact(entry.key, entry.content)) continue;
                 if (containsString(seen_keys.items, entry.key)) continue;
                 const estimated_bytes = @min(entry.content.len, FALLBACK_ENTRY_MAX_BYTES) + entry.key.len + 8;
                 if (!canAppendToBucket(buf.items.len, fallback_bytes, stats.fallback_bucket_entries, FALLBACK_BUCKET_MAX_BYTES, FALLBACK_BUCKET_MAX_ENTRIES, estimated_bytes)) break;
@@ -850,6 +883,9 @@ fn loadContextWithRuntimeDetailed(
             // V1.7 cmt9.6: extracted_<hash> rows join durable_fact in the
             // continuity bucket. Both shapes feed agent bootstrap context.
             if (!isDurableFactKey(entry.key) and !isExtractedFactKey(entry.key)) continue;
+            // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow
+            // behavior facts are never injected — see isShadowBehaviorFact.
+            if (isShadowBehaviorFact(entry.key, entry.content)) continue;
             if (containsString(seen_keys.items, entry.key)) continue;
             const estimated_bytes = @min(entry.content.len, SEMANTIC_ENTRY_MAX_BYTES) + entry.key.len + 8;
             if (!canAppendToBucket(buf.items.len, semantic_bytes, stats.semantic_bucket_entries, SEMANTIC_BUCKET_MAX_BYTES, null, estimated_bytes)) break;
@@ -891,6 +927,12 @@ fn loadContextWithRuntimeDetailed(
 
     for (candidates) |cand| {
         if (shouldSkipGenericEntry(cand.key, cand.snippet, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
+        // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow behavior
+        // facts are never injected, even via the vector/RRF candidate path
+        // — see isShadowBehaviorFact. cand.snippet is a full-content hydrate
+        // (memory/root.zig's hydrateSnippet dupes owned_entry.content), so
+        // the metadata header (if any) survives into it intact.
+        if (isShadowBehaviorFact(cand.key, cand.snippet)) continue;
         if (containsString(seen_keys.items, cand.key)) continue;
         if (isSemanticContinuityKey(cand.key)) {
             const estimated_bytes = @min(cand.snippet.len, SEMANTIC_ENTRY_MAX_BYTES) + cand.key.len + 8;
@@ -937,6 +979,9 @@ fn loadContextWithRuntimeDetailed(
             for (entries) |entry| {
                 if (containsCandidateKey(candidates, entry.key)) continue;
                 if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
+                // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow
+                // behavior facts are never injected — see isShadowBehaviorFact.
+                if (isShadowBehaviorFact(entry.key, entry.content)) continue;
                 if (containsString(seen_keys.items, entry.key)) continue;
                 if (isSemanticContinuityKey(entry.key) and (stats.semantic_bucket_entries < SEMANTIC_BUCKET_MIN_ENTRIES or semantic_bytes < 1600)) {
                     const semantic_estimated = @min(entry.content.len, SEMANTIC_ENTRY_MAX_BYTES) + entry.key.len + 8;
@@ -969,6 +1014,9 @@ fn loadContextWithRuntimeDetailed(
                     if (containsKey(keyword_entries, entry.key)) continue;
                 }
                 if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
+                // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow
+                // behavior facts are never injected — see isShadowBehaviorFact.
+                if (isShadowBehaviorFact(entry.key, entry.content)) continue;
                 if (containsString(seen_keys.items, entry.key)) continue;
                 const estimated_bytes = @min(entry.content.len, FALLBACK_ENTRY_MAX_BYTES) + entry.key.len + 8;
                 if (!canAppendToBucket(buf.items.len, fallback_bytes, stats.fallback_bucket_entries, FALLBACK_BUCKET_MAX_BYTES, FALLBACK_BUCKET_MAX_ENTRIES, estimated_bytes)) break;
@@ -2330,6 +2378,130 @@ test "loadTurnMemorySlot reports selection stats (context v2 packaging)" {
     try std.testing.expect(slot.stats.context_bytes > 0);
     try std.testing.expect(std.mem.startsWith(u8, slot.fenced_content, "<memory_for_turn>\n"));
     try std.testing.expect(std.mem.indexOf(u8, slot.fenced_content, "context_anchor_current") == null);
+}
+
+// ── Package 2a Task 2: injection obeys the learning-contract ladder ────────
+// Learning contract inv. 1/3/7: SHADOW IS NEVER INJECTED. Only state=active
+// behavior facts (and legacy facts with no state metadata — grandfathered,
+// same as pre-Task-2 behavior) reach the prompt.
+
+test "learning contract inv. 1/3/7: shadow behavior fact is never injected; active + legacy are" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // Active: origin=user_correction (birth-state law: active at birth).
+    const active_result = try learning.storeLearnedFact(
+        allocator,
+        mem,
+        "always mention shipping deadlines upfront",
+        .user_correction,
+        &.{},
+        null,
+    );
+    defer active_result.deinit(allocator);
+
+    // Shadow: origin=mined_aggregate (birth-state law: shadow at birth —
+    // NOT yet adopted, must never influence behavior per inv. 1).
+    const shadow_result = try learning.storeLearnedFact(
+        allocator,
+        mem,
+        "shipping retries should back off exponentially",
+        .mined_aggregate,
+        &.{},
+        null,
+    );
+    defer shadow_result.deinit(allocator);
+
+    // Legacy: pre-Task-2 shape — plain content, NO metadata header at all
+    // (exactly what the unmodified user_correction fast path in root.zig
+    // still writes today). Grandfathered as active.
+    try mem.store(
+        "durable_fact/behavior/legacyfact0000",
+        "shipping confirmations go out same day",
+        .core,
+        null,
+    );
+
+    const slot = try loadTurnMemorySlot(
+        allocator,
+        mem,
+        null,
+        "shipping",
+        "agent:zaki-bot:user:1:main",
+        null,
+        null,
+    );
+    defer allocator.free(slot.fenced_content);
+
+    try std.testing.expect(std.mem.indexOf(u8, slot.fenced_content, "always mention shipping deadlines upfront") != null);
+    try std.testing.expect(std.mem.indexOf(u8, slot.fenced_content, "shipping confirmations go out same day") != null);
+    try std.testing.expect(std.mem.indexOf(u8, slot.fenced_content, "shipping retries should back off exponentially") == null);
+}
+
+test "learning contract: legacy behavior fact (no metadata header at all) is grandfathered active, in isolation" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // The ONLY fact in this session is a legacy-shape durable_fact/behavior/
+    // entry — exactly what the pre-Task-2, still-unmodified user_correction
+    // fast path in root.zig writes (plain content, mem.store, no metadata).
+    // No active/shadow facts present, so a pass here proves the grandfather
+    // clause in isolation rather than as a side effect of a mixed scenario.
+    try mem.store(
+        "durable_fact/behavior/onlylegacyfact01",
+        "onboarding reminders should be gentle",
+        .core,
+        null,
+    );
+
+    const slot = try loadTurnMemorySlot(
+        allocator,
+        mem,
+        null,
+        "onboarding",
+        "agent:zaki-bot:user:2:main",
+        null,
+        null,
+    );
+    defer allocator.free(slot.fenced_content);
+
+    try std.testing.expect(std.mem.indexOf(u8, slot.fenced_content, "onboarding reminders should be gentle") != null);
+}
+
+test "isShadowBehaviorFact: true only for durable_fact/behavior/ keys carrying state=shadow" {
+    // Shadow behavior fact → true.
+    try std.testing.expect(isShadowBehaviorFact(
+        "durable_fact/behavior/abc123",
+        "origin=mined_aggregate\nstate=shadow\n\nretry with backoff",
+    ));
+
+    // Active behavior fact → false.
+    try std.testing.expect(!isShadowBehaviorFact(
+        "durable_fact/behavior/abc123",
+        "origin=user_correction\nstate=active\n\nalways use snake_case",
+    ));
+
+    // Legacy behavior fact (no header) → false (grandfathered active).
+    try std.testing.expect(!isShadowBehaviorFact(
+        "durable_fact/behavior/abc123",
+        "always use snake_case",
+    ));
+
+    // Non-behavior durable_fact/ key → false, even with shadow-shaped
+    // content — this gate must never touch facts outside its scope.
+    try std.testing.expect(!isShadowBehaviorFact(
+        "durable_fact/shipping_pref",
+        "origin=mined_aggregate\nstate=shadow\n\nirrelevant",
+    ));
+
+    // Unrelated key entirely → false.
+    try std.testing.expect(!isShadowBehaviorFact("summary_latest/agent:1:main", "state=shadow"));
 }
 
 test "global keyword fallback pulls cross-session entries when exact global recall misses punctuation variant" {
