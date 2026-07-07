@@ -139,6 +139,7 @@ fn buildAgentTaskPrompt(
                 "Read HEARTBEAT.md in workspace only as wake policy if it is relevant. " ++
                 "Use runtime_info and schedule first for runtime truth. " ++
                 "If a recent dream_log/<date> memory exists (memory_recall or memory_timeline), let its themes inform tone and selection — the reflection is context, not content to quote verbatim. " ++
+                "If any shadow suggestions await (check learn list), mention exactly one line: how many suggestions await review — never more. " ++
                 "Then gather data using read-only integrations/tools as needed (calendar/email/news/weather). " ++
                 "Deliver one concise Telegram-ready brief suitable for scheduler delivery. Do not call the message tool in this turn; scheduler delivery sends the final output. Do not create/update scheduler jobs in this turn." ++
                 PROACTIVE_USER_OUTPUT_GUARD,
@@ -1232,6 +1233,27 @@ test "buildAgentTaskPrompt brief mentions dream_log for reflection context" {
 
     // The brief prompt should reference dream_log to consult overnight reflections.
     try std.testing.expect(std.mem.indexOf(u8, prompt, "dream_log") != null);
+}
+
+// Package 2a Task 4 (learning-contract behaviour §4 "morning brief — at
+// most one learning line, and only when a shadow draft awaits adoption").
+// Mirrors the dream_log sentence above: ONE conditional instruction,
+// never a nag, never self-congratulating.
+test "buildAgentTaskPrompt brief mentions checking for shadow suggestions awaiting review" {
+    const prompt = try buildAgentTaskPrompt(std.testing.allocator, .brief, "daily_morning_brief");
+    defer std.testing.allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "learn list") != null);
+    // Behaviour §4: never nags — "mention exactly one line" / "never more".
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "one line") != null);
+}
+
+test "buildAgentTaskPrompt report and follow_up do NOT carry the shadow-suggestions brief line (brief-only)" {
+    inline for (.{ DesiredJobKind.report, DesiredJobKind.follow_up }) |kind| {
+        const prompt = try buildAgentTaskPrompt(std.testing.allocator, kind, "spec_text");
+        defer std.testing.allocator.free(prompt);
+        try std.testing.expect(std.mem.indexOf(u8, prompt, "learn list") == null);
+    }
 }
 
 test "schedule tool name" {

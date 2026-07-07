@@ -1043,6 +1043,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("dream_log_warmstart_enabled")) |v| {
                 if (v == .bool) self.agent.dream_log_warmstart_enabled = v.bool;
             }
+            // Package 2a Task 3 (the miner) — wire the trace-mining gate
+            // so operators can disable memory_maintain's mine_traces
+            // action via config.json (default ON).
+            if (ag.object.get("trace_mining_enabled")) |v| {
+                if (v == .bool) self.agent.trace_mining_enabled = v.bool;
+            }
             // C4 (brain-graph activation) — wire the nested [agent.extraction]
             // ExtractionConfig block. Previously this struct had NO parser, so
             // its "flip via TOML" docstring silently no-op'd. The session-end

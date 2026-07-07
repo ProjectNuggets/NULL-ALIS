@@ -49,6 +49,7 @@ enforced in extraction-builder tests inside `src/agent/extraction/runner.zig`.)
 | `memory_type` in EVERGREEN set | knowledge (durable) | exempt from decay (in-memory + persistent SQL), resurrect-proof, promote-no-clobber |
 | `memory_type == open_loop` | knowledge (durable) | decays in ranking; still resurrect-proof/demotable-guard |
 | Working-memory slots | transient | ≤15 slots, reaper, cleared on reset |
+| `wish/*` keys | proposal (learning-contract bucket 5) | brain-VISIBLE (user may see the agent's wishes), NOT embedded (`isSemanticBookkeepingKey`), never injected as a directive, storable via `memory_store` (`inlineKeyGuard` allows) — a request to the roadmap, not behaviour |
 
 ## Enforcement map
 
@@ -80,3 +81,4 @@ are deliberately omitted: they rot on unrelated edits; symbols survive refactors
 - `is_latest` written-but-not-read in memories retrieval filter.
 - Near-dup semantic MERGE at write time (C0 reports only).
 - `task_list`/`cron_runs`/`skill_registry` extraction judgment (kept fail-open deliberately).
+- Learning stores are bookkeeping to this pipeline — see `docs/learning-contract.md`.

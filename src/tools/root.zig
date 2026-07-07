@@ -1441,9 +1441,19 @@ pub fn allTools(
     try list.append(allocator, mppt.tool());
 
     // V1.9-5 — unified truth-maintenance toolkit. state_mgr +
-    // user_id wired separately via bindStateMgrTenant.
+    // user_id wired separately via bindStateMgrTenant. Package 2a
+    // Task 3 (the miner) — workspace_dir (for mine_traces' insights/
+    // output) and trace_mining_enabled (the config gate) are set here,
+    // at construction time, same as every other config-derived tool
+    // field in this function (see sandbox_user_explicit_enabled above
+    // for the opts.config idiom this mirrors). `.memory` is wired
+    // separately via bindMemoryTools below (mirrors every other
+    // memory-backed tool in this file).
     const mmt = try allocator.create(memory_maintain.MemoryMaintainTool);
-    mmt.* = .{};
+    mmt.* = .{
+        .workspace_dir = workspace_dir,
+        .trace_mining_enabled = if (opts.config) |cfg| cfg.agent.trace_mining_enabled else true,
+    };
     try list.append(allocator, mmt.tool());
 
     // V1.9-DX1 — time_now: wall-clock awareness for the agent.
@@ -2264,6 +2274,15 @@ pub fn bindMemoryTools(tools: []const Tool, memory: ?Memory) void {
             // otherwise (metadata dropped — graceful degrade).
             const cmt: *compose_memory.ComposeMemoryTool = @ptrCast(@alignCast(t.ptr));
             cmt.memory = memory;
+        } else if (t.vtable == &memory_maintain.MemoryMaintainTool.vtable) {
+            // Package 2a Task 3 (the miner) — mine_traces drafts shadow
+            // behavior facts via learning.storeLearnedFact, which needs
+            // the Memory backend. Other memory_maintain actions
+            // (cascade_update, invalidate_when, ...) use state_mgr
+            // directly (bound via bindStateMgrTenant) and never read
+            // this field; only mine_traces (user scope) consumes it.
+            const mmt: *memory_maintain.MemoryMaintainTool = @ptrCast(@alignCast(t.ptr));
+            mmt.memory = memory;
         }
     }
 }

@@ -28,6 +28,11 @@ const extraction_persist = @import("agent/extraction_persist.zig");
 const context_builder = @import("agent/context_builder.zig");
 const cron_mod = @import("cron.zig");
 const security_secrets = @import("security/secrets.zig");
+// Package 2a Task 3 (the miner) — trace_mining.zig owns the
+// ToolTraceDigestRow shape read by listRecentToolTraces /
+// listRecentToolTracesAllUsers below, so the pure analysis module and
+// the Manager read API can never drift on field names/types.
+const trace_mining = @import("agent/trace_mining.zig");
 
 /// W1.1 (Fix 4) — fail-closed precondition for the entity/edge write path.
 ///
@@ -985,6 +990,21 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     /// upsertSubagentResult's no-op idiom above.
     pub fn insertToolTraceEvents(_: *@This(), _: i64, _: []const u8, _: []const u8) !void {
         return;
+    }
+    /// Package 2a Task 3 (the miner) — stub for non-postgres builds.
+    /// The durable tool_traces table requires Postgres; without it
+    /// there is nothing to read back, so this mirrors
+    /// listPiiMemoryKeys's empty-slice idiom rather than erroring —
+    /// the miner action degrades to "no rows this window" instead of
+    /// failing the tool call outright.
+    pub fn listRecentToolTraces(_: *@This(), allocator: std.mem.Allocator, _: i64, _: u32) ![]trace_mining.ToolTraceDigestRow {
+        return allocator.alloc(trace_mining.ToolTraceDigestRow, 0);
+    }
+    /// Package 2a Task 3 (the miner), fleet scope — stub for
+    /// non-postgres builds. Same empty-slice degrade as
+    /// listRecentToolTraces above.
+    pub fn listRecentToolTracesAllUsers(_: *@This(), allocator: std.mem.Allocator, _: u32) ![]trace_mining.ToolTraceDigestRow {
+        return allocator.alloc(trace_mining.ToolTraceDigestRow, 0);
     }
     pub fn forgetMemory(_: *@This(), _: i64, _: []const u8) !bool {
         return error.PostgresNotEnabled;
@@ -11487,6 +11507,74 @@ const ManagerImpl = struct {
         c.PQclear(result);
     }
 
+    /// Package 2a Task 3 (the miner) — read side of the tool_traces
+    /// digest table for a single tenant. Returns rows created within
+    /// the last `since_days` days for `user_id`, ordered by created_at
+    /// ascending (oldest first — matches the mining pass's natural
+    /// "read the window, then analyze in order" flow). The `$2||'
+    /// days'` concat-then-cast is the standard Postgres idiom for a
+    /// parameterized INTERVAL (a bind parameter cannot be substituted
+    /// directly inside an INTERVAL literal). Caller owns the returned
+    /// slice and each row; call row.deinit() then free the slice.
+    pub fn listRecentToolTraces(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        since_days: u32,
+    ) ![]trace_mining.ToolTraceDigestRow {
+        const q = try self.buildQuery(
+            "SELECT run_id, events::text, EXTRACT(EPOCH FROM created_at)::bigint " ++
+                "FROM {schema}.tool_traces " ++
+                "WHERE user_id = $1 AND created_at > NOW() - ($2 || ' days')::interval " ++
+                "ORDER BY created_at ASC",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        var days_buf: [16]u8 = undefined;
+        const days_s = try std.fmt.bufPrintZ(&days_buf, "{d}", .{since_days});
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, days_s.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(days_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        return try collectToolTraceDigestRows(allocator, result);
+    }
+
+    /// Package 2a Task 3 (the miner), fleet scope (learning contract
+    /// inv. 5 — operator surface) — same read as listRecentToolTraces
+    /// but WITHOUT the user_id filter, across all tenants. Callers MUST
+    /// strip per-user identifiers before this leaves the operator
+    /// boundary — this method itself only reads events_json/run_id/
+    /// created_at, identical row shape to the single-tenant read; the
+    /// privacy narrowing happens in trace_mining's fleet-scope analysis
+    /// path, not here.
+    pub fn listRecentToolTracesAllUsers(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        since_days: u32,
+    ) ![]trace_mining.ToolTraceDigestRow {
+        const q = try self.buildQuery(
+            "SELECT run_id, events::text, EXTRACT(EPOCH FROM created_at)::bigint " ++
+                "FROM {schema}.tool_traces " ++
+                "WHERE created_at > NOW() - ($1 || ' days')::interval " ++
+                "ORDER BY created_at ASC",
+        );
+        defer self.allocator.free(q);
+
+        var days_buf: [16]u8 = undefined;
+        const days_s = try std.fmt.bufPrintZ(&days_buf, "{d}", .{since_days});
+
+        const params = [_]?[*:0]const u8{days_s.ptr};
+        const lengths = [_]c_int{@intCast(days_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+
+        return try collectToolTraceDigestRows(allocator, result);
+    }
+
     /// Return all 'pending' subagent_results rows for a user, ordered by
     /// created_at ASC (oldest first, so recovery re-delivers in order).
     /// Caller owns the returned slice and each row; call row.deinit() then
@@ -13926,6 +14014,42 @@ fn dupeResultValue(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int
     return out;
 }
 
+/// Package 2a Task 3 (the miner) — shared row-collection loop for
+/// listRecentToolTraces / listRecentToolTracesAllUsers. Both queries
+/// project the SAME 3-column shape (run_id, events::text,
+/// EXTRACT(EPOCH FROM created_at)::bigint), so one collector avoids
+/// duplicating the PQntuples/dupeResultValue/parseInt loop twice.
+/// Caller owns the returned slice and each row.
+fn collectToolTraceDigestRows(
+    allocator: std.mem.Allocator,
+    result: *c.PGresult,
+) ![]trace_mining.ToolTraceDigestRow {
+    const n: usize = @intCast(c.PQntuples(result));
+    var out: std.ArrayListUnmanaged(trace_mining.ToolTraceDigestRow) = .empty;
+    errdefer {
+        for (out.items) |r| r.deinit(allocator);
+        out.deinit(allocator);
+    }
+    try out.ensureTotalCapacity(allocator, n);
+    for (0..n) |i| {
+        const ri: c_int = @intCast(i);
+        const run_id = try dupeResultValue(allocator, result, ri, 0);
+        errdefer allocator.free(run_id);
+        const events_json = try dupeResultValue(allocator, result, ri, 1);
+        errdefer allocator.free(events_json);
+        const created_at_raw = try dupeResultValue(allocator, result, ri, 2);
+        defer allocator.free(created_at_raw);
+        const created_at_unix = std.fmt.parseInt(i64, created_at_raw, 10) catch 0;
+
+        try out.append(allocator, .{
+            .run_id = run_id,
+            .events_json = events_json,
+            .created_at_unix = created_at_unix,
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Parse a nullable `EXTRACT(EPOCH FROM ...)::bigint` column into ?i64.
 /// Returns null when the SQL value is NULL (S7 extension device registry).
 fn parseNullableEpochCol(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int, col: c_int) !?i64 {
@@ -14782,6 +14906,192 @@ test "tool_traces: insertToolTraceEvents persists one digest per run, idempotent
             events_val,
         );
     }
+
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+}
+
+test "tool_traces: listRecentToolTraces reads back seeded rows within the window, scoped to user_id" {
+    // Package 2a Task 3 (the miner) — read-side counterpart to
+    // insertToolTraceEvents. Proves:
+    //   (1) rows seeded via insertToolTraceEvents for user_id=42 are
+    //       returned by listRecentToolTraces(42, ...),
+    //   (2) a DIFFERENT user's row is NOT returned (tenant scoping),
+    //   (3) events_json + run_id round-trip intact.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_listtraces", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+
+    const events_json = "[{\"kind\":\"tool_call\",\"tool\":\"web_search\",\"success\":true,\"duration_ms\":420}]";
+    try mgr.insertToolTraceEvents(42, "r-1-1", events_json);
+    try mgr.insertToolTraceEvents(42, "r-2-1", events_json);
+    // A different user's row must NOT leak into user 42's read.
+    try mgr.insertToolTraceEvents(99, "r-9-1", events_json);
+
+    const rows = try mgr.listRecentToolTraces(allocator, 42, 7);
+    defer {
+        for (rows) |r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    var found_r1 = false;
+    var found_r2 = false;
+    for (rows) |r| {
+        if (std.mem.eql(u8, r.run_id, "r-1-1")) {
+            found_r1 = true;
+            try std.testing.expect(std.mem.indexOf(u8, r.events_json, "web_search") != null);
+        }
+        if (std.mem.eql(u8, r.run_id, "r-2-1")) found_r2 = true;
+        try std.testing.expect(r.created_at_unix > 0);
+    }
+    try std.testing.expect(found_r1);
+    try std.testing.expect(found_r2);
+
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+}
+
+test "tool_traces: listRecentToolTraces excludes rows older than since_days" {
+    // Migration 0008's created_at defaults to NOW() at insert time, so
+    // this test can't directly seed an "old" row via insertToolTraceEvents.
+    // Instead it inserts a row, then manually backdates created_at via raw
+    // SQL to simulate an old trace, and confirms the window filter excludes it.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_tracewindow", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+
+    const events_json = "[{\"kind\":\"tool_call\",\"tool\":\"bash\",\"success\":true,\"duration_ms\":1}]";
+    try mgr.insertToolTraceEvents(7, "r-1-1", events_json);
+    try mgr.insertToolTraceEvents(7, "r-2-1", events_json);
+
+    // Backdate r-1-1's created_at to 30 days ago (outside a 7-day window).
+    {
+        const q = try std.fmt.allocPrint(
+            allocator,
+            "UPDATE {s}.tool_traces SET created_at = NOW() - INTERVAL '30 days' WHERE run_id = 'r-1-1'",
+            .{schema},
+        );
+        defer allocator.free(q);
+        const result = try mgr.exec(q);
+        c.PQclear(result);
+    }
+
+    const rows = try mgr.listRecentToolTraces(allocator, 7, 7);
+    defer {
+        for (rows) |r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("r-2-1", rows[0].run_id);
+
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+}
+
+test "tool_traces: listRecentToolTracesAllUsers reads rows across users (fleet scope)" {
+    // Fleet-scope aggregation (learning contract inv. 5) needs a
+    // cross-user read. Proves the ALL-users variant returns rows from
+    // MULTIPLE user_ids, unlike listRecentToolTraces's single-tenant scope.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_fleettraces", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+
+    const events_json = "[{\"kind\":\"tool_call\",\"tool\":\"bash\",\"success\":true,\"duration_ms\":1}]";
+    try mgr.insertToolTraceEvents(1, "r-1-1", events_json);
+    try mgr.insertToolTraceEvents(2, "r-2-1", events_json);
+
+    const rows = try mgr.listRecentToolTracesAllUsers(allocator, 7);
+    defer {
+        for (rows) |r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    var found_1 = false;
+    var found_2 = false;
+    for (rows) |r| {
+        if (std.mem.eql(u8, r.run_id, "r-1-1")) found_1 = true;
+        if (std.mem.eql(u8, r.run_id, "r-2-1")) found_2 = true;
+    }
+    try std.testing.expect(found_1);
+    try std.testing.expect(found_2);
 
     {
         const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
