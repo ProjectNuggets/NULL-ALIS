@@ -608,6 +608,13 @@ pub const Agent = struct {
     /// sibling flags. Default true. See
     /// config_types.dream_log_warmstart_enabled.
     dream_log_warmstart_enabled: bool = true,
+    /// Package 2a Task 4 (review fix) — trace-mining gate, threaded from
+    /// gateway config to per-session Agent, read directly by
+    /// context_engine.assemble's insights-consultation block (the
+    /// mined-insights recap read from workspace/insights/). Same INIT-ONLY
+    /// concurrency contract as the sibling flags. Default true. See
+    /// config_types.trace_mining_enabled.
+    trace_mining_enabled: bool = true,
     /// P4 (memory-phase-0.5) — canonical-continuity-summary gate, threaded to
     /// the commands gating predicate (`shouldUseDeterministicSessionSummary`)
     /// so the two LIVE in-conversation boundary triggers
@@ -14360,6 +14367,46 @@ test "V1.14.4 booth-readiness: approval_continues_turn defaults to true (regress
     defer agent.history.deinit(allocator);
 
     try std.testing.expect(agent.approval_continues_turn);
+}
+
+test "Package 2a Task 4 (review fix): Agent.trace_mining_enabled exists and defaults to true" {
+    // Regression lock for the trace_mining_enabled review fix. Before this
+    // fix, `Agent` had NO such field at all — context_engine.zig's insights
+    // consultation gate fell back to a `@hasField(...) else true` duck-type
+    // that could never observe an operator's `trace_mining_enabled=false`
+    // config setting (the OFF=prior-behavior flag contract was violated).
+    // This test locks two things: (1) the field is real on Agent, so the
+    // duck-type in context_engine.zig can be deleted in favor of a direct
+    // read, and (2) its default is `true`, matching config_types.zig's
+    // `trace_mining_enabled: bool = true` and the sibling flags
+    // (`cost_vital_in_prompt` / `dream_log_warmstart_enabled`) threaded the
+    // same way.
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    const tools_arr = [_]Tool{};
+    const policy = SecurityPolicy{ .autonomy = .full, .workspace_dir = "/tmp" };
+
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = tools_arr[0..],
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        // Note: NO explicit trace_mining_enabled — relying on default.
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .policy = &policy,
+    };
+    defer allocator.free(agent.tool_specs);
+    defer agent.history.deinit(allocator);
+
+    try std.testing.expect(agent.trace_mining_enabled);
 }
 
 test "/approve allow-once executes pending tool exactly once" {

@@ -295,6 +295,11 @@ pub const SessionManager = struct {
     /// memory_loader (LoadTurnMemoryOptions). Same INIT-ONLY concurrency
     /// contract as the sibling fields. Default true.
     dream_log_warmstart_enabled: bool = true,
+    /// Package 2a Task 4 (review fix) — trace-mining gate, threaded from
+    /// gateway config to per-session Agent → context_engine's insights
+    /// consultation block. Same INIT-ONLY concurrency contract as the
+    /// sibling fields. Default true. See config_types.trace_mining_enabled.
+    trace_mining_enabled: bool = true,
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
@@ -792,6 +797,9 @@ pub const SessionManager = struct {
         // Task 4 (package1-activations) — dream_log warm-start gate, same
         // plumbing pattern.
         agent.dream_log_warmstart_enabled = self.dream_log_warmstart_enabled;
+        // Package 2a Task 4 (review fix) — trace-mining gate, same
+        // plumbing pattern.
+        agent.trace_mining_enabled = self.trace_mining_enabled;
         return agent;
     }
 

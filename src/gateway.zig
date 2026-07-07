@@ -2127,6 +2127,10 @@ const TenantRuntime = struct {
         // dream_log warm-start gate unconditionally, same plumbing pattern
         // as cost_vital_in_prompt above.
         runtime.session_mgr.dream_log_warmstart_enabled = runtime.config.agent.dream_log_warmstart_enabled;
+        // Package 2a Task 4 (review fix) — wire the trace-mining gate
+        // unconditionally, same plumbing pattern as cost_vital_in_prompt
+        // above.
+        runtime.session_mgr.trace_mining_enabled = runtime.config.agent.trace_mining_enabled;
 
         // Wire sidecar provider from bundle to session manager
         if (runtime.provider_bundle.sidecarProvider()) |sp| {
@@ -25016,6 +25020,11 @@ pub fn runWithRole(
                 // so the standalone/local-agent path also gets the latest
                 // overnight reflection injected (or not) per config.
                 sm.dream_log_warmstart_enabled = cfg.agent.dream_log_warmstart_enabled;
+                // Package 2a Task 4 (review fix) — mirror the tenant-runtime
+                // wiring: trace_mining_enabled travels the same way so the
+                // standalone/local-agent path also gates insights
+                // consultation per config.
+                sm.trace_mining_enabled = cfg.agent.trace_mining_enabled;
                 if (mem_rt) |*rt| {
                     sm.mem_rt = rt;
                     tools_mod.bindMemoryRuntime(tools_slice, rt);
@@ -28475,6 +28484,7 @@ test "handleApiChatStreamSseConnection tenant path flushes run trace once after 
             runtime.session_mgr.usage_rt = runtime.usage_rt;
             runtime.session_mgr.cost_vital_in_prompt = runtime.config.agent.cost_vital_in_prompt;
             runtime.session_mgr.dream_log_warmstart_enabled = runtime.config.agent.dream_log_warmstart_enabled;
+            runtime.session_mgr.trace_mining_enabled = runtime.config.agent.trace_mining_enabled;
 
             return runtime;
         }

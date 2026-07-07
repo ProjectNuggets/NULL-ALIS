@@ -5004,7 +5004,9 @@ fn transitionLearnedFact(
         // Idempotent no-op: already on the ladder rung the caller wanted,
         // or past it, or never a shadow draft at all (legacy/active).
         return switch (header.state orelse .active) {
-            .shadow => unreachable, // excluded by the `!= .shadow` guard above
+            // Unreachable: the `if (header.state != .shadow)` guard above
+            // already excludes `.shadow` from reaching this switch.
+            .shadow => unreachable,
             .active => try self.allocator.dupe(u8, "That fact is already active — nothing to do."),
             .retired => try self.allocator.dupe(u8, "That suggestion was already dismissed — nothing to do."),
         };

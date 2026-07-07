@@ -691,34 +691,14 @@ pub const ContextEngine = struct {
         // Package 2a Task 4 (learning-contract behaviour §4 in-turn
         // consultation) — recent mined-insights block. Reuses
         // `trace_mining_enabled` (no new flag: consultation is part of
-        // mining being on) via @hasField, the same duck-typed guard used
-        // for provider/narration_ring_buffer/active_task_plan above — a
-        // minimal fixture without the field defaults to enabled, matching
-        // the field's own `= true` default on Agent/MemoryMaintainTool.
-        //
-        // KNOWN GAP (scoped deliberately): `Agent` itself does not yet
-        // carry a real `trace_mining_enabled` field — only
-        // `MemoryMaintainTool` does (bound from config at tool-construction
-        // time, tools/root.zig). Threading `config.agent.trace_mining_enabled`
-        // through session.zig/gateway.zig onto `Agent` (the
-        // `cost_vital_in_prompt`/`dream_log_warmstart_enabled` house
-        // pattern) is out of this task's file scope
-        // (context_engine.zig/prompt.zig/commands.zig/schedule.zig only).
-        // Until that follow-up lands, this branch always evaluates
-        // `enabled = true` against the real production Agent — matching
-        // the flag's own default, so an operator who has NOT touched the
-        // flag sees identical behavior either way. An operator who
-        // explicitly sets `trace_mining_enabled=false` will still see the
-        // mine_traces ACTION itself fully no-op (verified gate in
-        // memory_maintain.zig), but this READ-side consultation block
-        // will keep consulting any insights files already on disk from
-        // before the flag was flipped off, until that follow-up lands.
+        // mining being on). Threaded onto `Agent` via the standard 6-hop
+        // pattern (config_types → config_parse → SessionManager field →
+        // gateway assignment sites → Agent field → session restore-on-turn),
+        // the same house pattern as `cost_vital_in_prompt` /
+        // `dream_log_warmstart_enabled`. Read directly off the Agent, no
+        // duck-typing.
         const insights_block: ?[]u8 = blk: {
-            const enabled = if (@hasField(@TypeOf(agent.*), "trace_mining_enabled"))
-                agent.trace_mining_enabled
-            else
-                true;
-            if (!enabled) break :blk null;
+            if (!agent.trace_mining_enabled) break :blk null;
             const insights_dir = try std.fs.path.join(allocator, &.{ agent.workspace_dir, "insights" });
             defer allocator.free(insights_dir);
             break :blk insights_block_mod.readInsightsBlock(allocator, insights_dir) catch |err| {
@@ -1224,6 +1204,11 @@ fn FakeIngestAgent(comptime ObserverT: type) type {
         // Task 4 (package1-activations) — dream_log warm-start gate, reached
         // through the agent: anytype the same way as typed_views_enabled.
         dream_log_warmstart_enabled: bool = true,
+        // Package 2a Task 4 (review fix) — trace-mining gate. Not read by
+        // ingest() (only assemble()'s insights_block gate reads it), but
+        // carried here for fixture parity with the sibling flags above so
+        // this struct stays a drop-in stand-in for the real Agent type.
+        trace_mining_enabled: bool = true,
         observer: ObserverT,
         current_run_id: ?[]const u8 = null,
     };
