@@ -542,10 +542,18 @@ pub const AgentConfig = struct {
     ///
     /// When FALSE, the Runtime section renders exactly as before this
     /// feature (no Cost line) — same null-pointer off-path used when no
-    /// UsageRuntime is wired at all. Safe rollback: this only changes what
-    /// the agent reads in its own system prompt; it never affects cost
-    /// computation, billing, or the ledger itself.
-    cost_vital_in_prompt: bool = true,
+    /// UsageRuntime is wired at all. This only changes what the agent reads
+    /// in its own system prompt; it never affects cost computation, billing,
+    /// or the ledger itself.
+    ///
+    /// DEFAULT FALSE (SaaS posture, 2026-07-07): runtime spend is the
+    /// OPERATOR'S unit-cost data, not end-user information — a SaaS user
+    /// pays a subscription, and an agent volunteering "I spent $0.07 on
+    /// you" leaks margin economics and confuses billing. The plumbing stays
+    /// as the substrate for the future OPERATOR-facing budget governor
+    /// (AGENT-ULTIMATE-DESIGN "cost interoception" / budget envelopes);
+    /// single-tenant/self-hosted operators may opt in.
+    cost_vital_in_prompt: bool = false,
     /// Task 4 (package1-activations, "first dream consumer") — dream_log
     /// warm-start gate.
     ///

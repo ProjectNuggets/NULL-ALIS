@@ -287,8 +287,9 @@ pub const SessionManager = struct {
     /// Task 3 (package1-activations, "cost interoception") — Runtime-prompt
     /// cost-vital gate, threaded from gateway config to per-session Agent →
     /// PromptContext.usage_runtime. Same INIT-ONLY concurrency contract as
-    /// the sibling fields. Default true.
-    cost_vital_in_prompt: bool = true,
+    /// the sibling fields. Default FALSE — SaaS posture; see
+    /// config_types.cost_vital_in_prompt.
+    cost_vital_in_prompt: bool = false,
     /// Task 4 (package1-activations, "first dream consumer") — dream_log
     /// warm-start gate, threaded from gateway config to per-session Agent →
     /// memory_loader (LoadTurnMemoryOptions). Same INIT-ONLY concurrency
