@@ -577,7 +577,7 @@ pub const PendingApprovalRow = struct {
 /// **Subagent Pass Phase 1** — borrowed-slice input for upsertSubagentResult.
 /// Caller owns the memory; the function dupes everything it needs to persist.
 pub const SubagentResultInput = struct {
-    result_id: []const u8,   // formatted "subagent:<task_id>"
+    result_id: []const u8, // formatted "subagent:<task_id>"
     user_id: i64,
     session_key: []const u8,
     task_id: i64,
@@ -11545,12 +11545,17 @@ const ManagerImpl = struct {
 
     /// Package 2a Task 3 (the miner), fleet scope (learning contract
     /// inv. 5 — operator surface) — same read as listRecentToolTraces
-    /// but WITHOUT the user_id filter, across all tenants. Callers MUST
-    /// strip per-user identifiers before this leaves the operator
-    /// boundary — this method itself only reads events_json/run_id/
-    /// created_at, identical row shape to the single-tenant read; the
-    /// privacy narrowing happens in trace_mining's fleet-scope analysis
-    /// path, not here.
+    /// but WITHOUT the user_id filter, across all tenants.
+    ///
+    /// P1 HARDENING: NO agent-facing tool may call this. The former
+    /// caller (mine_traces scope=fleet) now denies fail-closed before
+    /// any read — there is no per-request operator identity at the
+    /// tool layer, so tool-reachable == tenant-reachable. This method
+    /// is reserved for the future gateway internal-token operator
+    /// endpoint (the PII/GDPR surface precedent). Callers MUST strip
+    /// per-user identifiers before output leaves the operator boundary
+    /// (renderFleetJson in memory_maintain.zig is the verified
+    /// shape-only renderer for that).
     pub fn listRecentToolTracesAllUsers(
         self: *Self,
         allocator: std.mem.Allocator,
@@ -19479,11 +19484,17 @@ test "P7 person-as-subject — extracted edge makes the subject a resolvable nod
         .confidence = 0.9,
     }};
     const r1 = try extraction_persist.persistExtracted(
-        allocator, &mgr, 2, "p7-subject-session", &person_fact,
+        allocator,
+        &mgr,
+        2,
+        "p7-subject-session",
+        &person_fact,
         null, // judge
         coref, // P7: coref present → subject + object resolve to entity rows
         null, // mem_rt
-        .test_wire, 0, true,
+        .test_wire,
+        0,
+        true,
     );
     try std.testing.expect(r1.written_count == 1);
 
@@ -19541,8 +19552,17 @@ test "P7 person-as-subject — extracted edge makes the subject a resolvable nod
         .confidence = 0.9,
     }};
     const r2 = try extraction_persist.persistExtracted(
-        allocator, &mgr, 2, "p7-subject-session", &self_fact,
-        null, coref, null, .test_wire, 0, true,
+        allocator,
+        &mgr,
+        2,
+        "p7-subject-session",
+        &self_fact,
+        null,
+        coref,
+        null,
+        .test_wire,
+        0,
+        true,
     );
     try std.testing.expect(r2.written_count == 1);
     {
@@ -19614,11 +19634,17 @@ test "brain-leak A: scaffold triples rejected at persist write boundary; real fa
         .{ .text = "User prefers Helix editor", .subject = "user", .predicate = "PREFERS", .object = "Helix", .attributed_to = "user", .confidence = 0.95 },
     };
     const r = try extraction_persist.persistExtracted(
-        allocator, &mgr, 2, "brainleak-a-session", &triples,
+        allocator,
+        &mgr,
+        2,
+        "brainleak-a-session",
+        &triples,
         null, // judge
         coref, // coref present → any survivor resolves to an entity row
         null, // mem_rt
-        .test_wire, 0, true,
+        .test_wire,
+        0,
+        true,
     );
 
     // Exactly the 3 scaffold facts rejected; exactly the 1 genuine fact written.

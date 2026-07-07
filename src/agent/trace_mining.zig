@@ -387,7 +387,12 @@ fn mineToolStats(allocator: std.mem.Allocator, rows: []const ToolTraceDigestRow)
                 if (sv == .bool and sv.bool) gop.value_ptr.successes += 1;
             }
             if (obj.get("duration_ms")) |dv| {
-                if (dv == .integer) {
+                // Negative duration = malformed row (P3): SKIP the
+                // duration, keep the call counted. The prior naked
+                // @intCast(i64 -> u64) trapped the whole mining run on
+                // one bad row; clamping to 0 would instead skew p50
+                // with a fake sample.
+                if (dv == .integer and dv.integer >= 0) {
                     try gop.value_ptr.durations.append(allocator, @intCast(dv.integer));
                 }
             }
@@ -993,6 +998,34 @@ test "analyze: ToolStat p50_duration_ms is the median across uses" {
     var report = try analyze(allocator, &rows);
     defer report.deinit(allocator);
 
+    try std.testing.expectEqual(@as(u64, 30), report.tool_stats[0].p50_duration_ms);
+}
+
+test "analyze: a NEGATIVE duration_ms (malformed row) is skipped, not trapped (P3 regression)" {
+    const allocator = std.testing.allocator;
+    // One malformed row with duration_ms=-50 among valid ones. Before
+    // the fix, the naked @intCast(i64 -> u64) panicked the whole run.
+    const malformed = ToolTraceDigestRow{
+        .run_id = try allocator.dupe(u8, "r-2-1"),
+        .events_json = try allocator.dupe(u8, "[{\"kind\":\"tool_call\",\"tool\":\"bash\",\"success\":true,\"duration_ms\":-50}]"),
+        .created_at_unix = 0,
+    };
+    var rows = [_]ToolTraceDigestRow{
+        statRow("r-1-1", "bash", true, 10),
+        malformed,
+        statRow("r-3-1", "bash", true, 30),
+    };
+    defer for (rows) |r| r.deinit(allocator);
+
+    var report = try analyze(allocator, &rows);
+    defer report.deinit(allocator);
+
+    // The malformed call is still COUNTED (uses=3, all successes)...
+    try std.testing.expectEqual(@as(u64, 3), report.tool_stats[0].uses);
+    try std.testing.expectEqual(@as(f64, 1.0), report.tool_stats[0].success_rate);
+    // ...but its duration is ignored: p50 over {10, 30} (index len/2
+    // = 30), not over a set polluted by a clamped fake sample (which
+    // would make it {0, 10, 30} -> 10).
     try std.testing.expectEqual(@as(u64, 30), report.tool_stats[0].p50_duration_ms);
 }
 
