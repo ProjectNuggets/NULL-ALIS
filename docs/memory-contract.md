@@ -80,3 +80,4 @@ are deliberately omitted: they rot on unrelated edits; symbols survive refactors
 - `is_latest` written-but-not-read in memories retrieval filter.
 - Near-dup semantic MERGE at write time (C0 reports only).
 - `task_list`/`cron_runs`/`skill_registry` extraction judgment (kept fail-open deliberately).
+- Learning stores are bookkeeping to this pipeline — see `docs/learning-contract.md`.

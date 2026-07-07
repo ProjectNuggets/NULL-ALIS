@@ -36,6 +36,58 @@ pub const LearnedFact = struct {
     signal: LearningSignal,
 };
 
+// ── The Learning Contract vocabulary ────────────────────────────────────────
+// Normative source: docs/learning-contract.md. Executable form:
+// learning_contract_test.zig. If you change a name or a birth-state row,
+// change both.
+
+/// LearnedOrigin — axis 1 (provenance) of the learning contract. Immutable,
+/// stamped at birth. Trust follows provenance, never content (inv. 3):
+/// `user_correction` and `mined_aggregate` are never conflated.
+pub const LearnedOrigin = enum {
+    user_correction,
+    observed_success,
+    observed_failure,
+    mined_aggregate,
+    operator,
+
+    pub fn toSlice(self: LearnedOrigin) []const u8 {
+        return @tagName(self);
+    }
+
+    pub fn fromSlice(slice: []const u8) ?LearnedOrigin {
+        return std.meta.stringToEnum(LearnedOrigin, slice);
+    }
+};
+
+/// LearnedState — axis 4 (the trust ladder) of the learning contract:
+/// `shadow -> active -> retired`. Transitions are EXTERNAL events only
+/// (inv. 1); this type only names the rungs, it does not gate movement
+/// between them.
+pub const LearnedState = enum {
+    shadow,
+    active,
+    retired,
+
+    pub fn toSlice(self: LearnedState) []const u8 {
+        return @tagName(self);
+    }
+
+    pub fn fromSlice(slice: []const u8) ?LearnedState {
+        return std.meta.stringToEnum(LearnedState, slice);
+    }
+};
+
+/// The birth-state LAW (learning contract inv. 1): only a human-stated
+/// correction or operator directive is active at birth; everything the
+/// agent derives itself starts shadow.
+pub fn birthState(origin: LearnedOrigin) LearnedState {
+    return switch (origin) {
+        .user_correction, .operator => .active,
+        .observed_success, .observed_failure, .mined_aggregate => .shadow,
+    };
+}
+
 // Patterns for each signal type. All checked case-insensitively.
 const CORRECTION_PATTERNS = [_][]const u8{
     "no, actually",
@@ -360,4 +412,8 @@ test "extractFactFromMessage returns null for empty message" {
     const sigs = [_]LearningSignal{.explicit_preference};
     const result = try extractFactFromMessage(allocator, "   ", &sigs);
     try std.testing.expect(result == null);
+}
+
+test {
+    _ = @import("learning_contract_test.zig");
 }
