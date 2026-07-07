@@ -1,0 +1,7 @@
+{
+  "name": "delegation",
+  "version": "1.0.0",
+  "description": "When and how to fan out work to subagents and run them like a chief of staff — coordinator mode playbook.",
+  "author": "nullalis",
+  "always": false
+}
