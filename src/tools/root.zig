@@ -347,6 +347,25 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .cost_class = .a,
     },
     .{
+        // Pkg3 Task 5 — was UNREGISTERED → conservative() fallback
+        // (mutating + HIGH risk), wrong for a read tool. Verified behavior
+        // (file_read_hashed.zig): reads a workspace file and returns it
+        // with per-line Hashline tags; no writes. Same posture as file_read.
+        .name = file_read_hashed.FileReadHashedTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    },
+    .{
+        // Pkg3 Task 5 — pure in-process arithmetic/stats, no I/O and no
+        // state (calculator.zig). Was UNREGISTERED → conservative() marked
+        // it mutating+high. Read-only, background + concurrency safe.
+        .name = calculator.CalculatorTool.tool_name,
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    },
+    .{
         // D1.14c — cacheable. Same session re-asks the same question
         // (e.g. "what did I do yesterday") frequently in multi-turn
         // chat. 300s TTL covers continuation without missing fresh
@@ -482,6 +501,16 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .cost_class = .a,
     },
     .{
+        // Pkg3 Task 5 — was UNREGISTERED → conservative() fallback (HIGH
+        // risk). Verified behavior (file_edit_hashed.zig): replaces file
+        // lines in place via Hashline anchors (drift-tolerant), writing the
+        // file back — a mutating filesystem edit. Same posture as file_edit.
+        .name = file_edit_hashed.FileEditHashedTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .medium,
+        .cost_class = .a,
+    },
+    .{
         .name = file_append.FileAppendTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .medium,
@@ -510,6 +539,30 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     },
     .{
         .name = memory_forget.MemoryForgetTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    },
+    .{
+        // Pkg3 Task 5 — was UNREGISTERED → conservative() fallback
+        // (mutating + HIGH risk), misclassifying it in mode-gates.
+        // Verified behavior (memory_archive.zig): soft-closes one memory
+        // row (bi-temporal close-out: valid_to/invalid_at/expired_at +
+        // is_latest=false), cascades typed edges, deactivates the vector
+        // entry. A bounded, reversible curation write — mirrors
+        // memory_forget's MU/low/a (forget is the hard-delete sibling).
+        .name = memory_archive.MemoryArchiveTool.tool_name,
+        .flags = .{ .mutating = true },
+        .risk_level = .low,
+        .cost_class = .a,
+    },
+    .{
+        // Pkg3 Task 5 — was UNREGISTERED → conservative() fallback.
+        // Verified behavior (memory_demote.zig): downgrades a `core`
+        // memory's type back to daily/conversation/episodic so the V1.7
+        // immortality guard releases it for edit/archive. One row
+        // metadata write, bounded, reversible → MU/low/a.
+        .name = memory_demote.MemoryDemoteTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .low,
         .cost_class = .a,
@@ -552,9 +605,12 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     .{
         // V1.9-DX1 — wall-clock awareness. Read-only, low risk,
         // tiny cost. Pairs with memory_maintain action=temporal_decay
-        // for honest age reasoning.
+        // for honest age reasoning. Pkg3 Task 5: was `flags = .{}` (empty →
+        // neither read_only nor mutating, so plan/review mode-gates would
+        // not admit it as read-only). It only reads the system clock —
+        // background_safe + concurrency_safe like sibling read tools.
         .name = time_now.TimeNowTool.tool_name,
-        .flags = .{},
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -603,9 +659,12 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // V1.7-ship S2a — read-only graph navigation tool. Wraps
         // V1.7a-Obsidian-parity primitives (local_graph, communities,
         // orphans, diff). No writes; one or two PG round trips per
-        // call; bounded payloads. Safe + cheap.
+        // call; bounded payloads. Safe + cheap. Pkg3 Task 5: was
+        // `flags = .{}` (empty → not treated read-only by mode gates);
+        // the tool is explicitly read-only per its own doc, so mark it.
+        // background_safe: bounded PG reads, no auth-turn requirement.
         .name = brain_graph.BrainGraphTool.tool_name,
-        .flags = .{},
+        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -3597,6 +3656,13 @@ test "defaultMetadataRegistry only whitelists expected background_safe tools" {
         // (read_only against the in-memory batch tracker); safe in a background/
         // cron lane. spawn_many is NOT here (it mutates — spawns subagents).
              "subagent_batch_result",
+        // Pkg3 Task 5 — newly-classified read-only tools. time_now reads the
+        // system clock; brain_graph runs bounded read-only graph queries (like
+        // memory_list/memory_timeline); calculator is pure in-process compute;
+        // file_read_hashed reads a workspace file (same posture as file_read).
+        // All safe to run from a scheduled/cron lane.
+        "time_now",
+        "brain_graph",      "calculator",            "file_read_hashed",
     };
 
     // Everything in the whitelist must be background_safe.
@@ -3856,6 +3922,61 @@ test "canonicalMetadataForName resolves known tools via real registry (no empty-
     try std.testing.expect(unk.flags.mutating);
     try std.testing.expect(!unk.flags.read_only);
     try std.testing.expectEqual(metadata.RiskLevel.high, unk.risk_level);
+}
+
+test "metadata_completeness_pkg3: previously-unregistered + empty-flag tools classify correctly (not conservative)" {
+    // Package 3 Task 5, Part B. Five tools had NO DEFAULT_TOOL_METADATA
+    // row → conservative() fallback (mutating + high-risk), so plan/review
+    // mode-gates misclassified them (calculator/file_read_hashed were
+    // treated as high-risk mutations; memory_archive/demote already
+    // mutate but were wrongly high-risk). Two more (time_now, brain_graph)
+    // had EMPTY flag sets {} → neither read_only nor mutating, so read-only
+    // mode-gates would not admit them. This locks the corrected rows.
+
+    // --- memory_archive: mutating, NOT the high-risk conservative fallback ---
+    const archive = canonicalMetadataForName("memory_archive");
+    try std.testing.expect(archive.flags.mutating);
+    try std.testing.expect(!archive.flags.read_only);
+    // Prove it is our real row, not conservative() (which is high/.b):
+    try std.testing.expectEqual(metadata.RiskLevel.low, archive.risk_level);
+    try std.testing.expectEqual(metadata.CostClass.a, archive.cost_class);
+
+    // --- memory_demote: same posture as memory_archive ---
+    const demote = canonicalMetadataForName("memory_demote");
+    try std.testing.expect(demote.flags.mutating);
+    try std.testing.expect(!demote.flags.read_only);
+    try std.testing.expectEqual(metadata.RiskLevel.low, demote.risk_level);
+    try std.testing.expectEqual(metadata.CostClass.a, demote.cost_class);
+
+    // --- calculator: pure compute → read-only, background/concurrency safe ---
+    const calc = canonicalMetadataForName("calculator");
+    try std.testing.expect(calc.flags.read_only);
+    try std.testing.expect(!calc.flags.mutating);
+    try std.testing.expect(calc.flags.background_safe);
+    try std.testing.expect(calc.flags.concurrency_safe);
+    try std.testing.expectEqual(metadata.RiskLevel.low, calc.risk_level);
+
+    // --- file_read_hashed: read-only file read, mirrors file_read ---
+    const frh = canonicalMetadataForName("file_read_hashed");
+    try std.testing.expect(frh.flags.read_only);
+    try std.testing.expect(!frh.flags.mutating);
+    try std.testing.expect(frh.flags.background_safe);
+    try std.testing.expect(frh.flags.concurrency_safe);
+
+    // --- file_edit_hashed: mutating file write, mirrors file_edit (medium) ---
+    const feh = canonicalMetadataForName("file_edit_hashed");
+    try std.testing.expect(feh.flags.mutating);
+    try std.testing.expect(!feh.flags.read_only);
+    try std.testing.expectEqual(metadata.RiskLevel.medium, feh.risk_level);
+
+    // --- time_now + brain_graph: had empty flag sets; now explicitly read_only ---
+    const tn = canonicalMetadataForName("time_now");
+    try std.testing.expect(tn.flags.read_only);
+    try std.testing.expect(!tn.flags.mutating);
+
+    const bg = canonicalMetadataForName("brain_graph");
+    try std.testing.expect(bg.flags.read_only);
+    try std.testing.expect(!bg.flags.mutating);
 }
 
 test "canonicalMetadataForCall applies args-aware refinement (schedule.list, git status, GET)" {

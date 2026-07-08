@@ -454,6 +454,31 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    // Top-level `heartbeat` object (Package 3 Task 5). Before this, ONLY
+    // `agents.defaults.heartbeat` was parsed — a top-level
+    // `"heartbeat":{...}` in config.json was silently dropped (no
+    // root.get("heartbeat")). Mirror the same fields into `self.heartbeat`.
+    //
+    // PRECEDENCE: parsed here FIRST, then the `agents.defaults.heartbeat`
+    // block below runs SECOND and overwrites — so `agents.defaults` wins
+    // when BOTH are present. `agents.defaults` is the established path;
+    // this top-level form is the documented convenience alias. Either form
+    // setting `enabled` records `heartbeat_enabled_explicit` so the
+    // zaki_bot profile flip honors an explicit `false` opt-out.
+    if (root.get("heartbeat")) |hb| {
+        if (hb == .object) {
+            if (hb.object.get("enabled")) |v| {
+                if (v == .bool) {
+                    self.heartbeat.enabled = v.bool;
+                    self.heartbeat_enabled_explicit = true;
+                }
+            }
+            if (hb.object.get("interval_minutes")) |v| {
+                if (v == .integer) self.heartbeat.interval_minutes = @intCast(v.integer);
+            }
+        }
+    }
+
     // Agents section: agents.defaults.model.primary (provider/model) + agents.defaults.heartbeat + agents.list[]
     if (root.get("agents")) |agents_val| {
         if (agents_val == .object) {
@@ -496,9 +521,15 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                                     }
                                 }
                             }
-                            // Explicit enabled override
+                            // Explicit enabled override. Record the was-set
+                            // signal (Package 3 Task 5) so the zaki_bot
+                            // profile flip honors an explicit `false` opt-out
+                            // instead of force-flipping it to true.
                             if (hb.object.get("enabled")) |v| {
-                                if (v == .bool) self.heartbeat.enabled = v.bool;
+                                if (v == .bool) {
+                                    self.heartbeat.enabled = v.bool;
+                                    self.heartbeat_enabled_explicit = true;
+                                }
                             }
                             // Explicit interval_minutes (our internal field)
                             if (hb.object.get("interval_minutes")) |v| {

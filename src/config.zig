@@ -162,6 +162,13 @@ pub const Config = struct {
     memory_auto_save: bool = true,
     heartbeat_enabled: bool = false,
     heartbeat_interval_minutes: u32 = 60,
+    /// Was-set signal (Package 3 Task 5): true when config.json explicitly
+    /// carried a `heartbeat.enabled` bool — top-level OR
+    /// `agents.defaults.heartbeat.enabled`. The zaki_bot profile flip
+    /// (applyProfileDefaults) consults this so an operator's explicit
+    /// `false` is honored (opt-out) instead of being force-flipped to true.
+    /// Runtime/derived — set by the parser, never read from JSON directly.
+    heartbeat_enabled_explicit: bool = false,
     gateway_host: []const u8 = "127.0.0.1",
     gateway_port: u16 = 3000,
     workspace_only: bool = true,
@@ -435,7 +442,22 @@ pub const Config = struct {
             //   - snapshot_enabled, peripherals, query_expansion,
             //     llm_reranker, qmd — deliberately off; see deferred-register.
             if (!self.audio_media.enabled) self.audio_media.enabled = true;
-            if (!self.heartbeat.enabled) self.heartbeat.enabled = true;
+            // Heartbeat honesty (Package 3 Task 5): default absent→true, but
+            // NEVER override an operator's EXPLICIT `false`. `if (!x) x = true`
+            // alone flips false→true unconditionally, breaking the block
+            // comment's own promise above ("operators can still set explicit
+            // false to opt out"). `heartbeat_enabled_explicit` is set by the
+            // parser when config.json carries a `heartbeat.enabled` bool
+            // (top-level or agents.defaults.heartbeat.enabled), so we only
+            // apply the profile default when the operator was silent.
+            //
+            // SCOPE: heartbeat only. The other six flags below keep the
+            // unconditional flip (roadmap-deferred, Package 3 Self-Review
+            // "Deferred"): their explicit-false handling is out of scope for
+            // this task and their was-set tracking is not wired.
+            if (!self.heartbeat_enabled_explicit and !self.heartbeat.enabled) {
+                self.heartbeat.enabled = true;
+            }
             if (!self.cron.enabled) self.cron.enabled = true;
             if (!self.memory.response_cache.enabled) self.memory.response_cache.enabled = true;
             if (!self.memory.semantic_cache.enabled) self.memory.semantic_cache.enabled = true;
@@ -1330,6 +1352,7 @@ const config_field_accounting = [_]ConfigFieldAccount{
     .{ .name = "memory_auto_save", .disposition = .runtime_or_derived },
     .{ .name = "heartbeat_enabled", .disposition = .runtime_or_derived },
     .{ .name = "heartbeat_interval_minutes", .disposition = .runtime_or_derived },
+    .{ .name = "heartbeat_enabled_explicit", .disposition = .runtime_or_derived },
     .{ .name = "gateway_host", .disposition = .runtime_or_derived },
     .{ .name = "gateway_port", .disposition = .runtime_or_derived },
     .{ .name = "workspace_only", .disposition = .runtime_or_derived },
@@ -1497,6 +1520,88 @@ test "gateway config defaults require explicit chat stream session key" {
         .allocator = std.testing.allocator,
     };
     try std.testing.expect(cfg.gateway.require_explicit_chat_stream_session_key);
+}
+
+// ── Heartbeat honesty (Package 3 Task 5, Part A) ──────────────────
+//
+// The zaki_bot profile flips seven dormant feature flags default→true
+// (config.zig applyProfileDefaults). For heartbeat the flip MUST NOT
+// override an operator's EXPLICIT `false` — the block comment there
+// promises "operators can still set explicit false to opt out", and for
+// a bool that was a lie: `if (!x) x = true` flips false→true
+// unconditionally. These tests lock the honest behavior:
+//   1. explicit top-level false under zaki_bot stays false (heartbeat_zbfalse)
+//   2. absent heartbeat under zaki_bot still defaults true (profile default)
+//   3. explicit agents.defaults.heartbeat.enabled=false stays false
+
+test "heartbeat_zbfalse: explicit top-level heartbeat.enabled=false is honored under zaki_bot profile" {
+    // Arena mirrors the established zaki_bot-profile config tests (the
+    // profile flip dupes default_model/provider/sidecar strings).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{
+        \\  "profile": "zaki_bot",
+        \\  "heartbeat": {"enabled": false}
+        \\}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    cfg.syncFlatFields();
+    // Pre-fix this was TRUE (the unconditional profile flip). The operator
+    // explicitly opted out — honor it.
+    try std.testing.expect(!cfg.heartbeat.enabled);
+    try std.testing.expect(!cfg.heartbeat_enabled);
+}
+
+test "heartbeat_zbfalse: absent heartbeat under zaki_bot still defaults to true (profile default preserved)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{
+        \\  "profile": "zaki_bot"
+        \\}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    cfg.syncFlatFields();
+    // No explicit operator value → the profile default (proactive engine on)
+    // must still apply.
+    try std.testing.expect(cfg.heartbeat.enabled);
+    try std.testing.expect(cfg.heartbeat_enabled);
+}
+
+test "heartbeat_zbfalse: explicit agents.defaults.heartbeat.enabled=false is honored under zaki_bot profile" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{
+        \\  "profile": "zaki_bot",
+        \\  "agents": {"defaults": {"heartbeat": {"enabled": false}}}
+        \\}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    cfg.syncFlatFields();
+    // The established heartbeat parse path (agents.defaults) must also
+    // record the explicit-false so the profile flip respects it.
+    try std.testing.expect(!cfg.heartbeat.enabled);
+    try std.testing.expect(!cfg.heartbeat_enabled);
 }
 
 test "validation rejects bad temperature" {
