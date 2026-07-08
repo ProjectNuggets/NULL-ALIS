@@ -607,10 +607,14 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // tiny cost. Pairs with memory_maintain action=temporal_decay
         // for honest age reasoning. Pkg3 Task 5: was `flags = .{}` (empty →
         // neither read_only nor mutating, so plan/review mode-gates would
-        // not admit it as read-only). It only reads the system clock —
-        // background_safe + concurrency_safe like sibling read tools.
+        // not admit it as read-only). Pkg3 review fix: read_only +
+        // concurrency_safe ONLY, deliberately NOT background_safe — the
+        // locked design said "read_only", and the pre-task empty flags
+        // never admitted it to the background/cron lane, so granting BS
+        // would have widened that lane. RO-without-BS matches
+        // cron_list/cron_runs.
         .name = time_now.TimeNowTool.tool_name,
-        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .flags = .{ .read_only = true, .concurrency_safe = true },
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -662,9 +666,13 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // call; bounded payloads. Safe + cheap. Pkg3 Task 5: was
         // `flags = .{}` (empty → not treated read-only by mode gates);
         // the tool is explicitly read-only per its own doc, so mark it.
-        // background_safe: bounded PG reads, no auth-turn requirement.
+        // Pkg3 review fix: read_only + concurrency_safe ONLY, deliberately
+        // NOT background_safe — the locked design said "read_only", and
+        // the pre-task empty flags never admitted it to the background/cron
+        // lane, so granting BS would have widened that lane.
+        // RO-without-BS matches cron_list/cron_runs.
         .name = brain_graph.BrainGraphTool.tool_name,
-        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
+        .flags = .{ .read_only = true, .concurrency_safe = true },
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -3656,13 +3664,15 @@ test "defaultMetadataRegistry only whitelists expected background_safe tools" {
         // (read_only against the in-memory batch tracker); safe in a background/
         // cron lane. spawn_many is NOT here (it mutates — spawns subagents).
              "subagent_batch_result",
-        // Pkg3 Task 5 — newly-classified read-only tools. time_now reads the
-        // system clock; brain_graph runs bounded read-only graph queries (like
-        // memory_list/memory_timeline); calculator is pure in-process compute;
-        // file_read_hashed reads a workspace file (same posture as file_read).
-        // All safe to run from a scheduled/cron lane.
-        "time_now",
-        "brain_graph",      "calculator",            "file_read_hashed",
+        // Pkg3 Task 5 — calculator is pure in-process compute;
+        // file_read_hashed reads a workspace file (same background posture
+        // as its sibling file_read). Both safe from a scheduled/cron lane.
+        // time_now + brain_graph are deliberately NOT here (Pkg3 review
+        // fix): they are read_only + concurrency_safe WITHOUT
+        // background_safe — the locked design said "read_only" and their
+        // pre-task empty flags never admitted them to this lane.
+        "calculator",
+        "file_read_hashed",
     };
 
     // Everything in the whitelist must be background_safe.
@@ -3969,14 +3979,22 @@ test "metadata_completeness_pkg3: previously-unregistered + empty-flag tools cla
     try std.testing.expect(!feh.flags.read_only);
     try std.testing.expectEqual(metadata.RiskLevel.medium, feh.risk_level);
 
-    // --- time_now + brain_graph: had empty flag sets; now explicitly read_only ---
+    // --- time_now + brain_graph: had empty flag sets; now explicitly
+    // read_only + concurrency_safe and deliberately NOT background_safe
+    // (Pkg3 review fix: the locked design said "read_only"; their pre-task
+    // empty flags never admitted them to the background/cron lane, so BS
+    // would have widened it) ---
     const tn = canonicalMetadataForName("time_now");
     try std.testing.expect(tn.flags.read_only);
     try std.testing.expect(!tn.flags.mutating);
+    try std.testing.expect(tn.flags.concurrency_safe);
+    try std.testing.expect(!tn.flags.background_safe);
 
     const bg = canonicalMetadataForName("brain_graph");
     try std.testing.expect(bg.flags.read_only);
     try std.testing.expect(!bg.flags.mutating);
+    try std.testing.expect(bg.flags.concurrency_safe);
+    try std.testing.expect(!bg.flags.background_safe);
 }
 
 test "canonicalMetadataForCall applies args-aware refinement (schedule.list, git status, GET)" {

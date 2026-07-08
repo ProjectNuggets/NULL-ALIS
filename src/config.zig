@@ -937,7 +937,16 @@ pub const Config = struct {
         // agents.defaults (model + heartbeat) + agents.list
         {
             const has_model = self.default_model != null;
-            const has_heartbeat = self.heartbeat.enabled or self.heartbeat.interval_minutes != 60;
+            // The heartbeat block is ALWAYS emitted. A disabled heartbeat
+            // must round-trip as an explicit `"enabled": false` REGARDLESS
+            // of interval: the zaki_bot profile flip re-enables heartbeat on
+            // load unless the parsed JSON carried an explicit false
+            // (heartbeat_enabled_explicit), so the pre-fix condition here
+            // (`enabled or interval != 60`) — which omitted the block for
+            // {enabled=false, interval=60} — meant any config re-save (the
+            // channel wizard, quick setup) silently dropped an operator's
+            // opt-out. Enabled configs serialize byte-identically to before.
+            const has_heartbeat = true;
             const has_agents = self.agents.len > 0;
             if (has_model or has_heartbeat or has_agents) {
                 try w.print("  \"agents\": {{\n", .{});
@@ -1533,6 +1542,10 @@ test "gateway config defaults require explicit chat stream session key" {
 //   1. explicit top-level false under zaki_bot stays false (heartbeat_zbfalse)
 //   2. absent heartbeat under zaki_bot still defaults true (profile default)
 //   3. explicit agents.defaults.heartbeat.enabled=false stays false
+//   4. both sources present → agents.defaults wins over top-level (the
+//      documented precedence, otherwise enforced only by parse-block order)
+//   5. explicit false survives a save() round-trip (review fix: the
+//      serializer must emit the heartbeat block whenever disabled)
 
 test "heartbeat_zbfalse: explicit top-level heartbeat.enabled=false is honored under zaki_bot profile" {
     // Arena mirrors the established zaki_bot-profile config tests (the
@@ -1602,6 +1615,87 @@ test "heartbeat_zbfalse: explicit agents.defaults.heartbeat.enabled=false is hon
     // record the explicit-false so the profile flip respects it.
     try std.testing.expect(!cfg.heartbeat.enabled);
     try std.testing.expect(!cfg.heartbeat_enabled);
+}
+
+test "heartbeat_zbfalse: both-present precedence: agents.defaults.heartbeat.enabled=false beats top-level enabled=true" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    // BOTH sources present with CONFLICTING values. The documented
+    // precedence (config_parse.zig: top-level heartbeat parsed FIRST,
+    // agents.defaults SECOND and overwrites) says agents.defaults wins →
+    // final enabled=false. Under zaki_bot this also proves the explicit
+    // signal is recorded: were it lost, the profile flip would turn the
+    // false back into true. Pins the invariant against a parse-block
+    // reorder silently inverting it with an otherwise-green suite.
+    const json =
+        \\{
+        \\  "profile": "zaki_bot",
+        \\  "heartbeat": {"enabled": true},
+        \\  "agents": {"defaults": {"heartbeat": {"enabled": false}}}
+        \\}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    cfg.syncFlatFields();
+    try std.testing.expect(cfg.heartbeat_enabled_explicit);
+    try std.testing.expect(!cfg.heartbeat.enabled);
+    try std.testing.expect(!cfg.heartbeat_enabled);
+}
+
+test "heartbeat_zbfalse: explicit opt-out (enabled=false, default interval) survives save() round-trip under zaki_bot" {
+    // Review fix (Pkg3 Task 5 follow-up): the serializer emitted the
+    // heartbeat block only when `enabled or interval != 60`, so an explicit
+    // opt-out with the DEFAULT 60-minute interval serialized to NOTHING.
+    // Any config re-save (channel wizard runChannelsOnly, quick setup —
+    // both call cfg.save()) then dropped the opt-out and the NEXT zaki_bot
+    // load re-enabled the heartbeat. Round-trip: parse explicit false →
+    // save() → fresh parse of the saved file → opt-out must still hold.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    try cfg.parseJson(
+        \\{"profile": "zaki_bot", "heartbeat": {"enabled": false}}
+    );
+    cfg.syncFlatFields();
+    // Pre-conditions: the Task 5 fix honored the opt-out at parse time,
+    // and the interval is the default 60 (the exact dropped case).
+    try std.testing.expect(!cfg.heartbeat.enabled);
+    try std.testing.expectEqual(@as(u32, 60), cfg.heartbeat.interval_minutes);
+
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+
+    var cfg2 = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    try cfg2.parseJson(content);
+    cfg2.syncFlatFields();
+    // Pre-fix RED: the saved JSON carried no heartbeat block, so the fresh
+    // parse had no explicit signal and the zaki_bot profile flip silently
+    // re-enabled the heartbeat.
+    try std.testing.expect(cfg2.heartbeat_enabled_explicit);
+    try std.testing.expect(!cfg2.heartbeat.enabled);
+    try std.testing.expect(!cfg2.heartbeat_enabled);
 }
 
 test "validation rejects bad temperature" {
