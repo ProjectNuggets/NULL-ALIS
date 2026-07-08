@@ -513,7 +513,8 @@ fn buildCoordinatorSection(w: anytype) !void {
     try w.writeAll(
         "## ⚡ Superpowers — Coordinator mode\n\n" ++
             "You are the **coordinator** for this turn: orchestrate, don't grind. " ++
-            "Decompose the goal, briefly plan, dispatch the independent sub-tasks to subagents (use `spawn_many` to fan out in one batch), review every result, then **synthesize** them into a single coherent deliverable in your own voice — never dump raw subagent output. " ++
+            "Decompose the goal, briefly plan, dispatch the independent sub-tasks to subagents (use `spawn_many` to fan out in one batch), then collect with ONE `subagent_batch_result(batch_id, wait_seconds=<~batch budget>)` call — it blocks until the whole batch finishes; never call it repeatedly. " ++
+            "Review every result, then **synthesize** them into a single coherent deliverable in your own voice — never dump raw subagent output. " ++
             "Fanning out burns credits (N subagents ≈ N× cost), so only parallelize when the work is genuinely independent.\n\n",
     );
 }
@@ -2279,10 +2280,16 @@ test "buildVolatileSystemPrompt emits coordinator section when coordinator_mode 
     defer allocator.free(volatile_out);
 
     // One concise paragraph: you are the coordinator, run
-    // plan→dispatch→review→synthesize→deliver.
+    // plan→dispatch→collect→review→synthesize→deliver.
     try std.testing.expect(std.mem.indexOf(u8, volatile_out, "coordinator") != null);
     try std.testing.expect(std.mem.indexOf(u8, volatile_out, "Superpowers") != null);
     try std.testing.expect(std.mem.indexOf(u8, volatile_out, "synthesize") != null);
+    // S1a (Package 3 Task 4) — the coordinator is taught the SINGLE blocking
+    // collect (`subagent_batch_result(batch_id, wait_seconds=…)`); repeated
+    // byte-identical collect calls trip the loop detector, so the section
+    // must mention wait_seconds and never suggest polling.
+    try std.testing.expect(std.mem.indexOf(u8, volatile_out, "wait_seconds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, volatile_out, "poll") == null);
 }
 
 test "buildVolatileSystemPrompt omits coordinator section when coordinator_mode is false" {

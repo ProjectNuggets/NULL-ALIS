@@ -2438,7 +2438,7 @@ pub const Agent = struct {
         "  1. **Understand & decompose.** Restate the goal and split it into independent, parallelizable sub-tasks. If it isn't decomposable, say so and just answer directly — don't fan out for the sake of it.\n" ++
         "  2. **Plan briefly.** One short plan of which sub-tasks you'll dispatch and why. Don't over-plan.\n" ++
         "  3. **Dispatch with `spawn_many`.** Fan out the independent sub-tasks in a single batch. Each brief MUST be focused and self-contained — subagents inherit NO conversation context, so spell out everything they need.\n" ++
-        "  4. **Review each result.** When the batch returns (or via `subagent_batch_result`), read every result critically. Do not trust blindly; note gaps.\n" ++
+        "  4. **Collect with ONE `subagent_batch_result` call.** Pass the batch_id plus `wait_seconds` (≈ your batch budget, e.g. 90): the call blocks until every subagent finishes, then returns all results — one call, never a retry loop. Read every result critically; note gaps.\n" ++
         "  5. **Synthesize into ONE deliverable.** Merge the subagent outputs into a single coherent answer in YOUR voice. NEVER dump raw subagent transcripts at the user.\n" ++
         "  6. **Deliver.** Present the synthesized result.\n\n" ++
         "Partial success is fine: synthesize the survivors and name which sub-tasks failed and why — never silently drop a failure.\n" ++
@@ -11209,6 +11209,13 @@ test "getReflectionPrompt coordinator mentions plan, spawn_many, synthesize" {
     try std.testing.expect(std.mem.indexOf(u8, p, "plan") != null);
     try std.testing.expect(std.mem.indexOf(u8, p, "spawn_many") != null);
     try std.testing.expect(std.mem.indexOf(u8, p, "synthesize") != null);
+    // S1a (Package 3 Task 4) — collect with ONE blocking
+    // `subagent_batch_result(batch_id, wait_seconds=…)` call. The playbook
+    // must teach wait_seconds and never instruct repeated collect calls
+    // (3 byte-identical calls trip the loop detector, root.zig D1.10).
+    try std.testing.expect(std.mem.indexOf(u8, p, "subagent_batch_result") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "wait_seconds") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "poll") == null);
 }
 
 test "getReflectionPrompt plan stops before implementation" {

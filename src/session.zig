@@ -1178,8 +1178,9 @@ pub const SessionManager = struct {
             .provider = session.agent.default_provider,
             .model = session.agent.model_name,
             // Phase 5 T3 — propagate the per-turn Superpowers flag to tools.
-            // The fan-out tools (spawn_many / subagent_batch_result) self-gate
-            // on this; a non-Superpowers turn cannot fan out.
+            // spawn_many self-gates on this; a non-Superpowers turn cannot
+            // fan out. (subagent_batch_result is UNGATED since S1a — the
+            // collector is read-only, and the wake lane runs superpowers-unset.)
             .superpowers_mode = options.turn_superpowers_mode,
         });
         defer tools_mod.clearTurnContext();
@@ -1260,8 +1261,10 @@ pub const SessionManager = struct {
         // Phase 5 (Superpowers mode): activate coordinator mode for this turn
         // when the FE sent reasoning_effort="superpowers". Restored on defer so
         // the session reverts to the previous value after the turn completes.
-        // The fan-out tools (spawn_many / subagent_batch_result) self-gate on
-        // this flag — a non-superpowers turn cannot fan out (Phase 5 T3).
+        // spawn_many self-gates on this flag — a non-superpowers turn cannot
+        // fan out (Phase 5 T3). subagent_batch_result is UNGATED since S1a:
+        // collecting an already-dispatched batch is read-only, and the
+        // out-of-band wake turn (superpowers unset) must be able to collect.
         if (options.turn_superpowers_mode) {
             session.agent.superpowers_mode = true;
         }

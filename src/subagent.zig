@@ -804,6 +804,52 @@ pub const SubagentManager = struct {
         return entries.toOwnedSlice(allocator);
     }
 
+    // ── S1a (Package 3 Task 4) — bounded blocking batch wait ────────────────
+
+    /// Poll interval for `waitBatchTerminal`. 250 ms balances collect latency
+    /// (a batch is observed terminal ≤ 250 ms after its last completion)
+    /// against mutex traffic (4 short lock acquisitions per second while a
+    /// wait is active).
+    const BATCH_WAIT_POLL_INTERVAL_MS: i64 = 250;
+
+    /// S1a — Block until every task in `batch_id` is terminal, or until
+    /// `max_wait_ms` elapses — whichever comes first. Returns the wall-clock
+    /// milliseconds actually waited (~0 when the batch is already terminal on
+    /// the first sample; ≥ max_wait_ms when the deadline expired). The caller
+    /// (subagent_batch_result with wait_seconds > 0) follows up with
+    /// `getBatchResults` either way — a deadline expiry is NOT an error, it
+    /// just returns whatever states are current.
+    ///
+    /// LOCK DISCIPLINE: each sample acquires the manager mutex only long
+    /// enough to read the tracker (`taskIds` presence + `allTerminal`), then
+    /// RELEASES it before sleeping — the mutex is NEVER held across a sleep.
+    /// Everything that makes progress on the batch therefore interleaves
+    /// freely between samples: `completeTask` (subagent threads), the
+    /// deadline reaper (`reapBatchDeadlines`, 10 s ticker — which marks
+    /// overdue tasks terminal via completeTask and so ENDS this wait early
+    /// rather than fighting it), and concurrent spawns.
+    ///
+    /// Returns `error.UnknownBatch` immediately when the batch id is not in
+    /// the tracker — never waits on nonexistent ids. (Mid-wait this can only
+    /// trigger via the reaper's Phase-B expiry, i.e. for batches already
+    /// ≥ BATCH_EXPIRY_TTL_MS old; the error is the honest answer there too.)
+    pub fn waitBatchTerminal(self: *SubagentManager, batch_id: []const u8, max_wait_ms: i64) error{UnknownBatch}!i64 {
+        const start_ms = std.time.milliTimestamp();
+        while (true) {
+            {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                if (self.batches.taskIds(batch_id) == null) return error.UnknownBatch;
+                if (self.batches.allTerminal(batch_id))
+                    return std.time.milliTimestamp() - start_ms;
+            }
+            const elapsed = std.time.milliTimestamp() - start_ms;
+            if (elapsed >= max_wait_ms) return elapsed;
+            const sleep_ms: u64 = @intCast(@min(BATCH_WAIT_POLL_INTERVAL_MS, max_wait_ms - elapsed));
+            std.Thread.sleep(sleep_ms * std.time.ns_per_ms);
+        }
+    }
+
     pub fn getRunningCount(self: *SubagentManager) u32 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -4125,6 +4171,228 @@ test "reaper does not deadlock (no lock held across completeTask)" {
     // Verify the task became terminal (confirming reapBatchDeadlines ran).
     try std.testing.expect(mgr.getTaskStatus(501) != null);
     heartbeat_wake.clearForTest();
+}
+
+// ── S1a (Package 3 Task 4) tests: waitBatchTerminal (TDD — written before impl) ──
+
+/// S1a test helper — build a manually-inserted TaskState tagged with a batch,
+/// following the barrier-test pattern above (all strings duped into the
+/// manager/test allocator so freeTaskState can release them).
+fn makeBatchedTaskStateForTest(label: []const u8, session_key: []const u8, batch_id: []const u8) !*TaskState {
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, label),
+        .task_summary = try std.testing.allocator.dupe(u8, label),
+        .task_prompt = try std.testing.allocator.dupe(u8, label),
+        .session_key = try std.testing.allocator.dupe(u8, session_key),
+        .batch_id = try std.testing.allocator.dupe(u8, batch_id),
+        .started_at = std.time.milliTimestamp(),
+    };
+    return state;
+}
+
+/// S1a test helper — complete both tasks of a batch via the REAL completeTask
+/// path after a delay, from a separate thread (the production transition).
+fn completeTwoTasksAfterDelay(mgr: *SubagentManager, tid_a: u64, tid_b: u64, delay_ms: u64) void {
+    std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+    mgr.completeTask(tid_a, .{ .status = .completed, .text = "wait result A" }, null);
+    mgr.completeTask(tid_b, .{ .status = .completed, .text = "wait result B" }, null);
+}
+
+/// S1a test helper — run the deadline reaper after a delay, from a separate
+/// thread (simulates the production 10 s ticker firing mid-wait).
+fn reapAfterDelay(mgr: *SubagentManager, delay_ms: u64) void {
+    std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+    mgr.reapBatchDeadlines(std.time.milliTimestamp());
+}
+
+test "waitBatchTerminal S1a: returns immediately when the batch is already all-terminal" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const batch_id = "batch:wait:pre";
+    {
+        mgr.mutex.lock();
+        defer mgr.mutex.unlock();
+        const now = std.time.milliTimestamp();
+        try mgr.batches.register(batch_id, &[_]u64{31}, "agent:zaki-bot:user:31:main", now, now + 60_000);
+        mgr.batches.markTerminal(batch_id, 31);
+    }
+
+    const waited = try mgr.waitBatchTerminal(batch_id, 5_000);
+    // First sample sees all-terminal — no poll sleep ever happens.
+    try std.testing.expect(waited < 250);
+}
+
+test "waitBatchTerminal S1a: blocks until completeTask finishes the batch from another thread" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const batch_id = "batch:wait:block";
+    const session_key = "agent:zaki-bot:user:32:main";
+    try mgr.tasks.put(std.testing.allocator, 41, try makeBatchedTaskStateForTest("wait-a", session_key, batch_id));
+    try mgr.tasks.put(std.testing.allocator, 42, try makeBatchedTaskStateForTest("wait-b", session_key, batch_id));
+    {
+        mgr.mutex.lock();
+        defer mgr.mutex.unlock();
+        const now = std.time.milliTimestamp();
+        try mgr.batches.register(batch_id, &[_]u64{ 41, 42 }, session_key, now, now + 60_000);
+    }
+    _ = mgr.markTaskRunning(41);
+    _ = mgr.markTaskRunning(42);
+    heartbeat_wake.clearForTest();
+
+    // Real production transition: completeTask (durable/ledger/barrier path)
+    // fires from another thread ~500 ms in. The wait samples the tracker
+    // under the manager mutex between sleeps, so the completer's own mutex
+    // acquisitions interleave freely.
+    const helper = try std.Thread.spawn(.{}, completeTwoTasksAfterDelay, .{ &mgr, @as(u64, 41), @as(u64, 42), @as(u64, 500) });
+    defer heartbeat_wake.clearForTest(); // drain the barrier wake the completion enqueues
+    defer helper.join();
+
+    const waited = try mgr.waitBatchTerminal(batch_id, 30_000);
+
+    // The batch cannot be terminal before the helper ran at ~500 ms, and the
+    // wait must have ended on terminality — far below the 30 s deadline.
+    try std.testing.expect(waited >= 400);
+    try std.testing.expect(waited < 10_000);
+    try std.testing.expectEqual(TaskStatus.completed, mgr.getTaskStatus(41).?);
+    try std.testing.expectEqual(TaskStatus.completed, mgr.getTaskStatus(42).?);
+
+    // And the collect that follows sees the full terminal batch.
+    const entries = try mgr.getBatchResults(std.testing.allocator, batch_id);
+    defer SubagentManager.freeBatchResultEntries(std.testing.allocator, entries);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    for (entries) |e| try std.testing.expectEqualStrings("completed", e.status);
+}
+
+test "waitBatchTerminal S1a: returns at the deadline with a mixed batch (terminal + running)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const batch_id = "batch:wait:mixed";
+    const session_key = "agent:zaki-bot:user:33:main";
+    try mgr.tasks.put(std.testing.allocator, 51, try makeBatchedTaskStateForTest("mixed-a", session_key, batch_id));
+    try mgr.tasks.put(std.testing.allocator, 52, try makeBatchedTaskStateForTest("mixed-b", session_key, batch_id));
+    {
+        mgr.mutex.lock();
+        defer mgr.mutex.unlock();
+        const now = std.time.milliTimestamp();
+        try mgr.batches.register(batch_id, &[_]u64{ 51, 52 }, session_key, now, now + 600_000);
+    }
+    _ = mgr.markTaskRunning(51);
+    _ = mgr.markTaskRunning(52);
+    // Only ONE task completes; the other keeps running past our wait window.
+    mgr.completeTask(51, .{ .status = .completed, .text = "early bird" }, null);
+
+    const waited = try mgr.waitBatchTerminal(batch_id, 600);
+
+    // The wait expired (not an error) and reports having waited ~the window.
+    try std.testing.expect(waited >= 600);
+    // Collect returns the CURRENT mix: one completed, one still running.
+    const entries = try mgr.getBatchResults(std.testing.allocator, batch_id);
+    defer SubagentManager.freeBatchResultEntries(std.testing.allocator, entries);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    var saw_completed = false;
+    var saw_running = false;
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.status, "completed")) saw_completed = true;
+        if (std.mem.eql(u8, e.status, "running")) saw_running = true;
+    }
+    try std.testing.expect(saw_completed);
+    try std.testing.expect(saw_running);
+}
+
+test "waitBatchTerminal S1a: unknown batch returns error.UnknownBatch immediately" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const started = std.time.milliTimestamp();
+    try std.testing.expectError(error.UnknownBatch, mgr.waitBatchTerminal("batch:ghost:0", 30_000));
+    // No waiting on nonexistent ids.
+    try std.testing.expect(std.time.milliTimestamp() - started < 1_000);
+}
+
+test "waitBatchTerminal S1a: reaper timeout mid-wait ends the wait early (coexistence)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    // Batch whose BATCH deadline is already in the past; the task never
+    // completes on its own. A reaper tick mid-wait must mark it timeout →
+    // terminal → the wait ends long before ITS OWN 30 s ceiling. This is the
+    // production interplay: the 10 s reaper ticker, not the waiter, enforces
+    // batch deadlines; the waiter just observes the terminal transition.
+    const batch_id = "batch:wait:reaped";
+    const session_key = "agent:zaki-bot:user:34:main";
+    try mgr.tasks.put(std.testing.allocator, 61, try makeBatchedTaskStateForTest("reaped-a", session_key, batch_id));
+    const past: i64 = std.time.milliTimestamp() - 1;
+    {
+        mgr.mutex.lock();
+        defer mgr.mutex.unlock();
+        try mgr.batches.register(batch_id, &[_]u64{61}, session_key, past - 60_000, past);
+    }
+    _ = mgr.markTaskRunning(61);
+    heartbeat_wake.clearForTest();
+
+    const helper = try std.Thread.spawn(.{}, reapAfterDelay, .{ &mgr, @as(u64, 400) });
+    defer heartbeat_wake.clearForTest(); // drain the barrier wake the reap enqueues
+    defer helper.join();
+
+    const waited = try mgr.waitBatchTerminal(batch_id, 30_000);
+
+    // Ended by the reaper's terminal marking, not by our deadline.
+    try std.testing.expect(waited < 10_000);
+    const entries = try mgr.getBatchResults(std.testing.allocator, batch_id);
+    defer SubagentManager.freeBatchResultEntries(std.testing.allocator, entries);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    // Reaper text lands in the result (status becomes terminal via completeTask).
+    try std.testing.expectEqualStrings("subagent exceeded batch deadline", entries[0].text);
 }
 
 // Regression: non-batched single completion still wakes per-task (UNCHANGED PATH).
