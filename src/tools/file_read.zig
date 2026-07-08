@@ -137,6 +137,8 @@ pub const FileReadTool = struct {
     workspace_dir: []const u8,
     allowed_paths: []const []const u8 = &.{},
     max_file_size: u64 = DEFAULT_MAX_FILE_SIZE,
+    owned_allowed_paths: ?[]const []const u8 = null,
+    owned_allowed_path: ?[]const u8 = null,
 
     pub const tool_name = "file_read";
 
@@ -169,6 +171,21 @@ pub const FileReadTool = struct {
             .ptr = @ptrCast(self),
             .vtable = &vtable,
         };
+    }
+
+    pub fn appendOwnedAllowedPath(self: *FileReadTool, allocator: std.mem.Allocator, path: []const u8) !void {
+        const combined = try allocator.alloc([]const u8, self.allowed_paths.len + 1);
+        errdefer allocator.free(combined);
+        @memcpy(combined[0..self.allowed_paths.len], self.allowed_paths);
+        combined[self.allowed_paths.len] = path;
+        self.allowed_paths = combined;
+        self.owned_allowed_paths = combined;
+        self.owned_allowed_path = path;
+    }
+
+    pub fn deinitTool(self: *FileReadTool, allocator: std.mem.Allocator) void {
+        if (self.owned_allowed_paths) |paths| allocator.free(paths);
+        if (self.owned_allowed_path) |path| allocator.free(path);
     }
 
     pub fn execute(self: *FileReadTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {

@@ -81,17 +81,18 @@ pub const SubagentBatchResultTool = struct {
         };
     }
 
-    /// H7 failure builder — the clear "batch not found" message, shared by the
-    /// wait path and the collect path so both spellings stay byte-identical.
-    fn unknownBatchFailure(allocator: std.mem.Allocator, batch_id: []const u8) !ToolResult {
-        var ebuf: std.ArrayListUnmanaged(u8) = .{};
-        errdefer ebuf.deinit(allocator);
-        const ew = ebuf.writer(allocator);
-        try ew.print("Batch not found or expired (batch_id={s})", .{batch_id});
-        // Return as a failure with the output field carrying the message
-        // so the caller sees it via error_msg. We embed the string in
-        // output and set success=false (mirrors task_get's not-found pattern).
-        return .{ .success = false, .output = "", .error_msg = try ebuf.toOwnedSlice(allocator) };
+    /// Generic not-found failure shared by auth, wait, and collect paths.
+    /// Do not echo the requested id; batch ids can be probed across sessions.
+    fn batchNotFoundFailure() ToolResult {
+        return ToolResult.fail("Batch not found or expired");
+    }
+
+    fn authorizeBatchAccess(manager: *SubagentManager, batch_id: []const u8) ?ToolResult {
+        const turn_session = root.getTurnContext().session_key orelse return batchNotFoundFailure();
+
+        const owned = manager.batchSessionKeyEquals(batch_id, turn_session) catch return batchNotFoundFailure();
+        if (!owned) return batchNotFoundFailure();
+        return null;
     }
 
     pub fn execute(self: *SubagentBatchResultTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
@@ -118,20 +119,20 @@ pub const SubagentBatchResultTool = struct {
         const manager = self.manager orelse
             return ToolResult.fail("subagent_batch_result tool not connected to SubagentManager");
 
+        if (authorizeBatchAccess(manager, trimmed)) |failure| return failure;
+
         var waited_ms: i64 = 0;
         if (wait_seconds > 0) {
             // Bounded wait until all-terminal or deadline; the deadline expiry
             // is NOT an error — the collect below returns current states.
             // error.UnknownBatch → same H7 contract as the collect path, and
             // immediately: never wait on a nonexistent id.
-            waited_ms = manager.waitBatchTerminal(trimmed, wait_seconds * std.time.ms_per_s) catch {
-                return unknownBatchFailure(allocator, trimmed);
-            };
+            waited_ms = manager.waitBatchTerminal(trimmed, wait_seconds * std.time.ms_per_s) catch return batchNotFoundFailure();
         }
 
         // Collect entries — H7: error.UnknownBatch → clear message.
         const entries = manager.getBatchResults(allocator, trimmed) catch |err| {
-            if (err == error.UnknownBatch) return unknownBatchFailure(allocator, trimmed);
+            if (err == error.UnknownBatch) return batchNotFoundFailure();
             return ToolResult.fail("Failed to retrieve batch results");
         };
         defer SubagentManager.freeBatchResultEntries(allocator, entries);
@@ -192,7 +193,7 @@ test "subagent_batch_result schema contains batch_id" {
 
 test "subagent_batch_result missing batch_id" {
     // Superpowers ctx kept for coverage parity — the tool is ungated (S1a).
-    root.setTurnContext(.{ .superpowers_mode = true });
+    root.setTurnContext(.{ .superpowers_mode = true, .session_key = "agent:test:user:1:main" });
     defer root.clearTurnContext();
     var sbt = SubagentBatchResultTool{};
     const t = sbt.tool();
@@ -204,7 +205,7 @@ test "subagent_batch_result missing batch_id" {
 }
 
 test "subagent_batch_result without manager fails" {
-    root.setTurnContext(.{ .superpowers_mode = true });
+    root.setTurnContext(.{ .superpowers_mode = true, .session_key = "agent:test:user:1:main" });
     defer root.clearTurnContext();
     var sbt = SubagentBatchResultTool{};
     const t = sbt.tool();
@@ -217,7 +218,7 @@ test "subagent_batch_result without manager fails" {
 
 const config_mod = @import("../config.zig");
 
-test "subagent_batch_result H7 — unknown batch_id returns clear error" {
+test "subagent_batch_result H7 — unknown batch_id returns generic error" {
     var cfg = config_mod.Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
@@ -226,7 +227,7 @@ test "subagent_batch_result H7 — unknown batch_id returns clear error" {
     var manager = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
     defer manager.deinit();
 
-    root.setTurnContext(.{ .superpowers_mode = true });
+    root.setTurnContext(.{ .superpowers_mode = true, .session_key = "agent:test:user:1:main" });
     defer root.clearTurnContext();
 
     var sbt = SubagentBatchResultTool{ .manager = &manager };
@@ -235,11 +236,9 @@ test "subagent_batch_result H7 — unknown batch_id returns clear error" {
     const parsed = try root.parseTestArgs("{\"batch_id\":\"batch:9999:never\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.error_msg) |em| std.testing.allocator.free(em);
 
     try std.testing.expect(!result.success);
-    // H7: message must mention the batch_id
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "batch:9999:never") != null);
+    try std.testing.expectEqualStrings("Batch not found or expired", result.error_msg.?);
 }
 
 test "subagent_batch_result returns JSON array for known batch" {
@@ -267,7 +266,7 @@ test "subagent_batch_result returns JSON array for known batch" {
     }
 
     // Superpowers ctx kept for coverage parity — the tool is ungated (S1a).
-    root.setTurnContext(.{ .superpowers_mode = true });
+    root.setTurnContext(.{ .superpowers_mode = true, .session_key = "agent:test:user:1:main" });
     defer root.clearTurnContext();
 
     var sbt = SubagentBatchResultTool{ .manager = &manager };
@@ -309,7 +308,7 @@ test "subagent_batch_result proceeds on a Superpowers turn" {
     var manager = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
     defer manager.deinit();
 
-    root.setTurnContext(.{ .superpowers_mode = true });
+    root.setTurnContext(.{ .superpowers_mode = true, .session_key = "agent:test:user:1:main" });
     defer root.clearTurnContext();
 
     var sbt = SubagentBatchResultTool{ .manager = &manager };
@@ -317,12 +316,11 @@ test "subagent_batch_result proceeds on a Superpowers turn" {
     const parsed = try root.parseTestArgs("{\"batch_id\":\"batch:9999:never\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
-    defer if (result.error_msg) |em| std.testing.allocator.free(em);
 
     try std.testing.expect(!result.success);
     // The failure is the H7 unknown-batch error, NOT a gate refusal.
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Superpowers mode") == null);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "batch:9999:never") != null);
+    try std.testing.expectEqualStrings("Batch not found or expired", result.error_msg.?);
 }
 
 test "subagent_batch_result S1a: clampWaitSeconds clamps into [0, 120]" {
@@ -371,7 +369,7 @@ test "subagent_batch_result S1a: returns results on a non-Superpowers turn (gate
     // already-dispatched batch is not a fan-out privilege. The out-of-band
     // wake turn (superpowers unset on the wake lane) and ordinary follow-up
     // turns must be able to recover results.
-    root.setTurnContext(.{ .superpowers_mode = false });
+    root.setTurnContext(.{ .superpowers_mode = false, .session_key = "agent:test:user:1:main" });
     defer root.clearTurnContext();
 
     var sbt = SubagentBatchResultTool{ .manager = &manager };
@@ -386,6 +384,65 @@ test "subagent_batch_result S1a: returns results on a non-Superpowers turn (gate
     try std.testing.expect(result.output[0] == '[');
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"task_id\":501") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"task_id\":502") != null);
+}
+
+test "subagent_batch_result refuses a batch owned by another session" {
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    {
+        manager.mutex.lock();
+        defer manager.mutex.unlock();
+        const now = std.time.milliTimestamp();
+        try manager.batches.register("batch:foreign:1", &[_]u64{ 701, 702 }, "agent:test:user:1:main", now, now + 60_000);
+    }
+
+    root.setTurnContext(.{ .superpowers_mode = false, .session_key = "agent:test:user:2:main" });
+    defer root.clearTurnContext();
+
+    var sbt = SubagentBatchResultTool{ .manager = &manager };
+    const t = sbt.tool();
+    const parsed = try root.parseTestArgs("{\"batch_id\":\"batch:foreign:1\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Batch not found or expired", result.error_msg.?);
+    try std.testing.expectEqualStrings("", result.output);
+}
+
+test "subagent_batch_result without current session hides existing batch" {
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    {
+        manager.mutex.lock();
+        defer manager.mutex.unlock();
+        const now = std.time.milliTimestamp();
+        try manager.batches.register("batch:private:1", &[_]u64{ 801, 802 }, "agent:test:user:1:main", now, now + 60_000);
+    }
+
+    root.clearTurnContext();
+
+    var sbt = SubagentBatchResultTool{ .manager = &manager };
+    const t = sbt.tool();
+    const parsed = try root.parseTestArgs("{\"batch_id\":\"batch:private:1\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Batch not found or expired", result.error_msg.?);
+    try std.testing.expectEqualStrings("", result.output);
 }
 
 test "subagent_batch_result S1a: wait_seconds blocks until the batch is terminal — one call" {
@@ -405,7 +462,7 @@ test "subagent_batch_result S1a: wait_seconds blocks until the batch is terminal
         try manager.batches.register("batch:2:200", &task_ids, "agent:test:user:1:main", now, now + 600_000);
     }
 
-    root.setTurnContext(.{ .superpowers_mode = true });
+    root.setTurnContext(.{ .superpowers_mode = true, .session_key = "agent:test:user:1:main" });
     defer root.clearTurnContext();
 
     // Complete the batch from another thread ~400 ms after the call starts.
@@ -455,7 +512,7 @@ test "subagent_batch_result S1a: wait_seconds returns current states at the dead
         try manager.batches.register("batch:3:300", &[_]u64{701}, "agent:test:user:1:main", now, now + 600_000);
     }
 
-    root.setTurnContext(.{ .superpowers_mode = true });
+    root.setTurnContext(.{ .superpowers_mode = true, .session_key = "agent:test:user:1:main" });
     defer root.clearTurnContext();
 
     var sbt = SubagentBatchResultTool{ .manager = &manager };
@@ -488,7 +545,7 @@ test "subagent_batch_result S1a: wait_seconds on an unknown batch fails immediat
     var manager = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
     defer manager.deinit();
 
-    root.setTurnContext(.{ .superpowers_mode = true });
+    root.setTurnContext(.{ .superpowers_mode = true, .session_key = "agent:test:user:1:main" });
     defer root.clearTurnContext();
 
     var sbt = SubagentBatchResultTool{ .manager = &manager };
@@ -499,11 +556,10 @@ test "subagent_batch_result S1a: wait_seconds on an unknown batch fails immediat
     const started_ms = std.time.milliTimestamp();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     const elapsed_ms = std.time.milliTimestamp() - started_ms;
-    defer if (result.error_msg) |em| std.testing.allocator.free(em);
 
-    // H7 contract unchanged — and no waiting on nonexistent ids.
+    // H7 contract unchanged: no waiting on nonexistent ids.
     try std.testing.expect(!result.success);
-    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "batch:9999:never") != null);
+    try std.testing.expectEqualStrings("Batch not found or expired", result.error_msg.?);
     try std.testing.expect(elapsed_ms < 2_000);
 }
 
@@ -523,7 +579,7 @@ test "subagent_batch_result S1a: wait_seconds=0 keeps the bare-array non-blockin
         try manager.batches.register("batch:4:400", &[_]u64{801}, "agent:test:user:1:main", now, now + 60_000);
     }
 
-    root.setTurnContext(.{ .superpowers_mode = true });
+    root.setTurnContext(.{ .superpowers_mode = true, .session_key = "agent:test:user:1:main" });
     defer root.clearTurnContext();
 
     var sbt = SubagentBatchResultTool{ .manager = &manager };
@@ -555,7 +611,7 @@ test "subagent_batch_result S1a: negative wait_seconds clamps to 0 (non-blocking
         try manager.batches.register("batch:5:500", &[_]u64{901}, "agent:test:user:1:main", now, now + 60_000);
     }
 
-    root.setTurnContext(.{ .superpowers_mode = true });
+    root.setTurnContext(.{ .superpowers_mode = true, .session_key = "agent:test:user:1:main" });
     defer root.clearTurnContext();
 
     var sbt = SubagentBatchResultTool{ .manager = &manager };

@@ -695,6 +695,18 @@ pub const SubagentManager = struct {
         return null;
     }
 
+    /// Return an allocator-owned copy of a task's final-answer text.
+    /// Use this from tool serialization paths; the borrowed variant above is
+    /// only safe while no concurrent manager mutation can free task state.
+    pub fn getTaskResultTextAlloc(self: *SubagentManager, allocator: Allocator, task_id: u64) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.tasks.get(task_id)) |state| {
+            if (state.result) |r| return try allocator.dupe(u8, r.text);
+        }
+        return null;
+    }
+
     /// Subagent Pass S1b — the DURABLE recovery path for `task_get`. When the
     /// in-memory `getTaskResultText` misses (task evicted after the 30-min batch
     /// window, or delivered-and-cleared), read the persisted answer back from
@@ -719,6 +731,15 @@ pub const SubagentManager = struct {
             log.warn("subagent: durable result recovery failed task_id={d}: {}", .{ task_id, err });
             return null;
         };
+    }
+
+    /// Return whether a batch is owned by `session_key`. The check is performed
+    /// under the manager mutex because BatchTracker is lockless by contract.
+    pub fn batchSessionKeyEquals(self: *SubagentManager, batch_id: []const u8, session_key: []const u8) error{UnknownBatch}!bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const owner = self.batches.sessionKey(batch_id) orelse return error.UnknownBatch;
+        return std.mem.eql(u8, owner, session_key);
     }
 
     // ── Phase 4 G3 — getBatchResults ────────────────────────────────────────

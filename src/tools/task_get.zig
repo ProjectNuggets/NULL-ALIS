@@ -60,6 +60,11 @@ pub const TaskGetTool = struct {
             return ToolResult.fail("task not found");
         const entry = &snap;
 
+        const session_key = root.getTurnContext().session_key orelse
+            return ToolResult.fail("task not found");
+        if (!std.mem.eql(u8, session_key, entry.owner_session))
+            return ToolResult.fail("task not found");
+
         var buf: std.ArrayListUnmanaged(u8) = .{};
         errdefer buf.deinit(allocator);
         const w = buf.writer(allocator);
@@ -90,14 +95,12 @@ pub const TaskGetTool = struct {
         // subagents by design, so the answer lives only in the SubagentManager
         // (in-memory, live) and the durable `subagent_results` outbox (survives
         // delivery). Resolution order: in-memory live path first, then durable
-        // fallback. `result_text` is emitted ONLY when recovered; a non-subagent
-        // task, an unparseable id, or no attached manager leaves the JSON
-        // exactly as before (metadata-only) — no false promise.
+        // fallback. The owner-session check above guards both metadata and the
+        // recovered answer text.
         if (self.manager) |manager| {
             if (numericTaskId(&entry.task_id)) |numeric_id| {
-                // In-memory borrow is manager-lifetime; copy while we hold it via
-                // the serialize call (jsonEscapeInto reads it synchronously here).
-                if (manager.getTaskResultText(numeric_id)) |text| {
+                if (try manager.getTaskResultTextAlloc(allocator, numeric_id)) |text| {
+                    defer allocator.free(text);
                     try w.writeAll(",\"result_text\":\"");
                     try jsonEscapeInto(w, text);
                     try w.writeByte('"');
@@ -157,12 +160,38 @@ test "TaskGetTool.execute with valid task_id returns JSON" {
     defer args.deinit();
     try args.put("task_id", .{ .string = &id });
 
+    root.setTurnContext(.{ .session_key = "session-1" });
+    defer root.clearTurnContext();
+
     var tg = TaskGetTool{ .delivery = &delivery };
     const result = try tg.execute(allocator, args);
     defer allocator.free(result.output);
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "my task") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "queued") != null);
+}
+
+test "TaskGetTool.execute without current session hides existing task" {
+    const allocator = std.testing.allocator;
+    var ledger_inst = TaskLedger.init(allocator);
+    defer ledger_inst.deinit();
+    var noop = observability.NoopObserver{};
+    var delivery = TaskDelivery{ .ledger = &ledger_inst, .observer = noop.observer() };
+
+    const entry = try ledger_inst.createTask("private task", "session-1");
+    const id = entry.task_id;
+
+    var args = JsonObjectMap.init(allocator);
+    defer args.deinit();
+    try args.put("task_id", .{ .string = &id });
+
+    root.clearTurnContext();
+
+    var tg = TaskGetTool{ .delivery = &delivery };
+    const result = try tg.execute(allocator, args);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("task not found", result.error_msg.?);
+    try std.testing.expectEqualStrings("", result.output);
 }
 
 test "TaskGetTool.execute with invalid task_id returns error" {
@@ -254,6 +283,9 @@ test "S1b task_get returns result_text from the in-memory subagent path" {
     defer args.deinit();
     try args.put("task_id", .{ .string = &id });
 
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:7:main" });
+    defer root.clearTurnContext();
+
     var tg = TaskGetTool{ .delivery = &delivery, .manager = &mgr };
     const result = try tg.execute(allocator, args);
     defer allocator.free(result.output);
@@ -261,4 +293,56 @@ test "S1b task_get returns result_text from the in-memory subagent path" {
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"result_text\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "Rayleigh scattering") != null);
+}
+
+test "S1b task_get refuses a different session" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    var mgr = SubagentManager.init(allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const state = try allocator.create(subagent_mod.TaskState);
+    state.* = .{
+        .status = .completed,
+        .label = try allocator.dupe(u8, "foreign-task"),
+        .task_summary = try allocator.dupe(u8, "answer another session"),
+        .task_prompt = try allocator.dupe(u8, "answer another session"),
+        .result = .{
+            .status = .completed,
+            .text = try allocator.dupe(u8, "session private final answer"),
+        },
+        .started_at = std.time.milliTimestamp(),
+        .completed_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(allocator, 2, state);
+
+    var ledger_inst = TaskLedger.init(allocator);
+    defer ledger_inst.deinit();
+    var noop = observability.NoopObserver{};
+    var delivery = TaskDelivery{ .ledger = &ledger_inst, .observer = noop.observer() };
+    const entry = try ledger_inst.createTaskWithNumericId("answer another session", "agent:zaki-bot:user:7:main", 2);
+    const id = entry.task_id;
+
+    var args = JsonObjectMap.init(allocator);
+    defer args.deinit();
+    try args.put("task_id", .{ .string = &id });
+
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:8:main" });
+    defer root.clearTurnContext();
+
+    var tg = TaskGetTool{ .delivery = &delivery, .manager = &mgr };
+    const result = try tg.execute(allocator, args);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("task not found", result.error_msg.?);
+    try std.testing.expectEqualStrings("", result.output);
 }
