@@ -9,7 +9,7 @@
 
 ## Why it's its own path (the recon that made the scope clear)
 
-- Shared/builtin skills load from **`{HOME}/.nullalis/skills/<name>/`** (`appendSkillsSection`, `src/agent/prompt.zig:1089` → `listSkillsMerged`, `src/skills.zig:884`), merged with per-tenant `{workspace_dir}/skills/`.
+- Shared/builtin skills load from **`{HOME}/.nullalis/skills/skills/<name>/`** — the doubled `skills/skills` is real: `appendSkillsSection` passes `~/.nullalis/skills` as `listSkillsMerged`'s builtin_dir and `listSkills` appends `/skills` to whatever dir it is given (`src/agent/prompt.zig` → `src/skills.zig:833`) — merged with per-tenant `{workspace_dir}/skills/`.
 - In staging/prod the chart sets **`HOME=/data`** (`charts/nullalis/templates/deployment.yaml`), and **`/data` is a PVC mount** (mountPath `/data`, backed by a `persistentVolumeClaim`). So **an image-baked file at `/data/.nullalis/skills/` is shadowed by the volume** — image-bake alone does NOT deliver the skill to the running pod.
 - Therefore a shared skill file must be **seeded onto the PVC at boot** by the pod entrypoint (`/etc/nullalis/entrypoint.sh`, sourced from the chart) — a boot-path edit, cross-repo (engine image + zaki-infra chart), needing its own deploy verification. That's the scope that made this deserve its own package.
 
@@ -27,7 +27,8 @@
 
 **C. Infra (zaki-infra) — seed the PVC at boot:**
 - In the pod entrypoint (the chart template that renders `/etc/nullalis/entrypoint.sh`), BEFORE the engine starts, idempotently seed shared skills onto the PVC:
-  `mkdir -p "$HOME/.nullalis/skills" && cp -rn /opt/nullalis/skills/. "$HOME/.nullalis/skills/" 2>/dev/null || true`
+  `mkdir -p "$HOME/.nullalis/skills/skills" && cp -rn /opt/nullalis/skills/. "$HOME/.nullalis/skills/skills/" 2>/dev/null || true`
+  (target is `skills/skills/` — the nested path is what the production loader actually scans; see "Why it's its own path" above)
   (`cp -rn` = no-clobber, so a tenant/operator override always wins; USER 65534 already has write on /data). Keep it fail-soft (never block boot).
 - Verify on staging: the coordinator skill appears in the prompt's skills section; a superpowers turn can read it; boot is unaffected.
 

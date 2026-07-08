@@ -148,6 +148,20 @@ COPY --from=config /nullclaw-data /nullclaw-data
 # candidate "E" matches this exact location.
 COPY assets/branding /usr/local/share/nullalis/branding
 
+# Carry-forward package item A.2 (docs/superpowers/plans/CARRY-FORWARD-
+# loadable-skills-and-skill-author.md) — ship repo-authored builtin skills
+# (e.g. skills/spawn/) into the image at /opt/nullalis/skills/. This is
+# NOT under /data: in staging/prod HOME=/data is a PVC mount, so anything
+# baked here would be shadowed by the volume at runtime. The pod entrypoint
+# is responsible for idempotently seeding this image path onto the PVC
+# (`{HOME}/.nullalis/skills/skills/`, no-clobber) at boot — the doubled
+# `skills/skills` is REAL: appendSkillsSection passes `~/.nullalis/skills`
+# as the builtin_dir and listSkills appends `/skills` to whatever dir it
+# is given, so that nested path is the only one the production loader
+# scans. The seeding step lives in the deploy chart, not here; this COPY
+# only makes the source available inside the image for that step to read.
+COPY skills/ /opt/nullalis/skills/
+
 # ── Renderer chain — pip + npm install (D63) ─────────────────
 # Install renderer deps in a single layer. `--break-system-packages` is
 # safe here: this is a single-purpose runtime image (PEP 668 protection

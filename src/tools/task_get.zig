@@ -8,9 +8,16 @@ const JsonObjectMap = root.JsonObjectMap;
 const tasks_mod = @import("../tasks/root.zig");
 const TaskDelivery = tasks_mod.TaskDelivery;
 const TaskEntry = tasks_mod.TaskEntry;
+const SubagentManager = @import("../subagent.zig").SubagentManager;
 
 pub const TaskGetTool = struct {
     delivery: *TaskDelivery,
+    /// Subagent Pass S1b — optional handle to the subagent runtime, wired in
+    /// the main profile alongside spawn/subagent_batch_result. Present → task_get
+    /// can recover a subagent task's final-answer text (in-memory live window,
+    /// then the durable `subagent_results` outbox). Null (e.g. file-tenant/CLI
+    /// with no subagent manager) → metadata-only, exactly as before S1b.
+    manager: ?*SubagentManager = null,
 
     pub const tool_name = "task_get";
 
@@ -76,9 +83,50 @@ pub const TaskGetTool = struct {
             try jsonEscapeInto(w, em);
             try w.writeByte('"');
         }
+
+        // Subagent Pass S1b — recover the subagent's full final-answer text so a
+        // follow-up turn can read a prior batch's output instead of re-spawning
+        // (which costs an LLM run). The ledger mirror stores a null summary for
+        // subagents by design, so the answer lives only in the SubagentManager
+        // (in-memory, live) and the durable `subagent_results` outbox (survives
+        // delivery). Resolution order: in-memory live path first, then durable
+        // fallback. `result_text` is emitted ONLY when recovered; a non-subagent
+        // task, an unparseable id, or no attached manager leaves the JSON
+        // exactly as before (metadata-only) — no false promise.
+        if (self.manager) |manager| {
+            if (numericTaskId(&entry.task_id)) |numeric_id| {
+                // In-memory borrow is manager-lifetime; copy while we hold it via
+                // the serialize call (jsonEscapeInto reads it synchronously here).
+                if (manager.getTaskResultText(numeric_id)) |text| {
+                    try w.writeAll(",\"result_text\":\"");
+                    try jsonEscapeInto(w, text);
+                    try w.writeByte('"');
+                } else if (manager.getDurableResultText(allocator, numeric_id)) |durable_text| {
+                    defer allocator.free(durable_text);
+                    try w.writeAll(",\"result_text\":\"");
+                    try jsonEscapeInto(w, durable_text);
+                    try w.writeByte('"');
+                }
+            }
+        }
+
         try w.writeByte('}');
 
         return .{ .success = true, .output = try buf.toOwnedSlice(allocator) };
+    }
+
+    /// Subagent Pass S1b — parse the numeric subagent task id from the canonical
+    /// ledger id string. The id is formatted `task_<11 hex digits>` (see
+    /// `formatCanonicalTaskId` in subagent.zig / `createTaskWithNumericId` in
+    /// tasks/ledger.zig); this reverses that. Returns null for any id that does
+    /// not match the shape (e.g. a non-subagent task id), so callers silently
+    /// skip result recovery rather than misresolving.
+    fn numericTaskId(id: []const u8) ?u64 {
+        const prefix = "task_";
+        if (!std.mem.startsWith(u8, id, prefix)) return null;
+        const hex = id[prefix.len..];
+        if (hex.len == 0) return null;
+        return std.fmt.parseInt(u64, hex, 16) catch null;
     }
 };
 
@@ -147,4 +195,70 @@ test "TaskGetTool.execute without task_id returns error" {
     var tg = TaskGetTool{ .delivery = &delivery };
     const result = try tg.execute(allocator, args);
     try std.testing.expect(!result.success);
+}
+
+// ── S1b: task_get recovers the subagent's result text ────────────────────
+// RED→GREEN. A completed subagent task's `task_get` must surface `result_text`
+// carrying the actual answer, recovered from the in-memory SubagentManager via
+// getTaskResultText — the ledger mirror stores a null summary for subagents, so
+// before S1b this text was unrecoverable through task_get.
+
+const subagent_mod = @import("../subagent.zig");
+const config_mod = @import("../config.zig");
+
+test "S1b task_get returns result_text from the in-memory subagent path" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    var mgr = SubagentManager.init(allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    // Insert a completed task under numeric id 1 with the structured result set
+    // directly (completeTask is private to subagent.zig). All owned slices —
+    // including result.text — are duped into `allocator` so the manager's
+    // deinit → freeTaskState → freeSubagentResult frees them cleanly.
+    // getTaskResultText(1) then returns the answer text.
+    const state = try allocator.create(subagent_mod.TaskState);
+    state.* = .{
+        .status = .completed,
+        .label = try allocator.dupe(u8, "s1b-task"),
+        .task_summary = try allocator.dupe(u8, "answer the question"),
+        .task_prompt = try allocator.dupe(u8, "answer the question"),
+        .result = .{
+            .status = .completed,
+            .text = try allocator.dupe(u8, "the sky is blue because of Rayleigh scattering"),
+        },
+        .started_at = std.time.milliTimestamp(),
+        .completed_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(allocator, 1, state);
+
+    // Ledger carries the canonical id string for the same numeric id so the
+    // metadata snapshot resolves; the numeric id (1) drives the in-memory lookup.
+    var ledger_inst = TaskLedger.init(allocator);
+    defer ledger_inst.deinit();
+    var noop = observability.NoopObserver{};
+    var delivery = TaskDelivery{ .ledger = &ledger_inst, .observer = noop.observer() };
+    const entry = try ledger_inst.createTaskWithNumericId("answer the question", "agent:zaki-bot:user:7:main", 1);
+    const id = entry.task_id;
+
+    var args = JsonObjectMap.init(allocator);
+    defer args.deinit();
+    try args.put("task_id", .{ .string = &id });
+
+    var tg = TaskGetTool{ .delivery = &delivery, .manager = &mgr };
+    const result = try tg.execute(allocator, args);
+    defer allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"result_text\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "Rayleigh scattering") != null);
 }

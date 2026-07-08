@@ -33,6 +33,12 @@ const security_secrets = @import("security/secrets.zig");
 // listRecentToolTracesAllUsers below, so the pure analysis module and
 // the Manager read API can never drift on field names/types.
 const trace_mining = @import("agent/trace_mining.zig");
+// Subagent Pass S1b — the durable `subagent_results.result_json` stores a
+// serialized SubagentResult; getSubagentResultText parses it to recover the
+// `.text` answer. subagent_result.zig is a leaf (std + observability only), so
+// this is a plain module import with no comptime cycle.
+const subagent_result = @import("subagent_result.zig");
+const SubagentResult = subagent_result.SubagentResult;
 
 /// W1.1 (Fix 4) — fail-closed precondition for the entity/edge write path.
 ///
@@ -978,6 +984,14 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     /// guard in completeTask() handles idempotency for the non-PG path.
     pub fn subagentResultStatusIsDelivered(_: *@This(), _: []const u8) !bool {
         return false;
+    }
+    /// Subagent Pass S1b — stub for non-postgres builds. The durable
+    /// subagent_results outbox requires Postgres; without it there is no
+    /// row to recover, so the durable fallback resolves to null and the
+    /// in-memory getTaskResultText path is the only source. Mirrors
+    /// loadPendingSubagentResults's no-op idiom above.
+    pub fn getSubagentResultText(_: *@This(), _: std.mem.Allocator, _: i64, _: i64) !?[]u8 {
+        return null;
     }
     /// Task 2 (Loop-2 prerequisite, package1-activations) — stub for
     /// non-postgres builds. The durable tool_traces digest table
@@ -12125,6 +12139,41 @@ const ManagerImpl = struct {
         return std.mem.eql(u8, status_raw, "delivered");
     }
 
+    /// Subagent Pass S1b — recover a completed subagent's final-answer text from
+    /// the durable outbox, REGARDLESS of delivered status. `subagent_results`
+    /// keeps `result_json` after delivery (mark-delivered is an UPDATE, never a
+    /// DELETE), so a follow-up turn can recover a prior batch's answer via
+    /// `task_get` instead of re-spawning. Selects by the (user_id, task_id)
+    /// unique key, parses the stored `SubagentResult` JSON, and returns an
+    /// allocator-owned copy of its `.text` (caller frees). Returns null when no
+    /// row exists for (user_id, task_id) or the row's text is empty.
+    pub fn getSubagentResultText(self: *Self, allocator: std.mem.Allocator, user_id: i64, task_id: i64) !?[]u8 {
+        const q = try self.buildQuery(
+            "SELECT result_json FROM {schema}.subagent_results " ++
+                "WHERE user_id = $1 AND task_id = $2",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        var task_buf: [32]u8 = undefined;
+        const task_s = try std.fmt.bufPrintZ(&task_buf, "{d}", .{task_id});
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, task_s.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(task_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return null;
+
+        const result_json = std.mem.span(c.PQgetvalue(result, 0, 0));
+        // Parse the durable SubagentResult and hand back an owned copy of .text.
+        // Corrupt/legacy JSON → treat as unrecoverable (null) rather than fail.
+        var parsed = SubagentResult.fromJsonAlloc(allocator, result_json) catch return null;
+        defer parsed.deinit(allocator);
+        if (parsed.value.text.len == 0) return null;
+        return try allocator.dupe(u8, parsed.value.text);
+    }
+
     /// List the most-recent N skill execution traces for (user, skill_name).
     /// Used at the start of a skill invocation to inject "what worked
     /// last time" into the prompt. Returns owned slice; caller calls
@@ -15298,6 +15347,81 @@ test "subagent_results upsert is idempotent and loads pending" {
     const rows2 = try mgr.loadPendingSubagentResults(allocator, 42);
     defer allocator.free(rows2);
     try std.testing.expectEqual(@as(usize, 0), rows2.len);
+
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+}
+
+test "S1b getSubagentResultText recovers durable answer text regardless of delivered status" {
+    // Subagent Pass S1b keystone (PG). Proves the durable recovery path that
+    // makes task_get's promise true:
+    //   (1) getSubagentResultText parses subagent_results.result_json and
+    //       returns the SubagentResult .text by (user_id, task_id);
+    //   (2) it returns the SAME text AFTER markSubagentResultDelivered — the
+    //       durable row survives delivery (mark-delivered is an UPDATE, not a
+    //       DELETE), which is exactly what lets a follow-up turn recover a
+    //       prior batch's output instead of re-spawning;
+    //   (3) a miss (wrong task_id / wrong user_id) returns null, not an error.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_subrec", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+
+    // Persist a full SubagentResult JSON (as completeTask does) for task 7.
+    const input = SubagentResultInput{
+        .result_id = "subagent:7",
+        .user_id = 42,
+        .session_key = "agent:zaki-bot:user:42:main",
+        .task_id = 7,
+        .result_json = "{\"status\":\"completed\",\"text\":\"the treaty was signed in 1648\"}",
+    };
+    try mgr.upsertSubagentResult(input);
+
+    // (1) Recover the answer text by (user_id, task_id) while still pending.
+    const before = try mgr.getSubagentResultText(allocator, 42, 7);
+    try std.testing.expect(before != null);
+    defer if (before) |b| allocator.free(b);
+    try std.testing.expectEqualStrings("the treaty was signed in 1648", before.?);
+
+    // (2) Deliver, then recover AGAIN — the durable text must survive delivery.
+    try mgr.markSubagentResultDelivered("subagent:7");
+    // Sanity: it is no longer in the pending set (mirrors the delivered flip).
+    const pending = try mgr.loadPendingSubagentResults(allocator, 42);
+    defer allocator.free(pending);
+    try std.testing.expectEqual(@as(usize, 0), pending.len);
+    // But getSubagentResultText (status-agnostic) still returns the answer.
+    const after = try mgr.getSubagentResultText(allocator, 42, 7);
+    try std.testing.expect(after != null);
+    defer if (after) |a| allocator.free(a);
+    try std.testing.expectEqualStrings("the treaty was signed in 1648", after.?);
+
+    // (3) Misses resolve to null (wrong task_id and wrong user_id), not error.
+    try std.testing.expect((try mgr.getSubagentResultText(allocator, 42, 999)) == null);
+    try std.testing.expect((try mgr.getSubagentResultText(allocator, 999, 7)) == null);
 
     {
         const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());

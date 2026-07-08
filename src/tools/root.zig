@@ -1575,13 +1575,14 @@ pub fn allTools(
 
     // Phase 4 G3 / Phase 5 T3 — fan-out tools: spawn_many + subagent_batch_result.
     // Registered in the MAIN profile whenever multiagent is enabled (same gate
-    // as spawn/delegate above), so the coordinator has them available. They are
-    // then SELF-GATED at execute() to ⚡ Superpowers turns: a non-Superpowers
-    // turn REFUSES before any spawn (each execute() reads
-    // getTurnContext().superpowers_mode first). Their tool descriptions are
-    // tagged "⚡ Superpowers mode only" so the model does not call them on a
-    // normal turn. EXCLUDED from subagentTools() — depth guard: subagents must
-    // never fan out.
+    // as spawn/delegate above), so the coordinator has them available.
+    // Gate asymmetry (S1a): spawn_many — the tool that SPENDS (dispatches
+    // subagents) — is SELF-GATED at execute() to ⚡ Superpowers turns
+    // (getTurnContext().superpowers_mode). subagent_batch_result is a
+    // read-only collector and is NOT gated: wake-lane and follow-up turns
+    // must be able to collect an already-dispatched batch (optionally
+    // blocking via wait_seconds). Both EXCLUDED from the subagent profile —
+    // depth guard: subagents must never fan out.
     if (opts.tool_profile == .main and multiagent_enabled) {
         const smt = try allocator.create(spawn_many.SpawnManyTool);
         smt.* = .{ .manager = opts.subagent_manager };
@@ -1733,8 +1734,12 @@ pub fn allTools(
         tlt.* = .{ .delivery = delivery };
         try list.append(allocator, tlt.tool());
 
+        // Subagent Pass S1b — pass the subagent manager so task_get can recover
+        // a completed subagent's final-answer text (in-memory live window, then
+        // the durable subagent_results outbox). Null on runtimes without a
+        // manager (file-tenant/CLI) → metadata-only, unchanged.
         const tgt = try allocator.create(task_get.TaskGetTool);
-        tgt.* = .{ .delivery = delivery };
+        tgt.* = .{ .delivery = delivery, .manager = opts.subagent_manager };
         try list.append(allocator, tgt.tool());
 
         const tst = try allocator.create(task_stop.TaskStopTool);
