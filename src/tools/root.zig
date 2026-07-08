@@ -546,11 +546,14 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     .{
         // Pkg3 Task 5 — was UNREGISTERED → conservative() fallback
         // (mutating + HIGH risk), misclassifying it in mode-gates.
-        // Verified behavior (memory_archive.zig): soft-closes one memory
-        // row (bi-temporal close-out: valid_to/invalid_at/expired_at +
-        // is_latest=false), cascades typed edges, deactivates the vector
-        // entry. A bounded, reversible curation write — mirrors
-        // memory_forget's MU/low/a (forget is the hard-delete sibling).
+        // Verified behavior (memory_archive.zig): information-scoped
+        // soft-close (Pkg3 M3) — closes the named row (bi-temporal
+        // close-out: valid_to/invalid_at/expired_at + is_latest=false),
+        // cascade-closes live byte-identical knowledge copies (guarded:
+        // ≥16-byte floor, protected system keys skipped), cascades typed
+        // edges, deactivates vector entries; near-dups reported only.
+        // Close-outs stay reversible — mirrors memory_forget's MU/low/a
+        // (forget is the hard-delete sibling).
         .name = memory_archive.MemoryArchiveTool.tool_name,
         .flags = .{ .mutating = true },
         .risk_level = .low,
