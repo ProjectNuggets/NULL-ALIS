@@ -154,9 +154,12 @@ COPY assets/branding /usr/local/share/nullalis/branding
 # NOT under /data: in staging/prod HOME=/data is a PVC mount, so anything
 # baked here would be shadowed by the volume at runtime. The pod entrypoint
 # is responsible for idempotently seeding this image path onto the PVC
-# (`{HOME}/.nullalis/skills/`, no-clobber) at boot — that seeding step lives
-# in the deploy chart, not here; this COPY only makes the source available
-# inside the image for that step to read from.
+# (`{HOME}/.nullalis/skills/skills/`, no-clobber) at boot — the doubled
+# `skills/skills` is REAL: appendSkillsSection passes `~/.nullalis/skills`
+# as the builtin_dir and listSkills appends `/skills` to whatever dir it
+# is given, so that nested path is the only one the production loader
+# scans. The seeding step lives in the deploy chart, not here; this COPY
+# only makes the source available inside the image for that step to read.
 COPY skills/ /opt/nullalis/skills/
 
 # ── Renderer chain — pip + npm install (D63) ─────────────────

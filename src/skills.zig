@@ -2226,7 +2226,9 @@ test "listSkillsMerged with nonexistent dirs returns empty" {
 // Repo-root `skills/` is the shipped builtin-skill source (see
 // docs/superpowers/plans/CARRY-FORWARD-loadable-skills-and-skill-author.md
 // item A — Dockerfile COPYs it to /opt/nullalis/skills/, the pod entrypoint
-// seeds it onto {HOME}/.nullalis/skills/ at boot, and appendSkillsSection
+// seeds it onto {HOME}/.nullalis/skills/skills/ at boot (the doubled
+// segment is real — appendSkillsSection passes ~/.nullalis/skills as the
+// builtin_dir and listSkills appends /skills), and appendSkillsSection
 // (src/agent/prompt.zig) loads that seeded path as listSkillsMerged's
 // builtin_dir). This test loads the actual on-disk directory (relative to
 // the repo root, where `zig build test` runs) to prove the shipped
