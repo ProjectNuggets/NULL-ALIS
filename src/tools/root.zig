@@ -1733,8 +1733,12 @@ pub fn allTools(
         tlt.* = .{ .delivery = delivery };
         try list.append(allocator, tlt.tool());
 
+        // Subagent Pass S1b — pass the subagent manager so task_get can recover
+        // a completed subagent's final-answer text (in-memory live window, then
+        // the durable subagent_results outbox). Null on runtimes without a
+        // manager (file-tenant/CLI) → metadata-only, unchanged.
         const tgt = try allocator.create(task_get.TaskGetTool);
-        tgt.* = .{ .delivery = delivery };
+        tgt.* = .{ .delivery = delivery, .manager = opts.subagent_manager };
         try list.append(allocator, tgt.tool());
 
         const tst = try allocator.create(task_stop.TaskStopTool);

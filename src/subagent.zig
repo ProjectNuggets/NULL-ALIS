@@ -412,7 +412,6 @@ pub const SubagentManager = struct {
         return formatted;
     }
 
-
     // ── Phase 4 G2 types ────────────────────────────────────────────────────────
 
     /// A single spec passed to spawnMany. The task and label slices are borrowed
@@ -694,6 +693,32 @@ pub const SubagentManager = struct {
             if (state.result) |r| return r.text;
         }
         return null;
+    }
+
+    /// Subagent Pass S1b — the DURABLE recovery path for `task_get`. When the
+    /// in-memory `getTaskResultText` misses (task evicted after the 30-min batch
+    /// window, or delivered-and-cleared), read the persisted answer back from
+    /// the `subagent_results` outbox. Uses the manager's own attached ledger
+    /// handle + user_id (set by `attachPostgresLedger`), so callers (the
+    /// task_get tool) don't need to parse the user id from a session key. The
+    /// durable row's `result_json` survives delivery (mark-delivered is an
+    /// UPDATE), so this recovers a prior batch's outputs without re-spawning.
+    /// Returns an `allocator`-owned copy of the answer text (caller frees), or
+    /// null when no ledger is attached or no durable row exists. Best-effort:
+    /// a PG read error resolves to null rather than propagating, so a follow-up
+    /// turn degrades to "no recoverable text" instead of failing task_get.
+    pub fn getDurableResultText(self: *SubagentManager, allocator: Allocator, task_id: u64) ?[]u8 {
+        self.mutex.lock();
+        const state_mgr = self.ledger_state_mgr;
+        const user_id = self.ledger_user_id;
+        self.mutex.unlock();
+
+        const sm = state_mgr orelse return null;
+        const uid = user_id orelse return null;
+        return sm.getSubagentResultText(allocator, uid, @intCast(task_id)) catch |err| {
+            log.warn("subagent: durable result recovery failed task_id={d}: {}", .{ task_id, err });
+            return null;
+        };
     }
 
     // ── Phase 4 G3 — getBatchResults ────────────────────────────────────────
@@ -3773,7 +3798,10 @@ test "getBatchResults returns entries for spawned tasks" {
     for (entries) |e| {
         var found = false;
         for (handle.task_ids) |tid| {
-            if (e.task_id == tid) { found = true; break; }
+            if (e.task_id == tid) {
+                found = true;
+                break;
+            }
         }
         try std.testing.expect(found);
         // status must be a valid non-empty string

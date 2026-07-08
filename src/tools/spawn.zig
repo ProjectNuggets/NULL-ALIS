@@ -29,6 +29,15 @@ pub const SpawnTool = struct {
             "web_search — for external queries (answer directly with web_search; no subagent needed)",
             "memory_recall — for facts already stored in memory (call memory_recall yourself; no subagent needed)",
         },
+        // S1b: the completion hint is the model-facing recovery promise, and it
+        // is now TRUE — task_get(task_id) returns result_text with the final
+        // answer once status=succeeded (in-memory live window, then the durable
+        // subagent_results outbox). A follow-up turn can recover a prior batch's
+        // output this way instead of re-spawning (which costs another LLM run).
+        .completion_hint = "The result is delivered as a system message when the subagent finishes. " ++
+            "To recover it on a later turn, call task_get(task_id) — once status=succeeded it returns " ++
+            "the final answer in result_text (recoverable even after the system-message delivery). " ++
+            "Do NOT re-spawn the same task to re-read an answer you already have.",
     };
 
     comptime {
@@ -105,6 +114,20 @@ test "spawn tool description" {
     var st = SpawnTool{};
     const t = st.tool();
     try std.testing.expect(t.description().len > 0);
+}
+
+// S1b: the spawn description PROMISES task_get(task_id) retrieves "the final
+// answer". Before S1b that was false (task_get returned only metadata + a null
+// summary for subagents). Task 3 makes it true by adding result_text to
+// task_get (in-memory → durable subagent_results fallback). This test locks the
+// promise to the behavior: if someone removes the task_get-recovers-the-answer
+// wording, or the recovery path, this fails and forces the two back in sync.
+test "S1b spawn description promises task_get retrieves the final answer" {
+    var st = SpawnTool{};
+    const t = st.tool();
+    const desc = t.description();
+    try std.testing.expect(std.mem.indexOf(u8, desc, "task_get(task_id)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desc, "final answer") != null);
 }
 
 test "spawn tool schema has task" {
