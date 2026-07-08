@@ -1008,6 +1008,108 @@ pub fn freeProseFacts(allocator: std.mem.Allocator, facts: []ProseFact) void {
     allocator.free(facts);
 }
 
+/// Package 3 fix-wave Task 2 (M3) — result of an information-scoped
+/// archive/forget (`Manager.archiveInformationScoped` /
+/// `Manager.forgetInformationScoped`).
+///
+/// The M3 live battery proved that closing ONE key does not remove the
+/// INFORMATION from the agent's context: the same content routinely
+/// survives in sibling rows the single-key close never touched (an
+/// auto-promoted `durable_fact/behavior/<fnv>` copy of the user message,
+/// autosaves, a re-extracted `extracted_*` twin). This struct reports the
+/// full information-scoped outcome:
+///
+///   - exact-content copies (identical SHA-256 `content_hash`) are closed
+///     AUTOMATICALLY alongside the named key (zero false positives — byte
+///     identity is unambiguous), EXCEPT (fix-wave I2/I3): twins under
+///     protected system families (same `isEditableMemoryEntry` predicate
+///     as direct curation; `autosave_*` deliberately excepted) are skipped
+///     entirely, and twins with content shorter than 16 bytes are moved to
+///     the near-dup report instead of swept,
+///   - near-duplicates (different hash, shared salient token) are
+///     REPORTED but NEVER auto-closed (operator-adjudicated: rewordings
+///     can be genuinely different facts; the agent offers follow-up
+///     curation to the user instead).
+///
+/// Caller frees via `deinit`.
+pub const ArchiveScopeResult = struct {
+    /// True when the named key existed and was closed (archive) or
+    /// hard-deleted (forget). False only on a lost race (the row vanished
+    /// between the content read and the close).
+    primary_closed: bool,
+    /// Keys of OTHER live rows carrying byte-identical content
+    /// (same `content_hash`) that were closed/deleted alongside the
+    /// named key. In forget mode, `autosave_*` entries listed here were
+    /// CLOSED (bi-temporal close-out), not hard-deleted — audit rows are
+    /// never destroyed by the cascade (fix-wave I3). Caller frees each +
+    /// the slice.
+    exact_closed: [][]u8,
+    /// Live rows deliberately NOT closed, reported so the tool result can
+    /// offer "also found N related rows — archive these too?". Two
+    /// sources: rows sharing the content's salient token under a DIFFERENT
+    /// content_hash (near-duplicates), and byte-identical twins whose
+    /// content sits under the 16-byte cascade floor (fix-wave I2 — too
+    /// short for hash identity to prove same-information).
+    near_dups: []ProseFact,
+
+    pub fn deinit(self: *const ArchiveScopeResult, allocator: std.mem.Allocator) void {
+        for (self.exact_closed) |k| allocator.free(k);
+        allocator.free(self.exact_closed);
+        freeProseFacts(allocator, self.near_dups);
+    }
+};
+
+fn isSalientWordByte(ch: u8) bool {
+    // Letters/digits plus any non-ASCII byte (UTF-8 continuation or
+    // lead byte) — so Arabic/CJK words survive tokenization instead of
+    // being split into nothing.
+    return std.ascii.isAlphanumeric(ch) or ch >= 0x80;
+}
+
+/// Package 3 fix-wave Task 2 (M3) — pick a deterministic, salient search
+/// token from a memory's content for the near-duplicate report.
+///
+/// Heuristic (deliberately simple + deterministic; documented in
+/// docs/memory-contract.md's curability row):
+///   1. Tokenize on non-word bytes (word bytes = ASCII alphanumerics +
+///      any byte >= 0x80, so non-Latin scripts tokenize as words).
+///   2. Keep tokens of length >= 5 bytes that contain at least one
+///      letter-ish byte (pure numbers — timestamps, ids — discriminate
+///      poorly).
+///   3. Pick the LONGEST such token; ties broken by FIRST occurrence
+///      (single pass, strictly-greater comparison).
+///
+/// Rationale: the longest content-bearing word is usually the proper
+/// noun / domain term ("thmanyah", "Hamburg", "kubernetes") while short
+/// tokens are function words ("the", "user", "on"). The returned slice
+/// points INTO `content` (no allocation). Null when the content has no
+/// qualifying token — callers then skip the near-dup search entirely.
+///
+/// The token is fed to `fetchProseFactsByPattern` (`content ILIKE
+/// %token%`); word bytes never include `%`/`_`, so the pattern needs no
+/// LIKE-escaping.
+pub fn salientPatternToken(content: []const u8) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < content.len) {
+        while (i < content.len and !isSalientWordByte(content[i])) i += 1;
+        const start = i;
+        while (i < content.len and isSalientWordByte(content[i])) i += 1;
+        const tok = content[start..i];
+        if (tok.len < 5) continue;
+        var has_letter = false;
+        for (tok) |ch| {
+            if (std.ascii.isAlphabetic(ch) or ch >= 0x80) {
+                has_letter = true;
+                break;
+            }
+        }
+        if (!has_letter) continue;
+        if (best == null or tok.len > best.?.len) best = tok;
+    }
+    return best;
+}
+
 /// C0 (memory-phase-0.5) — aggregate report of a single Phase-0.5 backfill run.
 ///
 /// Returned by `state_mgr.phase05Backfill(allocator, user_id_opt, dry_run)`.
@@ -1355,6 +1457,11 @@ pub const BRAIN_HIDDEN_PREFIXES = [_][]const u8{
     "compaction_summary/",
     "summary_fallback/",
     "compaction_dropped/",
+    // Package 3 Task 1 (M2): superseded-version audit rows. The /brain/*
+    // surface is "what ZAKI remembers about ME" — a bi-temporal history
+    // snapshot of an OLD wording is an internal audit trail, not user-facing
+    // brain content, so hide it (mirrored into BRAIN_USER_KEY_FILTER SQL).
+    "history/",
     // internal
     "__tombstone__/",
     "__bootstrap.prompt.",
@@ -1400,6 +1507,13 @@ pub fn isBrainVisibleKey(key: []const u8) bool {
 pub fn isSemanticBookkeepingKey(key: []const u8) bool {
     return isDefaultHiddenMemoryKey(key) or
         std.mem.eql(u8, key, "context_anchor_current") or
+        // Package 3 Task 1 (M2): `history/<key>/<ts>` snapshots hold a
+        // SUPERSEDED wording. Embedding them would pollute the pgvector fact
+        // space with stale phrasings that compete with the live key at recall
+        // time. The live key carries current truth and stays embedded; the
+        // history row is validity-filtered out of reads and must stay out of
+        // the vector index too.
+        std.mem.startsWith(u8, key, "history/") or
         // Learning contract bucket 5 (docs/learning-contract.md line 24):
         // wish/ keys are capability-gap proposals — brain-visible but excluded
         // from embedding (they're not world knowledge, they're meta-requests to
@@ -1447,7 +1561,12 @@ pub fn isAppendOnlyMemoryKey(key: []const u8) bool {
         // explicit cleanup paths (memory_purge_topic, etc).
         std.mem.startsWith(u8, key, "compaction_summary/") or
         std.mem.startsWith(u8, key, "summary_fallback/") or
-        std.mem.startsWith(u8, key, "compaction_dropped/");
+        std.mem.startsWith(u8, key, "compaction_dropped/") or
+        // Package 3 Task 1 (M2): `history/<key>/<ts>` is a born-closed
+        // bi-temporal snapshot of a superseded memory version. It is written
+        // once by editMemorySupersede and must NEVER be re-edited or mutated
+        // by a later upsert — the historical record is immutable.
+        std.mem.startsWith(u8, key, "history/");
 }
 
 pub fn isSystemManagedMemoryKey(key: []const u8) bool {
@@ -4243,6 +4362,24 @@ test "P4b: continuity summaries are hidden from embedding but durable_fact stays
     try std.testing.expect(isBrainVisibleKey("durable_fact/x"));
 }
 
+// Package 3 Task 1 (M2) — `history/<key>/<ts>-<ns>` born-closed audit rows
+// must be classified as append-only (never re-editable), brain-hidden (an
+// internal audit trail, not user-facing brain content), and non-embedding
+// (the OLD wording must not pollute the pgvector fact space — the live key
+// carries the current truth). All three surfaces cannot drift.
+test "M2: history/ audit prefix is append-only, brain-hidden, and non-embedding" {
+    const k = "history/fav_tea/1700000000-042117333";
+    // Append-only: memory_edit / normal upsert must never mutate a history row.
+    try std.testing.expect(isAppendOnlyMemoryKey(k));
+    // Brain-hidden: the audit trail is not user-facing brain content.
+    try std.testing.expect(!isBrainVisibleKey(k));
+    // Non-embedding: the superseded wording stays out of the fact space.
+    try std.testing.expect(!shouldEmbedMemoryEntry(k, "oolong"));
+    try std.testing.expect(isSemanticBookkeepingKey(k));
+    // System-managed (edit/archive protection flows through this predicate).
+    try std.testing.expect(isSystemManagedMemoryKey(k));
+}
+
 test "MemoryRuntime.drainOutbox with no outbox returns 0" {
     var backend = none.NoneMemory.init();
     defer backend.deinit();
@@ -4759,6 +4896,35 @@ test "H1: probe fails closed on embedding-dimension mismatch" {
         .acquire_timeout_ms = 500,
     }) catch null;
     if (drop) |store| store.deinit();
+}
+
+// Package 3 fix-wave Task 2 (M3) — the salient-token heuristic feeding the
+// near-duplicate report must be deterministic: longest >=5-byte token with a
+// letter-ish byte, first occurrence wins ties.
+test "M3 salientPatternToken picks longest content-bearing word, first-occurrence ties" {
+    // "prefers"(7) < "thmanyah"(8); "podcasts"(8) ties with "thmanyah" but
+    // occurs later → first occurrence wins.
+    try std.testing.expectEqualStrings(
+        "thmanyah",
+        salientPatternToken("User prefers thmanyah podcasts on Fridays").?,
+    );
+    // Pure numbers never qualify (timestamps/ids discriminate poorly).
+    try std.testing.expect(salientPatternToken("call 1234567890 at 9") == null);
+    // Short-token-only content yields null (skip the near-dup search).
+    try std.testing.expect(salientPatternToken("a b cd efg hij") == null);
+    // Empty content yields null.
+    try std.testing.expect(salientPatternToken("") == null);
+    // Non-ASCII scripts tokenize as words (bytes >= 0x80 count as letters;
+    // an Arabic word of >=3 chars is >=6 bytes so it qualifies).
+    try std.testing.expectEqualStrings(
+        "ثمانية",
+        salientPatternToken("يفضل ثمانية").?,
+    );
+    // Punctuation splits tokens; LIKE metacharacters can never appear.
+    const tok = salientPatternToken("likes (kubernetes), 100%_of the time").?;
+    try std.testing.expectEqualStrings("kubernetes", tok);
+    try std.testing.expect(std.mem.indexOfScalar(u8, tok, '%') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, tok, '_') == null);
 }
 
 test {

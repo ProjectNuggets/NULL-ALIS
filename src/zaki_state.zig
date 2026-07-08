@@ -1149,6 +1149,39 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn setMemoryInvalidation(_: *@This(), _: i64, _: []const u8, _: i64, _: i64) !void {
         return;
     }
+    /// Package 3 fix-wave (review C1) — stub for non-postgres builds; the
+    /// same build-portability mirror setMemoryInvalidation has for
+    /// memory_archive, so memory_edit compiles on every engine set (default
+    /// `zig build`, -Dengines=base,sqlite, ...). Unreachable at runtime: this
+    /// stub Manager cannot be instantiated (init always fails) and the tool
+    /// only takes the supersede path when a live tenant Manager is bound —
+    /// otherwise it falls back to the legacy in-place store.
+    pub fn editMemorySupersede(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8, _: []const u8, _: i64) !?[]u8 {
+        return error.PostgresNotEnabled;
+    }
+    /// Package 3 fix-wave Task 2 (M3) — stub for non-postgres builds.
+    /// Mirrors findMemoryByContentHash's stub (empty result: "no exact
+    /// copies exist"); the learning fast-path dedup + information-scoped
+    /// archive only run against a live tenant Manager anyway.
+    pub fn findMemoriesByContentHashAll(_: *@This(), allocator: std.mem.Allocator, _: i64, _: []const u8) ![]memory_root.MemoryEntry {
+        return allocator.alloc(memory_root.MemoryEntry, 0);
+    }
+    /// Package 3 fix-wave Task 2 (M3) — stubs for non-postgres builds,
+    /// mirroring editMemorySupersede's stub idiom: unreachable at runtime
+    /// (this stub Manager cannot be instantiated — init always fails, and
+    /// the memory_archive/memory_forget tools only take the scoped path
+    /// when a live tenant Manager is bound), present so every engine set
+    /// compiles against the same Manager surface. The error set is EXPLICIT
+    /// (not inferred) and includes MemoryKeyNotFound so the tools'
+    /// `switch (err) { error.MemoryKeyNotFound => ... }` arm type-checks on
+    /// non-postgres builds too — the inferred set would only contain
+    /// PostgresNotEnabled and reject the switch arm at comptime.
+    pub fn archiveInformationScoped(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8, _: i64) error{ PostgresNotEnabled, MemoryKeyNotFound }!memory_root.ArchiveScopeResult {
+        return error.PostgresNotEnabled;
+    }
+    pub fn forgetInformationScoped(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8, _: i64) error{ PostgresNotEnabled, MemoryKeyNotFound }!memory_root.ArchiveScopeResult {
+        return error.PostgresNotEnabled;
+    }
     /// V1.6 commit 11 — stub for non-postgres builds. The CASE-guard
     /// immortality protection only fires on the postgres path, so demotion
     /// is a no-op for other backends.
@@ -9374,6 +9407,433 @@ const ManagerImpl = struct {
                 });
             };
         }
+    }
+
+    /// Package 3 Task 1 (M2) — edit a mutable memory by SUPERSEDING it with a
+    /// bi-temporal history row instead of mutating in place.
+    ///
+    /// Before this, `memory_edit` → `upsertMemory` mutated the durable row in
+    /// place: `valid_to` stayed NULL and the prior version was lost (only the
+    /// append-only `memory_events` log retained any trace). This writes an
+    /// auditable, validity-filtered-out snapshot of the OLD content while the
+    /// live key keeps its stable identity (no injection churn; sidesteps the
+    /// `is_latest`-written-but-not-read gap — a naive "insert new is_latest,
+    /// keep old" would double-inject).
+    ///
+    /// Steps:
+    ///   1. Read the current live row's content for (user_id, key). Missing →
+    ///      error.MemoryKeyNotFound (caller surfaces a clear message).
+    ///   2. INSERT a BORN-CLOSED history row inside one pinned txn: key
+    ///      `history/<key>/<editor_now>-<nanos>`, content = the OLD content,
+    ///      `valid_at = valid_to = invalid_at = expired_at = editor_now`,
+    ///      `is_latest = FALSE`, memory_type `conversation` (audit tier). The
+    ///      `valid_to <= now` bit hides it from MEMORIES_VALIDITY_FILTER
+    ///      automatically, so every normal read excludes it. It is NOT
+    ///      embedded (direct SQL INSERT; the vector-sync path is skipped) and
+    ///      `history/` classifies as append-only + brain-hidden + non-embedding
+    ///      (see memory/root.zig). Committing the snapshot BEFORE mutating the
+    ///      live row makes losing the old content impossible — a crash after
+    ///      the commit merely leaves a harmless orphan audit row.
+    ///   3. Update the live row in place via the existing upsert path so the
+    ///      current key keeps stable identity + injection.
+    ///   4. Append a `memory_events` row `event_type='edit_supersede'`.
+    ///
+    /// Key shape (fix-wave, review I2): `<editor_now>` is the edit's
+    /// wall-clock SECOND and stays the value of all four temporal close-out
+    /// columns; `<nanos>` is a zero-padded sub-second nanosecond component
+    /// that makes the key collision-proof — two edits of the same key within
+    /// one second write DISTINCT snapshots instead of the second one being
+    /// silently dropped by ON CONFLICT DO NOTHING.
+    ///
+    /// Returns the history key actually written (allocated with `allocator`,
+    /// caller owns), or null when the snapshot INSERT was skipped by
+    /// ON CONFLICT DO NOTHING (a row with the identical key already existed —
+    /// practically impossible now, but callers MUST NOT claim "prior version
+    /// archived" unless this returns non-null). The live-row update and the
+    /// audit event still happen on the null path.
+    pub fn editMemorySupersede(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        key: []const u8,
+        new_content: []const u8,
+        editor_now: i64,
+    ) !?[]u8 {
+        // ── Step 1: snapshot the current live content. ────────────────────
+        const old_entry = (try self.getMemory(self.allocator, user_id, key)) orelse
+            return error.MemoryKeyNotFound;
+        defer old_entry.deinit(self.allocator);
+        const old_content = old_entry.content;
+        const old_mem_type = categoryToMemoryType(old_entry.category);
+
+        // ── Step 2: born-closed history row, in one pinned txn. ───────────
+        // Fix-wave (review I2): the key carries a sub-second nanosecond
+        // component so same-second edits of the same key produce distinct
+        // snapshot rows. Only the KEY gets nanosecond precision — the
+        // temporal close-out columns stay at second granularity (editor_now),
+        // matching every other bi-temporal writer.
+        const nanos: u32 = @intCast(@mod(std.time.nanoTimestamp(), std.time.ns_per_s));
+        const history_key = try std.fmt.allocPrint(self.allocator, "history/{s}/{d}-{d:0>9}", .{ key, editor_now, nanos });
+        defer self.allocator.free(history_key);
+
+        const snapshot_inserted: bool = blk: {
+            var txn = try self.beginTransaction();
+            defer txn.deinit();
+
+            // Direct INSERT (NOT upsertMemory): upsertMemory forces a live row
+            // (valid_to=NULL, is_latest=TRUE) for non-durable types and runs a
+            // low-signal gate / promotion logic that must not apply to an audit
+            // snapshot. We write all bi-temporal close-out columns at birth.
+            const q = try self.buildQuery(
+                "INSERT INTO {schema}.memories " ++
+                    "(id, user_id, session_id, key, content, content_hash, memory_type, lemmatized, " ++
+                    " valid_at, valid_to, invalid_at, expired_at, is_latest, updated_at) " ++
+                    "VALUES ($1, $2, NULL, $3, $4, $5, 'conversation', $6, $7, $7, $7, $7, FALSE, NOW()) " ++
+                    // Belt-and-braces: with the nanosecond component a
+                    // (user_id, key) collision needs two edits in the SAME
+                    // nanosecond — practically impossible. If it ever fires,
+                    // keep the first snapshot untouched; RETURNING tells us
+                    // whether OUR row landed so the caller can report the
+                    // skip honestly instead of naming a row it didn't write.
+                    "ON CONFLICT (user_id, key) DO NOTHING RETURNING key",
+            );
+            defer self.allocator.free(q);
+
+            const id = try self.randomHexId(self.allocator, 16);
+            defer self.allocator.free(id);
+            const id_z = try self.allocator.dupeZ(u8, id);
+            defer self.allocator.free(id_z);
+            var user_buf: [32]u8 = undefined;
+            const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+            const history_key_z = try self.allocator.dupeZ(u8, history_key);
+            defer self.allocator.free(history_key_z);
+            const content_z = try self.allocator.dupeZ(u8, old_content);
+            defer self.allocator.free(content_z);
+            const content_hash = try computeContentHash(self.allocator, old_content);
+            defer self.allocator.free(content_hash);
+            const content_hash_z = try self.allocator.dupeZ(u8, content_hash);
+            defer self.allocator.free(content_hash_z);
+            const lemmatized = try text_norm.lemmatizeForBm25(self.allocator, old_content);
+            defer self.allocator.free(lemmatized);
+            const lemmatized_z = try self.allocator.dupeZ(u8, lemmatized);
+            defer self.allocator.free(lemmatized_z);
+            var ts_buf: [32]u8 = undefined;
+            const ts_s = try std.fmt.bufPrintZ(&ts_buf, "{d}", .{editor_now});
+
+            const params = [_]?[*:0]const u8{ id_z, user_s.ptr, history_key_z, content_z, content_hash_z, lemmatized_z, ts_s.ptr };
+            const lengths = [_]c_int{
+                @intCast(id.len),
+                @intCast(user_s.len),
+                @intCast(history_key.len),
+                @intCast(old_content.len),
+                @intCast(content_hash.len),
+                @intCast(lemmatized.len),
+                @intCast(ts_s.len),
+            };
+            const result = try txn.execParams(q, &params, &lengths);
+            const inserted = c.PQntuples(result) == 1;
+            c.PQclear(result);
+
+            try txn.commit();
+            break :blk inserted;
+        };
+
+        // ── Step 3: update the live row in place (reuse the upsert path). ──
+        // Keeps the current key's identity, injection, and (for durable rows)
+        // close-out discipline intact — content/wording refreshes to new.
+        try self.upsertMemory(user_id, key, new_content, old_entry.category, old_entry.session_id);
+
+        // ── Step 4: append the edit_supersede audit event. ────────────────
+        // memory_id points at the SUPERSEDED snapshot (the history row) so the
+        // event pins what was closed out. Best-effort audit; a failure here
+        // does not undo the edit.
+        self.insertMemoryEvent(user_id, history_key, "edit_supersede", key, old_content, old_mem_type, old_entry.session_id) catch |err| {
+            log.warn("edit_supersede.event_failed user={d} key={s} err={s}", .{ user_id, key, @errorName(err) });
+        };
+
+        // Fix-wave (review I2): honest snapshot reporting. On the conflict
+        // path the composed key names a row that does NOT hold this edit's
+        // prior version — return null so the caller never claims archival
+        // that didn't happen (the OLD content then survives only in the
+        // best-effort event payload above).
+        if (!snapshot_inserted) {
+            log.warn("edit_supersede.snapshot_skipped user={d} key={s} history_key={s} (ON CONFLICT — identical key already present)", .{ user_id, key, history_key });
+            return null;
+        }
+        return try allocator.dupe(u8, history_key);
+    }
+
+    /// Package 3 fix-wave Task 2 (M3) — every LIVE row carrying this exact
+    /// content_hash, i.e. `findMemoryByContentHash` without the LIMIT 1.
+    /// Ordered oldest-first (created_at, key) like the C0 exact-dedup
+    /// backfill so callers see a deterministic sequence. Same validity
+    /// filter: superseded rows never appear. Caller frees entries + slice.
+    pub fn findMemoriesByContentHashAll(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        content_hash: []const u8,
+    ) ![]memory_root.MemoryEntry {
+        return self.queryMemories(
+            allocator,
+            "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to FROM {schema}.memories " ++
+                "WHERE user_id = $1 AND content_hash = $2 AND " ++ MEMORIES_VALIDITY_FILTER ++ " ORDER BY created_at ASC, key ASC",
+            user_id,
+            content_hash,
+            null,
+        );
+    }
+
+    /// Package 3 fix-wave Task 2 (M3) — cap on the near-duplicate REPORT.
+    /// The salient-token ILIKE survey is a curation hint for the agent, not
+    /// an exhaustive sweep; 8 keys keeps the tool result readable.
+    const NEAR_DUP_REPORT_LIMIT: usize = 8;
+
+    /// Fix-wave (review I2) — auto-close floor for the exact-hash cascade.
+    /// Byte identity on content SHORTER than this many bytes ("blue",
+    /// "Hamburg", "42") does not prove same-information: two unrelated keys
+    /// can legitimately hold the same short generic value, and the forget
+    /// flavor of the cascade is irreversible. Sub-floor twins are moved to
+    /// the near-dup REPORT (visible, user-confirmable) instead of being
+    /// swept — preserving the cascade's zero-false-positive posture. The
+    /// floor never applies to the PRIMARY key: the user explicitly named it.
+    const CASCADE_CONTENT_FLOOR: usize = 16;
+
+    const InformationScopeMode = enum { archive, forget };
+
+    /// Package 3 fix-wave Task 2 (M3) — INFORMATION-scoped archive. The M3
+    /// live battery proved that closing ONE key does not remove the
+    /// information from the agent's context: the same content survives in
+    /// sibling rows the single-key close never touched (the per-turn
+    /// learning fast path's `durable_fact/behavior/<fnv>` copy of the user
+    /// message, autosaves, a re-extracted twin) and warm-start recall
+    /// re-injects it (map §3.2 M3).
+    ///
+    /// Steps (operator-adjudicated policy: exact-hash auto-close, near-dups
+    /// reported NOT auto-closed — zero false positives):
+    ///   (a) read the live row's content and derive its SHA-256
+    ///       `content_hash` exactly like the writers do (computeContentHash);
+    ///   (b) close the named key via `setMemoryInvalidation` (unchanged
+    ///       semantics incl. the memory_edges cascade + edge_closed events);
+    ///   (c) close EVERY other live row carrying the identical content_hash
+    ///       (`findMemoriesByContentHashAll` — the C0
+    ///       `phase05BackfillExactDedup` "supersede the losers" pattern,
+    ///       applied at archive time instead of backfill time), GUARDED
+    ///       twice (fix-wave, review I2/I3):
+    ///       PROTECTION — a candidate must pass the SAME predicate direct
+    ///       curation uses (`memory_root.isEditableMemoryEntry`, the guard
+    ///       behind lookupMemoryLifecycleEntry's `protected` verdict); a
+    ///       byte-identical twin under `summary_latest/`, `agent_plan/`,
+    ///       append-only families, etc. is SKIPPED in both modes — the
+    ///       cascade must not reach rows the memory_archive/memory_forget
+    ///       tools would refuse outright. DELIBERATE EXCEPTION: `autosave_*`
+    ///       audit rows stay cascade-CLOSABLE — sweeping the byte-identical
+    ///       autosave copy of the content IS the M3 point (it is the recall
+    ///       leak). Archive mode closes them normally; FORGET mode
+    ///       DOWNGRADES them to close-out (setMemoryInvalidation) instead
+    ///       of hard-delete: audit rows are never destroyed, and closing
+    ///       fixes the recall leak just the same (validity-filtered reads
+    ///       stop seeing them; getMemoryAnyValidity keeps the evidence).
+    ///       FLOOR — candidates with content shorter than
+    ///       CASCADE_CONTENT_FLOOR bytes are NOT auto-closed: byte identity
+    ///       on short generic values ("blue") does not prove same
+    ///       information, so sub-floor twins move to the near-dup REPORT
+    ///       (user-confirmable) instead. The primary key is exempt from the
+    ///       floor. Guard order: protection first (protected rows are not
+    ///       curation candidates, so they are skipped silently, never
+    ///       reported), then floor, then the mode-specific close/delete.
+    ///   (d) survey near-duplicates: derive a salient token from the content
+    ///       (`memory_root.salientPatternToken` — longest >=5-byte word,
+    ///       first-occurrence tie-break) and LIST live rows matching it via
+    ///       `fetchProseFactsByPattern` (different hash only) WITHOUT
+    ///       closing them. The caller reports them so the agent can offer
+    ///       follow-up curation. NOTE: fetchProseFactsByPattern's denylist
+    ///       scope EXCLUDES autosaves/audit families by design — exact-hash
+    ///       autosave copies are still caught by (c); reworded autosaves
+    ///       stay out of the report (they are cold-transcript audit rows,
+    ///       not curable facts — see docs/memory-contract.md).
+    ///
+    /// Vector-store cleanup is the CALLER's job (the Manager has no vector
+    /// handle): delete the primary + every `exact_closed` key, mirroring
+    /// memory_archive's existing per-key `deleteFromVectorStore`.
+    ///
+    /// Returns error.MemoryKeyNotFound when the named key has no live row.
+    /// Caller frees the result via `ArchiveScopeResult.deinit`.
+    pub fn archiveInformationScoped(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        key: []const u8,
+        now_unix: i64,
+    ) !memory_root.ArchiveScopeResult {
+        return self.informationScopedSweep(allocator, user_id, key, now_unix, .archive);
+    }
+
+    /// Package 3 fix-wave Task 2 (M3) — memory_forget's flavor of the
+    /// information-scoped sweep: identical shape to
+    /// `archiveInformationScoped` but the named key AND its exact-hash
+    /// KNOWLEDGE copies are HARD-deleted via `forgetMemory` (GDPR erasure
+    /// must reach the behavior copies of the content, not just the named
+    /// row). `autosave_*` twins are DOWNGRADED to close-out instead of
+    /// hard-delete (review I3): the audit record survives any-validity
+    /// reads while live recall stops seeing the content — the leak is
+    /// fixed either way, and cascade copies never destroy audit rows.
+    /// Near-dups are reported the same way and never auto-deleted; the
+    /// same protection predicate + 16-byte content floor apply (see
+    /// informationScopedSweep).
+    pub fn forgetInformationScoped(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        key: []const u8,
+        now_unix: i64,
+    ) !memory_root.ArchiveScopeResult {
+        return self.informationScopedSweep(allocator, user_id, key, now_unix, .forget);
+    }
+
+    fn informationScopedSweep(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        key: []const u8,
+        now_unix: i64,
+        mode: InformationScopeMode,
+    ) !memory_root.ArchiveScopeResult {
+        // ── (a) read the live row + derive its content hash. ──────────────
+        const entry = (try self.getMemory(self.allocator, user_id, key)) orelse
+            return error.MemoryKeyNotFound;
+        defer entry.deinit(self.allocator);
+        const content_hash = try computeContentHash(self.allocator, entry.content);
+        defer self.allocator.free(content_hash);
+
+        // ── (b) close/delete the named key via the EXISTING per-key path. ──
+        var primary_closed = false;
+        switch (mode) {
+            .archive => {
+                try self.setMemoryInvalidation(user_id, key, now_unix, now_unix);
+                primary_closed = true;
+            },
+            .forget => {
+                primary_closed = try self.forgetMemory(user_id, key);
+            },
+        }
+
+        // ── (c) exact-hash cascade. The finder is validity-filtered, so the
+        // just-closed (or just-deleted) primary is naturally excluded; the
+        // key comparison below is belt-and-braces against clock skew between
+        // this process and the DB's NOW().
+        const copies = try self.findMemoriesByContentHashAll(allocator, user_id, content_hash);
+        defer {
+            for (copies) |e| e.deinit(allocator);
+            allocator.free(copies);
+        }
+        var exact_closed: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (exact_closed.items) |k| allocator.free(k);
+            exact_closed.deinit(allocator);
+        }
+        // Declared before the cascade so the FLOOR branch below can report
+        // sub-floor twins; the salient-token survey (d) appends after.
+        var near_dups: std.ArrayListUnmanaged(memory_root.ProseFact) = .empty;
+        errdefer {
+            for (near_dups.items) |f| f.deinit(allocator);
+            near_dups.deinit(allocator);
+        }
+        for (copies) |cp| {
+            if (std.mem.eql(u8, cp.key, key)) continue;
+            // Fix-wave (review I3) — protection parity with direct curation,
+            // with the deliberate autosave exception (see doc comment).
+            const is_autosave = std.mem.startsWith(u8, cp.key, "autosave_user_") or
+                std.mem.startsWith(u8, cp.key, "autosave_assistant_");
+            if (!is_autosave and !memory_root.isEditableMemoryEntry(cp.key, cp.category)) {
+                log.info("information_scope.protected_twin_skipped user={d} key={s}", .{ user_id, cp.key });
+                continue;
+            }
+            // Fix-wave (review I2) — sub-floor twins are reported, not swept.
+            if (cp.content.len < CASCADE_CONTENT_FLOOR) {
+                const nd_key = try allocator.dupe(u8, cp.key);
+                errdefer allocator.free(nd_key);
+                const nd_content = try allocator.dupe(u8, cp.content);
+                errdefer allocator.free(nd_content);
+                try near_dups.append(allocator, .{
+                    .key = nd_key,
+                    .content = nd_content,
+                    .updated_at_unix = std.fmt.parseInt(i64, cp.timestamp, 10) catch 0,
+                });
+                continue;
+            }
+            switch (mode) {
+                .archive => self.setMemoryInvalidation(user_id, cp.key, now_unix, now_unix) catch |err| {
+                    log.warn("information_scope.exact_close_failed user={d} key={s} err={s}", .{ user_id, cp.key, @errorName(err) });
+                    continue;
+                },
+                // Fix-wave (review I3) — forget DOWNGRADES autosave twins to
+                // close-out: audit rows are never hard-deleted by the
+                // cascade; closing already removes them from live recall.
+                .forget => if (is_autosave) {
+                    self.setMemoryInvalidation(user_id, cp.key, now_unix, now_unix) catch |err| {
+                        log.warn("information_scope.exact_close_failed user={d} key={s} err={s}", .{ user_id, cp.key, @errorName(err) });
+                        continue;
+                    };
+                } else {
+                    _ = self.forgetMemory(user_id, cp.key) catch |err| {
+                        log.warn("information_scope.exact_delete_failed user={d} key={s} err={s}", .{ user_id, cp.key, @errorName(err) });
+                        continue;
+                    };
+                },
+            }
+            const owned = try allocator.dupe(u8, cp.key);
+            exact_closed.append(allocator, owned) catch |err| {
+                allocator.free(owned);
+                return err;
+            };
+        }
+
+        // ── (d) near-duplicate REPORT (never closes anything). ────────────
+        if (memory_root.salientPatternToken(entry.content)) |tok| {
+            const found = self.fetchProseFactsByPattern(allocator, user_id, tok, NEAR_DUP_REPORT_LIMIT) catch |err| blk: {
+                // Best-effort survey: the archive/delete already happened;
+                // a failed report must not fail the operation.
+                log.warn("information_scope.near_dup_survey_failed user={d} key={s} err={s}", .{ user_id, key, @errorName(err) });
+                break :blk try allocator.alloc(memory_root.ProseFact, 0);
+            };
+            var fi: usize = 0;
+            defer allocator.free(found);
+            errdefer while (fi < found.len) : (fi += 1) found[fi].deinit(allocator);
+            while (fi < found.len) : (fi += 1) {
+                const f = found[fi];
+                // Drop the primary, anything the exact cascade closed, and
+                // any row whose content hashes identical: same-hash rows
+                // were already handled by the cascade loop — closed,
+                // protected-skipped (not a curation candidate), or floor-
+                // reported into near_dups above — so listing them here
+                // would either double-report or offer curation the tools
+                // refuse. (Also the clock-skew belt-and-braces as above.)
+                var drop = std.mem.eql(u8, f.key, key);
+                if (!drop) for (exact_closed.items) |ck| {
+                    if (std.mem.eql(u8, f.key, ck)) {
+                        drop = true;
+                        break;
+                    }
+                };
+                if (!drop) {
+                    const fh = try computeContentHash(self.allocator, f.content);
+                    defer self.allocator.free(fh);
+                    if (std.mem.eql(u8, fh, content_hash)) drop = true;
+                }
+                if (drop) {
+                    f.deinit(allocator);
+                    continue;
+                }
+                try near_dups.append(allocator, f);
+            }
+        }
+
+        return .{
+            .primary_closed = primary_closed,
+            .exact_closed = try exact_closed.toOwnedSlice(allocator),
+            .near_dups = try near_dups.toOwnedSlice(allocator),
+        };
     }
 
     /// V1.6 commit 11 — flip a DURABLE memory back to a non-durable type.
@@ -18365,6 +18825,585 @@ test "V1.6 commit 6 setMemoryInvalidation closes out memory + filters from retri
 
     // 5. Non-existent key: silent no-op (caller doesn't gate on existence).
     try mgr.setMemoryInvalidation(2, "no_such_key", close_out_ts, close_out_ts);
+}
+
+// Package 3 Task 1 (M2) — editMemorySupersede writes a bi-temporal history
+// row instead of mutating in place. Proves: (a) the live key keeps stable
+// identity and reads back the NEW content; (b) a born-closed history row
+// carrying the OLD content is written under key
+// `history/<key>/<editor_now>-<nanos>` and is validity-filtered OUT of every
+// normal read (getMemory/listMemories); (c) the history row IS retrievable
+// via getMemoryAnyValidity + direct count; (d) a `memory_events` row
+// `event_type='edit_supersede'` is appended; (e) fix-wave I2: two edits in
+// the SAME second keep BOTH snapshots under distinct keys.
+test "M2 editMemorySupersede writes born-closed history row and updates live in place" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const result = try mgr.exec("SET client_min_messages TO WARNING");
+        c.PQclear(result);
+    }
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    // ── Seed: a live, editable fact holding "oolong". ─────────────────
+    try mgr.upsertMemory(2, "fav_tea", "oolong", .core, null);
+    {
+        const before = try mgr.getMemory(allocator, 2, "fav_tea");
+        try std.testing.expect(before != null);
+        defer before.?.deinit(allocator);
+        try std.testing.expectEqualStrings("oolong", before.?.content);
+    }
+
+    // ── Supersede: edit oolong → sencha at editor_now. ────────────────
+    // Fix-wave (review I2): editMemorySupersede now RETURNS the history key
+    // it actually wrote (null would mean the snapshot INSERT was skipped by
+    // ON CONFLICT — callers must not claim archival then). The key shape is
+    // `history/<key>/<editor_now>-<nanos>`: seconds in the temporal columns,
+    // a nanosecond component in the key for same-second collision-proofing.
+    const editor_now: i64 = std.time.timestamp();
+    const history_key = (try mgr.editMemorySupersede(allocator, 2, "fav_tea", "sencha", editor_now)) orelse {
+        std.debug.print("FAIL: first supersede reported a skipped snapshot\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    defer allocator.free(history_key);
+    {
+        var prefix_buf: [64]u8 = undefined;
+        const expected_prefix = try std.fmt.bufPrint(&prefix_buf, "history/fav_tea/{d}-", .{editor_now});
+        try std.testing.expect(std.mem.startsWith(u8, history_key, expected_prefix));
+    }
+
+    // ── Assertion 1: the live key keeps its address and reads NEW content.
+    {
+        const live = try mgr.getMemory(allocator, 2, "fav_tea");
+        try std.testing.expect(live != null);
+        defer live.?.deinit(allocator);
+        try std.testing.expectEqualStrings("sencha", live.?.content);
+    }
+
+    // ── Assertion 2: a default-validity listMemories does NOT surface the
+    //    history row (its valid_to <= now hides it), and DOES surface the
+    //    live key exactly once.
+    {
+        const rows = try mgr.listMemories(allocator, 2, null, null);
+        defer {
+            for (rows) |e| e.deinit(allocator);
+            allocator.free(rows);
+        }
+        var saw_live = false;
+        for (rows) |e| {
+            if (std.mem.eql(u8, e.key, history_key)) {
+                std.debug.print("FAIL: history row leaked into listMemories: {s}\n", .{e.key});
+                return error.TestUnexpectedResult;
+            }
+            if (std.mem.eql(u8, e.key, "fav_tea")) saw_live = true;
+        }
+        try std.testing.expect(saw_live);
+    }
+
+    // ── Assertion 3: getMemory (validity-filtered) hides the history row.
+    {
+        const hidden = try mgr.getMemory(allocator, 2, history_key);
+        try std.testing.expect(hidden == null);
+    }
+
+    // ── Assertion 4: getMemoryAnyValidity surfaces the history row holding
+    //    the OLD content ("oolong").
+    {
+        const audit = try mgr.getMemoryAnyValidity(allocator, 2, history_key);
+        try std.testing.expect(audit != null);
+        defer audit.?.deinit(allocator);
+        try std.testing.expectEqualStrings("oolong", audit.?.content);
+    }
+
+    // ── Assertion 5: direct SQL — the history row exists with valid_to /
+    //    invalid_at / expired_at = editor_now and is_latest = FALSE.
+    {
+        const audit_q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT content, valid_to, invalid_at, expired_at, is_latest FROM {s}.memories WHERE user_id = 2 AND key = $1",
+            .{schema},
+        );
+        defer allocator.free(audit_q);
+        const key_z = try allocator.dupeZ(u8, history_key);
+        defer allocator.free(key_z);
+        const params = [_]?[*:0]const u8{key_z};
+        const lengths = [_]c_int{@intCast(history_key.len)};
+        const result = try mgr.execParams(audit_q, &params, &lengths);
+        defer c.PQclear(result);
+        try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+
+        const content_str = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(content_str);
+        const valid_to_str = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(valid_to_str);
+        const invalid_at_str = try dupeResultValue(allocator, result, 0, 2);
+        defer allocator.free(invalid_at_str);
+        const expired_at_str = try dupeResultValue(allocator, result, 0, 3);
+        defer allocator.free(expired_at_str);
+        const is_latest_str = try dupeResultValue(allocator, result, 0, 4);
+        defer allocator.free(is_latest_str);
+
+        try std.testing.expectEqualStrings("oolong", content_str);
+        try std.testing.expectEqual(editor_now, try std.fmt.parseInt(i64, valid_to_str, 10));
+        try std.testing.expectEqual(editor_now, try std.fmt.parseInt(i64, invalid_at_str, 10));
+        try std.testing.expectEqual(editor_now, try std.fmt.parseInt(i64, expired_at_str, 10));
+        try std.testing.expectEqualStrings("f", is_latest_str);
+    }
+
+    // ── Assertion 6: a `memory_events` row event_type='edit_supersede'
+    //    exists for this user.
+    {
+        const ev_q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT COUNT(*) FROM {s}.memory_events WHERE user_id = 2 AND event_type = 'edit_supersede'",
+            .{schema},
+        );
+        defer allocator.free(ev_q);
+        const result = try mgr.exec(ev_q);
+        defer c.PQclear(result);
+        try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+        const count_str = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(count_str);
+        try std.testing.expectEqual(@as(i64, 1), try std.fmt.parseInt(i64, count_str, 10));
+    }
+
+    // ── Assertion 7 (fix-wave, review I2): a second edit within the SAME
+    //    second must NOT silently drop the intermediate snapshot. Reuse the
+    //    same editor_now (deterministic same-second collision under the old
+    //    `history/<key>/<ts>` shape — the nanosecond component now keeps the
+    //    keys distinct). BOTH snapshots exist afterwards, under distinct
+    //    history keys, each preserving its superseded content.
+    {
+        const history_key2 = (try mgr.editMemorySupersede(allocator, 2, "fav_tea", "matcha", editor_now)) orelse {
+            std.debug.print("FAIL: same-second second edit dropped its snapshot (ON CONFLICT)\n", .{});
+            return error.TestUnexpectedResult;
+        };
+        defer allocator.free(history_key2);
+
+        // Distinct history keys for the two same-second edits.
+        try std.testing.expect(!std.mem.eql(u8, history_key, history_key2));
+
+        // The live key reads the newest content.
+        const live = try mgr.getMemory(allocator, 2, "fav_tea");
+        try std.testing.expect(live != null);
+        defer live.?.deinit(allocator);
+        try std.testing.expectEqualStrings("matcha", live.?.content);
+
+        // Exactly TWO born-closed snapshots exist.
+        const count_q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT COUNT(*) FROM {s}.memories WHERE user_id = 2 AND key LIKE 'history/fav_tea/%'",
+            .{schema},
+        );
+        defer allocator.free(count_q);
+        const result = try mgr.exec(count_q);
+        defer c.PQclear(result);
+        const count_str = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(count_str);
+        try std.testing.expectEqual(@as(i64, 2), try std.fmt.parseInt(i64, count_str, 10));
+
+        // Both old contents are preserved: snapshot 1 = oolong, snapshot 2 =
+        // sencha (the intermediate version the old key shape used to drop).
+        const audit1 = try mgr.getMemoryAnyValidity(allocator, 2, history_key);
+        try std.testing.expect(audit1 != null);
+        defer audit1.?.deinit(allocator);
+        try std.testing.expectEqualStrings("oolong", audit1.?.content);
+
+        const audit2 = try mgr.getMemoryAnyValidity(allocator, 2, history_key2);
+        try std.testing.expect(audit2 != null);
+        defer audit2.?.deinit(allocator);
+        try std.testing.expectEqualStrings("sencha", audit2.?.content);
+    }
+}
+
+// Package 3 Task 2 (M3) — archiveInformationScoped is INFORMATION-scoped:
+// archiving one key auto-closes every live row with the identical
+// content_hash (the M3 leak shape: `durable_fact/behavior/<fnv>` copy +
+// `extracted_*` twin), reports the closed copies, and LISTS — without
+// closing — a reworded near-duplicate found via the salient-token survey.
+test "M3 archiveInformationScoped closes exact-hash copies and reports near-dups" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const result = try mgr.exec("SET client_min_messages TO WARNING");
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    // ── Seed the M3 leak shape. ────────────────────────────────────────
+    const info = "User prefers thmanyah podcasts on Fridays";
+    try mgr.upsertMemory(2, "extracted_m3mgr001", info, .core, null);
+    try mgr.upsertMemory(2, "durable_fact/behavior/1111cafe2222beef", info, .core, null);
+    const reworded = "User enjoys thmanyah episodes weekly";
+    try mgr.upsertMemory(2, "extracted_m3mgrnear", reworded, .core, null);
+    try mgr.upsertMemory(2, "extracted_m3mgrunrl", "User lives in Hamburg", .core, null);
+
+    // ── Act: archive ONE key. ──────────────────────────────────────────
+    const now_ts: i64 = std.time.timestamp();
+    var scope = try mgr.archiveInformationScoped(allocator, 2, "extracted_m3mgr001", now_ts);
+    defer scope.deinit(allocator);
+
+    // ── Result shape: primary closed; exactly the behavior twin in
+    //    exact_closed; exactly the reworded row in near_dups. ────────────
+    try std.testing.expect(scope.primary_closed);
+    try std.testing.expectEqual(@as(usize, 1), scope.exact_closed.len);
+    try std.testing.expectEqualStrings("durable_fact/behavior/1111cafe2222beef", scope.exact_closed[0]);
+    try std.testing.expectEqual(@as(usize, 1), scope.near_dups.len);
+    try std.testing.expectEqualStrings("extracted_m3mgrnear", scope.near_dups[0].key);
+    try std.testing.expectEqualStrings(reworded, scope.near_dups[0].content);
+
+    // ── BOTH identical-content rows carry valid_to (validity-filtered
+    //    out); the near-dup and the unrelated row stay live. ─────────────
+    {
+        const primary = try mgr.getMemory(allocator, 2, "extracted_m3mgr001");
+        try std.testing.expect(primary == null);
+        const copy = try mgr.getMemory(allocator, 2, "durable_fact/behavior/1111cafe2222beef");
+        try std.testing.expect(copy == null);
+        const near = try mgr.getMemory(allocator, 2, "extracted_m3mgrnear");
+        try std.testing.expect(near != null);
+        defer near.?.deinit(allocator);
+        const unrl = try mgr.getMemory(allocator, 2, "extracted_m3mgrunrl");
+        try std.testing.expect(unrl != null);
+        defer unrl.?.deinit(allocator);
+    }
+    // Direct SQL: the cascade-closed copy got the full bi-temporal
+    // close-out (valid_to/invalid_at/expired_at = now_ts, is_latest=f) —
+    // the same column discipline setMemoryInvalidation always applies.
+    {
+        const audit_q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT valid_to, invalid_at, expired_at, is_latest FROM {s}.memories WHERE user_id = 2 AND key = 'durable_fact/behavior/1111cafe2222beef'",
+            .{schema},
+        );
+        defer allocator.free(audit_q);
+        const result = try mgr.exec(audit_q);
+        defer c.PQclear(result);
+        try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+        const valid_to_str = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(valid_to_str);
+        const invalid_at_str = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(invalid_at_str);
+        const expired_at_str = try dupeResultValue(allocator, result, 0, 2);
+        defer allocator.free(expired_at_str);
+        const is_latest_str = try dupeResultValue(allocator, result, 0, 3);
+        defer allocator.free(is_latest_str);
+        try std.testing.expectEqual(now_ts, try std.fmt.parseInt(i64, valid_to_str, 10));
+        try std.testing.expectEqual(now_ts, try std.fmt.parseInt(i64, invalid_at_str, 10));
+        try std.testing.expectEqual(now_ts, try std.fmt.parseInt(i64, expired_at_str, 10));
+        try std.testing.expectEqualStrings("f", is_latest_str);
+    }
+
+    // ── Warm-start read paths no longer return EITHER closed row. ───────
+    {
+        const rows = try mgr.listMemories(allocator, 2, null, null);
+        defer {
+            for (rows) |e| e.deinit(allocator);
+            allocator.free(rows);
+        }
+        for (rows) |e| {
+            try std.testing.expect(!std.mem.eql(u8, e.key, "extracted_m3mgr001"));
+            try std.testing.expect(!std.mem.eql(u8, e.key, "durable_fact/behavior/1111cafe2222beef"));
+        }
+    }
+    {
+        const rows = try mgr.recallMemories(allocator, 2, "thmanyah", 10, null);
+        defer {
+            for (rows) |e| e.deinit(allocator);
+            allocator.free(rows);
+        }
+        for (rows) |e| {
+            try std.testing.expect(!std.mem.eql(u8, e.key, "extracted_m3mgr001"));
+            try std.testing.expect(!std.mem.eql(u8, e.key, "durable_fact/behavior/1111cafe2222beef"));
+        }
+    }
+
+    // ── Missing key surfaces MemoryKeyNotFound (M2 parity). ─────────────
+    try std.testing.expectError(
+        error.MemoryKeyNotFound,
+        mgr.archiveInformationScoped(allocator, 2, "no_such_key_m3", now_ts),
+    );
+}
+
+// Package 3 Task 2 (M3, forget flavor) — forgetInformationScoped HARD-deletes
+// the named key and its exact-hash KNOWLEDGE copies (rows GONE, not
+// validity-closed); near-dups are reported and untouched. Fix-wave (review
+// I3): autosave twins are DOWNGRADED to close-out — audit rows are never
+// destroyed by the cascade, only removed from live recall.
+test "M3 forgetInformationScoped hard-deletes exact-hash copies" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const result = try mgr.exec("SET client_min_messages TO WARNING");
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    const info = "User passport number is X99 via wanderlust";
+    try mgr.upsertMemory(2, "extracted_m3fmgr01", info, .core, null);
+    try mgr.upsertMemory(2, "autosave_user_777001", info, .conversation, null);
+    try mgr.upsertMemory(2, "extracted_m3fmgrnr", "User carries a wanderlust visa", .core, null);
+    try mgr.upsertMemory(2, "durable_fact/behavior/m3fmgrtwin01", info, .core, null);
+
+    const now_ts: i64 = std.time.timestamp();
+    var scope = try mgr.forgetInformationScoped(allocator, 2, "extracted_m3fmgr01", now_ts);
+    defer scope.deinit(allocator);
+
+    try std.testing.expect(scope.primary_closed);
+    try std.testing.expectEqual(@as(usize, 2), scope.exact_closed.len);
+    try std.testing.expectEqualStrings("autosave_user_777001", scope.exact_closed[0]);
+    try std.testing.expectEqualStrings("durable_fact/behavior/m3fmgrtwin01", scope.exact_closed[1]);
+
+    // HARD delete reaches the named row and the knowledge-lane copy — both
+    // GONE at any validity. The AUTOSAVE twin is downgraded to close-out
+    // (fix-wave I3): gone from live reads, preserved at any validity with
+    // valid_to set — GDPR recall erasure without destroying the audit row.
+    {
+        const primary = try mgr.getMemoryAnyValidity(allocator, 2, "extracted_m3fmgr01");
+        try std.testing.expect(primary == null);
+        const knowledge_copy = try mgr.getMemoryAnyValidity(allocator, 2, "durable_fact/behavior/m3fmgrtwin01");
+        try std.testing.expect(knowledge_copy == null);
+        const live = try mgr.getMemory(allocator, 2, "autosave_user_777001");
+        try std.testing.expect(live == null);
+        const audit = (try mgr.getMemoryAnyValidity(allocator, 2, "autosave_user_777001")) orelse return error.TestUnexpectedResult;
+        defer audit.deinit(allocator);
+        try std.testing.expectEqual(now_ts, audit.valid_to orelse return error.TestUnexpectedResult);
+    }
+    // The reworded near-dup is reported and untouched.
+    try std.testing.expectEqual(@as(usize, 1), scope.near_dups.len);
+    try std.testing.expectEqualStrings("extracted_m3fmgrnr", scope.near_dups[0].key);
+    {
+        const near = try mgr.getMemory(allocator, 2, "extracted_m3fmgrnr");
+        try std.testing.expect(near != null);
+        defer near.?.deinit(allocator);
+    }
+}
+
+// Package 3 fix-wave (review I2) — content-length floor on the exact-hash
+// cascade. Byte identity on SHORT generic content ("yes", "blue") does not
+// prove same-information: two unrelated keys can legitimately hold the same
+// short value, and pre-fix the cascade auto-closed (archive) or HARD-deleted
+// (forget) the unrelated twin. Twins shorter than 16 bytes are now REPORTED
+// in near_dups (visible, user-confirmable) instead of swept — in BOTH modes.
+// The primary key the user explicitly named is unaffected by the floor.
+test "M3 cascade floor: short identical content is reported, never swept" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const result = try mgr.exec("SET client_min_messages TO WARNING");
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    // Three unrelated user keys, identical 4-byte content. ("blue" clears
+    // the isLowSignalMemory ingestion gate — unlike "yes"/"ok" — while
+    // still sitting far below the 16-byte cascade floor.)
+    try mgr.upsertMemory(2, "pref_color_answer", "blue", .core, null);
+    try mgr.upsertMemory(2, "confirm_backup_yes", "blue", .core, null);
+    try mgr.upsertMemory(2, "reply_style_short", "blue", .core, null);
+
+    const now_ts: i64 = std.time.timestamp();
+    // ── Archive mode: primary closed; short twins reported, NOT closed. ──
+    var scope = try mgr.archiveInformationScoped(allocator, 2, "pref_color_answer", now_ts);
+    defer scope.deinit(allocator);
+    try std.testing.expect(scope.primary_closed);
+    try std.testing.expectEqual(@as(usize, 0), scope.exact_closed.len);
+    try std.testing.expectEqual(@as(usize, 2), scope.near_dups.len);
+    try std.testing.expectEqualStrings("confirm_backup_yes", scope.near_dups[0].key);
+    try std.testing.expectEqualStrings("reply_style_short", scope.near_dups[1].key);
+    {
+        const live1 = try mgr.getMemory(allocator, 2, "confirm_backup_yes");
+        try std.testing.expect(live1 != null);
+        live1.?.deinit(allocator);
+        const live2 = try mgr.getMemory(allocator, 2, "reply_style_short");
+        try std.testing.expect(live2 != null);
+        live2.?.deinit(allocator);
+    }
+
+    // ── Forget mode: primary hard-deleted (floor never guards the named
+    //    key); the remaining short twin survives LIVE and is reported. ────
+    var scope2 = try mgr.forgetInformationScoped(allocator, 2, "confirm_backup_yes", now_ts);
+    defer scope2.deinit(allocator);
+    try std.testing.expect(scope2.primary_closed);
+    try std.testing.expectEqual(@as(usize, 0), scope2.exact_closed.len);
+    try std.testing.expectEqual(@as(usize, 1), scope2.near_dups.len);
+    try std.testing.expectEqualStrings("reply_style_short", scope2.near_dups[0].key);
+    {
+        const gone = try mgr.getMemoryAnyValidity(allocator, 2, "confirm_backup_yes");
+        try std.testing.expect(gone == null);
+        const live = try mgr.getMemory(allocator, 2, "reply_style_short");
+        try std.testing.expect(live != null);
+        live.?.deinit(allocator);
+    }
+}
+
+// Package 3 fix-wave (review I3) — the exact-hash cascade obeys the SAME
+// protection predicate as direct curation (memory_root.isEditableMemoryEntry,
+// the guard behind lookupMemoryLifecycleEntry's `protected` verdict): a
+// byte-identical twin under a protected system family (summary_latest/,
+// agent_plan/, append-only families, ...) is SKIPPED in both modes — pre-fix
+// it was closed (archive) or hard-deleted (forget) even though curating that
+// key directly is refused as `protected`. DELIBERATE EXCEPTION: autosave_*
+// audit twins stay sweepable — the byte-identical autosave copy IS the M3
+// recall leak — but forget DOWNGRADES them to close-out instead of
+// hard-delete (audit rows are never destroyed; any-validity reads keep them).
+test "M3 cascade protection: system twins skipped; autosave twins closed, never hard-deleted" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const result = try mgr.exec("SET client_min_messages TO WARNING");
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    // ── Archive mode. ──────────────────────────────────────────────────
+    const info = "User prefers the desert road on weekends";
+    try mgr.upsertMemory(2, "extracted_m3prot01", info, .core, null);
+    try mgr.upsertMemory(2, "summary_latest/sess-prot1", info, .core, null);
+    try mgr.upsertMemory(2, "autosave_user_888001", info, .conversation, null);
+
+    const now_ts: i64 = std.time.timestamp();
+    var scope = try mgr.archiveInformationScoped(allocator, 2, "extracted_m3prot01", now_ts);
+    defer scope.deinit(allocator);
+    try std.testing.expect(scope.primary_closed);
+    // ONLY the autosave twin is swept; the protected summary row is
+    // skipped by the cascade — and never surfaces in the near-dup report
+    // either (it is not a curation candidate: direct curation refuses it).
+    try std.testing.expectEqual(@as(usize, 1), scope.exact_closed.len);
+    try std.testing.expectEqualStrings("autosave_user_888001", scope.exact_closed[0]);
+    for (scope.near_dups) |nd| try std.testing.expect(!std.mem.eql(u8, nd.key, "summary_latest/sess-prot1"));
+    {
+        const summary = try mgr.getMemory(allocator, 2, "summary_latest/sess-prot1");
+        try std.testing.expect(summary != null);
+        summary.?.deinit(allocator);
+    }
+    // The autosave twin is CLOSED (bi-temporal), not destroyed.
+    {
+        const live = try mgr.getMemory(allocator, 2, "autosave_user_888001");
+        try std.testing.expect(live == null);
+        const audit = (try mgr.getMemoryAnyValidity(allocator, 2, "autosave_user_888001")) orelse return error.TestUnexpectedResult;
+        defer audit.deinit(allocator);
+        try std.testing.expectEqual(now_ts, audit.valid_to orelse return error.TestUnexpectedResult);
+    }
+
+    // ── Forget mode (fresh content so the named key is live). ───────────
+    const info2 = "User plays the oud every Thursday evening";
+    try mgr.upsertMemory(2, "extracted_m3prot02", info2, .core, null);
+    try mgr.upsertMemory(2, "summary_latest/sess-prot2", info2, .core, null);
+    try mgr.upsertMemory(2, "autosave_user_888002", info2, .conversation, null);
+
+    var scope2 = try mgr.forgetInformationScoped(allocator, 2, "extracted_m3prot02", now_ts);
+    defer scope2.deinit(allocator);
+    try std.testing.expect(scope2.primary_closed);
+    try std.testing.expectEqual(@as(usize, 1), scope2.exact_closed.len);
+    try std.testing.expectEqualStrings("autosave_user_888002", scope2.exact_closed[0]);
+    // The protected summary twin survives forget untouched...
+    {
+        const summary = try mgr.getMemory(allocator, 2, "summary_latest/sess-prot2");
+        try std.testing.expect(summary != null);
+        summary.?.deinit(allocator);
+    }
+    // ...the named key is HARD-deleted (primary semantics unchanged)...
+    {
+        const gone = try mgr.getMemoryAnyValidity(allocator, 2, "extracted_m3prot02");
+        try std.testing.expect(gone == null);
+    }
+    // ...and the autosave twin is CLOSED, not hard-deleted: gone from live
+    // reads, still present at any validity with valid_to set.
+    {
+        const live = try mgr.getMemory(allocator, 2, "autosave_user_888002");
+        try std.testing.expect(live == null);
+        const audit = (try mgr.getMemoryAnyValidity(allocator, 2, "autosave_user_888002")) orelse return error.TestUnexpectedResult;
+        defer audit.deinit(allocator);
+        try std.testing.expectEqual(now_ts, audit.valid_to orelse return error.TestUnexpectedResult);
+    }
 }
 
 // V1.6 commit 6 — findRelatedExtractedMemories scoping smoke test.
