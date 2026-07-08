@@ -18,11 +18,17 @@ const log = std.log.scoped(.memory_forget);
 /// When a MemoryRuntime is available, also cleans up the vector store.
 ///
 /// Package 3 fix-wave Task 2 (M3): with a tenant Manager bound, forget is
-/// INFORMATION-scoped — the named key AND every other live row holding
-/// byte-identical content (same SHA-256 content_hash) are hard-deleted
-/// (GDPR erasure must reach the behavior/autosave copies of the content,
-/// not just the named row). Near-duplicates (similar wording, different
-/// hash) are reported in the result but never auto-deleted.
+/// INFORMATION-scoped — the named key AND every other live KNOWLEDGE row
+/// holding byte-identical content (same SHA-256 content_hash) are
+/// hard-deleted (GDPR erasure must reach the behavior copies of the
+/// content, not just the named row). Cascade guards (fix-wave I2/I3):
+/// twins under protected system families are skipped (same predicate as
+/// direct curation); `autosave_*` twins are DOWNGRADED to bi-temporal
+/// close-out instead of hard-delete (audit rows are never destroyed —
+/// live recall stops seeing them either way); twins with content under
+/// 16 bytes are only REPORTED (byte identity on short generic values
+/// does not prove same-information). Near-duplicates (similar wording,
+/// different hash) are reported in the result but never auto-deleted.
 pub const MemoryForgetTool = struct {
     memory: ?Memory = null,
     mem_rt: ?*mem_root.MemoryRuntime = null,
@@ -56,8 +62,10 @@ pub const MemoryForgetTool = struct {
     pub const tool_description =
         "Remove a memory by key. Use to delete outdated facts or sensitive " ++
         "data. Deletion is information-scoped: other rows holding " ++
-        "byte-identical content are hard-deleted along with the named key, " ++
-        "and near-duplicate rows (similar wording) are listed in the result " ++
+        "byte-identical content are removed along with the named key " ++
+        "(autosave audit copies are closed rather than destroyed; protected " ++
+        "system rows and very short content are skipped and reported), and " ++
+        "near-duplicate rows (similar wording) are listed in the result " ++
         "so you can offer to forget them too.";
     pub const tool_params =
         \\{"type":"object","properties":{"key":{"type":"string","description":"The key of the memory to forget"}},"required":["key"]}
@@ -158,7 +166,10 @@ pub const MemoryForgetTool = struct {
                 errdefer out.deinit(allocator);
                 try out.writer(allocator).print("Forgot memory: {s}", .{key});
                 if (scope.exact_closed.len > 0) {
-                    try out.writer(allocator).print("\nAlso deleted {d} exact-content {s}: ", .{
+                    // "removed", not "deleted": autosave twins in this list
+                    // were closed (audit preserved), knowledge twins were
+                    // hard-deleted — see forgetInformationScoped (fix-wave I3).
+                    try out.writer(allocator).print("\nAlso removed {d} exact-content {s}: ", .{
                         scope.exact_closed.len,
                         if (scope.exact_closed.len == 1) @as([]const u8, "copy") else "copies",
                     });
@@ -168,7 +179,7 @@ pub const MemoryForgetTool = struct {
                     }
                 }
                 if (scope.near_dups.len > 0) {
-                    try out.appendSlice(allocator, "\nRelated rows with similar wording found (NOT deleted): ");
+                    try out.appendSlice(allocator, "\nRelated rows with similar or identical wording found (NOT deleted): ");
                     for (scope.near_dups, 0..) |nd, i| {
                         if (i > 0) try out.appendSlice(allocator, ", ");
                         try out.appendSlice(allocator, nd.key);

@@ -1021,7 +1021,11 @@ pub fn freeProseFacts(allocator: std.mem.Allocator, facts: []ProseFact) void {
 ///
 ///   - exact-content copies (identical SHA-256 `content_hash`) are closed
 ///     AUTOMATICALLY alongside the named key (zero false positives — byte
-///     identity is unambiguous),
+///     identity is unambiguous), EXCEPT (fix-wave I2/I3): twins under
+///     protected system families (same `isEditableMemoryEntry` predicate
+///     as direct curation; `autosave_*` deliberately excepted) are skipped
+///     entirely, and twins with content shorter than 16 bytes are moved to
+///     the near-dup report instead of swept,
 ///   - near-duplicates (different hash, shared salient token) are
 ///     REPORTED but NEVER auto-closed (operator-adjudicated: rewordings
 ///     can be genuinely different facts; the agent offers follow-up
@@ -1035,12 +1039,17 @@ pub const ArchiveScopeResult = struct {
     primary_closed: bool,
     /// Keys of OTHER live rows carrying byte-identical content
     /// (same `content_hash`) that were closed/deleted alongside the
-    /// named key. Caller frees each + the slice.
+    /// named key. In forget mode, `autosave_*` entries listed here were
+    /// CLOSED (bi-temporal close-out), not hard-deleted — audit rows are
+    /// never destroyed by the cascade (fix-wave I3). Caller frees each +
+    /// the slice.
     exact_closed: [][]u8,
-    /// Live rows that share the archived content's salient token but
-    /// carry a DIFFERENT content_hash — near-duplicate candidates,
-    /// deliberately NOT closed. Reported so the tool result can offer
-    /// "also found N related rows — archive these too?".
+    /// Live rows deliberately NOT closed, reported so the tool result can
+    /// offer "also found N related rows — archive these too?". Two
+    /// sources: rows sharing the content's salient token under a DIFFERENT
+    /// content_hash (near-duplicates), and byte-identical twins whose
+    /// content sits under the 16-byte cascade floor (fix-wave I2 — too
+    /// short for hash identity to prove same-information).
     near_dups: []ProseFact,
 
     pub fn deinit(self: *const ArchiveScopeResult, allocator: std.mem.Allocator) void {

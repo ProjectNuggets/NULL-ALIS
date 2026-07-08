@@ -23,9 +23,15 @@
 //! M3 (information-scoped archive): archiving a key ALSO auto-closes every
 //! other live row with the identical SHA-256 content_hash (byte-identical
 //! copies — e.g. the learning fast path's `durable_fact/behavior/<fnv>`
-//! snapshot of the same user message, autosaves). Near-duplicates (same
-//! salient token, different hash) are REPORTED in the tool result but never
-//! auto-closed — the agent offers them to the user for follow-up curation.
+//! snapshot of the same user message, autosaves). Cascade guards (fix-wave
+//! I2/I3): twins under protected system families are skipped — the same
+//! `isEditableMemoryEntry` predicate the direct-curation pre-check below
+//! applies to the named key (`autosave_*` deliberately excepted: the
+//! byte-identical autosave copy IS the recall leak, and close-out keeps it
+//! as audit); twins with content under 16 bytes are only REPORTED, never
+//! swept. Near-duplicates (same salient token, different hash) are REPORTED
+//! in the tool result but never auto-closed — the agent offers them to the
+//! user for follow-up curation.
 //!
 //! Resurrect-on-upsert (W-INT-01 fix): if the agent later writes the
 //! same key again with non-core type, the close-out columns clear back
@@ -84,11 +90,13 @@ pub const MemoryArchiveTool = struct {
         "preserved as audit evidence (bi-temporal close-out: valid_to/invalid_at/" ++
         "expired_at populated, is_latest=false). Cascades to typed edges in " ++
         "the graph, and archiving is information-scoped: other rows holding " ++
-        "byte-identical content are closed automatically, and near-duplicate " ++
-        "rows (similar wording) are listed in the result so you can offer to " ++
-        "archive them too. Use this instead of memory_forget when you want the " ++
-        "agent to remember 'I used to know X but it changed' rather than scrub " ++
-        "it completely. Use memory_forget for GDPR/sensitive removal.";
+        "byte-identical content are closed automatically (protected system " ++
+        "rows and very short content are skipped and reported instead), and " ++
+        "near-duplicate rows (similar wording) are listed in the result so " ++
+        "you can offer to archive them too. Use this instead of memory_forget " ++
+        "when you want the agent to remember 'I used to know X but it changed' " ++
+        "rather than scrub it completely. Use memory_forget for GDPR/sensitive " ++
+        "removal.";
     pub const tool_params =
         \\{"type":"object","properties":{"key":{"type":"string","description":"The key of the memory to archive (soft-delete)"}},"required":["key"]}
     ;
@@ -187,7 +195,7 @@ pub const MemoryArchiveTool = struct {
             }
         }
         if (scope.near_dups.len > 0) {
-            try out.appendSlice(allocator, "\nRelated rows with similar wording found (NOT closed): ");
+            try out.appendSlice(allocator, "\nRelated rows with similar or identical wording found (NOT closed): ");
             for (scope.near_dups, 0..) |nd, i| {
                 if (i > 0) try out.appendSlice(allocator, ", ");
                 try out.appendSlice(allocator, nd.key);

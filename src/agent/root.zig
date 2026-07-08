@@ -7332,16 +7332,37 @@ fn parsePersistedToolCalls(allocator: std.mem.Allocator, json: []const u8) ![]pr
 ///
 /// Fix: before storing, hash the content exactly the way the DB does
 /// (SHA-256, lowercase hex — zaki_state.computeContentHash) and consult
-/// `findMemoryByContentHash`; when a LIVE row already carries byte-identical
-/// content, SKIP the behavior write (returns false). This mirrors the
-/// extraction path's WR-1 dedup discipline (extraction_persist.zig). The
-/// lookup is best-effort: on lookup failure we store anyway (one possible
-/// duplicate beats a lost learning fact — same trade extraction makes).
+/// `findMemoriesByContentHashAll`; when a LIVE KNOWLEDGE-lane row already
+/// carries byte-identical content, SKIP the behavior write (returns false).
+/// This mirrors the extraction path's WR-1 dedup discipline
+/// (extraction_persist.zig). The lookup is best-effort: on lookup failure we
+/// store anyway (one possible duplicate beats a lost learning fact — same
+/// trade extraction makes).
+///
+/// Fix-wave (review C1) — twin lookup is FAMILY-SCOPED. On the tenant lane
+/// every turn stores `autosave_user_<ns>` (the raw user message, WITH
+/// content_hash) BEFORE this fast path runs, and extractFactFromMessage
+/// returns the trimmed message — typically byte-identical to that autosave.
+/// An unscoped hash lookup therefore ALWAYS matched the same-turn autosave
+/// and silently disabled the learning store exactly where it matters
+/// (docs/learning-contract.md:90: the user-correction fast path stays
+/// active). Internal/append-only rows (autosaves, checkpoints, history/
+/// snapshots, compaction artifacts — audit-class bookkeeping, default-
+/// hidden, decaying) never count as twins; the skip only fires for
+/// brain-visible knowledge rows (`durable_fact/*`, `extracted_*`, user
+/// keys). The filter runs in Zig against the authoritative
+/// `memory_root.isInternalMemoryKey`/`isAppendOnlyMemoryKey` predicates
+/// rather than mirroring the family lists in SQL — the one existing SQL
+/// mirror (fetchProseFactsByPattern) needs a MUST-stay-in-lockstep warning
+/// precisely because those lists grow (history/ in M2, compaction families
+/// in iter31); rows sharing one SHA-256 are few, so filtering the full
+/// match set client-side is cheap.
 ///
 /// Tenant handles may be absent (CLI/sqlite/non-tenant lanes) — dedup is
 /// skipped then and the store behaves exactly as before. The non-postgres
-/// stub Manager's findMemoryByContentHash returns null, which also degrades
-/// to "store" — but those builds never bind a state_mgr here anyway.
+/// stub Manager's findMemoriesByContentHashAll returns an empty slice,
+/// which also degrades to "store" — but those builds never bind a
+/// state_mgr here anyway.
 ///
 /// Returns true when the fact was stored, false when the store was skipped
 /// because the information already exists.
@@ -7360,12 +7381,19 @@ pub fn storeBehaviorFactDeduped(
             std.crypto.hash.sha2.Sha256.hash(fact_content, &digest, .{});
             var hex_buf: [64]u8 = undefined;
             const content_hash = security_secrets.hexEncode(&digest, &hex_buf);
-            const existing = smgr.findMemoryByContentHash(allocator, uid, content_hash) catch |err| blk: {
+            const matches = smgr.findMemoriesByContentHashAll(allocator, uid, content_hash) catch |err| blk: {
                 log.warn("learning.dedup_lookup_failed key={s} err={s}", .{ key, @errorName(err) });
-                break :blk null;
+                break :blk try allocator.alloc(memory_mod.MemoryEntry, 0);
             };
-            if (existing) |e| {
-                defer e.deinit(allocator);
+            defer {
+                for (matches) |e| e.deinit(allocator);
+                allocator.free(matches);
+            }
+            for (matches) |e| {
+                // Fix-wave (review C1): audit-class rows — the same-turn
+                // autosave above all — are NOT twins; only a knowledge-lane
+                // row already holding this content suppresses the store.
+                if (memory_mod.isInternalMemoryKey(e.key) or memory_mod.isAppendOnlyMemoryKey(e.key)) continue;
                 log.info("learning.fast_path_dup_skipped key={s} matches_key={s}", .{ key, e.key });
                 return false;
             }
@@ -15858,4 +15886,62 @@ test "M3 learning fast-path skips byte-identical behavior fact (content dedup)" 
         defer row.deinit(allocator);
         try std.testing.expectEqualStrings(fact3, row.content);
     }
+}
+
+// Package 3 fix-wave (review C1) — the same-turn autosave must NOT suppress
+// the learning fast path. Production turn order on the tenant lane: the raw
+// user message is stored as `autosave_user_<ns>` (WITH content_hash) BEFORE
+// the learning-signal block runs, and extractFactFromMessage returns the
+// trimmed message — typically byte-identical to the autosave. An unscoped
+// content-hash lookup therefore ALWAYS found the autosave and skipped the
+// behavior-fact store, silently disabling learning exactly on the flagship
+// lane (docs/learning-contract.md:90 requires the user-correction fast path
+// to stay active). Audit-class twins (internal/append-only families) must be
+// ignored by the twin lookup; knowledge-lane twins must still dedup.
+test "M3 learning fast-path ignores audit twins (turn-ordered autosave) but dedups knowledge twins" {
+    if (!@import("build_options").enable_postgres) return error.SkipZigTest;
+    const env_rebrand = @import("../env_rebrand.zig");
+    const zaki_postgres = @import("../memory/engines/zaki_postgres.zig");
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+    var mgr = zaki_state_mod.Manager.init(allocator, cfg) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.migrate();
+    try mgr.provisionUser(13, "/tmp/nullalis-zaki-bot-test-user-13/workspace");
+
+    var pg_mem = zaki_postgres.ZakiPostgresMemory.init(allocator, &mgr, 13);
+
+    // ── Turn order: the autosave twin lands FIRST (raw user message,
+    //    byte-identical to the extracted fact). ──────────────────────────
+    const fact = "never schedule meetings on Friday afternoons";
+    try mgr.upsertMemory(13, "autosave_user_123", fact, .conversation, null);
+
+    // The behavior fact MUST still be stored — audit rows are not twins.
+    const key = try learning.factKey(allocator, fact);
+    defer allocator.free(key);
+    const stored = try storeBehaviorFactDeduped(allocator, pg_mem.memory(), &mgr, 13, key, fact, null);
+    try std.testing.expect(stored);
+    {
+        const row = (try mgr.getMemory(allocator, 13, key)) orelse return error.TestUnexpectedResult;
+        defer row.deinit(allocator);
+        try std.testing.expectEqualStrings(fact, row.content);
+    }
+
+    // ── A KNOWLEDGE-lane twin still dedups: with a durable_fact row (and
+    //    the just-stored behavior fact) live under the same hash, a second
+    //    fast-path store of the same content is SKIPPED. ─────────────────
+    try mgr.upsertMemory(13, "durable_fact/behavior/aaaa1111bbbb2222", fact, .core, null);
+    const stored2 = try storeBehaviorFactDeduped(allocator, pg_mem.memory(), &mgr, 13, key, fact, null);
+    try std.testing.expect(!stored2);
 }
