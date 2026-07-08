@@ -1149,6 +1149,16 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn setMemoryInvalidation(_: *@This(), _: i64, _: []const u8, _: i64, _: i64) !void {
         return;
     }
+    /// Package 3 fix-wave (review C1) — stub for non-postgres builds; the
+    /// same build-portability mirror setMemoryInvalidation has for
+    /// memory_archive, so memory_edit compiles on every engine set (default
+    /// `zig build`, -Dengines=base,sqlite, ...). Unreachable at runtime: this
+    /// stub Manager cannot be instantiated (init always fails) and the tool
+    /// only takes the supersede path when a live tenant Manager is bound —
+    /// otherwise it falls back to the legacy in-place store.
+    pub fn editMemorySupersede(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8, _: []const u8, _: i64) !?[]u8 {
+        return error.PostgresNotEnabled;
+    }
     /// V1.6 commit 11 — stub for non-postgres builds. The CASE-guard
     /// immortality protection only fires on the postgres path, so demotion
     /// is a no-op for other backends.
@@ -9391,7 +9401,7 @@ const ManagerImpl = struct {
     ///   1. Read the current live row's content for (user_id, key). Missing →
     ///      error.MemoryKeyNotFound (caller surfaces a clear message).
     ///   2. INSERT a BORN-CLOSED history row inside one pinned txn: key
-    ///      `history/<key>/<editor_now>`, content = the OLD content,
+    ///      `history/<key>/<editor_now>-<nanos>`, content = the OLD content,
     ///      `valid_at = valid_to = invalid_at = expired_at = editor_now`,
     ///      `is_latest = FALSE`, memory_type `conversation` (audit tier). The
     ///      `valid_to <= now` bit hides it from MEMORIES_VALIDITY_FILTER
@@ -9404,13 +9414,28 @@ const ManagerImpl = struct {
     ///   3. Update the live row in place via the existing upsert path so the
     ///      current key keeps stable identity + injection.
     ///   4. Append a `memory_events` row `event_type='edit_supersede'`.
+    ///
+    /// Key shape (fix-wave, review I2): `<editor_now>` is the edit's
+    /// wall-clock SECOND and stays the value of all four temporal close-out
+    /// columns; `<nanos>` is a zero-padded sub-second nanosecond component
+    /// that makes the key collision-proof — two edits of the same key within
+    /// one second write DISTINCT snapshots instead of the second one being
+    /// silently dropped by ON CONFLICT DO NOTHING.
+    ///
+    /// Returns the history key actually written (allocated with `allocator`,
+    /// caller owns), or null when the snapshot INSERT was skipped by
+    /// ON CONFLICT DO NOTHING (a row with the identical key already existed —
+    /// practically impossible now, but callers MUST NOT claim "prior version
+    /// archived" unless this returns non-null). The live-row update and the
+    /// audit event still happen on the null path.
     pub fn editMemorySupersede(
         self: *Self,
+        allocator: std.mem.Allocator,
         user_id: i64,
         key: []const u8,
         new_content: []const u8,
         editor_now: i64,
-    ) !void {
+    ) !?[]u8 {
         // ── Step 1: snapshot the current live content. ────────────────────
         const old_entry = (try self.getMemory(self.allocator, user_id, key)) orelse
             return error.MemoryKeyNotFound;
@@ -9419,10 +9444,16 @@ const ManagerImpl = struct {
         const old_mem_type = categoryToMemoryType(old_entry.category);
 
         // ── Step 2: born-closed history row, in one pinned txn. ───────────
-        const history_key = try std.fmt.allocPrint(self.allocator, "history/{s}/{d}", .{ key, editor_now });
+        // Fix-wave (review I2): the key carries a sub-second nanosecond
+        // component so same-second edits of the same key produce distinct
+        // snapshot rows. Only the KEY gets nanosecond precision — the
+        // temporal close-out columns stay at second granularity (editor_now),
+        // matching every other bi-temporal writer.
+        const nanos: u32 = @intCast(@mod(std.time.nanoTimestamp(), std.time.ns_per_s));
+        const history_key = try std.fmt.allocPrint(self.allocator, "history/{s}/{d}-{d:0>9}", .{ key, editor_now, nanos });
         defer self.allocator.free(history_key);
 
-        {
+        const snapshot_inserted: bool = blk: {
             var txn = try self.beginTransaction();
             defer txn.deinit();
 
@@ -9435,9 +9466,13 @@ const ManagerImpl = struct {
                     "(id, user_id, session_id, key, content, content_hash, memory_type, lemmatized, " ++
                     " valid_at, valid_to, invalid_at, expired_at, is_latest, updated_at) " ++
                     "VALUES ($1, $2, NULL, $3, $4, $5, 'conversation', $6, $7, $7, $7, $7, FALSE, NOW()) " ++
-                    // Idempotent: a repeated edit within the same second reuses
-                    // the same history key; keep the first snapshot untouched.
-                    "ON CONFLICT (user_id, key) DO NOTHING",
+                    // Belt-and-braces: with the nanosecond component a
+                    // (user_id, key) collision needs two edits in the SAME
+                    // nanosecond — practically impossible. If it ever fires,
+                    // keep the first snapshot untouched; RETURNING tells us
+                    // whether OUR row landed so the caller can report the
+                    // skip honestly instead of naming a row it didn't write.
+                    "ON CONFLICT (user_id, key) DO NOTHING RETURNING key",
             );
             defer self.allocator.free(q);
 
@@ -9473,10 +9508,12 @@ const ManagerImpl = struct {
                 @intCast(ts_s.len),
             };
             const result = try txn.execParams(q, &params, &lengths);
+            const inserted = c.PQntuples(result) == 1;
             c.PQclear(result);
 
             try txn.commit();
-        }
+            break :blk inserted;
+        };
 
         // ── Step 3: update the live row in place (reuse the upsert path). ──
         // Keeps the current key's identity, injection, and (for durable rows)
@@ -9490,6 +9527,17 @@ const ManagerImpl = struct {
         self.insertMemoryEvent(user_id, history_key, "edit_supersede", key, old_content, old_mem_type, old_entry.session_id) catch |err| {
             log.warn("edit_supersede.event_failed user={d} key={s} err={s}", .{ user_id, key, @errorName(err) });
         };
+
+        // Fix-wave (review I2): honest snapshot reporting. On the conflict
+        // path the composed key names a row that does NOT hold this edit's
+        // prior version — return null so the caller never claims archival
+        // that didn't happen (the OLD content then survives only in the
+        // best-effort event payload above).
+        if (!snapshot_inserted) {
+            log.warn("edit_supersede.snapshot_skipped user={d} key={s} history_key={s} (ON CONFLICT — identical key already present)", .{ user_id, key, history_key });
+            return null;
+        }
+        return try allocator.dupe(u8, history_key);
     }
 
     /// V1.6 commit 11 — flip a DURABLE memory back to a non-durable type.
@@ -18486,10 +18534,12 @@ test "V1.6 commit 6 setMemoryInvalidation closes out memory + filters from retri
 // Package 3 Task 1 (M2) — editMemorySupersede writes a bi-temporal history
 // row instead of mutating in place. Proves: (a) the live key keeps stable
 // identity and reads back the NEW content; (b) a born-closed history row
-// carrying the OLD content is written under key `history/<key>/<editor_now>`
-// and is validity-filtered OUT of every normal read (getMemory/listMemories);
-// (c) the history row IS retrievable via getMemoryAnyValidity + direct count;
-// (d) a `memory_events` row `event_type='edit_supersede'` is appended.
+// carrying the OLD content is written under key
+// `history/<key>/<editor_now>-<nanos>` and is validity-filtered OUT of every
+// normal read (getMemory/listMemories); (c) the history row IS retrievable
+// via getMemoryAnyValidity + direct count; (d) a `memory_events` row
+// `event_type='edit_supersede'` is appended; (e) fix-wave I2: two edits in
+// the SAME second keep BOTH snapshots under distinct keys.
 test "M2 editMemorySupersede writes born-closed history row and updates live in place" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -18533,11 +18583,22 @@ test "M2 editMemorySupersede writes born-closed history row and updates live in 
     }
 
     // ── Supersede: edit oolong → sencha at editor_now. ────────────────
+    // Fix-wave (review I2): editMemorySupersede now RETURNS the history key
+    // it actually wrote (null would mean the snapshot INSERT was skipped by
+    // ON CONFLICT — callers must not claim archival then). The key shape is
+    // `history/<key>/<editor_now>-<nanos>`: seconds in the temporal columns,
+    // a nanosecond component in the key for same-second collision-proofing.
     const editor_now: i64 = std.time.timestamp();
-    try mgr.editMemorySupersede(2, "fav_tea", "sencha", editor_now);
-
-    var history_key_buf: [128]u8 = undefined;
-    const history_key = try std.fmt.bufPrint(&history_key_buf, "history/fav_tea/{d}", .{editor_now});
+    const history_key = (try mgr.editMemorySupersede(allocator, 2, "fav_tea", "sencha", editor_now)) orelse {
+        std.debug.print("FAIL: first supersede reported a skipped snapshot\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    defer allocator.free(history_key);
+    {
+        var prefix_buf: [64]u8 = undefined;
+        const expected_prefix = try std.fmt.bufPrint(&prefix_buf, "history/fav_tea/{d}-", .{editor_now});
+        try std.testing.expect(std.mem.startsWith(u8, history_key, expected_prefix));
+    }
 
     // ── Assertion 1: the live key keeps its address and reads NEW content.
     {
@@ -18632,6 +18693,54 @@ test "M2 editMemorySupersede writes born-closed history row and updates live in 
         const count_str = try dupeResultValue(allocator, result, 0, 0);
         defer allocator.free(count_str);
         try std.testing.expectEqual(@as(i64, 1), try std.fmt.parseInt(i64, count_str, 10));
+    }
+
+    // ── Assertion 7 (fix-wave, review I2): a second edit within the SAME
+    //    second must NOT silently drop the intermediate snapshot. Reuse the
+    //    same editor_now (deterministic same-second collision under the old
+    //    `history/<key>/<ts>` shape — the nanosecond component now keeps the
+    //    keys distinct). BOTH snapshots exist afterwards, under distinct
+    //    history keys, each preserving its superseded content.
+    {
+        const history_key2 = (try mgr.editMemorySupersede(allocator, 2, "fav_tea", "matcha", editor_now)) orelse {
+            std.debug.print("FAIL: same-second second edit dropped its snapshot (ON CONFLICT)\n", .{});
+            return error.TestUnexpectedResult;
+        };
+        defer allocator.free(history_key2);
+
+        // Distinct history keys for the two same-second edits.
+        try std.testing.expect(!std.mem.eql(u8, history_key, history_key2));
+
+        // The live key reads the newest content.
+        const live = try mgr.getMemory(allocator, 2, "fav_tea");
+        try std.testing.expect(live != null);
+        defer live.?.deinit(allocator);
+        try std.testing.expectEqualStrings("matcha", live.?.content);
+
+        // Exactly TWO born-closed snapshots exist.
+        const count_q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT COUNT(*) FROM {s}.memories WHERE user_id = 2 AND key LIKE 'history/fav_tea/%'",
+            .{schema},
+        );
+        defer allocator.free(count_q);
+        const result = try mgr.exec(count_q);
+        defer c.PQclear(result);
+        const count_str = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(count_str);
+        try std.testing.expectEqual(@as(i64, 2), try std.fmt.parseInt(i64, count_str, 10));
+
+        // Both old contents are preserved: snapshot 1 = oolong, snapshot 2 =
+        // sencha (the intermediate version the old key shape used to drop).
+        const audit1 = try mgr.getMemoryAnyValidity(allocator, 2, history_key);
+        try std.testing.expect(audit1 != null);
+        defer audit1.?.deinit(allocator);
+        try std.testing.expectEqualStrings("oolong", audit1.?.content);
+
+        const audit2 = try mgr.getMemoryAnyValidity(allocator, 2, history_key2);
+        try std.testing.expect(audit2 != null);
+        defer audit2.?.deinit(allocator);
+        try std.testing.expectEqualStrings("sencha", audit2.?.content);
     }
 }
 

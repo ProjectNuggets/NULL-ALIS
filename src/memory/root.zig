@@ -4260,13 +4260,13 @@ test "P4b: continuity summaries are hidden from embedding but durable_fact stays
     try std.testing.expect(isBrainVisibleKey("durable_fact/x"));
 }
 
-// Package 3 Task 1 (M2) — `history/<key>/<ts>` born-closed audit rows must be
-// classified as append-only (never re-editable), brain-hidden (an internal
-// audit trail, not user-facing brain content), and non-embedding (the OLD
-// wording must not pollute the pgvector fact space — the live key carries the
-// current truth). All three surfaces cannot drift.
+// Package 3 Task 1 (M2) — `history/<key>/<ts>-<ns>` born-closed audit rows
+// must be classified as append-only (never re-editable), brain-hidden (an
+// internal audit trail, not user-facing brain content), and non-embedding
+// (the OLD wording must not pollute the pgvector fact space — the live key
+// carries the current truth). All three surfaces cannot drift.
 test "M2: history/ audit prefix is append-only, brain-hidden, and non-embedding" {
-    const k = "history/fav_tea/1700000000";
+    const k = "history/fav_tea/1700000000-042117333";
     // Append-only: memory_edit / normal upsert must never mutate a history row.
     try std.testing.expect(isAppendOnlyMemoryKey(k));
     // Brain-hidden: the audit trail is not user-facing brain content.

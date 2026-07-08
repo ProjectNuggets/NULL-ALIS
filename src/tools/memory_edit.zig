@@ -19,7 +19,7 @@ pub const MemoryEditTool = struct {
     mem_rt: ?*mem_root.MemoryRuntime = null,
     /// Package 3 Task 1 (M2) — tenant context for the bi-temporal supersede
     /// path. When bound (postgres tenant lane), an edit snapshots the prior
-    /// version into a born-closed `history/<key>/<now>` row via
+    /// version into a born-closed `history/<key>/<now>-<nanos>` row via
     /// `Manager.editMemorySupersede` instead of mutating in place. Wired the
     /// same way as memory_archive (bindStateMgrTenant in tools/root.zig). When
     /// null (no postgres lane, e.g. file-tenant/CLI/SQLite), the tool falls
@@ -104,11 +104,12 @@ pub const MemoryEditTool = struct {
         if (self.state_mgr) |smgr| {
             if (self.user_id) |uid| {
                 const editor_now = std.time.timestamp();
-                smgr.editMemorySupersede(uid, existing.key, content, editor_now) catch |err| {
+                const archived_key = smgr.editMemorySupersede(allocator, uid, existing.key, content, editor_now) catch |err| {
                     log.warn("memory_edit supersede failed user_id={d} key='{s}' err={s}", .{ uid, key, @errorName(err) });
                     const msg = try std.fmt.allocPrint(allocator, "Failed to edit memory '{s}': {s}", .{ key, @errorName(err) });
                     return ToolResult{ .success = false, .error_msg = msg, .output = "" };
                 };
+                defer if (archived_key) |hk| allocator.free(hk);
 
                 // Refresh the live key's vector so semantic recall matches the
                 // NEW content. The born-closed history row is intentionally
@@ -117,11 +118,25 @@ pub const MemoryEditTool = struct {
                     _ = rt.syncVectorAfterStore(allocator, existing.key, content);
                 }
 
-                const msg = try std.fmt.allocPrint(
-                    allocator,
-                    "Edited memory: {s} (prior version archived to history/{s}/{d})",
-                    .{ key, existing.key, editor_now },
-                );
+                // Fix-wave (review I2): claim archival ONLY when the snapshot
+                // row was actually inserted — editMemorySupersede returns the
+                // history key it wrote, or null when the INSERT hit
+                // ON CONFLICT DO NOTHING. That path is practically impossible
+                // now that history keys carry a nanosecond component, but if
+                // it ever fires the tool must not name a row that does not
+                // hold this edit's prior version.
+                const msg = if (archived_key) |hk|
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "Edited memory: {s} (prior version archived to {s})",
+                        .{ key, hk },
+                    )
+                else
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "Edited memory: {s} (prior-version snapshot NOT archived: an identical history row already existed; the old content survives only in the edit_supersede audit event)",
+                        .{key},
+                    );
                 return ToolResult{ .success = true, .output = msg };
             }
         }
@@ -248,14 +263,16 @@ test "memory_edit supersede tool: edit oolong to sencha, history row holds oolon
     try std.testing.expect(result.success);
 
     // The tool names the born-closed history key in its output so the audit
-    // trail is discoverable. Parse it back out.
+    // trail is discoverable. Parse it back out. The key's timestamp segment
+    // is `<editor_now>-<nanos>` (fix-wave I2: the nanosecond component keeps
+    // same-second edits collision-free), so consume digits AND the dash.
     const marker = "history/fav_tea/";
     const idx = std.mem.indexOf(u8, result.output, marker) orelse {
         std.debug.print("FAIL: tool output did not name the history key: {s}\n", .{result.output});
         return error.TestUnexpectedResult;
     };
     var end = idx + marker.len;
-    while (end < result.output.len and std.ascii.isDigit(result.output[end])) : (end += 1) {}
+    while (end < result.output.len and (std.ascii.isDigit(result.output[end]) or result.output[end] == '-')) : (end += 1) {}
     const history_key = result.output[idx..end];
 
     // Recall/get NEVER returns oolong-as-current: the live key reads "sencha".
