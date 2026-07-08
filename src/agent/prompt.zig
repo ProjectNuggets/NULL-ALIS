@@ -1185,7 +1185,7 @@ fn appendChannelAttachmentsSection(w: anytype) !void {
 
 /// Append available skills with progressive loading.
 /// - always=true skills: full instruction text in the prompt
-/// - always=false skills: XML summary only (agent must use read_file to load)
+/// - always=false skills: XML summary only (agent must use file_read to load)
 /// - unavailable skills: marked with available="false" and missing deps
 fn appendSkillsSection(
     allocator: std.mem.Allocator,
@@ -1246,7 +1246,7 @@ fn appendSkillsSection(
         if (skill.always and skill.available) continue; // already rendered above
         if (!has_summary) {
             try w.writeAll("## Available Skills\n\n");
-            try w.writeAll("Use the read_file tool to load full skill instructions when needed.\n\n");
+            try w.writeAll("Use the file_read tool to load full skill instructions when needed.\n\n");
             try w.writeAll("<available_skills>\n");
             has_summary = true;
         }
@@ -1844,7 +1844,7 @@ test "appendSkillsSection renders summary XML for always=false skill" {
     try std.testing.expect(std.mem.indexOf(u8, output, "name=\"greeter\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "description=\"Greets the user\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "SKILL.md") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "read_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "file_read") != null);
     // A summary-only skill must NOT get a full-instruction render block.
     // (## Skills now always renders as the discovery-nudge header.)
     try std.testing.expect(std.mem.indexOf(u8, output, "### Skill:") == null);
