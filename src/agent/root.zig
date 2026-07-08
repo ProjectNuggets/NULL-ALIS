@@ -31,6 +31,11 @@ const observability = @import("../observability.zig");
 // forget global; no-op when Sentry/GlitchTip isn't configured (same path the
 // W1.4 Manager error-capture uses).
 const sentry_runtime = @import("../sentry_runtime.zig");
+// Package 3 fix-wave Task 2 (M3 prevention) — hexEncode for the learning
+// fast-path's content-hash dedup; the SAME helper zaki_state's
+// computeContentHash uses, so the hex form matches the DB's content_hash
+// byte-for-byte.
+const security_secrets = @import("../security/secrets.zig");
 const json_util = @import("../json_util.zig");
 const tool_dispatcher = @import("../tool_mode.zig");
 const Observer = observability.Observer;
@@ -4324,13 +4329,26 @@ pub const Agent = struct {
                             // facts are the behavioral-correction corpus; losing
                             // one silently means the agent doesn't learn from a
                             // user correction it thought it saved.
-                            if (mem.store(k, fc, .core, self.memory_session_id)) |_| {
+                            //
+                            // Package 3 fix-wave Task 2 (M3 prevention) — the
+                            // store now routes through storeBehaviorFactDeduped:
+                            // when a live row already holds byte-identical
+                            // content, the behavior write is SKIPPED (stored=
+                            // false) so archiving that one canonical row later
+                            // actually removes the information. Tenant handles
+                            // (extraction_state_mgr/extraction_user_id) may be
+                            // absent on non-tenant lanes — then the store runs
+                            // undeduped, exactly as before.
+                            if (storeBehaviorFactDeduped(self.allocator, mem, self.extraction_state_mgr, self.extraction_user_id, k, fc, self.memory_session_id)) |stored| {
                                 // D1.8: only bump counter on confirmed-stored.
                                 // If the store fails, the count must NOT advance
                                 // or we'd silently exceed MAX_FACTS_PER_SESSION
                                 // on subsequent turns when the prior write didn't
-                                // actually land.
-                                if (self.learning_fact_count) |*c| c.* += 1;
+                                // actually land. (A dedup-skip stores no new row
+                                // either — same rule.)
+                                if (stored) {
+                                    if (self.learning_fact_count) |*c| c.* += 1;
+                                }
                             } else |err| {
                                 log.warn("learning.fact_store_failed key={s} err={s}", .{ k, @errorName(err) });
                             }
@@ -7301,6 +7319,61 @@ fn parsePersistedToolCalls(allocator: std.mem.Allocator, json: []const u8) ![]pr
 // and Pass A drop-window extraction uses buildCompactionTranscript
 // (compaction.zig). Keeping the function as zero-caller dead code would
 // invite future drift; deleted.
+
+/// Package 3 fix-wave Task 2 (M3 prevention) — the learning fast-path's
+/// behavior-fact store, extracted from the per-turn signal-detection block
+/// so the store decision is unit-testable against a real tenant Manager.
+///
+/// THE M3 LEAK SOURCE (map §3.1 writer 3, §3.2 M3): this path stored the
+/// full pattern-matched user message as `durable_fact/behavior/<fnv>` with
+/// NO content dedup, so the same information routinely lived in TWO rows
+/// (this one + an `extracted_*` / autosave twin). Archiving one key left
+/// the other alive and warm-start recall re-injected the "archived" fact.
+///
+/// Fix: before storing, hash the content exactly the way the DB does
+/// (SHA-256, lowercase hex — zaki_state.computeContentHash) and consult
+/// `findMemoryByContentHash`; when a LIVE row already carries byte-identical
+/// content, SKIP the behavior write (returns false). This mirrors the
+/// extraction path's WR-1 dedup discipline (extraction_persist.zig). The
+/// lookup is best-effort: on lookup failure we store anyway (one possible
+/// duplicate beats a lost learning fact — same trade extraction makes).
+///
+/// Tenant handles may be absent (CLI/sqlite/non-tenant lanes) — dedup is
+/// skipped then and the store behaves exactly as before. The non-postgres
+/// stub Manager's findMemoryByContentHash returns null, which also degrades
+/// to "store" — but those builds never bind a state_mgr here anyway.
+///
+/// Returns true when the fact was stored, false when the store was skipped
+/// because the information already exists.
+pub fn storeBehaviorFactDeduped(
+    allocator: std.mem.Allocator,
+    mem: Memory,
+    state_mgr: ?*zaki_state_mod.Manager,
+    user_id: ?i64,
+    key: []const u8,
+    fact_content: []const u8,
+    session_id: ?[]const u8,
+) !bool {
+    if (state_mgr) |smgr| {
+        if (user_id) |uid| {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(fact_content, &digest, .{});
+            var hex_buf: [64]u8 = undefined;
+            const content_hash = security_secrets.hexEncode(&digest, &hex_buf);
+            const existing = smgr.findMemoryByContentHash(allocator, uid, content_hash) catch |err| blk: {
+                log.warn("learning.dedup_lookup_failed key={s} err={s}", .{ key, @errorName(err) });
+                break :blk null;
+            };
+            if (existing) |e| {
+                defer e.deinit(allocator);
+                log.info("learning.fast_path_dup_skipped key={s} matches_key={s}", .{ key, e.key });
+                return false;
+            }
+        }
+    }
+    try mem.store(key, fact_content, .core, session_id);
+    return true;
+}
 
 pub const cli = @import("cli.zig");
 
@@ -15713,5 +15786,76 @@ test "synthMoonshotFilename falls back to mp4 on malformed media_type" {
         const name = try Agent.synthMoonshotFilename(allocator, mt);
         defer allocator.free(name);
         try std.testing.expect(std.mem.endsWith(u8, name, ".mp4"));
+    }
+}
+
+// Package 3 fix-wave Task 2 (M3 prevention) — the learning fast-path must not
+// re-store information that already lives, byte-identical, in another live
+// row. The M3 live battery proved the leak: a pattern-matched user message
+// was stored as durable_fact/behavior/<fnv> even though the same content
+// already existed as an extracted_* row — archiving either key later left
+// the twin alive, so a new session still surfaced the "archived" fact.
+test "M3 learning fast-path skips byte-identical behavior fact (content dedup)" {
+    if (!@import("build_options").enable_postgres) return error.SkipZigTest;
+    const env_rebrand = @import("../env_rebrand.zig");
+    const zaki_postgres = @import("../memory/engines/zaki_postgres.zig");
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+    var mgr = zaki_state_mod.Manager.init(allocator, cfg) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.migrate();
+    try mgr.provisionUser(13, "/tmp/nullalis-zaki-bot-test-user-13/workspace");
+
+    var pg_mem = zaki_postgres.ZakiPostgresMemory.init(allocator, &mgr, 13);
+
+    // ── Case 1: byte-identical live twin + tenant manager → SKIP. ──────
+    const fact = "always reply in formal Arabic";
+    try mgr.upsertMemory(13, "extracted_seed01", fact, .core, null);
+    const key = try learning.factKey(allocator, fact);
+    defer allocator.free(key);
+    const stored = try storeBehaviorFactDeduped(allocator, pg_mem.memory(), &mgr, 13, key, fact, null);
+    try std.testing.expect(!stored);
+    // No second row: the behavior key must not exist (count assertion —
+    // exactly ONE row carries this content, the seeded extracted twin).
+    {
+        const row = try mgr.getMemory(allocator, 13, key);
+        try std.testing.expect(row == null);
+    }
+
+    // ── Case 2: no live twin → stored normally. ────────────────────────
+    const fact2 = "prefer bullet lists over prose";
+    const key2 = try learning.factKey(allocator, fact2);
+    defer allocator.free(key2);
+    const stored2 = try storeBehaviorFactDeduped(allocator, pg_mem.memory(), &mgr, 13, key2, fact2, null);
+    try std.testing.expect(stored2);
+    {
+        const row = (try mgr.getMemory(allocator, 13, key2)) orelse return error.TestUnexpectedResult;
+        defer row.deinit(allocator);
+        try std.testing.expectEqualStrings(fact2, row.content);
+    }
+
+    // ── Case 3: twin exists but NO tenant manager (CLI/sqlite lanes) →
+    //    current behavior preserved: the store happens undeduped. ───────
+    const fact3 = "never send emails after midnight";
+    try mgr.upsertMemory(13, "extracted_seed03", fact3, .core, null);
+    const key3 = try learning.factKey(allocator, fact3);
+    defer allocator.free(key3);
+    const stored3 = try storeBehaviorFactDeduped(allocator, pg_mem.memory(), null, null, key3, fact3, null);
+    try std.testing.expect(stored3);
+    {
+        const row = (try mgr.getMemory(allocator, 13, key3)) orelse return error.TestUnexpectedResult;
+        defer row.deinit(allocator);
+        try std.testing.expectEqualStrings(fact3, row.content);
     }
 }

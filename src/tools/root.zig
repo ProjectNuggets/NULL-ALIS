@@ -2348,6 +2348,14 @@ pub fn bindStateMgrTenant(tools: []const Tool, state_mgr: ?*zaki_state.Manager, 
             const mt: *memory_edit.MemoryEditTool = @ptrCast(@alignCast(t.ptr));
             mt.state_mgr = state_mgr;
             mt.user_id = user_id;
+        } else if (t.vtable == &memory_forget.MemoryForgetTool.vtable) {
+            // Package 3 Task 2 (M3) — memory_forget needs tenant context for
+            // the information-scoped hard delete (forgetInformationScoped:
+            // exact-hash cascade + near-dup report). Null tenant falls back
+            // to the legacy single-key m.forget path inside the tool.
+            const mt: *memory_forget.MemoryForgetTool = @ptrCast(@alignCast(t.ptr));
+            mt.state_mgr = state_mgr;
+            mt.user_id = user_id;
         } else if (t.vtable == &memory_demote.MemoryDemoteTool.vtable) {
             const mt: *memory_demote.MemoryDemoteTool = @ptrCast(@alignCast(t.ptr));
             mt.state_mgr = state_mgr;

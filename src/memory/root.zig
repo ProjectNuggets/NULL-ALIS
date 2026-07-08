@@ -1008,6 +1008,99 @@ pub fn freeProseFacts(allocator: std.mem.Allocator, facts: []ProseFact) void {
     allocator.free(facts);
 }
 
+/// Package 3 fix-wave Task 2 (M3) — result of an information-scoped
+/// archive/forget (`Manager.archiveInformationScoped` /
+/// `Manager.forgetInformationScoped`).
+///
+/// The M3 live battery proved that closing ONE key does not remove the
+/// INFORMATION from the agent's context: the same content routinely
+/// survives in sibling rows the single-key close never touched (an
+/// auto-promoted `durable_fact/behavior/<fnv>` copy of the user message,
+/// autosaves, a re-extracted `extracted_*` twin). This struct reports the
+/// full information-scoped outcome:
+///
+///   - exact-content copies (identical SHA-256 `content_hash`) are closed
+///     AUTOMATICALLY alongside the named key (zero false positives — byte
+///     identity is unambiguous),
+///   - near-duplicates (different hash, shared salient token) are
+///     REPORTED but NEVER auto-closed (operator-adjudicated: rewordings
+///     can be genuinely different facts; the agent offers follow-up
+///     curation to the user instead).
+///
+/// Caller frees via `deinit`.
+pub const ArchiveScopeResult = struct {
+    /// True when the named key existed and was closed (archive) or
+    /// hard-deleted (forget). False only on a lost race (the row vanished
+    /// between the content read and the close).
+    primary_closed: bool,
+    /// Keys of OTHER live rows carrying byte-identical content
+    /// (same `content_hash`) that were closed/deleted alongside the
+    /// named key. Caller frees each + the slice.
+    exact_closed: [][]u8,
+    /// Live rows that share the archived content's salient token but
+    /// carry a DIFFERENT content_hash — near-duplicate candidates,
+    /// deliberately NOT closed. Reported so the tool result can offer
+    /// "also found N related rows — archive these too?".
+    near_dups: []ProseFact,
+
+    pub fn deinit(self: *const ArchiveScopeResult, allocator: std.mem.Allocator) void {
+        for (self.exact_closed) |k| allocator.free(k);
+        allocator.free(self.exact_closed);
+        freeProseFacts(allocator, self.near_dups);
+    }
+};
+
+fn isSalientWordByte(ch: u8) bool {
+    // Letters/digits plus any non-ASCII byte (UTF-8 continuation or
+    // lead byte) — so Arabic/CJK words survive tokenization instead of
+    // being split into nothing.
+    return std.ascii.isAlphanumeric(ch) or ch >= 0x80;
+}
+
+/// Package 3 fix-wave Task 2 (M3) — pick a deterministic, salient search
+/// token from a memory's content for the near-duplicate report.
+///
+/// Heuristic (deliberately simple + deterministic; documented in
+/// docs/memory-contract.md's curability row):
+///   1. Tokenize on non-word bytes (word bytes = ASCII alphanumerics +
+///      any byte >= 0x80, so non-Latin scripts tokenize as words).
+///   2. Keep tokens of length >= 5 bytes that contain at least one
+///      letter-ish byte (pure numbers — timestamps, ids — discriminate
+///      poorly).
+///   3. Pick the LONGEST such token; ties broken by FIRST occurrence
+///      (single pass, strictly-greater comparison).
+///
+/// Rationale: the longest content-bearing word is usually the proper
+/// noun / domain term ("thmanyah", "Hamburg", "kubernetes") while short
+/// tokens are function words ("the", "user", "on"). The returned slice
+/// points INTO `content` (no allocation). Null when the content has no
+/// qualifying token — callers then skip the near-dup search entirely.
+///
+/// The token is fed to `fetchProseFactsByPattern` (`content ILIKE
+/// %token%`); word bytes never include `%`/`_`, so the pattern needs no
+/// LIKE-escaping.
+pub fn salientPatternToken(content: []const u8) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < content.len) {
+        while (i < content.len and !isSalientWordByte(content[i])) i += 1;
+        const start = i;
+        while (i < content.len and isSalientWordByte(content[i])) i += 1;
+        const tok = content[start..i];
+        if (tok.len < 5) continue;
+        var has_letter = false;
+        for (tok) |ch| {
+            if (std.ascii.isAlphabetic(ch) or ch >= 0x80) {
+                has_letter = true;
+                break;
+            }
+        }
+        if (!has_letter) continue;
+        if (best == null or tok.len > best.?.len) best = tok;
+    }
+    return best;
+}
+
 /// C0 (memory-phase-0.5) — aggregate report of a single Phase-0.5 backfill run.
 ///
 /// Returned by `state_mgr.phase05Backfill(allocator, user_id_opt, dry_run)`.
@@ -4794,6 +4887,35 @@ test "H1: probe fails closed on embedding-dimension mismatch" {
         .acquire_timeout_ms = 500,
     }) catch null;
     if (drop) |store| store.deinit();
+}
+
+// Package 3 fix-wave Task 2 (M3) — the salient-token heuristic feeding the
+// near-duplicate report must be deterministic: longest >=5-byte token with a
+// letter-ish byte, first occurrence wins ties.
+test "M3 salientPatternToken picks longest content-bearing word, first-occurrence ties" {
+    // "prefers"(7) < "thmanyah"(8); "podcasts"(8) ties with "thmanyah" but
+    // occurs later → first occurrence wins.
+    try std.testing.expectEqualStrings(
+        "thmanyah",
+        salientPatternToken("User prefers thmanyah podcasts on Fridays").?,
+    );
+    // Pure numbers never qualify (timestamps/ids discriminate poorly).
+    try std.testing.expect(salientPatternToken("call 1234567890 at 9") == null);
+    // Short-token-only content yields null (skip the near-dup search).
+    try std.testing.expect(salientPatternToken("a b cd efg hij") == null);
+    // Empty content yields null.
+    try std.testing.expect(salientPatternToken("") == null);
+    // Non-ASCII scripts tokenize as words (bytes >= 0x80 count as letters;
+    // an Arabic word of >=3 chars is >=6 bytes so it qualifies).
+    try std.testing.expectEqualStrings(
+        "ثمانية",
+        salientPatternToken("يفضل ثمانية").?,
+    );
+    // Punctuation splits tokens; LIKE metacharacters can never appear.
+    const tok = salientPatternToken("likes (kubernetes), 100%_of the time").?;
+    try std.testing.expectEqualStrings("kubernetes", tok);
+    try std.testing.expect(std.mem.indexOfScalar(u8, tok, '%') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, tok, '_') == null);
 }
 
 test {

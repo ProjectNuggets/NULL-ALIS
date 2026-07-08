@@ -6,14 +6,33 @@ const JsonObjectMap = root.JsonObjectMap;
 const mem_root = @import("../memory/root.zig");
 const Memory = mem_root.Memory;
 const observability = @import("../observability.zig");
+const zaki_state = @import("../zaki_state.zig");
+const build_options = @import("build_options");
+const env_rebrand = @import("../env_rebrand.zig");
+const config_types = @import("../config_types.zig");
+const zaki_postgres = @import("../memory/engines/zaki_postgres.zig");
 
 const log = std.log.scoped(.memory_forget);
 
 /// Memory forget tool — lets the agent delete a memory entry.
 /// When a MemoryRuntime is available, also cleans up the vector store.
+///
+/// Package 3 fix-wave Task 2 (M3): with a tenant Manager bound, forget is
+/// INFORMATION-scoped — the named key AND every other live row holding
+/// byte-identical content (same SHA-256 content_hash) are hard-deleted
+/// (GDPR erasure must reach the behavior/autosave copies of the content,
+/// not just the named row). Near-duplicates (similar wording, different
+/// hash) are reported in the result but never auto-deleted.
 pub const MemoryForgetTool = struct {
     memory: ?Memory = null,
     mem_rt: ?*mem_root.MemoryRuntime = null,
+    /// Package 3 fix-wave Task 2 (M3) — tenant context for the
+    /// information-scoped hard-delete (`Manager.forgetInformationScoped`).
+    /// Wired via bindStateMgrTenant (tools/root.zig), mirroring
+    /// memory_archive. When null (file-tenant/CLI/SQLite lanes), the tool
+    /// falls back to the legacy single-key `m.forget` path.
+    state_mgr: ?*zaki_state.Manager = null,
+    user_id: ?i64 = null,
 
     pub const tool_name = "memory_forget";
 
@@ -34,7 +53,12 @@ pub const MemoryForgetTool = struct {
     comptime {
         @import("lint.zig").lintToolDescription("memory_forget", tool_description_struct, &@import("lint.zig").ALL_TOOLS);
     }
-    pub const tool_description = "Remove a memory by key. Use to delete outdated facts or sensitive data.";
+    pub const tool_description =
+        "Remove a memory by key. Use to delete outdated facts or sensitive " ++
+        "data. Deletion is information-scoped: other rows holding " ++
+        "byte-identical content are hard-deleted along with the named key, " ++
+        "and near-duplicate rows (similar wording) are listed in the result " ++
+        "so you can offer to forget them too.";
     pub const tool_params =
         \\{"type":"object","properties":{"key":{"type":"string","description":"The key of the memory to forget"}},"required":["key"]}
     ;
@@ -91,6 +115,68 @@ pub const MemoryForgetTool = struct {
                 return ToolResult{ .success = false, .error_msg = msg, .output = "" };
             },
             .editable => {},
+        }
+
+        // Package 3 fix-wave Task 2 (M3) — information-scoped hard delete on
+        // the postgres tenant lane: the named key plus every live row with
+        // the identical content_hash is deleted (mirrors memory_archive's
+        // exact-hash cascade with forget's hard-delete semantics). Near-dups
+        // are reported, never auto-deleted. Falls through to the legacy
+        // single-key path when no tenant Manager is bound.
+        if (self.state_mgr) |smgr| {
+            if (self.user_id) |uid| {
+                const now = std.time.timestamp();
+                var scope = smgr.forgetInformationScoped(allocator, uid, key, now) catch |err| switch (err) {
+                    error.MemoryKeyNotFound => {
+                        // Same idempotent message as the lookup-missing path.
+                        const msg = try std.fmt.allocPrint(allocator, "No memory found with key: {s}", .{key});
+                        return ToolResult{ .success = true, .output = msg };
+                    },
+                    else => {
+                        log.warn("memory_forget forgetInformationScoped failed user_id={d} key='{s}' err={s}", .{ uid, key, @errorName(err) });
+                        const msg = try std.fmt.allocPrint(allocator, "Failed to forget memory '{s}': {s}", .{ key, @errorName(err) });
+                        return ToolResult{ .success = false, .error_msg = msg, .output = "" };
+                    },
+                };
+                defer scope.deinit(allocator);
+
+                // Best-effort vector store cleanup for the primary + every
+                // exact-hash copy the cascade deleted.
+                if (self.mem_rt) |rt| {
+                    rt.deleteFromVectorStore(key);
+                    for (scope.exact_closed) |deleted_key| rt.deleteFromVectorStore(deleted_key);
+                }
+
+                if (!scope.primary_closed and scope.exact_closed.len == 0) {
+                    // Row raced away between read and delete, nothing else
+                    // matched — keep the idempotent contract.
+                    const msg = try std.fmt.allocPrint(allocator, "No memory found with key: {s}", .{key});
+                    return ToolResult{ .success = true, .output = msg };
+                }
+
+                var out: std.ArrayListUnmanaged(u8) = .empty;
+                errdefer out.deinit(allocator);
+                try out.writer(allocator).print("Forgot memory: {s}", .{key});
+                if (scope.exact_closed.len > 0) {
+                    try out.writer(allocator).print("\nAlso deleted {d} exact-content {s}: ", .{
+                        scope.exact_closed.len,
+                        if (scope.exact_closed.len == 1) @as([]const u8, "copy") else "copies",
+                    });
+                    for (scope.exact_closed, 0..) |deleted_key, i| {
+                        if (i > 0) try out.appendSlice(allocator, ", ");
+                        try out.appendSlice(allocator, deleted_key);
+                    }
+                }
+                if (scope.near_dups.len > 0) {
+                    try out.appendSlice(allocator, "\nRelated rows with similar wording found (NOT deleted): ");
+                    for (scope.near_dups, 0..) |nd, i| {
+                        if (i > 0) try out.appendSlice(allocator, ", ");
+                        try out.appendSlice(allocator, nd.key);
+                    }
+                    try out.appendSlice(allocator, " — review them and forget separately if the user confirms.");
+                }
+                return ToolResult{ .success = true, .output = try out.toOwnedSlice(allocator) };
+            }
         }
 
         const forgotten = m.forget(key) catch |err| {
@@ -215,4 +301,72 @@ test "memory_forget deletes editable key" {
 
     try std.testing.expect(result.success);
     try std.testing.expect((try mem.get(allocator, "user_name")) == null);
+}
+
+// Package 3 fix-wave Task 2 (M3 cure, forget flavor) — memory_forget mirrors
+// the information-scoped archive with HARD-delete semantics: exact-hash
+// copies are deleted alongside the named key (GDPR erasure must reach the
+// autosave/behavior copies of the content, not just the named row); near-
+// dups are reported, never auto-deleted.
+test "M3 memory_forget hard-deletes exact-hash copies and reports near-dups" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try zaki_state.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    try mgr.migrate();
+    try mgr.provisionUser(11, "/tmp/nullalis-zaki-bot-test-user-11/workspace");
+
+    // Same M3 leak shape as the archive test: byte-identical content under
+    // two keys, a reworded near-dup, an unrelated row.
+    const info = "User salary is 90000 riyal at thmanyah";
+    try mgr.upsertMemory(11, "extracted_m3fgt001", info, .core, null);
+    try mgr.upsertMemory(11, "durable_fact/behavior/00feedface00beef", info, .core, null);
+    const reworded = "User works at thmanyah for a 90k package";
+    try mgr.upsertMemory(11, "extracted_m3fgtnear", reworded, .core, null);
+    try mgr.upsertMemory(11, "extracted_m3fgtunrl", "User lives in Hamburg", .core, null);
+
+    var pg_mem = zaki_postgres.ZakiPostgresMemory.init(allocator, &mgr, 11);
+    var mt = MemoryForgetTool{ .memory = pg_mem.memory(), .state_mgr = &mgr, .user_id = 11 };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"key\": \"extracted_m3fgt001\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+    defer if (result.error_msg) |em| allocator.free(em);
+    try std.testing.expect(result.success);
+
+    // HARD delete: the named row is GONE (not merely validity-closed).
+    {
+        const primary = try mgr.getMemoryAnyValidity(allocator, 11, "extracted_m3fgt001");
+        try std.testing.expect(primary == null);
+    }
+    // THE M3 FIX (forget flavor): the byte-identical copy is gone too.
+    {
+        const copy = try mgr.getMemoryAnyValidity(allocator, 11, "durable_fact/behavior/00feedface00beef");
+        try std.testing.expect(copy == null);
+    }
+    // The reworded near-dup survives untouched (reported only).
+    {
+        const near = try mgr.getMemory(allocator, 11, "extracted_m3fgtnear");
+        try std.testing.expect(near != null);
+        defer near.?.deinit(allocator);
+    }
+    // The tool result names the deleted copy and the near-dup, not the
+    // unrelated row.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "durable_fact/behavior/00feedface00beef") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "extracted_m3fgtnear") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "extracted_m3fgtunrl") == null);
 }
