@@ -515,7 +515,8 @@ fn buildCoordinatorSection(w: anytype) !void {
             "You are the **coordinator** for this turn: orchestrate, don't grind. " ++
             "Decompose the goal, briefly plan, dispatch the independent sub-tasks to subagents (use `spawn_many` to fan out in one batch), then collect with ONE `subagent_batch_result(batch_id, wait_seconds=<~batch budget>)` call — it blocks until the whole batch finishes; never call it repeatedly. " ++
             "Review every result, then **synthesize** them into a single coherent deliverable in your own voice — never dump raw subagent output. " ++
-            "Fanning out burns credits (N subagents ≈ N× cost), so only parallelize when the work is genuinely independent.\n\n",
+            "Fanning out burns credits (N subagents ≈ N× cost), so only parallelize when the work is genuinely independent. " ++
+            "If a dispatch decision is non-obvious, consult the `spawn` skill — file_read its SKILL.md (path in the Skills list).\n\n",
     );
 }
 

@@ -1,0 +1,7 @@
+{
+  "name": "spawn",
+  "version": "1.0.0",
+  "description": "When fan-out beats grinding: dispatch parallel subagents with spawn/spawn_many, collect with one blocking call, then review and synthesize.",
+  "author": "nullalis",
+  "always": false
+}

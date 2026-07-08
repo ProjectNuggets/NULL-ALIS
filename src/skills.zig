@@ -2223,6 +2223,40 @@ test "listSkillsMerged with nonexistent dirs returns empty" {
     try std.testing.expectEqual(@as(usize, 0), skills.len);
 }
 
+// Repo-root `skills/` is the shipped builtin-skill source (see
+// docs/superpowers/plans/CARRY-FORWARD-loadable-skills-and-skill-author.md
+// item A — Dockerfile COPYs it to /opt/nullalis/skills/, the pod entrypoint
+// seeds it onto {HOME}/.nullalis/skills/ at boot, and appendSkillsSection
+// (src/agent/prompt.zig) loads that seeded path as listSkillsMerged's
+// builtin_dir). This test loads the actual on-disk directory (relative to
+// the repo root, where `zig build test` runs) to prove the shipped
+// skills/spawn/skill.json is a valid manifest AND that listSkillsMerged
+// actually discovers it — not just that the JSON parses in isolation.
+test "listSkillsMerged discovers the shipped spawn skill" {
+    const allocator = std.testing.allocator;
+    // listSkills/listSkillsMerged always scan "{dir}/skills/" (see listSkills's
+    // doc comment above) — the caller passes the PARENT of the skills/ folder,
+    // not the folder itself. The repo root is that parent for the shipped
+    // skills/spawn/ directory, and `zig build test` runs with cwd at the
+    // repo root (verified: build.zig does not override addRunArtifact's cwd).
+    const skills = try listSkillsMerged(allocator, ".", "/tmp/nullalis-nonexistent-workspace-spawn-skill-test");
+    defer freeSkills(allocator, skills);
+
+    var found: ?Skill = null;
+    for (skills) |s| {
+        if (std.mem.eql(u8, s.name, "spawn")) found = s;
+    }
+    const skill = found orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("spawn", skill.name);
+    // Deep playbook, load-on-need — must render as an XML summary in the
+    // prompt (appendSkillsSection), not inline full instructions on every
+    // turn. See skill.json's "always": false.
+    try std.testing.expectEqual(false, skill.always);
+    try std.testing.expect(skill.description.len > 0);
+    try std.testing.expect(skill.instructions.len > 0);
+}
+
 test "checkRequirements detects missing binary" {
     const allocator = std.testing.allocator;
     const bin_arr = try allocator.alloc([]const u8, 1);
