@@ -9376,6 +9376,122 @@ const ManagerImpl = struct {
         }
     }
 
+    /// Package 3 Task 1 (M2) — edit a mutable memory by SUPERSEDING it with a
+    /// bi-temporal history row instead of mutating in place.
+    ///
+    /// Before this, `memory_edit` → `upsertMemory` mutated the durable row in
+    /// place: `valid_to` stayed NULL and the prior version was lost (only the
+    /// append-only `memory_events` log retained any trace). This writes an
+    /// auditable, validity-filtered-out snapshot of the OLD content while the
+    /// live key keeps its stable identity (no injection churn; sidesteps the
+    /// `is_latest`-written-but-not-read gap — a naive "insert new is_latest,
+    /// keep old" would double-inject).
+    ///
+    /// Steps:
+    ///   1. Read the current live row's content for (user_id, key). Missing →
+    ///      error.MemoryKeyNotFound (caller surfaces a clear message).
+    ///   2. INSERT a BORN-CLOSED history row inside one pinned txn: key
+    ///      `history/<key>/<editor_now>`, content = the OLD content,
+    ///      `valid_at = valid_to = invalid_at = expired_at = editor_now`,
+    ///      `is_latest = FALSE`, memory_type `conversation` (audit tier). The
+    ///      `valid_to <= now` bit hides it from MEMORIES_VALIDITY_FILTER
+    ///      automatically, so every normal read excludes it. It is NOT
+    ///      embedded (direct SQL INSERT; the vector-sync path is skipped) and
+    ///      `history/` classifies as append-only + brain-hidden + non-embedding
+    ///      (see memory/root.zig). Committing the snapshot BEFORE mutating the
+    ///      live row makes losing the old content impossible — a crash after
+    ///      the commit merely leaves a harmless orphan audit row.
+    ///   3. Update the live row in place via the existing upsert path so the
+    ///      current key keeps stable identity + injection.
+    ///   4. Append a `memory_events` row `event_type='edit_supersede'`.
+    pub fn editMemorySupersede(
+        self: *Self,
+        user_id: i64,
+        key: []const u8,
+        new_content: []const u8,
+        editor_now: i64,
+    ) !void {
+        // ── Step 1: snapshot the current live content. ────────────────────
+        const old_entry = (try self.getMemory(self.allocator, user_id, key)) orelse
+            return error.MemoryKeyNotFound;
+        defer old_entry.deinit(self.allocator);
+        const old_content = old_entry.content;
+        const old_mem_type = categoryToMemoryType(old_entry.category);
+
+        // ── Step 2: born-closed history row, in one pinned txn. ───────────
+        const history_key = try std.fmt.allocPrint(self.allocator, "history/{s}/{d}", .{ key, editor_now });
+        defer self.allocator.free(history_key);
+
+        {
+            var txn = try self.beginTransaction();
+            defer txn.deinit();
+
+            // Direct INSERT (NOT upsertMemory): upsertMemory forces a live row
+            // (valid_to=NULL, is_latest=TRUE) for non-durable types and runs a
+            // low-signal gate / promotion logic that must not apply to an audit
+            // snapshot. We write all bi-temporal close-out columns at birth.
+            const q = try self.buildQuery(
+                "INSERT INTO {schema}.memories " ++
+                    "(id, user_id, session_id, key, content, content_hash, memory_type, lemmatized, " ++
+                    " valid_at, valid_to, invalid_at, expired_at, is_latest, updated_at) " ++
+                    "VALUES ($1, $2, NULL, $3, $4, $5, 'conversation', $6, $7, $7, $7, $7, FALSE, NOW()) " ++
+                    // Idempotent: a repeated edit within the same second reuses
+                    // the same history key; keep the first snapshot untouched.
+                    "ON CONFLICT (user_id, key) DO NOTHING",
+            );
+            defer self.allocator.free(q);
+
+            const id = try self.randomHexId(self.allocator, 16);
+            defer self.allocator.free(id);
+            const id_z = try self.allocator.dupeZ(u8, id);
+            defer self.allocator.free(id_z);
+            var user_buf: [32]u8 = undefined;
+            const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+            const history_key_z = try self.allocator.dupeZ(u8, history_key);
+            defer self.allocator.free(history_key_z);
+            const content_z = try self.allocator.dupeZ(u8, old_content);
+            defer self.allocator.free(content_z);
+            const content_hash = try computeContentHash(self.allocator, old_content);
+            defer self.allocator.free(content_hash);
+            const content_hash_z = try self.allocator.dupeZ(u8, content_hash);
+            defer self.allocator.free(content_hash_z);
+            const lemmatized = try text_norm.lemmatizeForBm25(self.allocator, old_content);
+            defer self.allocator.free(lemmatized);
+            const lemmatized_z = try self.allocator.dupeZ(u8, lemmatized);
+            defer self.allocator.free(lemmatized_z);
+            var ts_buf: [32]u8 = undefined;
+            const ts_s = try std.fmt.bufPrintZ(&ts_buf, "{d}", .{editor_now});
+
+            const params = [_]?[*:0]const u8{ id_z, user_s.ptr, history_key_z, content_z, content_hash_z, lemmatized_z, ts_s.ptr };
+            const lengths = [_]c_int{
+                @intCast(id.len),
+                @intCast(user_s.len),
+                @intCast(history_key.len),
+                @intCast(old_content.len),
+                @intCast(content_hash.len),
+                @intCast(lemmatized.len),
+                @intCast(ts_s.len),
+            };
+            const result = try txn.execParams(q, &params, &lengths);
+            c.PQclear(result);
+
+            try txn.commit();
+        }
+
+        // ── Step 3: update the live row in place (reuse the upsert path). ──
+        // Keeps the current key's identity, injection, and (for durable rows)
+        // close-out discipline intact — content/wording refreshes to new.
+        try self.upsertMemory(user_id, key, new_content, old_entry.category, old_entry.session_id);
+
+        // ── Step 4: append the edit_supersede audit event. ────────────────
+        // memory_id points at the SUPERSEDED snapshot (the history row) so the
+        // event pins what was closed out. Best-effort audit; a failure here
+        // does not undo the edit.
+        self.insertMemoryEvent(user_id, history_key, "edit_supersede", key, old_content, old_mem_type, old_entry.session_id) catch |err| {
+            log.warn("edit_supersede.event_failed user={d} key={s} err={s}", .{ user_id, key, @errorName(err) });
+        };
+    }
+
     /// V1.6 commit 11 — flip a DURABLE memory back to a non-durable type.
     /// Required because V1.7's CASE-guard in upsertMemory + the W-INT-01
     /// fix make durable rows immortal against subsequent upserts (preserving
@@ -18365,6 +18481,158 @@ test "V1.6 commit 6 setMemoryInvalidation closes out memory + filters from retri
 
     // 5. Non-existent key: silent no-op (caller doesn't gate on existence).
     try mgr.setMemoryInvalidation(2, "no_such_key", close_out_ts, close_out_ts);
+}
+
+// Package 3 Task 1 (M2) — editMemorySupersede writes a bi-temporal history
+// row instead of mutating in place. Proves: (a) the live key keeps stable
+// identity and reads back the NEW content; (b) a born-closed history row
+// carrying the OLD content is written under key `history/<key>/<editor_now>`
+// and is validity-filtered OUT of every normal read (getMemory/listMemories);
+// (c) the history row IS retrievable via getMemoryAnyValidity + direct count;
+// (d) a `memory_events` row `event_type='edit_supersede'` is appended.
+test "M2 editMemorySupersede writes born-closed history row and updates live in place" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const result = try mgr.exec("SET client_min_messages TO WARNING");
+        c.PQclear(result);
+    }
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-user-2/workspace");
+
+    // ── Seed: a live, editable fact holding "oolong". ─────────────────
+    try mgr.upsertMemory(2, "fav_tea", "oolong", .core, null);
+    {
+        const before = try mgr.getMemory(allocator, 2, "fav_tea");
+        try std.testing.expect(before != null);
+        defer before.?.deinit(allocator);
+        try std.testing.expectEqualStrings("oolong", before.?.content);
+    }
+
+    // ── Supersede: edit oolong → sencha at editor_now. ────────────────
+    const editor_now: i64 = std.time.timestamp();
+    try mgr.editMemorySupersede(2, "fav_tea", "sencha", editor_now);
+
+    var history_key_buf: [128]u8 = undefined;
+    const history_key = try std.fmt.bufPrint(&history_key_buf, "history/fav_tea/{d}", .{editor_now});
+
+    // ── Assertion 1: the live key keeps its address and reads NEW content.
+    {
+        const live = try mgr.getMemory(allocator, 2, "fav_tea");
+        try std.testing.expect(live != null);
+        defer live.?.deinit(allocator);
+        try std.testing.expectEqualStrings("sencha", live.?.content);
+    }
+
+    // ── Assertion 2: a default-validity listMemories does NOT surface the
+    //    history row (its valid_to <= now hides it), and DOES surface the
+    //    live key exactly once.
+    {
+        const rows = try mgr.listMemories(allocator, 2, null, null);
+        defer {
+            for (rows) |e| e.deinit(allocator);
+            allocator.free(rows);
+        }
+        var saw_live = false;
+        for (rows) |e| {
+            if (std.mem.eql(u8, e.key, history_key)) {
+                std.debug.print("FAIL: history row leaked into listMemories: {s}\n", .{e.key});
+                return error.TestUnexpectedResult;
+            }
+            if (std.mem.eql(u8, e.key, "fav_tea")) saw_live = true;
+        }
+        try std.testing.expect(saw_live);
+    }
+
+    // ── Assertion 3: getMemory (validity-filtered) hides the history row.
+    {
+        const hidden = try mgr.getMemory(allocator, 2, history_key);
+        try std.testing.expect(hidden == null);
+    }
+
+    // ── Assertion 4: getMemoryAnyValidity surfaces the history row holding
+    //    the OLD content ("oolong").
+    {
+        const audit = try mgr.getMemoryAnyValidity(allocator, 2, history_key);
+        try std.testing.expect(audit != null);
+        defer audit.?.deinit(allocator);
+        try std.testing.expectEqualStrings("oolong", audit.?.content);
+    }
+
+    // ── Assertion 5: direct SQL — the history row exists with valid_to /
+    //    invalid_at / expired_at = editor_now and is_latest = FALSE.
+    {
+        const audit_q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT content, valid_to, invalid_at, expired_at, is_latest FROM {s}.memories WHERE user_id = 2 AND key = $1",
+            .{schema},
+        );
+        defer allocator.free(audit_q);
+        const key_z = try allocator.dupeZ(u8, history_key);
+        defer allocator.free(key_z);
+        const params = [_]?[*:0]const u8{key_z};
+        const lengths = [_]c_int{@intCast(history_key.len)};
+        const result = try mgr.execParams(audit_q, &params, &lengths);
+        defer c.PQclear(result);
+        try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+
+        const content_str = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(content_str);
+        const valid_to_str = try dupeResultValue(allocator, result, 0, 1);
+        defer allocator.free(valid_to_str);
+        const invalid_at_str = try dupeResultValue(allocator, result, 0, 2);
+        defer allocator.free(invalid_at_str);
+        const expired_at_str = try dupeResultValue(allocator, result, 0, 3);
+        defer allocator.free(expired_at_str);
+        const is_latest_str = try dupeResultValue(allocator, result, 0, 4);
+        defer allocator.free(is_latest_str);
+
+        try std.testing.expectEqualStrings("oolong", content_str);
+        try std.testing.expectEqual(editor_now, try std.fmt.parseInt(i64, valid_to_str, 10));
+        try std.testing.expectEqual(editor_now, try std.fmt.parseInt(i64, invalid_at_str, 10));
+        try std.testing.expectEqual(editor_now, try std.fmt.parseInt(i64, expired_at_str, 10));
+        try std.testing.expectEqualStrings("f", is_latest_str);
+    }
+
+    // ── Assertion 6: a `memory_events` row event_type='edit_supersede'
+    //    exists for this user.
+    {
+        const ev_q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT COUNT(*) FROM {s}.memory_events WHERE user_id = 2 AND event_type = 'edit_supersede'",
+            .{schema},
+        );
+        defer allocator.free(ev_q);
+        const result = try mgr.exec(ev_q);
+        defer c.PQclear(result);
+        try std.testing.expectEqual(@as(c_int, 1), c.PQntuples(result));
+        const count_str = try dupeResultValue(allocator, result, 0, 0);
+        defer allocator.free(count_str);
+        try std.testing.expectEqual(@as(i64, 1), try std.fmt.parseInt(i64, count_str, 10));
+    }
 }
 
 // V1.6 commit 6 — findRelatedExtractedMemories scoping smoke test.

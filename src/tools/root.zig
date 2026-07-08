@@ -2340,6 +2340,14 @@ pub fn bindStateMgrTenant(tools: []const Tool, state_mgr: ?*zaki_state.Manager, 
             const mt: *memory_archive.MemoryArchiveTool = @ptrCast(@alignCast(t.ptr));
             mt.state_mgr = state_mgr;
             mt.user_id = user_id;
+        } else if (t.vtable == &memory_edit.MemoryEditTool.vtable) {
+            // Package 3 Task 1 (M2) — memory_edit needs tenant context to
+            // supersede with a bi-temporal history row (editMemorySupersede)
+            // instead of mutating in place. Null tenant (no postgres lane)
+            // falls back to the legacy in-place store inside the tool.
+            const mt: *memory_edit.MemoryEditTool = @ptrCast(@alignCast(t.ptr));
+            mt.state_mgr = state_mgr;
+            mt.user_id = user_id;
         } else if (t.vtable == &memory_demote.MemoryDemoteTool.vtable) {
             const mt: *memory_demote.MemoryDemoteTool = @ptrCast(@alignCast(t.ptr));
             mt.state_mgr = state_mgr;

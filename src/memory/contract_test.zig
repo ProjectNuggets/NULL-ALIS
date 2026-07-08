@@ -38,6 +38,21 @@ test "memory contract: bookkeeping keys are hidden from the /brain view" {
     try std.testing.expect(memory_root.isDefaultHiddenMemoryKey("session_checkpoint_1"));
 }
 
+test "memory contract: history/ supersede-audit keys are append-only, unembedded, brain-hidden" {
+    // Package 3 Task 1 (M2): editMemorySupersede writes a born-closed
+    // `history/<key>/<ts>` snapshot of the OLD version. It is bookkeeping —
+    // an internal audit trail of a superseded wording, not user-facing
+    // knowledge — so it is append-only (immutable), never embedded (the old
+    // wording must not compete with the live key at recall), and hidden from
+    // the /brain view. The live key keeps current truth.
+    const k = "history/favorite_editor/1700000000";
+    try std.testing.expect(memory_root.isAppendOnlyMemoryKey(k));
+    try std.testing.expect(memory_root.isSystemManagedMemoryKey(k));
+    try std.testing.expect(memory_root.isSemanticBookkeepingKey(k));
+    try std.testing.expect(!memory_root.shouldEmbedMemoryEntry(k, "some content"));
+    try std.testing.expect(!memory_root.isBrainVisibleKey(k));
+}
+
 test "memory contract: knowledge keys are visible, embeddable, and durable_fact is curable" {
     try std.testing.expect(!memory_root.isDefaultHiddenMemoryKey("favorite_editor"));
     try std.testing.expect(memory_root.shouldEmbedMemoryEntry("favorite_editor", "User prefers Helix"));
@@ -66,9 +81,9 @@ test "memory contract: scaffold entity names are denied, near-misses are not" {
 
 test "memory contract: extraction tool denylist is exactly the contracted set" {
     const contracted = [_][]const u8{
-        "memory_doctor", "memory_maintain", "brain_graph",
-        "context_snapshot", "trace_query", "runtime_info",
-        "memory_list", "memory_timeline", "transcript_read",
+        "memory_doctor",    "memory_maintain", "brain_graph",
+        "context_snapshot", "trace_query",     "runtime_info",
+        "memory_list",      "memory_timeline", "transcript_read",
     };
     try std.testing.expectEqual(contracted.len, extraction_runner.internal_extraction_tool_names.len);
     for (contracted) |name| {

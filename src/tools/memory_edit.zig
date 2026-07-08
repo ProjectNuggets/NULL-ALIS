@@ -5,6 +5,11 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const mem_root = @import("../memory/root.zig");
 const Memory = mem_root.Memory;
+const zaki_state = @import("../zaki_state.zig");
+const build_options = @import("build_options");
+const env_rebrand = @import("../env_rebrand.zig");
+const config_types = @import("../config_types.zig");
+const zaki_postgres = @import("../memory/engines/zaki_postgres.zig");
 
 const log = std.log.scoped(.memory_edit);
 
@@ -12,11 +17,20 @@ const log = std.log.scoped(.memory_edit);
 pub const MemoryEditTool = struct {
     memory: ?Memory = null,
     mem_rt: ?*mem_root.MemoryRuntime = null,
+    /// Package 3 Task 1 (M2) — tenant context for the bi-temporal supersede
+    /// path. When bound (postgres tenant lane), an edit snapshots the prior
+    /// version into a born-closed `history/<key>/<now>` row via
+    /// `Manager.editMemorySupersede` instead of mutating in place. Wired the
+    /// same way as memory_archive (bindStateMgrTenant in tools/root.zig). When
+    /// null (no postgres lane, e.g. file-tenant/CLI/SQLite), the tool falls
+    /// back to the legacy in-place `m.store` update.
+    state_mgr: ?*zaki_state.Manager = null,
+    user_id: ?i64 = null,
 
     pub const tool_name = "memory_edit";
 
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Edit a mutable memory in place by key; preserves original category and scope.",
+        .what = "Edit a mutable memory by key; the prior version is auto-archived and category/scope preserved.",
         .use_when = &.{
             "Correcting a typo or imprecise wording in an existing fact",
             "Refreshing a memory whose surface text needs to evolve but whose identity stays the same",
@@ -80,6 +94,39 @@ pub const MemoryEditTool = struct {
             return ToolResult{ .success = true, .output = msg };
         }
 
+        // Package 3 Task 1 (M2) — bi-temporal supersede on the postgres tenant
+        // lane: snapshot the prior version into a born-closed history row and
+        // update the live key in place (stable identity + injection). Falls
+        // back to the legacy in-place store when no tenant Manager is bound
+        // (file-tenant/CLI/SQLite) — the Memory vtable has no supersede path.
+        // The Manager is reached via the tool's state_mgr handle, mirroring
+        // memory_archive.zig's access pattern exactly.
+        if (self.state_mgr) |smgr| {
+            if (self.user_id) |uid| {
+                const editor_now = std.time.timestamp();
+                smgr.editMemorySupersede(uid, existing.key, content, editor_now) catch |err| {
+                    log.warn("memory_edit supersede failed user_id={d} key='{s}' err={s}", .{ uid, key, @errorName(err) });
+                    const msg = try std.fmt.allocPrint(allocator, "Failed to edit memory '{s}': {s}", .{ key, @errorName(err) });
+                    return ToolResult{ .success = false, .error_msg = msg, .output = "" };
+                };
+
+                // Refresh the live key's vector so semantic recall matches the
+                // NEW content. The born-closed history row is intentionally
+                // NOT embedded (its old wording must not pollute recall).
+                if (self.mem_rt) |rt| {
+                    _ = rt.syncVectorAfterStore(allocator, existing.key, content);
+                }
+
+                const msg = try std.fmt.allocPrint(
+                    allocator,
+                    "Edited memory: {s} (prior version archived to history/{s}/{d})",
+                    .{ key, existing.key, editor_now },
+                );
+                return ToolResult{ .success = true, .output = msg };
+            }
+        }
+
+        // Fallback: legacy in-place update (no bi-temporal history).
         m.store(existing.key, content, existing.category, existing.session_id) catch |err| {
             log.warn("memory_edit store failed key='{s}' err={s}", .{ key, @errorName(err) });
             const msg = try std.fmt.allocPrint(allocator, "Failed to edit memory '{s}': {s}", .{ key, @errorName(err) });
@@ -155,4 +202,82 @@ test "memory_edit rejects system-managed key" {
     defer if (result.output.len > 0) allocator.free(result.output);
     defer if (result.error_msg) |em| allocator.free(em);
     try std.testing.expect(!result.success);
+}
+
+// Package 3 Task 1 (M2) — memory_edit tool supersedes with a bi-temporal
+// history row when a tenant Manager is bound (mirrors memory_archive's
+// state_mgr + user_id access). Edit oolong → sencha; a validity-filtered
+// read (getMemory) NEVER returns oolong-as-current, and the born-closed
+// history row holds the OLD "oolong". Uses the same Postgres backend the
+// Memory vtable talks to so the tool exercises the real supersede path.
+test "memory_edit supersede tool: edit oolong to sencha, history row holds oolong" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try zaki_state.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    try mgr.migrate();
+    try mgr.provisionUser(7, "/tmp/nullalis-zaki-bot-test-user-7/workspace");
+
+    // Seed a live, editable fact holding "oolong".
+    try mgr.upsertMemory(7, "fav_tea", "oolong", .core, null);
+
+    // Wire the tool as production does: the Memory vtable (for the lifecycle
+    // lookup) is the ZakiPostgresMemory over the SAME Manager, plus the tenant
+    // state_mgr + user_id (for the supersede path).
+    var pg_mem = zaki_postgres.ZakiPostgresMemory.init(allocator, &mgr, 7);
+    var mt = MemoryEditTool{ .memory = pg_mem.memory(), .state_mgr = &mgr, .user_id = 7 };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"key\":\"fav_tea\",\"content\":\"sencha\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+    defer if (result.error_msg) |em| allocator.free(em);
+    try std.testing.expect(result.success);
+
+    // The tool names the born-closed history key in its output so the audit
+    // trail is discoverable. Parse it back out.
+    const marker = "history/fav_tea/";
+    const idx = std.mem.indexOf(u8, result.output, marker) orelse {
+        std.debug.print("FAIL: tool output did not name the history key: {s}\n", .{result.output});
+        return error.TestUnexpectedResult;
+    };
+    var end = idx + marker.len;
+    while (end < result.output.len and std.ascii.isDigit(result.output[end])) : (end += 1) {}
+    const history_key = result.output[idx..end];
+
+    // Recall/get NEVER returns oolong-as-current: the live key reads "sencha".
+    {
+        const live = try mgr.getMemory(allocator, 7, "fav_tea");
+        try std.testing.expect(live != null);
+        defer live.?.deinit(allocator);
+        try std.testing.expectEqualStrings("sencha", live.?.content);
+    }
+
+    // The history row is validity-filtered OUT of normal reads.
+    {
+        const hidden = try mgr.getMemory(allocator, 7, history_key);
+        try std.testing.expect(hidden == null);
+    }
+
+    // But getMemoryAnyValidity surfaces the born-closed history row holding
+    // the OLD "oolong".
+    {
+        const audit = try mgr.getMemoryAnyValidity(allocator, 7, history_key);
+        try std.testing.expect(audit != null);
+        defer audit.?.deinit(allocator);
+        try std.testing.expectEqualStrings("oolong", audit.?.content);
+    }
 }

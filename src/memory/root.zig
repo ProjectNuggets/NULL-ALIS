@@ -1355,6 +1355,11 @@ pub const BRAIN_HIDDEN_PREFIXES = [_][]const u8{
     "compaction_summary/",
     "summary_fallback/",
     "compaction_dropped/",
+    // Package 3 Task 1 (M2): superseded-version audit rows. The /brain/*
+    // surface is "what ZAKI remembers about ME" — a bi-temporal history
+    // snapshot of an OLD wording is an internal audit trail, not user-facing
+    // brain content, so hide it (mirrored into BRAIN_USER_KEY_FILTER SQL).
+    "history/",
     // internal
     "__tombstone__/",
     "__bootstrap.prompt.",
@@ -1400,6 +1405,13 @@ pub fn isBrainVisibleKey(key: []const u8) bool {
 pub fn isSemanticBookkeepingKey(key: []const u8) bool {
     return isDefaultHiddenMemoryKey(key) or
         std.mem.eql(u8, key, "context_anchor_current") or
+        // Package 3 Task 1 (M2): `history/<key>/<ts>` snapshots hold a
+        // SUPERSEDED wording. Embedding them would pollute the pgvector fact
+        // space with stale phrasings that compete with the live key at recall
+        // time. The live key carries current truth and stays embedded; the
+        // history row is validity-filtered out of reads and must stay out of
+        // the vector index too.
+        std.mem.startsWith(u8, key, "history/") or
         // Learning contract bucket 5 (docs/learning-contract.md line 24):
         // wish/ keys are capability-gap proposals — brain-visible but excluded
         // from embedding (they're not world knowledge, they're meta-requests to
@@ -1447,7 +1459,12 @@ pub fn isAppendOnlyMemoryKey(key: []const u8) bool {
         // explicit cleanup paths (memory_purge_topic, etc).
         std.mem.startsWith(u8, key, "compaction_summary/") or
         std.mem.startsWith(u8, key, "summary_fallback/") or
-        std.mem.startsWith(u8, key, "compaction_dropped/");
+        std.mem.startsWith(u8, key, "compaction_dropped/") or
+        // Package 3 Task 1 (M2): `history/<key>/<ts>` is a born-closed
+        // bi-temporal snapshot of a superseded memory version. It is written
+        // once by editMemorySupersede and must NEVER be re-edited or mutated
+        // by a later upsert — the historical record is immutable.
+        std.mem.startsWith(u8, key, "history/");
 }
 
 pub fn isSystemManagedMemoryKey(key: []const u8) bool {
@@ -4241,6 +4258,24 @@ test "P4b: continuity summaries are hidden from embedding but durable_fact stays
     try std.testing.expect(!isBrainVisibleKey("summary_fallback/x"));
     // durable_fact/ stays brain-visible too (user-authored content).
     try std.testing.expect(isBrainVisibleKey("durable_fact/x"));
+}
+
+// Package 3 Task 1 (M2) — `history/<key>/<ts>` born-closed audit rows must be
+// classified as append-only (never re-editable), brain-hidden (an internal
+// audit trail, not user-facing brain content), and non-embedding (the OLD
+// wording must not pollute the pgvector fact space — the live key carries the
+// current truth). All three surfaces cannot drift.
+test "M2: history/ audit prefix is append-only, brain-hidden, and non-embedding" {
+    const k = "history/fav_tea/1700000000";
+    // Append-only: memory_edit / normal upsert must never mutate a history row.
+    try std.testing.expect(isAppendOnlyMemoryKey(k));
+    // Brain-hidden: the audit trail is not user-facing brain content.
+    try std.testing.expect(!isBrainVisibleKey(k));
+    // Non-embedding: the superseded wording stays out of the fact space.
+    try std.testing.expect(!shouldEmbedMemoryEntry(k, "oolong"));
+    try std.testing.expect(isSemanticBookkeepingKey(k));
+    // System-managed (edit/archive protection flows through this predicate).
+    try std.testing.expect(isSystemManagedMemoryKey(k));
 }
 
 test "MemoryRuntime.drainOutbox with no outbox returns 0" {
