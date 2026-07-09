@@ -6,7 +6,7 @@ PRs touching the curated user-model injection are reviewed against this file.
 
 TELOS is the agent's **curated, always-on model of who the user is and where
 they are going** — mission, lifetime goals, challenges, strategies, projects,
-metrics, and identity anchors. It is a *governed view over existing durable
+metrics, values, and identity anchors. It is a *governed view over existing durable
 facts*, NOT a new store: the authoritative rows live under the reserved
 `durable_fact/telos/*` key namespace and ride the same memory substrate
 (embedding, `valid_to` aliveness, contradiction resolution, GDPR erase) as every
@@ -42,6 +42,28 @@ one substrate, one injection path.
 | Session goal ("finish today") | WM `active_goal` slot | transient (≤15 slots) | `<working_memory>` | decays; never filed |
 | People, events, preferences, world facts | `durable_fact/*` | memory rows | `memory_slot` retrieval | contradiction judge (unchanged) |
 
+## Schema (research-grounded, not Miessler-canonical)
+
+TELOS owns the user model's **static / foundation layer** — the slow-changing core
+the agent should always know. Dynamic/behavioral/contextual layers stay with the
+memory pipeline (working memory, extraction, retrieval). This static-foundation +
+dynamic-behavior split is the personalized-LLM-agent consensus (see Research basis).
+
+Rows are keyed `durable_fact/telos/<type>/<id>`, `type ∈ {mission, goal, challenge,
+strategy, project, value, identity}`. Each **goal** row additionally carries:
+
+- `specificity` + `metric` — a filed goal is specific and measurable; a vague,
+  metric-less goal is an inbox candidate, NOT a north star (Goal-Setting Theory).
+- `motivation: intrinsic | extrinsic` (+ optional `why`) — lets the agent prioritize
+  intrinsic goals and frame help autonomy-supportively (Self-Determination Theory).
+- `frame: ideal | ought` — aspiration vs obligation. They motivate differently
+  (ideal-gap → disappointment; ought-gap → guilt) so the agent treats them
+  differently (Self-Discrepancy Theory).
+
+The **actual-self** is NOT stored here — it is what the memory pipeline observes.
+The agent reasons over the *discrepancy* between observed actual and filed
+ideal/ought; that gap is the motivational signal, not the goal text alone.
+
 ## Invariants
 
 Executable form: `src/agent/telos_contract_test.zig`.
@@ -56,10 +78,13 @@ Executable form: `src/agent/telos_contract_test.zig`.
    all times; there is never a window where a goal is in both blocks or neither.
 3. **T3 — precedence.** telos > raw durable_fact > working memory, enforced at
    file-time by T2 (not at query time). Curated intent outranks stray extraction.
-4. **T4 — proposal-gated writes.** Telos rows enter only via the curation loop:
-   reflection proposes (a `wish/*` proposal — memory-contract's "request, not
-   behaviour" bucket), the user approves through `execution_mode`, then an
-   internal writer files. No silent self-authored identity.
+4. **T4 — human authorship (propose-only).** The user AUTHORS their model; the
+   agent only scaffolds. Rows enter via the curation loop as `wish/*` proposals
+   (memory-contract's "request, not behaviour" bucket); the user approves through
+   `execution_mode`; then an internal writer files. The loop NEVER auto-files.
+   This is not merely governance: AI-authored goals measurably *undermine* the
+   motivation they aim to drive by violating autonomy ("Optimized but Unowned";
+   SDT). Auto-authored identity is a correctness bug, not a convenience.
 5. **T5 — axis honesty.** Durability is `memory_type = core`; aliveness is
    `valid_to`; curability is provenance (the `telos/` namespace). Never proxy one
    axis through another (memory-contract Invariant 5).
@@ -86,6 +111,22 @@ symbols survive refactors.)
 - Durability (T5): `memory_type = core` ∈ `EVERGREEN_MEMORY_TYPES`
   (`src/memory/root.zig`).
 - Registry cross-check: `src/agent/telos_contract_test.zig`.
+
+## Research basis
+
+TELOS-the-brand (Miessler) is a practitioner ontology, not a validated construct.
+This contract keeps its useful structure but grounds the schema in theory that is:
+
+- **Goal-Setting Theory** (Locke & Latham) — goals perform when specific + measurable
+  + committed → `metric` / `specificity` (Schema).
+- **Self-Determination Theory** (Deci & Ryan) — intrinsic goals predict wellbeing,
+  extrinsic predict ill-being; autonomy is a core need → `motivation` tag + T4.
+- **Self-Discrepancy Theory** (Higgins) — actual / ideal / ought selves; the
+  *discrepancy* motivates → `frame` + actual-self-lives-in-the-memory-pipeline.
+- **Personalized-LLM-agent surveys (2026)** — layered profile, static-foundation +
+  dynamic-behavior, staleness as an open problem → the ownership split + T6.
+- **"Optimized but Unowned" (2026)** — AI-authored goals undermine motivation →
+  T4 human authorship is a requirement, not a nicety.
 
 ## Deferred register
 
