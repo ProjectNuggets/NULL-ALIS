@@ -130,9 +130,27 @@ This contract keeps its useful structure but grounds the schema in theory that i
 
 ## Deferred register
 
-- Confirm `resolveContradiction` sets `valid_to` on the memory ROW (not only the
-  edge) such that `listIdentityFacts` drops it — verify in Slice 1 before relying
-  on T2.
+- ~~Confirm `resolveContradiction` sets `valid_to` on the memory ROW~~ —
+  **VERIFIED CLOSED (Package 3 review, 2026-07-09)**: `resolveContradiction`
+  calls `setMemoryInvalidation` on the loser key, which sets
+  `valid_to`/`invalid_at`/`expired_at` + `is_latest=FALSE` on the memories ROW
+  in one txn (plus the edge cascade). This is the same close-out primitive
+  `memory_archive` and the M3 cascade ride — exhaustively exercised by the
+  Package 3 test suite and live drive. T2 may rely on it.
+- **T2b (NEW, must land in Slice 1) — protect telos rows from the M3
+  archive/forget cascade.** Package 3 made `memory_archive`/`memory_forget`
+  information-scoped: live rows with an identical `content_hash` are
+  cascade-closed. `durable_fact/` is an editable family, so a re-stored raw
+  duplicate later archived by the user could silently take the byte-identical
+  telos twin with it — curated intent killed by curation of a stray copy. Fix:
+  add `durable_fact/telos/` to the cascade's protected-key set (the same
+  predicate hook the M3 fix introduced for system keys; one line + one test).
+  Only explicit curation of the telos key itself may close a telos row.
+- **T4 key naming — use a `wish/telos/<type>/<id>` sub-namespace, not bare
+  `wish/*`.** Bare wishes are capability requests: the fleet wish-harvest and
+  the planned wish→Decision-Hub matchmaking mine that namespace. Mixing
+  identity proposals in muddies both. A dedicated sub-namespace keeps T4's
+  propose→approve flow intact and lets the miner/matchmaker filter it out.
 - Curation heuristic ("which raw durable fact is telos-worthy") — kept
   human-approval-gated (T4) so a weak heuristic proposes noise but cannot corrupt
   the model. Tune post-measurement.
