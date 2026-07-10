@@ -68,6 +68,7 @@ const json_util = @import("json_util.zig");
 const tenant_lock = @import("tenant_lock.zig");
 const onboard = @import("onboard.zig");
 const zaki_state_mod = @import("zaki_state.zig");
+const trace_mining = @import("agent/trace_mining.zig");
 const zaki_session = @import("session/root.zig");
 const ops_guard = @import("ops_guard.zig");
 const heartbeat_wake = @import("heartbeat_wake.zig");
@@ -4134,6 +4135,282 @@ test "D9 — entitlements_revoke happy path installs entitlement" {
     const r = handleEntitlementsRevokeRequest(raw, &tokens, true, "POST");
     try std.testing.expectEqualStrings("200 OK", r.status);
     try std.testing.expect(std.mem.indexOf(u8, r.body, "ok") != null);
+}
+
+/// Fleet-endpoint since_days bounds. Local copy of the semantics of
+/// tools/memory_maintain.zig's file-private `clampDays` (see
+/// MINE_TRACES_DEFAULT_SINCE_DAYS / MINE_TRACES_MAX_SINCE_DAYS there):
+/// same default, same maximum, so the operator route and the (denied)
+/// tool-layer argument speak one clamping dialect.
+const FLEET_MINING_DEFAULT_SINCE_DAYS: u32 = 7;
+const FLEET_MINING_MAX_SINCE_DAYS: u32 = 365;
+
+/// Parse + clamp the operator-supplied `since_days` query param into
+/// [1, 365], defaulting to 7. Mirrors the file-private `clampDays` in
+/// tools/memory_maintain.zig (absent/zero/negative → default; oversized
+/// → max — its P2 lesson: absurd input must clamp or default, never
+/// trap), with the query-string parse folded in: a value that does not
+/// parse as an integer (including > maxInt(i64)) is treated as absent.
+fn clampFleetSinceDays(raw: ?[]const u8) u32 {
+    const s = raw orelse return FLEET_MINING_DEFAULT_SINCE_DAYS;
+    const v = std.fmt.parseInt(i64, s, 10) catch return FLEET_MINING_DEFAULT_SINCE_DAYS;
+    if (v <= 0) return FLEET_MINING_DEFAULT_SINCE_DAYS;
+    if (v > FLEET_MINING_MAX_SINCE_DAYS) return FLEET_MINING_MAX_SINCE_DAYS;
+    return @intCast(v);
+}
+
+pub const FleetMiningStatsResponse = struct {
+    status: []const u8,
+    body: []const u8,
+};
+
+/// Operator fleet mining-stats route (learning contract inv. 5) —
+/// extracted from the `.fleet_mining_stats` switch arm so the route
+/// logic is unit-testable without spinning up a real HTTP listener
+/// (the D9 `handleEntitlementsRevokeRequest` pattern above): method
+/// check → `validateInternalServiceTokenWithPolicy` → 401 → work. The
+/// function takes only what it needs (raw request bytes + request
+/// target + token policy + method + an optional state manager) so
+/// tests don't need a full GatewayState.
+///
+/// P1 hardening context: `mine_traces scope=fleet` is DENIED at the
+/// agent tool layer — no per-request operator identity exists there
+/// (see executeMineTraces in tools/memory_maintain.zig). THIS endpoint
+/// is the internal-token operator surface P1 reserved the verified
+/// building blocks for: `Manager.listRecentToolTracesAllUsers` (the
+/// cross-tenant read) → `trace_mining.analyze` → `renderFleetJson`
+/// (the shape-only renderer whose privacy-sentinel test is pinned at
+/// the pure-function level). The response body is renderFleetJson
+/// VERBATIM — tool/count shapes only; no run_ids, no labels, no user
+/// ids, no tenant content. Any future field addition must extend the
+/// sentinel test in tools/memory_maintain.zig first.
+///
+/// Memory contract: on the 200 path `body` is allocated with
+/// `allocator` (the dispatch arm passes the per-request arena; tests
+/// free it explicitly); every non-200 body is a static literal.
+pub fn handleFleetMiningStatsRequest(
+    allocator: std.mem.Allocator,
+    state_mgr: ?*zaki_state_mod.Manager,
+    raw: []const u8,
+    target: []const u8,
+    internal_service_tokens: []const []const u8,
+    auth_required: bool,
+    method_str: []const u8,
+) FleetMiningStatsResponse {
+    if (!std.mem.eql(u8, method_str, "GET")) {
+        return .{
+            .status = "405 Method Not Allowed",
+            .body = "{\"error\":\"method not allowed\"}",
+        };
+    }
+    if (!validateInternalServiceTokenWithPolicy(raw, internal_service_tokens, auth_required)) {
+        return .{
+            .status = "401 Unauthorized",
+            .body = "{\"error\":\"unauthorized\"}",
+        };
+    }
+    // Auth passed → work. Non-postgres builds (and postgres builds
+    // without a wired backend) have no state manager: answer 503
+    // naming the dependency — a 200 with empty arrays would be
+    // dishonest "fleet is idle" when the backend is offline (the
+    // artifact routes' Wave-2 HIGH#3 precedent).
+    const mgr = state_mgr orelse return .{
+        .status = "503 Service Unavailable",
+        .body = "{\"error\":\"state_unavailable\",\"detail\":\"persistent state backend not configured; fleet mining stats require postgres\"}",
+    };
+    const since_days = clampFleetSinceDays(parseQueryParam(target, "since_days"));
+    const rows = mgr.listRecentToolTracesAllUsers(allocator, since_days) catch {
+        return .{
+            .status = "500 Internal Server Error",
+            .body = "{\"error\":\"fleet_read_failed\"}",
+        };
+    };
+    defer {
+        for (rows) |r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+    var report = trace_mining.analyze(allocator, rows) catch {
+        return .{
+            .status = "500 Internal Server Error",
+            .body = "{\"error\":\"fleet_analyze_failed\"}",
+        };
+    };
+    defer report.deinit(allocator);
+    const body = tools_mod.memory_maintain.renderFleetJson(allocator, report) catch {
+        return .{
+            .status = "500 Internal Server Error",
+            .body = "{\"error\":\"response build failed\"}",
+        };
+    };
+    return .{ .status = "200 OK", .body = body };
+}
+
+test "fleet mining-stats — rejects non-GET method (405 before token check)" {
+    // GET-only route: a POST with a VALID token still 405s, proving the
+    // method check precedes the token check (the D9 ordering, mirrored).
+    const raw = "POST /internal/fleet/mining-stats HTTP/1.1\r\nX-Internal-Token: tok\r\n\r\n";
+    const tokens = [_][]const u8{"tok"};
+    const r = handleFleetMiningStatsRequest(std.testing.allocator, null, raw, "/internal/fleet/mining-stats", &tokens, true, "POST");
+    try std.testing.expectEqualStrings("405 Method Not Allowed", r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "method not allowed") != null);
+}
+
+test "fleet mining-stats — rejects missing token when auth required" {
+    // state_mgr is null here AND below: a 401 (not 503) proves the token
+    // check precedes the state-backend check — an unauthenticated caller
+    // learns nothing about backend configuration.
+    const raw = "GET /internal/fleet/mining-stats HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const tokens = [_][]const u8{"expected-tok"};
+    const r = handleFleetMiningStatsRequest(std.testing.allocator, null, raw, "/internal/fleet/mining-stats", &tokens, true, "GET");
+    try std.testing.expectEqualStrings("401 Unauthorized", r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "unauthorized") != null);
+}
+
+test "fleet mining-stats — rejects wrong token" {
+    const raw = "GET /internal/fleet/mining-stats HTTP/1.1\r\nX-Internal-Token: nope\r\n\r\n";
+    const tokens = [_][]const u8{"expected-tok"};
+    const r = handleFleetMiningStatsRequest(std.testing.allocator, null, raw, "/internal/fleet/mining-stats", &tokens, true, "GET");
+    try std.testing.expectEqualStrings("401 Unauthorized", r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "unauthorized") != null);
+}
+
+test "fleet mining-stats — 503 when state backend not configured (non-PG path)" {
+    // Authenticated GET with no state manager wired (the non-postgres
+    // build's runtime reality: gateway never sets state.zaki_state) must
+    // answer 503 naming the dependency — NOT an empty-but-200 fleet
+    // report (the artifacts routes' "no data" vs "no storage" precedent).
+    const raw = "GET /internal/fleet/mining-stats HTTP/1.1\r\nX-Internal-Token: tok\r\n\r\n";
+    const tokens = [_][]const u8{"tok"};
+    const r = handleFleetMiningStatsRequest(std.testing.allocator, null, raw, "/internal/fleet/mining-stats", &tokens, true, "GET");
+    try std.testing.expectEqualStrings("503 Service Unavailable", r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "state backend not configured") != null);
+}
+
+test "fleet mining-stats — since_days parse+clamp: absent/malformed/zero/negative→7, in-range passthrough, oversized→365" {
+    try std.testing.expectEqual(@as(u32, 7), clampFleetSinceDays(null));
+    try std.testing.expectEqual(@as(u32, 7), clampFleetSinceDays("abc"));
+    try std.testing.expectEqual(@as(u32, 7), clampFleetSinceDays(""));
+    try std.testing.expectEqual(@as(u32, 7), clampFleetSinceDays("0"));
+    try std.testing.expectEqual(@as(u32, 7), clampFleetSinceDays("-3"));
+    try std.testing.expectEqual(@as(u32, 1), clampFleetSinceDays("1"));
+    try std.testing.expectEqual(@as(u32, 30), clampFleetSinceDays("30"));
+    try std.testing.expectEqual(@as(u32, 365), clampFleetSinceDays("365"));
+    try std.testing.expectEqual(@as(u32, 365), clampFleetSinceDays("99999"));
+    // Overflows i64 entirely → treated as malformed → default (the
+    // sibling clampDays' P2 lesson: absurd input must never trap).
+    try std.testing.expectEqual(@as(u32, 7), clampFleetSinceDays("999999999999999999999999"));
+}
+
+test "fleet mining-stats [PG] — cross-tenant happy path emits shapes only; since_days absent→7, 99999→365 (inv. 5)" {
+    // End-to-end privacy-sentinel discipline (the renderFleetJson
+    // pure-function sentinel test in tools/memory_maintain.zig, now
+    // through the operator route handler against live postgres): seed
+    // tool_traces for TWO different tenants whose label fields carry
+    // per-tenant secret content, call the handler, and require the
+    // output to contain tool+count shapes ONLY — no label content, no
+    // run_ids, no user ids (learning contract inv. 5).
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_fleet_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    // Manager.init auto-migrates the microtimestamp-fresh schema;
+    // teardown drops it (the D11 vault-route fixture strategy).
+    defer mgr.dropSchemaForTests() catch {};
+
+    // TWO tenants, 3 failed runs each (MIN_PATTERN_COUNT) so failure
+    // patterns form; labels carry tenant secrets that must never leave.
+    const SENTINEL_A = "TENANT_A_SECRET_ARG_XYZZY";
+    const SENTINEL_B = "TENANT_B_SECRET_ARG_PLUGH";
+    const events_a = "[{\"kind\":\"tool_call\",\"tool\":\"web_search\",\"success\":false,\"duration_ms\":420,\"label\":\"" ++ SENTINEL_A ++ "\"}]";
+    const events_b = "[{\"kind\":\"tool_call\",\"tool\":\"bash\",\"success\":false,\"duration_ms\":15,\"label\":\"" ++ SENTINEL_B ++ "\"}]";
+    try mgr.insertToolTraceEvents(987001, "fleet-a-1", events_a);
+    try mgr.insertToolTraceEvents(987001, "fleet-a-2", events_a);
+    try mgr.insertToolTraceEvents(987001, "fleet-a-3", events_a);
+    try mgr.insertToolTraceEvents(987002, "fleet-b-1", events_b);
+    try mgr.insertToolTraceEvents(987002, "fleet-b-2", events_b);
+    try mgr.insertToolTraceEvents(987002, "fleet-b-3", events_b);
+
+    // Window probes — created_at defaults to NOW() at insert, so
+    // backdate via raw SQL (the zaki_state window-test idiom; PGresult
+    // discarded per the subagent.zig cross-module exec teardown idiom):
+    //   10d  → outside the default 7-day window, inside 365
+    //   100d → outside 7, inside 365
+    //   400d → outside even the clamped 365 maximum
+    try mgr.insertToolTraceEvents(987001, "fleet-w-10d", "[{\"kind\":\"tool_call\",\"tool\":\"probe_ten_days\",\"success\":true,\"duration_ms\":1}]");
+    try mgr.insertToolTraceEvents(987002, "fleet-w-100d", "[{\"kind\":\"tool_call\",\"tool\":\"probe_hundred_days\",\"success\":true,\"duration_ms\":1}]");
+    try mgr.insertToolTraceEvents(987001, "fleet-w-400d", "[{\"kind\":\"tool_call\",\"tool\":\"probe_four_hundred_days\",\"success\":true,\"duration_ms\":1}]");
+    {
+        const q = try std.fmt.allocPrint(allocator, "UPDATE {s}.tool_traces SET created_at = NOW() - INTERVAL '10 days' WHERE run_id = 'fleet-w-10d'", .{schema});
+        defer allocator.free(q);
+        _ = try mgr.exec(q);
+    }
+    {
+        const q = try std.fmt.allocPrint(allocator, "UPDATE {s}.tool_traces SET created_at = NOW() - INTERVAL '100 days' WHERE run_id = 'fleet-w-100d'", .{schema});
+        defer allocator.free(q);
+        _ = try mgr.exec(q);
+    }
+    {
+        const q = try std.fmt.allocPrint(allocator, "UPDATE {s}.tool_traces SET created_at = NOW() - INTERVAL '400 days' WHERE run_id = 'fleet-w-400d'", .{schema});
+        defer allocator.free(q);
+        _ = try mgr.exec(q);
+    }
+
+    const tokens = [_][]const u8{"fleet-tok"};
+
+    // ── absent since_days → the 7-day default window.
+    {
+        const raw = "GET /internal/fleet/mining-stats HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: fleet-tok\r\n\r\n";
+        const r = handleFleetMiningStatsRequest(allocator, &mgr, raw, "/internal/fleet/mining-stats", &tokens, true, "GET");
+        defer allocator.free(r.body); // 200 path: body is caller-allocated
+        try std.testing.expectEqualStrings("200 OK", r.status);
+        // Shapes ARE present: both tenants' tools with counts.
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"tool\":\"web_search\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"tool\":\"bash\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"count\":3") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"uses\":3") != null);
+        // Privacy (inv. 5): NEITHER tenant's label content ...
+        try std.testing.expect(std.mem.indexOf(u8, r.body, SENTINEL_A) == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, SENTINEL_B) == null);
+        // ... nor ANY run_id ...
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "fleet-a-") == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "fleet-b-") == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "fleet-w-") == null);
+        // ... nor either tenant's user id.
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "987001") == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "987002") == null);
+        // Default window is 7 days: every backdated probe is outside it.
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "probe_ten_days") == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "probe_hundred_days") == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "probe_four_hundred_days") == null);
+    }
+
+    // ── since_days=99999 → clamped to 365: the 10d and 100d probes
+    // enter the window; the 400d probe stays out (99999 behaved as 365,
+    // not as itself).
+    {
+        const raw = "GET /internal/fleet/mining-stats?since_days=99999 HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: fleet-tok\r\n\r\n";
+        const r = handleFleetMiningStatsRequest(allocator, &mgr, raw, "/internal/fleet/mining-stats?since_days=99999", &tokens, true, "GET");
+        defer allocator.free(r.body);
+        try std.testing.expectEqualStrings("200 OK", r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "probe_ten_days") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "probe_hundred_days") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "probe_four_hundred_days") == null);
+        // Privacy assertions hold on the widened window too ("fleet-"
+        // covers every seeded run_id; the body's "scope":"fleet" has no
+        // trailing hyphen so the substring is collision-free).
+        try std.testing.expect(std.mem.indexOf(u8, r.body, SENTINEL_A) == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, SENTINEL_B) == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "fleet-") == null);
+    }
 }
 
 fn extractZakiUserId(raw: []const u8) ?[]const u8 {
@@ -23760,7 +24037,7 @@ fn handleAcceptedConnection(
     defer _ = state.in_flight_requests.fetchSub(1, .acq_rel);
 
     // Simple routing — control endpoints + descriptor-driven channel webhooks + ZAKI API.
-    const ControlRoute = enum { health, ready, webhook, pair, metrics, diagnostics, wake_heartbeat, invalidate_tenant_runtime_cache, cell_resolve, cell_ensure, cell_status, cell_drain, drain, undrain, shutdown, entitlements_revoke };
+    const ControlRoute = enum { health, ready, webhook, pair, metrics, diagnostics, wake_heartbeat, invalidate_tenant_runtime_cache, cell_resolve, cell_ensure, cell_status, cell_drain, drain, undrain, shutdown, entitlements_revoke, fleet_mining_stats };
     const control_route_map = std.StaticStringMap(ControlRoute).initComptime(.{
         .{ "/health", .health },
         .{ "/ready", .ready },
@@ -23778,6 +24055,7 @@ fn handleAcceptedConnection(
         .{ "/internal/undrain", .undrain },
         .{ "/internal/shutdown", .shutdown },
         .{ "/internal/entitlements/revoke", .entitlements_revoke },
+        .{ "/internal/fleet/mining-stats", .fleet_mining_stats },
     });
     const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
     const is_chat_stream_path = std.mem.eql(u8, base_path, "/api/v1/chat/stream");
@@ -24315,6 +24593,27 @@ fn handleAcceptedConnection(
             // below + tests in the entitlements_revoke test cluster.
             const route_response = handleEntitlementsRevokeRequest(
                 raw,
+                state.internal_service_tokens,
+                state.internal_auth_required,
+                method_str,
+            );
+            response_status = route_response.status;
+            response_body = route_response.body;
+        },
+        // Operator fleet mining-stats (learning contract inv. 5 — the
+        // surface P1 moved OUT of the agent tool; mine_traces
+        // scope=fleet stays denied there). Extracted into a testable
+        // function following the D9 entitlements_revoke pattern above;
+        // this arm just composes the route response. Passes `target`
+        // (not base_path) because the handler parses ?since_days=N,
+        // and req_allocator (per-request arena) so the 200 body needs
+        // no explicit free here.
+        .fleet_mining_stats => {
+            const route_response = handleFleetMiningStatsRequest(
+                req_allocator,
+                state.zaki_state,
+                raw,
+                target,
                 state.internal_service_tokens,
                 state.internal_auth_required,
                 method_str,

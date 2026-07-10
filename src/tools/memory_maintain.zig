@@ -1297,7 +1297,15 @@ fn executeMineTracesWithRows(
 /// / recurrences (which cite run_ids) are OMITTED ENTIRELY — no run_id,
 /// user_id, argument, or content string ever appears in fleet output
 /// (learning contract inv. 5).
-fn renderFleetJson(allocator: std.mem.Allocator, report: trace_mining.MiningReport) ![]u8 {
+///
+/// `pub` for exactly ONE caller: gateway.zig's
+/// `handleFleetMiningStatsRequest` (GET /internal/fleet/mining-stats),
+/// the internal-token operator endpoint this renderer was kept as the
+/// building block for when P1 denied scope=fleet at the agent tool
+/// layer. Its response body is this function's output VERBATIM — any
+/// future field addition must extend the privacy sentinel test below
+/// FIRST.
+pub fn renderFleetJson(allocator: std.mem.Allocator, report: trace_mining.MiningReport) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
