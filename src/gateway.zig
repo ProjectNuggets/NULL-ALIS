@@ -4230,8 +4230,12 @@ pub fn handleFleetMiningStatsRequest(
     // fix): fleetMiningStats aggregates ENTIRELY SQL-side over the jsonb
     // events column and returns only small per-tool shape rows — it never
     // loads every tenant's full events corpus into app memory, and never
-    // builds the run_id/recurrence work the fleet output discards. Its
-    // FleetStats result feeds renderFleetJson's SAME output shape.
+    // builds the run_id/recurrence work the fleet output discards. Round-2
+    // hardening: each list is additionally capped at the top
+    // FLEET_MAX_TOOLS rows (tool names are arbitrary strings, so distinct
+    // cardinality alone was not a real bound) with the cut reported via
+    // the body's `truncated` bool. Its FleetStats result feeds
+    // renderFleetJson's SAME output shape.
     var stats = mgr.fleetMiningStats(allocator, since_days) catch {
         return .{
             .status = "500 Internal Server Error",
@@ -4380,6 +4384,9 @@ test "fleet mining-stats [PG] — cross-tenant happy path emits shapes only; sin
         try std.testing.expect(std.mem.indexOf(u8, r.body, "\"tool\":\"bash\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, r.body, "\"count\":3") != null);
         try std.testing.expect(std.mem.indexOf(u8, r.body, "\"uses\":3") != null);
+        // Round-2 cap honesty bit: two distinct tools is far under
+        // FLEET_MAX_TOOLS, and the endpoint body says so verbatim.
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"truncated\":false") != null);
         // Privacy (inv. 5): NEITHER tenant's label content ...
         try std.testing.expect(std.mem.indexOf(u8, r.body, SENTINEL_A) == null);
         try std.testing.expect(std.mem.indexOf(u8, r.body, SENTINEL_B) == null);

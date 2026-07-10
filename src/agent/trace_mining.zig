@@ -112,6 +112,18 @@ pub const FleetFailurePattern = struct {
     }
 };
 
+/// Hard per-list cap on the fleet aggregate (operator-found round-2
+/// fix, post-#155): tool names in trace events are arbitrary JSON
+/// strings, so DISTINCT-tool cardinality is tenant-influenced —
+/// "O(distinct tools)" alone is not a real bound. Both fleet queries
+/// keep only the top FLEET_MAX_TOOLS rows of their deterministic
+/// ordering (count DESC, tool ASC) and report the cut via
+/// `FleetStats.truncated`. Lives here next to the fleet contract types
+/// (the MIN_PATTERN_COUNT precedent) so the SQL LIMIT in
+/// zaki_state.zig is comptime-pinned to the same number the pure types
+/// document.
+pub const FLEET_MAX_TOOLS: usize = 100;
+
 /// The bounded fleet-scope aggregate — the SHAPE-ONLY projection the
 /// operator endpoint (GET /internal/fleet/mining-stats) emits.
 ///
@@ -125,9 +137,16 @@ pub const FleetFailurePattern = struct {
 /// representable here. `tool_stats` reuses ToolStat (its four fields are
 /// exactly what renderFleetJson reads). Caller owns the result; call
 /// deinit.
+///
+/// `truncated` is the honesty bit for the FLEET_MAX_TOOLS cap: true
+/// when either list had more distinct tools than the cap (the rows
+/// kept are the top of the deterministic ordering). It carries no
+/// tenant content — a single bool derived from row COUNTS — so inv. 5
+/// is untouched.
 pub const FleetStats = struct {
     failure_patterns: []FleetFailurePattern,
     tool_stats: []ToolStat,
+    truncated: bool = false,
 
     pub fn deinit(self: FleetStats, allocator: std.mem.Allocator) void {
         for (self.failure_patterns) |p| p.deinit(allocator);
@@ -148,6 +167,10 @@ test "FleetStats is bounded BY CONSTRUCTION: no recurrence / run_id / label fiel
     try std.testing.expect(@hasField(FleetStats, "failure_patterns"));
     try std.testing.expect(!@hasField(FleetStats, "recurrences"));
     try std.testing.expect(!@hasField(FleetStats, "evidence_run_ids"));
+    // Round-2 bound: the cap's honesty bit exists, and the cap itself
+    // is a positive constant (LIMIT 0 would silently empty the report).
+    try std.testing.expect(@hasField(FleetStats, "truncated"));
+    try std.testing.expect(FLEET_MAX_TOOLS >= 1);
 
     // Fleet failure patterns are tool + count ONLY — no label (tenant
     // content) and no evidence run_ids (per-user identifiers).

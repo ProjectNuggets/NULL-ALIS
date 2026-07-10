@@ -12090,11 +12090,20 @@ const ManagerImpl = struct {
     ///   2. failure_patterns — per-tool failure count where the tool
     ///      failed at least MIN_PATTERN_COUNT (3) times (HAVING gate).
     ///
+    /// HARD bound (round-2 fix): tool names in events are arbitrary JSON
+    /// strings, so "O(distinct tools)" floats with the corpus. Both
+    /// queries LIMIT to the top FLEET_MAX_TOOLS rows of their
+    /// deterministic ordering (count DESC, tool ASC) plus one probe row;
+    /// a probe row coming back means the census was cut, reported as
+    /// FleetStats.truncated (the probe itself is never returned). Result
+    /// size is therefore O(FLEET_MAX_TOOLS) regardless of corpus
+    /// cardinality.
+    ///
     /// inv. 5 by construction: the SELECT lists NEVER project run_id,
     /// user_id, label, or arguments — only tool NAMES (shapes) and
     /// aggregate counts. FleetStats has no field that could carry a
-    /// per-user identifier. Caller owns the result; call
-    /// FleetStats.deinit.
+    /// per-user identifier (`truncated` is a bool derived from row
+    /// counts). Caller owns the result; call FleetStats.deinit.
     pub fn fleetMiningStats(
         self: *Self,
         allocator: std.mem.Allocator,
@@ -12105,25 +12114,32 @@ const ManagerImpl = struct {
         const params = [_]?[*:0]const u8{days_s.ptr};
         const lengths = [_]c_int{@intCast(days_s.len)};
 
-        // Query 1 — per-tool fluency census.
+        // Query 1 — per-tool fluency census (top FLEET_MAX_TOOLS + probe).
         const stats_q = try self.buildQuery(FLEET_TOOL_STATS_SQL);
         defer self.allocator.free(stats_q);
         const stats_res = try self.execParams(stats_q, &params, &lengths);
         defer c.PQclear(stats_res);
-        const tool_stats = try collectFleetToolStats(allocator, stats_res);
+        const stats_cut = @as(usize, @intCast(c.PQntuples(stats_res))) > trace_mining.FLEET_MAX_TOOLS;
+        const tool_stats = try collectFleetToolStats(allocator, stats_res, trace_mining.FLEET_MAX_TOOLS);
         errdefer {
             for (tool_stats) |t| t.deinit(allocator);
             allocator.free(tool_stats);
         }
 
-        // Query 2 — per-tool failure patterns (>= MIN_PATTERN_COUNT).
+        // Query 2 — per-tool failure patterns (>= MIN_PATTERN_COUNT,
+        // top FLEET_MAX_TOOLS + probe).
         const fail_q = try self.buildQuery(FLEET_FAILURE_SQL);
         defer self.allocator.free(fail_q);
         const fail_res = try self.execParams(fail_q, &params, &lengths);
         defer c.PQclear(fail_res);
-        const failure_patterns = try collectFleetFailurePatterns(allocator, fail_res);
+        const fail_cut = @as(usize, @intCast(c.PQntuples(fail_res))) > trace_mining.FLEET_MAX_TOOLS;
+        const failure_patterns = try collectFleetFailurePatterns(allocator, fail_res, trace_mining.FLEET_MAX_TOOLS);
 
-        return .{ .failure_patterns = failure_patterns, .tool_stats = tool_stats };
+        return .{
+            .failure_patterns = failure_patterns,
+            .tool_stats = tool_stats,
+            .truncated = stats_cut or fail_cut,
+        };
     }
 
     /// Return all 'pending' subagent_results rows for a user, ordered by
@@ -14636,6 +14652,15 @@ fn collectToolTraceDigestRows(
     return out.toOwnedSlice(allocator);
 }
 
+/// Row budget for both fleet queries: the FLEET_MAX_TOOLS cap plus ONE
+/// probe row. Fetching cap+1 lets fleetMiningStats detect "there was
+/// more" (rows > cap → FleetStats.truncated) without a second COUNT
+/// query; the probe row itself is never collected or returned. Pinned
+/// to the pure module's constant via comptimePrint (the
+/// MIN_PATTERN_COUNT precedent) so SQL and types cannot silently
+/// drift.
+const FLEET_SQL_LIMIT = std.fmt.comptimePrint("{d}", .{trace_mining.FLEET_MAX_TOOLS + 1});
+
 /// SQL-side per-tool fluency census for the bounded fleet endpoint
 /// (Manager.fleetMiningStats). Aggregates over jsonb `events` array
 /// elements; the SELECT list projects ONLY tool NAME + aggregate counts
@@ -14646,6 +14671,10 @@ fn collectToolTraceDigestRows(
 /// COALESCE'd to 0 when a tool logged no usable duration. The
 /// malformed-events guard (CASE ... '[]') mirrors the analyzer degrading
 /// a bad row to "no events" rather than erroring the whole aggregation.
+/// LIMIT (round-2 bound fix): tool names are arbitrary JSON strings, so
+/// GROUP BY tool alone is only bounded by corpus cardinality; keep the
+/// top FLEET_MAX_TOOLS rows of the deterministic ordering (+1 probe row,
+/// see FLEET_SQL_LIMIT).
 const FLEET_TOOL_STATS_SQL =
     "SELECT elem->>'tool' AS tool, " ++
     "count(*) AS uses, " ++
@@ -14657,14 +14686,16 @@ const FLEET_TOOL_STATS_SQL =
     "WHERE t.created_at > NOW() - ($1 || ' days')::interval " ++
     "AND elem->>'kind'='tool_call' AND jsonb_typeof(elem->'tool')='string' " ++
     "GROUP BY elem->>'tool' " ++
-    "ORDER BY count(*) DESC, elem->>'tool' ASC";
+    "ORDER BY count(*) DESC, elem->>'tool' ASC " ++
+    "LIMIT " ++ FLEET_SQL_LIMIT;
 
 /// SQL-side per-tool failure-count for the bounded fleet endpoint.
 /// Groups tool_call failures (success=false) by TOOL alone — no label
 /// grouping (inv. 5) — and surfaces only tools that failed at least
 /// MIN_PATTERN_COUNT times (the HAVING gate, pinned to the analyzer's
 /// constant via comptimePrint so the SQL and the pure module cannot
-/// silently drift).
+/// silently drift). LIMIT: same top-FLEET_MAX_TOOLS bound (+1 probe
+/// row) as the census query — see FLEET_SQL_LIMIT.
 const FLEET_FAILURE_SQL =
     "SELECT elem->>'tool' AS tool, count(*) AS failures " ++
     "FROM {schema}.tool_traces t " ++
@@ -14674,7 +14705,8 @@ const FLEET_FAILURE_SQL =
     "AND jsonb_typeof(elem->'success')='boolean' AND (elem->>'success')='false' " ++
     "GROUP BY elem->>'tool' " ++
     "HAVING count(*) >= " ++ std.fmt.comptimePrint("{d}", .{trace_mining.MIN_PATTERN_COUNT}) ++ " " ++
-    "ORDER BY count(*) DESC, elem->>'tool' ASC";
+    "ORDER BY count(*) DESC, elem->>'tool' ASC " ++
+    "LIMIT " ++ FLEET_SQL_LIMIT;
 
 /// Parse a small non-negative count column (bigint text) into usize;
 /// NULL/empty/unparseable → 0 (defensive — the fleet aggregates are
@@ -14693,13 +14725,17 @@ fn parseFleetU64Col(allocator: std.mem.Allocator, result: *c.PGresult, row: c_in
 }
 
 /// Collect FLEET_TOOL_STATS_SQL rows (tool, uses, successes, p50) into
-/// owned ToolStat values, deriving success_rate app-side. Caller owns
-/// the returned slice and each row's `.tool`.
+/// owned ToolStat values, deriving success_rate app-side. Collects at
+/// most `max_rows` rows — the query fetches one probe row past the
+/// FLEET_MAX_TOOLS cap purely so the caller can detect truncation, and
+/// that probe must never surface. Caller owns the returned slice and
+/// each row's `.tool`.
 fn collectFleetToolStats(
     allocator: std.mem.Allocator,
     result: *c.PGresult,
+    max_rows: usize,
 ) ![]trace_mining.ToolStat {
-    const n: usize = @intCast(c.PQntuples(result));
+    const n: usize = @min(@as(usize, @intCast(c.PQntuples(result))), max_rows);
     var out: std.ArrayListUnmanaged(trace_mining.ToolStat) = .empty;
     errdefer {
         for (out.items) |s| s.deinit(allocator);
@@ -14728,13 +14764,16 @@ fn collectFleetToolStats(
 }
 
 /// Collect FLEET_FAILURE_SQL rows (tool, count) into owned
-/// FleetFailurePattern values. Caller owns the returned slice and each
+/// FleetFailurePattern values. Collects at most `max_rows` rows (the
+/// cap+1 probe row is truncation-detection only — see
+/// collectFleetToolStats). Caller owns the returned slice and each
 /// row's `.tool`.
 fn collectFleetFailurePatterns(
     allocator: std.mem.Allocator,
     result: *c.PGresult,
+    max_rows: usize,
 ) ![]trace_mining.FleetFailurePattern {
-    const n: usize = @intCast(c.PQntuples(result));
+    const n: usize = @min(@as(usize, @intCast(c.PQntuples(result))), max_rows);
     var out: std.ArrayListUnmanaged(trace_mining.FleetFailurePattern) = .empty;
     errdefer {
         for (out.items) |p| p.deinit(allocator);
@@ -15994,6 +16033,96 @@ test "tool_traces: fleetMiningStats aggregates SQL-side across users — shapes 
     for (stats.failure_patterns) |p| {
         try std.testing.expect(std.mem.indexOf(u8, p.tool, SENTINEL_A) == null);
         try std.testing.expect(std.mem.indexOf(u8, p.tool, SENTINEL_B) == null);
+    }
+
+    // ── (d) 3 distinct tools is far under FLEET_MAX_TOOLS: nothing was
+    // cut, and the report says so.
+    try std.testing.expect(!stats.truncated);
+}
+
+test "tool_traces: fleetMiningStats is HARD-bounded — top-FLEET_MAX_TOOLS per list, truncated honesty bit (round-2 fix)" {
+    // Operator-found round-2 defect (post-#155): the "bounded"
+    // aggregation still returned EVERY distinct tool — no LIMIT on
+    // either fleet query — and tool names in trace events are arbitrary
+    // JSON strings, so distinct-tool cardinality (and with it the
+    // response body and the app-side row collection) grows with the
+    // corpus. O(distinct tools) was not a real bound. The fix caps both
+    // lists at the top FLEET_MAX_TOOLS rows of their deterministic
+    // ordering (count DESC, tool ASC) and reports the cut via
+    // FleetStats.truncated.
+    //
+    // Seeds FLEET_MAX_TOOLS+6 distinct tools (one high-use success tool
+    // + cap+5 failing tools that all clear MIN_PATTERN_COUNT) and pins:
+    // exact cap lengths on BOTH lists, truncated=true, the top-by-count
+    // row surviving, and the ordering TAIL being what got cut.
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_fleetcap", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    try mgr.migrate();
+    defer mgr.dropSchemaForTests() catch {};
+
+    const cap = trace_mining.FLEET_MAX_TOOLS;
+
+    // hot_tool — 5 successes (highest uses in the corpus): the cap must
+    // keep the TOP of the ordering, so this row has to survive.
+    try mgr.insertToolTraceEvents(987201, "cap-hot-1", "[" ++
+        ("{\"kind\":\"tool_call\",\"tool\":\"hot_tool\",\"success\":true,\"duration_ms\":1}," ** 4) ++
+        "{\"kind\":\"tool_call\",\"tool\":\"hot_tool\",\"success\":true,\"duration_ms\":1}]");
+
+    // cap+5 distinct failing tools (cap_tool_000 .. cap_tool_104 for
+    // cap=100, zero-padded so tool-ASC order == numeric order). One
+    // event per tool per run, three failed runs across two tenants →
+    // every cap_tool_* has uses=3 and failures=3 (exactly
+    // MIN_PATTERN_COUNT, so ALL of them clear the failure gate).
+    var events_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer events_buf.deinit(allocator);
+    try events_buf.append(allocator, '[');
+    var ti: usize = 0;
+    while (ti < cap + 5) : (ti += 1) {
+        if (ti > 0) try events_buf.append(allocator, ',');
+        try events_buf.writer(allocator).print(
+            "{{\"kind\":\"tool_call\",\"tool\":\"cap_tool_{d:0>3}\",\"success\":false,\"duration_ms\":10}}",
+            .{ti},
+        );
+    }
+    try events_buf.append(allocator, ']');
+    try mgr.insertToolTraceEvents(987201, "cap-run-1", events_buf.items);
+    try mgr.insertToolTraceEvents(987202, "cap-run-2", events_buf.items);
+    try mgr.insertToolTraceEvents(987201, "cap-run-3", events_buf.items);
+
+    var stats = try mgr.fleetMiningStats(allocator, 7);
+    defer stats.deinit(allocator);
+
+    // Hard cap on BOTH lists + the honesty bit.
+    try std.testing.expectEqual(cap, stats.tool_stats.len);
+    try std.testing.expectEqual(cap, stats.failure_patterns.len);
+    try std.testing.expect(stats.truncated);
+
+    // The cut respects the deterministic ordering. tool_stats is
+    // uses DESC, tool ASC: hot_tool (uses=5) leads, and the kept
+    // cap_tool_* rows are the ALPHABETIC HEAD of the tie group — the
+    // highest-indexed name is exactly what the cap dropped.
+    try std.testing.expectEqualStrings("hot_tool", stats.tool_stats[0].tool);
+    try std.testing.expectEqual(@as(usize, 5), stats.tool_stats[0].uses);
+    try std.testing.expect(findFleetStat(stats.tool_stats, "cap_tool_000") != null);
+    try std.testing.expect(findFleetStat(stats.tool_stats, "cap_tool_104") == null);
+
+    // failure_patterns (all count=3 → pure tool-ASC): keeps
+    // cap_tool_000 first; the beyond-cap tail never appears.
+    try std.testing.expectEqualStrings("cap_tool_000", stats.failure_patterns[0].tool);
+    for (stats.failure_patterns) |p| {
+        try std.testing.expectEqual(@as(usize, 3), p.count);
+        try std.testing.expect(!std.mem.eql(u8, p.tool, "cap_tool_104"));
     }
 }
 
