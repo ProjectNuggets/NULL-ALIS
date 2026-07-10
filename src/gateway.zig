@@ -2314,6 +2314,8 @@ const TenantRuntime = struct {
                     // session_mgr so each per-session Agent inherits it and
                     // propagates to memory_loader (LoadTurnMemoryOptions).
                     runtime.session_mgr.typed_views_enabled = runtime.config.agent.typed_views_enabled;
+                    // TELOS — wire the curated <telos> block gate from config.
+                    runtime.session_mgr.telos_in_prompt = runtime.config.agent.telos_in_prompt;
                     // P4 — wire canonical-continuity-summary flag from config
                     // to session_mgr so each per-session Agent inherits it and
                     // propagates to the commands gating predicate. Default ON;

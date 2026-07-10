@@ -1133,6 +1133,9 @@ pub const LoadTurnMemoryOptions = struct {
     /// memory signals. When false → no new blocks (exact prior context).
     /// Threaded from `agent.typed_views_enabled` (config_types.AgentConfig).
     typed_views_enabled: bool = true,
+    /// TELOS (docs/telos-contract.md, T1) — inject the curated `<telos>` block.
+    /// Default OFF (opt-in for measurement). Threaded from `agent.telos_in_prompt`.
+    telos_in_prompt: bool = false,
 
     /// Task 4 (Loop-1 consumer, package1-activations) — dream_log
     /// warm-start gate (default ON). When true, the loader finds the
@@ -1275,6 +1278,22 @@ pub fn loadTurnMemorySlotOpts(
     result.stats.identity_pin_appended_bytes = identity_stats.appended_bytes;
     defer if (identity_block) |b| allocator.free(b);
 
+    // ── TELOS: curated user-model north star (docs/telos-contract.md, T1) ──
+    // Always-on curated foundation (mission/goals/values), distinct from the
+    // extracted <active_identity> facts and rendered FIRST in the fence. Gated
+    // behind opts.telos_in_prompt (default OFF; opt-in for measurement, mirrors
+    // cost_vital_in_prompt). Fail-soft: flag off / no rows → null → omitted.
+    var telos_block: ?[]u8 = null;
+    if (opts.telos_in_prompt) {
+        if (state_mgr_for_graph) |sm| if (user_id_for_graph) |uid| {
+            telos_block = buildTelosBlock(allocator, sm, uid) catch |err| blk: {
+                log.warn("telos.append_failed err={s} — skipping telos context", .{@errorName(err)});
+                break :blk null;
+            };
+        };
+    }
+    defer if (telos_block) |b| allocator.free(b);
+
     // ── Phase 0.5: typed views ─────────────────────────────────────────
     // Read the P3-typed memory signals as four deterministic, always-on
     // blocks. Gated behind opts.typed_views_enabled (default ON, threaded
@@ -1340,13 +1359,14 @@ pub fn loadTurnMemorySlotOpts(
     const has_legacy = result.context.len > 0;
     const has_graph = if (graph_block) |g| g.len > 0 else false;
     const has_community = if (community_block) |c| c.len > 0 else false;
+    const has_telos = if (telos_block) |b| b.len > 0 else false;
     const has_identity = if (identity_block) |b| b.len > 0 else false;
     const has_pref = if (pref_block) |b| b.len > 0 else false;
     const has_loop = if (loop_block) |b| b.len > 0 else false;
     const has_decision = if (decision_block) |b| b.len > 0 else false;
     const has_people = if (people_block) |b| b.len > 0 else false;
     if (!has_legacy and !has_graph and !has_community and !has_identity and
-        !has_pref and !has_loop and !has_decision and !has_people)
+        !has_telos and !has_pref and !has_loop and !has_decision and !has_people)
     {
         allocator.free(result.context);
         return .{
@@ -1358,6 +1378,7 @@ pub fn loadTurnMemorySlotOpts(
     defer allocator.free(result.context);
     const graph_payload: []const u8 = if (graph_block) |g| g else "";
     const community_payload: []const u8 = if (community_block) |c| c else "";
+    const telos_payload: []const u8 = if (telos_block) |b| b else "";
     const identity_payload: []const u8 = if (identity_block) |b| b else "";
     const pref_payload: []const u8 = if (pref_block) |b| b else "";
     const loop_payload: []const u8 = if (loop_block) |b| b else "";
@@ -1387,8 +1408,8 @@ pub fn loadTurnMemorySlotOpts(
     // "first across all warm context."
     const fenced = try std.fmt.allocPrint(
         allocator,
-        "<memory_for_turn>\n{s}{s}{s}{s}{s}{s}{s}{s}</memory_for_turn>\n",
-        .{ identity_payload, pref_payload, loop_payload, decision_payload, people_payload, result.context, graph_payload, community_payload },
+        "<memory_for_turn>\n{s}{s}{s}{s}{s}{s}{s}{s}{s}</memory_for_turn>\n",
+        .{ telos_payload, identity_payload, pref_payload, loop_payload, decision_payload, people_payload, result.context, graph_payload, community_payload },
     );
     return .{
         .fenced_content = fenced,
@@ -3446,10 +3467,6 @@ test {
 
 test "renderTelosBlock: empty→null, XML-escaped, deduped, blanks skipped [T1]" {
     const allocator = std.testing.allocator;
-
-    // Force compile-analysis of the DB-backed wrapper now (it is wired into the
-    // prompt in task 5; Zig would otherwise lazily skip an unreferenced fn).
-    _ = &buildTelosBlock;
 
     // Cold start: no rows → null so the caller never emits a bare <telos></telos>.
     try std.testing.expect((try renderTelosBlock(allocator, &[_]MemoryEntry{})) == null);

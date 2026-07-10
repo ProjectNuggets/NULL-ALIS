@@ -452,6 +452,9 @@ pub const ContextEngine = struct {
                     // Phase 0.5 — typed views READ gate, threaded from agent
                     // config so operators can disable the four typed blocks.
                     .typed_views_enabled = agent.typed_views_enabled,
+                    // TELOS (docs/telos-contract.md, T1) — curated <telos> block
+                    // gate, threaded from agent config (default OFF).
+                    .telos_in_prompt = agent.telos_in_prompt,
                     // Task 4 (package1-activations) — dream_log warm-start
                     // gate, threaded from agent config so operators can
                     // disable the latest-reflection injection.

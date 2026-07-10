@@ -1050,6 +1050,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("typed_views_enabled")) |v| {
                 if (v == .bool) self.agent.typed_views_enabled = v.bool;
             }
+            // TELOS (docs/telos-contract.md) — operators opt into the curated
+            // <telos> north-star block via config.json (default OFF).
+            if (ag.object.get("telos_in_prompt")) |v| {
+                if (v == .bool) self.agent.telos_in_prompt = v.bool;
+            }
             // P4 (memory-phase-0.5) — wire the canonical-continuity-summary
             // gate so operators can disable the per-boundary LLM summarizer
             // (cost/latency rollback) via config.json (default ON).

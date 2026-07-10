@@ -280,6 +280,9 @@ pub const SessionManager = struct {
     /// gateway config to per-session Agent → memory_loader. Same INIT-ONLY
     /// concurrency contract as the sibling fields. Default true.
     typed_views_enabled: bool = true,
+    /// TELOS (docs/telos-contract.md, T1) — curated `<telos>` block gate.
+    /// Default false. Same INIT-ONLY plumbing pattern as the sibling fields.
+    telos_in_prompt: bool = false,
     /// P4 (memory-phase-0.5) — canonical-continuity-summary gate, threaded
     /// from gateway config to per-session Agent → commands gating predicate.
     /// Same INIT-ONLY concurrency contract as the sibling fields. Default true.
@@ -794,6 +797,8 @@ pub const SessionManager = struct {
         agent.semantic_type_routing_enabled = self.semantic_type_routing_enabled;
         // Phase 0.5 — typed-views READ gate, same plumbing pattern.
         agent.typed_views_enabled = self.typed_views_enabled;
+        // TELOS (docs/telos-contract.md) — curated <telos> block gate.
+        agent.telos_in_prompt = self.telos_in_prompt;
         // P4 — canonical-continuity-summary gate, same plumbing pattern.
         agent.canonical_continuity_summary_enabled = self.canonical_continuity_summary_enabled;
         // Task 3 (package1-activations) — cost-vital-in-prompt gate, same

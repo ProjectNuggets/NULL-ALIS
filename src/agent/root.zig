@@ -600,6 +600,9 @@ pub const Agent = struct {
     /// over the P3-typed memories. Default true. See
     /// config_types.typed_views_enabled.
     typed_views_enabled: bool = true,
+    /// TELOS (docs/telos-contract.md, T1) — curated `<telos>` block gate.
+    /// Default false. See config_types.telos_in_prompt.
+    telos_in_prompt: bool = false,
     /// Task 3 (package1-activations, "cost interoception") — Runtime-prompt
     /// cost-vital gate, threaded from gateway config to per-session Agent →
     /// PromptContext.usage_runtime at context_engine.assemble. Same
