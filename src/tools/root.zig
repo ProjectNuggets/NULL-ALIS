@@ -11,6 +11,7 @@ const memory_mod = @import("../memory/root.zig");
 const zaki_state = @import("../zaki_state.zig");
 const observability = @import("../observability.zig");
 const entitlement_mod = @import("../entitlement.zig");
+const platform = @import("../platform.zig");
 const Memory = memory_mod.Memory;
 
 pub const Entitlement = entitlement_mod.Entitlement;
@@ -271,6 +272,8 @@ pub const Tool = struct {
 ///   - `pub const tool_description: []const u8`
 ///   - `pub const tool_params: []const u8`
 ///   - `fn execute(self: *T, allocator: Allocator, args: JsonObjectMap) anyerror!ToolResult`
+/// Optionally, T may declare `fn deinitTool(self: *T, allocator: Allocator) void`
+/// to release owned fields before the backing struct is destroyed.
 pub fn ToolVTable(comptime T: type) Tool.VTable {
     return .{
         .execute = &struct {
@@ -300,6 +303,9 @@ pub fn ToolVTable(comptime T: type) Tool.VTable {
         .deinit = &struct {
             fn f(ptr: *anyopaque, allocator: std.mem.Allocator) void {
                 const self: *T = @ptrCast(@alignCast(ptr));
+                if (comptime @hasDecl(T, "deinitTool")) {
+                    self.deinitTool(allocator);
+                }
                 allocator.destroy(self);
             }
         }.f,
@@ -1246,6 +1252,22 @@ pub fn defaultToolsWithPaths(
     return list.toOwnedSlice(allocator);
 }
 
+fn appendBuiltinSkillsAllowedPath(allocator: std.mem.Allocator, tool: *file_read.FileReadTool) !void {
+    const home_dir = platform.getHomeDir(allocator) catch return;
+    defer allocator.free(home_dir);
+
+    const skills_dir = try std.fs.path.join(allocator, &.{ home_dir, ".nullalis", "skills" });
+    defer allocator.free(skills_dir);
+
+    const resolved = std.fs.cwd().realpathAlloc(allocator, skills_dir) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    errdefer allocator.free(resolved);
+
+    try tool.appendOwnedAllowedPath(allocator, resolved);
+}
+
 /// Create all tools including optional ones.
 pub fn allTools(
     allocator: std.mem.Allocator,
@@ -1391,9 +1413,16 @@ pub fn allTools(
     };
     try list.append(allocator, st.tool());
 
-    const ft = try allocator.create(file_read.FileReadTool);
-    ft.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths, .max_file_size = tc.max_file_size_bytes };
-    try list.append(allocator, ft.tool());
+    {
+        const ft = try allocator.create(file_read.FileReadTool);
+        errdefer {
+            ft.deinitTool(allocator);
+            allocator.destroy(ft);
+        }
+        ft.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths, .max_file_size = tc.max_file_size_bytes };
+        try appendBuiltinSkillsAllowedPath(allocator, ft);
+        try list.append(allocator, ft.tool());
+    }
 
     const wt = try allocator.create(file_write.FileWriteTool);
     wt.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
@@ -1649,10 +1678,13 @@ pub fn allTools(
     // Gate asymmetry (S1a): spawn_many — the tool that SPENDS (dispatches
     // subagents) — is SELF-GATED at execute() to ⚡ Superpowers turns
     // (getTurnContext().superpowers_mode). subagent_batch_result is a
-    // read-only collector and is NOT gated: wake-lane and follow-up turns
-    // must be able to collect an already-dispatched batch (optionally
-    // blocking via wait_seconds). Both EXCLUDED from the subagent profile —
-    // depth guard: subagents must never fan out.
+    // read-only collector and has NO Superpowers gate: wake-lane and
+    // follow-up turns must be able to collect an already-dispatched batch
+    // (optionally blocking via wait_seconds). Collection IS scoped to the
+    // batch's owning USER — user-granular, not lane-granular, so any lane of
+    // the same user (wake cron:heartbeat, main, threads) collects while
+    // other users get the probe-uniform not-found error. Both EXCLUDED from
+    // the subagent profile — depth guard: subagents must never fan out.
     if (opts.tool_profile == .main and multiagent_enabled) {
         const smt = try allocator.create(spawn_many.SpawnManyTool);
         smt.* = .{ .manager = opts.subagent_manager };
@@ -3338,6 +3370,83 @@ test "all tools propagates sandbox config to shell and git" {
     }
     try std.testing.expect(saw_shell);
     try std.testing.expect(saw_git);
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "all tools auto-allows builtin skills dir for file_read only" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("home/.nullalis/skills/skills/demo");
+    try tmp.dir.makePath("workspace");
+    try tmp.dir.writeFile(.{
+        .sub_path = "home/.nullalis/skills/skills/demo/SKILL.md",
+        .data = "demo skill instructions",
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "outside.txt", .data = "outside" });
+
+    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const home_path_z = try std.fs.path.joinZ(allocator, &.{ tmp_root, "home" });
+    defer allocator.free(home_path_z);
+    const workspace_path = try std.fs.path.join(allocator, &.{ tmp_root, "workspace" });
+    defer allocator.free(workspace_path);
+    const skill_path = try std.fs.path.join(allocator, &.{ home_path_z[0..home_path_z.len], ".nullalis", "skills", "skills", "demo", "SKILL.md" });
+    defer allocator.free(skill_path);
+    const unrelated_path = try std.fs.path.join(allocator, &.{ tmp_root, "outside.txt" });
+    defer allocator.free(unrelated_path);
+
+    const old_home_z: ?[:0]u8 = blk: {
+        const old_home = std.process.getEnvVarOwned(allocator, "HOME") catch break :blk null;
+        defer allocator.free(old_home);
+        break :blk try allocator.dupeZ(u8, old_home);
+    };
+    defer {
+        if (old_home_z) |old_home| {
+            _ = setenv("HOME", old_home.ptr, 1);
+            allocator.free(old_home);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+    _ = setenv("HOME", home_path_z.ptr, 1);
+
+    const Config = @import("../config.zig").Config;
+    const cfg = Config{
+        .workspace_dir = workspace_path,
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = allocator,
+    };
+    const tools = try allTools(allocator, workspace_path, .{ .config = &cfg });
+    defer deinitTools(allocator, tools);
+
+    var file_tool: ?Tool = null;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "file_read")) {
+            file_tool = t;
+            break;
+        }
+    }
+    const t = file_tool orelse return error.TestUnexpectedResult;
+
+    var skill_args = JsonObjectMap.init(allocator);
+    defer skill_args.deinit();
+    try skill_args.put("path", .{ .string = skill_path });
+    const skill_result = try t.execute(allocator, skill_args);
+    defer if (skill_result.success) allocator.free(skill_result.output);
+    try std.testing.expect(skill_result.success);
+    try std.testing.expectEqualStrings("demo skill instructions", skill_result.output);
+
+    var unrelated_args = JsonObjectMap.init(allocator);
+    defer unrelated_args.deinit();
+    try unrelated_args.put("path", .{ .string = unrelated_path });
+    const unrelated_result = try t.execute(allocator, unrelated_args);
+    try std.testing.expect(!unrelated_result.success);
 }
 
 test "all tools binds runtime_info to finalized tool slice" {

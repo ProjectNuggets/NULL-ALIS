@@ -9,6 +9,7 @@ const tasks_mod = @import("../tasks/root.zig");
 const TaskDelivery = tasks_mod.TaskDelivery;
 const TaskEntry = tasks_mod.TaskEntry;
 const SubagentManager = @import("../subagent.zig").SubagentManager;
+const session_identity = @import("../session/identity.zig");
 
 pub const TaskGetTool = struct {
     delivery: *TaskDelivery,
@@ -60,6 +61,18 @@ pub const TaskGetTool = struct {
             return ToolResult.fail("task not found");
         const entry = &snap;
 
+        // Ownership is USER-granular, not lane-granular (PR #150 review
+        // finding 2): owner_session carries the spawning lane's key, but S1b
+        // recovery happens on the same user's LATER turns — main, thread, and
+        // wake (cron:heartbeat) lanes included. Cross-USER access (and a turn
+        // with no session at all) gets the same probe-uniform "task not
+        // found" as a genuinely unknown id; legacy keys fall back to exact
+        // equality inside sameUser (fail-closed).
+        const session_key = root.getTurnContext().session_key orelse
+            return ToolResult.fail("task not found");
+        if (!session_identity.sameUser(session_key, entry.owner_session))
+            return ToolResult.fail("task not found");
+
         var buf: std.ArrayListUnmanaged(u8) = .{};
         errdefer buf.deinit(allocator);
         const w = buf.writer(allocator);
@@ -90,14 +103,12 @@ pub const TaskGetTool = struct {
         // subagents by design, so the answer lives only in the SubagentManager
         // (in-memory, live) and the durable `subagent_results` outbox (survives
         // delivery). Resolution order: in-memory live path first, then durable
-        // fallback. `result_text` is emitted ONLY when recovered; a non-subagent
-        // task, an unparseable id, or no attached manager leaves the JSON
-        // exactly as before (metadata-only) — no false promise.
+        // fallback. The user-ownership check above guards both metadata and
+        // the recovered answer text.
         if (self.manager) |manager| {
             if (numericTaskId(&entry.task_id)) |numeric_id| {
-                // In-memory borrow is manager-lifetime; copy while we hold it via
-                // the serialize call (jsonEscapeInto reads it synchronously here).
-                if (manager.getTaskResultText(numeric_id)) |text| {
+                if (try manager.getTaskResultTextAlloc(allocator, numeric_id)) |text| {
+                    defer allocator.free(text);
                     try w.writeAll(",\"result_text\":\"");
                     try jsonEscapeInto(w, text);
                     try w.writeByte('"');
@@ -157,12 +168,38 @@ test "TaskGetTool.execute with valid task_id returns JSON" {
     defer args.deinit();
     try args.put("task_id", .{ .string = &id });
 
+    root.setTurnContext(.{ .session_key = "session-1" });
+    defer root.clearTurnContext();
+
     var tg = TaskGetTool{ .delivery = &delivery };
     const result = try tg.execute(allocator, args);
     defer allocator.free(result.output);
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "my task") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "queued") != null);
+}
+
+test "TaskGetTool.execute without current session hides existing task" {
+    const allocator = std.testing.allocator;
+    var ledger_inst = TaskLedger.init(allocator);
+    defer ledger_inst.deinit();
+    var noop = observability.NoopObserver{};
+    var delivery = TaskDelivery{ .ledger = &ledger_inst, .observer = noop.observer() };
+
+    const entry = try ledger_inst.createTask("private task", "session-1");
+    const id = entry.task_id;
+
+    var args = JsonObjectMap.init(allocator);
+    defer args.deinit();
+    try args.put("task_id", .{ .string = &id });
+
+    root.clearTurnContext();
+
+    var tg = TaskGetTool{ .delivery = &delivery };
+    const result = try tg.execute(allocator, args);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("task not found", result.error_msg.?);
+    try std.testing.expectEqualStrings("", result.output);
 }
 
 test "TaskGetTool.execute with invalid task_id returns error" {
@@ -254,6 +291,9 @@ test "S1b task_get returns result_text from the in-memory subagent path" {
     defer args.deinit();
     try args.put("task_id", .{ .string = &id });
 
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:7:main" });
+    defer root.clearTurnContext();
+
     var tg = TaskGetTool{ .delivery = &delivery, .manager = &mgr };
     const result = try tg.execute(allocator, args);
     defer allocator.free(result.output);
@@ -261,4 +301,116 @@ test "S1b task_get returns result_text from the in-memory subagent path" {
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "\"result_text\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "Rayleigh scattering") != null);
+}
+
+test "task_get user-granular: same user reads the task from another lane" {
+    // PR #150 review finding 2 (RED→GREEN): ownership is USER-granular, not
+    // lane-granular. The ledger entry's owner_session is the spawning lane's
+    // key (main), but S1b's durable recovery happens on LATER turns of the
+    // same user — thread and wake lanes included. Both the metadata and the
+    // recovered result_text must be readable there.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    var mgr = SubagentManager.init(allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const state = try allocator.create(subagent_mod.TaskState);
+    state.* = .{
+        .status = .completed,
+        .label = try allocator.dupe(u8, "cross-lane-task"),
+        .task_summary = try allocator.dupe(u8, "answer across lanes"),
+        .task_prompt = try allocator.dupe(u8, "answer across lanes"),
+        .result = .{
+            .status = .completed,
+            .text = try allocator.dupe(u8, "recovered on a later lane"),
+        },
+        .started_at = std.time.milliTimestamp(),
+        .completed_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(allocator, 3, state);
+
+    var ledger_inst = TaskLedger.init(allocator);
+    defer ledger_inst.deinit();
+    var noop = observability.NoopObserver{};
+    var delivery = TaskDelivery{ .ledger = &ledger_inst, .observer = noop.observer() };
+    const entry = try ledger_inst.createTaskWithNumericId("answer across lanes", "agent:zaki-bot:user:7:main", 3);
+    const id = entry.task_id;
+
+    var args = JsonObjectMap.init(allocator);
+    defer args.deinit();
+    try args.put("task_id", .{ .string = &id });
+
+    // Same user (7), DIFFERENT lane (thread) than the owning main lane.
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:7:thread:abc" });
+    defer root.clearTurnContext();
+
+    var tg = TaskGetTool{ .delivery = &delivery, .manager = &mgr };
+    const result = try tg.execute(allocator, args);
+    defer if (result.success) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"status\":\"queued\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"result_text\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "recovered on a later lane") != null);
+}
+
+test "S1b task_get refuses a different session" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    var mgr = SubagentManager.init(allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const state = try allocator.create(subagent_mod.TaskState);
+    state.* = .{
+        .status = .completed,
+        .label = try allocator.dupe(u8, "foreign-task"),
+        .task_summary = try allocator.dupe(u8, "answer another session"),
+        .task_prompt = try allocator.dupe(u8, "answer another session"),
+        .result = .{
+            .status = .completed,
+            .text = try allocator.dupe(u8, "session private final answer"),
+        },
+        .started_at = std.time.milliTimestamp(),
+        .completed_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(allocator, 2, state);
+
+    var ledger_inst = TaskLedger.init(allocator);
+    defer ledger_inst.deinit();
+    var noop = observability.NoopObserver{};
+    var delivery = TaskDelivery{ .ledger = &ledger_inst, .observer = noop.observer() };
+    const entry = try ledger_inst.createTaskWithNumericId("answer another session", "agent:zaki-bot:user:7:main", 2);
+    const id = entry.task_id;
+
+    var args = JsonObjectMap.init(allocator);
+    defer args.deinit();
+    try args.put("task_id", .{ .string = &id });
+
+    root.setTurnContext(.{ .session_key = "agent:zaki-bot:user:8:main" });
+    defer root.clearTurnContext();
+
+    var tg = TaskGetTool{ .delivery = &delivery, .manager = &mgr };
+    const result = try tg.execute(allocator, args);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("task not found", result.error_msg.?);
+    try std.testing.expectEqualStrings("", result.output);
 }

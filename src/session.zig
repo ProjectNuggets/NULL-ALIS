@@ -1179,8 +1179,11 @@ pub const SessionManager = struct {
             .model = session.agent.model_name,
             // Phase 5 T3 — propagate the per-turn Superpowers flag to tools.
             // spawn_many self-gates on this; a non-Superpowers turn cannot
-            // fan out. (subagent_batch_result is UNGATED since S1a — the
-            // collector is read-only, and the wake lane runs superpowers-unset.)
+            // fan out. (subagent_batch_result has no Superpowers gate since
+            // S1a — the collector is read-only, and the wake lane runs
+            // superpowers-unset; its access check is user-granular ownership
+            // via the session_key above, so any lane of the owning user
+            // collects.)
             .superpowers_mode = options.turn_superpowers_mode,
         });
         defer tools_mod.clearTurnContext();
