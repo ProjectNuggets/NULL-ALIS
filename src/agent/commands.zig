@@ -160,9 +160,16 @@ fn memoryRuntimePtr(self: anytype) ?*memory_mod.MemoryRuntime {
 
 /// Query at most this many wishes per `/learn list` (top-1 match each).
 const WISH_HUB_QUERY_CAP: usize = 5;
-/// Bounded, short per-wish Hub timeout. The catalog endpoint answers in ~0.8s;
-/// this ceiling keeps a slow/unreachable Hub from stalling the list render.
+/// Bounded, short per-wish Hub timeout CEILING. The catalog endpoint answers
+/// in ~0.8s; this ceiling keeps a slow/unreachable Hub from stalling the list
+/// render. Round 2 Finding 4: the actual grant per call is
+/// min(this, remaining total budget) — never a fresh full ceiling for a call
+/// started late in the render.
 const WISH_HUB_TIMEOUT_MS: u32 = 3000;
+/// Below this remaining budget the Hub is not called at all: http_util's curl
+/// transport clamps --max-time UP to 1s (request_with_mode), so any smaller
+/// grant would overshoot the total deadline anyway. Fail-soft skip instead.
+const WISH_HUB_MIN_CALL_TIMEOUT_MS: u64 = 1000;
 /// Single TOTAL deadline across ALL wish→Hub queries in one `/learn list`
 /// render (latency fix): replaces the old 5×3s serial worst case (~15s) with
 /// ONE overall budget. Once exceeded, remaining wishes are not queried —
@@ -186,14 +193,17 @@ pub const WishHubMatch = struct {
 /// Injectable Hub searcher. `search` returns a top-1 match, `null` for "Hub had
 /// nothing", or an error for "Hub unreachable/timeout". Both `null` and error
 /// render as NO annotation — fail-soft, never error text in `/learn list`.
+/// Round 2 Finding 4: `timeout_ms` is the caller-computed grant for THIS call
+/// (min of the per-call ceiling and the remaining total budget), so a call
+/// started late in the render no longer gets a fresh full timeout.
 pub const WishHubSearcher = struct {
     ctx: ?*anyopaque = null,
-    search: *const fn (ctx: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8) anyerror!?WishHubMatch,
+    search: *const fn (ctx: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8, timeout_ms: u32) anyerror!?WishHubMatch,
 };
 
 /// Production Hub search: query the structured catalog endpoint, top-1, bounded.
-fn defaultWishHubSearch(_: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8) anyerror!?WishHubMatch {
-    const hits = try skills_mod.searchDecisionHubCatalog(allocator, query, 1, WISH_HUB_TIMEOUT_MS);
+fn defaultWishHubSearch(_: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8, timeout_ms: u32) anyerror!?WishHubMatch {
+    const hits = try skills_mod.searchDecisionHubCatalog(allocator, query, 1, timeout_ms);
     defer skills_mod.freeDecisionHubSearchResults(allocator, hits);
     if (hits.len == 0) return null;
     const name = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ hits[0].org_slug, hits[0].skill_name });
@@ -231,18 +241,29 @@ fn wishHubTotalBudgetNs(self: anytype) u64 {
     return WISH_HUB_TOTAL_BUDGET_NS;
 }
 
-/// Minimal alphanumeric tokenizer: yields maximal runs of ASCII-alphanumeric
-/// bytes, treating every other byte (whitespace, punctuation, `/`, `-`) as a
-/// delimiter. Shared by query derivation and the relevance gate so both sides
-/// tokenize identically.
+/// Word-byte class for wish tokenization: ASCII alphanumerics OR any byte >=
+/// 0x80 (UTF-8 lead/continuation bytes) — the same approach as
+/// memory/root.zig's salientPatternToken. Round 2 Finding 3: the previous
+/// ASCII-only class dissolved Arabic/Cyrillic/CJK wishes into an EMPTY query
+/// (no Hub call) and left the relevance gate blind to non-Latin overlap;
+/// counting non-ASCII bytes as letters makes UTF-8 scripts tokenize as whole
+/// words. ASCII whitespace/punctuation (`/`, `-`, …) still delimit.
+fn isWishWordByte(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch >= 0x80;
+}
+
+/// Minimal word tokenizer: yields maximal runs of word bytes (see
+/// `isWishWordByte`), treating every other byte (whitespace, punctuation,
+/// `/`, `-`) as a delimiter. Shared by query derivation and the relevance
+/// gate so both sides tokenize identically.
 const AlnumTokenizer = struct {
     s: []const u8,
     i: usize = 0,
     fn next(self: *AlnumTokenizer) ?[]const u8 {
-        while (self.i < self.s.len and !std.ascii.isAlphanumeric(self.s[self.i])) : (self.i += 1) {}
+        while (self.i < self.s.len and !isWishWordByte(self.s[self.i])) : (self.i += 1) {}
         if (self.i >= self.s.len) return null;
         const start = self.i;
-        while (self.i < self.s.len and std.ascii.isAlphanumeric(self.s[self.i])) : (self.i += 1) {}
+        while (self.i < self.s.len and isWishWordByte(self.s[self.i])) : (self.i += 1) {}
         return self.s[start..self.i];
     }
 };
@@ -300,10 +321,17 @@ fn deriveWishQuery(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
 
     var it = AlnumTokenizer{ .s = q };
     while (it.next()) |raw| {
+        // Cap invariant: a token is appended WHOLE or not at all. A token
+        // longer than the entire query budget can never fit on a token
+        // boundary — skip it outright rather than truncating (round 2
+        // Finding 3: truncation could split a multi-byte UTF-8 codepoint
+        // mid-sequence and ship mangled bytes to the Hub).
+        if (raw.len > WISH_QUERY_MAX_BYTES) continue;
         var lower_buf: [WISH_QUERY_MAX_BYTES]u8 = undefined;
-        const n = @min(raw.len, lower_buf.len);
-        for (raw[0..n], 0..) |c, k| lower_buf[k] = std.ascii.toLower(c);
-        const tok = lower_buf[0..n];
+        // ASCII-lowercase only: toLower is identity on bytes >= 0x80, so
+        // UTF-8 sequences pass through byte-for-byte unmangled.
+        for (raw, 0..) |c, k| lower_buf[k] = std.ascii.toLower(c);
+        const tok = lower_buf[0..raw.len];
         if (tok.len < 2) continue; // shed single-char noise
         if (isWishStopword(tok)) continue;
         const sep: usize = if (out.items.len == 0) 0 else 1;
@@ -5350,16 +5378,26 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
                 try w.print("  {d}. {s}\n     key: {s}\n", .{ idx, e.content[0..preview_len], e.key });
 
                 if (!matchmaking or idx > WISH_HUB_QUERY_CAP) continue;
-                // Total-deadline check BEFORE spending another query: once the
-                // overall budget is blown, stop querying the remaining wishes.
-                const over_budget = if (budget_timer) |*t| (t.read() >= total_budget_ns) else false;
-                if (over_budget) continue;
+                // Round 2 Finding 4: the total budget is a REAL deadline, not
+                // just an initiation gate. Each call is granted the REMAINING
+                // budget (capped by the per-call ceiling); once the remainder
+                // drops below curl's 1s --max-time floor, calling would
+                // overshoot the deadline — skip the remaining wishes instead
+                // (fail-soft). Hard wall-clock ≈ budget + ≤1s, never
+                // budget + a fresh full ceiling.
+                const remaining_ms: u64 = if (budget_timer) |*t| blk: {
+                    const elapsed_ns = t.read();
+                    if (elapsed_ns >= total_budget_ns) break :blk 0;
+                    break :blk (total_budget_ns - elapsed_ns) / std.time.ns_per_ms;
+                } else WISH_HUB_TIMEOUT_MS; // no monotonic clock: legacy per-call bound
+                if (remaining_ms < WISH_HUB_MIN_CALL_TIMEOUT_MS) continue;
+                const call_timeout_ms: u32 = @intCast(@min(@as(u64, WISH_HUB_TIMEOUT_MS), remaining_ms));
 
                 const query = try deriveWishQuery(self.allocator, e.content);
                 defer self.allocator.free(query);
                 if (query.len == 0) continue;
 
-                if (searcher.search(searcher.ctx, self.allocator, query)) |maybe_match| {
+                if (searcher.search(searcher.ctx, self.allocator, query, call_timeout_ms)) |maybe_match| {
                     if (maybe_match) |match| {
                         defer self.allocator.free(match.name);
                         defer self.allocator.free(match.description);
@@ -6837,7 +6875,7 @@ test "/learn list: renders Wishes section when capability requests exist" {
 const FakeHubFixed = struct {
     org_skill: []const u8,
     description: []const u8 = "",
-    fn search(ctx: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8) anyerror!?WishHubMatch {
+    fn search(ctx: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8, _: u32) anyerror!?WishHubMatch {
         _ = query;
         const self: *FakeHubFixed = @ptrCast(@alignCast(ctx.?));
         return WishHubMatch{
@@ -6847,7 +6885,7 @@ const FakeHubFixed = struct {
     }
 };
 
-fn fakeHubNull(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?WishHubMatch {
+fn fakeHubNull(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8, _: u32) anyerror!?WishHubMatch {
     return null;
 }
 
@@ -6857,7 +6895,7 @@ fn fakeHubNull(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?Wi
 const FakeHubSlow = struct {
     calls: usize = 0,
     sleep_ns: u64 = 0,
-    fn search(ctx: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8) anyerror!?WishHubMatch {
+    fn search(ctx: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8, _: u32) anyerror!?WishHubMatch {
         _ = allocator;
         _ = query;
         const self: *FakeHubSlow = @ptrCast(@alignCast(ctx.?));
@@ -6867,13 +6905,31 @@ const FakeHubSlow = struct {
     }
 };
 
-fn fakeHubError(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?WishHubMatch {
+fn fakeHubError(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8, _: u32) anyerror!?WishHubMatch {
     return error.HubUnreachable;
 }
 
+// Recording searcher for the remaining-budget tests (round 2 Finding 4):
+// records the timeout grant each call received and sleeps to consume real
+// budget between calls.
+const FakeHubRecorder = struct {
+    timeouts: [8]u32 = @splat(0),
+    calls: usize = 0,
+    sleep_ns: u64 = 0,
+    fn search(ctx: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8, timeout_ms: u32) anyerror!?WishHubMatch {
+        _ = allocator;
+        _ = query;
+        const self: *FakeHubRecorder = @ptrCast(@alignCast(ctx.?));
+        if (self.calls < self.timeouts.len) self.timeouts[self.calls] = timeout_ms;
+        self.calls += 1;
+        std.Thread.sleep(self.sleep_ns);
+        return null;
+    }
+};
+
 const FakeHubCounter = struct {
     calls: usize = 0,
-    fn search(ctx: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8) anyerror!?WishHubMatch {
+    fn search(ctx: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8, _: u32) anyerror!?WishHubMatch {
         _ = allocator;
         _ = query;
         const self: *FakeHubCounter = @ptrCast(@alignCast(ctx.?));
@@ -6885,7 +6941,7 @@ const FakeHubCounter = struct {
 const FakeHubCapture = struct {
     buf: [256]u8 = undefined,
     len: usize = 0,
-    fn search(ctx: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8) anyerror!?WishHubMatch {
+    fn search(ctx: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8, _: u32) anyerror!?WishHubMatch {
         _ = allocator;
         const self: *FakeHubCapture = @ptrCast(@alignCast(ctx.?));
         const n = @min(query.len, self.buf.len);
@@ -7140,7 +7196,93 @@ test "deriveWishQuery: caps length and reduces to salient tokens (bounded leak s
     try std.testing.expectEqualStrings("", q3);
 }
 
-test "/learn list: single total deadline stops querying remaining wishes once blown" {
+// ── Wish-matchmaking round 2, Finding 3: non-Latin wishes ───────────────────
+// The tokenizer recognized only ASCII alphanumerics, so a wish written
+// entirely in Arabic/Cyrillic/CJK derived an EMPTY query and silently skipped
+// the Hub call even with matchmaking enabled — and the relevance gate was
+// blind the same way. Word bytes now include any byte >= 0x80 (the M3
+// salientPatternToken approach, memory/root.zig): UTF-8 scripts tokenize as
+// whole words.
+
+test "deriveWishQuery: Arabic wish yields a non-empty, bounded, valid-UTF-8 query" {
+    const allocator = std.testing.allocator;
+
+    const q = try deriveWishQuery(allocator, "أرسل فاكس إلى العميل");
+    defer allocator.free(q);
+    // Non-empty: the Arabic tokens survive tokenization…
+    try std.testing.expect(q.len > 0);
+    // …bounded by the same hard cap…
+    try std.testing.expect(q.len <= WISH_QUERY_MAX_BYTES);
+    // …and never mangled: what rides the request URL is valid UTF-8.
+    try std.testing.expect(std.unicode.utf8ValidateSlice(q));
+    // No English stopwords apply; ASCII-lowercasing is identity on >=0x80
+    // bytes — the salient tokens come through whole.
+    try std.testing.expectEqualStrings("أرسل فاكس إلى العميل", q);
+}
+
+test "deriveWishQuery: token longer than the cap is skipped whole — never split mid-codepoint" {
+    const allocator = std.testing.allocator;
+
+    // A single 66-byte Arabic run (33 two-byte codepoints) exceeds the
+    // 64-byte query cap: it can never fit on a token boundary, so it must be
+    // skipped WHOLE — truncating it would split a codepoint mid-sequence.
+    const long_run = "ب" ** 33;
+    const q = try deriveWishQuery(allocator, long_run ++ " فاكس");
+    defer allocator.free(q);
+    try std.testing.expectEqualStrings("فاكس", q);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(q));
+}
+
+test "wishMatchHasOverlap: relevance gate sees non-Latin tokens (4-byte floor unchanged)" {
+    // A 2-char Arabic word is 4 bytes — exactly at WISH_OVERLAP_MIN_TOKEN_LEN,
+    // so short non-Latin capability words still carry a relevance signal.
+    try std.testing.expect(wishMatchHasOverlap("لو", "acme/لو-tool", "some helper"));
+    // A 1-char Arabic word (2 bytes) stays below the floor — no signal.
+    try std.testing.expect(!wishMatchHasOverlap("م", "acme/م-tool", "some helper"));
+    // Description-side overlap works for non-Latin tokens too.
+    try std.testing.expect(wishMatchHasOverlap("فاكس", "acme/faxer", "يرسل فاكس عبر البريد"));
+}
+
+test "/learn list: Arabic wish matches an Arabic-named skill (UTF-8 end-to-end)" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // "Send a fax to the client" — entirely Arabic; pre-fix this derived an
+    // empty query and the Hub was never consulted.
+    try mem.store("wish/fax-ar", "أرسل فاكس إلى العميل", .core, null);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_hub = FakeHubFixed{ .org_skill = "acme/فاكس-sender", .description = "إرسال فاكس" };
+    var fake_self = FakeLearnListSelf{
+        .allocator = allocator,
+        .mem_rt = &rt,
+        .wish_matchmaking_enabled = true, // explicit operator opt-in
+        .wish_hub_searcher = .{ .ctx = &fake_hub, .search = FakeHubFixed.search },
+    };
+
+    const out = try handleLearnCommand(&fake_self, "list");
+    defer allocator.free(out);
+
+    // The shared token "فاكس" (8 bytes ≥ 4) is a real relevance signal → the
+    // install affordance renders.
+    try std.testing.expect(std.mem.indexOf(u8, out, "wish/fax-ar") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "    \u{21B3} possible skill: acme/فاكس-sender — install with skill_registry action=\"install\" skill_ref=\"acme/فاكس-sender\"",
+    ) != null);
+}
+
+// Round 2 Finding 4 — the "≤3s total budget" must be a REAL deadline, not an
+// initiation gate: pre-fix, every call was granted a fresh full
+// WISH_HUB_TIMEOUT_MS, so a query started at 2.9s could still run 3s more
+// (worst wall-clock ≈ 2× budget). Now each call receives min(per-call
+// ceiling, REMAINING budget), and when the remainder is below curl's 1s
+// --max-time floor (http_util.request_with_mode clamps up to 1s) the call is
+// skipped outright.
+test "/learn list: total budget below the curl floor makes NO Hub call at all (fail-soft)" {
     const allocator = std.testing.allocator;
     var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
     defer sqlite_mem.deinit();
@@ -7155,8 +7297,8 @@ test "/learn list: single total deadline stops querying remaining wishes once bl
     try mem.store("wish/w4", "schedule nightly reports", .core, null);
 
     var rt = makeTestMemoryRuntime(allocator, mem);
-    // First call sleeps 20ms; injected total budget is 1ms — so after the first
-    // (slow) query the deadline is already blown and the rest are skipped.
+    // Injected total budget 1ms — below the 1s curl floor from the very first
+    // wish, so granting ANY call would overshoot the deadline by ~1000×.
     var slow = FakeHubSlow{ .sleep_ns = 20 * std.time.ns_per_ms };
     var fake_self = FakeLearnListSelf{
         .allocator = allocator,
@@ -7169,10 +7311,51 @@ test "/learn list: single total deadline stops querying remaining wishes once bl
     const out = try handleLearnCommand(&fake_self, "list");
     defer allocator.free(out);
 
-    // Exactly one Hub query happened; the budget blew before the 2nd wish.
-    try std.testing.expectEqual(@as(usize, 1), slow.calls);
+    // ZERO Hub queries: remaining (≈1ms) < the 1s floor ⇒ skip, never call.
+    try std.testing.expectEqual(@as(usize, 0), slow.calls);
     // Fail-soft: all five wishes still render, no error text, no affordance.
     try std.testing.expect(std.mem.indexOf(u8, out, "Wishes (capability requests) (5)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "↳") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "error") == null);
+}
+
+test "/learn list: a late Hub call gets only the REMAINING budget, then the deadline stops the rest" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("wish/w0", "provision database backups", .core, null);
+    try mem.store("wish/w1", "configure firewall rules", .core, null);
+    try mem.store("wish/w2", "rotate signing certificates", .core, null);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    // Total budget 1400ms; each call sleeps 450ms.
+    //   Call 1: remaining ≈1400ms ≥ the 1s floor → runs, granted ≤1400ms —
+    //           crucially NOT a fresh full WISH_HUB_TIMEOUT_MS (3000ms).
+    //   Call 2: elapsed ≥450ms ⇒ remaining ≤950ms < the 1s curl floor →
+    //           skipped entirely (granting it would overshoot the deadline).
+    // Hard wall-clock ≈ budget + ≤1s instead of budget + a full fresh 3s.
+    var rec = FakeHubRecorder{ .sleep_ns = 450 * std.time.ns_per_ms };
+    var fake_self = FakeLearnListSelf{
+        .allocator = allocator,
+        .mem_rt = &rt,
+        .wish_matchmaking_enabled = true,
+        .wish_hub_total_budget_ns = 1400 * std.time.ns_per_ms,
+        .wish_hub_searcher = .{ .ctx = &rec, .search = FakeHubRecorder.search },
+    };
+
+    const out = try handleLearnCommand(&fake_self, "list");
+    defer allocator.free(out);
+
+    // Exactly one call ran; the second was below the floor and skipped.
+    try std.testing.expectEqual(@as(usize, 1), rec.calls);
+    // The one granted timeout is the remaining budget (≤1400ms), never the
+    // fresh full per-call constant.
+    try std.testing.expect(rec.timeouts[0] <= 1400);
+    try std.testing.expect(rec.timeouts[0] >= 1000); // it ran ⇒ at/above the floor
+    // Fail-soft rendering as ever: wishes render, no error text, no affordance.
+    try std.testing.expect(std.mem.indexOf(u8, out, "Wishes (capability requests) (3)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "↳") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "error") == null);
 }
