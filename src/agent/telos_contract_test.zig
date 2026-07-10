@@ -31,6 +31,19 @@ test "namespace: durable_fact/telos/* is a durable-fact key" {
     try std.testing.expect(!memory_loader.isDurableFactKey("telos/goal/42"));
 }
 
+// ── T2b — telos rows are protected from the content_hash dedup cascade.
+// `isTelosKey` is the protected-key hook; `phase05BackfillExactDedup` skips telos
+// losers so a byte-identical raw duplicate cannot supersede a curated telos row
+// (docs/telos-contract.md). Behavioral proof (dedup + real DB) lives in
+// zaki_state.zig; here we pin the predicate the cascade consults. ──
+test "T2b: isTelosKey recognizes the telos namespace, rejects others" {
+    try std.testing.expect(memory_root.isTelosKey("durable_fact/telos/goal/0"));
+    try std.testing.expect(memory_root.isTelosKey("durable_fact/telos/mission/0"));
+    try std.testing.expect(!memory_root.isTelosKey("durable_fact/other_fact"));
+    try std.testing.expect(!memory_root.isTelosKey("durable_fact/telosX/0"));
+    try std.testing.expect(!memory_root.isTelosKey("telos/goal/0"));
+}
+
 // ── Invariants filled by later Slice-1 tasks. Kept as a visible checklist so a
 // half-built slice still reads as "these are the guarantees, here is who owns
 // each": ──
@@ -38,8 +51,9 @@ test "namespace: durable_fact/telos/* is a durable-fact key" {
 //                     rows; a filed telos referent is not also injected raw.
 //   T2  [task 6]    — filing supersedes: `resolveContradiction` sets valid_to on
 //                     the source row → excluded by `MEMORIES_VALIDITY_FILTER`.
-//   T2b [task 4]    — the M3 archive/forget cascade must NOT close a telos row via
-//                     a byte-identical raw duplicate; only explicit telos-key curation.
+//   T2b [task 4 ✓]  — a curated telos row is closed only by explicit curation of its
+//                     own key, never as a content_hash-dedup loser (isTelosKey +
+//                     phase05BackfillExactDedup). archive/forget are key-scoped (safe).
 //   T3  [task 6]    — precedence telos > raw > WM, enforced at file-time by T2.
 //   T4  [Slice 2]   — human authorship: rows enter via `wish/telos/*` proposals,
 //                     approved through `execution_mode`; the loop never auto-files.

@@ -9024,6 +9024,12 @@ const ManagerImpl = struct {
 
             // keys[0] is the oldest → canonical keeper. Supersede the rest.
             for (keys.items[1..]) |loser_key| {
+                // T2b (docs/telos-contract.md) — a curated telos row is closed
+                // ONLY by explicit curation of its own key, never as a
+                // content_hash-cascade loser. Without this, a byte-identical raw
+                // duplicate (older → keeper) would silently supersede the telos
+                // twin. Skip before counting so it is not reported as collapsed.
+                if (memory_root.isTelosKey(loser_key)) continue;
                 report.exact_dups_collapsed += 1;
                 if (dry_run) continue;
                 // Reuse the bitemporal close-out path (sets valid_to/invalid_at/
@@ -17096,6 +17102,36 @@ test "C0 phase05Backfill: live re-type + idempotent second run" {
     const pref_t2 = try c0ReadMemoryType(allocator, &mgr, 2, "c0_pref");
     defer allocator.free(pref_t2);
     try std.testing.expectEqualStrings("preference", pref_t2);
+}
+
+test "T2b: telos row survives content_hash dedup vs a byte-identical raw dup" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-t2b/workspace");
+
+    // A raw duplicate and a curated telos row with byte-identical content →
+    // identical content_hash. The raw row is inserted first (older) AND sorts
+    // first by key, so it is the dedup keeper and the telos row is the "loser" —
+    // exactly the shape T2b must protect against.
+    const dup_content = "Ship v1 by Q3";
+    try mgr.upsertMemoryWithMetadata(2, "durable_fact/aaa_raw_dup", dup_content, .core, "sess-t2b", "{}");
+    try mgr.upsertMemoryWithMetadata(2, "durable_fact/telos/goal/x", dup_content, .core, "sess-t2b", "{}");
+
+    const r = try mgr.phase05Backfill(allocator, 2, false);
+    // The telos loser is SKIPPED, not collapsed (isTelosKey guard).
+    try std.testing.expectEqual(@as(usize, 0), r.exact_dups_collapsed);
+
+    // The curated telos row is still live — never superseded by a stray dup.
+    const telos = try mgr.getMemory(allocator, 2, "durable_fact/telos/goal/x");
+    try std.testing.expect(telos != null);
+    if (telos) |m| m.deinit(allocator);
+
+    // The raw keeper is untouched too — both remain live.
+    const raw = try mgr.getMemory(allocator, 2, "durable_fact/aaa_raw_dup");
+    try std.testing.expect(raw != null);
+    if (raw) |m| m.deinit(allocator);
 }
 
 test "C0 phase05Backfill: exact content_hash dedup supersedes (never hard-deletes), idempotent" {
