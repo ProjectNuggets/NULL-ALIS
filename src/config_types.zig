@@ -594,6 +594,26 @@ pub const AgentConfig = struct {
     /// `dream_log_warmstart_enabled`) of flag-gated features degrading
     /// to their exact pre-feature behavior when off.
     trace_mining_enabled: bool = true,
+    /// Package 2b (privacy fix) — wish→Decision-Hub matchmaking gate.
+    ///
+    /// When FALSE (DEFAULT — opt-in), `/learn list` performs NO Hub call for
+    /// its Wishes section: the affordance code path is fully skipped and the
+    /// section renders BYTE-IDENTICAL to the pre-matchmaking version. This is
+    /// the primary privacy control — a wish's CONTENT (which can carry names,
+    /// medical context, internal project detail) never leaves the tenant
+    /// without explicit operator opt-in.
+    ///
+    /// When TRUE, `/learn list` live-queries the Hub for the first few wishes
+    /// under a single bounded deadline, fail-soft, using a BOUNDED,
+    /// keyword-reduced query (never the raw wish) and a relevance gate (token
+    /// overlap required) before showing an install affordance. Residual: even
+    /// bounded, that query rides the request URL to hub.decision.ai — the
+    /// documented tradeoff of opting in.
+    ///
+    /// Threaded to per-session Agent via the same 6-hop plumbing as
+    /// `trace_mining_enabled` (config_types → config_parse → SessionManager
+    /// buildSessionAgent → gateway assignment → Agent field → commands.zig).
+    wish_matchmaking_enabled: bool = false,
     // V1.14.12 (Path A) — extraction_legacy_direct_writes FIELD REMOVED.
     // M5 sprint flag-gated two redundant direct write paths during a
     // soak window. Path A closes the M5 sprint by:
