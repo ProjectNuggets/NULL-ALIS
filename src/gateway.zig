@@ -2132,6 +2132,9 @@ const TenantRuntime = struct {
         // unconditionally, same plumbing pattern as cost_vital_in_prompt
         // above.
         runtime.session_mgr.trace_mining_enabled = runtime.config.agent.trace_mining_enabled;
+        // Package 2b (privacy fix) — wire the wish→Hub matchmaking gate
+        // unconditionally, same plumbing pattern.
+        runtime.session_mgr.wish_matchmaking_enabled = runtime.config.agent.wish_matchmaking_enabled;
 
         // Wire sidecar provider from bundle to session manager
         if (runtime.provider_bundle.sidecarProvider()) |sp| {
@@ -25324,6 +25327,11 @@ pub fn runWithRole(
                 // standalone/local-agent path also gates insights
                 // consultation per config.
                 sm.trace_mining_enabled = cfg.agent.trace_mining_enabled;
+                // Package 2b (privacy fix) — mirror the tenant-runtime wiring:
+                // wish_matchmaking_enabled travels the same way so the
+                // standalone/local-agent path also keeps `/learn list`
+                // matchmaking opt-in per config.
+                sm.wish_matchmaking_enabled = cfg.agent.wish_matchmaking_enabled;
                 if (mem_rt) |*rt| {
                     sm.mem_rt = rt;
                     tools_mod.bindMemoryRuntime(tools_slice, rt);
@@ -28784,6 +28792,7 @@ test "handleApiChatStreamSseConnection tenant path flushes run trace once after 
             runtime.session_mgr.cost_vital_in_prompt = runtime.config.agent.cost_vital_in_prompt;
             runtime.session_mgr.dream_log_warmstart_enabled = runtime.config.agent.dream_log_warmstart_enabled;
             runtime.session_mgr.trace_mining_enabled = runtime.config.agent.trace_mining_enabled;
+            runtime.session_mgr.wish_matchmaking_enabled = runtime.config.agent.wish_matchmaking_enabled;
 
             return runtime;
         }

@@ -163,11 +163,24 @@ const WISH_HUB_QUERY_CAP: usize = 5;
 /// Bounded, short per-wish Hub timeout. The catalog endpoint answers in ~0.8s;
 /// this ceiling keeps a slow/unreachable Hub from stalling the list render.
 const WISH_HUB_TIMEOUT_MS: u32 = 3000;
+/// Single TOTAL deadline across ALL wish→Hub queries in one `/learn list`
+/// render (latency fix): replaces the old 5×3s serial worst case (~15s) with
+/// ONE overall budget. Once exceeded, remaining wishes are not queried —
+/// fail-soft, no annotation, no error text. `WISH_HUB_TIMEOUT_MS` still bounds
+/// each individual query.
+const WISH_HUB_TOTAL_BUDGET_NS: u64 = 3 * std.time.ns_per_s;
+/// Hard cap on the derived, keyword-reduced query the Hub ever sees. Even under
+/// the opt-in gate we never ship the raw full wish: the query is bounded to
+/// this many bytes and stripped to salient tokens (see `deriveWishQuery`).
+const WISH_QUERY_MAX_BYTES: usize = 64;
 
-/// A top-1 Hub match for one wish. `name` ("org_slug/skill_name") is
-/// allocator-owned; the render loop frees it after emitting the affordance.
+/// A top-1 Hub match for one wish. Both fields are allocator-owned; the render
+/// loop frees them after the relevance check. `name` ("org_slug/skill_name")
+/// is what an install references; `description` is carried solely so the
+/// relevance gate can look for token overlap against it.
 pub const WishHubMatch = struct {
     name: []const u8,
+    description: []const u8,
 };
 
 /// Injectable Hub searcher. `search` returns a top-1 match, `null` for "Hub had
@@ -184,7 +197,9 @@ fn defaultWishHubSearch(_: ?*anyopaque, allocator: std.mem.Allocator, query: []c
     defer skills_mod.freeDecisionHubSearchResults(allocator, hits);
     if (hits.len == 0) return null;
     const name = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ hits[0].org_slug, hits[0].skill_name });
-    return WishHubMatch{ .name = name };
+    errdefer allocator.free(name);
+    const description = try allocator.dupe(u8, hits[0].description);
+    return WishHubMatch{ .name = name, .description = description };
 }
 
 /// Resolve the Hub searcher: a test-injected one if `self` carries the seam,
@@ -196,16 +211,142 @@ fn wishHubSearcher(self: anytype) WishHubSearcher {
     return .{ .ctx = null, .search = defaultWishHubSearch };
 }
 
-/// Derive a search query from a wish's CONTENT (the human capability-need text).
-/// The `wish/` prefix lives on the KEY, never the content, so nothing to strip
-/// there; we do drop the trailing `evidence_run_id=<id>` machine marker so the
-/// query is natural language, not bookkeeping.
-fn deriveWishQuery(content: []const u8) []const u8 {
+/// Privacy gate (Package 2b review): wish→Hub matchmaking is OPT-IN. Resolve
+/// the operator flag from `self` if present, defaulting FALSE (no Hub call, no
+/// wish content leaves the tenant) when the field is absent. Same `@hasField`
+/// seam as `wishHubSearcher`.
+fn wishMatchmakingEnabled(self: anytype) bool {
+    if (@hasField(@TypeOf(self.*), "wish_matchmaking_enabled")) {
+        return self.wish_matchmaking_enabled;
+    }
+    return false;
+}
+
+/// Resolve the single total wish-query deadline: a test-injected override if
+/// `self` carries one, otherwise the production `WISH_HUB_TOTAL_BUDGET_NS`.
+fn wishHubTotalBudgetNs(self: anytype) u64 {
+    if (@hasField(@TypeOf(self.*), "wish_hub_total_budget_ns")) {
+        if (self.wish_hub_total_budget_ns) |ns| return ns;
+    }
+    return WISH_HUB_TOTAL_BUDGET_NS;
+}
+
+/// Minimal alphanumeric tokenizer: yields maximal runs of ASCII-alphanumeric
+/// bytes, treating every other byte (whitespace, punctuation, `/`, `-`) as a
+/// delimiter. Shared by query derivation and the relevance gate so both sides
+/// tokenize identically.
+const AlnumTokenizer = struct {
+    s: []const u8,
+    i: usize = 0,
+    fn next(self: *AlnumTokenizer) ?[]const u8 {
+        while (self.i < self.s.len and !std.ascii.isAlphanumeric(self.s[self.i])) : (self.i += 1) {}
+        if (self.i >= self.s.len) return null;
+        const start = self.i;
+        while (self.i < self.s.len and std.ascii.isAlphanumeric(self.s[self.i])) : (self.i += 1) {}
+        return self.s[start..self.i];
+    }
+};
+
+/// Common English function words dropped from a derived wish query: keep the
+/// CAPABILITY nouns/verbs (send, fax, multipart, timeout) and shed request
+/// boilerplate ("I need to be able to …") so both the leaked surface and the
+/// relevance signal are the salient tokens only.
+const WISH_STOPWORDS = [_][]const u8{
+    // Two-letter function words (kept explicit so real 2-char capability
+    // tokens like "s3"/"ci"/"db" survive).
+    "to",     "be",     "of",     "in",     "on",    "at",     "is",   "it",
+    "as",     "by",     "or",     "an",     "we",    "my",     "so",   "do",
+    "if",     "no",     "me",     "us",     "am",    "up",
+    // Longer function / request-boilerplate words.
+        "the",  "and",
+    "for",    "with",   "that",   "this",   "you",   "your",   "our",  "from",
+    "need",   "needed", "needs",  "want",   "wants", "wanted", "able", "can",
+    "could",  "would",  "should", "please", "some",  "any",    "all",  "when",
+    "will",   "have",   "has",    "had",    "not",   "but",    "are",  "was",
+    "were",   "been",   "being",  "into",   "onto",  "out",    "over", "just",
+    "really", "very",   "more",   "most",   "them",  "they",   "than", "then",
+    "there",  "here",   "what",   "which",  "who",   "how",    "get",  "got",
+    "let",    "make",   "made",   "use",    "used",  "via",    "per",
+};
+
+fn isWishStopword(lower_tok: []const u8) bool {
+    for (WISH_STOPWORDS) |sw| {
+        if (std.mem.eql(u8, lower_tok, sw)) return true;
+    }
+    return false;
+}
+
+/// Derive a BOUNDED, keyword-reduced search query from a wish's CONTENT.
+///
+/// Privacy fix (Package 2b review): the naive version returned the FULL wish
+/// content (minus the `evidence_run_id` marker), which then rode the request
+/// URL to the external Hub as a GET param. Even behind the opt-in gate we never
+/// ship the raw wish: this drops the `evidence_run_id` bookkeeping suffix,
+/// tokenizes, lowercases, sheds stopwords/punctuation, and joins the salient
+/// tokens with single spaces — hard-capped at `WISH_QUERY_MAX_BYTES`, truncated
+/// on a token boundary. Caller owns the returned slice.
+///
+/// Residual (the opt-in tradeoff): when matchmaking is enabled, this bounded
+/// query still leaves the tenant on the request URL. That is the documented
+/// cost of opting in; the DEFAULT-FALSE gate is the real privacy control.
+fn deriveWishQuery(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
     var q = std.mem.trim(u8, content, " \t\r\n");
     if (std.mem.indexOf(u8, q, "evidence_run_id=")) |i| {
-        q = std.mem.trimRight(u8, q[0..i], " \t\r\n.;,");
+        q = q[0..i];
     }
-    return q;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var it = AlnumTokenizer{ .s = q };
+    while (it.next()) |raw| {
+        var lower_buf: [WISH_QUERY_MAX_BYTES]u8 = undefined;
+        const n = @min(raw.len, lower_buf.len);
+        for (raw[0..n], 0..) |c, k| lower_buf[k] = std.ascii.toLower(c);
+        const tok = lower_buf[0..n];
+        if (tok.len < 2) continue; // shed single-char noise
+        if (isWishStopword(tok)) continue;
+        const sep: usize = if (out.items.len == 0) 0 else 1;
+        // Hard cap: stop on the token boundary that would overflow the budget.
+        if (out.items.len + sep + tok.len > WISH_QUERY_MAX_BYTES) break;
+        if (sep == 1) try out.append(allocator, ' ');
+        try out.appendSlice(allocator, tok);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// Relevance gate (Package 2b review): the Hub returns no score, so before
+/// surfacing an install affordance we require a real signal — at least one
+/// meaningful token (length ≥ `WISH_OVERLAP_MIN_TOKEN_LEN`, case-insensitive)
+/// shared between the derived query and the candidate's skill_name +
+/// description. No overlap ⇒ no affordance (kills "Zoom for a fax wish").
+const WISH_OVERLAP_MIN_TOKEN_LEN: usize = 4;
+
+fn candidateContainsToken(haystack: []const u8, lower_token: []const u8) bool {
+    var it = AlnumTokenizer{ .s = haystack };
+    while (it.next()) |raw| {
+        if (raw.len != lower_token.len) continue;
+        var same = true;
+        for (raw, lower_token) |c, lc| {
+            if (std.ascii.toLower(c) != lc) {
+                same = false;
+                break;
+            }
+        }
+        if (same) return true;
+    }
+    return false;
+}
+
+fn wishMatchHasOverlap(query: []const u8, name: []const u8, description: []const u8) bool {
+    // `query` is already lowercased salient tokens joined by single spaces.
+    var qit = std.mem.tokenizeScalar(u8, query, ' ');
+    while (qit.next()) |qtok| {
+        if (qtok.len < WISH_OVERLAP_MIN_TOKEN_LEN) continue;
+        if (candidateContainsToken(name, qtok) or candidateContainsToken(description, qtok)) return true;
+    }
+    return false;
 }
 
 /// V1.6 cmt9.5 — derive a hash-stable entity key from an `object` string,
@@ -5186,11 +5327,20 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
                 try w.writeAll("\n");
             }
             try w.print("Wishes (capability requests) ({d}):\n", .{wish_count});
-            // Package 2b: render-time matchmaking. For the first WISH_HUB_QUERY_CAP
-            // wishes, live-query the Decision Hub (bounded, fail-soft) and, on a
-            // hit, emit an install affordance under the wish. Any Hub error/timeout
-            // or no-match renders exactly as before (no annotation, no error text).
+            // Package 2b: render-time wish→Hub matchmaking. OPT-IN (privacy
+            // fix): the whole apparatus is skipped unless the operator enabled
+            // `wish_matchmaking_enabled`. When OFF, the Wishes section renders
+            // byte-identical to the pre-matchmaking version and NO wish content
+            // leaves the tenant. When ON, we live-query the Decision Hub for the
+            // first WISH_HUB_QUERY_CAP wishes under ONE total deadline (bounded,
+            // fail-soft) with a bounded/keyword-reduced query, and only emit an
+            // install affordance when a relevance signal (token overlap) exists.
+            const matchmaking = wishMatchmakingEnabled(self);
             const searcher = wishHubSearcher(self);
+            const total_budget_ns = wishHubTotalBudgetNs(self);
+            // Single total deadline across ALL wish queries in this render.
+            var budget_timer: ?std.time.Timer =
+                if (matchmaking) (std.time.Timer.start() catch null) else null;
             var idx: usize = 0;
             for (entries) |e| {
                 if (!std.mem.startsWith(u8, e.key, "wish/")) continue;
@@ -5199,21 +5349,30 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
                 const preview_len = @min(@as(usize, 200), e.content.len);
                 try w.print("  {d}. {s}\n     key: {s}\n", .{ idx, e.content[0..preview_len], e.key });
 
-                if (idx <= WISH_HUB_QUERY_CAP) {
-                    const query = deriveWishQuery(e.content);
-                    if (query.len > 0) {
-                        if (searcher.search(searcher.ctx, self.allocator, query)) |maybe_match| {
-                            if (maybe_match) |match| {
-                                defer self.allocator.free(match.name);
-                                try w.print(
-                                    "    \u{21B3} possible skill: {s} — install with skill_registry action=\"install\" skill_ref=\"{s}\"\n",
-                                    .{ match.name, match.name },
-                                );
-                            }
-                        } else |_| {
-                            // Fail-soft: Hub unreachable/timeout ⇒ no annotation.
+                if (!matchmaking or idx > WISH_HUB_QUERY_CAP) continue;
+                // Total-deadline check BEFORE spending another query: once the
+                // overall budget is blown, stop querying the remaining wishes.
+                const over_budget = if (budget_timer) |*t| (t.read() >= total_budget_ns) else false;
+                if (over_budget) continue;
+
+                const query = try deriveWishQuery(self.allocator, e.content);
+                defer self.allocator.free(query);
+                if (query.len == 0) continue;
+
+                if (searcher.search(searcher.ctx, self.allocator, query)) |maybe_match| {
+                    if (maybe_match) |match| {
+                        defer self.allocator.free(match.name);
+                        defer self.allocator.free(match.description);
+                        // Relevance gate: no token overlap ⇒ no affordance.
+                        if (wishMatchHasOverlap(query, match.name, match.description)) {
+                            try w.print(
+                                "    \u{21B3} possible skill: {s} — install with skill_registry action=\"install\" skill_ref=\"{s}\"\n",
+                                .{ match.name, match.name },
+                            );
                         }
                     }
+                } else |_| {
+                    // Fail-soft: Hub unreachable/timeout ⇒ no annotation.
                 }
             }
         }
@@ -6107,6 +6266,14 @@ const FakeLearnListSelf = struct {
     // Package 2b: inject a fake Hub searcher so /learn list matchmaking tests
     // never touch the network.
     wish_hub_searcher: ?WishHubSearcher = null,
+    // Privacy fix (Package 2b review): wish→Hub matchmaking is opt-in. Mirrors
+    // the real Agent.wish_matchmaking_enabled gate; default FALSE so any test
+    // that does NOT explicitly opt in exercises the private (no-Hub) path.
+    wish_matchmaking_enabled: bool = false,
+    // Test-only override for the single total deadline across all wish queries.
+    // null ⇒ production default (WISH_HUB_TOTAL_BUDGET_NS). Tests set a tiny
+    // budget so the deadline path is exercised without a multi-second sleep.
+    wish_hub_total_budget_ns: ?u64 = null,
 };
 
 fn makeTestMemoryRuntime(allocator: std.mem.Allocator, mem: memory_mod.Memory) memory_mod.MemoryRuntime {
@@ -6669,16 +6836,36 @@ test "/learn list: renders Wishes section when capability requests exist" {
 
 const FakeHubFixed = struct {
     org_skill: []const u8,
+    description: []const u8 = "",
     fn search(ctx: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8) anyerror!?WishHubMatch {
         _ = query;
         const self: *FakeHubFixed = @ptrCast(@alignCast(ctx.?));
-        return WishHubMatch{ .name = try allocator.dupe(u8, self.org_skill) };
+        return WishHubMatch{
+            .name = try allocator.dupe(u8, self.org_skill),
+            .description = try allocator.dupe(u8, self.description),
+        };
     }
 };
 
 fn fakeHubNull(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?WishHubMatch {
     return null;
 }
+
+// Slow searcher for the single-total-deadline test: counts calls and sleeps
+// long enough (relative to the test's tiny injected budget) that the FIRST
+// call blows the budget, so subsequent wishes must not be queried.
+const FakeHubSlow = struct {
+    calls: usize = 0,
+    sleep_ns: u64 = 0,
+    fn search(ctx: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8) anyerror!?WishHubMatch {
+        _ = allocator;
+        _ = query;
+        const self: *FakeHubSlow = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        std.Thread.sleep(self.sleep_ns);
+        return null;
+    }
+};
 
 fn fakeHubError(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?WishHubMatch {
     return error.HubUnreachable;
@@ -6711,32 +6898,68 @@ const FakeHubCapture = struct {
     }
 };
 
-test "/learn list: annotates a wish with a Decision Hub match (install affordance)" {
+test "/learn list: gate ON + relevant hit (token overlap) emits the install affordance" {
     const allocator = std.testing.allocator;
     var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
     defer sqlite_mem.deinit();
     const mem = sqlite_mem.memory();
 
-    try mem.store("wish/fax-support", "Needed: send a fax. evidence_run_id=r-1", .core, null);
+    // Query derives to {support, multipart, form, uploads}; the candidate
+    // shares "multipart" (len 9 ≥ 4) → real relevance signal.
+    try mem.store("wish/uploads", "Support multipart form uploads. evidence_run_id=r-1", .core, null);
 
     var rt = makeTestMemoryRuntime(allocator, mem);
-    var fake_hub = FakeHubFixed{ .org_skill = "acme/fax-tool" };
+    var fake_hub = FakeHubFixed{ .org_skill = "acme/multipart-helper", .description = "Streams multipart form-data uploads" };
     var fake_self = FakeLearnListSelf{
         .allocator = allocator,
         .mem_rt = &rt,
+        .wish_matchmaking_enabled = true, // explicit operator opt-in
         .wish_hub_searcher = .{ .ctx = &fake_hub, .search = FakeHubFixed.search },
     };
 
     const out = try handleLearnCommand(&fake_self, "list");
     defer allocator.free(out);
 
-    // The wish still renders, plus a matchmaking affordance line beneath it.
-    try std.testing.expect(std.mem.indexOf(u8, out, "wish/fax-support") != null);
+    // The wish still renders, plus a matchmaking affordance line (skill_ref
+    // form, unchanged) beneath it.
+    try std.testing.expect(std.mem.indexOf(u8, out, "wish/uploads") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         out,
-        "    ↳ possible skill: acme/fax-tool — install with skill_registry action=\"install\" skill_ref=\"acme/fax-tool\"",
+        "    ↳ possible skill: acme/multipart-helper — install with skill_registry action=\"install\" skill_ref=\"acme/multipart-helper\"",
     ) != null);
+}
+
+test "/learn list: gate ON + irrelevant hit (no token overlap) emits NO affordance" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // The classic false positive: a fax wish, a Zoom hit. Query derives to
+    // {send, fax}; candidate "webconf/zoom-meeting" + "Video conferencing"
+    // shares no meaningful token (len ≥ 4) → relevance gate suppresses it.
+    try mem.store("wish/fax", "Needed: send a fax. evidence_run_id=r-1", .core, null);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_hub = FakeHubFixed{ .org_skill = "webconf/zoom-meeting", .description = "Video conferencing and screen sharing" };
+    var fake_self = FakeLearnListSelf{
+        .allocator = allocator,
+        .mem_rt = &rt,
+        .wish_matchmaking_enabled = true,
+        .wish_hub_searcher = .{ .ctx = &fake_hub, .search = FakeHubFixed.search },
+    };
+
+    const out = try handleLearnCommand(&fake_self, "list");
+    defer allocator.free(out);
+
+    // Wish renders, but the irrelevant Zoom match is suppressed — no affordance.
+    try std.testing.expectEqualStrings(
+        "Wishes (capability requests) (1):\n  1. Needed: send a fax. evidence_run_id=r-1\n     key: wish/fax\n",
+        out,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, out, "zoom") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "↳") == null);
 }
 
 test "/learn list: no Hub match leaves wish rendering byte-identical (regression pin)" {
@@ -6751,6 +6974,7 @@ test "/learn list: no Hub match leaves wish rendering byte-identical (regression
     var fake_self = FakeLearnListSelf{
         .allocator = allocator,
         .mem_rt = &rt,
+        .wish_matchmaking_enabled = true,
         .wish_hub_searcher = .{ .ctx = null, .search = fakeHubNull },
     };
 
@@ -6776,6 +7000,7 @@ test "/learn list: Hub error renders identically to no match (fail-soft, no erro
     var fake_self = FakeLearnListSelf{
         .allocator = allocator,
         .mem_rt = &rt,
+        .wish_matchmaking_enabled = true,
         .wish_hub_searcher = .{ .ctx = null, .search = fakeHubError },
     };
 
@@ -6812,6 +7037,7 @@ test "/learn list: Hub matchmaking queries at most 5 wishes (cap)" {
     var fake_self = FakeLearnListSelf{
         .allocator = allocator,
         .mem_rt = &rt,
+        .wish_matchmaking_enabled = true,
         .wish_hub_searcher = .{ .ctx = &counter, .search = FakeHubCounter.search },
     };
 
@@ -6837,15 +7063,118 @@ test "/learn list: Hub query is derived from wish content (evidence marker strip
     var fake_self = FakeLearnListSelf{
         .allocator = allocator,
         .mem_rt = &rt,
+        .wish_matchmaking_enabled = true,
         .wish_hub_searcher = .{ .ctx = &cap, .search = FakeHubCapture.search },
     };
 
     const out = try handleLearnCommand(&fake_self, "list");
     defer allocator.free(out);
 
-    // Query comes from the CONTENT, with the evidence_run_id marker stripped —
-    // never from the key's `wish/` slug.
-    try std.testing.expectEqualStrings("Needed: send a fax", cap.captured());
+    // Query comes from the CONTENT, with the evidence_run_id marker stripped
+    // AND reduced to salient tokens (stopwords/punctuation dropped) — never the
+    // raw full wish, never the key's `wish/` slug.
+    try std.testing.expectEqualStrings("send fax", cap.captured());
+}
+
+// ── Privacy fix (Package 2b review): matchmaking is opt-in ──────────────────
+// HIGH-severity: a formerly local, read-only `/learn list` began exfiltrating
+// full wish CONTENT (names, medical context, internal projects) to the external
+// Hub as a GET query param, with no config gate and no consent. The primary
+// control is a DEFAULT-FALSE gate: when off, `/learn list` makes NO Hub call and
+// renders byte-identical to the pre-matchmaking Wishes section.
+
+test "/learn list: matchmaking gate OFF (default) makes NO Hub call and renders byte-identical" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // Content a naive matchmaker would happily ship to hub.decision.ai.
+    try mem.store("wish/hipaa", "Send patient MRI results to Dr. Alvarez at Mercy General", .core, null);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var counter = FakeHubCounter{};
+    // Note: wish_matchmaking_enabled defaults FALSE — no explicit opt-in here.
+    var fake_self = FakeLearnListSelf{
+        .allocator = allocator,
+        .mem_rt = &rt,
+        .wish_hub_searcher = .{ .ctx = &counter, .search = FakeHubCounter.search },
+    };
+
+    const out = try handleLearnCommand(&fake_self, "list");
+    defer allocator.free(out);
+
+    // The injected searcher must NEVER be invoked when the gate is off — no
+    // wish content leaves the tenant without an explicit operator opt-in.
+    try std.testing.expectEqual(@as(usize, 0), counter.calls);
+    // And the rendering is exactly the pre-matchmaking Wishes section.
+    try std.testing.expectEqualStrings(
+        "Wishes (capability requests) (1):\n  1. Send patient MRI results to Dr. Alvarez at Mercy General\n     key: wish/hipaa\n",
+        out,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, out, "\u{21B3}") == null);
+}
+
+test "deriveWishQuery: caps length and reduces to salient tokens (bounded leak surface)" {
+    const allocator = std.testing.allocator;
+
+    // Stopwords + punctuation dropped, evidence marker stripped, salient
+    // capability tokens kept and lowercased — never the raw full wish.
+    const q1 = try deriveWishQuery(allocator, "I really need to be able to send a fax. evidence_run_id=r-9");
+    defer allocator.free(q1);
+    try std.testing.expectEqualStrings("send fax", q1);
+
+    // Hard 64-byte cap, truncated on a token boundary (never mid-token).
+    const long = "deploy kubernetes cluster autoscaling ingress observability dashboards alerting pipelines provisioning";
+    const q2 = try deriveWishQuery(allocator, long);
+    defer allocator.free(q2);
+    try std.testing.expect(q2.len <= WISH_QUERY_MAX_BYTES);
+    try std.testing.expect(std.mem.startsWith(u8, q2, "deploy kubernetes cluster"));
+    // A boundary truncation means the result never ends with a partial token
+    // nor a trailing separator.
+    try std.testing.expect(q2[q2.len - 1] != ' ');
+
+    // An all-stopword wish reduces to the empty query (⇒ no Hub call upstream).
+    const q3 = try deriveWishQuery(allocator, "I need to be able to");
+    defer allocator.free(q3);
+    try std.testing.expectEqualStrings("", q3);
+}
+
+test "/learn list: single total deadline stops querying remaining wishes once blown" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // Five queryable wishes (all within the cap), each with a distinct salient
+    // token so none derive to an empty query.
+    try mem.store("wish/w0", "provision database backups", .core, null);
+    try mem.store("wish/w1", "configure firewall rules", .core, null);
+    try mem.store("wish/w2", "rotate signing certificates", .core, null);
+    try mem.store("wish/w3", "compress archived logs", .core, null);
+    try mem.store("wish/w4", "schedule nightly reports", .core, null);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    // First call sleeps 20ms; injected total budget is 1ms — so after the first
+    // (slow) query the deadline is already blown and the rest are skipped.
+    var slow = FakeHubSlow{ .sleep_ns = 20 * std.time.ns_per_ms };
+    var fake_self = FakeLearnListSelf{
+        .allocator = allocator,
+        .mem_rt = &rt,
+        .wish_matchmaking_enabled = true,
+        .wish_hub_total_budget_ns = 1 * std.time.ns_per_ms,
+        .wish_hub_searcher = .{ .ctx = &slow, .search = FakeHubSlow.search },
+    };
+
+    const out = try handleLearnCommand(&fake_self, "list");
+    defer allocator.free(out);
+
+    // Exactly one Hub query happened; the budget blew before the 2nd wish.
+    try std.testing.expectEqual(@as(usize, 1), slow.calls);
+    // Fail-soft: all five wishes still render, no error text, no affordance.
+    try std.testing.expect(std.mem.indexOf(u8, out, "Wishes (capability requests) (5)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "↳") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "error") == null);
 }
 
 test "/learn adopt on a legacy fact (no metadata header at all) reports 'already active', never corrupts it" {

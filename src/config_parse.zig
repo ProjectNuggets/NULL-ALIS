@@ -1080,6 +1080,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("trace_mining_enabled")) |v| {
                 if (v == .bool) self.agent.trace_mining_enabled = v.bool;
             }
+            // Package 2b (privacy fix) — wire the wish→Hub matchmaking gate so
+            // operators can opt IN via config.json (default OFF; no wish
+            // content leaves the tenant until enabled).
+            if (ag.object.get("wish_matchmaking_enabled")) |v| {
+                if (v == .bool) self.agent.wish_matchmaking_enabled = v.bool;
+            }
             // C4 (brain-graph activation) — wire the nested [agent.extraction]
             // ExtractionConfig block. Previously this struct had NO parser, so
             // its "flip via TOML" docstring silently no-op'd. The session-end

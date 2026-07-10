@@ -71,6 +71,18 @@ The bucket is decided by these axes — never by content matching:
    blocks (`listRecentToolTracesAllUsers`, `renderFleetJson`) stay
    verified against this invariant, and the endpoint returns
    `renderFleetJson` output verbatim.
+   Wish→Hub matchmaking note (Package 2b): `/learn list` can live-query the
+   external Decision Hub for skills that answer a wish, which puts wish
+   CONTENT (names, medical context, internal projects) on the request URL —
+   a genuine tenant egress. This path is OPERATOR-GATED and OFF by default
+   (`wish_matchmaking_enabled=false`): with the gate off, `/learn list` makes
+   NO Hub call and the Wishes section renders byte-identical to before, so no
+   wish text leaves the tenant without explicit operator opt-in. When enabled,
+   only a BOUNDED, keyword-reduced query (≤64 bytes, stopwords/punctuation
+   stripped — never the raw wish) is sent, and an install affordance is shown
+   only on a real relevance signal (shared token, length ≥ 4). Residual: even
+   the bounded query rides the URL when enabled — the documented cost of opting
+   in; the default-off gate is the control.
 6. **Disclosure without theatre.** The agent may say "I've noticed X fails
    when Y — seen 4 times; adjusting" (citing real evidence) and must not
    claim improvement it cannot cite. Ties to AGENTS.md §14.7: no directive

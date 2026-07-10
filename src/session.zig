@@ -300,6 +300,11 @@ pub const SessionManager = struct {
     /// consultation block. Same INIT-ONLY concurrency contract as the
     /// sibling fields. Default true. See config_types.trace_mining_enabled.
     trace_mining_enabled: bool = true,
+    /// Package 2b (privacy fix) — wish→Hub matchmaking gate, threaded from
+    /// gateway config to per-session Agent → commands.zig's `/learn list`.
+    /// Same INIT-ONLY concurrency contract as the sibling fields. Default
+    /// FALSE (opt-in). See config_types.wish_matchmaking_enabled.
+    wish_matchmaking_enabled: bool = false,
 
     mutex: std.Thread.Mutex,
     sessions: std.StringHashMapUnmanaged(*Session),
@@ -800,6 +805,9 @@ pub const SessionManager = struct {
         // Package 2a Task 4 (review fix) — trace-mining gate, same
         // plumbing pattern.
         agent.trace_mining_enabled = self.trace_mining_enabled;
+        // Package 2b (privacy fix) — wish→Hub matchmaking gate, same
+        // plumbing pattern.
+        agent.wish_matchmaking_enabled = self.wish_matchmaking_enabled;
         return agent;
     }
 

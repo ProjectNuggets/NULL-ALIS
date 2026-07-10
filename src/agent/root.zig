@@ -620,6 +620,13 @@ pub const Agent = struct {
     /// concurrency contract as the sibling flags. Default true. See
     /// config_types.trace_mining_enabled.
     trace_mining_enabled: bool = true,
+    /// Package 2b (privacy fix) — wish→Hub matchmaking gate, threaded from
+    /// gateway config to per-session Agent, read directly by commands.zig's
+    /// `/learn list` (`wishMatchmakingEnabled`). When FALSE (DEFAULT — opt-in),
+    /// `/learn list` makes NO Hub call and no wish content leaves the tenant.
+    /// Same INIT-ONLY concurrency contract as the sibling flags. See
+    /// config_types.wish_matchmaking_enabled.
+    wish_matchmaking_enabled: bool = false,
     /// P4 (memory-phase-0.5) — canonical-continuity-summary gate, threaded to
     /// the commands gating predicate (`shouldUseDeterministicSessionSummary`)
     /// so the two LIVE in-conversation boundary triggers
