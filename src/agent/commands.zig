@@ -5206,7 +5206,7 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
                             if (maybe_match) |match| {
                                 defer self.allocator.free(match.name);
                                 try w.print(
-                                    "    \u{21B3} possible skill: {s} — install with skill_registry action=\"install\" name=\"{s}\"\n",
+                                    "    \u{21B3} possible skill: {s} — install with skill_registry action=\"install\" skill_ref=\"{s}\"\n",
                                     .{ match.name, match.name },
                                 );
                             }
@@ -6735,7 +6735,7 @@ test "/learn list: annotates a wish with a Decision Hub match (install affordanc
     try std.testing.expect(std.mem.indexOf(
         u8,
         out,
-        "    ↳ possible skill: acme/fax-tool — install with skill_registry action=\"install\" name=\"acme/fax-tool\"",
+        "    ↳ possible skill: acme/fax-tool — install with skill_registry action=\"install\" skill_ref=\"acme/fax-tool\"",
     ) != null);
 }
 
