@@ -1,13 +1,19 @@
 //! subagent_batch_result tool — collect results for a fan-out batch by id.
 //!
-//! Registered in the MAIN profile when multiagent is enabled. UNGATED at
-//! execute() since S1a (Package 3 Task 4): the collector is READ-ONLY
+//! Registered in the MAIN profile when multiagent is enabled. No Superpowers
+//! gate at execute() since S1a (Package 3 Task 4): the collector is READ-ONLY
 //! (read_only + coordinator_dispatch in the registry) — collecting an
 //! already-dispatched batch is not a fan-out privilege, and the out-of-band
 //! wake turn (superpowers unset on the wake lane) plus ordinary follow-up
 //! turns must be able to recover results. spawn_many KEEPS its Superpowers
 //! self-gate, so batches still only come into existence on a Superpowers
 //! turn. Excluded from subagentTools() — depth guard.
+//!
+//! Access IS scoped to the batch's owning USER (user-granular, not
+//! lane-granular — any lane of the same user may collect, since the wake
+//! turn runs on the cron:heartbeat lane while batches register under the
+//! spawning lane's key). Foreign users get the probe-uniform
+//! "Batch not found or expired" — indistinguishable from an unknown id.
 //!
 //! S1a: optional `wait_seconds` (clamped [0,120], default 0) turns the read
 //! into a bounded blocking collect: ONE call waits until the batch is
@@ -90,7 +96,12 @@ pub const SubagentBatchResultTool = struct {
     fn authorizeBatchAccess(manager: *SubagentManager, batch_id: []const u8) ?ToolResult {
         const turn_session = root.getTurnContext().session_key orelse return batchNotFoundFailure();
 
-        const owned = manager.batchSessionKeyEquals(batch_id, turn_session) catch return batchNotFoundFailure();
+        // Ownership is USER-granular, not lane-granular: the batch is
+        // registered under the spawning turn's key, but the same user's wake
+        // turn (cron:heartbeat lane) and follow-up turns (main/thread lanes)
+        // must be able to collect it (S1a). Cross-USER access gets the same
+        // probe-uniform not-found error as a genuinely unknown id.
+        const owned = manager.batchOwnedBySessionUser(batch_id, turn_session) catch return batchNotFoundFailure();
         if (!owned) return batchNotFoundFailure();
         return null;
     }
@@ -408,6 +419,77 @@ test "subagent_batch_result refuses a batch owned by another session" {
     var sbt = SubagentBatchResultTool{ .manager = &manager };
     const t = sbt.tool();
     const parsed = try root.parseTestArgs("{\"batch_id\":\"batch:foreign:1\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Batch not found or expired", result.error_msg.?);
+    try std.testing.expectEqualStrings("", result.output);
+}
+
+test "subagent_batch_result user-granular: same user collects from the wake lane" {
+    // PR #150 review finding 1 (RED→GREEN): ownership is USER-granular, not
+    // lane-granular. The batch is registered under the spawning turn's key
+    // (here the MAIN lane), but S1a's out-of-band wake turn runs on the SAME
+    // user's cron:heartbeat lane (daemon.zig lane resolution, superpowers
+    // unset) — it must still be able to collect the batch.
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    {
+        manager.mutex.lock();
+        defer manager.mutex.unlock();
+        const now = std.time.milliTimestamp();
+        try manager.batches.register("batch:wake:1", &[_]u64{ 901, 902 }, "agent:zaki-bot:user:7:main", now, now + 60_000);
+    }
+
+    root.setTurnContext(.{ .superpowers_mode = false, .session_key = "agent:zaki-bot:user:7:cron:heartbeat" });
+    defer root.clearTurnContext();
+
+    var sbt = SubagentBatchResultTool{ .manager = &manager };
+    const t = sbt.tool();
+    const parsed = try root.parseTestArgs("{\"batch_id\":\"batch:wake:1\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.success) std.testing.allocator.free(result.output);
+
+    // Same user, different lane → results, not the not-found refusal.
+    try std.testing.expect(result.success);
+    try std.testing.expect(result.output[0] == '[');
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"task_id\":901") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"task_id\":902") != null);
+}
+
+test "subagent_batch_result user-granular: canonical cross-user stays denied" {
+    // Guard for the security win PR #150 landed: with fully canonical keys,
+    // a DIFFERENT user (user:8) probing user:7's batch — even from an
+    // identically named lane — gets the probe-uniform not-found error.
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    {
+        manager.mutex.lock();
+        defer manager.mutex.unlock();
+        const now = std.time.milliTimestamp();
+        try manager.batches.register("batch:xuser:1", &[_]u64{911}, "agent:zaki-bot:user:7:main", now, now + 60_000);
+    }
+
+    root.setTurnContext(.{ .superpowers_mode = false, .session_key = "agent:zaki-bot:user:8:main" });
+    defer root.clearTurnContext();
+
+    var sbt = SubagentBatchResultTool{ .manager = &manager };
+    const t = sbt.tool();
+    const parsed = try root.parseTestArgs("{\"batch_id\":\"batch:xuser:1\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
 

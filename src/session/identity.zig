@@ -181,6 +181,29 @@ pub fn isOwnedBy(session_key: []const u8, user_id: []const u8) bool {
     return std.mem.startsWith(u8, session_key, prefix);
 }
 
+// ── sameUser ─────────────────────────────────────────────────────────────────
+
+/// Return true when two session keys belong to the SAME user.
+///
+/// Ownership checks built on session keys must be USER-granular, not
+/// lane-granular: one user's turns run on many lanes of the same identity
+/// (`agent:zaki-bot:user:{id}:main`, `:thread:{conv}`, `:cron:{job}`), and
+/// artifacts created on one lane (subagent batches, ledger task entries) must
+/// stay accessible from the user's other lanes — the S1a wake turn collects
+/// on the cron:heartbeat lane, S1b recovery reads from later main/thread
+/// turns.
+///
+/// When BOTH keys parse as canonical identities, they match iff their
+/// `user_id` components are equal. When either key is non-canonical
+/// (legacy/opaque keys), fall back to exact key equality — fail-closed: an
+/// unparseable key never matches anything but its byte-identical self, and a
+/// canonical key never matches a non-canonical one.
+pub fn sameUser(key_a: []const u8, key_b: []const u8) bool {
+    const a = parseSessionKey(key_a) catch return std.mem.eql(u8, key_a, key_b);
+    const b = parseSessionKey(key_b) catch return std.mem.eql(u8, key_a, key_b);
+    return std.mem.eql(u8, a.user_id, b.user_id);
+}
+
 // ── Inline tests ─────────────────────────────────────────────────────────────
 
 test "parse valid main key" {
@@ -269,6 +292,34 @@ test "isOwnedBy returns false for non-matching user" {
     try std.testing.expect(!isOwnedBy("agent:zaki-bot:user:42:main", "99"));
     try std.testing.expect(!isOwnedBy("agent:zaki-bot:user:42:main", "4"));
     try std.testing.expect(!isOwnedBy("totally-wrong", "42"));
+}
+
+test "sameUser: same user matches across every lane pairing" {
+    // main ↔ cron (the S1a wake lane), main ↔ thread, thread ↔ task.
+    try std.testing.expect(sameUser("agent:zaki-bot:user:7:main", "agent:zaki-bot:user:7:cron:heartbeat"));
+    try std.testing.expect(sameUser("agent:zaki-bot:user:7:main", "agent:zaki-bot:user:7:thread:conv-a"));
+    try std.testing.expect(sameUser("agent:zaki-bot:user:7:thread:conv-a", "agent:zaki-bot:user:7:task:t-1"));
+    // Identical keys trivially match.
+    try std.testing.expect(sameUser("agent:zaki-bot:user:7:main", "agent:zaki-bot:user:7:main"));
+}
+
+test "sameUser: different users never match" {
+    try std.testing.expect(!sameUser("agent:zaki-bot:user:7:main", "agent:zaki-bot:user:8:main"));
+    // Same lane naming across users must not confuse the check.
+    try std.testing.expect(!sameUser("agent:zaki-bot:user:7:cron:heartbeat", "agent:zaki-bot:user:8:cron:heartbeat"));
+    // Prefix-shaped user ids must not match ("7" vs "77").
+    try std.testing.expect(!sameUser("agent:zaki-bot:user:7:main", "agent:zaki-bot:user:77:main"));
+}
+
+test "sameUser: non-canonical keys fall back to exact equality (fail-closed)" {
+    // Legacy/opaque keys: byte-identical → match, anything else → no match.
+    try std.testing.expect(sameUser("session-1", "session-1"));
+    try std.testing.expect(!sameUser("session-1", "session-2"));
+    // Unparseable prefix, same-user-looking pair: NOT treated as same user.
+    try std.testing.expect(!sameUser("agent:test:user:1:main", "agent:test:user:1:thread:x"));
+    // Canonical vs non-canonical never match.
+    try std.testing.expect(!sameUser("agent:zaki-bot:user:7:main", "session-1"));
+    try std.testing.expect(!sameUser("session-1", "agent:zaki-bot:user:7:main"));
 }
 
 test "SessionLane fromSlice and toSlice round-trip all variants" {

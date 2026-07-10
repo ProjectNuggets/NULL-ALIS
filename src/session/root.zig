@@ -17,6 +17,7 @@ pub const SessionLane = identity.SessionLane;
 pub const parseSessionKey = identity.parseSessionKey;
 pub const formatSessionKey = identity.formatSessionKey;
 pub const isOwnedBy = identity.isOwnedBy;
+pub const sameUser = identity.sameUser;
 
 // ── Legacy-compatible format helpers ────────────────────────────────────────
 // Preserve prior `zaki_session.zig` signatures and silent-fallback semantics.

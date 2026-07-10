@@ -733,13 +733,20 @@ pub const SubagentManager = struct {
         };
     }
 
-    /// Return whether a batch is owned by `session_key`. The check is performed
-    /// under the manager mutex because BatchTracker is lockless by contract.
-    pub fn batchSessionKeyEquals(self: *SubagentManager, batch_id: []const u8, session_key: []const u8) error{UnknownBatch}!bool {
+    /// Return whether `session_key` may access batch `batch_id`. Ownership is
+    /// USER-granular, not lane-granular (PR #150 review finding 1): the batch
+    /// is registered under the spawning turn's key while collection may
+    /// arrive on the same user's wake (cron:heartbeat), main, or another
+    /// thread lane — S1a's wake-lane collection and cross-turn recovery.
+    /// Cross-USER access stays denied; non-canonical (legacy) keys fall back
+    /// to exact key equality, fail-closed (see identity.sameUser). The check
+    /// is performed under the manager mutex because BatchTracker is lockless
+    /// by contract and the owner slice is tracker-owned.
+    pub fn batchOwnedBySessionUser(self: *SubagentManager, batch_id: []const u8, session_key: []const u8) error{UnknownBatch}!bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         const owner = self.batches.sessionKey(batch_id) orelse return error.UnknownBatch;
-        return std.mem.eql(u8, owner, session_key);
+        return zaki_session.sameUser(owner, session_key);
     }
 
     // ── Phase 4 G3 — getBatchResults ────────────────────────────────────────
@@ -1252,6 +1259,18 @@ pub const SubagentManager = struct {
                             if (state.status == .failed) {
                                 td.markFailed(id_slice, null) catch |err| {
                                     log.warn("subagent: failed to mirror failed status for task #{d}: {}", .{ task_id, err });
+                                };
+                            } else if (state.result != null and state.result.?.status == .timeout) {
+                                // PR #150 review finding 5: the batch-deadline
+                                // reaper completes tasks with result.status ==
+                                // .timeout and no error string, so state.status
+                                // reads .completed here. Mirroring that as
+                                // SUCCEEDED made the canonical ledger (and
+                                // task_get/task_list) report a timed-out task
+                                // as succeeded — route it to the ledger's own
+                                // timed_out terminal state instead.
+                                td.markTimedOut(id_slice) catch |err| {
+                                    log.warn("subagent: failed to mirror timed_out status for task #{d}: {}", .{ task_id, err });
                                 };
                             } else {
                                 td.markSucceeded(id_slice, null) catch |err| {
@@ -4061,6 +4080,83 @@ test "reaper marks still-running batch tasks timeout past deadline + fires the b
     try std.testing.expect(std.mem.indexOf(u8, mutable_req.reason, "subagent_batch_complete") != null);
     try std.testing.expectEqualStrings("55", mutable_req.user_id.?);
     try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount()); // no extra wakes
+}
+
+// PR #150 review finding 5 (RED→GREEN): a reaper-timed-out task must mirror
+// into the canonical ledger as TIMED_OUT, not SUCCEEDED. completeTask keeps
+// the in-memory contract (state.status=.completed with result.status=.timeout)
+// but the ledger mirror must route the timeout to markTimedOut so task_get /
+// task_list report the truth.
+test "reaper timeout mirrors timed_out into the canonical ledger" {
+    heartbeat_wake.clearForTest();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+    const cfg = config_mod.Config{
+        .workspace_dir = workspace,
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    var ledger_inst = tasks_mod.TaskLedger.init(std.testing.allocator);
+    defer ledger_inst.deinit();
+    var noop = observability.NoopObserver{};
+    var delivery = tasks_mod.TaskDelivery{ .ledger = &ledger_inst, .observer = noop.observer() };
+
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.attachTaskDelivery(&delivery);
+    defer mgr.deinit();
+
+    const batch_id = "batch:reaper:mirror";
+    const session_key = "agent:zaki-bot:user:55:main";
+
+    // Still-running batched task, mirrored into the canonical ledger the same
+    // way spawn's bridge does (createTaskWithNumericId, then markTaskRunning
+    // mirrors queued → running).
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .queued,
+        .label = try std.testing.allocator.dupe(u8, "reaper-mirror-task"),
+        .task_summary = try std.testing.allocator.dupe(u8, "mirror timeout"),
+        .task_prompt = try std.testing.allocator.dupe(u8, "mirror timeout"),
+        .session_key = try std.testing.allocator.dupe(u8, session_key),
+        .batch_id = try std.testing.allocator.dupe(u8, batch_id),
+        .started_at = std.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 401, state);
+    _ = try delivery.createTaskWithNumericId("mirror timeout", session_key, 401);
+
+    const past_deadline: i64 = std.time.milliTimestamp() - 1;
+    {
+        mgr.mutex.lock();
+        defer mgr.mutex.unlock();
+        try mgr.batches.register(batch_id, &[_]u64{401}, session_key, past_deadline - 60_000, past_deadline);
+    }
+
+    try std.testing.expect(mgr.markTaskRunning(401));
+
+    // Reaper fires past the deadline: completeTask(.timeout) marks the task
+    // terminal and mirrors the terminal state into the ledger.
+    mgr.reapBatchDeadlines(std.time.milliTimestamp() + 1);
+
+    // In-memory contract unchanged: terminal via completeTask, timeout carried
+    // in result.status.
+    try std.testing.expect(mgr.getTaskStatus(401).? == .completed);
+
+    // Canonical ledger truth: timed_out — NOT succeeded.
+    var id_buf: [tasks_mod.ledger.TASK_ID_LEN]u8 = undefined;
+    const id_slice = try std.fmt.bufPrint(&id_buf, "task_{x:0>11}", .{@as(u64, 401)});
+    const entry = ledger_inst.getTask(id_slice) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(tasks_mod.TaskStatus.timed_out, entry.status);
+
+    // Drain the batch wake the timeout fired so no cross-test state lingers.
+    if (heartbeat_wake.dequeue()) |req| {
+        var mutable_req = req;
+        mutable_req.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 0), heartbeat_wake.pendingCount());
 }
 
 // Test 2: reaper expires old delivered batches (H4) — batchOf → null after expiry.

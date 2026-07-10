@@ -1678,10 +1678,13 @@ pub fn allTools(
     // Gate asymmetry (S1a): spawn_many — the tool that SPENDS (dispatches
     // subagents) — is SELF-GATED at execute() to ⚡ Superpowers turns
     // (getTurnContext().superpowers_mode). subagent_batch_result is a
-    // read-only collector and is NOT gated: wake-lane and follow-up turns
-    // must be able to collect an already-dispatched batch (optionally
-    // blocking via wait_seconds). Both EXCLUDED from the subagent profile —
-    // depth guard: subagents must never fan out.
+    // read-only collector and has NO Superpowers gate: wake-lane and
+    // follow-up turns must be able to collect an already-dispatched batch
+    // (optionally blocking via wait_seconds). Collection IS scoped to the
+    // batch's owning USER — user-granular, not lane-granular, so any lane of
+    // the same user (wake cron:heartbeat, main, threads) collects while
+    // other users get the probe-uniform not-found error. Both EXCLUDED from
+    // the subagent profile — depth guard: subagents must never fan out.
     if (opts.tool_profile == .main and multiagent_enabled) {
         const smt = try allocator.create(spawn_many.SpawnManyTool);
         smt.* = .{ .manager = opts.subagent_manager };
