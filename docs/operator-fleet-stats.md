@@ -7,10 +7,24 @@ normally injected via `NULLALIS_INTERNAL_SERVICE_TOKEN`). GET only.
 This is the operator surface for fleet mining shapes — the surface the P1
 hardening deliberately removed from the agent tool (`mine_traces scope=fleet`
 denies fail-closed there: no per-request operator identity exists at the tool
-layer). The gateway route rides the building blocks P1 kept verified for it:
-`Manager.listRecentToolTracesAllUsers` → `trace_mining.analyze` →
-`renderFleetJson` (`src/tools/memory_maintain.zig`), and its response body is
-`renderFleetJson` output **verbatim**.
+layer). The gateway route computes its aggregates with the **bounded**
+`Manager.fleetMiningStats` → `renderFleetJson` (`src/tools/memory_maintain.zig`)
+pipeline, and its response body is `renderFleetJson` output **verbatim**.
+
+### Bounded aggregation (why it does not materialize the corpus)
+
+`Manager.fleetMiningStats` aggregates **entirely SQL-side** over the jsonb
+`events` column (`jsonb_array_elements` + `GROUP BY tool`), returning only a
+handful of per-tool shape rows. It never loads every tenant's full
+`events::text` into app memory, and never builds the run_id-evidence or
+recurrence-shingle work that the fleet output discards anyway. App-side memory
+is therefore O(distinct tools), not O(corpus) — this is the fix for the
+HIGH-severity unbounded-materialization defect the earlier
+`listRecentToolTracesAllUsers` → `trace_mining.analyze` path carried (that full
+reader still exists as a per-tenant building block but is **not** on this
+route). Because the SQL `SELECT` lists never project `run_id`, `user_id`,
+`label`, or arguments, inv. 5 holds at the query itself: per-user content never
+even leaves Postgres.
 
 ## Privacy boundary (learning contract invariant 5)
 
@@ -53,8 +67,8 @@ Example response:
 | Field | Meaning |
 |---|---|
 | `scope` | Always `"fleet"`. |
-| `failure_patterns[].tool` | Tool name of a failure mode seen ≥ 3 times in the window (`MIN_PATTERN_COUNT`). |
-| `failure_patterns[].count` | Occurrence count of that failure mode. The label that grouped it is **dropped** (labels can carry tenant content). |
+| `failure_patterns[].tool` | Tool name whose `tool_call` failures (`success=false`) totalled ≥ 3 across the window (`MIN_PATTERN_COUNT`). |
+| `failure_patterns[].count` | Total failure count for that tool. Failures are grouped by **tool alone** (never by label — labels can carry tenant content), so a tool appears at most once. |
 | `tool_stats[].tool` | Tool name (a shape, not content). |
 | `tool_stats[].uses` | Total `tool_call` events for that tool in the window. |
 | `tool_stats[].success_rate` | Fraction of those calls with `success=true`, 4 decimal places. |

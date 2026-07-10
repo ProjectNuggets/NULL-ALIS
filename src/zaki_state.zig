@@ -1020,6 +1020,16 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn listRecentToolTracesAllUsers(_: *@This(), allocator: std.mem.Allocator, _: u32) ![]trace_mining.ToolTraceDigestRow {
         return allocator.alloc(trace_mining.ToolTraceDigestRow, 0);
     }
+    /// Bounded fleet aggregation — stub for non-postgres builds. The
+    /// tool_traces table requires Postgres; there is nothing to
+    /// aggregate, so this returns the standard error. Unreachable at
+    /// runtime: the gateway never wires a state manager in non-postgres
+    /// builds, so handleFleetMiningStatsRequest answers 503 before ever
+    /// reaching this method. It exists only so both build modes compile
+    /// against the same Manager surface.
+    pub fn fleetMiningStats(_: *@This(), _: std.mem.Allocator, _: u32) !trace_mining.FleetStats {
+        return error.PostgresNotEnabled;
+    }
     pub fn forgetMemory(_: *@This(), _: i64, _: []const u8) !bool {
         return error.PostgresNotEnabled;
     }
@@ -12030,6 +12040,15 @@ const ManagerImpl = struct {
     /// per-user identifiers before output leaves the operator boundary
     /// (renderFleetJson in memory_maintain.zig is the verified
     /// shape-only renderer for that).
+    ///
+    /// UNBOUNDED — DO NOT USE FOR THE FLEET ENDPOINT. This selects every
+    /// tenant's full `events::text` for a window up to 365 days into app
+    /// memory (no LIMIT). The operator fleet endpoint
+    /// (GET /internal/fleet/mining-stats) NO LONGER calls this: it uses
+    /// the bounded `fleetMiningStats` below, which aggregates SQL-side
+    /// and never materializes the corpus. This method is retained only
+    /// as a tested cross-tenant building block; any new caller that
+    /// needs fleet AGGREGATES must use `fleetMiningStats` instead.
     pub fn listRecentToolTracesAllUsers(
         self: *Self,
         allocator: std.mem.Allocator,
@@ -12052,6 +12071,59 @@ const ManagerImpl = struct {
         defer c.PQclear(result);
 
         return try collectToolTraceDigestRows(allocator, result);
+    }
+
+    /// BOUNDED fleet-scope aggregation (learning contract inv. 5 —
+    /// operator surface). This is the fix for the HIGH-severity
+    /// unbounded-materialization defect: instead of shipping every
+    /// tenant's full `events::text` into app memory and running the
+    /// pure analyzer (which builds run_id evidence + recurrence shingles
+    /// the fleet renderer then discards), it aggregates ENTIRELY
+    /// SQL-side over the jsonb `events` column and returns only small
+    /// per-tool shape rows. App-side memory is O(distinct tools), not
+    /// O(corpus).
+    ///
+    /// Two grouped queries, both scoped to the `since_days` window and
+    /// both scanning only `kind='tool_call'` array elements:
+    ///   1. tool_stats — per-tool uses / successes / p50 duration
+    ///      (percentile_cont(0.5), null/negative durations filtered out).
+    ///   2. failure_patterns — per-tool failure count where the tool
+    ///      failed at least MIN_PATTERN_COUNT (3) times (HAVING gate).
+    ///
+    /// inv. 5 by construction: the SELECT lists NEVER project run_id,
+    /// user_id, label, or arguments — only tool NAMES (shapes) and
+    /// aggregate counts. FleetStats has no field that could carry a
+    /// per-user identifier. Caller owns the result; call
+    /// FleetStats.deinit.
+    pub fn fleetMiningStats(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        since_days: u32,
+    ) !trace_mining.FleetStats {
+        var days_buf: [16]u8 = undefined;
+        const days_s = try std.fmt.bufPrintZ(&days_buf, "{d}", .{since_days});
+        const params = [_]?[*:0]const u8{days_s.ptr};
+        const lengths = [_]c_int{@intCast(days_s.len)};
+
+        // Query 1 — per-tool fluency census.
+        const stats_q = try self.buildQuery(FLEET_TOOL_STATS_SQL);
+        defer self.allocator.free(stats_q);
+        const stats_res = try self.execParams(stats_q, &params, &lengths);
+        defer c.PQclear(stats_res);
+        const tool_stats = try collectFleetToolStats(allocator, stats_res);
+        errdefer {
+            for (tool_stats) |t| t.deinit(allocator);
+            allocator.free(tool_stats);
+        }
+
+        // Query 2 — per-tool failure patterns (>= MIN_PATTERN_COUNT).
+        const fail_q = try self.buildQuery(FLEET_FAILURE_SQL);
+        defer self.allocator.free(fail_q);
+        const fail_res = try self.execParams(fail_q, &params, &lengths);
+        defer c.PQclear(fail_res);
+        const failure_patterns = try collectFleetFailurePatterns(allocator, fail_res);
+
+        return .{ .failure_patterns = failure_patterns, .tool_stats = tool_stats };
     }
 
     /// Return all 'pending' subagent_results rows for a user, ordered by
@@ -14564,6 +14636,121 @@ fn collectToolTraceDigestRows(
     return out.toOwnedSlice(allocator);
 }
 
+/// SQL-side per-tool fluency census for the bounded fleet endpoint
+/// (Manager.fleetMiningStats). Aggregates over jsonb `events` array
+/// elements; the SELECT list projects ONLY tool NAME + aggregate counts
+/// — never run_id, user_id, label, or arguments (learning contract
+/// inv. 5). `success_rate` is derived app-side from uses+successes
+/// (matching the pure analyzer's exact f64 arithmetic); p50 is
+/// percentile_cont(0.5) over non-negative numeric durations, rounded,
+/// COALESCE'd to 0 when a tool logged no usable duration. The
+/// malformed-events guard (CASE ... '[]') mirrors the analyzer degrading
+/// a bad row to "no events" rather than erroring the whole aggregation.
+const FLEET_TOOL_STATS_SQL =
+    "SELECT elem->>'tool' AS tool, " ++
+    "count(*) AS uses, " ++
+    "sum(CASE WHEN jsonb_typeof(elem->'success')='boolean' AND (elem->>'success')='true' THEN 1 ELSE 0 END) AS successes, " ++
+    "COALESCE(round(percentile_cont(0.5) WITHIN GROUP (ORDER BY (elem->>'duration_ms')::double precision) " ++
+    "FILTER (WHERE jsonb_typeof(elem->'duration_ms')='number' AND (elem->>'duration_ms')::double precision >= 0))::bigint, 0) AS p50 " ++
+    "FROM {schema}.tool_traces t " ++
+    "CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(t.events)='array' THEN t.events ELSE '[]'::jsonb END) AS elem " ++
+    "WHERE t.created_at > NOW() - ($1 || ' days')::interval " ++
+    "AND elem->>'kind'='tool_call' AND jsonb_typeof(elem->'tool')='string' " ++
+    "GROUP BY elem->>'tool' " ++
+    "ORDER BY count(*) DESC, elem->>'tool' ASC";
+
+/// SQL-side per-tool failure-count for the bounded fleet endpoint.
+/// Groups tool_call failures (success=false) by TOOL alone — no label
+/// grouping (inv. 5) — and surfaces only tools that failed at least
+/// MIN_PATTERN_COUNT times (the HAVING gate, pinned to the analyzer's
+/// constant via comptimePrint so the SQL and the pure module cannot
+/// silently drift).
+const FLEET_FAILURE_SQL =
+    "SELECT elem->>'tool' AS tool, count(*) AS failures " ++
+    "FROM {schema}.tool_traces t " ++
+    "CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(t.events)='array' THEN t.events ELSE '[]'::jsonb END) AS elem " ++
+    "WHERE t.created_at > NOW() - ($1 || ' days')::interval " ++
+    "AND elem->>'kind'='tool_call' AND jsonb_typeof(elem->'tool')='string' " ++
+    "AND jsonb_typeof(elem->'success')='boolean' AND (elem->>'success')='false' " ++
+    "GROUP BY elem->>'tool' " ++
+    "HAVING count(*) >= " ++ std.fmt.comptimePrint("{d}", .{trace_mining.MIN_PATTERN_COUNT}) ++ " " ++
+    "ORDER BY count(*) DESC, elem->>'tool' ASC";
+
+/// Parse a small non-negative count column (bigint text) into usize;
+/// NULL/empty/unparseable → 0 (defensive — the fleet aggregates are
+/// counts, never identifiers). Frees the intermediate copy.
+fn parseFleetCountCol(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int, col: c_int) !usize {
+    const raw = try dupeResultValue(allocator, result, row, col);
+    defer allocator.free(raw);
+    return std.fmt.parseInt(usize, raw, 10) catch 0;
+}
+
+/// Parse a bigint text column into u64; NULL/empty/unparseable → 0.
+fn parseFleetU64Col(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int, col: c_int) !u64 {
+    const raw = try dupeResultValue(allocator, result, row, col);
+    defer allocator.free(raw);
+    return std.fmt.parseInt(u64, raw, 10) catch 0;
+}
+
+/// Collect FLEET_TOOL_STATS_SQL rows (tool, uses, successes, p50) into
+/// owned ToolStat values, deriving success_rate app-side. Caller owns
+/// the returned slice and each row's `.tool`.
+fn collectFleetToolStats(
+    allocator: std.mem.Allocator,
+    result: *c.PGresult,
+) ![]trace_mining.ToolStat {
+    const n: usize = @intCast(c.PQntuples(result));
+    var out: std.ArrayListUnmanaged(trace_mining.ToolStat) = .empty;
+    errdefer {
+        for (out.items) |s| s.deinit(allocator);
+        out.deinit(allocator);
+    }
+    try out.ensureTotalCapacity(allocator, n);
+    for (0..n) |i| {
+        const ri: c_int = @intCast(i);
+        const tool = try dupeResultValue(allocator, result, ri, 0);
+        errdefer allocator.free(tool);
+        const uses = try parseFleetCountCol(allocator, result, ri, 1);
+        const successes = try parseFleetCountCol(allocator, result, ri, 2);
+        const p50 = try parseFleetU64Col(allocator, result, ri, 3);
+        const success_rate: f64 = if (uses == 0)
+            0.0
+        else
+            @as(f64, @floatFromInt(successes)) / @as(f64, @floatFromInt(uses));
+        try out.append(allocator, .{
+            .tool = tool,
+            .uses = uses,
+            .success_rate = success_rate,
+            .p50_duration_ms = p50,
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Collect FLEET_FAILURE_SQL rows (tool, count) into owned
+/// FleetFailurePattern values. Caller owns the returned slice and each
+/// row's `.tool`.
+fn collectFleetFailurePatterns(
+    allocator: std.mem.Allocator,
+    result: *c.PGresult,
+) ![]trace_mining.FleetFailurePattern {
+    const n: usize = @intCast(c.PQntuples(result));
+    var out: std.ArrayListUnmanaged(trace_mining.FleetFailurePattern) = .empty;
+    errdefer {
+        for (out.items) |p| p.deinit(allocator);
+        out.deinit(allocator);
+    }
+    try out.ensureTotalCapacity(allocator, n);
+    for (0..n) |i| {
+        const ri: c_int = @intCast(i);
+        const tool = try dupeResultValue(allocator, result, ri, 0);
+        errdefer allocator.free(tool);
+        const count = try parseFleetCountCol(allocator, result, ri, 1);
+        try out.append(allocator, .{ .tool = tool, .count = count });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Parse a nullable `EXTRACT(EPOCH FROM ...)::bigint` column into ?i64.
 /// Returns null when the SQL value is NULL (S7 extension device registry).
 fn parseNullableEpochCol(allocator: std.mem.Allocator, result: *c.PGresult, row: c_int, col: c_int) !?i64 {
@@ -15689,6 +15876,124 @@ test "tool_traces: listRecentToolTracesAllUsers reads rows across users (fleet s
         defer allocator.free(drop_q);
         const result = try mgr.exec(drop_q);
         c.PQclear(result);
+    }
+}
+
+/// Test helper: seed one tool_traces row carrying a single tool_call
+/// event (with a per-tenant secret label) for the fleet-aggregation
+/// tests. `mgr` is `anytype` so this compiles only when referenced (PG
+/// builds).
+fn seedFleetToolCall(
+    mgr: anytype,
+    allocator: std.mem.Allocator,
+    user_id: i64,
+    run_id: []const u8,
+    tool: []const u8,
+    success: bool,
+    duration_ms: i64,
+    label: []const u8,
+) !void {
+    const events = try std.fmt.allocPrint(
+        allocator,
+        "[{{\"kind\":\"tool_call\",\"tool\":\"{s}\",\"success\":{s},\"duration_ms\":{d},\"label\":\"{s}\"}}]",
+        .{ tool, if (success) "true" else "false", duration_ms, label },
+    );
+    defer allocator.free(events);
+    try mgr.insertToolTraceEvents(user_id, run_id, events);
+}
+
+fn findFleetStat(stats: []const trace_mining.ToolStat, tool: []const u8) ?trace_mining.ToolStat {
+    for (stats) |s| {
+        if (std.mem.eql(u8, s.tool, tool)) return s;
+    }
+    return null;
+}
+
+test "tool_traces: fleetMiningStats aggregates SQL-side across users — shapes only, failure gate, p50 median (bounded-materialization fix)" {
+    // TDD keystone for the HIGH-severity unbounded-materialization fix.
+    // Seeds tool_traces for TWO tenants with distinct secret labels and
+    // varied durations/success, then calls the BOUNDED fleetMiningStats
+    // path and asserts: (a) correct aggregated shapes across BOTH users,
+    // (b) neither tenant's label/sentinel bleeds into any returned field
+    // (FleetStats has no run_id/label field at all — inv. 5 by
+    // construction), (c) failure_patterns include only tools that failed
+    // >= MIN_PATTERN_COUNT (3) times, and p50 is the true median of a
+    // known set ({10,20,30,40,50} -> 30).
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_fleetagg", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    try mgr.migrate();
+    // Drop the throwaway schema on teardown even if an assertion below
+    // returns early (the gateway D11 fixture idiom).
+    defer mgr.dropSchemaForTests() catch {};
+
+    const A: i64 = 987101;
+    const B: i64 = 987102;
+    const SENTINEL_A = "AGG_TENANT_A_SECRET_QUUX";
+    const SENTINEL_B = "AGG_TENANT_B_SECRET_THUD";
+
+    // alpha_tool — cross-user, all success; durations combine to
+    // {10,20,30,40,50} => uses 5, success_rate 1.0, p50 30.
+    try seedFleetToolCall(&mgr, allocator, A, "a-alpha-1", "alpha_tool", true, 10, SENTINEL_A);
+    try seedFleetToolCall(&mgr, allocator, A, "a-alpha-2", "alpha_tool", true, 30, SENTINEL_A);
+    try seedFleetToolCall(&mgr, allocator, A, "a-alpha-3", "alpha_tool", true, 50, SENTINEL_A);
+    try seedFleetToolCall(&mgr, allocator, B, "b-alpha-1", "alpha_tool", true, 20, SENTINEL_B);
+    try seedFleetToolCall(&mgr, allocator, B, "b-alpha-2", "alpha_tool", true, 40, SENTINEL_B);
+
+    // beta_tool — cross-user failures (2 from A + 1 from B = 3, at the
+    // gate) plus 1 success from A => uses 4, success_rate 0.25.
+    try seedFleetToolCall(&mgr, allocator, A, "a-beta-1", "beta_tool", false, 100, SENTINEL_A);
+    try seedFleetToolCall(&mgr, allocator, A, "a-beta-2", "beta_tool", false, 100, SENTINEL_A);
+    try seedFleetToolCall(&mgr, allocator, A, "a-beta-3", "beta_tool", true, 100, SENTINEL_A);
+    try seedFleetToolCall(&mgr, allocator, B, "b-beta-1", "beta_tool", false, 100, SENTINEL_B);
+
+    // gamma_tool — only 2 failures (below the gate) => present in
+    // tool_stats but NOT in failure_patterns.
+    try seedFleetToolCall(&mgr, allocator, A, "a-gamma-1", "gamma_tool", false, 5, SENTINEL_A);
+    try seedFleetToolCall(&mgr, allocator, A, "a-gamma-2", "gamma_tool", false, 5, SENTINEL_A);
+
+    var stats = try mgr.fleetMiningStats(allocator, 7);
+    defer stats.deinit(allocator);
+
+    // ── (a) aggregated tool_stats across BOTH users.
+    try std.testing.expectEqual(@as(usize, 3), stats.tool_stats.len);
+
+    const alpha = findFleetStat(stats.tool_stats, "alpha_tool") orelse return error.MissingAlpha;
+    try std.testing.expectEqual(@as(usize, 5), alpha.uses); // 3 from A + 2 from B
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), alpha.success_rate, 0.0001);
+    try std.testing.expectEqual(@as(u64, 30), alpha.p50_duration_ms); // median {10,20,30,40,50}
+
+    const beta = findFleetStat(stats.tool_stats, "beta_tool") orelse return error.MissingBeta;
+    try std.testing.expectEqual(@as(usize, 4), beta.uses);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), beta.success_rate, 0.0001);
+
+    const gamma = findFleetStat(stats.tool_stats, "gamma_tool") orelse return error.MissingGamma;
+    try std.testing.expectEqual(@as(usize, 2), gamma.uses);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), gamma.success_rate, 0.0001);
+
+    // ── (c) failure_patterns: only beta_tool clears the >= 3 gate.
+    try std.testing.expectEqual(@as(usize, 1), stats.failure_patterns.len);
+    try std.testing.expectEqualStrings("beta_tool", stats.failure_patterns[0].tool);
+    try std.testing.expectEqual(@as(usize, 3), stats.failure_patterns[0].count); // 2 from A + 1 from B
+
+    // ── (b) NEITHER tenant's secret label appears in ANY returned field.
+    for (stats.tool_stats) |s| {
+        try std.testing.expect(std.mem.indexOf(u8, s.tool, SENTINEL_A) == null);
+        try std.testing.expect(std.mem.indexOf(u8, s.tool, SENTINEL_B) == null);
+    }
+    for (stats.failure_patterns) |p| {
+        try std.testing.expect(std.mem.indexOf(u8, p.tool, SENTINEL_A) == null);
+        try std.testing.expect(std.mem.indexOf(u8, p.tool, SENTINEL_B) == null);
     }
 }
 

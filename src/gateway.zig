@@ -4176,14 +4176,18 @@ pub const FleetMiningStatsResponse = struct {
 /// P1 hardening context: `mine_traces scope=fleet` is DENIED at the
 /// agent tool layer — no per-request operator identity exists there
 /// (see executeMineTraces in tools/memory_maintain.zig). THIS endpoint
-/// is the internal-token operator surface P1 reserved the verified
-/// building blocks for: `Manager.listRecentToolTracesAllUsers` (the
-/// cross-tenant read) → `trace_mining.analyze` → `renderFleetJson`
-/// (the shape-only renderer whose privacy-sentinel test is pinned at
-/// the pure-function level). The response body is renderFleetJson
-/// VERBATIM — tool/count shapes only; no run_ids, no labels, no user
-/// ids, no tenant content. Any future field addition must extend the
-/// sentinel test in tools/memory_maintain.zig first.
+/// is the internal-token operator surface. It uses the BOUNDED
+/// aggregation path `Manager.fleetMiningStats` (SQL-side aggregation
+/// over the jsonb events column) → `renderFleetJson` (the shape-only
+/// renderer whose privacy-sentinel test is pinned at the pure-function
+/// level). It deliberately does NOT use `listRecentToolTracesAllUsers`
+/// + `trace_mining.analyze`: that path materialized every tenant's full
+/// events corpus into app memory and built run_id/recurrence work the
+/// fleet output discards (the HIGH-severity unbounded-materialization
+/// defect this route was fixed for). The response body is
+/// renderFleetJson VERBATIM — tool/count shapes only; no run_ids, no
+/// labels, no user ids, no tenant content. Any future field addition
+/// must extend the sentinel test in tools/memory_maintain.zig first.
 ///
 /// Memory contract: on the 200 path `body` is allocated with
 /// `allocator` (the dispatch arm passes the per-request arena; tests
@@ -4219,24 +4223,20 @@ pub fn handleFleetMiningStatsRequest(
         .body = "{\"error\":\"state_unavailable\",\"detail\":\"persistent state backend not configured; fleet mining stats require postgres\"}",
     };
     const since_days = clampFleetSinceDays(parseQueryParam(target, "since_days"));
-    const rows = mgr.listRecentToolTracesAllUsers(allocator, since_days) catch {
+    // BOUNDED fleet aggregation (HIGH-severity unbounded-materialization
+    // fix): fleetMiningStats aggregates ENTIRELY SQL-side over the jsonb
+    // events column and returns only small per-tool shape rows — it never
+    // loads every tenant's full events corpus into app memory, and never
+    // builds the run_id/recurrence work the fleet output discards. Its
+    // FleetStats result feeds renderFleetJson's SAME output shape.
+    var stats = mgr.fleetMiningStats(allocator, since_days) catch {
         return .{
             .status = "500 Internal Server Error",
             .body = "{\"error\":\"fleet_read_failed\"}",
         };
     };
-    defer {
-        for (rows) |r| r.deinit(allocator);
-        allocator.free(rows);
-    }
-    var report = trace_mining.analyze(allocator, rows) catch {
-        return .{
-            .status = "500 Internal Server Error",
-            .body = "{\"error\":\"fleet_analyze_failed\"}",
-        };
-    };
-    defer report.deinit(allocator);
-    const body = tools_mod.memory_maintain.renderFleetJson(allocator, report) catch {
+    defer stats.deinit(allocator);
+    const body = tools_mod.memory_maintain.renderFleetJson(allocator, stats) catch {
         return .{
             .status = "500 Internal Server Error",
             .body = "{\"error\":\"response build failed\"}",

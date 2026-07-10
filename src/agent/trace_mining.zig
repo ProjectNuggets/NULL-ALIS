@@ -96,6 +96,67 @@ pub const MiningReport = struct {
     }
 };
 
+/// A fleet-scope failure mode: tool + failure-count ONLY. Unlike
+/// FailurePattern (the per-tenant type), this deliberately has NO
+/// `label` and NO `evidence_run_ids` field — labels can embed tenant
+/// content and run_ids identify a user's runs (learning contract
+/// inv. 5). Grouping is by TOOL alone (all of a tool's failures across
+/// the window collapse to one count), never by (tool, label). Produced
+/// by Manager.fleetMiningStats' SQL-side aggregation.
+pub const FleetFailurePattern = struct {
+    tool: []const u8,
+    count: usize,
+
+    pub fn deinit(self: FleetFailurePattern, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool);
+    }
+};
+
+/// The bounded fleet-scope aggregate — the SHAPE-ONLY projection the
+/// operator endpoint (GET /internal/fleet/mining-stats) emits.
+///
+/// This type is the structural half of the fix for the HIGH-severity
+/// unbounded-materialization defect: the fleet path computes these
+/// aggregates SQL-side (Manager.fleetMiningStats) and never loads the
+/// full cross-tenant trace corpus into app memory. FleetStats
+/// deliberately has NO `recurrences` and NO evidence/run_id fields —
+/// the discarded run_id/recurrence work MiningReport carried is not
+/// merely dropped at render time, it is never built or even
+/// representable here. `tool_stats` reuses ToolStat (its four fields are
+/// exactly what renderFleetJson reads). Caller owns the result; call
+/// deinit.
+pub const FleetStats = struct {
+    failure_patterns: []FleetFailurePattern,
+    tool_stats: []ToolStat,
+
+    pub fn deinit(self: FleetStats, allocator: std.mem.Allocator) void {
+        for (self.failure_patterns) |p| p.deinit(allocator);
+        allocator.free(self.failure_patterns);
+        for (self.tool_stats) |t| t.deinit(allocator);
+        allocator.free(self.tool_stats);
+    }
+};
+
+test "FleetStats is bounded BY CONSTRUCTION: no recurrence / run_id / label fields (inv. 5 + no-full-corpus)" {
+    // The bounded fleet path returns FleetStats, NOT MiningReport. This
+    // is the compile-time proof that the fleet endpoint cannot even
+    // REPRESENT run_id evidence or recurrence shingles, let alone
+    // materialize them: those fields do not exist on the fleet types. A
+    // future edit that reintroduces run_id/recurrence/label plumbing onto
+    // the fleet surface fails this test at comptime.
+    try std.testing.expect(@hasField(FleetStats, "tool_stats"));
+    try std.testing.expect(@hasField(FleetStats, "failure_patterns"));
+    try std.testing.expect(!@hasField(FleetStats, "recurrences"));
+    try std.testing.expect(!@hasField(FleetStats, "evidence_run_ids"));
+
+    // Fleet failure patterns are tool + count ONLY — no label (tenant
+    // content) and no evidence run_ids (per-user identifiers).
+    try std.testing.expect(@hasField(FleetFailurePattern, "tool"));
+    try std.testing.expect(@hasField(FleetFailurePattern, "count"));
+    try std.testing.expect(!@hasField(FleetFailurePattern, "label"));
+    try std.testing.expect(!@hasField(FleetFailurePattern, "evidence_run_ids"));
+}
+
 /// Parsed view of one `tool_call`-kind event relevant to failure-pattern
 /// mining. Borrows slices from the parsed std.json.Value tree — valid
 /// only while that tree (and its owning ParseFromSliceResult) is alive.
