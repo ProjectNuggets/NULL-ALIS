@@ -31,6 +31,12 @@
 //! callers (e.g. testing, manual trigger). What it ISN'T: a
 //! parallel runtime, a CLI, an orchestrator. The agent IS the
 //! orchestrator; the prompt is the contract.
+//!
+//! saas-v1 addendum: this module hosts the whole "agent-orchestrated
+//! nightly work" family — `dream_system_prompt` (3 AM reflection) and
+//! its sibling `mine_system_prompt` (3:30 AM trace mining). Same
+//! pattern, same isolated lane, different nightly job. Both ride the
+//! cron-sentinel substitution in daemon.zig::resolveCronSentinelPrompt.
 
 const std = @import("std");
 
@@ -62,6 +68,71 @@ pub const dream_system_prompt =
     \\Be warm but observational. You are not sentient — express calibrations, not feelings.
 ;
 
+/// Trace-mining sentinel prompt ("mine"). Sibling of the dream cycle:
+/// one isolated proactive turn, zero new services — the agent IS the
+/// orchestrator, the miner is one tool call away. daemon.zig substitutes
+/// this prompt when a cron entry's command is the sentinel "mine"
+/// (daemon.zig::resolveCronSentinelPrompt).
+///
+/// Wiring (single cron entry in ~/.nullalis/cron.json). This is the REAL
+/// store shape parsed by cron.zig::appendJobFromJsonObjectWithPolicy —
+/// the cron field is `expression` (there is no `schedule` alias), and
+/// `job_type:"agent"` is REQUIRED (the store default is "shell", which
+/// would exec `mine` as a shell command instead of an agent turn):
+///
+///   {
+///     "id": "mine_330am",
+///     "expression": "30 3 * * *",
+///     "command": "mine",
+///     "job_type": "agent",
+///     "session_target": "isolated",
+///     "enabled": true
+///   }
+///
+/// Lane safety: scheduled turns are never .user-origin, so even a
+/// mistyped session_target:"main" reroutes to the isolated lane
+/// (daemon.zig::resolveCronSessionTarget) — the mine turn cannot run in
+/// the user's main session.
+///
+/// trace_mining_enabled=false keeps the whole turn a clean no-op: the
+/// tool answers disabled-success and the prompt stops the agent there.
+/// Nightly scheduling is safe by construction — the miner's same-window
+/// rerun is byte-identical (idempotent), so a double-fire drafts no
+/// duplicates.
+pub const mine_system_prompt =
+    \\It is 3:30 AM. Nightly maintenance: mine the recent tool traces for
+    \\learnable patterns. This is the trace-mining sibling of the dream
+    \\cycle — same isolated lane, different job.
+    \\
+    \\Step 1 — run the miner:
+    \\  memory_maintain action=mine_traces scope=user
+    \\Leave since_days at its default window; do not pass it.
+    \\
+    \\Step 2 — read the tool's JSON result and branch:
+    \\- If it reports disabled (operator set trace_mining_enabled=false):
+    \\  stop here. Do nothing else. A disabled miner is a clean no-op, not
+    \\  an error.
+    \\- If facts_drafted, failure_patterns and recurrences are all 0: stop
+    \\  here. Nothing new was learned tonight; write no note.
+    \\- ONLY if the result reports new facts drafted or new patterns
+    \\  (facts_drafted > 0, or failure_patterns > 0, or recurrences > 0):
+    \\  persist a short note — 2-3 sentences of plain prose saying what
+    \\  tonight's mining found. First memory_recall
+    \\  query=dream_log/<today's date in YYYY-MM-DD form>; if tonight's
+    \\  dream reflection already exists under that key, keep it and append
+    \\  your note after it (the store is an upsert by key — never discard
+    \\  the reflection). Then persist via memory_store with:
+    \\    key=dream_log/<today's date in YYYY-MM-DD form>
+    \\    category=daily
+    \\    scope=global
+    \\    content=<existing reflection if any, then your mining note>
+    \\
+    \\This is a maintenance turn (schedule kind=maintenance semantics).
+    \\Do NOT message the user. Never message the user on any channel, and
+    \\do not surface the drafted suggestions yourself — the morning brief
+    \\already surfaces pending shadow suggestions.
+;
+
 // ─────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────
@@ -79,4 +150,31 @@ test "dream_system_prompt contains expected sections" {
 test "dream_system_prompt is non-trivial size (real instructions, not stub)" {
     try std.testing.expect(dream_system_prompt.len > 500);
     try std.testing.expect(dream_system_prompt.len < 4096);
+}
+
+test "mine sentinel prompt contains expected sections" {
+    const p = mine_system_prompt;
+    try std.testing.expect(std.mem.indexOf(u8, p, "memory_maintain") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "mine_traces") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "scope=user") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "trace_mining_enabled") != null);
+    // Conditional dream_log note (only when the run drafted/found something).
+    try std.testing.expect(std.mem.indexOf(u8, p, "dream_log/") != null);
+    // Maintenance semantics: must explicitly forbid messaging the user.
+    try std.testing.expect(std.mem.indexOf(u8, p, "Never message the user") != null);
+}
+
+test "mine sentinel prompt is non-trivial size (real instructions, not stub)" {
+    try std.testing.expect(mine_system_prompt.len > 500);
+    try std.testing.expect(mine_system_prompt.len < 4096);
+}
+
+test "mine_system_prompt branch contract: disabled stop, conditional note, no user messaging" {
+    const p = mine_system_prompt;
+    // Disabled miner (trace_mining_enabled=false) must be a clean stop.
+    try std.testing.expect(std.mem.indexOf(u8, p, "disabled") != null);
+    // The dream_log note is strictly conditional on new facts / patterns.
+    try std.testing.expect(std.mem.indexOf(u8, p, "ONLY if") != null);
+    // Maintenance semantics, phrased as a hard prohibition.
+    try std.testing.expect(std.mem.indexOf(u8, p, "Do NOT message the user") != null);
 }
