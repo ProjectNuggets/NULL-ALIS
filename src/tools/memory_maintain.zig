@@ -1291,33 +1291,38 @@ fn executeMineTracesWithRows(
 
 /// Fleet-scope JSON: tool_stats carry the full shape (tool, uses,
 /// success_rate, p50_duration_ms — no user content), failure_patterns
-/// carry tool+count ONLY (label is DROPPED — labels can carry tenant
-/// content, e.g. an error message embedding a fragment of the failing
-/// argument; see the privacy sentinel test below), and evidence_run_ids
-/// / recurrences (which cite run_ids) are OMITTED ENTIRELY — no run_id,
-/// user_id, argument, or content string ever appears in fleet output
-/// (learning contract inv. 5).
+/// carry tool+count ONLY (there is no label to drop — labels can carry
+/// tenant content, e.g. an error message embedding a fragment of the
+/// failing argument), and evidence_run_ids / recurrences (which cite
+/// run_ids) do not exist on the input type at all — no run_id, user_id,
+/// argument, or content string ever appears in fleet output (learning
+/// contract inv. 5).
+///
+/// Input is `trace_mining.FleetStats` — the bounded projection produced
+/// SQL-side by `Manager.fleetMiningStats`. FleetStats structurally has
+/// no run_id / label / recurrence fields, so inv. 5 is enforced BY
+/// CONSTRUCTION here (the renderer cannot leak what its input cannot
+/// carry), not merely by remembering to skip fields as the former
+/// MiningReport input required.
 ///
 /// `pub` for exactly ONE caller: gateway.zig's
 /// `handleFleetMiningStatsRequest` (GET /internal/fleet/mining-stats),
-/// the internal-token operator endpoint this renderer was kept as the
-/// building block for when P1 denied scope=fleet at the agent tool
-/// layer. Its response body is this function's output VERBATIM — any
-/// future field addition must extend the privacy sentinel test below
-/// FIRST.
-pub fn renderFleetJson(allocator: std.mem.Allocator, report: trace_mining.MiningReport) ![]u8 {
+/// the internal-token operator endpoint. Its response body is this
+/// function's output VERBATIM — any future field addition must extend
+/// the privacy sentinel test below FIRST.
+pub fn renderFleetJson(allocator: std.mem.Allocator, stats: trace_mining.FleetStats) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     try buf.appendSlice(allocator, "{\"scope\":\"fleet\",\"failure_patterns\":[");
-    for (report.failure_patterns, 0..) |p, i| {
+    for (stats.failure_patterns, 0..) |p, i| {
         if (i > 0) try buf.append(allocator, ',');
         try buf.appendSlice(allocator, "{\"tool\":\"");
         try appendJsonEscapedFleet(allocator, &buf, p.tool);
         try buf.writer(allocator).print("\",\"count\":{d}}}", .{p.count});
     }
     try buf.appendSlice(allocator, "],\"tool_stats\":[");
-    for (report.tool_stats, 0..) |t, i| {
+    for (stats.tool_stats, 0..) |t, i| {
         if (i > 0) try buf.append(allocator, ',');
         try buf.appendSlice(allocator, "{\"tool\":\"");
         try appendJsonEscapedFleet(allocator, &buf, t.tool);
@@ -1509,35 +1514,50 @@ test "mine_traces: user scope end-to-end — writes insight files AND drafts a s
     try std.testing.expect(std.mem.indexOf(u8, entry.content, "state=shadow") != null);
 }
 
-test "renderFleetJson — privacy sentinel: a secret string in a label field never reaches fleet output (inv. 5)" {
-    // renderFleetJson is no longer reachable from the agent tool (P1 —
-    // scope=fleet is denied fail-closed), but it is KEPT as the building
-    // block for the future gateway operator endpoint. This test pins its
-    // inv. 5 guarantee at the pure-function level so the endpoint
-    // inherits it already-verified.
+test "renderFleetJson — privacy sentinel (inv. 5): renders tool+count / tool+uses shapes ONLY; input type cannot carry labels or run_ids" {
+    // renderFleetJson now consumes trace_mining.FleetStats — the bounded
+    // projection produced SQL-side by Manager.fleetMiningStats. That type
+    // structurally has NO label and NO run_id/recurrence fields, so a
+    // secret-in-a-label leak is impossible BY CONSTRUCTION here (the
+    // former MiningReport input carried labels that this renderer had to
+    // remember to drop; FleetStats cannot represent one). The stronger
+    // end-to-end inv. 5 guarantee — that a secret label seeded in the DB
+    // never reaches output — is pinned by the cross-tenant
+    // `fleet mining-stats [PG]` test in gateway.zig, which drives real
+    // postgres through this renderer. This pure-function test pins the
+    // exact output SHAPE the endpoint emits verbatim.
     const allocator = std.testing.allocator;
 
-    const SENTINEL = "SUPER_SECRET_TENANT_ARGUMENT_XYZZY_42";
-    var rows = [_]trace_mining.ToolTraceDigestRow{
-        try digestRow(allocator, "r-1-1", "web_search", SENTINEL),
-        try digestRow(allocator, "r-2-1", "web_search", SENTINEL),
-        try digestRow(allocator, "r-3-1", "web_search", SENTINEL),
+    // Fixture uses string literals for .tool (never freed), so we
+    // deliberately do NOT call FleetStats.deinit here.
+    var failure_patterns = [_]trace_mining.FleetFailurePattern{
+        .{ .tool = "web_search", .count = 3 },
     };
-    defer for (rows) |r| r.deinit(allocator);
+    var tool_stats = [_]trace_mining.ToolStat{
+        .{ .tool = "web_search", .uses = 10, .success_rate = 0.9, .p50_duration_ms = 150 },
+    };
+    const stats = trace_mining.FleetStats{
+        .failure_patterns = &failure_patterns,
+        .tool_stats = &tool_stats,
+    };
 
-    var report = try trace_mining.analyze(allocator, &rows);
-    defer report.deinit(allocator);
-    const fleet_json = try renderFleetJson(allocator, report);
+    const fleet_json = try renderFleetJson(allocator, stats);
     defer allocator.free(fleet_json);
 
-    // The sentinel (which only ever appears in the LABEL field) must
-    // NEVER appear in fleet output — labels are dropped entirely at
-    // fleet scope (learning contract inv. 5).
-    try std.testing.expect(std.mem.indexOf(u8, fleet_json, SENTINEL) == null);
-    // The tool NAME (a shape, not content) IS allowed to appear.
-    try std.testing.expect(std.mem.indexOf(u8, fleet_json, "web_search") != null);
-    // Run_ids must NEVER appear at fleet scope either.
-    try std.testing.expect(std.mem.indexOf(u8, fleet_json, "r-1-1") == null);
+    // Exact shape pin — tool/count for failures, tool/uses/success_rate/
+    // p50 for stats, wrapped in the fleet envelope. No run_ids, labels,
+    // recurrences, or user ids anywhere.
+    try std.testing.expectEqualStrings(
+        "{\"scope\":\"fleet\",\"failure_patterns\":[{\"tool\":\"web_search\",\"count\":3}]," ++
+            "\"tool_stats\":[{\"tool\":\"web_search\",\"uses\":10,\"success_rate\":0.9000,\"p50_duration_ms\":150}]}",
+        fleet_json,
+    );
+    // Belt-and-suspenders: the fleet vocabulary never includes the
+    // per-tenant evidence keys.
+    try std.testing.expect(std.mem.indexOf(u8, fleet_json, "run_id") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fleet_json, "label") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fleet_json, "recurrence") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fleet_json, "evidence") == null);
 }
 
 test "mine_traces: scope=fleet is DENIED from the agent tool and writes nothing (P1 regression)" {
