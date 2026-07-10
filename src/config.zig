@@ -1033,6 +1033,34 @@ pub const Config = struct {
             .parallel_tools_rollout_percent = self.agent.parallel_tools_rollout_percent,
             .tool_dispatcher = self.agent.tool_dispatcher,
             .session_idle_timeout_secs = self.agent.session_idle_timeout_secs,
+            // Wish-matchmaking round 2, Finding 1: every field config_parse.zig
+            // reads from the `agent` block must be emitted here, or a config
+            // rewrite (onboarding wizard → Config.save) silently reverts an
+            // explicit operator setting to the struct default. The whole
+            // parsed agent-flag family follows, matching this section's
+            // always-emit pattern.
+            .extraction_judge_model = self.agent.extraction_judge_model,
+            .extraction_cardinality_fastpath = self.agent.extraction_cardinality_fastpath,
+            .extraction_coverage_filter_enabled = self.agent.extraction_coverage_filter_enabled,
+            .semantic_type_routing_enabled = self.agent.semantic_type_routing_enabled,
+            .typed_views_enabled = self.agent.typed_views_enabled,
+            .canonical_continuity_summary_enabled = self.agent.canonical_continuity_summary_enabled,
+            .trace_persistence_enabled = self.agent.trace_persistence_enabled,
+            .cost_vital_in_prompt = self.agent.cost_vital_in_prompt,
+            .dream_log_warmstart_enabled = self.agent.dream_log_warmstart_enabled,
+            .trace_mining_enabled = self.agent.trace_mining_enabled,
+            .wish_matchmaking_enabled = self.agent.wish_matchmaking_enabled,
+            // token_limit is the one conditional: emitted only when the
+            // operator explicitly set it (token_limit_explicit) — an
+            // unconditional emit would promote the struct default to an
+            // explicit override on reload and pin the fallback chain in
+            // agent/root.zig. `null` round-trips as a no-op (parse ignores
+            // non-integer values).
+            .token_limit = if (self.agent.token_limit_explicit) self.agent.token_limit else null,
+            // Nested [agent.extraction] block — parse reads its four bool
+            // gates (config_parse.zig); the plain-struct fmt emits exactly
+            // those fields.
+            .extraction = self.agent.extraction,
             .compaction_keep_recent = self.agent.compaction_keep_recent,
             .compaction_max_summary_chars = self.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = self.agent.compaction_max_source_chars,
@@ -2242,6 +2270,119 @@ test "save roundtrip preserves extended config sections" {
     // hardware.* roundtrip assertion removed D19 (2026-04-25).
     try std.testing.expectEqual(config_types.DmScope.per_peer, loaded.session.dm_scope);
     try std.testing.expectEqual(@as(usize, 1), loaded.session.identity_links.len);
+}
+
+// Wish-matchmaking round 2, Finding 1 — the parsed agent-flag family
+// (config_parse.zig `agent` block) was OMITTED by Config.save's `agent`
+// section, so any config rewrite (reachable via the onboarding wizard)
+// silently reset an explicit operator opt-in/out back to the struct default.
+// Every value below is set to the OPPOSITE of its AgentConfig default so any
+// dropped field shows up as a reverted default after re-parse.
+test "save roundtrip preserves parsed agent flags (wish_matchmaking + family)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.agent.extraction_judge_model = "together/llama-3.3-70b";
+    cfg.agent.extraction_cardinality_fastpath = false;
+    cfg.agent.extraction_coverage_filter_enabled = false;
+    cfg.agent.semantic_type_routing_enabled = false;
+    cfg.agent.typed_views_enabled = false;
+    cfg.agent.canonical_continuity_summary_enabled = false;
+    cfg.agent.trace_persistence_enabled = false;
+    cfg.agent.cost_vital_in_prompt = true;
+    cfg.agent.dream_log_warmstart_enabled = false;
+    cfg.agent.trace_mining_enabled = false;
+    cfg.agent.wish_matchmaking_enabled = true; // explicit operator opt-in
+    cfg.agent.token_limit = 123_456;
+    cfg.agent.token_limit_explicit = true;
+    cfg.agent.extraction.per_turn_enqueue_enabled = true;
+    cfg.agent.extraction.memory_nudge_enabled = true;
+    cfg.agent.extraction.skills_nudge_enabled = true;
+    cfg.agent.extraction.session_end_entity_pipeline_enabled = false;
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expectEqualStrings("together/llama-3.3-70b", loaded.agent.extraction_judge_model);
+    try std.testing.expect(!loaded.agent.extraction_cardinality_fastpath);
+    try std.testing.expect(!loaded.agent.extraction_coverage_filter_enabled);
+    try std.testing.expect(!loaded.agent.semantic_type_routing_enabled);
+    try std.testing.expect(!loaded.agent.typed_views_enabled);
+    try std.testing.expect(!loaded.agent.canonical_continuity_summary_enabled);
+    try std.testing.expect(!loaded.agent.trace_persistence_enabled);
+    try std.testing.expect(loaded.agent.cost_vital_in_prompt);
+    try std.testing.expect(!loaded.agent.dream_log_warmstart_enabled);
+    try std.testing.expect(!loaded.agent.trace_mining_enabled);
+    try std.testing.expect(loaded.agent.wish_matchmaking_enabled);
+    try std.testing.expectEqual(@as(u64, 123_456), loaded.agent.token_limit);
+    try std.testing.expect(loaded.agent.token_limit_explicit);
+    try std.testing.expect(loaded.agent.extraction.per_turn_enqueue_enabled);
+    try std.testing.expect(loaded.agent.extraction.memory_nudge_enabled);
+    try std.testing.expect(loaded.agent.extraction.skills_nudge_enabled);
+    try std.testing.expect(!loaded.agent.extraction.session_end_entity_pipeline_enabled);
+}
+
+// Companion guard: a DEFAULT token_limit must NOT be promoted to an explicit
+// override by a save→load round-trip — `token_limit_explicit` gates a
+// fallback chain (agent/root.zig) and only an operator-set value may pin it.
+test "save roundtrip does not promote default token_limit to explicit" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expect(!loaded.agent.token_limit_explicit);
+    // And the flag family keeps its defaults when saved as defaults.
+    try std.testing.expect(!loaded.agent.wish_matchmaking_enabled);
+    try std.testing.expect(loaded.agent.trace_mining_enabled);
 }
 
 test "save escapes mcp_servers strings safely" {
