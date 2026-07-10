@@ -151,6 +151,63 @@ fn memoryRuntimePtr(self: anytype) ?*memory_mod.MemoryRuntime {
     return if (@hasField(@TypeOf(self.*), "mem_rt")) self.mem_rt else null;
 }
 
+// ── Package 2b: render-time wish → Decision Hub matchmaking ─────────────────
+// Wishes are dead letters until the Hub later grows a skill that answers one.
+// `/learn list` live-queries the Hub per wish (bounded, fail-soft) and, on a
+// hit, annotates the wish with an install affordance. NO wish-file-time storage
+// (Hub content drifts; render-time is always fresh). The seam is injectable so
+// unit tests never touch the network — production falls through to the real Hub.
+
+/// Query at most this many wishes per `/learn list` (top-1 match each).
+const WISH_HUB_QUERY_CAP: usize = 5;
+/// Bounded, short per-wish Hub timeout. The catalog endpoint answers in ~0.8s;
+/// this ceiling keeps a slow/unreachable Hub from stalling the list render.
+const WISH_HUB_TIMEOUT_MS: u32 = 3000;
+
+/// A top-1 Hub match for one wish. `name` ("org_slug/skill_name") is
+/// allocator-owned; the render loop frees it after emitting the affordance.
+pub const WishHubMatch = struct {
+    name: []const u8,
+};
+
+/// Injectable Hub searcher. `search` returns a top-1 match, `null` for "Hub had
+/// nothing", or an error for "Hub unreachable/timeout". Both `null` and error
+/// render as NO annotation — fail-soft, never error text in `/learn list`.
+pub const WishHubSearcher = struct {
+    ctx: ?*anyopaque = null,
+    search: *const fn (ctx: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8) anyerror!?WishHubMatch,
+};
+
+/// Production Hub search: query the structured catalog endpoint, top-1, bounded.
+fn defaultWishHubSearch(_: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8) anyerror!?WishHubMatch {
+    const hits = try skills_mod.searchDecisionHubCatalog(allocator, query, 1, WISH_HUB_TIMEOUT_MS);
+    defer skills_mod.freeDecisionHubSearchResults(allocator, hits);
+    if (hits.len == 0) return null;
+    const name = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ hits[0].org_slug, hits[0].skill_name });
+    return WishHubMatch{ .name = name };
+}
+
+/// Resolve the Hub searcher: a test-injected one if `self` carries the seam,
+/// otherwise the real network path.
+fn wishHubSearcher(self: anytype) WishHubSearcher {
+    if (@hasField(@TypeOf(self.*), "wish_hub_searcher")) {
+        if (self.wish_hub_searcher) |s| return s;
+    }
+    return .{ .ctx = null, .search = defaultWishHubSearch };
+}
+
+/// Derive a search query from a wish's CONTENT (the human capability-need text).
+/// The `wish/` prefix lives on the KEY, never the content, so nothing to strip
+/// there; we do drop the trailing `evidence_run_id=<id>` machine marker so the
+/// query is natural language, not bookkeeping.
+fn deriveWishQuery(content: []const u8) []const u8 {
+    var q = std.mem.trim(u8, content, " \t\r\n");
+    if (std.mem.indexOf(u8, q, "evidence_run_id=")) |i| {
+        q = std.mem.trimRight(u8, q[0..i], " \t\r\n.;,");
+    }
+    return q;
+}
+
 /// V1.6 cmt9.5 — derive a hash-stable entity key from an `object` string,
 /// mirroring extraction_persist.deriveEntityKey shape so session-end edges
 /// land on the SAME entity nodes that compaction Pass C extraction creates.
@@ -5129,6 +5186,11 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
                 try w.writeAll("\n");
             }
             try w.print("Wishes (capability requests) ({d}):\n", .{wish_count});
+            // Package 2b: render-time matchmaking. For the first WISH_HUB_QUERY_CAP
+            // wishes, live-query the Decision Hub (bounded, fail-soft) and, on a
+            // hit, emit an install affordance under the wish. Any Hub error/timeout
+            // or no-match renders exactly as before (no annotation, no error text).
+            const searcher = wishHubSearcher(self);
             var idx: usize = 0;
             for (entries) |e| {
                 if (!std.mem.startsWith(u8, e.key, "wish/")) continue;
@@ -5136,6 +5198,23 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
                 // Wishes have no metadata header — just the content
                 const preview_len = @min(@as(usize, 200), e.content.len);
                 try w.print("  {d}. {s}\n     key: {s}\n", .{ idx, e.content[0..preview_len], e.key });
+
+                if (idx <= WISH_HUB_QUERY_CAP) {
+                    const query = deriveWishQuery(e.content);
+                    if (query.len > 0) {
+                        if (searcher.search(searcher.ctx, self.allocator, query)) |maybe_match| {
+                            if (maybe_match) |match| {
+                                defer self.allocator.free(match.name);
+                                try w.print(
+                                    "    \u{21B3} possible skill: {s} — install with skill_registry action=\"install\" name=\"{s}\"\n",
+                                    .{ match.name, match.name },
+                                );
+                            }
+                        } else |_| {
+                            // Fail-soft: Hub unreachable/timeout ⇒ no annotation.
+                        }
+                    }
+                }
             }
         }
 
@@ -6025,6 +6104,9 @@ const FakeLearnListSelf = struct {
     allocator: std.mem.Allocator,
     memory_session_id: ?[]const u8 = null,
     mem_rt: ?*memory_mod.MemoryRuntime = null,
+    // Package 2b: inject a fake Hub searcher so /learn list matchmaking tests
+    // never touch the network.
+    wish_hub_searcher: ?WishHubSearcher = null,
 };
 
 fn makeTestMemoryRuntime(allocator: std.mem.Allocator, mem: memory_mod.Memory) memory_mod.MemoryRuntime {
@@ -6579,6 +6661,191 @@ test "/learn list: renders Wishes section when capability requests exist" {
     try std.testing.expect(std.mem.indexOf(u8, out, "fix-npm-timeout") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "multipart-form-upload") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Better npm request timeout") != null or std.mem.indexOf(u8, out, "npm request timeout") != null);
+}
+
+// ── Package 2b: /learn list wish → Decision Hub matchmaking ─────────────────
+// Render-time, bounded, fail-soft. The Hub searcher is injected as a function
+// pointer + opaque context so these tests never touch the network.
+
+const FakeHubFixed = struct {
+    org_skill: []const u8,
+    fn search(ctx: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8) anyerror!?WishHubMatch {
+        _ = query;
+        const self: *FakeHubFixed = @ptrCast(@alignCast(ctx.?));
+        return WishHubMatch{ .name = try allocator.dupe(u8, self.org_skill) };
+    }
+};
+
+fn fakeHubNull(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?WishHubMatch {
+    return null;
+}
+
+fn fakeHubError(_: ?*anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?WishHubMatch {
+    return error.HubUnreachable;
+}
+
+const FakeHubCounter = struct {
+    calls: usize = 0,
+    fn search(ctx: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8) anyerror!?WishHubMatch {
+        _ = allocator;
+        _ = query;
+        const self: *FakeHubCounter = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        return null;
+    }
+};
+
+const FakeHubCapture = struct {
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+    fn search(ctx: ?*anyopaque, allocator: std.mem.Allocator, query: []const u8) anyerror!?WishHubMatch {
+        _ = allocator;
+        const self: *FakeHubCapture = @ptrCast(@alignCast(ctx.?));
+        const n = @min(query.len, self.buf.len);
+        @memcpy(self.buf[0..n], query[0..n]);
+        self.len = n;
+        return null;
+    }
+    fn captured(self: *const FakeHubCapture) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+test "/learn list: annotates a wish with a Decision Hub match (install affordance)" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("wish/fax-support", "Needed: send a fax. evidence_run_id=r-1", .core, null);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_hub = FakeHubFixed{ .org_skill = "acme/fax-tool" };
+    var fake_self = FakeLearnListSelf{
+        .allocator = allocator,
+        .mem_rt = &rt,
+        .wish_hub_searcher = .{ .ctx = &fake_hub, .search = FakeHubFixed.search },
+    };
+
+    const out = try handleLearnCommand(&fake_self, "list");
+    defer allocator.free(out);
+
+    // The wish still renders, plus a matchmaking affordance line beneath it.
+    try std.testing.expect(std.mem.indexOf(u8, out, "wish/fax-support") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "    ↳ possible skill: acme/fax-tool — install with skill_registry action=\"install\" name=\"acme/fax-tool\"",
+    ) != null);
+}
+
+test "/learn list: no Hub match leaves wish rendering byte-identical (regression pin)" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("wish/foo", "Need a foo tool", .core, null);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{
+        .allocator = allocator,
+        .mem_rt = &rt,
+        .wish_hub_searcher = .{ .ctx = null, .search = fakeHubNull },
+    };
+
+    const out = try handleLearnCommand(&fake_self, "list");
+    defer allocator.free(out);
+
+    // Zero hits ⇒ exactly the pre-Package-2b Wishes rendering (no extra line).
+    try std.testing.expectEqualStrings(
+        "Wishes (capability requests) (1):\n  1. Need a foo tool\n     key: wish/foo\n",
+        out,
+    );
+}
+
+test "/learn list: Hub error renders identically to no match (fail-soft, no error text)" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("wish/foo", "Need a foo tool", .core, null);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var fake_self = FakeLearnListSelf{
+        .allocator = allocator,
+        .mem_rt = &rt,
+        .wish_hub_searcher = .{ .ctx = null, .search = fakeHubError },
+    };
+
+    const out = try handleLearnCommand(&fake_self, "list");
+    defer allocator.free(out);
+
+    // A Hub error/timeout must vanish silently — identical bytes to no-hits.
+    try std.testing.expectEqualStrings(
+        "Wishes (capability requests) (1):\n  1. Need a foo tool\n     key: wish/foo\n",
+        out,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, out, "↳") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "error") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "failed") == null);
+}
+
+test "/learn list: Hub matchmaking queries at most 5 wishes (cap)" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    // Seven wishes; only the first five may be queried against the Hub.
+    try mem.store("wish/w0", "capability zero", .core, null);
+    try mem.store("wish/w1", "capability one", .core, null);
+    try mem.store("wish/w2", "capability two", .core, null);
+    try mem.store("wish/w3", "capability three", .core, null);
+    try mem.store("wish/w4", "capability four", .core, null);
+    try mem.store("wish/w5", "capability five", .core, null);
+    try mem.store("wish/w6", "capability six", .core, null);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var counter = FakeHubCounter{};
+    var fake_self = FakeLearnListSelf{
+        .allocator = allocator,
+        .mem_rt = &rt,
+        .wish_hub_searcher = .{ .ctx = &counter, .search = FakeHubCounter.search },
+    };
+
+    const out = try handleLearnCommand(&fake_self, "list");
+    defer allocator.free(out);
+
+    // Exactly five Hub queries despite seven wishes.
+    try std.testing.expectEqual(@as(usize, 5), counter.calls);
+    // The listing itself is NOT capped — all seven wishes still appear.
+    try std.testing.expect(std.mem.indexOf(u8, out, "Wishes (capability requests) (7)") != null);
+}
+
+test "/learn list: Hub query is derived from wish content (evidence marker stripped)" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("wish/fax", "Needed: send a fax. evidence_run_id=r-42", .core, null);
+
+    var rt = makeTestMemoryRuntime(allocator, mem);
+    var cap = FakeHubCapture{};
+    var fake_self = FakeLearnListSelf{
+        .allocator = allocator,
+        .mem_rt = &rt,
+        .wish_hub_searcher = .{ .ctx = &cap, .search = FakeHubCapture.search },
+    };
+
+    const out = try handleLearnCommand(&fake_self, "list");
+    defer allocator.free(out);
+
+    // Query comes from the CONTENT, with the evidence_run_id marker stripped —
+    // never from the key's `wish/` slug.
+    try std.testing.expectEqualStrings("Needed: send a fax", cap.captured());
 }
 
 test "/learn adopt on a legacy fact (no metadata header at all) reports 'already active', never corrupts it" {
