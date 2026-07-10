@@ -146,6 +146,17 @@ This contract keeps its useful structure but grounds the schema in theory that i
   add `durable_fact/telos/` to the cascade's protected-key set (the same
   predicate hook the M3 fix introduced for system keys; one line + one test).
   Only explicit curation of the telos key itself may close a telos row.
+
+  **Implementation note (task 4 + review).** On this branch `memory_archive`/
+  `memory_forget` are KEY-scoped (no content_hash sibling cascade) — the real
+  content_hash cascade is `phase05BackfillExactDedup` (C0 dedup), guarded by
+  `isTelosKey`. The review found a higher-frequency surface: `applyContradictions`
+  (the extraction contradiction judge, ~every turn) closes rows by `existing_key`,
+  and its candidate list includes the recall neighborhood — so a stray
+  conversational contradiction could close a telos row. Now guarded by `isTelosKey`
+  too (extraction never silently overwrites the curated model; see T4). Deferred to
+  Slice 2 curation design: telos-loser protection in `resolveContradiction` /
+  `memory_maintain` (agent-invoked, and the primitive curation itself will use).
 - **T4 key naming — use a `wish/telos/<type>/<id>` sub-namespace, not bare
   `wish/*`.** Bare wishes are capability requests: the fleet wish-harvest and
   the planned wish→Decision-Hub matchmaking mine that namespace. Mixing
