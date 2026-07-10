@@ -244,7 +244,9 @@ fn loadGlobalKeywordFallbackEntries(
     return try merged.toOwnedSlice(allocator);
 }
 
-fn isDurableFactKey(key: []const u8) bool {
+/// `pub`: test surface for `telos_contract_test.zig` — pins the
+/// `durable_fact/telos/*` namespace against this recognizer (contract enforcement map).
+pub fn isDurableFactKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "durable_fact/");
 }
 
@@ -3347,6 +3349,14 @@ test "typed views: renderTypedViewBlock strips XML structural chars (defense-in-
 test "typed views: LoadTurnMemoryOptions.typed_views_enabled defaults to true" {
     const opts = LoadTurnMemoryOptions{};
     try std.testing.expect(opts.typed_views_enabled);
+}
+
+// ── TELOS contract (executable form of docs/telos-contract.md) ─────────────
+// Contract-first: hosts telos_contract_test.zig into the build so its
+// invariants (T1–T6, T2b) compile+run under BOTH the default `zig build` and
+// the all-engine `zig build test` — the stub-parity gate.
+test {
+    _ = @import("telos_contract_test.zig");
 }
 
 // ── dream_log warm-start injection (first dream consumer) ──────────────────
