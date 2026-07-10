@@ -17,14 +17,23 @@ pipeline, and its response body is `renderFleetJson` output **verbatim**.
 `events` column (`jsonb_array_elements` + `GROUP BY tool`), returning only a
 handful of per-tool shape rows. It never loads every tenant's full
 `events::text` into app memory, and never builds the run_id-evidence or
-recurrence-shingle work that the fleet output discards anyway. App-side memory
-is therefore O(distinct tools), not O(corpus) — this is the fix for the
-HIGH-severity unbounded-materialization defect the earlier
+recurrence-shingle work that the fleet output discards anyway — this is the
+fix for the HIGH-severity unbounded-materialization defect the earlier
 `listRecentToolTracesAllUsers` → `trace_mining.analyze` path carried (that full
 reader still exists as a per-tenant building block but is **not** on this
 route). Because the SQL `SELECT` lists never project `run_id`, `user_id`,
 `label`, or arguments, inv. 5 holds at the query itself: per-user content never
 even leaves Postgres.
+
+**Hard top-N cap (round-2 fix).** Tool names inside trace events are arbitrary
+JSON strings, so "O(distinct tools)" floats with the corpus. Both queries
+therefore keep only the **top `FLEET_MAX_TOOLS` (100)** rows of their
+deterministic ordering (count DESC, tool ASC — constant pinned in
+`src/agent/trace_mining.zig`), making the response and app-side memory O(100)
+regardless of corpus cardinality. When either list was cut, the response says
+so via `"truncated": true`; on a healthy fleet (dozens of tools) it stays
+`false`. A `true` here is itself a signal worth investigating: something is
+minting high-cardinality tool names.
 
 ## Privacy boundary (learning contract invariant 5)
 
@@ -58,7 +67,8 @@ Example response:
   ],
   "tool_stats": [
     {"tool": "web_search", "uses": 132, "success_rate": 0.9697, "p50_duration_ms": 420}
-  ]
+  ],
+  "truncated": false
 }
 ```
 
@@ -73,6 +83,7 @@ Example response:
 | `tool_stats[].uses` | Total `tool_call` events for that tool in the window. |
 | `tool_stats[].success_rate` | Fraction of those calls with `success=true`, 4 decimal places. |
 | `tool_stats[].p50_duration_ms` | Median duration of the calls that carried a non-negative `duration_ms`. |
+| `truncated` | `true` when either list had more than `FLEET_MAX_TOOLS` (100) distinct tools and was cut to the top of its ordering; otherwise `false`. Content-free (derived from row counts only). |
 
 There are **no `run_ids` anywhere in this output — ever.** Evidence run_ids
 and recurrence clusters (which cite run_ids) are omitted entirely at fleet

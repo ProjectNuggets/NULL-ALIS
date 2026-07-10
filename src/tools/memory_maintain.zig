@@ -1296,7 +1296,10 @@ fn executeMineTracesWithRows(
 /// failing argument), and evidence_run_ids / recurrences (which cite
 /// run_ids) do not exist on the input type at all — no run_id, user_id,
 /// argument, or content string ever appears in fleet output (learning
-/// contract inv. 5).
+/// contract inv. 5). The trailing `truncated` bool is the
+/// FLEET_MAX_TOOLS cap's honesty bit (round-2 bound fix): true means
+/// the lists are the top of the deterministic ordering, not the whole
+/// census — it carries counts-derived truth only, never content.
 ///
 /// Input is `trace_mining.FleetStats` — the bounded projection produced
 /// SQL-side by `Manager.fleetMiningStats`. FleetStats structurally has
@@ -1331,7 +1334,9 @@ pub fn renderFleetJson(allocator: std.mem.Allocator, stats: trace_mining.FleetSt
             .{ t.uses, t.success_rate, t.p50_duration_ms },
         );
     }
-    try buf.appendSlice(allocator, "]}");
+    try buf.appendSlice(allocator, "],\"truncated\":");
+    try buf.appendSlice(allocator, if (stats.truncated) "true" else "false");
+    try buf.append(allocator, '}');
 
     return buf.toOwnedSlice(allocator);
 }
@@ -1545,11 +1550,14 @@ test "renderFleetJson — privacy sentinel (inv. 5): renders tool+count / tool+u
     defer allocator.free(fleet_json);
 
     // Exact shape pin — tool/count for failures, tool/uses/success_rate/
-    // p50 for stats, wrapped in the fleet envelope. No run_ids, labels,
-    // recurrences, or user ids anywhere.
+    // p50 for stats, plus the truncated honesty bit for the
+    // FLEET_MAX_TOOLS cap (a content-free bool; sentinel extended FIRST
+    // per the field-addition discipline), wrapped in the fleet envelope.
+    // No run_ids, labels, recurrences, or user ids anywhere.
     try std.testing.expectEqualStrings(
         "{\"scope\":\"fleet\",\"failure_patterns\":[{\"tool\":\"web_search\",\"count\":3}]," ++
-            "\"tool_stats\":[{\"tool\":\"web_search\",\"uses\":10,\"success_rate\":0.9000,\"p50_duration_ms\":150}]}",
+            "\"tool_stats\":[{\"tool\":\"web_search\",\"uses\":10,\"success_rate\":0.9000,\"p50_duration_ms\":150}]," ++
+            "\"truncated\":false}",
         fleet_json,
     );
     // Belt-and-suspenders: the fleet vocabulary never includes the
@@ -1558,6 +1566,17 @@ test "renderFleetJson — privacy sentinel (inv. 5): renders tool+count / tool+u
     try std.testing.expect(std.mem.indexOf(u8, fleet_json, "label") == null);
     try std.testing.expect(std.mem.indexOf(u8, fleet_json, "recurrence") == null);
     try std.testing.expect(std.mem.indexOf(u8, fleet_json, "evidence") == null);
+
+    // A capped report says so — truncated=true renders as the bare JSON
+    // bool (no counts-of-what-was-cut, no names: nothing to leak).
+    const capped = trace_mining.FleetStats{
+        .failure_patterns = &failure_patterns,
+        .tool_stats = &tool_stats,
+        .truncated = true,
+    };
+    const capped_json = try renderFleetJson(allocator, capped);
+    defer allocator.free(capped_json);
+    try std.testing.expect(std.mem.endsWith(u8, capped_json, "\"truncated\":true}"));
 }
 
 test "mine_traces: scope=fleet is DENIED from the agent tool and writes nothing (P1 regression)" {
