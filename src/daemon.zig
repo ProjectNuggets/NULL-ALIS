@@ -1568,6 +1568,27 @@ fn schedulerJobChanged(job: *const cron.CronJob, snapshot: SchedulerJobSnapshot)
     return false;
 }
 
+/// Cron "sentinel" → full system-prompt substitution.
+///
+/// V1.13 Day 5.2 — a short one-word `command` in cron.json (e.g. "dream")
+/// is a clean cron entry for operators to type; here we swap it for the
+/// full agent-facing prompt before the turn runs, so the agent sees the
+/// complete contract without anyone pasting an 800-char prompt into
+/// cron.json. Unknown commands pass through unchanged — a non-sentinel
+/// command is used verbatim as the turn prompt, exactly as before
+/// sentinels existed (fail-soft; regression-pinned by test).
+///
+/// Sentinel family ("agent-orchestrated nightly work", both prompts live
+/// in agent/dream.zig):
+///   "dream" → dream_system_prompt (3 AM reflection)
+///   "mine"  → mine_system_prompt  (3:30 AM trace mining, saas-v1)
+fn resolveCronSentinelPrompt(prompt: []const u8) []const u8 {
+    const dream_mod = @import("agent/dream.zig");
+    if (std.mem.eql(u8, prompt, "dream")) return dream_mod.dream_system_prompt;
+    if (std.mem.eql(u8, prompt, "mine")) return dream_mod.mine_system_prompt;
+    return prompt;
+}
+
 fn runCronAgentTurnWithBus(
     ctx: ?*anyopaque,
     allocator: std.mem.Allocator,
@@ -1579,22 +1600,10 @@ fn runCronAgentTurnWithBus(
     const cfg_ptr = ctx orelse return error.InvalidArgument;
     const cfg: *const Config = @ptrCast(@alignCast(cfg_ptr));
 
-    // V1.13 Day 5.2 — dream-as-cron sentinel. When cron.json has
-    // `command: "dream"` (a 5-character sentinel; clean for users to
-    // type), substitute the full dream_system_prompt before running
-    // the agent turn. This way users get a one-word cron entry while
-    // the agent sees the full reflection contract. Avoids requiring
-    // users to paste 800-char prompts into cron.json.
-    //
-    // Cron entry shape:
-    //   { "id": "dream_3am_user_1", "user_id": 1,
-    //     "schedule": "0 3 * * *", "kind": "agent",
-    //     "command": "dream", "session_target": "isolated" }
-    const dream_mod = @import("agent/dream.zig");
-    const effective_prompt: []const u8 = if (std.mem.eql(u8, prompt, "dream"))
-        dream_mod.dream_system_prompt
-    else
-        prompt;
+    // Cron-sentinel substitution: a one-word `command` in cron.json
+    // (e.g. "dream", "mine") is expanded to its full agent-facing prompt
+    // here, before the turn runs. See resolveCronSentinelPrompt.
+    const effective_prompt: []const u8 = resolveCronSentinelPrompt(prompt);
 
     if (job.session_target == .main and job.wake_mode == .next_heartbeat) {
         if (scheduler.context_user_id) |user_id| {
@@ -4091,6 +4100,44 @@ test "resolveCronSessionLaneWithMetrics records reroute counter" {
     try std.testing.expectEqualStrings("metric-probe", snap.last_job_id.?);
 }
 
+test "cron sentinel 'dream' substitutes the dream reflection prompt" {
+    const dream_mod = @import("agent/dream.zig");
+    const resolved = resolveCronSentinelPrompt("dream");
+    try std.testing.expectEqualStrings(dream_mod.dream_system_prompt, resolved);
+}
+
+test "cron sentinel 'mine' substitutes the trace-mining prompt" {
+    const dream_mod = @import("agent/dream.zig");
+    const resolved = resolveCronSentinelPrompt("mine");
+    try std.testing.expectEqualStrings(dream_mod.mine_system_prompt, resolved);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "memory_maintain") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "mine_traces") != null);
+}
+
+test "unknown cron sentinel passes through unchanged (fail-soft regression pin)" {
+    const resolved = resolveCronSentinelPrompt("dance");
+    try std.testing.expectEqualStrings("dance", resolved);
+}
+
+test "mine cron job never runs in the main lane" {
+    // Even if an operator writes session_target:"main", a scheduled mine
+    // turn's origin is never .user, so the lane resolver must reroute it
+    // to isolated (same guarantee the dream sentinel relies on).
+    const job = cron.CronJob{
+        .id = "mine_330am",
+        .expression = "30 3 * * *",
+        .command = "mine",
+        .job_type = .agent,
+        .session_target = .main,
+        .delivery = .{ .mode = .none },
+    };
+    const origin = resolveCronTurnOrigin(&job);
+    try std.testing.expectEqual(tools_mod.TurnOrigin.scheduler, origin);
+    const resolution = resolveCronSessionTarget(&job, origin);
+    try std.testing.expectEqual(cron.SessionTarget.isolated, resolution.effective_target);
+    try std.testing.expect(resolution.rerouted_from_main);
+}
+
 test "parseHeartbeatReplyDirective accepts HEARTBEAT_OK variants" {
     try std.testing.expectEqual(HeartbeatReplyDirective.ok, parseHeartbeatReplyDirective("HEARTBEAT_OK"));
     try std.testing.expectEqual(HeartbeatReplyDirective.ok, parseHeartbeatReplyDirective("<b>HEARTBEAT_OK</b> ✅"));
@@ -4699,9 +4746,9 @@ test "C2 half-open wedge — every post-probe early-return records an outcome (b
     {
         var b = ExtractionBreaker.init(2, 0);
         const cycle = [_]Path{
-            .normal_ok,        .parse_failure, .claim_race_null,
-            .short_text,       .thrown_error,  .normal_llm_failed,
-            .normal_ok,        .empty_queue,   .normal_ok,
+            .normal_ok,  .parse_failure, .claim_race_null,
+            .short_text, .thrown_error,  .normal_llm_failed,
+            .normal_ok,  .empty_queue,   .normal_ok,
         };
         var iter: usize = 0;
         while (iter < 50) : (iter += 1) {
