@@ -905,6 +905,12 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn listIdentityFacts(_: *@This(), allocator: std.mem.Allocator, _: i64, _: u32) ![]memory_root.MemoryEntry {
         return allocator.alloc(memory_root.MemoryEntry, 0);
     }
+    /// Stub for non-postgres builds — telos injection degrades to empty (the
+    /// `<telos>` block simply omits). Parity with the real impl above keeps the
+    /// default `zig build` in lockstep with the all-engine suite.
+    pub fn listTelosFacts(_: *@This(), allocator: std.mem.Allocator, _: i64, _: u32) ![]memory_root.MemoryEntry {
+        return allocator.alloc(memory_root.MemoryEntry, 0);
+    }
     /// V1.11 hardening (2026-05-08) — stub for non-postgres builds; the
     /// /brain/me endpoint degrades to 404 on file-state deployments.
     pub fn pickSelfAnchor(_: *@This(), _: std.mem.Allocator, _: i64) !?memory_root.MemoryEntry {
@@ -6391,6 +6397,40 @@ const ManagerImpl = struct {
                 "        'STAKEHOLDER_OF','HAS_ACTIVE_CONTRACT'" ++
                 "    )" ++
                 ") ORDER BY m.created_at DESC, m.id DESC LIMIT $2::int",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        var lim_buf: [16]u8 = undefined;
+        const lim_s = try std.fmt.bufPrintZ(&lim_buf, "{d}", .{limit});
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, lim_s.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(lim_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        return try decodeMemoryRows(allocator, result, false);
+    }
+
+    /// Curated user-model rows (docs/telos-contract.md) — the `durable_fact/telos/*`
+    /// namespace. Unlike `listIdentityFacts` (an edge-predicate query), this is a
+    /// key-prefix query: telos is a reserved namespace, not a predicate class.
+    /// `MEMORIES_VALIDITY_FILTER` excludes superseded rows, so a telos row a later
+    /// `resolveContradiction` closed out (T2) drops out here automatically — the
+    /// same mechanism that keeps a filed telos referent out of every other surface.
+    pub fn listTelosFacts(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        limit: u32,
+    ) ![]memory_root.MemoryEntry {
+        const q = try self.buildQuery(
+            "SELECT m.id, m.key, m.content, m.memory_type, " ++
+                "COALESCE((EXTRACT(EPOCH FROM m.created_at))::bigint::text, '0'), " ++
+                "m.session_id, m.valid_to FROM {schema}.memories m " ++
+                "WHERE m.user_id = $1 AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
+                "AND m.key LIKE 'durable_fact/telos/%' " ++
+                "ORDER BY m.created_at DESC, m.id DESC LIMIT $2::int",
         );
         defer self.allocator.free(q);
 
@@ -19274,6 +19314,52 @@ test "postgres deleteSession removes thread durable state and preserves non-auto
 // row; findRelatedExtractedMemories no longer returns it; getMemory
 // (which applies MEMORIES_VALIDITY_FILTER) also hides it. The agent's
 // retrieval path can never see a closed-out row again.
+test "listTelosFacts returns live telos rows, excludes superseded + non-telos [T1/T2]" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-telos-test-user-2/workspace");
+
+    // Seed: two telos goals + one non-telos durable fact.
+    try mgr.upsertMemory(2, "durable_fact/telos/goal/live", "Ship v1 by Q3", .core, null);
+    try mgr.upsertMemory(2, "durable_fact/telos/goal/stale", "Old superseded goal", .core, null);
+    try mgr.upsertMemory(2, "durable_fact/other_fact", "User likes tea", .core, null);
+
+    // T2: supersede one telos goal (resolveContradiction's close-out primitive).
+    const close_ts: i64 = std.time.timestamp();
+    try mgr.setMemoryInvalidation(2, "durable_fact/telos/goal/stale", close_ts, close_ts);
+
+    const rows = try mgr.listTelosFacts(allocator, 2, 20);
+    defer {
+        for (rows) |e| e.deinit(allocator);
+        allocator.free(rows);
+    }
+
+    // Exactly the live telos goal: superseded telos row filtered by validity,
+    // non-telos durable fact filtered by the telos/ key prefix.
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("durable_fact/telos/goal/live", rows[0].key);
+}
+
 test "V1.6 commit 6 setMemoryInvalidation closes out memory + filters from retrieval" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
