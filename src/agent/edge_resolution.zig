@@ -474,7 +474,9 @@ test "applyContradictions skips telos existing_keys [T2b — extraction guard]" 
     // self, so the guard is exercised without a DB. The RETURN value reflects
     // the guard — telos keys are skipped (not counted), non-telos keys ARE
     // counted (the mock no-ops the actual close). Postgres builds use the real
-    // Manager, which would dereference the undefined handle, so skip there.
+    // Manager (which would deref the handle), so we SKIP there — but the test
+    // must still COMPILE under it, which is why `mock` is `undefined`, not `.{}`
+    // (`.{}` would fail on ManagerImpl's required fields).
     if (build_options.enable_postgres) return error.SkipZigTest;
     var mock: zaki_state.Manager = undefined;
     const telos = [_]Contradiction{.{ .existing_key = "durable_fact/telos/goal/x", .invalid_at = 1, .expired_at = 1 }};

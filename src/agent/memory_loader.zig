@@ -1495,8 +1495,14 @@ const IDENTITY_FACT_FETCH_LIMIT: u32 = 8;
 
 /// Telos fetch limit — a curated north star aggregates more referent types than
 /// the identity block (mission + goals + challenges + strategies + values), so a
-/// higher ceiling; still byte-bounded by IDENTITY_BLOCK_MAX_BYTES below.
+/// higher ceiling; still byte-bounded by TELOS_BLOCK_MAX_BYTES below.
 const TELOS_FACT_FETCH_LIMIT: u32 = 24;
+
+/// TELOS block byte budget — larger than the identity block (1500) because the
+/// curated north star aggregates mission + goals + challenges + strategies +
+/// values, not just pinned identity facts. Still bounded so a pathological telos
+/// can't rot the prompt (context-rot guard). Review finding ③.
+const TELOS_BLOCK_MAX_BYTES: usize = 3000;
 /// Lower-case prefix length used for de-dup. "Eli Vance is a software
 /// engineer." vs "Eli Vance is a software engineer based in Berlin." —
 /// the first 50 lowercase chars usually match for restated facts. Picks
@@ -1682,7 +1688,7 @@ fn renderTelosBlock(allocator: std.mem.Allocator, facts: []const MemoryEntry) !?
 
         const truncated = truncateUtf8(trimmed, IDENTITY_FACT_MAX_BYTES);
         const line_overhead: usize = 3; // "- " + "\n"
-        if (bytes_used + truncated.len + line_overhead > IDENTITY_BLOCK_MAX_BYTES) break;
+        if (bytes_used + truncated.len + line_overhead > TELOS_BLOCK_MAX_BYTES) break;
         try w.writeAll("- ");
         for (truncated) |ch| {
             if (ch == '<' or ch == '>' or ch == '\r') continue;

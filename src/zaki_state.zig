@@ -6430,7 +6430,18 @@ const ManagerImpl = struct {
                 "m.session_id, m.valid_to FROM {schema}.memories m " ++
                 "WHERE m.user_id = $1 AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
                 "AND m.key LIKE 'durable_fact/telos/%' " ++
-                "ORDER BY m.created_at DESC, m.id DESC LIMIT $2::int",
+                // Contract-schema order (mission→goal→challenge→strategy→project→
+                // value→identity), newest-first within a type — a structured north
+                // star, not a raw recency dump (review finding ②).
+                "ORDER BY CASE " ++
+                "  WHEN m.key LIKE 'durable_fact/telos/mission/%' THEN 0 " ++
+                "  WHEN m.key LIKE 'durable_fact/telos/goal/%' THEN 1 " ++
+                "  WHEN m.key LIKE 'durable_fact/telos/challenge/%' THEN 2 " ++
+                "  WHEN m.key LIKE 'durable_fact/telos/strategy/%' THEN 3 " ++
+                "  WHEN m.key LIKE 'durable_fact/telos/project/%' THEN 4 " ++
+                "  WHEN m.key LIKE 'durable_fact/telos/value/%' THEN 5 " ++
+                "  WHEN m.key LIKE 'durable_fact/telos/identity/%' THEN 6 " ++
+                "  ELSE 7 END, m.created_at DESC, m.id DESC LIMIT $2::int",
         );
         defer self.allocator.free(q);
 
