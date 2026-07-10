@@ -1471,6 +1471,11 @@ const IDENTITY_BLOCK_MAX_BYTES: usize = 1500;
 const IDENTITY_FACT_MAX_BYTES: usize = 220;
 /// Maximum facts to fetch from PG. Loader trims further by byte budget.
 const IDENTITY_FACT_FETCH_LIMIT: u32 = 8;
+
+/// Telos fetch limit — a curated north star aggregates more referent types than
+/// the identity block (mission + goals + challenges + strategies + values), so a
+/// higher ceiling; still byte-bounded by IDENTITY_BLOCK_MAX_BYTES below.
+const TELOS_FACT_FETCH_LIMIT: u32 = 24;
 /// Lower-case prefix length used for de-dup. "Eli Vance is a software
 /// engineer." vs "Eli Vance is a software engineer based in Berlin." —
 /// the first 50 lowercase chars usually match for restated facts. Picks
@@ -1597,6 +1602,86 @@ fn buildActiveIdentityBlock(
     stats.appended = true;
     stats.fact_count = emitted;
     stats.appended_bytes = bytes_used;
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// TELOS injection block (docs/telos-contract.md, T1) — the curated, always-on
+/// user-model north star. Sibling of `buildActiveIdentityBlock`, but sourced from
+/// the `durable_fact/telos/*` namespace via `listTelosFacts` and rendered
+/// UNCONDITIONALLY (curated), not retrieval-gated. Fail-soft: no rows (cold start)
+/// or all-blank → null, and the caller omits the block.
+fn buildTelosBlock(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state.Manager,
+    user_id: i64,
+) !?[]u8 {
+    const facts = try state_mgr.listTelosFacts(allocator, user_id, TELOS_FACT_FETCH_LIMIT);
+    defer memory_mod.freeEntries(allocator, facts);
+    const block = try renderTelosBlock(allocator, facts);
+    if (block) |b| log.info("telos.injected user_id={d} bytes={d}", .{ user_id, b.len });
+    return block;
+}
+
+/// Pure renderer for the `<telos>` block — no DB, so it is unit-testable with
+/// hand-built entries. Bounded (IDENTITY_BLOCK_MAX_BYTES), per-item capped
+/// (IDENTITY_FACT_MAX_BYTES), XML-escaped (strips `<`/`>`/`\r`, `\n`→space so a
+/// row cannot inject system-prompt markup), and deduped by content prefix.
+/// Returns null when nothing renders (empty input or all-blank/dup) so the caller
+/// never emits a bare `<telos></telos>`.
+fn renderTelosBlock(allocator: std.mem.Allocator, facts: []const MemoryEntry) !?[]u8 {
+    if (facts.len == 0) return null;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("<telos>\n");
+
+    var seen_prefixes: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (seen_prefixes.items) |p| allocator.free(p);
+        seen_prefixes.deinit(allocator);
+    }
+
+    var emitted: usize = 0;
+    var bytes_used: usize = 0;
+    for (facts) |entry| {
+        const trimmed = std.mem.trim(u8, entry.content, " \t\r\n");
+        if (trimmed.len == 0) continue;
+
+        const dedup_key = try identityDedupKey(allocator, trimmed);
+        defer allocator.free(dedup_key);
+        var is_dup = false;
+        for (seen_prefixes.items) |seen| {
+            if (std.mem.eql(u8, seen, dedup_key)) {
+                is_dup = true;
+                break;
+            }
+        }
+        if (is_dup) continue;
+
+        const truncated = truncateUtf8(trimmed, IDENTITY_FACT_MAX_BYTES);
+        const line_overhead: usize = 3; // "- " + "\n"
+        if (bytes_used + truncated.len + line_overhead > IDENTITY_BLOCK_MAX_BYTES) break;
+        try w.writeAll("- ");
+        for (truncated) |ch| {
+            if (ch == '<' or ch == '>' or ch == '\r') continue;
+            if (ch == '\n') {
+                try w.writeByte(' ');
+                continue;
+            }
+            try w.writeByte(ch);
+        }
+        try w.writeByte('\n');
+        bytes_used += truncated.len + line_overhead;
+        emitted += 1;
+        try seen_prefixes.append(allocator, try allocator.dupe(u8, dedup_key));
+    }
+
+    if (emitted == 0) {
+        buf.deinit(allocator);
+        return null;
+    }
+    try w.writeAll("</telos>\n");
     return try buf.toOwnedSlice(allocator);
 }
 
@@ -3357,6 +3442,35 @@ test "typed views: LoadTurnMemoryOptions.typed_views_enabled defaults to true" {
 // the all-engine `zig build test` — the stub-parity gate.
 test {
     _ = @import("telos_contract_test.zig");
+}
+
+test "renderTelosBlock: empty→null, XML-escaped, deduped, blanks skipped [T1]" {
+    const allocator = std.testing.allocator;
+
+    // Force compile-analysis of the DB-backed wrapper now (it is wired into the
+    // prompt in task 5; Zig would otherwise lazily skip an unreferenced fn).
+    _ = &buildTelosBlock;
+
+    // Cold start: no rows → null so the caller never emits a bare <telos></telos>.
+    try std.testing.expect((try renderTelosBlock(allocator, &[_]MemoryEntry{})) == null);
+
+    const entries = [_]MemoryEntry{
+        .{ .id = "1", .key = "durable_fact/telos/mission/0", .content = "Build the best <agent>", .category = .core, .timestamp = "0" },
+        .{ .id = "2", .key = "durable_fact/telos/goal/0", .content = "Ship v1 by Q3", .category = .core, .timestamp = "0" },
+        .{ .id = "3", .key = "durable_fact/telos/goal/1", .content = "Ship v1 by Q3", .category = .core, .timestamp = "0" }, // dup
+        .{ .id = "4", .key = "durable_fact/telos/value/0", .content = "   ", .category = .core, .timestamp = "0" }, // blank
+    };
+    const block = (try renderTelosBlock(allocator, &entries)).?;
+    defer allocator.free(block);
+
+    try std.testing.expect(std.mem.startsWith(u8, block, "<telos>\n"));
+    try std.testing.expect(std.mem.endsWith(u8, block, "</telos>\n"));
+    // XML structural chars stripped — a row cannot inject system-prompt markup.
+    try std.testing.expect(std.mem.indexOf(u8, block, "Build the best agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, block, "<agent>") == null);
+    // Dedup by content prefix + blank skipped → exactly two bullets (mission + goal).
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, block, "Ship v1 by Q3"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, block, "- "));
 }
 
 // ── dream_log warm-start injection (first dream consumer) ──────────────────
