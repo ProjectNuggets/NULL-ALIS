@@ -345,6 +345,47 @@ pub fn searchDecisionHubSkills(
     query: []const u8,
     max_results: usize,
 ) ![]DecisionHubSearchResult {
+    // Interactive `/skill search` + `skill_registry` path: the LLM-curated
+    // `/v1/ask` answer endpoint (30s budget — it may synthesize prose).
+    // Signature preserved for its three existing callers (stub-parity).
+    return searchDecisionHubImpl(allocator, query, max_results, .{
+        .path_prefix = "/v1/ask?q=",
+        .result_key = "skills",
+        .timeout_ms = 30_000,
+    });
+}
+
+/// Package 2b — render-time wish→hub matchmaking helper. Unlike
+/// `searchDecisionHubSkills` (the `/v1/ask` LLM-answer endpoint, ~3.3-3.7s),
+/// this queries the structured `/v1/skills` catalog endpoint (~0.8s) and takes
+/// an EXPLICIT, caller-supplied timeout so callers on a latency-sensitive path
+/// (e.g. `/learn list` render) stay bounded and fail-soft. Same result shape —
+/// caller frees with `freeDecisionHubSearchResults`.
+pub fn searchDecisionHubCatalog(
+    allocator: std.mem.Allocator,
+    query: []const u8,
+    max_results: usize,
+    timeout_ms: u32,
+) ![]DecisionHubSearchResult {
+    return searchDecisionHubImpl(allocator, query, max_results, .{
+        .path_prefix = "/v1/skills?q=",
+        .result_key = "items",
+        .timeout_ms = timeout_ms,
+    });
+}
+
+const DecisionHubQuery = struct {
+    path_prefix: []const u8,
+    result_key: []const u8,
+    timeout_ms: u32,
+};
+
+fn searchDecisionHubImpl(
+    allocator: std.mem.Allocator,
+    query: []const u8,
+    max_results: usize,
+    q: DecisionHubQuery,
+) ![]DecisionHubSearchResult {
     const trimmed = std.mem.trim(u8, query, " \t\r\n");
     if (trimmed.len == 0) return error.EmptyQuery;
 
@@ -353,7 +394,7 @@ pub fn searchDecisionHubSkills(
     const encoded_query = try urlEncode(allocator, trimmed);
     defer allocator.free(encoded_query);
 
-    const url = try std.fmt.allocPrint(allocator, "{s}/v1/ask?q={s}", .{ api_url, encoded_query });
+    const url = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ api_url, q.path_prefix, encoded_query });
     defer allocator.free(url);
 
     const token = apiToken(allocator);
@@ -366,7 +407,7 @@ pub fn searchDecisionHubSkills(
         .url = url,
         .headers = header_bundle.headers,
         .body = null,
-        .timeout_ms = 30_000,
+        .timeout_ms = q.timeout_ms,
         .subsystem = .tools,
     });
     defer allocator.free(response.body);
@@ -376,7 +417,7 @@ pub fn searchDecisionHubSkills(
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidDecisionHubResponse;
-    const skills_val = parsed.value.object.get("skills") orelse return try allocator.alloc(DecisionHubSearchResult, 0);
+    const skills_val = parsed.value.object.get(q.result_key) orelse return try allocator.alloc(DecisionHubSearchResult, 0);
     if (skills_val != .array) return try allocator.alloc(DecisionHubSearchResult, 0);
 
     var out: std.ArrayList(DecisionHubSearchResult) = .empty;
