@@ -3387,6 +3387,7 @@ pub const Agent = struct {
         results_buf: *std.ArrayListUnmanaged(ToolExecutionResult),
     ) !void {
         for (parsed_calls, 0..) |call, i| {
+            const trace_tool = self.canonical_trace_tool_name(call.name);
             var tool_use_id_buf: [96]u8 = undefined;
             const tool_use_id = toolUseIdForCall(call, iteration, i, &tool_use_id_buf);
             const command = toolCommandFromCall(call);
@@ -3395,7 +3396,7 @@ pub const Agent = struct {
             const files = filesFromHint(file_hint, &files_buf);
             self.last_executed_tool = call.name;
             const tool_start_event = ObserverEvent{ .tool_call_start = .{
-                .tool = call.name,
+                .tool = trace_tool,
                 .tool_use_id = tool_use_id,
                 .input_preview = call.arguments_json,
                 .command = command,
@@ -3437,7 +3438,7 @@ pub const Agent = struct {
                     const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
                     if (preflightBlockEmitsToolResult(decision.source)) {
                         const tool_event = ObserverEvent{ .tool_call = .{
-                            .tool = call.name,
+                            .tool = trace_tool,
                             .duration_ms = tool_duration,
                             .success = result.success,
                             .tool_use_id = tool_use_id,
@@ -3522,7 +3523,7 @@ pub const Agent = struct {
             }
 
             const tool_event = ObserverEvent{ .tool_call = .{
-                .tool = call.name,
+                .tool = trace_tool,
                 .duration_ms = tool_duration,
                 .success = result.success,
                 .tool_use_id = tool_use_id,
@@ -3545,6 +3546,16 @@ pub const Agent = struct {
             try results_buf.append(self.allocator, result);
             if (self.pending_tool_approval != null) break;
         }
+    }
+
+    /// Observer traces can feed fleet aggregates, so never persist the raw
+    /// LLM-provided tool name. Registered names are canonical operator-defined
+    /// shapes; hallucinated names collapse to one bounded sentinel.
+    fn canonical_trace_tool_name(self: *const Agent, requested: []const u8) []const u8 {
+        for (self.tools) |tool| {
+            if (std.mem.eql(u8, tool.name(), requested)) return tool.name();
+        }
+        return "unknown";
     }
 
     fn toolUseIdForCall(call: ParsedToolCall, iteration: u32, index: usize, buf: *[96]u8) ?[]const u8 {
@@ -3675,6 +3686,7 @@ pub const Agent = struct {
         var force_serial_tail = false;
 
         for (parsed_calls, 0..) |call, i| {
+            const trace_tool = self.canonical_trace_tool_name(call.name);
             var tool_use_id_buf: [96]u8 = undefined;
             const tool_use_id = toolUseIdForCall(call, iteration, i, &tool_use_id_buf);
             const command = toolCommandFromCall(call);
@@ -3682,7 +3694,7 @@ pub const Agent = struct {
             var files_buf: [1][]const u8 = undefined;
             const files = filesFromHint(file_hint, &files_buf);
             const tool_start_event = ObserverEvent{ .tool_call_start = .{
-                .tool = call.name,
+                .tool = trace_tool,
                 .tool_use_id = tool_use_id,
                 .input_preview = call.arguments_json,
                 .command = command,
@@ -3745,9 +3757,10 @@ pub const Agent = struct {
             const file_hint = toolFileFromCall(call);
             var files_buf: [1][]const u8 = undefined;
             const files = filesFromHint(file_hint, &files_buf);
+            const trace_tool = self.canonical_trace_tool_name(call.name);
             if (!blocked[i] or preflightBlockEmitsToolResult(blocked_sources[i])) {
                 const tool_event = ObserverEvent{ .tool_call = .{
-                    .tool = call.name,
+                    .tool = trace_tool,
                     .duration_ms = ordered_durations[i],
                     .success = result.success,
                     .tool_use_id = tool_use_id,
@@ -15373,6 +15386,8 @@ test "tool dispatch emits tool_start and tool_result with matching run_id and to
     try std.testing.expect(result_evt.tool_use_id != null);
     try std.testing.expectEqualStrings("call_match_1", start_evt.tool_use_id.?);
     try std.testing.expectEqualStrings("call_match_1", result_evt.tool_use_id.?);
+    try std.testing.expectEqualStrings("unknown", start_evt.tool);
+    try std.testing.expectEqualStrings("unknown", result_evt.tool);
 }
 
 test "Agent.run_id_counter increments and remains stable across event emit sites" {
