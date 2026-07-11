@@ -481,7 +481,9 @@ fn shouldSkipGenericEntry(
     summary_latest_key: ?[]const u8,
     current_timeline_prefix: ?[]const u8,
     has_priority_context: bool,
+    skip_telos_generic: bool,
 ) bool {
+    if (skip_telos_generic and memory_mod.isTelosKey(key)) return true;
     if (shouldSkipLowSignalEntry(key, content)) return true;
     if (summary_latest_key) |latest_key| {
         if (std.mem.eql(u8, key, latest_key)) return true;
@@ -543,6 +545,7 @@ fn loadContextDetailed(
     state_mgr_for_supersede: ?*zaki_state.Manager,
     user_id_for_supersede: ?i64,
     dream_log_warmstart_enabled: bool,
+    skip_telos_generic: bool,
 ) !ContextResult {
     var stats = SelectionStats{ .available = true };
     const scoped_entries = mem.recall(allocator, user_message, WARM_CANDIDATE_FETCH_LIMIT, session_id) catch {
@@ -655,6 +658,7 @@ fn loadContextDetailed(
             // V1.7 cmt9.6: extracted_<hash> rows join durable_fact in the
             // continuity bucket. Both shapes feed agent bootstrap context.
             if (!isDurableFactKey(entry.key) and !isExtractedFactKey(entry.key)) continue;
+            if (skip_telos_generic and memory_mod.isTelosKey(entry.key)) continue;
             // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow
             // behavior facts are never injected — see isRetiredOrShadowBehaviorFact.
             if (isRetiredOrShadowBehaviorFact(entry.key, entry.content)) continue;
@@ -711,7 +715,7 @@ fn loadContextDetailed(
     }
 
     for (scoped_entries) |entry| {
-        if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
+        if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context, skip_telos_generic)) continue;
         // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow behavior
         // facts are never injected, through ANY bucket — see isRetiredOrShadowBehaviorFact.
         if (isRetiredOrShadowBehaviorFact(entry.key, entry.content)) continue;
@@ -743,7 +747,7 @@ fn loadContextDetailed(
             for (entries) |entry| {
                 if (entry.session_id != null) continue; // keep scoped isolation (no cross-session bleed)
                 if (containsKey(scoped_entries, entry.key)) continue;
-                if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
+                if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context, skip_telos_generic)) continue;
                 // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow
                 // behavior facts are never injected — see isRetiredOrShadowBehaviorFact.
                 if (isRetiredOrShadowBehaviorFact(entry.key, entry.content)) continue;
@@ -782,6 +786,7 @@ fn loadContextWithRuntimeDetailed(
     state_mgr_for_supersede: ?*zaki_state.Manager,
     user_id_for_supersede: ?i64,
     dream_log_warmstart_enabled: bool,
+    skip_telos_generic: bool,
 ) !ContextResult {
     var stats = SelectionStats{ .available = true };
     // P4: tier gate — read once per call; 0.0 = disabled.
@@ -899,6 +904,7 @@ fn loadContextWithRuntimeDetailed(
             // V1.7 cmt9.6: extracted_<hash> rows join durable_fact in the
             // continuity bucket. Both shapes feed agent bootstrap context.
             if (!isDurableFactKey(entry.key) and !isExtractedFactKey(entry.key)) continue;
+            if (skip_telos_generic and memory_mod.isTelosKey(entry.key)) continue;
             // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow
             // behavior facts are never injected — see isRetiredOrShadowBehaviorFact.
             if (isRetiredOrShadowBehaviorFact(entry.key, entry.content)) continue;
@@ -942,7 +948,7 @@ fn loadContextWithRuntimeDetailed(
     }
 
     for (candidates) |cand| {
-        if (shouldSkipGenericEntry(cand.key, cand.snippet, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
+        if (shouldSkipGenericEntry(cand.key, cand.snippet, summary_latest_key, current_timeline_prefix, has_priority_context, skip_telos_generic)) continue;
         // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow behavior
         // facts are never injected, even via the vector/RRF candidate path
         // — see isRetiredOrShadowBehaviorFact. cand.snippet is a full-content hydrate
@@ -994,7 +1000,7 @@ fn loadContextWithRuntimeDetailed(
         if (global_keyword_entries) |entries| {
             for (entries) |entry| {
                 if (containsCandidateKey(candidates, entry.key)) continue;
-                if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
+                if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context, skip_telos_generic)) continue;
                 // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow
                 // behavior facts are never injected — see isRetiredOrShadowBehaviorFact.
                 if (isRetiredOrShadowBehaviorFact(entry.key, entry.content)) continue;
@@ -1029,7 +1035,7 @@ fn loadContextWithRuntimeDetailed(
                 if (global_keyword_entries) |keyword_entries| {
                     if (containsKey(keyword_entries, entry.key)) continue;
                 }
-                if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context)) continue;
+                if (shouldSkipGenericEntry(entry.key, entry.content, summary_latest_key, current_timeline_prefix, has_priority_context, skip_telos_generic)) continue;
                 // Learning contract inv. 1/3/7 (Package 2a Task 2): shadow
                 // behavior facts are never injected — see isRetiredOrShadowBehaviorFact.
                 if (isRetiredOrShadowBehaviorFact(entry.key, entry.content)) continue;
@@ -1065,7 +1071,7 @@ pub fn loadContext(
     // need filtering should use loadTurnMemorySlot (which threads
     // state_mgr through). This shim preserves backwards-compat for
     // tests + non-tenant call paths.
-    const result = try loadContextDetailed(allocator, mem, user_message, session_id, null, null, true);
+    const result = try loadContextDetailed(allocator, mem, user_message, session_id, null, null, true, false);
     return result.context;
 }
 
@@ -1077,7 +1083,7 @@ pub fn loadContextWithRuntime(
     session_id: ?[]const u8,
 ) ![]const u8 {
     // V1.10-A: same legacy-shim shape as loadContext above.
-    const result = try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id, null, null, true);
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id, null, null, true, false);
     return result.context;
 }
 
@@ -1188,15 +1194,30 @@ pub fn loadTurnMemorySlotOpts(
     user_id_for_graph: ?i64,
     opts: LoadTurnMemoryOptions,
 ) !MemorySlot {
+    // Build the curated TELOS block before generic recall. Generic retrieval is
+    // suppressed only when the curated block actually exists; if Postgres is
+    // unavailable or the block is empty, legacy recall remains the fail-soft
+    // fallback instead of making TELOS facts disappear.
+    var telos_block: ?[]u8 = null;
+    if (opts.telos_in_prompt) {
+        if (state_mgr_for_graph) |sm| if (user_id_for_graph) |uid| {
+            telos_block = buildTelosBlock(allocator, sm, uid) catch |err| blk: {
+                log.warn("telos.append_failed err={s} — keeping generic recall fallback", .{@errorName(err)});
+                break :blk null;
+            };
+        };
+    }
+    defer if (telos_block) |b| allocator.free(b);
+
     // V1.10-A — pass state_mgr_for_graph + user_id_for_graph through as
     // the supersede-filter inputs. They're already required for graph
     // expansion / community block; reusing them avoids new params on
     // the public surface. Callers that don't supply them get
     // graceful-degrade (no supersede filtering — same behavior as pre-V1.10).
     var result = if (mem_rt) |rt|
-        try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id, state_mgr_for_graph, user_id_for_graph, opts.dream_log_warmstart_enabled)
+        try loadContextWithRuntimeDetailed(allocator, mem, rt, user_message, session_id, state_mgr_for_graph, user_id_for_graph, opts.dream_log_warmstart_enabled, telos_block != null)
     else
-        try loadContextDetailed(allocator, mem, user_message, session_id, state_mgr_for_graph, user_id_for_graph, opts.dream_log_warmstart_enabled);
+        try loadContextDetailed(allocator, mem, user_message, session_id, state_mgr_for_graph, user_id_for_graph, opts.dream_log_warmstart_enabled, telos_block != null);
 
     // ── V1.7a-2 graph-expand recall consumer ───────────────────────────
     // Append graph_neighbors block when state_mgr + user_id are both
@@ -1277,22 +1298,6 @@ pub fn loadTurnMemorySlotOpts(
     result.stats.identity_pin_fact_count = identity_stats.fact_count;
     result.stats.identity_pin_appended_bytes = identity_stats.appended_bytes;
     defer if (identity_block) |b| allocator.free(b);
-
-    // ── TELOS: curated user-model north star (docs/telos-contract.md, T1) ──
-    // Always-on curated foundation (mission/goals/values), distinct from the
-    // extracted <active_identity> facts and rendered FIRST in the fence. Gated
-    // behind opts.telos_in_prompt (default OFF; opt-in for measurement, mirrors
-    // cost_vital_in_prompt). Fail-soft: flag off / no rows → null → omitted.
-    var telos_block: ?[]u8 = null;
-    if (opts.telos_in_prompt) {
-        if (state_mgr_for_graph) |sm| if (user_id_for_graph) |uid| {
-            telos_block = buildTelosBlock(allocator, sm, uid) catch |err| blk: {
-                log.warn("telos.append_failed err={s} — skipping telos context", .{@errorName(err)});
-                break :blk null;
-            };
-        };
-    }
-    defer if (telos_block) |b| allocator.free(b);
 
     // ── Phase 0.5: typed views ─────────────────────────────────────────
     // Read the P3-typed memory signals as four deterministic, always-on
@@ -2867,7 +2872,7 @@ test "loadContext keeps non-runtime fallback on the small bucket" {
         try mem.store(key, content, .conversation, "agent:test:user:1:main");
     }
 
-    const result = try loadContextDetailed(allocator, mem, "shipping raw recall", "agent:test:user:1:main", null, null, true);
+    const result = try loadContextDetailed(allocator, mem, "shipping raw recall", "agent:test:user:1:main", null, null, true, false);
     defer allocator.free(result.context);
 
     try std.testing.expect(result.stats.fallback_bucket_entries <= FALLBACK_BUCKET_MAX_ENTRIES);
@@ -3109,7 +3114,7 @@ test "loadContextWithRuntime overfetches past internal candidate pollution" {
         ._allocator = allocator,
     };
 
-    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "alexsignal saturday", null, null, null, true);
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "alexsignal saturday", null, null, null, true, false);
     defer allocator.free(result.context);
 
     try std.testing.expect(result.stats.candidate_count > config_types.DEFAULT_MEMORY_ENRICH_RECALL_LIMIT);
@@ -3183,7 +3188,7 @@ test "loadContextWithRuntime keeps semantic continuity candidates when priority 
         ._allocator = allocator,
     };
 
-    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "Alex 30GB project", "agent:test:user:1:main", null, null, true);
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "Alex 30GB project", "agent:test:user:1:main", null, null, true, false);
     defer allocator.free(result.context);
 
     try std.testing.expect(result.stats.summary_latest_used);
@@ -3237,7 +3242,7 @@ test "loadContextWithRuntime keeps valid debug-key memories and filters known tr
         ._allocator = allocator,
     };
 
-    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "Alex 30GB debug checklist", null, null, null, true);
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "Alex 30GB debug checklist", null, null, null, true, false);
     defer allocator.free(result.context);
 
     try std.testing.expect(std.mem.indexOf(u8, result.context, "user_debug_note") != null);
@@ -3317,7 +3322,7 @@ test "loadContextWithRuntime caps fallback bucket and preserves semantic budget"
         ._allocator = allocator,
     };
 
-    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "30GB Alex project", "agent:test:user:1:main", null, null, true);
+    const result = try loadContextWithRuntimeDetailed(allocator, mem, &rt, "30GB Alex project", "agent:test:user:1:main", null, null, true, false);
     defer allocator.free(result.context);
 
     try std.testing.expect(result.stats.semantic_bucket_entries >= 2);
@@ -3601,6 +3606,40 @@ test "renderTelosBlock counts escaped bytes in the whole-block budget" {
     try std.testing.expect(block.len <= TELOS_BLOCK_MAX_BYTES);
     try std.testing.expect(std.unicode.utf8ValidateSlice(block));
     try std.testing.expect(std.mem.indexOf(u8, block, "‹") != null);
+}
+
+test "T1: curated telos renders exactly once and generic recall remains fail-soft" {
+    const allocator = std.testing.allocator;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    const telos_content = "Quokka launch is the north star";
+    const generic_content = "Quokka launch checklist is approved";
+    try mem.store("durable_fact/telos/goal/0", telos_content, .core, null);
+    try mem.store("durable_fact/release_checklist", generic_content, .core, null);
+
+    // With no curated block, generic recall remains the fail-soft source.
+    const fallback = try loadContextDetailed(allocator, mem, "Quokka launch", null, null, null, true, false);
+    defer allocator.free(fallback.context);
+    try std.testing.expect(std.mem.indexOf(u8, fallback.context, telos_content) != null);
+
+    // Once the curated block exists, the generic loader excludes only TELOS;
+    // unrelated durable facts keep their normal recall behavior.
+    const recalled = try loadContextDetailed(allocator, mem, "Quokka launch", null, null, null, true, true);
+    defer allocator.free(recalled.context);
+    try std.testing.expect(std.mem.indexOf(u8, recalled.context, telos_content) == null);
+    try std.testing.expect(std.mem.indexOf(u8, recalled.context, generic_content) != null);
+
+    const facts = [_]MemoryEntry{
+        .{ .id = "1", .key = "durable_fact/telos/goal/0", .content = telos_content, .category = .core, .timestamp = "0" },
+    };
+    const telos_block = (try renderTelosBlock(allocator, &facts, 1_000_000)).?;
+    defer allocator.free(telos_block);
+    const assembled = try std.fmt.allocPrint(allocator, "{s}{s}", .{ telos_block, recalled.context });
+    defer allocator.free(assembled);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, assembled, telos_content));
 }
 
 // ── dream_log warm-start injection (first dream consumer) ──────────────────
