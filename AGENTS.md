@@ -3,6 +3,13 @@
 This file defines the default working protocol for coding agents in this repository.
 Scope: entire repository.
 
+> 🤝 **Platform coordination:** the live multi-agent board for the whole ZAKI platform is
+> **`zaki-infra/docs/COORDINATION.md`** (local: `~/Desktop/zaki-infra`, branch `staging`) — per-repo
+> registry, active task claims, cross-repo handoffs, and an agent notes log where concurrent agents
+> leave messages to each other. **Claim your task there before starting non-trivial work; leave a
+> note when you finish or hand off.** Backlog: `zaki-infra/docs/superpowers/ROADMAP-2026-07-11.md` ·
+> cross-repo map: `zaki-infra/docs/PLATFORM.md`.
+
 ## 1) Project Snapshot (Read First)
 
 nullALIS is a Zig-first autonomous AI assistant runtime deployed at chatzaki.com. Optimized for:
