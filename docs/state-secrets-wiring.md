@@ -30,14 +30,14 @@ This key **is**:
 Default name:
 
 ```bash
-NULLCLAW_STATE_MASTER_KEY
+NULLALIS_STATE_MASTER_KEY
 ```
 
 The runtime hashes the env value with SHA-256 and uses that 32-byte digest as the ChaCha20-Poly1305 key.
 
 ## Production Wiring
 
-Production should inject one strong random value as `NULLCLAW_STATE_MASTER_KEY` into every `nullalis` runtime process that reads or writes `user_secrets`.
+Production should inject one strong random value as `NULLALIS_STATE_MASTER_KEY` into every `nullalis` runtime process that reads or writes `user_secrets`.
 
 Requirements:
 - all replicas in the same environment must receive the same value
@@ -46,7 +46,7 @@ Requirements:
 - rotation must be treated as a planned migration event
 
 Recommended pattern:
-1. Store `NULLCLAW_STATE_MASTER_KEY` in the deployment secret authority.
+1. Store `NULLALIS_STATE_MASTER_KEY` in the deployment secret authority.
 2. Inject it into gateway/daemon/service pods as an env var.
 3. Restart all runtime pods together so all replicas use the same key.
 4. Rewrite any legacy rows with empty `nonce` so old plaintext-hex rows become encrypted rows.
@@ -60,14 +60,14 @@ Important:
 For one shell session:
 
 ```bash
-export NULLCLAW_STATE_MASTER_KEY="$(openssl rand -hex 32)"
+export NULLALIS_STATE_MASTER_KEY="$(openssl rand -hex 32)"
 ./zig-out/bin/nullalis gateway --host 127.0.0.1 --port 3000
 ```
 
 For macOS GUI / launchd-launched apps:
 
 ```bash
-launchctl setenv NULLCLAW_STATE_MASTER_KEY "$(openssl rand -hex 32)"
+launchctl setenv NULLALIS_STATE_MASTER_KEY "$(openssl rand -hex 32)"
 ```
 
 Then restart the app from the same launch context that will run it.
@@ -126,7 +126,7 @@ ORDER BY user_id, key;
 
 ## Current Operational Warning
 
-If `NULLCLAW_STATE_MASTER_KEY` is absent:
+If `NULLALIS_STATE_MASTER_KEY` is absent:
 - secrets remain readable by the app
 - but they are stored as hex-encoded plaintext with empty `nonce`
 - this is not acceptable for production secret-at-rest guarantees
@@ -136,3 +136,5 @@ If `NULLCLAW_STATE_MASTER_KEY` is absent:
 - This key protects `user_secrets`, not general config values already present in config files or env vars.
 - Existing rows with empty `nonce` are not auto-migrated when the key appears later.
 - Rewriting a secret through the runtime is enough to store it in encrypted form once the master key is active.
+
+> Env-var note (2026-07-11): `NULLALIS_*` is the primary name; the legacy `NULLCLAW_*` equivalents are still honored as fallbacks by the loader for backward compatibility.
