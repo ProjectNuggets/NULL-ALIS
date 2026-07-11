@@ -9926,6 +9926,19 @@ const ManagerImpl = struct {
         }
         for (copies) |cp| {
             if (std.mem.eql(u8, cp.key, key)) continue;
+            // T2b (docs/telos-contract.md) — RECONCILE SHIELD. A curated telos row
+            // is closed ONLY by explicit curation of its own key, never as an
+            // information-scoped cascade twin of a byte-identical raw copy. This M3
+            // sweep (#147) landed AFTER the TELOS branch forked (#144), so the
+            // isEditableMemoryEntry guard below does NOT cover telos — durable_fact/
+            // is an editable family. Shield telos first (both archive and forget go
+            // through this one loop) so a stray same-hash twin can never silently
+            // close the north star. Checked before the FLOOR/near-dup branch so a
+            // telos row is neither swept nor mis-reported as a near-dup.
+            if (memory_root.isTelosKey(cp.key)) {
+                log.info("information_scope.telos_twin_shielded user={d} key={s}", .{ user_id, cp.key });
+                continue;
+            }
             // Fix-wave (review I3) — protection parity with direct curation,
             // with the deliberate autosave exception (see doc comment).
             const is_autosave = std.mem.startsWith(u8, cp.key, "autosave_user_") or
@@ -17247,6 +17260,77 @@ test "T2b: telos row survives content_hash dedup vs a byte-identical raw dup" {
     const raw = try mgr.getMemory(allocator, 2, "durable_fact/aaa_raw_dup");
     try std.testing.expect(raw != null);
     if (raw) |m| m.deinit(allocator);
+}
+
+// T2b — RECONCILE ADDITION. main's M3 information-scoped cascade
+// (archiveInformationScoped / forgetInformationScoped → informationScopedSweep,
+// #147) landed AFTER the TELOS branch forked (#144), so the branch's T2b only
+// shielded the C0 dedup path (phase05Backfill) it could see. The M3 sweep closes
+// EVERY live row sharing a content_hash and skips only NON-editable keys — but
+// `durable_fact/` is editable, so `durable_fact/telos/*` was NOT protected:
+// archiving/forgetting a byte-identical raw twin would silently close the curated
+// north star. These two tests pin the shield the reconcile adds to that sweep.
+test "T2b M3: telos row survives archiveInformationScoped cascade of a byte-identical raw twin" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-t2b-m3-arch/workspace");
+
+    // A curated telos row and a byte-identical raw twin → identical content_hash.
+    const shared = "Reach 1000 paying teams by Q4 without diluting the craft";
+    try mgr.upsertMemoryWithMetadata(2, "durable_fact/telos/mission/x", shared, .core, "sess-t2bm3a", "{}");
+    try mgr.upsertMemoryWithMetadata(2, "durable_fact/behavior/deadbeefcafe0001", shared, .core, "sess-t2bm3a", "{}");
+
+    // Archive the RAW twin (not the telos row). The M3 cascade sweeps same-hash
+    // live rows; the telos twin must be SHIELDED, never a cascade casualty.
+    const now_ts: i64 = std.time.timestamp();
+    var scope = try mgr.archiveInformationScoped(allocator, 2, "durable_fact/behavior/deadbeefcafe0001", now_ts);
+    defer scope.deinit(allocator);
+
+    // No telos key may appear among the cascade-closed copies.
+    try std.testing.expect(scope.primary_closed);
+    for (scope.exact_closed) |k| try std.testing.expect(!memory_root.isTelosKey(k));
+
+    // The curated telos row is still live (validity-filtered read → valid_to NULL,
+    // is_latest true). This is the assertion that goes RED on the un-shielded sweep.
+    const telos = try mgr.getMemory(allocator, 2, "durable_fact/telos/mission/x");
+    try std.testing.expect(telos != null);
+    if (telos) |m| m.deinit(allocator);
+
+    // The raw twin (the archived primary) IS closed — the cascade still works.
+    const raw = try mgr.getMemory(allocator, 2, "durable_fact/behavior/deadbeefcafe0001");
+    try std.testing.expect(raw == null);
+}
+
+test "T2b M3: telos row survives forgetInformationScoped cascade of a byte-identical raw twin" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-t2b-m3-forget/workspace");
+
+    // Same shape, forget (GDPR hard-erase) flavor: forgetting a raw twin must not
+    // erase the curated telos row that happens to share its content_hash.
+    const shared = "Keep the extraction judge honest and the memory boundary clean";
+    try mgr.upsertMemoryWithMetadata(2, "durable_fact/telos/value/y", shared, .core, "sess-t2bm3f", "{}");
+    try mgr.upsertMemoryWithMetadata(2, "durable_fact/behavior/deadbeefcafe0002", shared, .core, "sess-t2bm3f", "{}");
+
+    const now_ts: i64 = std.time.timestamp();
+    var scope = try mgr.forgetInformationScoped(allocator, 2, "durable_fact/behavior/deadbeefcafe0002", now_ts);
+    defer scope.deinit(allocator);
+
+    try std.testing.expect(scope.primary_closed);
+    for (scope.exact_closed) |k| try std.testing.expect(!memory_root.isTelosKey(k));
+
+    // The curated telos row survives the erasure cascade.
+    const telos = try mgr.getMemory(allocator, 2, "durable_fact/telos/value/y");
+    try std.testing.expect(telos != null);
+    if (telos) |m| m.deinit(allocator);
+
+    // The raw twin is gone (hard-deleted by forget).
+    const raw = try mgr.getMemory(allocator, 2, "durable_fact/behavior/deadbeefcafe0002");
+    try std.testing.expect(raw == null);
 }
 
 test "C0 phase05Backfill: exact content_hash dedup supersedes (never hard-deletes), idempotent" {
