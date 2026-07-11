@@ -1204,6 +1204,10 @@ fn FakeIngestAgent(comptime ObserverT: type) type {
         // Phase 0.5 — typed-views READ gate, reached through the agent:
         // anytype in ContextEngine.ingest at the loadTurnMemorySlotOpts call.
         typed_views_enabled: bool = true,
+        // TELOS (docs/telos-contract.md, T1) — curated <telos> block gate,
+        // reached through the agent: anytype the same way as typed_views_enabled.
+        // Default false mirrors the real Agent (telos is opt-in) for fixture parity.
+        telos_in_prompt: bool = false,
         // Task 4 (package1-activations) — dream_log warm-start gate, reached
         // through the agent: anytype the same way as typed_views_enabled.
         dream_log_warmstart_enabled: bool = true,
