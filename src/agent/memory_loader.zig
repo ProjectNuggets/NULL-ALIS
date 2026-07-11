@@ -1503,6 +1503,31 @@ const TELOS_FACT_FETCH_LIMIT: u32 = 24;
 /// values, not just pinned identity facts. Still bounded so a pathological telos
 /// can't rot the prompt (context-rot guard). Review finding ③.
 const TELOS_BLOCK_MAX_BYTES: usize = 3000;
+
+/// T6 (freshness) — reconfirmation horizon. A curated telos row that has gone
+/// this long without being re-confirmed is rendered with an age annotation so
+/// the MODEL can discount stale intent (an always-on block that silently goes
+/// stale is worse than retrieval-gated memory — the agent would confidently
+/// pursue an abandoned goal). Slice 1.1 implements the ANNOTATION only; the
+/// pinned→retrieval-gated DEMOTION remains Slice 2.
+const TELOS_STALE_HORIZON_DAYS: i64 = 180;
+
+/// Pure T6 helper: given a telos row's `created_at` (unix-epoch-seconds as a
+/// decimal string, exactly as `listTelosFacts` emits it via
+/// `EXTRACT(EPOCH FROM created_at)::bigint::text`) and the current unix time,
+/// return the row's age in whole days IFF it exceeds TELOS_STALE_HORIZON_DAYS,
+/// else null (fresh → no annotation). Fail-soft: an unparseable/empty/negative
+/// or future timestamp returns null (never annotate garbage). Deterministic
+/// over (timestamp_str, now_unix) so it is unit-testable without a clock.
+pub fn telosStaleDays(timestamp_str: []const u8, now_unix: i64) ?u64 {
+    const created = std.fmt.parseInt(i64, std.mem.trim(u8, timestamp_str, " \t\r\n"), 10) catch return null;
+    if (created <= 0) return null; // "0" sentinel / missing created_at → don't annotate
+    const age_s = now_unix - created;
+    if (age_s <= 0) return null; // future/now → fresh
+    const age_days: i64 = @divTrunc(age_s, 86_400);
+    if (age_days <= TELOS_STALE_HORIZON_DAYS) return null;
+    return @intCast(age_days);
+}
 /// Lower-case prefix length used for de-dup. "Eli Vance is a software
 /// engineer." vs "Eli Vance is a software engineer based in Berlin." —
 /// the first 50 lowercase chars usually match for restated facts. Picks
@@ -1644,7 +1669,7 @@ fn buildTelosBlock(
 ) !?[]u8 {
     const facts = try state_mgr.listTelosFacts(allocator, user_id, TELOS_FACT_FETCH_LIMIT);
     defer memory_mod.freeEntries(allocator, facts);
-    const block = try renderTelosBlock(allocator, facts);
+    const block = try renderTelosBlock(allocator, facts, std.time.timestamp());
     if (block) |b| log.info("telos.injected user_id={d} bytes={d}", .{ user_id, b.len });
     return block;
 }
@@ -1655,7 +1680,7 @@ fn buildTelosBlock(
 /// row cannot inject system-prompt markup), and deduped by content prefix.
 /// Returns null when nothing renders (empty input or all-blank/dup) so the caller
 /// never emits a bare `<telos></telos>`.
-fn renderTelosBlock(allocator: std.mem.Allocator, facts: []const MemoryEntry) !?[]u8 {
+fn renderTelosBlock(allocator: std.mem.Allocator, facts: []const MemoryEntry, now_unix: i64) !?[]u8 {
     if (facts.len == 0) return null;
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -1689,7 +1714,16 @@ fn renderTelosBlock(allocator: std.mem.Allocator, facts: []const MemoryEntry) !?
 
         const truncated = truncateUtf8(trimmed, IDENTITY_FACT_MAX_BYTES);
         const line_overhead: usize = 3; // "- " + "\n"
-        if (bytes_used + truncated.len + line_overhead > TELOS_BLOCK_MAX_BYTES) break;
+
+        // T6 — stale rows get an age annotation so the model discounts them.
+        // Fresh rows render clean (unchanged bytes) to keep the common case terse.
+        var ann_buf: [40]u8 = undefined;
+        const annotation: []const u8 = if (telosStaleDays(entry.timestamp, now_unix)) |days|
+            std.fmt.bufPrint(&ann_buf, " (unconfirmed {d}d)", .{days}) catch ""
+        else
+            "";
+
+        if (bytes_used + truncated.len + annotation.len + line_overhead > TELOS_BLOCK_MAX_BYTES) break;
         try w.writeAll("- ");
         for (truncated) |ch| {
             // M1 — SUBSTITUTE (not delete) structural chars: dropping `<`/`>` erases
@@ -1703,8 +1737,9 @@ fn renderTelosBlock(allocator: std.mem.Allocator, facts: []const MemoryEntry) !?
                 else => try w.writeByte(ch),
             }
         }
+        try w.writeAll(annotation);
         try w.writeByte('\n');
-        bytes_used += truncated.len + line_overhead;
+        bytes_used += truncated.len + annotation.len + line_overhead;
         emitted += 1;
         try seen_prefixes.append(allocator, try allocator.dupe(u8, trimmed));
     }
@@ -3480,15 +3515,18 @@ test "renderTelosBlock: empty→null, XML-escaped, deduped, blanks skipped [T1]"
     const allocator = std.testing.allocator;
 
     // Cold start: no rows → null so the caller never emits a bare <telos></telos>.
-    try std.testing.expect((try renderTelosBlock(allocator, &[_]MemoryEntry{})) == null);
+    try std.testing.expect((try renderTelosBlock(allocator, &[_]MemoryEntry{}, 1_000_000)) == null);
 
+    // timestamp="0" is the missing-created_at sentinel → NEVER annotated (T6
+    // telosStaleDays returns null for created<=0), so this escaping/dedup test
+    // stays byte-stable regardless of now_unix.
     const entries = [_]MemoryEntry{
         .{ .id = "1", .key = "durable_fact/telos/mission/0", .content = "Build the best <agent>", .category = .core, .timestamp = "0" },
         .{ .id = "2", .key = "durable_fact/telos/goal/0", .content = "Ship v1 by Q3", .category = .core, .timestamp = "0" },
         .{ .id = "3", .key = "durable_fact/telos/goal/1", .content = "Ship v1 by Q3", .category = .core, .timestamp = "0" }, // dup
         .{ .id = "4", .key = "durable_fact/telos/value/0", .content = "   ", .category = .core, .timestamp = "0" }, // blank
     };
-    const block = (try renderTelosBlock(allocator, &entries)).?;
+    const block = (try renderTelosBlock(allocator, &entries, 1_000_000)).?;
     defer allocator.free(block);
 
     try std.testing.expect(std.mem.startsWith(u8, block, "<telos>\n"));
@@ -3500,6 +3538,45 @@ test "renderTelosBlock: empty→null, XML-escaped, deduped, blanks skipped [T1]"
     // Dedup by content prefix + blank skipped → exactly two bullets (mission + goal).
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, block, "Ship v1 by Q3"));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, block, "- "));
+}
+
+test "telosStaleDays: fresh→null, stale→age, sentinel/garbage/future→null [T6]" {
+    const created: i64 = 1_000_000_000;
+    // Fresh: 10 days old ≤ 180d horizon → null.
+    try std.testing.expectEqual(@as(?u64, null), telosStaleDays("1000000000", created + 10 * 86_400));
+    // Exactly at the horizon (180d) → still fresh (strictly-greater trips it).
+    try std.testing.expectEqual(@as(?u64, null), telosStaleDays("1000000000", created + 180 * 86_400));
+    // Stale: 200 days old > 180d → annotated with the age.
+    try std.testing.expectEqual(@as(?u64, 200), telosStaleDays("1000000000", created + 200 * 86_400));
+    // Sentinel "0" (missing created_at) → never annotate.
+    try std.testing.expectEqual(@as(?u64, null), telosStaleDays("0", created + 9_999 * 86_400));
+    // Garbage / empty → fail-soft null.
+    try std.testing.expectEqual(@as(?u64, null), telosStaleDays("not-a-number", created));
+    try std.testing.expectEqual(@as(?u64, null), telosStaleDays("", created));
+    // Future timestamp (clock skew) → fresh.
+    try std.testing.expectEqual(@as(?u64, null), telosStaleDays("2000000000", created));
+}
+
+test "renderTelosBlock: T6 stale rows annotated, fresh rows clean [T6]" {
+    const allocator = std.testing.allocator;
+    const now: i64 = 1_000_000_000 + 200 * 86_400; // 200 days after the base
+
+    // A FRESH row (filed 'now') and a STALE row (filed at the base, 200d ago).
+    const fresh_ts = "1017280000"; // == now → fresh
+    const stale_ts = "1000000000"; // 200 days before now → stale
+    const entries = [_]MemoryEntry{
+        .{ .id = "1", .key = "durable_fact/telos/mission/0", .content = "Ship v1", .category = .core, .timestamp = fresh_ts },
+        .{ .id = "2", .key = "durable_fact/telos/goal/0", .content = "Grow to 1000 users", .category = .core, .timestamp = stale_ts },
+    };
+    const block = (try renderTelosBlock(allocator, &entries, now)).?;
+    defer allocator.free(block);
+
+    // Fresh row: NO annotation.
+    try std.testing.expect(std.mem.indexOf(u8, block, "Ship v1\n") != null);
+    // Stale row: annotated with its age.
+    try std.testing.expect(std.mem.indexOf(u8, block, "Grow to 1000 users (unconfirmed 200d)\n") != null);
+    // Exactly one annotation (only the stale row).
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, block, "(unconfirmed"));
 }
 
 // ── dream_log warm-start injection (first dream consumer) ──────────────────
