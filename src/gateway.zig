@@ -17945,6 +17945,25 @@ fn telosType(key: []const u8) []const u8 {
     return rest[0..slash];
 }
 
+fn render_telos_json(allocator: std.mem.Allocator, rows: []const memory_mod.MemoryEntry) RouteResponse {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"telos\":[") catch return response_build_err;
+    for (rows, 0..) |r, i| {
+        if (i > 0) w.writeByte(',') catch return response_build_err;
+        w.writeAll("{\"key\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, r.key) catch return response_build_err;
+        w.writeAll(",\"type\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, telosType(r.key)) catch return response_build_err;
+        w.writeAll(",\"content\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, r.content) catch return response_build_err;
+        w.writeByte('}') catch return response_build_err;
+    }
+    w.writeAll("]}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
 /// GET /api/v1/users/{id}/telos — the curated user-model north star
 /// (docs/telos-contract.md). Powers the read-only Settings view in zaki-prod
 /// (task 8). Mirrors handleBrainMe: validity-filtered live telos rows in
@@ -17975,28 +17994,47 @@ fn handleTelos(
         allocator.free(rows);
     }
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(allocator);
-    const w = out.writer(allocator);
-    w.writeAll("{\"telos\":[") catch return response_build_err;
-    for (rows, 0..) |r, i| {
-        if (i > 0) w.writeByte(',') catch return response_build_err;
-        w.writeAll("{\"key\":") catch return response_build_err;
-        json_util.appendJsonString(&out, allocator, r.key) catch return response_build_err;
-        w.writeAll(",\"type\":") catch return response_build_err;
-        json_util.appendJsonString(&out, allocator, telosType(r.key)) catch return response_build_err;
-        w.writeAll(",\"content\":") catch return response_build_err;
-        json_util.appendJsonString(&out, allocator, r.content) catch return response_build_err;
-        w.writeAll("}") catch return response_build_err;
-    }
-    w.writeAll("]}") catch return response_build_err;
-    return finalizeJsonBuf(allocator, &out);
+    return render_telos_json(allocator, rows);
 }
 
 test "telosType extracts the referent type from a durable_fact/telos key" {
     try std.testing.expectEqualStrings("goal", telosType("durable_fact/telos/goal/3"));
     try std.testing.expectEqualStrings("mission", telosType("durable_fact/telos/mission/0"));
     try std.testing.expectEqualStrings("unknown", telosType("durable_fact/other_fact"));
+}
+
+test "telos endpoint enforces method, user id, and state-manager boundaries" {
+    var dummy_state: GatewayState = undefined;
+    const method = handleTelos(std.testing.allocator, "POST", "1", &dummy_state);
+    try std.testing.expectEqualStrings("405 Method Not Allowed", method.status);
+    const invalid_user = handleTelos(std.testing.allocator, "GET", "not-a-user", &dummy_state);
+    try std.testing.expectEqualStrings("400 Bad Request", invalid_user.status);
+
+    dummy_state.zaki_state = null;
+    const unavailable = handleTelos(std.testing.allocator, "GET", "1", &dummy_state);
+    try std.testing.expectEqualStrings("503 Service Unavailable", unavailable.status);
+}
+
+test "telos endpoint JSON renders type and escapes curated content" {
+    const allocator = std.testing.allocator;
+    const rows = [_]memory_mod.MemoryEntry{
+        .{
+            .id = "1",
+            .key = "durable_fact/telos/goal/launch",
+            .content = "Ship \"safe\" <v1>\nnow",
+            .category = .core,
+            .timestamp = "0",
+        },
+    };
+    const response = render_telos_json(allocator, &rows);
+    defer allocator.free(response.body);
+    try std.testing.expectEqualStrings("200 OK", response.status);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const item = parsed.value.object.get("telos").?.array.items[0].object;
+    try std.testing.expectEqualStrings("goal", item.get("type").?.string);
+    try std.testing.expectEqualStrings("Ship \"safe\" <v1>\nnow", item.get("content").?.string);
 }
 
 fn handleBrainOrphans(
