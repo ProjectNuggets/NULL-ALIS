@@ -35,11 +35,20 @@ so via `"truncated": true`; on a healthy fleet (dozens of tools) it stays
 `false`. A `true` here is itself a signal worth investigating: something is
 minting high-cardinality tool names.
 
+The aggregation also runs in a connection-pinned PostgreSQL transaction with
+`statement_timeout=5000ms` and `work_mem=4MB` applied via `SET LOCAL`. These
+database-side guards bound work performed before `LIMIT` can take effect; a
+timeout fails the endpoint closed instead of allowing an adversarial trace
+corpus to consume unbounded query time or per-operation memory.
+
 ## Privacy boundary (learning contract invariant 5)
 
 See `docs/learning-contract.md`, invariant 5: per-user trace CONTENT never
 leaves the tenant. Fleet output carries tool names, outcome counts, and
 duration shapes — never run_ids, labels, arguments, keys, user ids, or text.
+Trace emission canonicalizes names against the registered tool set before
+persistence. Hallucinated/model-supplied names become the single `unknown`
+sentinel, preventing tenant-text disclosure and fleet-cardinality inflation.
 The operator sees the fleet shape, not the user's life. This is pinned by the
 privacy-sentinel test on `renderFleetJson` (pure-function level) plus a
 cross-tenant end-to-end test on the route handler

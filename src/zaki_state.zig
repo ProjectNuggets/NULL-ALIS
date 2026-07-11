@@ -12294,6 +12294,15 @@ const ManagerImpl = struct {
         allocator: std.mem.Allocator,
         since_days: u32,
     ) !trace_mining.FleetStats {
+        // Pin both aggregates to one transaction so SET LOCAL guards apply to
+        // every statement and disappear automatically on commit/rollback.
+        var txn = try self.beginTransaction();
+        defer txn.deinit();
+        const timeout_res = try txn.exec(FLEET_STATEMENT_TIMEOUT_SQL);
+        c.PQclear(timeout_res);
+        const work_mem_res = try txn.exec(FLEET_WORK_MEM_SQL);
+        c.PQclear(work_mem_res);
+
         var days_buf: [16]u8 = undefined;
         const days_s = try std.fmt.bufPrintZ(&days_buf, "{d}", .{since_days});
         const params = [_]?[*:0]const u8{days_s.ptr};
@@ -12302,7 +12311,7 @@ const ManagerImpl = struct {
         // Query 1 — per-tool fluency census (top FLEET_MAX_TOOLS + probe).
         const stats_q = try self.buildQuery(FLEET_TOOL_STATS_SQL);
         defer self.allocator.free(stats_q);
-        const stats_res = try self.execParams(stats_q, &params, &lengths);
+        const stats_res = try txn.execParams(stats_q, &params, &lengths);
         defer c.PQclear(stats_res);
         const stats_cut = @as(usize, @intCast(c.PQntuples(stats_res))) > trace_mining.FLEET_MAX_TOOLS;
         const tool_stats = try collectFleetToolStats(allocator, stats_res, trace_mining.FLEET_MAX_TOOLS);
@@ -12315,10 +12324,16 @@ const ManagerImpl = struct {
         // top FLEET_MAX_TOOLS + probe).
         const fail_q = try self.buildQuery(FLEET_FAILURE_SQL);
         defer self.allocator.free(fail_q);
-        const fail_res = try self.execParams(fail_q, &params, &lengths);
+        const fail_res = try txn.execParams(fail_q, &params, &lengths);
         defer c.PQclear(fail_res);
         const fail_cut = @as(usize, @intCast(c.PQntuples(fail_res))) > trace_mining.FLEET_MAX_TOOLS;
         const failure_patterns = try collectFleetFailurePatterns(allocator, fail_res, trace_mining.FLEET_MAX_TOOLS);
+        errdefer {
+            for (failure_patterns) |p| p.deinit(allocator);
+            allocator.free(failure_patterns);
+        }
+
+        try txn.commit();
 
         return .{
             .failure_patterns = failure_patterns,
@@ -14845,6 +14860,16 @@ fn collectToolTraceDigestRows(
 /// MIN_PATTERN_COUNT precedent) so SQL and types cannot silently
 /// drift.
 const FLEET_SQL_LIMIT = std.fmt.comptimePrint("{d}", .{trace_mining.FLEET_MAX_TOOLS + 1});
+
+/// Cross-tenant aggregation must have database-side execution and memory
+/// ceilings too: a result LIMIT alone does not bound GROUP BY work.
+const FLEET_STATEMENT_TIMEOUT_SQL = "SET LOCAL statement_timeout = '5000ms'";
+const FLEET_WORK_MEM_SQL = "SET LOCAL work_mem = '4MB'";
+
+test "fleet aggregation SQL has database-side time and memory guards" {
+    try std.testing.expect(std.mem.indexOf(u8, FLEET_STATEMENT_TIMEOUT_SQL, "statement_timeout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, FLEET_WORK_MEM_SQL, "work_mem") != null);
+}
 
 /// SQL-side per-tool fluency census for the bounded fleet endpoint
 /// (Manager.fleetMiningStats). Aggregates over jsonb `events` array
