@@ -47,6 +47,7 @@ const log = std.log.scoped(.edge_resolution);
 const providers = @import("../providers/root.zig");
 const zaki_state = @import("../zaki_state.zig");
 const memory_root = @import("../memory/root.zig");
+const build_options = @import("build_options");
 const extraction_persist = @import("extraction_persist.zig");
 
 const ChatMessage = providers.ChatMessage;
@@ -448,6 +449,15 @@ pub fn applyContradictions(
 ) usize {
     var applied: usize = 0;
     for (contradictions) |c| {
+        // T2b (docs/telos-contract.md) — extraction NEVER silently closes a
+        // curated telos row. A conversational remark the judge reads as
+        // contradicting a filed goal must not overwrite the user's north star;
+        // that requires explicit curation (Slice 1) or an approved wish/telos
+        // proposal (T4, Slice 2). Drop the contradiction rather than apply it.
+        if (memory_root.isTelosKey(c.existing_key)) {
+            log.info("edge_resolution.telos_contradiction_skipped key={s}", .{c.existing_key});
+            continue;
+        }
         state_mgr.setMemoryInvalidation(user_id, c.existing_key, c.invalid_at, c.expired_at) catch |err| {
             log.warn("edge_resolution.invalidation_write_failed key={s} err={s}", .{
                 c.existing_key, @errorName(err),
@@ -457,6 +467,22 @@ pub fn applyContradictions(
         applied += 1;
     }
     return applied;
+}
+
+test "applyContradictions skips telos existing_keys [T2b — extraction guard]" {
+    // Non-postgres mock Manager: setMemoryInvalidation is a no-op that ignores
+    // self, so the guard is exercised without a DB. The RETURN value reflects
+    // the guard — telos keys are skipped (not counted), non-telos keys ARE
+    // counted (the mock no-ops the actual close). Postgres builds use the real
+    // Manager (which would deref the handle), so we SKIP there — but the test
+    // must still COMPILE under it, which is why `mock` is `undefined`, not `.{}`
+    // (`.{}` would fail on ManagerImpl's required fields).
+    if (build_options.enable_postgres) return error.SkipZigTest;
+    var mock: zaki_state.Manager = undefined;
+    const telos = [_]Contradiction{.{ .existing_key = "durable_fact/telos/goal/x", .invalid_at = 1, .expired_at = 1 }};
+    const raw = [_]Contradiction{.{ .existing_key = "durable_fact/other_fact", .invalid_at = 1, .expired_at = 1 }};
+    try std.testing.expectEqual(@as(usize, 0), applyContradictions(&mock, 2, &telos));
+    try std.testing.expectEqual(@as(usize, 1), applyContradictions(&mock, 2, &raw));
 }
 
 // ── Prompt construction ─────────────────────────────────────────────────────

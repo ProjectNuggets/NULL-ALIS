@@ -1586,6 +1586,16 @@ pub fn isSystemManagedMemoryKey(key: []const u8) bool {
         isAppendOnlyMemoryKey(key);
 }
 
+/// TELOS curated-model keys — `durable_fact/telos/<type>/<id>`. Narrower than
+/// `isSystemManagedMemoryKey` (which matches ALL `durable_fact/`): used to shield
+/// curated telos rows from content_hash cascade close-out (T2b,
+/// docs/telos-contract.md) so a byte-identical raw duplicate can never silently
+/// supersede the curated twin. Only explicit curation of the telos key itself
+/// may close a telos row.
+pub fn isTelosKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "durable_fact/telos/");
+}
+
 pub fn isMutableMemoryEntry(key: []const u8, category: MemoryCategory) bool {
     // Used by markdown engine paths (compaction/collapse) — they need the
     // tighter "core only" semantic to decide what to fold. Keep this

@@ -244,7 +244,9 @@ fn loadGlobalKeywordFallbackEntries(
     return try merged.toOwnedSlice(allocator);
 }
 
-fn isDurableFactKey(key: []const u8) bool {
+/// `pub`: test surface for `telos_contract_test.zig` — pins the
+/// `durable_fact/telos/*` namespace against this recognizer (contract enforcement map).
+pub fn isDurableFactKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "durable_fact/");
 }
 
@@ -1131,6 +1133,9 @@ pub const LoadTurnMemoryOptions = struct {
     /// memory signals. When false → no new blocks (exact prior context).
     /// Threaded from `agent.typed_views_enabled` (config_types.AgentConfig).
     typed_views_enabled: bool = true,
+    /// TELOS (docs/telos-contract.md, T1) — inject the curated `<telos>` block.
+    /// Default OFF (opt-in for measurement). Threaded from `agent.telos_in_prompt`.
+    telos_in_prompt: bool = false,
 
     /// Task 4 (Loop-1 consumer, package1-activations) — dream_log
     /// warm-start gate (default ON). When true, the loader finds the
@@ -1273,6 +1278,22 @@ pub fn loadTurnMemorySlotOpts(
     result.stats.identity_pin_appended_bytes = identity_stats.appended_bytes;
     defer if (identity_block) |b| allocator.free(b);
 
+    // ── TELOS: curated user-model north star (docs/telos-contract.md, T1) ──
+    // Always-on curated foundation (mission/goals/values), distinct from the
+    // extracted <active_identity> facts and rendered FIRST in the fence. Gated
+    // behind opts.telos_in_prompt (default OFF; opt-in for measurement, mirrors
+    // cost_vital_in_prompt). Fail-soft: flag off / no rows → null → omitted.
+    var telos_block: ?[]u8 = null;
+    if (opts.telos_in_prompt) {
+        if (state_mgr_for_graph) |sm| if (user_id_for_graph) |uid| {
+            telos_block = buildTelosBlock(allocator, sm, uid) catch |err| blk: {
+                log.warn("telos.append_failed err={s} — skipping telos context", .{@errorName(err)});
+                break :blk null;
+            };
+        };
+    }
+    defer if (telos_block) |b| allocator.free(b);
+
     // ── Phase 0.5: typed views ─────────────────────────────────────────
     // Read the P3-typed memory signals as four deterministic, always-on
     // blocks. Gated behind opts.typed_views_enabled (default ON, threaded
@@ -1338,13 +1359,14 @@ pub fn loadTurnMemorySlotOpts(
     const has_legacy = result.context.len > 0;
     const has_graph = if (graph_block) |g| g.len > 0 else false;
     const has_community = if (community_block) |c| c.len > 0 else false;
+    const has_telos = if (telos_block) |b| b.len > 0 else false;
     const has_identity = if (identity_block) |b| b.len > 0 else false;
     const has_pref = if (pref_block) |b| b.len > 0 else false;
     const has_loop = if (loop_block) |b| b.len > 0 else false;
     const has_decision = if (decision_block) |b| b.len > 0 else false;
     const has_people = if (people_block) |b| b.len > 0 else false;
     if (!has_legacy and !has_graph and !has_community and !has_identity and
-        !has_pref and !has_loop and !has_decision and !has_people)
+        !has_telos and !has_pref and !has_loop and !has_decision and !has_people)
     {
         allocator.free(result.context);
         return .{
@@ -1356,6 +1378,7 @@ pub fn loadTurnMemorySlotOpts(
     defer allocator.free(result.context);
     const graph_payload: []const u8 = if (graph_block) |g| g else "";
     const community_payload: []const u8 = if (community_block) |c| c else "";
+    const telos_payload: []const u8 = if (telos_block) |b| b else "";
     const identity_payload: []const u8 = if (identity_block) |b| b else "";
     const pref_payload: []const u8 = if (pref_block) |b| b else "";
     const loop_payload: []const u8 = if (loop_block) |b| b else "";
@@ -1385,8 +1408,8 @@ pub fn loadTurnMemorySlotOpts(
     // "first across all warm context."
     const fenced = try std.fmt.allocPrint(
         allocator,
-        "<memory_for_turn>\n{s}{s}{s}{s}{s}{s}{s}{s}</memory_for_turn>\n",
-        .{ identity_payload, pref_payload, loop_payload, decision_payload, people_payload, result.context, graph_payload, community_payload },
+        "<memory_for_turn>\n{s}{s}{s}{s}{s}{s}{s}{s}{s}</memory_for_turn>\n",
+        .{ telos_payload, identity_payload, pref_payload, loop_payload, decision_payload, people_payload, result.context, graph_payload, community_payload },
     );
     return .{
         .fenced_content = fenced,
@@ -1469,6 +1492,17 @@ const IDENTITY_BLOCK_MAX_BYTES: usize = 1500;
 const IDENTITY_FACT_MAX_BYTES: usize = 220;
 /// Maximum facts to fetch from PG. Loader trims further by byte budget.
 const IDENTITY_FACT_FETCH_LIMIT: u32 = 8;
+
+/// Telos fetch limit — a curated north star aggregates more referent types than
+/// the identity block (mission + goals + challenges + strategies + values), so a
+/// higher ceiling; still byte-bounded by TELOS_BLOCK_MAX_BYTES below.
+const TELOS_FACT_FETCH_LIMIT: u32 = 24;
+
+/// TELOS block byte budget — larger than the identity block (1500) because the
+/// curated north star aggregates mission + goals + challenges + strategies +
+/// values, not just pinned identity facts. Still bounded so a pathological telos
+/// can't rot the prompt (context-rot guard). Review finding ③.
+const TELOS_BLOCK_MAX_BYTES: usize = 3000;
 /// Lower-case prefix length used for de-dup. "Eli Vance is a software
 /// engineer." vs "Eli Vance is a software engineer based in Berlin." —
 /// the first 50 lowercase chars usually match for restated facts. Picks
@@ -1595,6 +1629,91 @@ fn buildActiveIdentityBlock(
     stats.appended = true;
     stats.fact_count = emitted;
     stats.appended_bytes = bytes_used;
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// TELOS injection block (docs/telos-contract.md, T1) — the curated, always-on
+/// user-model north star. Sibling of `buildActiveIdentityBlock`, but sourced from
+/// the `durable_fact/telos/*` namespace via `listTelosFacts` and rendered
+/// UNCONDITIONALLY (curated), not retrieval-gated. Fail-soft: no rows (cold start)
+/// or all-blank → null, and the caller omits the block.
+fn buildTelosBlock(
+    allocator: std.mem.Allocator,
+    state_mgr: *zaki_state.Manager,
+    user_id: i64,
+) !?[]u8 {
+    const facts = try state_mgr.listTelosFacts(allocator, user_id, TELOS_FACT_FETCH_LIMIT);
+    defer memory_mod.freeEntries(allocator, facts);
+    const block = try renderTelosBlock(allocator, facts);
+    if (block) |b| log.info("telos.injected user_id={d} bytes={d}", .{ user_id, b.len });
+    return block;
+}
+
+/// Pure renderer for the `<telos>` block — no DB, so it is unit-testable with
+/// hand-built entries. Bounded (IDENTITY_BLOCK_MAX_BYTES), per-item capped
+/// (IDENTITY_FACT_MAX_BYTES), XML-escaped (strips `<`/`>`/`\r`, `\n`→space so a
+/// row cannot inject system-prompt markup), and deduped by content prefix.
+/// Returns null when nothing renders (empty input or all-blank/dup) so the caller
+/// never emits a bare `<telos></telos>`.
+fn renderTelosBlock(allocator: std.mem.Allocator, facts: []const MemoryEntry) !?[]u8 {
+    if (facts.len == 0) return null;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("<telos>\n");
+
+    var seen_prefixes: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (seen_prefixes.items) |p| allocator.free(p);
+        seen_prefixes.deinit(allocator);
+    }
+
+    var emitted: usize = 0;
+    var bytes_used: usize = 0;
+    for (facts) |entry| {
+        const trimmed = std.mem.trim(u8, entry.content, " \t\r\n");
+        if (trimmed.len == 0) continue;
+
+        // L3 — dedup on FULL content (seen_prefixes stores whole rows here), not a
+        // 50-char prefix: two distinct curated goals that share a long prefix must
+        // both survive — a vanished north-star row is worse than a redundant one.
+        var is_dup = false;
+        for (seen_prefixes.items) |seen| {
+            if (std.mem.eql(u8, seen, trimmed)) {
+                is_dup = true;
+                break;
+            }
+        }
+        if (is_dup) continue;
+
+        const truncated = truncateUtf8(trimmed, IDENTITY_FACT_MAX_BYTES);
+        const line_overhead: usize = 3; // "- " + "\n"
+        if (bytes_used + truncated.len + line_overhead > TELOS_BLOCK_MAX_BYTES) break;
+        try w.writeAll("- ");
+        for (truncated) |ch| {
+            // M1 — SUBSTITUTE (not delete) structural chars: dropping `<`/`>` erases
+            // metric operators ("< 200ms" -> " 200ms"), destroying the goal's
+            // meaning. Guillemets are visually faithful yet can't forge a </telos> tag.
+            switch (ch) {
+                '<' => try w.writeAll("‹"),
+                '>' => try w.writeAll("›"),
+                '\r' => {},
+                '\n' => try w.writeByte(' '),
+                else => try w.writeByte(ch),
+            }
+        }
+        try w.writeByte('\n');
+        bytes_used += truncated.len + line_overhead;
+        emitted += 1;
+        try seen_prefixes.append(allocator, try allocator.dupe(u8, trimmed));
+    }
+
+    if (emitted == 0) {
+        buf.deinit(allocator);
+        return null;
+    }
+    try w.writeAll("</telos>\n");
     return try buf.toOwnedSlice(allocator);
 }
 
@@ -3347,6 +3466,40 @@ test "typed views: renderTypedViewBlock strips XML structural chars (defense-in-
 test "typed views: LoadTurnMemoryOptions.typed_views_enabled defaults to true" {
     const opts = LoadTurnMemoryOptions{};
     try std.testing.expect(opts.typed_views_enabled);
+}
+
+// ── TELOS contract (executable form of docs/telos-contract.md) ─────────────
+// Contract-first: hosts telos_contract_test.zig into the build so its
+// invariants (T1–T6, T2b) compile+run under BOTH the default `zig build` and
+// the all-engine `zig build test` — the stub-parity gate.
+test {
+    _ = @import("telos_contract_test.zig");
+}
+
+test "renderTelosBlock: empty→null, XML-escaped, deduped, blanks skipped [T1]" {
+    const allocator = std.testing.allocator;
+
+    // Cold start: no rows → null so the caller never emits a bare <telos></telos>.
+    try std.testing.expect((try renderTelosBlock(allocator, &[_]MemoryEntry{})) == null);
+
+    const entries = [_]MemoryEntry{
+        .{ .id = "1", .key = "durable_fact/telos/mission/0", .content = "Build the best <agent>", .category = .core, .timestamp = "0" },
+        .{ .id = "2", .key = "durable_fact/telos/goal/0", .content = "Ship v1 by Q3", .category = .core, .timestamp = "0" },
+        .{ .id = "3", .key = "durable_fact/telos/goal/1", .content = "Ship v1 by Q3", .category = .core, .timestamp = "0" }, // dup
+        .{ .id = "4", .key = "durable_fact/telos/value/0", .content = "   ", .category = .core, .timestamp = "0" }, // blank
+    };
+    const block = (try renderTelosBlock(allocator, &entries)).?;
+    defer allocator.free(block);
+
+    try std.testing.expect(std.mem.startsWith(u8, block, "<telos>\n"));
+    try std.testing.expect(std.mem.endsWith(u8, block, "</telos>\n"));
+    // M1 — structural chars SUBSTITUTED (‹›), not dropped, so metric operators
+    // survive while a row still can't forge a tag.
+    try std.testing.expect(std.mem.indexOf(u8, block, "‹agent›") != null);
+    try std.testing.expect(std.mem.indexOf(u8, block, "<agent>") == null);
+    // Dedup by content prefix + blank skipped → exactly two bullets (mission + goal).
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, block, "Ship v1 by Q3"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, block, "- "));
 }
 
 // ── dream_log warm-start injection (first dream consumer) ──────────────────

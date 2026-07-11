@@ -233,6 +233,27 @@ const c = if (build_options.enable_postgres) @cImport({
 /// has no equivalent function.
 const MEMORIES_VALIDITY_FILTER = "(valid_to IS NULL OR valid_to > EXTRACT(EPOCH FROM NOW())::bigint)";
 
+/// A promoted active_goal working-memory slot, parsed out of its durable key.
+const ActiveGoalSlot = struct { session_id: []const u8, slot_id: i32 };
+
+/// Parse a promoted active_goal durable key —
+/// `durable_fact/active_goal/<session_id>/<slot_id>` (promotion.zig P8 shape) —
+/// into (session_id, slot_id) so the source WM slot can be evicted when the goal
+/// is filed into telos (T2b ①; supersession touches memories/edges but NOT the
+/// working_memory table). Returns null for any other key shape (nothing to
+/// evict). `session_id` borrows from `key`.
+fn parseActiveGoalSlot(key: []const u8) ?ActiveGoalSlot {
+    const prefix = "durable_fact/active_goal/";
+    if (!std.mem.startsWith(u8, key, prefix)) return null;
+    const rest = key[prefix.len..];
+    const slash = std.mem.lastIndexOfScalar(u8, rest, '/') orelse return null;
+    const sid = rest[0..slash];
+    const slot_str = rest[slash + 1 ..];
+    if (sid.len == 0 or slot_str.len == 0) return null;
+    const slot_id = std.fmt.parseInt(i32, slot_str, 10) catch return null;
+    return .{ .session_id = sid, .slot_id = slot_id };
+}
+
 /// V1.5.1 brain-hygiene SQL filter — comptime-derived from
 /// `memory_root.BRAIN_HIDDEN_PREFIXES` + `memory_root.BRAIN_HIDDEN_EXACT_KEYS`.
 ///
@@ -904,6 +925,21 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     /// degrades to empty (loader falls back to legacy cosine retrieval).
     pub fn listIdentityFacts(_: *@This(), allocator: std.mem.Allocator, _: i64, _: u32) ![]memory_root.MemoryEntry {
         return allocator.alloc(memory_root.MemoryEntry, 0);
+    }
+    /// Stub for non-postgres builds — telos injection degrades to empty (the
+    /// `<telos>` block simply omits). Parity with the real impl above keeps the
+    /// default `zig build` in lockstep with the all-engine suite.
+    pub fn listTelosFacts(_: *@This(), allocator: std.mem.Allocator, _: i64, _: u32) ![]memory_root.MemoryEntry {
+        return allocator.alloc(memory_root.MemoryEntry, 0);
+    }
+    /// Stubs for non-postgres builds — telos curation degrades to no-op. Parity
+    /// with the real impls keeps the default `zig build` in lockstep with the
+    /// all-engine suite.
+    pub fn fileTelosFact(_: *@This(), _: i64, _: []const u8, _: []const u8, _: ?[]const u8) !void {
+        return;
+    }
+    pub fn telosBackfill(_: *@This(), _: std.mem.Allocator, _: i64) !usize {
+        return 0;
     }
     /// V1.11 hardening (2026-05-08) — stub for non-postgres builds; the
     /// /brain/me endpoint degrades to 404 on file-state deployments.
@@ -6406,6 +6442,125 @@ const ManagerImpl = struct {
         return try decodeMemoryRows(allocator, result, false);
     }
 
+    /// Curated user-model rows (docs/telos-contract.md) — the `durable_fact/telos/*`
+    /// namespace. Unlike `listIdentityFacts` (an edge-predicate query), this is a
+    /// key-prefix query: telos is a reserved namespace, not a predicate class.
+    /// `MEMORIES_VALIDITY_FILTER` excludes superseded rows, so a telos row a later
+    /// `resolveContradiction` closed out (T2) drops out here automatically — the
+    /// same mechanism that keeps a filed telos referent out of every other surface.
+    pub fn listTelosFacts(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        limit: u32,
+    ) ![]memory_root.MemoryEntry {
+        const q = try self.buildQuery(
+            "SELECT m.id, m.key, m.content, m.memory_type, " ++
+                "COALESCE((EXTRACT(EPOCH FROM m.created_at))::bigint::text, '0'), " ++
+                "m.session_id, m.valid_to FROM {schema}.memories m " ++
+                "WHERE m.user_id = $1 AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
+                // L1 — escape the `_` (a LIKE wildcard) so this predicate matches
+                // the literal `isTelosKey` guard exactly (no `durableXfact` drift).
+                "AND m.key LIKE 'durable\\_fact/telos/%' ESCAPE '\\' " ++
+                // Contract-schema order (mission→goal→challenge→strategy→project→
+                // value→identity), newest-first within a type — a structured north
+                // star, not a raw recency dump (review finding ②).
+                "ORDER BY CASE " ++
+                "  WHEN m.key LIKE 'durable_fact/telos/mission/%' THEN 0 " ++
+                "  WHEN m.key LIKE 'durable_fact/telos/goal/%' THEN 1 " ++
+                "  WHEN m.key LIKE 'durable_fact/telos/challenge/%' THEN 2 " ++
+                "  WHEN m.key LIKE 'durable_fact/telos/strategy/%' THEN 3 " ++
+                "  WHEN m.key LIKE 'durable_fact/telos/project/%' THEN 4 " ++
+                "  WHEN m.key LIKE 'durable_fact/telos/value/%' THEN 5 " ++
+                "  WHEN m.key LIKE 'durable_fact/telos/identity/%' THEN 6 " ++
+                "  ELSE 7 END, m.created_at DESC, m.id DESC LIMIT $2::int",
+        );
+        defer self.allocator.free(q);
+
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        var lim_buf: [16]u8 = undefined;
+        const lim_s = try std.fmt.bufPrintZ(&lim_buf, "{d}", .{limit});
+
+        const params = [_]?[*:0]const u8{ user_s.ptr, lim_s.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(lim_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        return try decodeMemoryRows(allocator, result, false);
+    }
+
+    /// File a curated telos fact (docs/telos-contract.md) — the reusable primitive
+    /// behind both the one-shot backfill and the Slice-2 approved-curation loop.
+    /// Writes the row as a durable `core` memory (T5/④). When `source_key` is given:
+    /// supersedes it (T2, so it drops from every recall surface) AND, if the source
+    /// is a promoted active_goal WM slot, evicts that slot (①) — supersession
+    /// touches memories/edges but NOT the working_memory table, so a filed goal
+    /// would otherwise linger in <working_memory>. Idempotent on `telos_key`.
+    pub fn fileTelosFact(
+        self: *Self,
+        user_id: i64,
+        telos_key: []const u8,
+        content: []const u8,
+        source_key: ?[]const u8,
+    ) !void {
+        // NOTE (review M2): not a single transaction — upsertMemory /
+        // setMemoryInvalidation run on the manager connection, not a txn lease.
+        // Ordered write-telos-then-supersede so the worst partial-failure state is a
+        // self-healing REDUNDANCY (goal live in <telos> AND still recallable until
+        // the next backfill re-supersedes), never data loss. True atomicity is
+        // deferred to the Slice-2 curation primitive.
+        try self.upsertMemory(user_id, telos_key, content, .core, null);
+        if (source_key) |src| {
+            const now = std.time.timestamp();
+            try self.setMemoryInvalidation(user_id, src, now, now);
+            if (parseActiveGoalSlot(src)) |slot| {
+                self.removeWorkingMemorySlot(user_id, slot.session_id, slot.slot_id) catch |err| {
+                    log.warn("telos.file.wm_evict_failed key={s} err={s}", .{ src, @errorName(err) });
+                };
+            }
+        }
+    }
+
+    /// One-shot OPERATOR migration (NOT agent auto-authoring — ongoing curation is
+    /// Slice-2, human-gated per T4): seed the curated telos namespace from existing
+    /// promoted goals. Each live `durable_fact/active_goal/*` row is filed as
+    /// `durable_fact/telos/goal/<sid>_<slot>` (idempotent), the source superseded
+    /// (T2), and its WM slot evicted (①). Returns the number filed.
+    pub fn telosBackfill(self: *Self, allocator: std.mem.Allocator, user_id: i64) !usize {
+        const q = try self.buildQuery(
+            "SELECT m.id, m.key, m.content, m.memory_type, " ++
+                "COALESCE((EXTRACT(EPOCH FROM m.created_at))::bigint::text, '0'), " ++
+                "m.session_id, m.valid_to FROM {schema}.memories m " ++
+                "WHERE m.user_id = $1 AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
+                "AND m.key LIKE 'durable\\_fact/active\\_goal/%' ESCAPE '\\'",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const rows = try decodeMemoryRows(allocator, result, false);
+        defer {
+            for (rows) |e| e.deinit(allocator);
+            allocator.free(rows);
+        }
+
+        var filed: usize = 0;
+        for (rows) |r| {
+            const slot = parseActiveGoalSlot(r.key) orelse continue;
+            const telos_key = try std.fmt.allocPrint(allocator, "durable_fact/telos/goal/{s}_{d}", .{ slot.session_id, slot.slot_id });
+            defer allocator.free(telos_key);
+            self.fileTelosFact(user_id, telos_key, r.content, r.key) catch |err| {
+                log.warn("telos.backfill.file_failed key={s} err={s}", .{ r.key, @errorName(err) });
+                continue;
+            };
+            filed += 1;
+        }
+        return filed;
+    }
+
     /// V1.11 hardening (2026-05-08, FE spec #2 follow-up) — pick the
     /// canonical self-anchor memory for /brain/me.
     ///
@@ -8984,6 +9139,12 @@ const ManagerImpl = struct {
 
             // keys[0] is the oldest → canonical keeper. Supersede the rest.
             for (keys.items[1..]) |loser_key| {
+                // T2b (docs/telos-contract.md) — a curated telos row is closed
+                // ONLY by explicit curation of its own key, never as a
+                // content_hash-cascade loser. Without this, a byte-identical raw
+                // duplicate (older → keeper) would silently supersede the telos
+                // twin. Skip before counting so it is not reported as collapsed.
+                if (memory_root.isTelosKey(loser_key)) continue;
                 report.exact_dups_collapsed += 1;
                 if (dry_run) continue;
                 // Reuse the bitemporal close-out path (sets valid_to/invalid_at/
@@ -9765,6 +9926,19 @@ const ManagerImpl = struct {
         }
         for (copies) |cp| {
             if (std.mem.eql(u8, cp.key, key)) continue;
+            // T2b (docs/telos-contract.md) — RECONCILE SHIELD. A curated telos row
+            // is closed ONLY by explicit curation of its own key, never as an
+            // information-scoped cascade twin of a byte-identical raw copy. This M3
+            // sweep (#147) landed AFTER the TELOS branch forked (#144), so the
+            // isEditableMemoryEntry guard below does NOT cover telos — durable_fact/
+            // is an editable family. Shield telos first (both archive and forget go
+            // through this one loop) so a stray same-hash twin can never silently
+            // close the north star. Checked before the FLOOR/near-dup branch so a
+            // telos row is neither swept nor mis-reported as a near-dup.
+            if (memory_root.isTelosKey(cp.key)) {
+                log.info("information_scope.telos_twin_shielded user={d} key={s}", .{ user_id, cp.key });
+                continue;
+            }
             // Fix-wave (review I3) — protection parity with direct curation,
             // with the deliberate autosave exception (see doc comment).
             const is_autosave = std.mem.startsWith(u8, cp.key, "autosave_user_") or
@@ -17058,6 +17232,107 @@ test "C0 phase05Backfill: live re-type + idempotent second run" {
     try std.testing.expectEqualStrings("preference", pref_t2);
 }
 
+test "T2b: telos row survives content_hash dedup vs a byte-identical raw dup" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-t2b/workspace");
+
+    // A raw duplicate and a curated telos row with byte-identical content →
+    // identical content_hash. The raw row is inserted first (older) AND sorts
+    // first by key, so it is the dedup keeper and the telos row is the "loser" —
+    // exactly the shape T2b must protect against.
+    const dup_content = "Ship v1 by Q3";
+    try mgr.upsertMemoryWithMetadata(2, "durable_fact/aaa_raw_dup", dup_content, .core, "sess-t2b", "{}");
+    try mgr.upsertMemoryWithMetadata(2, "durable_fact/telos/goal/x", dup_content, .core, "sess-t2b", "{}");
+
+    const r = try mgr.phase05Backfill(allocator, 2, false);
+    // The telos loser is SKIPPED, not collapsed (isTelosKey guard).
+    try std.testing.expectEqual(@as(usize, 0), r.exact_dups_collapsed);
+
+    // The curated telos row is still live — never superseded by a stray dup.
+    const telos = try mgr.getMemory(allocator, 2, "durable_fact/telos/goal/x");
+    try std.testing.expect(telos != null);
+    if (telos) |m| m.deinit(allocator);
+
+    // The raw keeper is untouched too — both remain live.
+    const raw = try mgr.getMemory(allocator, 2, "durable_fact/aaa_raw_dup");
+    try std.testing.expect(raw != null);
+    if (raw) |m| m.deinit(allocator);
+}
+
+// T2b — RECONCILE ADDITION. main's M3 information-scoped cascade
+// (archiveInformationScoped / forgetInformationScoped → informationScopedSweep,
+// #147) landed AFTER the TELOS branch forked (#144), so the branch's T2b only
+// shielded the C0 dedup path (phase05Backfill) it could see. The M3 sweep closes
+// EVERY live row sharing a content_hash and skips only NON-editable keys — but
+// `durable_fact/` is editable, so `durable_fact/telos/*` was NOT protected:
+// archiving/forgetting a byte-identical raw twin would silently close the curated
+// north star. These two tests pin the shield the reconcile adds to that sweep.
+test "T2b M3: telos row survives archiveInformationScoped cascade of a byte-identical raw twin" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-t2b-m3-arch/workspace");
+
+    // A curated telos row and a byte-identical raw twin → identical content_hash.
+    const shared = "Reach 1000 paying teams by Q4 without diluting the craft";
+    try mgr.upsertMemoryWithMetadata(2, "durable_fact/telos/mission/x", shared, .core, "sess-t2bm3a", "{}");
+    try mgr.upsertMemoryWithMetadata(2, "durable_fact/behavior/deadbeefcafe0001", shared, .core, "sess-t2bm3a", "{}");
+
+    // Archive the RAW twin (not the telos row). The M3 cascade sweeps same-hash
+    // live rows; the telos twin must be SHIELDED, never a cascade casualty.
+    const now_ts: i64 = std.time.timestamp();
+    var scope = try mgr.archiveInformationScoped(allocator, 2, "durable_fact/behavior/deadbeefcafe0001", now_ts);
+    defer scope.deinit(allocator);
+
+    // No telos key may appear among the cascade-closed copies.
+    try std.testing.expect(scope.primary_closed);
+    for (scope.exact_closed) |k| try std.testing.expect(!memory_root.isTelosKey(k));
+
+    // The curated telos row is still live (validity-filtered read → valid_to NULL,
+    // is_latest true). This is the assertion that goes RED on the un-shielded sweep.
+    const telos = try mgr.getMemory(allocator, 2, "durable_fact/telos/mission/x");
+    try std.testing.expect(telos != null);
+    if (telos) |m| m.deinit(allocator);
+
+    // The raw twin (the archived primary) IS closed — the cascade still works.
+    const raw = try mgr.getMemory(allocator, 2, "durable_fact/behavior/deadbeefcafe0001");
+    try std.testing.expect(raw == null);
+}
+
+test "T2b M3: telos row survives forgetInformationScoped cascade of a byte-identical raw twin" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-t2b-m3-forget/workspace");
+
+    // Same shape, forget (GDPR hard-erase) flavor: forgetting a raw twin must not
+    // erase the curated telos row that happens to share its content_hash.
+    const shared = "Keep the extraction judge honest and the memory boundary clean";
+    try mgr.upsertMemoryWithMetadata(2, "durable_fact/telos/value/y", shared, .core, "sess-t2bm3f", "{}");
+    try mgr.upsertMemoryWithMetadata(2, "durable_fact/behavior/deadbeefcafe0002", shared, .core, "sess-t2bm3f", "{}");
+
+    const now_ts: i64 = std.time.timestamp();
+    var scope = try mgr.forgetInformationScoped(allocator, 2, "durable_fact/behavior/deadbeefcafe0002", now_ts);
+    defer scope.deinit(allocator);
+
+    try std.testing.expect(scope.primary_closed);
+    for (scope.exact_closed) |k| try std.testing.expect(!memory_root.isTelosKey(k));
+
+    // The curated telos row survives the erasure cascade.
+    const telos = try mgr.getMemory(allocator, 2, "durable_fact/telos/value/y");
+    try std.testing.expect(telos != null);
+    if (telos) |m| m.deinit(allocator);
+
+    // The raw twin is gone (hard-deleted by forget).
+    const raw = try mgr.getMemory(allocator, 2, "durable_fact/behavior/deadbeefcafe0002");
+    try std.testing.expect(raw == null);
+}
+
 test "C0 phase05Backfill: exact content_hash dedup supersedes (never hard-deletes), idempotent" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -19274,6 +19549,92 @@ test "postgres deleteSession removes thread durable state and preserves non-auto
 // row; findRelatedExtractedMemories no longer returns it; getMemory
 // (which applies MEMORIES_VALIDITY_FILTER) also hides it. The agent's
 // retrieval path can never see a closed-out row again.
+test "parseActiveGoalSlot parses promoted active_goal keys, rejects others [①]" {
+    const ok = parseActiveGoalSlot("durable_fact/active_goal/sess-abc/3").?;
+    try std.testing.expectEqualStrings("sess-abc", ok.session_id);
+    try std.testing.expectEqual(@as(i32, 3), ok.slot_id);
+    try std.testing.expect(parseActiveGoalSlot("durable_fact/telos/goal/x") == null);
+    try std.testing.expect(parseActiveGoalSlot("durable_fact/active_goal/no-slot") == null);
+    try std.testing.expect(parseActiveGoalSlot("durable_fact/active_goal/sess/notanint") == null);
+}
+
+test "telosBackfill files active_goals into telos, supersedes source, evicts WM slot [T2/①/④]" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-telos-backfill/workspace");
+
+    // A promoted active_goal: a durable_fact row + its working_memory slot.
+    const sid = "sess-bf";
+    const src_key = "durable_fact/active_goal/sess-bf/3";
+    try mgr.upsertMemory(2, src_key, "Ship v1 by Q3", .core, null);
+    _ = try mgr.upsertWorkingMemorySlot(2, sid, 3, "active_goal", "Ship v1 by Q3", "k_goal", 0.95, false);
+
+    const filed = try mgr.telosBackfill(allocator, 2);
+    try std.testing.expectEqual(@as(usize, 1), filed);
+
+    // ④ — the telos row exists and is live (written as core).
+    const telos = try mgr.getMemory(allocator, 2, "durable_fact/telos/goal/sess-bf_3");
+    try std.testing.expect(telos != null);
+    if (telos) |m| m.deinit(allocator);
+
+    // T2 — the source active_goal row is superseded (gone from validity-filtered reads).
+    const src = try mgr.getMemory(allocator, 2, src_key);
+    try std.testing.expect(src == null);
+
+    // ① — the working_memory slot was evicted (no slot_id 3 remains for the session).
+    const slots = try mgr.listWorkingMemorySlots(allocator, 2, sid);
+    defer memory_root.freeWorkingMemorySlots(allocator, slots);
+    for (slots) |s| try std.testing.expect(s.slot_id != 3);
+}
+
+test "listTelosFacts returns live telos rows, excludes superseded + non-telos [T1/T2]" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    {
+        const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+        defer allocator.free(schema_q);
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-telos-test-user-2/workspace");
+
+    // Seed: two telos goals + one non-telos durable fact.
+    try mgr.upsertMemory(2, "durable_fact/telos/goal/live", "Ship v1 by Q3", .core, null);
+    try mgr.upsertMemory(2, "durable_fact/telos/goal/stale", "Old superseded goal", .core, null);
+    try mgr.upsertMemory(2, "durable_fact/other_fact", "User likes tea", .core, null);
+
+    // T2: supersede one telos goal (resolveContradiction's close-out primitive).
+    const close_ts: i64 = std.time.timestamp();
+    try mgr.setMemoryInvalidation(2, "durable_fact/telos/goal/stale", close_ts, close_ts);
+
+    const rows = try mgr.listTelosFacts(allocator, 2, 20);
+    defer {
+        for (rows) |e| e.deinit(allocator);
+        allocator.free(rows);
+    }
+
+    // Exactly the live telos goal: superseded telos row filtered by validity,
+    // non-telos durable fact filtered by the telos/ key prefix.
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("durable_fact/telos/goal/live", rows[0].key);
+}
+
 test "V1.6 commit 6 setMemoryInvalidation closes out memory + filters from retrieval" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;

@@ -2314,6 +2314,8 @@ const TenantRuntime = struct {
                     // session_mgr so each per-session Agent inherits it and
                     // propagates to memory_loader (LoadTurnMemoryOptions).
                     runtime.session_mgr.typed_views_enabled = runtime.config.agent.typed_views_enabled;
+                    // TELOS — wire the curated <telos> block gate from config.
+                    runtime.session_mgr.telos_in_prompt = runtime.config.agent.telos_in_prompt;
                     // P4 — wire canonical-continuity-summary flag from config
                     // to session_mgr so each per-session Agent inherits it and
                     // propagates to the commands gating predicate. Default ON;
@@ -17931,6 +17933,72 @@ fn handleBrainMe(
     return finalizeJsonBuf(allocator, &out);
 }
 
+const TELOS_ENDPOINT_LIMIT: u32 = 50;
+
+/// Extract the telos referent type from a `durable_fact/telos/<type>/<id>` key
+/// (mission / goal / challenge / …) for the FE. Returns "unknown" off-namespace.
+fn telosType(key: []const u8) []const u8 {
+    const prefix = "durable_fact/telos/";
+    if (!std.mem.startsWith(u8, key, prefix)) return "unknown";
+    const rest = key[prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return rest;
+    return rest[0..slash];
+}
+
+/// GET /api/v1/users/{id}/telos — the curated user-model north star
+/// (docs/telos-contract.md). Powers the read-only Settings view in zaki-prod
+/// (task 8). Mirrors handleBrainMe: validity-filtered live telos rows in
+/// contract-schema order (listTelosFacts). Read-only — writes go through the
+/// approved-curation loop (Slice 2), never this endpoint (T4).
+/// Response: {"telos":[{"key","type","content"}]}.
+fn handleTelos(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    if (!std.mem.eql(u8, method, "GET")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    const numeric_user_id = std.fmt.parseInt(i64, user_id, 10) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
+
+    const rows = state_mgr.listTelosFacts(allocator, numeric_user_id, TELOS_ENDPOINT_LIMIT) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"telos_query_failed\"}" };
+    };
+    defer {
+        for (rows) |e| e.deinit(allocator);
+        allocator.free(rows);
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"telos\":[") catch return response_build_err;
+    for (rows, 0..) |r, i| {
+        if (i > 0) w.writeByte(',') catch return response_build_err;
+        w.writeAll("{\"key\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, r.key) catch return response_build_err;
+        w.writeAll(",\"type\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, telosType(r.key)) catch return response_build_err;
+        w.writeAll(",\"content\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, r.content) catch return response_build_err;
+        w.writeAll("}") catch return response_build_err;
+    }
+    w.writeAll("]}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+test "telosType extracts the referent type from a durable_fact/telos key" {
+    try std.testing.expectEqualStrings("goal", telosType("durable_fact/telos/goal/3"));
+    try std.testing.expectEqualStrings("mission", telosType("durable_fact/telos/mission/0"));
+    try std.testing.expectEqualStrings("unknown", telosType("durable_fact/other_fact"));
+}
+
 fn handleBrainOrphans(
     allocator: std.mem.Allocator,
     method: []const u8,
@@ -21427,6 +21495,14 @@ fn handleApiRoute(
     //   { error: "no_self_anchor" }                   on 404 (cold corpus)
     if (std.mem.eql(u8, parsed.subpath, "brain/me")) {
         return handleBrainMe(req_allocator, method, scoped_user_id, state);
+    }
+
+    // ── /telos — TELOS Slice 1 (docs/telos-contract.md) ──────────────────
+    // GET /api/v1/users/{id}/telos — curated user-model north star for the
+    // read-only Settings view (zaki-prod). Read-only; curation writes go through
+    // the approved wish/telos loop (Slice 2), never this endpoint (T4).
+    if (std.mem.eql(u8, parsed.subpath, "telos")) {
+        return handleTelos(req_allocator, method, scoped_user_id, state);
     }
 
     // ── /brain/communities — V1.7a-9d ────────────────────────────────────

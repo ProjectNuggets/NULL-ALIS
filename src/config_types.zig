@@ -554,6 +554,12 @@ pub const AgentConfig = struct {
     /// (AGENT-ULTIMATE-DESIGN "cost interoception" / budget envelopes);
     /// single-tenant/self-hosted operators may opt in.
     cost_vital_in_prompt: bool = false,
+    /// TELOS (docs/telos-contract.md, T1) — inject the curated `<telos>`
+    /// north-star block into the volatile prompt. Default OFF: opt-in per
+    /// tenant/profile so telos-on vs telos-off is A/B-measurable against
+    /// bench_self before it becomes the default. Threaded to
+    /// `memory_loader.LoadTurnMemoryOptions.telos_in_prompt`.
+    telos_in_prompt: bool = false,
     /// Task 4 (package1-activations, "first dream consumer") — dream_log
     /// warm-start gate.
     ///
