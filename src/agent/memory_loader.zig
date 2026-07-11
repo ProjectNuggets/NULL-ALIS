@@ -1675,7 +1675,7 @@ fn buildTelosBlock(
 }
 
 /// Pure renderer for the `<telos>` block — no DB, so it is unit-testable with
-/// hand-built entries. Bounded (IDENTITY_BLOCK_MAX_BYTES), per-item capped
+/// hand-built entries. Bounded (TELOS_BLOCK_MAX_BYTES), per-item capped
 /// (IDENTITY_FACT_MAX_BYTES), XML-escaped (strips `<`/`>`/`\r`, `\n`→space so a
 /// row cannot inject system-prompt markup), and deduped by content prefix.
 /// Returns null when nothing renders (empty input or all-blank/dup) so the caller
@@ -1695,7 +1695,8 @@ fn renderTelosBlock(allocator: std.mem.Allocator, facts: []const MemoryEntry, no
     }
 
     var emitted: usize = 0;
-    var bytes_used: usize = 0;
+    // Count both wrapper tags in the advertised whole-block byte budget.
+    var bytes_used: usize = "<telos>\n".len + "</telos>\n".len;
     for (facts) |entry| {
         const trimmed = std.mem.trim(u8, entry.content, " \t\r\n");
         if (trimmed.len == 0) continue;
@@ -1723,23 +1724,32 @@ fn renderTelosBlock(allocator: std.mem.Allocator, facts: []const MemoryEntry, no
         else
             "";
 
-        if (bytes_used + truncated.len + annotation.len + line_overhead > TELOS_BLOCK_MAX_BYTES) break;
-        try w.writeAll("- ");
+        var escaped: std.ArrayListUnmanaged(u8) = .empty;
+        defer escaped.deinit(allocator);
+        const escaped_w = escaped.writer(allocator);
         for (truncated) |ch| {
             // M1 — SUBSTITUTE (not delete) structural chars: dropping `<`/`>` erases
             // metric operators ("< 200ms" -> " 200ms"), destroying the goal's
             // meaning. Guillemets are visually faithful yet can't forge a </telos> tag.
             switch (ch) {
-                '<' => try w.writeAll("‹"),
-                '>' => try w.writeAll("›"),
+                '<' => try escaped_w.writeAll("‹"),
+                '>' => try escaped_w.writeAll("›"),
                 '\r' => {},
-                '\n' => try w.writeByte(' '),
-                else => try w.writeByte(ch),
+                '\n' => try escaped_w.writeByte(' '),
+                else => try escaped_w.writeByte(ch),
             }
         }
+        if (bytes_used + annotation.len + line_overhead >= TELOS_BLOCK_MAX_BYTES) break;
+        const available = TELOS_BLOCK_MAX_BYTES - bytes_used - annotation.len - line_overhead;
+        const bounded_escaped = truncateUtf8(escaped.items, available);
+        if (bounded_escaped.len == 0) break;
+        const rendered_len = bounded_escaped.len + annotation.len + line_overhead;
+        if (bytes_used + rendered_len > TELOS_BLOCK_MAX_BYTES) break;
+        try w.writeAll("- ");
+        try w.writeAll(bounded_escaped);
         try w.writeAll(annotation);
         try w.writeByte('\n');
-        bytes_used += truncated.len + annotation.len + line_overhead;
+        bytes_used += rendered_len;
         emitted += 1;
         try seen_prefixes.append(allocator, try allocator.dupe(u8, trimmed));
     }
@@ -3577,6 +3587,20 @@ test "renderTelosBlock: T6 stale rows annotated, fresh rows clean [T6]" {
     try std.testing.expect(std.mem.indexOf(u8, block, "Grow to 1000 users (unconfirmed 200d)\n") != null);
     // Exactly one annotation (only the stale row).
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, block, "(unconfirmed"));
+}
+
+test "renderTelosBlock counts escaped bytes in the whole-block budget" {
+    const allocator = std.testing.allocator;
+    const content = "<" ** IDENTITY_FACT_MAX_BYTES;
+    const entries = [_]MemoryEntry{
+        .{ .id = "1", .key = "durable_fact/telos/goal/0", .content = content, .category = .core, .timestamp = "0" },
+    };
+    const block = (try renderTelosBlock(allocator, &entries, 1_000_000)).?;
+    defer allocator.free(block);
+
+    try std.testing.expect(block.len <= TELOS_BLOCK_MAX_BYTES);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(block));
+    try std.testing.expect(std.mem.indexOf(u8, block, "‹") != null);
 }
 
 // ── dream_log warm-start injection (first dream consumer) ──────────────────
