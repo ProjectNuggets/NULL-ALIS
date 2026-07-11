@@ -184,8 +184,11 @@ git hooks (`git config core.hooksPath .githooks`) and format only the files you 
 
 ## Status & roadmap
 
-Live status and forward plan live in **[`STATUS.md`](STATUS.md)** and
-[`docs/ROADMAP.md`](docs/ROADMAP.md). The living docs index is [`docs/README.md`](docs/README.md).
+The **live cross-repo coordination board** is `zaki-infra/docs/COORDINATION.md` (task claims,
+tree state, agent notes) and the **consolidated backlog** is
+`zaki-infra/docs/superpowers/ROADMAP-2026-07-11.md` — those two are current. Repo-local
+[`STATUS.md`](STATUS.md) and [`docs/ROADMAP.md`](docs/ROADMAP.md) are pending a deep refresh
+(tracked as roadmap items 1.1/1.2). The living docs index is [`docs/README.md`](docs/README.md).
 
 ## License
 

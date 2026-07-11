@@ -382,6 +382,9 @@ repo. They are the lift from "running code" to "production-grade product." Viola
 treated as defects, not preferences.
 
 **Bound documents (read these before working):**
+- `zaki-infra/docs/COORDINATION.md` — the **live multi-agent board** (claim your task in §2
+  before non-trivial work; leave a note in §4 on finish/handoff).
+- `zaki-infra/docs/superpowers/ROADMAP-2026-07-11.md` — the consolidated cross-repo backlog.
 - `docs/ROADMAP.md` — the versioned plan (which V block lands at which tag).
 - `docs/archive/2026-05-25/MULTI_AGENT_PLAN.md` — the agent dispatch matrix (which agent does what, file ownership,
   branch conventions, bench gate convergence). When you are spawned as Agent A/B/C/..., your

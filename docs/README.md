@@ -36,7 +36,7 @@ isn't listed below, it's been archived or doesn't exist.
 | [`sandbox-deploy.md`](sandbox-deploy.md) | Operator deployment guide (bubblewrap / firejail / docker) |
 | [`sandbox-tool-coverage.md`](sandbox-tool-coverage.md) | Per-tool sandbox coverage matrix |
 | [`reliability-ops-runbook.md`](reliability-ops-runbook.md) | Operations runbook |
-| [`SLO.md`](SLO.md) | Service level objectives |
+| [`operations/SLOs.md`](operations/SLOs.md) | Service level objectives |
 | [`multi-instance.md`](multi-instance.md) | Multi-instance deployment guide |
 | [`session-key-policy.md`](session-key-policy.md) | Session-key issuance + rotation policy |
 | [`silent-catches-policy.md`](silent-catches-policy.md) | §14.5 honesty policy — when catches are allowed |

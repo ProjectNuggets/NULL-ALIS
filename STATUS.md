@@ -4,6 +4,11 @@
 
 This is the single cold-start document. If it disagrees with `.planning/STATE.md`, `PROJECT_LEDGER.md` (archived), or anything in `docs/archive/`, **this wins**.
 
+> ⚠️ **STALE (deep refresh tracked as zaki-infra roadmap 1.1).** For current cross-repo state and
+> live task claims see `zaki-infra/docs/COORDINATION.md`; for the current backlog see
+> `zaki-infra/docs/superpowers/ROADMAP-2026-07-11.md`. Engine work since this header: memory/learning/
+> telos contracts, Package 3, Wave A, TELOS Slices 1+1.1, fleet stats, GDPR purge (engine half), #162.
+
 ---
 
 ## 2026-05-29 — Sprint S6: V1 production verification matrix (ready for review)
