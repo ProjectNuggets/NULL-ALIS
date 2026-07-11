@@ -10,6 +10,7 @@ const providers = @import("../providers/root.zig");
 const config_types = @import("../config_types.zig");
 const memory_mod = @import("../memory/root.zig");
 const context_estimator = @import("context_estimator.zig");
+const util = @import("../util.zig");
 const Provider = providers.Provider;
 const ChatMessage = providers.ChatMessage;
 const Memory = memory_mod.Memory;
@@ -843,7 +844,21 @@ fn archiveDroppedMessages(
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
 
-    std.fmt.format(w, "type=compaction_archive\nmessages_dropped={d}\nreason=context_exhaustion\n\n", .{count}) catch return;
+    const now_s = std.time.timestamp();
+    var ts_buf: [32]u8 = undefined;
+    var date_buf: [16]u8 = undefined;
+    const now_iso = util.timestamp_from_unix(now_s, &ts_buf);
+    const date_utc = util.date_utc_from_unix(now_s, &date_buf);
+
+    std.fmt.format(
+        w,
+        "type=compaction_archive\nmessages_dropped={d}\nreason=context_exhaustion\ncreated_at_unix={d}\ncreated_at_utc={s}\ndate_utc={s}\nboundary_reason=compaction_dropped\n",
+        .{ count, now_s, now_iso, date_utc },
+    ) catch return;
+    if (session_id) |sid| {
+        std.fmt.format(w, "session_id={s}\n", .{sid}) catch return;
+    }
+    w.writeByte('\n') catch return;
 
     for (messages) |msg| {
         if (buf.items.len >= MAX_ARCHIVE_CHARS) {
@@ -896,13 +911,18 @@ fn archiveCompactionSummary(
     const ts: u128 = @bitCast(std.time.nanoTimestamp());
     const key = try std.fmt.allocPrint(allocator, "compaction_summary/{s}/{d}", .{ session_id, ts });
     defer allocator.free(key);
+    const now_s = std.time.timestamp();
+    var ts_buf: [32]u8 = undefined;
+    var date_buf: [16]u8 = undefined;
+    const now_iso = util.timestamp_from_unix(now_s, &ts_buf);
+    const date_utc = util.date_utc_from_unix(now_s, &date_buf);
 
     // Prefix metadata so downstream timeline/recall tools recognize the
     // provenance. Format mirrors summary_latest's metadata block.
     const payload = try std.fmt.allocPrint(
         allocator,
-        "type=compaction_summary\nsession={s}\nat={d}\ntrigger=autoCompactHistory:passC\nmessages_compacted={d}\n\n{s}",
-        .{ session_id, ts, compacted_message_count, summary_body },
+        "type=compaction_summary\nsession={s}\nat={d}\ncreated_at_unix={d}\ncreated_at_utc={s}\ndate_utc={s}\nsession_id={s}\nboundary_reason=compaction_summary\ntrigger=autoCompactHistory:passC\nmessages_compacted={d}\n\n{s}",
+        .{ session_id, ts, now_s, now_iso, date_utc, session_id, compacted_message_count, summary_body },
     );
     defer allocator.free(payload);
 
@@ -1594,6 +1614,70 @@ test "forceCompressHistory no-op when history is small" {
     const compressed = forceCompressHistory(allocator, &agent.history);
     try std.testing.expect(!compressed);
     try std.testing.expectEqual(@as(usize, 2), agent.history.items.len);
+}
+
+test "archiveCompactionSummary writes UTC-readable metadata" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try archiveCompactionSummary(
+        allocator,
+        mem,
+        null,
+        "agent:zaki-bot:user:1:main",
+        "focus: compacted context\ndecisions:\n- keep summary\nopen_loops:\n- none\nnext:\n- continue\n",
+        4,
+    );
+
+    const entries = try mem.list(allocator, .daily, null);
+    defer memory_mod.freeEntries(allocator, entries);
+    var found = false;
+    for (entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, "compaction_summary/agent:zaki-bot:user:1:main/")) continue;
+        found = true;
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "type=compaction_summary") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "created_at_unix=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "created_at_utc=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "date_utc=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "session_id=agent:zaki-bot:user:1:main") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "boundary_reason=compaction_summary") != null);
+        break;
+    }
+    try std.testing.expect(found);
+}
+
+test "archiveDroppedMessages writes UTC-readable metadata" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var history: std.ArrayListUnmanaged(OwnedMessage) = .empty;
+    defer {
+        for (history.items) |*msg| msg.deinit(allocator);
+        history.deinit(allocator);
+    }
+    try history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "old context") });
+
+    archiveDroppedMessages(allocator, mem, null, "agent:zaki-bot:user:1:main", history.items, history.items.len);
+
+    const entries = try mem.list(allocator, .conversation, "agent:zaki-bot:user:1:main");
+    defer memory_mod.freeEntries(allocator, entries);
+    var found = false;
+    for (entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, "compaction_dropped/agent:zaki-bot:user:1:main/")) continue;
+        found = true;
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "type=compaction_archive") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "created_at_unix=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "created_at_utc=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "date_utc=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "session_id=agent:zaki-bot:user:1:main") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "boundary_reason=compaction_dropped") != null);
+        break;
+    }
+    try std.testing.expect(found);
 }
 
 test "manualCompactHistory summarizes older context and keeps recent recovery tail" {
