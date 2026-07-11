@@ -6459,7 +6459,9 @@ const ManagerImpl = struct {
                 "COALESCE((EXTRACT(EPOCH FROM m.created_at))::bigint::text, '0'), " ++
                 "m.session_id, m.valid_to FROM {schema}.memories m " ++
                 "WHERE m.user_id = $1 AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
-                "AND m.key LIKE 'durable_fact/telos/%' " ++
+                // L1 — escape the `_` (a LIKE wildcard) so this predicate matches
+                // the literal `isTelosKey` guard exactly (no `durableXfact` drift).
+                "AND m.key LIKE 'durable\\_fact/telos/%' ESCAPE '\\' " ++
                 // Contract-schema order (mission→goal→challenge→strategy→project→
                 // value→identity), newest-first within a type — a structured north
                 // star, not a raw recency dump (review finding ②).
@@ -6501,6 +6503,12 @@ const ManagerImpl = struct {
         content: []const u8,
         source_key: ?[]const u8,
     ) !void {
+        // NOTE (review M2): not a single transaction — upsertMemory /
+        // setMemoryInvalidation run on the manager connection, not a txn lease.
+        // Ordered write-telos-then-supersede so the worst partial-failure state is a
+        // self-healing REDUNDANCY (goal live in <telos> AND still recallable until
+        // the next backfill re-supersedes), never data loss. True atomicity is
+        // deferred to the Slice-2 curation primitive.
         try self.upsertMemory(user_id, telos_key, content, .core, null);
         if (source_key) |src| {
             const now = std.time.timestamp();
@@ -6524,7 +6532,7 @@ const ManagerImpl = struct {
                 "COALESCE((EXTRACT(EPOCH FROM m.created_at))::bigint::text, '0'), " ++
                 "m.session_id, m.valid_to FROM {schema}.memories m " ++
                 "WHERE m.user_id = $1 AND " ++ MEMORIES_VALIDITY_FILTER ++ " " ++
-                "AND m.key LIKE 'durable_fact/active_goal/%'",
+                "AND m.key LIKE 'durable\\_fact/active\\_goal/%' ESCAPE '\\'",
         );
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;

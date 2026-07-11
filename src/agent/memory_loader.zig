@@ -1675,11 +1675,12 @@ fn renderTelosBlock(allocator: std.mem.Allocator, facts: []const MemoryEntry) !?
         const trimmed = std.mem.trim(u8, entry.content, " \t\r\n");
         if (trimmed.len == 0) continue;
 
-        const dedup_key = try identityDedupKey(allocator, trimmed);
-        defer allocator.free(dedup_key);
+        // L3 — dedup on FULL content (seen_prefixes stores whole rows here), not a
+        // 50-char prefix: two distinct curated goals that share a long prefix must
+        // both survive — a vanished north-star row is worse than a redundant one.
         var is_dup = false;
         for (seen_prefixes.items) |seen| {
-            if (std.mem.eql(u8, seen, dedup_key)) {
+            if (std.mem.eql(u8, seen, trimmed)) {
                 is_dup = true;
                 break;
             }
@@ -1691,17 +1692,21 @@ fn renderTelosBlock(allocator: std.mem.Allocator, facts: []const MemoryEntry) !?
         if (bytes_used + truncated.len + line_overhead > TELOS_BLOCK_MAX_BYTES) break;
         try w.writeAll("- ");
         for (truncated) |ch| {
-            if (ch == '<' or ch == '>' or ch == '\r') continue;
-            if (ch == '\n') {
-                try w.writeByte(' ');
-                continue;
+            // M1 — SUBSTITUTE (not delete) structural chars: dropping `<`/`>` erases
+            // metric operators ("< 200ms" -> " 200ms"), destroying the goal's
+            // meaning. Guillemets are visually faithful yet can't forge a </telos> tag.
+            switch (ch) {
+                '<' => try w.writeAll("‹"),
+                '>' => try w.writeAll("›"),
+                '\r' => {},
+                '\n' => try w.writeByte(' '),
+                else => try w.writeByte(ch),
             }
-            try w.writeByte(ch);
         }
         try w.writeByte('\n');
         bytes_used += truncated.len + line_overhead;
         emitted += 1;
-        try seen_prefixes.append(allocator, try allocator.dupe(u8, dedup_key));
+        try seen_prefixes.append(allocator, try allocator.dupe(u8, trimmed));
     }
 
     if (emitted == 0) {
@@ -3488,8 +3493,9 @@ test "renderTelosBlock: empty→null, XML-escaped, deduped, blanks skipped [T1]"
 
     try std.testing.expect(std.mem.startsWith(u8, block, "<telos>\n"));
     try std.testing.expect(std.mem.endsWith(u8, block, "</telos>\n"));
-    // XML structural chars stripped — a row cannot inject system-prompt markup.
-    try std.testing.expect(std.mem.indexOf(u8, block, "Build the best agent") != null);
+    // M1 — structural chars SUBSTITUTED (‹›), not dropped, so metric operators
+    // survive while a row still can't forge a tag.
+    try std.testing.expect(std.mem.indexOf(u8, block, "‹agent›") != null);
     try std.testing.expect(std.mem.indexOf(u8, block, "<agent>") == null);
     // Dedup by content prefix + blank skipped → exactly two bullets (mission + goal).
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, block, "Ship v1 by Q3"));
