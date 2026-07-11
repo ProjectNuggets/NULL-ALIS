@@ -254,6 +254,12 @@ fn parseActiveGoalSlot(key: []const u8) ?ActiveGoalSlot {
     return .{ .session_id = sid, .slot_id = slot_id };
 }
 
+/// Curated TELOS rows are changed only through the explicit curation surface.
+/// Generic contradiction/prose-maintenance operations must never retire them.
+fn reject_protected_telos_loser(key: []const u8) !void {
+    if (memory_root.isTelosKey(key)) return error.ProtectedTelosKey;
+}
+
 /// V1.5.1 brain-hygiene SQL filter — comptime-derived from
 /// `memory_root.BRAIN_HIDDEN_PREFIXES` + `memory_root.BRAIN_HIDDEN_EXACT_KEYS`.
 ///
@@ -1109,9 +1115,10 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn resolveContradiction(
         _: *@This(),
         _: i64,
-        _: []const u8,
+        loser_key: []const u8,
         _: []const u8,
     ) !memory_root.ResolveContradictionResult {
+        try reject_protected_telos_loser(loser_key);
         return .{ .loser_existed = false, .winner_existed = false, .loser_closed = false };
     }
     /// V1.9-3 — stub for non-postgres builds; propagate_correction no-ops.
@@ -1173,9 +1180,10 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn markMemorySupersededByKey(
         _: *@This(),
         _: i64,
-        _: []const u8,
+        loser_key: []const u8,
         _: []const u8,
     ) !bool {
+        try reject_protected_telos_loser(loser_key);
         return false;
     }
     /// C0 (memory-phase-0.5) — stub for non-postgres builds; the one-time
@@ -6511,13 +6519,14 @@ const ManagerImpl = struct {
         // deferred to the Slice-2 curation primitive.
         try self.upsertMemory(user_id, telos_key, content, .core, null);
         if (source_key) |src| {
+            // Evict first and propagate failures while the source remains live.
+            // If eviction fails, the next backfill can retry; invalidating first
+            // would remove the source from that retry census permanently.
+            if (parseActiveGoalSlot(src)) |slot| {
+                try self.removeWorkingMemorySlot(user_id, slot.session_id, slot.slot_id);
+            }
             const now = std.time.timestamp();
             try self.setMemoryInvalidation(user_id, src, now, now);
-            if (parseActiveGoalSlot(src)) |slot| {
-                self.removeWorkingMemorySlot(user_id, slot.session_id, slot.slot_id) catch |err| {
-                    log.warn("telos.file.wm_evict_failed key={s} err={s}", .{ src, @errorName(err) });
-                };
-            }
         }
     }
 
@@ -7835,6 +7844,7 @@ const ManagerImpl = struct {
         loser_key: []const u8,
         winner_key: []const u8,
     ) !memory_root.ResolveContradictionResult {
+        try reject_protected_telos_loser(loser_key);
         var user_buf: [32]u8 = undefined;
         const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
 
@@ -8664,6 +8674,7 @@ const ManagerImpl = struct {
     ) !bool {
         if (loser_key.len == 0 or winner_key.len == 0) return error.EmptyKey;
         if (std.mem.eql(u8, loser_key, winner_key)) return error.LoserEqualsWinner;
+        try reject_protected_telos_loser(loser_key);
 
         // V1.14.12 (Memory audit Finding 3 fix) — pin all statements to one
         // connection so the loser + winner metadata updates are atomic.
@@ -12283,6 +12294,15 @@ const ManagerImpl = struct {
         allocator: std.mem.Allocator,
         since_days: u32,
     ) !trace_mining.FleetStats {
+        // Pin both aggregates to one transaction so SET LOCAL guards apply to
+        // every statement and disappear automatically on commit/rollback.
+        var txn = try self.beginTransaction();
+        defer txn.deinit();
+        const timeout_res = try txn.exec(FLEET_STATEMENT_TIMEOUT_SQL);
+        c.PQclear(timeout_res);
+        const work_mem_res = try txn.exec(FLEET_WORK_MEM_SQL);
+        c.PQclear(work_mem_res);
+
         var days_buf: [16]u8 = undefined;
         const days_s = try std.fmt.bufPrintZ(&days_buf, "{d}", .{since_days});
         const params = [_]?[*:0]const u8{days_s.ptr};
@@ -12291,7 +12311,7 @@ const ManagerImpl = struct {
         // Query 1 — per-tool fluency census (top FLEET_MAX_TOOLS + probe).
         const stats_q = try self.buildQuery(FLEET_TOOL_STATS_SQL);
         defer self.allocator.free(stats_q);
-        const stats_res = try self.execParams(stats_q, &params, &lengths);
+        const stats_res = try txn.execParams(stats_q, &params, &lengths);
         defer c.PQclear(stats_res);
         const stats_cut = @as(usize, @intCast(c.PQntuples(stats_res))) > trace_mining.FLEET_MAX_TOOLS;
         const tool_stats = try collectFleetToolStats(allocator, stats_res, trace_mining.FLEET_MAX_TOOLS);
@@ -12304,10 +12324,16 @@ const ManagerImpl = struct {
         // top FLEET_MAX_TOOLS + probe).
         const fail_q = try self.buildQuery(FLEET_FAILURE_SQL);
         defer self.allocator.free(fail_q);
-        const fail_res = try self.execParams(fail_q, &params, &lengths);
+        const fail_res = try txn.execParams(fail_q, &params, &lengths);
         defer c.PQclear(fail_res);
         const fail_cut = @as(usize, @intCast(c.PQntuples(fail_res))) > trace_mining.FLEET_MAX_TOOLS;
         const failure_patterns = try collectFleetFailurePatterns(allocator, fail_res, trace_mining.FLEET_MAX_TOOLS);
+        errdefer {
+            for (failure_patterns) |p| p.deinit(allocator);
+            allocator.free(failure_patterns);
+        }
+
+        try txn.commit();
 
         return .{
             .failure_patterns = failure_patterns,
@@ -14835,6 +14861,16 @@ fn collectToolTraceDigestRows(
 /// drift.
 const FLEET_SQL_LIMIT = std.fmt.comptimePrint("{d}", .{trace_mining.FLEET_MAX_TOOLS + 1});
 
+/// Cross-tenant aggregation must have database-side execution and memory
+/// ceilings too: a result LIMIT alone does not bound GROUP BY work.
+const FLEET_STATEMENT_TIMEOUT_SQL = "SET LOCAL statement_timeout = '5000ms'";
+const FLEET_WORK_MEM_SQL = "SET LOCAL work_mem = '4MB'";
+
+test "fleet aggregation SQL has database-side time and memory guards" {
+    try std.testing.expect(std.mem.indexOf(u8, FLEET_STATEMENT_TIMEOUT_SQL, "statement_timeout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, FLEET_WORK_MEM_SQL, "work_mem") != null);
+}
+
 /// SQL-side per-tool fluency census for the bounded fleet endpoint
 /// (Manager.fleetMiningStats). Aggregates over jsonb `events` array
 /// elements; the SELECT list projects ONLY tool NAME + aggregate counts
@@ -17254,7 +17290,10 @@ test "T2b: telos row survives content_hash dedup vs a byte-identical raw dup" {
     // The curated telos row is still live — never superseded by a stray dup.
     const telos = try mgr.getMemory(allocator, 2, "durable_fact/telos/goal/x");
     try std.testing.expect(telos != null);
-    if (telos) |m| m.deinit(allocator);
+    if (telos) |m| {
+        try std.testing.expectEqual(memory_root.MemoryCategory.core, m.category);
+        m.deinit(allocator);
+    }
 
     // The raw keeper is untouched too — both remain live.
     const raw = try mgr.getMemory(allocator, 2, "durable_fact/aaa_raw_dup");
@@ -19558,6 +19597,14 @@ test "parseActiveGoalSlot parses promoted active_goal keys, rejects others [①]
     try std.testing.expect(parseActiveGoalSlot("durable_fact/active_goal/sess/notanint") == null);
 }
 
+test "generic maintenance cannot retire curated telos keys" {
+    try std.testing.expectError(
+        error.ProtectedTelosKey,
+        reject_protected_telos_loser("durable_fact/telos/goal/north-star"),
+    );
+    try reject_protected_telos_loser("durable_fact/active_goal/session/1");
+}
+
 test "telosBackfill files active_goals into telos, supersedes source, evicts WM slot [T2/①/④]" {
     if (!build_options.enable_postgres) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -19577,7 +19624,10 @@ test "telosBackfill files active_goals into telos, supersedes source, evicts WM 
     // ④ — the telos row exists and is live (written as core).
     const telos = try mgr.getMemory(allocator, 2, "durable_fact/telos/goal/sess-bf_3");
     try std.testing.expect(telos != null);
-    if (telos) |m| m.deinit(allocator);
+    if (telos) |m| {
+        try std.testing.expectEqual(memory_root.MemoryCategory.core, m.category);
+        m.deinit(allocator);
+    }
 
     // T2 — the source active_goal row is superseded (gone from validity-filtered reads).
     const src = try mgr.getMemory(allocator, 2, src_key);

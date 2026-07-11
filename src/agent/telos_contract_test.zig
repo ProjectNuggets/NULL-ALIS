@@ -47,11 +47,9 @@ test "T2b: isTelosKey recognizes the telos namespace, rejects others" {
 // ── T1 — single-source injection (pure discriminators). A telos referent rides
 // the durable substrate (isDurableFactKey true) AND is routed to the curated
 // <telos> block rather than the generic durable-fact injection path (isTelosKey
-// true). These two predicates together are what make injection single-source:
-// buildTelosBlock consumes exactly the isTelosKey rows, and the filing path
-// supersedes their raw source. The behavioral proof that the raw source is NOT
-// also injected lives in the PG tests (zaki_state.zig `fileTelosFact`/supersede
-// + the extended live drive B1/B3); here we pin the discriminators. ──
+// true). The behavioral exact-once and fail-soft proof lives beside the loader
+// in memory_loader.zig (`T1: curated telos renders exactly once...`); here we
+// pin the namespace discriminators shared by the renderer and recall gate. ──
 test "T1: telos keys ride the durable substrate AND route to the telos block" {
     // durable substrate (so aliveness/decay/GDPR all apply for free):
     try std.testing.expect(memory_loader.isDurableFactKey("durable_fact/telos/mission/0"));

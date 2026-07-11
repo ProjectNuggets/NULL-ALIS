@@ -241,29 +241,48 @@ fn wishHubTotalBudgetNs(self: anytype) u64 {
     return WISH_HUB_TOTAL_BUDGET_NS;
 }
 
-/// Word-byte class for wish tokenization: ASCII alphanumerics OR any byte >=
-/// 0x80 (UTF-8 lead/continuation bytes) — the same approach as
-/// memory/root.zig's salientPatternToken. Round 2 Finding 3: the previous
-/// ASCII-only class dissolved Arabic/Cyrillic/CJK wishes into an EMPTY query
-/// (no Hub call) and left the relevance gate blind to non-Latin overlap;
-/// counting non-ASCII bytes as letters makes UTF-8 scripts tokenize as whole
-/// words. ASCII whitespace/punctuation (`/`, `-`, …) still delimit.
-fn isWishWordByte(ch: u8) bool {
-    return std.ascii.isAlphanumeric(ch) or ch >= 0x80;
+const WishCodepoint = struct { len: usize, is_word: bool };
+
+/// Decode one codepoint and classify common Unicode whitespace, punctuation,
+/// symbols, and emoji as delimiters. Everything else outside ASCII is kept as
+/// a word codepoint, covering Arabic/Cyrillic/Greek/CJK without a large Unicode
+/// category table. Invalid UTF-8 bytes are safe one-byte delimiters.
+fn classify_wish_codepoint(s: []const u8, i: usize) WishCodepoint {
+    const cp_len = std.unicode.utf8ByteSequenceLength(s[i]) catch return .{ .len = 1, .is_word = false };
+    if (i + cp_len > s.len) return .{ .len = 1, .is_word = false };
+    const cp = std.unicode.utf8Decode(s[i .. i + cp_len]) catch return .{ .len = cp_len, .is_word = false };
+    if (cp < 0x80) return .{ .len = cp_len, .is_word = std.ascii.isAlphanumeric(@intCast(cp)) };
+
+    const delimiter =
+        cp == 0x00A0 or cp == 0x1680 or (cp >= 0x2000 and cp <= 0x206F) or
+        cp == 0x2028 or cp == 0x2029 or cp == 0x202F or cp == 0x205F or cp == 0x3000 or
+        cp == 0x060C or cp == 0x061B or cp == 0x061F or cp == 0x06D4 or // Arabic punctuation
+        (cp >= 0x2190 and cp <= 0x2BFF) or // arrows, math, technical symbols
+        (cp >= 0x3000 and cp <= 0x303F) or // CJK punctuation
+        (cp >= 0xFE10 and cp <= 0xFE6F) or // vertical/small-form punctuation
+        (cp >= 0xFF01 and cp <= 0xFF0F) or (cp >= 0xFF1A and cp <= 0xFF20) or
+        (cp >= 0xFF3B and cp <= 0xFF40) or (cp >= 0xFF5B and cp <= 0xFF65) or
+        (cp >= 0x1F000 and cp <= 0x1FAFF); // emoji/pictographs
+    return .{ .len = cp_len, .is_word = !delimiter };
 }
 
-/// Minimal word tokenizer: yields maximal runs of word bytes (see
-/// `isWishWordByte`), treating every other byte (whitespace, punctuation,
-/// `/`, `-`) as a delimiter. Shared by query derivation and the relevance
-/// gate so both sides tokenize identically.
-const AlnumTokenizer = struct {
+/// UTF-8-aware tokenizer shared by query derivation and relevance matching.
+const WishTokenizer = struct {
     s: []const u8,
     i: usize = 0,
-    fn next(self: *AlnumTokenizer) ?[]const u8 {
-        while (self.i < self.s.len and !isWishWordByte(self.s[self.i])) : (self.i += 1) {}
+    fn next(self: *WishTokenizer) ?[]const u8 {
+        while (self.i < self.s.len) {
+            const classified = classify_wish_codepoint(self.s, self.i);
+            if (classified.is_word) break;
+            self.i += classified.len;
+        }
         if (self.i >= self.s.len) return null;
         const start = self.i;
-        while (self.i < self.s.len and isWishWordByte(self.s[self.i])) : (self.i += 1) {}
+        while (self.i < self.s.len) {
+            const classified = classify_wish_codepoint(self.s, self.i);
+            if (!classified.is_word) break;
+            self.i += classified.len;
+        }
         return self.s[start..self.i];
     }
 };
@@ -319,19 +338,14 @@ fn deriveWishQuery(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
-    var it = AlnumTokenizer{ .s = q };
+    var it = WishTokenizer{ .s = q };
     while (it.next()) |raw| {
-        // Cap invariant: a token is appended WHOLE or not at all. A token
-        // longer than the entire query budget can never fit on a token
-        // boundary — skip it outright rather than truncating (round 2
-        // Finding 3: truncation could split a multi-byte UTF-8 codepoint
-        // mid-sequence and ship mangled bytes to the Hub).
-        if (raw.len > WISH_QUERY_MAX_BYTES) continue;
-        var lower_buf: [WISH_QUERY_MAX_BYTES]u8 = undefined;
-        // ASCII-lowercase only: toLower is identity on bytes >= 0x80, so
-        // UTF-8 sequences pass through byte-for-byte unmangled.
-        for (raw, 0..) |c, k| lower_buf[k] = std.ascii.toLower(c);
-        const tok = lower_buf[0..raw.len];
+        // Preserve long no-space CJK runs by truncating on a UTF-8 boundary;
+        // skipping them made an otherwise valid wish query empty.
+        const bounded = text_norm.truncateUtf8(raw, WISH_QUERY_MAX_BYTES);
+        const lower = try extraction_persist.lowerForEntityKey(allocator, bounded);
+        defer allocator.free(lower);
+        const tok = lower;
         if (tok.len < 2) continue; // shed single-char noise
         if (isWishStopword(tok)) continue;
         const sep: usize = if (out.items.len == 0) 0 else 1;
@@ -351,28 +365,32 @@ fn deriveWishQuery(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
 /// description. No overlap ⇒ no affordance (kills "Zoom for a fax wish").
 const WISH_OVERLAP_MIN_TOKEN_LEN: usize = 4;
 
-fn candidateContainsToken(haystack: []const u8, lower_token: []const u8) bool {
-    var it = AlnumTokenizer{ .s = haystack };
+fn contains_non_ascii(s: []const u8) bool {
+    for (s) |ch| if (ch >= 0x80) return true;
+    return false;
+}
+
+fn candidateContainsToken(allocator: std.mem.Allocator, haystack: []const u8, lower_token: []const u8) !bool {
+    var it = WishTokenizer{ .s = haystack };
     while (it.next()) |raw| {
-        if (raw.len != lower_token.len) continue;
-        var same = true;
-        for (raw, lower_token) |c, lc| {
-            if (std.ascii.toLower(c) != lc) {
-                same = false;
-                break;
-            }
-        }
-        if (same) return true;
+        const lower_raw = try extraction_persist.lowerForEntityKey(allocator, raw);
+        defer allocator.free(lower_raw);
+        if (std.mem.eql(u8, lower_raw, lower_token)) return true;
+        // CJK frequently has no spaces, so a candidate may describe a shorter
+        // phrase inside a bounded long query token (or vice versa).
+        if (contains_non_ascii(lower_raw) and contains_non_ascii(lower_token) and
+            lower_raw.len >= WISH_OVERLAP_MIN_TOKEN_LEN and lower_token.len >= WISH_OVERLAP_MIN_TOKEN_LEN and
+            (std.mem.indexOf(u8, lower_raw, lower_token) != null or std.mem.indexOf(u8, lower_token, lower_raw) != null)) return true;
     }
     return false;
 }
 
-fn wishMatchHasOverlap(query: []const u8, name: []const u8, description: []const u8) bool {
+fn wishMatchHasOverlap(allocator: std.mem.Allocator, query: []const u8, name: []const u8, description: []const u8) !bool {
     // `query` is already lowercased salient tokens joined by single spaces.
     var qit = std.mem.tokenizeScalar(u8, query, ' ');
     while (qit.next()) |qtok| {
         if (qtok.len < WISH_OVERLAP_MIN_TOKEN_LEN) continue;
-        if (candidateContainsToken(name, qtok) or candidateContainsToken(description, qtok)) return true;
+        if (try candidateContainsToken(allocator, name, qtok) or try candidateContainsToken(allocator, description, qtok)) return true;
     }
     return false;
 }
@@ -5402,7 +5420,7 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
                         defer self.allocator.free(match.name);
                         defer self.allocator.free(match.description);
                         // Relevance gate: no token overlap ⇒ no affordance.
-                        if (wishMatchHasOverlap(query, match.name, match.description)) {
+                        if (try wishMatchHasOverlap(self.allocator, query, match.name, match.description)) {
                             try w.print(
                                 "    \u{21B3} possible skill: {s} — install with skill_registry action=\"install\" skill_ref=\"{s}\"\n",
                                 .{ match.name, match.name },
@@ -7220,27 +7238,43 @@ test "deriveWishQuery: Arabic wish yields a non-empty, bounded, valid-UTF-8 quer
     try std.testing.expectEqualStrings("أرسل فاكس إلى العميل", q);
 }
 
-test "deriveWishQuery: token longer than the cap is skipped whole — never split mid-codepoint" {
+test "deriveWishQuery: token longer than the cap is UTF-8 truncated, not discarded" {
     const allocator = std.testing.allocator;
 
-    // A single 66-byte Arabic run (33 two-byte codepoints) exceeds the
-    // 64-byte query cap: it can never fit on a token boundary, so it must be
-    // skipped WHOLE — truncating it would split a codepoint mid-sequence.
+    // A single 66-byte Arabic run exceeds the cap. Keep a valid bounded prefix
+    // instead of discarding the only salient token.
     const long_run = "ب" ** 33;
     const q = try deriveWishQuery(allocator, long_run ++ " فاكس");
     defer allocator.free(q);
-    try std.testing.expectEqualStrings("فاكس", q);
+    try std.testing.expect(q.len > 0);
+    try std.testing.expect(q.len <= WISH_QUERY_MAX_BYTES);
+    try std.testing.expect(std.mem.startsWith(u8, q, "ب"));
     try std.testing.expect(std.unicode.utf8ValidateSlice(q));
 }
 
 test "wishMatchHasOverlap: relevance gate sees non-Latin tokens (4-byte floor unchanged)" {
+    const allocator = std.testing.allocator;
     // A 2-char Arabic word is 4 bytes — exactly at WISH_OVERLAP_MIN_TOKEN_LEN,
     // so short non-Latin capability words still carry a relevance signal.
-    try std.testing.expect(wishMatchHasOverlap("لو", "acme/لو-tool", "some helper"));
+    try std.testing.expect(try wishMatchHasOverlap(allocator, "لو", "acme/لو-tool", "some helper"));
     // A 1-char Arabic word (2 bytes) stays below the floor — no signal.
-    try std.testing.expect(!wishMatchHasOverlap("م", "acme/م-tool", "some helper"));
+    try std.testing.expect(!try wishMatchHasOverlap(allocator, "م", "acme/م-tool", "some helper"));
     // Description-side overlap works for non-Latin tokens too.
-    try std.testing.expect(wishMatchHasOverlap("فاكس", "acme/faxer", "يرسل فاكس عبر البريد"));
+    try std.testing.expect(try wishMatchHasOverlap(allocator, "فاكس", "acme/faxer", "يرسل فاكس عبر البريد"));
+}
+
+test "deriveWishQuery: Unicode punctuation splits and long CJK remains useful" {
+    const allocator = std.testing.allocator;
+    const punctuated = try deriveWishQuery(allocator, "ФАКС，Отправить。Срочно");
+    defer allocator.free(punctuated);
+    try std.testing.expectEqualStrings("факс отправить срочно", punctuated);
+
+    const cjk = try deriveWishQuery(allocator, "部署一个能够自动扩展并监控生产环境健康状态的云原生服务平台以及告警系统和故障恢复工作流");
+    defer allocator.free(cjk);
+    try std.testing.expect(cjk.len > 0);
+    try std.testing.expect(cjk.len <= WISH_QUERY_MAX_BYTES);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(cjk));
+    try std.testing.expect(try wishMatchHasOverlap(allocator, cjk, "云原生平台", "监控生产环境健康状态"));
 }
 
 test "/learn list: Arabic wish matches an Arabic-named skill (UTF-8 end-to-end)" {

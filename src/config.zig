@@ -1050,6 +1050,7 @@ pub const Config = struct {
             .dream_log_warmstart_enabled = self.agent.dream_log_warmstart_enabled,
             .trace_mining_enabled = self.agent.trace_mining_enabled,
             .wish_matchmaking_enabled = self.agent.wish_matchmaking_enabled,
+            .telos_in_prompt = self.agent.telos_in_prompt,
             // token_limit is the one conditional: emitted only when the
             // operator explicitly set it (token_limit_explicit) — an
             // unconditional emit would promote the struct default to an
@@ -2304,6 +2305,7 @@ test "save roundtrip preserves parsed agent flags (wish_matchmaking + family)" {
     cfg.agent.dream_log_warmstart_enabled = false;
     cfg.agent.trace_mining_enabled = false;
     cfg.agent.wish_matchmaking_enabled = true; // explicit operator opt-in
+    cfg.agent.telos_in_prompt = true;
     cfg.agent.token_limit = 123_456;
     cfg.agent.token_limit_explicit = true;
     cfg.agent.extraction.per_turn_enqueue_enabled = true;
@@ -2337,6 +2339,7 @@ test "save roundtrip preserves parsed agent flags (wish_matchmaking + family)" {
     try std.testing.expect(!loaded.agent.dream_log_warmstart_enabled);
     try std.testing.expect(!loaded.agent.trace_mining_enabled);
     try std.testing.expect(loaded.agent.wish_matchmaking_enabled);
+    try std.testing.expect(loaded.agent.telos_in_prompt);
     try std.testing.expectEqual(@as(u64, 123_456), loaded.agent.token_limit);
     try std.testing.expect(loaded.agent.token_limit_explicit);
     try std.testing.expect(loaded.agent.extraction.per_turn_enqueue_enabled);
@@ -2383,6 +2386,7 @@ test "save roundtrip does not promote default token_limit to explicit" {
     // And the flag family keeps its defaults when saved as defaults.
     try std.testing.expect(!loaded.agent.wish_matchmaking_enabled);
     try std.testing.expect(loaded.agent.trace_mining_enabled);
+    try std.testing.expect(!loaded.agent.telos_in_prompt);
 }
 
 test "save escapes mcp_servers strings safely" {
