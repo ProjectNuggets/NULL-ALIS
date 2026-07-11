@@ -44,17 +44,58 @@ test "T2b: isTelosKey recognizes the telos namespace, rejects others" {
     try std.testing.expect(!memory_root.isTelosKey("telos/goal/0"));
 }
 
-// ── Invariants filled by later Slice-1 tasks. Kept as a visible checklist so a
-// half-built slice still reads as "these are the guarantees, here is who owns
-// each": ──
-//   T1  [tasks 3,5] — single-source injection: `buildTelosBlock` renders telos
-//                     rows; a filed telos referent is not also injected raw.
-//   T2  [task 6]    — filing supersedes: `resolveContradiction` sets valid_to on
-//                     the source row → excluded by `MEMORIES_VALIDITY_FILTER`.
-//   T2b [task 4 ✓]  — a curated telos row is closed only by explicit curation of its
-//                     own key, never as a content_hash-dedup loser (isTelosKey +
-//                     phase05BackfillExactDedup). archive/forget are key-scoped (safe).
-//   T3  [task 6]    — precedence telos > raw > WM, enforced at file-time by T2.
-//   T4  [Slice 2]   — human authorship: rows enter via `wish/telos/*` proposals,
-//                     approved through `execution_mode`; the loop never auto-files.
-//   T6  [Slice 2]   — freshness: stale telos rows demote pinned → retrieval-gated.
+// ── T1 — single-source injection (pure discriminators). A telos referent rides
+// the durable substrate (isDurableFactKey true) AND is routed to the curated
+// <telos> block rather than the generic durable-fact injection path (isTelosKey
+// true). These two predicates together are what make injection single-source:
+// buildTelosBlock consumes exactly the isTelosKey rows, and the filing path
+// supersedes their raw source. The behavioral proof that the raw source is NOT
+// also injected lives in the PG tests (zaki_state.zig `fileTelosFact`/supersede
+// + the extended live drive B1/B3); here we pin the discriminators. ──
+test "T1: telos keys ride the durable substrate AND route to the telos block" {
+    // durable substrate (so aliveness/decay/GDPR all apply for free):
+    try std.testing.expect(memory_loader.isDurableFactKey("durable_fact/telos/mission/0"));
+    // routed to the curated block, distinct from a generic durable fact:
+    try std.testing.expect(memory_root.isTelosKey("durable_fact/telos/mission/0"));
+    try std.testing.expect(!memory_root.isTelosKey("durable_fact/generic_pref"));
+}
+
+// ── T3 — precedence telos > raw durable_fact > WM is enforced at FILE-TIME by T2
+// (the source raw row is superseded, so at query time only the telos copy is
+// live). That is a PG/txn property; the behavioral proof is the PG supersede test
+// in zaki_state.zig (`fileTelosFact` sets valid_to on the raw source). The pure
+// invariant we can pin here: the classifier that underpins the ordering treats a
+// telos key as strictly more specific than a bare durable_fact key. ──
+test "T3: telos key is strictly more specific than a bare durable_fact key" {
+    // both are durable facts...
+    try std.testing.expect(memory_loader.isDurableFactKey("durable_fact/telos/goal/0"));
+    try std.testing.expect(memory_loader.isDurableFactKey("durable_fact/goal_note"));
+    // ...but only the telos one is telos (the discriminator that wins precedence):
+    try std.testing.expect(memory_root.isTelosKey("durable_fact/telos/goal/0"));
+    try std.testing.expect(!memory_root.isTelosKey("durable_fact/goal_note"));
+}
+
+// ── T6 — freshness (Slice 1.1). A curated telos row past the reconfirmation
+// horizon is rendered with an age annotation so the model discounts stale intent.
+// `telosStaleDays` is the pure decision fn; the renderer behavior (fresh clean,
+// stale annotated) is pinned in memory_loader.zig's renderTelosBlock tests. The
+// pinned→retrieval-gated DEMOTION remains Slice 2. ──
+test "T6: telosStaleDays annotates only rows past the horizon; fail-soft otherwise" {
+    const base: i64 = 1_000_000_000;
+    try std.testing.expectEqual(@as(?u64, null), memory_loader.telosStaleDays("1000000000", base + 10 * 86_400)); // fresh
+    try std.testing.expectEqual(@as(?u64, 200), memory_loader.telosStaleDays("1000000000", base + 200 * 86_400)); // stale
+    try std.testing.expectEqual(@as(?u64, null), memory_loader.telosStaleDays("0", base + 9_999 * 86_400)); // sentinel
+    try std.testing.expectEqual(@as(?u64, null), memory_loader.telosStaleDays("garbage", base)); // fail-soft
+}
+
+// ── Invariants covered by PG behavioral tests (named here so the "executable
+// form" claim is honest — pure predicates asserted above, DB behavior below): ──
+//   T2  [PG] — filing supersedes: `fileTelosFact`→`setMemoryInvalidation` sets
+//              valid_to on the source row → excluded by `MEMORIES_VALIDITY_FILTER`
+//              (zaki_state.zig telos supersede test + live-drive B3).
+//   T2b [✓]  — telos rows shielded from the content_hash dedup AND the M3
+//              information-scoped archive/forget cascade (isTelosKey +
+//              phase05BackfillExactDedup + informationScopedSweep guards;
+//              zaki_state.zig telos-twin-shield tests + live-drive B3).
+//   T4  [Slice 2] — human authorship: rows enter via `wish/telos/*` proposals,
+//                   approved through `execution_mode`; the loop never auto-files.
