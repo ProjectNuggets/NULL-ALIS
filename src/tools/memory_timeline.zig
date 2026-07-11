@@ -7,6 +7,7 @@ const mem_root = @import("../memory/root.zig");
 const Memory = mem_root.Memory;
 const zaki_state = @import("../zaki_state.zig");
 const supersede_filter = @import("supersede_filter.zig");
+const util = @import("../util.zig");
 
 const log = std.log.scoped(.memory_timeline);
 
@@ -194,10 +195,13 @@ pub const MemoryTimelineTool = struct {
             var latest_source_key: ?[]const u8 = null;
             if (try mem.get(allocator, latest_key)) |latest| {
                 const source_key = mem_root.metadataValue(latest.content, "source_key=");
-                const effective_at = mem_root.metadataValue(latest.content, "at=") orelse latest.timestamp;
-                if (summaryMatchesFilters(latest.content, latest.key, source_key, effective_at, filters)) {
+                const at_metadata = mem_root.metadataValue(latest.content, "at=");
+                if (summaryMatchesFilters(latest.content, latest.key, source_key, at_metadata, latest.timestamp, filters)) {
+                    errdefer latest.deinit(allocator);
                     const source_key_owned = if (source_key) |value| try allocator.dupe(u8, value) else null;
-                    const at_owned = if (mem_root.metadataValue(latest.content, "at=")) |value| try allocator.dupe(u8, value) else null;
+                    errdefer if (source_key_owned) |value| allocator.free(value);
+                    const at_owned = if (at_metadata) |value| try allocator.dupe(u8, value) else null;
+                    errdefer if (at_owned) |value| allocator.free(value);
                     try views.append(allocator, .{
                         .entry = latest,
                         .source_key_override = source_key_owned,
@@ -249,21 +253,31 @@ pub const MemoryTimelineTool = struct {
                 if (latest_source_key) |source_key| {
                     if (std.mem.eql(u8, entry.key, source_key)) continue;
                 }
-                if (!summaryMatchesFilters(entry.content, entry.key, entry.key, entry.timestamp, filters)) continue;
-                try matches.append(allocator, try cloneEntry(allocator, entry));
+                if (!summaryMatchesFilters(entry.content, entry.key, entry.key, mem_root.metadataValue(entry.content, "at="), entry.timestamp, filters)) continue;
+                {
+                    var cloned = try cloneEntry(allocator, entry);
+                    errdefer cloned.deinit(allocator);
+                    try matches.append(allocator, cloned);
+                }
             }
             for (daily_conversation_entries) |entry| {
                 if (!familyMatches.check(entry.key, timeline_prefix, compaction_prefix, fallback_prefix, dropped_prefix)) continue;
                 if (latest_source_key) |source_key| {
                     if (std.mem.eql(u8, entry.key, source_key)) continue;
                 }
-                if (!summaryMatchesFilters(entry.content, entry.key, entry.key, entry.timestamp, filters)) continue;
-                try matches.append(allocator, try cloneEntry(allocator, entry));
+                if (!summaryMatchesFilters(entry.content, entry.key, entry.key, mem_root.metadataValue(entry.content, "at="), entry.timestamp, filters)) continue;
+                {
+                    var cloned = try cloneEntry(allocator, entry);
+                    errdefer cloned.deinit(allocator);
+                    try matches.append(allocator, cloned);
+                }
             }
             sortEntriesNewestFirst(matches.items);
             var idx: usize = 0;
             while (idx < matches.items.len and views.items.len < filters.limit) : (idx += 1) {
-                try views.append(allocator, .{ .entry = try cloneEntry(allocator, matches.items[idx]) });
+                var cloned = try cloneEntry(allocator, matches.items[idx]);
+                errdefer cloned.deinit(allocator);
+                try views.append(allocator, .{ .entry = cloned });
             }
             return views.toOwnedSlice(allocator);
         }
@@ -293,11 +307,19 @@ pub const MemoryTimelineTool = struct {
                 if (containsSourceKey(views.items, parsed.key)) continue;
 
                 if (try mem.get(allocator, parsed.key)) |entry| {
-                    if (!summaryMatchesFilters(entry.content, entry.key, entry.key, entry.timestamp, filters)) {
-                        entry.deinit(allocator);
+                    var owned_entry = entry;
+                    errdefer owned_entry.deinit(allocator);
+                    const entry_at_metadata = mem_root.metadataValue(entry.content, "at=") orelse parsed.at;
+                    if (!summaryMatchesFilters(entry.content, entry.key, entry.key, entry_at_metadata, entry.timestamp, filters)) {
+                        owned_entry.deinit(allocator);
                         continue;
                     }
-                    try views.append(allocator, .{ .entry = entry });
+                    const at_override = if (mem_root.metadataValue(entry.content, "at=") == null)
+                        try allocator.dupe(u8, parsed.at)
+                    else
+                        null;
+                    errdefer if (at_override) |value| allocator.free(value);
+                    try views.append(allocator, .{ .entry = owned_entry, .at_override = at_override });
                 }
             }
         }
@@ -319,13 +341,19 @@ pub const MemoryTimelineTool = struct {
         for (entries) |entry| {
             if (!mem_root.isTimelineSummaryKey(entry.key)) continue;
             if (containsSourceKey(views.items, entry.key)) continue;
-            if (!summaryMatchesFilters(entry.content, entry.key, entry.key, entry.timestamp, filters)) continue;
-            try matches.append(allocator, try cloneEntry(allocator, entry));
+            if (!summaryMatchesFilters(entry.content, entry.key, entry.key, mem_root.metadataValue(entry.content, "at="), entry.timestamp, filters)) continue;
+            {
+                var cloned = try cloneEntry(allocator, entry);
+                errdefer cloned.deinit(allocator);
+                try matches.append(allocator, cloned);
+            }
         }
         sortEntriesNewestFirst(matches.items);
         var idx: usize = 0;
         while (idx < matches.items.len and views.items.len < filters.limit) : (idx += 1) {
-            try views.append(allocator, .{ .entry = try cloneEntry(allocator, matches.items[idx]) });
+            var cloned = try cloneEntry(allocator, matches.items[idx]);
+            errdefer cloned.deinit(allocator);
+            try views.append(allocator, .{ .entry = cloned });
         }
     }
 
@@ -341,11 +369,87 @@ pub const MemoryTimelineTool = struct {
         if (filters.channel) |channel| {
             if (!std.ascii.eqlIgnoreCase(parsed.channel, channel)) return false;
         }
+        return true;
+    }
+
+    fn date_prefix(value: []const u8) ?[]const u8 {
+        if (value.len < 10) return null;
+        const candidate = value[0..10];
+        return if (isValidDate(candidate)) candidate else null;
+    }
+
+    fn parse_positive_unix_seconds(value: []const u8) ?i64 {
+        if (value.len == 0 or value.len > 11) return null;
+        for (value) |ch| {
+            if (!std.ascii.isDigit(ch)) return null;
+        }
+        return std.fmt.parseInt(i64, value, 10) catch null;
+    }
+
+    fn parse_last_path_unix_seconds(key: []const u8) ?i64 {
+        const slash_idx = std.mem.lastIndexOfScalar(u8, key, '/') orelse return null;
+        return parse_positive_unix_seconds(key[slash_idx + 1 ..]);
+    }
+
+    fn parse_key_unix_seconds(key: []const u8) ?i64 {
+        if (mem_root.parseTimelineSummaryTimestamp(key)) |timestamp_s| return timestamp_s;
+        if (std.mem.startsWith(u8, key, "summary_fallback/")) return parse_last_path_unix_seconds(key);
+        return null;
+    }
+
+    fn resolve_date_utc(
+        content: []const u8,
+        key: []const u8,
+        source_key: ?[]const u8,
+        at_metadata: ?[]const u8,
+        entry_timestamp: []const u8,
+        buf: []u8,
+    ) []const u8 {
+        if (mem_root.metadataValue(content, "date_utc=")) |value| {
+            if (date_prefix(value)) |date| return date;
+        }
+        if (mem_root.metadataValue(content, "created_at_utc=")) |value| {
+            if (date_prefix(value)) |date| return date;
+        }
+        if (at_metadata) |at| {
+            if (date_prefix(at)) |date| return date;
+        }
+        if (source_key) |candidate_key| {
+            if (parse_key_unix_seconds(candidate_key)) |timestamp_s| return util.date_utc_from_unix(timestamp_s, buf);
+        }
+        if (parse_key_unix_seconds(key)) |timestamp_s| return util.date_utc_from_unix(timestamp_s, buf);
+        if (date_prefix(entry_timestamp)) |date| return date;
+        if (parse_positive_unix_seconds(entry_timestamp)) |timestamp_s| return util.date_utc_from_unix(timestamp_s, buf);
+        return "unknown";
+    }
+
+    fn resolve_created_at_utc(
+        content: []const u8,
+        key: []const u8,
+        source_key: ?[]const u8,
+        at_metadata: ?[]const u8,
+        entry_timestamp: []const u8,
+        buf: []u8,
+    ) []const u8 {
+        if (mem_root.metadataValue(content, "created_at_utc=")) |value| return value;
+        if (at_metadata) |at| {
+            if (at.len >= 20 and at[10] == 'T') return at;
+        }
+        if (source_key) |candidate_key| {
+            if (parse_key_unix_seconds(candidate_key)) |timestamp_s| return util.timestamp_from_unix(timestamp_s, buf);
+        }
+        if (parse_key_unix_seconds(key)) |timestamp_s| return util.timestamp_from_unix(timestamp_s, buf);
+        if (entry_timestamp.len >= 20 and entry_timestamp[10] == 'T') return entry_timestamp;
+        if (parse_positive_unix_seconds(entry_timestamp)) |timestamp_s| return util.timestamp_from_unix(timestamp_s, buf);
+        return "unknown";
+    }
+
+    fn date_matches_filters(date_utc: []const u8, filters: Filters) bool {
         if (filters.date_from) |date_from| {
-            if (parsed.at.len < 10 or std.mem.order(u8, parsed.at[0..10], date_from) == .lt) return false;
+            if (date_utc.len < 10 or std.mem.order(u8, date_utc[0..10], date_from) == .lt) return false;
         }
         if (filters.date_to) |date_to| {
-            if (parsed.at.len < 10 or std.mem.order(u8, parsed.at[0..10], date_to) == .gt) return false;
+            if (date_utc.len < 10 or std.mem.order(u8, date_utc[0..10], date_to) == .gt) return false;
         }
         return true;
     }
@@ -354,7 +458,8 @@ pub const MemoryTimelineTool = struct {
         content: []const u8,
         key: []const u8,
         source_key: ?[]const u8,
-        effective_at: []const u8,
+        at_metadata: ?[]const u8,
+        entry_timestamp: []const u8,
         filters: Filters,
     ) bool {
         if (filters.session_id) |session_id| {
@@ -365,11 +470,10 @@ pub const MemoryTimelineTool = struct {
             const provenance = mem_root.resolveStoredMemoryProvenance(content, null, source_key orelse key);
             if (!std.ascii.eqlIgnoreCase(provenance.channel, channel)) return false;
         }
-        if (filters.date_from) |date_from| {
-            if (effective_at.len < 10 or std.mem.order(u8, effective_at[0..10], date_from) == .lt) return false;
-        }
-        if (filters.date_to) |date_to| {
-            if (effective_at.len < 10 or std.mem.order(u8, effective_at[0..10], date_to) == .gt) return false;
+        if (filters.date_from != null or filters.date_to != null) {
+            var date_buf: [16]u8 = undefined;
+            const date_utc = resolve_date_utc(content, key, source_key, at_metadata, entry_timestamp, &date_buf);
+            if (!date_matches_filters(date_utc, filters)) return false;
         }
         if (filters.query) |query| {
             const summary_body = summaryBody(content);
@@ -396,18 +500,37 @@ pub const MemoryTimelineTool = struct {
     }
 
     fn cloneEntry(allocator: std.mem.Allocator, entry: mem_root.MemoryEntry) !mem_root.MemoryEntry {
-        return .{
-            .id = try allocator.dupe(u8, entry.id),
-            .key = try allocator.dupe(u8, entry.key),
-            .content = try allocator.dupe(u8, entry.content),
-            .category = switch (entry.category) {
-                .core => .core,
-                .daily => .daily,
-                .conversation => .conversation,
-                .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
+        const id = try allocator.dupe(u8, entry.id);
+        errdefer allocator.free(id);
+        const key = try allocator.dupe(u8, entry.key);
+        errdefer allocator.free(key);
+        const content = try allocator.dupe(u8, entry.content);
+        errdefer allocator.free(content);
+        const category: mem_root.MemoryCategory = switch (entry.category) {
+            .core => .core,
+            .daily => .daily,
+            .conversation => .conversation,
+            .custom => |name| blk: {
+                const owned_name = try allocator.dupe(u8, name);
+                errdefer allocator.free(owned_name);
+                break :blk .{ .custom = owned_name };
             },
-            .timestamp = try allocator.dupe(u8, entry.timestamp),
-            .session_id = if (entry.session_id) |sid| try allocator.dupe(u8, sid) else null,
+        };
+        errdefer switch (category) {
+            .custom => |name| allocator.free(name),
+            else => {},
+        };
+        const timestamp = try allocator.dupe(u8, entry.timestamp);
+        errdefer allocator.free(timestamp);
+        const session_id = if (entry.session_id) |sid| try allocator.dupe(u8, sid) else null;
+        errdefer if (session_id) |sid| allocator.free(sid);
+        return .{
+            .id = id,
+            .key = key,
+            .content = content,
+            .category = category,
+            .timestamp = timestamp,
+            .session_id = session_id,
             .score = entry.score,
         };
     }
@@ -460,7 +583,12 @@ pub const MemoryTimelineTool = struct {
             if (supersede_filter.isKeySuperseded(view.entry.key, superseded_keys)) continue;
             visible_idx += 1;
             const provenance = mem_root.resolveStoredMemoryProvenance(view.entry.content, view.entry.session_id, source_key);
-            const at = view.at_override orelse view.entry.timestamp;
+            const at_metadata = view.at_override orelse mem_root.metadataValue(view.entry.content, "at=");
+            const at = at_metadata orelse view.entry.timestamp;
+            var created_buf: [32]u8 = undefined;
+            var date_buf: [16]u8 = undefined;
+            const created_at_utc = resolve_created_at_utc(view.entry.content, view.entry.key, source_key, at_metadata, view.entry.timestamp, &created_buf);
+            const date_utc = resolve_date_utc(view.entry.content, view.entry.key, source_key, at_metadata, view.entry.timestamp, &date_buf);
             const focus = mem_root.extractSummarySection(view.entry.content, "focus:");
             const decisions = try mem_root.extractSummaryListSection(allocator, view.entry.content, "decisions:\n");
             defer allocator.free(decisions);
@@ -469,13 +597,15 @@ pub const MemoryTimelineTool = struct {
             const next = try mem_root.extractSummaryListSection(allocator, view.entry.content, "next:\n");
             defer allocator.free(next);
             try w.print(
-                "{d}. session={s} channel={s} lane={s} at={s} source_key={s}\n   focus: {s}\n   decisions: {s}\n   open_loops: {s}\n   next: {s}\n",
+                "{d}. session={s} channel={s} lane={s} at={s} date_utc={s} created_at_utc={s} source_key={s}\n   focus: {s}\n   decisions: {s}\n   open_loops: {s}\n   next: {s}\n",
                 .{
                     visible_idx,
                     provenance.session_id orelse "unknown",
                     provenance.channel,
                     provenance.lane,
                     at,
+                    date_utc,
+                    created_at_utc,
                     source_key,
                     focus,
                     decisions,
@@ -614,6 +744,88 @@ test "memory_timeline filters by date range" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "No session summaries found.") != null);
 }
 
+test "memory_timeline prefers date_utc metadata over legacy at field" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "summary_latest/agent:zaki-bot:user:1:main",
+        "type=summary_latest\nsession=agent:zaki-bot:user:1:main\nchannel=app\nlane=main\nsource_key=timeline_summary/agent:zaki-bot:user:1:main/1774300000\nat=2026-03-01T12:00:00Z\ncreated_at_utc=2026-06-17T09:55:58Z\ndate_utc=2026-06-17\nfocus: metadata date\ndecisions:\n- align\nopen_loops:\n- none\nnext:\n- continue\n",
+        .core,
+        null,
+    );
+    try mem.store(
+        "timeline_summary/agent:zaki-bot:user:1:main/1774300000",
+        "created_at_utc=2026-06-17T09:55:58Z\ndate_utc=2026-06-17\n\nfocus: metadata date\ndecisions:\n- align\nopen_loops:\n- none\nnext:\n- continue\n",
+        .daily,
+        null,
+    );
+
+    var mt = MemoryTimelineTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"session_id\":\"agent:zaki-bot:user:1:main\",\"date_from\":\"2026-06-17\",\"date_to\":\"2026-06-17\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "date_utc=2026-06-17") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "created_at_utc=2026-06-17T09:55:58Z") != null);
+}
+
+test "memory_timeline indexed date filter uses entry date_utc metadata" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store(
+        "timeline_summary/telegram:chat:1/1774300000",
+        "created_at_utc=2026-06-17T09:55:58Z\ndate_utc=2026-06-17\n\nfocus: indexed metadata date\ndecisions:\n- align\nopen_loops:\n- none\nnext:\n- continue\n",
+        .daily,
+        null,
+    );
+    try mem.store(
+        "timeline_index/current",
+        "- at=2026-03-01T12:00:00Z channel=telegram lane=unknown session=telegram:chat:1 key=timeline_summary/telegram:chat:1/1774300000 focus=indexed metadata date\n",
+        .core,
+        null,
+    );
+
+    var mt = MemoryTimelineTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"date_from\":\"2026-06-17\",\"date_to\":\"2026-06-17\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "source_key=timeline_summary/telegram:chat:1/1774300000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "date_utc=2026-06-17") != null);
+}
+
+test "memory_timeline derives UTC date from legacy timeline key suffix" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("timeline_summary/telegram:chat:1/0", "focus: legacy epoch\ndecisions:\n- keep compatibility\nopen_loops:\n- none\nnext:\n- continue\n", .daily, null);
+
+    var mt = MemoryTimelineTool{ .memory = mem };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs("{\"date_from\":\"1970-01-01\",\"date_to\":\"1970-01-01\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer if (result.output.len > 0) allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "date_utc=1970-01-01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "created_at_utc=1970-01-01T00:00:00Z") != null);
+}
+
 test "memory_timeline rejects malformed date input" {
     const allocator = std.testing.allocator;
     var sqlite_mem = try mem_root.SqliteMemory.init(allocator, ":memory:");
@@ -721,11 +933,11 @@ test "memory_timeline session date filter uses summary_latest at metadata" {
 
     try mem.store(
         "summary_latest/agent:zaki-bot:user:1:main",
-        "type=summary_latest\nsession=agent:zaki-bot:user:1:main\nchannel=app\nlane=main\nsource_key=timeline_summary/agent:zaki-bot:user:1:main/1774300000\nat=2026-03-01T12:00:00Z\nfocus: shipping\ndecisions:\n- align\nopen_loops:\n- none\nnext:\n- continue\n",
+        "type=summary_latest\nsession=agent:zaki-bot:user:1:main\nchannel=app\nlane=main\nsource_key=timeline_summary/agent:zaki-bot:user:1:main/1772323200\nat=2026-03-01T12:00:00Z\nfocus: shipping\ndecisions:\n- align\nopen_loops:\n- none\nnext:\n- continue\n",
         .core,
         null,
     );
-    try mem.store("timeline_summary/agent:zaki-bot:user:1:main/1774300000", "focus: shipping\ndecisions:\n- align\nopen_loops:\n- none\nnext:\n- continue\n", .daily, null);
+    try mem.store("timeline_summary/agent:zaki-bot:user:1:main/1772323200", "focus: shipping\ndecisions:\n- align\nopen_loops:\n- none\nnext:\n- continue\n", .daily, null);
 
     var mt = MemoryTimelineTool{ .memory = mem };
     const t = mt.tool();
