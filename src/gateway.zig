@@ -4169,6 +4169,32 @@ pub const FleetMiningStatsResponse = struct {
     body: []const u8,
 };
 
+fn is_registered_fleet_tool(tool_name: []const u8) bool {
+    for (tools_mod.defaultMetadataRegistry()) |meta| {
+        if (std.mem.eql(u8, meta.name, tool_name)) return true;
+    }
+    return false;
+}
+
+/// Older trace rows may predate dispatch-side canonicalization. Sanitize the
+/// bounded aggregate again at the operator boundary so historic LLM-supplied
+/// names cannot disclose tenant text. Unknown and dynamic names collapse to a
+/// single sentinel; built-in registered names retain their useful shape.
+fn sanitize_fleet_tool_names(allocator: std.mem.Allocator, stats: *trace_mining.FleetStats) !void {
+    for (stats.tool_stats) |*tool_stat| {
+        if (is_registered_fleet_tool(tool_stat.tool)) continue;
+        const safe_name = try allocator.dupe(u8, "unknown");
+        allocator.free(tool_stat.tool);
+        tool_stat.tool = safe_name;
+    }
+    for (stats.failure_patterns) |*pattern| {
+        if (is_registered_fleet_tool(pattern.tool)) continue;
+        const safe_name = try allocator.dupe(u8, "unknown");
+        allocator.free(pattern.tool);
+        pattern.tool = safe_name;
+    }
+}
+
 /// Operator fleet mining-stats route (learning contract inv. 5) —
 /// extracted from the `.fleet_mining_stats` switch arm so the route
 /// logic is unit-testable without spinning up a real HTTP listener
@@ -4245,6 +4271,12 @@ pub fn handleFleetMiningStatsRequest(
         };
     };
     defer stats.deinit(allocator);
+    sanitize_fleet_tool_names(allocator, &stats) catch {
+        return .{
+            .status = "500 Internal Server Error",
+            .body = "{\"error\":\"response build failed\"}",
+        };
+    };
     const body = tools_mod.memory_maintain.renderFleetJson(allocator, stats) catch {
         return .{
             .status = "500 Internal Server Error",
@@ -4310,6 +4342,43 @@ test "fleet mining-stats — since_days parse+clamp: absent/malformed/zero/negat
     try std.testing.expectEqual(@as(u32, 7), clampFleetSinceDays("999999999999999999999999"));
 }
 
+test "fleet mining-stats sanitizes historic unregistered tool names" {
+    const allocator = std.testing.allocator;
+    const registered = try allocator.dupe(u8, "web_search");
+    const private_tool = try allocator.dupe(u8, "patient_alice_private_detail");
+    const private_pattern = try allocator.dupe(u8, "another_private_detail");
+    var tool_stats = [_]trace_mining.ToolStat{
+        .{
+            .tool = registered,
+            .uses = 3,
+            .success_rate = 1.0,
+            .p50_duration_ms = 10,
+        },
+        .{
+            .tool = private_tool,
+            .uses = 1,
+            .success_rate = 0.0,
+            .p50_duration_ms = 0,
+        },
+    };
+    var failure_patterns = [_]trace_mining.FleetFailurePattern{
+        .{ .tool = private_pattern, .count = 3 },
+    };
+    var stats = trace_mining.FleetStats{
+        .tool_stats = &tool_stats,
+        .failure_patterns = &failure_patterns,
+    };
+    defer {
+        for (stats.tool_stats) |tool_stat| allocator.free(tool_stat.tool);
+        for (stats.failure_patterns) |pattern| allocator.free(pattern.tool);
+    }
+
+    try sanitize_fleet_tool_names(allocator, &stats);
+    try std.testing.expectEqualStrings("web_search", stats.tool_stats[0].tool);
+    try std.testing.expectEqualStrings("unknown", stats.tool_stats[1].tool);
+    try std.testing.expectEqualStrings("unknown", stats.failure_patterns[0].tool);
+}
+
 test "fleet mining-stats [PG] — cross-tenant happy path emits shapes only; since_days absent→7, 99999→365 (inv. 5)" {
     // End-to-end privacy-sentinel discipline (the renderFleetJson
     // pure-function sentinel test in tools/memory_maintain.zig, now
@@ -4340,13 +4409,17 @@ test "fleet mining-stats [PG] — cross-tenant happy path emits shapes only; sin
     const SENTINEL_A = "TENANT_A_SECRET_ARG_XYZZY";
     const SENTINEL_B = "TENANT_B_SECRET_ARG_PLUGH";
     const events_a = "[{\"kind\":\"tool_call\",\"tool\":\"web_search\",\"success\":false,\"duration_ms\":420,\"label\":\"" ++ SENTINEL_A ++ "\"}]";
-    const events_b = "[{\"kind\":\"tool_call\",\"tool\":\"bash\",\"success\":false,\"duration_ms\":15,\"label\":\"" ++ SENTINEL_B ++ "\"}]";
+    const events_b = "[{\"kind\":\"tool_call\",\"tool\":\"shell\",\"success\":false,\"duration_ms\":15,\"label\":\"" ++ SENTINEL_B ++ "\"}]";
     try mgr.insertToolTraceEvents(987001, "fleet-a-1", events_a);
     try mgr.insertToolTraceEvents(987001, "fleet-a-2", events_a);
     try mgr.insertToolTraceEvents(987001, "fleet-a-3", events_a);
     try mgr.insertToolTraceEvents(987002, "fleet-b-1", events_b);
     try mgr.insertToolTraceEvents(987002, "fleet-b-2", events_b);
     try mgr.insertToolTraceEvents(987002, "fleet-b-3", events_b);
+    // Simulate a historic row written before dispatch-side tool-name
+    // canonicalization: tenant text in the tool field must become "unknown".
+    const historic_private_tool = "[{\"kind\":\"tool_call\",\"tool\":\"" ++ SENTINEL_A ++ "\",\"success\":true,\"duration_ms\":1}]";
+    try mgr.insertToolTraceEvents(987001, "fleet-private-tool", historic_private_tool);
 
     // Window probes — created_at defaults to NOW() at insert, so
     // backdate via raw SQL (the zaki_state window-test idiom; PGresult
@@ -4354,9 +4427,9 @@ test "fleet mining-stats [PG] — cross-tenant happy path emits shapes only; sin
     //   10d  → outside the default 7-day window, inside 365
     //   100d → outside 7, inside 365
     //   400d → outside even the clamped 365 maximum
-    try mgr.insertToolTraceEvents(987001, "fleet-w-10d", "[{\"kind\":\"tool_call\",\"tool\":\"probe_ten_days\",\"success\":true,\"duration_ms\":1}]");
-    try mgr.insertToolTraceEvents(987002, "fleet-w-100d", "[{\"kind\":\"tool_call\",\"tool\":\"probe_hundred_days\",\"success\":true,\"duration_ms\":1}]");
-    try mgr.insertToolTraceEvents(987001, "fleet-w-400d", "[{\"kind\":\"tool_call\",\"tool\":\"probe_four_hundred_days\",\"success\":true,\"duration_ms\":1}]");
+    try mgr.insertToolTraceEvents(987001, "fleet-w-10d", "[{\"kind\":\"tool_call\",\"tool\":\"file_read\",\"success\":true,\"duration_ms\":1}]");
+    try mgr.insertToolTraceEvents(987002, "fleet-w-100d", "[{\"kind\":\"tool_call\",\"tool\":\"calculator\",\"success\":true,\"duration_ms\":1}]");
+    try mgr.insertToolTraceEvents(987001, "fleet-w-400d", "[{\"kind\":\"tool_call\",\"tool\":\"file_write\",\"success\":true,\"duration_ms\":1}]");
     {
         const q = try std.fmt.allocPrint(allocator, "UPDATE {s}.tool_traces SET created_at = NOW() - INTERVAL '10 days' WHERE run_id = 'fleet-w-10d'", .{schema});
         defer allocator.free(q);
@@ -4383,10 +4456,11 @@ test "fleet mining-stats [PG] — cross-tenant happy path emits shapes only; sin
         try std.testing.expectEqualStrings("200 OK", r.status);
         // Shapes ARE present: both tenants' tools with counts.
         try std.testing.expect(std.mem.indexOf(u8, r.body, "\"tool\":\"web_search\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"tool\":\"bash\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"tool\":\"shell\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"tool\":\"unknown\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, r.body, "\"count\":3") != null);
         try std.testing.expect(std.mem.indexOf(u8, r.body, "\"uses\":3") != null);
-        // Round-2 cap honesty bit: two distinct tools is far under
+        // Round-2 cap honesty bit: the small registered+unknown set is far under
         // FLEET_MAX_TOOLS, and the endpoint body says so verbatim.
         try std.testing.expect(std.mem.indexOf(u8, r.body, "\"truncated\":false") != null);
         // Privacy (inv. 5): NEITHER tenant's label content ...
@@ -4400,9 +4474,9 @@ test "fleet mining-stats [PG] — cross-tenant happy path emits shapes only; sin
         try std.testing.expect(std.mem.indexOf(u8, r.body, "987001") == null);
         try std.testing.expect(std.mem.indexOf(u8, r.body, "987002") == null);
         // Default window is 7 days: every backdated probe is outside it.
-        try std.testing.expect(std.mem.indexOf(u8, r.body, "probe_ten_days") == null);
-        try std.testing.expect(std.mem.indexOf(u8, r.body, "probe_hundred_days") == null);
-        try std.testing.expect(std.mem.indexOf(u8, r.body, "probe_four_hundred_days") == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"tool\":\"file_read\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"tool\":\"calculator\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"tool\":\"file_write\"") == null);
     }
 
     // ── since_days=99999 → clamped to 365: the 10d and 100d probes
@@ -4413,9 +4487,9 @@ test "fleet mining-stats [PG] — cross-tenant happy path emits shapes only; sin
         const r = handleFleetMiningStatsRequest(allocator, &mgr, raw, "/internal/fleet/mining-stats?since_days=99999", &tokens, true, "GET");
         defer allocator.free(r.body);
         try std.testing.expectEqualStrings("200 OK", r.status);
-        try std.testing.expect(std.mem.indexOf(u8, r.body, "probe_ten_days") != null);
-        try std.testing.expect(std.mem.indexOf(u8, r.body, "probe_hundred_days") != null);
-        try std.testing.expect(std.mem.indexOf(u8, r.body, "probe_four_hundred_days") == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"tool\":\"file_read\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"tool\":\"calculator\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"tool\":\"file_write\"") == null);
         // Privacy assertions hold on the widened window too ("fleet-"
         // covers every seeded run_id; the body's "scope":"fleet" has no
         // trailing hyphen so the substring is collision-free).

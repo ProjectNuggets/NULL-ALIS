@@ -49,6 +49,8 @@ duration shapes — never run_ids, labels, arguments, keys, user ids, or text.
 Trace emission canonicalizes names against the registered tool set before
 persistence. Hallucinated/model-supplied names become the single `unknown`
 sentinel, preventing tenant-text disclosure and fleet-cardinality inflation.
+The operator read path repeats this check on the bounded aggregate so rows
+written before dispatch-side canonicalization are safe immediately too.
 The operator sees the fleet shape, not the user's life. This is pinned by the
 privacy-sentinel test on `renderFleetJson` (pure-function level) plus a
 cross-tenant end-to-end test on the route handler
