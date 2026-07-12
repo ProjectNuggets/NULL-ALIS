@@ -20,10 +20,10 @@ This key **is**:
 
 ## Code Paths
 
-- default env var name: [src/config_types.zig](/Users/nova/Desktop/nullalis/src/config_types.zig#L895)
-- env loading and key derivation: [src/zaki_state.zig](/Users/nova/Desktop/nullalis/src/zaki_state.zig#L2422)
-- Postgres secret read/write: [src/zaki_state.zig](/Users/nova/Desktop/nullalis/src/zaki_state.zig#L972)
-- encryption/decryption primitives: [src/security/secrets.zig](/Users/nova/Desktop/nullalis/src/security/secrets.zig)
+- default env var name: [`src/config_types.zig`](../src/config_types.zig)
+- env loading and key derivation: [`src/zaki_state.zig`](../src/zaki_state.zig)
+- Postgres secret read/write: [`src/zaki_state.zig`](../src/zaki_state.zig)
+- encryption/decryption primitives: [`src/security/secrets.zig`](../src/security/secrets.zig)
 
 ## Env Var
 

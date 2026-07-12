@@ -3,12 +3,14 @@
 This file defines the default working protocol for coding agents in this repository.
 Scope: entire repository.
 
-> 🤝 **Platform coordination:** the live multi-agent board for the whole ZAKI platform is
-> **`zaki-infra/docs/COORDINATION.md`** (local: `~/Desktop/zaki-infra`, branch `staging`) — per-repo
-> registry, active task claims, cross-repo handoffs, and an agent notes log where concurrent agents
-> leave messages to each other. **Claim your task there before starting non-trivial work; leave a
-> note when you finish or hand off.** Backlog: `zaki-infra/docs/superpowers/ROADMAP-2026-07-11.md` ·
-> cross-repo map: `zaki-infra/docs/PLATFORM.md`.
+> 🤝 **Platform coordination (maintainers and agents with `zaki-infra` access):** use the
+> [coordination board](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/COORDINATION.md)
+> for task claims and cross-repo handoffs. Its backlog is the
+> [platform roadmap](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/superpowers/ROADMAP-2026-07-11.md),
+> and the [platform map](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/PLATFORM.md)
+> defines repository ownership. Internal checkouts normally live at `~/Desktop/zaki-infra` on
+> `staging`. If you do not have access, state your scope in the relevant GitHub issue or PR before
+> non-trivial work and use that thread for handoff; lack of access does not block a contribution.
 
 ## 1) Project Snapshot (Read First)
 
@@ -382,9 +384,8 @@ repo. They are the lift from "running code" to "production-grade product." Viola
 treated as defects, not preferences.
 
 **Bound documents (read these before working):**
-- `zaki-infra/docs/COORDINATION.md` — the **live multi-agent board** (claim your task in §2
-  before non-trivial work; leave a note in §4 on finish/handoff).
-- `zaki-infra/docs/superpowers/ROADMAP-2026-07-11.md` — the consolidated cross-repo backlog.
+- [ZAKI coordination board](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/COORDINATION.md) — the live multi-agent board for maintainers and agents with platform access (claim in §2; leave a note in §4). Contributors without access use the issue/PR fallback described at the top of this file.
+- [ZAKI platform roadmap](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/superpowers/ROADMAP-2026-07-11.md) — the consolidated cross-repo backlog for contributors with platform access.
 - `docs/ROADMAP.md` — the versioned plan (which V block lands at which tag).
 - `docs/archive/2026-05-25/MULTI_AGENT_PLAN.md` — the agent dispatch matrix (which agent does what, file ownership,
   branch conventions, bench gate convergence). When you are spawned as Agent A/B/C/..., your

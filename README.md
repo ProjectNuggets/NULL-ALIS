@@ -186,9 +186,12 @@ git hooks (`git config core.hooksPath .githooks`) and format only the files you 
 
 ## Status & roadmap
 
-The **live cross-repo coordination board** is `zaki-infra/docs/COORDINATION.md` (task claims,
-tree state, agent notes) and the **consolidated backlog** is
-`zaki-infra/docs/superpowers/ROADMAP-2026-07-11.md` — those two are current. Repo-local
+For maintainers with platform access, the live cross-repo
+[coordination board](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/COORDINATION.md)
+holds task claims, tree state, and agent notes; the
+[consolidated backlog](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/superpowers/ROADMAP-2026-07-11.md)
+is the current platform plan. Contributors without that access can coordinate in the relevant issue
+or PR. Repo-local
 [`STATUS.md`](STATUS.md) and [`docs/ROADMAP.md`](docs/ROADMAP.md) are pending a deep refresh
 (tracked as roadmap items 1.1/1.2). The living docs index is [`docs/README.md`](docs/README.md).
 
