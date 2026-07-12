@@ -19,12 +19,14 @@ retrieval pipeline** backed by tenant Postgres (pgvector), plus a learning loop,
 subagents, cron/proactive autonomy, a browser-extension control plane, and MCP (client and
 server). It is deliberately a **second-brain / digital-twin runtime, not an embedded-device
 runtime** — the hardware surface was removed in 2026-04. Hard product constraints: minimal binary
-size (`ReleaseSmall` < 30 MB) and low RSS (< 80 MB test peak; current ~66–72 MB).
+size (`ReleaseSmall` < 30 MB) and a < 80 MB test-RSS target. Canonical Linux CI currently reports
+~99–100 MB MaxRSS for the main test process, so memory is above target and needs ratcheting back down.
 
 **Naming:** brand `nullALIS`; runtime/CLI/config path `nullalis` (binary), `~/.nullalis/`.
 
-**Scale at HEAD (`c05bcac2`):** 366 Zig files under `src/`, ~349K LoC, ~7,700 test blocks
-(canonical `-Dengines=base,sqlite,postgres` suite: **7,679 pass / 24 skip / 0 fail**). Zig 0.15.2.
+**Scale at HEAD (`c05bcac2`):** 366 Zig files under `src/`, ~349K LoC, ~7,700 test blocks.
+Canonical CI (`zig build test --summary all -Dengines=base,sqlite,postgres -Dchannels=cli,telegram`):
+**7,677 / 7,703 pass · 26 skip · 0 fail**. Live-PG opt-in lanes can change the pass/skip split. Zig 0.15.2.
 
 > **Doc-truth rule:** code truth beats doc truth. When a doc disagrees with `src/`, the code wins —
 > fix or archive the doc in the same change.
@@ -184,9 +186,12 @@ git hooks (`git config core.hooksPath .githooks`) and format only the files you 
 
 ## Status & roadmap
 
-The **live cross-repo coordination board** is `zaki-infra/docs/COORDINATION.md` (task claims,
-tree state, agent notes) and the **consolidated backlog** is
-`zaki-infra/docs/superpowers/ROADMAP-2026-07-11.md` — those two are current. Repo-local
+For maintainers with platform access, the live cross-repo
+[coordination board](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/COORDINATION.md)
+holds task claims, tree state, and agent notes; the
+[consolidated backlog](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/superpowers/ROADMAP-2026-07-11.md)
+is the current platform plan. Contributors without that access can coordinate in the relevant issue
+or PR. Repo-local
 [`STATUS.md`](STATUS.md) and [`docs/ROADMAP.md`](docs/ROADMAP.md) are pending a deep refresh
 (tracked as roadmap items 1.1/1.2). The living docs index is [`docs/README.md`](docs/README.md).
 

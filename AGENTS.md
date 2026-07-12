@@ -3,19 +3,21 @@
 This file defines the default working protocol for coding agents in this repository.
 Scope: entire repository.
 
-> 🤝 **Platform coordination:** the live multi-agent board for the whole ZAKI platform is
-> **`zaki-infra/docs/COORDINATION.md`** (local: `~/Desktop/zaki-infra`, branch `staging`) — per-repo
-> registry, active task claims, cross-repo handoffs, and an agent notes log where concurrent agents
-> leave messages to each other. **Claim your task there before starting non-trivial work; leave a
-> note when you finish or hand off.** Backlog: `zaki-infra/docs/superpowers/ROADMAP-2026-07-11.md` ·
-> cross-repo map: `zaki-infra/docs/PLATFORM.md`.
+> 🤝 **Platform coordination (maintainers and agents with `zaki-infra` access):** use the
+> [coordination board](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/COORDINATION.md)
+> for task claims and cross-repo handoffs. Its backlog is the
+> [platform roadmap](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/superpowers/ROADMAP-2026-07-11.md),
+> and the [platform map](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/PLATFORM.md)
+> defines repository ownership. Internal checkouts normally live at `~/Desktop/zaki-infra` on
+> `staging`. If you do not have access, state your scope in the relevant GitHub issue or PR before
+> non-trivial work and use that thread for handoff; lack of access does not block a contribution.
 
 ## 1) Project Snapshot (Read First)
 
 nullALIS is a Zig-first autonomous AI assistant runtime deployed at chatzaki.com. Optimized for:
 
 - minimal binary size (target: < 30 MB ReleaseSmall with engines + channels baked in; < 1 MB legacy target predated the Sprint 2 entitlement + secret-vault + telemetry surfaces)
-- minimal memory footprint (target: **< 80 MB peak RSS during tests** — updated 2026-05-25 from the v1.14.12-era 50 MB target. The increase is the cumulative cost of Sprint 2 surfaces, the memory pipeline + retrieval engine, the extension WS hub + 10 user-browser tools, the 8 artifact tools + multimodal + Moonshot Files API, the D62 migrations.run adapter, and observability + auth additions. Current HEAD reports ~66-72 MB — genuinely lean for the surface shipped; comparable Node.js/Python/Go services with the same feature set run 150 MB to 1 GB.)
+- minimal memory footprint (target: **< 80 MB peak RSS during tests** — updated 2026-05-25 from the v1.14.12-era 50 MB target. The increase is the cumulative cost of Sprint 2 surfaces, the memory pipeline + retrieval engine, the extension WS hub + 10 user-browser tools, the 8 artifact tools + multimodal + Moonshot Files API, the D62 migrations.run adapter, and observability + auth additions. Canonical Linux CI at this HEAD reports ~99-100 MB MaxRSS for the main test process, above the target; treat this as an open regression budget, not a passing gate. Comparable Node.js/Python/Go services with the same feature set run 150 MB to 1 GB.)
 - zero external dependencies beyond libc, optional SQLite, optional libpq (for the postgres engine)
 
 Core architecture is **vtable-driven** and modular. All extension work is done by implementing
@@ -36,7 +38,7 @@ Entitlement + secret-vault + cost-class surfaces (Sprint 2 / D8):
 - `src/gateway/secret_vault.zig` — two-phase mutation handshake with audit trail
 - `src/tools/metadata.zig` — cost classes A/B/C on `ToolMetadata`; weight-budget gate in preflight
 
-Current scale (2026-07-11, HEAD `c05bcac2`): **366 Zig files under `src/`, ~349K Zig LoC, ~7,700 `test "…"` blocks**. The authoritative run count is profile-dependent — the **canonical production profile** `zig build test -Dengines=base,sqlite,postgres -Dchannels=cli,telegram` passes **7,679 / 24 skipped / 0 failed** at this HEAD (a bare `zig build test` runs fewer — the PG/state/memory/trace layer is a no-op; see §2.6). Treat these as a snapshot; refresh them when publishing a new roadmap/status lock, and quote ONE profile-qualified number (do not mix default-build and engine-profile counts).
+Current scale (2026-07-11, HEAD `c05bcac2`): **366 Zig files under `src/`, ~349K Zig LoC, ~7,700 `test "…"` blocks**. The authoritative run count is profile-dependent — the **canonical CI profile** `zig build test --summary all -Dengines=base,sqlite,postgres -Dchannels=cli,telegram` passes **7,677 / 7,703 tests, 26 skipped, 0 failed** at this HEAD. Live-PG opt-in lanes can change the pass/skip split, so always quote the exact command and environment. A bare `zig build test` runs fewer because the PG/state/memory/trace layer is a no-op; see §2.5. Treat these as a snapshot and refresh them when publishing a roadmap/status lock.
 
 Build and test:
 
@@ -64,7 +66,7 @@ These codebase realities should drive every design decision:
 2. **Binary size and memory are hard product constraints**
    - `zig build -Doptimize=ReleaseSmall` is the release target. Every dependency and abstraction has a size cost.
    - Avoid adding libc calls, runtime allocations, or large data tables without justification.
-   - `MaxRSS` during `zig build test` should stay under **80 MB** (updated 2026-05-25 from the 50 MB v1.14.12-era target — see §1 above for the cumulative-cost breakdown of the v1.14.13 → v1.14.25 surface growth). Current HEAD reports ~66-72 MB, well inside the new ceiling. Future profiling work can ratchet this down opportunistically; the prior 50 MB number was a stale aspiration, not a real production bar.
+   - `MaxRSS` during `zig build test` should stay under **80 MB** (updated 2026-05-25 from the 50 MB v1.14.12-era target — see §1 above for the cumulative-cost breakdown of the v1.14.13 → v1.14.25 surface growth). Canonical Linux CI currently reports ~99-100 MB for the main test process, so the target is not met. Treat that delta as a regression budget to ratchet down; do not report the 80 MB ceiling as a passing gate until measured output is below it.
 
 3. **Security-critical surfaces are first-class**
    - `src/gateway.zig`, `src/security/`, `src/tools/`, `src/runtime.zig` carry high blast radius.
@@ -382,9 +384,8 @@ repo. They are the lift from "running code" to "production-grade product." Viola
 treated as defects, not preferences.
 
 **Bound documents (read these before working):**
-- `zaki-infra/docs/COORDINATION.md` — the **live multi-agent board** (claim your task in §2
-  before non-trivial work; leave a note in §4 on finish/handoff).
-- `zaki-infra/docs/superpowers/ROADMAP-2026-07-11.md` — the consolidated cross-repo backlog.
+- [ZAKI coordination board](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/COORDINATION.md) — the live multi-agent board for maintainers and agents with platform access (claim in §2; leave a note in §4). Contributors without access use the issue/PR fallback described at the top of this file.
+- [ZAKI platform roadmap](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/superpowers/ROADMAP-2026-07-11.md) — the consolidated cross-repo backlog for contributors with platform access.
 - `docs/ROADMAP.md` — the versioned plan (which V block lands at which tag).
 - `docs/archive/2026-05-25/MULTI_AGENT_PLAN.md` — the agent dispatch matrix (which agent does what, file ownership,
   branch conventions, bench gate convergence). When you are spawned as Agent A/B/C/..., your
