@@ -2,24 +2,26 @@
 //!
 //! Single entrypoint that reduces a user to zero traces across every
 //! persistence surface nullalis operates: the tenant Postgres schema,
-//! the vector store (pgvector / qdrant / sqlite-shared), the per-user
+//! the direct pgvector table plus optional vector store (qdrant /
+//! sqlite-shared), the per-user
 //! filesystem tree, and the in-process session cache.
 //!
 //! Design choices (deliberate, worth preserving):
 //!
 //!  • **Order matters.** Sessions are evicted FIRST so no in-flight turn
 //!    attempts to write to the user's rows while we're deleting them.
-//!    Postgres cascade runs SECOND because it's the authoritative identity
+//!    Direct Postgres embedding deletion runs SECOND because embeddings have
+//!    no FK and must not depend on a resident runtime. The Postgres user
+//!    cascade runs THIRD because it's the authoritative identity
 //!    surface — if the users row is gone, downstream systems can treat
-//!    the user as not-present. Vector store runs THIRD because pgvector
-//!    has no FK to users and a partial cascade there wouldn't be visible
-//!    to pg observers. Filesystem is LAST because it's the slowest and
+//!    the user as not-present. The optional vector store runs FOURTH for
+//!    non-Postgres backends. Filesystem is LAST because it's the slowest and
 //!    also the easiest to retry (idempotent `rm -rf`).
 //!
 //!  • **No true 2PC.** The tenant Postgres pool and the pgvector pool are
 //!    separate connections. A failure between the pg cascade and the
-//!    vector bulk-delete could leave orphaned embeddings. The orchestrator
-//!    reports every per-step outcome in `PurgeReport`; every step is
+//!    optional vector bulk-delete could leave external-store residue. The
+//!    orchestrator reports every per-step outcome in `PurgeReport`; every step is
 //!    idempotent, so the caller can safely retry on failure.
 //!
 //!  • **Best-effort continuation.** One surface failing does not abort
@@ -56,6 +58,7 @@ pub const PurgeReport = struct {
     sessions_evicted: usize = 0,
     sessions_skipped_active: usize = 0,
     pg_user_row_deleted: bool = false,
+    pg_embedding_rows_removed: usize = 0,
     vector_rows_removed: usize = 0,
     filesystem_removed: bool = false,
     /// Per-step error names (e.g. "pg_delete_user_failed:PgQueryFailed").
@@ -86,7 +89,8 @@ pub const PurgeDeps = struct {
     /// and `pg_user_row_deleted` stays false. Only valid to be null in
     /// tests or in non-postgres deployments.
     zaki_state: ?*zaki_state_mod.Manager = null,
-    /// Vector store. When null, embeddings are skipped.
+    /// Optional runtime vector store for non-Postgres backends. Postgres
+    /// `memory_embeddings` deletion never depends on this pointer.
     vector_store: ?memory_mod.VectorStore = null,
     /// In-process session manager. When null, session-cache purge is
     /// skipped (typical for non-gateway tools).
@@ -134,7 +138,27 @@ pub fn purgeUser(deps: PurgeDeps, user_id: i64) !PurgeReport {
         }
     }
 
-    // Step 2: Postgres cascade. Single `DELETE FROM users` removes 17
+    // Step 2: direct Postgres embedding purge. `memory_embeddings` has no
+    // FK to users, and a tenant runtime may not be resident when erasure is
+    // requested. Delete through the durable state manager unconditionally;
+    // any SQL failure is residue and must make the manifest loud.
+    if (deps.zaki_state) |state| {
+        if (state.deleteMemoryEmbeddingsForUser(user_id)) |removed| {
+            report.pg_embedding_rows_removed = removed;
+        } else |err| {
+            log.warn("gdpr.pg_embedding_delete_failed user_id={d} err={s}", .{ user_id, @errorName(err) });
+            const msg = std.fmt.allocPrint(
+                deps.allocator,
+                "pg_embedding_delete_failed:{s}",
+                .{@errorName(err)},
+            ) catch null;
+            if (msg) |m| {
+                report.errors.append(deps.allocator, m) catch deps.allocator.free(m);
+            }
+        }
+    }
+
+    // Step 3: Postgres cascade. Single `DELETE FROM users` removes 17
     // per-user tables via ON DELETE CASCADE (see zaki_state.deleteUser
     // doc comment for the table list).
     if (deps.zaki_state) |state| {
@@ -153,8 +177,9 @@ pub fn purgeUser(deps: PurgeDeps, user_id: i64) !PurgeReport {
         }
     }
 
-    // Step 3: vector store bulk purge. pgvector's `memory_vectors` has no
-    // FK to `users`; this is the only path that removes those rows.
+    // Step 4: optional vector-store bulk purge. This remains necessary for
+    // non-Postgres vector backends. Pgvector's durable table was already
+    // deleted above, so a resident pgvector runtime observes zero rows here.
     if (deps.vector_store) |vs| {
         if (vs.deleteAllForUser(user_id)) |removed| {
             report.vector_rows_removed = removed;
@@ -171,7 +196,7 @@ pub fn purgeUser(deps: PurgeDeps, user_id: i64) !PurgeReport {
         }
     }
 
-    // Step 4: filesystem. Recursively remove `{users_root}/{user_id}`.
+    // Step 5: filesystem. Recursively remove `{users_root}/{user_id}`.
     //
     // D32 (2026-04-25) — `users_root` MUST be absolute. `std.fs.cwd().
     // deleteTree` resolves relative paths against the worker CWD, so a
@@ -227,12 +252,13 @@ pub fn purgeUser(deps: PurgeDeps, user_id: i64) !PurgeReport {
     }
 
     log.info(
-        "gdpr.purge.complete user_id={d} sessions_evicted={d} sessions_skipped={d} pg_deleted={} vector_rows={d} fs_removed={} errors={d}",
+        "gdpr.purge.complete user_id={d} sessions_evicted={d} sessions_skipped={d} pg_deleted={} pg_embedding_rows={d} vector_rows={d} fs_removed={} errors={d}",
         .{
             user_id,
             report.sessions_evicted,
             report.sessions_skipped_active,
             report.pg_user_row_deleted,
+            report.pg_embedding_rows_removed,
             report.vector_rows_removed,
             report.filesystem_removed,
             report.errors.items.len,
@@ -250,6 +276,7 @@ pub fn purgeUser(deps: PurgeDeps, user_id: i64) !PurgeReport {
     } else {
         const any_success = report.sessions_evicted > 0 or
             report.pg_user_row_deleted or
+            report.pg_embedding_rows_removed > 0 or
             report.vector_rows_removed > 0 or
             report.filesystem_removed;
         if (any_success) {

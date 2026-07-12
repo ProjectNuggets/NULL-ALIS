@@ -788,6 +788,9 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn deleteUser(_: *@This(), _: i64) !void {
         return error.PostgresNotEnabled;
     }
+    pub fn deleteMemoryEmbeddingsForUser(_: *@This(), _: i64) !usize {
+        return error.PostgresNotEnabled;
+    }
     pub fn recordTelegramChat(_: *@This(), _: i64, _: []const u8, _: i64) !void {
         return error.PostgresNotEnabled;
     }
@@ -4014,6 +4017,37 @@ const ManagerImpl = struct {
         return !std.mem.eql(u8, std.mem.span(affected), "0");
     }
 
+    /// GDPR vector tail — delete pgvector rows directly by tenant user scope.
+    /// This lives on the durable state manager instead of a resident tenant
+    /// runtime so a cold user's erasure cannot silently skip embeddings.
+    /// A deployment without the optional table has zero residue and returns 0.
+    pub fn deleteMemoryEmbeddingsForUser(self: *Self, user_id: i64) !usize {
+        const exists_q = try self.buildQuery(
+            "SELECT to_regclass('{schema}.memory_embeddings') IS NOT NULL",
+        );
+        defer self.allocator.free(exists_q);
+        const exists_result = try self.exec(exists_q);
+        defer c.PQclear(exists_result);
+        if (c.PQntuples(exists_result) == 0) return error.ExecFailed;
+        if (c.PQgetisnull(exists_result, 0, 0) != 0) return error.ExecFailed;
+        const exists_value = c.PQgetvalue(exists_result, 0, 0) orelse return error.ExecFailed;
+        if (!std.mem.eql(u8, std.mem.span(exists_value), "t")) return 0;
+
+        const q = try self.buildQuery("DELETE FROM {schema}.memory_embeddings WHERE user_id = $1");
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const params = [_]?[*:0]const u8{user_s.ptr};
+        const lengths = [_]c_int{@intCast(user_s.len)};
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const affected = c.PQcmdTuples(result);
+        if (affected == null) return error.ExecFailed;
+        const affected_slice = std.mem.span(affected);
+        if (affected_slice.len == 0) return error.ExecFailed;
+        return std.fmt.parseInt(usize, affected_slice, 10) catch error.ExecFailed;
+    }
+
     /// S7.2 — GDPR row-level user delete. Every per-user FK references
     /// `{schema}.users(user_id)` with `ON DELETE CASCADE` (see schema at
     /// lines 743–974 of this file), so a single DELETE on the users row
@@ -4025,9 +4059,9 @@ const ManagerImpl = struct {
     /// The S7 provider API key secrets live in user_secrets (already
     /// cascaded above) under `provider_<id>_api_key`.
     ///
-    /// Note: `memory_vectors` (pgvector) has no FK to users and is NOT
-    /// covered by this cascade — the GDPR orchestrator deletes those
-    /// embeddings separately via `VectorStore.deleteAllForUser`.
+    /// Note: `memory_embeddings` (pgvector) has no FK to users and is NOT
+    /// covered by this cascade — the GDPR orchestrator calls
+    /// `deleteMemoryEmbeddingsForUser` directly before this delete.
     pub fn deleteUser(self: *Self, user_id: i64) !void {
         const q = try self.buildQuery("DELETE FROM {schema}.users WHERE user_id = $1");
         defer self.allocator.free(q);
@@ -17474,6 +17508,49 @@ test "C0 phase05Backfill: un-embed deletes continuity embeddings, keeps durable_
     // Idempotent — nothing left to remove.
     const r2 = try mgr.phase05Backfill(allocator, 2, false);
     try std.testing.expectEqual(@as(usize, 0), r2.continuity_embeddings_removed);
+}
+
+test "GDPR embeddings purge deletes every memory_embeddings row for only the scoped user" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-gdpr-embeddings-2/workspace");
+    try mgr.provisionUser(3, "/tmp/nullalis-zaki-bot-test-gdpr-embeddings-3/workspace");
+
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+    {
+        const ddl = try std.fmt.allocPrint(allocator,
+            \\CREATE TABLE IF NOT EXISTS {s}.memory_embeddings (
+            \\  user_id BIGINT NOT NULL, key TEXT NOT NULL,
+            \\  embedding vector(3), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            \\  PRIMARY KEY (user_id, key))
+        , .{schema_q});
+        defer allocator.free(ddl);
+        const result = mgr.exec(ddl) catch return error.SkipZigTest;
+        c.PQclear(result);
+    }
+    {
+        const insert = try std.fmt.allocPrint(allocator,
+            \\INSERT INTO {s}.memory_embeddings (user_id, key, embedding) VALUES
+            \\  (2, 'fact-a', '[0,0,0]'),
+            \\  (2, 'fact-b', '[0,0,0]'),
+            \\  (3, 'fact-c', '[0,0,0]')
+        , .{schema_q});
+        defer allocator.free(insert);
+        const result = try mgr.exec(insert);
+        c.PQclear(result);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), try mgr.deleteMemoryEmbeddingsForUser(2));
+    const count_query = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}.memory_embeddings", .{schema_q});
+    defer allocator.free(count_query);
+    const count_result = try mgr.exec(count_query);
+    defer c.PQclear(count_result);
+    const count = try dupeResultValue(allocator, count_result, 0, 0);
+    defer allocator.free(count);
+    try std.testing.expectEqualStrings("1", count);
 }
 
 test "C0 phase05Backfill: PROPER entity with relationship edge upgrades to PERSON, idempotent + no-clobber" {

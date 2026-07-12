@@ -19354,12 +19354,13 @@ fn handleGdprDataPurge(
     defer resp.deinit(allocator);
     const w = resp.writer(allocator);
     w.print(
-        "{{\"status\":\"{s}\",\"sessions_evicted\":{d},\"sessions_skipped_active\":{d},\"pg_user_row_deleted\":{s},\"vector_rows_removed\":{d},\"filesystem_removed\":{s},\"errors\":[",
+        "{{\"status\":\"{s}\",\"sessions_evicted\":{d},\"sessions_skipped_active\":{d},\"pg_user_row_deleted\":{s},\"pg_embedding_rows_removed\":{d},\"vector_rows_removed\":{d},\"filesystem_removed\":{s},\"errors\":[",
         .{
             if (report.fullySucceeded()) "ok" else "partial",
             report.sessions_evicted,
             report.sessions_skipped_active,
             if (report.pg_user_row_deleted) "true" else "false",
+            report.pg_embedding_rows_removed,
             report.vector_rows_removed,
             if (report.filesystem_removed) "true" else "false",
         },
@@ -19374,12 +19375,14 @@ fn handleGdprDataPurge(
     }
     w.writeAll("]}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
 
-    // Partial success still returns 200 with the body marking which
-    // surfaces didn't fully purge. Full failure (allocator OOM etc.)
-    // returned 500 above. 207 Multi-Status would be more RFC-accurate
-    // but is non-standard in our gateway router.
-    return .{ .body = resp.toOwnedSlice(allocator) catch
-        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
+    const response_body = resp.toOwnedSlice(allocator) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    // Complete-or-loud: a manifest that names residue must also fail the HTTP
+    // request so a caller cannot mistake a partial erasure for completion.
+    return .{
+        .status = if (report.fullySucceeded()) "200 OK" else "500 Internal Server Error",
+        .body = response_body,
+    };
 }
 
 // ── S7 — channel activation control plane ─────────────────────────────
@@ -27184,6 +27187,25 @@ test "vault route [D11] — GET /secrets/:key/audit scopes mutations to the requ
 }
 
 // ── Sprint 7B — DELETE /api/v1/users/:id/data GDPR purge route ─────
+
+test "gdpr purge manifest is loud when any persistence surface reports residue" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = "relative/users";
+    const body = "{\"confirm\":\"PURGE-USER-1\"}";
+    const raw = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "DELETE /api/v1/users/1/data HTTP/1.1\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    defer std.testing.allocator.free(raw);
+
+    const response = handleGdprDataPurge(std.testing.allocator, raw, "1", &state, null);
+    defer std.testing.allocator.free(response.body);
+    try std.testing.expectEqualStrings("500 Internal Server Error", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"status\":\"partial\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "fs_path_not_absolute") != null);
+}
 
 test "gdpr purge route — DELETE without body returns 400 missing_body" {
     var tmp = std.testing.tmpDir(.{});
