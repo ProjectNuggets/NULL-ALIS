@@ -3,12 +3,21 @@
 This file defines the default working protocol for coding agents in this repository.
 Scope: entire repository.
 
+> 🤝 **Platform coordination (maintainers and agents with `zaki-infra` access):** use the
+> [coordination board](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/COORDINATION.md)
+> for task claims and cross-repo handoffs. Its backlog is the
+> [platform roadmap](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/superpowers/ROADMAP-2026-07-11.md),
+> and the [platform map](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/PLATFORM.md)
+> defines repository ownership. Internal checkouts normally live at `~/Desktop/zaki-infra` on
+> `staging`. If you do not have access, state your scope in the relevant GitHub issue or PR before
+> non-trivial work and use that thread for handoff; lack of access does not block a contribution.
+
 ## 1) Project Snapshot (Read First)
 
 nullALIS is a Zig-first autonomous AI assistant runtime deployed at chatzaki.com. Optimized for:
 
 - minimal binary size (target: < 30 MB ReleaseSmall with engines + channels baked in; < 1 MB legacy target predated the Sprint 2 entitlement + secret-vault + telemetry surfaces)
-- minimal memory footprint (target: **< 80 MB peak RSS during tests** — updated 2026-05-25 from the v1.14.12-era 50 MB target. The increase is the cumulative cost of Sprint 2 surfaces, the memory pipeline + retrieval engine, the extension WS hub + 10 user-browser tools, the 8 artifact tools + multimodal + Moonshot Files API, the D62 migrations.run adapter, and observability + auth additions. Current HEAD reports ~66-72 MB — genuinely lean for the surface shipped; comparable Node.js/Python/Go services with the same feature set run 150 MB to 1 GB.)
+- minimal memory footprint (target: **< 80 MB peak RSS during tests** — updated 2026-05-25 from the v1.14.12-era 50 MB target. The increase is the cumulative cost of Sprint 2 surfaces, the memory pipeline + retrieval engine, the extension WS hub + 10 user-browser tools, the 8 artifact tools + multimodal + Moonshot Files API, the D62 migrations.run adapter, and observability + auth additions. Canonical Linux CI at this HEAD reports ~99-100 MB MaxRSS for the main test process, above the target; treat this as an open regression budget, not a passing gate. Comparable Node.js/Python/Go services with the same feature set run 150 MB to 1 GB.)
 - zero external dependencies beyond libc, optional SQLite, optional libpq (for the postgres engine)
 
 Core architecture is **vtable-driven** and modular. All extension work is done by implementing
@@ -29,7 +38,7 @@ Entitlement + secret-vault + cost-class surfaces (Sprint 2 / D8):
 - `src/gateway/secret_vault.zig` — two-phase mutation handshake with audit trail
 - `src/tools/metadata.zig` — cost classes A/B/C on `ToolMetadata`; weight-budget gate in preflight
 
-Current scale (2026-05-19, HEAD `365065b1`): **296 Zig files under `src/`, ~260K Zig LoC, 6,149 default build tests** (`zig build test --summary all`: 6,083 passed / 66 skipped). Treat these numbers as a snapshot, not a promise; refresh them when publishing a new roadmap/status lock.
+Current scale (2026-07-11, HEAD `c05bcac2`): **366 Zig files under `src/`, ~349K Zig LoC, ~7,700 `test "…"` blocks**. The authoritative run count is profile-dependent — the **canonical CI profile** `zig build test --summary all -Dengines=base,sqlite,postgres -Dchannels=cli,telegram` passes **7,677 / 7,703 tests, 26 skipped, 0 failed** at this HEAD. Live-PG opt-in lanes can change the pass/skip split, so always quote the exact command and environment. A bare `zig build test` runs fewer because the PG/state/memory/trace layer is a no-op; see §2.5. Treat these as a snapshot and refresh them when publishing a roadmap/status lock.
 
 Build and test:
 
@@ -42,8 +51,7 @@ zig build test -Dengines=base,sqlite,postgres -Dchannels=cli,telegram   # canoni
 
 Where to look when something breaks:
 
-- **Sprint board / deferred register** — `CLOSURE_CHECKLIST.md` (16-sprint Swiss-watch plan) + `docs/deferred-register.md` (every deferred item D1–D24 with status).
-- **Per-sprint close-outs** — `docs/sprints/sprint-N.md` + `docs/sprints/sprint-N-review.md` for self-review findings.
+- **Deferred register** — `docs/deferred-register.md` (every deferred item with status). The historical 16-sprint "Swiss-watch" close-out checklist and per-sprint reviews are archived under `docs/archive/` (the old root `CLOSURE_CHECKLIST.md` and `docs/sprints/` paths no longer exist).
 - **Internals x-ray** — `.claude/projects/-Users-nova-Desktop-nullalis/memory/internals/` — file-cited P1 / P2 / P3 / P4 maps. Read the relevant P-file before touching a subsystem. Stale since baseline `87cb435`; files with Sprint 1–6 drift are tracked in the `project_nullalis_internals.md` index.
 
 ## 2) Deep Architecture Observations (Why This Protocol Exists)
@@ -58,7 +66,7 @@ These codebase realities should drive every design decision:
 2. **Binary size and memory are hard product constraints**
    - `zig build -Doptimize=ReleaseSmall` is the release target. Every dependency and abstraction has a size cost.
    - Avoid adding libc calls, runtime allocations, or large data tables without justification.
-   - `MaxRSS` during `zig build test` should stay under **80 MB** (updated 2026-05-25 from the 50 MB v1.14.12-era target — see §1 above for the cumulative-cost breakdown of the v1.14.13 → v1.14.25 surface growth). Current HEAD reports ~66-72 MB, well inside the new ceiling. Future profiling work can ratchet this down opportunistically; the prior 50 MB number was a stale aspiration, not a real production bar.
+   - `MaxRSS` during `zig build test` should stay under **80 MB** (updated 2026-05-25 from the 50 MB v1.14.12-era target — see §1 above for the cumulative-cost breakdown of the v1.14.13 → v1.14.25 surface growth). Canonical Linux CI currently reports ~99-100 MB for the main test process, so the target is not met. Treat that delta as a regression budget to ratchet down; do not report the 80 MB ceiling as a passing gate until measured output is below it.
 
 3. **Security-critical surfaces are first-class**
    - `src/gateway.zig`, `src/security/`, `src/tools/`, `src/runtime.zig` carry high blast radius.
@@ -72,10 +80,61 @@ These codebase realities should drive every design decision:
    - SQLite: linked via `/opt/homebrew/opt/sqlite/{lib,include}` on the compile step, not the module.
    - `ArrayListUnmanaged`: init with `.empty`, pass allocator to every method.
 
-5. **All 3,371+ tests must pass at zero leaks**
+5. **The full suite must pass at zero leaks** (canonical profile: ~7,700 test blocks, 0 failed at HEAD `c05bcac2`; quote a profile-qualified number — see §1)
    - The test suite uses `std.testing.allocator` (leak-detecting GPA). Every allocation must be freed.
    - `Config.load()` allocates — always wrap in `std.heap.ArenaAllocator` in tests and production.
    - `ChaCha20Poly1305.decrypt` segfaults on tag failure with heap-allocated output on macOS/Zig 0.15 — use a stack buffer then `allocator.dupe()`.
+
+## 2.5) The Build-Profile / Postgres Discipline (READ BEFORE TOUCHING PG/STATE/MEMORY)
+
+This is the single most common way to ship a broken change. The default build lies to you.
+
+- **A bare `zig build` / `zig build test` ships `enable_postgres=false`** (`defaultEngines()`, `build.zig`). That compiles the **stub** `Manager` (`src/zaki_state.zig`), so the **entire Postgres / state / memory / trace layer is a silent no-op** and its tests `SkipZigTest` (hundreds of gates across ~32 files). A green default `zig build test` proves NOTHING about those layers.
+- **Canonical profile — the ONLY one that exercises PG/state/memory/trace:**
+  `zig build test --summary all -Dengines=base,sqlite,postgres -Dchannels=cli,telegram`
+  (add `NULLALIS_POSTGRES_TEST_URL=postgres://<user>@localhost:5432/postgres` for the live-PG lane).
+- **Comptime false-clean trap:** `ManagerImpl` is referenced only through a ternary; under `enable_postgres=false` Zig never semantically analyzes it, so a **type error inside the real PG body compiles green** on the default build and only surfaces under the postgres engine. Always compile+test with `-Dengines=…,postgres` before claiming a PG-touching change is done.
+- **Stub parity:** any new method on `ManagerImpl` MUST also be added to the stub struct or the default build fails comptime method lookup. Stubs return `error.PostgresNotEnabled` (mutations) or benign empties (reads).
+- **Hard compile gate:** `zig build test-postgres` `@compileError`s if the postgres engine is absent — it does not skip, it fails to compile.
+- **Pre-push hook runs the DEFAULT (non-PG) suite** — it will NOT catch PG-layer breakage. Run the canonical profile yourself before pushing a PG-touching change.
+
+## 2.6) Contract-First Governance (the project's central discipline)
+
+Three subsystems are governed by a **normative doc paired with an executable test**. You edit
+**both together** — the doc is prose law, the test is its executable form, and the test is compiled
+into the build so drift fails CI.
+
+| Contract | Normative doc | Executable test | Hosted into build via |
+|---|---|---|---|
+| Memory | `docs/memory-contract.md` | `src/memory/contract_test.zig` | `_ = @import("contract_test.zig")` in a `test {}` at `src/memory/root.zig` |
+| Learning | `docs/learning-contract.md` | `src/agent/learning_contract_test.zig` | `src/agent/learning.zig` |
+| TELOS | `docs/telos-contract.md` | `src/agent/telos_contract_test.zig` | `src/agent/memory_loader.zig` |
+
+- The contract tests are **not named in `build.zig`** — they ride in through the
+  `_ = @import("*_contract_test.zig")` "hosting-in-a-test-block" idiom and run under BOTH the
+  default and all-engine builds (a stub-parity gate in itself).
+- They genuinely cross-check code against the doc: e.g. the memory contract test asserts the
+  extraction denylist equals the exact contracted tool set AND cross-checks every entry against the
+  tool metadata registry, returning `error.DenylistDrift` on a typo — an anti-drift guard *between*
+  subsystems.
+- **Rule:** if you change a predicate, an enum, a key namespace, or a contract doc, change the
+  paired test in the same commit. A PR that touches memory/learning/telos classification is
+  reviewed against these files.
+
+## 2.7) Change discipline this repo actually runs on
+
+- **RED-first TDD** — write the failing test first, observe it fail, then implement. The contract
+  and Package 3 work all ran RED-first; "the test compiles green against unmodified main" is not RED.
+- **Worktree isolation** — do feature/fix work in a git worktree, not the main checkout. This repo's
+  worktrees live under `~/.config/superpowers/worktrees/nullalis/`. One task = one worktree = one branch.
+- **Live-drive acceptance gate** — for anything behavioral, *drive the real binary and observe the
+  durable side-effects* (DB rows, emitted events, prompt bytes) before merge. A green unit suite is
+  necessary, not sufficient; the live drive is what catches integration bugs the suite hides.
+- **Review cadence** — per-task spec+quality review, then a whole-branch review before merge; the
+  `.superpowers/sdd/` ledger (task briefs → per-task reports → `review-<base>..<head>.diff` →
+  `progress.md`) is the durable record.
+- **Commits** — conventional-commits with a scope (`fix(telos):`, `feat(fleet):`) and, for
+  AI-authored commits, a `Co-Authored-By: Claude <model> <noreply@anthropic.com>` trailer.
 
 ## 3) Engineering Principles (Normative)
 
@@ -131,7 +190,7 @@ src/
   main.zig              CLI entrypoint and command routing
   root.zig              module exports (lib root)
   agent.zig             orchestration loop
-  config.zig            schema + config loading/merging (~/.nullclaw/config.json)
+  config.zig            schema + config loading/merging (~/.nullalis/config.json)
   gateway.zig           webhook/HTTP gateway server
   onboard.zig           interactive setup wizard
   health.zig            component health registry
@@ -139,8 +198,6 @@ src/
   tunnel.zig            tunnel providers (cloudflared, ngrok, tailscale, custom)
   skills.zig            skill discovery and integration
   migration.zig         memory migration from other backends
-  hardware.zig          hardware discovery and management
-  peripherals.zig       hardware peripherals (Arduino, STM32/Nucleo, RPi)
   security/             policy, pairing, secrets, sandbox backends
   memory/               SQLite + markdown backends, embeddings, vector search
   providers/            50+ AI provider implementations (9 core + 41 compatible services)
@@ -187,8 +244,8 @@ Apply these naming rules consistently:
 
 ### 7.1 Adding a Provider
 
-- Add `src/providers/<name>.zig` implementing `Provider.VTable` (`chatWithSystem`, `chat`, `supportsNativeTools`, `getName`, `deinit`).
-- Register in `src/providers/root.zig` factory.
+- Add `src/providers/<name>.zig` implementing `Provider.VTable` (required members: `chatWithSystem`, `chat`, `supportsNativeTools`, `getName`, `deinit`; streaming/tools/vision are layered, not core vtable members).
+- Register in the factory **`src/providers/factory.zig`** (`core_providers` StaticStringMap + `classifyProvider` + `ProviderHolder.fromConfig`) — NOT `providers/root.zig`, which only re-exports the interface.
 - `chatImpl` must extract system/user from `request.messages` (see existing providers for pattern).
 - Add tests for vtable wiring, error paths, and config parsing.
 
@@ -203,14 +260,11 @@ Apply these naming rules consistently:
 - Add `src/tools/<name>.zig` implementing `Tool.VTable` (`execute`, `name`, `description`, `parameters_json`).
 - Validate and sanitize all inputs. Return `ToolResult`; never panic in the runtime path.
 - Add `builtin.is_test` guard if the tool spawns processes or opens network connections.
-- Register in `src/tools/root.zig`.
+- Register in `allTools` (`src/tools/root.zig`).
+- **Add a `DEFAULT_TOOL_METADATA` entry in `src/tools/root.zig`** (the metadata array lives beside `allTools` there; the `ToolMetadata` *type* is in `src/tools/metadata.zig`) — cost class A/B/C, risk, `read_only`/`mutating`/`operator_only` flags. This is de-facto required — the memory contract test fails `DenylistDrift` if an introspection tool is missing from the registry. Correct flow: implement VTable → append in `allTools` → add metadata entry.
 
-### 7.4 Adding a Peripheral
+<!-- §7.4 "Adding a Peripheral" removed 2026-07-11: the hardware/peripheral surface (src/peripherals.zig, hardware.zig) was stripped in D19 (2026-04-25). nullalis is a digital-twin runtime, not an embedded-device runtime. -->
 
-- Implement the `Peripheral` interface in `src/peripherals.zig`.
-- Peripherals expose `read`/`write` methods that delegate to real hardware I/O.
-- Use `probe-rs` CLI for STM32/Nucleo flash access; serial JSON protocol for Arduino.
-- Non-Linux platforms must return `error.UnsupportedOperation` (not silent 0).
 
 ### 7.5 Security / Runtime / Gateway Changes
 
@@ -330,6 +384,8 @@ repo. They are the lift from "running code" to "production-grade product." Viola
 treated as defects, not preferences.
 
 **Bound documents (read these before working):**
+- [ZAKI coordination board](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/COORDINATION.md) — the live multi-agent board for maintainers and agents with platform access (claim in §2; leave a note in §4). Contributors without access use the issue/PR fallback described at the top of this file.
+- [ZAKI platform roadmap](https://github.com/ProjectNuggets/zaki-infra/blob/staging/docs/superpowers/ROADMAP-2026-07-11.md) — the consolidated cross-repo backlog for contributors with platform access.
 - `docs/ROADMAP.md` — the versioned plan (which V block lands at which tag).
 - `docs/archive/2026-05-25/MULTI_AGENT_PLAN.md` — the agent dispatch matrix (which agent does what, file ownership,
   branch conventions, bench gate convergence). When you are spawned as Agent A/B/C/..., your

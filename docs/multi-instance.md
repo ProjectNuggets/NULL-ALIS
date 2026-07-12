@@ -36,7 +36,7 @@ Operational rule:
 1. Point all instances to the same Postgres:
    `state.postgres.connection_string`
 2. Use unique owner IDs:
-   `NULLCLAW_OWNER_ID` per instance (or rely on `HOSTNAME` fallback).
+   `NULLALIS_OWNER_ID` per instance (or rely on `HOSTNAME` fallback).
 3. Tenant root strategy:
    - Postgres ownership mode: shared root optional for lock correctness, but recommended if you need cross-node workspace/file portability.
    - File-lock mode: shared root required (`tenant.data_root` must be identical across nodes).
@@ -95,3 +95,5 @@ Use `/metrics` for transport and gateway counters, including pool and lock-confl
 4. `owned_users_count` non-overlapping under steady load
 5. No sustained increase in lock conflict metrics
 6. Cron/heartbeat actions observed once per user window (no duplicates)
+
+> Env-var note (2026-07-11): `NULLALIS_OWNER_ID` is primary; legacy `NULLCLAW_OWNER_ID` remains a supported fallback.

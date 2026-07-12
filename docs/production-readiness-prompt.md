@@ -1,6 +1,8 @@
 # Nullalis Production-Readiness Prompt
 
-Status: active handoff for the ZAKI commercial V1 production push.
+Status: **SUPERSEDED 2026-07-12** — this May-era dispatch prompt executed; do not work from it.
+Current backlog + launch blockers: `zaki-infra/docs/superpowers/ROADMAP-2026-07-11.md`; live
+multi-agent board: `zaki-infra/docs/COORDINATION.md`. Retained for audit context.
 Date: 2026-05-28.
 
 Use this document when assigning backend work to a Nullalis implementation

@@ -18,7 +18,12 @@ Before opening a PR:
 ```bash
 zig build test --summary all
 zig build -Doptimize=ReleaseSmall
+# REQUIRED for changes touching PG/state/memory/trace — the canonical deploy profile:
+zig build test --summary all -Dengines=base,sqlite,postgres -Dchannels=cli,telegram
 ```
+
+The default build ships `enable_postgres=false` (the PG layer compiles to a silent no-op), so the
+default suite alone can green-light a broken postgres path — see AGENTS.md §2.5.
 
 Optional (recommended):
 
