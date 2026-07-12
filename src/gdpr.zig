@@ -89,6 +89,10 @@ pub const PurgeDeps = struct {
     /// and `pg_user_row_deleted` stays false. Only valid to be null in
     /// tests or in non-postgres deployments.
     zaki_state: ?*zaki_state_mod.Manager = null,
+    /// Configured pgvector target. These are explicit because the supported
+    /// vector schema/table may differ from the state manager's own schema.
+    pgvector_schema: []const u8 = "zaki_bot",
+    pgvector_table: []const u8 = "memory_embeddings",
     /// Optional runtime vector store for non-Postgres backends. Postgres
     /// `memory_embeddings` deletion never depends on this pointer.
     vector_store: ?memory_mod.VectorStore = null,
@@ -143,7 +147,7 @@ pub fn purgeUser(deps: PurgeDeps, user_id: i64) !PurgeReport {
     // requested. Delete through the durable state manager unconditionally;
     // any SQL failure is residue and must make the manifest loud.
     if (deps.zaki_state) |state| {
-        if (state.deleteMemoryEmbeddingsForUser(user_id)) |removed| {
+        if (state.deleteMemoryEmbeddingsForUser(user_id, deps.pgvector_schema, deps.pgvector_table)) |removed| {
             report.pg_embedding_rows_removed = removed;
         } else |err| {
             log.warn("gdpr.pg_embedding_delete_failed user_id={d} err={s}", .{ user_id, @errorName(err) });

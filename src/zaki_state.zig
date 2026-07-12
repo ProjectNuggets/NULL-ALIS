@@ -788,7 +788,7 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn deleteUser(_: *@This(), _: i64) !void {
         return error.PostgresNotEnabled;
     }
-    pub fn deleteMemoryEmbeddingsForUser(_: *@This(), _: i64) !usize {
+    pub fn deleteMemoryEmbeddingsForUser(_: *@This(), _: i64, _: []const u8, _: []const u8) !usize {
         return error.PostgresNotEnabled;
     }
     pub fn recordTelegramChat(_: *@This(), _: i64, _: []const u8, _: i64) !void {
@@ -878,6 +878,12 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     }
     pub fn listMemories(_: *@This(), allocator: std.mem.Allocator, _: i64, _: ?memory_root.MemoryCategory, _: ?[]const u8) ![]memory_root.MemoryEntry {
         return allocator.alloc(memory_root.MemoryEntry, 0);
+    }
+    pub fn listLearningSuggestions(_: *@This(), allocator: std.mem.Allocator, _: i64, _: u32) ![]memory_root.MemoryEntry {
+        return allocator.alloc(memory_root.MemoryEntry, 0);
+    }
+    pub fn transitionLearningSuggestion(_: *@This(), _: i64, _: []const u8, _: []const u8, _: []const u8) !bool {
+        return error.PostgresNotEnabled;
     }
     /// V1.5.1 brain-hygiene — stub for non-postgres builds. Returns empty
     /// so `/brain/graph` gracefully degrades when state manager is
@@ -4021,19 +4027,31 @@ const ManagerImpl = struct {
     /// This lives on the durable state manager instead of a resident tenant
     /// runtime so a cold user's erasure cannot silently skip embeddings.
     /// A deployment without the optional table has zero residue and returns 0.
-    pub fn deleteMemoryEmbeddingsForUser(self: *Self, user_id: i64) !usize {
-        const exists_q = try self.buildQuery(
-            "SELECT to_regclass('{schema}.memory_embeddings') IS NOT NULL",
-        );
-        defer self.allocator.free(exists_q);
-        const exists_result = try self.exec(exists_q);
+    pub fn deleteMemoryEmbeddingsForUser(
+        self: *Self,
+        user_id: i64,
+        schema_name: []const u8,
+        table_name: []const u8,
+    ) !usize {
+        const schema_q = try pg_helpers.quoteIdentifier(self.allocator, schema_name);
+        defer self.allocator.free(schema_q);
+        const table_q = try pg_helpers.quoteIdentifier(self.allocator, table_name);
+        defer self.allocator.free(table_q);
+        const qualified = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ schema_q, table_q });
+        defer self.allocator.free(qualified);
+        const qualified_z = try self.allocator.dupeZ(u8, qualified);
+        defer self.allocator.free(qualified_z);
+
+        const exists_params = [_]?[*:0]const u8{qualified_z};
+        const exists_lengths = [_]c_int{@intCast(qualified.len)};
+        const exists_result = try self.execParams("SELECT to_regclass($1) IS NOT NULL", &exists_params, &exists_lengths);
         defer c.PQclear(exists_result);
         if (c.PQntuples(exists_result) == 0) return error.ExecFailed;
         if (c.PQgetisnull(exists_result, 0, 0) != 0) return error.ExecFailed;
         const exists_value = c.PQgetvalue(exists_result, 0, 0) orelse return error.ExecFailed;
         if (!std.mem.eql(u8, std.mem.span(exists_value), "t")) return 0;
 
-        const q = try self.buildQuery("DELETE FROM {schema}.memory_embeddings WHERE user_id = $1");
+        const q = try std.fmt.allocPrint(self.allocator, "DELETE FROM {s} WHERE user_id = $1", .{qualified});
         defer self.allocator.free(q);
         var user_buf: [32]u8 = undefined;
         const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
@@ -5904,6 +5922,93 @@ const ManagerImpl = struct {
             null,
             null,
         );
+    }
+
+    /// Bounded, provenance-valid shadow rows for the authenticated Suggestions
+    /// UI. The SQL predicate mirrors learning.is_reviewable_shadow and applies
+    /// LIMIT in Postgres, so response cost never scales with the full corpus.
+    pub fn listLearningSuggestions(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        user_id: i64,
+        requested_limit: u32,
+    ) ![]memory_root.MemoryEntry {
+        const limit = @max(@as(u32, 1), @min(requested_limit, 100));
+        const q = try self.buildQuery(
+            "SELECT id, key, content, memory_type, COALESCE((EXTRACT(EPOCH FROM updated_at))::bigint::text, '0'), session_id, valid_to " ++
+                "FROM {schema}.memories WHERE user_id = $1 " ++
+                "AND key LIKE 'durable_fact/behavior/%' " ++
+                "AND content ~ E'^origin=(observed_success|observed_failure|mined_aggregate)\\nstate=shadow\\n' " ++
+                "AND " ++ MEMORIES_VALIDITY_FILTER ++ " ORDER BY updated_at DESC, id DESC LIMIT $2::int",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        var limit_buf: [16]u8 = undefined;
+        const limit_s = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
+        const params = [_]?[*:0]const u8{ user_s.ptr, limit_s.ptr };
+        const lengths = [_]c_int{ @intCast(user_s.len), @intCast(limit_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        return try decodeMemoryRows(allocator, result, false);
+    }
+
+    /// Atomic compare-and-set for the external learning gate. The expected
+    /// content includes the original `state=shadow` header, so concurrent
+    /// adopt/dismiss requests cannot both win even when the per-user ownership
+    /// lease is re-entered by the same gateway instance.
+    pub fn transitionLearningSuggestion(
+        self: *Self,
+        user_id: i64,
+        key: []const u8,
+        expected_content: []const u8,
+        new_content: []const u8,
+    ) !bool {
+        const content_hash = try computeContentHash(self.allocator, new_content);
+        defer self.allocator.free(content_hash);
+        const lemmatized = try text_norm.lemmatizeForBm25(self.allocator, new_content);
+        defer self.allocator.free(lemmatized);
+        const q = try self.buildQuery(
+            "UPDATE {schema}.memories SET content = $4, content_hash = $5, lemmatized = $6, updated_at = NOW() " ++
+                "WHERE user_id = $1 AND key = $2 AND content = $3 " ++
+                "AND content ~ E'^origin=(observed_success|observed_failure|mined_aggregate)\\nstate=shadow\\n' " ++
+                "AND " ++ MEMORIES_VALIDITY_FILTER ++
+                " RETURNING id, memory_type, session_id",
+        );
+        defer self.allocator.free(q);
+        var user_buf: [32]u8 = undefined;
+        const user_s = try std.fmt.bufPrintZ(&user_buf, "{d}", .{user_id});
+        const key_z = try self.allocator.dupeZ(u8, key);
+        defer self.allocator.free(key_z);
+        const expected_z = try self.allocator.dupeZ(u8, expected_content);
+        defer self.allocator.free(expected_z);
+        const new_z = try self.allocator.dupeZ(u8, new_content);
+        defer self.allocator.free(new_z);
+        const hash_z = try self.allocator.dupeZ(u8, content_hash);
+        defer self.allocator.free(hash_z);
+        const lemmatized_z = try self.allocator.dupeZ(u8, lemmatized);
+        defer self.allocator.free(lemmatized_z);
+        const params = [_]?[*:0]const u8{ user_s.ptr, key_z, expected_z, new_z, hash_z, lemmatized_z };
+        const lengths = [_]c_int{
+            @intCast(user_s.len),
+            @intCast(key.len),
+            @intCast(expected_content.len),
+            @intCast(new_content.len),
+            @intCast(content_hash.len),
+            @intCast(lemmatized.len),
+        };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        if (c.PQntuples(result) == 0) return false;
+
+        const id = std.mem.span(c.PQgetvalue(result, 0, 0));
+        const memory_type = std.mem.span(c.PQgetvalue(result, 0, 1));
+        const session_id: ?[]const u8 = if (c.PQgetisnull(result, 0, 2) == 0)
+            std.mem.span(c.PQgetvalue(result, 0, 2))
+        else
+            null;
+        try self.insertMemoryEvent(user_id, id, "upsert", key, new_content, memory_type, session_id);
+        return true;
     }
 
     /// V1.5.1 brain-hygiene: like `listMemories(user_id, null, null)` but
@@ -17543,12 +17648,90 @@ test "GDPR embeddings purge deletes every memory_embeddings row for only the sco
         c.PQclear(result);
     }
 
-    try std.testing.expectEqual(@as(usize, 2), try mgr.deleteMemoryEmbeddingsForUser(2));
+    try std.testing.expectEqual(@as(usize, 2), try mgr.deleteMemoryEmbeddingsForUser(2, mgr.schemaRaw(), "memory_embeddings"));
     const count_query = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}.memory_embeddings", .{schema_q});
     defer allocator.free(count_query);
     const count_result = try mgr.exec(count_query);
     defer c.PQclear(count_result);
     const count = try dupeResultValue(allocator, count_result, 0, 0);
+    defer allocator.free(count);
+    try std.testing.expectEqualStrings("1", count);
+}
+
+test "review fixes: suggestions list is bounded and transition is atomic compare-and-set" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-suggestions-review/workspace");
+
+    const shadow_a = "origin=mined_aggregate\nstate=shadow\nevidence_run_ids=run-a\n\nUse path A.";
+    const shadow_b = "origin=observed_failure\nstate=shadow\nevidence_run_ids=run-b\n\nAvoid path B.";
+    try mgr.upsertMemory(2, "durable_fact/behavior/aaaaaaaaaaaaaaaa", shadow_a, .core, null);
+    try mgr.upsertMemory(2, "durable_fact/behavior/bbbbbbbbbbbbbbbb", shadow_b, .core, null);
+    try mgr.upsertMemory(2, "durable_fact/behavior/cccccccccccccccc", "origin=user_correction\nstate=active\n\nAlready active.", .core, null);
+    try mgr.upsertMemory(2, "durable_fact/behavior/dddddddddddddddd", "origin=user_correction\nstate=shadow\n\nMalformed provenance.", .core, null);
+    try mgr.upsertMemory(2, "ordinary-memory", "Not a suggestion.", .core, null);
+
+    const one = try mgr.listLearningSuggestions(allocator, 2, 1);
+    defer memory_root.freeEntries(allocator, one);
+    try std.testing.expectEqual(@as(usize, 1), one.len);
+
+    const all = try mgr.listLearningSuggestions(allocator, 2, 10);
+    defer memory_root.freeEntries(allocator, all);
+    try std.testing.expectEqual(@as(usize, 2), all.len);
+
+    const active_a = "origin=mined_aggregate\nstate=active\nevidence_run_ids=run-a\n\nUse path A.";
+    const retired_a = "origin=mined_aggregate\nstate=retired\nevidence_run_ids=run-a\n\nUse path A.";
+    try std.testing.expect(try mgr.transitionLearningSuggestion(2, "durable_fact/behavior/aaaaaaaaaaaaaaaa", shadow_a, active_a));
+    try std.testing.expect(!try mgr.transitionLearningSuggestion(2, "durable_fact/behavior/aaaaaaaaaaaaaaaa", shadow_a, retired_a));
+    var persisted = (try mgr.getMemory(allocator, 2, "durable_fact/behavior/aaaaaaaaaaaaaaaa")).?;
+    defer persisted.deinit(allocator);
+    try std.testing.expectEqualStrings(active_a, persisted.content);
+}
+
+test "review fix: GDPR embedding purge honors configured schema and table" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+
+    var schema_buf: [96]u8 = undefined;
+    const custom_schema = try std.fmt.bufPrint(&schema_buf, "gdpr_vectors_{d}", .{std.time.microTimestamp()});
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, custom_schema);
+    defer allocator.free(schema_q);
+    const table_name = "custom_embeddings";
+    const table_q = try pg_helpers.quoteIdentifier(allocator, table_name);
+    defer allocator.free(table_q);
+    defer {
+        const drop = std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q}) catch unreachable;
+        defer allocator.free(drop);
+        const result = mgr.exec(drop) catch unreachable;
+        c.PQclear(result);
+    }
+    {
+        const ddl = try std.fmt.allocPrint(
+            allocator,
+            "CREATE SCHEMA {s}; CREATE TABLE {s}.{s} (user_id BIGINT NOT NULL, key TEXT NOT NULL PRIMARY KEY)",
+            .{ schema_q, schema_q, table_q },
+        );
+        defer allocator.free(ddl);
+        const result = try mgr.exec(ddl);
+        c.PQclear(result);
+    }
+    {
+        const insert = try std.fmt.allocPrint(allocator, "INSERT INTO {s}.{s} (user_id, key) VALUES (2, 'a'), (2, 'b'), (3, 'c')", .{ schema_q, table_q });
+        defer allocator.free(insert);
+        const result = try mgr.exec(insert);
+        c.PQclear(result);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), try mgr.deleteMemoryEmbeddingsForUser(2, custom_schema, table_name));
+    const count_q = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {s}.{s}", .{ schema_q, table_q });
+    defer allocator.free(count_q);
+    const result = try mgr.exec(count_q);
+    defer c.PQclear(result);
+    const count = try dupeResultValue(allocator, result, 0, 0);
     defer allocator.free(count);
     try std.testing.expectEqualStrings("1", count);
 }

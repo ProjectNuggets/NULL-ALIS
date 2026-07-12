@@ -9,6 +9,7 @@ const LearnedOrigin = learning.LearnedOrigin;
 const LearnedState = learning.LearnedState;
 const birthState = learning.birthState;
 const external_transition_allowed = learning.external_transition_allowed;
+const is_reviewable_shadow = learning.is_reviewable_shadow;
 
 // ── Axis 1 (provenance): enum round-trips are total ────────────────────────
 
@@ -91,6 +92,16 @@ test "learning contract inv. 1: external gate only transitions shadow to active 
     try std.testing.expect(!external_transition_allowed(.active, .retired));
     try std.testing.expect(!external_transition_allowed(.retired, .shadow));
     try std.testing.expect(!external_transition_allowed(.retired, .active));
+}
+
+test "learning contract inv. 1 and 3: reviewable shadows require derived provenance" {
+    try std.testing.expect(is_reviewable_shadow(.{ .origin = .mined_aggregate, .state = .shadow }));
+    try std.testing.expect(is_reviewable_shadow(.{ .origin = .observed_success, .state = .shadow }));
+    try std.testing.expect(is_reviewable_shadow(.{ .origin = .observed_failure, .state = .shadow }));
+    try std.testing.expect(!is_reviewable_shadow(.{ .origin = null, .state = .shadow }));
+    try std.testing.expect(!is_reviewable_shadow(.{ .origin = .user_correction, .state = .shadow }));
+    try std.testing.expect(!is_reviewable_shadow(.{ .origin = .operator, .state = .shadow }));
+    try std.testing.expect(!is_reviewable_shadow(.{ .origin = .mined_aggregate, .state = .active }));
 }
 
 // ── Bucket 5 (proposal): wish ledger ───────────────────────────────────────

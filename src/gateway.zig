@@ -18136,6 +18136,13 @@ test "suggestions endpoint JSON exposes shadow facts only and strips learning me
             .category = .core,
             .timestamp = "0",
         },
+        .{
+            .id = "4",
+            .key = "durable_fact/behavior/4444444444444444",
+            .content = "origin=user_correction\nstate=shadow\n\nMalformed provenance.",
+            .category = .core,
+            .timestamp = "0",
+        },
     };
     const response = render_suggestions_json(allocator, &rows);
     defer allocator.free(response.body);
@@ -18212,7 +18219,7 @@ fn render_suggestions_json(allocator: std.mem.Allocator, rows: []const memory_mo
         if (emitted == max_suggestions) break;
         if (!std.mem.startsWith(u8, row.key, "durable_fact/behavior/")) continue;
         const header = learning_mod.parseLearnedMetadataHeader(row.content);
-        if (header.state != .shadow) continue;
+        if (!learning_mod.is_reviewable_shadow(header)) continue;
         if (!first) w.writeByte(',') catch return response_build_err;
         first = false;
         const origin = if (header.origin) |value| value.toSlice() else "unknown";
@@ -18278,7 +18285,7 @@ fn handle_suggestions(
     };
 
     if (action == null) {
-        const rows = state_mgr.listMemories(allocator, numeric_user_id, null, null) catch {
+        const rows = state_mgr.listLearningSuggestions(allocator, numeric_user_id, 100) catch {
             return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"suggestions_query_failed\"}" };
         };
         defer memory_mod.freeEntries(allocator, rows);
@@ -18302,7 +18309,11 @@ fn handle_suggestions(
     defer entry.deinit(allocator);
 
     const next = action.?;
-    const current = learning_mod.parseLearnedMetadataHeader(entry.content).state orelse .active;
+    const header = learning_mod.parseLearnedMetadataHeader(entry.content);
+    if (header.state == .shadow and !learning_mod.is_reviewable_shadow(header)) {
+        return .{ .status = "409 Conflict", .body = "{\"error\":\"invalid_suggestion_provenance\"}" };
+    }
+    const current = header.state orelse .active;
     if (!learning_mod.external_transition_allowed(current, next)) {
         if (current == next) {
             return suggestion_transition_response(allocator, key, if (next == .active) "already_adopted" else "already_dismissed");
@@ -18314,9 +18325,12 @@ fn handle_suggestions(
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"suggestion_transition_failed\"}" };
     };
     defer allocator.free(rewritten);
-    state_mgr.upsertMemory(numeric_user_id, key, rewritten, entry.category, entry.session_id) catch {
+    const transitioned = state_mgr.transitionLearningSuggestion(numeric_user_id, key, entry.content, rewritten) catch {
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"suggestion_write_failed\"}" };
     };
+    if (!transitioned) {
+        return .{ .status = "409 Conflict", .body = "{\"error\":\"suggestion_changed_retry\"}" };
+    }
     return suggestion_transition_response(allocator, key, if (next == .active) "adopted" else "dismissed");
 }
 
@@ -19300,6 +19314,7 @@ fn handleGdprDataPurge(
     scoped_user_id: []const u8,
     state: *GatewayState,
     effective_session_mgr: ?*session_mod.SessionManager,
+    config_opt: ?*const Config,
 ) RouteResponse {
     const numeric_user_id = parseNumericUserId(scoped_user_id) catch {
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
@@ -19342,6 +19357,11 @@ fn handleGdprDataPurge(
     var report = gdpr_mod.purgeUser(.{
         .allocator = allocator,
         .zaki_state = state.zaki_state,
+        .pgvector_schema = if (config_opt) |cfg| blk: {
+            if (cfg.memory.search.store.pgvector_schema.len > 0) break :blk cfg.memory.search.store.pgvector_schema;
+            break :blk cfg.memory.postgres.schema;
+        } else "zaki_bot",
+        .pgvector_table = if (config_opt) |cfg| cfg.memory.search.store.pgvector_table else "memory_embeddings",
         .vector_store = vector_store_opt,
         .session_manager = effective_session_mgr,
         .users_root = state.tenant_data_root,
@@ -21933,7 +21953,7 @@ fn handleApiRoute(
         if (!std.mem.eql(u8, method, "DELETE")) {
             return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\",\"detail\":\"use DELETE to purge user data\"}" };
         }
-        return handleGdprDataPurge(req_allocator, raw_request, scoped_user_id, state, effective_session_mgr);
+        return handleGdprDataPurge(req_allocator, raw_request, scoped_user_id, state, effective_session_mgr, config_opt);
     }
 
     // ── Task query endpoints (WP2.2) ────────────────────────────────────
@@ -27200,7 +27220,7 @@ test "gdpr purge manifest is loud when any persistence surface reports residue" 
     );
     defer std.testing.allocator.free(raw);
 
-    const response = handleGdprDataPurge(std.testing.allocator, raw, "1", &state, null);
+    const response = handleGdprDataPurge(std.testing.allocator, raw, "1", &state, null, null);
     defer std.testing.allocator.free(response.body);
     try std.testing.expectEqualStrings("500 Internal Server Error", response.status);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "\"status\":\"partial\"") != null);

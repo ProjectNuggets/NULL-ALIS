@@ -136,6 +136,9 @@ The bucket is decided by these axes — never by content matching:
   `src/agent/learning.zig`, consumed by `/learn adopt|dismiss` and the
   authenticated gateway suggestions routes. Only `shadow -> active|retired`
   is permitted; no route can resurrect or self-promote a draft.
+- Review eligibility: `is_reviewable_shadow` requires both `state=shadow` and
+  a derived origin whose birth state is shadow. Missing or active-at-birth
+  provenance fails closed and cannot be adopted through either surface.
 - Registry cross-check: `src/agent/learning_contract_test.zig`.
 
 ## Deferred register
