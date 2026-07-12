@@ -33,8 +33,8 @@ RUN ZIG_VERSION="$(cat .zigversion | tr -d '[:space:]')" && \
     zig version
 
 RUN case "${TARGETARCH}" in \
-      amd64) zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres -Dchannels=cli,telegram -Dcpu=haswell ;; \
-      arm64) zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres -Dchannels=cli,telegram ;; \
+      amd64) zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres -Dchannels=cli,telegram,email,discord,slack,whatsapp -Dcpu=haswell ;; \
+      arm64) zig build -Doptimize=ReleaseSmall -Dengines=base,sqlite,postgres -Dchannels=cli,telegram,email,discord,slack,whatsapp ;; \
       *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac
 
