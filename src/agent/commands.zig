@@ -5244,7 +5244,7 @@ fn transitionLearnedFact(
     defer entry.deinit(self.allocator);
 
     const header = learning.parseLearnedMetadataHeader(entry.content);
-    if (header.state != .shadow) {
+    if (!learning.external_transition_allowed(header.state orelse .active, new_state)) {
         // Idempotent no-op: already on the ladder rung the caller wanted,
         // or past it, or never a shadow draft at all (legacy/active).
         return switch (header.state orelse .active) {

@@ -230,6 +230,14 @@ pub const LearnedMetadataHeader = struct {
     state: ?LearnedState = null,
 };
 
+/// The only state transitions an external review surface may perform.
+/// Both `/learn adopt|dismiss` and the authenticated gateway suggestions
+/// route use this predicate so neither surface can grow a self-promotion or
+/// resurrection path independently of the learning contract.
+pub fn external_transition_allowed(current: LearnedState, next: LearnedState) bool {
+    return current == .shadow and (next == .active or next == .retired);
+}
+
 /// headerBlockEnd returns the byte offset of the body start (just past the
 /// first "\n\n") ONLY when `content`'s very FIRST line is a real
 /// `origin=` header line — i.e. a header written by

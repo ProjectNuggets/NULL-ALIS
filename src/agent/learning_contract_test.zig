@@ -8,6 +8,7 @@ const learning = @import("learning.zig");
 const LearnedOrigin = learning.LearnedOrigin;
 const LearnedState = learning.LearnedState;
 const birthState = learning.birthState;
+const external_transition_allowed = learning.external_transition_allowed;
 
 // ── Axis 1 (provenance): enum round-trips are total ────────────────────────
 
@@ -80,6 +81,16 @@ test "learning contract inv. 1: no origin births retired (retired is only reacha
     for (origins) |origin| {
         try std.testing.expect(birthState(origin) != .retired);
     }
+}
+
+test "learning contract inv. 1: external gate only transitions shadow to active or retired" {
+    try std.testing.expect(external_transition_allowed(.shadow, .active));
+    try std.testing.expect(external_transition_allowed(.shadow, .retired));
+    try std.testing.expect(!external_transition_allowed(.shadow, .shadow));
+    try std.testing.expect(!external_transition_allowed(.active, .shadow));
+    try std.testing.expect(!external_transition_allowed(.active, .retired));
+    try std.testing.expect(!external_transition_allowed(.retired, .shadow));
+    try std.testing.expect(!external_transition_allowed(.retired, .active));
 }
 
 // ── Bucket 5 (proposal): wish ledger ───────────────────────────────────────
