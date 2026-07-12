@@ -230,6 +230,22 @@ pub const LearnedMetadataHeader = struct {
     state: ?LearnedState = null,
 };
 
+/// The only state transitions an external review surface may perform.
+/// Both `/learn adopt|dismiss` and the authenticated gateway suggestions
+/// route use this predicate so neither surface can grow a self-promotion or
+/// resurrection path independently of the learning contract.
+pub fn external_transition_allowed(current: LearnedState, next: LearnedState) bool {
+    return current == .shadow and (next == .active or next == .retired);
+}
+
+/// A shadow is reviewable only when it carries provenance that is shadow at
+/// birth. This joins invariants 1 and 3: corrupted/missing provenance can
+/// never be promoted merely because a `state=shadow` line is present.
+pub fn is_reviewable_shadow(header: LearnedMetadataHeader) bool {
+    const origin = header.origin orelse return false;
+    return header.state == .shadow and birthState(origin) == .shadow;
+}
+
 /// headerBlockEnd returns the byte offset of the body start (just past the
 /// first "\n\n") ONLY when `content`'s very FIRST line is a real
 /// `origin=` header line — i.e. a header written by

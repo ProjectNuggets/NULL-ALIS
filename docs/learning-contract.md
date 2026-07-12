@@ -19,7 +19,7 @@ Every learning artifact lands in exactly one bucket:
 |---|---|---|---|
 | **experience** | raw operational record: `tool_traces` rows (what was tried, outcome, duration) | Postgres, retention-bounded (operational tier) | never directly |
 | **insight** | derived pattern: failure-modes, recurrence clusters, tool-fluency stats — RE-DERIVABLE from experience | workspace files (`insights/`), versioned per mining run | consultable context only (reports, briefs, dream) |
-| **shadow directive** | a drafted behaviour rule mined from experience (`origin=mined_aggregate` or an `observed_*` origin), NOT yet active | behavior-fact store, `state=shadow` | NO — visible in reports and `/learn list`, never injected |
+| **shadow directive** | a drafted behaviour rule mined from experience (`origin=mined_aggregate` or an `observed_*` origin), NOT yet active | behavior-fact store, `state=shadow` | NO — visible in reports, `/learn list`, and authenticated `GET /api/v1/users/{id}/suggestions`; never injected |
 | **active directive** | a behaviour rule the gate promoted: user-stated correction (`origin=user_correction`, active at birth — today's learning.zig path, unchanged) or an ADOPTED mined draft | behavior-fact store, `state=active` | yes — priority injection (existing mechanism) |
 | **proposal** | capability gap or skill candidate the agent wants (wish-ledger entry; future skill draft) | `wish/` memory namespace / `.pending/` | never — it's a request to the roadmap, not a behaviour |
 
@@ -40,7 +40,8 @@ The bucket is decided by these axes — never by content matching:
 ## Invariants
 
 1. **No self-promotion.** `shadow -> active` happens only by an external
-   gate: the user adopts it (`/learn adopt`), or a future trust-governor
+   gate: the user adopts it (`/learn adopt` or authenticated
+   `POST /api/v1/users/{id}/suggestions/adopt`), or a future trust-governor
    policy the OPERATOR configured. The miner's confidence score may rank
    suggestions; it may never promote them. ("Never let the agent grade its
    own homework into trust.") Executable as the birth-state law: only
@@ -52,8 +53,8 @@ The bucket is decided by these axes — never by content matching:
    insights/shadow drafts. It never mutates prompts, config, skills, tools,
    or active directives.
 3. **Provenance is mandatory and immutable**; `origin=user_correction` and
-   `origin=mined_aggregate` are never conflated — `/learn list` shows them
-   separately.
+   `origin=mined_aggregate` are never conflated — `/learn list` and the
+   authenticated suggestions REST surface preserve the origin.
 4. **Insights are rebuildable.** Delete all insight files -> re-mine from
    traces -> equivalent content (the memsearch invariant applied to
    learning). Anything not re-derivable does not belong in the insight
@@ -131,6 +132,13 @@ The bucket is decided by these axes — never by content matching:
 
 - Vocabulary (provenance + state enums, birth-state law): `src/agent/learning.zig`
   — `LearnedOrigin`, `LearnedState`, `birthState`.
+- External transition law: `external_transition_allowed` in
+  `src/agent/learning.zig`, consumed by `/learn adopt|dismiss` and the
+  authenticated gateway suggestions routes. Only `shadow -> active|retired`
+  is permitted; no route can resurrect or self-promote a draft.
+- Review eligibility: `is_reviewable_shadow` requires both `state=shadow` and
+  a derived origin whose birth state is shadow. Missing or active-at-birth
+  provenance fails closed and cannot be adopted through either surface.
 - Registry cross-check: `src/agent/learning_contract_test.zig`.
 
 ## Deferred register

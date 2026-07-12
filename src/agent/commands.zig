@@ -5244,13 +5244,16 @@ fn transitionLearnedFact(
     defer entry.deinit(self.allocator);
 
     const header = learning.parseLearnedMetadataHeader(entry.content);
-    if (header.state != .shadow) {
+    if (header.state == .shadow and !learning.is_reviewable_shadow(header)) {
+        return try self.allocator.dupe(u8, "That suggestion has invalid provenance and cannot be adopted or dismissed.");
+    }
+    if (!learning.external_transition_allowed(header.state orelse .active, new_state)) {
         // Idempotent no-op: already on the ladder rung the caller wanted,
         // or past it, or never a shadow draft at all (legacy/active).
         return switch (header.state orelse .active) {
-            // Unreachable: the `if (header.state != .shadow)` guard above
-            // already excludes `.shadow` from reaching this switch.
-            .shadow => unreachable,
+            // Defensive fallback: the explicit malformed-shadow guard above
+            // normally handles this branch before the switch.
+            .shadow => try self.allocator.dupe(u8, "That suggestion has invalid provenance and cannot be changed."),
             .active => try self.allocator.dupe(u8, "That fact is already active — nothing to do."),
             .retired => try self.allocator.dupe(u8, "That suggestion was already dismissed — nothing to do."),
         };

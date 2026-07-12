@@ -57,6 +57,7 @@ const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const agent_routing = @import("agent_routing.zig");
 const agent_prompt = @import("agent/prompt.zig");
+const learning_mod = @import("agent/learning.zig");
 const agent_transcript = @import("agent/transcript.zig");
 const graph_expand = @import("agent/graph_expand.zig");
 const extraction_persist = @import("agent/extraction_persist.zig");
@@ -18111,6 +18112,228 @@ test "telos endpoint JSON renders type and escapes curated content" {
     try std.testing.expectEqualStrings("Ship \"safe\" <v1>\nnow", item.get("content").?.string);
 }
 
+test "suggestions endpoint JSON exposes shadow facts only and strips learning metadata" {
+    const allocator = std.testing.allocator;
+    const rows = [_]memory_mod.MemoryEntry{
+        .{
+            .id = "1",
+            .key = "durable_fact/behavior/1111111111111111",
+            .content = "origin=mined_aggregate\nstate=shadow\nevidence_run_ids=run-1\n\nPrefer the safe \"quoted\" path.",
+            .category = .core,
+            .timestamp = "0",
+        },
+        .{
+            .id = "2",
+            .key = "durable_fact/behavior/2222222222222222",
+            .content = "origin=user_correction\nstate=active\n\nAlready active.",
+            .category = .core,
+            .timestamp = "0",
+        },
+        .{
+            .id = "3",
+            .key = "durable_fact/behavior/3333333333333333",
+            .content = "origin=observed_failure\nstate=retired\n\nDismissed.",
+            .category = .core,
+            .timestamp = "0",
+        },
+        .{
+            .id = "4",
+            .key = "durable_fact/behavior/4444444444444444",
+            .content = "origin=user_correction\nstate=shadow\n\nMalformed provenance.",
+            .category = .core,
+            .timestamp = "0",
+        },
+    };
+    const response = render_suggestions_json(allocator, &rows);
+    defer allocator.free(response.body);
+    try std.testing.expectEqualStrings("200 OK", response.status);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    const suggestions = parsed.value.object.get("suggestions").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), suggestions.len);
+    const suggestion = suggestions[0].object;
+    try std.testing.expectEqualStrings("durable_fact/behavior/1111111111111111", suggestion.get("key").?.string);
+    try std.testing.expectEqualStrings("mined_aggregate", suggestion.get("origin").?.string);
+    try std.testing.expectEqualStrings("Prefer the safe \"quoted\" path.", suggestion.get("content").?.string);
+}
+
+test "suggestions route requires internal authentication before tenant lookup" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const raw = "GET /api/v1/users/1/suggestions HTTP/1.1\r\nHost: localhost\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_arena.allocator(),
+        raw,
+        "GET",
+        "/api/v1/users/1/suggestions",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("401 Unauthorized", response.status);
+}
+
+test "suggestions route dispatches authenticated GET independently of tenant runtime residency" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const raw = "GET /api/v1/users/1/suggestions HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 1\r\n\r\n";
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_arena.allocator(),
+        raw,
+        "GET",
+        "/api/v1/users/1/suggestions",
+        &state,
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("503 Service Unavailable", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "state_manager_unavailable") != null);
+}
+
+fn render_suggestions_json(allocator: std.mem.Allocator, rows: []const memory_mod.MemoryEntry) RouteResponse {
+    const max_suggestions: usize = 100;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"suggestions\":[") catch return response_build_err;
+    var first = true;
+    var emitted: usize = 0;
+    for (rows) |row| {
+        if (emitted == max_suggestions) break;
+        if (!std.mem.startsWith(u8, row.key, "durable_fact/behavior/")) continue;
+        const header = learning_mod.parseLearnedMetadataHeader(row.content);
+        if (!learning_mod.is_reviewable_shadow(header)) continue;
+        if (!first) w.writeByte(',') catch return response_build_err;
+        first = false;
+        const origin = if (header.origin) |value| value.toSlice() else "unknown";
+        w.writeAll("{\"key\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, row.key) catch return response_build_err;
+        w.writeAll(",\"origin\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, origin) catch return response_build_err;
+        w.writeAll(",\"content\":") catch return response_build_err;
+        json_util.appendJsonString(&out, allocator, learning_mod.stripLearnedMetadataHeader(row.content)) catch return response_build_err;
+        w.writeByte('}') catch return response_build_err;
+        emitted += 1;
+    }
+    w.writeAll("]}") catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+fn suggestion_transition_response(
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    status: []const u8,
+) RouteResponse {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    w.writeAll("{\"status\":") catch return response_build_err;
+    json_util.appendJsonString(&out, allocator, status) catch return response_build_err;
+    w.writeAll(",\"key\":") catch return response_build_err;
+    json_util.appendJsonString(&out, allocator, key) catch return response_build_err;
+    w.writeByte('}') catch return response_build_err;
+    return finalizeJsonBuf(allocator, &out);
+}
+
+/// Authenticated external review gate for mined learning drafts.
+///
+/// GET  /api/v1/users/{id}/suggestions
+/// POST /api/v1/users/{id}/suggestions/adopt   {"key":"durable_fact/behavior/..."}
+/// POST /api/v1/users/{id}/suggestions/dismiss {"key":"durable_fact/behavior/..."}
+///
+/// Authentication and tenant pinning are enforced by handleApiRoute before
+/// this handler. Only shadow facts transition; active facts cannot be retired
+/// here and retired facts cannot be resurrected.
+fn handle_suggestions(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    user_id: []const u8,
+    action: ?learning_mod.LearnedState,
+    raw_request: []const u8,
+    state: *GatewayState,
+) RouteResponse {
+    const numeric_user_id = parseNumericUserId(user_id) catch {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
+    };
+
+    if (action == null) {
+        if (!std.mem.eql(u8, method, "GET")) {
+            return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+        }
+    } else if (!std.mem.eql(u8, method, "POST")) {
+        return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
+    }
+    const state_mgr = state.zaki_state orelse {
+        return .{ .status = "503 Service Unavailable", .body = "{\"error\":\"state_manager_unavailable\"}" };
+    };
+
+    if (action == null) {
+        const rows = state_mgr.listLearningSuggestions(allocator, numeric_user_id, 100) catch {
+            return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"suggestions_query_failed\"}" };
+        };
+        defer memory_mod.freeEntries(allocator, rows);
+        return render_suggestions_json(allocator, rows);
+    }
+    const body = extractBody(raw_request) orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_body\"}" };
+    };
+    const key = jsonStringField(body, "key") orelse {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"missing_key\"}" };
+    };
+    if (!std.mem.startsWith(u8, key, "durable_fact/behavior/") or key.len == "durable_fact/behavior/".len) {
+        return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_suggestion_key\"}" };
+    }
+
+    var entry = (state_mgr.getMemory(allocator, numeric_user_id, key) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"suggestion_query_failed\"}" };
+    }) orelse {
+        return .{ .status = "404 Not Found", .body = "{\"error\":\"suggestion_not_found\"}" };
+    };
+    defer entry.deinit(allocator);
+
+    const next = action.?;
+    const header = learning_mod.parseLearnedMetadataHeader(entry.content);
+    if (header.state == .shadow and !learning_mod.is_reviewable_shadow(header)) {
+        return .{ .status = "409 Conflict", .body = "{\"error\":\"invalid_suggestion_provenance\"}" };
+    }
+    const current = header.state orelse .active;
+    if (!learning_mod.external_transition_allowed(current, next)) {
+        if (current == next) {
+            return suggestion_transition_response(allocator, key, if (next == .active) "already_adopted" else "already_dismissed");
+        }
+        return .{ .status = "409 Conflict", .body = "{\"error\":\"suggestion_not_shadow\"}" };
+    }
+
+    const rewritten = learning_mod.rewriteLearnedFactState(allocator, entry.content, next) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"suggestion_transition_failed\"}" };
+    };
+    defer allocator.free(rewritten);
+    const transitioned = state_mgr.transitionLearningSuggestion(numeric_user_id, key, entry.content, rewritten) catch {
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"suggestion_write_failed\"}" };
+    };
+    if (!transitioned) {
+        return .{ .status = "409 Conflict", .body = "{\"error\":\"suggestion_changed_retry\"}" };
+    }
+    return suggestion_transition_response(allocator, key, if (next == .active) "adopted" else "dismissed");
+}
+
 fn handleBrainOrphans(
     allocator: std.mem.Allocator,
     method: []const u8,
@@ -19091,6 +19314,7 @@ fn handleGdprDataPurge(
     scoped_user_id: []const u8,
     state: *GatewayState,
     effective_session_mgr: ?*session_mod.SessionManager,
+    config_opt: ?*const Config,
 ) RouteResponse {
     const numeric_user_id = parseNumericUserId(scoped_user_id) catch {
         return .{ .status = "400 Bad Request", .body = "{\"error\":\"invalid_user_id\"}" };
@@ -19133,6 +19357,11 @@ fn handleGdprDataPurge(
     var report = gdpr_mod.purgeUser(.{
         .allocator = allocator,
         .zaki_state = state.zaki_state,
+        .pgvector_schema = if (config_opt) |cfg| blk: {
+            if (cfg.memory.search.store.pgvector_schema.len > 0) break :blk cfg.memory.search.store.pgvector_schema;
+            break :blk cfg.memory.postgres.schema;
+        } else "zaki_bot",
+        .pgvector_table = if (config_opt) |cfg| cfg.memory.search.store.pgvector_table else "memory_embeddings",
         .vector_store = vector_store_opt,
         .session_manager = effective_session_mgr,
         .users_root = state.tenant_data_root,
@@ -19145,12 +19374,13 @@ fn handleGdprDataPurge(
     defer resp.deinit(allocator);
     const w = resp.writer(allocator);
     w.print(
-        "{{\"status\":\"{s}\",\"sessions_evicted\":{d},\"sessions_skipped_active\":{d},\"pg_user_row_deleted\":{s},\"vector_rows_removed\":{d},\"filesystem_removed\":{s},\"errors\":[",
+        "{{\"status\":\"{s}\",\"sessions_evicted\":{d},\"sessions_skipped_active\":{d},\"pg_user_row_deleted\":{s},\"pg_embedding_rows_removed\":{d},\"vector_rows_removed\":{d},\"filesystem_removed\":{s},\"errors\":[",
         .{
             if (report.fullySucceeded()) "ok" else "partial",
             report.sessions_evicted,
             report.sessions_skipped_active,
             if (report.pg_user_row_deleted) "true" else "false",
+            report.pg_embedding_rows_removed,
             report.vector_rows_removed,
             if (report.filesystem_removed) "true" else "false",
         },
@@ -19165,12 +19395,14 @@ fn handleGdprDataPurge(
     }
     w.writeAll("]}") catch return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
 
-    // Partial success still returns 200 with the body marking which
-    // surfaces didn't fully purge. Full failure (allocator OOM etc.)
-    // returned 500 above. 207 Multi-Status would be more RFC-accurate
-    // but is non-standard in our gateway router.
-    return .{ .body = resp.toOwnedSlice(allocator) catch
-        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" } };
+    const response_body = resp.toOwnedSlice(allocator) catch
+        return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response_build_failed\"}" };
+    // Complete-or-loud: a manifest that names residue must also fail the HTTP
+    // request so a caller cannot mistake a partial erasure for completion.
+    return .{
+        .status = if (report.fullySucceeded()) "200 OK" else "500 Internal Server Error",
+        .body = response_body,
+    };
 }
 
 // ── S7 — channel activation control plane ─────────────────────────────
@@ -21617,6 +21849,18 @@ fn handleApiRoute(
         return handleTelos(req_allocator, method, scoped_user_id, state);
     }
 
+    // Learning-contract external gate. The GET lists shadow drafts; the two
+    // POST routes are the authenticated REST twins of `/learn adopt|dismiss`.
+    if (std.mem.eql(u8, parsed.subpath, "suggestions")) {
+        return handle_suggestions(req_allocator, method, scoped_user_id, null, raw_request, state);
+    }
+    if (std.mem.eql(u8, parsed.subpath, "suggestions/adopt")) {
+        return handle_suggestions(req_allocator, method, scoped_user_id, .active, raw_request, state);
+    }
+    if (std.mem.eql(u8, parsed.subpath, "suggestions/dismiss")) {
+        return handle_suggestions(req_allocator, method, scoped_user_id, .retired, raw_request, state);
+    }
+
     // ── /brain/communities — V1.7a-9d ────────────────────────────────────
     // GET  /api/v1/users/{id}/brain/communities             — list summaries
     // POST /api/v1/users/{id}/brain/communities/recompute   — manual trigger
@@ -21709,7 +21953,7 @@ fn handleApiRoute(
         if (!std.mem.eql(u8, method, "DELETE")) {
             return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\",\"detail\":\"use DELETE to purge user data\"}" };
         }
-        return handleGdprDataPurge(req_allocator, raw_request, scoped_user_id, state, effective_session_mgr);
+        return handleGdprDataPurge(req_allocator, raw_request, scoped_user_id, state, effective_session_mgr, config_opt);
     }
 
     // ── Task query endpoints (WP2.2) ────────────────────────────────────
@@ -26963,6 +27207,25 @@ test "vault route [D11] — GET /secrets/:key/audit scopes mutations to the requ
 }
 
 // ── Sprint 7B — DELETE /api/v1/users/:id/data GDPR purge route ─────
+
+test "gdpr purge manifest is loud when any persistence surface reports residue" {
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = "relative/users";
+    const body = "{\"confirm\":\"PURGE-USER-1\"}";
+    const raw = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "DELETE /api/v1/users/1/data HTTP/1.1\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    defer std.testing.allocator.free(raw);
+
+    const response = handleGdprDataPurge(std.testing.allocator, raw, "1", &state, null, null);
+    defer std.testing.allocator.free(response.body);
+    try std.testing.expectEqualStrings("500 Internal Server Error", response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"status\":\"partial\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "fs_path_not_absolute") != null);
+}
 
 test "gdpr purge route — DELETE without body returns 400 missing_body" {
     var tmp = std.testing.tmpDir(.{});
