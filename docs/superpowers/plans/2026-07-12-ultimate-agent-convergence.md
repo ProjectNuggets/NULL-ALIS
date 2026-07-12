@@ -143,7 +143,7 @@ explicit owner approval before edits, as required by `AGENTS.md`.
 - [x] Independent plan checker returns PASS after findings are resolved.
 - [x] Adversarial safety/architecture reviewer returns no unresolved P0/P1.
 - [x] Independent SOTA/premium evaluator returns PASS after measurement gaps are resolved.
-- [ ] nullALIS branch pushed and linked from zaki-infra coordination.
+- [x] nullALIS branch pushed; zaki-infra coordination link is the next handoff action.
 - [ ] Infra records GREEN LIGHT / GREEN LIGHT WITH CONDITIONS / BLOCKED.
 - [ ] Owner accepts, amends, or rejects the authority matrix and autonomous promotion thresholds.
 
