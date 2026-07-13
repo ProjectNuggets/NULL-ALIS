@@ -1177,6 +1177,7 @@ pub const Agent = struct {
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
             .security_config = cfg.security,
             .extraction_cfg = cfg.agent.extraction,
+            .wish_matchmaking_enabled = cfg.agent.wish_matchmaking_enabled,
             .history = .empty,
             .total_tokens = 0,
             .has_system_prompt = false,
@@ -8857,7 +8858,7 @@ test "Agent.fromConfig clamps max_tokens to token_limit" {
     try std.testing.expectEqual(@as(u32, 4096), agent.max_tokens);
 }
 
-test "Agent.fromConfig applies queue ttl activation send and tts knobs" {
+test "Agent.fromConfig applies queue ttl activation send tts and wish matchmaking knobs" {
     const allocator = std.testing.allocator;
     var cfg = Config{
         .workspace_dir = "/tmp/yc",
@@ -8877,6 +8878,7 @@ test "Agent.fromConfig applies queue ttl activation send and tts knobs" {
     cfg.agent.tts_limit_chars = 777;
     cfg.agent.tts_summary = true;
     cfg.agent.tts_audio = true;
+    cfg.agent.wish_matchmaking_enabled = true;
 
     var noop = observability.NoopObserver{};
     var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
@@ -8895,6 +8897,7 @@ test "Agent.fromConfig applies queue ttl activation send and tts knobs" {
     try std.testing.expectEqual(@as(u32, 777), agent.tts_limit_chars);
     try std.testing.expect(agent.tts_summary);
     try std.testing.expect(agent.tts_audio);
+    try std.testing.expect(agent.wish_matchmaking_enabled);
 }
 
 test "slash /new clears history" {

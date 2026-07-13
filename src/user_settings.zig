@@ -83,6 +83,10 @@ pub const ProductSettings = struct {
     /// improves recall on short / vague questions)." Maps to
     /// `memory.retrieval_stages.query_expansion_enabled` at runtime.
     query_expansion_enabled: bool = false,
+    /// Per-tenant privacy opt-in for wish-to-Decision-Hub matchmaking.
+    /// Defaults false so wish-derived queries never leave the tenant unless
+    /// this exact tenant enables the feature.
+    wish_matchmaking_enabled: bool = false,
     /// 2026-05-25 (v1.14.22 hotfix sprint) — per-user model selection.
     ///
     /// When non-null, this overrides `cfg.default_model` for this tenant's
@@ -317,6 +321,7 @@ const tenant_preference_product_settings_keys = [_][]const u8{
     "autonomy",
     "dream_enabled",
     "query_expansion_enabled",
+    "wish_matchmaking_enabled",
     "selected_model",
 };
 
@@ -468,6 +473,11 @@ pub fn applyPatchToSettingsJson(
             next.query_expansion_enabled = value.bool;
             continue;
         }
+        if (std.mem.eql(u8, key, "wish_matchmaking_enabled")) {
+            if (value != .bool) return error.InvalidPayload;
+            next.wish_matchmaking_enabled = value.bool;
+            continue;
+        }
         if (std.mem.eql(u8, key, "selected_model")) {
             // v1.14.22 — same validation rules as parseProductSettings.
             // String must be on SELECTED_MODEL_ALLOWLIST; null clears
@@ -514,6 +524,7 @@ pub fn mergeSettingsIntoConfigJson(
     try putString(product_obj, a, "autonomy", settings.autonomy.toString());
     try putBool(product_obj, a, "dream_enabled", settings.dream_enabled);
     try putBool(product_obj, a, "query_expansion_enabled", settings.query_expansion_enabled);
+    try putBool(product_obj, a, "wish_matchmaking_enabled", settings.wish_matchmaking_enabled);
     // v1.14.22 — when the tenant has picked a model, persist it; when they
     // haven't, ensure any stale key is REMOVED so the round-trip doesn't
     // resurrect a deleted choice on the next read.
@@ -584,6 +595,7 @@ pub fn normalizeTenantConfigJson(
     try putString(product_obj, a, "autonomy", settings.autonomy.toString());
     try putBool(product_obj, a, "dream_enabled", settings.dream_enabled);
     try putBool(product_obj, a, "query_expansion_enabled", settings.query_expansion_enabled);
+    try putBool(product_obj, a, "wish_matchmaking_enabled", settings.wish_matchmaking_enabled);
     if (settings.selectedModelSlice()) |sm| {
         try putString(product_obj, a, "selected_model", sm);
     } else {
@@ -659,6 +671,11 @@ pub fn applySettingsToConfig(cfg: *Config, settings: ProductSettings) void {
     // on short / vague questions)." Default false; user opts in.
     cfg.memory.retrieval_stages.query_expansion_enabled = settings.query_expansion_enabled;
 
+    // Wish content can contain sensitive tenant context. Keep the runtime
+    // egress gate false unless this tenant explicitly opted in through its
+    // allowlisted product settings.
+    cfg.agent.wish_matchmaking_enabled = settings.wish_matchmaking_enabled;
+
     // dream_enabled propagation: handled by the daemon wake-turn reconciler
     // reading `user_settings.dream_enabled` and matching against
     // AUTOMATIONS.json's dream_3am.enabled field — not a config flip here.
@@ -697,7 +714,7 @@ pub fn renderSettingsJson(allocator: std.mem.Allocator, settings: ProductSetting
     // here is known-safe at render time.
     const head = try std.fmt.allocPrint(
         allocator,
-        "{{\"assistant_mode\":\"{s}\",\"group_activation\":\"{s}\",\"proactive_updates\":{s},\"voice_replies\":{s},\"session_timeout_minutes\":{d},\"autonomy\":\"{s}\",\"dream_enabled\":{s},\"query_expansion_enabled\":{s}",
+        "{{\"assistant_mode\":\"{s}\",\"group_activation\":\"{s}\",\"proactive_updates\":{s},\"voice_replies\":{s},\"session_timeout_minutes\":{d},\"autonomy\":\"{s}\",\"dream_enabled\":{s},\"query_expansion_enabled\":{s},\"wish_matchmaking_enabled\":{s}",
         .{
             settings.assistant_mode.toSlice(),
             settings.group_activation.toSlice(),
@@ -707,6 +724,7 @@ pub fn renderSettingsJson(allocator: std.mem.Allocator, settings: ProductSetting
             settings.autonomy.toString(),
             if (settings.dream_enabled) "true" else "false",
             if (settings.query_expansion_enabled) "true" else "false",
+            if (settings.wish_matchmaking_enabled) "true" else "false",
         },
     );
     defer allocator.free(head);
@@ -768,6 +786,11 @@ fn parseProductSettings(value: std.json.Value) Error!ProductSettings {
         if (raw != .bool) return error.InvalidPayload;
         break :blk raw.bool;
     };
+    const wish_matchmaking_enabled: bool = blk: {
+        const raw = obj.get("wish_matchmaking_enabled") orelse break :blk false;
+        if (raw != .bool) return error.InvalidPayload;
+        break :blk raw.bool;
+    };
 
     // v1.14.22 — selected_model is optional. Three valid shapes:
     //  1. key absent           → null (operator default wins)
@@ -785,6 +808,7 @@ fn parseProductSettings(value: std.json.Value) Error!ProductSettings {
         .autonomy = autonomy_resolved,
         .dream_enabled = dream_enabled,
         .query_expansion_enabled = query_expansion_enabled,
+        .wish_matchmaking_enabled = wish_matchmaking_enabled,
     };
 
     if (obj.get("selected_model")) |raw| switch (raw) {
@@ -1060,6 +1084,25 @@ test "applySettingsToConfig wires session_timeout_minutes to session_idle_timeou
     try std.testing.expectEqual(@as(u64, 300), cfg.agent.session_idle_timeout_secs);
     // Hard TTL must NOT be touched by the UI slider (operator-only).
     try std.testing.expectEqual(@as(?u64, null), cfg.agent.session_ttl_secs);
+}
+
+test "wish matchmaking opt-in survives tenant normalization and reaches agent config" {
+    const raw =
+        \\{"product_settings":{"assistant_mode":"balanced","group_activation":"mention","proactive_updates":true,"voice_replies":false,"session_timeout_minutes":30,"wish_matchmaking_enabled":true}}
+    ;
+    const normalized = try normalizeTenantConfigJson(std.testing.allocator, raw);
+    defer std.testing.allocator.free(normalized.json);
+    try std.testing.expect(normalized.settings.wish_matchmaking_enabled);
+    try std.testing.expect(std.mem.indexOf(u8, normalized.json, "\"wish_matchmaking_enabled\":true") != null);
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "test/mock-model",
+        .allocator = std.testing.allocator,
+    };
+    applySettingsToConfig(&cfg, normalized.settings);
+    try std.testing.expect(cfg.agent.wish_matchmaking_enabled);
 }
 
 test "deriveNearestFromAgentObject reads session_idle_timeout_secs first, falls back to legacy session_ttl_secs" {

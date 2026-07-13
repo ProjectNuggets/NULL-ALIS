@@ -306,7 +306,7 @@ pub const SessionManager = struct {
     /// Package 2b (privacy fix) — wish→Hub matchmaking gate, threaded from
     /// gateway config to per-session Agent → commands.zig's `/learn list`.
     /// Same INIT-ONLY concurrency contract as the sibling fields. Default
-    /// FALSE (opt-in). See config_types.wish_matchmaking_enabled.
+    /// FALSE (per-tenant opt-in). See config_types.wish_matchmaking_enabled.
     wish_matchmaking_enabled: bool = false,
 
     mutex: std.Thread.Mutex,
