@@ -2612,6 +2612,23 @@ test "memory lifecycle retention TTLs default off and parse per table" {
     try std.testing.expectEqual(@as(u32, 90), cfg.memory.lifecycle.memory_events_retention_days);
 }
 
+test "memory lifecycle retention TTLs reject values outside Postgres int4 range" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullalis",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = arena.allocator(),
+    };
+    try cfg.parseJson(
+        \\{"memory":{"lifecycle":{"tool_traces_retention_days":2147483648,"subagent_results_retention_days":2147483648,"memory_events_retention_days":2147483648}}}
+    );
+    try std.testing.expectEqual(@as(u32, 0), cfg.memory.lifecycle.tool_traces_retention_days);
+    try std.testing.expectEqual(@as(u32, 0), cfg.memory.lifecycle.subagent_results_retention_days);
+    try std.testing.expectEqual(@as(u32, 0), cfg.memory.lifecycle.memory_events_retention_days);
+}
+
 test "syncFlatFields propagates nested values" {
     var cfg = Config{
         .workspace_dir = "/tmp/yc",

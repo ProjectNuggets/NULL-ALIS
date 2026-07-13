@@ -15,9 +15,9 @@ The Postgres bookkeeping tables retain rows forever unless an operator sets a no
 }
 ```
 
-`0` means disabled/forever and preserves the pre-change behavior. Changing these values needs no database migration.
+`0` means disabled/forever and preserves the pre-change behavior. The three TTL values are copied from the base operator config at gateway startup; per-tenant overrides do not change this schema-wide policy.
 
-The existing tenant-maintenance cadence runs the Postgres prune once per sweep, not once per resident tenant. Each invocation deletes at most 1,000 eligible rows from each enabled table, so a backlog drains over multiple sweeps instead of creating one unbounded delete.
+The gateway attempts the Postgres prune once at startup and then at most once per hour. Each invocation deletes at most 1,000 eligible rows from each enabled table, so a backlog drains over multiple hourly batches instead of creating one unbounded delete. A failed attempt is not retried until the next hourly window.
 
 Table semantics:
 
@@ -25,6 +25,8 @@ Table semantics:
 - `subagent_results`: deletes only `status='delivered'` rows older than its TTL. Pending outbox rows are exempt so restart recovery is never discarded by retention.
 - `memory_events`: deletes audit-event rows older than its TTL. It does not delete or close the referenced live memory.
 
-Set `conversation_retention_days` separately for conversation-memory hygiene. Its default remains `0` (forever); it is not coupled to the three Postgres TTLs.
+Set `conversation_retention_days` separately for conversation-memory hygiene. It is not coupled to the three Postgres TTLs.
 
-After changing the deployment config, restart or roll the engine pods so the base operator config is reloaded. Verify the `retention.pruned` log fields during a maintenance sweep. The absence of that log is expected when no eligible rows were deleted.
+Migration `0009_retention_ttl_indexes` builds concurrent indexes for the three cutoff scans. Apply migrations before enabling a TTL on an existing deployment.
+
+After changing the deployment config, restart or roll the engine pods so the base operator config is reloaded. Verify the `retention.pruned` log fields during an hourly maintenance window. The absence of that log is expected when no eligible rows were deleted.

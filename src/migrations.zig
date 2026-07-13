@@ -155,6 +155,15 @@ pub const MIGRATIONS = [_]Migration{
         .name = "0008_tool_traces",
         .sql = @embedFile("migrations/0008_tool_traces.sql"),
     },
+    .{
+        // WP-02 — schema-wide TTL pruning must not scan each bookkeeping
+        // table on every bounded batch. These indexes are built outside a
+        // transaction so existing production tables remain writable.
+        .version = 9,
+        .name = "0009_retention_ttl_indexes",
+        .sql = @embedFile("migrations/0009_retention_ttl_indexes.sql"),
+        .concurrent_only = true,
+    },
 };
 
 /// Trait the runner's caller must satisfy: a method that takes a
@@ -453,6 +462,24 @@ test "MIGRATIONS array is in strict ascending version order with no gaps" {
         try std.testing.expect(m.version == prev + 1);
         prev = m.version;
     }
+}
+
+test "WP-02 retention indexes use concurrent schema-wide access paths" {
+    const found = blk: {
+        for (MIGRATIONS) |m| {
+            if (m.version == 9) break :blk m;
+        }
+        return error.Migration0009NotFound;
+    };
+    try std.testing.expectEqualStrings("0009_retention_ttl_indexes", found.name);
+    try std.testing.expect(found.concurrent_only);
+    try std.testing.expect(std.mem.indexOf(u8, found.sql, "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tool_traces_retention") != null);
+    try std.testing.expect(std.mem.indexOf(u8, found.sql, "ON {schema}.tool_traces (created_at)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, found.sql, "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memory_events_retention") != null);
+    try std.testing.expect(std.mem.indexOf(u8, found.sql, "ON {schema}.memory_events (created_at)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, found.sql, "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_subagent_results_retention") != null);
+    try std.testing.expect(std.mem.indexOf(u8, found.sql, "COALESCE(delivered_at, created_at)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, found.sql, "WHERE status = 'delivered'") != null);
 }
 
 test "Wave 2 — migration 0004_turn_usage is registered with the durable metering schema" {

@@ -579,6 +579,7 @@ pub const IdempotencyStore = struct {
 const TENANT_TELEGRAM_ASYNC_QUEUE_CAPACITY: usize = 256;
 const USER_CELL_REGISTRATION_REFRESH_SECS: u64 = 5;
 const TENANT_RUNTIME_MAINTENANCE_INTERVAL_SECS: i64 = 1;
+const RETENTION_MAINTENANCE_INTERVAL_SECS: i64 = 60 * 60;
 const GATEWAY_SESSION_LOCK_WAIT_STAGE: []const u8 = "session_lock_wait";
 
 pub const GatewayRole = enum {
@@ -1190,6 +1191,10 @@ pub const GatewayState = struct {
     pairing_guard: ?PairingGuard,
     event_bus: ?*bus_mod.Bus = null,
     zaki_state: ?*zaki_state_mod.Manager = null,
+    /// Schema-wide retention is an operator policy, copied from the base
+    /// config at boot. It must not depend on which tenant runtime happens to
+    /// be first in the cache iteration order.
+    retention_policy: zaki_state_mod.RetentionPolicy = .{},
     lifecycle_metrics: LifecycleMetrics = .{},
     /// S5 (2026-05-29, prod-readiness) — bridge to the process-wide
     /// `observability_metrics.Registry`. Backing storage lives on
@@ -2732,7 +2737,6 @@ fn pruneTenantRuntimeCache(state: *GatewayState, now_s: i64) void {
 fn runTenantRuntimeMaintenance(state: *GatewayState, now_s: i64) void {
     state.tenant_runtime_mutex.lock();
     defer state.tenant_runtime_mutex.unlock();
-    var retention_pruned = false;
     var it = state.tenant_runtimes.iterator();
     while (it.next()) |entry| {
         // Wave-E — shutdown-responsive sweep. Check shutdown BETWEEN runtimes
@@ -2768,16 +2772,6 @@ fn runTenantRuntimeMaintenance(state: *GatewayState, now_s: i64) void {
             if (retention_days > 0) {
                 _ = state_mgr.reapStaleWorkingMemory(retention_days) catch |err|
                     log.warn("gateway.wm_reap_failed err={s}", .{@errorName(err)});
-            }
-            // These are schema-wide tables. Run the batch-capped prune once
-            // per maintenance sweep, never once per resident tenant.
-            if (!retention_pruned) {
-                retention_pruned = true;
-                _ = state_mgr.pruneRetention(.{
-                    .tool_traces_retention_days = runtime.config.memory.lifecycle.tool_traces_retention_days,
-                    .subagent_results_retention_days = runtime.config.memory.lifecycle.subagent_results_retention_days,
-                    .memory_events_retention_days = runtime.config.memory.lifecycle.memory_events_retention_days,
-                }) catch |err| log.warn("gateway.retention_prune_failed err={s}", .{@errorName(err)});
             }
         }
     }
@@ -25318,9 +25312,28 @@ fn pingDbReadiness(state: *GatewayState) void {
     health.markComponentOk(DB_HEALTH_COMPONENT);
 }
 
+fn retentionMaintenanceDue(now_s: i64, last_run_s: ?i64) bool {
+    const last = last_run_s orelse return true;
+    // Treat a wall-clock rollback as due rather than suppressing maintenance
+    // indefinitely until the clock catches up.
+    return now_s < last or now_s - last >= RETENTION_MAINTENANCE_INTERVAL_SECS;
+}
+
+fn runRetentionMaintenance(state: *GatewayState) void {
+    const policy = state.retention_policy;
+    if (policy.tool_traces_retention_days == 0 and
+        policy.subagent_results_retention_days == 0 and
+        policy.memory_events_retention_days == 0) return;
+
+    const state_mgr = state.zaki_state orelse return;
+    _ = state_mgr.pruneRetention(policy) catch |err|
+        log.warn("gateway.retention_prune_failed err={s}", .{@errorName(err)});
+}
+
 fn tenantRuntimeMaintenanceMain(ctx: *MaintenanceContext) void {
     var last_run_s: i64 = 0;
     var last_db_ping_s: i64 = 0;
+    var last_retention_run_s: ?i64 = null;
     // H6: seed the "db" component to ok at startup for a Postgres-backed
     // gateway so /ready does not flap not-ready in the first ping interval
     // (boot already proved Postgres reachable via migrate()/zaki_state init;
@@ -25339,10 +25352,23 @@ fn tenantRuntimeMaintenanceMain(ctx: *MaintenanceContext) void {
             pingDbReadiness(ctx.state);
             last_db_ping_s = now_s;
         }
+        if (retentionMaintenanceDue(now_s, last_retention_run_s)) {
+            runRetentionMaintenance(ctx.state);
+            // Record the attempt even on a failure so a database incident
+            // cannot turn the maintenance thread into a one-second retry loop.
+            last_retention_run_s = now_s;
+        }
         // Sleep in short increments so shutdown is observed promptly (the
         // accept loop tears down within ~50ms; match that responsiveness).
         std.Thread.sleep(50 * std.time.ns_per_ms);
     }
+}
+
+test "retention maintenance is due at startup and then hourly" {
+    try std.testing.expect(retentionMaintenanceDue(100, null));
+    try std.testing.expect(!retentionMaintenanceDue(101, 100));
+    try std.testing.expect(!retentionMaintenanceDue(3699, 100));
+    try std.testing.expect(retentionMaintenanceDue(3700, 100));
 }
 
 pub fn runWithRole(
@@ -25628,6 +25654,11 @@ pub fn runWithRole(
         state.workspace_dir = cfg.workspace_dir;
         state.tenant_runtime_cache_max_users = cfg.tenant.runtime_cache_max_users;
         state.tenant_runtime_idle_ttl_secs = cfg.tenant.runtime_idle_ttl_secs;
+        state.retention_policy = .{
+            .tool_traces_retention_days = cfg.memory.lifecycle.tool_traces_retention_days,
+            .subagent_results_retention_days = cfg.memory.lifecycle.subagent_results_retention_days,
+            .memory_events_retention_days = cfg.memory.lifecycle.memory_events_retention_days,
+        };
         if (std.mem.eql(u8, cfg.state.backend, "postgres")) init_state: {
             const mgr = allocator.create(zaki_state_mod.Manager) catch break :init_state;
             mgr.* = zaki_state_mod.Manager.init(allocator, cfg.state) catch |err| {

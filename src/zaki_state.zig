@@ -11722,6 +11722,7 @@ const ManagerImpl = struct {
             "WITH doomed AS (" ++
                 "SELECT ctid FROM {schema}.tool_traces " ++
                 "WHERE created_at < NOW() - ($1::int * INTERVAL '1 day') " ++
+                "ORDER BY created_at " ++
                 "LIMIT $2::int" ++
                 ") DELETE FROM {schema}.tool_traces AS target USING doomed " ++
                 "WHERE target.ctid = doomed.ctid",
@@ -11733,6 +11734,7 @@ const ManagerImpl = struct {
                 "SELECT ctid FROM {schema}.subagent_results " ++
                 "WHERE status = 'delivered' " ++
                 "AND COALESCE(delivered_at, created_at) < NOW() - ($1::int * INTERVAL '1 day') " ++
+                "ORDER BY COALESCE(delivered_at, created_at) " ++
                 "LIMIT $2::int" ++
                 ") DELETE FROM {schema}.subagent_results AS target USING doomed " ++
                 "WHERE target.ctid = doomed.ctid",
@@ -11743,6 +11745,7 @@ const ManagerImpl = struct {
             "WITH doomed AS (" ++
                 "SELECT ctid FROM {schema}.memory_events " ++
                 "WHERE created_at < NOW() - ($1::int * INTERVAL '1 day') " ++
+                "ORDER BY created_at " ++
                 "LIMIT $2::int" ++
                 ") DELETE FROM {schema}.memory_events AS target USING doomed " ++
                 "WHERE target.ctid = doomed.ctid",
