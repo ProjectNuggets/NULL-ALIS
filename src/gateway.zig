@@ -580,6 +580,7 @@ pub const IdempotencyStore = struct {
 const TENANT_TELEGRAM_ASYNC_QUEUE_CAPACITY: usize = 256;
 const USER_CELL_REGISTRATION_REFRESH_SECS: u64 = 5;
 const TENANT_RUNTIME_MAINTENANCE_INTERVAL_SECS: i64 = 1;
+const RETENTION_MAINTENANCE_INTERVAL_SECS: i64 = 60 * 60;
 const GATEWAY_SESSION_LOCK_WAIT_STAGE: []const u8 = "session_lock_wait";
 
 pub const GatewayRole = enum {
@@ -1191,6 +1192,10 @@ pub const GatewayState = struct {
     pairing_guard: ?PairingGuard,
     event_bus: ?*bus_mod.Bus = null,
     zaki_state: ?*zaki_state_mod.Manager = null,
+    /// Schema-wide retention is an operator policy, copied from the base
+    /// config at boot. It must not depend on which tenant runtime happens to
+    /// be first in the cache iteration order.
+    retention_policy: zaki_state_mod.RetentionPolicy = .{},
     lifecycle_metrics: LifecycleMetrics = .{},
     /// S5 (2026-05-29, prod-readiness) — bridge to the process-wide
     /// `observability_metrics.Registry`. Backing storage lives on
@@ -25445,9 +25450,28 @@ fn pingDbReadiness(state: *GatewayState) void {
     health.markComponentOk(DB_HEALTH_COMPONENT);
 }
 
+fn retentionMaintenanceDue(now_s: i64, last_run_s: ?i64) bool {
+    const last = last_run_s orelse return true;
+    // Treat a wall-clock rollback as due rather than suppressing maintenance
+    // indefinitely until the clock catches up.
+    return now_s < last or now_s - last >= RETENTION_MAINTENANCE_INTERVAL_SECS;
+}
+
+fn runRetentionMaintenance(state: *GatewayState) void {
+    const policy = state.retention_policy;
+    if (policy.tool_traces_retention_days == 0 and
+        policy.subagent_results_retention_days == 0 and
+        policy.memory_events_retention_days == 0) return;
+
+    const state_mgr = state.zaki_state orelse return;
+    _ = state_mgr.pruneRetention(policy) catch |err|
+        log.warn("gateway.retention_prune_failed err={s}", .{@errorName(err)});
+}
+
 fn tenantRuntimeMaintenanceMain(ctx: *MaintenanceContext) void {
     var last_run_s: i64 = 0;
     var last_db_ping_s: i64 = 0;
+    var last_retention_run_s: ?i64 = null;
     // H6: seed the "db" component to ok at startup for a Postgres-backed
     // gateway so /ready does not flap not-ready in the first ping interval
     // (boot already proved Postgres reachable via migrate()/zaki_state init;
@@ -25466,10 +25490,23 @@ fn tenantRuntimeMaintenanceMain(ctx: *MaintenanceContext) void {
             pingDbReadiness(ctx.state);
             last_db_ping_s = now_s;
         }
+        if (retentionMaintenanceDue(now_s, last_retention_run_s)) {
+            runRetentionMaintenance(ctx.state);
+            // Record the attempt even on a failure so a database incident
+            // cannot turn the maintenance thread into a one-second retry loop.
+            last_retention_run_s = now_s;
+        }
         // Sleep in short increments so shutdown is observed promptly (the
         // accept loop tears down within ~50ms; match that responsiveness).
         std.Thread.sleep(50 * std.time.ns_per_ms);
     }
+}
+
+test "retention maintenance is due at startup and then hourly" {
+    try std.testing.expect(retentionMaintenanceDue(100, null));
+    try std.testing.expect(!retentionMaintenanceDue(101, 100));
+    try std.testing.expect(!retentionMaintenanceDue(3699, 100));
+    try std.testing.expect(retentionMaintenanceDue(3700, 100));
 }
 
 pub fn runWithRole(
@@ -25755,6 +25792,11 @@ pub fn runWithRole(
         state.workspace_dir = cfg.workspace_dir;
         state.tenant_runtime_cache_max_users = cfg.tenant.runtime_cache_max_users;
         state.tenant_runtime_idle_ttl_secs = cfg.tenant.runtime_idle_ttl_secs;
+        state.retention_policy = .{
+            .tool_traces_retention_days = cfg.memory.lifecycle.tool_traces_retention_days,
+            .subagent_results_retention_days = cfg.memory.lifecycle.subagent_results_retention_days,
+            .memory_events_retention_days = cfg.memory.lifecycle.memory_events_retention_days,
+        };
         if (std.mem.eql(u8, cfg.state.backend, "postgres")) init_state: {
             const mgr = allocator.create(zaki_state_mod.Manager) catch break :init_state;
             mgr.* = zaki_state_mod.Manager.init(allocator, cfg.state) catch |err| {
@@ -28107,6 +28149,59 @@ test "handleApiRoute PATCH settings rejects invalid assistant mode" {
 
     try std.testing.expectEqualStrings("400 Bad Request", response.status);
     try std.testing.expectEqualStrings("{\"error\":\"invalid_assistant_mode\"}", response.body);
+}
+
+test "handleApiRoute PATCH settings rejects non-allowlisted selected_model without persistence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    const user_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/1", .{tenant_root});
+    defer std.testing.allocator.free(user_dir);
+    try std.fs.makeDirAbsolute(user_dir);
+    const config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{user_dir});
+    defer std.testing.allocator.free(config_path);
+    const original_config =
+        \\{"product_settings":{"assistant_mode":"balanced","group_activation":"mention","proactive_updates":true,"voice_replies":false,"session_timeout_minutes":30,"selected_model":"kimi-k2.6"}}
+    ;
+    try writeFile(config_path, original_config);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{\"selected_model\":\"openrouter/proxy.evil/model-x\"}";
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "PATCH /api/v1/users/1/settings HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "PATCH",
+        "/api/v1/users/1/settings",
+        &state,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqualStrings("400 Bad Request", response.status);
+    try std.testing.expectEqualStrings("{\"error\":\"invalid_selected_model\"}", response.body);
+
+    const persisted_config = try readFileOrDefault(std.testing.allocator, config_path, "");
+    defer std.testing.allocator.free(persisted_config);
+    try std.testing.expectEqualStrings(original_config, persisted_config);
 }
 
 test "handleApiRoute PATCH settings clamps huge timeout without crashing" {

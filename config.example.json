@@ -102,6 +102,9 @@
       "archive_after_days": 7,
       "purge_after_days": 30,
       "conversation_retention_days": 30,
+      "tool_traces_retention_days": 0,
+      "subagent_results_retention_days": 0,
+      "memory_events_retention_days": 0,
       "snapshot_enabled": false,
       "snapshot_on_hygiene": false,
       "auto_hydrate": true

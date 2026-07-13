@@ -632,6 +632,28 @@ pub const SubagentResultRow = struct {
     }
 };
 
+/// Hard ceiling per table and maintenance sweep. The policy carries a lower
+/// value only for focused tests; production can never delete beyond this cap
+/// in one sweep even if a caller constructs a larger value.
+pub const RETENTION_PRUNE_BATCH_ROWS: u32 = 1000;
+
+pub const RetentionPolicy = struct {
+    tool_traces_retention_days: u32 = 0,
+    subagent_results_retention_days: u32 = 0,
+    memory_events_retention_days: u32 = 0,
+    max_rows_per_table: u32 = RETENTION_PRUNE_BATCH_ROWS,
+};
+
+pub const RetentionPruneReport = struct {
+    tool_traces_deleted: u64 = 0,
+    subagent_results_deleted: u64 = 0,
+    memory_events_deleted: u64 = 0,
+
+    pub fn total(self: @This()) u64 {
+        return self.tool_traces_deleted + self.subagent_results_deleted + self.memory_events_deleted;
+    }
+};
+
 pub const ArtifactVersionRow = struct {
     artifact_id: []u8,
     version: u64,
@@ -1368,6 +1390,10 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     /// rows exist without Postgres, so nothing to reap.
     pub fn reapStaleWorkingMemory(_: *@This(), _: u32) !u64 {
         return 0;
+    }
+    /// Retention prune stub: non-Postgres builds have none of these tables.
+    pub fn pruneRetention(_: *@This(), _: RetentionPolicy) !RetentionPruneReport {
+        return .{};
     }
     /// V1.13 Day 2 — extraction queue stubs for non-postgres builds.
     /// Non-postgres builds run extraction synchronously inline (V1.12
@@ -11662,6 +11688,83 @@ const ManagerImpl = struct {
             log.info("working_memory.reaped rows={d} retention_days={d}", .{ deleted, retention_days });
         }
         return deleted;
+    }
+
+    fn pruneRetentionTable(
+        self: *Self,
+        query_template: []const u8,
+        retention_days: u32,
+        max_rows: u32,
+    ) !u64 {
+        if (retention_days == 0 or max_rows == 0) return 0;
+        const q = try self.buildQuery(query_template);
+        defer self.allocator.free(q);
+
+        var days_buf: [16]u8 = undefined;
+        const days_s = try std.fmt.bufPrintZ(&days_buf, "{d}", .{retention_days});
+        var rows_buf: [16]u8 = undefined;
+        const rows_s = try std.fmt.bufPrintZ(&rows_buf, "{d}", .{@min(max_rows, RETENTION_PRUNE_BATCH_ROWS)});
+        const params = [_]?[*:0]const u8{ days_s.ptr, rows_s.ptr };
+        const lengths = [_]c_int{ @intCast(days_s.len), @intCast(rows_s.len) };
+        const result = try self.execParams(q, &params, &lengths);
+        defer c.PQclear(result);
+        const affected = c.PQcmdTuples(result);
+        if (affected == null) return 0;
+        return std.fmt.parseInt(u64, std.mem.span(affected), 10) catch 0;
+    }
+
+    /// Batch-capped retention for Postgres bookkeeping tables. Zero TTL keeps
+    /// the current forever-retention behavior. Pending subagent outbox rows are
+    /// deliberately exempt: pruning an undelivered result would break restart
+    /// recovery, so only terminal `delivered` rows age out.
+    pub fn pruneRetention(self: *Self, policy: RetentionPolicy) !RetentionPruneReport {
+        const tool_traces_deleted = try self.pruneRetentionTable(
+            "WITH doomed AS (" ++
+                "SELECT ctid FROM {schema}.tool_traces " ++
+                "WHERE created_at < NOW() - ($1::int * INTERVAL '1 day') " ++
+                "ORDER BY created_at " ++
+                "LIMIT $2::int" ++
+                ") DELETE FROM {schema}.tool_traces AS target USING doomed " ++
+                "WHERE target.ctid = doomed.ctid",
+            policy.tool_traces_retention_days,
+            policy.max_rows_per_table,
+        );
+        const subagent_results_deleted = try self.pruneRetentionTable(
+            "WITH doomed AS (" ++
+                "SELECT ctid FROM {schema}.subagent_results " ++
+                "WHERE status = 'delivered' " ++
+                "AND COALESCE(delivered_at, created_at) < NOW() - ($1::int * INTERVAL '1 day') " ++
+                "ORDER BY COALESCE(delivered_at, created_at) " ++
+                "LIMIT $2::int" ++
+                ") DELETE FROM {schema}.subagent_results AS target USING doomed " ++
+                "WHERE target.ctid = doomed.ctid",
+            policy.subagent_results_retention_days,
+            policy.max_rows_per_table,
+        );
+        const memory_events_deleted = try self.pruneRetentionTable(
+            "WITH doomed AS (" ++
+                "SELECT ctid FROM {schema}.memory_events " ++
+                "WHERE created_at < NOW() - ($1::int * INTERVAL '1 day') " ++
+                "ORDER BY created_at " ++
+                "LIMIT $2::int" ++
+                ") DELETE FROM {schema}.memory_events AS target USING doomed " ++
+                "WHERE target.ctid = doomed.ctid",
+            policy.memory_events_retention_days,
+            policy.max_rows_per_table,
+        );
+        const report = RetentionPruneReport{
+            .tool_traces_deleted = tool_traces_deleted,
+            .subagent_results_deleted = subagent_results_deleted,
+            .memory_events_deleted = memory_events_deleted,
+        };
+        if (report.total() > 0) {
+            log.info("retention.pruned tool_traces={d} subagent_results={d} memory_events={d}", .{
+                report.tool_traces_deleted,
+                report.subagent_results_deleted,
+                report.memory_events_deleted,
+            });
+        }
+        return report;
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -23849,6 +23952,89 @@ test "WM reapStaleWorkingMemory deletes only rows past the retention window" {
     // is left untouched and nothing is deleted.
     const deleted_disabled = try mgr.reapStaleWorkingMemory(0);
     try std.testing.expectEqual(@as(u64, 0), deleted_disabled);
+
+    {
+        const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
+        defer allocator.free(drop_q);
+        const result = try mgr.exec(drop_q);
+        c.PQclear(result);
+    }
+}
+
+test "retention prune is TTL-gated batch-bounded and preserves pending subagent results" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-retention-test/workspace");
+
+    try mgr.insertToolTraceEvents(2, "retention-old-1", "[]");
+    try mgr.insertToolTraceEvents(2, "retention-old-2", "[]");
+    try mgr.insertToolTraceEvents(2, "retention-fresh", "[]");
+
+    const subagent_rows = [_]SubagentResultInput{
+        .{ .result_id = "subagent:retention-old-1", .user_id = 2, .session_key = "retention-session", .task_id = 9101, .result_json = "{\"status\":\"ok\",\"text\":\"old one\"}" },
+        .{ .result_id = "subagent:retention-old-2", .user_id = 2, .session_key = "retention-session", .task_id = 9102, .result_json = "{\"status\":\"ok\",\"text\":\"old two\"}" },
+        .{ .result_id = "subagent:retention-pending", .user_id = 2, .session_key = "retention-session", .task_id = 9103, .result_json = "{\"status\":\"ok\",\"text\":\"pending\"}" },
+    };
+    for (subagent_rows) |row| try mgr.upsertSubagentResult(row);
+    try mgr.markSubagentResultDelivered("subagent:retention-old-1");
+    try mgr.markSubagentResultDelivered("subagent:retention-old-2");
+
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+    {
+        const seed_q = try std.fmt.allocPrint(
+            allocator,
+            "UPDATE {s}.tool_traces SET created_at = NOW() - INTERVAL '40 days' WHERE run_id LIKE 'retention-old-%'; " ++
+                "UPDATE {s}.subagent_results SET created_at = NOW() - INTERVAL '40 days', delivered_at = CASE WHEN status = 'delivered' THEN NOW() - INTERVAL '40 days' ELSE NULL END WHERE result_id LIKE 'subagent:retention-%'; " ++
+                "INSERT INTO {s}.memory_events (id, user_id, event_type, payload, created_at) VALUES " ++
+                "('retention-event-old-1', 2, 'test', '{{}}'::jsonb, NOW() - INTERVAL '40 days'), " ++
+                "('retention-event-old-2', 2, 'test', '{{}}'::jsonb, NOW() - INTERVAL '40 days'), " ++
+                "('retention-event-fresh', 2, 'test', '{{}}'::jsonb, NOW())",
+            .{ schema_q, schema_q, schema_q },
+        );
+        defer allocator.free(seed_q);
+        const result = try mgr.exec(seed_q);
+        c.PQclear(result);
+    }
+
+    const disabled = try mgr.pruneRetention(.{});
+    try std.testing.expectEqual(@as(u64, 0), disabled.total());
+
+    const policy = RetentionPolicy{
+        .tool_traces_retention_days = 30,
+        .subagent_results_retention_days = 30,
+        .memory_events_retention_days = 30,
+        .max_rows_per_table = 1,
+    };
+    const first = try mgr.pruneRetention(policy);
+    try std.testing.expectEqual(@as(u64, 1), first.tool_traces_deleted);
+    try std.testing.expectEqual(@as(u64, 1), first.subagent_results_deleted);
+    try std.testing.expectEqual(@as(u64, 1), first.memory_events_deleted);
+
+    const second = try mgr.pruneRetention(policy);
+    try std.testing.expectEqual(@as(u64, 3), second.total());
+    const third = try mgr.pruneRetention(policy);
+    try std.testing.expectEqual(@as(u64, 0), third.total());
+
+    {
+        const verify_q = try std.fmt.allocPrint(
+            allocator,
+            "SELECT " ++
+                "(SELECT COUNT(*) FROM {s}.tool_traces WHERE run_id = 'retention-fresh'), " ++
+                "(SELECT COUNT(*) FROM {s}.subagent_results WHERE result_id = 'subagent:retention-pending' AND status = 'pending'), " ++
+                "(SELECT COUNT(*) FROM {s}.memory_events WHERE id = 'retention-event-fresh')",
+            .{ schema_q, schema_q, schema_q },
+        );
+        defer allocator.free(verify_q);
+        const result = try mgr.exec(verify_q);
+        defer c.PQclear(result);
+        try std.testing.expectEqualStrings("1", std.mem.span(c.PQgetvalue(result, 0, 0)));
+        try std.testing.expectEqualStrings("1", std.mem.span(c.PQgetvalue(result, 0, 1)));
+        try std.testing.expectEqualStrings("1", std.mem.span(c.PQgetvalue(result, 0, 2)));
+    }
 
     {
         const drop_q = try std.fmt.allocPrint(allocator, "DROP SCHEMA IF EXISTS {s} CASCADE", .{schema_q});
