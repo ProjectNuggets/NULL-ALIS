@@ -1798,14 +1798,17 @@ paths:
   /api/v1/users/{user_id}/channels/{channel}/test:
     post:
       tags: [user]
-      summary: Test a channel's stored credentials (structural check)
+      summary: Test a channel's stored credentials and provider liveness
       description: |
-        V1 test is a deterministic structural check — it verifies every
-        required secret is present in the vault and well-formed, records
-        the result as `last_test`, and returns the refreshed status. It
-        does NOT make a live outbound call to the provider (documented
-        follow-up) so it never reports a false positive requiring the
-        network. Telegram is read-only here (409).
+        Every test first verifies that required secrets are present in the
+        vault and well-formed. Telegram then performs one bounded, read-only
+        getMe request; Slack performs one bounded, read-only auth.test request.
+        Provider probes have a 5-second total timeout, no retry, and accept at
+        most 64 KiB of response data. Discord, email, and WhatsApp retain the
+        structural-only result until a safe provider probe is specified.
+        Results are recorded as last_test and the refreshed status is returned.
+        Telegram uses this generic test route while its connect/disconnect
+        mutations remain on the dedicated Telegram routes.
       security:
         - InternalToken: []
       parameters:
@@ -1815,8 +1818,10 @@ paths:
         "200":
           description: |
             Refreshed status with last_test populated. last_test.detail is
-            machine-readable: credentials_present | missing_required_secret:<key>
-            | malformed_secret:<key>.
+            machine-readable: provider_reachable | provider_auth_rejected |
+            provider_timeout | provider_unreachable | invalid_provider_response |
+            credentials_present | missing_required_secret:<key> |
+            malformed_secret:<key>.
           content:
             application/json:
               schema:
@@ -1824,7 +1829,7 @@ paths:
         "404":
           description: channel_not_supported
         "409":
-          description: telegram_uses_dedicated_routes
+          description: channel_disabled_in_build
         "501":
           description: State backend (Postgres) not wired
 
@@ -4145,7 +4150,7 @@ components:
             checked_at_s: { type: integer, format: int64 }
             detail:
               type: string
-              description: credentials_present | missing_required_secret:<key> | malformed_secret:<key>
+              description: provider_reachable | provider_auth_rejected | provider_timeout | provider_unreachable | invalid_provider_response | credentials_present | missing_required_secret:<key> | malformed_secret:<key>
         endpoints:
           type: object
           required: [self, connect, test, disconnect]

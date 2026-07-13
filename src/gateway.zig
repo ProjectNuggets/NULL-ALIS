@@ -107,6 +107,7 @@ const channel_dispatch = @import("channels/dispatch.zig");
 // route parsing, validation, status, JSON shape). Pure logic; the
 // vault/state IO stays here in the gateway.
 const channel_control = @import("channel_control.zig");
+const channel_liveness = @import("channel_liveness.zig");
 // S7 follow-up — user-facing memory governance contract (forget, PII
 // purge dry-run/apply, export, provenance counts). Pure logic; the
 // zaki_state memory IO stays here in the gateway.
@@ -19619,7 +19620,7 @@ fn handleChannelControl(
         .mutate => |m| {
             // Telegram keeps its dedicated connect/disconnect routes so the
             // shipped flow is never destabilised.
-            if (!m.channel.userManaged()) {
+            if (cc.usesDedicatedMutationRoute(m.channel, m.action)) {
                 return .{
                     .status = "409 Conflict",
                     .body = "{\"error\":\"telegram_uses_dedicated_routes\",\"hint\":\"use channels/telegram/connect and channels/telegram/disconnect\"}",
@@ -19773,15 +19774,18 @@ fn handleChannelTest(
     if (!std.mem.eql(u8, method, "POST")) {
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method_not_allowed\"}" };
     }
+    if (!channelBuildEnabled(ch)) {
+        return .{ .status = "409 Conflict", .body = "{\"error\":\"channel_disabled_in_build\"}" };
+    }
     const desc = cc.descriptor(ch);
 
-    // V1 test = structural credential check (presence + format) against
-    // the vault. It deliberately does NOT make a live outbound call to the
-    // provider — that stays a documented follow-up so the contract is
-    // deterministic and never reports a false "connected" requiring the
-    // network. Detail is machine-readable for the UI.
+    // Reject missing/malformed credentials before any outbound request. For
+    // Telegram and Slack, a structurally valid bot token is then checked with
+    // exactly one bounded, read-only provider request. Other surfaced channels
+    // retain structural-only semantics until their safe probes are specified.
     var ok = true;
     var detail: []const u8 = "credentials_present";
+    var provider_token: ?[]const u8 = null;
     for (desc.secrets) |s| {
         if (!s.required) continue;
         const stored = mgr.getSecret(req_allocator, user_id_num, s.key) catch {
@@ -19796,6 +19800,25 @@ fn handleChannelTest(
             ok = false;
             detail = std.fmt.allocPrint(req_allocator, "malformed_secret:{s}", .{s.key}) catch "malformed_secret";
             break;
+        }
+        if ((ch == .telegram and std.mem.eql(u8, s.key, "telegram_bot_token")) or
+            (ch == .slack and std.mem.eql(u8, s.key, "slack_bot_token")))
+        {
+            provider_token = stored.?;
+        }
+    }
+    if (ok) {
+        const probe_channel: ?channel_liveness.Channel = switch (ch) {
+            .telegram => .telegram,
+            .slack => .slack,
+            .discord, .email, .whatsapp => null,
+        };
+        if (probe_channel) |live_channel| {
+            const token = provider_token orelse return channel_internal_error;
+            const probe_result = channel_liveness.probe(req_allocator, live_channel, token) catch
+                return channel_internal_error;
+            ok = probe_result.ok;
+            detail = probe_result.detail;
         }
     }
     const now = std.time.timestamp();
