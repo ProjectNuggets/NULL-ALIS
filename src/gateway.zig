@@ -19562,6 +19562,24 @@ fn writeChannelControlObject(
 
 const channel_internal_error: RouteResponse = .{ .status = "500 Internal Server Error", .body = "{\"error\":\"channel_control_failed\"}" };
 
+/// Stable `429` for a `/test` call that hit the per-(user, channel)
+/// cooldown. Carries a `Retry-After` header (via `retry_after_secs`) and a
+/// machine-readable body so the UI can tell the user when to try again. No
+/// outbound provider request was made and the stored last_test is unchanged.
+fn channelTestRateLimited(req_allocator: std.mem.Allocator, retry_after_s: i64) RouteResponse {
+    const clamped: u16 = @intCast(std.math.clamp(retry_after_s, 1, cooldown_window_s_for_response));
+    const body = std.fmt.allocPrint(
+        req_allocator,
+        "{{\"error\":\"rate_limited\",\"retry_after_s\":{d},\"detail\":\"try again in {d}s\"}}",
+        .{ clamped, clamped },
+    ) catch return channel_internal_error;
+    return .{ .status = "429 Too Many Requests", .body = body, .retry_after_secs = clamped };
+}
+
+/// Upper bound for the `Retry-After` we advertise — mirrors the probe
+/// cooldown window in `channel_liveness`.
+const cooldown_window_s_for_response: i64 = 30;
+
 /// Entry point for the channel control plane. Caller guarantees the
 /// subpath is under `channels` (and that the dedicated telegram/bindings
 /// routes already had their chance upstream).
@@ -19633,6 +19651,25 @@ fn handleChannelControl(
             };
         },
     }
+}
+
+/// Compensating audit entry for a secret whose `put` already recorded an
+/// audit `ok` but was then rolled back (because a later secret write or the
+/// channel-state write failed). Without this, the audit trail would retain a
+/// stale `ok` for a credential that is no longer in effect. Records the
+/// actual reversal — `put` when a prior value was restored, `delete` when the
+/// just-added secret was removed — with a `channel_connect_rollback` reason.
+fn recordChannelSecretRollback(
+    mgr: *zaki_state_mod.Manager,
+    user_id_num: i64,
+    key: []const u8,
+    actor_id: ?[]const u8,
+    restored_previous: bool,
+    reverted_ok: bool,
+) void {
+    const action = if (restored_previous) "put" else "delete";
+    const outcome = if (reverted_ok) "ok" else "write_failed";
+    mgr.recordSecretMutation(user_id_num, key, action, actor_id, outcome, "channel_connect_rollback") catch {};
 }
 
 fn handleChannelConnect(
@@ -19730,10 +19767,21 @@ fn handleChannelConnect(
                 // credentials that predated the failed update.
                 for (desc.secrets[0 .. i + 1], 0..) |prev, prev_i| {
                     if (secret_vals[prev_i] == null) continue;
+                    var reverted_ok = true;
                     if (previous_secret_vals[prev_i]) |previous| {
-                        mgr.putSecret(user_id_num, prev.key, previous) catch {};
+                        mgr.putSecret(user_id_num, prev.key, previous) catch {
+                            reverted_ok = false;
+                        };
                     } else {
-                        _ = mgr.deleteSecret(user_id_num, prev.key) catch {};
+                        _ = mgr.deleteSecret(user_id_num, prev.key) catch {
+                            reverted_ok = false;
+                        };
+                    }
+                    // Index `i` failed its put (already audited "write_failed"),
+                    // so it never recorded a stale "ok"; only the earlier,
+                    // already-committed secrets need a compensating entry.
+                    if (prev_i != i) {
+                        recordChannelSecretRollback(mgr, user_id_num, prev.key, actor_id, previous_secret_vals[prev_i] != null, reverted_ok);
                     }
                 }
                 return jsonFieldError(req_allocator, "secret_store_failed", s.key);
@@ -19747,13 +19795,23 @@ fn handleChannelConnect(
     const sw = state_buf.writer(req_allocator);
     writeChannelStateStorageJson(sw, true, std.time.timestamp(), config_pairs[0..config_n], null) catch return channel_internal_error;
     mgr.putChannelStateJson(user_id_num, ch.key(), state_buf.items) catch {
+        // The secret puts above each recorded an audit "ok", but the
+        // channel-state write just failed, so we roll them back. Emit a
+        // compensating audit entry per reverted secret so the trail never
+        // retains a stale "ok" for a credential that is no longer in effect.
         for (desc.secrets, 0..) |s, i| {
             if (secret_vals[i] == null) continue;
+            var reverted_ok = true;
             if (previous_secret_vals[i]) |previous| {
-                mgr.putSecret(user_id_num, s.key, previous) catch {};
+                mgr.putSecret(user_id_num, s.key, previous) catch {
+                    reverted_ok = false;
+                };
             } else {
-                _ = mgr.deleteSecret(user_id_num, s.key) catch {};
+                _ = mgr.deleteSecret(user_id_num, s.key) catch {
+                    reverted_ok = false;
+                };
             }
+            recordChannelSecretRollback(mgr, user_id_num, s.key, actor_id, previous_secret_vals[i] != null, reverted_ok);
         }
         return channel_internal_error;
     };
@@ -19807,6 +19865,10 @@ fn handleChannelTest(
             provider_token = stored.?;
         }
     }
+    // Timestamp shared by the cooldown-window start and the recorded
+    // last_test. Computed before the (up to ~5s) outbound probe so a burst of
+    // calls is measured from when each attempt began.
+    const now = std.time.timestamp();
     if (ok) {
         const probe_channel: ?channel_liveness.Channel = switch (ch) {
             .telegram => .telegram,
@@ -19815,13 +19877,20 @@ fn handleChannelTest(
         };
         if (probe_channel) |live_channel| {
             const token = provider_token orelse return channel_internal_error;
-            const probe_result = channel_liveness.probe(req_allocator, live_channel, token) catch
+            // Per-(user, channel) cooldown: a call inside the window is
+            // answered as rate_limited WITHOUT making the outbound provider
+            // request, and leaves the previously recorded last_test untouched.
+            const outcome = channel_liveness.probeWithCooldown(req_allocator, user_id_num, live_channel, token, now) catch
                 return channel_internal_error;
-            ok = probe_result.ok;
-            detail = probe_result.detail;
+            switch (outcome) {
+                .rate_limited => |retry_after_s| return channelTestRateLimited(req_allocator, retry_after_s),
+                .probed => |probe_result| {
+                    ok = probe_result.ok;
+                    detail = probe_result.detail;
+                },
+            }
         }
     }
-    const now = std.time.timestamp();
 
     // Re-emit the channel-state object preserving config, refreshing
     // last_test. Config values are strings, so declared-field re-emit is

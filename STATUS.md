@@ -21,6 +21,17 @@ no retries, fixed HTTPS provider endpoints, and stable secret-free result codes.
 Telegram keeps its dedicated connect/disconnect routes but now shares the generic
 test route. Discord, email, and WhatsApp remain explicitly structural-only.
 
+Review hardening (FIX_FIRST): (1) outbound probes are now rate-limited to one
+call per 30s per (user, channel) via a fixed-capacity, self-evicting cooldown
+table — a call inside the window returns `429 rate_limited` with `Retry-After`
+and makes no outbound request; (2) the probe runs over the curl transport
+(`.curl_only`) so `--connect-timeout` bounds the TCP-connect + DNS phase, not
+just recv/send — a blackholed provider host now fails fast within the ~5s total
+deadline instead of hanging on the native transport's unbounded connect;
+(3) `channels/{ch}/connect` writes a compensating `channel_connect_rollback`
+audit entry when a secret is reverted after its `put` recorded an audit `ok`,
+so the trail never retains a stale `ok`.
+
 ---
 
 ## 2026-05-29 — Sprint S6: V1 production verification matrix (ready for review)

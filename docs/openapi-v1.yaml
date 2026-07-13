@@ -1803,12 +1803,18 @@ paths:
         Every test first verifies that required secrets are present in the
         vault and well-formed. Telegram then performs one bounded, read-only
         getMe request; Slack performs one bounded, read-only auth.test request.
-        Provider probes have a 5-second total timeout, no retry, and accept at
-        most 64 KiB of response data. Discord, email, and WhatsApp retain the
+        Provider probes have a 5-second total timeout (bounding TCP connect and
+        DNS resolution, not only recv/send), no retry, and accept at most
+        64 KiB of response data. Discord, email, and WhatsApp retain the
         structural-only result until a safe provider probe is specified.
         Results are recorded as last_test and the refreshed status is returned.
         Telegram uses this generic test route while its connect/disconnect
         mutations remain on the dedicated Telegram routes.
+
+        Outbound probes are rate-limited to one call per 30 seconds per
+        (user, channel). A call inside that window returns 429 rate_limited
+        WITHOUT contacting the provider, carries a Retry-After header, and
+        leaves the previously recorded last_test unchanged.
       security:
         - InternalToken: []
       parameters:
@@ -1830,6 +1836,15 @@ paths:
           description: channel_not_supported
         "409":
           description: channel_disabled_in_build
+        "429":
+          description: |
+            rate_limited — inside the per-(user, channel) 30s probe cooldown.
+            No outbound provider request was made and last_test is unchanged.
+            Body: {"error":"rate_limited","retry_after_s":<n>,"detail":"try again in <n>s"}.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Seconds until the next probe is allowed.
         "501":
           description: State backend (Postgres) not wired
 
