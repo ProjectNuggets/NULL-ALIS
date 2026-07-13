@@ -358,6 +358,7 @@ pub fn errorCode(err: anyerror) []const u8 {
         error.InvalidVoiceReplies => "invalid_voice_replies",
         error.InvalidSessionTimeoutMinutes => "invalid_session_timeout_minutes",
         error.InvalidAutonomy => "invalid_autonomy",
+        error.InvalidSelectedModel => "invalid_selected_model",
         else => "invalid_payload",
     };
 }

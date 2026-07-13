@@ -28059,6 +28059,59 @@ test "handleApiRoute PATCH settings rejects invalid assistant mode" {
     try std.testing.expectEqualStrings("{\"error\":\"invalid_assistant_mode\"}", response.body);
 }
 
+test "handleApiRoute PATCH settings rejects non-allowlisted selected_model without persistence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tenant_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tenant_root);
+
+    const user_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/1", .{tenant_root});
+    defer std.testing.allocator.free(user_dir);
+    try std.fs.makeDirAbsolute(user_dir);
+    const config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{user_dir});
+    defer std.testing.allocator.free(config_path);
+    const original_config =
+        \\{"product_settings":{"assistant_mode":"balanced","group_activation":"mention","proactive_updates":true,"voice_replies":false,"session_timeout_minutes":30,"selected_model":"kimi-k2.6"}}
+    ;
+    try writeFile(config_path, original_config);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+
+    var req_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+
+    const body = "{\"selected_model\":\"openrouter/proxy.evil/model-x\"}";
+    const raw_request = try std.fmt.allocPrint(
+        req_allocator,
+        "PATCH /api/v1/users/1/settings HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+
+    const response = handleApiRoute(
+        std.testing.allocator,
+        req_allocator,
+        raw_request,
+        "PATCH",
+        "/api/v1/users/1/settings",
+        &state,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqualStrings("400 Bad Request", response.status);
+    try std.testing.expectEqualStrings("{\"error\":\"invalid_selected_model\"}", response.body);
+
+    const persisted_config = try readFileOrDefault(std.testing.allocator, config_path, "");
+    defer std.testing.allocator.free(persisted_config);
+    try std.testing.expectEqualStrings(original_config, persisted_config);
+}
+
 test "handleApiRoute PATCH settings clamps huge timeout without crashing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
