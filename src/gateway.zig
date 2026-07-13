@@ -19660,25 +19660,55 @@ fn handleChannelConnect(
     const body = extractBody(raw_request) orelse "{}";
 
     // ── Validate everything BEFORE writing any secret (no half-connect).
+    // Connect also serves as the partial-update route: an omitted required
+    // secret is valid when the user's vault already contains it.
     var secret_vals: [8]?[]const u8 = .{null} ** 8;
+    var previous_secret_vals: [8]?[]const u8 = .{null} ** 8;
     for (desc.secrets, 0..) |s, i| {
         const val = jsonStringField(body, s.key);
         if (val == null) {
             if (s.required) {
-                return jsonFieldError(req_allocator, "missing_required_secret", s.key);
+                const stored_meta = mgr.getSecretMetadata(req_allocator, user_id_num, s.key) catch {
+                    return channel_internal_error;
+                };
+                if (stored_meta == null) {
+                    return jsonFieldError(req_allocator, "missing_required_secret", s.key);
+                }
             }
             continue;
         }
         if (!cc.validateSecretValue(s.key, val.?)) {
             return jsonFieldError(req_allocator, "invalid_secret", s.key);
         }
+        previous_secret_vals[i] = mgr.getSecret(req_allocator, user_id_num, s.key) catch {
+            return channel_internal_error;
+        };
         secret_vals[i] = val.?;
     }
+
+    const existing_state = mgr.getChannelStateJson(req_allocator, user_id_num, ch.key()) catch {
+        return channel_internal_error;
+    };
+    var existing_parsed: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(std.json.Value, req_allocator, existing_state, .{}) catch null;
+    defer if (existing_parsed) |*p| p.deinit();
 
     var config_pairs: [12]ChannelKV = undefined;
     var config_n: usize = 0;
     for (desc.config_fields) |f| {
-        const val = jsonStringField(body, f.key);
+        var val = jsonStringField(body, f.key);
+        if (val == null) {
+            if (existing_parsed) |p| {
+                if (p.value == .object) {
+                    if (p.value.object.get("config")) |config_value| {
+                        if (config_value == .object) {
+                            if (config_value.object.get(f.key)) |stored_value| {
+                                if (stored_value == .string) val = stored_value.string;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if (val == null) {
             if (f.required) {
                 return jsonFieldError(req_allocator, "missing_required_config", f.key);
@@ -19700,10 +19730,16 @@ fn handleChannelConnect(
         if (secret_vals[i]) |val| {
             mgr.putSecret(user_id_num, s.key, val) catch {
                 mgr.recordSecretMutation(user_id_num, s.key, "put", actor_id, "write_failed", "channel_connect") catch {};
-                // Roll back any secrets already written for this channel so
-                // a mid-loop failure doesn't leave a half-connected vault
-                // (best-effort; deleteSecret is idempotent on absent keys).
-                for (desc.secrets) |prev| _ = mgr.deleteSecret(user_id_num, prev.key) catch {};
+                // Restore only fields this request attempted, preserving any
+                // credentials that predated the failed update.
+                for (desc.secrets[0 .. i + 1], 0..) |prev, prev_i| {
+                    if (secret_vals[prev_i] == null) continue;
+                    if (previous_secret_vals[prev_i]) |previous| {
+                        mgr.putSecret(user_id_num, prev.key, previous) catch {};
+                    } else {
+                        _ = mgr.deleteSecret(user_id_num, prev.key) catch {};
+                    }
+                }
                 return jsonFieldError(req_allocator, "secret_store_failed", s.key);
             };
             mgr.recordSecretMutation(user_id_num, s.key, "put", actor_id, "ok", "channel_connect") catch {};
@@ -19714,7 +19750,17 @@ fn handleChannelConnect(
     var state_buf: std.ArrayListUnmanaged(u8) = .empty;
     const sw = state_buf.writer(req_allocator);
     writeChannelStateStorageJson(sw, true, std.time.timestamp(), config_pairs[0..config_n], null) catch return channel_internal_error;
-    mgr.putChannelStateJson(user_id_num, ch.key(), state_buf.items) catch return channel_internal_error;
+    mgr.putChannelStateJson(user_id_num, ch.key(), state_buf.items) catch {
+        for (desc.secrets, 0..) |s, i| {
+            if (secret_vals[i] == null) continue;
+            if (previous_secret_vals[i]) |previous| {
+                mgr.putSecret(user_id_num, s.key, previous) catch {};
+            } else {
+                _ = mgr.deleteSecret(user_id_num, s.key) catch {};
+            }
+        }
+        return channel_internal_error;
+    };
 
     return singleChannelResponse(req_allocator, mgr, scoped_user_id, user_id_num, ch, config_opt);
 }
@@ -27246,6 +27292,72 @@ test "vault route [D11] — GET /secrets/:key/audit scopes mutations to the requ
     try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "v_KEY_ALPHA") == null);
     try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "v_KEY_BETA") == null);
     try std.testing.expect(std.mem.indexOf(u8, audit_resp.body, "v_KEY_GAMMA") == null);
+}
+
+test "channel control [D11] — Discord partial updates retain stored credentials and config" {
+    if (!build_options.enable_postgres or !build_options.enable_channel_discord) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "nullalis_channel_connect_test_{d}", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+    };
+    var mgr = try zaki_state_mod.Manager.init(allocator, cfg);
+    defer mgr.deinit();
+    defer mgr.dropSchemaForTests() catch {};
+    try mgr.ensureUserProvisioned(42);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tenant_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tenant_root);
+
+    var state = GatewayState.init(allocator);
+    defer state.deinit();
+    defer state.zaki_state = null;
+    state.tenant_data_root = tenant_root;
+    const internal_tokens = [_][]const u8{"test-internal-token"};
+    state.internal_service_tokens = &internal_tokens;
+    state.zaki_state = &mgr;
+
+    var req_arena = std.heap.ArenaAllocator.init(allocator);
+    defer req_arena.deinit();
+    const req_allocator = req_arena.allocator();
+    const route = "/api/v1/users/42/channels/discord/connect";
+
+    // A first-time connection still requires the bot token even when an
+    // optional Guild ID is present.
+    const missing_body = "{\"guild_id\":\"111111111111111111\"}";
+    const missing_raw = try std.fmt.allocPrint(req_allocator, "POST {s} HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ route, missing_body.len, missing_body });
+    const missing_resp = handleApiRoute(allocator, req_allocator, missing_raw, "POST", route, &state, null, null);
+    try std.testing.expectEqualStrings("400 Bad Request", missing_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, missing_resp.body, "missing_required_secret") != null);
+
+    const initial_body = "{\"discord_bot_token\":\"initial-discord-token-123456\",\"guild_id\":\"111111111111111111\"}";
+    const initial_raw = try std.fmt.allocPrint(req_allocator, "POST {s} HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ route, initial_body.len, initial_body });
+    const initial_resp = handleApiRoute(allocator, req_allocator, initial_raw, "POST", route, &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", initial_resp.status);
+
+    // Rotating only the token must retain the optional Guild ID.
+    const token_body = "{\"discord_bot_token\":\"rotated-discord-token-123456\"}";
+    const token_raw = try std.fmt.allocPrint(req_allocator, "POST {s} HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ route, token_body.len, token_body });
+    const token_resp = handleApiRoute(allocator, req_allocator, token_raw, "POST", route, &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", token_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, token_resp.body, "\"guild_id\":\"111111111111111111\"") != null);
+
+    // Updating only the optional Guild ID must retain the vault token.
+    const guild_body = "{\"guild_id\":\"222222222222222222\"}";
+    const guild_raw = try std.fmt.allocPrint(req_allocator, "POST {s} HTTP/1.1\r\nHost: localhost\r\nX-Internal-Token: test-internal-token\r\nX-Zaki-User-Id: 42\r\nContent-Length: {d}\r\n\r\n{s}", .{ route, guild_body.len, guild_body });
+    const guild_resp = handleApiRoute(allocator, req_allocator, guild_raw, "POST", route, &state, null, null);
+    try std.testing.expectEqualStrings("200 OK", guild_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, guild_resp.body, "\"guild_id\":\"222222222222222222\"") != null);
+
+    const stored_token = (try mgr.getSecret(req_allocator, 42, "discord_bot_token")).?;
+    try std.testing.expectEqualStrings("rotated-discord-token-123456", stored_token);
 }
 
 // ── Sprint 7B — DELETE /api/v1/users/:id/data GDPR purge route ─────

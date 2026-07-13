@@ -138,7 +138,7 @@ const discord_secrets = [_]SecretRef{
     .{ .key = "discord_bot_token", .label = "Bot token", .required = true },
 };
 const discord_config = [_]ConfigField{
-    .{ .key = "application_id", .label = "Application ID", .required = false, .is_digits = true },
+    .{ .key = "guild_id", .label = "Guild ID", .required = false, .is_digits = true },
 };
 
 const email_secrets = [_]SecretRef{
@@ -568,6 +568,15 @@ test "requiredSecretCount matches descriptors" {
     try std.testing.expectEqual(@as(usize, 1), descriptor(.discord).requiredSecretCount());
     try std.testing.expectEqual(@as(usize, 1), descriptor(.email).requiredSecretCount());
     try std.testing.expectEqual(@as(usize, 2), descriptor(.whatsapp).requiredSecretCount());
+}
+
+test "discord descriptor exposes the runtime guild id field" {
+    const fields = descriptor(.discord).config_fields;
+    try std.testing.expectEqual(@as(usize, 1), fields.len);
+    try std.testing.expectEqualStrings("guild_id", fields[0].key);
+    try std.testing.expectEqualStrings("Guild ID", fields[0].label);
+    try std.testing.expect(!fields[0].required);
+    try std.testing.expect(fields[0].is_digits);
 }
 
 test "resolveStatus transitions" {

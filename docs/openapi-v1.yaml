@@ -1747,9 +1747,11 @@ paths:
         Validates the provider-specific required secrets and config fields,
         writes secrets to the encrypted vault, and persists non-secret
         connection metadata. Returns the refreshed channel status (secret
-        values are NEVER echoed). Required fields per channel:
+        values are NEVER echoed). On updates, omitted fields retain their
+        stored values; required fields must be supplied only when they are not
+        already present. Required fields per channel:
           * slack:    slack_bot_token (xoxb-…), slack_signing_secret
-          * discord:  discord_bot_token
+          * discord:  discord_bot_token (optional: guild_id)
           * email:    email_imap_password, imap_host, smtp_host, username
           * whatsapp: whatsapp_access_token, whatsapp_verify_token,
                       phone_number_id

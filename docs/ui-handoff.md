@@ -414,7 +414,7 @@ enterprise backlog — not user self-service in V1.
 | Channel | Required secrets (vault) | Required config (non-secret) | Optional |
 |---|---|---|---|
 | slack | `slack_bot_token` (xoxb-…), `slack_signing_secret` | — | `slack_app_token`, `team_id` |
-| discord | `discord_bot_token` | — | `application_id` |
+| discord | `discord_bot_token` | — | `guild_id` |
 | email | `email_imap_password` | `imap_host`, `smtp_host`, `username` | `email_smtp_password`, `imap_port`, `smtp_port`, `from_address` |
 | whatsapp | `whatsapp_access_token`, `whatsapp_verify_token` | `phone_number_id` | `whatsapp_app_secret`, `business_account_id` |
 
