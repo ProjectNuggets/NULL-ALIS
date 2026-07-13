@@ -2732,6 +2732,7 @@ fn pruneTenantRuntimeCache(state: *GatewayState, now_s: i64) void {
 fn runTenantRuntimeMaintenance(state: *GatewayState, now_s: i64) void {
     state.tenant_runtime_mutex.lock();
     defer state.tenant_runtime_mutex.unlock();
+    var retention_pruned = false;
     var it = state.tenant_runtimes.iterator();
     while (it.next()) |entry| {
         // Wave-E — shutdown-responsive sweep. Check shutdown BETWEEN runtimes
@@ -2767,6 +2768,16 @@ fn runTenantRuntimeMaintenance(state: *GatewayState, now_s: i64) void {
             if (retention_days > 0) {
                 _ = state_mgr.reapStaleWorkingMemory(retention_days) catch |err|
                     log.warn("gateway.wm_reap_failed err={s}", .{@errorName(err)});
+            }
+            // These are schema-wide tables. Run the batch-capped prune once
+            // per maintenance sweep, never once per resident tenant.
+            if (!retention_pruned) {
+                retention_pruned = true;
+                _ = state_mgr.pruneRetention(.{
+                    .tool_traces_retention_days = runtime.config.memory.lifecycle.tool_traces_retention_days,
+                    .subagent_results_retention_days = runtime.config.memory.lifecycle.subagent_results_retention_days,
+                    .memory_events_retention_days = runtime.config.memory.lifecycle.memory_events_retention_days,
+                }) catch |err| log.warn("gateway.retention_prune_failed err={s}", .{@errorName(err)});
             }
         }
     }

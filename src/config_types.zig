@@ -1304,6 +1304,12 @@ pub const MemoryLifecycleConfig = struct {
     archive_after_days: u32 = 7,
     purge_after_days: u32 = 30,
     conversation_retention_days: u32 = 0,
+    /// Postgres bookkeeping retention. Zero preserves rows forever. Non-zero
+    /// values are enforced by a batch-capped maintenance prune; no schema
+    /// migration is required to change them.
+    tool_traces_retention_days: u32 = 0,
+    subagent_results_retention_days: u32 = 0,
+    memory_events_retention_days: u32 = 0,
     snapshot_enabled: bool = false,
     snapshot_on_hygiene: bool = false,
     auto_hydrate: bool = true,

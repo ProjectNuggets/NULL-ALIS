@@ -111,3 +111,8 @@ test "memory contract: extraction denylist entries are real registered tools (no
         }
     }
 }
+
+test "memory contract: memory event retention is explicit opt-in" {
+    const lifecycle = @import("../config_types.zig").MemoryLifecycleConfig{};
+    try std.testing.expectEqual(@as(u32, 0), lifecycle.memory_events_retention_days);
+}

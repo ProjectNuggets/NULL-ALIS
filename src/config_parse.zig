@@ -1576,6 +1576,15 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (lc.get("conversation_retention_days")) |v| if (v == .integer) {
                         self.memory.lifecycle.conversation_retention_days = @intCast(v.integer);
                     };
+                    if (lc.get("tool_traces_retention_days")) |v| if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) {
+                        self.memory.lifecycle.tool_traces_retention_days = @intCast(v.integer);
+                    };
+                    if (lc.get("subagent_results_retention_days")) |v| if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) {
+                        self.memory.lifecycle.subagent_results_retention_days = @intCast(v.integer);
+                    };
+                    if (lc.get("memory_events_retention_days")) |v| if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) {
+                        self.memory.lifecycle.memory_events_retention_days = @intCast(v.integer);
+                    };
                     if (lc.get("snapshot_enabled")) |v| if (v == .bool) {
                         self.memory.lifecycle.snapshot_enabled = v.bool;
                     };

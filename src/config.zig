@@ -2591,6 +2591,27 @@ test "parseJson accepts float semantic cache similarity threshold" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.9), cfg.memory.semantic_cache.similarity_threshold, 0.0001);
 }
 
+test "memory lifecycle retention TTLs default off and parse per table" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/nullalis",
+        .config_path = "/tmp/nullalis/config.json",
+        .allocator = arena.allocator(),
+    };
+    try std.testing.expectEqual(@as(u32, 0), cfg.memory.lifecycle.tool_traces_retention_days);
+    try std.testing.expectEqual(@as(u32, 0), cfg.memory.lifecycle.subagent_results_retention_days);
+    try std.testing.expectEqual(@as(u32, 0), cfg.memory.lifecycle.memory_events_retention_days);
+
+    try cfg.parseJson(
+        \\{"memory":{"lifecycle":{"tool_traces_retention_days":14,"subagent_results_retention_days":30,"memory_events_retention_days":90}}}
+    );
+    try std.testing.expectEqual(@as(u32, 14), cfg.memory.lifecycle.tool_traces_retention_days);
+    try std.testing.expectEqual(@as(u32, 30), cfg.memory.lifecycle.subagent_results_retention_days);
+    try std.testing.expectEqual(@as(u32, 90), cfg.memory.lifecycle.memory_events_retention_days);
+}
+
 test "syncFlatFields propagates nested values" {
     var cfg = Config{
         .workspace_dir = "/tmp/yc",
