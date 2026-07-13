@@ -9016,6 +9016,11 @@ test "slash /new writes checkpoint, summary objects, and context anchor" {
         if (!std.mem.startsWith(u8, entry.key, "session_checkpoint_")) continue;
         checkpoint_found = true;
         try std.testing.expect(std.mem.indexOf(u8, entry.content, "reason=new") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "created_at_unix=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "created_at_utc=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "date_utc=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "boundary_reason=new") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "session_id=agent:zaki-bot:user:1:main") != null);
         try std.testing.expect(std.mem.indexOf(u8, entry.content, "actual user request") != null);
         try std.testing.expect(std.mem.indexOf(u8, entry.content, "[Memory context]") == null);
         try std.testing.expect(std.mem.indexOf(u8, entry.content, "Working on it.") != null);
@@ -9032,6 +9037,10 @@ test "slash /new writes checkpoint, summary objects, and context anchor" {
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "origin_channel=app") != null);
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "origin_lane=main") != null);
     try std.testing.expect(std.mem.indexOf(u8, anchor.content, "last_summary_key=timeline_summary/agent:zaki-bot:user:1:main/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "created_at_utc=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "date_utc=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "boundary_reason=new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anchor.content, "session_id=agent:zaki-bot:user:1:main") != null);
 
     const session_entries = try mem.list(allocator, .conversation, "agent:zaki-bot:user:1:main");
     defer memory_mod.freeEntries(allocator, session_entries);
@@ -9046,6 +9055,10 @@ test "slash /new writes checkpoint, summary objects, and context anchor" {
         if (!std.mem.startsWith(u8, entry.key, "timeline_summary/agent:zaki-bot:user:1:main/")) continue;
         found_timeline_summary = true;
         try std.testing.expect(std.mem.indexOf(u8, entry.content, "focus:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "created_at_utc=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "date_utc=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "boundary_reason=new") != null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "session_id=agent:zaki-bot:user:1:main") != null);
         break;
     }
     try std.testing.expect(found_timeline_summary);
@@ -9059,7 +9072,33 @@ test "slash /new writes checkpoint, summary objects, and context anchor" {
     try std.testing.expect(std.mem.indexOf(u8, latest.content, "origin_channel=app") != null);
     try std.testing.expect(std.mem.indexOf(u8, latest.content, "origin_lane=main") != null);
     try std.testing.expect(std.mem.indexOf(u8, latest.content, "source_key=timeline_summary/agent:zaki-bot:user:1:main/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "created_at_utc=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "date_utc=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "boundary_reason=new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest.content, "session_id=agent:zaki-bot:user:1:main") != null);
     try std.testing.expect(std.mem.indexOf(u8, latest.content, "focus:") != null);
+
+    var timeline_tool_impl = tools_mod.memory_timeline.MemoryTimelineTool{ .memory = mem };
+    const timeline_tool = timeline_tool_impl.tool();
+    const timeline_args = try tools_mod.parseTestArgs("{\"session_id\":\"agent:zaki-bot:user:1:main\"}");
+    defer timeline_args.deinit();
+    const timeline_result = try timeline_tool.execute(allocator, timeline_args.value.object);
+    defer if (timeline_result.output.len > 0) allocator.free(timeline_result.output);
+    try std.testing.expect(timeline_result.success);
+
+    const date_prefix = "date_utc=";
+    const date_start = (std.mem.indexOf(u8, latest.content, date_prefix) orelse return error.TestUnexpectedResult) + date_prefix.len;
+    const emitted_date = latest.content[date_start .. date_start + 10];
+    const created_at_prefix = "created_at_utc=";
+    const created_at_start = (std.mem.indexOf(u8, latest.content, created_at_prefix) orelse return error.TestUnexpectedResult) + created_at_prefix.len;
+    const created_at_end = std.mem.indexOfScalarPos(u8, latest.content, created_at_start, '\n') orelse return error.TestUnexpectedResult;
+    const emitted_created_at = latest.content[created_at_start..created_at_end];
+    const rendered_date = try std.fmt.allocPrint(allocator, "date_utc={s}", .{emitted_date});
+    defer allocator.free(rendered_date);
+    const rendered_created_at = try std.fmt.allocPrint(allocator, "created_at_utc={s}", .{emitted_created_at});
+    defer allocator.free(rendered_created_at);
+    try std.testing.expect(std.mem.indexOf(u8, timeline_result.output, rendered_date) != null);
+    try std.testing.expect(std.mem.indexOf(u8, timeline_result.output, rendered_created_at) != null);
 
     const timeline_index = (try mem.get(allocator, "timeline_index/current")) orelse return error.TestUnexpectedResult;
     defer timeline_index.deinit(allocator);
