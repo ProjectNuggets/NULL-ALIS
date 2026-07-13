@@ -1749,7 +1749,7 @@ paths:
         connection metadata. Returns the refreshed channel status (secret
         values are NEVER echoed). Required fields per channel:
           * slack:    slack_bot_token (xoxb-…), slack_signing_secret
-          * discord:  discord_bot_token
+          * discord:  discord_bot_token (optional: guild_id)
           * email:    email_imap_password, imap_host, smtp_host, username
           * whatsapp: whatsapp_access_token, whatsapp_verify_token,
                       phone_number_id
