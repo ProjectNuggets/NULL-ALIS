@@ -75,8 +75,9 @@ The bucket is decided by these axes — never by content matching:
    Wish→Hub matchmaking note (Package 2b): `/learn list` can live-query the
    external Decision Hub for skills that answer a wish, which puts wish
    CONTENT (names, medical context, internal projects) on the request URL —
-   a genuine tenant egress. This path is OPERATOR-GATED and OFF by default
-   (`wish_matchmaking_enabled=false`): with the gate off, `/learn list` makes
+   a genuine tenant egress. This path is PER-TENANT OPT-IN and OFF by default
+   (`product_settings.wish_matchmaking_enabled=false`, mapped to the runtime
+   `agent.wish_matchmaking_enabled` gate): with the gate off, `/learn list` makes
    NO Hub call and the Wishes section renders byte-identical to before, so no
    wish text leaves the tenant without explicit operator opt-in. When enabled,
    only a BOUNDED, keyword-reduced query (≤64 bytes, stopwords/punctuation

@@ -607,7 +607,7 @@ pub const AgentConfig = struct {
     /// section renders BYTE-IDENTICAL to the pre-matchmaking version. This is
     /// the primary privacy control — a wish's CONTENT (which can carry names,
     /// medical context, internal project detail) never leaves the tenant
-    /// without explicit operator opt-in.
+    /// without an explicit per-tenant opt-in.
     ///
     /// When TRUE, `/learn list` live-queries the Hub for the first few wishes
     /// under a single bounded deadline, fail-soft, using a BOUNDED,
@@ -616,6 +616,9 @@ pub const AgentConfig = struct {
     /// bounded, that query rides the request URL to hub.decision.ai — the
     /// documented tradeoff of opting in.
     ///
+    /// The allowlisted `product_settings.wish_matchmaking_enabled` tenant
+    /// preference maps to this runtime flag; deployment-wide config may still
+    /// set the base default for dedicated single-tenant installations.
     /// Threaded to per-session Agent via the same 6-hop plumbing as
     /// `trace_mining_enabled` (config_types → config_parse → SessionManager
     /// buildSessionAgent → gateway assignment → Agent field → commands.zig).

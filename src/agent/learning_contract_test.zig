@@ -128,3 +128,8 @@ test "learning contract bucket 5: wish/ keys pass inlineKeyGuard (agent-authored
     try std.testing.expectEqual(@as(?[]const u8, null), memory_store_tool.inlineKeyGuard("wish/calendar-tz-fix"));
     try std.testing.expectEqual(@as(?[]const u8, null), memory_store_tool.inlineKeyGuard("wish/send-sms"));
 }
+
+test "learning contract privacy: wish matchmaking defaults off" {
+    const AgentConfig = @import("../config_types.zig").AgentConfig;
+    try std.testing.expect(!(@as(AgentConfig, .{})).wish_matchmaking_enabled);
+}
