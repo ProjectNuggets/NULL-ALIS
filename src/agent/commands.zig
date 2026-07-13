@@ -1277,6 +1277,24 @@ const SummaryQuality = enum {
     fallback,
 };
 
+fn date_utc_from_iso(iso: []const u8) []const u8 {
+    if (iso.len >= 10) return iso[0..10];
+    return "0000-00-00";
+}
+
+fn write_utc_memory_metadata(
+    writer: anytype,
+    session_id: []const u8,
+    boundary_reason: ?[]const u8,
+    now_s: i64,
+    now_iso: []const u8,
+) !void {
+    try writer.print("created_at_unix={d}\ncreated_at_utc={s}\ndate_utc={s}\nsession_id={s}\n", .{
+        now_s, now_iso, date_utc_from_iso(now_iso), session_id,
+    });
+    if (boundary_reason) |reason| try writer.print("boundary_reason={s}\n", .{reason});
+}
+
 fn resolveSummaryOrigin(self: anytype, session_id: []const u8, key_hint: []const u8) SummaryOrigin {
     const derived = memory_mod.deriveMemoryProvenance(session_id, key_hint);
     const turn_ctx = message_tool.MessageTool.getTurnContext();
@@ -1291,6 +1309,10 @@ fn resolveSummaryOrigin(self: anytype, session_id: []const u8, key_hint: []const
 fn appendOriginMetadata(
     allocator: std.mem.Allocator,
     origin: SummaryOrigin,
+    session_id: []const u8,
+    reason: []const u8,
+    now_s: i64,
+    now_iso: []const u8,
     body: []const u8,
 ) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -1303,6 +1325,7 @@ fn appendOriginMetadata(
     if (origin.account_id) |account_id| {
         try w.print("origin_account_id={s}\n", .{account_id});
     }
+    try write_utc_memory_metadata(w, session_id, reason, now_s, now_iso);
     try w.writeByte('\n');
     try w.writeAll(body);
     return out.toOwnedSlice(allocator);
@@ -1314,6 +1337,8 @@ fn buildSummaryLatestContent(
     origin: SummaryOrigin,
     source_key: []const u8,
     at: []const u8,
+    now_s: i64,
+    reason: []const u8,
     quality: SummaryQuality,
     summary_body: []const u8,
 ) ![]u8 {
@@ -1330,9 +1355,9 @@ fn buildSummaryLatestContent(
     if (origin.account_id) |account_id| {
         try w.print("origin_account_id={s}\n", .{account_id});
     }
-    try w.print("source_key={s}\nat={s}\nquality_tier={s}\n{s}", .{
-        source_key,
-        at,
+    try w.print("source_key={s}\nat={s}\n", .{ source_key, at });
+    try write_utc_memory_metadata(w, session_id, reason, now_s, at);
+    try w.print("quality_tier={s}\n{s}", .{
         switch (quality) {
             .canonical => "canonical",
             .fallback => "fallback",
@@ -1405,6 +1430,7 @@ fn buildContextAnchorContent(
     checkpoint_key: []const u8,
     summary_key: ?[]const u8,
     at: []const u8,
+    now_s: i64,
 ) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -1426,7 +1452,8 @@ fn buildContextAnchorContent(
     if (summary_key) |value| {
         try w.print("last_summary_key={s}\n", .{value});
     }
-    try w.print("last_at={s}", .{at});
+    try w.print("last_at={s}\n", .{at});
+    try write_utc_memory_metadata(w, session_id, reason, now_s, at);
     return out.toOwnedSlice(allocator);
 }
 
@@ -1625,7 +1652,15 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
     };
 
     const summary_origin = resolveSummaryOrigin(self, session_id, session_id);
-    const summary_content = appendOriginMetadata(self.allocator, summary_origin, content) catch return false;
+    const summary_content = appendOriginMetadata(
+        self.allocator,
+        summary_origin,
+        session_id,
+        reason,
+        now_s,
+        now_iso,
+        content,
+    ) catch return false;
     defer self.allocator.free(summary_content);
 
     // C: downgrade summaries that encode external-entity claims without tool
@@ -1667,6 +1702,8 @@ fn persistSessionSemanticSummary(self: anytype, checkpoint_content: []const u8, 
         summary_origin,
         timeline_key,
         now_iso,
+        now_s,
+        reason,
         summary_quality,
         content,
     ) catch return true;
@@ -2203,7 +2240,7 @@ fn persistSessionCheckpointDetailedImpl(self: anytype, reason: []const u8, emit_
 
     const now_s = std.time.timestamp();
     var ts_buf: [32]u8 = undefined;
-    const now_iso = util.timestamp(&ts_buf);
+    const now_iso = util.timestamp_from_unix(now_s, &ts_buf);
 
     var key_buf: [96]u8 = undefined;
     const checkpoint_key = std.fmt.bufPrint(&key_buf, "session_checkpoint_{d}", .{now_s}) catch return false;
@@ -2212,8 +2249,8 @@ fn persistSessionCheckpointDetailedImpl(self: anytype, reason: []const u8, emit_
     defer content.deinit(self.allocator);
     const w = content.writer(self.allocator);
     w.print(
-        "type=session_checkpoint\nreason={s}\nsession={s}\nmodel={s}\nat={s}\ncounts.user={d}\ncounts.assistant={d}\n\n",
-        .{ reason, session_id, self.model_name, now_iso, user_count, assistant_count },
+        "type=session_checkpoint\nreason={s}\nsession={s}\nmodel={s}\nat={s}\ncreated_at_unix={d}\ncreated_at_utc={s}\ndate_utc={s}\nboundary_reason={s}\nsession_id={s}\ncounts.user={d}\ncounts.assistant={d}\n\n",
+        .{ reason, session_id, self.model_name, now_iso, now_s, now_iso, date_utc_from_iso(now_iso), reason, session_id, user_count, assistant_count },
     ) catch return false;
     w.writeAll("recent_user:\n") catch return false;
     appendRecentRoleSnippets(w, self.history.items, .user, 3, 220) catch return false;
@@ -2244,6 +2281,7 @@ fn persistSessionCheckpointDetailedImpl(self: anytype, reason: []const u8, emit_
         checkpoint_key,
         summary_key,
         now_iso,
+        now_s,
     ) catch return false;
     defer self.allocator.free(anchor_content);
     mem.store("context_anchor_current", anchor_content, .core, null) catch return false;
