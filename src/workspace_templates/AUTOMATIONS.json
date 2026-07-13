@@ -13,6 +13,18 @@
         "description": "Your agent reviews the last 7 days of conversation at 3 AM and writes a short reflection — themes, patterns, questions worth asking next time. Stored as a dream_log/<date> memory you can read in your brain timeline.",
         "user_toggle_setting": "dream_enabled"
       }
+    },
+    {
+      "id": "mine_330am",
+      "schedule": "30 3 * * *",
+      "kind": "agent",
+      "command": "mine",
+      "session_target": "isolated",
+      "enabled": true,
+      "_user_facing": {
+        "title": "Nightly self-review",
+        "user_toggle_setting": "dream_enabled"
+      }
     }
   ],
   "_doc": "Durable automation spec — see daemon.zig:238. Wake turns reconcile canonical jobs here via `schedule ensure`. User can edit `enabled` per job or use the matching toggle in user_settings (e.g. dream_enabled). Adding/removing jobs from this file means the next wake turn will install/remove them in the live cron."

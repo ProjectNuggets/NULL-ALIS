@@ -5415,7 +5415,7 @@ fn handleLearnCommand(self: anytype, arg: []const u8) ![]const u8 {
             }
             try w.print("Wishes (capability requests) ({d}):\n", .{wish_count});
             // Package 2b: render-time wish→Hub matchmaking. OPT-IN (privacy
-            // fix): the whole apparatus is skipped unless the operator enabled
+            // fix): the whole apparatus is skipped unless this tenant enabled
             // `wish_matchmaking_enabled`. When OFF, the Wishes section renders
             // byte-identical to the pre-matchmaking version and NO wish content
             // leaves the tenant. When ON, we live-query the Decision Hub for the
