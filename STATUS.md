@@ -12,6 +12,28 @@ This is the single cold-start document. If it disagrees with `.planning/STATE.md
 
 ---
 
+## 2026-07-13 — WP-06 bounded channel liveness
+
+`POST /api/v1/users/{id}/channels/{channel}/test` now performs one bounded,
+read-only provider request for Telegram (`getMe`) and Slack (`auth.test`) after
+the existing vault presence/format checks. Probes use a five-second deadline,
+no retries, fixed HTTPS provider endpoints, and stable secret-free result codes.
+Telegram keeps its dedicated connect/disconnect routes but now shares the generic
+test route. Discord, email, and WhatsApp remain explicitly structural-only.
+
+Review hardening (FIX_FIRST): (1) outbound probes are now rate-limited to one
+call per 30s per (user, channel) via a fixed-capacity, self-evicting cooldown
+table — a call inside the window returns `429 rate_limited` with `Retry-After`
+and makes no outbound request; (2) the probe runs over the curl transport
+(`.curl_only`) so `--connect-timeout` bounds the TCP-connect + DNS phase, not
+just recv/send — a blackholed provider host now fails fast within the ~5s total
+deadline instead of hanging on the native transport's unbounded connect;
+(3) `channels/{ch}/connect` writes a compensating `channel_connect_rollback`
+audit entry when a secret is reverted after its `put` recorded an audit `ok`,
+so the trail never retains a stale `ok`.
+
+---
+
 ## 2026-05-29 — Sprint S6: V1 production verification matrix (ready for review)
 
 **Branch:** `prod-readiness/s6-verification-matrix`. **PR:** [#115](https://github.com/ProjectNuggets/NULL-ALIS/pull/115). Builds on the hardened S1–S5 stack (S1 #108, S2 #109, S3 #110, S4 #111, S5 #112 + follow-up #113, #114 OOM fix — all on `main`). S6 is the production-readiness gate: a fresh checkout verifies the pinned V1 backend surfaces (see [docs/operations/verification-matrix.md](docs/operations/verification-matrix.md) "Surface coverage" table — health/metrics, sanitizer/parser/detector contracts, and the live-PG integrations D25 cascade / memory_purge_pii / trace-share durability / artifact CRUD) with two commands. Surfaces NOT in the table are explicitly deferred with compensating controls.

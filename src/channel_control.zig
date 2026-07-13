@@ -10,11 +10,10 @@
 //! serialization here.
 //!
 //! Surfaced channels (V1 launch set): slack, discord, email, whatsapp.
-//! Telegram is included read-only in the aggregate listing; its
-//! connect/disconnect stay on the dedicated `channels/telegram/*` routes
-//! so the shipped Telegram flow is never destabilised (the gateway
-//! answers 409 + a pointer if a caller tries to mutate Telegram through
-//! the generic action routes).
+//! Telegram keeps connect/disconnect on the dedicated
+//! `channels/telegram/*` routes while sharing the generic read-only test
+//! action. This preserves the shipped webhook flow while allowing bounded
+//! provider liveness checks.
 //!
 //! Every other adapter in the catalog (signal, matrix, irc, line, lark,
 //! onebot, qq, nostr, maixcam, teams, imessage, webhook, cli) is
@@ -28,6 +27,7 @@
 //!   - The surfaced channel set is a fixed allowlist; unknown keys 404.
 
 const std = @import("std");
+const telegram_token = @import("telegram_token.zig");
 
 /// The user-surfaced channel set. Anything not in this enum is hidden
 /// from the control plane on purpose (see module doc).
@@ -194,6 +194,13 @@ pub const Action = enum {
     }
 };
 
+/// Telegram's shipped connect/disconnect flow performs webhook-specific
+/// work on dedicated routes. Its read-only liveness check is safe to share
+/// with the generic control plane.
+pub fn usesDedicatedMutationRoute(ch: Channel, action: Action) bool {
+    return ch == .telegram and action != .@"test";
+}
+
 pub const Route = union(enum) {
     /// GET /channels — aggregate listing.
     list,
@@ -291,6 +298,9 @@ pub fn validateSecretValue(secret_key: []const u8, value: []const u8) bool {
     }
     if (std.mem.eql(u8, secret_key, "slack_app_token")) {
         return std.mem.startsWith(u8, value, "xapp-") and value.len > 10;
+    }
+    if (std.mem.eql(u8, secret_key, "telegram_bot_token")) {
+        return telegram_token.is_bot_token_shape(value);
     }
     if (std.mem.eql(u8, secret_key, "discord_bot_token")) {
         return value.len >= 24;
@@ -518,6 +528,13 @@ test "parseRoute: hidden channel + unknown action are unsupported, not silently 
     try std.testing.expectEqual(Route.unsupported, parseRoute("channels/slack/frobnicate").?);
 }
 
+test "telegram keeps dedicated connect routes but uses generic liveness test" {
+    try std.testing.expect(usesDedicatedMutationRoute(.telegram, .connect));
+    try std.testing.expect(!usesDedicatedMutationRoute(.telegram, .@"test"));
+    try std.testing.expect(usesDedicatedMutationRoute(.telegram, .disconnect));
+    try std.testing.expect(!usesDedicatedMutationRoute(.slack, .@"test"));
+}
+
 test "parseRoute: non-channel + bindings + deep paths fall through" {
     try std.testing.expect(parseRoute("voice/transcribe") == null);
     try std.testing.expect(parseRoute("settings") == null);
@@ -544,6 +561,8 @@ test "validateSecretValue enforces provider token shapes" {
     try std.testing.expect(!validateSecretValue("slack_signing_secret", "has space"));
     try std.testing.expect(!validateSecretValue("slack_signing_secret", "line\nbreak"));
     try std.testing.expect(!validateSecretValue("slack_signing_secret", ""));
+    try std.testing.expect(validateSecretValue("telegram_bot_token", "8622705808:AAFVrWAamFu8Q3Av4V_OdInaJr_7Qn-26CA"));
+    try std.testing.expect(!validateSecretValue("telegram_bot_token", "123456:bad/path"));
 }
 
 test "config validation: ports, digit ids, hosts" {

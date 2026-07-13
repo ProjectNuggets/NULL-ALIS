@@ -395,14 +395,15 @@ hidden.
 | `GET /api/v1/users/{id}/channels` | Aggregate status for the launch channels |
 | `GET /api/v1/users/{id}/channels/{channel}` | One channel's status |
 | `POST /api/v1/users/{id}/channels/{channel}/connect` | Store vault credentials + config |
-| `POST /api/v1/users/{id}/channels/{channel}/test` | Structural credential check (records `last_test`) |
+| `POST /api/v1/users/{id}/channels/{channel}/test` | Bounded credential liveness test (records `last_test`) |
 | `POST` or `DELETE` `…/channels/{channel}/disconnect` | Delete vault secrets + metadata |
 
 **Surfaced channels (bind these):** `slack`, `discord`, `email`,
 `whatsapp` are user-managed (full connect/test/disconnect). `telegram`
-appears **read-only** in the listing — keep using the dedicated
-`channels/telegram/connect|disconnect` routes for its mutation; a generic
-mutate on telegram returns `409 telegram_uses_dedicated_routes`.
+keeps the dedicated `channels/telegram/connect|disconnect` routes for
+webhook mutation, but shares the generic `channels/telegram/test` liveness
+route. Generic connect/disconnect on telegram returns
+`409 telegram_uses_dedicated_routes`.
 
 **Hidden channels (do NOT surface):** signal, matrix, mattermost, irc,
 line, lark, onebot, qq, nostr, maixcam, teams, imessage, webhook, cli.
@@ -431,12 +432,16 @@ not_connected`.
 - `connect` validates provider token shapes server-side (e.g. slack bot
   token must be `xoxb-…`); a bad field returns `400 {error, key}` —
   surface the offending `key` inline.
-- `test` is a **structural** check (presence + format), not a live
-  provider call. `last_test.detail` is machine-readable
-  (`credentials_present` / `missing_required_secret:<key>` /
-  `malformed_secret:<key>`). Do not claim "reachable" — claim
-  "credentials saved & valid". Live reachability probe is a documented
-  follow-up.
+- `test` always checks required vault values for presence + format first.
+  Telegram then makes one read-only `getMe` call and Slack makes one
+  read-only `auth.test` call. Each probe has a 5-second total timeout, no
+  retry, and a 64 KiB accepted response limit. Discord, email, and WhatsApp
+  remain structural-only and return `credentials_present` when valid.
+- `last_test.detail` is machine-readable: `provider_reachable`,
+  `provider_auth_rejected`, `provider_timeout`, `provider_unreachable`,
+  `invalid_provider_response`, `credentials_present`,
+  `missing_required_secret:<key>`, or `malformed_secret:<key>`. Provider
+  response bodies and credential values are never persisted or returned.
 - Requires the Postgres tenant state backend; without it the routes
   answer `501` (show a degraded/operator-managed state, not an error).
 

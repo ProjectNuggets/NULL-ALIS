@@ -1798,14 +1798,23 @@ paths:
   /api/v1/users/{user_id}/channels/{channel}/test:
     post:
       tags: [user]
-      summary: Test a channel's stored credentials (structural check)
+      summary: Test a channel's stored credentials and provider liveness
       description: |
-        V1 test is a deterministic structural check — it verifies every
-        required secret is present in the vault and well-formed, records
-        the result as `last_test`, and returns the refreshed status. It
-        does NOT make a live outbound call to the provider (documented
-        follow-up) so it never reports a false positive requiring the
-        network. Telegram is read-only here (409).
+        Every test first verifies that required secrets are present in the
+        vault and well-formed. Telegram then performs one bounded, read-only
+        getMe request; Slack performs one bounded, read-only auth.test request.
+        Provider probes have a 5-second total timeout (bounding TCP connect and
+        DNS resolution, not only recv/send), no retry, and accept at most
+        64 KiB of response data. Discord, email, and WhatsApp retain the
+        structural-only result until a safe provider probe is specified.
+        Results are recorded as last_test and the refreshed status is returned.
+        Telegram uses this generic test route while its connect/disconnect
+        mutations remain on the dedicated Telegram routes.
+
+        Outbound probes are rate-limited to one call per 30 seconds per
+        (user, channel). A call inside that window returns 429 rate_limited
+        WITHOUT contacting the provider, carries a Retry-After header, and
+        leaves the previously recorded last_test unchanged.
       security:
         - InternalToken: []
       parameters:
@@ -1815,8 +1824,10 @@ paths:
         "200":
           description: |
             Refreshed status with last_test populated. last_test.detail is
-            machine-readable: credentials_present | missing_required_secret:<key>
-            | malformed_secret:<key>.
+            machine-readable: provider_reachable | provider_auth_rejected |
+            provider_timeout | provider_unreachable | invalid_provider_response |
+            credentials_present | missing_required_secret:<key> |
+            malformed_secret:<key>.
           content:
             application/json:
               schema:
@@ -1824,7 +1835,16 @@ paths:
         "404":
           description: channel_not_supported
         "409":
-          description: telegram_uses_dedicated_routes
+          description: channel_disabled_in_build
+        "429":
+          description: |
+            rate_limited — inside the per-(user, channel) 30s probe cooldown.
+            No outbound provider request was made and last_test is unchanged.
+            Body: {"error":"rate_limited","retry_after_s":<n>,"detail":"try again in <n>s"}.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Seconds until the next probe is allowed.
         "501":
           description: State backend (Postgres) not wired
 
@@ -4145,7 +4165,7 @@ components:
             checked_at_s: { type: integer, format: int64 }
             detail:
               type: string
-              description: credentials_present | missing_required_secret:<key> | malformed_secret:<key>
+              description: provider_reachable | provider_auth_rejected | provider_timeout | provider_unreachable | invalid_provider_response | credentials_present | missing_required_secret:<key> | malformed_secret:<key>
         endpoints:
           type: object
           required: [self, connect, test, disconnect]

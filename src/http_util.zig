@@ -45,6 +45,7 @@ fn curlExitHint(code: u8) []const u8 {
         52 => "empty_reply",
         56 => "recv_failed",
         60 => "tls_cert_verify_failed",
+        63 => "response_too_large",
         else => "curl_failed",
     };
 }
@@ -357,10 +358,13 @@ pub fn curlRequestResolved(
     headers: []const []const u8,
     body: ?[]const u8,
     timeout_secs: []const u8,
+    max_response_bytes: usize,
     resolve_host: []const u8,
     resolve_port: u16,
     connect_host: []const u8,
 ) !CurlResponse {
+    const max_response_arg = try std.fmt.allocPrint(allocator, "{d}", .{max_response_bytes});
+    defer allocator.free(max_response_arg);
     var resolve_target_storage: [512]u8 = undefined;
     const resolve_target = try std.fmt.bufPrint(
         &resolve_target_storage,
@@ -394,6 +398,10 @@ pub fn curlRequestResolved(
     argv_buf[argc] = "--write-out";
     argc += 1;
     argv_buf[argc] = STATUS_MARKER ++ "%{http_code}";
+    argc += 1;
+    argv_buf[argc] = "--max-filesize";
+    argc += 1;
+    argv_buf[argc] = max_response_arg;
     argc += 1;
 
     for (headers) |hdr| {
@@ -439,7 +447,16 @@ pub fn curlRequestResolved(
         }
     }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return error.CurlReadError;
+    const response_read_limit = std.math.add(
+        usize,
+        max_response_bytes,
+        STATUS_MARKER.len + 3,
+    ) catch std.math.maxInt(usize);
+    const stdout = child.stdout.?.readToEndAlloc(allocator, response_read_limit) catch |err| {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return if (err == error.StreamTooLong) error.ResponseTooLarge else error.CurlReadError;
+    };
     errdefer allocator.free(stdout);
 
     const term = child.wait() catch return error.CurlWaitError;
@@ -447,6 +464,7 @@ pub fn curlRequestResolved(
         .Exited => |code| if (code != 0) {
             log.warn("curlRequest failed exit_code={d} reason={s} method={s}", .{ code, curlExitHint(code), method });
             if (code == 28) return error.Timeout;
+            if (code == 63) return error.ResponseTooLarge;
             return error.CurlFailed;
         },
         else => {
@@ -478,6 +496,7 @@ pub const CurlArgsSpec = struct {
     has_body: bool,
     proxy: ?[]const u8,
     timeout_secs: []const u8,
+    max_response_bytes: ?[]const u8 = null,
 };
 
 /// Pure builder for the `curlRequest` argv. Fills `argv_buf` and returns the
@@ -508,6 +527,13 @@ fn buildCurlArgs(argv_buf: *[64][]const u8, spec: CurlArgsSpec) usize {
     argc += 1;
     argv_buf[argc] = STATUS_MARKER ++ "%{http_code}";
     argc += 1;
+
+    if (spec.max_response_bytes) |max_response_bytes| {
+        argv_buf[argc] = "--max-filesize";
+        argc += 1;
+        argv_buf[argc] = max_response_bytes;
+        argc += 1;
+    }
 
     if (spec.proxy) |p| {
         argv_buf[argc] = "--proxy";
@@ -546,6 +572,30 @@ pub fn curlRequest(
     proxy: ?[]const u8,
     timeout_secs: []const u8,
 ) !CurlResponse {
+    return curlRequestBounded(
+        allocator,
+        method,
+        url,
+        headers,
+        body,
+        proxy,
+        timeout_secs,
+        4 * 1024 * 1024,
+    );
+}
+
+pub fn curlRequestBounded(
+    allocator: Allocator,
+    method: []const u8,
+    url: []const u8,
+    headers: []const []const u8,
+    body: ?[]const u8,
+    proxy: ?[]const u8,
+    timeout_secs: []const u8,
+    max_response_bytes: usize,
+) !CurlResponse {
+    const max_response_arg = try std.fmt.allocPrint(allocator, "{d}", .{max_response_bytes});
+    defer allocator.free(max_response_arg);
     var argv_buf: [64][]const u8 = undefined;
     const argc = buildCurlArgs(&argv_buf, .{
         .method = method,
@@ -554,6 +604,7 @@ pub fn curlRequest(
         .has_body = body != null,
         .proxy = proxy,
         .timeout_secs = timeout_secs,
+        .max_response_bytes = max_response_arg,
     });
 
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
@@ -581,7 +632,16 @@ pub fn curlRequest(
         }
     }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return error.CurlReadError;
+    const response_read_limit = std.math.add(
+        usize,
+        max_response_bytes,
+        STATUS_MARKER.len + 3,
+    ) catch std.math.maxInt(usize);
+    const stdout = child.stdout.?.readToEndAlloc(allocator, response_read_limit) catch |err| {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return if (err == error.StreamTooLong) error.ResponseTooLarge else error.CurlReadError;
+    };
     errdefer allocator.free(stdout);
     var stderr_bytes: ?[]u8 = null;
     if (child.stderr) |stderr_file| {
@@ -623,6 +683,7 @@ pub fn curlRequest(
                 });
             }
             if (code == 28) return error.Timeout;
+            if (code == 63) return error.ResponseTooLarge;
             return error.CurlFailed;
         },
         else => {
@@ -666,13 +727,14 @@ pub fn request_with_mode(
                     options.headers,
                     options.body,
                     timeout_secs,
+                    options.max_response_bytes,
                     options.resolve_host.?,
                     options.resolve_port,
                     options.connect_host.?,
                 );
             }
 
-            return curlRequest(
+            return curlRequestBounded(
                 allocator,
                 options.method,
                 options.url,
@@ -680,6 +742,7 @@ pub fn request_with_mode(
                 options.body,
                 options.proxy,
                 timeout_secs,
+                options.max_response_bytes,
             );
         },
         .native_preferred => {
@@ -854,4 +917,23 @@ test "buildCurlArgs includes --connect-timeout with configured value" {
     const mt_idx = argvIndexOf(argv, "--max-time") orelse return error.MissingMaxTime;
     try std.testing.expect(mt_idx + 1 < argv.len);
     try std.testing.expectEqualStrings("30", argv[mt_idx + 1]);
+}
+
+test "buildCurlArgs enforces a caller-provided response byte cap" {
+    var argv_buf: [64][]const u8 = undefined;
+    const argc = buildCurlArgs(&argv_buf, .{
+        .method = "GET",
+        .url = "https://provider.example/auth.test",
+        .headers = &.{},
+        .has_body = false,
+        .proxy = null,
+        .timeout_secs = "5",
+        .max_response_bytes = "65536",
+    });
+    const argv = argv_buf[0..argc];
+
+    const cap_idx = argvIndexOf(argv, "--max-filesize") orelse
+        return error.MissingResponseCap;
+    try std.testing.expect(cap_idx + 1 < argv.len);
+    try std.testing.expectEqualStrings("65536", argv[cap_idx + 1]);
 }
