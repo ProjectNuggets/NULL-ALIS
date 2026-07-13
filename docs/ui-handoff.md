@@ -306,7 +306,7 @@ don't enforce.
 | Capability | Surface |
 |---|---|
 | Cron jobs (per-user) | Settings → Automations table |
-| Default `dream_3am` job | Pre-installed; toggle in Settings → Memory → "Enable dream reflection" |
+| Default `dream_3am` + `mine_330am` jobs | Pre-installed in recall-then-review order; the dream toggle controls both nightly jobs |
 | Heartbeat (idle wake) | Toggle in Settings → Automations |
 | Custom scheduled prompts | "+ New automation" button |
 

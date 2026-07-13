@@ -2794,7 +2794,7 @@ test "heartbeatTemplate is non-empty" {
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "HEARTBEAT.md") != null);
 }
 
-test "automationTemplate is non-empty + ships dream_3am canonical job (v1.14.21)" {
+test "automationTemplate ships dream then mine canonical jobs" {
     const tmpl = try automationTemplate(std.testing.allocator, &ProjectContext{});
     defer std.testing.allocator.free(tmpl);
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "\"version\": 1") != null);
@@ -2803,6 +2803,12 @@ test "automationTemplate is non-empty + ships dream_3am canonical job (v1.14.21)
     // operator intervention. User toggle: product_settings.dream_enabled.
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "\"dream_3am\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "\"schedule\": \"0 3 * * *\"") != null);
+    const dream_idx = std.mem.indexOf(u8, tmpl, "\"dream_3am\"") orelse return error.TestUnexpectedResult;
+    const mine_idx = std.mem.indexOf(u8, tmpl, "\"mine_330am\"") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(dream_idx < mine_idx);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "\"schedule\": \"30 3 * * *\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "\"command\": \"mine\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "\"title\": \"Nightly self-review\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "user_toggle_setting") != null);
 }
 
@@ -2836,6 +2842,7 @@ test "zaki templates contain onboarding and proactive guidance" {
     // 2026-05-24 (v1.14.21): zaki bot ships dream_3am canonical job in the
     // AUTOMATIONS.json template — every new tenant gets nightly reflection.
     try std.testing.expect(std.mem.indexOf(u8, automations, "\"dream_3am\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, automations, "\"mine_330am\"") != null);
 
     const bootstrap = try bootstrapTemplate(std.testing.allocator, &ctx);
     defer std.testing.allocator.free(bootstrap);
