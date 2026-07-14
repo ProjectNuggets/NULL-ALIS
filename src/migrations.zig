@@ -164,6 +164,15 @@ pub const MIGRATIONS = [_]Migration{
         .sql = @embedFile("migrations/0009_retention_ttl_indexes.sql"),
         .concurrent_only = true,
     },
+    .{
+        // WP-I / F21 — remove pre-guard assistant scaffold memories and exact
+        // scaffold graph entities. The migration records hash-only audit
+        // events before deleting rows and scopes every graph/vector delete by
+        // user_id. See docs/memory-contract.md for the matching contract.
+        .version = 10,
+        .name = "0010_brain_scaffold_purge",
+        .sql = @embedFile("migrations/0010_brain_scaffold_purge.sql"),
+    },
 };
 
 /// Trait the runner's caller must satisfy: a method that takes a
@@ -480,6 +489,30 @@ test "WP-02 retention indexes use concurrent schema-wide access paths" {
     try std.testing.expect(std.mem.indexOf(u8, found.sql, "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_subagent_results_retention") != null);
     try std.testing.expect(std.mem.indexOf(u8, found.sql, "COALESCE(delivered_at, created_at)") != null);
     try std.testing.expect(std.mem.indexOf(u8, found.sql, "WHERE status = 'delivered'") != null);
+}
+
+test "WP-I migration 0010 purges only explicit Brain scaffold artifacts with audit events" {
+    const found = blk: {
+        for (MIGRATIONS) |m| {
+            if (m.version == 10) break :blk m;
+        }
+        return error.Migration0010NotFound;
+    };
+    try std.testing.expectEqualStrings("0010_brain_scaffold_purge", found.name);
+    try std.testing.expect(!found.concurrent_only);
+
+    const sql = found.sql;
+    try std.testing.expect(std.mem.indexOf(u8, sql, "[[ZAKI_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "<memory_for_turn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "<memory_context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "scaffold_purge") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "scaffold_entity_purge") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "DELETE FROM {schema}.memory_edges") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "DELETE FROM {schema}.memories") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "DELETE FROM {schema}.memory_entities") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "memory_embeddings") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "content_hash") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "DROP TABLE") == null);
 }
 
 test "Wave 2 — migration 0004_turn_usage is registered with the durable metering schema" {

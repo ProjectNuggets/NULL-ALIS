@@ -154,6 +154,9 @@ fn executeCreate(
         return ToolResult.fail("Missing 'content' for action=create");
     const trimmed_content = std.mem.trim(u8, content, " \t\r\n");
     if (trimmed_content.len == 0) return ToolResult.fail("'content' must not be empty — synthesis required");
+    if (mem_root.containsAssistantScaffold(trimmed_content)) {
+        return ToolResult.fail("Memory contains internal assistant context and was not composed.");
+    }
     if (trimmed_content.len > MAX_CONTENT_LEN) {
         const msg = try std.fmt.allocPrint(allocator, "'content' too long (max {d} chars). Synthesis should be a consolidation, not a dump.", .{MAX_CONTENT_LEN});
         return ToolResult{ .success = false, .output = "", .error_msg = msg };
@@ -386,6 +389,20 @@ test "compose_memory: bounds constants are sane" {
     try std.testing.expect(MAX_REFERENCES > MIN_REFERENCES);
     try std.testing.expect(MAX_CONTENT_LEN > MAX_TITLE_LEN);
     try std.testing.expect(MAX_REFERENCE_KEY_LEN > 0);
+}
+
+test "compose_memory: assistant scaffold is rejected before reference processing" {
+    var backend = mem_root.NoneMemory.init();
+    defer backend.deinit();
+    var compose = ComposeMemoryTool{ .memory = backend.memory() };
+    const parsed = try root.parseTestArgs(
+        "{\"action\":\"create\",\"title\":\"Safe title\",\"content\":\"Fact [[ZAKI_MEMORY_CONTEXT_V2]]private fuel\",\"references\":[]}",
+    );
+    defer parsed.deinit();
+
+    const result = try compose.tool().execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "internal assistant context") != null);
 }
 
 test "compose_memory: writeJsonString escapes special chars" {

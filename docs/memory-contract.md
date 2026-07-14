@@ -17,7 +17,10 @@ Every piece of content at a memory boundary lands in exactly one bucket:
 
 ## Decision axes
 
-The bucket is decided by these axes — never by content matching:
+The bucket is decided by these axes — never by semantic content matching. A
+separate exact-syntax safety backstop rejects runtime-owned scaffold fences
+(`[[ZAKI_*]]`, `<memory_for_turn>`, `<memory_context>`) at write time; it does
+not classify ordinary prose:
 
 1. **Provenance** — which role (`.system` never extracts) / which tool
    (introspection tools never extract) / which writer (key prefix).
@@ -42,6 +45,7 @@ enforced in extraction-builder tests inside `src/agent/extraction/runner.zig`.)
 | `.tool` result from data tools (`web_search`, `web_fetch`, `file_read`, …) [E] | knowledge (candidate) | extracted |
 | `.tool` result, `name == null` [E] | unknown | fail-open: extracted |
 | Entity named in `scaffold_entity_names` at persist boundary | bookkeeping | write rejected (denylist backstop) |
+| Content containing a runtime-owned assistant scaffold fence | bookkeeping | `containsAssistantScaffold` rejects the entire write before persistence; `memory_store` returns a user-safe failure and the Postgres manager returns `error.AssistantScaffoldRejected` on simple + metadata paths |
 | `memory_store` (inline path) with a scaffold-entity, system-managed, default-hidden-bookkeeping, or >255-byte key | bookkeeping | tool call rejected with redirect message (`inlineKeyGuard`); the unified-triple path is exempt — it derives its own `extracted_<hash>` key and ignores the caller's |
 | Keys `summary_latest/ timeline_summary/ session_summary/ summary_fallback/` | derived | not embedded (`shouldEmbedMemoryEntry`=false), semantic-bookkeeping (excluded from fact recall), hidden from the /brain view (`isBrainVisibleKey`=false) but NOT default-hidden — stays injectable for warm-start (P4) |
 | Keys `audit_shell/ __tombstone__/ compaction_* autosave_* session_checkpoint_*` | bookkeeping | hidden from the /brain view (`BRAIN_HIDDEN_PREFIXES`); internal/audit families also default-hidden (`isDefaultHiddenMemoryKey`); append-only or system-managed |
@@ -61,6 +65,8 @@ are deliberately omitted: they rot on unrelated edits; symbols survive refactors
 - Tool-identity filter: `runner.zig` `internal_extraction_tool_names` (pub = test-only surface) + `isInternalExtractionToolName`
 - Entity denylist: `src/agent/context_builder.zig` `scaffold_entity_names` (comptime drift-guarded vs `stable_prompt_markers`; normalized forms precomputed at comptime)
 - Key predicates: `src/memory/root.zig` — `isInternalMemoryKey`, `isContinuityArtifactKey`, `isContinuitySummaryKey`, `isDefaultHiddenMemoryKey`, `isBrainVisibleKey`, `BRAIN_HIDDEN_PREFIXES` / `BRAIN_HIDDEN_EXACT_KEYS`, `isSemanticBookkeepingKey`, `shouldEmbedMemoryEntry`, `isTombstoneKey`, `isAppendOnlyMemoryKey`, `isSystemManagedMemoryKey`, `isMutableMemoryEntry`, `isEditableMemoryEntry`
+- Scaffold-content predicate: `src/memory/root.zig` `containsAssistantScaffold`; enforced by the shared `Memory.store` / `storeWithMetadata` facade, agent-facing store/edit/compose tools, and every Postgres manager path that can accept caller-authored replacement content before database work
+- Existing-row cleanup: versioned migration `src/migrations/0010_brain_scaffold_purge.sql` records hash-only `memory_events`, removes explicitly fenced memories plus exact scaffold entities and their tenant-scoped edges/default pgvector rows, and leaves ordinary prose untouched
 - Type sets: `src/memory/root.zig` `EVERGREEN_MEMORY_TYPES` / `DURABLE_MEMORY_TYPES` (+SQL fragments, comptime drift guard)
 - Store-boundary guard: `src/tools/memory_store.zig` `inlineKeyGuard` (inline path only — see truth table)
 - Registry cross-check: `src/memory/contract_test.zig`
@@ -69,11 +75,11 @@ are deliberately omitted: they rot on unrelated edits; symbols survive refactors
 ## Invariants
 
 1. Bookkeeping never becomes knowledge (no extraction, no entities, no embedding).
-2. The line is drawn by PROVENANCE, never content — rewording cannot cross it.
+2. The semantic line is drawn by PROVENANCE, never prose matching — rewording cannot cross it. Exact runtime-owned scaffold syntax is rejected as a safety invariant, not used as a knowledge classifier.
 3. Unknown identity fails OPEN into extraction (data loss is worse than redundancy) but fails CLOSED at explicit write boundaries (denylist, store guard).
 4. Derived artifacts are persisted and injectable but never pollute fact recall.
 5. Durability is a property of `memory_type` only; curability is provenance; aliveness is state (`valid_to`/`is_latest`). Never proxy one axis through another.
-6. **Every agent-facing write tool carries its own fail-closed key guard.** The engine API (`Memory.store`/`storeWithMetadata`) is UNGUARDED BY DESIGN — internal writers (promotion, learning, session-end, timeline) legitimately write system-managed keys through it. Therefore the guard obligation sits at the tool layer: `memory_store` uses `inlineKeyGuard`; `compose_memory` satisfies it via its `compose:` key-namespace allowlist (equivalent mechanism). A NEW write tool must add one of the two — a namespace allowlist or `inlineKeyGuard`-style denylist — before it ships; a tool calling the engine API with agent-chosen keys and no guard violates this contract.
+6. **Every agent-facing write tool carries its own fail-closed key guard.** The engine API (`Memory.store`/`storeWithMetadata`) remains unguarded for KEY namespaces by design — internal writers (promotion, learning, session-end, timeline) legitimately write system-managed keys through it. Therefore the key-guard obligation sits at the tool layer: `memory_store` uses `inlineKeyGuard`; `compose_memory` satisfies it via its `compose:` key-namespace allowlist (equivalent mechanism). CONTENT is different: the shared Memory facade rejects assistant scaffold syntax for every backend, the production Postgres manager repeats that check at its direct write chokepoints, and store/edit/compose tools return user-safe failures. A NEW write tool must add a namespace allowlist or `inlineKeyGuard`-style denylist before it ships; a tool calling the engine API with agent-chosen keys and no guard violates this contract.
 7. `memory_events` is an audit stream, not live knowledge. It is retained forever when `memory_events_retention_days=0`; a non-zero operator TTL may prune only event rows in bounded batches and never deletes the referenced live memory.
 
 ## Deferred register
