@@ -512,6 +512,10 @@ test "WP-I migration 0010 purges only explicit Brain scaffold artifacts with aud
     try std.testing.expect(std.mem.indexOf(u8, sql, "DELETE FROM {schema}.memory_entities") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "memory_embeddings") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "content_hash") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "UPDATE {schema}.memory_events") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "payload_hash") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "memory_id = NULL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "encode(digest(content, 'sha256'), 'hex')") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "DROP TABLE") == null);
 }
 

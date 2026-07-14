@@ -14,7 +14,7 @@ SELECT
     id,
     user_id,
     key,
-    COALESCE(NULLIF(content_hash, ''), md5(content)) AS audit_content_hash
+    encode(digest(content, 'sha256'), 'hex') AS audit_content_hash
 FROM {schema}.memories
 WHERE content ~* '\[\[[[:space:]]*/?[[:space:]]*ZAKI_'
    OR content ~* '<[[:space:]]*/?[[:space:]]*memory_for_turn([[:space:]/>]|$)'
@@ -49,16 +49,37 @@ WHERE btrim(regexp_replace(lower(name), '[[:space:]]+', ' ', 'g')) IN (
     'link type'
 );
 
+-- Existing upsert/edit events contain the full memory content in payload.
+-- Preserve their audit identity and event type, but replace all payload fields
+-- with hashes before the poisoned memory disappears. Clearing memory_id avoids
+-- retaining a possibly caller-shaped identifier in the hash-only audit trail.
+UPDATE {schema}.memory_events AS event
+SET memory_id = NULL,
+    payload = jsonb_build_object(
+        'migration', '0010_brain_scaffold_purge',
+        'reason', 'historical_scaffold_event_redacted',
+        'original_event_type', event.event_type,
+        'memory_id_hash', encode(digest(event.memory_id, 'sha256'), 'hex'),
+        'payload_hash', encode(digest(event.payload::text, 'sha256'), 'hex')
+    )
+WHERE EXISTS (
+    SELECT 1
+    FROM wp_i_poisoned_memories AS poisoned
+    WHERE poisoned.user_id = event.user_id
+      AND poisoned.id = event.memory_id
+);
+
 INSERT INTO {schema}.memory_events (id, user_id, memory_id, event_type, payload)
 SELECT
     'mig0010-memory-' || md5(user_id::text || ':' || id),
     user_id,
-    id,
+    NULL,
     'scaffold_purge',
     jsonb_build_object(
         'migration', '0010_brain_scaffold_purge',
         'reason', 'explicit_assistant_scaffold',
-        'key_hash', md5(key),
+        'memory_id_hash', encode(digest(id, 'sha256'), 'hex'),
+        'key_hash', encode(digest(key, 'sha256'), 'hex'),
         'content_hash', audit_content_hash
     )
 FROM wp_i_poisoned_memories
@@ -73,8 +94,8 @@ SELECT
     jsonb_build_object(
         'migration', '0010_brain_scaffold_purge',
         'reason', 'exact_scaffold_entity',
-        'entity_id_hash', md5(id),
-        'entity_name_hash', md5(name)
+        'entity_id_hash', encode(digest(id, 'sha256'), 'hex'),
+        'entity_name_hash', encode(digest(name, 'sha256'), 'hex')
     )
 FROM wp_i_scaffold_entities
 ON CONFLICT (id) DO NOTHING;

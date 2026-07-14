@@ -18105,10 +18105,13 @@ test "brain integrity: migration 0010 purges poisoned rows and preserves tenant-
 
     // Bypass the new write guard to model rows that existed before WP-I.
     const seed_q = try std.fmt.allocPrint(allocator,
-        \\INSERT INTO {s}.memories (id, user_id, key, content, memory_type) VALUES
-        \\  ('wp-i-poison', 2, 'poison-key', 'Fact [[ZAKI_MEMORY_CONTEXT_V2]]private fuel', 'core'),
-        \\  ('wp-i-clean-u2', 2, 'clean-key-u2', 'User studies memory architecture', 'core'),
-        \\  ('wp-i-clean-u3', 3, 'clean-key-u3', 'Other tenant keeps a legitimate fact', 'core');
+        \\INSERT INTO {s}.memories (id, user_id, key, content, content_hash, memory_type) VALUES
+        \\  ('wp-i-poison', 2, 'poison-key', 'Fact [[ZAKI_MEMORY_CONTEXT_V2]]private fuel', 'not-a-hash [[ZAKI_MEMORY_CONTEXT_V2]]private hash', 'core'),
+        \\  ('wp-i-clean-u2', 2, 'clean-key-u2', 'User studies memory architecture', NULL, 'core'),
+        \\  ('wp-i-clean-u3', 3, 'clean-key-u3', 'Other tenant keeps a legitimate fact', NULL, 'core');
+        \\INSERT INTO {s}.memory_events (id, user_id, memory_id, event_type, payload) VALUES
+        \\  ('wp-i-existing-event', 2, 'wp-i-poison', 'upsert',
+        \\   '{{"key":"poison-key","content":"Fact [[ZAKI_MEMORY_CONTEXT_V2]]private event fuel"}}'::jsonb);
         \\INSERT INTO {s}.memory_entities (id, user_id, name, name_lower) VALUES
         \\  ('wp-i-scaffold-entity', 2, '  Brain   Architecture ', 'brain architecture'),
         \\  ('wp-i-clean-entity', 3, 'Customer Architecture', 'customer architecture');
@@ -18121,7 +18124,7 @@ test "brain integrity: migration 0010 purges poisoned rows and preserves tenant-
         \\INSERT INTO {s}.memory_embeddings (user_id, key) VALUES
         \\  (2, 'poison-key'), (2, 'clean-key-u2'), (3, 'clean-key-u3');
         \\DELETE FROM {s}.schema_migrations WHERE version = 10;
-    , .{ schema_q, schema_q, schema_q, schema_q, schema_q, schema_q });
+    , .{ schema_q, schema_q, schema_q, schema_q, schema_q, schema_q, schema_q });
     defer allocator.free(seed_q);
     const seeded = try mgr.exec(seed_q);
     c.PQclear(seeded);
@@ -18151,6 +18154,9 @@ test "brain integrity: migration 0010 purges poisoned rows and preserves tenant-
         .{ .sql = "SELECT COUNT(*) FROM {schema}.memory_embeddings WHERE user_id = 2 AND key = 'poison-key'", .expected = 0 },
         .{ .sql = "SELECT COUNT(*) FROM {schema}.memory_embeddings WHERE key IN ('clean-key-u2', 'clean-key-u3')", .expected = 2 },
         .{ .sql = "SELECT COUNT(*) FROM {schema}.memory_events WHERE event_type IN ('scaffold_purge', 'scaffold_entity_purge')", .expected = 2 },
+        .{ .sql = "SELECT COUNT(*) FROM {schema}.memory_events WHERE id = 'wp-i-existing-event' AND memory_id IS NULL AND payload ? 'payload_hash' AND NOT (payload ? 'content')", .expected = 1 },
+        .{ .sql = "SELECT COUNT(*) FROM {schema}.memory_events WHERE payload::text ~* '(\\[\\[[[:space:]]*/?[[:space:]]*ZAKI_|<[[:space:]]*/?[[:space:]]*memory_(for_turn|context))'", .expected = 0 },
+        .{ .sql = "SELECT COUNT(*) FROM {schema}.memory_events WHERE event_type = 'scaffold_purge' AND memory_id IS NULL AND payload ? 'memory_id_hash' AND length(payload->>'content_hash') = 64", .expected = 1 },
     };
     for (assertions) |assertion| {
         const query = try mgr.buildQuery(assertion.sql);
