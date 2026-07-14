@@ -89,6 +89,10 @@ const ChatStreamTurnOptions = struct {
     execution_mode: ?execution_mode_mod.ExecutionMode = null,
     autonomy: ?security.AutonomyLevel = null,
     reasoning_effort: ?[]const u8 = null,
+    /// Whether the inbound user-role turn belongs in user-facing history and
+    /// exports. Backend-authored bootstrap turns set this false in context;
+    /// ordinary user turns default to visible.
+    user_visible: bool = true,
     /// Phase 5 (Superpowers mode) — set when reasoning_effort=="superpowers".
     /// Tells the session layer to activate coordinator mode. The provider
     /// NEVER sees "superpowers" raw (mapReasoningEffort converts it to "high").
@@ -2547,6 +2551,7 @@ const TenantRuntime = struct {
             .turn_autonomy = turn_options.autonomy,
             .turn_reasoning_effort = turn_options.reasoning_effort,
             .turn_superpowers_mode = turn_options.superpowers_mode,
+            .user_visible = turn_options.user_visible,
         });
         return response;
     }
@@ -6591,6 +6596,11 @@ fn parseChatStreamTurnOptions(body: []const u8) ChatStreamTurnOptions {
     // the superpowers_mode activation flag for the coordinator path.
     const effort_raw = cleanJsonStringField(body, "reasoning_effort");
     const mapped = mapReasoningEffort(effort_raw);
+    const authored_by = cleanJsonStringField(body, "authored_by");
+    const backend_authored = if (authored_by) |value|
+        std.ascii.eqlIgnoreCase(value, "backend")
+    else
+        false;
     // assistant_mode fallback (legacy — only applies when reasoning_effort absent)
     const effort_final: ?[]const u8 = if (mapped.effort != null) mapped.effort else blk: {
         if (cleanJsonStringField(body, "assistant_mode")) |raw| {
@@ -6605,6 +6615,10 @@ fn parseChatStreamTurnOptions(body: []const u8) ChatStreamTurnOptions {
         .autonomy = parseChatStreamAutonomy(body),
         .reasoning_effort = effort_final,
         .superpowers_mode = mapped.superpowers,
+        .user_visible = if (backend_authored)
+            (jsonBoolField(body, "user_visible") orelse true)
+        else
+            true,
     };
 }
 
@@ -6637,6 +6651,23 @@ test "chat stream turn options still parse explicit mode overrides" {
     try std.testing.expectEqual(execution_mode_mod.ExecutionMode.review, options.execution_mode.?);
     try std.testing.expectEqual(security.AutonomyLevel.read_only, options.autonomy.?);
     try std.testing.expectEqualStrings("high", options.reasoning_effort.?);
+}
+
+test "chat stream turn options parse hidden user provenance from context" {
+    const hidden = parseChatStreamTurnOptions(
+        \\{"message":"internal bootstrap","context":{"authored_by":"backend","user_visible":false}}
+    );
+    try std.testing.expect(!hidden.user_visible);
+
+    const normal = parseChatStreamTurnOptions(
+        \\{"message":"internal bootstrap"}
+    );
+    try std.testing.expect(normal.user_visible);
+
+    const untrusted_hidden = parseChatStreamTurnOptions(
+        \\{"message":"internal bootstrap","context":{"user_visible":false}}
+    );
+    try std.testing.expect(untrusted_hidden.user_visible);
 }
 
 test "chat stream turn options map assistant mode fallback to reasoning effort" {
@@ -11588,6 +11619,7 @@ fn handleApiChatStreamSseConnection(
                 .turn_autonomy = turn_options.autonomy,
                 .turn_reasoning_effort = turn_options.reasoning_effort,
                 .turn_superpowers_mode = turn_options.superpowers_mode,
+                .user_visible = turn_options.user_visible,
             }) catch {
                 _ = state.chat_stream_errors_total.fetchAdd(1, .monotonic);
                 break :blk .{ .err = .{ .code = "chat_failed", .msg = "chat failed" } };
@@ -15480,6 +15512,7 @@ fn writeHistoryMessagesJson(w: anytype, history: []const @import("agent/root.zig
     const capped = if (history.len > SESSION_EXPORT_MAX_MESSAGES) history[0..SESSION_EXPORT_MAX_MESSAGES] else history;
     var wrote_any = false;
     for (capped) |entry| {
+        if (!entry.user_visible) continue;
         if (!agent_transcript.shouldExposeHistoryMessage(entry.role, entry.content)) continue;
         if (wrote_any) try w.writeAll(",");
         wrote_any = true;
@@ -36353,6 +36386,7 @@ test "handleSessionHistory filters internal persisted history messages" {
     try store.saveMessage(session_key, "assistant", "persisted assistant");
     try store.saveMessage(session_key, "system", "persisted system");
     try store.saveMessage(session_key, "tool", "persisted tool");
+    try store.saveMessage(session_key, "internal_user", "persisted backend bootstrap");
     try store.saveMessage(session_key, "user", "The user CANNOT see the `<tool_result>` block above — they see only your text.");
     try store.saveMessage(session_key, "assistant", "**This is your reply");
 
@@ -36363,6 +36397,7 @@ test "handleSessionHistory filters internal persisted history messages" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "persisted assistant") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "persisted system") == null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "persisted tool") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "persisted backend bootstrap") == null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "The user CANNOT see") == null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "**This is your reply") == null);
 }
@@ -36373,6 +36408,7 @@ test "writeMessageEntriesJson filters state-manager persisted history entries" {
         .{ .role = "user", .content = "visible user" },
         .{ .role = "system", .content = "hidden system" },
         .{ .role = "tool", .content = "hidden tool" },
+        .{ .role = "internal_user", .content = "hidden backend bootstrap" },
         .{ .role = "user", .content = "**This is your reply to the user. Not a planning document. Not a step-by-step outline. The actual reply.**" },
         .{ .role = "assistant", .content = "visible assistant" },
     };
@@ -36412,6 +36448,23 @@ test "handleSessionExport returns session_key and messages" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"messages\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "Export me") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "Exported reply") != null);
+}
+
+test "history export filters hidden user turns by provenance rather than content" {
+    const history = [_]@import("agent/root.zig").Agent.HistoryPair{
+        .{ .role = "user", .content = "same prompt", .user_visible = false },
+        .{ .role = "assistant", .content = "bootstrap reply" },
+        .{ .role = "user", .content = "same prompt", .user_visible = true },
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try writeHistoryMessagesJson(out.writer(std.testing.allocator), &history);
+
+    try std.testing.expectEqualStrings(
+        "{\"role\":\"assistant\",\"content\":\"bootstrap reply\"},{\"role\":\"user\",\"content\":\"same prompt\"}",
+        out.items,
+    );
 }
 
 test "handleSessionExport returns 404 for unknown session" {

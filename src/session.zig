@@ -345,6 +345,9 @@ pub const SessionManager = struct {
         /// agent for this turn; restored to false on defer (same pattern as
         /// turn_reasoning_effort / turn_execution_mode).
         turn_superpowers_mode: bool = false,
+        /// False for backend-authored bootstrap turns that must remain model
+        /// context without appearing as user-authored transcript history.
+        user_visible: bool = true,
     };
 
     pub const OriginSnapshot = struct {
@@ -1257,6 +1260,7 @@ pub const SessionManager = struct {
         const previous_execution_mode = session.agent.execution_mode;
         const previous_reasoning_effort = session.agent.reasoning_effort;
         const previous_superpowers_mode = session.agent.superpowers_mode;
+        const previous_user_visible = session.agent.current_turn_user_visible;
         const previous_policy = session.agent.policy;
         var turn_policy = if (session.agent.policy) |policy| policy.* else SecurityPolicy{};
         var turn_policy_applied = false;
@@ -1284,6 +1288,7 @@ pub const SessionManager = struct {
         if (options.turn_superpowers_mode) {
             session.agent.superpowers_mode = true;
         }
+        session.agent.current_turn_user_visible = options.user_visible;
         if (options.turn_autonomy) |autonomy| {
             turn_policy.autonomy = autonomy;
             session.agent.policy = &turn_policy;
@@ -1299,6 +1304,7 @@ pub const SessionManager = struct {
             if (options.turn_superpowers_mode) {
                 session.agent.superpowers_mode = previous_superpowers_mode;
             }
+            session.agent.current_turn_user_visible = previous_user_visible;
             if (turn_policy_applied) {
                 session.agent.policy = previous_policy;
             }
@@ -1355,7 +1361,8 @@ pub const SessionManager = struct {
                 // directive). Dropping a saveMessage silently means the turn
                 // completed but the history it claims to have persisted is
                 // incomplete; /history export would under-report.
-                store.saveMessage(session_key, "user", content) catch |err|
+                const persisted_user_role = if (options.user_visible) "user" else "internal_user";
+                store.saveMessage(session_key, persisted_user_role, content) catch |err|
                     log.warn("session.saveMessage_user_failed session={s} err={s}", .{ session_key, @errorName(err) });
                 // P1-5 transcript fidelity — persist the assistant turn WITH
                 // its native tool_calls + reasoning (from history) so a
