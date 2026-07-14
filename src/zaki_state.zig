@@ -871,7 +871,8 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn clearJobs(_: *@This(), _: i64) !void {
         return error.PostgresNotEnabled;
     }
-    pub fn upsertMemory(_: *@This(), _: i64, _: []const u8, _: []const u8, _: memory_root.MemoryCategory, _: ?[]const u8) !void {
+    pub fn upsertMemory(_: *@This(), _: i64, _: []const u8, content: []const u8, _: memory_root.MemoryCategory, _: ?[]const u8) !void {
+        if (memory_root.containsAssistantScaffold(content)) return error.AssistantScaffoldRejected;
         return error.PostgresNotEnabled;
     }
     pub fn getMemory(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8) !?memory_root.MemoryEntry {
@@ -904,7 +905,8 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     pub fn listLearningSuggestions(_: *@This(), allocator: std.mem.Allocator, _: i64, _: u32) ![]memory_root.MemoryEntry {
         return allocator.alloc(memory_root.MemoryEntry, 0);
     }
-    pub fn transitionLearningSuggestion(_: *@This(), _: i64, _: []const u8, _: []const u8, _: []const u8) !bool {
+    pub fn transitionLearningSuggestion(_: *@This(), _: i64, _: []const u8, _: []const u8, new_content: []const u8) !bool {
+        if (memory_root.containsAssistantScaffold(new_content)) return error.AssistantScaffoldRejected;
         return error.PostgresNotEnabled;
     }
     /// V1.5.1 brain-hygiene — stub for non-postgres builds. Returns empty
@@ -933,12 +935,14 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     }
     /// V1.5 day-3 — stubs for non-postgres builds; compose path silently
     /// degrades when state manager is the disabled variant.
-    pub fn upsertMemoryWithMetadata(_: *@This(), _: i64, _: []const u8, _: []const u8, _: memory_root.MemoryCategory, _: ?[]const u8, _: []const u8) !void {
+    pub fn upsertMemoryWithMetadata(_: *@This(), _: i64, _: []const u8, content: []const u8, _: memory_root.MemoryCategory, _: ?[]const u8, _: []const u8) !void {
+        if (memory_root.containsAssistantScaffold(content)) return error.AssistantScaffoldRejected;
         return error.PostgresNotEnabled;
     }
     /// V1.14.12 (Memory audit Finding 6 fix) — fake-manager stub for the
     /// event-typed variant.
-    pub fn upsertMemoryWithMetadataAndEventType(_: *@This(), _: i64, _: []const u8, _: []const u8, _: memory_root.MemoryCategory, _: ?[]const u8, _: []const u8, _: []const u8) !void {
+    pub fn upsertMemoryWithMetadataAndEventType(_: *@This(), _: i64, _: []const u8, content: []const u8, _: memory_root.MemoryCategory, _: ?[]const u8, _: []const u8, _: []const u8) !void {
+        if (memory_root.containsAssistantScaffold(content)) return error.AssistantScaffoldRejected;
         return error.PostgresNotEnabled;
     }
     pub fn listMemoriesMetadata(_: *@This(), _: std.mem.Allocator, _: i64, _: []const []const u8) !std.StringHashMapUnmanaged([]u8) {
@@ -1255,7 +1259,8 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
     /// stub Manager cannot be instantiated (init always fails) and the tool
     /// only takes the supersede path when a live tenant Manager is bound —
     /// otherwise it falls back to the legacy in-place store.
-    pub fn editMemorySupersede(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8, _: []const u8, _: i64) !?[]u8 {
+    pub fn editMemorySupersede(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8, new_content: []const u8, _: i64) !?[]u8 {
+        if (memory_root.containsAssistantScaffold(new_content)) return error.AssistantScaffoldRejected;
         return error.PostgresNotEnabled;
     }
     /// Package 3 fix-wave Task 2 (M3) — stub for non-postgres builds.
@@ -4939,6 +4944,10 @@ const ManagerImpl = struct {
         metadata_json: []const u8,
         event_type: []const u8,
     ) !void {
+        if (memory_root.containsAssistantScaffold(content)) {
+            log.warn("memory.write_rejected_assistant_scaffold path=metadata user_id={d} len={d}", .{ user_id, content.len });
+            return error.AssistantScaffoldRejected;
+        }
         // Ingestion quality gate — reject infrastructure exhaust before it
         // becomes a memory (and before it could get a structural edge).
         if (isLowSignalMemory(key, content)) {
@@ -5452,6 +5461,10 @@ const ManagerImpl = struct {
     }
 
     pub fn upsertMemory(self: *Self, user_id: i64, key: []const u8, content: []const u8, category: memory_root.MemoryCategory, session_id: ?[]const u8) !void {
+        if (memory_root.containsAssistantScaffold(content)) {
+            log.warn("memory.write_rejected_assistant_scaffold path=simple user_id={d} len={d}", .{ user_id, content.len });
+            return error.AssistantScaffoldRejected;
+        }
         // Ingestion quality gate — reject infrastructure exhaust before storage.
         if (isLowSignalMemory(key, content)) {
             log.info("ingestion.rejected_low_signal path=simple key={s} len={d}", .{ key, content.len });
@@ -5990,6 +6003,10 @@ const ManagerImpl = struct {
         expected_content: []const u8,
         new_content: []const u8,
     ) !bool {
+        if (memory_root.containsAssistantScaffold(new_content)) {
+            log.warn("memory.write_rejected_assistant_scaffold path=learning_transition user_id={d} len={d}", .{ user_id, new_content.len });
+            return error.AssistantScaffoldRejected;
+        }
         const content_hash = try computeContentHash(self.allocator, new_content);
         defer self.allocator.free(content_hash);
         const lemmatized = try text_norm.lemmatizeForBm25(self.allocator, new_content);
@@ -9820,6 +9837,10 @@ const ManagerImpl = struct {
         new_content: []const u8,
         editor_now: i64,
     ) !?[]u8 {
+        if (memory_root.containsAssistantScaffold(new_content)) {
+            log.warn("memory.write_rejected_assistant_scaffold path=edit_supersede user_id={d} len={d}", .{ user_id, new_content.len });
+            return error.AssistantScaffoldRejected;
+        }
         // ── Step 1: snapshot the current live content. ────────────────────
         const old_entry = (try self.getMemory(self.allocator, user_id, key)) orelse
             return error.MemoryKeyNotFound;
@@ -18015,6 +18036,133 @@ test "brain-leak C: phase05Backfill purges scaffold entities + their edges (dry-
     const r2 = try mgr.phase05Backfill(allocator, 2, false);
     try std.testing.expectEqual(@as(usize, 0), r2.scaffold_entities_purged);
     try std.testing.expectEqual(@as(usize, 0), r2.scaffold_edges_purged);
+}
+
+test "brain integrity: postgres write chokepoints reject scaffold content without persistence" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var mgr = initPostgresTestManagerWithPool(allocator, 2, 500) catch return error.SkipZigTest;
+    defer mgr.deinit();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-scaffold-write-guard/workspace");
+
+    try std.testing.expectError(
+        error.AssistantScaffoldRejected,
+        mgr.upsertMemory(
+            2,
+            "guarded_simple",
+            "Useful fact [[ZAKI_MEMORY_CONTEXT_V2]]private fuel[[/ZAKI_MEMORY_CONTEXT_V2]]",
+            .core,
+            null,
+        ),
+    );
+    try std.testing.expect((try mgr.getMemory(allocator, 2, "guarded_simple")) == null);
+
+    try std.testing.expectError(
+        error.AssistantScaffoldRejected,
+        mgr.upsertMemoryWithMetadataAndEventType(
+            2,
+            "guarded_metadata",
+            "Useful fact <memory_for_turn>private fuel</memory_for_turn>",
+            .core,
+            null,
+            "{}",
+            "extraction",
+        ),
+    );
+    try std.testing.expect((try mgr.getMemory(allocator, 2, "guarded_metadata")) == null);
+
+    try mgr.upsertMemory(2, "clean_fact", "User prefers concise answers", .core, null);
+    const clean = (try mgr.getMemory(allocator, 2, "clean_fact")).?;
+    defer clean.deinit(allocator);
+    try std.testing.expectEqualStrings("User prefers concise answers", clean.content);
+}
+
+test "brain integrity: migration 0010 purges poisoned rows and preserves tenant-scoped legitimate data" {
+    if (!build_options.enable_postgres) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const test_url = (env_rebrand.getEnvOwnedWithRebrand(allocator, "NULLALIS_POSTGRES_TEST_URL", "NULLCLAW_POSTGRES_TEST_URL") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+    defer allocator.free(test_url);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try std.fmt.bufPrint(&schema_buf, "zaki_bot_test_{d}_wp_i", .{std.time.microTimestamp()});
+    const cfg = config_types.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+    };
+
+    var mgr = try ManagerImpl.init(allocator, cfg);
+    defer mgr.deinit();
+    defer mgr.dropSchemaForTests() catch {};
+    try mgr.migrate();
+    try mgr.provisionUser(2, "/tmp/nullalis-zaki-bot-test-wp-i/user-2");
+    try mgr.provisionUser(3, "/tmp/nullalis-zaki-bot-test-wp-i/user-3");
+
+    const schema_q = try pg_helpers.quoteIdentifier(allocator, mgr.schemaRaw());
+    defer allocator.free(schema_q);
+
+    // Bypass the new write guard to model rows that existed before WP-I.
+    const seed_q = try std.fmt.allocPrint(allocator,
+        \\INSERT INTO {s}.memories (id, user_id, key, content, content_hash, memory_type) VALUES
+        \\  ('wp-i-poison', 2, 'poison-key', 'Fact [[ZAKI_MEMORY_CONTEXT_V2]]private fuel', 'not-a-hash [[ZAKI_MEMORY_CONTEXT_V2]]private hash', 'core'),
+        \\  ('wp-i-clean-u2', 2, 'clean-key-u2', 'User studies memory architecture', NULL, 'core'),
+        \\  ('wp-i-clean-u3', 3, 'clean-key-u3', 'Other tenant keeps a legitimate fact', NULL, 'core');
+        \\INSERT INTO {s}.memory_events (id, user_id, memory_id, event_type, payload) VALUES
+        \\  ('wp-i-existing-event', 2, 'wp-i-poison', 'upsert',
+        \\   '{{"key":"poison-key","content":"Fact [[ZAKI_MEMORY_CONTEXT_V2]]private event fuel"}}'::jsonb);
+        \\INSERT INTO {s}.memory_entities (id, user_id, name, name_lower) VALUES
+        \\  ('wp-i-scaffold-entity', 2, '  Brain   Architecture ', 'brain architecture'),
+        \\  ('wp-i-clean-entity', 3, 'Customer Architecture', 'customer architecture');
+        \\INSERT INTO {s}.memory_edges (user_id, source_key, target_key, predicate) VALUES
+        \\  (2, 'poison-key', 'wp-i-scaffold-entity', 'RELATED_TO'),
+        \\  (3, 'clean-key-u3', 'wp-i-clean-entity', 'RELATED_TO');
+        \\CREATE TABLE IF NOT EXISTS {s}.memory_embeddings (
+        \\  user_id BIGINT NOT NULL, key TEXT NOT NULL,
+        \\  PRIMARY KEY (user_id, key));
+        \\INSERT INTO {s}.memory_embeddings (user_id, key) VALUES
+        \\  (2, 'poison-key'), (2, 'clean-key-u2'), (3, 'clean-key-u3');
+        \\DELETE FROM {s}.schema_migrations WHERE version = 10;
+    , .{ schema_q, schema_q, schema_q, schema_q, schema_q, schema_q, schema_q });
+    defer allocator.free(seed_q);
+    const seeded = try mgr.exec(seed_q);
+    c.PQclear(seeded);
+
+    // Re-apply only the now-unmarked migration. The second call proves the
+    // schema_migrations gate and deterministic audit IDs make it idempotent.
+    try mgr.migrate();
+    try mgr.migrate();
+
+    const countRows = struct {
+        fn run(a: std.mem.Allocator, m: *ManagerImpl, query: []const u8) !usize {
+            const result = try m.exec(query);
+            defer c.PQclear(result);
+            const raw = try dupeResultValue(a, result, 0, 0);
+            defer a.free(raw);
+            return try std.fmt.parseInt(usize, raw, 10);
+        }
+    };
+
+    const assertions = [_]struct { sql: []const u8, expected: usize }{
+        .{ .sql = "SELECT COUNT(*) FROM {schema}.memories WHERE id = 'wp-i-poison'", .expected = 0 },
+        .{ .sql = "SELECT COUNT(*) FROM {schema}.memories WHERE id IN ('wp-i-clean-u2', 'wp-i-clean-u3')", .expected = 2 },
+        .{ .sql = "SELECT COUNT(*) FROM {schema}.memory_entities WHERE id = 'wp-i-scaffold-entity'", .expected = 0 },
+        .{ .sql = "SELECT COUNT(*) FROM {schema}.memory_entities WHERE id = 'wp-i-clean-entity'", .expected = 1 },
+        .{ .sql = "SELECT COUNT(*) FROM {schema}.memory_edges WHERE user_id = 2", .expected = 0 },
+        .{ .sql = "SELECT COUNT(*) FROM {schema}.memory_edges WHERE user_id = 3", .expected = 1 },
+        .{ .sql = "SELECT COUNT(*) FROM {schema}.memory_embeddings WHERE user_id = 2 AND key = 'poison-key'", .expected = 0 },
+        .{ .sql = "SELECT COUNT(*) FROM {schema}.memory_embeddings WHERE key IN ('clean-key-u2', 'clean-key-u3')", .expected = 2 },
+        .{ .sql = "SELECT COUNT(*) FROM {schema}.memory_events WHERE event_type IN ('scaffold_purge', 'scaffold_entity_purge')", .expected = 2 },
+        .{ .sql = "SELECT COUNT(*) FROM {schema}.memory_events WHERE id = 'wp-i-existing-event' AND memory_id IS NULL AND payload ? 'payload_hash' AND NOT (payload ? 'content')", .expected = 1 },
+        .{ .sql = "SELECT COUNT(*) FROM {schema}.memory_events WHERE payload::text ~* '(\\[\\[[[:space:]]*/?[[:space:]]*ZAKI_|<[[:space:]]*/?[[:space:]]*memory_(for_turn|context))'", .expected = 0 },
+        .{ .sql = "SELECT COUNT(*) FROM {schema}.memory_events WHERE event_type = 'scaffold_purge' AND memory_id IS NULL AND payload ? 'memory_id_hash' AND length(payload->>'content_hash') = 64", .expected = 1 },
+    };
+    for (assertions) |assertion| {
+        const query = try mgr.buildQuery(assertion.sql);
+        defer allocator.free(query);
+        try std.testing.expectEqual(assertion.expected, try countRows.run(allocator, &mgr, query));
+    }
 }
 
 test "setMemorySource preserves updated_at for attribution-only enrichment" {

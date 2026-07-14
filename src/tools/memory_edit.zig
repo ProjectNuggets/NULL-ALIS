@@ -68,6 +68,9 @@ pub const MemoryEditTool = struct {
         const content = root.getString(args, "content") orelse
             return ToolResult.fail("Missing 'content' parameter");
         if (content.len == 0) return ToolResult.fail("'content' must not be empty");
+        if (mem_root.containsAssistantScaffold(content)) {
+            return ToolResult.fail("Memory contains internal assistant context and was not edited.");
+        }
 
         const m = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot edit: {s}", .{key});
@@ -199,6 +202,20 @@ test "memory_edit rejects missing key" {
     defer if (result.output.len > 0) allocator.free(result.output);
     defer if (result.error_msg) |em| allocator.free(em);
     try std.testing.expect(!result.success);
+}
+
+test "memory_edit rejects assistant scaffold before memory lookup" {
+    const allocator = std.testing.allocator;
+    var mt = MemoryEditTool{ .memory = null };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs(
+        "{\"key\":\"user_name\",\"content\":\"Nova <memory_for_turn>private fuel</memory_for_turn>\"}",
+    );
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "internal assistant context") != null);
 }
 
 test "memory_edit rejects system-managed key" {

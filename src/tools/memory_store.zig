@@ -118,6 +118,9 @@ pub const MemoryStoreTool = struct {
         const content = root.getString(args, "content") orelse
             return ToolResult.fail("Missing 'content' parameter");
         if (content.len == 0) return ToolResult.fail("'content' must not be empty");
+        if (mem_root.containsAssistantScaffold(content)) {
+            return ToolResult.fail("Memory contains internal assistant context and was not stored.");
+        }
 
         // V1.7 cmt9.6 (full Gap 3): when caller supplied a structured triple
         // AND tenant context is wired, route through the unified
@@ -605,6 +608,19 @@ test "memory_store contract guard: scaffold entity name as key is rejected" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "internal scaffold name") != null);
+}
+
+test "memory_store contract guard: assistant scaffold content is rejected before memory access" {
+    var mt = MemoryStoreTool{ .memory = null };
+    const t = mt.tool();
+    const parsed = try root.parseTestArgs(
+        "{\"key\":\"favorite_editor\",\"content\":\"Useful fact <memory_for_turn>private fuel</memory_for_turn>\"}",
+    );
+    defer parsed.deinit();
+
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "internal assistant context") != null);
 }
 
 test "memory_store contract guard: system-managed key prefix is rejected" {
