@@ -952,6 +952,10 @@ pub const Agent = struct {
     /// substituted; raw is what goes to the provider).
     current_turn_raw_user: ?[]const u8 = null,
 
+    /// Transcript provenance for the current inbound user-role turn. Hidden
+    /// turns still reach the model but are omitted from user-facing history.
+    current_turn_user_visible: bool = true,
+
     /// Anti-thrash ring (iter20): last two compaction savings percentages.
     /// If both below COMPACTION_MIN_SAVINGS_PERCENT, autoCompactHistory skips
     /// its next attempt. Force-compress path bypasses this guard.
@@ -977,6 +981,9 @@ pub const Agent = struct {
         /// Optional native tool-call id for `.tool` messages. Allocator-owned
         /// when set.
         tool_call_id: ?[]const u8 = null,
+        /// False only for backend-authored user-role turns. This is separate
+        /// from content so identical text authored by a real user stays visible.
+        user_visible: bool = true,
 
         pub fn deinit(self: *const OwnedMessage, allocator: std.mem.Allocator) void {
             allocator.free(self.content);
@@ -4306,6 +4313,7 @@ pub const Agent = struct {
         try self.history.append(self.allocator, .{
             .role = .user,
             .content = raw_user_history,
+            .user_visible = self.current_turn_user_visible,
         });
         raw_user_history_appended = true;
         self.current_turn_raw_user = raw_user_history;
@@ -7101,6 +7109,7 @@ pub const Agent = struct {
     /// The agent takes ownership of the content strings.
     pub fn loadHistory(self: *Agent, entries: anytype) !void {
         for (entries) |entry| {
+            const is_internal_user = std.mem.eql(u8, entry.role, "internal_user");
             const role: providers.Role = if (std.mem.eql(u8, entry.role, "assistant"))
                 .assistant
             else if (std.mem.eql(u8, entry.role, "system"))
@@ -7143,6 +7152,7 @@ pub const Agent = struct {
                 .content = content_copy,
                 .reasoning = reasoning_copy,
                 .tool_calls = tool_calls_copy,
+                .user_visible = !is_internal_user,
             });
         }
     }
@@ -7150,6 +7160,7 @@ pub const Agent = struct {
     pub const HistoryPair = struct {
         role: []const u8,
         content: []const u8,
+        user_visible: bool = true,
     };
 
     /// Get history entries as role-string + content pairs (for persistence).
@@ -7165,6 +7176,7 @@ pub const Agent = struct {
                     .tool => "tool",
                 },
                 .content = msg.content,
+                .user_visible = msg.user_visible,
             };
         }
         return result;
@@ -7725,6 +7737,10 @@ test "Agent loadHistory handles zero-length content safely" {
     defer allocator.free(assistant_role);
     const assistant_content = try allocator.dupe(u8, "persisted reply");
     defer allocator.free(assistant_content);
+    const internal_user_role = try allocator.dupe(u8, "internal_user");
+    defer allocator.free(internal_user_role);
+    const internal_user_content = try allocator.dupe(u8, "backend bootstrap");
+    defer allocator.free(internal_user_content);
 
     const Entry = struct {
         role: []const u8,
@@ -7733,14 +7749,18 @@ test "Agent loadHistory handles zero-length content safely" {
     const entries = [_]Entry{
         .{ .role = user_role, .content = empty_content },
         .{ .role = assistant_role, .content = assistant_content },
+        .{ .role = internal_user_role, .content = internal_user_content },
     };
 
     try agent.loadHistory(entries[0..]);
-    try std.testing.expectEqual(@as(usize, 2), agent.historyLen());
+    try std.testing.expectEqual(@as(usize, 3), agent.historyLen());
     try std.testing.expect(agent.history.items[0].role == .user);
     try std.testing.expectEqual(@as(usize, 0), agent.history.items[0].content.len);
     try std.testing.expect(agent.history.items[1].role == .assistant);
     try std.testing.expectEqualStrings("persisted reply", agent.history.items[1].content);
+    try std.testing.expect(agent.history.items[2].role == .user);
+    try std.testing.expect(!agent.history.items[2].user_visible);
+    try std.testing.expectEqualStrings("backend bootstrap", agent.history.items[2].content);
 }
 
 test "P1-5 — serializeToolCalls round-trips through parsePersistedToolCalls" {

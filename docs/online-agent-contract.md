@@ -551,6 +551,12 @@ data: <json_payload>\n
   emitted periodically.
 - HTTP status codes: 200 (success), 400 (bad request), 401 (unauthorized),
   409 (ownership conflict), 429 (rate limited), 503 (draining).
+- A trusted BFF may send
+  `context: {"authored_by":"backend","user_visible":false}` for an
+  internal bootstrap turn. Nullalis persists that user-role turn with
+  `internal_user` provenance, restores it as model context, and excludes it
+  from session history/export. `user_visible:false` without backend authorship
+  is ignored, so matching user-authored text remains visible.
 
 ## 7. Known Caveats
 

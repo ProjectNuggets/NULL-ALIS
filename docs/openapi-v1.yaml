@@ -538,6 +538,18 @@ paths:
                 session_key:
                   type: string
                   description: Required explicit lane key. In tenant mode it must belong to the authenticated user and use one of `main`, `thread:<id>`, `task:<id>`, or `cron:<id>`.
+                context:
+                  type: object
+                  description: Trusted BFF turn metadata. Ordinary user turns should omit this object.
+                  properties:
+                    authored_by:
+                      type: string
+                      enum: [backend]
+                      description: Marks a turn as authored by the trusted backend rather than the end user.
+                    user_visible:
+                      type: boolean
+                      default: true
+                      description: When false together with `authored_by: backend`, the user-role turn remains model context but is excluded from session history and export by durable provenance.
       responses:
         "200":
           description: |
