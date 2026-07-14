@@ -79,6 +79,28 @@ pub fn validateExpandSql(sql: []const u8) !void {
             try appendNormalizedSpace(&normalized, allocator);
             continue;
         }
+
+        // Keywords inside ordinary string literals and quoted identifiers are
+        // data/names, not executable SQL tokens. Ignore them so a harmless
+        // default such as 'drop table' does not force a migration to contract.
+        if (sql[index] == '\'' or sql[index] == '"') {
+            const quote = sql[index];
+            index += 1;
+            while (index < sql.len) {
+                if (sql[index] != quote) {
+                    index += 1;
+                    continue;
+                }
+                if (index + 1 < sql.len and sql[index + 1] == quote) {
+                    index += 2;
+                    continue;
+                }
+                index += 1;
+                break;
+            }
+            try appendNormalizedSpace(&normalized, allocator);
+            continue;
+        }
         if (index + 1 < sql.len and sql[index] == '/' and sql[index + 1] == '*') {
             index += 2;
             while (index + 1 < sql.len and !(sql[index] == '*' and sql[index + 1] == '/')) : (index += 1) {}
@@ -101,10 +123,36 @@ pub fn validateExpandSql(sql: []const u8) !void {
         " drop table ",
         " drop column ",
         " drop constraint ",
+        " drop schema ",
+        " drop view ",
+        " drop materialized view ",
+        " drop type ",
+        " drop domain ",
+        " drop sequence ",
+        " drop function ",
+        " drop procedure ",
+        " drop trigger ",
+        " drop policy ",
+        " drop default ",
+        " drop identity ",
+        " drop expression ",
+        " add constraint ",
+        " add primary key ",
+        " add unique ",
+        " add check ",
+        " add foreign key ",
+        " add exclude ",
         " rename column ",
+        " rename constraint ",
+        " rename attribute ",
+        " rename value ",
         " rename to ",
         " set not null ",
         " truncate table ",
+        " create or replace view ",
+        " create or replace function ",
+        " create or replace procedure ",
+        " execute ",
     };
     for (forbidden) |needle| {
         if (std.mem.indexOf(u8, normalized.items, needle) != null) return error.DestructiveExpandMigration;
@@ -112,10 +160,13 @@ pub fn validateExpandSql(sql: []const u8) !void {
 
     // ALTER COLUMN ... TYPE may contain an arbitrary type expression between
     // the two tokens, so it cannot be represented by one fixed phrase.
-    if (std.mem.indexOf(u8, normalized.items, " alter column ") != null and
-        std.mem.indexOf(u8, normalized.items, " type ") != null)
-    {
-        return error.DestructiveExpandMigration;
+    var statements = std.mem.tokenizeScalar(u8, normalized.items, ';');
+    while (statements.next()) |statement| {
+        if (std.mem.indexOf(u8, statement, " alter column ") != null and
+            std.mem.indexOf(u8, statement, " type ") != null)
+        {
+            return error.DestructiveExpandMigration;
+        }
     }
 }
 
@@ -310,13 +361,23 @@ pub fn runWith(rc: RunnerContext, migrations: []const Migration) !void {
         try rc.exec(rc.ctx, q);
     }
 
-    // Step 2: iterate migrations, apply unapplied ones in order.
+    // Step 2: preflight the complete registry before any migration body runs.
+    // This prevents a safe earlier migration from being committed before a
+    // later unsafe declaration stops boot halfway through the registry.
     for (migrations) |m| {
-        // Fail closed before opening a migration transaction or executing its
-        // body. This is also evaluated for already-applied entries so a later
-        // registry edit cannot silently weaken the compatibility contract.
-        if (m.phase == .expand) try validateExpandSql(m.sql);
+        switch (m.phase) {
+            .baseline => if (m.version != 1) return error.InvalidBaselineMigration,
+            .expand => try validateExpandSql(m.sql),
+            .contract => {
+                if (!try rc.isApplied(rc.ctx, m.version)) {
+                    return error.ContractMigrationRequiresOperatorApproval;
+                }
+            },
+        }
+    }
 
+    // Step 3: iterate migrations, apply unapplied ones in order.
+    for (migrations) |m| {
         if (try rc.isApplied(rc.ctx, m.version)) {
             std.log.scoped(.migrations).debug("migration {d} '{s}' already applied", .{ m.version, m.name });
             continue;
@@ -541,6 +602,101 @@ test "migrations.runWith rejects destructive SQL declared as expand before DDL" 
     try std.testing.expectEqual(@as(usize, 1), tr.queries.items.len);
     try std.testing.expect(!tr.in_tx);
     try std.testing.expectEqual(@as(usize, 0), tr.applied.count());
+}
+
+test "migrations.runWith refuses an unapplied contract migration before DDL" {
+    var tr = TestRunner{ .allocator = std.testing.allocator };
+    defer tr.deinit();
+
+    const contract = [_]Migration{.{
+        .version = 1,
+        .name = "0001_contract_fixture",
+        .sql = "ALTER TABLE {schema}.fixture DROP COLUMN value",
+        .phase = .contract,
+    }};
+
+    try std.testing.expectError(error.ContractMigrationRequiresOperatorApproval, runWith(tr.context(), &contract));
+    // Only the idempotent schema_migrations tracker may execute.
+    try std.testing.expectEqual(@as(usize, 1), tr.queries.items.len);
+    try std.testing.expect(!tr.in_tx);
+    try std.testing.expectEqual(@as(usize, 0), tr.applied.count());
+}
+
+test "migrations.runWith preflights every phase before applying an earlier migration" {
+    var tr = TestRunner{ .allocator = std.testing.allocator };
+    defer tr.deinit();
+
+    const mixed = [_]Migration{
+        .{ .version = 1, .name = "0001_safe_expand", .sql = "CREATE TABLE {schema}.safe (id INT)", .phase = .expand },
+        .{ .version = 2, .name = "0002_unsafe_expand", .sql = "DROP TABLE {schema}.safe", .phase = .expand },
+    };
+
+    try std.testing.expectError(error.DestructiveExpandMigration, runWith(tr.context(), &mixed));
+    try std.testing.expectEqual(@as(usize, 1), tr.queries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), tr.applied.count());
+}
+
+test "migrations.runWith reserves baseline compatibility for version one" {
+    var tr = TestRunner{ .allocator = std.testing.allocator };
+    defer tr.deinit();
+
+    const invalid = [_]Migration{.{
+        .version = 2,
+        .name = "0002_invalid_baseline",
+        .sql = "DROP TABLE {schema}.fixture",
+        .phase = .baseline,
+    }};
+
+    try std.testing.expectError(error.InvalidBaselineMigration, runWith(tr.context(), &invalid));
+    try std.testing.expectEqual(@as(usize, 1), tr.queries.items.len);
+}
+
+test "migrations.runWith permits a contract migration already recorded by an operator" {
+    var tr = TestRunner{ .allocator = std.testing.allocator };
+    defer tr.deinit();
+
+    const contract = [_]Migration{.{
+        .version = 10,
+        .name = "0010_contract_fixture",
+        .sql = "ALTER TABLE {schema}.fixture DROP COLUMN value",
+        .phase = .contract,
+    }};
+    try tr.applied.put(tr.allocator, 10, {});
+
+    try runWith(tr.context(), &contract);
+    try std.testing.expectEqual(@as(usize, 1), tr.queries.items.len);
+    try std.testing.expect(!tr.in_tx);
+}
+
+test "validateExpandSql rejects additional rollback-breaking schema operations" {
+    const forbidden = [_][]const u8{
+        "DROP VIEW {schema}.legacy_view",
+        "DROP TYPE {schema}.legacy_status",
+        "ALTER TABLE {schema}.fixture RENAME CONSTRAINT old_name TO new_name",
+        "ALTER TABLE {schema}.fixture ALTER COLUMN value DROP DEFAULT",
+        "CREATE OR REPLACE VIEW {schema}.legacy_view AS SELECT id FROM {schema}.fixture",
+        "DO $$ BEGIN EXECUTE 'DROP TABLE {schema}.fixture'; END $$",
+        "ALTER TABLE {schema}.fixture ADD CONSTRAINT value_nonempty CHECK (value <> '')",
+    };
+    for (forbidden) |sql| {
+        try std.testing.expectError(error.DestructiveExpandMigration, validateExpandSql(sql));
+    }
+}
+
+test "validateExpandSql scopes ALTER COLUMN TYPE detection to one statement" {
+    try validateExpandSql(
+        \\ALTER TABLE {schema}.fixture ALTER COLUMN value SET DEFAULT 1;
+        \\CREATE TYPE {schema}.status AS ENUM ('ready');
+    );
+}
+
+test "validateExpandSql ignores destructive words inside literals and quoted identifiers" {
+    try validateExpandSql(
+        \\CREATE TABLE {schema}.fixture (
+        \\  "drop column" TEXT,
+        \\  note TEXT DEFAULT 'drop table and rename column'
+        \\)
+    );
 }
 
 test "migrations.run with production MIGRATIONS executes tracker + each registered migration" {

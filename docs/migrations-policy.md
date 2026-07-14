@@ -43,7 +43,11 @@ corruption or an explicitly owner-approved destructive recovery.
 
 A contract migration is blocked until the previous binary is retired, the rollback observation
 window has closed, a current managed-Postgres recovery point/PITR check exists, and the operator has
-an explicit data replay or accepted-loss plan.
+an explicit data replay or accepted-loss plan. The automatic boot runner refuses every unapplied
+`contract` entry with `ContractMigrationRequiresOperatorApproval`. During the approved window, the
+operator applies the reviewed contract SQL and records the matching version in
+`{schema}.schema_migrations` as one controlled operation. Once that row exists, normal boots accept
+the registry entry without trying to execute it again.
 
 ## Idempotency
 
