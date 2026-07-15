@@ -85,3 +85,25 @@ The implementation was exercised with the real Postgres-enabled CLI binary again
 ```
 
 The deterministic endpoint received the keyword-reduced query, not the raw wish. No shared or fleet config was changed.
+
+## Staging live-drive evidence (2026-07-15)
+
+The runbook was exercised against the explicitly tagged `agentproof` staging fixture (numeric user
+ID 148) on image `sha-12d1a1382e4dd050a6c2bfa47ab20a0a16544296`:
+
+1. The fixture started with `wish_matchmaking_enabled=false`. A single neutral, temporary
+   `wish/w2-pilot-apple-notes` record was added for the drive.
+2. With the gate off, `/learn list` rendered the wish with no install affordance.
+3. The JSONB update changed exactly one row; a fleet count confirmed exactly one enabled tenant.
+   Tenant-only cache invalidation reported `requested=1`, `removed=1`, `all=false`.
+4. With the gate on, `/learn list` rendered a `possible skill` affordance. A Cilium trace from the
+   Nullalis endpoint showed the corresponding TLS connection to a current `hub.decision.ai`
+   address (`44.217.9.182:443`).
+5. The flag was restored to false and the same tenant-only cache invalidation was repeated. A
+   matched Cilium observation window around the off-gate `/learn list` showed no connection to any
+   currently resolved `hub.decision.ai` address.
+6. Final cleanup removed the temporary wish and confirmed zero enabled tenants and zero residual
+   pilot records. No production or fleet-wide configuration changed.
+
+This staging drive proves both sides of the privacy gate at the network boundary, not merely the
+presence or absence of a rendered suggestion.
