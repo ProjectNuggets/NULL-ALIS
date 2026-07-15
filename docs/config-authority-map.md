@@ -63,9 +63,10 @@ This document is the canonical contract for who owns each class of config and wh
 The heartbeat loop is effective only when the operator scheduler is enabled **and** the per-user
 heartbeat record is enabled. A tenant's `proactive_updates` preference is a separate intent field;
 it is not an authority for the scheduler and must not be presented as proof that proactive delivery
-ran. During ZAKI's launch pause, the authenticated Hub boundary rejects `proactive_updates=true` and
-returns the launch-effective value as false. Re-enabling it later requires a deliberate BFF policy
-change plus an effective-status surface backed by heartbeat runtime diagnostics.
+ran. During ZAKI's launch pause, the authenticated Hub boundary rejects both
+`proactive_updates=true` and heartbeat `enabled=true` (on the canonical and legacy aliases), while
+returning both launch-effective values as false. Re-enabling them later requires a deliberate BFF
+policy change plus an effective-status surface backed by heartbeat runtime diagnostics.
 
 ### Tenant integration plane
 - Owner: user/channel onboarding flow
