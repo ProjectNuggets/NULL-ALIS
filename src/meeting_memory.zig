@@ -45,6 +45,7 @@ pub const ValidationError = error{
     InvalidGrantedAt,
     ConsentSourceMismatch,
     ConsentCandidateMismatch,
+    PreparedMemoryIntegrityMismatch,
 };
 
 pub const SourceTupleInput = struct {
@@ -125,6 +126,7 @@ pub const ConfirmationAuthority = enum { authenticated_user_control };
 
 pub const ConfirmedConsentGrant = struct {
     grant_digest: Digest,
+    integrity_digest: Digest,
     policy_version: []const u8,
     granted_at_unix_ms: i64,
     authority: ConfirmationAuthority,
@@ -140,11 +142,30 @@ pub const ConfirmedConsentGrant = struct {
         if (input.granted_at_unix_ms <= 0) return error.InvalidGrantedAt;
 
         const identity = deriveIdentity(source, candidate);
+        const authority: ConfirmationAuthority = .authenticated_user_control;
+        const grant_digest = deriveGrantDigest(
+            identity.source_digest,
+            identity.candidate_digest,
+            input.grant_id,
+            input.policy_version,
+            input.granted_at_unix_ms,
+            authority,
+            candidate.dlp_approval,
+        );
         return .{
-            .grant_digest = deriveGrantDigest(identity.source_digest, identity.candidate_digest, input.grant_id),
+            .grant_digest = grant_digest,
+            .integrity_digest = deriveConsentIntegrity(
+                grant_digest,
+                identity.source_digest,
+                identity.candidate_digest,
+                input.policy_version,
+                input.granted_at_unix_ms,
+                authority,
+                candidate.dlp_approval,
+            ),
             .policy_version = input.policy_version,
             .granted_at_unix_ms = input.granted_at_unix_ms,
-            .authority = .authenticated_user_control,
+            .authority = authority,
             .source_digest = identity.source_digest,
             .candidate_digest = identity.candidate_digest,
         };
@@ -236,6 +257,64 @@ pub const PreparedMemory = struct {
             .provenance = .{
                 .identity = identity,
                 .consent = consent,
+                .dlp_approval = candidate.dlp_approval,
+            },
+        };
+    }
+
+    /// Rebuild and compare every derived field immediately before persistence.
+    ///
+    /// The input structs borrow slices, so constructor-time validation alone is
+    /// insufficient: a caller can reuse or mutate a backing buffer after
+    /// `init`. This boundary check validates the current bytes and
+    /// constant-time-compares all digest-bearing provenance with a freshly
+    /// derived identity. The consent integrity digest also binds the current
+    /// policy, timestamp, authority, and DLP state to the grant digest.
+    pub fn validateForStore(self: PreparedMemory) ValidationError!PreparedMemory {
+        const source = try SourceTuple.init(.{
+            .user_id = self.source.user_id,
+            .source_item_id = self.source.source_item_id,
+            .meeting_id = self.source.meeting_id,
+        });
+        const candidate = try Candidate.init(
+            self.candidate.kind,
+            self.candidate.text_value,
+            self.candidate.dlp_approval,
+        );
+        try validateConsentEnvelope(self.provenance.consent);
+
+        const identity = deriveIdentity(source, candidate);
+        if (!digestEql(identity.source_digest, self.provenance.identity.source_digest) or
+            !digestEql(identity.meeting_digest, self.provenance.identity.meeting_digest) or
+            !digestEql(identity.candidate_digest, self.provenance.identity.candidate_digest) or
+            !digestEql(identity.key_digest, self.provenance.identity.key_digest) or
+            !std.mem.eql(u8, &identity.memory_key, &self.provenance.identity.memory_key) or
+            !digestEql(identity.source_digest, self.provenance.consent.source_digest) or
+            !digestEql(identity.candidate_digest, self.provenance.consent.candidate_digest) or
+            self.provenance.dlp_approval != candidate.dlp_approval)
+        {
+            return error.PreparedMemoryIntegrityMismatch;
+        }
+
+        const expected_integrity = deriveConsentIntegrity(
+            self.provenance.consent.grant_digest,
+            identity.source_digest,
+            identity.candidate_digest,
+            self.provenance.consent.policy_version,
+            self.provenance.consent.granted_at_unix_ms,
+            self.provenance.consent.authority,
+            candidate.dlp_approval,
+        );
+        if (!digestEql(expected_integrity, self.provenance.consent.integrity_digest)) {
+            return error.PreparedMemoryIntegrityMismatch;
+        }
+
+        return .{
+            .source = source,
+            .candidate = candidate,
+            .provenance = .{
+                .identity = identity,
+                .consent = self.provenance.consent,
                 .dlp_approval = candidate.dlp_approval,
             },
         };
@@ -339,6 +418,22 @@ fn validateUserId(user_id: i64) ValidationError!void {
     if (user_id <= 0) return error.InvalidUserId;
 }
 
+fn validateConsentEnvelope(consent: ConfirmedConsentGrant) ValidationError!void {
+    try validateField(
+        consent.policy_version,
+        max_policy_version_bytes,
+        error.EmptyPolicyVersion,
+        error.PolicyVersionTooLong,
+        error.PolicyVersionContainsNul,
+    );
+    if (!std.unicode.utf8ValidateSlice(consent.policy_version) or
+        !isSafeSlug(consent.policy_version)) return error.InvalidPolicyVersion;
+    if (consent.granted_at_unix_ms <= 0) return error.InvalidGrantedAt;
+    if (consent.authority != .authenticated_user_control) {
+        return error.PreparedMemoryIntegrityMismatch;
+    }
+}
+
 fn validateCanonicalId(
     value: []const u8,
     max_len: usize,
@@ -423,6 +518,20 @@ fn deriveMeetingDigest(user_id: i64, meeting_id: []const u8) Digest {
     return digest;
 }
 
+/// Minimal pseudonymous account scope used by durable anti-resurrection
+/// tombstones. It contains no raw meeting, transcript, candidate, or grant ID.
+pub fn userScopeDigest(user_id: i64) ValidationError!Digest {
+    try validateUserId(user_id);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    updateField(&hasher, "domain", "zaki.minutes.user-scope.v1");
+    updateField(&hasher, "write_origin", write_origin);
+    updateField(&hasher, "source_spoke", source_spoke);
+    updateUserId(&hasher, user_id);
+    var digest: Digest = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
 fn deriveRequestDigest(meeting_digest: Digest, request_id: []const u8) Digest {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     updateField(&hasher, "domain", "zaki.minutes.erasure-request.v1");
@@ -433,12 +542,47 @@ fn deriveRequestDigest(meeting_digest: Digest, request_id: []const u8) Digest {
     return digest;
 }
 
-fn deriveGrantDigest(source_digest: Digest, candidate_digest: Digest, grant_id: []const u8) Digest {
+fn deriveGrantDigest(
+    source_digest: Digest,
+    candidate_digest: Digest,
+    grant_id: []const u8,
+    policy_version: []const u8,
+    granted_at_unix_ms: i64,
+    authority: ConfirmationAuthority,
+    dlp_approval: DlpApproval,
+) Digest {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     updateField(&hasher, "domain", "zaki.minutes.consent-grant.v1");
     updateField(&hasher, "source_digest", &source_digest);
     updateField(&hasher, "candidate_digest", &candidate_digest);
     updateField(&hasher, "grant_id", grant_id);
+    updateField(&hasher, "policy_version", policy_version);
+    updateI64(&hasher, "granted_at_unix_ms", granted_at_unix_ms);
+    updateField(&hasher, "authority", @tagName(authority));
+    updateField(&hasher, "dlp_approval", @tagName(dlp_approval));
+    var digest: Digest = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn deriveConsentIntegrity(
+    grant_digest: Digest,
+    source_digest: Digest,
+    candidate_digest: Digest,
+    policy_version: []const u8,
+    granted_at_unix_ms: i64,
+    authority: ConfirmationAuthority,
+    dlp_approval: DlpApproval,
+) Digest {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    updateField(&hasher, "domain", "zaki.minutes.consent-integrity.v1");
+    updateField(&hasher, "grant_digest", &grant_digest);
+    updateField(&hasher, "source_digest", &source_digest);
+    updateField(&hasher, "candidate_digest", &candidate_digest);
+    updateField(&hasher, "policy_version", policy_version);
+    updateI64(&hasher, "granted_at_unix_ms", granted_at_unix_ms);
+    updateField(&hasher, "authority", @tagName(authority));
+    updateField(&hasher, "dlp_approval", @tagName(dlp_approval));
     var digest: Digest = undefined;
     hasher.final(&digest);
     return digest;
@@ -463,6 +607,16 @@ fn updateUserId(hasher: *std.crypto.hash.sha2.Sha256, user_id: i64) void {
     var buffer: [20]u8 = undefined;
     const canonical = std.fmt.bufPrint(&buffer, "{d}", .{user_id}) catch unreachable;
     updateField(hasher, "user_id", canonical);
+}
+
+fn updateI64(hasher: *std.crypto.hash.sha2.Sha256, label: []const u8, value: i64) void {
+    var buffer: [20]u8 = undefined;
+    const canonical = std.fmt.bufPrint(&buffer, "{d}", .{value}) catch unreachable;
+    updateField(hasher, label, canonical);
+}
+
+fn digestEql(a: Digest, b: Digest) bool {
+    return std.crypto.timing_safe.eql(Digest, a, b);
 }
 
 fn hexDigest(digest: Digest) HexDigest {
@@ -663,6 +817,76 @@ test "confirmed consent is bound to one source and candidate" {
     try std.testing.expect(std.meta.stringToEnum(ConfirmationAuthority, "unconfirmed") == null);
 }
 
+test "store validation rejects mutable backing buffers and provenance splices" {
+    var meeting_id = [_]u8{ 'm', 'e', 'e', 't', 'i', 'n', 'g', '-', 'a' };
+    var candidate_text = [_]u8{ 'S', 'h', 'i', 'p', ' ', 'p', 'i', 'l', 'o', 't' };
+    var policy = [_]u8{ 'm', 'i', 'n', 'u', 't', 'e', 's', '-', 'v', '1' };
+    const mutable_source = try SourceTuple.init(.{
+        .user_id = 7,
+        .source_item_id = "item-a",
+        .meeting_id = &meeting_id,
+    });
+    const mutable_candidate = try Candidate.init(.decision, &candidate_text, .approved);
+    const mutable_grant = try ConfirmedConsentGrant.init(mutable_source, mutable_candidate, .{
+        .grant_id = "grant-a",
+        .policy_version = &policy,
+        .granted_at_unix_ms = 1_784_200_000_000,
+    });
+    const prepared = try PreparedMemory.init(mutable_source, mutable_candidate, mutable_grant);
+    _ = try prepared.validateForStore();
+
+    candidate_text[0] = 'X';
+    try std.testing.expectError(error.PreparedMemoryIntegrityMismatch, prepared.validateForStore());
+    candidate_text[0] = 'S';
+    meeting_id[meeting_id.len - 1] = 'b';
+    try std.testing.expectError(error.PreparedMemoryIntegrityMismatch, prepared.validateForStore());
+    meeting_id[meeting_id.len - 1] = 'a';
+    policy[policy.len - 1] = '2';
+    try std.testing.expectError(error.PreparedMemoryIntegrityMismatch, prepared.validateForStore());
+
+    const source_b = try SourceTuple.init(.{
+        .user_id = 7,
+        .source_item_id = "item-b",
+        .meeting_id = "meeting-b",
+    });
+    const candidate_b = try Candidate.init(.decision, "Do not ship pilot", .approved);
+    const grant_b = try ConfirmedConsentGrant.init(source_b, candidate_b, .{
+        .grant_id = "grant-b",
+        .policy_version = "minutes-v1",
+        .granted_at_unix_ms = 1_784_200_000_001,
+    });
+    const prepared_b = try PreparedMemory.init(source_b, candidate_b, grant_b);
+    var spliced = prepared_b;
+    spliced.provenance = prepared.provenance;
+    try std.testing.expectError(error.PreparedMemoryIntegrityMismatch, spliced.validateForStore());
+}
+
+test "grant digest binds the complete consent envelope" {
+    const source = try SourceTuple.init(.{
+        .user_id = 7,
+        .source_item_id = "item-a",
+        .meeting_id = "meeting-a",
+    });
+    const candidate = try Candidate.init(.decision, "Ship pilot", .approved);
+    const first = try ConfirmedConsentGrant.init(source, candidate, .{
+        .grant_id = "same-grant",
+        .policy_version = "minutes-v1",
+        .granted_at_unix_ms = 1_784_200_000_000,
+    });
+    const changed_policy = try ConfirmedConsentGrant.init(source, candidate, .{
+        .grant_id = "same-grant",
+        .policy_version = "minutes-v2",
+        .granted_at_unix_ms = 1_784_200_000_000,
+    });
+    const changed_time = try ConfirmedConsentGrant.init(source, candidate, .{
+        .grant_id = "same-grant",
+        .policy_version = "minutes-v1",
+        .granted_at_unix_ms = 1_784_200_000_001,
+    });
+    try std.testing.expect(!digestEql(first.grant_digest, changed_policy.grant_digest));
+    try std.testing.expect(!digestEql(first.grant_digest, changed_time.grant_digest));
+}
+
 test "memory identity is retry stable source scoped and content free" {
     const source = try SourceTuple.init(.{
         .user_id = 42,
@@ -740,7 +964,7 @@ test "meeting memory digest golden vector remains stable" {
     try std.testing.expectEqualStrings("sha256=6a6ed392f4bc7026bb0b0724a997967759089b9facc4cbca07e0588488896a43", &source_text);
     try std.testing.expectEqualStrings("sha256=7cc99b54f8ec2c09d62220e8591184830b4c9650b50bd418caf7d6e133fd4b3c", &meeting_text);
     try std.testing.expectEqualStrings("sha256=5f34b0af1d1f9a8ee28ed1f0c9bfd36ebfc8dfe11ad219f1bb5bdfb212fc2faf", &candidate_text);
-    try std.testing.expectEqualStrings("sha256=8e692216a135fc577c4a53df44238fa41e4c818d3b2593a21248a2c2a4a4608e", &grant_text);
+    try std.testing.expectEqualStrings("sha256=2d9aee40297805ec075844d763c64d837705360c34eb4c3f704e913966a7a292", &grant_text);
     try std.testing.expectEqualStrings("meeting_ingest/c117acfd660860fb202049c2487496d930a24e6180de50e3b25964e35916f425", prepared.provenance.identity.memoryKey());
 }
 

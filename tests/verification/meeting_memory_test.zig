@@ -10,14 +10,48 @@
 const std = @import("std");
 const nullalis = @import("nullalis");
 const harness = @import("harness.zig");
+const c = @cImport({
+    @cInclude("libpq-fe.h");
+});
 
 const meeting_memory = nullalis.meeting_memory;
+
+fn execPostgresSql(
+    allocator: std.mem.Allocator,
+    test_url: []const u8,
+    sql: []const u8,
+    expect_success: bool,
+) !void {
+    const url_z = try allocator.dupeZ(u8, test_url);
+    defer allocator.free(url_z);
+    const sql_z = try allocator.dupeZ(u8, sql);
+    defer allocator.free(sql_z);
+    const conn = c.PQconnectdb(url_z.ptr) orelse return error.TestPostgresConnectFailed;
+    defer c.PQfinish(conn);
+    if (c.PQstatus(conn) != c.CONNECTION_OK) return error.TestPostgresConnectFailed;
+    const result = c.PQexec(conn, sql_z.ptr) orelse return error.TestPostgresSqlFailed;
+    defer c.PQclear(result);
+    const status = c.PQresultStatus(result);
+    const succeeded = status == c.PGRES_COMMAND_OK or status == c.PGRES_TUPLES_OK;
+    if (succeeded != expect_success) {
+        std.debug.print("WP-15 raw SQL unexpected status: {s}\n", .{std.mem.span(c.PQresultErrorMessage(result))});
+        return error.TestPostgresSqlUnexpectedStatus;
+    }
+}
+
+fn freeEvents(allocator: std.mem.Allocator, events: []nullalis.memory.MemoryEventRow) void {
+    for (events) |*event| event.deinit(allocator);
+    allocator.free(events);
+}
 
 test "WP-15 schema: provenance links are one-to-one and receipts cannot retain content" {
     const migration_sql = try harness.loadProjectFile("src/migrations/0011_meeting_memory_provenance.sql");
     const required = [_][]const u8{
         "CREATE TABLE IF NOT EXISTS {schema}.memory_source_links",
         "CREATE TABLE IF NOT EXISTS {schema}.meeting_memory_erasure_receipts",
+        "CREATE TABLE IF NOT EXISTS {schema}.meeting_memory_erasure_tombstones",
+        "CREATE TABLE IF NOT EXISTS {schema}.meeting_memory_account_erasure_tombstones",
+        "CREATE OR REPLACE RULE meeting_memory_erasure_receipts_no_update",
         "FOREIGN KEY (user_id, memory_key)",
         "UNIQUE INDEX IF NOT EXISTS idx_memory_source_links_memory",
         "(user_id, memory_key)",
@@ -117,8 +151,21 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     const memory_b = try prepared(meeting_b, .decision, identical_text, "grant-b");
     const memory_other_tenant = try prepared(other_tenant, .decision, identical_text, "grant-c");
 
-    // A generic row with byte-identical content is deliberately unrelated.
-    try mgr.upsertMemory(user_a, "generic-identical", identical_text, .core, null);
+    // The persistence boundary revalidates borrowed bytes rather than trusting
+    // a constructor that may have run before the caller reused its buffer.
+    var mutable_text = [_]u8{ 'S', 'h', 'i', 'p', ' ', 'o', 'n', ' ', 'F', 'r', 'i', 'd', 'a', 'y' };
+    const mutable_candidate = try meeting_memory.Candidate.init(.decision, &mutable_text, .approved);
+    const mutable_grant = try meeting_memory.ConfirmedConsentGrant.init(meeting_a, mutable_candidate, .{
+        .grant_id = "grant-mutable",
+        .policy_version = "minutes-memory-v1",
+        .granted_at_unix_ms = 1_784_200_000_000,
+    });
+    const mutable_prepared = try meeting_memory.PreparedMemory.init(meeting_a, mutable_candidate, mutable_grant);
+    mutable_text[0] = 'X';
+    try std.testing.expectError(
+        error.PreparedMemoryIntegrityMismatch,
+        mgr.storeMeetingMemory(mutable_prepared),
+    );
 
     const first = try mgr.storeMeetingMemory(memory_a);
     try std.testing.expect(first.inserted);
@@ -131,16 +178,114 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     try std.testing.expect(!std.mem.eql(u8, first.memoryKey(), second_meeting.memoryKey()));
     try std.testing.expect(!std.mem.eql(u8, first.memoryKey(), second_tenant.memoryKey()));
 
+    // Every generic persistence mutation rejects the reserved namespace even
+    // when a caller bypasses agent-tool predicates (for example governance
+    // HTTP routes or a direct backend handle).
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
+        mgr.upsertMemory(user_a, first.memoryKey(), "overwrite", .core, null),
+    );
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
+        mgr.upsertMemoryWithMetadata(user_a, first.memoryKey(), "overwrite", .core, null, "{}"),
+    );
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
+        mgr.forgetMemory(user_a, first.memoryKey()),
+    );
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
+        mgr.setMemoryInvalidation(user_a, first.memoryKey(), 1_784_200_050, 1_784_200_050),
+    );
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
+        mgr.editMemorySupersede(allocator, user_a, first.memoryKey(), "edited", 1_784_200_050),
+    );
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
+        mgr.archiveInformationScoped(allocator, user_a, first.memoryKey(), 1_784_200_050),
+    );
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
+        mgr.demoteMemoryFromCore(user_a, first.memoryKey(), "daily"),
+    );
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
+        mgr.setMemorySource(user_a, first.memoryKey(), "session-a", "snippet"),
+    );
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
+        mgr.upsertMemoryEdge(user_a, first.memoryKey(), "generic-identical", "MENTIONS", null, 1.0),
+    );
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
+        mgr.upsertWorkingMemorySlot(user_a, "session-a", 1, "decision", identical_text, first.memoryKey(), 1.0, false),
+    );
+
+    // Generic information-scoped forget uses content_hash sweeps. Meeting
+    // rows deliberately carry content_hash=NULL, so forgetting a
+    // byte-identical generic fact cannot sweep either meeting source.
+    try mgr.upsertMemory(user_a, "generic-identical-forget", identical_text, .core, null);
+    var generic_sweep = try mgr.forgetInformationScoped(
+        allocator,
+        user_a,
+        "generic-identical-forget",
+        1_784_200_100,
+    );
+    defer generic_sweep.deinit(allocator);
+    try std.testing.expect(generic_sweep.primary_closed);
+    const meeting_a_after_sweep = try mgr.getMemory(allocator, user_a, first.memoryKey());
+    if (meeting_a_after_sweep) |entry| entry.deinit(allocator);
+    try std.testing.expect(meeting_a_after_sweep != null);
+    const meeting_b_after_sweep = try mgr.getMemory(allocator, user_a, second_meeting.memoryKey());
+    if (meeting_b_after_sweep) |entry| entry.deinit(allocator);
+    try std.testing.expect(meeting_b_after_sweep != null);
+
+    // A second generic row proves meeting erasure does not over-delete by
+    // candidate bytes either.
+    try mgr.upsertMemory(user_a, "generic-identical", identical_text, .core, null);
+    try mgr.upsertMemory(user_a, "generic-unrelated", "Unrelated graph fact", .core, null);
+
+    // Seed legacy/adversarial carriers directly. Canonical graph and working-
+    // memory writers now reject these attachments, but exact erasure must also
+    // clean residue created before that boundary existed. An unrelated edge
+    // and event prove the payload-key deletion remains source scoped.
+    const residue_sql = try std.fmt.allocPrint(
+        allocator,
+        "INSERT INTO {s}.memory_edges (user_id, source_key, target_key, predicate, confidence, valid_from) VALUES " ++
+            "({d}, '{s}', 'generic-identical', 'MENTIONS', 1.0, 1784200000), " ++
+            "({d}, 'generic-unrelated', 'generic-identical', 'RELATED_TO', 1.0, 1784200000); " ++
+            "INSERT INTO {s}.memory_events (id, user_id, memory_id, event_type, payload) VALUES " ++
+            "('wp15-meeting-edge-event', {d}, NULL, 'edge_added', jsonb_build_object('source_key', '{s}', 'target_key', 'generic-identical')), " ++
+            "('wp15-unrelated-edge-event', {d}, NULL, 'edge_added', jsonb_build_object('source_key', 'generic-unrelated', 'target_key', 'generic-identical')); " ++
+            "INSERT INTO {s}.working_memory (user_id, session_id, slot_id, slot_type, content, source_key, importance, pinned) " ++
+            "VALUES ({d}, 'legacy-session', 1, 'decision', 'legacy meeting residue', '{s}', 1.0, false)",
+        .{
+            schema,
+            user_a,
+            first.memoryKey(),
+            user_a,
+            schema,
+            user_a,
+            first.memoryKey(),
+            user_a,
+            schema,
+            user_a,
+            first.memoryKey(),
+        },
+    );
+    try execPostgresSql(allocator, test_url, residue_sql, true);
+
     const erase_request = try meeting_memory.ErasureRequest.init(user_a, "meeting-a", "request-a");
     const erased = try mgr.eraseMeetingMemories(erase_request);
     try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.memory_source_links_deleted);
     try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.memories_deleted);
-    try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_events_deleted);
+    try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.memory_events_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_embeddings_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_vectors_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_entities_deleted);
-    try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_edges_deleted);
-    try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.working_memory_deleted);
+    try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.memory_edges_deleted);
+    try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.working_memory_deleted);
 
     const retry_request = try meeting_memory.ErasureRequest.init(user_a, "meeting-a", "request-a-retry");
     const erased_replay = try mgr.eraseMeetingMemories(retry_request);
@@ -167,5 +312,100 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     try std.testing.expectError(
         error.MeetingMemoryErased,
         mgr.storeMeetingMemory(memory_a),
+    );
+
+    const meeting_events = try mgr.listEventsForMemoryKey(allocator, user_a, first.memoryKey(), 10);
+    defer freeEvents(allocator, meeting_events);
+    try std.testing.expectEqual(@as(usize, 0), meeting_events.len);
+    const unrelated_events = try mgr.listEventsForMemoryKey(allocator, user_a, "generic-unrelated", 10);
+    defer freeEvents(allocator, unrelated_events);
+    try std.testing.expectEqual(@as(usize, 1), unrelated_events.len);
+    const remaining_edges = try mgr.listEdgesForUser(allocator, user_a);
+    defer {
+        for (remaining_edges) |*edge| edge.deinit(allocator);
+        allocator.free(remaining_edges);
+    }
+    var saw_unrelated_edge = false;
+    for (remaining_edges) |edge| {
+        try std.testing.expect(!std.mem.eql(u8, edge.source_key, first.memoryKey()));
+        try std.testing.expect(!std.mem.eql(u8, edge.target_key, first.memoryKey()));
+        if (std.mem.eql(u8, edge.source_key, "generic-unrelated")) saw_unrelated_edge = true;
+    }
+    try std.testing.expect(saw_unrelated_edge);
+
+    // Receipt retention may remove the detailed audit row, but never the
+    // minimal meeting tombstone. Cleanup cannot reopen the write gate.
+    const receipt_cleanup_sql = try std.fmt.allocPrint(
+        allocator,
+        "DELETE FROM {s}.meeting_memory_erasure_receipts WHERE user_id = {d}",
+        .{ schema, user_a },
+    );
+    try execPostgresSql(allocator, test_url, receipt_cleanup_sql, true);
+    try std.testing.expectError(error.MeetingMemoryErased, mgr.storeMeetingMemory(memory_a));
+    const after_retention_request = try meeting_memory.ErasureRequest.init(user_a, "meeting-a", "request-after-retention");
+    const after_retention = try mgr.eraseMeetingMemories(after_retention_request);
+    try std.testing.expect(after_retention.replayed);
+    try std.testing.expectEqual(meeting_memory.ErasureDisposition.already_absent, after_retention.manifest.disposition);
+    try std.testing.expectEqual(@as(u64, 0), after_retention.manifest.counts.memories_deleted);
+
+    // The content-free meeting tombstone intentionally survives the tenant
+    // cascade. Replaying erasure after account deletion returns the same
+    // receipt; reprovisioning the same numeric tenant cannot resurrect this
+    // erased meeting.
+    try mgr.deleteUser(user_a);
+    const after_account_request = try meeting_memory.ErasureRequest.init(user_a, "meeting-a", "request-after-account");
+    const after_account = try mgr.eraseMeetingMemories(after_account_request);
+    try std.testing.expect(after_account.replayed);
+    try mgr.provisionUser(user_a, "/tmp/nullalis-minutes-a-reprovisioned");
+    try std.testing.expectError(error.MeetingMemoryAccountErased, mgr.storeMeetingMemory(memory_a));
+    try std.testing.expectError(error.MeetingMemoryAccountErased, mgr.storeMeetingMemory(memory_b));
+}
+
+test "WP-15 live: receipt replay verifies immutable compliance evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const test_url = try harness.requirePostgresUrl(allocator);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try harness.schemaName(&schema_buf, "meeting_receipt_integrity");
+    var mgr = try harness.newManager(allocator, test_url, schema);
+    defer harness.dropAndDeinit(&mgr, "meeting_receipt_integrity");
+    mgr.skipExternalIdentityForTests();
+
+    const user_id = harness.testUid();
+    try mgr.provisionUser(user_id, "/tmp/nullalis-minutes-receipt-integrity");
+    const source_tuple = try source(user_id, "transcript-a", "meeting-a");
+    const memory = try prepared(source_tuple, .decision, "Use a staged rollout", "grant-a");
+    _ = try mgr.storeMeetingMemory(memory);
+    const request = try meeting_memory.ErasureRequest.init(user_id, "meeting-a", "request-a");
+    _ = try mgr.eraseMeetingMemories(request);
+
+    // Normal SQL cannot mutate append-only receipt evidence.
+    const guarded_tamper_sql = try std.fmt.allocPrint(
+        allocator,
+        "UPDATE {s}.meeting_memory_erasure_receipts SET memories_deleted = 99 WHERE user_id = {d}",
+        .{ schema, user_id },
+    );
+    try execPostgresSql(allocator, test_url, guarded_tamper_sql, false);
+
+    // Simulate out-of-band corruption by the schema owner, then prove the
+    // application recomputes the receipt digest and fails complete-or-loud.
+    const disable_rule_sql = try std.fmt.allocPrint(
+        allocator,
+        "ALTER TABLE {s}.meeting_memory_erasure_receipts DISABLE RULE meeting_memory_erasure_receipts_no_update",
+        .{schema},
+    );
+    try execPostgresSql(allocator, test_url, disable_rule_sql, true);
+    try execPostgresSql(allocator, test_url, guarded_tamper_sql, true);
+    const enable_rule_sql = try std.fmt.allocPrint(
+        allocator,
+        "ALTER TABLE {s}.meeting_memory_erasure_receipts ENABLE RULE meeting_memory_erasure_receipts_no_update",
+        .{schema},
+    );
+    try execPostgresSql(allocator, test_url, enable_rule_sql, true);
+    try std.testing.expectError(
+        error.MeetingMemoryReceiptIntegrity,
+        mgr.eraseMeetingMemories(request),
     );
 }
