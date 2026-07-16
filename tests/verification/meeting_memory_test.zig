@@ -90,6 +90,7 @@ fn freeEvents(allocator: std.mem.Allocator, events: []nullalis.memory.MemoryEven
 
 test "WP-15 schema: provenance links are one-to-one and receipts cannot retain content" {
     const migration_sql = try harness.loadProjectFile("src/migrations/0011_meeting_memory_provenance.sql");
+    const index_migration_sql = try harness.loadProjectFile("src/migrations/0012_meeting_memory_erasure_indexes.sql");
     const state_source = try harness.loadProjectFile("src/zaki_state.zig");
     const required = [_][]const u8{
         "CREATE TABLE IF NOT EXISTS {schema}.meeting_memory_crypto_state",
@@ -119,10 +120,6 @@ test "WP-15 schema: provenance links are one-to-one and receipts cannot retain c
         "receipt_key_id",
         "receipt_signature",
         "idx_meeting_memory_erasure_receipts_key_id",
-        "idx_memory_events_user_memory_all",
-        "idx_memory_edges_source_all",
-        "idx_memory_edges_target_all",
-        "idx_memory_edges_episodes_all",
         "memory_source_links_deleted",
         "memories_deleted",
         "memory_events_deleted",
@@ -136,6 +133,20 @@ test "WP-15 schema: provenance links are one-to-one and receipts cannot retain c
         if (std.mem.indexOf(u8, migration_sql, needle) == null) {
             std.debug.print("WP-15 migration missing invariant: {s}\n", .{needle});
             return error.MissingMeetingMemorySchemaInvariant;
+        }
+    }
+
+    const required_concurrent_indexes = [_][]const u8{
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memory_events_user_memory_all",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memory_edges_source_all",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memory_edges_target_all",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memory_edges_episodes_all",
+        "ON {schema}.memory_edges USING GIN (episodes)",
+    };
+    for (required_concurrent_indexes) |needle| {
+        if (std.mem.indexOf(u8, index_migration_sql, needle) == null) {
+            std.debug.print("WP-15 erasure index migration missing invariant: {s}\n", .{needle});
+            return error.MissingMeetingMemoryErasureIndex;
         }
     }
 
@@ -828,10 +839,9 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
             "WITH targets AS MATERIALIZED (SELECT l.memory_key AS key " ++
             "FROM {s}.memory_source_links AS l WHERE l.user_id = {d} " ++
             "AND l.source_spoke = 'minutes' AND l.meeting_scope_digest = '{s}') " ++
-            "DELETE FROM {s}.memory_edges AS e WHERE e.user_id = {d} AND (" ++
-            "e.source_key IN (SELECT key FROM targets) OR " ++
-            "e.target_key IN (SELECT key FROM targets) OR " ++
-            "e.episodes && ARRAY(SELECT key FROM targets))",
+            "DELETE FROM {s}.memory_edges AS e USING targets AS t " ++
+            "WHERE e.user_id = {d} AND (e.source_key = t.key OR " ++
+            "e.target_key = t.key OR e.episodes @> ARRAY[t.key])",
         .{ schema, user_a, meeting_a_scope, schema, user_a },
     );
     const edge_plan = try queryPostgresText(allocator, test_url, edge_explain_sql);

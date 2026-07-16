@@ -1497,12 +1497,13 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
         _: ?f64,
         _: ?[]const u8,
         _: ?i64,
-        _: ?[]const u8,
+        episode_key: ?[]const u8,
         _: ?[]const u8, // extraction_pass (P3)
         _: ?i64, // session_boundary_id (P3)
     ) !void {
         try assertGenericMemoryMutationAllowed(source_key);
         try assertGenericMemoryMutationAllowed(target_key);
+        if (episode_key) |key| try assertGenericMemoryMutationAllowed(key);
         return;
     }
     pub fn countEdgesForSource(_: *@This(), _: i64, _: []const u8) !usize {
@@ -5064,128 +5065,137 @@ const ManagerImpl = struct {
             counts.memory_source_links_deleted = try parsePgU64(result, 0, 0);
         }
 
-        // V1 deliberately creates no entity carrier. Refuse complete-success
-        // if one appears instead of deleting a potentially shared entity and
-        // overreaching into another meeting's graph.
-        {
-            const q = try self.buildQuery(
-                "SELECT count(*)::text FROM {schema}.memory_entities AS e " ++
-                    "WHERE e.user_id = $1 AND e.linked_memory_ids && ARRAY(" ++
-                    "SELECT m.id FROM {schema}.memories AS m " ++
-                    "JOIN {schema}.memory_source_links AS l " ++
-                    "ON l.user_id = m.user_id AND l.memory_key = m.key " ++
-                    "WHERE l.user_id = $1 AND l.source_spoke = 'minutes' " ++
-                    "AND l.meeting_scope_digest = $2)",
-            );
-            defer self.allocator.free(q);
-            const result = try txn.execParams(q, &scope_params, &scope_lengths);
-            defer c.PQclear(result);
-            const entity_residue = try parsePgU64(result, 0, 0);
-            if (entity_residue != 0) return error.UnexpectedMeetingMemoryEntityCarrier;
-        }
-
-        // Delete content-bearing audit events, working-memory references, and
-        // graph edges only when they point at an exact target key/id. Legacy
-        // event payloads are not shape-stable: an exact key may occur as a
-        // nested string or object property name, so walk every JSONB node.
-        // This is deliberately equality-based; prefixes and other meetings'
-        // keys remain untouched.
-        {
-            const q = try self.buildQuery(
-                "WITH targets AS MATERIALIZED (" ++
-                    "SELECT m.id, m.key FROM {schema}.memories AS m " ++
-                    "JOIN {schema}.memory_source_links AS l " ++
-                    "ON l.user_id = m.user_id AND l.memory_key = m.key " ++
-                    "WHERE l.user_id = $1 AND l.source_spoke = 'minutes' " ++
-                    "AND l.meeting_scope_digest = $2) " ++
-                    "DELETE FROM {schema}.memory_events AS e " ++
-                    "WHERE e.user_id = $1 AND (e.memory_id IN (SELECT id FROM targets) " ++
-                    "OR EXISTS (SELECT 1 FROM jsonb_path_query(e.payload, '$.**') " ++
-                    "AS carrier(value) JOIN targets AS t ON " ++
-                    "(jsonb_typeof(carrier.value) = 'string' " ++
-                    "AND carrier.value = to_jsonb(t.key)) " ++
-                    "OR (jsonb_typeof(carrier.value) = 'object' " ++
-                    "AND carrier.value ? t.key)))",
-            );
-            defer self.allocator.free(q);
-            const result = try txn.execParams(q, &scope_params, &scope_lengths);
-            defer c.PQclear(result);
-            counts.memory_events_deleted = try pgCommandCount(result);
-        }
-        {
-            const q = try self.buildQuery(
-                "DELETE FROM {schema}.working_memory AS w WHERE w.user_id = $1 " ++
-                    "AND w.source_key IN (SELECT l.memory_key FROM {schema}.memory_source_links AS l " ++
-                    "WHERE l.user_id = $1 AND l.source_spoke = 'minutes' " ++
-                    "AND l.meeting_scope_digest = $2)",
-            );
-            defer self.allocator.free(q);
-            const result = try txn.execParams(q, &scope_params, &scope_lengths);
-            defer c.PQclear(result);
-            counts.working_memory_deleted = try pgCommandCount(result);
-        }
-        {
-            const q = try self.buildQuery(
-                "DELETE FROM {schema}.memory_edges AS e WHERE e.user_id = $1 AND (" ++
-                    "e.source_key IN (SELECT l.memory_key FROM {schema}.memory_source_links AS l " ++
-                    "WHERE l.user_id = $1 AND l.source_spoke = 'minutes' AND l.meeting_scope_digest = $2) " ++
-                    "OR e.target_key IN (SELECT l.memory_key FROM {schema}.memory_source_links AS l " ++
-                    "WHERE l.user_id = $1 AND l.source_spoke = 'minutes' AND l.meeting_scope_digest = $2))",
-            );
-            defer self.allocator.free(q);
-            const result = try txn.execParams(q, &scope_params, &scope_lengths);
-            defer c.PQclear(result);
-            counts.memory_edges_deleted = try pgCommandCount(result);
-        }
-
-        // The database embedding table is optional/lazy. If present, scrub it
-        // by exact target keys. The external vector carrier stays provably zero
-        // because meeting_ingest/* is rejected by every embedding/reindex gate.
-        {
-            const exists_q = try self.buildQuery(
-                "SELECT to_regclass('{schema}.memory_embeddings') IS NOT NULL",
-            );
-            defer self.allocator.free(exists_q);
-            const exists_result = try txn.exec(exists_q);
-            defer c.PQclear(exists_result);
-            if (c.PQntuples(exists_result) != 1) return error.ExecFailed;
-            const exists = std.mem.eql(
-                u8,
-                std.mem.span(c.PQgetvalue(exists_result, 0, 0)),
-                "t",
-            );
-            if (exists) {
+        // A never-stored scope has no source-derived carrier by construction.
+        // Skip every tenant-wide carrier statement rather than asking
+        // PostgreSQL to prove the empty target set repeatedly; this keeps
+        // authenticated nonexistent-scope erasure O(1) and still emits the
+        // durable tombstone plus signed zero-count receipt below.
+        if (counts.memory_source_links_deleted != 0) {
+            // V1 deliberately creates no entity carrier. Refuse complete-success
+            // if one appears instead of deleting a potentially shared entity and
+            // overreaching into another meeting's graph.
+            {
                 const q = try self.buildQuery(
-                    "DELETE FROM {schema}.memory_embeddings AS e WHERE e.user_id = $1 " ++
-                        "AND e.key IN (SELECT l.memory_key FROM {schema}.memory_source_links AS l " ++
+                    "SELECT count(*)::text FROM {schema}.memory_entities AS e " ++
+                        "WHERE e.user_id = $1 AND e.linked_memory_ids && ARRAY(" ++
+                        "SELECT m.id FROM {schema}.memories AS m " ++
+                        "JOIN {schema}.memory_source_links AS l " ++
+                        "ON l.user_id = m.user_id AND l.memory_key = m.key " ++
                         "WHERE l.user_id = $1 AND l.source_spoke = 'minutes' " ++
                         "AND l.meeting_scope_digest = $2)",
                 );
                 defer self.allocator.free(q);
                 const result = try txn.execParams(q, &scope_params, &scope_lengths);
                 defer c.PQclear(result);
-                counts.memory_embeddings_deleted = try pgCommandCount(result);
+                const entity_residue = try parsePgU64(result, 0, 0);
+                if (entity_residue != 0) return error.UnexpectedMeetingMemoryEntityCarrier;
             }
-        }
-        counts.memory_vectors_deleted = 0;
-        counts.memory_entities_deleted = 0;
 
-        // Delete memories last; the composite FK cascades their exact source
-        // links. No content hash participates, so byte-identical generic or
-        // other-meeting rows cannot match.
-        {
-            const q = try self.buildQuery(
-                "DELETE FROM {schema}.memories AS m USING {schema}.memory_source_links AS l " ++
-                    "WHERE m.user_id = $1 AND l.user_id = m.user_id AND l.memory_key = m.key " ++
-                    "AND l.source_spoke = 'minutes' AND l.meeting_scope_digest = $2",
-            );
-            defer self.allocator.free(q);
-            const result = try txn.execParams(q, &scope_params, &scope_lengths);
-            defer c.PQclear(result);
-            counts.memories_deleted = try pgCommandCount(result);
-        }
-        if (counts.memories_deleted != counts.memory_source_links_deleted) {
-            return error.MeetingMemoryEraseInvariant;
+            // Delete content-bearing audit events, working-memory references, and
+            // graph edges only when they point at an exact target key/id. Legacy
+            // event payloads are not shape-stable: an exact key may occur as a
+            // nested string or object property name, so walk every JSONB node.
+            // This is deliberately equality-based; prefixes and other meetings'
+            // keys remain untouched.
+            {
+                const q = try self.buildQuery(
+                    "WITH targets AS MATERIALIZED (" ++
+                        "SELECT m.id, m.key FROM {schema}.memories AS m " ++
+                        "JOIN {schema}.memory_source_links AS l " ++
+                        "ON l.user_id = m.user_id AND l.memory_key = m.key " ++
+                        "WHERE l.user_id = $1 AND l.source_spoke = 'minutes' " ++
+                        "AND l.meeting_scope_digest = $2) " ++
+                        "DELETE FROM {schema}.memory_events AS e " ++
+                        "WHERE e.user_id = $1 AND (e.memory_id IN (SELECT id FROM targets) " ++
+                        "OR EXISTS (SELECT 1 FROM jsonb_path_query(e.payload, '$.**') " ++
+                        "AS carrier(value) JOIN targets AS t ON " ++
+                        "(jsonb_typeof(carrier.value) = 'string' AND (" ++
+                        "carrier.value = to_jsonb(t.key) OR carrier.value = to_jsonb(t.id))) " ++
+                        "OR (jsonb_typeof(carrier.value) = 'object' " ++
+                        "AND (carrier.value ? t.key OR carrier.value ? t.id))))",
+                );
+                defer self.allocator.free(q);
+                const result = try txn.execParams(q, &scope_params, &scope_lengths);
+                defer c.PQclear(result);
+                counts.memory_events_deleted = try pgCommandCount(result);
+            }
+            {
+                const q = try self.buildQuery(
+                    "DELETE FROM {schema}.working_memory AS w WHERE w.user_id = $1 " ++
+                        "AND w.source_key IN (SELECT l.memory_key FROM {schema}.memory_source_links AS l " ++
+                        "WHERE l.user_id = $1 AND l.source_spoke = 'minutes' " ++
+                        "AND l.meeting_scope_digest = $2)",
+                );
+                defer self.allocator.free(q);
+                const result = try txn.execParams(q, &scope_params, &scope_lengths);
+                defer c.PQclear(result);
+                counts.working_memory_deleted = try pgCommandCount(result);
+            }
+            {
+                const q = try self.buildQuery(
+                    "WITH targets AS MATERIALIZED (" ++
+                        "SELECT l.memory_key AS key FROM {schema}.memory_source_links AS l " ++
+                        "WHERE l.user_id = $1 AND l.source_spoke = 'minutes' " ++
+                        "AND l.meeting_scope_digest = $2) " ++
+                        "DELETE FROM {schema}.memory_edges AS e USING targets AS t " ++
+                        "WHERE e.user_id = $1 AND (e.source_key = t.key " ++
+                        "OR e.target_key = t.key OR e.episodes @> ARRAY[t.key])",
+                );
+                defer self.allocator.free(q);
+                const result = try txn.execParams(q, &scope_params, &scope_lengths);
+                defer c.PQclear(result);
+                counts.memory_edges_deleted = try pgCommandCount(result);
+            }
+
+            // The database embedding table is optional/lazy. If present, scrub it
+            // by exact target keys. The external vector carrier stays provably zero
+            // because meeting_ingest/* is rejected by every embedding/reindex gate.
+            {
+                const exists_q = try self.buildQuery(
+                    "SELECT to_regclass('{schema}.memory_embeddings') IS NOT NULL",
+                );
+                defer self.allocator.free(exists_q);
+                const exists_result = try txn.exec(exists_q);
+                defer c.PQclear(exists_result);
+                if (c.PQntuples(exists_result) != 1) return error.ExecFailed;
+                const exists = std.mem.eql(
+                    u8,
+                    std.mem.span(c.PQgetvalue(exists_result, 0, 0)),
+                    "t",
+                );
+                if (exists) {
+                    const q = try self.buildQuery(
+                        "DELETE FROM {schema}.memory_embeddings AS e WHERE e.user_id = $1 " ++
+                            "AND e.key IN (SELECT l.memory_key FROM {schema}.memory_source_links AS l " ++
+                            "WHERE l.user_id = $1 AND l.source_spoke = 'minutes' " ++
+                            "AND l.meeting_scope_digest = $2)",
+                    );
+                    defer self.allocator.free(q);
+                    const result = try txn.execParams(q, &scope_params, &scope_lengths);
+                    defer c.PQclear(result);
+                    counts.memory_embeddings_deleted = try pgCommandCount(result);
+                }
+            }
+            counts.memory_vectors_deleted = 0;
+            counts.memory_entities_deleted = 0;
+
+            // Delete memories last; the composite FK cascades their exact source
+            // links. No content hash participates, so byte-identical generic or
+            // other-meeting rows cannot match.
+            {
+                const q = try self.buildQuery(
+                    "DELETE FROM {schema}.memories AS m USING {schema}.memory_source_links AS l " ++
+                        "WHERE m.user_id = $1 AND l.user_id = m.user_id AND l.memory_key = m.key " ++
+                        "AND l.source_spoke = 'minutes' AND l.meeting_scope_digest = $2",
+                );
+                defer self.allocator.free(q);
+                const result = try txn.execParams(q, &scope_params, &scope_lengths);
+                defer c.PQclear(result);
+                counts.memories_deleted = try pgCommandCount(result);
+            }
+            if (counts.memories_deleted != counts.memory_source_links_deleted) {
+                return error.MeetingMemoryEraseInvariant;
+            }
         }
 
         // One database clock value binds the tombstone, returned manifest,
@@ -11858,6 +11868,7 @@ const ManagerImpl = struct {
     ) !void {
         try assertGenericMemoryMutationAllowed(source_key);
         try assertGenericMemoryMutationAllowed(target_key);
+        if (episode_key) |key| try assertGenericMemoryMutationAllowed(key);
         // W1.1 (Fix 4) — fail-closed on a bogus tenant id before the row
         // can land. The async extraction worker bypasses the threadlocal
         // write-boundary assertion; this guards the explicit user_id arg.
