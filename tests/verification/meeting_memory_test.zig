@@ -136,19 +136,50 @@ test "WP-15 schema: provenance links are one-to-one and receipts cannot retain c
         }
     }
 
-    const required_concurrent_indexes = [_][]const u8{
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memory_events_user_memory_all",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memory_edges_source_all",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memory_edges_target_all",
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memory_edges_episodes_all",
-        "ON {schema}.memory_edges USING GIN (episodes)",
+    const recoverable_concurrent_indexes = [_]struct {
+        drop: []const u8,
+        create: []const u8,
+    }{
+        .{
+            .drop = "DROP INDEX CONCURRENTLY IF EXISTS {schema}.idx_memory_events_user_memory_all",
+            .create = "CREATE INDEX CONCURRENTLY idx_memory_events_user_memory_all",
+        },
+        .{
+            .drop = "DROP INDEX CONCURRENTLY IF EXISTS {schema}.idx_memory_edges_source_all",
+            .create = "CREATE INDEX CONCURRENTLY idx_memory_edges_source_all",
+        },
+        .{
+            .drop = "DROP INDEX CONCURRENTLY IF EXISTS {schema}.idx_memory_edges_target_all",
+            .create = "CREATE INDEX CONCURRENTLY idx_memory_edges_target_all",
+        },
+        .{
+            .drop = "DROP INDEX CONCURRENTLY IF EXISTS {schema}.idx_memory_edges_episodes_all",
+            .create = "CREATE INDEX CONCURRENTLY idx_memory_edges_episodes_all",
+        },
     };
-    for (required_concurrent_indexes) |needle| {
-        if (std.mem.indexOf(u8, index_migration_sql, needle) == null) {
-            std.debug.print("WP-15 erasure index migration missing invariant: {s}\n", .{needle});
+    for (recoverable_concurrent_indexes) |pair| {
+        const drop_at = std.mem.indexOf(u8, index_migration_sql, pair.drop) orelse {
+            std.debug.print("WP-15 erasure index migration missing retry drop: {s}\n", .{pair.drop});
             return error.MissingMeetingMemoryErasureIndex;
+        };
+        const create_at = std.mem.indexOf(u8, index_migration_sql, pair.create) orelse {
+            std.debug.print("WP-15 erasure index migration missing rebuild: {s}\n", .{pair.create});
+            return error.MissingMeetingMemoryErasureIndex;
+        };
+        if (drop_at >= create_at) {
+            return error.UnsafeMeetingMemoryErasureIndexRetryOrder;
         }
     }
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        index_migration_sql,
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS",
+    ) == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        index_migration_sql,
+        "ON {schema}.memory_edges USING GIN (episodes)",
+    ) != null);
 
     const source_links_end = std.mem.indexOf(
         u8,
