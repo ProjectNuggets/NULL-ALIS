@@ -28636,7 +28636,12 @@ test "ownership_lock_wait_succeeds_within_budget_when_lease_released" {
     defer std.testing.allocator.free(user_root);
     try std.fs.makeDirAbsolute(user_root);
 
-    var held_lock = try tenant_lock.acquireUserOwnershipLock(std.testing.allocator, user_root, "owner-b", 1);
+    // Hold with a long lease so only the explicit release below can hand the
+    // lock over. Lease expiry has whole-second granularity: a 1s lease taken
+    // just before a wall-clock second boundary is reclaimable milliseconds
+    // later, letting the waiter's first attempt succeed with zero conflict
+    // retries (observed on macos-14 CI).
+    var held_lock = try tenant_lock.acquireUserOwnershipLock(std.testing.allocator, user_root, "owner-b", 300);
     defer held_lock.deinit();
 
     var state = GatewayState.init(std.testing.allocator);
@@ -28644,9 +28649,18 @@ test "ownership_lock_wait_succeeds_within_budget_when_lease_released" {
     state.tenant_enabled = true;
     state.ownership_lock_enabled = true;
     state.owner_instance_id = "owner-a";
-    state.ownership_lock_wait_ms = 1500;
-    state.ownership_lock_retry_min_ms = 100;
-    state.ownership_lock_retry_max_ms = 100;
+    state.ownership_lock_wait_ms = 5000;
+    state.ownership_lock_retry_min_ms = 25;
+    state.ownership_lock_retry_max_ms = 25;
+
+    const Releaser = struct {
+        fn run(lock: *tenant_lock.UserOwnershipLock) void {
+            std.Thread.sleep(400 * std.time.ns_per_ms);
+            lock.release();
+        }
+    };
+    const releaser = try std.Thread.spawn(.{}, Releaser.run, .{&held_lock});
+    defer releaser.join();
 
     var acquired = try maybeAcquireTenantOwnershipLock(std.testing.allocator, &state, "9", user_root);
     defer acquired.deinit();
