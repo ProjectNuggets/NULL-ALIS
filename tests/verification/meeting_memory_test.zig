@@ -54,6 +54,35 @@ fn execPostgresSql(
     }
 }
 
+fn queryPostgresText(
+    allocator: std.mem.Allocator,
+    test_url: []const u8,
+    sql: []const u8,
+) ![]u8 {
+    const url_z = try allocator.dupeZ(u8, test_url);
+    defer allocator.free(url_z);
+    const sql_z = try allocator.dupeZ(u8, sql);
+    defer allocator.free(sql_z);
+    const conn = c.PQconnectdb(url_z.ptr) orelse return error.TestPostgresConnectFailed;
+    defer c.PQfinish(conn);
+    if (c.PQstatus(conn) != c.CONNECTION_OK) return error.TestPostgresConnectFailed;
+    const result = c.PQexec(conn, sql_z.ptr) orelse return error.TestPostgresSqlFailed;
+    defer c.PQclear(result);
+    if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
+        std.debug.print("WP-15 raw SQL query failed: {s}\n", .{std.mem.span(c.PQresultErrorMessage(result))});
+        return error.TestPostgresSqlUnexpectedStatus;
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var row: c_int = 0;
+    while (row < c.PQntuples(result)) : (row += 1) {
+        if (row != 0) try out.append(allocator, '\n');
+        try out.appendSlice(allocator, std.mem.span(c.PQgetvalue(result, row, 0)));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn freeEvents(allocator: std.mem.Allocator, events: []nullalis.memory.MemoryEventRow) void {
     for (events) |*event| event.deinit(allocator);
     allocator.free(events);
@@ -90,6 +119,10 @@ test "WP-15 schema: provenance links are one-to-one and receipts cannot retain c
         "receipt_key_id",
         "receipt_signature",
         "idx_meeting_memory_erasure_receipts_key_id",
+        "idx_memory_events_user_memory_all",
+        "idx_memory_edges_source_all",
+        "idx_memory_edges_target_all",
+        "idx_memory_edges_episodes_all",
         "memory_source_links_deleted",
         "memories_deleted",
         "memory_events_deleted",
@@ -511,6 +544,22 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     );
     try std.testing.expectError(
         error.MeetingMemoryRequiresDedicatedMutation,
+        mgr.upsertMemoryEdgeRich(
+            user_a,
+            "generic-unrelated",
+            "generic-identical",
+            "EPISODE_LEAK",
+            null,
+            1.0,
+            "Sensitive meeting fact",
+            null,
+            first.memoryKey(),
+            null,
+            null,
+        ),
+    );
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
         mgr.upsertWorkingMemorySlot(user_a, "session-a", 1, "decision", identical_text, first.memoryKey(), 1.0, false),
     );
     const governed_assignment = [_]nullalis.memory.CommunityAssignment{.{
@@ -726,15 +775,112 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     );
     try execPostgresSql(allocator, test_url, residue_sql, true);
 
+    // Legacy rows can hide meeting provenance in an edge episode array or in
+    // a payload-only memory ID even when both graph endpoints are generic.
+    // Exact erasure must remove both carriers without touching their controls.
+    const hidden_carriers_sql = try std.fmt.allocPrint(
+        allocator,
+        "INSERT INTO {s}.memory_edges " ++
+            "(user_id, source_key, target_key, predicate, confidence, valid_from, fact, episodes) " ++
+            "VALUES ({d}, 'generic-unrelated', 'generic-identical', 'EPISODE_CARRIER', " ++
+            "1.0, 1784200000, 'Sensitive meeting fact', ARRAY['{s}']); " ++
+            "INSERT INTO {s}.memory_events (id, user_id, memory_id, event_type, payload) " ++
+            "SELECT 'wp15-meeting-memory-id-event', {d}, NULL, 'legacy', " ++
+            "jsonb_build_object('nested', jsonb_build_array(jsonb_build_object('memory_id', m.id))) " ++
+            "FROM {s}.memories AS m WHERE m.user_id = {d} AND m.key = '{s}'",
+        .{
+            schema,
+            user_a,
+            first.memoryKey(),
+            schema,
+            user_a,
+            schema,
+            user_a,
+            first.memoryKey(),
+        },
+    );
+    try execPostgresSql(allocator, test_url, hidden_carriers_sql, true);
+
+    // These EXPLAIN probes force index consideration and prove the complete-
+    // history erasure predicates have usable tenant/key/episode access paths.
+    const event_explain_sql = try std.fmt.allocPrint(
+        allocator,
+        "SET enable_seqscan = off; EXPLAIN (COSTS OFF) " ++
+            "WITH targets AS MATERIALIZED (SELECT m.id, m.key FROM {s}.memories AS m " ++
+            "JOIN {s}.memory_source_links AS l ON l.user_id = m.user_id AND l.memory_key = m.key " ++
+            "WHERE l.user_id = {d} AND l.source_spoke = 'minutes' " ++
+            "AND l.meeting_scope_digest = '{s}') " ++
+            "DELETE FROM {s}.memory_events AS e WHERE e.user_id = {d} AND (" ++
+            "e.memory_id IN (SELECT id FROM targets) OR EXISTS (" ++
+            "SELECT 1 FROM jsonb_path_query(e.payload, '$.**') AS carrier(value) " ++
+            "JOIN targets AS t ON (jsonb_typeof(carrier.value) = 'string' AND " ++
+            "(carrier.value = to_jsonb(t.key) OR carrier.value = to_jsonb(t.id))) OR " ++
+            "(jsonb_typeof(carrier.value) = 'object' AND " ++
+            "(carrier.value ? t.key OR carrier.value ? t.id))))",
+        .{ schema, schema, user_a, meeting_a_scope, schema, user_a },
+    );
+    const event_plan = try queryPostgresText(allocator, test_url, event_explain_sql);
+    try std.testing.expect(std.mem.indexOf(u8, event_plan, "idx_memory_events_user_memory_all") != null);
+
+    const edge_explain_sql = try std.fmt.allocPrint(
+        allocator,
+        "SET enable_seqscan = off; EXPLAIN (COSTS OFF) " ++
+            "WITH targets AS MATERIALIZED (SELECT l.memory_key AS key " ++
+            "FROM {s}.memory_source_links AS l WHERE l.user_id = {d} " ++
+            "AND l.source_spoke = 'minutes' AND l.meeting_scope_digest = '{s}') " ++
+            "DELETE FROM {s}.memory_edges AS e WHERE e.user_id = {d} AND (" ++
+            "e.source_key IN (SELECT key FROM targets) OR " ++
+            "e.target_key IN (SELECT key FROM targets) OR " ++
+            "e.episodes && ARRAY(SELECT key FROM targets))",
+        .{ schema, user_a, meeting_a_scope, schema, user_a },
+    );
+    const edge_plan = try queryPostgresText(allocator, test_url, edge_explain_sql);
+    try std.testing.expect(std.mem.indexOf(u8, edge_plan, "idx_memory_edges_source_all") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edge_plan, "idx_memory_edges_target_all") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edge_plan, "idx_memory_edges_episodes_all") != null);
+
+    // A nonexistent meeting must not issue carrier DELETE statements at all.
+    // Statement triggers turn an accidental empty-target scan into a loud test
+    // failure, independent of planner cost estimates or fixture cardinality.
+    const empty_scope_guard_sql = try std.fmt.allocPrint(
+        allocator,
+        "CREATE FUNCTION {s}.wp15_reject_empty_scope_carrier_delete() RETURNS trigger " ++
+            "LANGUAGE plpgsql AS $wp15$ BEGIN RAISE EXCEPTION 'empty-scope carrier delete'; END $wp15$; " ++
+            "CREATE TRIGGER wp15_no_empty_event_delete BEFORE DELETE ON {s}.memory_events " ++
+            "FOR EACH STATEMENT EXECUTE FUNCTION {s}.wp15_reject_empty_scope_carrier_delete(); " ++
+            "CREATE TRIGGER wp15_no_empty_edge_delete BEFORE DELETE ON {s}.memory_edges " ++
+            "FOR EACH STATEMENT EXECUTE FUNCTION {s}.wp15_reject_empty_scope_carrier_delete()",
+        .{ schema, schema, schema, schema, schema },
+    );
+    try execPostgresSql(allocator, test_url, empty_scope_guard_sql, true);
+    const empty_request = try meeting_memory.ErasureRequest.init(
+        &test_pseudonymizer,
+        user_a,
+        "meeting-never-created",
+        "request-empty-scope",
+    );
+    const empty_erased = try mgr.eraseMeetingMemories(empty_request);
+    try std.testing.expectEqual(meeting_memory.ErasureDisposition.already_absent, empty_erased.manifest.disposition);
+    try std.testing.expectEqual(@as(u64, 0), empty_erased.manifest.counts.memory_events_deleted);
+    try std.testing.expectEqual(@as(u64, 0), empty_erased.manifest.counts.memory_edges_deleted);
+    const empty_scope_guard_cleanup_sql = try std.fmt.allocPrint(
+        allocator,
+        "DROP TRIGGER wp15_no_empty_event_delete ON {s}.memory_events; " ++
+            "DROP TRIGGER wp15_no_empty_edge_delete ON {s}.memory_edges; " ++
+            "DROP FUNCTION {s}.wp15_reject_empty_scope_carrier_delete()",
+        .{ schema, schema, schema },
+    );
+    try execPostgresSql(allocator, test_url, empty_scope_guard_cleanup_sql, true);
+
     const erase_request = try meeting_memory.ErasureRequest.init(&test_pseudonymizer, user_a, "meeting-a", "request-a");
     const erased = try mgr.eraseMeetingMemories(erase_request);
     try std.testing.expectEqual(1 + cardinality_targets, erased.manifest.counts.memory_source_links_deleted);
     try std.testing.expectEqual(1 + cardinality_targets, erased.manifest.counts.memories_deleted);
-    try std.testing.expectEqual(5 + cardinality_targets, erased.manifest.counts.memory_events_deleted);
+    try std.testing.expectEqual(6 + cardinality_targets, erased.manifest.counts.memory_events_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_embeddings_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_vectors_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_entities_deleted);
-    try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.memory_edges_deleted);
+    try std.testing.expectEqual(@as(u64, 2), erased.manifest.counts.memory_edges_deleted);
     try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.working_memory_deleted);
 
     const retry_request = try meeting_memory.ErasureRequest.init(&test_pseudonymizer, user_a, "meeting-a", "request-a-retry");
@@ -782,7 +928,8 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
         "DO $wp15$ BEGIN " ++
             "IF EXISTS (SELECT 1 FROM {s}.memory_events WHERE user_id = {d} " ++
             "AND id IN ('wp15-meeting-graph-event', 'wp15-meeting-timeline-event', " ++
-            "'wp15-meeting-nested-value-event', 'wp15-meeting-nested-property-event')) " ++
+            "'wp15-meeting-nested-value-event', 'wp15-meeting-nested-property-event', " ++
+            "'wp15-meeting-memory-id-event')) " ++
             "THEN RAISE EXCEPTION 'meeting traversal carrier survived'; END IF; " ++
             "IF NOT EXISTS (SELECT 1 FROM {s}.memory_events WHERE user_id = {d} " ++
             "AND id IN ('wp15-unrelated-traversal-event', 'wp15-unrelated-nested-event') " ++
