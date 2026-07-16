@@ -384,6 +384,14 @@ pub const ToolSpec = struct {
     parameters_json: []const u8 = "{}",
 };
 
+/// Controls which provider and model candidates may process a request.
+pub const ProviderSelectionPolicy = enum {
+    /// Preserve normal retry, model fallback, and extra-provider behavior.
+    fallback_chain,
+    /// Retry only the primary provider with the exact requested model.
+    exact_primary_and_model,
+};
+
 /// Request payload for provider chat calls.
 pub const ChatRequest = struct {
     messages: []const ChatMessage,
@@ -398,6 +406,9 @@ pub const ChatRequest = struct {
     timeout_secs: u64 = 0,
     /// Reasoning effort for reasoning models (o1, o3, gpt-5*). null = don't send.
     reasoning_effort: ?[]const u8 = null,
+    /// Request-local provider/model selection boundary. Sensitive payloads can
+    /// forbid model and provider widening without changing ordinary requests.
+    provider_selection_policy: ProviderSelectionPolicy = .fallback_chain,
 };
 
 /// A single tool result message in a conversation.
@@ -460,6 +471,12 @@ pub const Provider = struct {
 
         /// Optional: pre-warm connection. Default: no-op.
         warmup: ?*const fn (ptr: *anyopaque) void = null,
+        /// Optional request-aware native-tool capability. Providers that can
+        /// route across backends use this to honor request-local boundaries.
+        supports_native_tools_for_request: ?*const fn (
+            ptr: *anyopaque,
+            request: ChatRequest,
+        ) bool = null,
         /// Optional: native function calling. Default: delegates to chat().
         chat_with_tools: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, req: ChatRequest) anyerror!ChatResponse = null,
         /// Optional: returns true if provider supports streaming. Default: false.
@@ -512,6 +529,15 @@ pub const Provider = struct {
 
     pub fn supportsNativeTools(self: Provider) bool {
         return self.vtable.supportsNativeTools(self.ptr);
+    }
+
+    /// Request-aware native-tool capability. Falls back to the provider-wide
+    /// answer so existing providers and ordinary requests remain unchanged.
+    pub fn supportsNativeToolsForRequest(self: Provider, request: ChatRequest) bool {
+        if (self.vtable.supports_native_tools_for_request) |f| {
+            return f(self.ptr, request);
+        }
+        return self.supportsNativeTools();
     }
 
     pub fn getName(self: Provider) []const u8 {
@@ -650,6 +676,18 @@ test "ChatResponse helpers" {
     };
     try std.testing.expect(with_tools.hasToolCalls());
     try std.testing.expectEqualStrings("Let me check", with_tools.contentOrEmpty());
+}
+
+test "provider selection policy: ChatRequest defaults to fallback chain and can require exact primary and model" {
+    const messages = [_]ChatMessage{ChatMessage.user("test")};
+    const ordinary = ChatRequest{ .messages = &messages };
+    try std.testing.expect(ordinary.provider_selection_policy == .fallback_chain);
+
+    const restricted = ChatRequest{
+        .messages = &messages,
+        .provider_selection_policy = .exact_primary_and_model,
+    };
+    try std.testing.expect(restricted.provider_selection_policy == .exact_primary_and_model);
 }
 
 test "ConversationMessage union variants" {
