@@ -9,6 +9,11 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const TEST_THREAD_STACK_SIZE: usize = 256 * 1024;
 
+fn wipeAndFree(allocator: Allocator, value: []const u8) void {
+    if (value.len > 0) std.crypto.secureZero(u8, @constCast(value));
+    allocator.free(value);
+}
+
 // ---------------------------------------------------------------------------
 // Message types
 // ---------------------------------------------------------------------------
@@ -29,7 +34,7 @@ pub const InboundMessage = struct {
         // channel is a string literal or long-lived config pointer — not owned, don't free
         allocator.free(self.sender_id);
         allocator.free(self.chat_id);
-        allocator.free(self.content);
+        wipeAndFree(allocator, self.content);
         allocator.free(self.session_key);
     }
 };
@@ -53,7 +58,7 @@ pub const OutboundMessage = struct {
         if (self.user_id) |user_id| allocator.free(user_id);
         if (self.dedupe_key) |dedupe_key| allocator.free(dedupe_key);
         allocator.free(self.chat_id);
-        allocator.free(self.content);
+        wipeAndFree(allocator, self.content);
     }
 };
 
@@ -94,7 +99,7 @@ pub fn makeInbound(
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
-    errdefer allocator.free(ct);
+    errdefer wipeAndFree(allocator, ct);
     const sk = try allocator.dupe(u8, session_key);
 
     return .{
@@ -123,7 +128,7 @@ pub fn makeInboundFull(
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
-    errdefer allocator.free(ct);
+    errdefer wipeAndFree(allocator, ct);
     const sk = try allocator.dupe(u8, session_key);
     errdefer allocator.free(sk);
 
@@ -172,7 +177,7 @@ pub fn makeOutbound(
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
-    errdefer allocator.free(ct);
+    errdefer wipeAndFree(allocator, ct);
 
     return .{
         .channel = channel_copy,
@@ -210,7 +215,7 @@ pub fn makeOutboundWithAccount(
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
-    errdefer allocator.free(ct);
+    errdefer wipeAndFree(allocator, ct);
     const aid = try allocator.dupe(u8, account_id);
     errdefer allocator.free(aid);
 
@@ -286,7 +291,7 @@ fn makeOutboundWithMedia(
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
-    errdefer allocator.free(ct);
+    errdefer wipeAndFree(allocator, ct);
 
     const media = if (media_src.len > 0) blk: {
         const arr = try allocator.alloc([]const u8, media_src.len);
@@ -902,6 +907,19 @@ test "OutboundMessage without media defaults to empty" {
     var msg = try makeOutbound(alloc, "ch", "c", "hi");
     defer msg.deinit(alloc);
     try testing.expectEqual(@as(usize, 0), msg.media.len);
+}
+
+test "OutboundMessage clears reply content before allocator release" {
+    const sentinel = "minutes-outbound-secret-31f8";
+    var backing: [512]u8 = undefined;
+    @memset(&backing, 0xaa);
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    const allocator = fixed.allocator();
+
+    var msg = try makeOutbound(allocator, "zaki_app", "meeting", sentinel);
+    try testing.expect(std.mem.indexOf(u8, &backing, sentinel) != null);
+    msg.deinit(allocator);
+    try testing.expect(std.mem.indexOf(u8, &backing, sentinel) == null);
 }
 
 test "makeInboundFull with null metadata" {

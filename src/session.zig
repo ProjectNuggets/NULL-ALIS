@@ -38,6 +38,61 @@ const SESSION_LOCK_WAIT_STAGE = "session_lock_wait";
 const SESSION_LOCK_WAIT_WARN_MS: u64 = 50;
 const SESSION_IDLE_CONTEXT_THRESHOLD_SECS: u64 = 5 * 60;
 
+/// End the display lifetime of a reply returned by any `SessionManager`
+/// process-message entry point. Replies can contain Minutes-derived PII, and
+/// the legacy return type does not carry `ReplyDataPolicy`, so every caller
+/// clears the owned bytes before returning them to the allocator. This is
+/// intentionally safe for ordinary replies too.
+fn clearOwnedReply(reply: []const u8) void {
+    if (reply.len > 0) std.crypto.secureZero(u8, @constCast(reply));
+}
+
+pub fn deinitOwnedReply(allocator: Allocator, reply: []const u8) void {
+    clearOwnedReply(reply);
+    allocator.free(reply);
+}
+
+fn hasMinutesReadTool(tools: []const Tool) bool {
+    for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name(), tools_mod.minutes_read.MinutesReadTool.tool_name)) return true;
+    }
+    return false;
+}
+
+fn shouldInstallMinutesReadBudget(
+    tools: []const Tool,
+    origin: tools_mod.TurnOrigin,
+    message_turn_context: ?tools_mod.MessageTurnContext,
+) bool {
+    if (tools_mod.isBackgroundTurnOrigin(origin) or !hasMinutesReadTool(tools)) return false;
+    const context = message_turn_context orelse return false;
+    const channel = context.channel orelse return false;
+    // Package 1 launches only through the first-party Hub SSE boundary, whose
+    // reply buffers and render controls are provenance-aware and zeroized.
+    // External channel adapters retain extra transport copies and link-preview
+    // behavior; they stay unavailable until that scratch is audited end to end.
+    return std.mem.eql(u8, channel, "zaki_app");
+}
+
+fn replaceReplayOutcome(
+    slot: *?Agent.TurnOutcome,
+    allocator: Allocator,
+    next: Agent.TurnOutcome,
+) void {
+    if (slot.*) |*previous| previous.deinit(allocator);
+    slot.* = null;
+
+    const owned = next;
+    if (owned.reply_data_policy == .minutes_display_only) {
+        // The caller already owns the transport copy. Keeping this second full
+        // text until the next turn or idle eviction would exceed the display
+        // lifetime, and no production caller consumes replay metadata today.
+        owned.deinit(allocator);
+        return;
+    }
+    slot.* = owned;
+}
+
 /// Maximum concurrent sessions per user (DoS mitigation T-03-04).
 ///
 /// V1.11 (2026-05-07): raised 50 → 200. Power users running ZAKI across
@@ -214,6 +269,7 @@ pub const Session = struct {
             .spawned_task_ids = tasks_copy,
             .iterations_used = src.iterations_used,
             .loop_detected = src.loop_detected,
+            .reply_data_policy = src.reply_data_policy,
         };
     }
 };
@@ -1057,6 +1113,13 @@ pub const SessionManager = struct {
             std.ascii.eqlIgnoreCase(cmd, "restart");
     }
 
+    /// Minutes replies are authorized for the current display only.  The
+    /// Session owns a short-lived copy so the gateway can render it, but it
+    /// must never cross the durable SessionStore boundary.
+    fn shouldPersistAssistantReply(policy: Agent.ReplyDataPolicy) bool {
+        return policy == .ordinary;
+    }
+
     /// WM (memory-phase-0.5) — clear the session's working-memory slots on
     /// /new|/reset|/restart, then RE-PIN identity so the agent still knows
     /// who the user is after the reset. A /reset should wipe stale
@@ -1092,7 +1155,9 @@ pub const SessionManager = struct {
     }
 
     /// Process a message within a session context.
-    /// Finds or creates the session, locks it, runs agent.turn(), returns owned response.
+    /// Finds or creates the session, locks it, runs agent.turn(), and returns
+    /// an owned response. The caller must use `deinitOwnedReply` after the
+    /// response's display lifetime ends.
     pub fn processMessage(self: *SessionManager, session_key: []const u8, content: []const u8, conversation_context: ?ConversationContext) ![]const u8 {
         return self.processMessageWithContext(session_key, content, conversation_context, .{});
     }
@@ -1187,12 +1252,21 @@ pub const SessionManager = struct {
 
         tools_mod.setMessageTurnContext(options.message_turn_context);
         defer tools_mod.clearMessageTurnContext();
+        var minutes_read_budget = tools_mod.MinutesReadTurnBudget{};
+        const minutes_read_enabled = shouldInstallMinutesReadBudget(
+            self.tools,
+            options.turn_origin,
+            options.message_turn_context,
+        );
+        defer if (minutes_read_enabled)
+            std.crypto.secureZero(u8, std.mem.asBytes(&minutes_read_budget));
         tools_mod.setTurnContext(.{
             .origin = options.turn_origin,
             .entry_kind = options.entry_kind,
             .session_key = session_key,
             .provider = session.agent.default_provider,
             .model = session.agent.model_name,
+            .minutes_read_budget = if (minutes_read_enabled) &minutes_read_budget else null,
             // Phase 5 T3 — propagate the per-turn Superpowers flag to tools.
             // spawn_many self-gates on this; a non-Superpowers turn cannot
             // fan out. (subagent_batch_result has no Superpowers gate since
@@ -1321,9 +1395,13 @@ pub const SessionManager = struct {
         // (caller frees with agent.allocator) is preserved; the outcome
         // itself is owned by the Session and freed on next turn or deinit.
         const outcome = try (&session.agent).turnOutcome(effective_content);
-        if (session.last_turn_outcome) |*prev| prev.deinit(session.agent.allocator);
-        session.last_turn_outcome = outcome;
-        const response = try session.agent.allocator.dupe(u8, outcome.text);
+        const reply_data_policy = outcome.reply_data_policy;
+        const response = session.agent.allocator.dupe(u8, outcome.text) catch |err| {
+            var unclaimed = outcome;
+            unclaimed.deinit(session.agent.allocator);
+            return err;
+        };
+        replaceReplayOutcome(&session.last_turn_outcome, session.agent.allocator, outcome);
         const agent_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - agent_start_ms));
         session.turn_count += 1;
         session.last_active = std.time.timestamp();
@@ -1364,23 +1442,18 @@ pub const SessionManager = struct {
                 const persisted_user_role = if (options.user_visible) "user" else "internal_user";
                 store.saveMessage(session_key, persisted_user_role, content) catch |err|
                     log.warn("session.saveMessage_user_failed session={s} err={s}", .{ session_key, @errorName(err) });
-                // P1-5 transcript fidelity — persist the assistant turn WITH
-                // its native tool_calls + reasoning (from history) so a
-                // reloaded transcript carries the structure instead of
-                // degrading to flat text. saveMessageRich falls back to plain
-                // saveMessage when the turn had neither (→ NULL columns, loads
-                // as before) or the backend has no rich slot. We hold
-                // session.mutex here, so the history pointers the extras borrow
-                // are valid; the serialized tool_calls_json is owned and freed
-                // right after the write. A serialization OOM degrades to a flat
-                // assistant save rather than dropping the turn entirely.
-                if ((&session.agent).lastAssistantTranscriptExtras(self.allocator)) |extras| {
-                    defer if (extras.tool_calls_json) |tcj| self.allocator.free(tcj);
-                    store.saveMessageRich(session_key, "assistant", response, extras.tool_calls_json, extras.reasoning) catch |err|
-                        log.warn("session.saveMessage_assistant_failed session={s} err={s}", .{ session_key, @errorName(err) });
-                } else |_| {
-                    store.saveMessage(session_key, "assistant", response) catch |err|
-                        log.warn("session.saveMessage_assistant_failed session={s} err={s}", .{ session_key, @errorName(err) });
+                if (shouldPersistAssistantReply(reply_data_policy)) {
+                    // P1-5 transcript fidelity — persist ordinary assistant
+                    // turns WITH native tool_calls + reasoning. Minutes
+                    // display-only replies deliberately skip this sink.
+                    if ((&session.agent).lastAssistantTranscriptExtras(self.allocator)) |extras| {
+                        defer if (extras.tool_calls_json) |tcj| self.allocator.free(tcj);
+                        store.saveMessageRich(session_key, "assistant", response, extras.tool_calls_json, extras.reasoning) catch |err|
+                            log.warn("session.saveMessage_assistant_failed session={s} err={s}", .{ session_key, @errorName(err) });
+                    } else |_| {
+                        store.saveMessage(session_key, "assistant", response) catch |err|
+                            log.warn("session.saveMessage_assistant_failed session={s} err={s}", .{ session_key, @errorName(err) });
+                    }
                 }
             }
         }
@@ -1913,6 +1986,70 @@ fn testConfig() Config {
         .default_model = "test/mock-model",
         .allocator = testing.allocator,
     };
+}
+
+test "Minutes display-only replies do not cross the durable session-store boundary" {
+    try testing.expect(SessionManager.shouldPersistAssistantReply(.ordinary));
+    try testing.expect(!SessionManager.shouldPersistAssistantReply(.minutes_display_only));
+}
+
+test "owned session replies are cleared when their display lifetime ends" {
+    var storage: [64]u8 = undefined;
+    @memset(&storage, 0xaa);
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const allocator = fixed.allocator();
+    const reply = try allocator.dupe(u8, "meeting-secret");
+    const forensic_view = reply;
+
+    clearOwnedReply(reply);
+    for (forensic_view) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    allocator.free(reply);
+}
+
+test "Minutes budget is installed only for a registered foreground capability" {
+    const FakeMinutesTool = struct {
+        pub const tool_name = tools_mod.minutes_read.MinutesReadTool.tool_name;
+        pub const tool_description = "test Minutes capability";
+        pub const tool_params = "{}";
+        pub const vtable = tools_mod.ToolVTable(@This());
+
+        pub fn tool(self: *@This()) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *@This(), _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return tools_mod.ToolResult.fail("not executed");
+        }
+    };
+
+    var minutes = FakeMinutesTool{};
+    const tools = [_]Tool{minutes.tool()};
+    const app_context = tools_mod.MessageTurnContext{ .channel = "zaki_app" };
+    const telegram_context = tools_mod.MessageTurnContext{ .channel = "telegram" };
+    try testing.expect(shouldInstallMinutesReadBudget(&tools, .user, app_context));
+    try testing.expect(shouldInstallMinutesReadBudget(&tools, .mcp, app_context));
+    try testing.expect(!shouldInstallMinutesReadBudget(&tools, .heartbeat, app_context));
+    try testing.expect(!shouldInstallMinutesReadBudget(&tools, .scheduler, app_context));
+    try testing.expect(!shouldInstallMinutesReadBudget(&tools, .user, telegram_context));
+    try testing.expect(!shouldInstallMinutesReadBudget(&tools, .user, null));
+    try testing.expect(!shouldInstallMinutesReadBudget(&.{}, .user, app_context));
+}
+
+test "Minutes display-only outcome is not retained for session replay" {
+    const sentinel = "meeting-replay-secret";
+    var storage: [256]u8 = undefined;
+    @memset(&storage, 0xaa);
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const allocator = fixed.allocator();
+    var slot: ?Agent.TurnOutcome = null;
+
+    replaceReplayOutcome(&slot, allocator, .{
+        .text = try allocator.dupe(u8, sentinel),
+        .reply_data_policy = .minutes_display_only,
+    });
+
+    try testing.expect(slot == null);
+    try testing.expect(std.mem.indexOf(u8, &storage, sentinel) == null);
 }
 
 // ---------------------------------------------------------------------------

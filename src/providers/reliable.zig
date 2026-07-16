@@ -384,6 +384,7 @@ pub const ReliableProvider = struct {
         .chat = chatImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
         .supports_native_tools_for_request = supportsNativeToolsForRequestImpl,
+        .supports_sensitive_streaming_for_request = supportsSensitiveStreamingForRequestImpl,
         .supports_streaming = supportsStreamingImpl,
         .supports_vision = supportsVisionImpl,
         .supports_vision_for_model = supportsVisionForModelImpl,
@@ -650,6 +651,15 @@ pub const ReliableProvider = struct {
         return supportsNativeToolsImpl(ptr);
     }
 
+    fn supportsSensitiveStreamingForRequestImpl(ptr: *anyopaque, request: ChatRequest) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        // Sensitive requests are exact-primary-only. Never infer safety from
+        // an extra/fallback adapter with different process boundaries.
+        if (request.provider_selection_policy != .exact_primary_and_model) return false;
+        return self.inner.supportsStreaming() and
+            self.inner.supportsSensitiveStreamingForRequest(request);
+    }
+
     fn supportsStreamingImpl(ptr: *anyopaque) bool {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
         if (self.inner.supportsStreaming()) return true;
@@ -732,36 +742,19 @@ pub const ReliableProvider = struct {
         _ = temperature;
 
         if (request.provider_selection_policy == .exact_primary_and_model) {
-            if (self.inner.supportsStreaming()) {
-                if (try self.tryStreamProvider(
-                    self.inner,
-                    allocator,
-                    request,
-                    model,
-                    false,
-                    callback,
-                    callback_ctx,
-                )) |result| {
-                    return result;
-                }
-            }
-
-            if (self.tryChatProvider(self.inner, allocator, request, model, false)) |response| {
-                if (response.content) |content| {
-                    if (content.len > 0) {
-                        callback(callback_ctx, StreamChunk.textDelta(content));
-                    }
-                }
-                callback(callback_ctx, StreamChunk.finalChunk());
-                return .{
-                    .content = response.content,
-                    .tool_calls = response.tool_calls,
-                    .usage = response.usage,
-                    .model = response.model,
-                    .reasoning_content = response.reasoning_content,
-                    .stream_tool_call_chunks = response.stream_tool_call_chunks,
-                };
-            }
+            if (!self.inner.supportsStreaming()) return error.UnsupportedOperation;
+            if (try self.tryStreamProvider(
+                self.inner,
+                allocator,
+                request,
+                model,
+                false,
+                callback,
+                callback_ctx,
+            )) |result| return result;
+            // Exact sensitive routing must never downgrade from the audited
+            // streaming transport into blocking chat, whose subprocess and
+            // error-body boundary may not carry the same guarantees.
             return self.finalFailureError();
         }
 
@@ -1195,6 +1188,7 @@ const StreamingMockProvider = struct {
     supports_tools: bool = false,
     supports_vision: bool = true,
     supports_streaming: bool = true,
+    supports_sensitive_streaming: bool = false,
     response: []const u8 = "streamed response",
     models_seen_buf: [16][]const u8 = undefined,
     models_seen_len: usize = 0,
@@ -1206,6 +1200,7 @@ const StreamingMockProvider = struct {
         .chat = streamMockChat,
         .supportsNativeTools = streamMockSupportsNativeTools,
         .supports_streaming = streamMockSupportsStreaming,
+        .supports_sensitive_streaming_for_request = streamMockSupportsSensitiveStreaming,
         .supports_vision = streamMockSupportsVision,
         .getName = streamMockGetName,
         .deinit = streamMockDeinit,
@@ -1282,6 +1277,11 @@ const StreamingMockProvider = struct {
     fn streamMockSupportsStreaming(ptr: *anyopaque) bool {
         const self: *StreamingMockProvider = @ptrCast(@alignCast(ptr));
         return self.supports_streaming;
+    }
+
+    fn streamMockSupportsSensitiveStreaming(ptr: *anyopaque, _: ChatRequest) bool {
+        const self: *StreamingMockProvider = @ptrCast(@alignCast(ptr));
+        return self.supports_sensitive_streaming;
     }
 
     fn streamMockSupportsVision(ptr: *anyopaque) bool {
@@ -1857,10 +1857,11 @@ test "provider selection policy: exact primary and model retries primary timeout
     try std.testing.expectEqual(@as(u32, 0), extra.call_count);
 }
 
-test "provider selection policy: exact primary and model streams through primary blocking chat when needed" {
+test "provider selection policy: exact stream never downgrades to blocking chat or an extra provider" {
     var primary = StreamingMockProvider{
         .name = "primary",
         .supports_streaming = false,
+        .supports_sensitive_streaming = true,
         .response = "primary blocking response",
     };
     var extra = StreamingMockProvider{
@@ -1884,34 +1885,35 @@ test "provider selection policy: exact primary and model streams through primary
         .model = "sensitive-model",
         .provider_selection_policy = .exact_primary_and_model,
     };
-    const result = try reliable.provider().streamChat(
-        std.testing.allocator,
-        request,
-        "sensitive-model",
-        0.7,
-        StreamCollector.onChunk,
-        @ptrCast(&collector),
+    try std.testing.expect(!reliable.provider().supportsSensitiveStreamingForRequest(request));
+    try std.testing.expectError(
+        error.UnsupportedOperation,
+        reliable.provider().streamChat(
+            std.testing.allocator,
+            request,
+            "sensitive-model",
+            0.7,
+            StreamCollector.onChunk,
+            @ptrCast(&collector),
+        ),
     );
-    defer if (result.content) |content| std.testing.allocator.free(content);
-
-    try std.testing.expectEqualStrings("primary blocking response", result.content.?);
-    try std.testing.expectEqualStrings("primary blocking response", collector.textSlice());
-    try std.testing.expectEqual(@as(u32, 1), collector.non_final_chunks);
-    try std.testing.expectEqual(@as(u32, 1), collector.final_chunks);
+    try std.testing.expectEqualStrings("", collector.textSlice());
+    try std.testing.expectEqual(@as(u32, 0), collector.non_final_chunks);
+    try std.testing.expectEqual(@as(u32, 0), collector.final_chunks);
     try std.testing.expectEqual(@as(u32, 0), primary.stream_count);
-    try std.testing.expectEqual(@as(u32, 1), primary.chat_count);
-    try std.testing.expectEqual(@as(usize, 1), primary.modelsSeen().len);
-    try std.testing.expectEqualStrings("sensitive-model", primary.modelsSeen()[0]);
+    try std.testing.expectEqual(@as(u32, 0), primary.chat_count);
+    try std.testing.expectEqual(@as(usize, 0), primary.modelsSeen().len);
     try std.testing.expectEqual(@as(u32, 0), extra.stream_count);
     try std.testing.expectEqual(@as(u32, 0), extra.chat_count);
     try std.testing.expectEqual(@as(usize, 0), extra.modelsSeen().len);
 }
 
-test "provider selection policy: pre-token stream failure falls back to blocking chat on the same primary" {
+test "provider selection policy: pre-token exact stream failure never falls back to blocking chat" {
     var primary = StreamingMockProvider{
         .name = "primary",
         .fail_stream_until = 10,
         .fail_error = error.Timeout,
+        .supports_sensitive_streaming = true,
         .response = "primary blocking response",
     };
     var extra = StreamingMockProvider{
@@ -1935,26 +1937,26 @@ test "provider selection policy: pre-token stream failure falls back to blocking
         .model = "sensitive-model",
         .provider_selection_policy = .exact_primary_and_model,
     };
-    const result = try reliable.provider().streamChat(
-        std.testing.allocator,
-        request,
-        "sensitive-model",
-        0.7,
-        StreamCollector.onChunk,
-        @ptrCast(&collector),
+    try std.testing.expect(reliable.provider().supportsSensitiveStreamingForRequest(request));
+    try std.testing.expectError(
+        error.Timeout,
+        reliable.provider().streamChat(
+            std.testing.allocator,
+            request,
+            "sensitive-model",
+            0.7,
+            StreamCollector.onChunk,
+            @ptrCast(&collector),
+        ),
     );
-    defer if (result.content) |content| std.testing.allocator.free(content);
-
-    try std.testing.expectEqualStrings("primary blocking response", result.content.?);
-    try std.testing.expectEqualStrings("primary blocking response", collector.textSlice());
-    try std.testing.expectEqual(@as(u32, 1), collector.non_final_chunks);
-    try std.testing.expectEqual(@as(u32, 1), collector.final_chunks);
+    try std.testing.expectEqualStrings("", collector.textSlice());
+    try std.testing.expectEqual(@as(u32, 0), collector.non_final_chunks);
+    try std.testing.expectEqual(@as(u32, 0), collector.final_chunks);
     try std.testing.expectEqual(@as(u32, 2), primary.stream_count);
-    try std.testing.expectEqual(@as(u32, 1), primary.chat_count);
-    try std.testing.expectEqual(@as(usize, 3), primary.modelsSeen().len);
+    try std.testing.expectEqual(@as(u32, 0), primary.chat_count);
+    try std.testing.expectEqual(@as(usize, 2), primary.modelsSeen().len);
     try std.testing.expectEqualStrings("sensitive-model", primary.modelsSeen()[0]);
     try std.testing.expectEqualStrings("sensitive-model", primary.modelsSeen()[1]);
-    try std.testing.expectEqualStrings("sensitive-model", primary.modelsSeen()[2]);
     try std.testing.expectEqual(@as(u32, 0), extra.stream_count);
     try std.testing.expectEqual(@as(u32, 0), extra.chat_count);
     try std.testing.expectEqual(@as(usize, 0), extra.modelsSeen().len);
