@@ -85,6 +85,7 @@ pub const ALL_TOOLS = [_][]const u8{
     "memory_store",
     "memory_timeline",
     "message",
+    "minutes_read",
     "openapi",
     "produce_document",
     "pushover",
@@ -151,6 +152,9 @@ pub fn lintToolDescription(
     comptime desc: metadata.ToolDescription,
     comptime registry: []const []const u8,
 ) void {
+    // The sibling-name checks scan the full production registry for each
+    // entry. Keep the linter's branch budget proportional as the catalog grows.
+    @setEvalBranchQuota(10_000);
     // Phase D: Full enforcement of 5 lint rules for production quality
 
     // Rule 1: .what is 20–100 chars, 1 sentence, ends with .!?
