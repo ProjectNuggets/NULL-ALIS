@@ -272,21 +272,23 @@ const ReceiptVerifierKey = struct {
     key_id: Sha256Text,
 };
 
-/// Public-only keyring for live receipt verification and one-key rotation.
+/// Public-only keyring for two-phase receipt-key rotation. `secondary` may be
+/// the next key during phase one or the prior key during phase two, allowing
+/// old and new pods to verify each other's receipts during a rolling deploy.
 pub const ErasureReceiptVerifierKeyring = struct {
     current: ReceiptVerifierKey,
-    previous: ?ReceiptVerifierKey,
+    secondary: ?ReceiptVerifierKey,
 
     pub fn init(
         current_public_key_bytes: [Ed25519.PublicKey.encoded_length]u8,
-        previous_public_key_bytes: ?[Ed25519.PublicKey.encoded_length]u8,
+        secondary_public_key_bytes: ?[Ed25519.PublicKey.encoded_length]u8,
     ) ReceiptCryptoError!ErasureReceiptVerifierKeyring {
         const current = try verifierKey(current_public_key_bytes);
-        const previous = if (previous_public_key_bytes) |bytes|
+        const secondary = if (secondary_public_key_bytes) |bytes|
             try verifierKey(bytes)
         else
             null;
-        return .{ .current = current, .previous = previous };
+        return .{ .current = current, .secondary = secondary };
     }
 
     pub fn verifyDigest(
@@ -298,8 +300,8 @@ pub const ErasureReceiptVerifierKeyring = struct {
         if (!isCanonicalSha256Text(key_id)) return error.InvalidReceiptKeyId;
         const public_key = if (std.mem.eql(u8, key_id, &self.current.key_id))
             self.current.public_key
-        else if (self.previous) |previous|
-            if (std.mem.eql(u8, key_id, &previous.key_id)) previous.public_key else return error.UnknownReceiptKeyId
+        else if (self.secondary) |secondary|
+            if (std.mem.eql(u8, key_id, &secondary.key_id)) secondary.public_key else return error.UnknownReceiptKeyId
         else
             return error.UnknownReceiptKeyId;
 
@@ -322,8 +324,8 @@ pub const ErasureReceiptVerifierKeyring = struct {
     pub fn recognizesKeyId(self: *const ErasureReceiptVerifierKeyring, key_id: []const u8) bool {
         if (!isCanonicalSha256Text(key_id)) return false;
         if (std.mem.eql(u8, key_id, &self.current.key_id)) return true;
-        return if (self.previous) |previous|
-            std.mem.eql(u8, key_id, &previous.key_id)
+        return if (self.secondary) |secondary|
+            std.mem.eql(u8, key_id, &secondary.key_id)
         else
             false;
     }
@@ -1438,22 +1440,22 @@ test "pseudonym key separates meeting identity and seals store validation" {
     try std.testing.expectError(error.ErasureRequestIntegrityMismatch, first_request.validateForErase(&second));
 }
 
-test "erasure receipt signatures verify current and previous keys only" {
+test "erasure receipt signatures verify current and secondary keys only" {
     const current = try ErasureReceiptSigner.init([_]u8{0x31} ** 32);
-    const previous = try ErasureReceiptSigner.init([_]u8{0x27} ** 32);
+    const secondary = try ErasureReceiptSigner.init([_]u8{0x27} ** 32);
     const keyring = try ErasureReceiptVerifierKeyring.init(
         current.publicKeyBytes(),
-        previous.publicKeyBytes(),
+        secondary.publicKeyBytes(),
     );
     var digest: Digest = undefined;
     std.crypto.hash.sha2.Sha256.hash("canonical receipt", &digest, .{});
 
     const current_receipt = try current.signDigest(digest);
-    const previous_receipt = try previous.signDigest(digest);
+    const secondary_receipt = try secondary.signDigest(digest);
     try keyring.verifyDigest(digest, current_receipt.keyId(), current_receipt.signatureText());
-    try keyring.verifyDigest(digest, previous_receipt.keyId(), previous_receipt.signatureText());
+    try keyring.verifyDigest(digest, secondary_receipt.keyId(), secondary_receipt.signatureText());
     try std.testing.expect(keyring.recognizesKeyId(current_receipt.keyId()));
-    try std.testing.expect(keyring.recognizesKeyId(previous_receipt.keyId()));
+    try std.testing.expect(keyring.recognizesKeyId(secondary_receipt.keyId()));
 
     var tampered = digest;
     tampered[0] ^= 0xff;
@@ -1463,7 +1465,7 @@ test "erasure receipt signatures verify current and previous keys only" {
     );
     try std.testing.expectError(
         error.ReceiptSignatureVerificationFailed,
-        keyring.verifyDigest(digest, previous_receipt.keyId(), current_receipt.signatureText()),
+        keyring.verifyDigest(digest, secondary_receipt.keyId(), current_receipt.signatureText()),
     );
     var unknown_key_id = current_receipt.key_id;
     unknown_key_id[unknown_key_id.len - 1] = if (unknown_key_id[unknown_key_id.len - 1] == '0') '1' else '0';

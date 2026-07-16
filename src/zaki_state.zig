@@ -2204,7 +2204,7 @@ const ManagerImpl = struct {
         self: *Self,
         pseudonym_key: [32]u8,
         receipt_signing_seed: [32]u8,
-        previous_receipt_public_key: ?[32]u8,
+        secondary_receipt_public_key: ?[32]u8,
     ) !void {
         if (!builtin.is_test) {
             @compileError("Manager.installMeetingMemoryCryptoForTests is test-only");
@@ -2212,7 +2212,7 @@ const ManagerImpl = struct {
         var candidate = try meetingMemoryCryptoFromSeeds(
             pseudonym_key,
             receipt_signing_seed,
-            previous_receipt_public_key,
+            secondary_receipt_public_key,
         );
         errdefer std.crypto.secureZero(
             u8,
@@ -2314,10 +2314,9 @@ const ManagerImpl = struct {
         }
     }
 
-    /// One previous public key is enough only when key retirement cannot
-    /// outrun receipt retention. Validate every retained key ID at boot (and
-    /// in the test rotation hook) so an unsafe second rotation fails before a
-    /// request discovers unverifiable compliance evidence during replay.
+    /// The secondary public key supports the next/previous halves of a
+    /// two-phase rolling rotation. Validate every retained key ID at boot (and
+    /// in the test hook) so key retirement cannot outrun receipt retention.
     fn validateMeetingMemoryReceiptVerifierCoverage(
         self: *Self,
         verifier: *const meeting_memory.ErasureReceiptVerifierKeyring,
@@ -5093,16 +5092,16 @@ const ManagerImpl = struct {
         // keys remain untouched.
         {
             const q = try self.buildQuery(
-                "WITH targets AS (" ++
+                "WITH targets AS MATERIALIZED (" ++
                     "SELECT m.id, m.key FROM {schema}.memories AS m " ++
                     "JOIN {schema}.memory_source_links AS l " ++
                     "ON l.user_id = m.user_id AND l.memory_key = m.key " ++
                     "WHERE l.user_id = $1 AND l.source_spoke = 'minutes' " ++
                     "AND l.meeting_scope_digest = $2) " ++
-                    "DELETE FROM {schema}.memory_events AS e USING targets AS t " ++
-                    "WHERE e.user_id = $1 AND (e.memory_id = t.id " ++
+                    "DELETE FROM {schema}.memory_events AS e " ++
+                    "WHERE e.user_id = $1 AND (e.memory_id IN (SELECT id FROM targets) " ++
                     "OR EXISTS (SELECT 1 FROM jsonb_path_query(e.payload, '$.**') " ++
-                    "AS carrier(value) WHERE " ++
+                    "AS carrier(value) JOIN targets AS t ON " ++
                     "(jsonb_typeof(carrier.value) = 'string' " ++
                     "AND carrier.value = to_jsonb(t.key)) " ++
                     "OR (jsonb_typeof(carrier.value) = 'object' " ++
@@ -18788,7 +18787,7 @@ fn loadMeetingMemorySeed(
     return seed;
 }
 
-fn loadMeetingMemoryPreviousPublicKey(
+fn loadMeetingMemorySecondaryPublicKey(
     allocator: std.mem.Allocator,
     env_name: ?[]const u8,
 ) !?[32]u8 {
@@ -18809,7 +18808,7 @@ fn loadMeetingMemoryPreviousPublicKey(
 fn meetingMemoryCryptoFromSeeds(
     pseudonym_seed: [32]u8,
     receipt_signing_seed: [32]u8,
-    previous_receipt_public_key: ?[32]u8,
+    secondary_receipt_public_key: ?[32]u8,
 ) !MeetingMemoryCrypto {
     const signer = try meeting_memory.ErasureReceiptSigner.init(receipt_signing_seed);
     return .{
@@ -18817,7 +18816,7 @@ fn meetingMemoryCryptoFromSeeds(
         .receipt_signer = signer,
         .receipt_verifier = try meeting_memory.ErasureReceiptVerifierKeyring.init(
             signer.publicKeyBytes(),
-            previous_receipt_public_key,
+            secondary_receipt_public_key,
         ),
     };
 }
@@ -18832,7 +18831,7 @@ fn loadMeetingMemoryCrypto(
     defer if (receipt_seed) |*seed| std.crypto.secureZero(u8, seed);
 
     if (pseudonym_seed == null and receipt_seed == null) {
-        if (cfg.receipt_previous_public_key_env != null) {
+        if (cfg.receipt_secondary_public_key_env != null) {
             return error.IncompleteMeetingMemoryCryptoConfig;
         }
         return null;
@@ -18840,14 +18839,14 @@ fn loadMeetingMemoryCrypto(
     if (pseudonym_seed == null or receipt_seed == null) {
         return error.IncompleteMeetingMemoryCryptoConfig;
     }
-    const previous = try loadMeetingMemoryPreviousPublicKey(
+    const secondary = try loadMeetingMemorySecondaryPublicKey(
         allocator,
-        cfg.receipt_previous_public_key_env,
+        cfg.receipt_secondary_public_key_env,
     );
     return try meetingMemoryCryptoFromSeeds(
         pseudonym_seed.?,
         receipt_seed.?,
-        previous,
+        secondary,
     );
 }
 

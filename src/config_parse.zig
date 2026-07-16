@@ -1996,9 +1996,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     if (crypto.object.get("receipt_signing_seed_env")) |v| {
                         if (v == .string) self.state.meeting_memory_crypto.receipt_signing_seed_env = try self.allocator.dupe(u8, v.string);
                     }
-                    if (crypto.object.get("receipt_previous_public_key_env")) |v| {
-                        if (v == .string) self.state.meeting_memory_crypto.receipt_previous_public_key_env = try self.allocator.dupe(u8, v.string);
-                        if (v == .null) self.state.meeting_memory_crypto.receipt_previous_public_key_env = null;
+                    if (crypto.object.get("receipt_secondary_public_key_env")) |v| {
+                        if (v == .string) self.state.meeting_memory_crypto.receipt_secondary_public_key_env = try self.allocator.dupe(u8, v.string);
+                        if (v == .null) self.state.meeting_memory_crypto.receipt_secondary_public_key_env = null;
                     }
                 }
             }

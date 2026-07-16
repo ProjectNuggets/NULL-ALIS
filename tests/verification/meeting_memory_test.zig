@@ -272,6 +272,92 @@ test "WP-15 live: default-off boot becomes fail-closed after crypto binding" {
     );
 }
 
+test "WP-15 live: two-phase receipt rotation is bidirectionally compatible" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const test_url = try harness.requirePostgresUrl(allocator);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try harness.schemaName(&schema_buf, "meeting_crypto_rotation");
+    const drop_sql = try std.fmt.allocPrint(
+        allocator,
+        "DROP SCHEMA IF EXISTS {s} CASCADE",
+        .{schema},
+    );
+    defer execPostgresSql(allocator, test_url, drop_sql, true) catch |err| {
+        std.debug.print("WP-15 rotation cleanup failed: {s}\n", .{@errorName(err)});
+    };
+    const cfg = nullalis.config.StateConfig{
+        .backend = "postgres",
+        .postgres = .{ .connection_string = test_url, .schema = schema },
+        .meeting_memory_crypto = .{
+            .pseudonym_key_env = "NULLALIS_WP15_ROTATION_ABSENT_PSEUDONYM_KEY",
+            .receipt_signing_seed_env = "NULLALIS_WP15_ROTATION_ABSENT_RECEIPT_SEED",
+        },
+    };
+
+    // Both pods boot while the schema is still default-off. Phase one gives
+    // K1 pods K2's public key; phase two gives K2 pods K1's public key.
+    var k1_pod = try nullalis.zaki_state.Manager.init(allocator, cfg);
+    defer k1_pod.deinit();
+    var k2_pod = try nullalis.zaki_state.Manager.init(allocator, cfg);
+    defer k2_pod.deinit();
+    k1_pod.skipExternalIdentityForTests();
+    k2_pod.skipExternalIdentityForTests();
+    const k1_seed = [_]u8{0x41} ** 32;
+    const k2_seed = [_]u8{0x42} ** 32;
+    const k1_signer = try meeting_memory.ErasureReceiptSigner.init(k1_seed);
+    const k2_signer = try meeting_memory.ErasureReceiptSigner.init(k2_seed);
+    try k1_pod.installMeetingMemoryCryptoForTests(
+        test_pseudonym_key,
+        k1_seed,
+        k2_signer.publicKeyBytes(),
+    );
+    try k2_pod.installMeetingMemoryCryptoForTests(
+        test_pseudonym_key,
+        k2_seed,
+        k1_signer.publicKeyBytes(),
+    );
+
+    const user_id = harness.testUid();
+    try k1_pod.provisionUser(user_id, "/tmp/nullalis-minutes-rotation");
+    _ = try k1_pod.storeMeetingMemory(try prepared(
+        try source(user_id, "transcript-k1", "meeting-k1"),
+        .decision,
+        "K1 signs before the rollout flips",
+        "grant-k1",
+    ));
+    _ = try k1_pod.storeMeetingMemory(try prepared(
+        try source(user_id, "transcript-k2", "meeting-k2"),
+        .decision,
+        "K2 signs after the rollout flips",
+        "grant-k2",
+    ));
+
+    const request_k1 = try meeting_memory.ErasureRequest.init(
+        &test_pseudonymizer,
+        user_id,
+        "meeting-k1",
+        "request-k1",
+    );
+    const k1_receipt = try k1_pod.eraseMeetingMemories(request_k1);
+    try std.testing.expectEqualStrings(k1_signer.keyId(), k1_receipt.receiptKeyId());
+    const k1_seen_by_k2 = try k2_pod.eraseMeetingMemories(request_k1);
+    try std.testing.expectEqualStrings(k1_receipt.receiptSignature(), k1_seen_by_k2.receiptSignature());
+
+    const request_k2 = try meeting_memory.ErasureRequest.init(
+        &test_pseudonymizer,
+        user_id,
+        "meeting-k2",
+        "request-k2",
+    );
+    const k2_receipt = try k2_pod.eraseMeetingMemories(request_k2);
+    try std.testing.expectEqualStrings(k2_signer.keyId(), k2_receipt.receiptKeyId());
+    const k2_seen_by_k1 = try k1_pod.eraseMeetingMemories(request_k2);
+    try std.testing.expectEqualStrings(k2_receipt.receiptSignature(), k2_seen_by_k1.receiptSignature());
+}
+
 test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte-identical rows" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -551,6 +637,46 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     );
     try execPostgresSql(allocator, test_url, verify_decay_sql, true);
 
+    // Exercise erasure with enough target rows and unrelated nested payloads
+    // to catch an event×target recursive JSON rescan. Each extra target has
+    // one nested carrier that must be deleted; 128 other-meeting payloads must
+    // each be walked once and survive exact-scope matching.
+    const cardinality_targets: u64 = 24;
+    const unrelated_cardinality_events: u64 = 128;
+    for (0..cardinality_targets) |index| {
+        const item_id = try std.fmt.allocPrint(allocator, "transcript-cardinality-{d}", .{index});
+        const candidate_text = try std.fmt.allocPrint(
+            allocator,
+            "Meeting decision {d} keeps exact erasure bounded",
+            .{index},
+        );
+        const grant_id = try std.fmt.allocPrint(allocator, "grant-cardinality-{d}", .{index});
+        const extra_source = try source(user_a, item_id, "meeting-a");
+        const extra = try mgr.storeMeetingMemory(try prepared(
+            extra_source,
+            .decision,
+            candidate_text,
+            grant_id,
+        ));
+        const carrier_sql = try std.fmt.allocPrint(
+            allocator,
+            "INSERT INTO {s}.memory_events (id, user_id, memory_id, event_type, payload) " ++
+                "VALUES ('wp15-cardinality-meeting-{d}', {d}, NULL, 'legacy', " ++
+                "jsonb_build_object('nested', jsonb_build_array(jsonb_build_object('value', '{s}'))))",
+            .{ schema, index, user_a, extra.memoryKey() },
+        );
+        try execPostgresSql(allocator, test_url, carrier_sql, true);
+    }
+    const unrelated_cardinality_sql = try std.fmt.allocPrint(
+        allocator,
+        "INSERT INTO {s}.memory_events (id, user_id, memory_id, event_type, payload) " ++
+            "SELECT 'wp15-cardinality-unrelated-' || g::text, {d}, NULL, 'legacy', " ++
+            "jsonb_build_object('nested', jsonb_build_array(jsonb_build_object('value', '{s}'))) " ++
+            "FROM generate_series(1, {d}) AS g",
+        .{ schema, user_a, second_meeting.memoryKey(), unrelated_cardinality_events },
+    );
+    try execPostgresSql(allocator, test_url, unrelated_cardinality_sql, true);
+
     // Seed legacy/adversarial carriers directly. Canonical graph and working-
     // memory writers now reject these attachments, but exact erasure must also
     // clean residue created before that boundary existed. An unrelated edge
@@ -602,9 +728,9 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
 
     const erase_request = try meeting_memory.ErasureRequest.init(&test_pseudonymizer, user_a, "meeting-a", "request-a");
     const erased = try mgr.eraseMeetingMemories(erase_request);
-    try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.memory_source_links_deleted);
-    try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.memories_deleted);
-    try std.testing.expectEqual(@as(u64, 5), erased.manifest.counts.memory_events_deleted);
+    try std.testing.expectEqual(1 + cardinality_targets, erased.manifest.counts.memory_source_links_deleted);
+    try std.testing.expectEqual(1 + cardinality_targets, erased.manifest.counts.memories_deleted);
+    try std.testing.expectEqual(5 + cardinality_targets, erased.manifest.counts.memory_events_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_embeddings_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_vectors_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_entities_deleted);
@@ -662,8 +788,11 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
             "AND id IN ('wp15-unrelated-traversal-event', 'wp15-unrelated-nested-event') " ++
             "GROUP BY user_id HAVING COUNT(*) = 2) " ++
             "THEN RAISE EXCEPTION 'unrelated nested/traversal event was over-deleted'; END IF; " ++
+            "IF (SELECT count(*) FROM {s}.memory_events WHERE user_id = {d} " ++
+            "AND id LIKE 'wp15-cardinality-unrelated-%') <> {d} " ++
+            "THEN RAISE EXCEPTION 'unrelated cardinality controls were over-deleted'; END IF; " ++
             "END $wp15$",
-        .{ schema, user_a, schema, user_a },
+        .{ schema, user_a, schema, user_a, schema, user_a, unrelated_cardinality_events },
     );
     try execPostgresSql(allocator, test_url, traversal_residue_sql, true);
     const remaining_edges = try mgr.listEdgesForUser(allocator, user_a);
@@ -734,9 +863,9 @@ test "WP-15 live: receipt replay verifies immutable compliance evidence" {
     try std.testing.expect(std.mem.startsWith(u8, erased.receiptKeyId(), "sha256="));
     try std.testing.expect(std.mem.startsWith(u8, erased.receiptSignature(), "ed25519="));
 
-    // One-key rotation keeps old receipts verifiable with a public-only
-    // previous key. A second rotation that would retire a still-retained key
-    // is rejected before the runtime swaps keys.
+    // The secondary public key keeps old receipts verifiable after the signer
+    // flips. A later rotation that would retire a still-retained key is
+    // rejected before the runtime swaps keys.
     const original_signer = try meeting_memory.ErasureReceiptSigner.init(
         test_receipt_signing_seed,
     );

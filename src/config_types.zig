@@ -1536,11 +1536,11 @@ pub const MeetingMemoryCryptoConfig = struct {
     /// Environment variable containing at least 32 bytes of seed material for
     /// the current Ed25519 receipt signer.
     receipt_signing_seed_env: []const u8 = "NULLALIS_MINUTES_MEMORY_RECEIPT_SIGNING_SEED",
-    /// Optional env-var name containing the previous Ed25519 public key during
-    /// a verification-only rotation window. No previous private seed is loaded.
-    /// Runtime boot refuses to retire this key while a retained receipt still
-    /// references it, so signing-key retirement cannot outrun receipt cleanup.
-    receipt_previous_public_key_env: ?[]const u8 = null,
+    /// Optional env-var name containing a secondary Ed25519 public key. Use the
+    /// next key during rotation phase one and the prior key during phase two so
+    /// old/new pods verify each other. No secondary private seed is loaded.
+    /// Runtime boot also refuses to retire any still-retained receipt key.
+    receipt_secondary_public_key_env: ?[]const u8 = null,
 };
 
 pub const StateConfig = struct {
