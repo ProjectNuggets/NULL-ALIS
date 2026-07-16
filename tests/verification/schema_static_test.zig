@@ -86,3 +86,33 @@ test "S6.12 schema: every migration version maps to a unique name" {
         }
     }
 }
+
+test "WP-12 schema rollback: every migration declares a compatibility phase" {
+    try std.testing.expectEqual(migrations.CompatibilityPhase.baseline, migrations.MIGRATIONS[0].phase);
+    for (migrations.MIGRATIONS[1..]) |migration| {
+        try std.testing.expect(migration.phase != .baseline);
+    }
+}
+
+test "WP-12 schema rollback: expand migrations reject destructive SQL" {
+    for (migrations.MIGRATIONS) |migration| {
+        if (migration.phase == .expand) {
+            try migrations.validateExpandSql(migration.sql);
+        }
+    }
+}
+
+test "WP-12 schema rollback: destructive expand fixtures fail closed" {
+    const forbidden = [_][]const u8{
+        "ALTER TABLE {schema}.messages DROP COLUMN content",
+        "DROP TABLE {schema}.messages",
+        "ALTER TABLE {schema}.messages RENAME COLUMN content TO body",
+        "ALTER TABLE {schema}.messages ALTER COLUMN content TYPE JSONB",
+        "ALTER TABLE {schema}.messages ALTER COLUMN content SET NOT NULL",
+        "ALTER TABLE {schema}.messages DROP CONSTRAINT messages_user_id_fkey",
+        "TRUNCATE TABLE {schema}.messages",
+    };
+    for (forbidden) |sql| {
+        try std.testing.expectError(error.DestructiveExpandMigration, migrations.validateExpandSql(sql));
+    }
+}

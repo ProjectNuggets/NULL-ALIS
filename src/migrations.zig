@@ -18,8 +18,9 @@
 //!
 //! Adding a new migration:
 //!   1. Append to `MIGRATIONS` array below with the next version
-//!      number + descriptive name + SQL string (may use `{schema}`
-//!      placeholder which the caller expands via `buildQuery`)
+//!      number + descriptive name + SQL string + explicit compatibility
+//!      phase (may use `{schema}` placeholder which the caller expands
+//!      via `buildQuery`)
 //!   2. Each migration must be a single `BEGIN`-able transaction
 //!      (no `CREATE INDEX CONCURRENTLY` — that statement can't run
 //!      inside a transaction; if you need it, use a separate
@@ -32,10 +33,21 @@
 
 const std = @import("std");
 
+/// Compatibility phase used by the release rollback contract.
+pub const CompatibilityPhase = enum {
+    /// Initial adoption of the versioned migration framework.
+    baseline,
+    /// Additive schema that the previous binary must continue to tolerate.
+    expand,
+    /// Destructive cleanup allowed only after the previous binary is retired.
+    contract,
+};
+
 pub const Migration = struct {
     version: u32,
     name: []const u8,
     sql: []const u8,
+    phase: CompatibilityPhase,
 
     /// **S10.3** — when true, this migration's statements must run
     /// outside of a BEGIN/COMMIT transaction (e.g. `CREATE INDEX
@@ -48,6 +60,121 @@ pub const Migration = struct {
     /// Use sparingly — most migrations should be transactional.
     concurrent_only: bool = false,
 };
+
+/// Reject SQL shapes that cannot safely remain in place while the previous
+/// binary is serving during an image rollback. This is deliberately
+/// conservative; semantic compatibility still requires review and a live
+/// old-binary-on-expanded-schema rehearsal.
+pub fn validateExpandSql(sql: []const u8) !void {
+    const allocator = std.heap.page_allocator;
+    var normalized: std.ArrayListUnmanaged(u8) = .empty;
+    defer normalized.deinit(allocator);
+    try normalized.append(allocator, ' ');
+
+    var index: usize = 0;
+    while (index < sql.len) {
+        if (index + 1 < sql.len and sql[index] == '-' and sql[index + 1] == '-') {
+            index += 2;
+            while (index < sql.len and sql[index] != '\n') : (index += 1) {}
+            try appendNormalizedSpace(&normalized, allocator);
+            continue;
+        }
+
+        // Keywords inside ordinary string literals and quoted identifiers are
+        // data/names, not executable SQL tokens. Ignore them so a harmless
+        // default such as 'drop table' does not force a migration to contract.
+        if (sql[index] == '\'' or sql[index] == '"') {
+            const quote = sql[index];
+            index += 1;
+            while (index < sql.len) {
+                if (sql[index] != quote) {
+                    index += 1;
+                    continue;
+                }
+                if (index + 1 < sql.len and sql[index + 1] == quote) {
+                    index += 2;
+                    continue;
+                }
+                index += 1;
+                break;
+            }
+            try appendNormalizedSpace(&normalized, allocator);
+            continue;
+        }
+        if (index + 1 < sql.len and sql[index] == '/' and sql[index + 1] == '*') {
+            index += 2;
+            while (index + 1 < sql.len and !(sql[index] == '*' and sql[index + 1] == '/')) : (index += 1) {}
+            if (index + 1 < sql.len) index += 2;
+            try appendNormalizedSpace(&normalized, allocator);
+            continue;
+        }
+
+        const byte = sql[index];
+        index += 1;
+        if (std.ascii.isWhitespace(byte)) {
+            try appendNormalizedSpace(&normalized, allocator);
+        } else {
+            try normalized.append(allocator, std.ascii.toLower(byte));
+        }
+    }
+    try appendNormalizedSpace(&normalized, allocator);
+
+    const forbidden = [_][]const u8{
+        " drop table ",
+        " drop column ",
+        " drop constraint ",
+        " drop schema ",
+        " drop view ",
+        " drop materialized view ",
+        " drop type ",
+        " drop domain ",
+        " drop sequence ",
+        " drop function ",
+        " drop procedure ",
+        " drop trigger ",
+        " drop policy ",
+        " drop default ",
+        " drop identity ",
+        " drop expression ",
+        " add constraint ",
+        " add primary key ",
+        " add unique ",
+        " add check ",
+        " add foreign key ",
+        " add exclude ",
+        " rename column ",
+        " rename constraint ",
+        " rename attribute ",
+        " rename value ",
+        " rename to ",
+        " set not null ",
+        " truncate table ",
+        " create or replace view ",
+        " create or replace function ",
+        " create or replace procedure ",
+        " execute ",
+    };
+    for (forbidden) |needle| {
+        if (std.mem.indexOf(u8, normalized.items, needle) != null) return error.DestructiveExpandMigration;
+    }
+
+    // ALTER COLUMN ... TYPE may contain an arbitrary type expression between
+    // the two tokens, so it cannot be represented by one fixed phrase.
+    var statements = std.mem.tokenizeScalar(u8, normalized.items, ';');
+    while (statements.next()) |statement| {
+        if (std.mem.indexOf(u8, statement, " alter column ") != null and
+            std.mem.indexOf(u8, statement, " type ") != null)
+        {
+            return error.DestructiveExpandMigration;
+        }
+    }
+}
+
+fn appendNormalizedSpace(buffer: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator) !void {
+    if (buffer.items.len == 0 or buffer.items[buffer.items.len - 1] != ' ') {
+        try buffer.append(allocator, ' ');
+    }
+}
 
 /// SQL for the `schema_migrations` tracker table itself. Idempotent —
 /// safe to run on every boot (it's a `CREATE TABLE IF NOT EXISTS`).
@@ -75,17 +202,20 @@ pub const SCHEMA_MIGRATIONS_DDL =
 ///       .version = N+1,
 ///       .name = "{NNNN}_descriptive_name",
 ///       .sql = @embedFile("migrations/{NNNN}_descriptive_name.sql"),
+///       .phase = .expand,
 ///   },
 pub const MIGRATIONS = [_]Migration{
     .{
         .version = 1,
         .name = "0001_initial_schema",
         .sql = @embedFile("migrations/0001_initial_schema.sql"),
+        .phase = .baseline,
     },
     .{
         .version = 2,
         .name = "0002_artifacts",
         .sql = @embedFile("migrations/0002_artifacts.sql"),
+        .phase = .expand,
     },
     .{
         // Sprint 3 (2026-05-28, prod-readiness) — durable trace shares.
@@ -96,6 +226,7 @@ pub const MIGRATIONS = [_]Migration{
         .version = 3,
         .name = "0003_trace_shares",
         .sql = @embedFile("migrations/0003_trace_shares.sql"),
+        .phase = .expand,
     },
     .{
         // Wave 2 (2026-06-11, nullALIS metering completeness) — durable
@@ -106,6 +237,7 @@ pub const MIGRATIONS = [_]Migration{
         .version = 4,
         .name = "0004_turn_usage",
         .sql = @embedFile("migrations/0004_turn_usage.sql"),
+        .phase = .expand,
     },
     .{
         // Wave A (2026-06-12, agent-runtime resilience) — P0-4 durable,
@@ -119,6 +251,7 @@ pub const MIGRATIONS = [_]Migration{
         .version = 5,
         .name = "0005_pending_approvals",
         .sql = @embedFile("migrations/0005_pending_approvals.sql"),
+        .phase = .expand,
     },
     .{
         // Wave C C4 (2026-06-12, agent-runtime resilience) — P1-5 transcript
@@ -133,6 +266,7 @@ pub const MIGRATIONS = [_]Migration{
         .version = 6,
         .name = "0006_message_transcript_fidelity",
         .sql = @embedFile("migrations/0006_message_transcript_fidelity.sql"),
+        .phase = .expand,
     },
     .{
         // Subagent Pass Phase 1 (2026-06-13) — durable outbox for subagent
@@ -143,6 +277,7 @@ pub const MIGRATIONS = [_]Migration{
         .version = 7,
         .name = "0007_subagent_results",
         .sql = @embedFile("migrations/0007_subagent_results.sql"),
+        .phase = .expand,
     },
     .{
         // Loop-2 substrate (three-loops spec §3.1, docs/memory-contract.md)
@@ -154,6 +289,7 @@ pub const MIGRATIONS = [_]Migration{
         .version = 8,
         .name = "0008_tool_traces",
         .sql = @embedFile("migrations/0008_tool_traces.sql"),
+        .phase = .expand,
     },
     .{
         // WP-02 — schema-wide TTL pruning must not scan each bookkeeping
@@ -162,6 +298,7 @@ pub const MIGRATIONS = [_]Migration{
         .version = 9,
         .name = "0009_retention_ttl_indexes",
         .sql = @embedFile("migrations/0009_retention_ttl_indexes.sql"),
+        .phase = .expand,
         .concurrent_only = true,
     },
     .{
@@ -233,7 +370,22 @@ pub fn runWith(rc: RunnerContext, migrations: []const Migration) !void {
         try rc.exec(rc.ctx, q);
     }
 
-    // Step 2: iterate migrations, apply unapplied ones in order.
+    // Step 2: preflight the complete registry before any migration body runs.
+    // This prevents a safe earlier migration from being committed before a
+    // later unsafe declaration stops boot halfway through the registry.
+    for (migrations) |m| {
+        switch (m.phase) {
+            .baseline => if (m.version != 1) return error.InvalidBaselineMigration,
+            .expand => try validateExpandSql(m.sql),
+            .contract => {
+                if (!try rc.isApplied(rc.ctx, m.version)) {
+                    return error.ContractMigrationRequiresOperatorApproval;
+                }
+            },
+        }
+    }
+
+    // Step 3: iterate migrations, apply unapplied ones in order.
     for (migrations) |m| {
         if (try rc.isApplied(rc.ctx, m.version)) {
             std.log.scoped(.migrations).debug("migration {d} '{s}' already applied", .{ m.version, m.name });
@@ -386,13 +538,12 @@ const TestRunner = struct {
     }
 };
 
-// Fixture migrations for tests — small, fast, deterministic. The
-// production `MIGRATIONS` array is empty in S10.1; S10.2 populates
-// it with the real schema. Tests use `runWith(rc, &fixture)` to
-// exercise the runner independently of the production array.
+// Fixture migrations for tests — small, fast, deterministic. Tests use
+// `runWith(rc, &fixture)` to exercise the runner independently of the
+// production array and must obey the same explicit-phase contract.
 const fixture_migrations = [_]Migration{
-    .{ .version = 1, .name = "0001_test_fixture", .sql = "CREATE TABLE {schema}.fixture_a (id INT)" },
-    .{ .version = 2, .name = "0002_test_fixture", .sql = "CREATE TABLE {schema}.fixture_b (id INT)" },
+    .{ .version = 1, .name = "0001_test_fixture", .sql = "CREATE TABLE {schema}.fixture_a (id INT)", .phase = .baseline },
+    .{ .version = 2, .name = "0002_test_fixture", .sql = "CREATE TABLE {schema}.fixture_b (id INT)", .phase = .expand },
 };
 
 test "migrations.runWith on empty DB applies all fixture migrations once" {
@@ -442,6 +593,119 @@ test "migrations.runWith failure inside a transactional migration triggers rollb
     try std.testing.expect(!tr.applied.contains(1));
     // Transaction should be cleanly closed (no leak).
     try std.testing.expect(!tr.in_tx);
+}
+
+test "migrations.runWith rejects destructive SQL declared as expand before DDL" {
+    var tr = TestRunner{ .allocator = std.testing.allocator };
+    defer tr.deinit();
+
+    const unsafe = [_]Migration{.{
+        .version = 1,
+        .name = "0001_unsafe_expand_fixture",
+        .sql = "ALTER TABLE {schema}.fixture DROP COLUMN value",
+        .phase = .expand,
+    }};
+
+    try std.testing.expectError(error.DestructiveExpandMigration, runWith(tr.context(), &unsafe));
+    // Only the idempotent schema_migrations tracker may execute.
+    try std.testing.expectEqual(@as(usize, 1), tr.queries.items.len);
+    try std.testing.expect(!tr.in_tx);
+    try std.testing.expectEqual(@as(usize, 0), tr.applied.count());
+}
+
+test "migrations.runWith refuses an unapplied contract migration before DDL" {
+    var tr = TestRunner{ .allocator = std.testing.allocator };
+    defer tr.deinit();
+
+    const contract = [_]Migration{.{
+        .version = 1,
+        .name = "0001_contract_fixture",
+        .sql = "ALTER TABLE {schema}.fixture DROP COLUMN value",
+        .phase = .contract,
+    }};
+
+    try std.testing.expectError(error.ContractMigrationRequiresOperatorApproval, runWith(tr.context(), &contract));
+    // Only the idempotent schema_migrations tracker may execute.
+    try std.testing.expectEqual(@as(usize, 1), tr.queries.items.len);
+    try std.testing.expect(!tr.in_tx);
+    try std.testing.expectEqual(@as(usize, 0), tr.applied.count());
+}
+
+test "migrations.runWith preflights every phase before applying an earlier migration" {
+    var tr = TestRunner{ .allocator = std.testing.allocator };
+    defer tr.deinit();
+
+    const mixed = [_]Migration{
+        .{ .version = 1, .name = "0001_safe_expand", .sql = "CREATE TABLE {schema}.safe (id INT)", .phase = .expand },
+        .{ .version = 2, .name = "0002_unsafe_expand", .sql = "DROP TABLE {schema}.safe", .phase = .expand },
+    };
+
+    try std.testing.expectError(error.DestructiveExpandMigration, runWith(tr.context(), &mixed));
+    try std.testing.expectEqual(@as(usize, 1), tr.queries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), tr.applied.count());
+}
+
+test "migrations.runWith reserves baseline compatibility for version one" {
+    var tr = TestRunner{ .allocator = std.testing.allocator };
+    defer tr.deinit();
+
+    const invalid = [_]Migration{.{
+        .version = 2,
+        .name = "0002_invalid_baseline",
+        .sql = "DROP TABLE {schema}.fixture",
+        .phase = .baseline,
+    }};
+
+    try std.testing.expectError(error.InvalidBaselineMigration, runWith(tr.context(), &invalid));
+    try std.testing.expectEqual(@as(usize, 1), tr.queries.items.len);
+}
+
+test "migrations.runWith permits a contract migration already recorded by an operator" {
+    var tr = TestRunner{ .allocator = std.testing.allocator };
+    defer tr.deinit();
+
+    const contract = [_]Migration{.{
+        .version = 10,
+        .name = "0010_contract_fixture",
+        .sql = "ALTER TABLE {schema}.fixture DROP COLUMN value",
+        .phase = .contract,
+    }};
+    try tr.applied.put(tr.allocator, 10, {});
+
+    try runWith(tr.context(), &contract);
+    try std.testing.expectEqual(@as(usize, 1), tr.queries.items.len);
+    try std.testing.expect(!tr.in_tx);
+}
+
+test "validateExpandSql rejects additional rollback-breaking schema operations" {
+    const forbidden = [_][]const u8{
+        "DROP VIEW {schema}.legacy_view",
+        "DROP TYPE {schema}.legacy_status",
+        "ALTER TABLE {schema}.fixture RENAME CONSTRAINT old_name TO new_name",
+        "ALTER TABLE {schema}.fixture ALTER COLUMN value DROP DEFAULT",
+        "CREATE OR REPLACE VIEW {schema}.legacy_view AS SELECT id FROM {schema}.fixture",
+        "DO $$ BEGIN EXECUTE 'DROP TABLE {schema}.fixture'; END $$",
+        "ALTER TABLE {schema}.fixture ADD CONSTRAINT value_nonempty CHECK (value <> '')",
+    };
+    for (forbidden) |sql| {
+        try std.testing.expectError(error.DestructiveExpandMigration, validateExpandSql(sql));
+    }
+}
+
+test "validateExpandSql scopes ALTER COLUMN TYPE detection to one statement" {
+    try validateExpandSql(
+        \\ALTER TABLE {schema}.fixture ALTER COLUMN value SET DEFAULT 1;
+        \\CREATE TYPE {schema}.status AS ENUM ('ready');
+    );
+}
+
+test "validateExpandSql ignores destructive words inside literals and quoted identifiers" {
+    try validateExpandSql(
+        \\CREATE TABLE {schema}.fixture (
+        \\  "drop column" TEXT,
+        \\  note TEXT DEFAULT 'drop table and rename column'
+        \\)
+    );
 }
 
 test "migrations.run with production MIGRATIONS executes tracker + each registered migration" {
