@@ -6,6 +6,74 @@ const NNGTs_prefix_order = @import("NNGTs_prefix_order.zig");
 
 const log = std.log.scoped(.providers);
 
+const Non2xxEndpoint = enum {
+    chat_completions,
+    token_estimate,
+};
+
+fn safeDiagnosticLabel(label: []const u8) []const u8 {
+    if (label.len == 0 or label.len > 160) return "<redacted>";
+    for (label) |byte| {
+        if (std.ascii.isAlphanumeric(byte)) continue;
+        switch (byte) {
+            '-', '_', '.', '/', ':', '@', '+' => continue,
+            else => return "<redacted>",
+        }
+    }
+    return label;
+}
+
+/// Content-free metadata for an upstream HTTP failure. The body slices are
+/// accepted only to derive byte counts; their contents are never retained or
+/// exposed through the formatter used at the logging boundary.
+const Non2xxDiagnostic = struct {
+    status: u16,
+    provider: []const u8,
+    model: []const u8,
+    endpoint: Non2xxEndpoint,
+    request_bytes: usize,
+    response_bytes: usize,
+
+    fn init(
+        status: u16,
+        provider: []const u8,
+        model: []const u8,
+        endpoint: Non2xxEndpoint,
+        request_body: []const u8,
+        response_body: []const u8,
+    ) Non2xxDiagnostic {
+        return .{
+            .status = status,
+            .provider = safeDiagnosticLabel(provider),
+            .model = safeDiagnosticLabel(model),
+            .endpoint = endpoint,
+            .request_bytes = request_body.len,
+            .response_bytes = response_body.len,
+        };
+    }
+
+    pub fn format(self: Non2xxDiagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print(
+            "status={d} provider={s} model={s} endpoint={s} req_bytes={d} resp_bytes={d}",
+            .{
+                self.status,
+                self.provider,
+                self.model,
+                @tagName(self.endpoint),
+                self.request_bytes,
+                self.response_bytes,
+            },
+        );
+    }
+};
+
+fn logNon2xx(diagnostic: Non2xxDiagnostic) void {
+    switch (diagnostic.endpoint) {
+        .chat_completions => log.warn("compatible.http_non2xx {f}", .{diagnostic}),
+        .token_estimate => log.warn("compatible.token_estimate_non2xx {f}", .{diagnostic}),
+    }
+}
+
 const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
 const ChatRequest = root.ChatRequest;
@@ -662,14 +730,15 @@ pub const OpenAiCompatibleProvider = struct {
         // mis-read as context_exhausted. Classify retryable conditions
         // from the status code before any body heuristics.
         if (response.status_code < 200 or response.status_code >= 300) {
-            const snippet = response.body[0..@min(response.body.len, 480)];
-            log.warn("compatible.http_non2xx status={d} model={s} url={s} req_bytes={d} body_snippet={s}", .{
+            const diagnostic = Non2xxDiagnostic.init(
                 response.status_code,
+                self.name,
                 effective_model,
-                url,
-                body.len,
-                snippet,
-            });
+                .chat_completions,
+                body,
+                response.body,
+            );
+            logNon2xx(diagnostic);
             if (error_classify.classifyHttpStatus(response.status_code)) |kind| {
                 return error_classify.kindToError(kind);
             }
@@ -739,14 +808,15 @@ pub const OpenAiCompatibleProvider = struct {
         // (429/408 rate-limit, 413 context, 503 overload) from the status
         // code — the authoritative signal — before any body heuristics.
         if (response.status_code < 200 or response.status_code >= 300) {
-            const snippet = response.body[0..@min(response.body.len, 480)];
-            log.warn("compatible.http_non2xx status={d} model={s} url={s} req_bytes={d} body_snippet={s}", .{
+            const diagnostic = Non2xxDiagnostic.init(
                 response.status_code,
+                self.name,
                 effective_model,
-                url,
-                body.len,
-                snippet,
-            });
+                .chat_completions,
+                body,
+                response.body,
+            );
+            logNon2xx(diagnostic);
             if (error_classify.classifyHttpStatus(response.status_code)) |kind| {
                 return error_classify.kindToError(kind);
             }
@@ -815,14 +885,15 @@ pub const OpenAiCompatibleProvider = struct {
         defer allocator.free(response.body);
 
         if (response.status_code < 200 or response.status_code >= 300) {
-            const snippet = response.body[0..@min(response.body.len, 480)];
-            log.warn("compatible.token_estimate_non2xx status={d} model={s} url={s} req_bytes={d} body_snippet={s}", .{
+            const diagnostic = Non2xxDiagnostic.init(
                 response.status_code,
+                self.name,
                 effective_model,
-                url,
-                body.len,
-                snippet,
-            });
+                .token_estimate,
+                body,
+                response.body,
+            );
+            logNon2xx(diagnostic);
             return error.CompatibleApiError;
         }
 
@@ -1549,6 +1620,60 @@ test "compatible chat and token preflight timeout policies stay distinct" {
     try std.testing.expectEqual(@as(u32, 10_000), tokenPreflightTimeoutMs(default_req));
     try std.testing.expectEqual(@as(u32, 10_000), tokenPreflightTimeoutMs(explicit_req));
     try std.testing.expectEqual(@as(u32, 2_000), tokenPreflightTimeoutMs(short_req));
+}
+
+test "compatible non-2xx diagnostic omits request and response content" {
+    const request_body =
+        \\{"messages":[{"role":"user","content":"REQUEST_SECRET_SENTINEL"}]}
+    ;
+    const response_body =
+        \\{"error":{"message":"RESPONSE_SECRET_SENTINEL"}}
+    ;
+    const diagnostic = Non2xxDiagnostic.init(
+        429,
+        "groq",
+        "llama-3.3-70b",
+        .chat_completions,
+        request_body,
+        response_body,
+    );
+
+    var buffer: [256]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&buffer, "{f}", .{diagnostic});
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "REQUEST_SECRET_SENTINEL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "RESPONSE_SECRET_SENTINEL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "status=429") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "provider=groq") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "model=llama-3.3-70b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "endpoint=chat_completions") != null);
+
+    var request_bytes_buf: [32]u8 = undefined;
+    const request_bytes = try std.fmt.bufPrint(&request_bytes_buf, "req_bytes={d}", .{request_body.len});
+    try std.testing.expect(std.mem.indexOf(u8, rendered, request_bytes) != null);
+
+    var response_bytes_buf: [32]u8 = undefined;
+    const response_bytes = try std.fmt.bufPrint(&response_bytes_buf, "resp_bytes={d}", .{response_body.len});
+    try std.testing.expect(std.mem.indexOf(u8, rendered, response_bytes) != null);
+}
+
+test "compatible non-2xx diagnostic redacts unsafe metadata labels" {
+    const diagnostic = Non2xxDiagnostic.init(
+        500,
+        "groq\nPROVIDER_SECRET_SENTINEL",
+        "model RESPONSE_SECRET_SENTINEL",
+        .chat_completions,
+        "{}",
+        "{}",
+    );
+
+    var buffer: [256]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&buffer, "{f}", .{diagnostic});
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "PROVIDER_SECRET_SENTINEL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "RESPONSE_SECRET_SENTINEL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "provider=<redacted>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "model=<redacted>") != null);
 }
 
 test "vtable has stream_chat not null" {
