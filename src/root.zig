@@ -187,6 +187,7 @@ pub const integrations = @import("integrations.zig");
 pub const tunnel = @import("tunnel.zig");
 pub const voice = @import("voice.zig");
 pub const zaki_state = @import("zaki_state.zig");
+pub const meeting_memory = @import("meeting_memory.zig");
 pub const channel_identity_key = @import("channel_identity_key.zig");
 pub const inbound_canonicalizer = @import("inbound_canonicalizer.zig");
 
