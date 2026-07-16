@@ -16,6 +16,21 @@ const c = @cImport({
 
 const meeting_memory = nullalis.meeting_memory;
 
+const test_pseudonym_key = [_]u8{0xa5} ** 32;
+const test_receipt_signing_seed = [_]u8{0x31} ** 32;
+const test_pseudonymizer = blk: {
+    @setEvalBranchQuota(100_000);
+    break :blk meeting_memory.Pseudonymizer.init(test_pseudonym_key);
+};
+
+fn installMeetingMemoryCrypto(mgr: anytype) !void {
+    try mgr.installMeetingMemoryCryptoForTests(
+        test_pseudonym_key,
+        test_receipt_signing_seed,
+        null,
+    );
+}
+
 fn execPostgresSql(
     allocator: std.mem.Allocator,
     test_url: []const u8,
@@ -48,20 +63,32 @@ test "WP-15 schema: provenance links are one-to-one and receipts cannot retain c
     const migration_sql = try harness.loadProjectFile("src/migrations/0011_meeting_memory_provenance.sql");
     const state_source = try harness.loadProjectFile("src/zaki_state.zig");
     const required = [_][]const u8{
+        "CREATE TABLE IF NOT EXISTS {schema}.meeting_memory_crypto_state",
         "CREATE TABLE IF NOT EXISTS {schema}.memory_source_links",
         "CREATE TABLE IF NOT EXISTS {schema}.meeting_memory_erasure_receipts",
         "CREATE TABLE IF NOT EXISTS {schema}.meeting_memory_erasure_tombstones",
         "CREATE TABLE IF NOT EXISTS {schema}.meeting_memory_account_erasure_tombstones",
-        "CREATE OR REPLACE RULE meeting_memory_erasure_receipts_no_update",
+        "CREATE TRIGGER meeting_memory_crypto_state_no_update_delete",
+        "CREATE TRIGGER meeting_memory_crypto_state_no_truncate",
+        "CREATE TRIGGER meeting_memory_erasure_tombstones_no_update_delete",
+        "CREATE TRIGGER meeting_memory_erasure_tombstones_no_truncate",
+        "CREATE TRIGGER meeting_memory_account_tombstones_no_update_delete",
+        "CREATE TRIGGER meeting_memory_account_tombstones_no_truncate",
+        "CREATE TRIGGER meeting_memory_erasure_receipts_no_update",
+        "CREATE TRIGGER meeting_memory_erasure_receipts_no_truncate",
         "FOREIGN KEY (user_id, memory_key)",
         "UNIQUE INDEX IF NOT EXISTS idx_memory_source_links_memory",
         "(user_id, memory_key)",
+        "pseudonym_key_id",
+        "user_scope_digest",
         "meeting_scope_digest",
         "source_digest",
         "candidate_digest",
         "consent_grant_digest",
         "consent_policy_version",
         "consented_at",
+        "receipt_key_id",
+        "receipt_signature",
         "memory_source_links_deleted",
         "memories_deleted",
         "memory_events_deleted",
@@ -132,6 +159,8 @@ test "WP-15 schema: provenance links are one-to-one and receipts cannot retain c
         "meeting_id TEXT",
         "request_id TEXT",
         "idempotency_key TEXT",
+        "user_id BIGINT",
+        "receipt_digest TEXT",
     };
     for (forbidden_receipt_columns) |needle| {
         if (std.mem.indexOf(u8, receipt_sql, needle) != null) {
@@ -141,15 +170,15 @@ test "WP-15 schema: provenance links are one-to-one and receipts cannot retain c
     }
 
     const bigint_count_fragments = [_][]const u8{
-        "$5::bigint, $6::bigint, $7::bigint, $8::bigint, $9::bigint",
-        "$10::bigint, $11::bigint, $12::bigint",
+        "$6::bigint, $7::bigint, $8::bigint, $9::bigint, $10::bigint",
+        "$11::bigint, $12::bigint, $13::bigint",
     };
     for (bigint_count_fragments) |fragment| {
         if (std.mem.indexOf(u8, state_source, fragment) == null) {
             return error.MeetingErasureReceiptCountNarrowing;
         }
     }
-    if (std.mem.indexOf(u8, state_source, "$5::integer, $6::integer") != null) {
+    if (std.mem.indexOf(u8, state_source, "$6::integer, $7::integer") != null) {
         return error.MeetingErasureReceiptCountNarrowing;
     }
 }
@@ -168,13 +197,23 @@ fn prepared(
     text: []const u8,
     grant_id: []const u8,
 ) !meeting_memory.PreparedMemory {
+    return preparedWith(&test_pseudonymizer, source_tuple, kind, text, grant_id);
+}
+
+fn preparedWith(
+    pseudonymizer: *const meeting_memory.Pseudonymizer,
+    source_tuple: meeting_memory.SourceTuple,
+    kind: meeting_memory.CandidateKind,
+    text: []const u8,
+    grant_id: []const u8,
+) !meeting_memory.PreparedMemory {
     const candidate = try meeting_memory.Candidate.init(kind, text, .approved);
-    const grant = try meeting_memory.ConfirmedConsentGrant.init(source_tuple, candidate, .{
+    const grant = try meeting_memory.ConfirmedConsentGrant.init(pseudonymizer, source_tuple, candidate, .{
         .grant_id = grant_id,
         .policy_version = "minutes-memory-v1",
         .granted_at_unix_ms = 1_784_200_000_000,
     });
-    return meeting_memory.PreparedMemory.init(source_tuple, candidate, grant);
+    return meeting_memory.PreparedMemory.init(pseudonymizer, source_tuple, candidate, grant);
 }
 
 test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte-identical rows" {
@@ -188,6 +227,7 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     var mgr = try harness.newManager(allocator, test_url, schema);
     defer harness.dropAndDeinit(&mgr, "meeting_memory");
     mgr.skipExternalIdentityForTests();
+    try installMeetingMemoryCrypto(&mgr);
 
     const user_a = harness.testUid();
     const user_b = user_a + 1;
@@ -207,6 +247,7 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     // meeting digest. Reject it before locks/tombstones so tenant A's later
     // legitimate erasure cannot be poisoned by the global digest uniqueness.
     var cross_tenant_poison = try meeting_memory.ErasureRequest.init(
+        &test_pseudonymizer,
         user_a,
         "meeting-a",
         "request-cross-tenant-poison",
@@ -221,12 +262,12 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     // a constructor that may have run before the caller reused its buffer.
     var mutable_text = [_]u8{ 'S', 'h', 'i', 'p', ' ', 'o', 'n', ' ', 'F', 'r', 'i', 'd', 'a', 'y' };
     const mutable_candidate = try meeting_memory.Candidate.init(.decision, &mutable_text, .approved);
-    const mutable_grant = try meeting_memory.ConfirmedConsentGrant.init(meeting_a, mutable_candidate, .{
+    const mutable_grant = try meeting_memory.ConfirmedConsentGrant.init(&test_pseudonymizer, meeting_a, mutable_candidate, .{
         .grant_id = "grant-mutable",
         .policy_version = "minutes-memory-v1",
         .granted_at_unix_ms = 1_784_200_000_000,
     });
-    const mutable_prepared = try meeting_memory.PreparedMemory.init(meeting_a, mutable_candidate, mutable_grant);
+    const mutable_prepared = try meeting_memory.PreparedMemory.init(&test_pseudonymizer, meeting_a, mutable_candidate, mutable_grant);
     mutable_text[0] = 'X';
     try std.testing.expectError(
         error.PreparedMemoryIntegrityMismatch,
@@ -238,6 +279,30 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     const replay = try mgr.storeMeetingMemory(memory_a);
     try std.testing.expect(!replay.inserted);
     try std.testing.expectEqualStrings(first.memoryKey(), replay.memoryKey());
+
+    // Persisted pseudonyms are bound to one deployment key. A differently
+    // keyed runtime must fail closed instead of creating a second digest
+    // universe that could bypass the existing tombstones.
+    const alternate_pseudonym_key = [_]u8{0xb6} ** 32;
+    const alternate_pseudonymizer = meeting_memory.Pseudonymizer.init(alternate_pseudonym_key);
+    try mgr.installMeetingMemoryCryptoForTests(
+        alternate_pseudonym_key,
+        [_]u8{0x32} ** 32,
+        null,
+    );
+    const alternate_source = try source(user_a, "transcript-wrong-key", "meeting-wrong-key");
+    const alternate_memory = try preparedWith(
+        &alternate_pseudonymizer,
+        alternate_source,
+        .decision,
+        "This must never enter a second pseudonym universe",
+        "grant-wrong-key",
+    );
+    try std.testing.expectError(
+        error.MeetingMemoryPseudonymKeyMismatch,
+        mgr.storeMeetingMemory(alternate_memory),
+    );
+    try installMeetingMemoryCrypto(&mgr);
 
     // Callers still provide validated opaque source IDs, but durable
     // provenance and replay identity retain only tenant-bound digests.
@@ -481,7 +546,7 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     );
     try execPostgresSql(allocator, test_url, residue_sql, true);
 
-    const erase_request = try meeting_memory.ErasureRequest.init(user_a, "meeting-a", "request-a");
+    const erase_request = try meeting_memory.ErasureRequest.init(&test_pseudonymizer, user_a, "meeting-a", "request-a");
     const erased = try mgr.eraseMeetingMemories(erase_request);
     try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.memory_source_links_deleted);
     try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.memories_deleted);
@@ -492,11 +557,12 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.memory_edges_deleted);
     try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.working_memory_deleted);
 
-    const retry_request = try meeting_memory.ErasureRequest.init(user_a, "meeting-a", "request-a-retry");
+    const retry_request = try meeting_memory.ErasureRequest.init(&test_pseudonymizer, user_a, "meeting-a", "request-a-retry");
     const erased_replay = try mgr.eraseMeetingMemories(retry_request);
     try std.testing.expect(erased_replay.replayed);
     try std.testing.expectEqual(erased.manifest.counts.memories_deleted, erased_replay.manifest.counts.memories_deleted);
-    try std.testing.expectEqualStrings(erased.receiptDigest(), erased_replay.receiptDigest());
+    try std.testing.expectEqualStrings(erased.receiptKeyId(), erased_replay.receiptKeyId());
+    try std.testing.expectEqualStrings(erased.receiptSignature(), erased_replay.receiptSignature());
 
     const gone = try mgr.getMemory(allocator, user_a, first.memoryKey());
     if (gone) |entry| entry.deinit(allocator);
@@ -561,23 +627,26 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     // minimal meeting tombstone. Cleanup cannot reopen the write gate.
     const receipt_cleanup_sql = try std.fmt.allocPrint(
         allocator,
-        "DELETE FROM {s}.meeting_memory_erasure_receipts WHERE user_id = {d}",
-        .{ schema, user_a },
+        "DELETE FROM {s}.meeting_memory_erasure_receipts WHERE user_scope_digest = '{s}'",
+        .{
+            schema,
+            meeting_memory.formatSha256(try meeting_memory.userScopeDigest(&test_pseudonymizer, user_a)),
+        },
     );
     try execPostgresSql(allocator, test_url, receipt_cleanup_sql, true);
     try std.testing.expectError(error.MeetingMemoryErased, mgr.storeMeetingMemory(memory_a));
-    const after_retention_request = try meeting_memory.ErasureRequest.init(user_a, "meeting-a", "request-after-retention");
+    const after_retention_request = try meeting_memory.ErasureRequest.init(&test_pseudonymizer, user_a, "meeting-a", "request-after-retention");
     const after_retention = try mgr.eraseMeetingMemories(after_retention_request);
     try std.testing.expect(after_retention.replayed);
     try std.testing.expectEqual(meeting_memory.ErasureDisposition.already_absent, after_retention.manifest.disposition);
     try std.testing.expectEqual(@as(u64, 0), after_retention.manifest.counts.memories_deleted);
 
     // The content-free meeting tombstone intentionally survives the tenant
-    // cascade. Replaying erasure after account deletion returns the same
-    // receipt; reprovisioning the same numeric tenant cannot resurrect this
-    // erased meeting.
+    // cascade. Replaying erasure after account deletion returns a signed
+    // already-absent proof; reprovisioning the same numeric tenant cannot
+    // resurrect this erased meeting.
     try mgr.deleteUser(user_a);
-    const after_account_request = try meeting_memory.ErasureRequest.init(user_a, "meeting-a", "request-after-account");
+    const after_account_request = try meeting_memory.ErasureRequest.init(&test_pseudonymizer, user_a, "meeting-a", "request-after-account");
     const after_account = try mgr.eraseMeetingMemories(after_account_request);
     try std.testing.expect(after_account.replayed);
     try mgr.provisionUser(user_a, "/tmp/nullalis-minutes-a-reprovisioned");
@@ -596,39 +665,110 @@ test "WP-15 live: receipt replay verifies immutable compliance evidence" {
     var mgr = try harness.newManager(allocator, test_url, schema);
     defer harness.dropAndDeinit(&mgr, "meeting_receipt_integrity");
     mgr.skipExternalIdentityForTests();
+    try installMeetingMemoryCrypto(&mgr);
 
     const user_id = harness.testUid();
     try mgr.provisionUser(user_id, "/tmp/nullalis-minutes-receipt-integrity");
     const source_tuple = try source(user_id, "transcript-a", "meeting-a");
     const memory = try prepared(source_tuple, .decision, "Use a staged rollout", "grant-a");
     _ = try mgr.storeMeetingMemory(memory);
-    const request = try meeting_memory.ErasureRequest.init(user_id, "meeting-a", "request-a");
+    const request = try meeting_memory.ErasureRequest.init(&test_pseudonymizer, user_id, "meeting-a", "request-a");
     const erased = try mgr.eraseMeetingMemories(request);
     try std.testing.expect(erased.manifest.erased_at_unix_us > 0);
+    try std.testing.expect(std.mem.startsWith(u8, erased.receiptKeyId(), "sha256="));
+    try std.testing.expect(std.mem.startsWith(u8, erased.receiptSignature(), "ed25519="));
 
-    // Normal SQL cannot mutate append-only receipt evidence.
+    const user_scope_digest = meeting_memory.formatSha256(
+        try meeting_memory.userScopeDigest(&test_pseudonymizer, user_id),
+    );
+    const meeting_scope_digest = meeting_memory.formatSha256(request.meeting_digest);
+
+    // Runtime SQL cannot mutate the pseudonym-key binding, permanent
+    // tombstones, or retained receipt evidence. Receipt DELETE remains
+    // intentionally available to the separate retention role and is covered
+    // by the source-scoped erasure test above.
     const guarded_tamper_sql = try std.fmt.allocPrint(
         allocator,
-        "UPDATE {s}.meeting_memory_erasure_receipts SET memories_deleted = 99 WHERE user_id = {d}",
-        .{ schema, user_id },
+        "UPDATE {s}.meeting_memory_erasure_receipts SET memories_deleted = 99 " ++
+            "WHERE user_scope_digest = '{s}'",
+        .{ schema, user_scope_digest },
     );
-    try execPostgresSql(allocator, test_url, guarded_tamper_sql, false);
+    const immutable_mutations = [_][]const u8{
+        try std.fmt.allocPrint(
+            allocator,
+            "UPDATE {s}.meeting_memory_crypto_state SET pseudonym_key_id = pseudonym_key_id",
+            .{schema},
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "DELETE FROM {s}.meeting_memory_crypto_state",
+            .{schema},
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "TRUNCATE TABLE {s}.meeting_memory_crypto_state",
+            .{schema},
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "UPDATE {s}.meeting_memory_erasure_tombstones SET erased_at = erased_at " ++
+                "WHERE meeting_scope_digest = '{s}'",
+            .{ schema, meeting_scope_digest },
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "DELETE FROM {s}.meeting_memory_erasure_tombstones " ++
+                "WHERE meeting_scope_digest = '{s}'",
+            .{ schema, meeting_scope_digest },
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "TRUNCATE TABLE {s}.meeting_memory_erasure_tombstones",
+            .{schema},
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "UPDATE {s}.meeting_memory_account_erasure_tombstones SET erased_at = erased_at",
+            .{schema},
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "DELETE FROM {s}.meeting_memory_account_erasure_tombstones",
+            .{schema},
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "TRUNCATE TABLE {s}.meeting_memory_account_erasure_tombstones",
+            .{schema},
+        ),
+        guarded_tamper_sql,
+        try std.fmt.allocPrint(
+            allocator,
+            "TRUNCATE TABLE {s}.meeting_memory_erasure_receipts",
+            .{schema},
+        ),
+    };
+    for (immutable_mutations) |sql| {
+        try execPostgresSql(allocator, test_url, sql, false);
+    }
 
     // Simulate out-of-band corruption by the schema owner, then prove the
-    // application recomputes the receipt digest and fails complete-or-loud.
-    const disable_rule_sql = try std.fmt.allocPrint(
+    // application recomputes the signed envelope and fails complete-or-loud.
+    const disable_trigger_sql = try std.fmt.allocPrint(
         allocator,
-        "ALTER TABLE {s}.meeting_memory_erasure_receipts DISABLE RULE meeting_memory_erasure_receipts_no_update",
+        "ALTER TABLE {s}.meeting_memory_erasure_receipts " ++
+            "DISABLE TRIGGER meeting_memory_erasure_receipts_no_update",
         .{schema},
     );
-    try execPostgresSql(allocator, test_url, disable_rule_sql, true);
+    try execPostgresSql(allocator, test_url, disable_trigger_sql, true);
     try execPostgresSql(allocator, test_url, guarded_tamper_sql, true);
-    const enable_rule_sql = try std.fmt.allocPrint(
+    const enable_trigger_sql = try std.fmt.allocPrint(
         allocator,
-        "ALTER TABLE {s}.meeting_memory_erasure_receipts ENABLE RULE meeting_memory_erasure_receipts_no_update",
+        "ALTER TABLE {s}.meeting_memory_erasure_receipts " ++
+            "ENABLE TRIGGER meeting_memory_erasure_receipts_no_update",
         .{schema},
     );
-    try execPostgresSql(allocator, test_url, enable_rule_sql, true);
+    try execPostgresSql(allocator, test_url, enable_trigger_sql, true);
     try std.testing.expectError(
         error.MeetingMemoryReceiptIntegrity,
         mgr.eraseMeetingMemories(request),
@@ -636,16 +776,61 @@ test "WP-15 live: receipt replay verifies immutable compliance evidence" {
 
     // Restore the count but move the database erasure timestamp. Timestamp is
     // part of the canonical manifest/digest because it controls retention.
-    try execPostgresSql(allocator, test_url, disable_rule_sql, true);
+    try execPostgresSql(allocator, test_url, disable_trigger_sql, true);
     const timestamp_tamper_sql = try std.fmt.allocPrint(
         allocator,
         "UPDATE {s}.meeting_memory_erasure_receipts " ++
             "SET memories_deleted = {d}, erased_at = erased_at - INTERVAL '1 microsecond' " ++
-            "WHERE user_id = {d}",
-        .{ schema, erased.manifest.counts.memories_deleted, user_id },
+            "WHERE user_scope_digest = '{s}'",
+        .{ schema, erased.manifest.counts.memories_deleted, user_scope_digest },
     );
     try execPostgresSql(allocator, test_url, timestamp_tamper_sql, true);
-    try execPostgresSql(allocator, test_url, enable_rule_sql, true);
+    try execPostgresSql(allocator, test_url, enable_trigger_sql, true);
+    try std.testing.expectError(
+        error.MeetingMemoryReceiptIntegrity,
+        mgr.eraseMeetingMemories(request),
+    );
+
+    // A canonical-looking forged signature and a canonical-looking unknown
+    // key ID must also fail. Syntax checks alone are not receipt verification.
+    try execPostgresSql(allocator, test_url, disable_trigger_sql, true);
+    const signature_tamper_sql = try std.fmt.allocPrint(
+        allocator,
+        "UPDATE {s}.meeting_memory_erasure_receipts " ++
+            "SET memories_deleted = {d}, " ++
+            "erased_at = to_timestamp({d}::numeric / 1000000), " ++
+            "receipt_signature = 'ed25519={s}' " ++
+            "WHERE user_scope_digest = '{s}'",
+        .{
+            schema,
+            erased.manifest.counts.memories_deleted,
+            erased.manifest.erased_at_unix_us,
+            [_]u8{'0'} ** 128,
+            user_scope_digest,
+        },
+    );
+    try execPostgresSql(allocator, test_url, signature_tamper_sql, true);
+    try execPostgresSql(allocator, test_url, enable_trigger_sql, true);
+    try std.testing.expectError(
+        error.MeetingMemoryReceiptIntegrity,
+        mgr.eraseMeetingMemories(request),
+    );
+
+    try execPostgresSql(allocator, test_url, disable_trigger_sql, true);
+    const key_id_tamper_sql = try std.fmt.allocPrint(
+        allocator,
+        "UPDATE {s}.meeting_memory_erasure_receipts " ++
+            "SET receipt_key_id = 'sha256={s}', receipt_signature = '{s}' " ++
+            "WHERE user_scope_digest = '{s}'",
+        .{
+            schema,
+            [_]u8{'0'} ** 64,
+            erased.receiptSignature(),
+            user_scope_digest,
+        },
+    );
+    try execPostgresSql(allocator, test_url, key_id_tamper_sql, true);
+    try execPostgresSql(allocator, test_url, enable_trigger_sql, true);
     try std.testing.expectError(
         error.MeetingMemoryReceiptIntegrity,
         mgr.eraseMeetingMemories(request),

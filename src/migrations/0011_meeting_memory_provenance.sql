@@ -1,6 +1,7 @@
 -- Minutes meeting-memory provenance and erasure tombstones.
 --
--- Source links store only domain-separated SHA-256 source/scope digests,
+-- Source links store only domain-separated HMAC-SHA-256 source/scope
+-- pseudonyms (rendered with the legacy-compatible sha256= prefix),
 -- policy evidence, and timestamps. Raw spoke identifiers, transcripts,
 -- extracted candidate text, consent grants, and receipt payloads do not
 -- belong here.
@@ -10,6 +11,18 @@
 -- transaction-scoped advisory lock. Permanent, digest-only meeting/account
 -- tombstones are deliberately separate from time-bounded compliance receipts:
 -- receipt retention may delete audit evidence, but must never reopen ingest.
+
+-- One immutable identifier binds all existing pseudonyms to the configured
+-- deployment key. Runtime initialization must insert the active key ID and
+-- fail closed when the singleton already contains a different value; changing
+-- this key is a data migration, never an ordinary secret rotation.
+CREATE TABLE IF NOT EXISTS {schema}.meeting_memory_crypto_state (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    pseudonym_key_id TEXT NOT NULL
+        CHECK (pseudonym_key_id ~ '^sha256=[0-9a-f]{64}$'),
+    initialized_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        CHECK (isfinite(initialized_at))
+);
 
 CREATE TABLE IF NOT EXISTS {schema}.memory_source_links (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -116,8 +129,8 @@ CREATE TABLE IF NOT EXISTS {schema}.meeting_memory_erasure_receipts (
     -- Intentionally no users FK: this time-bounded compliance row may outlive
     -- tenant deletion until the configured compliance-retention window ends.
     -- It is not the anti-resurrection authority; the tombstone above is.
-    user_id BIGINT NOT NULL
-        CHECK (user_id > 0),
+    user_scope_digest TEXT NOT NULL
+        CHECK (user_scope_digest ~ '^sha256=[0-9a-f]{64}$'),
     write_origin TEXT NOT NULL DEFAULT 'meeting_ingest'
         CHECK (write_origin = 'meeting_ingest'),
     source_spoke TEXT NOT NULL DEFAULT 'minutes'
@@ -127,12 +140,14 @@ CREATE TABLE IF NOT EXISTS {schema}.meeting_memory_erasure_receipts (
         REFERENCES {schema}.meeting_memory_erasure_tombstones(meeting_scope_digest),
 
     -- These bind one authenticated request to one stable, immutable receipt.
-    -- Neither may contain source data; both are hashes of canonical,
-    -- domain-separated, content-free envelopes.
+    -- The request is a keyed pseudonym; the key ID and Ed25519 signature attest
+    -- the canonical, domain-separated, content-free receipt envelope.
     request_digest TEXT NOT NULL
         CHECK (request_digest ~ '^sha256=[0-9a-f]{64}$'),
-    receipt_digest TEXT NOT NULL
-        CHECK (receipt_digest ~ '^sha256=[0-9a-f]{64}$'),
+    receipt_key_id TEXT NOT NULL
+        CHECK (receipt_key_id ~ '^sha256=[0-9a-f]{64}$'),
+    receipt_signature TEXT NOT NULL
+        CHECK (receipt_signature ~ '^ed25519=[0-9a-f]{128}$'),
 
     -- Content-free carrier manifest. V1 must persist explicit zeroes for
     -- prohibited carriers instead of omitting them from the proof.
@@ -167,21 +182,18 @@ CREATE TABLE IF NOT EXISTS {schema}.meeting_memory_erasure_receipts (
 -- replace it. Deleting an expired receipt never deletes the durable tombstone.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_meeting_memory_erasure_receipts_scope
     ON {schema}.meeting_memory_erasure_receipts (
-        user_id,
+        user_scope_digest,
         source_spoke,
         meeting_scope_digest
     );
 
--- Prevent request or receipt replay across two meeting scopes.
+-- Prevent one authenticated request from replaying across meeting scopes.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_meeting_memory_erasure_receipts_request_digest
     ON {schema}.meeting_memory_erasure_receipts (
-        user_id,
+        user_scope_digest,
         source_spoke,
         request_digest
     );
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_meeting_memory_erasure_receipts_receipt_digest
-    ON {schema}.meeting_memory_erasure_receipts (receipt_digest);
 
 -- The compliance worker applies its configured audit-receipt window to
 -- erased_at and may DELETE expired rows. Durable tombstones are separate, so
@@ -189,46 +201,70 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_meeting_memory_erasure_receipts_receipt_di
 CREATE INDEX IF NOT EXISTS idx_meeting_memory_erasure_receipts_retention
     ON {schema}.meeting_memory_erasure_receipts (erased_at);
 
--- Receipts are append-only while retained, including for the table owner. For
--- every matched UPDATE this idempotent rewrite rule attempts to reinsert the
--- immutable OLD row. The retained row necessarily collides with its unique
--- scope/request/receipt digests, so PostgreSQL aborts the statement loudly.
--- DELETE is deliberately unaffected so the retention worker can expire rows.
-CREATE OR REPLACE RULE meeting_memory_erasure_receipts_no_update AS
-    ON UPDATE TO {schema}.meeting_memory_erasure_receipts
-    DO INSTEAD
-    INSERT INTO {schema}.meeting_memory_erasure_receipts (
-        user_id,
-        write_origin,
-        source_spoke,
-        meeting_scope_digest,
-        request_digest,
-        receipt_digest,
-        memory_source_links_deleted,
-        memories_deleted,
-        memory_events_deleted,
-        memory_embeddings_deleted,
-        memory_vectors_deleted,
-        memory_entities_deleted,
-        memory_edges_deleted,
-        working_memory_deleted,
-        erased_at,
-        created_at
-    ) VALUES (
-        OLD.user_id,
-        OLD.write_origin,
-        OLD.source_spoke,
-        OLD.meeting_scope_digest,
-        OLD.request_digest,
-        OLD.receipt_digest,
-        OLD.memory_source_links_deleted,
-        OLD.memories_deleted,
-        OLD.memory_events_deleted,
-        OLD.memory_embeddings_deleted,
-        OLD.memory_vectors_deleted,
-        OLD.memory_entities_deleted,
-        OLD.memory_edges_deleted,
-        OLD.working_memory_deleted,
-        OLD.erased_at,
-        OLD.created_at
-    );
+-- Fail-loud application guards. Tombstones and the pseudonym-key binding are
+-- permanent; receipts are immutable while retained, but DELETE remains open
+-- for the compliance-retention worker. PostgreSQL owners/superusers can bypass
+-- or disable triggers, so real enforcement still requires infra to split the
+-- migration-owner, runtime, and retention roles and grant least privilege.
+CREATE OR REPLACE FUNCTION {schema}.reject_meeting_memory_immutable_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $meeting_memory_guard$
+BEGIN
+    RAISE EXCEPTION 'immutable Minutes state mutation rejected on %.% via %',
+        TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_OP
+        USING ERRCODE = '55000';
+END;
+$meeting_memory_guard$;
+
+DROP TRIGGER IF EXISTS meeting_memory_crypto_state_no_update_delete
+    ON {schema}.meeting_memory_crypto_state;
+CREATE TRIGGER meeting_memory_crypto_state_no_update_delete
+    BEFORE UPDATE OR DELETE ON {schema}.meeting_memory_crypto_state
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION {schema}.reject_meeting_memory_immutable_mutation();
+DROP TRIGGER IF EXISTS meeting_memory_crypto_state_no_truncate
+    ON {schema}.meeting_memory_crypto_state;
+CREATE TRIGGER meeting_memory_crypto_state_no_truncate
+    BEFORE TRUNCATE ON {schema}.meeting_memory_crypto_state
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION {schema}.reject_meeting_memory_immutable_mutation();
+
+DROP TRIGGER IF EXISTS meeting_memory_erasure_tombstones_no_update_delete
+    ON {schema}.meeting_memory_erasure_tombstones;
+CREATE TRIGGER meeting_memory_erasure_tombstones_no_update_delete
+    BEFORE UPDATE OR DELETE ON {schema}.meeting_memory_erasure_tombstones
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION {schema}.reject_meeting_memory_immutable_mutation();
+DROP TRIGGER IF EXISTS meeting_memory_erasure_tombstones_no_truncate
+    ON {schema}.meeting_memory_erasure_tombstones;
+CREATE TRIGGER meeting_memory_erasure_tombstones_no_truncate
+    BEFORE TRUNCATE ON {schema}.meeting_memory_erasure_tombstones
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION {schema}.reject_meeting_memory_immutable_mutation();
+
+DROP TRIGGER IF EXISTS meeting_memory_account_tombstones_no_update_delete
+    ON {schema}.meeting_memory_account_erasure_tombstones;
+CREATE TRIGGER meeting_memory_account_tombstones_no_update_delete
+    BEFORE UPDATE OR DELETE ON {schema}.meeting_memory_account_erasure_tombstones
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION {schema}.reject_meeting_memory_immutable_mutation();
+DROP TRIGGER IF EXISTS meeting_memory_account_tombstones_no_truncate
+    ON {schema}.meeting_memory_account_erasure_tombstones;
+CREATE TRIGGER meeting_memory_account_tombstones_no_truncate
+    BEFORE TRUNCATE ON {schema}.meeting_memory_account_erasure_tombstones
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION {schema}.reject_meeting_memory_immutable_mutation();
+
+DROP TRIGGER IF EXISTS meeting_memory_erasure_receipts_no_update
+    ON {schema}.meeting_memory_erasure_receipts;
+CREATE TRIGGER meeting_memory_erasure_receipts_no_update
+    BEFORE UPDATE ON {schema}.meeting_memory_erasure_receipts
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION {schema}.reject_meeting_memory_immutable_mutation();
+DROP TRIGGER IF EXISTS meeting_memory_erasure_receipts_no_truncate
+    ON {schema}.meeting_memory_erasure_receipts;
+CREATE TRIGGER meeting_memory_erasure_receipts_no_truncate
+    BEFORE TRUNCATE ON {schema}.meeting_memory_erasure_receipts
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION {schema}.reject_meeting_memory_immutable_mutation();
