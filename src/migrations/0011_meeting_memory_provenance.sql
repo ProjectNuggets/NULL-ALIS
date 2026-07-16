@@ -201,12 +201,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_meeting_memory_erasure_receipts_request_di
 CREATE INDEX IF NOT EXISTS idx_meeting_memory_erasure_receipts_retention
     ON {schema}.meeting_memory_erasure_receipts (erased_at);
 
+-- Readiness verifies that every retained receipt still has a trusted public
+-- verification key before accepting traffic. The index keeps that bounded to
+-- the tiny set of distinct key IDs instead of scanning retained evidence.
+CREATE INDEX IF NOT EXISTS idx_meeting_memory_erasure_receipts_key_id
+    ON {schema}.meeting_memory_erasure_receipts (receipt_key_id);
+
 -- Fail-loud application guards. Tombstones and the pseudonym-key binding are
 -- permanent; receipts are immutable while retained, but DELETE remains open
 -- for the compliance-retention worker. PostgreSQL owners/superusers can bypass
 -- or disable triggers, so real enforcement still requires infra to split the
 -- migration-owner, runtime, and retention roles and grant least privilege.
-CREATE OR REPLACE FUNCTION {schema}.reject_meeting_memory_immutable_mutation()
+CREATE FUNCTION {schema}.reject_meeting_memory_immutable_mutation()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $meeting_memory_guard$
@@ -217,53 +223,37 @@ BEGIN
 END;
 $meeting_memory_guard$;
 
-DROP TRIGGER IF EXISTS meeting_memory_crypto_state_no_update_delete
-    ON {schema}.meeting_memory_crypto_state;
 CREATE TRIGGER meeting_memory_crypto_state_no_update_delete
     BEFORE UPDATE OR DELETE ON {schema}.meeting_memory_crypto_state
     FOR EACH STATEMENT
     EXECUTE FUNCTION {schema}.reject_meeting_memory_immutable_mutation();
-DROP TRIGGER IF EXISTS meeting_memory_crypto_state_no_truncate
-    ON {schema}.meeting_memory_crypto_state;
 CREATE TRIGGER meeting_memory_crypto_state_no_truncate
     BEFORE TRUNCATE ON {schema}.meeting_memory_crypto_state
     FOR EACH STATEMENT
     EXECUTE FUNCTION {schema}.reject_meeting_memory_immutable_mutation();
 
-DROP TRIGGER IF EXISTS meeting_memory_erasure_tombstones_no_update_delete
-    ON {schema}.meeting_memory_erasure_tombstones;
 CREATE TRIGGER meeting_memory_erasure_tombstones_no_update_delete
     BEFORE UPDATE OR DELETE ON {schema}.meeting_memory_erasure_tombstones
     FOR EACH STATEMENT
     EXECUTE FUNCTION {schema}.reject_meeting_memory_immutable_mutation();
-DROP TRIGGER IF EXISTS meeting_memory_erasure_tombstones_no_truncate
-    ON {schema}.meeting_memory_erasure_tombstones;
 CREATE TRIGGER meeting_memory_erasure_tombstones_no_truncate
     BEFORE TRUNCATE ON {schema}.meeting_memory_erasure_tombstones
     FOR EACH STATEMENT
     EXECUTE FUNCTION {schema}.reject_meeting_memory_immutable_mutation();
 
-DROP TRIGGER IF EXISTS meeting_memory_account_tombstones_no_update_delete
-    ON {schema}.meeting_memory_account_erasure_tombstones;
 CREATE TRIGGER meeting_memory_account_tombstones_no_update_delete
     BEFORE UPDATE OR DELETE ON {schema}.meeting_memory_account_erasure_tombstones
     FOR EACH STATEMENT
     EXECUTE FUNCTION {schema}.reject_meeting_memory_immutable_mutation();
-DROP TRIGGER IF EXISTS meeting_memory_account_tombstones_no_truncate
-    ON {schema}.meeting_memory_account_erasure_tombstones;
 CREATE TRIGGER meeting_memory_account_tombstones_no_truncate
     BEFORE TRUNCATE ON {schema}.meeting_memory_account_erasure_tombstones
     FOR EACH STATEMENT
     EXECUTE FUNCTION {schema}.reject_meeting_memory_immutable_mutation();
 
-DROP TRIGGER IF EXISTS meeting_memory_erasure_receipts_no_update
-    ON {schema}.meeting_memory_erasure_receipts;
 CREATE TRIGGER meeting_memory_erasure_receipts_no_update
     BEFORE UPDATE ON {schema}.meeting_memory_erasure_receipts
     FOR EACH STATEMENT
     EXECUTE FUNCTION {schema}.reject_meeting_memory_immutable_mutation();
-DROP TRIGGER IF EXISTS meeting_memory_erasure_receipts_no_truncate
-    ON {schema}.meeting_memory_erasure_receipts;
 CREATE TRIGGER meeting_memory_erasure_receipts_no_truncate
     BEFORE TRUNCATE ON {schema}.meeting_memory_erasure_receipts
     FOR EACH STATEMENT

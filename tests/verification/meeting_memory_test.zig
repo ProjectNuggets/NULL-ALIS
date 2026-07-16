@@ -89,6 +89,7 @@ test "WP-15 schema: provenance links are one-to-one and receipts cannot retain c
         "consented_at",
         "receipt_key_id",
         "receipt_signature",
+        "idx_meeting_memory_erasure_receipts_key_id",
         "memory_source_links_deleted",
         "memories_deleted",
         "memory_events_deleted",
@@ -216,6 +217,61 @@ fn preparedWith(
     return meeting_memory.PreparedMemory.init(pseudonymizer, source_tuple, candidate, grant);
 }
 
+test "WP-15 live: default-off boot becomes fail-closed after crypto binding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const test_url = try harness.requirePostgresUrl(allocator);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try harness.schemaName(&schema_buf, "meeting_crypto_boot");
+    const drop_sql = try std.fmt.allocPrint(
+        allocator,
+        "DROP SCHEMA IF EXISTS {s} CASCADE",
+        .{schema},
+    );
+    defer execPostgresSql(allocator, test_url, drop_sql, true) catch |err| {
+        std.debug.print("WP-15 crypto boot cleanup failed: {s}\n", .{@errorName(err)});
+    };
+
+    const cfg = nullalis.config.StateConfig{
+        .backend = "postgres",
+        .postgres = .{
+            .connection_string = test_url,
+            .schema = schema,
+        },
+        .meeting_memory_crypto = .{
+            .pseudonym_key_env = "NULLALIS_WP15_TEST_ABSENT_PSEUDONYM_KEY",
+            .receipt_signing_seed_env = "NULLALIS_WP15_TEST_ABSENT_RECEIPT_SEED",
+        },
+    };
+
+    // A genuinely unused Minutes schema remains default-off and boots with no
+    // operator secrets. First source-scoped use binds the pseudonym key.
+    {
+        var mgr = try nullalis.zaki_state.Manager.init(allocator, cfg);
+        defer mgr.deinit();
+        mgr.skipExternalIdentityForTests();
+        try installMeetingMemoryCrypto(&mgr);
+        const user_id = harness.testUid();
+        try mgr.provisionUser(user_id, "/tmp/nullalis-minutes-crypto-boot");
+        const source_tuple = try source(user_id, "transcript-a", "meeting-a");
+        _ = try mgr.storeMeetingMemory(try prepared(
+            source_tuple,
+            .decision,
+            "Keep the erasure capability ready",
+            "grant-a",
+        ));
+    }
+
+    // Losing both operator secrets after activation is a readiness failure,
+    // not a latent surprise on the first store/delete/erasure request.
+    try std.testing.expectError(
+        error.MeetingMemoryCryptoUnavailable,
+        nullalis.zaki_state.Manager.init(allocator, cfg),
+    );
+}
+
 test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte-identical rows" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -284,25 +340,14 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     // keyed runtime must fail closed instead of creating a second digest
     // universe that could bypass the existing tombstones.
     const alternate_pseudonym_key = [_]u8{0xb6} ** 32;
-    const alternate_pseudonymizer = meeting_memory.Pseudonymizer.init(alternate_pseudonym_key);
-    try mgr.installMeetingMemoryCryptoForTests(
-        alternate_pseudonym_key,
-        [_]u8{0x32} ** 32,
-        null,
-    );
-    const alternate_source = try source(user_a, "transcript-wrong-key", "meeting-wrong-key");
-    const alternate_memory = try preparedWith(
-        &alternate_pseudonymizer,
-        alternate_source,
-        .decision,
-        "This must never enter a second pseudonym universe",
-        "grant-wrong-key",
-    );
     try std.testing.expectError(
         error.MeetingMemoryPseudonymKeyMismatch,
-        mgr.storeMeetingMemory(alternate_memory),
+        mgr.installMeetingMemoryCryptoForTests(
+            alternate_pseudonym_key,
+            [_]u8{0x32} ** 32,
+            null,
+        ),
     );
-    try installMeetingMemoryCrypto(&mgr);
 
     // Callers still provide validated opaque source IDs, but durable
     // provenance and replay identity retain only tenant-bound digests.

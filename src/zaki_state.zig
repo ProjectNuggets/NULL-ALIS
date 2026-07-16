@@ -2165,6 +2165,10 @@ const ManagerImpl = struct {
             .statement_timeout_ms = cfg.postgres.statement_timeout_ms,
             .lock_timeout_ms = cfg.postgres.lock_timeout_ms,
         };
+        errdefer {
+            manager.closeAllPoolConns();
+            manager.pool_entries.deinit(allocator);
+        }
 
         manager.secrets_enabled = true;
         manager.master_key = try loadMasterKey(allocator, cfg.secrets.master_key_env);
@@ -2177,11 +2181,9 @@ const ManagerImpl = struct {
             manager.meeting_memory_crypto = null;
         };
         try manager.migrate();
-        if (manager.meeting_memory_crypto) |*crypto| {
-            try manager.validateMeetingMemoryReceiptVerifierCoverage(
-                &crypto.receipt_verifier,
-            );
-        }
+        try manager.validateMeetingMemoryCryptoState(
+            if (manager.meeting_memory_crypto) |*crypto| crypto else null,
+        );
         return manager;
     }
 
@@ -2216,9 +2218,7 @@ const ManagerImpl = struct {
             u8,
             @as([*]volatile u8, @ptrCast(&candidate))[0..@sizeOf(MeetingMemoryCrypto)],
         );
-        try self.validateMeetingMemoryReceiptVerifierCoverage(
-            &candidate.receipt_verifier,
-        );
+        try self.validateMeetingMemoryCryptoState(&candidate);
         if (self.meeting_memory_crypto) |*existing| {
             std.crypto.secureZero(
                 u8,
@@ -2352,6 +2352,73 @@ const ManagerImpl = struct {
                 return error.MeetingMemoryReceiptVerificationKeyMissing;
             }
         }
+    }
+
+    /// Readiness invariant for the default-off boundary. A fresh, empty
+    /// schema may run without Minutes secrets. Once any source-scoped state is
+    /// bound, missing or mismatched pseudonym material is a boot failure—not a
+    /// latent failure on the first GDPR erasure request.
+    fn validateMeetingMemoryCryptoState(
+        self: *Self,
+        candidate: ?*const MeetingMemoryCrypto,
+    ) !void {
+        const relation_q = try self.buildQuery(
+            "SELECT to_regclass('{schema}.meeting_memory_crypto_state') IS NOT NULL",
+        );
+        defer self.allocator.free(relation_q);
+        const relation_result = try self.exec(relation_q);
+        defer c.PQclear(relation_result);
+        if (c.PQntuples(relation_result) != 1 or c.PQgetisnull(relation_result, 0, 0) != 0) {
+            return error.InvalidMeetingMemoryCryptoState;
+        }
+        if (!std.mem.eql(
+            u8,
+            std.mem.span(c.PQgetvalue(relation_result, 0, 0)),
+            "t",
+        )) return;
+
+        const state_q = try self.buildQuery(
+            "SELECT pseudonym_key_id FROM {schema}.meeting_memory_crypto_state " ++
+                "WHERE singleton = TRUE LIMIT 2",
+        );
+        defer self.allocator.free(state_q);
+        const state_result = try self.exec(state_q);
+        defer c.PQclear(state_result);
+        const state_rows = c.PQntuples(state_result);
+        if (state_rows > 1) return error.InvalidMeetingMemoryCryptoState;
+        if (state_rows == 0) {
+            const residue_q = try self.buildQuery(
+                "SELECT EXISTS (SELECT 1 FROM {schema}.memory_source_links LIMIT 1) " ++
+                    "OR EXISTS (SELECT 1 FROM {schema}.meeting_memory_erasure_tombstones LIMIT 1) " ++
+                    "OR EXISTS (SELECT 1 FROM {schema}.meeting_memory_account_erasure_tombstones LIMIT 1) " ++
+                    "OR EXISTS (SELECT 1 FROM {schema}.meeting_memory_erasure_receipts LIMIT 1)",
+            );
+            defer self.allocator.free(residue_q);
+            const residue_result = try self.exec(residue_q);
+            defer c.PQclear(residue_result);
+            if (c.PQntuples(residue_result) != 1 or c.PQgetisnull(residue_result, 0, 0) != 0) {
+                return error.InvalidMeetingMemoryCryptoState;
+            }
+            if (std.mem.eql(
+                u8,
+                std.mem.span(c.PQgetvalue(residue_result, 0, 0)),
+                "t",
+            )) return error.InvalidMeetingMemoryCryptoState;
+            return;
+        }
+        if (c.PQgetisnull(state_result, 0, 0) != 0) {
+            return error.InvalidMeetingMemoryCryptoState;
+        }
+
+        const crypto = candidate orelse return error.MeetingMemoryCryptoUnavailable;
+        const configured_key_id = crypto.pseudonymizer.keyId();
+        const stored_key_id = std.mem.span(c.PQgetvalue(state_result, 0, 0));
+        if (!std.mem.eql(u8, &configured_key_id, stored_key_id)) {
+            return error.MeetingMemoryPseudonymKeyMismatch;
+        }
+        try self.validateMeetingMemoryReceiptVerifierCoverage(
+            &crypto.receipt_verifier,
+        );
     }
 
     pub fn debugPoolSnapshot(self: *Self) PoolDebugSnapshot {
