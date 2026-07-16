@@ -46,6 +46,7 @@ fn freeEvents(allocator: std.mem.Allocator, events: []nullalis.memory.MemoryEven
 
 test "WP-15 schema: provenance links are one-to-one and receipts cannot retain content" {
     const migration_sql = try harness.loadProjectFile("src/migrations/0011_meeting_memory_provenance.sql");
+    const state_source = try harness.loadProjectFile("src/zaki_state.zig");
     const required = [_][]const u8{
         "CREATE TABLE IF NOT EXISTS {schema}.memory_source_links",
         "CREATE TABLE IF NOT EXISTS {schema}.meeting_memory_erasure_receipts",
@@ -55,8 +56,6 @@ test "WP-15 schema: provenance links are one-to-one and receipts cannot retain c
         "FOREIGN KEY (user_id, memory_key)",
         "UNIQUE INDEX IF NOT EXISTS idx_memory_source_links_memory",
         "(user_id, memory_key)",
-        "source_item_id",
-        "meeting_id",
         "meeting_scope_digest",
         "source_digest",
         "candidate_digest",
@@ -76,6 +75,46 @@ test "WP-15 schema: provenance links are one-to-one and receipts cannot retain c
         if (std.mem.indexOf(u8, migration_sql, needle) == null) {
             std.debug.print("WP-15 migration missing invariant: {s}\n", .{needle});
             return error.MissingMeetingMemorySchemaInvariant;
+        }
+    }
+
+    const source_links_end = std.mem.indexOf(
+        u8,
+        migration_sql,
+        "CREATE TABLE IF NOT EXISTS {schema}.meeting_memory_erasure_tombstones",
+    ) orelse return error.MissingMeetingMemoryTombstone;
+    const source_links_sql = migration_sql[0..source_links_end];
+    const forbidden_source_link_columns = [_][]const u8{
+        "source_item_id TEXT",
+        "meeting_id TEXT",
+    };
+    for (forbidden_source_link_columns) |needle| {
+        if (std.mem.indexOf(u8, source_links_sql, needle) != null) {
+            std.debug.print("WP-15 provenance retains raw identifier column: {s}\n", .{needle});
+            return error.ContentBearingMeetingProvenance;
+        }
+    }
+
+    const store_start = std.mem.lastIndexOf(
+        u8,
+        state_source,
+        "pub fn storeMeetingMemory(",
+    ) orelse return error.MissingMeetingMemoryStore;
+    const erase_start = std.mem.indexOfPos(
+        u8,
+        state_source,
+        store_start,
+        "pub fn eraseMeetingMemories(",
+    ) orelse return error.MissingMeetingMemoryErase;
+    const store_source = state_source[store_start..erase_start];
+    const forbidden_store_fields = [_][]const u8{
+        "source_item_id",
+        "meeting_id",
+    };
+    for (forbidden_store_fields) |needle| {
+        if (std.mem.indexOf(u8, store_source, needle) != null) {
+            std.debug.print("WP-15 store persists or replays raw identifier: {s}\n", .{needle});
+            return error.ContentBearingMeetingStore;
         }
     }
 
@@ -99,6 +138,19 @@ test "WP-15 schema: provenance links are one-to-one and receipts cannot retain c
             std.debug.print("WP-15 receipt contains forbidden content field: {s}\n", .{needle});
             return error.ContentBearingMeetingErasureReceipt;
         }
+    }
+
+    const bigint_count_fragments = [_][]const u8{
+        "$5::bigint, $6::bigint, $7::bigint, $8::bigint, $9::bigint",
+        "$10::bigint, $11::bigint, $12::bigint",
+    };
+    for (bigint_count_fragments) |fragment| {
+        if (std.mem.indexOf(u8, state_source, fragment) == null) {
+            return error.MeetingErasureReceiptCountNarrowing;
+        }
+    }
+    if (std.mem.indexOf(u8, state_source, "$5::integer, $6::integer") != null) {
+        return error.MeetingErasureReceiptCountNarrowing;
     }
 }
 
@@ -151,6 +203,20 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     const memory_b = try prepared(meeting_b, .decision, identical_text, "grant-b");
     const memory_other_tenant = try prepared(other_tenant, .decision, identical_text, "grant-c");
 
+    // A copied authority must not be able to pair tenant B with tenant A's
+    // meeting digest. Reject it before locks/tombstones so tenant A's later
+    // legitimate erasure cannot be poisoned by the global digest uniqueness.
+    var cross_tenant_poison = try meeting_memory.ErasureRequest.init(
+        user_a,
+        "meeting-a",
+        "request-cross-tenant-poison",
+    );
+    cross_tenant_poison.user_id = user_b;
+    try std.testing.expectError(
+        error.ErasureRequestIntegrityMismatch,
+        mgr.eraseMeetingMemories(cross_tenant_poison),
+    );
+
     // The persistence boundary revalidates borrowed bytes rather than trusting
     // a constructor that may have run before the caller reused its buffer.
     var mutable_text = [_]u8{ 'S', 'h', 'i', 'p', ' ', 'o', 'n', ' ', 'F', 'r', 'i', 'd', 'a', 'y' };
@@ -172,6 +238,36 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     const replay = try mgr.storeMeetingMemory(memory_a);
     try std.testing.expect(!replay.inserted);
     try std.testing.expectEqualStrings(first.memoryKey(), replay.memoryKey());
+
+    // Callers still provide validated opaque source IDs, but durable
+    // provenance and replay identity retain only tenant-bound digests.
+    const meeting_a_scope = meeting_memory.formatSha256(memory_a.provenance.identity.meeting_digest);
+    const meeting_a_source = meeting_memory.formatSha256(memory_a.provenance.identity.source_digest);
+    const meeting_a_candidate = meeting_memory.formatSha256(memory_a.provenance.identity.candidate_digest);
+    const verify_digest_only_provenance_sql = try std.fmt.allocPrint(
+        allocator,
+        "DO $wp15$ BEGIN " ++
+            "IF EXISTS (SELECT 1 FROM information_schema.columns " ++
+            "WHERE table_schema = '{s}' AND table_name = 'memory_source_links' " ++
+            "AND column_name IN ('source_item_id', 'meeting_id')) " ++
+            "THEN RAISE EXCEPTION 'raw meeting identifier column survived'; END IF; " ++
+            "IF (SELECT count(*) FROM {s}.memory_source_links " ++
+            "WHERE user_id = {d} AND memory_key = '{s}' " ++
+            "AND meeting_scope_digest = '{s}' AND source_digest = '{s}' " ++
+            "AND candidate_digest = '{s}') <> 1 " ++
+            "THEN RAISE EXCEPTION 'digest-only exact provenance missing'; END IF; " ++
+            "END $wp15$",
+        .{
+            schema,
+            schema,
+            user_a,
+            first.memoryKey(),
+            meeting_a_scope,
+            meeting_a_source,
+            meeting_a_candidate,
+        },
+    );
+    try execPostgresSql(allocator, test_url, verify_digest_only_provenance_sql, true);
 
     const second_meeting = try mgr.storeMeetingMemory(memory_b);
     const second_tenant = try mgr.storeMeetingMemory(memory_other_tenant);
@@ -221,6 +317,26 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
         error.MeetingMemoryRequiresDedicatedMutation,
         mgr.upsertWorkingMemorySlot(user_a, "session-a", 1, "decision", identical_text, first.memoryKey(), 1.0, false),
     );
+    const governed_assignment = [_]nullalis.memory.CommunityAssignment{.{
+        .key = first.memoryKey(),
+        .community_id = 7,
+    }};
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
+        mgr.setMemoryCommunityIds(user_a, &governed_assignment),
+    );
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
+        mgr.markMemorySupersededByKey(user_a, first.memoryKey(), "generic-unrelated"),
+    );
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
+        mgr.markMemorySupersededByKey(user_a, "generic-unrelated", first.memoryKey()),
+    );
+    try std.testing.expectError(
+        error.MeetingMemoryRequiresDedicatedMutation,
+        mgr.propagateCorrection(allocator, user_a, first.memoryKey(), "pilot"),
+    );
 
     // Generic information-scoped forget uses content_hash sweeps. Meeting
     // rows deliberately carry content_hash=NULL, so forgetting a
@@ -246,10 +362,91 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     try mgr.upsertMemory(user_a, "generic-identical", identical_text, .core, null);
     try mgr.upsertMemory(user_a, "generic-unrelated", "Unrelated graph fact", .core, null);
 
+    // Reads remain available, but the generic access-counter side effect must
+    // not mutate a source-governed Minutes row. Ordinary memories still bump.
+    const reset_access_sql = try std.fmt.allocPrint(
+        allocator,
+        "UPDATE {s}.memories SET access_count = 0, last_accessed_at = NULL " ++
+            "WHERE user_id = {d} AND key IN ('{s}', 'generic-identical')",
+        .{ schema, user_a, first.memoryKey() },
+    );
+    try execPostgresSql(allocator, test_url, reset_access_sql, true);
+    const governed_read = (try mgr.getMemory(allocator, user_a, first.memoryKey())).?;
+    governed_read.deinit(allocator);
+    const generic_read = (try mgr.getMemory(allocator, user_a, "generic-identical")).?;
+    generic_read.deinit(allocator);
+    const verify_access_sql = try std.fmt.allocPrint(
+        allocator,
+        "DO $wp15$ BEGIN " ++
+            "IF EXISTS (SELECT 1 FROM {s}.memories WHERE user_id = {d} AND key = '{s}' " ++
+            "AND (access_count <> 0 OR last_accessed_at IS NOT NULL)) " ++
+            "THEN RAISE EXCEPTION 'meeting memory access metadata mutated'; END IF; " ++
+            "IF NOT EXISTS (SELECT 1 FROM {s}.memories WHERE user_id = {d} AND key = 'generic-identical' " ++
+            "AND access_count = 1 AND last_accessed_at IS NOT NULL) " ++
+            "THEN RAISE EXCEPTION 'generic access metadata did not bump'; END IF; " ++
+            "END $wp15$",
+        .{ schema, user_a, first.memoryKey(), schema, user_a },
+    );
+    try execPostgresSql(allocator, test_url, verify_access_sql, true);
+
+    // Prose-survey input is itself a mutation boundary: the judge must never
+    // receive a meeting-derived key that markMemorySupersededByKey would later
+    // be asked to mutate. A byte-identical generic row remains eligible.
+    const prose_facts = try mgr.fetchProseFactsByPattern(allocator, user_a, "Launch the pilot", 100);
+    defer nullalis.memory.freeProseFacts(allocator, prose_facts);
+    var saw_generic_prose = false;
+    for (prose_facts) |fact| {
+        try std.testing.expect(!std.mem.startsWith(u8, fact.key, meeting_memory.memory_key_prefix));
+        if (std.mem.eql(u8, fact.key, "generic-identical")) saw_generic_prose = true;
+    }
+    try std.testing.expect(saw_generic_prose);
+
+    // Temporal decay is a tenant-wide batch operation. It must continue to
+    // decay ordinary open loops while filtering the governed Minutes row.
+    const temporal_source = try source(user_a, "transcript-temporal", "meeting-temporal");
+    const temporal_memory = try prepared(
+        temporal_source,
+        .action_item,
+        "Follow up with the pilot cohort",
+        "grant-temporal",
+    );
+    const temporal_store = try mgr.storeMeetingMemory(temporal_memory);
+    try mgr.upsertMemoryWithMetadata(
+        user_a,
+        "generic-decay-control",
+        "Follow up with the generic cohort",
+        .{ .custom = "open_loop" },
+        null,
+        "{}",
+    );
+    const age_decay_rows_sql = try std.fmt.allocPrint(
+        allocator,
+        "UPDATE {s}.memories SET created_at = NOW() - INTERVAL '90 days', " ++
+            "last_accessed_at = NULL, confidence_score = 0.8 " ++
+            "WHERE user_id = {d} AND key IN ('{s}', 'generic-decay-control')",
+        .{ schema, user_a, temporal_store.memoryKey() },
+    );
+    try execPostgresSql(allocator, test_url, age_decay_rows_sql, true);
+    const decay = try mgr.temporalDecay(user_a, 1, 30);
+    try std.testing.expect(decay.rows_decayed >= 1);
+    const verify_decay_sql = try std.fmt.allocPrint(
+        allocator,
+        "DO $wp15$ BEGIN " ++
+            "IF (SELECT confidence_score FROM {s}.memories WHERE user_id = {d} AND key = '{s}') IS DISTINCT FROM 0.8 " ++
+            "THEN RAISE EXCEPTION 'meeting memory confidence mutated'; END IF; " ++
+            "IF (SELECT confidence_score FROM {s}.memories WHERE user_id = {d} AND key = 'generic-decay-control') >= 0.8 " ++
+            "THEN RAISE EXCEPTION 'generic confidence did not decay'; END IF; " ++
+            "END $wp15$",
+        .{ schema, user_a, temporal_store.memoryKey(), schema, user_a },
+    );
+    try execPostgresSql(allocator, test_url, verify_decay_sql, true);
+
     // Seed legacy/adversarial carriers directly. Canonical graph and working-
     // memory writers now reject these attachments, but exact erasure must also
     // clean residue created before that boundary existed. An unrelated edge
-    // and event prove the payload-key deletion remains source scoped.
+    // and event prove the payload-key deletion remains source scoped. Legacy
+    // graph/timeline traversal arrays are carriers too: matching arrays must
+    // be scrubbed while an unrelated traversal array survives.
     const residue_sql = try std.fmt.allocPrint(
         allocator,
         "INSERT INTO {s}.memory_edges (user_id, source_key, target_key, predicate, confidence, valid_from) VALUES " ++
@@ -257,7 +454,10 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
             "({d}, 'generic-unrelated', 'generic-identical', 'RELATED_TO', 1.0, 1784200000); " ++
             "INSERT INTO {s}.memory_events (id, user_id, memory_id, event_type, payload) VALUES " ++
             "('wp15-meeting-edge-event', {d}, NULL, 'edge_added', jsonb_build_object('source_key', '{s}', 'target_key', 'generic-identical')), " ++
-            "('wp15-unrelated-edge-event', {d}, NULL, 'edge_added', jsonb_build_object('source_key', 'generic-unrelated', 'target_key', 'generic-identical')); " ++
+            "('wp15-unrelated-edge-event', {d}, NULL, 'edge_added', jsonb_build_object('source_key', 'generic-unrelated', 'target_key', 'generic-identical')), " ++
+            "('wp15-meeting-graph-event', {d}, NULL, 'traversal', jsonb_build_object('node_keys', jsonb_build_array('{s}', 'generic-identical'))), " ++
+            "('wp15-meeting-timeline-event', {d}, NULL, 'traversal', jsonb_build_object('entry_keys', jsonb_build_array('generic-unrelated', '{s}'))), " ++
+            "('wp15-unrelated-traversal-event', {d}, NULL, 'traversal', jsonb_build_object('node_keys', jsonb_build_array('generic-unrelated', 'generic-identical'))); " ++
             "INSERT INTO {s}.working_memory (user_id, session_id, slot_id, slot_type, content, source_key, importance, pinned) " ++
             "VALUES ({d}, 'legacy-session', 1, 'decision', 'legacy meeting residue', '{s}', 1.0, false)",
         .{
@@ -266,6 +466,11 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
             first.memoryKey(),
             user_a,
             schema,
+            user_a,
+            first.memoryKey(),
+            user_a,
+            user_a,
+            first.memoryKey(),
             user_a,
             first.memoryKey(),
             user_a,
@@ -280,7 +485,7 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     const erased = try mgr.eraseMeetingMemories(erase_request);
     try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.memory_source_links_deleted);
     try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.memories_deleted);
-    try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.memory_events_deleted);
+    try std.testing.expectEqual(@as(u64, 3), erased.manifest.counts.memory_events_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_embeddings_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_vectors_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_entities_deleted);
@@ -326,6 +531,19 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
         }
     }
     try std.testing.expect(saw_unrelated_edge_event);
+    const traversal_residue_sql = try std.fmt.allocPrint(
+        allocator,
+        "DO $wp15$ BEGIN " ++
+            "IF EXISTS (SELECT 1 FROM {s}.memory_events WHERE user_id = {d} " ++
+            "AND id IN ('wp15-meeting-graph-event', 'wp15-meeting-timeline-event')) " ++
+            "THEN RAISE EXCEPTION 'meeting traversal carrier survived'; END IF; " ++
+            "IF NOT EXISTS (SELECT 1 FROM {s}.memory_events WHERE user_id = {d} " ++
+            "AND id = 'wp15-unrelated-traversal-event') " ++
+            "THEN RAISE EXCEPTION 'unrelated traversal event was over-deleted'; END IF; " ++
+            "END $wp15$",
+        .{ schema, user_a, schema, user_a },
+    );
+    try execPostgresSql(allocator, test_url, traversal_residue_sql, true);
     const remaining_edges = try mgr.listEdgesForUser(allocator, user_a);
     defer {
         for (remaining_edges) |*edge| edge.deinit(allocator);
@@ -385,7 +603,8 @@ test "WP-15 live: receipt replay verifies immutable compliance evidence" {
     const memory = try prepared(source_tuple, .decision, "Use a staged rollout", "grant-a");
     _ = try mgr.storeMeetingMemory(memory);
     const request = try meeting_memory.ErasureRequest.init(user_id, "meeting-a", "request-a");
-    _ = try mgr.eraseMeetingMemories(request);
+    const erased = try mgr.eraseMeetingMemories(request);
+    try std.testing.expect(erased.manifest.erased_at_unix_us > 0);
 
     // Normal SQL cannot mutate append-only receipt evidence.
     const guarded_tamper_sql = try std.fmt.allocPrint(
@@ -409,6 +628,23 @@ test "WP-15 live: receipt replay verifies immutable compliance evidence" {
         "ALTER TABLE {s}.meeting_memory_erasure_receipts ENABLE RULE meeting_memory_erasure_receipts_no_update",
         .{schema},
     );
+    try execPostgresSql(allocator, test_url, enable_rule_sql, true);
+    try std.testing.expectError(
+        error.MeetingMemoryReceiptIntegrity,
+        mgr.eraseMeetingMemories(request),
+    );
+
+    // Restore the count but move the database erasure timestamp. Timestamp is
+    // part of the canonical manifest/digest because it controls retention.
+    try execPostgresSql(allocator, test_url, disable_rule_sql, true);
+    const timestamp_tamper_sql = try std.fmt.allocPrint(
+        allocator,
+        "UPDATE {s}.meeting_memory_erasure_receipts " ++
+            "SET memories_deleted = {d}, erased_at = erased_at - INTERVAL '1 microsecond' " ++
+            "WHERE user_id = {d}",
+        .{ schema, erased.manifest.counts.memories_deleted, user_id },
+    );
+    try execPostgresSql(allocator, test_url, timestamp_tamper_sql, true);
     try execPostgresSql(allocator, test_url, enable_rule_sql, true);
     try std.testing.expectError(
         error.MeetingMemoryReceiptIntegrity,

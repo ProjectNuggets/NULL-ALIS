@@ -1,8 +1,9 @@
 -- Minutes meeting-memory provenance and erasure tombstones.
 --
--- Source links store opaque spoke identifiers, domain-separated SHA-256
--- digests, policy evidence, and timestamps. Raw transcripts, extracted
--- candidate text, consent grants, and receipt payloads do not belong here.
+-- Source links store only domain-separated SHA-256 source/scope digests,
+-- policy evidence, and timestamps. Raw spoke identifiers, transcripts,
+-- extracted candidate text, consent grants, and receipt payloads do not
+-- belong here.
 --
 -- State methods derive meeting_scope_digest from the authenticated user and
 -- meeting scope, then serialize writes and erasure for that digest with a
@@ -20,18 +21,6 @@ CREATE TABLE IF NOT EXISTS {schema}.memory_source_links (
         CHECK (write_origin = 'meeting_ingest'),
     source_spoke TEXT NOT NULL DEFAULT 'minutes'
         CHECK (source_spoke = 'minutes'),
-    source_item_id TEXT NOT NULL
-        CHECK (
-            source_item_id = btrim(source_item_id)
-            AND octet_length(source_item_id) BETWEEN 1 AND 512
-            AND source_item_id !~ '[[:cntrl:]]'
-        ),
-    meeting_id TEXT NOT NULL
-        CHECK (
-            meeting_id = btrim(meeting_id)
-            AND octet_length(meeting_id) BETWEEN 1 AND 512
-            AND meeting_id !~ '[[:cntrl:]]'
-        ),
     meeting_scope_digest TEXT NOT NULL
         CHECK (meeting_scope_digest ~ '^sha256=[0-9a-f]{64}$'),
     source_digest TEXT NOT NULL
@@ -63,19 +52,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_source_links_exact_provenance
         user_id,
         write_origin,
         source_spoke,
-        source_item_id,
-        meeting_id,
         meeting_scope_digest,
         source_digest,
         candidate_digest
     );
 
--- Meeting-scoped write/forget lookup, shared with the advisory-lock scope.
-CREATE INDEX IF NOT EXISTS idx_memory_source_links_user_spoke_meeting
-    ON {schema}.memory_source_links (user_id, source_spoke, meeting_id);
-
--- Erasure selects the complete meeting scope without retaining raw item IDs in
--- its tombstone.
+-- Meeting-scoped write/erasure lookup, shared with the advisory-lock scope,
+-- without retaining raw item identifiers.
 CREATE INDEX IF NOT EXISTS idx_memory_source_links_user_spoke_scope_digest
     ON {schema}.memory_source_links (
         user_id,

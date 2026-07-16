@@ -46,6 +46,8 @@ pub const ValidationError = error{
     ConsentSourceMismatch,
     ConsentCandidateMismatch,
     PreparedMemoryIntegrityMismatch,
+    ErasureRequestIntegrityMismatch,
+    InvalidErasedAt,
 };
 
 pub const SourceTupleInput = struct {
@@ -338,6 +340,7 @@ pub const ErasureRequest = struct {
     user_id: i64,
     meeting_digest: Digest,
     request_digest: Digest,
+    integrity_digest: Digest,
 
     pub fn init(user_id: i64, meeting_id: []const u8, request_id: []const u8) ValidationError!ErasureRequest {
         try validateUserId(user_id);
@@ -355,11 +358,30 @@ pub const ErasureRequest = struct {
         if (!isSafeSlug(request_id)) return error.InvalidRequestId;
 
         const meeting_digest = deriveMeetingDigest(user_id, meeting_id);
+        const request_digest = deriveRequestDigest(meeting_digest, request_id);
         return .{
             .user_id = user_id,
             .meeting_digest = meeting_digest,
-            .request_digest = deriveRequestDigest(meeting_digest, request_id),
+            .request_digest = request_digest,
+            .integrity_digest = deriveErasureRequestIntegrity(user_id, meeting_digest, request_digest),
         };
+    }
+
+    /// Revalidate the content-free erasure authority immediately before any
+    /// state lookup or tombstone write. The seal binds the authenticated user
+    /// and both derived scopes so a copied or mutated value cannot pair one
+    /// tenant with another tenant's meeting digest.
+    pub fn validateForErase(self: ErasureRequest) ValidationError!ErasureRequest {
+        try validateUserId(self.user_id);
+        const expected = deriveErasureRequestIntegrity(
+            self.user_id,
+            self.meeting_digest,
+            self.request_digest,
+        );
+        if (!digestEql(expected, self.integrity_digest)) {
+            return error.ErasureRequestIntegrityMismatch;
+        }
+        return self;
     }
 };
 
@@ -375,13 +397,21 @@ pub const ErasureManifest = struct {
     request_digest: Digest,
     counts: ErasureCounts,
     disposition: ErasureDisposition,
+    erased_at_unix_us: i64,
 
-    pub fn init(request: ErasureRequest, counts: ErasureCounts, disposition: ErasureDisposition) ErasureManifest {
+    pub fn init(
+        request: ErasureRequest,
+        counts: ErasureCounts,
+        disposition: ErasureDisposition,
+        erased_at_unix_us: i64,
+    ) ValidationError!ErasureManifest {
+        if (erased_at_unix_us <= 0) return error.InvalidErasedAt;
         return .{
             .meeting_digest = request.meeting_digest,
             .request_digest = request.request_digest,
             .counts = counts,
             .disposition = disposition,
+            .erased_at_unix_us = erased_at_unix_us,
         };
     }
 
@@ -397,6 +427,7 @@ pub const ErasureManifest = struct {
             .meeting_digest = meeting_digest_text[0..],
             .request_digest = request_digest_text[0..],
             .disposition = @tagName(self.disposition),
+            .erased_at_unix_us = self.erased_at_unix_us,
             .counts = self.counts,
         }, .{});
     }
@@ -537,6 +568,19 @@ fn deriveRequestDigest(meeting_digest: Digest, request_id: []const u8) Digest {
     updateField(&hasher, "domain", "zaki.minutes.erasure-request.v1");
     updateField(&hasher, "meeting_digest", &meeting_digest);
     updateField(&hasher, "request_id", request_id);
+    var digest: Digest = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn deriveErasureRequestIntegrity(user_id: i64, meeting_digest: Digest, request_digest: Digest) Digest {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    updateField(&hasher, "domain", "zaki.minutes.erasure-request-integrity.v1");
+    updateField(&hasher, "write_origin", write_origin);
+    updateField(&hasher, "source_spoke", source_spoke);
+    updateUserId(&hasher, user_id);
+    updateField(&hasher, "meeting_digest", &meeting_digest);
+    updateField(&hasher, "request_digest", &request_digest);
     var digest: Digest = undefined;
     hasher.final(&digest);
     return digest;
@@ -1004,7 +1048,7 @@ test "provenance and erasure serializers expose digests but no raw content or id
     try std.testing.expect(!@hasField(ErasureRequest, "meeting_id"));
     try std.testing.expect(!@hasField(ErasureRequest, "request_id"));
 
-    const manifest = ErasureManifest.init(request, .{
+    const manifest = try ErasureManifest.init(request, .{
         .memory_source_links_deleted = 2,
         .memories_deleted = 2,
         .memory_events_deleted = 3,
@@ -1013,7 +1057,7 @@ test "provenance and erasure serializers expose digests but no raw content or id
         .memory_entities_deleted = 1,
         .memory_embeddings_deleted = 2,
         .memory_vectors_deleted = 2,
-    }, .erased);
+    }, .erased, 1_784_200_000_123_456);
     const manifest_json = try manifest.serializeJson(allocator);
     defer allocator.free(manifest_json);
     try expectContentFree(manifest_json, &.{
@@ -1062,6 +1106,44 @@ test "erasure request validates its boundary and retains digests only" {
     try std.testing.expect(!std.mem.eql(u8, &first.request_digest, &other_request.request_digest));
     try std.testing.expect(!std.mem.eql(u8, &first.meeting_digest, &other_meeting.meeting_digest));
     try std.testing.expect(!std.mem.eql(u8, &first.request_digest, &other_meeting.request_digest));
+}
+
+test "erasure request seal rejects every mutable authority field" {
+    const request = try ErasureRequest.init(42, "meeting-9", "request-1");
+    _ = try request.validateForErase();
+
+    var changed_user = request;
+    changed_user.user_id = 43;
+    try std.testing.expectError(error.ErasureRequestIntegrityMismatch, changed_user.validateForErase());
+
+    var changed_meeting = request;
+    changed_meeting.meeting_digest[0] ^= 0xff;
+    try std.testing.expectError(error.ErasureRequestIntegrityMismatch, changed_meeting.validateForErase());
+
+    var changed_request = request;
+    changed_request.request_digest[0] ^= 0xff;
+    try std.testing.expectError(error.ErasureRequestIntegrityMismatch, changed_request.validateForErase());
+}
+
+test "erasure manifest binds the database erasure timestamp" {
+    const allocator = std.testing.allocator;
+    const request = try ErasureRequest.init(42, "meeting-9", "request-1");
+    const erased_at_unix_us: i64 = 1_784_200_000_123_456;
+    const manifest = try ErasureManifest.init(request, .{}, .already_absent, erased_at_unix_us);
+    try std.testing.expectEqual(erased_at_unix_us, manifest.erased_at_unix_us);
+
+    const serialized = try manifest.serializeJson(allocator);
+    defer allocator.free(serialized);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        serialized,
+        "\"erased_at_unix_us\":1784200000123456",
+    ) != null);
+
+    try std.testing.expectError(
+        error.InvalidErasedAt,
+        ErasureManifest.init(request, .{}, .already_absent, 0),
+    );
 }
 
 fn expectContentFree(serialized: []const u8, forbidden: []const []const u8) !void {
