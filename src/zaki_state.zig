@@ -5136,10 +5136,15 @@ const ManagerImpl = struct {
                     "WITH targets AS MATERIALIZED (" ++
                         "SELECT l.memory_key AS key FROM {schema}.memory_source_links AS l " ++
                         "WHERE l.user_id = $1 AND l.source_spoke = 'minutes' " ++
-                        "AND l.meeting_scope_digest = $2) " ++
-                        "DELETE FROM {schema}.memory_edges AS e USING targets AS t " ++
-                        "WHERE e.user_id = $1 AND (e.source_key = t.key " ++
-                        "OR e.target_key = t.key OR e.episodes @> ARRAY[t.key])",
+                        "AND l.meeting_scope_digest = $2), doomed AS MATERIALIZED (" ++
+                        "SELECT e.id FROM targets AS t JOIN {schema}.memory_edges AS e " ++
+                        "ON e.user_id = $1 AND e.source_key = t.key UNION " ++
+                        "SELECT e.id FROM targets AS t JOIN {schema}.memory_edges AS e " ++
+                        "ON e.user_id = $1 AND e.target_key = t.key UNION " ++
+                        "SELECT e.id FROM targets AS t JOIN {schema}.memory_edges AS e " ++
+                        "ON e.user_id = $1 AND e.episodes @> ARRAY[t.key]) " ++
+                        "DELETE FROM {schema}.memory_edges AS e USING doomed AS d " ++
+                        "WHERE e.id = d.id",
                 );
                 defer self.allocator.free(q);
                 const result = try txn.execParams(q, &scope_params, &scope_lengths);

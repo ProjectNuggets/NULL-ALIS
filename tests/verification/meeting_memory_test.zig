@@ -838,11 +838,27 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
         "SET enable_seqscan = off; EXPLAIN (COSTS OFF) " ++
             "WITH targets AS MATERIALIZED (SELECT l.memory_key AS key " ++
             "FROM {s}.memory_source_links AS l WHERE l.user_id = {d} " ++
-            "AND l.source_spoke = 'minutes' AND l.meeting_scope_digest = '{s}') " ++
-            "DELETE FROM {s}.memory_edges AS e USING targets AS t " ++
-            "WHERE e.user_id = {d} AND (e.source_key = t.key OR " ++
-            "e.target_key = t.key OR e.episodes @> ARRAY[t.key])",
-        .{ schema, user_a, meeting_a_scope, schema, user_a },
+            "AND l.source_spoke = 'minutes' AND l.meeting_scope_digest = '{s}'), " ++
+            "doomed AS MATERIALIZED (" ++
+            "SELECT e.id FROM targets AS t JOIN {s}.memory_edges AS e " ++
+            "ON e.user_id = {d} AND e.source_key = t.key UNION " ++
+            "SELECT e.id FROM targets AS t JOIN {s}.memory_edges AS e " ++
+            "ON e.user_id = {d} AND e.target_key = t.key UNION " ++
+            "SELECT e.id FROM targets AS t JOIN {s}.memory_edges AS e " ++
+            "ON e.user_id = {d} AND e.episodes @> ARRAY[t.key]) " ++
+            "DELETE FROM {s}.memory_edges AS e USING doomed AS d WHERE e.id = d.id",
+        .{
+            schema,
+            user_a,
+            meeting_a_scope,
+            schema,
+            user_a,
+            schema,
+            user_a,
+            schema,
+            user_a,
+            schema,
+        },
     );
     const edge_plan = try queryPostgresText(allocator, test_url, edge_explain_sql);
     try std.testing.expect(std.mem.indexOf(u8, edge_plan, "idx_memory_edges_source_all") != null);
