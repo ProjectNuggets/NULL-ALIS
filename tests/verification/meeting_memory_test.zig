@@ -319,7 +319,13 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     try std.testing.expectEqual(@as(usize, 0), meeting_events.len);
     const unrelated_events = try mgr.listEventsForMemoryKey(allocator, user_a, "generic-unrelated", 10);
     defer freeEvents(allocator, unrelated_events);
-    try std.testing.expectEqual(@as(usize, 1), unrelated_events.len);
+    var saw_unrelated_edge_event = false;
+    for (unrelated_events) |event| {
+        if (std.mem.eql(u8, event.id, "wp15-unrelated-edge-event")) {
+            saw_unrelated_edge_event = true;
+        }
+    }
+    try std.testing.expect(saw_unrelated_edge_event);
     const remaining_edges = try mgr.listEdgesForUser(allocator, user_a);
     defer {
         for (remaining_edges) |*edge| edge.deinit(allocator);

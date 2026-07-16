@@ -4801,23 +4801,16 @@ const ManagerImpl = struct {
         for (count_numbers, 0..) |value, index| {
             count_values[index] = try std.fmt.bufPrintZ(&count_buffers[index], "{d}", .{value});
         }
-        var erased_at_buf: [32]u8 = undefined;
-        const erased_at_s = try std.fmt.bufPrintZ(
-            &erased_at_buf,
-            "{d}",
-            .{std.time.milliTimestamp()},
-        );
-
         {
             const q = try self.buildQuery(
                 "INSERT INTO {schema}.meeting_memory_erasure_receipts " ++
                     "(user_id, write_origin, source_spoke, meeting_scope_digest, request_digest, receipt_digest, " ++
                     "memory_source_links_deleted, memories_deleted, memory_events_deleted, " ++
                     "memory_embeddings_deleted, memory_vectors_deleted, memory_entities_deleted, " ++
-                    "memory_edges_deleted, working_memory_deleted, erased_at) " ++
+                    "memory_edges_deleted, working_memory_deleted, erased_at, created_at) " ++
                     "VALUES ($1, 'meeting_ingest', 'minutes', $2, $3, $4, " ++
                     "$5::integer, $6::integer, $7::integer, $8::integer, $9::integer, " ++
-                    "$10::integer, $11::integer, $12::integer, to_timestamp($13::numeric / 1000))",
+                    "$10::integer, $11::integer, $12::integer, statement_timestamp(), statement_timestamp())",
             );
             defer self.allocator.free(q);
             const params = [_]?[*:0]const u8{
@@ -4833,7 +4826,6 @@ const ManagerImpl = struct {
                 count_values[5].ptr,
                 count_values[6].ptr,
                 count_values[7].ptr,
-                erased_at_s.ptr,
             };
             const lengths = [_]c_int{
                 @intCast(user_s.len),
@@ -4848,7 +4840,6 @@ const ManagerImpl = struct {
                 @intCast(count_values[5].len),
                 @intCast(count_values[6].len),
                 @intCast(count_values[7].len),
-                @intCast(erased_at_s.len),
             };
             const result = try txn.execParams(q, &params, &lengths);
             c.PQclear(result);
