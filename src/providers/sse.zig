@@ -695,6 +695,7 @@ fn curl_stream_fallback(
 
     const file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
+    defer std.crypto.secureZero(u8, read_buf[0..]);
     var saw_done = false;
 
     outer: while (true) {
@@ -782,6 +783,8 @@ const OpenAiStreamCtx = struct {
     task_plan_residue_guard: usize = 0,
 
     fn deinit(self: *OpenAiStreamCtx) void {
+        std.crypto.secureZero(u8, self.xml_tail[0..]);
+        self.xml_tail_len = 0;
         self.accumulated.deinit(self.allocator);
         self.reasoning_accumulated.deinit(self.allocator);
         self.line_buf.deinit(self.allocator);
@@ -872,6 +875,7 @@ fn filterLiveXmlBlocks(
     // Save the hold-back portion as next carry.
     const carry_start = if (i > scan_end) @min(i, buf.len) else scan_end;
     const new_carry = buf[carry_start..];
+    std.crypto.secureZero(u8, ctx.xml_tail[0..]);
     if (new_carry.len > ctx.xml_tail.len) {
         // Shouldn't happen because hold_back <= 15, but be defensive.
         const start = new_carry.len - ctx.xml_tail.len;
@@ -970,6 +974,7 @@ fn flushLiveXmlTail(
             i += 1;
         }
     }
+    std.crypto.secureZero(u8, ctx.xml_tail[0..]);
     ctx.xml_tail_len = 0;
     ctx.task_plan_residue_guard = 0;
     return scratch.items;
@@ -1334,6 +1339,30 @@ test "stream filter passes prose through unchanged when no tags present" {
     try std.testing.expectEqualStrings(chunk, captured.items);
 }
 
+test "stream filter clears XML carry bytes on flush and deinit" {
+    var captured: std.ArrayListUnmanaged(u8) = .empty;
+    defer captured.deinit(std.testing.allocator);
+    var ctx = OpenAiStreamCtx{
+        .allocator = std.testing.allocator,
+        .callback = captureTextDelta,
+        .callback_ctx = @ptrCast(&captured),
+    };
+
+    var scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch.deinit(std.testing.allocator);
+    _ = try filterLiveXmlBlocks(&ctx, "private transcript tail", &scratch);
+    try std.testing.expect(ctx.xml_tail_len > 0);
+    _ = try flushLiveXmlTail(&ctx, &scratch);
+    try std.testing.expectEqual(@as(usize, 0), ctx.xml_tail_len);
+    for (ctx.xml_tail) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+
+    @memset(ctx.xml_tail[0..], 0xA5);
+    ctx.xml_tail_len = ctx.xml_tail.len;
+    ctx.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ctx.xml_tail_len);
+    for (ctx.xml_tail) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
 fn native_openai_chunk(ctx: *OpenAiStreamCtx, bytes: []const u8) anyerror!bool {
     for (bytes) |byte| {
         if (byte == '\n') {
@@ -1585,6 +1614,7 @@ fn curl_stream_anthropic_fallback(
 
     const file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
+    defer std.crypto.secureZero(u8, read_buf[0..]);
 
     outer: while (true) {
         const n = file.read(&read_buf) catch break;
