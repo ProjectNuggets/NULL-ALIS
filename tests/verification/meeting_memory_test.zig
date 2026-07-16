@@ -522,6 +522,9 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
             "('wp15-unrelated-edge-event', {d}, NULL, 'edge_added', jsonb_build_object('source_key', 'generic-unrelated', 'target_key', 'generic-identical')), " ++
             "('wp15-meeting-graph-event', {d}, NULL, 'traversal', jsonb_build_object('node_keys', jsonb_build_array('{s}', 'generic-identical'))), " ++
             "('wp15-meeting-timeline-event', {d}, NULL, 'traversal', jsonb_build_object('entry_keys', jsonb_build_array('generic-unrelated', '{s}'))), " ++
+            "('wp15-meeting-nested-value-event', {d}, NULL, 'legacy', jsonb_build_object('nested', jsonb_build_array(jsonb_build_object('value', '{s}')))), " ++
+            "('wp15-meeting-nested-property-event', {d}, NULL, 'legacy', jsonb_build_object('nested', jsonb_build_object('{s}', true))), " ++
+            "('wp15-unrelated-nested-event', {d}, NULL, 'legacy', jsonb_build_object('nested', jsonb_build_array(jsonb_build_object('value', '{s}')))), " ++
             "('wp15-unrelated-traversal-event', {d}, NULL, 'traversal', jsonb_build_object('node_keys', jsonb_build_array('generic-unrelated', 'generic-identical'))); " ++
             "INSERT INTO {s}.working_memory (user_id, session_id, slot_id, slot_type, content, source_key, importance, pinned) " ++
             "VALUES ({d}, 'legacy-session', 1, 'decision', 'legacy meeting residue', '{s}', 1.0, false)",
@@ -539,6 +542,12 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
             user_a,
             first.memoryKey(),
             user_a,
+            first.memoryKey(),
+            user_a,
+            first.memoryKey(),
+            user_a,
+            second_meeting.memoryKey(),
+            user_a,
             schema,
             user_a,
             first.memoryKey(),
@@ -550,7 +559,7 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     const erased = try mgr.eraseMeetingMemories(erase_request);
     try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.memory_source_links_deleted);
     try std.testing.expectEqual(@as(u64, 1), erased.manifest.counts.memories_deleted);
-    try std.testing.expectEqual(@as(u64, 3), erased.manifest.counts.memory_events_deleted);
+    try std.testing.expectEqual(@as(u64, 5), erased.manifest.counts.memory_events_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_embeddings_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_vectors_deleted);
     try std.testing.expectEqual(@as(u64, 0), erased.manifest.counts.memory_entities_deleted);
@@ -601,11 +610,13 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
         allocator,
         "DO $wp15$ BEGIN " ++
             "IF EXISTS (SELECT 1 FROM {s}.memory_events WHERE user_id = {d} " ++
-            "AND id IN ('wp15-meeting-graph-event', 'wp15-meeting-timeline-event')) " ++
+            "AND id IN ('wp15-meeting-graph-event', 'wp15-meeting-timeline-event', " ++
+            "'wp15-meeting-nested-value-event', 'wp15-meeting-nested-property-event')) " ++
             "THEN RAISE EXCEPTION 'meeting traversal carrier survived'; END IF; " ++
             "IF NOT EXISTS (SELECT 1 FROM {s}.memory_events WHERE user_id = {d} " ++
-            "AND id = 'wp15-unrelated-traversal-event') " ++
-            "THEN RAISE EXCEPTION 'unrelated traversal event was over-deleted'; END IF; " ++
+            "AND id IN ('wp15-unrelated-traversal-event', 'wp15-unrelated-nested-event') " ++
+            "GROUP BY user_id HAVING COUNT(*) = 2) " ++
+            "THEN RAISE EXCEPTION 'unrelated nested/traversal event was over-deleted'; END IF; " ++
             "END $wp15$",
         .{ schema, user_a, schema, user_a },
     );
@@ -677,6 +688,32 @@ test "WP-15 live: receipt replay verifies immutable compliance evidence" {
     try std.testing.expect(erased.manifest.erased_at_unix_us > 0);
     try std.testing.expect(std.mem.startsWith(u8, erased.receiptKeyId(), "sha256="));
     try std.testing.expect(std.mem.startsWith(u8, erased.receiptSignature(), "ed25519="));
+
+    // One-key rotation keeps old receipts verifiable with a public-only
+    // previous key. A second rotation that would retire a still-retained key
+    // is rejected before the runtime swaps keys.
+    const original_signer = try meeting_memory.ErasureReceiptSigner.init(
+        test_receipt_signing_seed,
+    );
+    const rotated_seed = [_]u8{0x32} ** 32;
+    const rotated_signer = try meeting_memory.ErasureReceiptSigner.init(rotated_seed);
+    try mgr.installMeetingMemoryCryptoForTests(
+        test_pseudonym_key,
+        rotated_seed,
+        original_signer.publicKeyBytes(),
+    );
+    const rotated_replay = try mgr.eraseMeetingMemories(request);
+    try std.testing.expect(rotated_replay.replayed);
+    try std.testing.expectEqualStrings(erased.receiptKeyId(), rotated_replay.receiptKeyId());
+    try std.testing.expectEqualStrings(erased.receiptSignature(), rotated_replay.receiptSignature());
+    try std.testing.expectError(
+        error.MeetingMemoryReceiptVerificationKeyMissing,
+        mgr.installMeetingMemoryCryptoForTests(
+            test_pseudonym_key,
+            [_]u8{0x33} ** 32,
+            rotated_signer.publicKeyBytes(),
+        ),
+    );
 
     const user_scope_digest = meeting_memory.formatSha256(
         try meeting_memory.userScopeDigest(&test_pseudonymizer, user_id),

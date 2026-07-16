@@ -316,6 +316,17 @@ pub const ErasureReceiptVerifierKeyring = struct {
         signature.verify(&message, public_key) catch
             return error.ReceiptSignatureVerificationFailed;
     }
+
+    /// Prevent retiring a verification key while one of its signed receipts
+    /// is still inside the configured retention window.
+    pub fn recognizesKeyId(self: *const ErasureReceiptVerifierKeyring, key_id: []const u8) bool {
+        if (!isCanonicalSha256Text(key_id)) return false;
+        if (std.mem.eql(u8, key_id, &self.current.key_id)) return true;
+        return if (self.previous) |previous|
+            std.mem.eql(u8, key_id, &previous.key_id)
+        else
+            false;
+    }
 };
 
 /// Canonical SQL/wire representation for every persisted digest in this
@@ -1441,6 +1452,8 @@ test "erasure receipt signatures verify current and previous keys only" {
     const previous_receipt = try previous.signDigest(digest);
     try keyring.verifyDigest(digest, current_receipt.keyId(), current_receipt.signatureText());
     try keyring.verifyDigest(digest, previous_receipt.keyId(), previous_receipt.signatureText());
+    try std.testing.expect(keyring.recognizesKeyId(current_receipt.keyId()));
+    try std.testing.expect(keyring.recognizesKeyId(previous_receipt.keyId()));
 
     var tampered = digest;
     tampered[0] ^= 0xff;
@@ -1458,6 +1471,7 @@ test "erasure receipt signatures verify current and previous keys only" {
         error.UnknownReceiptKeyId,
         keyring.verifyDigest(digest, &unknown_key_id, current_receipt.signatureText()),
     );
+    try std.testing.expect(!keyring.recognizesKeyId(&unknown_key_id));
     var noncanonical_signature = current_receipt.signature;
     noncanonical_signature[noncanonical_signature.len - 1] = 'A';
     try std.testing.expectError(

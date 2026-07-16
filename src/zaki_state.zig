@@ -2177,6 +2177,11 @@ const ManagerImpl = struct {
             manager.meeting_memory_crypto = null;
         };
         try manager.migrate();
+        if (manager.meeting_memory_crypto) |*crypto| {
+            try manager.validateMeetingMemoryReceiptVerifierCoverage(
+                &crypto.receipt_verifier,
+            );
+        }
         return manager;
     }
 
@@ -2202,10 +2207,28 @@ const ManagerImpl = struct {
         if (!builtin.is_test) {
             @compileError("Manager.installMeetingMemoryCryptoForTests is test-only");
         }
-        self.meeting_memory_crypto = try meetingMemoryCryptoFromSeeds(
+        var candidate = try meetingMemoryCryptoFromSeeds(
             pseudonym_key,
             receipt_signing_seed,
             previous_receipt_public_key,
+        );
+        errdefer std.crypto.secureZero(
+            u8,
+            @as([*]volatile u8, @ptrCast(&candidate))[0..@sizeOf(MeetingMemoryCrypto)],
+        );
+        try self.validateMeetingMemoryReceiptVerifierCoverage(
+            &candidate.receipt_verifier,
+        );
+        if (self.meeting_memory_crypto) |*existing| {
+            std.crypto.secureZero(
+                u8,
+                @as([*]volatile u8, @ptrCast(existing))[0..@sizeOf(MeetingMemoryCrypto)],
+            );
+        }
+        self.meeting_memory_crypto = candidate;
+        std.crypto.secureZero(
+            u8,
+            @as([*]volatile u8, @ptrCast(&candidate))[0..@sizeOf(MeetingMemoryCrypto)],
         );
     }
 
@@ -2288,6 +2311,46 @@ const ManagerImpl = struct {
         defer c.PQclear(state_result);
         if (c.PQntuples(state_result) != 0) {
             return error.MeetingMemoryCryptoUnavailable;
+        }
+    }
+
+    /// One previous public key is enough only when key retirement cannot
+    /// outrun receipt retention. Validate every retained key ID at boot (and
+    /// in the test rotation hook) so an unsafe second rotation fails before a
+    /// request discovers unverifiable compliance evidence during replay.
+    fn validateMeetingMemoryReceiptVerifierCoverage(
+        self: *Self,
+        verifier: *const meeting_memory.ErasureReceiptVerifierKeyring,
+    ) !void {
+        const relation_q = try self.buildQuery(
+            "SELECT to_regclass('{schema}.meeting_memory_erasure_receipts') IS NOT NULL",
+        );
+        defer self.allocator.free(relation_q);
+        const relation_result = try self.exec(relation_q);
+        defer c.PQclear(relation_result);
+        if (c.PQntuples(relation_result) != 1 or c.PQgetisnull(relation_result, 0, 0) != 0) {
+            return error.InvalidMeetingMemoryCryptoState;
+        }
+        if (!std.mem.eql(
+            u8,
+            std.mem.span(c.PQgetvalue(relation_result, 0, 0)),
+            "t",
+        )) return;
+
+        const keys_q = try self.buildQuery(
+            "SELECT DISTINCT receipt_key_id " ++
+                "FROM {schema}.meeting_memory_erasure_receipts",
+        );
+        defer self.allocator.free(keys_q);
+        const keys_result = try self.exec(keys_q);
+        defer c.PQclear(keys_result);
+        var row: c_int = 0;
+        while (row < c.PQntuples(keys_result)) : (row += 1) {
+            if (c.PQgetisnull(keys_result, row, 0) != 0 or
+                !verifier.recognizesKeyId(std.mem.span(c.PQgetvalue(keys_result, row, 0))))
+            {
+                return error.MeetingMemoryReceiptVerificationKeyMissing;
+            }
         }
     }
 
@@ -4956,9 +5019,11 @@ const ManagerImpl = struct {
         }
 
         // Delete content-bearing audit events, working-memory references, and
-        // graph edges only when they point at an exact target key/id. Edge
-        // audit events intentionally carry memory_id=NULL, so payload key
-        // fields are part of the exact source-scoped carrier set.
+        // graph edges only when they point at an exact target key/id. Legacy
+        // event payloads are not shape-stable: an exact key may occur as a
+        // nested string or object property name, so walk every JSONB node.
+        // This is deliberately equality-based; prefixes and other meetings'
+        // keys remain untouched.
         {
             const q = try self.buildQuery(
                 "WITH targets AS (" ++
@@ -4969,11 +5034,12 @@ const ManagerImpl = struct {
                     "AND l.meeting_scope_digest = $2) " ++
                     "DELETE FROM {schema}.memory_events AS e USING targets AS t " ++
                     "WHERE e.user_id = $1 AND (e.memory_id = t.id " ++
-                    "OR e.payload->>'key' = t.key " ++
-                    "OR e.payload->>'source_key' = t.key " ++
-                    "OR e.payload->>'target_key' = t.key " ++
-                    "OR e.payload->'node_keys' ? t.key " ++
-                    "OR e.payload->'entry_keys' ? t.key)",
+                    "OR EXISTS (SELECT 1 FROM jsonb_path_query(e.payload, '$.**') " ++
+                    "AS carrier(value) WHERE " ++
+                    "(jsonb_typeof(carrier.value) = 'string' " ++
+                    "AND carrier.value = to_jsonb(t.key)) " ++
+                    "OR (jsonb_typeof(carrier.value) = 'object' " ++
+                    "AND carrier.value ? t.key)))",
             );
             defer self.allocator.free(q);
             const result = try txn.execParams(q, &scope_params, &scope_lengths);

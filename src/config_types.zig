@@ -1538,6 +1538,8 @@ pub const MeetingMemoryCryptoConfig = struct {
     receipt_signing_seed_env: []const u8 = "NULLALIS_MINUTES_MEMORY_RECEIPT_SIGNING_SEED",
     /// Optional env-var name containing the previous Ed25519 public key during
     /// a verification-only rotation window. No previous private seed is loaded.
+    /// Runtime boot refuses to retire this key while a retained receipt still
+    /// references it, so signing-key retirement cannot outrun receipt cleanup.
     receipt_previous_public_key_env: ?[]const u8 = null,
 };
 
