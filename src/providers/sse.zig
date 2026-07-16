@@ -423,6 +423,211 @@ pub fn logStreamingTransportBanner() void {
     }
 }
 
+const CurlSseInvocationOptions = struct {
+    fail_on_http_error: bool = false,
+    timeout_secs: ?u64 = null,
+};
+
+const curl_sse_environment_allowlist = [_][]const u8{
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CURL_CA_BUNDLE",
+};
+
+fn isCurlSseEnvironmentKeyAllowed(key: []const u8) bool {
+    for (curl_sse_environment_allowlist) |allowed| {
+        if (std.mem.eql(u8, key, allowed)) return true;
+    }
+    return false;
+}
+
+fn environmentValueContainsRequestData(
+    value: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+) bool {
+    if (body.len > 0 and std.mem.indexOf(u8, value, body) != null) return true;
+
+    for (headers) |header| {
+        if (header.len > 0 and std.mem.indexOf(u8, value, header) != null) return true;
+        const colon = std.mem.indexOfScalar(u8, header, ':') orelse continue;
+        var credential = std.mem.trim(u8, header[colon + 1 ..], " \t");
+        if (std.ascii.startsWithIgnoreCase(credential, "Bearer ")) {
+            credential = std.mem.trimLeft(u8, credential["Bearer ".len..], " \t");
+        } else if (std.ascii.startsWithIgnoreCase(credential, "Basic ")) {
+            credential = std.mem.trimLeft(u8, credential["Basic ".len..], " \t");
+        }
+        if (credential.len > 0 and
+            (std.mem.eql(u8, value, credential) or std.mem.indexOf(u8, value, credential) != null))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn buildCurlSseEnvironment(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    headers: []const []const u8,
+) !std.process.EnvMap {
+    var env_map = std.process.EnvMap.init(allocator);
+    errdefer env_map.deinit();
+
+    for (curl_sse_environment_allowlist) |key| {
+        const value = std.process.getEnvVarOwned(allocator, key) catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => continue,
+            else => return err,
+        };
+        defer allocator.free(value);
+        if (environmentValueContainsRequestData(value, body, headers)) continue;
+        try env_map.put(key, value);
+    }
+    return env_map;
+}
+
+/// A curl SSE request split across the process metadata boundary:
+///
+/// - `argv` contains only fixed transport flags and a non-sensitive timeout.
+/// - `stdin_config` contains the URL, headers, and serialized request body.
+///
+/// curl reads the latter through its anonymous stdin pipe via `--config -`.
+/// This keeps bearer tokens and user/meeting content out of process listings,
+/// crash reports that capture argv/env, and temporary files. The config buffer
+/// is wiped before it is released.
+const CurlSseInvocation = struct {
+    allocator: std.mem.Allocator,
+    argv: [][]const u8,
+    stdin_config: []u8,
+    timeout_arg: ?[]u8,
+    env_map: std.process.EnvMap,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        url: []const u8,
+        body: []const u8,
+        headers: []const []const u8,
+        options: CurlSseInvocationOptions,
+    ) !CurlSseInvocation {
+        var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer argv.deinit(allocator);
+
+        // `-q` must be curl's first option. It disables ~/.curlrc so an
+        // operator-local trace/output directive cannot persist request PII.
+        try argv.appendSlice(allocator, &.{ "curl", "-q", "-s", "--no-buffer" });
+        // Suppress non-2xx response bodies instead of preserving them. An
+        // upstream error can echo request content, and the streaming parser
+        // must never receive that body as if it were provider output.
+        if (options.fail_on_http_error) try argv.append(allocator, "--fail");
+
+        var timeout_arg: ?[]u8 = null;
+        errdefer if (timeout_arg) |value| allocator.free(value);
+        if (options.timeout_secs) |timeout_secs| {
+            const value = try std.fmt.allocPrint(allocator, "{d}", .{timeout_secs});
+            timeout_arg = value;
+            try argv.appendSlice(allocator, &.{ "--max-time", value });
+        }
+
+        try argv.appendSlice(allocator, &.{ "-X", "POST", "--config", "-" });
+        const owned_argv = try argv.toOwnedSlice(allocator);
+        errdefer allocator.free(owned_argv);
+
+        const stdin_config = try buildCurlSseStdinConfig(allocator, url, body, headers);
+        errdefer {
+            std.crypto.secureZero(u8, stdin_config);
+            allocator.free(stdin_config);
+        }
+        const env_map = try buildCurlSseEnvironment(allocator, body, headers);
+        return .{
+            .allocator = allocator,
+            .argv = owned_argv,
+            .stdin_config = stdin_config,
+            .timeout_arg = timeout_arg,
+            .env_map = env_map,
+        };
+    }
+
+    fn deinit(self: *CurlSseInvocation) void {
+        std.crypto.secureZero(u8, self.stdin_config);
+        self.allocator.free(self.stdin_config);
+        if (self.timeout_arg) |value| self.allocator.free(value);
+        self.allocator.free(self.argv);
+        self.env_map.deinit();
+        self.* = undefined;
+    }
+};
+
+fn appendCurlConfigValue(
+    allocator: std.mem.Allocator,
+    config: *std.ArrayListUnmanaged(u8),
+    option: []const u8,
+    value: []const u8,
+) !void {
+    // curl's config parser accepts these C-style escapes inside double
+    // quotes. Escaping both line delimiters and backslashes prevents a
+    // header/body value from becoming a second config directive.
+    try config.appendSlice(allocator, option);
+    try config.appendSlice(allocator, " = \"");
+    for (value) |byte| {
+        switch (byte) {
+            0 => return error.InvalidCurlConfigValue,
+            '\\' => try config.appendSlice(allocator, "\\\\"),
+            '"' => try config.appendSlice(allocator, "\\\""),
+            '\n' => try config.appendSlice(allocator, "\\n"),
+            '\r' => try config.appendSlice(allocator, "\\r"),
+            '\t' => try config.appendSlice(allocator, "\\t"),
+            0x0b => try config.appendSlice(allocator, "\\v"),
+            else => try config.append(allocator, byte),
+        }
+    }
+    try config.appendSlice(allocator, "\"\n");
+}
+
+fn buildCurlSseStdinConfig(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+) ![]u8 {
+    var config: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer {
+        std.crypto.secureZero(u8, config.items);
+        config.deinit(allocator);
+    }
+
+    try appendCurlConfigValue(allocator, &config, "url", url);
+    try appendCurlConfigValue(allocator, &config, "header", "Content-Type: application/json");
+    for (headers) |header| {
+        try appendCurlConfigValue(allocator, &config, "header", header);
+    }
+    // The provider callers always supply serialized JSON. Using a literal
+    // data-binary config value preserves its bytes without a request file.
+    try appendCurlConfigValue(allocator, &config, "data-binary", body);
+    return try config.toOwnedSlice(allocator);
+}
+
+fn sendCurlStdinConfig(child: *std.process.Child, config: []const u8) !void {
+    const stdin_file = child.stdin orelse return error.CurlWriteError;
+    stdin_file.writeAll(config) catch {
+        stdin_file.close();
+        child.stdin = null;
+        return error.CurlWriteError;
+    };
+    stdin_file.close();
+    child.stdin = null;
+}
+
 fn curl_stream_fallback(
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -433,19 +638,6 @@ fn curl_stream_fallback(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
-    // Build argv on stack (max 32 args)
-    var argv_buf: [32][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "--no-buffer";
-    argc += 1;
-    argv_buf[argc] = "--fail-with-body";
-    argc += 1;
-
     // R15 fix (2026-04-27): always pass --max-time. Pre-fix curl ran
     // with no limit on timeout_secs=0 → infinite hang on Together hiccup.
     //
@@ -461,48 +653,38 @@ fn curl_stream_fallback(
     // "the agent took too long" cap. If you ever hit 1 hour, something
     // is genuinely wrong upstream — NOT the agent thinking.
     const effective_timeout: u64 = if (timeout_secs > 0) timeout_secs else DEFAULT_STREAM_TIMEOUT_SECS;
-    var timeout_buf: [32]u8 = undefined;
-    const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{effective_timeout}) catch unreachable;
-    argv_buf[argc] = "--max-time";
-    argc += 1;
-    argv_buf[argc] = timeout_str;
-    argc += 1;
 
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
+    var request_headers: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer request_headers.deinit(allocator);
+    if (auth_header) |auth| try request_headers.append(allocator, auth);
+    try request_headers.appendSlice(allocator, extra_headers);
 
-    if (auth_header) |auth| {
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = auth;
-        argc += 1;
-    }
+    var invocation = try CurlSseInvocation.init(
+        allocator,
+        url,
+        body,
+        request_headers.items,
+        .{ .fail_on_http_error = true, .timeout_secs = effective_timeout },
+    );
+    defer invocation.deinit();
 
-    for (extra_headers) |hdr| {
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
-
-    argv_buf[argc] = "-d";
-    argc += 1;
-    argv_buf[argc] = body;
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std.process.Child.init(invocation.argv, allocator);
+    child.env_map = &invocation.env_map;
+    child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
     try child.spawn();
+    var child_reaped = false;
+    defer if (!child_reaped) {
+        if (child.stdin) |stdin_file| {
+            stdin_file.close();
+            child.stdin = null;
+        }
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    };
+    try sendCurlStdinConfig(&child, invocation.stdin_config);
 
     var stream_ctx = OpenAiStreamCtx{
         .allocator = allocator,
@@ -549,6 +731,7 @@ fn curl_stream_fallback(
     }
 
     const term = child.wait() catch return error.CurlWaitError;
+    child_reaped = true;
     switch (term) {
         .Exited => |code| if (code != 0) return error.CurlFailed,
         else => return error.CurlFailed,
@@ -1362,44 +1545,32 @@ fn curl_stream_anthropic_fallback(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
-    // Build argv on stack (max 32 args)
-    var argv_buf: [32][]const u8 = undefined;
-    var argc: usize = 0;
+    var invocation = try CurlSseInvocation.init(
+        allocator,
+        url,
+        body,
+        headers,
+        .{ .fail_on_http_error = true },
+    );
+    defer invocation.deinit();
 
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "--no-buffer";
-    argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
-
-    for (headers) |hdr| {
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
-
-    argv_buf[argc] = "-d";
-    argc += 1;
-    argv_buf[argc] = body;
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
-
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std.process.Child.init(invocation.argv, allocator);
+    child.env_map = &invocation.env_map;
+    child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
     try child.spawn();
+    var child_reaped = false;
+    defer if (!child_reaped) {
+        if (child.stdin) |stdin_file| {
+            stdin_file.close();
+            child.stdin = null;
+        }
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    };
+    try sendCurlStdinConfig(&child, invocation.stdin_config);
 
     // Read stdout line by line, parse Anthropic SSE events
     var accumulated: std.ArrayListUnmanaged(u8) = .empty;
@@ -1409,6 +1580,7 @@ fn curl_stream_anthropic_fallback(
     defer line_buf.deinit(allocator);
 
     var current_event: []const u8 = "";
+    defer if (current_event.len > 0) allocator.free(@constCast(current_event));
     var output_tokens: u32 = 0;
 
     const file = child.stdout.?;
@@ -1449,9 +1621,6 @@ fn curl_stream_anthropic_fallback(
         }
     }
 
-    // Free owned event string
-    if (current_event.len > 0) allocator.free(@constCast(current_event));
-
     // Send final chunk
     callback(ctx, root.StreamChunk.finalChunk());
 
@@ -1462,6 +1631,7 @@ fn curl_stream_anthropic_fallback(
     }
 
     const term = child.wait() catch return error.CurlWaitError;
+    child_reaped = true;
     switch (term) {
         .Exited => |code| if (code != 0) return error.CurlFailed,
         else => return error.CurlFailed,
@@ -1913,6 +2083,54 @@ test "StreamChunk finalChunk" {
     try std.testing.expect(chunk.is_final);
     try std.testing.expectEqualStrings("", chunk.delta);
     try std.testing.expect(chunk.token_count == 0);
+}
+
+test "curl SSE invocation keeps request secrets and body off argv" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"messages":[{"content":"MINUTES_TRANSCRIPT_SENTINEL"}]}
+    ;
+    const headers = [_][]const u8{
+        "Authorization: Bearer MINUTES_AUTH_SENTINEL",
+        "X-Api-Key: MINUTES_HEADER_SENTINEL",
+    };
+
+    var invocation = try CurlSseInvocation.init(
+        allocator,
+        "https://provider.invalid/v1/chat/completions",
+        body,
+        &headers,
+        .{ .fail_on_http_error = true, .timeout_secs = 3600 },
+    );
+    defer invocation.deinit();
+
+    var saw_fail = false;
+    var saw_fail_with_body = false;
+    for (invocation.argv) |arg| {
+        saw_fail = saw_fail or std.mem.eql(u8, arg, "--fail");
+        saw_fail_with_body = saw_fail_with_body or std.mem.eql(u8, arg, "--fail-with-body");
+        try std.testing.expect(std.mem.indexOf(u8, arg, "MINUTES_AUTH_SENTINEL") == null);
+        try std.testing.expect(std.mem.indexOf(u8, arg, "MINUTES_HEADER_SENTINEL") == null);
+        try std.testing.expect(std.mem.indexOf(u8, arg, "MINUTES_TRANSCRIPT_SENTINEL") == null);
+    }
+    try std.testing.expect(saw_fail);
+    try std.testing.expect(!saw_fail_with_body);
+
+    var env_it = invocation.env_map.hash_map.iterator();
+    while (env_it.next()) |entry| {
+        try std.testing.expect(isCurlSseEnvironmentKeyAllowed(entry.key_ptr.*));
+        try std.testing.expect(std.mem.indexOf(u8, entry.value_ptr.*, "MINUTES_AUTH_SENTINEL") == null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.value_ptr.*, "MINUTES_HEADER_SENTINEL") == null);
+        try std.testing.expect(std.mem.indexOf(u8, entry.value_ptr.*, "MINUTES_TRANSCRIPT_SENTINEL") == null);
+    }
+    try std.testing.expect(environmentValueContainsRequestData("MINUTES_AUTH_SENTINEL", body, &headers));
+    try std.testing.expect(environmentValueContainsRequestData("MINUTES_HEADER_SENTINEL", body, &headers));
+    try std.testing.expect(environmentValueContainsRequestData(body, body, &headers));
+
+    // The sensitive material travels only in the anonymous stdin pipe.
+    try std.testing.expect(std.mem.indexOf(u8, invocation.stdin_config, "MINUTES_AUTH_SENTINEL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invocation.stdin_config, "MINUTES_HEADER_SENTINEL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invocation.stdin_config, "MINUTES_TRANSCRIPT_SENTINEL") != null);
 }
 
 // ── Anthropic SSE Tests ─────────────────────────────────────────
