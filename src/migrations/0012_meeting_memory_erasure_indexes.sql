@@ -7,7 +7,7 @@
 --
 -- PostgreSQL can leave an INVALID same-name index behind when a concurrent
 -- build is interrupted. Version 12 is recorded only after every statement
--- succeeds, so an unapplied retry must remove that residue before rebuilding;
+-- succeeds, so an unapplied retry must remove that residue before rebuilding.
 -- IF NOT EXISTS would otherwise accept the unusable index and mark the
 -- migration complete.
 
