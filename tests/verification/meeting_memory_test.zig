@@ -832,6 +832,7 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     );
     const event_plan = try queryPostgresText(allocator, test_url, event_explain_sql);
     try std.testing.expect(std.mem.indexOf(u8, event_plan, "idx_memory_events_user_memory_all") != null);
+    try std.testing.expect(std.mem.indexOf(u8, event_plan, "Seq Scan on memory_events") == null);
 
     const edge_explain_sql = try std.fmt.allocPrint(
         allocator,
@@ -863,7 +864,16 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     const edge_plan = try queryPostgresText(allocator, test_url, edge_explain_sql);
     try std.testing.expect(std.mem.indexOf(u8, edge_plan, "idx_memory_edges_source_all") != null);
     try std.testing.expect(std.mem.indexOf(u8, edge_plan, "idx_memory_edges_target_all") != null);
-    try std.testing.expect(std.mem.indexOf(u8, edge_plan, "idx_memory_edges_episodes_all") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edge_plan, "Seq Scan on memory_edges") == null);
+
+    const episode_explain_sql = try std.fmt.allocPrint(
+        allocator,
+        "SET enable_seqscan = off; EXPLAIN (COSTS OFF) " ++
+            "SELECT id FROM {s}.memory_edges WHERE episodes @> ARRAY['{s}']",
+        .{ schema, first.memoryKey() },
+    );
+    const episode_plan = try queryPostgresText(allocator, test_url, episode_explain_sql);
+    try std.testing.expect(std.mem.indexOf(u8, episode_plan, "idx_memory_edges_episodes_all") != null);
 
     // A nonexistent meeting must not issue carrier DELETE statements at all.
     // Statement triggers turn an accidental empty-target scan into a loud test
