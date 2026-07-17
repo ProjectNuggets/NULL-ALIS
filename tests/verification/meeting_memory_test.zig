@@ -31,6 +31,27 @@ fn installMeetingMemoryCrypto(mgr: anytype) !void {
     );
 }
 
+fn installMeetingMemorySchemaForTest(
+    allocator: std.mem.Allocator,
+    test_url: []const u8,
+    schema: []const u8,
+) !void {
+    const migration_sql = try harness.loadProjectFile("src/migrations/0011_meeting_memory_provenance.sql");
+    const rendered = try std.mem.replaceOwned(u8, allocator, migration_sql, "{schema}", schema);
+    defer allocator.free(rendered);
+    try execPostgresSql(allocator, test_url, rendered, true);
+
+    const index_migration_sql = try harness.loadProjectFile("src/migrations/0012_meeting_memory_erasure_indexes.sql");
+    const rendered_indexes = try std.mem.replaceOwned(u8, allocator, index_migration_sql, "{schema}", schema);
+    defer allocator.free(rendered_indexes);
+    var statements = std.mem.splitScalar(u8, rendered_indexes, ';');
+    while (statements.next()) |raw_statement| {
+        const statement = std.mem.trim(u8, raw_statement, " \t\r\n");
+        if (statement.len == 0) continue;
+        try execPostgresSql(allocator, test_url, statement, true);
+    }
+}
+
 fn execPostgresSql(
     allocator: std.mem.Allocator,
     test_url: []const u8,
@@ -327,6 +348,7 @@ test "WP-15 live: default-off boot becomes fail-closed after crypto binding" {
         var mgr = try nullalis.zaki_state.Manager.init(allocator, cfg);
         defer mgr.deinit();
         mgr.skipExternalIdentityForTests();
+        try installMeetingMemorySchemaForTest(allocator, test_url, schema);
         try installMeetingMemoryCrypto(&mgr);
         const user_id = harness.testUid();
         try mgr.provisionUser(user_id, "/tmp/nullalis-minutes-crypto-boot");
@@ -380,6 +402,7 @@ test "WP-15 live: two-phase receipt rotation is bidirectionally compatible" {
     defer k2_pod.deinit();
     k1_pod.skipExternalIdentityForTests();
     k2_pod.skipExternalIdentityForTests();
+    try installMeetingMemorySchemaForTest(allocator, test_url, schema);
     const k1_seed = [_]u8{0x41} ** 32;
     const k2_seed = [_]u8{0x42} ** 32;
     const k1_signer = try meeting_memory.ErasureReceiptSigner.init(k1_seed);
@@ -433,6 +456,124 @@ test "WP-15 live: two-phase receipt rotation is bidirectionally compatible" {
     try std.testing.expectEqualStrings(k2_receipt.receiptSignature(), k2_seen_by_k1.receiptSignature());
 }
 
+test "WP-15 live: unknown meeting erasure leaves no durable state" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const test_url = try harness.requirePostgresUrl(allocator);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try harness.schemaName(&schema_buf, "meeting_unknown_erasure");
+    var mgr = try harness.newManager(allocator, test_url, schema);
+    defer harness.dropAndDeinit(&mgr, "meeting_unknown_erasure");
+    mgr.skipExternalIdentityForTests();
+    try installMeetingMemorySchemaForTest(allocator, test_url, schema);
+    try installMeetingMemoryCrypto(&mgr);
+
+    const user_id = harness.testUid();
+    try mgr.provisionUser(user_id, "/tmp/nullalis-minutes-unknown-erasure");
+
+    var meeting_buf: [64]u8 = undefined;
+    var request_buf: [64]u8 = undefined;
+    for (0..32) |index| {
+        const meeting_id = try std.fmt.bufPrint(&meeting_buf, "invented-meeting-{d}", .{index});
+        const request_id = try std.fmt.bufPrint(&request_buf, "request-invented-{d}", .{index});
+        const request = try meeting_memory.ErasureRequest.init(
+            &test_pseudonymizer,
+            user_id,
+            meeting_id,
+            request_id,
+        );
+        try std.testing.expectError(
+            error.MeetingMemoryScopeNotFound,
+            mgr.eraseMeetingMemories(request),
+        );
+    }
+
+    const no_durable_state_sql = try std.fmt.allocPrint(
+        allocator,
+        "DO $wp15$ BEGIN " ++
+            "IF EXISTS (SELECT 1 FROM {s}.meeting_memory_erasure_tombstones) " ++
+            "OR EXISTS (SELECT 1 FROM {s}.meeting_memory_erasure_receipts) " ++
+            "OR EXISTS (SELECT 1 FROM {s}.meeting_memory_crypto_state) " ++
+            "THEN RAISE EXCEPTION 'unknown meeting minted durable erasure state'; END IF; " ++
+            "END $wp15$",
+        .{ schema, schema, schema },
+    );
+    try execPostgresSql(allocator, test_url, no_durable_state_sql, true);
+
+    const later_real = try mgr.storeMeetingMemory(try prepared(
+        try source(user_id, "transcript-later-real", "invented-meeting-0"),
+        .decision,
+        "The verified meeting remains eligible for governed ingestion",
+        "grant-later-real",
+    ));
+    try std.testing.expect(later_real.inserted);
+}
+
+test "WP-15 pre-ingest erasure has no production raw-request bypass" {
+    const state_source = try harness.loadProjectFile("src/zaki_state.zig");
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        state_source,
+        "pub fn eraseMeetingMemoriesAfterMinutesOwnerLookup(",
+    ) == null);
+}
+
+test "WP-15 live: Minutes owner lookup may tombstone before Brain ingest" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const test_url = try harness.requirePostgresUrl(allocator);
+
+    var schema_buf: [96]u8 = undefined;
+    const schema = try harness.schemaName(&schema_buf, "meeting_trusted_erasure");
+    var mgr = try harness.newManager(allocator, test_url, schema);
+    defer harness.dropAndDeinit(&mgr, "meeting_trusted_erasure");
+    mgr.skipExternalIdentityForTests();
+    try installMeetingMemorySchemaForTest(allocator, test_url, schema);
+    try installMeetingMemoryCrypto(&mgr);
+
+    const user_id = harness.testUid();
+    try mgr.provisionUser(user_id, "/tmp/nullalis-minutes-trusted-erasure");
+    const request = try meeting_memory.ErasureRequest.init(
+        &test_pseudonymizer,
+        user_id,
+        "owned-meeting-before-ingest",
+        "request-owned-before-ingest",
+    );
+
+    const erased = try mgr.eraseMeetingMemoriesAfterMinutesOwnerLookupForTests(request);
+    try std.testing.expectEqual(meeting_memory.ErasureDisposition.already_absent, erased.manifest.disposition);
+    try std.testing.expect(!erased.replayed);
+
+    const one_durable_scope_sql = try std.fmt.allocPrint(
+        allocator,
+        "DO $wp15$ BEGIN " ++
+            "IF (SELECT count(*) FROM {s}.meeting_memory_erasure_tombstones) <> 1 " ++
+            "OR (SELECT count(*) FROM {s}.meeting_memory_erasure_receipts) <> 1 " ++
+            "THEN RAISE EXCEPTION 'trusted meeting erasure state missing'; END IF; " ++
+            "END $wp15$",
+        .{ schema, schema },
+    );
+    try execPostgresSql(allocator, test_url, one_durable_scope_sql, true);
+
+    const replay = try mgr.eraseMeetingMemoriesAfterMinutesOwnerLookupForTests(request);
+    try std.testing.expect(replay.replayed);
+    try std.testing.expectEqualStrings(erased.receiptSignature(), replay.receiptSignature());
+
+    try std.testing.expectError(
+        error.MeetingMemoryErased,
+        mgr.storeMeetingMemory(try prepared(
+            try source(user_id, "transcript-delayed", "owned-meeting-before-ingest"),
+            .decision,
+            "A delayed write cannot resurrect the verified erased meeting",
+            "grant-delayed",
+        )),
+    );
+}
+
 test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte-identical rows" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -444,6 +585,7 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     var mgr = try harness.newManager(allocator, test_url, schema);
     defer harness.dropAndDeinit(&mgr, "meeting_memory");
     mgr.skipExternalIdentityForTests();
+    try installMeetingMemorySchemaForTest(allocator, test_url, schema);
     try installMeetingMemoryCrypto(&mgr);
 
     const user_a = harness.testUid();
@@ -906,7 +1048,7 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     const episode_plan = try queryPostgresText(allocator, test_url, episode_explain_sql);
     try std.testing.expect(std.mem.indexOf(u8, episode_plan, "idx_memory_edges_episodes_all") != null);
 
-    // A nonexistent meeting must not issue carrier DELETE statements at all.
+    // A Minutes-owned meeting verified before Brain ingest has no carriers.
     // Statement triggers turn an accidental empty-target scan into a loud test
     // failure, independent of planner cost estimates or fixture cardinality.
     const empty_scope_guard_sql = try std.fmt.allocPrint(
@@ -923,10 +1065,10 @@ test "WP-15 live: source-scoped store and meeting erase isolate tenants and byte
     const empty_request = try meeting_memory.ErasureRequest.init(
         &test_pseudonymizer,
         user_a,
-        "meeting-never-created",
+        "meeting-owned-before-brain",
         "request-empty-scope",
     );
-    const empty_erased = try mgr.eraseMeetingMemories(empty_request);
+    const empty_erased = try mgr.eraseMeetingMemoriesAfterMinutesOwnerLookupForTests(empty_request);
     try std.testing.expectEqual(meeting_memory.ErasureDisposition.already_absent, empty_erased.manifest.disposition);
     try std.testing.expectEqual(@as(u64, 0), empty_erased.manifest.counts.memory_events_deleted);
     try std.testing.expectEqual(@as(u64, 0), empty_erased.manifest.counts.memory_edges_deleted);
@@ -1064,6 +1206,7 @@ test "WP-15 live: receipt replay verifies immutable compliance evidence" {
     var mgr = try harness.newManager(allocator, test_url, schema);
     defer harness.dropAndDeinit(&mgr, "meeting_receipt_integrity");
     mgr.skipExternalIdentityForTests();
+    try installMeetingMemorySchemaForTest(allocator, test_url, schema);
     try installMeetingMemoryCrypto(&mgr);
 
     const user_id = harness.testUid();

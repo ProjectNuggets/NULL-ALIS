@@ -90,6 +90,11 @@ const MeetingMemoryCrypto = struct {
     receipt_verifier: meeting_memory.ErasureReceiptVerifierKeyring,
 };
 
+const MeetingMemoryErasureAuthority = enum {
+    existing_provenance,
+    minutes_owner_lookup,
+};
+
 /// Reserved Minutes keys are governed by source-scoped consent and exact
 /// erasure. Generic Manager callers (including authenticated governance
 /// routes that bypass agent-tool predicates) must never mutate this namespace.
@@ -1024,6 +1029,12 @@ pub const Manager = if (build_options.enable_postgres) ManagerImpl else struct {
         return error.PostgresNotEnabled;
     }
     pub fn eraseMeetingMemories(_: *@This(), _: meeting_memory.ErasureRequest) !MeetingMemoryErasureResult {
+        return error.PostgresNotEnabled;
+    }
+    pub fn eraseMeetingMemoriesAfterMinutesOwnerLookupForTests(_: *@This(), _: meeting_memory.ErasureRequest) !MeetingMemoryErasureResult {
+        if (!builtin.is_test) {
+            @compileError("Manager.eraseMeetingMemoriesAfterMinutesOwnerLookupForTests is test-only; production callers must perform authenticated Minutes ownership resolution at the integration boundary");
+        }
         return error.PostgresNotEnabled;
     }
     pub fn getMemory(_: *@This(), _: std.mem.Allocator, _: i64, _: []const u8) !?memory_root.MemoryEntry {
@@ -4853,6 +4864,34 @@ const ManagerImpl = struct {
         self: *Self,
         untrusted_request: meeting_memory.ErasureRequest,
     ) !MeetingMemoryErasureResult {
+        return self.eraseMeetingMemoriesWithAuthority(
+            untrusted_request,
+            .existing_provenance,
+        );
+    }
+
+    /// Test-only seam for the delete-before-ingest invariant. Production code
+    /// must not expose a raw-request bypass: the eventual integration adapter
+    /// must perform an authenticated Minutes ownership lookup itself before it
+    /// invokes the private authority-bearing sink below.
+    pub fn eraseMeetingMemoriesAfterMinutesOwnerLookupForTests(
+        self: *Self,
+        untrusted_request: meeting_memory.ErasureRequest,
+    ) !MeetingMemoryErasureResult {
+        if (!builtin.is_test) {
+            @compileError("Manager.eraseMeetingMemoriesAfterMinutesOwnerLookupForTests is test-only; production callers must perform authenticated Minutes ownership resolution at the integration boundary");
+        }
+        return self.eraseMeetingMemoriesWithAuthority(
+            untrusted_request,
+            .minutes_owner_lookup,
+        );
+    }
+
+    fn eraseMeetingMemoriesWithAuthority(
+        self: *Self,
+        untrusted_request: meeting_memory.ErasureRequest,
+        authority: MeetingMemoryErasureAuthority,
+    ) !MeetingMemoryErasureResult {
         // ErasureRequest is content-free but still caller-owned. Revalidate
         // its authority seal before deriving locks, row scopes, tombstones, or
         // receipts so a mutated value cannot cross tenant/scope boundaries.
@@ -5065,11 +5104,17 @@ const ManagerImpl = struct {
             counts.memory_source_links_deleted = try parsePgU64(result, 0, 0);
         }
 
-        // A never-stored scope has no source-derived carrier by construction.
-        // Skip every tenant-wide carrier statement rather than asking
-        // PostgreSQL to prove the empty target set repeatedly; this keeps
-        // authenticated nonexistent-scope erasure O(1) and still emits the
-        // durable tombstone plus signed zero-count receipt below.
+        // A caller-owned meeting identifier is not proof that Minutes issued
+        // or owns that meeting. Refuse unknown scopes before creating durable
+        // tombstones or receipts so fabricated IDs cannot grow immutable state.
+        if (counts.memory_source_links_deleted == 0 and authority != .minutes_owner_lookup) {
+            return error.MeetingMemoryScopeNotFound;
+        }
+
+        // A source-derived scope has carriers by construction. Keep the guard
+        // explicit so the trusted Minutes owner-lookup path added below can
+        // continue to skip tenant-wide carrier statements for a legitimate
+        // meeting that has not reached Brain yet.
         if (counts.memory_source_links_deleted != 0) {
             // V1 deliberately creates no entity carrier. Refuse complete-success
             // if one appears instead of deleting a potentially shared entity and
