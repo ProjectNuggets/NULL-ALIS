@@ -27,7 +27,12 @@ Every entry in `MIGRATIONS` must declare one `CompatibilityPhase`; there is no d
   requirements, and old constraint removal are contract operations.
 
 The verification suite strips SQL comments and rejects destructive tokens in migrations declared
-`expand`. This is a fail-closed tripwire, not a proof of semantic compatibility. Every migration PR
+`expand`, including `TRUNCATE`, `DROP INDEX`, `CREATE OR REPLACE TRIGGER`, inline `ADD COLUMN ...
+NOT NULL`, and `DELETE FROM`. This is a fail-closed tripwire, not a proof of semantic compatibility.
+`DELETE FROM` is forbidden by default even for data-only work. The only current exception is migration
+0010's audited scaffold purge, which declares `allow_expand_data_delete = true`; that one-bit flag
+permits static deletes only and does not relax any schema-destructive rule. A future exception requires
+an explicit old-binary compatibility rationale and audit review in the migration PR. Every migration PR
 also documents:
 
 1. previous-binary behavior on the expanded schema;

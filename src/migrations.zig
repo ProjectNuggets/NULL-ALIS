@@ -59,6 +59,11 @@ pub const Migration = struct {
     ///     all statements succeed
     /// Use sparingly — most migrations should be transactional.
     concurrent_only: bool = false,
+
+    /// A reviewed data-only expand migration may opt into static DELETE
+    /// statements. This does not relax any schema-destructive rule. At
+    /// present only migration 0010 uses the exception.
+    allow_expand_data_delete: bool = false,
 };
 
 /// Reject SQL shapes that cannot safely remain in place while the previous
@@ -66,6 +71,17 @@ pub const Migration = struct {
 /// conservative; semantic compatibility still requires review and a live
 /// old-binary-on-expanded-schema rehearsal.
 pub fn validateExpandSql(sql: []const u8) !void {
+    return validateExpandSqlWithPolicy(sql, false);
+}
+
+/// Validate an expand migration with its explicit, narrowly-scoped policy.
+/// The runner and production registry use this entry point; standalone SQL
+/// validation remains strict through `validateExpandSql`.
+pub fn validateExpandMigration(migration: Migration) !void {
+    return validateExpandSqlWithPolicy(migration.sql, migration.allow_expand_data_delete);
+}
+
+fn validateExpandSqlWithPolicy(sql: []const u8, allow_expand_data_delete: bool) !void {
     const allocator = std.heap.page_allocator;
     var normalized: std.ArrayListUnmanaged(u8) = .empty;
     defer normalized.deinit(allocator);
@@ -132,6 +148,7 @@ pub fn validateExpandSql(sql: []const u8) !void {
         " drop function ",
         " drop procedure ",
         " drop trigger ",
+        " drop index ",
         " drop policy ",
         " drop default ",
         " drop identity ",
@@ -152,16 +169,34 @@ pub fn validateExpandSql(sql: []const u8) !void {
         " create or replace view ",
         " create or replace function ",
         " create or replace procedure ",
-        " execute ",
+        " create or replace trigger ",
     };
     for (forbidden) |needle| {
         if (std.mem.indexOf(u8, normalized.items, needle) != null) return error.DestructiveExpandMigration;
     }
-
+    if (!allow_expand_data_delete and std.mem.indexOf(u8, normalized.items, " delete from ") != null) {
+        return error.DestructiveExpandMigration;
+    }
     // ALTER COLUMN ... TYPE may contain an arbitrary type expression between
     // the two tokens, so it cannot be represented by one fixed phrase.
     var statements = std.mem.tokenizeScalar(u8, normalized.items, ';');
     while (statements.next()) |statement| {
+        const trimmed_statement = std.mem.trim(u8, statement, " ");
+        if (containsTruncateToken(statement) and !isCreateTriggerExecuteFunction(trimmed_statement)) {
+            return error.DestructiveExpandMigration;
+        }
+        // `EXECUTE FUNCTION` is part of a normal CREATE TRIGGER clause; every
+        // other EXECUTE form remains dynamic SQL and is forbidden in expand.
+        if (std.mem.indexOf(u8, statement, " execute ") != null and
+            !isCreateTriggerExecuteFunction(trimmed_statement))
+        {
+            return error.DestructiveExpandMigration;
+        }
+        if (std.mem.indexOf(u8, statement, " add column ") != null and
+            hasNotNullConstraint(statement))
+        {
+            return error.DestructiveExpandMigration;
+        }
         if (std.mem.indexOf(u8, statement, " alter column ") != null and
             std.mem.indexOf(u8, statement, " type ") != null)
         {
@@ -174,6 +209,31 @@ fn appendNormalizedSpace(buffer: *std.ArrayListUnmanaged(u8), allocator: std.mem
     if (buffer.items.len == 0 or buffer.items[buffer.items.len - 1] != ' ') {
         try buffer.append(allocator, ' ');
     }
+}
+
+fn isCreateTriggerExecuteFunction(statement: []const u8) bool {
+    return std.mem.startsWith(u8, statement, "create trigger ") and
+        std.mem.indexOf(u8, statement, " execute function ") != null;
+}
+
+fn hasNotNullConstraint(statement: []const u8) bool {
+    const needle = " not null";
+    var index: usize = 0;
+    while (index + needle.len <= statement.len) : (index += 1) {
+        if (!std.mem.startsWith(u8, statement[index..], needle)) continue;
+        const after = index + needle.len;
+        if (after == statement.len) return true;
+        switch (statement[after]) {
+            ' ', ',', ')' => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn containsTruncateToken(sql: []const u8) bool {
+    const needle = " truncate ";
+    return std.mem.indexOf(u8, sql, needle) != null;
 }
 
 /// SQL for the `schema_migrations` tracker table itself. Idempotent —
@@ -313,6 +373,7 @@ pub const MIGRATIONS = [_]Migration{
         // binary tolerates the pruned rows, so this is expand-safe under the
         // rollback contract. W.4 classification per the Minutes launch handoff.
         .phase = .expand,
+        .allow_expand_data_delete = true,
     },
 };
 
@@ -380,7 +441,7 @@ pub fn runWith(rc: RunnerContext, migrations: []const Migration) !void {
     for (migrations) |m| {
         switch (m.phase) {
             .baseline => if (m.version != 1) return error.InvalidBaselineMigration,
-            .expand => try validateExpandSql(m.sql),
+            .expand => try validateExpandMigration(m),
             .contract => {
                 if (!try rc.isApplied(rc.ctx, m.version)) {
                     return error.ContractMigrationRequiresOperatorApproval;
@@ -703,6 +764,75 @@ test "validateExpandSql scopes ALTER COLUMN TYPE detection to one statement" {
     );
 }
 
+test "validateExpandSql rejects bare TRUNCATE without rejecting a trigger event" {
+    try std.testing.expectError(
+        error.DestructiveExpandMigration,
+        validateExpandSql("TRUNCATE {schema}.fixture"),
+    );
+    try std.testing.expectError(
+        error.DestructiveExpandMigration,
+        validateExpandSql("DO $$ BEGIN TRUNCATE {schema}.fixture; END $$"),
+    );
+    try validateExpandSql(
+        "CREATE TRIGGER fixture_before_truncate BEFORE TRUNCATE ON {schema}.fixture FOR EACH STATEMENT EXECUTE FUNCTION {schema}.audit_fixture()",
+    );
+    try validateExpandSql(
+        "CREATE TRIGGER fixture_before_insert_or_truncate BEFORE INSERT OR TRUNCATE ON {schema}.fixture FOR EACH STATEMENT EXECUTE FUNCTION {schema}.audit_fixture()",
+    );
+    try validateExpandSql(
+        "CREATE FUNCTION {schema}.audit_fixture() RETURNS trigger LANGUAGE plpgsql AS $fixture$\nBEGIN\n  RETURN NEW;\nEND;\n$fixture$;\nCREATE TRIGGER fixture_before_truncate BEFORE TRUNCATE ON {schema}.fixture FOR EACH STATEMENT EXECUTE FUNCTION {schema}.audit_fixture()",
+    );
+}
+
+test "validateExpandSql rejects inline ADD COLUMN NOT NULL without crossing statement boundaries" {
+    try std.testing.expectError(
+        error.DestructiveExpandMigration,
+        validateExpandSql("ALTER TABLE {schema}.fixture ADD COLUMN required_value TEXT NOT NULL"),
+    );
+    try std.testing.expectError(
+        error.DestructiveExpandMigration,
+        validateExpandSql(
+            "ALTER TABLE {schema}.fixture ADD COLUMN required_value TEXT NOT NULL, ADD COLUMN optional_value TEXT",
+        ),
+    );
+    try validateExpandSql(
+        "CREATE TABLE {schema}.new_fixture (id TEXT NOT NULL); ALTER TABLE {schema}.fixture ADD COLUMN optional_value TEXT;",
+    );
+}
+
+test "validateExpandSql rejects index removal and trigger replacement" {
+    const forbidden = [_][]const u8{
+        "DROP INDEX CONCURRENTLY IF EXISTS {schema}.fixture_lookup_idx",
+        "CREATE OR REPLACE TRIGGER fixture_before_insert BEFORE INSERT ON {schema}.fixture FOR EACH ROW EXECUTE FUNCTION {schema}.audit_fixture()",
+    };
+    for (forbidden) |sql| {
+        try std.testing.expectError(error.DestructiveExpandMigration, validateExpandSql(sql));
+    }
+}
+
+test "validateExpandSql rejects DELETE FROM including a CTE form" {
+    const forbidden = [_][]const u8{
+        "DELETE FROM {schema}.fixture",
+        "WITH stale AS (SELECT id FROM {schema}.fixture) DELETE FROM {schema}.fixture USING stale WHERE fixture.id = stale.id",
+    };
+    for (forbidden) |sql| {
+        try std.testing.expectError(error.DestructiveExpandMigration, validateExpandSql(sql));
+    }
+}
+
+test "validateExpandSql rejects W.6 destructive shapes through comments and newlines" {
+    const forbidden = [_][]const u8{
+        "TRUNCATE /* temporary */ {schema}.fixture",
+        "ALTER TABLE {schema}.fixture ADD /* inline */ COLUMN required_value TEXT NOT /* inline */ NULL",
+        "DROP /* schema cleanup */ INDEX {schema}.fixture_lookup_idx",
+        "DELETE\nFROM {schema}.fixture",
+        "CREATE OR /* replacement */ REPLACE TRIGGER fixture_before_insert BEFORE INSERT ON {schema}.fixture FOR EACH ROW EXECUTE FUNCTION {schema}.audit_fixture()",
+    };
+    for (forbidden) |sql| {
+        try std.testing.expectError(error.DestructiveExpandMigration, validateExpandSql(sql));
+    }
+}
+
 test "validateExpandSql ignores destructive words inside literals and quoted identifiers" {
     try validateExpandSql(
         \\CREATE TABLE {schema}.fixture (
@@ -727,13 +857,31 @@ test "validateExpandSql rejects every dynamic EXECUTE shape, even static-looking
     }
 }
 
-test "validateExpandSql admits 0010's data-only static conditional purge" {
+test "validateExpandMigration admits only 0010's audited data-only purge" {
     // Regression guard for the shipped registry: 0010 is a data-only purge
     // (temp tables + static DELETE/UPDATE/INSERT audit rows, no schema DDL,
     // no EXECUTE) classified .expand. Future validator hardening that starts
     // rejecting static DELETE must whitelist this shipped migration
     // deliberately, not break boot.
-    try validateExpandSql(@embedFile("migrations/0010_brain_scaffold_purge.sql"));
+    const migration = blk: {
+        for (MIGRATIONS) |candidate| {
+            if (candidate.version == 10) break :blk candidate;
+        }
+        return error.Migration0010NotFound;
+    };
+    try std.testing.expectError(error.DestructiveExpandMigration, validateExpandSql(migration.sql));
+    try validateExpandMigration(migration);
+}
+
+test "validateExpandMigration keeps destructive DDL forbidden for a data-delete exception" {
+    const migration = Migration{
+        .version = 11,
+        .name = "0011_delete_exception_fixture",
+        .sql = "DROP INDEX {schema}.fixture_lookup_idx",
+        .phase = .expand,
+        .allow_expand_data_delete = true,
+    };
+    try std.testing.expectError(error.DestructiveExpandMigration, validateExpandMigration(migration));
 }
 
 test "migrations.run with production MIGRATIONS executes tracker + each registered migration" {
