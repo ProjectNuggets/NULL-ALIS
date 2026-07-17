@@ -4541,6 +4541,41 @@ pub const Agent = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &agent_controller_vtable };
     }
 
+    /// Keep the after-turn snapshot out of `turnOutcome`'s already-large
+    /// debug frame. Zig lowers a defer at every error/return edge; leaving the
+    /// snapshot inline duplicates its result temporaries across those edges.
+    noinline fn finishContextTurn(
+        self: *Agent,
+        ingest_out: *const context_engine.IngestOutput,
+        assemble_result: *const context_engine.AssembleResult,
+        assemble_duration_ms: u64,
+        turn_compaction_ms: u64,
+        turn_start_ms: i64,
+    ) void {
+        const compact_method: context_engine.CompactResult.CompactMethod = if (!self.last_turn_compacted)
+            .none
+        else if (self.context_force_compressed)
+            .force_compress
+        else
+            .auto;
+        _ = self.context_engine_state.afterTurn(
+            self.allocator,
+            ingest_out.result,
+            assemble_result.*,
+            .{
+                .compacted = self.last_turn_compacted,
+                .method = compact_method,
+            },
+            .{
+                .ingest_ms = ingest_out.result.memory_enrich_ms,
+                .assemble_ms = assemble_duration_ms,
+                .compact_ms = turn_compaction_ms,
+            },
+            turn_start_ms,
+            self.memory_session_id orelse "none",
+        );
+    }
+
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
     /// execute tools, and loop until a final text response is produced.
     ///
@@ -4879,30 +4914,13 @@ pub const Agent = struct {
         // returned context-exhausted mid-turn and a subsequent auto-compact
         // also succeeded). Reports `.force_compress` in that case — operator
         // dashboards still see "compaction happened," just not the multiplicity.
-        defer {
-            const compact_method: context_engine.CompactResult.CompactMethod = if (!self.last_turn_compacted)
-                .none
-            else if (self.context_force_compressed)
-                .force_compress
-            else
-                .auto;
-            _ = self.context_engine_state.afterTurn(
-                self.allocator,
-                ingest_out.result,
-                assemble_result,
-                .{
-                    .compacted = self.last_turn_compacted,
-                    .method = compact_method,
-                },
-                .{
-                    .ingest_ms = ingest_out.result.memory_enrich_ms,
-                    .assemble_ms = assemble_duration_ms,
-                    .compact_ms = turn_compaction_ms,
-                },
-                turn_start_ms,
-                self.memory_session_id orelse "none",
-            );
-        }
+        defer self.finishContextTurn(
+            &ingest_out,
+            &assemble_result,
+            assemble_duration_ms,
+            turn_compaction_ms,
+            turn_start_ms,
+        );
 
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
         if (self.auto_save) {

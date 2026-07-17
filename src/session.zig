@@ -1252,21 +1252,27 @@ pub const SessionManager = struct {
 
         tools_mod.setMessageTurnContext(options.message_turn_context);
         defer tools_mod.clearMessageTurnContext();
-        var minutes_read_budget = tools_mod.MinutesReadTurnBudget{};
         const minutes_read_enabled = shouldInstallMinutesReadBudget(
             self.tools,
             options.turn_origin,
             options.message_turn_context,
         );
-        defer if (minutes_read_enabled)
-            std.crypto.secureZero(u8, std.mem.asBytes(&minutes_read_budget));
+        const minutes_read_budget: ?*tools_mod.MinutesReadTurnBudget = if (minutes_read_enabled) blk: {
+            const budget = try self.allocator.create(tools_mod.MinutesReadTurnBudget);
+            budget.* = .{};
+            break :blk budget;
+        } else null;
+        defer if (minutes_read_budget) |budget| {
+            std.crypto.secureZero(u8, std.mem.asBytes(budget));
+            self.allocator.destroy(budget);
+        };
         tools_mod.setTurnContext(.{
             .origin = options.turn_origin,
             .entry_kind = options.entry_kind,
             .session_key = session_key,
             .provider = session.agent.default_provider,
             .model = session.agent.model_name,
-            .minutes_read_budget = if (minutes_read_enabled) &minutes_read_budget else null,
+            .minutes_read_budget = minutes_read_budget,
             // Phase 5 T3 — propagate the per-turn Superpowers flag to tools.
             // spawn_many self-gates on this; a non-Superpowers turn cannot
             // fan out. (subagent_batch_result has no Superpowers gate since
