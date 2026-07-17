@@ -274,7 +274,8 @@ fn sendGatewayControlCommand(host: []const u8, port: u16, path: []const u8, inte
 }
 
 const HEARTBEAT_PROMPT_DEFAULT =
-    "Read HEARTBEAT.md if it exists (workspace context) and treat it as wake policy only, not as proof that jobs already exist. " ++
+    "Read HEARTBEAT.md if it exists (workspace context) and treat it as optional wake policy only, not as proof that jobs already exist. " ++
+    "When HEARTBEAT.md has no actionable notes, use the default check-in policy: inspect the user context already available to this turn plus runtime and canonical automation health, and send only a novel, timely, actionable update. Never send a generic greeting or a status recap with no user value. " ++
     "If AUTOMATIONS.json exists, treat it as desired durable automation state for canonical scheduled jobs, not as the execution truth for all jobs. " ++
     "Heartbeat is a wake trigger, not the exact-time scheduler. Scheduler state is execution truth: if a job exists in schedule, it is valid and should run even if not declared in AUTOMATIONS.json. Use runtime_info first, then inspect durable jobs with schedule. " ++
     "Wake turns may reconcile only canonical jobs declared in AUTOMATIONS.json by using schedule ensure. " ++
@@ -621,6 +622,10 @@ fn isHeartbeatContentEffectivelyEmpty(content: []const u8) bool {
     return true;
 }
 
+fn shouldSkipHeartbeatTurn(enabled: bool, content: []const u8) bool {
+    return !enabled and isHeartbeatContentEffectivelyEmpty(content);
+}
+
 fn isDefaultHeartbeatTemplate(content: []const u8) bool {
     const trimmed = std.mem.trim(u8, content, " \t\r\n");
     if (trimmed.len == 0) return true;
@@ -858,7 +863,7 @@ fn runTenantHeartbeatForUser(
     const heartbeat_content = readTrimmedFileOwned(allocator, heartbeat_md_path) catch null;
     defer if (heartbeat_content) |content| allocator.free(content);
     if (heartbeat_content) |content| {
-        if (isHeartbeatContentEffectivelyEmpty(content)) {
+        if (shouldSkipHeartbeatTurn(hb_cfg.enabled, content)) {
             saveHeartbeatRuntimeState(allocator, user_root, now_s, "idle", "heartbeat_template_empty");
             return;
         }
@@ -4285,6 +4290,18 @@ test "default heartbeat templates are treated as effectively empty" {
         \\
         \\Keep only tasks the user actually wants automated.
     ));
+}
+
+test "explicit heartbeat opt-in runs the shipped default policy" {
+    const shipped_template =
+        \\# HEARTBEAT.md
+        \\
+        \\# Heartbeat is a wake policy file, not the exact-time scheduler.
+        \\# Add short wake policy notes below when you want the agent to check something periodically.
+    ;
+    try std.testing.expect(!shouldSkipHeartbeatTurn(true, shipped_template));
+    try std.testing.expect(shouldSkipHeartbeatTurn(false, shipped_template));
+    try std.testing.expect(!shouldSkipHeartbeatTurn(false, "- Check the user-requested report"));
 }
 
 test "heartbeat prompt treats scheduler as execution truth" {
