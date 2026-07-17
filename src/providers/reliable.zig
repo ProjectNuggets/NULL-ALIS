@@ -383,6 +383,7 @@ pub const ReliableProvider = struct {
         .chatWithSystem = chatWithSystemImpl,
         .chat = chatImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
+        .supports_native_tools_for_request = supportsNativeToolsForRequestImpl,
         .supports_streaming = supportsStreamingImpl,
         .supports_vision = supportsVisionImpl,
         .supports_vision_for_model = supportsVisionForModelImpl,
@@ -444,6 +445,7 @@ pub const ReliableProvider = struct {
         allocator: std.mem.Allocator,
         request: ChatRequest,
         current_model: []const u8,
+        extra_fallback_available: bool,
     ) ?ChatResponse {
         var backoff_ms = self.base_backoff_ms;
         var attempt: u32 = 0;
@@ -455,10 +457,10 @@ pub const ReliableProvider = struct {
                 const err_slice = self.lastErrorSlice();
 
                 if (isNonRetryable(err_slice)) break;
-                if (isTimeout(err_slice) and self.extras.len > 0) break;
+                if (isTimeout(err_slice) and extra_fallback_available) break;
 
                 if (isRateLimited(err_slice)) {
-                    if (self.extras.len > 0) break;
+                    if (extra_fallback_available) break;
                     _ = self.rotateKey();
                 }
 
@@ -478,6 +480,7 @@ pub const ReliableProvider = struct {
         allocator: std.mem.Allocator,
         request: ChatRequest,
         current_model: []const u8,
+        extra_fallback_available: bool,
         callback: StreamCallback,
         callback_ctx: *anyopaque,
     ) anyerror!?StreamChatResult {
@@ -521,10 +524,10 @@ pub const ReliableProvider = struct {
 
                 if (relay_ctx.saw_first_token) return err;
                 if (isNonRetryable(err_slice)) break;
-                if (isTimeout(err_slice) and self.extras.len > 0) break;
+                if (isTimeout(err_slice) and extra_fallback_available) break;
 
                 if (isRateLimited(err_slice)) {
-                    if (self.extras.len > 0) break;
+                    if (extra_fallback_available) break;
                     _ = self.rotateKey();
                 }
 
@@ -591,6 +594,13 @@ pub const ReliableProvider = struct {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
         _ = temperature;
 
+        if (request.provider_selection_policy == .exact_primary_and_model) {
+            if (self.tryChatProvider(self.inner, allocator, request, model, false)) |result| {
+                return result;
+            }
+            return self.finalFailureError();
+        }
+
         const models = try self.modelChain(allocator, model);
         defer allocator.free(models);
 
@@ -601,6 +611,7 @@ pub const ReliableProvider = struct {
                 allocator,
                 request,
                 current_model,
+                self.extras.len > 0,
             )) |result| {
                 return result;
             }
@@ -612,6 +623,7 @@ pub const ReliableProvider = struct {
                     allocator,
                     request,
                     entry.model_override orelse current_model,
+                    self.extras.len > 0,
                 )) |result| {
                     return result;
                 }
@@ -628,6 +640,14 @@ pub const ReliableProvider = struct {
             if (entry.provider.supportsNativeTools()) return true;
         }
         return false;
+    }
+
+    fn supportsNativeToolsForRequestImpl(ptr: *anyopaque, request: ChatRequest) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        if (request.provider_selection_policy == .exact_primary_and_model) {
+            return self.inner.supportsNativeToolsForRequest(request);
+        }
+        return supportsNativeToolsImpl(ptr);
     }
 
     fn supportsStreamingImpl(ptr: *anyopaque) bool {
@@ -669,6 +689,16 @@ pub const ReliableProvider = struct {
         model: []const u8,
     ) anyerror!root.TokenEstimateResult {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+
+        if (request.provider_selection_policy == .exact_primary_and_model) {
+            if (self.inner.estimateTokens(allocator, request, model)) |maybe| {
+                if (maybe) |result| return result;
+            } else |err| {
+                self.storeErrorName(err);
+            }
+            return error.UnsupportedOperation;
+        }
+
         const models = try self.modelChain(allocator, model);
         defer allocator.free(models);
 
@@ -701,6 +731,40 @@ pub const ReliableProvider = struct {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
         _ = temperature;
 
+        if (request.provider_selection_policy == .exact_primary_and_model) {
+            if (self.inner.supportsStreaming()) {
+                if (try self.tryStreamProvider(
+                    self.inner,
+                    allocator,
+                    request,
+                    model,
+                    false,
+                    callback,
+                    callback_ctx,
+                )) |result| {
+                    return result;
+                }
+            }
+
+            if (self.tryChatProvider(self.inner, allocator, request, model, false)) |response| {
+                if (response.content) |content| {
+                    if (content.len > 0) {
+                        callback(callback_ctx, StreamChunk.textDelta(content));
+                    }
+                }
+                callback(callback_ctx, StreamChunk.finalChunk());
+                return .{
+                    .content = response.content,
+                    .tool_calls = response.tool_calls,
+                    .usage = response.usage,
+                    .model = response.model,
+                    .reasoning_content = response.reasoning_content,
+                    .stream_tool_call_chunks = response.stream_tool_call_chunks,
+                };
+            }
+            return self.finalFailureError();
+        }
+
         const models = try self.modelChain(allocator, model);
         defer allocator.free(models);
 
@@ -710,6 +774,7 @@ pub const ReliableProvider = struct {
                 allocator,
                 request,
                 current_model,
+                self.extras.len > 0,
                 callback,
                 callback_ctx,
             )) |result| {
@@ -724,6 +789,7 @@ pub const ReliableProvider = struct {
                     allocator,
                     request,
                     entry.model_override orelse current_model,
+                    self.extras.len > 0,
                     callback,
                     callback_ctx,
                 )) |tagged| {
@@ -997,6 +1063,8 @@ const MockInnerProvider = struct {
 /// Mock that records which model was used for each call.
 const ModelAwareMock = struct {
     call_count: u32 = 0,
+    estimate_count: u32 = 0,
+    estimated_prompt_tokens: u32 = 42,
     models_seen_buf: [16][]const u8 = undefined,
     models_seen_len: usize = 0,
     fail_models_buf: [8][]const u8 = undefined,
@@ -1012,6 +1080,7 @@ const ModelAwareMock = struct {
         .supports_vision = modelSupportsVision,
         .getName = modelGetName,
         .deinit = modelDeinit,
+        .estimate_tokens = modelEstimateTokens,
     };
 
     fn toProvider(self: *ModelAwareMock) Provider {
@@ -1089,6 +1158,24 @@ const ModelAwareMock = struct {
     fn modelSupportsVision(ptr: *anyopaque) bool {
         const self: *ModelAwareMock = @ptrCast(@alignCast(ptr));
         return self.supports_vision;
+    }
+
+    fn modelEstimateTokens(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        _: ChatRequest,
+        model: []const u8,
+    ) anyerror!root.TokenEstimateResult {
+        const self: *ModelAwareMock = @ptrCast(@alignCast(ptr));
+        self.estimate_count += 1;
+        self.recordModel(model);
+        if (self.failsModel(model)) {
+            return error.UnsupportedOperation;
+        }
+        return .{
+            .prompt_tokens = self.estimated_prompt_tokens,
+            .total_tokens = self.estimated_prompt_tokens,
+        };
     }
 
     fn modelGetName(_: *anyopaque) []const u8 {
@@ -1651,6 +1738,36 @@ test "supportsNativeTools returns true if any extra supports it" {
     try std.testing.expect(reliable.provider().supportsNativeTools() == true);
 }
 
+test "provider selection policy: exact requests report native tool support from the primary only" {
+    var primary = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 0,
+        .supports_tools = false,
+    };
+    var extra = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 0,
+        .supports_tools = true,
+    };
+    const extras = [_]ProviderEntry{
+        .{ .name = "extra", .provider = extra.toProvider() },
+    };
+    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50)
+        .withExtras(&extras);
+    const provider = reliable.provider();
+
+    const messages = [_]root.ChatMessage{root.ChatMessage.user("request")};
+    const ordinary = ChatRequest{ .messages = &messages };
+    const restricted = ChatRequest{
+        .messages = &messages,
+        .provider_selection_policy = .exact_primary_and_model,
+    };
+
+    try std.testing.expect(provider.supportsNativeTools());
+    try std.testing.expect(provider.supportsNativeToolsForRequest(ordinary));
+    try std.testing.expect(!provider.supportsNativeToolsForRequest(restricted));
+}
+
 test "multi-provider chat fallback" {
     var primary = MockInnerProvider{ .call_count = 0, .fail_until = 100, .supports_tools = false };
     var fallback = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = true };
@@ -1668,4 +1785,286 @@ test "multi-provider chat fallback" {
     try std.testing.expectEqualStrings("mock chat", result.content.?);
     try std.testing.expect(primary.call_count == 1);
     try std.testing.expect(fallback.call_count == 1);
+}
+
+test "provider selection policy: exact primary and model keeps chat retries on the requested route" {
+    const blocked_models = [_][]const u8{ "sensitive-model", "alternate-model" };
+    var primary = ModelAwareMock.initWithFailModels(&blocked_models, "never");
+    var extra = ModelAwareMock.initWithFailModels(&blocked_models, "never");
+    const extras = [_]ProviderEntry{
+        .{ .name = "extra", .provider = extra.toProvider() },
+    };
+    const model_fallbacks = [_]ModelFallbackEntry{
+        .{ .model = "sensitive-model", .fallbacks = &.{"alternate-model"} },
+    };
+    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 1, 50)
+        .withExtras(&extras)
+        .withModelFallbacks(&model_fallbacks);
+
+    const messages = [_]root.ChatMessage{root.ChatMessage.user("transcript")};
+    const request = ChatRequest{
+        .messages = &messages,
+        .model = "sensitive-model",
+        .provider_selection_policy = .exact_primary_and_model,
+    };
+    try std.testing.expectError(
+        error.AllProvidersFailed,
+        reliable.provider().chat(std.testing.allocator, request, "sensitive-model", 0.7),
+    );
+
+    const primary_models = primary.modelsSeen();
+    try std.testing.expectEqual(@as(usize, 2), primary_models.len);
+    try std.testing.expectEqualStrings("sensitive-model", primary_models[0]);
+    try std.testing.expectEqualStrings("sensitive-model", primary_models[1]);
+    try std.testing.expectEqual(@as(u32, 0), extra.call_count);
+    try std.testing.expectEqual(@as(usize, 0), extra.modelsSeen().len);
+}
+
+test "provider selection policy: exact primary and model retries primary timeouts instead of widening" {
+    var primary = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 1,
+        .fail_error = error.Timeout,
+        .supports_tools = false,
+    };
+    var extra = MockInnerProvider{
+        .call_count = 0,
+        .fail_until = 0,
+        .supports_tools = false,
+    };
+    const extras = [_]ProviderEntry{
+        .{ .name = "extra", .provider = extra.toProvider() },
+    };
+    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 1, 50)
+        .withExtras(&extras);
+
+    const messages = [_]root.ChatMessage{root.ChatMessage.user("transcript")};
+    const request = ChatRequest{
+        .messages = &messages,
+        .model = "sensitive-model",
+        .provider_selection_policy = .exact_primary_and_model,
+    };
+    const result = try reliable.provider().chat(
+        std.testing.allocator,
+        request,
+        "sensitive-model",
+        0.7,
+    );
+    defer if (result.content) |content| std.testing.allocator.free(content);
+
+    try std.testing.expectEqualStrings("mock chat", result.content.?);
+    try std.testing.expectEqual(@as(u32, 2), primary.call_count);
+    try std.testing.expectEqual(@as(u32, 0), extra.call_count);
+}
+
+test "provider selection policy: exact primary and model streams through primary blocking chat when needed" {
+    var primary = StreamingMockProvider{
+        .name = "primary",
+        .supports_streaming = false,
+        .response = "primary blocking response",
+    };
+    var extra = StreamingMockProvider{
+        .name = "extra",
+        .response = "extra streamed response",
+    };
+    const extras = [_]ProviderEntry{
+        .{ .name = "extra", .provider = extra.toProvider() },
+    };
+    const model_fallbacks = [_]ModelFallbackEntry{
+        .{ .model = "sensitive-model", .fallbacks = &.{"alternate-model"} },
+    };
+    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50)
+        .withExtras(&extras)
+        .withModelFallbacks(&model_fallbacks);
+
+    var collector = StreamCollector{};
+    const messages = [_]root.ChatMessage{root.ChatMessage.user("transcript")};
+    const request = ChatRequest{
+        .messages = &messages,
+        .model = "sensitive-model",
+        .provider_selection_policy = .exact_primary_and_model,
+    };
+    const result = try reliable.provider().streamChat(
+        std.testing.allocator,
+        request,
+        "sensitive-model",
+        0.7,
+        StreamCollector.onChunk,
+        @ptrCast(&collector),
+    );
+    defer if (result.content) |content| std.testing.allocator.free(content);
+
+    try std.testing.expectEqualStrings("primary blocking response", result.content.?);
+    try std.testing.expectEqualStrings("primary blocking response", collector.textSlice());
+    try std.testing.expectEqual(@as(u32, 1), collector.non_final_chunks);
+    try std.testing.expectEqual(@as(u32, 1), collector.final_chunks);
+    try std.testing.expectEqual(@as(u32, 0), primary.stream_count);
+    try std.testing.expectEqual(@as(u32, 1), primary.chat_count);
+    try std.testing.expectEqual(@as(usize, 1), primary.modelsSeen().len);
+    try std.testing.expectEqualStrings("sensitive-model", primary.modelsSeen()[0]);
+    try std.testing.expectEqual(@as(u32, 0), extra.stream_count);
+    try std.testing.expectEqual(@as(u32, 0), extra.chat_count);
+    try std.testing.expectEqual(@as(usize, 0), extra.modelsSeen().len);
+}
+
+test "provider selection policy: pre-token stream failure falls back to blocking chat on the same primary" {
+    var primary = StreamingMockProvider{
+        .name = "primary",
+        .fail_stream_until = 10,
+        .fail_error = error.Timeout,
+        .response = "primary blocking response",
+    };
+    var extra = StreamingMockProvider{
+        .name = "extra",
+        .response = "extra streamed response",
+    };
+    const extras = [_]ProviderEntry{
+        .{ .name = "extra", .provider = extra.toProvider() },
+    };
+    const model_fallbacks = [_]ModelFallbackEntry{
+        .{ .model = "sensitive-model", .fallbacks = &.{"alternate-model"} },
+    };
+    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 1, 50)
+        .withExtras(&extras)
+        .withModelFallbacks(&model_fallbacks);
+
+    var collector = StreamCollector{};
+    const messages = [_]root.ChatMessage{root.ChatMessage.user("transcript")};
+    const request = ChatRequest{
+        .messages = &messages,
+        .model = "sensitive-model",
+        .provider_selection_policy = .exact_primary_and_model,
+    };
+    const result = try reliable.provider().streamChat(
+        std.testing.allocator,
+        request,
+        "sensitive-model",
+        0.7,
+        StreamCollector.onChunk,
+        @ptrCast(&collector),
+    );
+    defer if (result.content) |content| std.testing.allocator.free(content);
+
+    try std.testing.expectEqualStrings("primary blocking response", result.content.?);
+    try std.testing.expectEqualStrings("primary blocking response", collector.textSlice());
+    try std.testing.expectEqual(@as(u32, 1), collector.non_final_chunks);
+    try std.testing.expectEqual(@as(u32, 1), collector.final_chunks);
+    try std.testing.expectEqual(@as(u32, 2), primary.stream_count);
+    try std.testing.expectEqual(@as(u32, 1), primary.chat_count);
+    try std.testing.expectEqual(@as(usize, 3), primary.modelsSeen().len);
+    try std.testing.expectEqualStrings("sensitive-model", primary.modelsSeen()[0]);
+    try std.testing.expectEqualStrings("sensitive-model", primary.modelsSeen()[1]);
+    try std.testing.expectEqualStrings("sensitive-model", primary.modelsSeen()[2]);
+    try std.testing.expectEqual(@as(u32, 0), extra.stream_count);
+    try std.testing.expectEqual(@as(u32, 0), extra.chat_count);
+    try std.testing.expectEqual(@as(usize, 0), extra.modelsSeen().len);
+}
+
+test "provider selection policy: partial stream failure never starts blocking chat or an extra provider" {
+    var primary = StreamingMockProvider{
+        .name = "primary",
+        .fail_stream_until = 10,
+        .fail_error = error.Timeout,
+        .emit_partial_before_error = true,
+        .response = "must not be emitted",
+    };
+    var extra = StreamingMockProvider{
+        .name = "extra",
+        .response = "must not be emitted",
+    };
+    const extras = [_]ProviderEntry{
+        .{ .name = "extra", .provider = extra.toProvider() },
+    };
+    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50)
+        .withExtras(&extras);
+
+    var collector = StreamCollector{};
+    const messages = [_]root.ChatMessage{root.ChatMessage.user("transcript")};
+    const request = ChatRequest{
+        .messages = &messages,
+        .model = "sensitive-model",
+        .provider_selection_policy = .exact_primary_and_model,
+    };
+    try std.testing.expectError(
+        error.Timeout,
+        reliable.provider().streamChat(
+            std.testing.allocator,
+            request,
+            "sensitive-model",
+            0.7,
+            StreamCollector.onChunk,
+            @ptrCast(&collector),
+        ),
+    );
+
+    try std.testing.expectEqualStrings("partial", collector.textSlice());
+    try std.testing.expectEqual(@as(u32, 1), collector.non_final_chunks);
+    try std.testing.expectEqual(@as(u32, 0), collector.final_chunks);
+    try std.testing.expectEqual(@as(u32, 1), primary.stream_count);
+    try std.testing.expectEqual(@as(u32, 0), primary.chat_count);
+    try std.testing.expectEqual(@as(u32, 0), extra.stream_count);
+    try std.testing.expectEqual(@as(u32, 0), extra.chat_count);
+}
+
+test "provider selection policy: exact primary and model keeps token estimates on the requested route" {
+    const primary_fail_models = [_][]const u8{"sensitive-model"};
+    var primary = ModelAwareMock.initWithFailModels(&primary_fail_models, "unused");
+    var extra = ModelAwareMock{
+        .estimated_prompt_tokens = 99,
+    };
+    const extras = [_]ProviderEntry{
+        .{ .name = "extra", .provider = extra.toProvider() },
+    };
+    const model_fallbacks = [_]ModelFallbackEntry{
+        .{ .model = "sensitive-model", .fallbacks = &.{"alternate-model"} },
+    };
+    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50)
+        .withExtras(&extras)
+        .withModelFallbacks(&model_fallbacks);
+
+    const messages = [_]root.ChatMessage{root.ChatMessage.user("transcript")};
+    const request = ChatRequest{
+        .messages = &messages,
+        .model = "sensitive-model",
+        .provider_selection_policy = .exact_primary_and_model,
+    };
+    try std.testing.expectError(
+        error.UnsupportedOperation,
+        reliable.provider().estimateTokens(std.testing.allocator, request, "sensitive-model"),
+    );
+
+    try std.testing.expectEqual(@as(u32, 1), primary.estimate_count);
+    try std.testing.expectEqual(@as(usize, 1), primary.modelsSeen().len);
+    try std.testing.expectEqualStrings("sensitive-model", primary.modelsSeen()[0]);
+    try std.testing.expectEqual(@as(u32, 0), extra.estimate_count);
+    try std.testing.expectEqual(@as(usize, 0), extra.modelsSeen().len);
+}
+
+test "provider selection policy: ordinary token estimates still use the fallback chain" {
+    const primary_fail_models = [_][]const u8{"ordinary-model"};
+    var primary = ModelAwareMock.initWithFailModels(&primary_fail_models, "unused");
+    var extra = ModelAwareMock{
+        .estimated_prompt_tokens = 99,
+    };
+    const extras = [_]ProviderEntry{
+        .{ .name = "extra", .provider = extra.toProvider() },
+    };
+    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50)
+        .withExtras(&extras);
+
+    const messages = [_]root.ChatMessage{root.ChatMessage.user("ordinary request")};
+    const request = ChatRequest{
+        .messages = &messages,
+        .model = "ordinary-model",
+    };
+    const estimate = (try reliable.provider().estimateTokens(
+        std.testing.allocator,
+        request,
+        "ordinary-model",
+    )).?;
+
+    try std.testing.expectEqual(@as(u32, 99), estimate.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 1), primary.estimate_count);
+    try std.testing.expectEqual(@as(u32, 1), extra.estimate_count);
+    try std.testing.expectEqualStrings("ordinary-model", extra.modelsSeen()[0]);
 }
