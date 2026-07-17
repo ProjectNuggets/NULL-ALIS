@@ -263,7 +263,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             }
             return err;
         };
-        defer allocator.free(response);
+        defer agent.deinitTurnReply(response);
 
         if (supports_streaming) {
             try w.print("\n", .{});
@@ -374,7 +374,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             try w.flush();
             continue;
         };
-        defer allocator.free(response);
+        defer agent.deinitTurnReply(response);
 
         if (supports_streaming) {
             try w.print("\n\n", .{});

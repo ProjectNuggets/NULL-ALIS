@@ -6058,7 +6058,7 @@ fn tenantTelegramAsyncWorker(job: *TenantTelegramAsyncJob) void {
         }
         return;
     };
-    defer job.allocator.free(reply);
+    defer session_mod.deinitOwnedReply(job.allocator, reply);
 
     if (job.bot_token.len == 0) return;
     sendTelegramReply(job.allocator, job.bot_token, job.chat_id, reply) catch |err| {
@@ -10365,7 +10365,7 @@ fn sseSubagentCompletionFrame(
 
 fn sseTokenFrame(allocator: std.mem.Allocator, delta: []const u8, seq: usize) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(allocator);
+    errdefer wipeAndDeinitTransportBuffer(allocator, &buf);
     const w = buf.writer(allocator);
     try w.writeAll("event: token\ndata: {\"delta\":\"");
     try jsonEscapeInto(w, delta);
@@ -10373,6 +10373,19 @@ fn sseTokenFrame(allocator: std.mem.Allocator, delta: []const u8, seq: usize) ![
     try jsonEscapeInto(w, delta);
     try w.print("\",\"seq\":{d},\"stream_kind\":\"final_reply\",\"live\":false}}\n\n", .{seq});
     return buf.toOwnedSlice(allocator);
+}
+
+fn wipeAndFreeTransportBytes(allocator: std.mem.Allocator, bytes: []const u8) void {
+    if (bytes.len > 0) std.crypto.secureZero(u8, @constCast(bytes));
+    allocator.free(bytes);
+}
+
+fn wipeAndDeinitTransportBuffer(
+    allocator: std.mem.Allocator,
+    buffer: *std.ArrayListUnmanaged(u8),
+) void {
+    if (buffer.capacity > 0) std.crypto.secureZero(u8, buffer.allocatedSlice());
+    buffer.deinit(allocator);
 }
 
 /// V1.11 hardening (2026-05-07) — audio_reply SSE frame for the zaki_app
@@ -10561,7 +10574,7 @@ fn sseToolOnlySummaryFrame(allocator: std.mem.Allocator) ![]u8 {
 
 fn sseChatPayload(allocator: std.mem.Allocator, text: []const u8, session_id: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(allocator);
+    errdefer wipeAndDeinitTransportBuffer(allocator, &buf);
     const w = buf.writer(allocator);
     const message_id = std.time.milliTimestamp();
 
@@ -10574,7 +10587,7 @@ fn sseChatPayload(allocator: std.mem.Allocator, text: []const u8, session_id: []
     while (start < text.len) : (start += SSE_TOKEN_CHUNK_SIZE) {
         const end = @min(start + SSE_TOKEN_CHUNK_SIZE, text.len);
         const token_frame = try sseTokenFrame(allocator, text[start..end], seq);
-        defer allocator.free(token_frame);
+        defer wipeAndFreeTransportBytes(allocator, token_frame);
         try w.writeAll(token_frame);
         seq += 1;
     }
@@ -11107,6 +11120,11 @@ const LiveSseCtx = struct {
     utf8_tail: [4]u8 = undefined,
     utf8_tail_len: u8 = 0,
 
+    fn clearUtf8Tail(self: *LiveSseCtx) void {
+        std.crypto.secureZero(u8, &self.utf8_tail);
+        self.utf8_tail_len = 0;
+    }
+
     /// FrameSink-compatible write that delegates to the error-returning
     /// sendFrameFn, setting client_gone on failure. Used as the inner
     /// sink for PacedFrameSink so pacing delays apply before each send.
@@ -11228,7 +11246,7 @@ fn liveStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
         // Stream end. If the UTF-8 tail still holds an incomplete sequence,
         // drop it — provider truncated mid-codepoint and emitting garbage
         // bytes would just become U+FFFD at the frontend.
-        ctx.utf8_tail_len = 0;
+        ctx.clearUtf8Tail();
         return;
     }
     if (chunk.delta.len == 0) return; // empty/keep-alive chunks
@@ -11237,12 +11255,12 @@ fn liveStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
     // the provider's chunk boundary is stitched back together before we
     // emit anything.
     var merged: std.ArrayListUnmanaged(u8) = .empty;
-    defer merged.deinit(ctx.allocator);
+    defer wipeAndDeinitTransportBuffer(ctx.allocator, &merged);
     if (ctx.utf8_tail_len > 0) {
         merged.appendSlice(ctx.allocator, ctx.utf8_tail[0..ctx.utf8_tail_len]) catch return;
     }
     merged.appendSlice(ctx.allocator, chunk.delta) catch return;
-    ctx.utf8_tail_len = 0;
+    ctx.clearUtf8Tail();
 
     const emit_len = utf8SafeEmitLen(merged.items);
     const remaining = merged.items[emit_len..];
@@ -11254,7 +11272,7 @@ fn liveStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
     if (emit_len == 0) return; // nothing complete to emit yet
 
     const frame = sseTokenFrame(ctx.allocator, merged.items[0..emit_len], ctx.seq.*) catch return;
-    defer ctx.allocator.free(frame);
+    defer wipeAndFreeTransportBytes(ctx.allocator, frame);
     if (ctx.paced_sink) |paced| {
         paced.sink().write(frame);
     } else {
@@ -11592,6 +11610,7 @@ fn handleApiChatStreamSseConnection(
         .seq = &live_seq,
         .client_gone = &live_client_gone,
     };
+    defer live_ctx.clearUtf8Tail();
     const pacing_delay = gateway_run_events.resolvePacingDelay(channel_name);
     var paced_sink = gateway_run_events.PacedFrameSink.init(live_ctx.frameSink(), pacing_delay);
     if (is_live and pacing_delay > 0) {
@@ -11741,7 +11760,7 @@ fn handleApiChatStreamSseConnection(
             return true;
         },
     };
-    defer root_allocator.free(reply);
+    defer session_mod.deinitOwnedReply(root_allocator, reply);
 
     // Determine if live streaming actually delivered tokens. If the provider
     // does not support streaming, live_seq stays 0 and we must fall back to
@@ -11850,7 +11869,7 @@ fn handleApiChatStreamSseConnection(
                 sendLockedSseErrorFrames(&sse_stream, req_allocator, "stream_encode_failed", "failed to encode token frame");
                 return true;
             };
-            defer req_allocator.free(token_owned);
+            defer wipeAndFreeTransportBytes(req_allocator, token_owned);
             sse_stream.sendFrame(token_owned) catch return true;
             seq += 1;
         }
@@ -15144,7 +15163,7 @@ fn handleSessionMode(
     if (session.active_refs > 0) session.active_refs -= 1;
     mgr.mutex.unlock();
 
-    defer allocator.free(result);
+    defer session_mod.deinitOwnedReply(allocator, result);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
@@ -15898,7 +15917,7 @@ fn handleSessionApprove(
         mgr.mutex.unlock();
         return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"approval_failed\"}" };
     };
-    defer allocator.free(result);
+    defer session_mod.deinitOwnedReply(allocator, result);
 
     // Unpin after successful processing
     mgr.mutex.lock();
@@ -23462,7 +23481,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     });
                 }
                 if (reply) |r| {
-                    defer ctx.root_allocator.free(r);
+                    defer session_mod.deinitOwnedReply(ctx.root_allocator, r);
                     if (tenant_user_ctx) |*send_user_ctx| {
                         const send_token_opt: ?[]const u8 = blk: {
                             const send_token = resolveTenantTelegramBotTokenForSend(
@@ -23532,7 +23551,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     break :blk null;
                 };
                 if (reply) |r| {
-                    defer ctx.root_allocator.free(r);
+                    defer session_mod.deinitOwnedReply(ctx.root_allocator, r);
                     if (tg_bot_token.len > 0) {
                         sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, r) catch |send_err| {
                             log.warn("telegram webhook sync reply send failed: {}", .{send_err});
@@ -23677,7 +23696,7 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                     break :blk null;
                 };
                 if (reply) |r| {
-                    defer ctx.root_allocator.free(r);
+                    defer session_mod.deinitOwnedReply(ctx.root_allocator, r);
                     ctx.response_body = ctx.req_allocator.dupe(u8, r) catch "{\"status\":\"received\"}";
                 } else {
                     ctx.response_body = "{\"status\":\"received\"}";
@@ -23739,7 +23758,7 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                     break :blk null;
                 };
                 if (reply) |r| {
-                    defer ctx.root_allocator.free(r);
+                    defer session_mod.deinitOwnedReply(ctx.root_allocator, r);
                     ctx.response_body = ctx.req_allocator.dupe(u8, r) catch "{\"status\":\"received\"}";
                 } else {
                     ctx.response_body = "{\"status\":\"received\"}";
@@ -24013,7 +24032,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
             break :blk null;
         };
         if (reply) |r| {
-            defer ctx.root_allocator.free(r);
+            defer session_mod.deinitOwnedReply(ctx.root_allocator, r);
             var outbound_ch = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
             outbound_ch.sendMessage(channel_id, r) catch {};
         }
@@ -24153,7 +24172,7 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
                         break :blk null;
                     };
                     if (reply) |r| {
-                        defer ctx.root_allocator.free(r);
+                        defer session_mod.deinitOwnedReply(ctx.root_allocator, r);
                         if (evt.reply_token) |rt| {
                             var line_ch = channels.line.LineChannel.init(ctx.req_allocator, .{
                                 .access_token = line_access_token,
@@ -24274,7 +24293,7 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
                 break :blk null;
             };
             if (reply) |r| {
-                defer ctx.root_allocator.free(r);
+                defer session_mod.deinitOwnedReply(ctx.root_allocator, r);
                 lark_ch.sendMessage(msg.sender, r) catch {};
             }
         }
@@ -24399,7 +24418,7 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
                 break :blk null;
             };
             if (reply) |r| {
-                defer ctx.root_allocator.free(r);
+                defer session_mod.deinitOwnedReply(ctx.root_allocator, r);
                 (teams_ch.channel()).send(teams_target, r, &.{}) catch {};
             }
         }
@@ -25006,7 +25025,7 @@ fn handleAcceptedConnection(
                                 break :blk null;
                             };
                             if (reply) |r| {
-                                defer allocator.free(r);
+                                defer session_mod.deinitOwnedReply(allocator, r);
                                 const json_resp = jsonWrapResponse(req_allocator, r) catch null;
                                 response_body = json_resp orelse "{\"status\":\"received\"}";
                             } else {
@@ -34077,6 +34096,57 @@ test "sseTokenFrame emits explicit final reply metadata" {
     try std.testing.expect(std.mem.indexOf(u8, frame, "\"seq\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "\"stream_kind\":\"final_reply\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "\"live\":false") != null);
+}
+
+test "Minutes buffered SSE frame scratch is cleared after send lifetime" {
+    const sentinel = "minutes-buffered-sse-secret-7d2a";
+    var backing: [2048]u8 = undefined;
+    @memset(&backing, 0xaa);
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    const allocator = fixed.allocator();
+
+    const frame = try sseTokenFrame(allocator, sentinel, 0);
+    try std.testing.expect(std.mem.indexOf(u8, &backing, sentinel) != null);
+    wipeAndFreeTransportBytes(allocator, frame);
+    try std.testing.expect(std.mem.indexOf(u8, &backing, sentinel) == null);
+}
+
+test "Minutes live SSE scratch and UTF-8 tail are cleared after callback" {
+    const Sink = struct {
+        saw_secret: bool = false,
+
+        fn send(ptr: *anyopaque, frame: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.saw_secret = std.mem.indexOf(u8, frame, "minutes-live-sse-secret-4c91") != null;
+        }
+    };
+
+    const sentinel = "minutes-live-sse-secret-4c91";
+    var backing: [4096]u8 = undefined;
+    @memset(&backing, 0xaa);
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    var sink = Sink{};
+    var seq: usize = 0;
+    var client_gone = false;
+    var live = LiveSseCtx{
+        .stream_ptr = @ptrCast(&sink),
+        .sendFrameFn = Sink.send,
+        .allocator = fixed.allocator(),
+        .seq = &seq,
+        .client_gone = &client_gone,
+        .utf8_tail = .{ 0xaa, 0xaa, 0xaa, 0xaa },
+    };
+
+    liveStreamCallback(@ptrCast(&live), providers.StreamChunk.textDelta(sentinel));
+    try std.testing.expect(sink.saw_secret);
+    try std.testing.expect(std.mem.indexOf(u8, &backing, sentinel) == null);
+
+    const incomplete_utf8 = [_]u8{0xe2};
+    liveStreamCallback(@ptrCast(&live), providers.StreamChunk.textDelta(&incomplete_utf8));
+    try std.testing.expectEqual(@as(u8, 1), live.utf8_tail_len);
+    liveStreamCallback(@ptrCast(&live), providers.StreamChunk.finalChunk());
+    try std.testing.expectEqual(@as(u8, 0), live.utf8_tail_len);
+    for (live.utf8_tail) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 
 test "sseChatPayload emits token deltas and done metadata" {

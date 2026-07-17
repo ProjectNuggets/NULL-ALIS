@@ -477,6 +477,14 @@ pub const Provider = struct {
             ptr: *anyopaque,
             request: ChatRequest,
         ) bool = null,
+        /// Optional request-aware declaration that the provider's streaming
+        /// transport keeps prompt bodies and credentials out of argv, env,
+        /// logs, and non-2xx diagnostics. Default false: sensitive tools are
+        /// fail-closed until an adapter is explicitly audited.
+        supports_sensitive_streaming_for_request: ?*const fn (
+            ptr: *anyopaque,
+            request: ChatRequest,
+        ) bool = null,
         /// Optional: native function calling. Default: delegates to chat().
         chat_with_tools: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, req: ChatRequest) anyerror!ChatResponse = null,
         /// Optional: returns true if provider supports streaming. Default: false.
@@ -538,6 +546,16 @@ pub const Provider = struct {
             return f(self.ptr, request);
         }
         return self.supportsNativeTools();
+    }
+
+    pub fn supportsSensitiveStreamingForRequest(self: Provider, request: ChatRequest) bool {
+        // A capability declaration is meaningful only when the adapter has a
+        // real streaming entry point. Provider.streamChat intentionally has a
+        // blocking compatibility fallback, which is never an acceptable
+        // transport for transcript-bearing requests.
+        if (!self.supportsStreaming() or self.vtable.stream_chat == null) return false;
+        const capability = self.vtable.supports_sensitive_streaming_for_request orelse return false;
+        return capability(self.ptr, request);
     }
 
     pub fn getName(self: Provider) []const u8 {
@@ -970,6 +988,12 @@ test "Provider.streamChat fallback emits single chunk and final" {
         fn supNativeTools(_: *anyopaque) bool {
             return false;
         }
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+        fn supportsSensitiveStreaming(_: *anyopaque, _: ChatRequest) bool {
+            return true;
+        }
         fn getName(_: *anyopaque) []const u8 {
             return "dummy";
         }
@@ -981,6 +1005,8 @@ test "Provider.streamChat fallback emits single chunk and final" {
         .chatWithSystem = DummyProvider.chatWithSystem,
         .chat = DummyProvider.chat,
         .supportsNativeTools = DummyProvider.supNativeTools,
+        .supports_streaming = DummyProvider.supportsStreaming,
+        .supports_sensitive_streaming_for_request = DummyProvider.supportsSensitiveStreaming,
         .getName = DummyProvider.getName,
         .deinit = DummyProvider.deinitFn,
     };
@@ -989,6 +1015,9 @@ test "Provider.streamChat fallback emits single chunk and final" {
     var ctx = TestCtx{};
     const msgs = [_]ChatMessage{ChatMessage.user("test")};
     const req = ChatRequest{ .messages = &msgs, .model = "test" };
+    // A declaration cannot make the ordinary blocking compatibility fallback
+    // eligible for transcript-bearing requests.
+    try std.testing.expect(!prov.supportsSensitiveStreamingForRequest(req));
     const result = try prov.streamChat(std.testing.allocator, req, "test", 0.7, TestCtx.onChunk, @ptrCast(&ctx));
 
     try std.testing.expect(ctx.got_content);

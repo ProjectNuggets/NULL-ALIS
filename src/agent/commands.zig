@@ -3310,6 +3310,21 @@ fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool)
 /// Resolve /approve when a generic pending tool approval exists.
 /// Handles: status display, allow-once, deny, and allow-always (treated as
 /// allow-once in v1 — there is no persistent generic allowlist yet).
+fn runToolApprovalContinuation(self: anytype, synthetic: []const u8) anyerror![]const u8 {
+    if (@hasDecl(@TypeOf(self.*), "turnForCommandContinuation")) {
+        return self.turnForCommandContinuation(synthetic);
+    }
+    return self.turn(synthetic);
+}
+
+fn deinitToolApprovalContinuation(self: anytype, continuation: []const u8) void {
+    if (@hasDecl(@TypeOf(self.*), "deinitTurnReply")) {
+        self.deinitTurnReply(continuation);
+        return;
+    }
+    self.allocator.free(continuation);
+}
+
 fn handleGenericToolApprove(self: anytype, arg: []const u8) ![]const u8 {
     const pending = self.pending_tool_approval.?;
 
@@ -3388,10 +3403,10 @@ fn handleGenericToolApprove(self: anytype, arg: []const u8) ![]const u8 {
             );
             defer self.allocator.free(synthetic);
 
-            const continuation_result: anyerror![]const u8 = self.turn(synthetic);
+            const continuation_result = runToolApprovalContinuation(self, synthetic);
             if (continuation_result) |continuation| {
                 if (std.mem.trim(u8, continuation, " \t\r\n").len == 0) {
-                    self.allocator.free(continuation);
+                    deinitToolApprovalContinuation(self, continuation);
                     return try std.fmt.allocPrint(
                         self.allocator,
                         "Tool approval id={d} denied.",
@@ -3545,10 +3560,10 @@ fn handleGenericToolApprove(self: anytype, arg: []const u8) ![]const u8 {
     // `self: anytype` forces us to cast through `anyerror` explicitly
     // so the error set resolves at the call site instead of propagating
     // through the caller's inferred union.
-    const continuation_result: anyerror![]const u8 = self.turn(synthetic);
+    const continuation_result = runToolApprovalContinuation(self, synthetic);
     if (continuation_result) |continuation| {
         if (std.mem.trim(u8, continuation, " \t\r\n").len == 0) {
-            self.allocator.free(continuation);
+            deinitToolApprovalContinuation(self, continuation);
             return try std.fmt.allocPrint(
                 self.allocator,
                 "Approved tool (id={d}) {s}.{s}\n{s}",
@@ -4790,6 +4805,22 @@ pub fn composeFinalReply(
     reasoning_content: ?[]const u8,
     usage: providers.TokenUsage,
 ) ![]const u8 {
+    return composeFinalReplyWithAllocator(
+        self,
+        self.allocator,
+        base_text,
+        reasoning_content,
+        usage,
+    );
+}
+
+pub fn composeFinalReplyWithAllocator(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    base_text: []const u8,
+    reasoning_content: ?[]const u8,
+    usage: providers.TokenUsage,
+) ![]const u8 {
     const trimmed_base = std.mem.trim(u8, base_text, " \t\r\n");
     const has_visible_text = trimmed_base.len > 0;
     // ME-05 fix (2026-05-07): test the TRIMMED reasoning length, not the
@@ -4833,12 +4864,12 @@ pub fn composeFinalReply(
     // is .on. If we already fell back to reasoning above, don't double-print.
     const show_reasoning = has_visible_text and self.reasoning_mode == .on and has_reasoning;
     if (!show_reasoning and self.usage_mode == .off) {
-        return try self.allocator.dupe(u8, final_base);
+        return try allocator.dupe(u8, final_base);
     }
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
 
     try w.writeAll(final_base);
 
@@ -4860,7 +4891,7 @@ pub fn composeFinalReply(
         ),
     }
 
-    return try out.toOwnedSlice(self.allocator);
+    return try out.toOwnedSlice(allocator);
 }
 
 fn handleDoctorCommand(self: anytype) ![]const u8 {
@@ -6019,7 +6050,8 @@ test "generic approval fallback returns tool output when continuation is empty" 
             .risk_level = .low,
             .reason = "supervised_mutating_requires_approval",
         },
-        turn_calls: usize = 0,
+        legacy_turn_calls: usize = 0,
+        continuation_turn_calls: usize = 0,
 
         fn executeApprovedPendingTool(_: *@This(), _: std.mem.Allocator) !struct {
             success: bool,
@@ -6033,7 +6065,12 @@ test "generic approval fallback returns tool output when continuation is empty" 
         }
 
         fn turn(self: *@This(), _: []const u8) ![]const u8 {
-            self.turn_calls += 1;
+            self.legacy_turn_calls += 1;
+            return try self.allocator.dupe(u8, "legacy path lost reply policy");
+        }
+
+        fn turnForCommandContinuation(self: *@This(), _: []const u8) ![]const u8 {
+            self.continuation_turn_calls += 1;
             return try self.allocator.dupe(u8, " \n\t ");
         }
     };
@@ -6043,7 +6080,8 @@ test "generic approval fallback returns tool output when continuation is empty" 
     const response = try handleGenericToolApprove(&fake, "allow-once");
     defer allocator.free(response);
 
-    try std.testing.expectEqual(@as(usize, 1), fake.turn_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.legacy_turn_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.continuation_turn_calls);
     try std.testing.expect(fake.pending_tool_approval == null);
     try std.testing.expect(std.mem.indexOf(u8, response, "Approved tool (id=41) succeeded.") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "artifact row created") != null);

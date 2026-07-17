@@ -14,6 +14,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
+const session_mod = @import("session.zig");
 const CronScheduler = @import("cron.zig").CronScheduler;
 const cron = @import("cron.zig");
 const bus_mod = @import("bus.zig");
@@ -886,7 +887,7 @@ fn runTenantHeartbeatForUser(
         saveHeartbeatRuntimeState(allocator, user_root, now_s, "send_failed", "turn_error");
         return;
     };
-    defer allocator.free(reply);
+    defer session_mod.deinitOwnedReply(allocator, reply);
 
     const actionable_reply = switch (parseHeartbeatReplyDirective(reply)) {
         .ok => {
@@ -2613,7 +2614,7 @@ fn inboundDispatcherThread(
             };
             continue;
         };
-        defer allocator.free(reply);
+        defer session_mod.deinitOwnedReply(allocator, reply);
 
         const out = (if (outbound_account_id) |aid|
             bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, reply)

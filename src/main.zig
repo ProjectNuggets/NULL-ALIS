@@ -3037,9 +3037,9 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
                 }
                 continue;
             };
-            defer allocator.free(reply);
+            defer yc.session.deinitOwnedReply(allocator, reply);
 
-            std.debug.print("  -> {s}\n", .{reply});
+            std.debug.print("  -> reply ready ({d} bytes)\n", .{reply.len});
 
             // Reply on Signal; handles split
             if (msg.reply_target) |target| {
@@ -3387,9 +3387,9 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
                 tg.sendMessageWithReply(msg.sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
                 continue;
             };
-            defer allocator.free(reply);
+            defer yc.session.deinitOwnedReply(allocator, reply);
 
-            std.debug.print("  -> {s}\n", .{reply});
+            std.debug.print("  -> reply ready ({d} bytes)\n", .{reply.len});
 
             // Reply on telegram; handles [IMAGE:path] markers + split
             tg.sendMessageWithReply(msg.sender, reply, reply_to_id) catch |err| {

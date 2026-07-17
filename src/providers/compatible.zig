@@ -624,6 +624,7 @@ pub const OpenAiCompatibleProvider = struct {
         .chatWithSystem = chatWithSystemImpl,
         .chat = chatImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
+        .supports_sensitive_streaming_for_request = supportsSensitiveStreamingForRequestImpl,
         .supports_vision = supportsVisionImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
@@ -828,6 +829,12 @@ pub const OpenAiCompatibleProvider = struct {
     fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         return self.native_tools;
+    }
+
+    fn supportsSensitiveStreamingForRequestImpl(_: *anyopaque, _: root.ChatRequest) bool {
+        // Streaming requests use providers/sse.zig's anonymous-stdin curl
+        // config with a scrubbed environment and content-free HTTP errors.
+        return true;
     }
 
     fn supportsVisionImpl(_: *anyopaque) bool {

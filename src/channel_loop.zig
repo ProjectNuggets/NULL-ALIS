@@ -704,7 +704,7 @@ fn processTelegramMessages(
                 tg_ptr.sendMessageWithReply(msg.sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
                 break :handle_one;
             };
-            defer allocator.free(reply);
+            defer session_mod.deinitOwnedReply(allocator, reply);
 
             tg_ptr.sendMessageWithReply(msg.sender, reply, reply_to_id) catch |err| {
                 log.warn("Send error: {}", .{err});
@@ -992,7 +992,7 @@ pub fn runSignalLoop(
                 }
                 continue;
             };
-            defer allocator.free(reply);
+            defer session_mod.deinitOwnedReply(allocator, reply);
 
             // Reply on Signal
             if (msg.reply_target) |target| {
@@ -1272,7 +1272,7 @@ pub fn runMatrixLoop(
                 mx_ptr.sendMessage(typing_target, err_msg) catch |send_err| log.err("failed to send matrix error reply: {}", .{send_err});
                 continue;
             };
-            defer allocator.free(reply);
+            defer session_mod.deinitOwnedReply(allocator, reply);
 
             mx_ptr.sendMessage(typing_target, reply) catch |err| {
                 log.warn("Matrix send error: {}", .{err});
@@ -1417,7 +1417,7 @@ pub fn runEmailLoop(
                 em_ptr.sendMessage(email_target, err_msg) catch |send_err| log.err("failed to send email error reply: {}", .{send_err});
                 continue;
             };
-            defer allocator.free(reply);
+            defer session_mod.deinitOwnedReply(allocator, reply);
 
             em_ptr.sendMessage(email_target, reply) catch |err| {
                 log.warn("Email send error: {}", .{err});

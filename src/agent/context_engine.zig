@@ -608,11 +608,17 @@ pub const ContextEngine = struct {
         );
 
         const stable_prefix_state = context_cache.buildStablePrefixState(refresh_plan, snapshot.has_system_prompt);
-        const provider_supports_native_tools = if (@hasField(@TypeOf(agent.*), "provider"))
+        const provider_supports_native_tools = if (@hasDecl(@TypeOf(agent.*), "supportsProviderNativeToolsForCurrentTurn"))
+            agent.supportsProviderNativeToolsForCurrentTurn()
+        else if (@hasField(@TypeOf(agent.*), "provider"))
             agent.provider.supportsNativeTools()
         else
             false;
-        const tool_surface_plan = tool_surface.select(provider_supports_native_tools, agent.tools.len);
+        const current_turn_tools = if (@hasDecl(@TypeOf(agent.*), "toolsForCurrentTurn"))
+            agent.toolsForCurrentTurn()
+        else
+            agent.tools;
+        const tool_surface_plan = tool_surface.select(provider_supports_native_tools, current_turn_tools.len);
 
         // S5.7 — memoized Config fetch. Replaces a per-turn
         // `Config.load` + JSON parse + deinit triad. The cached_config
@@ -622,7 +628,7 @@ pub const ContextEngine = struct {
         const capabilities_section = capabilities_mod.buildPromptSection(
             allocator,
             cfg_for_caps_ptr,
-            agent.tools,
+            current_turn_tools,
         ) catch null;
         defer if (capabilities_section) |section| allocator.free(section);
 
@@ -814,7 +820,7 @@ pub const ContextEngine = struct {
         const prompt_ctx = prompt.PromptContext{
             .workspace_dir = agent.workspace_dir,
             .model_name = agent.model_name,
-            .tools = agent.tools,
+            .tools = current_turn_tools,
             .tool_surface_plan = tool_surface_plan,
             .capabilities_section = capabilities_section,
             .conversation_context = agent.conversation_context,
@@ -844,7 +850,7 @@ pub const ContextEngine = struct {
         const stable_prompt = try prompt.buildStableSystemPrompt(allocator, prompt_ctx);
         defer allocator.free(stable_prompt);
 
-        const tool_instructions = try dispatcher.buildToolInstructionsForSurface(allocator, agent.tools, tool_surface_plan);
+        const tool_instructions = try dispatcher.buildToolInstructionsForSurface(allocator, current_turn_tools, tool_surface_plan);
         defer allocator.free(tool_instructions);
 
         const volatile_prompt = try prompt.buildVolatileSystemPrompt(allocator, prompt_ctx);

@@ -13,6 +13,7 @@ const Allocator = std.mem.Allocator;
 const bus_mod = @import("bus.zig");
 const config_mod = @import("config.zig");
 const channel_loop = @import("channel_loop.zig");
+const session_mod = @import("session.zig");
 const tools_mod = @import("tools/root.zig");
 const json_util = @import("json_util.zig");
 const observability = @import("observability.zig");
@@ -1873,7 +1874,7 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
         return;
     };
-    defer ctx.manager.allocator.free(result);
+    defer session_mod.deinitOwnedReply(ctx.manager.allocator, result);
 
     const dur_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - run_started_at));
     // Phase 3: hand the captured artifacts to completeTask, which deep-copies
@@ -4520,7 +4521,6 @@ test "subagent production turn carries entry_kind=daemon (metering fix)" {
     // the SAME options literal as the production code path and asserts the
     // discriminator — a direct compile-time guarantee that the fix is present.
     // (Full turn_usage PG billing is verified on staging.)
-    const session_mod = @import("session.zig");
     const opts: session_mod.SessionManager.ProcessMessageOptions = .{
         .turn_origin = .proactive,
         .entry_kind = .daemon,

