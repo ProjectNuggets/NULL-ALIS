@@ -121,14 +121,18 @@ OR EXISTS (
 
 -- The pgvector table is created lazily and may not exist in every deployment.
 -- Delete from the production-default table when present without making the
--- migration depend on pgvector being enabled.
+-- migration depend on pgvector being enabled. The DELETE is written as a
+-- static statement in the conditional branch — PL/pgSQL parses and resolves
+-- a statement only the first time its branch executes, so deployments
+-- without the table never reference it. Static SQL (no EXECUTE) is required
+-- by the WP-12 expand-phase gate (validateExpandSql).
 DO $wp_i$
 BEGIN
     IF to_regclass('{schema}.memory_embeddings') IS NOT NULL THEN
-        EXECUTE 'DELETE FROM {schema}.memory_embeddings AS embedding
-                 USING pg_temp.wp_i_poisoned_memories AS poisoned
-                 WHERE embedding.user_id = poisoned.user_id
-                   AND embedding.key = poisoned.key';
+        DELETE FROM {schema}.memory_embeddings AS embedding
+        USING pg_temp.wp_i_poisoned_memories AS poisoned
+        WHERE embedding.user_id = poisoned.user_id
+          AND embedding.key = poisoned.key;
     END IF;
 END
 $wp_i$;
