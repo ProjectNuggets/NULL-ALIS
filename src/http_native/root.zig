@@ -61,6 +61,10 @@ pub const TlsIoState = struct {
     }
 
     pub fn deinit(self: *TlsIoState, allocator: std.mem.Allocator) void {
+        @memset(self.tls_read_buf, 0);
+        @memset(self.tls_write_buf, 0);
+        @memset(self.socket_write_buf, 0);
+        @memset(self.socket_read_buf, 0);
         allocator.free(self.tls_read_buf);
         allocator.free(self.tls_write_buf);
         allocator.free(self.socket_write_buf);
@@ -242,7 +246,10 @@ fn root_request(allocator: std.mem.Allocator, options: RequestOptions) RequestEr
     apply_timeouts(stream, options.timeout_ms) catch return error.SocketTimeoutFailed;
 
     var raw_response = std.ArrayListUnmanaged(u8).empty;
-    defer raw_response.deinit(allocator);
+    defer {
+        @memset(raw_response.items, 0);
+        raw_response.deinit(allocator);
+    }
 
     if (is_tls) {
         try request_tls_with_state(allocator, &raw_response, tls_state.?, parsed, options);
@@ -307,7 +314,10 @@ fn request_plain(
     options: RequestOptions,
 ) RequestError!void {
     const request_bytes = try build_request(allocator, parsed, options);
-    defer allocator.free(request_bytes);
+    defer {
+        @memset(request_bytes, 0);
+        allocator.free(request_bytes);
+    }
 
     stream.writeAll(request_bytes) catch return error.TlsWriteFailed;
     try read_to_eof_plain(allocator, raw_response, stream, options.max_response_bytes);
@@ -331,7 +341,10 @@ fn stream_plain_body(
     comptime on_chunk: fn (@TypeOf(ctx), []const u8) anyerror!bool,
 ) anyerror!u16 {
     const request_bytes = try build_request(allocator, parsed, options);
-    defer allocator.free(request_bytes);
+    defer {
+        @memset(request_bytes, 0);
+        allocator.free(request_bytes);
+    }
 
     stream.writeAll(request_bytes) catch return error.TlsWriteFailed;
 
@@ -350,7 +363,10 @@ fn request_tls(
     defer tls.deinit(allocator);
 
     const request_bytes = try build_request(allocator, parsed, options);
-    defer allocator.free(request_bytes);
+    defer {
+        @memset(request_bytes, 0);
+        allocator.free(request_bytes);
+    }
 
     tls.tls_client.writer.writeAll(request_bytes) catch return error.TlsWriteFailed;
     tls.tls_client.writer.flush() catch return error.TlsWriteFailed;
@@ -372,7 +388,10 @@ fn request_tls_with_state(
     options: RequestOptions,
 ) RequestError!void {
     const request_bytes = try build_request(allocator, parsed, options);
-    defer allocator.free(request_bytes);
+    defer {
+        @memset(request_bytes, 0);
+        allocator.free(request_bytes);
+    }
 
     tls.tls_client.writer.writeAll(request_bytes) catch return error.TlsWriteFailed;
     tls.tls_client.writer.flush() catch return error.TlsWriteFailed;
@@ -395,7 +414,10 @@ fn stream_tls_body(
     defer tls.deinit(allocator);
 
     const request_bytes = try build_request(allocator, parsed, options);
-    defer allocator.free(request_bytes);
+    defer {
+        @memset(request_bytes, 0);
+        allocator.free(request_bytes);
+    }
 
     tls.tls_client.writer.writeAll(request_bytes) catch return error.TlsWriteFailed;
     tls.tls_client.writer.flush() catch return error.TlsWriteFailed;
@@ -535,6 +557,7 @@ fn read_to_eof_plain(
     max_response_bytes: usize,
 ) RequestError!void {
     var buf: [4096]u8 = undefined;
+    defer @memset(&buf, 0);
     while (true) {
         const n = stream.read(&buf) catch return error.TlsReadFailed;
         if (n == 0) break;
@@ -550,6 +573,7 @@ fn read_to_eof_tls(
     max_response_bytes: usize,
 ) RequestError!void {
     var buf: [4096]u8 = undefined;
+    defer @memset(&buf, 0);
     while (true) {
         const n = try tls_read_fn(tls_client, &buf);
         if (n == 0) break;
@@ -757,9 +781,13 @@ fn stream_http_body_from_reader(
     comptime on_chunk: fn (@TypeOf(ctx), []const u8) anyerror!bool,
 ) anyerror!u16 {
     var header_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer header_buf.deinit(allocator);
+    defer {
+        @memset(header_buf.items, 0);
+        header_buf.deinit(allocator);
+    }
 
     var tmp: [4096]u8 = undefined;
+    defer @memset(&tmp, 0);
     var body_start_index: usize = 0;
 
     while (std.mem.indexOf(u8, header_buf.items, "\r\n\r\n") == null) {
@@ -832,6 +860,7 @@ fn stream_sized_body(
     }
 
     var tmp: [4096]u8 = undefined;
+    defer @memset(&tmp, 0);
     while (remaining > 0) {
         const to_read = @min(tmp.len, remaining);
         const n = try read_fn(reader, tmp[0..to_read]);
@@ -857,6 +886,7 @@ fn stream_eof_body(
     }
 
     var tmp: [4096]u8 = undefined;
+    defer @memset(&tmp, 0);
     while (true) {
         const n = try read_fn(reader, &tmp);
         if (n == 0) break;
@@ -875,12 +905,23 @@ fn stream_chunked_body(
     ctx: anytype,
     comptime on_chunk: fn (@TypeOf(ctx), []const u8) anyerror!bool,
 ) anyerror!void {
+    // Bound partial framing separately from decoded body bytes. A peer can
+    // withhold the CRLF that terminates a chunk-size line, so the parser must
+    // not let framing grow without limit while it waits for a complete frame.
+    const max_framing_bytes: usize = 16 * 1024;
+    const initial_buffer_cap = std.math.add(usize, max_response_bytes, max_framing_bytes) catch std.math.maxInt(usize);
+    if (initial_body.len > initial_buffer_cap) return error.ResponseTooLarge;
+
     var buffer: std.ArrayListUnmanaged(u8) = .empty;
-    defer buffer.deinit(allocator);
+    defer {
+        @memset(buffer.items, 0);
+        buffer.deinit(allocator);
+    }
     try buffer.appendSlice(allocator, initial_body);
 
     var total: usize = 0;
     var tmp: [4096]u8 = undefined;
+    defer @memset(&tmp, 0);
 
     while (true) {
         while (true) {
@@ -890,18 +931,24 @@ fn stream_chunked_body(
             const size_str = std.mem.trim(u8, size_line[0..semi], " \t");
             const chunk_len = std.fmt.parseInt(usize, size_str, 16) catch return error.InvalidChunkedEncoding;
 
-            const frame_len = line_end + 2 + chunk_len + 2;
+            // Reject the declared size as soon as the size line is complete.
+            // Waiting for an oversized frame to arrive would allow the peer to
+            // grow `buffer` past the configured decoded-response budget.
+            const remaining_budget = max_response_bytes - total;
+            if (chunk_len > remaining_budget) return error.ResponseTooLarge;
+
+            const chunk_start = std.math.add(usize, line_end, 2) catch return error.InvalidChunkedEncoding;
+            const chunk_end = std.math.add(usize, chunk_start, chunk_len) catch return error.InvalidChunkedEncoding;
+            const frame_len = std.math.add(usize, chunk_end, 2) catch return error.InvalidChunkedEncoding;
             if (buffer.items.len < frame_len) break;
 
             if (chunk_len == 0) return;
 
-            const chunk_start = line_end + 2;
-            const chunk = buffer.items[chunk_start .. chunk_start + chunk_len];
+            const chunk = buffer.items[chunk_start..chunk_end];
             total += chunk.len;
-            if (total > max_response_bytes) return error.ResponseTooLarge;
             if (!(try on_chunk(ctx, chunk))) return;
 
-            if (!std.mem.eql(u8, buffer.items[chunk_start + chunk_len .. chunk_start + chunk_len + 2], "\r\n")) {
+            if (!std.mem.eql(u8, buffer.items[chunk_end..frame_len], "\r\n")) {
                 return error.InvalidChunkedEncoding;
             }
 
@@ -912,6 +959,9 @@ fn stream_chunked_body(
 
         const n = try read_fn(reader, &tmp);
         if (n == 0) return error.InvalidChunkedEncoding;
+        const remaining_budget = max_response_bytes - total;
+        const buffer_cap = std.math.add(usize, remaining_budget, max_framing_bytes) catch std.math.maxInt(usize);
+        if (buffer.items.len > buffer_cap or n > buffer_cap - buffer.items.len) return error.ResponseTooLarge;
         try buffer.appendSlice(allocator, tmp[0..n]);
     }
 }
@@ -989,6 +1039,44 @@ test "native http request decodes chunked response" {
 
     try std.testing.expectEqual(@as(u16, 200), response.status_code);
     try std.testing.expectEqualStrings("hello world", response.body);
+}
+
+test "streaming native http rejects an oversized declared chunk before buffering its body" {
+    const addr = try std.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+
+    // The peer declares a chunk larger than the entire response budget, then
+    // closes without sending its body. The streaming parser must reject the
+    // declaration itself; waiting for the frame would let a peer grow the
+    // parser buffer beyond the configured response cap.
+    const oversized_chunk =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" ++
+        "100000000\r\n";
+    const thread = try std.Thread.spawn(.{}, serve_once, .{ &server, oversized_chunk });
+    defer thread.join();
+
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/oversized-chunk", .{server.listen_address.getPort()});
+    defer std.testing.allocator.free(url);
+
+    const Sink = struct {
+        fn onChunk(_: *@This(), _: []const u8) !bool {
+            return true;
+        }
+    };
+    var sink = Sink{};
+    try std.testing.expectError(error.ResponseTooLarge, stream_body(
+        std.testing.allocator,
+        .{
+            .method = "GET",
+            .url = url,
+            .timeout_ms = 5_000,
+            .max_response_bytes = 1024,
+            .subsystem = .tools,
+        },
+        &sink,
+        Sink.onChunk,
+    ));
 }
 
 test "native http request resolves localhost hostname" {
