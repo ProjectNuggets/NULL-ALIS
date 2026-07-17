@@ -5359,6 +5359,87 @@ fn proactiveStatusLabel(heartbeat_enabled: bool, runtime_summary: HeartbeatRunti
     return "enabled_unproven";
 }
 
+fn buildHeartbeatControlResponse(
+    allocator: std.mem.Allocator,
+    enabled: bool,
+    operator_enabled: bool,
+    interval_minutes: u32,
+    telegram_connected: bool,
+    runtime_summary: HeartbeatRuntimeSummary,
+) ![]u8 {
+    const effective_enabled = enabled and operator_enabled;
+    const delivery_ready = effective_enabled and telegram_connected;
+    const status = if (!enabled)
+        "disabled"
+    else if (!operator_enabled)
+        "operator_disabled"
+    else if (!telegram_connected)
+        "needs_telegram"
+    else
+        "ready";
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKey(&buf, allocator, "enabled");
+    try buf.appendSlice(allocator, if (enabled) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "operator_enabled");
+    try buf.appendSlice(allocator, if (operator_enabled) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "effective_enabled");
+    try buf.appendSlice(allocator, if (effective_enabled) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "interval_minutes", interval_minutes);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "delivery_channel", "telegram");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "delivery_ready");
+    try buf.appendSlice(allocator, if (delivery_ready) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "status", status);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "last_run_s");
+    if (runtime_summary.last_run_s) |last_run_s| {
+        try buf.writer(allocator).print("{d}", .{last_run_s});
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "last_status");
+    try appendJsonStringValue(&buf, allocator, runtime_summary.last_status);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "last_reason");
+    try appendJsonStringValue(&buf, allocator, runtime_summary.last_reason);
+    try buf.appendSlice(allocator, "}");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn heartbeatControlResponseForUser(
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    user_ctx: *const UserContext,
+    scoped_user_id: []const u8,
+    enabled: bool,
+) ![]u8 {
+    var telegram_readiness = NormalizedTelegramReadiness{};
+    defer telegram_readiness.deinit(allocator);
+    if (build_options.enable_channel_telegram) {
+        telegram_readiness = loadNormalizedTelegramReadiness(allocator, state, scoped_user_id, user_ctx) catch .{};
+    }
+
+    var runtime_summary = loadHeartbeatRuntimeSummary(allocator, state, scoped_user_id);
+    defer runtime_summary.deinit(allocator);
+    return buildHeartbeatControlResponse(
+        allocator,
+        enabled,
+        state.heartbeat_enabled,
+        @max(@as(u32, 1), state.heartbeat_interval_minutes),
+        telegram_readiness.connected_normalized,
+        runtime_summary,
+    );
+}
+
 fn clientReadyStatus(operator_chat_ready: bool, telegram_readiness: NormalizedTelegramReadiness) []const u8 {
     if (telegram_readiness.requiresReconnect()) return "needs_reconnect";
     if (!operator_chat_ready) return "operator_action_required";
@@ -21237,10 +21318,10 @@ fn handleApiRoute(
     if (std.mem.eql(u8, parsed.subpath, "heartbeat")) {
         if (std.mem.eql(u8, method, "GET")) {
             const enabled = loadNormalizedHeartbeatEnabled(req_allocator, state, scoped_user_id, user_ctx.heartbeat_path);
-            const canonical_body = canonicalHeartbeatEnabledJson(req_allocator, enabled) catch {
+            const response_body = heartbeatControlResponseForUser(req_allocator, state, &user_ctx, scoped_user_id, enabled) catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
             };
-            return .{ .body = canonical_body };
+            return .{ .body = response_body };
         }
         if (std.mem.eql(u8, method, "PUT")) {
             const body = extractBody(raw_request) orelse "{}\n";
@@ -21251,8 +21332,12 @@ fn handleApiRoute(
             const canonical_body = writeHeartbeatEnabledForUser(req_allocator, state, &user_ctx, scoped_user_id, enabled) catch {
                 return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"write failed\"}" };
             };
+            defer req_allocator.free(canonical_body);
             markTenantRuntimeForDestroy(state, scoped_user_id);
-            return .{ .body = canonical_body };
+            const response_body = heartbeatControlResponseForUser(req_allocator, state, &user_ctx, scoped_user_id, enabled) catch {
+                return .{ .status = "500 Internal Server Error", .body = "{\"error\":\"response build failed\"}" };
+            };
+            return .{ .body = response_body };
         }
         return .{ .status = "405 Method Not Allowed", .body = "{\"error\":\"method not allowed\"}" };
     }
@@ -28017,7 +28102,7 @@ test "handleApiRoute GET settings returns defaults when no profile exists" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("balanced", parsed.value.object.get("assistant_mode").?.string);
     try std.testing.expectEqualStrings("mention", parsed.value.object.get("group_activation").?.string);
-    try std.testing.expectEqual(true, parsed.value.object.get("proactive_updates").?.bool);
+    try std.testing.expectEqual(false, parsed.value.object.get("proactive_updates").?.bool);
     try std.testing.expectEqual(false, parsed.value.object.get("voice_replies").?.bool);
     try std.testing.expectEqual(@as(i64, 30), parsed.value.object.get("session_timeout_minutes").?.integer);
 }
@@ -28169,7 +28254,10 @@ test "handleApiRoute PATCH settings writes canonical tenant preferences and stri
         null,
     );
     try std.testing.expectEqualStrings("200 OK", heartbeat_get_response.status);
-    try std.testing.expectEqualStrings("{\"enabled\":true}", heartbeat_get_response.body);
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat_get_response.body, "\"enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat_get_response.body, "\"operator_enabled\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat_get_response.body, "\"effective_enabled\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat_get_response.body, "\"status\":\"operator_disabled\"") != null);
 }
 
 test "handleApiRoute PATCH config rejects raw config writes" {
@@ -28352,6 +28440,8 @@ test "handleApiRoute PUT heartbeat stores canonical enabled-only payload" {
     var state = GatewayState.init(std.testing.allocator);
     defer state.deinit();
     state.tenant_data_root = tenant_root;
+    state.heartbeat_enabled = true;
+    state.heartbeat_interval_minutes = 60;
     const internal_tokens = [_][]const u8{"test-internal-token"};
     state.internal_service_tokens = &internal_tokens;
 
@@ -28384,7 +28474,13 @@ test "handleApiRoute PUT heartbeat stores canonical enabled-only payload" {
         null,
     );
     try std.testing.expectEqualStrings("200 OK", put_response.status);
-    try std.testing.expectEqualStrings("{\"enabled\":true}", put_response.body);
+    try std.testing.expect(std.mem.indexOf(u8, put_response.body, "\"enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, put_response.body, "\"operator_enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, put_response.body, "\"effective_enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, put_response.body, "\"interval_minutes\":60") != null);
+    try std.testing.expect(std.mem.indexOf(u8, put_response.body, "\"delivery_channel\":\"telegram\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, put_response.body, "\"delivery_ready\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, put_response.body, "\"status\":\"needs_telegram\"") != null);
 
     const get_request = try std.fmt.allocPrint(
         req_allocator,
@@ -28402,7 +28498,9 @@ test "handleApiRoute PUT heartbeat stores canonical enabled-only payload" {
         null,
     );
     try std.testing.expectEqualStrings("200 OK", get_response.status);
-    try std.testing.expectEqualStrings("{\"enabled\":true}", get_response.body);
+    try std.testing.expect(std.mem.indexOf(u8, get_response.body, "\"enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_response.body, "\"effective_enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_response.body, "\"status\":\"needs_telegram\"") != null);
 
     const settings_request = try std.fmt.allocPrint(
         req_allocator,
@@ -28465,7 +28563,8 @@ test "handleApiRoute GET heartbeat normalizes legacy stored payload" {
         null,
     );
     try std.testing.expectEqualStrings("200 OK", get_response.status);
-    try std.testing.expectEqualStrings("{\"enabled\":true}", get_response.body);
+    try std.testing.expect(std.mem.indexOf(u8, get_response.body, "\"enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_response.body, "\"status\":\"operator_disabled\"") != null);
 }
 
 test "handleApiRoute PUT heartbeat rejects payload without enabled" {
@@ -28603,7 +28702,12 @@ test "ownership_lock_wait_succeeds_within_budget_when_lease_released" {
     defer std.testing.allocator.free(user_root);
     try std.fs.makeDirAbsolute(user_root);
 
-    var held_lock = try tenant_lock.acquireUserOwnershipLock(std.testing.allocator, user_root, "owner-b", 1);
+    // Hold with a long lease so only the explicit release below can hand the
+    // lock over. Lease expiry has whole-second granularity: a 1s lease taken
+    // just before a wall-clock second boundary is reclaimable milliseconds
+    // later, letting the waiter's first attempt succeed with zero conflict
+    // retries (observed on macos-14 CI).
+    var held_lock = try tenant_lock.acquireUserOwnershipLock(std.testing.allocator, user_root, "owner-b", 300);
     defer held_lock.deinit();
 
     var state = GatewayState.init(std.testing.allocator);
@@ -28611,9 +28715,18 @@ test "ownership_lock_wait_succeeds_within_budget_when_lease_released" {
     state.tenant_enabled = true;
     state.ownership_lock_enabled = true;
     state.owner_instance_id = "owner-a";
-    state.ownership_lock_wait_ms = 1500;
-    state.ownership_lock_retry_min_ms = 100;
-    state.ownership_lock_retry_max_ms = 100;
+    state.ownership_lock_wait_ms = 5000;
+    state.ownership_lock_retry_min_ms = 25;
+    state.ownership_lock_retry_max_ms = 25;
+
+    const Releaser = struct {
+        fn run(lock: *tenant_lock.UserOwnershipLock) void {
+            std.Thread.sleep(400 * std.time.ns_per_ms);
+            lock.release();
+        }
+    };
+    const releaser = try std.Thread.spawn(.{}, Releaser.run, .{&held_lock});
+    defer releaser.join();
 
     var acquired = try maybeAcquireTenantOwnershipLock(std.testing.allocator, &state, "9", user_root);
     defer acquired.deinit();

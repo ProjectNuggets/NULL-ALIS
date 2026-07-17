@@ -48,7 +48,7 @@ pub const GroupActivation = enum {
 pub const ProductSettings = struct {
     assistant_mode: AssistantMode = .balanced,
     group_activation: GroupActivation = .mention,
-    proactive_updates: bool = true,
+    proactive_updates: bool = false,
     voice_replies: bool = false,
     session_timeout_minutes: u32 = 30,
     /// V1.14.4 (booth-readiness, autonomy toggle wire-up).
@@ -966,7 +966,7 @@ test "defaults uses balanced profile" {
     const settings = defaults();
     try std.testing.expect(settings.assistant_mode == .balanced);
     try std.testing.expect(settings.group_activation == .mention);
-    try std.testing.expect(settings.proactive_updates);
+    try std.testing.expect(!settings.proactive_updates);
     try std.testing.expect(!settings.voice_replies);
     try std.testing.expectEqual(@as(u32, 30), settings.session_timeout_minutes);
 }

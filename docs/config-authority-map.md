@@ -41,7 +41,7 @@ This document is the canonical contract for who owns each class of config and wh
 |---|---|---|
 | `assistant_mode` | Agent Runtime Defaults | Selects an operator-defined preset; it does not let a tenant redefine the preset. |
 | `group_activation` | Channels / Agent Runtime Defaults | Controls when the agent responds in group channels. |
-| `proactive_updates` | Agent Runtime Defaults | Records tenant intent only. It does not by itself start heartbeat work. ZAKI's launch boundary currently reports this off and rejects attempts to set it true. |
+| `proactive_updates` | Legacy background-send compatibility field | Maps only to background agent message-tool `send_mode`; it does not start or stop heartbeat work and defaults off. ZAKI does not expose it as the proactive check-in control. |
 | `voice_replies` | Channels | Enables replies for supported audio-capable channel turns. |
 | `session_timeout_minutes` | Agent Runtime Defaults | Clamped to 5-180 minutes. |
 | `autonomy` | Agent Runtime Defaults | Selects `read_only`, `supervised`, or `full` inside the operator security policy. |
@@ -51,22 +51,24 @@ This document is the canonical contract for who owns each class of config and wh
 | `selected_model` | Models & Providers | Selects only an engine-allowlisted model; operator provider credentials and routing remain operator-owned. |
 
 ### Per-user runtime plane
-- Owner: user runtime controls, exposed by product UX only when the launch policy allows it
+- Owner: Agent Settings → Proactive check-ins
 - Authority: `GET|PUT /api/v1/users/{id}/heartbeat`
 - Canonical state: `zaki_state` heartbeat JSON when the Postgres state manager is active;
   `heartbeat.json` is the file fallback/mirror
-- Current writable fields: heartbeat `enabled` (the engine also reads cadence/prompt from the
+- Current writable fields: heartbeat `enabled` (default false; the engine also reads cadence/prompt from the
   canonical heartbeat document, but clients must not claim those controls until their BFF schema
   supports them)
-- Derived, read-only state: `heartbeat_runtime.json` (`last_run_s`, `last_status`, `last_reason`)
+- Derived, read-only response fields: operator availability, effective enablement, interval,
+  Telegram delivery readiness, status, and `heartbeat_runtime.json` outcome
+  (`last_run_s`, `last_status`, `last_reason`)
 
-The heartbeat loop is effective only when the operator scheduler is enabled **and** the per-user
+The heartbeat loop is effective only when the operator heartbeat worker is enabled **and** the per-user
 heartbeat record is enabled. A tenant's `proactive_updates` preference is a separate intent field;
 it is not an authority for the scheduler and must not be presented as proof that proactive delivery
-ran. During ZAKI's launch pause, the authenticated Hub boundary rejects both
-`proactive_updates=true` and heartbeat `enabled=true` (on the canonical and legacy aliases), while
-returning both launch-effective values as false. Re-enabling them later requires a deliberate BFF
-policy change plus an effective-status surface backed by heartbeat runtime diagnostics.
+ran. ZAKI ships the operator worker on, keeps each user's heartbeat off by default, and accepts an
+explicit authenticated opt-in through the heartbeat route. The canonical and legacy Hub aliases use
+the same handler. Heartbeat output is currently delivered only through a connected Telegram target;
+it is not injected into ZAKI web chat. Cron jobs remain separately scheduled and separately revocable.
 
 ### Tenant integration plane
 - Owner: user/channel onboarding flow
