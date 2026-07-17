@@ -549,7 +549,7 @@ paths:
                     user_visible:
                       type: boolean
                       default: true
-                      description: When false together with `authored_by: backend`, the user-role turn remains model context but is excluded from session history and export by durable provenance.
+                      description: "When false together with `authored_by: backend`, the user-role turn remains model context but is excluded from session history and export by durable provenance."
       responses:
         "200":
           description: |
@@ -921,12 +921,11 @@ paths:
         - $ref: "#/components/parameters/UserIdPath"
       responses:
         "200":
-          description: Heartbeat config
+          description: User heartbeat preference plus effective runtime and delivery status
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: "#/components/schemas/HeartbeatControlState"
     put:
       tags: [user]
       summary: Set user heartbeat config
@@ -940,14 +939,18 @@ paths:
           application/json:
             schema:
               type: object
-              additionalProperties: true
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+              additionalProperties: false
       responses:
         "200":
-          description: Updated
+          description: Updated heartbeat preference plus effective runtime and delivery status
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/StatusResponse"
+                $ref: "#/components/schemas/HeartbeatControlState"
         "409":
           description: Tenant ownership lock conflict
           content:
@@ -4320,6 +4323,8 @@ components:
           enum: [mention, always]
         proactive_updates:
           type: boolean
+          default: false
+          description: Legacy background message-tool send preference; not heartbeat authority.
         voice_replies:
           type: boolean
         session_timeout_minutes:
@@ -4332,6 +4337,51 @@ components:
         - proactive_updates
         - voice_replies
         - session_timeout_minutes
+      additionalProperties: false
+    HeartbeatControlState:
+      type: object
+      required:
+        - enabled
+        - operator_enabled
+        - effective_enabled
+        - interval_minutes
+        - delivery_channel
+        - delivery_ready
+        - status
+        - last_run_s
+        - last_status
+        - last_reason
+      properties:
+        enabled:
+          type: boolean
+          description: Per-user desired check-in state. Defaults false until the user opts in.
+        operator_enabled:
+          type: boolean
+          description: Whether the deployment heartbeat worker is available.
+        effective_enabled:
+          type: boolean
+          description: True only when both operator and per-user heartbeat controls are enabled.
+        interval_minutes:
+          type: integer
+          minimum: 1
+        delivery_channel:
+          type: string
+          enum: [telegram]
+        delivery_ready:
+          type: boolean
+          description: True when effective heartbeat execution has a connected Telegram target.
+        status:
+          type: string
+          enum: [disabled, operator_disabled, needs_telegram, ready]
+        last_run_s:
+          type: integer
+          nullable: true
+        last_status:
+          type: string
+          nullable: true
+        last_reason:
+          type: string
+          nullable: true
       additionalProperties: false
     OnboardingState:
       type: object

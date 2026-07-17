@@ -309,6 +309,10 @@ pub const MIGRATIONS = [_]Migration{
         .version = 10,
         .name = "0010_brain_scaffold_purge",
         .sql = @embedFile("migrations/0010_brain_scaffold_purge.sql"),
+        // Data-only static DELETE/UPDATE purge (no schema DDL): the previous
+        // binary tolerates the pruned rows, so this is expand-safe under the
+        // rollback contract. W.4 classification per the Minutes launch handoff.
+        .phase = .expand,
     },
 };
 
@@ -706,6 +710,30 @@ test "validateExpandSql ignores destructive words inside literals and quoted ide
         \\  note TEXT DEFAULT 'drop table and rename column'
         \\)
     );
+}
+
+test "validateExpandSql rejects every dynamic EXECUTE shape, even static-looking literals" {
+    // The expand gate has NO dynamic-SQL admission: 0010 was rewritten to a
+    // static conditional DELETE (PL/pgSQL binds a statement only when its
+    // branch first executes) precisely so EXECUTE can stay forbidden.
+    const rejected = [_][]const u8{
+        "DO $$ BEGIN EXECUTE 'DELETE FROM {schema}.a'; END $$",
+        "DO $$ BEGIN EXECUTE 'DROP TABLE {schema}.memories'; END $$",
+        "DO $$ BEGIN EXECUTE format('DELETE FROM %I', tbl); END $$",
+        "SELECT 1 EXECUTE now",
+    };
+    for (rejected) |sql| {
+        try std.testing.expectError(error.DestructiveExpandMigration, validateExpandSql(sql));
+    }
+}
+
+test "validateExpandSql admits 0010's data-only static conditional purge" {
+    // Regression guard for the shipped registry: 0010 is a data-only purge
+    // (temp tables + static DELETE/UPDATE/INSERT audit rows, no schema DDL,
+    // no EXECUTE) classified .expand. Future validator hardening that starts
+    // rejecting static DELETE must whitelist this shipped migration
+    // deliberately, not break boot.
+    try validateExpandSql(@embedFile("migrations/0010_brain_scaffold_purge.sql"));
 }
 
 test "migrations.run with production MIGRATIONS executes tracker + each registered migration" {
