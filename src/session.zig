@@ -1259,10 +1259,11 @@ pub const SessionManager = struct {
         );
         const minutes_read_state: ?*tools_mod.MinutesReadTurnState = if (minutes_read_enabled) blk: {
             const state = try self.allocator.create(tools_mod.MinutesReadTurnState);
-            state.* = .{};
+            state.* = tools_mod.MinutesReadTurnState.init(self.allocator);
             break :blk state;
         } else null;
         defer if (minutes_read_state) |state| {
+            state.deinit();
             std.crypto.secureZero(u8, std.mem.asBytes(state));
             self.allocator.destroy(state);
         };

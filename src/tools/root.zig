@@ -2024,22 +2024,44 @@ pub const MinutesReadTurnState = struct {
     /// This consumer accepts at most 50 items from one validated index page,
     /// even though the spoke contract permits a larger server-side maximum.
     /// Keep a bounded digest-only working set for same-turn item authorization;
-    /// this is not a read-call or response-byte allowance.
+    /// this is not a read-call or response-byte allowance. Storage grows only
+    /// with validated results and remains bounded by the Agent's ordinary turn
+    /// iteration policy plus each collection response's 50-item cap.
     pub const max_issued_items: usize = 50;
-    pub const max_turn_issued_items: usize = 500;
     pub const CapabilityDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
+    const IssuedItem = struct {
+        digest: CapabilityDigest,
+        summary_eligible: bool,
+    };
+
+    allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
     // Cross-spoke identifiers and cursors are capabilities. Keep only digests
     // so prompt-controlled plaintext cannot survive in turn state or logs.
-    issued_items: [max_turn_issued_items]CapabilityDigest = undefined,
-    issued_item_summary_eligible: [max_turn_issued_items]bool = undefined,
-    issued_item_count: usize = 0,
+    issued_items: std.ArrayListUnmanaged(IssuedItem) = .empty,
     issued_cursor: CapabilityDigest = undefined,
     issued_cursor_query: CapabilityDigest = undefined,
     has_issued_cursor: bool = false,
     summary_fallback_item: CapabilityDigest = undefined,
     has_summary_fallback_item: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator) MinutesReadTurnState {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *MinutesReadTurnState) void {
+        if (self.issued_items.capacity > 0) {
+            std.crypto.secureZero(u8, std.mem.sliceAsBytes(self.issued_items.allocatedSlice()));
+        }
+        self.issued_items.deinit(self.allocator);
+        self.issued_items = .empty;
+        std.crypto.secureZero(u8, &self.issued_cursor);
+        std.crypto.secureZero(u8, &self.issued_cursor_query);
+        std.crypto.secureZero(u8, &self.summary_fallback_item);
+        self.has_issued_cursor = false;
+        self.has_summary_fallback_item = false;
+    }
 
     pub fn digestCapability(value: []const u8) CapabilityDigest {
         var digest: CapabilityDigest = undefined;
@@ -2079,19 +2101,19 @@ pub const MinutesReadTurnState = struct {
         item_summary_eligible: []const bool,
         next_cursor: ?CapabilityDigest,
         index_query: CapabilityDigest,
-    ) bool {
+    ) !void {
         std.debug.assert(item_digests.len <= max_issued_items);
         std.debug.assert(item_summary_eligible.len == item_digests.len);
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Capacity-check before mutation so a failed record cannot authorize a
+        // Reserve before mutation so allocation failure cannot authorize a
         // partial page that was never returned to the model.
         var new_item_count: usize = 0;
         for (item_digests, 0..) |candidate, candidate_index| {
             var already_issued = false;
-            for (self.issued_items[0..self.issued_item_count]) |issued| {
-                if (std.mem.eql(u8, &issued, &candidate)) {
+            for (self.issued_items.items) |issued| {
+                if (std.mem.eql(u8, &issued.digest, &candidate)) {
                     already_issued = true;
                     break;
                 }
@@ -2106,12 +2128,12 @@ pub const MinutesReadTurnState = struct {
             }
             if (!already_issued) new_item_count += 1;
         }
-        if (new_item_count > max_turn_issued_items - self.issued_item_count) return false;
+        try self.issued_items.ensureUnusedCapacity(self.allocator, new_item_count);
 
         for (item_digests, item_summary_eligible) |candidate, summary_eligible| {
             var existing_index: ?usize = null;
-            for (self.issued_items[0..self.issued_item_count], 0..) |issued, index| {
-                if (std.mem.eql(u8, &issued, &candidate)) {
+            for (self.issued_items.items, 0..) |issued, index| {
+                if (std.mem.eql(u8, &issued.digest, &candidate)) {
                     existing_index = index;
                     break;
                 }
@@ -2119,11 +2141,12 @@ pub const MinutesReadTurnState = struct {
             if (existing_index) |index| {
                 // Seeing validated transcript metadata on any page is enough
                 // to permit the one-shot, response-validated summary fallback.
-                self.issued_item_summary_eligible[index] = self.issued_item_summary_eligible[index] or summary_eligible;
+                self.issued_items.items[index].summary_eligible = self.issued_items.items[index].summary_eligible or summary_eligible;
             } else {
-                self.issued_items[self.issued_item_count] = candidate;
-                self.issued_item_summary_eligible[self.issued_item_count] = summary_eligible;
-                self.issued_item_count += 1;
+                self.issued_items.appendAssumeCapacity(.{
+                    .digest = candidate,
+                    .summary_eligible = summary_eligible,
+                });
             }
         }
         if (next_cursor) |digest| {
@@ -2134,7 +2157,6 @@ pub const MinutesReadTurnState = struct {
             self.has_issued_cursor = false;
         }
         self.has_summary_fallback_item = false;
-        return true;
     }
 
     pub fn isCursorIssued(self: *MinutesReadTurnState, cursor: []const u8, index_query: CapabilityDigest) bool {
@@ -2155,15 +2177,15 @@ pub const MinutesReadTurnState = struct {
         defer self.mutex.unlock();
 
         var issued_item_index: ?usize = null;
-        for (self.issued_items[0..self.issued_item_count], 0..) |issued, index| {
-            if (std.mem.eql(u8, &issued, &digest)) {
+        for (self.issued_items.items, 0..) |issued, index| {
+            if (std.mem.eql(u8, &issued.digest, &digest)) {
                 issued_item_index = index;
                 break;
             }
         }
         const item_index = issued_item_index orelse return false;
         if (!summary_retry) return true;
-        if (!self.issued_item_summary_eligible[item_index]) return false;
+        if (!self.issued_items.items[item_index].summary_eligible) return false;
         if (!self.has_summary_fallback_item or !std.mem.eql(u8, &self.summary_fallback_item, &digest)) return false;
         self.has_summary_fallback_item = false;
         return true;
@@ -2173,9 +2195,9 @@ pub const MinutesReadTurnState = struct {
         const digest = digestCapability(item_id);
         self.mutex.lock();
         defer self.mutex.unlock();
-        for (self.issued_items[0..self.issued_item_count], 0..) |issued, index| {
-            if (std.mem.eql(u8, &issued, &digest)) {
-                if (!self.issued_item_summary_eligible[index]) return false;
+        for (self.issued_items.items) |issued| {
+            if (std.mem.eql(u8, &issued.digest, &digest)) {
+                if (!issued.summary_eligible) return false;
                 self.summary_fallback_item = digest;
                 self.has_summary_fallback_item = true;
                 return true;

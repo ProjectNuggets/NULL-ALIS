@@ -15998,7 +15998,8 @@ test "image fallback removes Minutes from request and blocks hallucinated execut
     };
     defer agent.deinit();
 
-    var minutes_state = tools_mod.MinutesReadTurnState{};
+    var minutes_state = tools_mod.MinutesReadTurnState.init(std.testing.allocator);
+    defer minutes_state.deinit();
     installMinutesTestTurnContext(&minutes_state);
     defer tools_mod.clearTurnContext();
     var outcome = try agent.turnOutcome(
@@ -16139,7 +16140,8 @@ test "unaudited provider removes Minutes from request and blocks hallucinated ex
     };
     defer agent.deinit();
 
-    var minutes_state = tools_mod.MinutesReadTurnState{};
+    var minutes_state = tools_mod.MinutesReadTurnState.init(std.testing.allocator);
+    defer minutes_state.deinit();
     installMinutesTestTurnContext(&minutes_state);
     defer tools_mod.clearTurnContext();
     var outcome = try agent.turnOutcome("Summarize my last meeting.");
@@ -16657,7 +16659,8 @@ test "minutes_read native streaming turn discards adversarial task plan and pres
         .is_dm = true,
     });
     defer tools_mod.clearMessageTurnContext();
-    var minutes_state = tools_mod.MinutesReadTurnState{};
+    var minutes_state = tools_mod.MinutesReadTurnState.init(std.testing.allocator);
+    defer minutes_state.deinit();
     installMinutesTestTurnContext(&minutes_state);
     defer tools_mod.clearTurnContext();
 
@@ -16905,7 +16908,8 @@ test "minutes_read streaming exhaustion holds preamble so gateway replays blocki
     };
     defer agent.deinit();
 
-    var minutes_state = tools_mod.MinutesReadTurnState{};
+    var minutes_state = tools_mod.MinutesReadTurnState.init(std.testing.allocator);
+    defer minutes_state.deinit();
     installMinutesTestTurnContext(&minutes_state);
     defer tools_mod.clearTurnContext();
     var outcome = try agent.turnOutcome(
@@ -17070,7 +17074,8 @@ test "minutes_read XML turn discards adversarial task plan and keeps raw transcr
     };
     defer agent.deinit();
 
-    var minutes_state = tools_mod.MinutesReadTurnState{};
+    var minutes_state = tools_mod.MinutesReadTurnState.init(std.testing.allocator);
+    defer minutes_state.deinit();
     installMinutesTestTurnContext(&minutes_state);
     defer tools_mod.clearTurnContext();
     const response = try agent.turn("Summarize my last meeting through XML fallback.");
@@ -17200,7 +17205,8 @@ test "minutes_read foreground lane is destroyed on provider error" {
     };
     defer agent.deinit();
 
-    var minutes_state = tools_mod.MinutesReadTurnState{};
+    var minutes_state = tools_mod.MinutesReadTurnState.init(std.testing.allocator);
+    defer minutes_state.deinit();
     installMinutesTestTurnContext(&minutes_state);
     defer tools_mod.clearTurnContext();
     try std.testing.expectError(error.DeliberateMinutesProviderFailure, agent.turn("Read a meeting, then fail safely."));
