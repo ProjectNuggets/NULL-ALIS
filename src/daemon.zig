@@ -805,7 +805,7 @@ fn runHeartbeatAgentTurn(
     event_bus: *bus_mod.Bus,
     prompt: []const u8,
     turn_origin: tools_mod.TurnOrigin,
-) ![]const u8 {
+) !cron.AgentRunResult {
     var scheduler = CronScheduler.init(allocator, 1, true);
     defer scheduler.deinit();
     try scheduler.setExecutionContext(user_id, user_root, workspace_path);
@@ -882,14 +882,14 @@ fn runTenantHeartbeatForUser(
 
     const turn_origin: tools_mod.TurnOrigin = .wake;
 
-    const reply = runHeartbeatAgentTurn(allocator, config, user_id, user_root, workspace_path, event_bus, hb_cfg.prompt, turn_origin) catch |err| {
+    var reply = runHeartbeatAgentTurn(allocator, config, user_id, user_root, workspace_path, event_bus, hb_cfg.prompt, turn_origin) catch |err| {
         log.warn("heartbeat agent turn failed for user={s}: {}", .{ user_id, err });
         saveHeartbeatRuntimeState(allocator, user_root, now_s, "send_failed", "turn_error");
         return;
     };
-    defer session_mod.deinitOwnedReply(allocator, reply);
+    defer reply.deinit(allocator);
 
-    const actionable_reply = switch (parseHeartbeatReplyDirective(reply)) {
+    const actionable_reply = switch (parseHeartbeatReplyDirective(reply.output)) {
         .ok => {
             saveHeartbeatRuntimeState(allocator, user_root, now_s, "idle", "no_actionable_output");
             return;
@@ -1602,7 +1602,7 @@ fn runCronAgentTurnWithBus(
     job: *const cron.CronJob,
     prompt: []const u8,
     out_bus: ?*bus_mod.Bus,
-) ![]const u8 {
+) !cron.AgentRunResult {
     const cfg_ptr = ctx orelse return error.InvalidArgument;
     const cfg: *const Config = @ptrCast(@alignCast(cfg_ptr));
 
@@ -1620,7 +1620,7 @@ fn runCronAgentTurnWithBus(
             );
             defer allocator.free(reason);
             try heartbeat_wake.enqueue(user_id, reason);
-            return allocator.dupe(u8, "");
+            return .{ .output = try allocator.dupe(u8, "") };
         }
     }
 
@@ -1657,7 +1657,7 @@ fn runCronAgentTurnWithBus(
                 entitlement.status.toSlice(),
                 job.id,
             });
-            return allocator.dupe(u8, "");
+            return .{ .output = try allocator.dupe(u8, "") };
         }
         const effective_tier = entitlement.effectiveTier(now_unix);
         const limits = entitlement_mod.Entitlement.limitsFor(effective_tier);
@@ -1671,7 +1671,7 @@ fn runCronAgentTurnWithBus(
                 effective_tier.toSlice(),
                 job.id,
             });
-            return allocator.dupe(u8, "");
+            return .{ .output = try allocator.dupe(u8, "") };
         }
         // Full propagation of entitlement onto RuntimeTurnContext for the
         // downstream tool-preflight gate (S2.4) is tracked as part of S2.1
@@ -1733,7 +1733,7 @@ fn runCronAgentTurnWithBus(
                         scheduler.context_user_id orelse "-",
                         job.id,
                     });
-                    return allocator.dupe(u8, "");
+                    return .{ .output = try allocator.dupe(u8, "") };
                 }
                 log.warn("cron.ensure_user_provisioned_failed user={s} job_id={s} err={s}", .{
                     scheduler.context_user_id orelse "-",
@@ -1752,13 +1752,20 @@ fn runCronAgentTurnWithBus(
     });
     defer tools_mod.clearTenantContext();
 
-    return runtime.session_mgr.processMessageWithContext(session_key, effective_prompt, null, .{
+    const result = try runtime.session_mgr.processMessageResultWithContext(session_key, effective_prompt, null, .{
         .turn_origin = turn_origin,
         // Wave 2 (metering completeness): cron / heartbeat / wake / proactive
         // turns run with `usage_rt = null` (no SSE done frame). Tag `.daemon`
         // so the durable `turn_usage` row is written + reconcilable by the BFF.
         .entry_kind = .daemon,
     });
+    return .{
+        .output = result.text,
+        .retention = switch (result.reply_data_policy) {
+            .ordinary => .retain,
+            .minutes_display_only => .display_only,
+        },
+    };
 }
 
 fn runCronAgentTurn(
@@ -1767,7 +1774,7 @@ fn runCronAgentTurn(
     scheduler: *const CronScheduler,
     job: *const cron.CronJob,
     prompt: []const u8,
-) ![]const u8 {
+) !cron.AgentRunResult {
     return runCronAgentTurnWithBus(
         ctx,
         allocator,
@@ -4007,9 +4014,10 @@ test "runCronAgentTurn defers main session next_heartbeat jobs" {
         .wake_mode = .next_heartbeat,
     };
 
-    const output = try runCronAgentTurn(@ptrCast(@constCast(&cfg)), std.testing.allocator, &scheduler, &job, "ignored");
-    defer std.testing.allocator.free(output);
-    try std.testing.expectEqualStrings("", output);
+    var result = try runCronAgentTurn(@ptrCast(@constCast(&cfg)), std.testing.allocator, &scheduler, &job, "ignored");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", result.output);
+    try std.testing.expectEqual(cron.AgentOutputRetention.retain, result.retention);
     try std.testing.expectEqual(@as(usize, 1), heartbeat_wake.pendingCount());
 
     var req = heartbeat_wake.dequeue() orelse return error.TestUnexpectedResult;
