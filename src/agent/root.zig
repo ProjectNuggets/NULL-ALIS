@@ -12540,7 +12540,7 @@ test "preflight permits unknown tools in execute mode" {
     try std.testing.expect(agent.preflightToolPolicy(call) == .allowed);
 }
 
-test "preflight allows read-only sub-actions of mutating tools in plan mode" {
+test "preflight allows bounded read-only sub-actions of mutating tools in plan mode" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
@@ -12552,8 +12552,6 @@ test "preflight allows read-only sub-actions of mutating tools in plan mode" {
         .{ .name = "schedule", .args = "{\"action\":\"get\",\"id\":\"abc\"}" },
         .{ .name = "git_operations", .args = "{\"operation\":\"status\"}" },
         .{ .name = "git_operations", .args = "{\"operation\":\"diff\"}" },
-        .{ .name = "http_request", .args = "{\"url\":\"https://x\",\"method\":\"GET\"}" },
-        .{ .name = "http_request", .args = "{\"url\":\"https://x\"}" },
         .{ .name = "composio", .args = "{\"action\":\"list\",\"app\":\"gmail\"}" },
         .{ .name = "composio", .args = "{\"action\":\"execute\",\"tool_slug\":\"gmail-list-messages\"}" },
         .{ .name = "skill_registry", .args = "{\"action\":\"list\"}" },
@@ -12575,6 +12573,10 @@ test "preflight still blocks mutating sub-actions in plan mode" {
     const cases = [_]struct { name: []const u8, args: []const u8 }{
         .{ .name = "schedule", .args = "{\"action\":\"create\",\"expression\":\"*/5 * * * *\",\"command\":\"echo\"}" },
         .{ .name = "git_operations", .args = "{\"operation\":\"commit\",\"message\":\"x\"}" },
+        .{ .name = "http_request", .args = "{\"url\":\"https://x\"}" },
+        .{ .name = "http_request", .args = "{\"url\":\"https://x\",\"method\":\"GET\"}" },
+        .{ .name = "http_request", .args = "{\"url\":\"https://x\",\"method\":\"HEAD\"}" },
+        .{ .name = "http_request", .args = "{\"url\":\"https://x\",\"method\":\"OPTIONS\"}" },
         .{ .name = "http_request", .args = "{\"url\":\"https://x\",\"method\":\"POST\"}" },
         .{ .name = "composio", .args = "{\"action\":\"execute\",\"tool_slug\":\"gmail-send-email\"}" },
         .{ .name = "skill_registry", .args = "{\"action\":\"install\",\"skill_ref\":\"x/y\"}" },

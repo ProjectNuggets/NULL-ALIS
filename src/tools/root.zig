@@ -1087,13 +1087,6 @@ fn isReadOnlyGitOperation(args: JsonObjectMap) bool {
         std.ascii.eqlIgnoreCase(op, "branch");
 }
 
-fn isReadOnlyHttpMethod(args: JsonObjectMap) bool {
-    const method = getString(args, "method") orelse "GET";
-    return std.ascii.eqlIgnoreCase(method, "GET") or
-        std.ascii.eqlIgnoreCase(method, "HEAD") or
-        std.ascii.eqlIgnoreCase(method, "OPTIONS");
-}
-
 fn isReadOnlySkillRegistryAction(args: JsonObjectMap) bool {
     const action = getString(args, "action") orelse "list";
     return std.ascii.eqlIgnoreCase(action, "list") or std.ascii.eqlIgnoreCase(action, "search");
@@ -1138,8 +1131,7 @@ pub fn canonicalMetadataForName(tool_name: []const u8) metadata.ToolMetadata {
 ///   1. Registry lookup (`defaultMetadataRegistry`).
 ///   2. Conservative fallback for unknown names.
 ///   3. Args-aware refinement via `refineMetadata` (downgrades known
-///      read-only dispatch arguments like `schedule.list`, `git status`,
-///      HTTP GET, etc.).
+///      read-only dispatch arguments like `schedule.list` and `git status`).
 ///
 /// Any runtime gate that classifies tools — agent preflight, `/permissions`
 /// reporting, SecurityPolicy.resolveApproval callers — must route through
@@ -1178,7 +1170,6 @@ pub fn refineMetadata(base: metadata.ToolMetadata, args: JsonObjectMap) metadata
         if (std.mem.eql(u8, base.name, composio.ComposioTool.tool_name)) break :blk isReadOnlyComposioCall(args);
         if (std.mem.eql(u8, base.name, openapi.OpenApiTool.tool_name)) break :blk isReadOnlyOpenApiCall(args);
         if (std.mem.eql(u8, base.name, git.GitTool.tool_name)) break :blk isReadOnlyGitOperation(args);
-        if (std.mem.eql(u8, base.name, http_request.HttpRequestTool.tool_name)) break :blk isReadOnlyHttpMethod(args);
         if (std.mem.eql(u8, base.name, skill_registry.SkillRegistryTool.tool_name)) break :blk isReadOnlySkillRegistryAction(args);
         if (std.mem.eql(u8, base.name, todo.TodoTool.tool_name)) break :blk isReadOnlyTodoAction(args);
         break :blk false;
@@ -1203,14 +1194,11 @@ pub fn refineMetadata(base: metadata.ToolMetadata, args: JsonObjectMap) metadata
     // covers composio list/get — per-tenant API key, so scope =
     // .tenant; catalog-style results, so 60s TTL is safe.
     //
-    // Other action-dependent tools (schedule list, git status, http
-    // GET, skill_registry list) intentionally do NOT opt in here:
+    // Other action-dependent tools (schedule list, git status,
+    // skill_registry list) intentionally do NOT opt in here:
     //   - schedule list: low-value cache; user expects to see fresh
     //     scheduled jobs after a write
     //   - git status: local + fast; no measurable cache win
-    //   - http GET: per-URL responses may include user-specific data;
-    //     blanket caching is risky (cache-key includes URL but not
-    //     auth headers a tenant might pass via args — over-cautious)
     //   - skill_registry list: local + fast; no measurable cache win
     if (std.mem.eql(u8, base.name, composio.ComposioTool.tool_name)) {
         refined.flags.cacheable = true;
@@ -4306,35 +4294,26 @@ test "refineMetadata keeps git commit/add/checkout/stash mutating" {
     }
 }
 
-test "refineMetadata downgrades HTTP GET/HEAD/OPTIONS" {
+test "refineMetadata keeps every arbitrary HTTP request mutating" {
     const registry = defaultMetadataRegistry();
     const base = metadata.lookupMetadata("http_request", registry).?;
 
-    const safe_methods = [_][]const u8{ "GET", "get", "HEAD", "OPTIONS" };
-    for (safe_methods) |method| {
+    const methods = [_][]const u8{ "GET", "get", "HEAD", "OPTIONS", "POST", "PUT", "DELETE", "PATCH" };
+    for (methods) |method| {
         const buf = try std.fmt.allocPrint(std.testing.allocator, "{{\"url\":\"https://x\",\"method\":\"{s}\"}}", .{method});
         defer std.testing.allocator.free(buf);
         const parsed = try parseTestArgs(buf);
         defer parsed.deinit();
-        try std.testing.expect(refineMetadata(base, parsed.value.object).flags.read_only);
+        const refined = refineMetadata(base, parsed.value.object);
+        try std.testing.expect(refined.flags.mutating);
+        try std.testing.expect(!refined.flags.read_only);
     }
 
     const default_parsed = try parseTestArgs("{\"url\":\"https://x\"}");
     defer default_parsed.deinit();
-    try std.testing.expect(refineMetadata(base, default_parsed.value.object).flags.read_only);
-}
-
-test "refineMetadata keeps HTTP POST/PUT/DELETE/PATCH mutating" {
-    const registry = defaultMetadataRegistry();
-    const base = metadata.lookupMetadata("http_request", registry).?;
-    const mutating_methods = [_][]const u8{ "POST", "PUT", "DELETE", "PATCH" };
-    for (mutating_methods) |method| {
-        const buf = try std.fmt.allocPrint(std.testing.allocator, "{{\"url\":\"https://x\",\"method\":\"{s}\"}}", .{method});
-        defer std.testing.allocator.free(buf);
-        const parsed = try parseTestArgs(buf);
-        defer parsed.deinit();
-        try std.testing.expect(refineMetadata(base, parsed.value.object).flags.mutating);
-    }
+    const default_refined = refineMetadata(base, default_parsed.value.object);
+    try std.testing.expect(default_refined.flags.mutating);
+    try std.testing.expect(!default_refined.flags.read_only);
 }
 
 test "refineMetadata downgrades composio list/get and read-only execute" {
@@ -4536,7 +4515,7 @@ test "metadata_completeness_pkg3: previously-unregistered + empty-flag tools cla
     try std.testing.expect(!bg.flags.background_safe);
 }
 
-test "canonicalMetadataForCall applies args-aware refinement (schedule.list, git status, GET)" {
+test "canonicalMetadataForCall refines bounded local reads but keeps arbitrary HTTP dangerous" {
     const allocator = std.testing.allocator;
 
     const sched = canonicalMetadataForCall(allocator, "schedule", "{\"action\":\"list\"}");
@@ -4550,11 +4529,13 @@ test "canonicalMetadataForCall applies args-aware refinement (schedule.list, git
     try std.testing.expect(git_write.flags.mutating);
     try std.testing.expect(!git_write.flags.read_only);
 
-    const http_get = canonicalMetadataForCall(allocator, "http_request", "{\"method\":\"GET\"}");
-    try std.testing.expect(http_get.flags.read_only);
-
-    const http_post = canonicalMetadataForCall(allocator, "http_request", "{\"method\":\"POST\"}");
-    try std.testing.expect(http_post.flags.mutating);
+    inline for (.{ "GET", "HEAD", "OPTIONS", "POST" }) |method| {
+        const args = std.fmt.comptimePrint("{{\"method\":\"{s}\"}}", .{method});
+        const http_call = canonicalMetadataForCall(allocator, "http_request", args);
+        try std.testing.expect(http_call.flags.mutating);
+        try std.testing.expect(!http_call.flags.read_only);
+        try std.testing.expectEqual(metadata.RiskLevel.high, http_call.risk_level);
+    }
 }
 
 test "canonicalMetadataForCall falls back to base metadata on invalid JSON" {
