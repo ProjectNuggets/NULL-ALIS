@@ -15,10 +15,12 @@ const ToolResult = root.ToolResult;
 
 pub const MAX_RESPONSE_BYTES: usize = 270_336;
 pub const MAX_ITEM_CONTENT_BYTES: usize = 256 * 1024;
-pub const MAX_TURN_CALLS: u8 = root.MinutesReadTurnBudget.max_calls;
-pub const MAX_TURN_RESPONSE_BYTES: usize = root.MinutesReadTurnBudget.max_response_bytes;
 pub const MAX_DISPATCH_OUTPUT_BYTES: usize = 200_000;
 pub const INDEX_DEFAULT: i64 = 50;
+/// `latest` is one user intent, so bound its internal pagination separately
+/// from Agent tool-call policy. Ten 50-row pages cover 500 retained meetings;
+/// the updated_at frontier normally settles after the first page.
+const LATEST_MAX_PAGES: usize = 10;
 /// The spoke contract may serve up to 200 rows, but this privacy-sensitive
 /// consumer requests no more than 50. With the sealed field bounds, a
 /// canonical 50-row metadata page and a 256-KiB item envelope each fit the
@@ -27,8 +29,11 @@ pub const INDEX_DEFAULT: i64 = 50;
 pub const INDEX_LIMIT: i64 = 50;
 
 comptime {
-    if (INDEX_LIMIT != root.MinutesReadTurnBudget.max_issued_items) {
+    if (INDEX_LIMIT != root.MinutesReadTurnState.max_issued_items) {
         @compileError("Minutes index request cap and capability page cap must match");
+    }
+    if (LATEST_MAX_PAGES * @as(usize, @intCast(INDEX_LIMIT)) > root.MinutesReadTurnState.max_turn_issued_items) {
+        @compileError("Minutes latest scan must fit the authorization working set");
     }
 }
 
@@ -83,12 +88,12 @@ pub const MinutesReadTool = struct {
 
     pub const tool_name = "minutes_read";
     pub const tool_description_struct = @import("metadata.zig").ToolDescription{
-        .what = "Read owner-scoped meeting metadata or one bounded Minutes item.",
+        .what = "Search or read owner-scoped meetings and resolve the latest transcript.",
         .use_when = &.{
             "The user asks about a meeting, transcript, or Minutes-produced summary",
-            "You need the user's latest readable meeting before answering or extracting a distillate",
-            "For last meeting, scan readable transcripts and choose greatest occurred_at instead of index row order",
-            "Scan at most 50 metadata rows per index page and follow only the issued next cursor when more pages exist",
+            "Use action=latest for the user's last meeting; it resolves the greatest occurred_at",
+            "Use action=search with the user's topic when they ask about a specific meeting",
+            "Index and search scan at most 50 rows per page using only issued cursors; item accepts only server-issued ids",
         },
         .do_not_use_for = &.{
             "transcript_read — for the transcript of the current Agent conversation",
@@ -100,9 +105,9 @@ pub const MinutesReadTool = struct {
         @import("lint.zig").lintToolDescription(tool_name, tool_description_struct, &@import("lint.zig").ALL_TOOLS);
     }
 
-    pub const tool_description = "Read owner-scoped meeting metadata or one bounded transcript or summary from the Minutes read plane. Index pages contain at most 50 metadata rows; follow issued cursors to scan more. For last meeting, scan readable transcripts and choose greatest occurred_at; index order follows updated_at.";
+    pub const tool_description = "Read or search owner-scoped meeting metadata, resolve the latest transcript, or read one bounded transcript or summary from the Minutes read plane. Index and search pages contain at most 50 rows. Use latest for the user's last meeting; it scans pagination by occurred_at because index order follows updated_at.";
     pub const tool_params =
-        \\{"type":"object","additionalProperties":false,"properties":{"action":{"type":"string","enum":["index","item"]},"since":{"type":"string","description":"Optional RFC3339 lower bound for index reads"},"limit":{"type":"integer","minimum":1,"maximum":50},"cursor":{"type":"string","minLength":1,"maxLength":2048},"item_id":{"type":"string","minLength":1,"maxLength":160},"variant":{"type":"string","enum":["full","summary"]}},"required":["action"]}
+        \\{"type":"object","additionalProperties":false,"properties":{"action":{"type":"string","enum":["index","search","latest","item"]},"query":{"type":"string","minLength":1,"maxLength":512},"since":{"type":"string","description":"Optional RFC3339 lower bound for index reads"},"limit":{"type":"integer","minimum":1,"maximum":50},"cursor":{"type":"string","minLength":1,"maxLength":2048},"item_id":{"type":"string","minLength":1,"maxLength":160},"variant":{"type":"string","enum":["full","summary"]}},"required":["action"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -111,7 +116,7 @@ pub const MinutesReadTool = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 
-    pub fn execute(self: *MinutesReadTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+    pub fn execute(self: *MinutesReadTool, allocator: std.mem.Allocator, args: JsonObjectMap) anyerror!ToolResult {
         self.client.validate() catch return ToolResult.fail("Minutes read is not configured safely");
 
         const numeric_user_id = root.getTenantContext().numeric_user_id orelse
@@ -121,38 +126,52 @@ pub const MinutesReadTool = struct {
         if (root.isBackgroundTurnOrigin(turn_context.origin)) {
             return ToolResult.fail("Minutes reads require a foreground user turn");
         }
-        const turn_budget = turn_context.minutes_read_budget orelse
-            return ToolResult.fail("Minutes read turn budget is not initialized");
+        const turn_state = turn_context.minutes_read_state orelse
+            return ToolResult.fail("Minutes read authorization state is not initialized");
 
         const action = root.getString(args, "action") orelse
             return ToolResult.fail("Missing required 'action' parameter");
+        if (std.mem.eql(u8, action, "latest")) return self.executeLatest(allocator, args);
+        const is_index = std.mem.eql(u8, action, "index");
+        const is_search = std.mem.eql(u8, action, "search");
+        const is_collection = is_index or is_search;
         const requested_item_id: ?[]const u8 = if (std.mem.eql(u8, action, "item"))
             root.getString(args, "item_id") orelse return ToolResult.fail("Missing required 'item_id' parameter")
         else
             null;
         const variant = root.getString(args, "variant") orelse "full";
-        const index_query_digest: ?root.MinutesReadTurnBudget.CapabilityDigest = if (std.mem.eql(u8, action, "index"))
-            root.MinutesReadTurnBudget.digestIndexQuery(root.getString(args, "since"), resolvedIndexLimit(args))
+        const index_query_digest: ?root.MinutesReadTurnState.CapabilityDigest = if (is_index)
+            root.MinutesReadTurnState.digestIndexQuery(root.getString(args, "since"), resolvedIndexLimit(args))
+        else if (is_search)
+            if (root.getString(args, "query")) |query|
+                root.MinutesReadTurnState.digestSearchQuery(query, resolvedIndexLimit(args))
+            else
+                null
         else
             null;
 
         // Treat server-issued IDs and cursors as same-turn capabilities. This
-        // check happens before URL construction, reservation, and transport so
+        // check happens before URL construction and transport so
         // transcript prompt injection cannot turn a tool argument into an
         // outbound plaintext channel.
-        if (std.mem.eql(u8, action, "index")) {
+        if (is_collection) {
+            if (is_search) {
+                const query = root.getString(args, "query") orelse
+                    return ToolResult.fail("Missing required 'query' parameter");
+                if (!isValidSearchQuery(query)) {
+                    return ToolResult.fail("Minutes search query must be 1 to 512 visible characters");
+                }
+            }
             if (root.getString(args, "since")) |since| {
-                if (parseRfc3339(since) == null) {
+                if (!is_index or parseRfc3339(since) == null) {
                     return ToolResult.fail("Minutes index 'since' must be an RFC3339 timestamp");
                 }
             }
             if (root.getString(args, "cursor")) |cursor| {
                 if (cursor.len == 0 or cursor.len > 2048) return ToolResult.fail("Invalid Minutes index cursor");
-                if (!turn_budget.isCursorIssued(cursor, index_query_digest.?)) {
+                if (!turn_state.isCursorIssued(cursor, index_query_digest.?)) {
                     return ToolResult.fail("Minutes read capability is not authorized for this turn");
                 }
-            } else if (!turn_budget.authorizeRootIndexQuery(index_query_digest.?)) {
-                return ToolResult.fail("Minutes read capability is not authorized for this turn");
             }
         } else if (std.mem.eql(u8, action, "item")) {
             const item_id = requested_item_id.?;
@@ -160,14 +179,21 @@ pub const MinutesReadTool = struct {
             if (!std.mem.eql(u8, variant, "full") and !std.mem.eql(u8, variant, "summary")) {
                 return ToolResult.fail("Minutes item variant must be full or summary");
             }
-            if (!turn_budget.authorizeItemRequest(item_id, std.mem.eql(u8, variant, "summary"))) {
+            if (!turn_state.authorizeItemRequest(item_id, std.mem.eql(u8, variant, "summary"))) {
                 return ToolResult.fail("Minutes read capability is not authorized for this turn");
             }
         }
-        const url = if (std.mem.eql(u8, action, "index"))
+        const url = if (is_index)
             self.buildIndexUrl(allocator, numeric_user_id, args) catch |err| switch (err) {
                 error.InvalidSince => return ToolResult.fail("Minutes index 'since' must be an RFC3339 timestamp"),
                 error.InvalidCursor => return ToolResult.fail("Invalid Minutes index cursor"),
+                else => return err,
+            }
+        else if (is_search)
+            self.buildSearchUrl(allocator, numeric_user_id, args) catch |err| switch (err) {
+                error.MissingQuery => return ToolResult.fail("Missing required 'query' parameter"),
+                error.InvalidQuery => return ToolResult.fail("Minutes search query must be 1 to 512 visible characters"),
+                error.InvalidCursor => return ToolResult.fail("Invalid Minutes search cursor"),
                 else => return err,
             }
         else if (std.mem.eql(u8, action, "item"))
@@ -178,8 +204,11 @@ pub const MinutesReadTool = struct {
                 else => return err,
             }
         else
-            return ToolResult.fail("Unknown Minutes read action. Use index or item.");
-        defer allocator.free(url);
+            return ToolResult.fail("Unknown Minutes read action. Use index, search, latest, or item.");
+        defer {
+            std.crypto.secureZero(u8, url);
+            allocator.free(url);
+        }
 
         const user_header = try std.fmt.allocPrint(allocator, "X-Zaki-User-Id: {d}", .{numeric_user_id});
         defer allocator.free(user_header);
@@ -207,36 +236,25 @@ pub const MinutesReadTool = struct {
             response.deinit(allocator);
         }
 
-        var reservation = turn_budget.reserveCall(MAX_RESPONSE_BYTES) catch |err| switch (err) {
-            error.MinutesReadCallBudgetExhausted => return ToolResult.fail("Minutes read call budget exhausted"),
-            else => return ToolResult.fail("Minutes read response budget exhausted"),
-        };
-        defer if (!reservation.finished) reservation.finish(0) catch {};
-
         const status = self.client.transport.streamGet(
             allocator,
             .{
                 .url = url,
                 .headers = &headers,
                 .timeout_ms = self.client.timeout_ms,
-                .max_response_bytes = reservation.allowance,
+                .max_response_bytes = MAX_RESPONSE_BYTES,
             },
             &response,
-        ) catch {
-            reservation.finish(response.items.len) catch {};
-            return ToolResult.fail("Minutes read transport failed");
-        };
-        reservation.finish(response.items.len) catch
-            return ToolResult.fail("Minutes read response budget exhausted");
+        ) catch return ToolResult.fail("Minutes read transport failed");
 
         if (response.items.len > MAX_RESPONSE_BYTES) {
             return ToolResult.fail("Minutes read response exceeded the byte cap");
         }
-        const shape: ResponseShape = if (std.mem.eql(u8, action, "index")) .index else .item;
+        const shape: ResponseShape = if (is_collection) .index else .item;
         if (status != 200) {
             if (status == 413 and shape == .item) {
                 if (std.mem.eql(u8, variant, "full")) {
-                    if (turn_budget.grantSummaryFallback(requested_item_id.?)) {
+                    if (turn_state.grantSummaryFallback(requested_item_id.?)) {
                         return ToolResult.fail("Minutes item exceeds the read cap; retry with variant=summary");
                     }
                     return ToolResult.fail("Minutes read was refused");
@@ -248,7 +266,7 @@ pub const MinutesReadTool = struct {
 
         const expected_item_id = requested_item_id;
         const expected_index_limit = if (shape == .index) resolvedIndexLimit(args) else null;
-        const expected_index_since: ?i64 = if (shape == .index)
+        const expected_index_since: ?i64 = if (is_index)
             if (root.getString(args, "since")) |since| parseRfc3339(since) else null
         else
             null;
@@ -267,7 +285,7 @@ pub const MinutesReadTool = struct {
         const wrapped_len = UNTRUSTED_PREFIX.len + response.items.len + UNTRUSTED_SUFFIX.len;
         if (wrapped_len > MAX_DISPATCH_OUTPUT_BYTES) {
             if (shape == .item and std.mem.eql(u8, variant, "full")) {
-                if (turn_budget.grantSummaryFallback(requested_item_id.?)) {
+                if (turn_state.grantSummaryFallback(requested_item_id.?)) {
                     return ToolResult.fail("Minutes item exceeds the Agent delivery cap; retry with variant=summary");
                 }
             }
@@ -279,7 +297,7 @@ pub const MinutesReadTool = struct {
             .{ UNTRUSTED_PREFIX, response.items, UNTRUSTED_SUFFIX },
         );
         switch (validated) {
-            .index => |capabilities| if (!turn_budget.retainIssuedCapabilities(
+            .index => |capabilities| if (!turn_state.retainIssuedCapabilities(
                 capabilities.item_digests[0..capabilities.item_count],
                 capabilities.item_summary_eligible[0..capabilities.item_count],
                 capabilities.next_cursor,
@@ -332,6 +350,134 @@ pub const MinutesReadTool = struct {
         try appendUrlEncoded(writer, variant);
         return try url.toOwnedSlice(allocator);
     }
+
+    fn buildSearchUrl(self: *MinutesReadTool, allocator: std.mem.Allocator, user_id: i64, args: JsonObjectMap) ![]u8 {
+        const query = root.getString(args, "query") orelse return error.MissingQuery;
+        if (!isValidSearchQuery(query)) return error.InvalidQuery;
+        const limit = resolvedIndexLimit(args);
+
+        var url: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer url.deinit(allocator);
+        const writer = url.writer(allocator);
+        try writer.print("{s}/api/zaki/read/v1/{d}/search?q=", .{ trimOriginSlash(self.client.base_url), user_id });
+        try appendUrlEncoded(writer, query);
+        try writer.print("&limit={d}", .{limit});
+        if (root.getString(args, "cursor")) |cursor| {
+            if (cursor.len == 0 or cursor.len > 2048) return error.InvalidCursor;
+            try writer.writeAll("&cursor=");
+            try appendUrlEncoded(writer, cursor);
+        }
+        return try url.toOwnedSlice(allocator);
+    }
+
+    fn executeLatest(self: *MinutesReadTool, allocator: std.mem.Allocator, args: JsonObjectMap) anyerror!ToolResult {
+        const variant = root.getString(args, "variant") orelse "full";
+        if (!std.mem.eql(u8, variant, "full") and !std.mem.eql(u8, variant, "summary")) {
+            return ToolResult.fail("Minutes item variant must be full or summary");
+        }
+
+        var latest_id: [160]u8 = undefined;
+        defer std.crypto.secureZero(u8, &latest_id);
+        var latest_id_len: usize = 0;
+        var latest_occurred_at: i64 = std.math.minInt(i64);
+        var cursor: [2048]u8 = undefined;
+        defer std.crypto.secureZero(u8, &cursor);
+        var cursor_len: usize = 0;
+        var truncated = true;
+
+        var page_count: usize = 0;
+        while (truncated and page_count < LATEST_MAX_PAGES) : (page_count += 1) {
+            var page_args = JsonObjectMap.init(allocator);
+            defer page_args.deinit();
+            try page_args.put("action", .{ .string = "index" });
+            try page_args.put("limit", .{ .integer = INDEX_LIMIT });
+            if (cursor_len > 0) try page_args.put("cursor", .{ .string = cursor[0..cursor_len] });
+
+            const page_result = try self.execute(allocator, page_args);
+            if (!page_result.success) return page_result;
+            defer {
+                std.crypto.secureZero(u8, @constCast(page_result.output));
+                allocator.free(page_result.output);
+            }
+
+            var parsed = std.json.parseFromSlice(JsonValue, allocator, page_result.output, .{}) catch
+                return ToolResult.fail("Minutes latest response is invalid");
+            defer parsed.deinit();
+            const wrapper = asObject(parsed.value) orelse
+                return ToolResult.fail("Minutes latest response is invalid");
+            const envelope = asObject(wrapper.get("minutes_response") orelse
+                return ToolResult.fail("Minutes latest response is invalid")) orelse
+                return ToolResult.fail("Minutes latest response is invalid");
+            const items = asArray(envelope.get("items") orelse
+                return ToolResult.fail("Minutes latest response is invalid")) orelse
+                return ToolResult.fail("Minutes latest response is invalid");
+
+            var page_oldest_updated_at: i64 = std.math.maxInt(i64);
+            for (items) |item_value| {
+                const item = asObject(item_value) orelse continue;
+                const updated_at_text = asString(item.get("updated_at") orelse continue) orelse continue;
+                const updated_at = parseRfc3339(updated_at_text) orelse continue;
+                page_oldest_updated_at = @min(page_oldest_updated_at, updated_at);
+                const kind = asString(item.get("kind") orelse continue) orelse continue;
+                if (!std.mem.eql(u8, kind, "transcript")) continue;
+                const occurred_at_text = asString(item.get("occurred_at") orelse continue) orelse continue;
+                const occurred_at = parseRfc3339(occurred_at_text) orelse continue;
+                if (latest_id_len != 0 and occurred_at <= latest_occurred_at) continue;
+                const item_id = asString(item.get("id") orelse continue) orelse continue;
+                if (item_id.len > latest_id.len) continue;
+                @memcpy(latest_id[0..item_id.len], item_id);
+                latest_id_len = item_id.len;
+                latest_occurred_at = occurred_at;
+            }
+
+            truncated = asBool(envelope.get("truncated") orelse
+                return ToolResult.fail("Minutes latest response is invalid")) orelse
+                return ToolResult.fail("Minutes latest response is invalid");
+            // Index pages descend by updated_at, and sealed metadata requires
+            // occurred_at <= updated_at. Once the current winner is newer
+            // than this page's oldest update, no later page can beat it.
+            if (truncated and latest_id_len > 0 and
+                page_oldest_updated_at != std.math.maxInt(i64) and
+                latest_occurred_at >= page_oldest_updated_at)
+            {
+                truncated = false;
+                continue;
+            }
+            if (truncated) {
+                const next_cursor = asString(envelope.get("next_cursor") orelse
+                    return ToolResult.fail("Minutes latest response is invalid")) orelse
+                    return ToolResult.fail("Minutes latest response is invalid");
+                if (next_cursor.len == 0 or next_cursor.len > cursor.len or
+                    std.mem.eql(u8, next_cursor, cursor[0..cursor_len]))
+                {
+                    return ToolResult.fail("Minutes latest pagination is invalid");
+                }
+                @memcpy(cursor[0..next_cursor.len], next_cursor);
+                cursor_len = next_cursor.len;
+            }
+        }
+        if (truncated) return ToolResult.fail("Minutes latest history is too large; narrow it with search");
+        if (latest_id_len == 0) return ToolResult.fail("No readable meeting transcript was found");
+
+        var item_args = JsonObjectMap.init(allocator);
+        defer item_args.deinit();
+        try item_args.put("action", .{ .string = "item" });
+        try item_args.put("item_id", .{ .string = latest_id[0..latest_id_len] });
+        try item_args.put("variant", .{ .string = variant });
+        const item_result = try self.execute(allocator, item_args);
+        if (item_result.success or !std.mem.eql(u8, variant, "full")) return item_result;
+        const item_error = item_result.error_msg orelse return item_result;
+        if (!std.mem.eql(u8, item_error, "Minutes item exceeds the read cap; retry with variant=summary") and
+            !std.mem.eql(u8, item_error, "Minutes item exceeds the Agent delivery cap; retry with variant=summary"))
+        {
+            return item_result;
+        }
+        // The failed bounded full read granted a one-shot summary capability
+        // for this exact server-issued transcript. Retry internally so the
+        // high-level latest intent never needs to reveal or reconstruct its id.
+        try item_args.put("variant", .{ .string = "summary" });
+        return self.execute(allocator, item_args);
+    }
 };
 
 fn resolvedIndexLimit(args: JsonObjectMap) i64 {
@@ -339,13 +485,21 @@ fn resolvedIndexLimit(args: JsonObjectMap) i64 {
     return @min(@max(requested_limit, 1), INDEX_LIMIT);
 }
 
+fn isValidSearchQuery(query: []const u8) bool {
+    if (!stringLengthWithin(query, 1, 512) or !hasNonWhitespaceCodepoint(query)) return false;
+    for (query) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return false;
+    }
+    return true;
+}
+
 const ResponseShape = enum { index, item };
 
 const IndexCapabilities = struct {
-    item_digests: [root.MinutesReadTurnBudget.max_issued_items]root.MinutesReadTurnBudget.CapabilityDigest = undefined,
-    item_summary_eligible: [root.MinutesReadTurnBudget.max_issued_items]bool = undefined,
+    item_digests: [root.MinutesReadTurnState.max_issued_items]root.MinutesReadTurnState.CapabilityDigest = undefined,
+    item_summary_eligible: [root.MinutesReadTurnState.max_issued_items]bool = undefined,
     item_count: usize = 0,
-    next_cursor: ?root.MinutesReadTurnBudget.CapabilityDigest = null,
+    next_cursor: ?root.MinutesReadTurnState.CapabilityDigest = null,
 };
 
 const ValidatedResponse = union(ResponseShape) {
@@ -486,7 +640,7 @@ fn validateIndexEnvelope(envelope: JsonObjectMap, expected_limit: i64, expected_
         }
         previous_updated_at = updated_at;
         const item_id = asString(item.get("id") orelse return error.InvalidResponse) orelse return error.InvalidResponse;
-        capabilities.item_digests[capabilities.item_count] = root.MinutesReadTurnBudget.digestCapability(item_id);
+        capabilities.item_digests[capabilities.item_count] = root.MinutesReadTurnState.digestCapability(item_id);
         capabilities.item_summary_eligible[capabilities.item_count] = std.mem.eql(u8, kind, "transcript");
         capabilities.item_count += 1;
     }
@@ -496,7 +650,7 @@ fn validateIndexEnvelope(envelope: JsonObjectMap, expected_limit: i64, expected_
     if (truncated) {
         const value = asString(cursor orelse return error.InvalidResponse) orelse return error.InvalidResponse;
         if (value.len == 0 or value.len > 2048) return error.InvalidResponse;
-        capabilities.next_cursor = root.MinutesReadTurnBudget.digestCapability(value);
+        capabilities.next_cursor = root.MinutesReadTurnState.digestCapability(value);
     } else if (cursor != null) {
         return error.InvalidResponse;
     }
@@ -885,6 +1039,38 @@ const RecordingTransport = struct {
     }
 };
 
+const SequencedTransport = struct {
+    bodies: []const []const u8,
+    statuses: ?[]const u16 = null,
+    call_count: usize = 0,
+    url_storage: [4][4096]u8 = undefined,
+    url_lens: [4]usize = .{0} ** 4,
+
+    fn streamGet(
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        request: Request,
+        response: *std.ArrayListUnmanaged(u8),
+    ) !u16 {
+        const self: *SequencedTransport = @ptrCast(@alignCast(context orelse return error.MissingTestContext));
+        if (self.call_count >= self.bodies.len or self.call_count >= self.url_storage.len) {
+            return error.UnexpectedTestRequest;
+        }
+        const body = self.bodies[self.call_count];
+        if (request.url.len > self.url_storage[self.call_count].len) return error.TestUrlTooLong;
+        @memcpy(self.url_storage[self.call_count][0..request.url.len], request.url);
+        self.url_lens[self.call_count] = request.url.len;
+        self.call_count += 1;
+        if (body.len > request.max_response_bytes) return error.ResponseTooLarge;
+        try response.appendSlice(allocator, body);
+        return if (self.statuses) |statuses| statuses[self.call_count - 1] else 200;
+    }
+
+    fn transport(self: *SequencedTransport) Transport {
+        return .{ .context = self, .stream_get_fn = streamGet };
+    }
+};
+
 fn testClient(recording: *RecordingTransport) Client {
     return .{
         .base_url = "https://minutes.test",
@@ -893,9 +1079,9 @@ fn testClient(recording: *RecordingTransport) Client {
     };
 }
 
-fn installTestTurn(budget: *root.MinutesReadTurnBudget, user_id: i64) void {
+fn installTestTurn(state: *root.MinutesReadTurnState, user_id: i64) void {
     root.setTenantContext(.{ .numeric_user_id = user_id });
-    root.setTurnContext(.{ .origin = .user, .minutes_read_budget = budget });
+    root.setTurnContext(.{ .origin = .user, .minutes_read_state = state });
 }
 
 fn clearTestTurn() void {
@@ -965,8 +1151,8 @@ test "minutes_read index is owner-scoped, fixed-origin, and clamps the limit" {
     var recording = RecordingTransport{};
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     root.setTenantContext(.{ .user_id = "attacker-controlled", .numeric_user_id = 7 });
     defer clearTestTurn();
 
@@ -990,8 +1176,8 @@ test "minutes_read item escapes the sealed identifier and validates transcript s
     var recording = RecordingTransport{ .body = valid_transcript };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
     try issueTranscriptCapabilityForTest(&tool, &recording, "transcript:7");
 
@@ -1011,8 +1197,8 @@ test "minutes_read rejects an unissued item capability before transport" {
     var recording = RecordingTransport{ .body = valid_transcript };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
 
     var parsed = try root.parseTestArgs(
@@ -1026,7 +1212,6 @@ test "minutes_read rejects an unissued item capability before transport" {
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg orelse "", attacker_value) == null);
     try std.testing.expectEqual(@as(usize, 0), recording.call_count);
     try std.testing.expectEqual(@as(usize, 0), recording.url_len);
-    try std.testing.expectEqual(@as(u8, 0), budget.snapshot().calls);
 }
 
 test "minutes_read shares validated item capabilities across copied tool contexts" {
@@ -1034,8 +1219,8 @@ test "minutes_read shares validated item capabilities across copied tool context
     const client = testClient(&recording);
     var index_tool = MinutesReadTool{ .client = &client };
     var item_tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
 
     try issueTranscriptCapabilityForTest(&index_tool, &recording, "transcript:7");
@@ -1055,8 +1240,8 @@ test "minutes_read does not grant capabilities from an invalid index response" {
     var recording = RecordingTransport{ .body = rejected_index };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
 
     var index_args = try root.parseTestArgs("{\"action\":\"index\"}");
@@ -1075,15 +1260,14 @@ test "minutes_read does not grant capabilities from an invalid index response" {
         item_result.error_msg orelse "",
     );
     try std.testing.expectEqual(@as(usize, 1), recording.call_count);
-    try std.testing.expectEqual(@as(u8, 1), budget.snapshot().calls);
 }
 
 test "minutes_read binds an item response to the requested item id" {
     var recording = RecordingTransport{ .body = valid_transcript };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
     try issueTranscriptCapabilityForTest(&tool, &recording, "transcript:8");
 
@@ -1101,8 +1285,8 @@ test "minutes_read rejects unissued cursors and binds issued cursors to index co
     var recording = RecordingTransport{ .body = paged_index };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
 
     var unissued_args = try root.parseTestArgs("{\"action\":\"index\",\"cursor\":\"brain-secret\"}");
@@ -1112,7 +1296,6 @@ test "minutes_read rejects unissued cursors and binds issued cursors to index co
     try std.testing.expectEqualStrings("Minutes read capability is not authorized for this turn", unissued.error_msg orelse "");
     try std.testing.expect(std.mem.indexOf(u8, unissued.error_msg orelse "", "brain-secret") == null);
     try std.testing.expectEqual(@as(usize, 0), recording.call_count);
-    try std.testing.expectEqual(@as(u8, 0), budget.snapshot().calls);
 
     var first_page_args = try root.parseTestArgs(
         "{\"action\":\"index\",\"since\":\"2026-07-01T00:00:00Z\",\"limit\":1}",
@@ -1131,7 +1314,6 @@ test "minutes_read rejects unissued cursors and binds issued cursors to index co
     try std.testing.expect(!changed_controls.success);
     try std.testing.expectEqualStrings("Minutes read capability is not authorized for this turn", changed_controls.error_msg orelse "");
     try std.testing.expectEqual(@as(usize, 1), recording.call_count);
-    try std.testing.expectEqual(@as(u8, 1), budget.snapshot().calls);
 
     var changed_since_args = try root.parseTestArgs(
         "{\"action\":\"index\",\"since\":\"2026-07-02T00:00:00Z\",\"limit\":1,\"cursor\":\"server-cursor-1\"}",
@@ -1141,7 +1323,6 @@ test "minutes_read rejects unissued cursors and binds issued cursors to index co
     try std.testing.expect(!changed_since.success);
     try std.testing.expectEqualStrings("Minutes read capability is not authorized for this turn", changed_since.error_msg orelse "");
     try std.testing.expectEqual(@as(usize, 1), recording.call_count);
-    try std.testing.expectEqual(@as(u8, 1), budget.snapshot().calls);
 
     recording.body = valid_index;
     var next_page_args = try root.parseTestArgs(
@@ -1168,8 +1349,8 @@ test "minutes_read retains validated candidates across index pages without widen
     var recording = RecordingTransport{ .body = first_page };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
 
     var first_args = try root.parseTestArgs("{\"action\":\"index\",\"limit\":1}");
@@ -1213,47 +1394,12 @@ test "minutes_read retains validated candidates across index pages without widen
     try std.testing.expectEqual(@as(usize, 3), recording.call_count);
 }
 
-test "minutes_read pins the first cursorless index query and permits only exact retries" {
-    var recording = RecordingTransport{};
-    const client = testClient(&recording);
-    var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
-    defer clearTestTurn();
-
-    var first_args = try root.parseTestArgs(
-        "{\"action\":\"index\",\"since\":\"2026-07-01T00:00:00Z\",\"limit\":1}",
-    );
-    defer first_args.deinit();
-    const first = try tool.execute(std.testing.allocator, first_args.value.object);
-    defer std.testing.allocator.free(first.output);
-    try std.testing.expect(first.success);
-    try std.testing.expectEqual(@as(usize, 1), recording.call_count);
-
-    var changed_args = try root.parseTestArgs(
-        "{\"action\":\"index\",\"since\":\"2026-07-02T00:00:00Z\",\"limit\":2}",
-    );
-    defer changed_args.deinit();
-    const changed = try tool.execute(std.testing.allocator, changed_args.value.object);
-    if (changed.success) std.testing.allocator.free(changed.output);
-    try std.testing.expect(!changed.success);
-    try std.testing.expectEqualStrings("Minutes read capability is not authorized for this turn", changed.error_msg orelse "");
-    try std.testing.expectEqual(@as(usize, 1), recording.call_count);
-    try std.testing.expectEqual(@as(u8, 1), budget.snapshot().calls);
-
-    const retry = try tool.execute(std.testing.allocator, first_args.value.object);
-    defer std.testing.allocator.free(retry.output);
-    try std.testing.expect(retry.success);
-    try std.testing.expectEqual(@as(usize, 2), recording.call_count);
-    try std.testing.expectEqual(@as(u8, 2), budget.snapshot().calls);
-}
-
 test "minutes_read limits index pages to 50 and rejects server over-cap pages" {
     var recording = RecordingTransport{};
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
 
     var default_args = try root.parseTestArgs("{\"action\":\"index\"}");
@@ -1333,8 +1479,8 @@ test "minutes_read rejects malformed index controls before transport" {
     var recording = RecordingTransport{};
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
 
     var parsed = try root.parseTestArgs("{\"action\":\"index\",\"since\":\"not-a-time\"}");
@@ -1351,8 +1497,8 @@ test "minutes_read rejects index items older than the requested since bound" {
     var recording = RecordingTransport{ .body = older_index };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
 
     var index_args = try root.parseTestArgs(
@@ -1382,8 +1528,8 @@ test "minutes_read applies since to update time without hiding older meetings" {
     var recording = RecordingTransport{ .body = recently_updated_index };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
 
     var args = try root.parseTestArgs(
@@ -1403,8 +1549,8 @@ test "minutes_read orders index chronology by update time while preserving occur
     var recording = RecordingTransport{ .body = recently_updated_old_meeting };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
 
     var args = try root.parseTestArgs("{\"action\":\"index\"}");
@@ -1422,8 +1568,8 @@ test "minutes_read rejects index pages outside newest-update-first chronology" {
     var recording = RecordingTransport{ .body = ascending_index };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
 
     var args = try root.parseTestArgs("{\"action\":\"index\"}");
@@ -1442,8 +1588,8 @@ test "minutes_read rejects index metadata updated before it occurred" {
     var recording = RecordingTransport{ .body = invalid_update_index };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
 
     var args = try root.parseTestArgs("{\"action\":\"index\"}");
@@ -1462,8 +1608,8 @@ test "minutes_read rejects index metadata for a future meeting" {
     var recording = RecordingTransport{ .body = future_index };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
 
     var args = try root.parseTestArgs("{\"action\":\"index\"}");
@@ -1475,7 +1621,7 @@ test "minutes_read rejects index metadata for a future meeting" {
     try std.testing.expectEqualStrings("Minutes read response is invalid", result.error_msg orelse "");
 }
 
-test "minutes_read fails closed without a shared turn budget or on a background turn" {
+test "minutes_read fails closed without authorization state or on a background turn" {
     var recording = RecordingTransport{};
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
@@ -1484,57 +1630,230 @@ test "minutes_read fails closed without a shared turn budget or on a background 
     var parsed = try root.parseTestArgs("{\"action\":\"index\"}");
     defer parsed.deinit();
 
-    const no_budget = try tool.execute(std.testing.allocator, parsed.value.object);
-    try std.testing.expect(!no_budget.success);
-    try std.testing.expectEqualStrings("Minutes read turn budget is not initialized", no_budget.error_msg orelse "");
+    const no_state = try tool.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!no_state.success);
+    try std.testing.expectEqualStrings("Minutes read authorization state is not initialized", no_state.error_msg orelse "");
 
-    var budget = root.MinutesReadTurnBudget{};
-    root.setTurnContext(.{ .origin = .heartbeat, .minutes_read_budget = &budget });
+    var state = root.MinutesReadTurnState{};
+    root.setTurnContext(.{ .origin = .heartbeat, .minutes_read_state = &state });
     const background = try tool.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!background.success);
     try std.testing.expectEqualStrings("Minutes reads require a foreground user turn", background.error_msg orelse "");
     try std.testing.expectEqual(@as(usize, 0), recording.url_len);
 }
 
-test "minutes_read enforces one shared eight-call budget across tool invocations" {
+test "minutes_read does not impose a special per-turn call budget" {
     var recording = RecordingTransport{};
     const client = testClient(&recording);
     var first_tool = MinutesReadTool{ .client = &client };
     var second_tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
     var parsed = try root.parseTestArgs("{\"action\":\"index\"}");
     defer parsed.deinit();
 
-    for (0..MAX_TURN_CALLS) |index| {
+    for (0..9) |index| {
         const selected = if (index % 2 == 0) &first_tool else &second_tool;
         const result = try selected.execute(std.testing.allocator, parsed.value.object);
         try std.testing.expect(result.success);
         std.testing.allocator.free(result.output);
     }
-    const ninth = try first_tool.execute(std.testing.allocator, parsed.value.object);
-    try std.testing.expect(!ninth.success);
-    try std.testing.expectEqualStrings("Minutes read call budget exhausted", ninth.error_msg orelse "");
-    const snapshot = budget.snapshot();
-    try std.testing.expectEqual(MAX_TURN_CALLS, snapshot.calls);
-    try std.testing.expectEqual(@as(usize, 0), snapshot.reserved_bytes);
+    try std.testing.expectEqual(@as(usize, 9), recording.call_count);
 }
 
-test "Minutes shared turn budget reserves the one MiB response ceiling" {
-    var budget = root.MinutesReadTurnBudget{};
-    var total: usize = 0;
-    while (total < MAX_TURN_RESPONSE_BYTES) {
-        var reservation = try budget.reserveCall(MAX_RESPONSE_BYTES);
-        const consumed = reservation.allowance;
-        try reservation.finish(consumed);
-        total += consumed;
+test "minutes_read search safely encodes intent and issues item capabilities" {
+    const search_index =
+        \\{"items":[{"id":"transcript:7","kind":"transcript","title":"Launch review","meeting_id":"meeting_7","occurred_at":"2026-07-16T09:00:00Z","updated_at":"2026-07-16T10:00:00Z","sensitivity":"sensitive_pii","retention":{"scope":"minutes.transcript","expires_at":"2099-07-16T10:00:00Z"}}],"truncated":false}
+    ;
+    var recording = RecordingTransport{ .body = search_index };
+    const client = testClient(&recording);
+    var tool = MinutesReadTool{ .client = &client };
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
+    defer clearTestTurn();
+
+    var search_args = try root.parseTestArgs(
+        "{\"action\":\"search\",\"query\":\"launch & roadmap\",\"limit\":1}",
+    );
+    defer search_args.deinit();
+    const search_result = try tool.execute(std.testing.allocator, search_args.value.object);
+    defer if (search_result.success) std.testing.allocator.free(search_result.output);
+    try std.testing.expect(search_result.success);
+    try std.testing.expectEqualStrings(
+        "https://minutes.test/api/zaki/read/v1/7/search?q=launch%20%26%20roadmap&limit=1",
+        recording.url_storage[0..recording.url_len],
+    );
+
+    recording.body = valid_transcript;
+    var item_args = try root.parseTestArgs(
+        "{\"action\":\"item\",\"item_id\":\"transcript:7\",\"variant\":\"full\"}",
+    );
+    defer item_args.deinit();
+    const item_result = try tool.execute(std.testing.allocator, item_args.value.object);
+    defer if (item_result.success) std.testing.allocator.free(item_result.output);
+    try std.testing.expect(item_result.success);
+    try std.testing.expectEqual(@as(usize, 2), recording.call_count);
+}
+
+test "minutes_read rejects missing blank control and oversized search queries before transport" {
+    var recording = RecordingTransport{};
+    const client = testClient(&recording);
+    var tool = MinutesReadTool{ .client = &client };
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
+    defer clearTestTurn();
+
+    const invalid_queries = [_]?[]const u8{ null, " \t\n", "launch\nsecret" };
+    for (invalid_queries) |query| {
+        var args = JsonObjectMap.init(std.testing.allocator);
+        defer args.deinit();
+        try args.put("action", .{ .string = "search" });
+        if (query) |value| try args.put("query", .{ .string = value });
+        const result = try tool.execute(std.testing.allocator, args);
+        try std.testing.expect(!result.success);
     }
-    try std.testing.expectEqual(MAX_TURN_RESPONSE_BYTES, total);
-    try std.testing.expectError(error.MinutesReadResponseBudgetExhausted, budget.reserveCall(MAX_RESPONSE_BYTES));
-    const snapshot = budget.snapshot();
-    try std.testing.expectEqual(MAX_TURN_RESPONSE_BYTES, snapshot.response_bytes);
-    try std.testing.expectEqual(@as(usize, 0), snapshot.reserved_bytes);
+
+    const oversized = "x" ** 513;
+    var oversized_args = JsonObjectMap.init(std.testing.allocator);
+    defer oversized_args.deinit();
+    try oversized_args.put("action", .{ .string = "search" });
+    try oversized_args.put("query", .{ .string = oversized });
+    const oversized_result = try tool.execute(std.testing.allocator, oversized_args);
+    try std.testing.expect(!oversized_result.success);
+    try std.testing.expectEqual(@as(usize, 0), recording.call_count);
+}
+
+test "minutes_read permits independent collection queries in one turn" {
+    var recording = RecordingTransport{};
+    const client = testClient(&recording);
+    var tool = MinutesReadTool{ .client = &client };
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
+    defer clearTestTurn();
+
+    var index_args = try root.parseTestArgs("{\"action\":\"index\",\"limit\":1}");
+    defer index_args.deinit();
+    const index_result = try tool.execute(std.testing.allocator, index_args.value.object);
+    defer if (index_result.success) std.testing.allocator.free(index_result.output);
+    try std.testing.expect(index_result.success);
+
+    var search_args = try root.parseTestArgs(
+        "{\"action\":\"search\",\"query\":\"launch roadmap\",\"limit\":1}",
+    );
+    defer search_args.deinit();
+    const search_result = try tool.execute(std.testing.allocator, search_args.value.object);
+    defer if (search_result.success) std.testing.allocator.free(search_result.output);
+    try std.testing.expect(search_result.success);
+    try std.testing.expectEqual(@as(usize, 2), recording.call_count);
+}
+
+test "minutes_read latest scans all pages by occurred_at and returns the newest transcript" {
+    const first_page =
+        \\{"items":[{"id":"transcript:older","kind":"transcript","title":"Recently edited old meeting","meeting_id":"meeting_old","occurred_at":"2026-07-10T09:00:00Z","updated_at":"2026-07-18T10:00:00Z","sensitivity":"sensitive_pii","retention":{"scope":"minutes.transcript","expires_at":"2099-07-18T10:00:00Z"}}],"truncated":true,"next_cursor":"page-2"}
+    ;
+    const second_page =
+        \\{"items":[{"id":"transcript:newest","kind":"transcript","title":"Actual last meeting","meeting_id":"meeting_new","occurred_at":"2026-07-17T09:00:00Z","updated_at":"2026-07-17T10:00:00Z","sensitivity":"sensitive_pii","retention":{"scope":"minutes.transcript","expires_at":"2099-07-17T10:00:00Z"}}],"truncated":false}
+    ;
+    const newest_transcript =
+        \\{"item":{"id":"transcript:newest","kind":"transcript","title":"Actual last meeting","meeting_id":"meeting_new","occurred_at":"2026-07-17T09:00:00Z","updated_at":"2026-07-17T10:00:00Z","sensitivity":"sensitive_pii","capture_notice":{"bot_visible":true,"tenant_attested_at":"2026-07-17T08:55:00Z","policy_version":"v1"},"retention":{"scope":"minutes.transcript","expires_at":"2099-07-17T10:00:00Z"},"content":{"format":"speaker_turns","turns":[{"speaker":"Nova","started_at":"2026-07-17T09:00:00Z","text":"Newest meeting content."}]}},"truncated":false}
+    ;
+    const bodies = [_][]const u8{ first_page, second_page, newest_transcript };
+    var sequence = SequencedTransport{ .bodies = &bodies };
+    const client = Client{
+        .base_url = "https://minutes.test",
+        .read_token = "0123456789abcdef0123456789abcdef",
+        .transport = sequence.transport(),
+    };
+    var tool = MinutesReadTool{ .client = &client };
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
+    defer clearTestTurn();
+
+    var args = try root.parseTestArgs("{\"action\":\"latest\",\"variant\":\"full\"}");
+    defer args.deinit();
+    const result = try tool.execute(std.testing.allocator, args.value.object);
+    defer if (result.success) std.testing.allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try expectWrappedPayload(result.output, "Newest meeting content.");
+    try std.testing.expectEqual(@as(usize, 3), sequence.call_count);
+    try std.testing.expectEqualStrings(
+        "https://minutes.test/api/zaki/read/v1/7/index?limit=50",
+        sequence.url_storage[0][0..sequence.url_lens[0]],
+    );
+    try std.testing.expectEqualStrings(
+        "https://minutes.test/api/zaki/read/v1/7/index?limit=50&cursor=page-2",
+        sequence.url_storage[1][0..sequence.url_lens[1]],
+    );
+    try std.testing.expectEqualStrings(
+        "https://minutes.test/api/zaki/read/v1/7/item/transcript%3Anewest?variant=full",
+        sequence.url_storage[2][0..sequence.url_lens[2]],
+    );
+}
+
+test "minutes_read latest stops when the update frontier proves the winner" {
+    const settled_page =
+        \\{"items":[{"id":"transcript:newest","kind":"transcript","title":"Actual last meeting","meeting_id":"meeting_new","occurred_at":"2026-07-17T09:00:00Z","updated_at":"2026-07-17T10:00:00Z","sensitivity":"sensitive_pii","retention":{"scope":"minutes.transcript","expires_at":"2099-07-17T10:00:00Z"}},{"id":"meeting:older","kind":"meeting","title":"Older meeting","occurred_at":"2026-07-16T07:00:00Z","updated_at":"2026-07-16T08:00:00Z","sensitivity":"sensitive_pii","retention":{"scope":"minutes.transcript","expires_at":"2099-07-16T08:00:00Z"}}],"truncated":true,"next_cursor":"unneeded-page"}
+    ;
+    const newest_transcript =
+        \\{"item":{"id":"transcript:newest","kind":"transcript","title":"Actual last meeting","meeting_id":"meeting_new","occurred_at":"2026-07-17T09:00:00Z","updated_at":"2026-07-17T10:00:00Z","sensitivity":"sensitive_pii","capture_notice":{"bot_visible":true,"tenant_attested_at":"2026-07-17T08:55:00Z","policy_version":"v1"},"retention":{"scope":"minutes.transcript","expires_at":"2099-07-17T10:00:00Z"},"content":{"format":"speaker_turns","turns":[{"speaker":"Nova","started_at":"2026-07-17T09:00:00Z","text":"Settled winner."}]}},"truncated":false}
+    ;
+    const bodies = [_][]const u8{ settled_page, newest_transcript };
+    var sequence = SequencedTransport{ .bodies = &bodies };
+    const client = Client{
+        .base_url = "https://minutes.test",
+        .read_token = "0123456789abcdef0123456789abcdef",
+        .transport = sequence.transport(),
+    };
+    var tool = MinutesReadTool{ .client = &client };
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
+    defer clearTestTurn();
+
+    var args = try root.parseTestArgs("{\"action\":\"latest\"}");
+    defer args.deinit();
+    const result = try tool.execute(std.testing.allocator, args.value.object);
+    defer if (result.success) std.testing.allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try expectWrappedPayload(result.output, "Settled winner.");
+    try std.testing.expectEqual(@as(usize, 2), sequence.call_count);
+}
+
+test "minutes_read latest automatically uses the authorized summary fallback" {
+    const index =
+        \\{"items":[{"id":"transcript:large","kind":"transcript","title":"Long meeting","meeting_id":"meeting_large","occurred_at":"2026-07-17T09:00:00Z","updated_at":"2026-07-17T10:00:00Z","sensitivity":"sensitive_pii","retention":{"scope":"minutes.transcript","expires_at":"2099-07-17T10:00:00Z"}}],"truncated":false}
+    ;
+    const summary =
+        \\{"item":{"id":"transcript:large","kind":"transcript","title":"Long meeting","meeting_id":"meeting_large","occurred_at":"2026-07-17T09:00:00Z","updated_at":"2026-07-17T10:00:00Z","sensitivity":"sensitive_pii","capture_notice":{"bot_visible":true,"tenant_attested_at":"2026-07-17T08:55:00Z","policy_version":"v1"},"retention":{"scope":"minutes.transcript","expires_at":"2099-07-17T10:00:00Z"},"content":{"format":"summary","text":"Spoke summary fallback."}},"truncated":false}
+    ;
+    const bodies = [_][]const u8{ index, "upstream body must stay hidden", summary };
+    const statuses = [_]u16{ 200, 413, 200 };
+    var sequence = SequencedTransport{ .bodies = &bodies, .statuses = &statuses };
+    const client = Client{
+        .base_url = "https://minutes.test",
+        .read_token = "0123456789abcdef0123456789abcdef",
+        .transport = sequence.transport(),
+    };
+    var tool = MinutesReadTool{ .client = &client };
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
+    defer clearTestTurn();
+
+    var args = try root.parseTestArgs("{\"action\":\"latest\"}");
+    defer args.deinit();
+    const result = try tool.execute(std.testing.allocator, args.value.object);
+    defer if (result.success) std.testing.allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try expectWrappedPayload(result.output, "Spoke summary fallback.");
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "upstream body") == null);
+    try std.testing.expectEqual(@as(usize, 3), sequence.call_count);
+    try std.testing.expectEqualStrings(
+        "https://minutes.test/api/zaki/read/v1/7/item/transcript%3Alarge?variant=summary",
+        sequence.url_storage[2][0..sequence.url_lens[2]],
+    );
 }
 
 test "minutes_read refuses redirects and upstream bodies without reflecting content" {
@@ -1542,8 +1861,8 @@ test "minutes_read refuses redirects and upstream bodies without reflecting cont
     var recording = RecordingTransport{ .status_code = 302, .body = secret };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
     var parsed = try root.parseTestArgs("{\"action\":\"index\"}");
     defer parsed.deinit();
@@ -1556,8 +1875,8 @@ test "minutes_read turns upstream item 413 into one bounded summary retry" {
     var recording = RecordingTransport{ .status_code = 413 };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
     try issueTranscriptCapabilityForTest(&tool, &recording, "transcript:7");
 
@@ -1595,8 +1914,8 @@ test "minutes_read never grants transcript summary fallback after a meeting 413"
     var recording = RecordingTransport{ .body = meeting_index };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
 
     var index_args = try root.parseTestArgs("{\"action\":\"index\"}");
@@ -1640,8 +1959,8 @@ test "minutes_read rejects index content leaks missing labels and expired retent
         var recording = RecordingTransport{ .body = body };
         const client = testClient(&recording);
         var tool = MinutesReadTool{ .client = &client };
-        var budget = root.MinutesReadTurnBudget{};
-        installTestTurn(&budget, 7);
+        var state = root.MinutesReadTurnState{};
+        installTestTurn(&state, 7);
         defer clearTestTurn();
         var parsed = try root.parseTestArgs("{\"action\":\"index\"}");
         defer parsed.deinit();
@@ -1654,8 +1973,8 @@ test "minutes_read rejects transcript variant confusion and invalid turn orderin
     var recording = RecordingTransport{ .body = valid_transcript };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
     try issueTranscriptCapabilityForTest(&tool, &recording, "transcript:7");
 
@@ -1687,8 +2006,8 @@ test "minutes_read summary variant accepts only a transcript summary response" {
     var recording = RecordingTransport{ .body = meeting_response };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
     try issueTranscriptCapabilityForTest(&tool, &recording, "transcript:7");
 
@@ -1717,8 +2036,8 @@ test "minutes_read rejects a Unicode-whitespace-only transcript summary" {
     var recording = RecordingTransport{ .body = blank_summary };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
     try issueTranscriptCapabilityForTest(&tool, &recording, "transcript:7");
 
@@ -1747,8 +2066,8 @@ test "minutes_read rejects capture attestation from the future" {
     var recording = RecordingTransport{ .body = future_attestation };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
     try issueTranscriptCapabilityForTest(&tool, &recording, "transcript:7");
 
@@ -1767,8 +2086,8 @@ test "minutes_read rejects a Unicode-whitespace-only capture policy version" {
     var recording = RecordingTransport{ .body = blank_policy };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
     try issueTranscriptCapabilityForTest(&tool, &recording, "transcript:7");
 
@@ -1787,8 +2106,8 @@ test "minutes_read validates Arabic transcript strings by code point and byte ca
     var recording = RecordingTransport{ .body = arabic_transcript };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
     try issueTranscriptCapabilityForTest(&tool, &recording, "transcript:arabic");
 
@@ -1807,8 +2126,8 @@ test "minutes_read keeps spoken prompt injection inside an explicit untrusted-da
     var recording = RecordingTransport{ .body = injected_transcript };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
     try issueTranscriptCapabilityForTest(&tool, &recording, "transcript:injected");
     var parsed = try root.parseTestArgs("{\"action\":\"item\",\"item_id\":\"transcript:injected\"}");
@@ -1839,8 +2158,8 @@ test "minutes_read refuses a sealed-valid full item that the Agent dispatcher wo
     var recording = RecordingTransport{ .body = large_transcript };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
-    var budget = root.MinutesReadTurnBudget{};
-    installTestTurn(&budget, 7);
+    var state = root.MinutesReadTurnState{};
+    installTestTurn(&state, 7);
     defer clearTestTurn();
     try issueTranscriptCapabilityForTest(&tool, &recording, "transcript:large");
     var parsed = try root.parseTestArgs("{\"action\":\"item\",\"item_id\":\"transcript:large\",\"variant\":\"full\"}");
