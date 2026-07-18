@@ -511,10 +511,33 @@ fn actionArgumentsValid(args: JsonObjectMap, action: []const u8) bool {
 
 fn isValidSearchQuery(query: []const u8) bool {
     if (!stringLengthWithin(query, 1, 512) or !hasNonWhitespaceCodepoint(query)) return false;
-    for (query) |byte| {
-        if (byte < 0x20 or byte == 0x7f) return false;
+    var iterator = (std.unicode.Utf8View.init(query) catch return false).iterator();
+    while (iterator.nextCodepoint()) |codepoint| {
+        if (isUnsafeSearchCodepoint(codepoint)) return false;
     }
     return true;
+}
+
+fn isUnsafeSearchCodepoint(codepoint: u21) bool {
+    return switch (codepoint) {
+        // C0/C1 controls, including newlines and Unicode NEL.
+        0x0000...0x001F,
+        0x007F...0x009F,
+        // Invisible discretionary/word separators.
+        0x00AD,
+        0x200B,
+        0x2060...0x2064,
+        0xFEFF,
+        // Directionality controls can make the executed query differ from
+        // what an operator sees. U+200C/U+200D remain valid because they are
+        // meaningful join controls in Arabic-derived scripts.
+        0x061C,
+        0x200E...0x200F,
+        0x202A...0x202E,
+        0x2066...0x206F,
+        => true,
+        else => false,
+    };
 }
 
 const ResponseShape = enum { index, item };
@@ -1744,6 +1767,8 @@ test "minutes_read search safely encodes intent and issues item capabilities" {
 }
 
 test "minutes_read rejects missing blank control and oversized search queries before transport" {
+    try std.testing.expect(isValidSearchQuery("فارسی\u{200C}زبان"));
+
     var recording = RecordingTransport{};
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
@@ -1751,13 +1776,20 @@ test "minutes_read rejects missing blank control and oversized search queries be
     installTestTurn(&state, 7);
     defer clearTestTurn();
 
-    const invalid_queries = [_]?[]const u8{ null, " \t\n", "launch\nsecret" };
+    const invalid_queries = [_]?[]const u8{
+        null,
+        " \t\n",
+        "launch\nsecret",
+        "budget\u{0085}notes",
+        "budget\u{202E}notes",
+    };
     for (invalid_queries) |query| {
         var args = JsonObjectMap.init(std.testing.allocator);
         defer args.deinit();
         try args.put("action", .{ .string = "search" });
         if (query) |value| try args.put("query", .{ .string = value });
         const result = try tool.execute(std.testing.allocator, args);
+        defer if (result.success) std.testing.allocator.free(result.output);
         try std.testing.expect(!result.success);
     }
 
