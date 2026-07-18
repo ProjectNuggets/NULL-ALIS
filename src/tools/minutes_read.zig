@@ -128,6 +128,12 @@ pub const MinutesReadTool = struct {
 
         const action = root.getString(args, "action") orelse
             return ToolResult.fail("Missing required 'action' parameter");
+        if (!oneOf(action, &.{ "index", "search", "latest", "item" })) {
+            return ToolResult.fail("Unknown Minutes read action. Use index, search, latest, or item.");
+        }
+        if (!actionArgumentsValid(args, action)) {
+            return ToolResult.fail("Minutes read parameters do not match the selected action");
+        }
         if (std.mem.eql(u8, action, "latest")) return self.executeLatest(allocator, args);
         const is_index = std.mem.eql(u8, action, "index");
         const is_search = std.mem.eql(u8, action, "search");
@@ -480,6 +486,27 @@ pub const MinutesReadTool = struct {
 fn resolvedIndexLimit(args: JsonObjectMap) i64 {
     const requested_limit = root.getInt(args, "limit") orelse INDEX_DEFAULT;
     return @min(@max(requested_limit, 1), INDEX_LIMIT);
+}
+
+fn actionArgumentsValid(args: JsonObjectMap, action: []const u8) bool {
+    const allowed: []const []const u8 = if (std.mem.eql(u8, action, "index"))
+        &.{ "action", "since", "limit", "cursor" }
+    else if (std.mem.eql(u8, action, "search"))
+        &.{ "action", "query", "limit", "cursor" }
+    else if (std.mem.eql(u8, action, "latest"))
+        &.{ "action", "variant" }
+    else
+        &.{ "action", "item_id", "variant" };
+
+    var iterator = args.iterator();
+    while (iterator.next()) |entry| {
+        // Identity is sealed in the turn context. Keep accepting a caller-
+        // supplied user_id only to preserve the fail-closed ownership contract:
+        // it is always ignored and can never alter the spoke path or headers.
+        if (std.mem.eql(u8, entry.key_ptr.*, "user_id")) continue;
+        if (!oneOf(entry.key_ptr.*, allowed)) return false;
+    }
+    return true;
 }
 
 fn isValidSearchQuery(query: []const u8) bool {
@@ -1741,6 +1768,33 @@ test "minutes_read rejects missing blank control and oversized search queries be
     try oversized_args.put("query", .{ .string = oversized });
     const oversized_result = try tool.execute(std.testing.allocator, oversized_args);
     try std.testing.expect(!oversized_result.success);
+    try std.testing.expectEqual(@as(usize, 0), recording.call_count);
+}
+
+test "minutes_read rejects action-incompatible parameters before transport" {
+    var recording = RecordingTransport{};
+    const client = testClient(&recording);
+    var tool = MinutesReadTool{ .client = &client };
+    var state: root.MinutesReadTurnState = undefined;
+    installTestTurn(&state, 7);
+    defer clearTestTurn();
+
+    const cases = [_][]const u8{
+        "{\"action\":\"latest\",\"query\":\"budget\"}",
+        "{\"action\":\"search\",\"query\":\"budget\",\"since\":\"2026-07-01T00:00:00Z\"}",
+        "{\"action\":\"index\",\"item_id\":\"transcript:7\"}",
+        "{\"action\":\"item\",\"item_id\":\"transcript:7\",\"limit\":1}",
+    };
+    for (cases) |json| {
+        var args = try root.parseTestArgs(json);
+        defer args.deinit();
+        const result = try tool.execute(std.testing.allocator, args.value.object);
+        try std.testing.expect(!result.success);
+        try std.testing.expectEqualStrings(
+            "Minutes read parameters do not match the selected action",
+            result.error_msg orelse "",
+        );
+    }
     try std.testing.expectEqual(@as(usize, 0), recording.call_count);
 }
 
