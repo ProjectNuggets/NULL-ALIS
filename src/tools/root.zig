@@ -461,7 +461,7 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     // Together FLUX costs $0.003+ per call — expensive tier.
     .{
         .name = image_generate.ImageGenerateTool.tool_name,
-        .flags = .{ .concurrency_safe = true },
+        .flags = .{ .mutating = true, .concurrency_safe = true },
         .risk_level = .low,
         .cost_class = .c,
     },
@@ -471,7 +471,7 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     // timestamped filename). Medium cost — invokes an external binary.
     .{
         .name = produce_document.ProduceDocumentTool.tool_name,
-        .flags = .{ .mutating = true, .background_safe = true, .concurrency_safe = true },
+        .flags = .{ .mutating = true, .background_safe = true, .concurrency_safe = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .b,
     },
@@ -506,13 +506,13 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     },
     .{
         .name = file_write.FileWriteTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .medium,
         .cost_class = .a,
     },
     .{
         .name = file_edit.FileEditTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .medium,
         .cost_class = .a,
     },
@@ -522,13 +522,13 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // lines in place via Hashline anchors (drift-tolerant), writing the
         // file back — a mutating filesystem edit. Same posture as file_edit.
         .name = file_edit_hashed.FileEditHashedTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .medium,
         .cost_class = .a,
     },
     .{
         .name = file_append.FileAppendTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .medium,
         .cost_class = .a,
     },
@@ -543,13 +543,13 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
     },
     .{
         .name = memory_store.MemoryStoreTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .a,
     },
     .{
         .name = memory_edit.MemoryEditTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -571,7 +571,7 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // Close-outs stay reversible — mirrors memory_forget's MU/low/a
         // (forget is the hard-delete sibling).
         .name = memory_archive.MemoryArchiveTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -582,7 +582,7 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // immortality guard releases it for edit/archive. One row
         // metadata write, bounded, reversible → MU/low/a.
         .name = memory_demote.MemoryDemoteTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -646,7 +646,7 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // one LLM call (~$0.0003 on Kimi K2.6 cheap path) plus N cosine
         // resolutions, capped at MAX_MENTIONS_PER_TURN=24.
         .name = wiki_link.WikiLinkTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .b,
     },
@@ -663,7 +663,7 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // but the tool as a whole mutates persisted lists). Per-session
         // scope; cost is local memory writes only.
         .name = todo.TodoTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -674,7 +674,7 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         // write + 1 memory_event row. Risk low: bounded inputs +
         // dangling references are filtered at /brain/graph render time.
         .name = compose_memory.ComposeMemoryTool.tool_name,
-        .flags = .{ .mutating = true },
+        .flags = .{ .mutating = true, .supervised_auto_approve = true },
         .risk_level = .low,
         .cost_class = .a,
     },
@@ -1741,7 +1741,9 @@ pub fn allTools(
 
     if (opts.http_enabled) {
         const ht = try allocator.create(http_request.HttpRequestTool);
-        ht.* = .{};
+        ht.* = .{
+            .allowed_domains = if (opts.config) |cfg| cfg.http_request.allowed_domains else &.{},
+        };
         try list.append(allocator, ht.tool());
 
         const wft = try allocator.create(web_fetch.WebFetchTool);
@@ -3058,6 +3060,7 @@ pub fn subagentTools(
     workspace_dir: []const u8,
     opts: struct {
         http_enabled: bool = false,
+        http_allowed_domains: []const []const u8 = &.{},
         allowed_paths: []const []const u8 = &.{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
         // Phase 3 (Subagent Pass): tenant handles so the subagent's
@@ -3103,7 +3106,7 @@ pub fn subagentTools(
 
     if (opts.http_enabled) {
         const ht = try allocator.create(http_request.HttpRequestTool);
-        ht.* = .{};
+        ht.* = .{ .allowed_domains = opts.http_allowed_domains };
         try list.append(allocator, ht.tool());
     }
 
@@ -3543,6 +3546,31 @@ test "all tools includes extras when enabled" {
     //   in the MAIN profile when multiagent is on — Superpowers-gated at
     //   execute(), not at registration) = 59.
     try std.testing.expectEqual(@as(usize, 59), tools.len);
+}
+
+test "all tools wires configured http request allowlist" {
+    const Config = @import("../config.zig").Config;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.http_request.allowed_domains = &.{"api.example.com"};
+
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .config = &cfg,
+        .http_enabled = true,
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    for (tools) |tool_entry| {
+        if (!std.mem.eql(u8, tool_entry.name(), http_request.HttpRequestTool.tool_name)) continue;
+        const request_tool: *http_request.HttpRequestTool = @ptrCast(@alignCast(tool_entry.ptr));
+        try std.testing.expectEqual(@as(usize, 1), request_tool.allowed_domains.len);
+        try std.testing.expectEqualStrings("api.example.com", request_tool.allowed_domains[0]);
+        return;
+    }
+    return error.TestUnexpectedResult;
 }
 
 test "all tools excludes extras when disabled" {
@@ -4038,21 +4066,47 @@ test "defaultMetadataRegistry flags all validate" {
     }
 }
 
-test "defaultMetadataRegistry auto-approves only local editable artifact writes" {
-    const registry = defaultMetadataRegistry();
-    const create = metadata.lookupMetadata("artifact_create", registry) orelse return error.TestUnexpectedResult;
-    const update = metadata.lookupMetadata("artifact_update", registry) orelse return error.TestUnexpectedResult;
-    const share = metadata.lookupMetadata("artifact_share", registry) orelse return error.TestUnexpectedResult;
-    const produce = metadata.lookupMetadata("produce_document", registry) orelse return error.TestUnexpectedResult;
+test "defaultMetadataRegistry supervised auto-approve set is exact" {
+    const safe_mutating = [_][]const u8{
+        "memory_store",    "memory_edit",      "compose_memory", "wiki_link",
+        "memory_archive",  "memory_demote",    "todo",           "file_write",
+        "file_edit",       "file_edit_hashed", "file_append",    "produce_document",
+        "artifact_create", "artifact_update",
+    };
 
-    try std.testing.expect(create.flags.mutating);
-    try std.testing.expect(create.flags.supervised_auto_approve);
-    try std.testing.expect(update.flags.mutating);
-    try std.testing.expect(update.flags.supervised_auto_approve);
+    for (safe_mutating) |name| {
+        const entry = metadata.lookupMetadata(name, &DEFAULT_TOOL_METADATA) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(entry.flags.mutating);
+        try std.testing.expect(entry.flags.supervised_auto_approve);
+    }
 
-    try std.testing.expect(share.flags.mutating);
-    try std.testing.expect(!share.flags.supervised_auto_approve);
-    try std.testing.expect(!produce.flags.supervised_auto_approve);
+    var auto_approve_count: usize = 0;
+    for (DEFAULT_TOOL_METADATA) |entry| {
+        if (entry.flags.supervised_auto_approve) auto_approve_count += 1;
+    }
+    try std.testing.expectEqual(safe_mutating.len, auto_approve_count);
+
+    const gated = [_][]const u8{
+        "shell",            "http_request",   "message",       "pushover",
+        "git_operations",   "schedule",       "cron_add",      "cron_update",
+        "cron_remove",      "cron_run",       "memory_forget", "memory_purge_topic",
+        "memory_purge_pii", "artifact_share", "delegate",      "spawn",
+        "spawn_many",       "image_generate",
+    };
+    for (gated) |name| {
+        const entry = metadata.lookupMetadata(name, &DEFAULT_TOOL_METADATA) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(!entry.flags.supervised_auto_approve);
+        try std.testing.expect(entry.flags.mutating);
+    }
+}
+
+test "defaultMetadataRegistry has no unclassified side-effecting tool" {
+    for (DEFAULT_TOOL_METADATA) |entry| {
+        if (!entry.flags.read_only and !entry.flags.mutating) {
+            std.debug.print("unclassified tool metadata: {s}\n", .{entry.name});
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "defaultMetadataRegistry classifies known read-only tools" {

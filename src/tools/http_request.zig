@@ -10,7 +10,7 @@ const http_util = @import("../root.zig").http_util;
 /// Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods with
 /// domain allowlisting, SSRF protection, and header redaction.
 pub const HttpRequestTool = struct {
-    allowed_domains: []const []const u8 = &.{}, // empty = allow all
+    allowed_domains: []const []const u8 = &.{}, // empty = deny all
 
     pub const tool_name = "http_request";
 
@@ -56,6 +56,11 @@ pub const HttpRequestTool = struct {
             return ToolResult.fail("Only https:// URLs are allowed");
         }
 
+        const method = validateMethod(method_str) orelse {
+            const msg = try std.fmt.allocPrint(allocator, "Unsupported HTTP method: {s}", .{method_str});
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        };
+
         // Build URI
         const uri = std.Uri.parse(url) catch
             return ToolResult.fail("Invalid URL format");
@@ -67,24 +72,19 @@ pub const HttpRequestTool = struct {
         // resolve once, validate global address, and connect directly to it.
         const host = net_security.extractHost(url) orelse
             return ToolResult.fail("Invalid URL: cannot extract host");
+
+        if (self.allowed_domains.len == 0) {
+            return ToolResult.fail("http_request is disabled until http_request.allowed_domains is configured");
+        }
+        if (!net_security.hostMatchesAllowlist(host, self.allowed_domains)) {
+            return ToolResult.fail("Host is not in http_request.allowed_domains");
+        }
+
         const connect_host = net_security.resolveConnectHost(allocator, host, resolved_port) catch |err| switch (err) {
             error.LocalAddressBlocked => return ToolResult.fail("Blocked local/private host"),
             else => return ToolResult.fail("Unable to verify host safety"),
         };
         defer allocator.free(connect_host);
-
-        // Check domain allowlist
-        if (self.allowed_domains.len > 0) {
-            if (!net_security.hostMatchesAllowlist(host, self.allowed_domains)) {
-                return ToolResult.fail("Host is not in http_request.allowed_domains");
-            }
-        }
-
-        // Validate method
-        const method = validateMethod(method_str) orelse {
-            const msg = try std.fmt.allocPrint(allocator, "Unsupported HTTP method: {s}", .{method_str});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
 
         // Parse custom headers from ObjectMap
         const headers_val = root.getValue(args, "headers");
@@ -448,8 +448,21 @@ test "execute rejects plain http scheme" {
     try std.testing.expectEqualStrings("Only https:// URLs are allowed", result.error_msg.?);
 }
 
-test "execute rejects localhost SSRF" {
+test "execute rejects when http allowlist is empty" {
     var ht = HttpRequestTool{};
+    const t = ht.tool();
+    const parsed = try root.parseTestArgs("{\"url\": \"https://127.0.0.1/admin\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings(
+        "http_request is disabled until http_request.allowed_domains is configured",
+        result.error_msg.?,
+    );
+}
+
+test "execute rejects localhost SSRF" {
+    var ht = HttpRequestTool{ .allowed_domains = &.{"127.0.0.1"} };
     const t = ht.tool();
     const parsed = try root.parseTestArgs("{\"url\": \"https://127.0.0.1:8080/admin\"}");
     defer parsed.deinit();
@@ -459,7 +472,7 @@ test "execute rejects localhost SSRF" {
 }
 
 test "execute rejects localhost SSRF with URL userinfo" {
-    var ht = HttpRequestTool{};
+    var ht = HttpRequestTool{ .allowed_domains = &.{"127.0.0.1"} };
     const t = ht.tool();
     const parsed = try root.parseTestArgs("{\"url\": \"https://user:pass@127.0.0.1:8080/admin\"}");
     defer parsed.deinit();
@@ -469,7 +482,7 @@ test "execute rejects localhost SSRF with URL userinfo" {
 }
 
 test "execute rejects localhost SSRF with unbracketed ipv6 authority" {
-    var ht = HttpRequestTool{};
+    var ht = HttpRequestTool{ .allowed_domains = &.{"::1"} };
     const t = ht.tool();
     const parsed = try root.parseTestArgs("{\"url\": \"https://::1:8080/admin\"}");
     defer parsed.deinit();
@@ -479,7 +492,7 @@ test "execute rejects localhost SSRF with unbracketed ipv6 authority" {
 }
 
 test "execute rejects private IP SSRF" {
-    var ht = HttpRequestTool{};
+    var ht = HttpRequestTool{ .allowed_domains = &.{"192.168.1.1"} };
     const t = ht.tool();
     const parsed = try root.parseTestArgs("{\"url\": \"https://192.168.1.1/admin\"}");
     defer parsed.deinit();
@@ -488,7 +501,7 @@ test "execute rejects private IP SSRF" {
 }
 
 test "execute rejects 10.x private range" {
-    var ht = HttpRequestTool{};
+    var ht = HttpRequestTool{ .allowed_domains = &.{"10.0.0.1"} };
     const t = ht.tool();
     const parsed = try root.parseTestArgs("{\"url\": \"https://10.0.0.1/secret\"}");
     defer parsed.deinit();
@@ -497,7 +510,7 @@ test "execute rejects 10.x private range" {
 }
 
 test "execute rejects loopback decimal alias SSRF" {
-    var ht = HttpRequestTool{};
+    var ht = HttpRequestTool{ .allowed_domains = &.{"2130706433"} };
     const t = ht.tool();
     const parsed = try root.parseTestArgs("{\"url\": \"https://2130706433/admin\"}");
     defer parsed.deinit();

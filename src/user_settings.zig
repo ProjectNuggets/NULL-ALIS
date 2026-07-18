@@ -54,9 +54,9 @@ pub const ProductSettings = struct {
     /// V1.14.4 (booth-readiness, autonomy toggle wire-up).
     ///
     /// User-controllable autonomy: `.read_only` (no writes), `.supervised`
-    /// (approval-gated medium-risk), `.full` (auto-approve within
+    /// (dangerous and paid side effects approval-gated), `.full` (auto-approve within
     /// SecurityPolicy bounds). Default matches `AutonomyConfig.level`'s
-    /// default at config_types.zig:67 (`.full`) — single source of truth
+    /// default (`.supervised`) — single source of truth
     /// for "what does a fresh user get."
     ///
     /// Gap pre-V1.14.4: FE shipped this toggle as
@@ -66,7 +66,7 @@ pub const ProductSettings = struct {
     /// silently no-op'd at the backend. parseProductSettings rejected
     /// the field as InvalidPayload, but the FE error was swallowed by
     /// retry logic. Now wired.
-    autonomy: AutonomyLevel = .full,
+    autonomy: AutonomyLevel = .supervised,
     /// 2026-05-24 (v1.14.21 final-sprint) — user toggle for the nightly
     /// 3 AM dream-reflection cron job declared in `AUTOMATIONS.json`.
     /// Default true: every new tenant gets a nightly reflection out of
@@ -383,7 +383,7 @@ pub fn deriveNearestFromConfigJson(allocator: std.mem.Allocator, config_json: []
     if (parsed.value != .object) return defaults();
     // V1.14.4 review MD-01 — operator-set autonomy.level is honored when
     // the tenant has no `product_settings` block. Pre-fix path returned
-    // defaults() ⇒ autonomy=.full regardless of operator config, silently
+    // defaults() ⇒ the struct default regardless of operator config, silently
     // elevating autonomy on first FE save. Now we extract autonomy.level
     // (if present at the top level) BEFORE delegating to the agent-shape
     // snapper, then merge it into the snapped result.
@@ -769,7 +769,7 @@ fn parseProductSettings(value: std.json.Value) Error!ProductSettings {
     // to the default. New writes always include the key (mergeSettingsIntoConfigJson
     // + normalizeTenantConfigJson + renderSettingsJson all emit it).
     const autonomy_resolved: AutonomyLevel = blk: {
-        const raw = obj.get("autonomy") orelse break :blk .full;
+        const raw = obj.get("autonomy") orelse break :blk .supervised;
         if (raw != .string) return error.InvalidAutonomy;
         break :blk AutonomyLevel.fromString(raw.string) orelse return error.InvalidAutonomy;
     };
@@ -1222,12 +1222,12 @@ test "ownership registry classifies operator and tenant preference keys" {
     try std.testing.expect(productSettingsFieldOwnership("queue_mode") == .unknown);
 }
 
-test "V1.14.4: autonomy default is .full and survives patch round-trip" {
+test "WP-SEC1: autonomy default is supervised and full remains an explicit choice" {
     const settings = defaults();
-    try std.testing.expect(settings.autonomy == .full);
+    try std.testing.expect(settings.autonomy == .supervised);
 
-    const patched = try applyPatchToSettingsJson(std.testing.allocator, settings, "{\"autonomy\":\"supervised\"}");
-    try std.testing.expect(patched.autonomy == .supervised);
+    const patched = try applyPatchToSettingsJson(std.testing.allocator, settings, "{\"autonomy\":\"full\"}");
+    try std.testing.expect(patched.autonomy == .full);
 
     const patched2 = try applyPatchToSettingsJson(std.testing.allocator, patched, "{\"autonomy\":\"read_only\"}");
     try std.testing.expect(patched2.autonomy == .read_only);
@@ -1284,15 +1284,14 @@ test "V1.14.4: applySettingsToConfig propagates autonomy into cfg.autonomy.level
     try std.testing.expect(cfg.autonomy.level == .full);
 }
 
-test "V1.14.4: pre-V1.14.4 stored configs without autonomy key default to .full" {
-    // Backward-compat: a tenant config saved before V1.14.4 won't have
-    // the `autonomy` key in product_settings. Loading should yield
-    // .full (matching ProductSettings default + AutonomyConfig default).
+test "WP-SEC1: stored configs without autonomy key resolve to supervised" {
+    // A tenant config saved before V1.14.4 has no explicit autonomy choice.
+    // Resolve it to the safe default; an explicitly stored `full` remains full.
     const cfg =
         \\{"product_settings":{"assistant_mode":"balanced","group_activation":"mention","proactive_updates":true,"voice_replies":false,"session_timeout_minutes":30}}
     ;
     const settings = try resolveSettingsFromConfigJson(std.testing.allocator, cfg);
-    try std.testing.expect(settings.autonomy == .full);
+    try std.testing.expect(settings.autonomy == .supervised);
 }
 
 test "V1.14.4 review MD-01: operator-set cfg.autonomy.level honored when product_settings absent" {
