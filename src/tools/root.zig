@@ -2043,8 +2043,6 @@ pub const MinutesReadTurnState = struct {
     issued_cursor: CapabilityDigest = undefined,
     issued_cursor_query: CapabilityDigest = undefined,
     has_issued_cursor: bool = false,
-    summary_fallback_item: CapabilityDigest = undefined,
-    has_summary_fallback_item: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) MinutesReadTurnState {
         return .{ .allocator = allocator };
@@ -2058,9 +2056,7 @@ pub const MinutesReadTurnState = struct {
         self.issued_items = .empty;
         std.crypto.secureZero(u8, &self.issued_cursor);
         std.crypto.secureZero(u8, &self.issued_cursor_query);
-        std.crypto.secureZero(u8, &self.summary_fallback_item);
         self.has_issued_cursor = false;
-        self.has_summary_fallback_item = false;
     }
 
     pub fn digestCapability(value: []const u8) CapabilityDigest {
@@ -2140,7 +2136,7 @@ pub const MinutesReadTurnState = struct {
             }
             if (existing_index) |index| {
                 // Seeing validated transcript metadata on any page is enough
-                // to permit the one-shot, response-validated summary fallback.
+                // to permit a response-validated summary read.
                 self.issued_items.items[index].summary_eligible = self.issued_items.items[index].summary_eligible or summary_eligible;
             } else {
                 self.issued_items.appendAssumeCapacity(.{
@@ -2156,7 +2152,6 @@ pub const MinutesReadTurnState = struct {
         } else {
             self.has_issued_cursor = false;
         }
-        self.has_summary_fallback_item = false;
     }
 
     pub fn isCursorIssued(self: *MinutesReadTurnState, cursor: []const u8, index_query: CapabilityDigest) bool {
@@ -2168,10 +2163,10 @@ pub const MinutesReadTurnState = struct {
             std.mem.eql(u8, &self.issued_cursor_query, &index_query);
     }
 
-    /// Full item reads require an ID from a validated index page in this turn.
-    /// A summary retry additionally consumes the one-shot grant created by a
-    /// bounded full-item failure.
-    pub fn authorizeItemRequest(self: *MinutesReadTurnState, item_id: []const u8, summary_retry: bool) bool {
+    /// Item reads require an ID from a validated collection page in this turn.
+    /// Summary reads additionally require that page to identify the item as a
+    /// transcript; the returned body is still sealed-profile validated.
+    pub fn authorizeItemRequest(self: *MinutesReadTurnState, item_id: []const u8, summary_variant: bool) bool {
         const digest = digestCapability(item_id);
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -2184,26 +2179,7 @@ pub const MinutesReadTurnState = struct {
             }
         }
         const item_index = issued_item_index orelse return false;
-        if (!summary_retry) return true;
-        if (!self.issued_items.items[item_index].summary_eligible) return false;
-        if (!self.has_summary_fallback_item or !std.mem.eql(u8, &self.summary_fallback_item, &digest)) return false;
-        self.has_summary_fallback_item = false;
-        return true;
-    }
-
-    pub fn grantSummaryFallback(self: *MinutesReadTurnState, item_id: []const u8) bool {
-        const digest = digestCapability(item_id);
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        for (self.issued_items.items) |issued| {
-            if (std.mem.eql(u8, &issued.digest, &digest)) {
-                if (!issued.summary_eligible) return false;
-                self.summary_fallback_item = digest;
-                self.has_summary_fallback_item = true;
-                return true;
-            }
-        }
-        return false;
+        return !summary_variant or self.issued_items.items[item_index].summary_eligible;
     }
 };
 

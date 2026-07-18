@@ -251,7 +251,7 @@ pub const MinutesReadTool = struct {
         if (status != 200) {
             if (status == 413 and shape == .item) {
                 if (std.mem.eql(u8, variant, "full")) {
-                    if (turn_state.grantSummaryFallback(requested_item_id.?)) {
+                    if (turn_state.authorizeItemRequest(requested_item_id.?, true)) {
                         return ToolResult.fail("Minutes item exceeds the read cap; retry with variant=summary");
                     }
                     return ToolResult.fail("Minutes read was refused");
@@ -282,7 +282,7 @@ pub const MinutesReadTool = struct {
         const wrapped_len = UNTRUSTED_PREFIX.len + response.items.len + UNTRUSTED_SUFFIX.len;
         if (wrapped_len > MAX_DISPATCH_OUTPUT_BYTES) {
             if (shape == .item and std.mem.eql(u8, variant, "full")) {
-                if (turn_state.grantSummaryFallback(requested_item_id.?)) {
+                if (turn_state.authorizeItemRequest(requested_item_id.?, true)) {
                     return ToolResult.fail("Minutes item exceeds the Agent delivery cap; retry with variant=summary");
                 }
             }
@@ -470,9 +470,8 @@ pub const MinutesReadTool = struct {
         {
             return item_result;
         }
-        // The failed bounded full read granted a one-shot summary capability
-        // for this exact server-issued transcript. Retry internally so the
-        // high-level latest intent never needs to reveal or reconstruct its id.
+        // The exact server-issued transcript is summary-eligible. Retry
+        // internally so latest never needs to reveal or reconstruct its id.
         try item_args.put("variant", .{ .string = "summary" });
         return self.execute(allocator, item_args);
     }
@@ -1877,6 +1876,39 @@ test "minutes_read latest automatically uses the authorized summary fallback" {
     );
 }
 
+test "minutes_read latest can request a validated spoke summary directly" {
+    const index =
+        \\{"items":[{"id":"transcript:7","kind":"transcript","title":"Launch review","meeting_id":"meeting_7","occurred_at":"2026-07-17T09:00:00Z","updated_at":"2026-07-17T10:00:00Z","sensitivity":"sensitive_pii","retention":{"scope":"minutes.transcript","expires_at":"2099-07-17T10:00:00Z"}}],"truncated":false}
+    ;
+    const summary =
+        \\{"item":{"id":"transcript:7","kind":"transcript","title":"Launch review","meeting_id":"meeting_7","occurred_at":"2026-07-17T09:00:00Z","updated_at":"2026-07-17T10:00:00Z","sensitivity":"sensitive_pii","capture_notice":{"bot_visible":true,"tenant_attested_at":"2026-07-17T08:55:00Z","policy_version":"v1"},"retention":{"scope":"minutes.transcript","expires_at":"2099-07-17T10:00:00Z"},"content":{"format":"summary","text":"Direct spoke summary."}},"truncated":false}
+    ;
+    const bodies = [_][]const u8{ index, summary };
+    var sequence = SequencedTransport{ .bodies = &bodies };
+    const client = Client{
+        .base_url = "https://minutes.test",
+        .read_token = "0123456789abcdef0123456789abcdef",
+        .transport = sequence.transport(),
+    };
+    var tool = MinutesReadTool{ .client = &client };
+    var state: root.MinutesReadTurnState = undefined;
+    installTestTurn(&state, 7);
+    defer clearTestTurn();
+
+    var args = try root.parseTestArgs("{\"action\":\"latest\",\"variant\":\"summary\"}");
+    defer args.deinit();
+    const result = try tool.execute(std.testing.allocator, args.value.object);
+    defer if (result.success) std.testing.allocator.free(result.output);
+
+    try std.testing.expect(result.success);
+    try expectWrappedPayload(result.output, "Direct spoke summary.");
+    try std.testing.expectEqual(@as(usize, 2), sequence.call_count);
+    try std.testing.expectEqualStrings(
+        "https://minutes.test/api/zaki/read/v1/7/item/transcript%3A7?variant=summary",
+        sequence.url_storage[1][0..sequence.url_lens[1]],
+    );
+}
+
 test "minutes_read refuses redirects and upstream bodies without reflecting content" {
     const secret = "RAW TRANSCRIPT MUST NOT BE REFLECTED";
     var recording = RecordingTransport{ .status_code = 302, .body = secret };
@@ -1892,7 +1924,7 @@ test "minutes_read refuses redirects and upstream bodies without reflecting cont
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg orelse "", secret) == null);
 }
 
-test "minutes_read turns upstream item 413 into one bounded summary retry" {
+test "minutes_read turns upstream item 413 into bounded transcript summary reads" {
     var recording = RecordingTransport{ .status_code = 413 };
     const client = testClient(&recording);
     var tool = MinutesReadTool{ .client = &client };
@@ -1922,13 +1954,13 @@ test "minutes_read turns upstream item 413 into one bounded summary retry" {
     const repeated_summary = try tool.execute(std.testing.allocator, summary_args.value.object);
     try std.testing.expect(!repeated_summary.success);
     try std.testing.expectEqualStrings(
-        "Minutes read capability is not authorized for this turn",
+        "Minutes summary exceeds the read cap",
         repeated_summary.error_msg orelse "",
     );
-    try std.testing.expectEqual(calls_after_summary, recording.call_count);
+    try std.testing.expectEqual(calls_after_summary + 1, recording.call_count);
 }
 
-test "minutes_read never grants transcript summary fallback after a meeting 413" {
+test "minutes_read meeting metadata never authorizes a transcript summary variant" {
     const meeting_index =
         \\{"items":[{"id":"meeting_7","kind":"meeting","title":"Launch review","occurred_at":"2026-07-16T09:00:00Z","updated_at":"2026-07-16T10:00:00Z","sensitivity":"sensitive_pii","retention":{"scope":"minutes.transcript","expires_at":"2099-07-16T10:00:00Z"}}],"truncated":false}
     ;
