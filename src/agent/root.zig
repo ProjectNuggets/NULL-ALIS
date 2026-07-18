@@ -12392,9 +12392,8 @@ test "preflight allows read-only tools in plan mode" {
 
     agent.execution_mode = .plan;
     const read_only_tools = [_][]const u8{
-        "runtime_info",    "file_read", "memory_recall", "memory_list",
-        "memory_timeline", "web_fetch", "web_search",    "task_list",
-        "task_get",
+        "runtime_info",    "file_read",  "memory_recall", "memory_list",
+        "memory_timeline", "web_search", "task_list",     "task_get",
     };
     for (read_only_tools) |name| {
         const call = ParsedToolCall{ .name = name, .arguments_json = "{}", .tool_call_id = null };
@@ -12414,7 +12413,7 @@ test "preflight blocks mutating tools in plan mode" {
     // sub-actions" test — they need concrete args to remain mutating.)
     const mutating_tools = [_][]const u8{
         "shell",    "file_write", "file_edit", "memory_store",
-        "delegate", "spawn",      "message",
+        "delegate", "spawn",      "message",   "web_fetch",
     };
     for (mutating_tools) |name| {
         const call = ParsedToolCall{ .name = name, .arguments_json = "{}", .tool_call_id = null };

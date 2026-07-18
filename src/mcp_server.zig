@@ -372,9 +372,9 @@ fn runServeCommand(allocator: Allocator, sub_args: []const []const u8) !void {
     }
 
     // Build the tool registry. `tool_profile = .main` and HTTP enabled so
-    // web_search / web_fetch (in the safe subset) are available. The
-    // exposure policy still gates what an external caller can see/call;
-    // building the full set just means the safe subset is present.
+    // web_search is available in the safe subset. Arbitrary web_fetch stays
+    // hidden unless the operator explicitly chooses --expose-all. Building
+    // the full set only ensures the policy-selected subset is present.
     const tools = tools_mod.allTools(allocator, workspace_dir, .{
         .tool_profile = .main,
         .config = cfg_ptr,

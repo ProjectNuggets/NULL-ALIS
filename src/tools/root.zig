@@ -428,10 +428,12 @@ const DEFAULT_TOOL_METADATA = [_]metadata.ToolMetadata{
         .cache_scope = .global,
     },
     .{
-        // External HTTP fetch with up to 1MB response — medium cost.
+        // Arbitrary external HTTPS fetch. Even though the local operation is
+        // read-like, the request itself can exfiltrate model-visible data in
+        // its URL, so supervised mode must approval-gate it as outbound egress.
         .name = web_fetch.WebFetchTool.tool_name,
-        .flags = .{ .read_only = true, .background_safe = true, .concurrency_safe = true },
-        .risk_level = .medium,
+        .flags = .{ .mutating = true, .concurrency_safe = true },
+        .risk_level = .high,
         .cost_class = .b,
     },
     .{
@@ -4079,13 +4081,24 @@ test "defaultMetadataRegistry supervised auto-approve set is exact" {
         "git_operations",   "schedule",       "cron_add",      "cron_update",
         "cron_remove",      "cron_run",       "memory_forget", "memory_purge_topic",
         "memory_purge_pii", "artifact_share", "delegate",      "spawn",
-        "spawn_many",       "image_generate",
+        "spawn_many",       "image_generate", "web_fetch",
     };
     for (gated) |name| {
         const entry = metadata.lookupMetadata(name, &DEFAULT_TOOL_METADATA) orelse return error.TestUnexpectedResult;
         try std.testing.expect(!entry.flags.supervised_auto_approve);
         try std.testing.expect(entry.flags.mutating);
     }
+}
+
+test "WP-SEC1: web_fetch arbitrary egress requires supervised approval" {
+    const ApprovalPolicy = @import("../security/approval_modes.zig").ApprovalPolicy;
+    const entry = canonicalMetadataForName(web_fetch.WebFetchTool.tool_name);
+
+    try std.testing.expect(entry.flags.mutating);
+    try std.testing.expect(!entry.flags.read_only);
+    try std.testing.expect(!entry.flags.background_safe);
+    try std.testing.expectEqual(metadata.RiskLevel.high, entry.risk_level);
+    try std.testing.expectEqual(ApprovalPolicy.confirm_once, ApprovalPolicy.forTool(entry, .supervised));
 }
 
 test "defaultMetadataRegistry has no unclassified side-effecting tool" {
@@ -4102,8 +4115,7 @@ test "defaultMetadataRegistry classifies known read-only tools" {
     const read_only = [_][]const u8{
         "runtime_info", "file_read",       "image_info", "memory_recall",
         "memory_list",  "memory_timeline", "cron_list",  "cron_runs",
-        "task_list",    "task_get",        "web_fetch",  "web_search",
-        "screenshot",
+        "task_list",    "task_get",        "web_search", "screenshot",
     };
     for (read_only) |name| {
         const m = metadata.lookupMetadata(name, registry) orelse {
@@ -4123,12 +4135,12 @@ test "defaultMetadataRegistry classifies known mutating tools" {
     // tools still classify" test below.
     const registry = defaultMetadataRegistry();
     const mutating = [_][]const u8{
-        "shell",               "file_write",       "file_edit",    "file_append",
-        "git_operations",      "memory_store",     "memory_edit",  "memory_forget",
-        "schedule",            "message",          "pushover",     "cron_add",
-        "cron_remove",         "cron_update",      "cron_run",     "http_request",
-        "browser_new_session", "browser_navigate", "browser_exec", "browser_close_session",
-        "composio",            "skill_registry",   "task_stop",
+        "shell",                 "file_write",          "file_edit",        "file_append",
+        "git_operations",        "memory_store",        "memory_edit",      "memory_forget",
+        "schedule",              "message",             "pushover",         "cron_add",
+        "cron_remove",           "cron_update",         "cron_run",         "http_request",
+        "web_fetch",             "browser_new_session", "browser_navigate", "browser_exec",
+        "browser_close_session", "composio",            "skill_registry",   "task_stop",
     };
     for (mutating) |name| {
         const m = metadata.lookupMetadata(name, registry) orelse {
@@ -4162,10 +4174,10 @@ test "multiagent-gated tools (delegate, spawn) still classify as mutating + non-
 test "defaultMetadataRegistry only whitelists expected background_safe tools" {
     const registry = defaultMetadataRegistry();
     const background_safe_names = [_][]const u8{
-        "runtime_info",     "file_read",             "memory_recall",
-        "memory_list",      "memory_timeline",       "transcript_read",
-        "web_fetch",        "web_search",            "task_list",
-        "task_get",         "set_execution_mode",    "context_snapshot",
+        "runtime_info",          "file_read",        "memory_recall",
+        "memory_list",           "memory_timeline",  "transcript_read",
+        "web_search",            "task_list",        "task_get",
+        "set_execution_mode",    "context_snapshot",
         // produce_document: writes ONLY to <workspace>/attachments/produced/
         // with timestamped filenames (no overwrite, no cross-invocation
         // state). Safe to run from a scheduled job / cron lane. Wave 2A.
@@ -4180,17 +4192,17 @@ test "defaultMetadataRegistry only whitelists expected background_safe tools" {
         // history tools. Same posture as get + list: safe to run from
         // a cron summary job. The mutating share + revoke_share
         // variants are explicitly NOT here.
-        "artifact_diff",    "artifact_history",
+           "artifact_diff",
+        "artifact_history",
         // 2026-05-25 surface-audit close — memory_doctor + trace_query
         // are pure in-process diagnostics. Memory doctor inspects RAM
         // counters + capabilities; trace_query reads a bounded RAM
         // store. Both are safe to run from a scheduled lane.
-             "memory_doctor",
-        "trace_query",
+             "memory_doctor",    "trace_query",
         // Phase 4 fan-out — subagent_batch_result reads a batch's task results
         // (read_only against the in-memory batch tracker); safe in a background/
         // cron lane. spawn_many is NOT here (it mutates — spawns subagents).
-             "subagent_batch_result",
+        "subagent_batch_result",
         // Pkg3 Task 5 — calculator is pure in-process compute;
         // file_read_hashed reads a workspace file (same background posture
         // as its sibling file_read). Both safe from a scheduled/cron lane.
@@ -4198,8 +4210,7 @@ test "defaultMetadataRegistry only whitelists expected background_safe tools" {
         // fix): they are read_only + concurrency_safe WITHOUT
         // background_safe — the locked design said "read_only" and their
         // pre-task empty flags never admitted them to this lane.
-        "calculator",
-        "file_read_hashed",
+        "calculator",       "file_read_hashed",
     };
 
     // Everything in the whitelist must be background_safe.
