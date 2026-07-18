@@ -97,9 +97,20 @@ test "WP-12 schema rollback: every migration declares a compatibility phase" {
 test "WP-12 schema rollback: expand migrations reject destructive SQL" {
     for (migrations.MIGRATIONS) |migration| {
         if (migration.phase == .expand) {
-            try migrations.validateExpandSql(migration.sql);
+            try migrations.validateExpandMigration(migration);
         }
     }
+}
+
+test "WP-12 schema rollback: 0010 is the sole audited data-delete exception" {
+    var exception_count: usize = 0;
+    for (migrations.MIGRATIONS) |migration| {
+        if (!migration.allow_expand_data_delete) continue;
+        exception_count += 1;
+        try std.testing.expectEqual(@as(u32, 10), migration.version);
+        try std.testing.expectEqualStrings("0010_brain_scaffold_purge", migration.name);
+    }
+    try std.testing.expectEqual(@as(usize, 1), exception_count);
 }
 
 test "WP-12 schema rollback: destructive expand fixtures fail closed" {
@@ -111,6 +122,11 @@ test "WP-12 schema rollback: destructive expand fixtures fail closed" {
         "ALTER TABLE {schema}.messages ALTER COLUMN content SET NOT NULL",
         "ALTER TABLE {schema}.messages DROP CONSTRAINT messages_user_id_fkey",
         "TRUNCATE TABLE {schema}.messages",
+        "TRUNCATE {schema}.messages",
+        "ALTER TABLE {schema}.messages ADD COLUMN required_value TEXT NOT NULL",
+        "DROP INDEX CONCURRENTLY IF EXISTS {schema}.messages_lookup_idx",
+        "DELETE FROM {schema}.messages",
+        "CREATE OR REPLACE TRIGGER messages_before_insert BEFORE INSERT ON {schema}.messages FOR EACH ROW EXECUTE FUNCTION {schema}.audit_message()",
     };
     for (forbidden) |sql| {
         try std.testing.expectError(error.DestructiveExpandMigration, migrations.validateExpandSql(sql));
