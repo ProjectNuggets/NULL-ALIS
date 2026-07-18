@@ -16529,6 +16529,47 @@ const BRAIN_TYPED_EDGE_CAP_PER_SOURCE: usize = 20;
 // timeline still ships even if the event-write fails. Logging gaps
 // are preferable to user-visible 500s.
 
+fn writeTraversalEventKeyArray(writer: anytype, entries: anytype) !void {
+    try writer.writeAll("[");
+    var wrote_key = false;
+    for (entries) |entry| {
+        // Minutes rows carry consent-governed meeting provenance. They may
+        // be visible in the Brain UI, but must not be copied into the
+        // generic learning-event stream; the dedicated meeting erasure
+        // boundary must not accumulate new event carriers.
+        if (memory_mod.isMeetingDerivedMemoryKey(entry.key)) continue;
+
+        if (wrote_key) try writer.writeAll(",");
+        try writer.writeAll("\"");
+        try jsonEscapeInto(writer, entry.key);
+        try writer.writeAll("\"");
+        wrote_key = true;
+    }
+    try writer.writeAll("]");
+}
+
+fn buildBrainGraphTraversalPayload(
+    allocator: std.mem.Allocator,
+    nodes: []const BrainNode,
+    total_in_corpus: usize,
+    trimmed: bool,
+    semantic_degraded: bool,
+    viewed_at: i64,
+) ![]u8 {
+    var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer payload_buf.deinit(allocator);
+    const pw = payload_buf.writer(allocator);
+    try pw.writeAll("{\"action\":\"view_graph\",\"node_keys\":");
+    try writeTraversalEventKeyArray(pw, nodes);
+    try pw.print(",\"total_nodes_in_corpus\":{d},\"trimmed\":{s},\"semantic_degraded\":{s},\"viewed_at\":{d}}}", .{
+        total_in_corpus,
+        if (trimmed) "true" else "false",
+        if (semantic_degraded) "true" else "false",
+        viewed_at,
+    });
+    return payload_buf.toOwnedSlice(allocator);
+}
+
 fn brainLogGraphView(
     allocator: std.mem.Allocator,
     state_mgr: *zaki_state_mod.Manager,
@@ -16538,23 +16579,36 @@ fn brainLogGraphView(
     trimmed: bool,
     semantic_degraded: bool,
 ) !void {
-    var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer payload_buf.deinit(allocator);
-    const pw = payload_buf.writer(allocator);
-    try pw.writeAll("{\"action\":\"view_graph\",\"node_keys\":[");
-    for (nodes, 0..) |n, i| {
-        if (i > 0) try pw.writeAll(",");
-        try pw.writeAll("\"");
-        try jsonEscapeInto(pw, n.key);
-        try pw.writeAll("\"");
-    }
-    try pw.print("],\"total_nodes_in_corpus\":{d},\"trimmed\":{s},\"semantic_degraded\":{s},\"viewed_at\":{d}}}", .{
+    const payload = try buildBrainGraphTraversalPayload(
+        allocator,
+        nodes,
         total_in_corpus,
-        if (trimmed) "true" else "false",
-        if (semantic_degraded) "true" else "false",
+        trimmed,
+        semantic_degraded,
         std.time.timestamp(),
+    );
+    defer allocator.free(payload);
+    try state_mgr.insertTraversalEvent(user_id, payload);
+}
+
+fn buildBrainTimelineTraversalPayload(
+    allocator: std.mem.Allocator,
+    entries: []const memory_mod.MemoryEntry,
+    has_more: bool,
+    cursor_used: bool,
+    viewed_at: i64,
+) ![]u8 {
+    var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer payload_buf.deinit(allocator);
+    const pw = payload_buf.writer(allocator);
+    try pw.writeAll("{\"action\":\"view_timeline\",\"entry_keys\":");
+    try writeTraversalEventKeyArray(pw, entries);
+    try pw.print(",\"has_more\":{s},\"cursor_used\":{s},\"viewed_at\":{d}}}", .{
+        if (has_more) "true" else "false",
+        if (cursor_used) "true" else "false",
+        viewed_at,
     });
-    try state_mgr.insertTraversalEvent(user_id, payload_buf.items);
+    return payload_buf.toOwnedSlice(allocator);
 }
 
 fn brainLogTimelineView(
@@ -16565,22 +16619,15 @@ fn brainLogTimelineView(
     has_more: bool,
     cursor_used: bool,
 ) !void {
-    var payload_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer payload_buf.deinit(allocator);
-    const pw = payload_buf.writer(allocator);
-    try pw.writeAll("{\"action\":\"view_timeline\",\"entry_keys\":[");
-    for (entries, 0..) |entry, i| {
-        if (i > 0) try pw.writeAll(",");
-        try pw.writeAll("\"");
-        try jsonEscapeInto(pw, entry.key);
-        try pw.writeAll("\"");
-    }
-    try pw.print("],\"has_more\":{s},\"cursor_used\":{s},\"viewed_at\":{d}}}", .{
-        if (has_more) "true" else "false",
-        if (cursor_used) "true" else "false",
+    const payload = try buildBrainTimelineTraversalPayload(
+        allocator,
+        entries,
+        has_more,
+        cursor_used,
         std.time.timestamp(),
-    });
-    try state_mgr.insertTraversalEvent(user_id, payload_buf.items);
+    );
+    defer allocator.free(payload);
+    try state_mgr.insertTraversalEvent(user_id, payload);
 }
 
 fn handleBrainGraph(
@@ -37622,6 +37669,31 @@ test "handleBrainGraph rejects malformed max_nodes" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "invalid_max_nodes") != null);
 }
 
+test "brain traversal payload: graph excludes meeting-ingest keys and keeps unrelated keys" {
+    const nodes = [_]BrainNode{
+        .{ .key = "meeting_ingest/fixture/meeting-1/summary", .kind = "meeting", .session_id = null, .created_at = 1, .summary = "", .valid_to = null },
+        .{ .key = "user_preferences", .kind = "core", .session_id = null, .created_at = 2, .summary = "", .valid_to = null },
+        .{ .key = "meeting_ingest/fixture/meeting-1/action/0", .kind = "meeting", .session_id = null, .created_at = 3, .summary = "", .valid_to = null },
+        .{ .key = "meeting_ingestion/user-key", .kind = "core", .session_id = null, .created_at = 4, .summary = "", .valid_to = null },
+        .{ .key = "durable_fact/123/0", .kind = "core", .session_id = null, .created_at = 5, .summary = "", .valid_to = null },
+    };
+
+    const payload = try buildBrainGraphTraversalPayload(
+        std.testing.allocator,
+        &nodes,
+        5,
+        false,
+        false,
+        1714521600,
+    );
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"view_graph\",\"node_keys\":[\"user_preferences\",\"meeting_ingestion/user-key\",\"durable_fact/123/0\"],\"total_nodes_in_corpus\":5,\"trimmed\":false,\"semantic_degraded\":false,\"viewed_at\":1714521600}",
+        payload,
+    );
+}
+
 // ── /brain/timeline cursor pagination unit tests ───────────────────
 
 test "timeline cursor: encode + decode round-trip" {
@@ -37689,6 +37761,30 @@ test "handleBrainTimeline rejects invalid user_id" {
     var dummy_state: GatewayState = undefined;
     const resp = handleBrainTimeline(std.testing.allocator, "GET", "abc", "/api/v1/users/abc/brain/timeline", &dummy_state);
     try std.testing.expectEqualStrings("400 Bad Request", resp.status);
+}
+
+test "brain traversal payload: timeline excludes meeting-ingest keys and keeps unrelated keys" {
+    const entries = [_]memory_mod.MemoryEntry{
+        .{ .id = "1", .key = "meeting_ingest/fixture/meeting-1/summary", .content = "", .category = .core, .timestamp = "2026-07-16T10:00:00Z" },
+        .{ .id = "2", .key = "user_preferences", .content = "", .category = .core, .timestamp = "2026-07-16T10:01:00Z" },
+        .{ .id = "3", .key = "meeting_ingest/fixture/meeting-1/action/0", .content = "", .category = .core, .timestamp = "2026-07-16T10:02:00Z" },
+        .{ .id = "4", .key = "meeting_ingestion/user-key", .content = "", .category = .core, .timestamp = "2026-07-16T10:03:00Z" },
+        .{ .id = "5", .key = "durable_fact/123/0", .content = "", .category = .core, .timestamp = "2026-07-16T10:04:00Z" },
+    };
+
+    const payload = try buildBrainTimelineTraversalPayload(
+        std.testing.allocator,
+        &entries,
+        true,
+        false,
+        1714521600,
+    );
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"view_timeline\",\"entry_keys\":[\"user_preferences\",\"meeting_ingestion/user-key\",\"durable_fact/123/0\"],\"has_more\":true,\"cursor_used\":false,\"viewed_at\":1714521600}",
+        payload,
+    );
 }
 
 // ── /brain/graph filter extension — V1.7a-8b unit tests ───────────────

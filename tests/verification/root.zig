@@ -32,6 +32,7 @@ test {
     _ = @import("trace_share_test.zig");
     _ = @import("extension_browser_test.zig");
     _ = @import("memory_tools_test.zig");
+    _ = @import("meeting_memory_test.zig");
     _ = @import("gdpr_cascade_test.zig");
     _ = @import("schema_static_test.zig");
     _ = @import("observability_test.zig");
