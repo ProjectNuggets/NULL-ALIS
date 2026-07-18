@@ -505,8 +505,22 @@ fn actionArgumentsValid(args: JsonObjectMap, action: []const u8) bool {
         // it is always ignored and can never alter the spoke path or headers.
         if (std.mem.eql(u8, entry.key_ptr.*, "user_id")) continue;
         if (!oneOf(entry.key_ptr.*, allowed)) return false;
+        if (!actionArgumentTypeValid(entry.key_ptr.*, entry.value_ptr.*)) return false;
     }
     return true;
+}
+
+fn actionArgumentTypeValid(key: []const u8, value: JsonValue) bool {
+    if (std.mem.eql(u8, key, "limit")) {
+        return switch (value) {
+            .integer => true,
+            else => false,
+        };
+    }
+    return switch (value) {
+        .string => true,
+        else => false,
+    };
 }
 
 fn isValidSearchQuery(query: []const u8) bool {
@@ -1821,6 +1835,36 @@ test "minutes_read rejects action-incompatible parameters before transport" {
         var args = try root.parseTestArgs(json);
         defer args.deinit();
         const result = try tool.execute(std.testing.allocator, args.value.object);
+        try std.testing.expect(!result.success);
+        try std.testing.expectEqualStrings(
+            "Minutes read parameters do not match the selected action",
+            result.error_msg orelse "",
+        );
+    }
+    try std.testing.expectEqual(@as(usize, 0), recording.call_count);
+}
+
+test "minutes_read rejects wrong-typed action parameters before transport" {
+    var recording = RecordingTransport{};
+    const client = testClient(&recording);
+    var tool = MinutesReadTool{ .client = &client };
+    var state: root.MinutesReadTurnState = undefined;
+    installTestTurn(&state, 7);
+    defer clearTestTurn();
+
+    const cases = [_][]const u8{
+        "{\"action\":\"index\",\"limit\":\"50\"}",
+        "{\"action\":\"index\",\"since\":7}",
+        "{\"action\":\"index\",\"cursor\":false}",
+        "{\"action\":\"search\",\"query\":\"budget\",\"limit\":true}",
+        "{\"action\":\"latest\",\"variant\":7}",
+        "{\"action\":\"item\",\"item_id\":\"transcript:7\",\"variant\":false}",
+    };
+    for (cases) |json| {
+        var args = try root.parseTestArgs(json);
+        defer args.deinit();
+        const result = try tool.execute(std.testing.allocator, args.value.object);
+        defer if (result.success) std.testing.allocator.free(result.output);
         try std.testing.expect(!result.success);
         try std.testing.expectEqualStrings(
             "Minutes read parameters do not match the selected action",
